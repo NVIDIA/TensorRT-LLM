@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +107,25 @@ def _encoder_input_params(params: DisaggregatedParams | None) -> DisaggregatedPa
     if params.request_type not in ("context_only", "context_and_generation"):
         raise UnsupportedFeatureError("encoder caches require a prefill or aggregated request")
     return params
+
+
+def _encoder_output_params(
+    params: DisaggregatedParams,
+    handles: list[dict],
+    hashes: list[list[int]] | None,
+    mrope: dict[str, dict],
+) -> DisaggregatedParams:
+    """Apply native hash validation and the missing-hash fallback to a handoff."""
+    try:
+        return replace(
+            params,
+            multimodal_embedding_handles=handles,
+            multimodal_hashes=hashes,
+            mrope_position_ids_handle=mrope.get("mrope_position_ids_handle"),
+            mrope_position_deltas_handle=mrope.get("mrope_position_deltas_handle"),
+        )
+    except (AssertionError, TypeError) as error:
+        raise ValueError(f"invalid encoder handoff parameters: {error}") from error
 
 
 def _capture_encoder_decode_state(llm: Any, inputs: Any, mrope: dict) -> None:
@@ -320,10 +340,7 @@ class EncoderCache:
                         handle = SharedTensorContainer.from_tensor(tensor).dump_to_dict()
                         exports.append(handle)
                         mrope[field] = handle
-            params.multimodal_embedding_handles = handles
-            params.multimodal_hashes = metadata["hashes"]
-            params.mrope_position_ids_handle = mrope.get("mrope_position_ids_handle")
-            params.mrope_position_deltas_handle = mrope.get("mrope_position_deltas_handle")
+            params = _encoder_output_params(params, handles, metadata["hashes"], mrope)
             inputs = llm.preprocess({"prompt": prompt}, sampling, params)
             exports.clear()  # PreprocessedInputs now owns the worker exports.
             if params.request_type == "context_only":

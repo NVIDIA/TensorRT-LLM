@@ -24,6 +24,7 @@ from .bindings import generation_pb2 as pb
 from .encoder import (
     _capture_encoder_decode_state,
     _encoder_input_params,
+    _encoder_output_params,
     _release,
     take_encoder_exports,
 )
@@ -527,10 +528,7 @@ class NixlEncoderCache:
                     "mrope_position_ids_handle": exports[-2],
                     "mrope_position_deltas_handle": exports[-1],
                 }
-            params.multimodal_embedding_handles = exports[:count]
-            params.multimodal_hashes = metadata["hashes"]
-            params.mrope_position_ids_handle = positions.get("mrope_position_ids_handle")
-            params.mrope_position_deltas_handle = positions.get("mrope_position_deltas_handle")
+            params = _encoder_output_params(params, exports[:count], metadata["hashes"], positions)
             inputs = llm.preprocess({"prompt": prompt}, sampling, params)
             exports.clear()
             if params.request_type == "context_only":

@@ -15,7 +15,13 @@ import grpc
 import pytest
 import torch
 from conftest import AbortError, FakeServicerContext
-from test_encoder import model, native_result, request
+from test_encoder import (
+    _check_handoff_hash_initialization,
+    _check_malformed_handoff_hashes,
+    model,
+    native_result,
+    request,
+)
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.grpc.openengine import encoder_nixl as transport
@@ -146,6 +152,16 @@ def _writes(cache):
     return sum(agent.writes for agent in cache.test_agents)
 
 
+@pytest.mark.parametrize("supplied", [False, True])
+def test_nixl_handoff_restores_hash_validation_and_missing_hash_fallback(pair, supplied):
+    _check_handoff_hash_initialization(*pair, supplied)
+
+
+@pytest.mark.parametrize("hashes", [[], [[1] * 7], [[1.0] * 8], ["bad"], 42, [[1] * 8] * 2])
+def test_nixl_handoff_rejects_malformed_hashes_and_releases_exports(pair, monkeypatch, hashes):
+    _check_malformed_handoff_hashes(*pair, hashes, monkeypatch)
+
+
 @pytest.fixture
 def pair(monkeypatch):
     producer = _cache("encoder.example:30001")
@@ -203,10 +219,13 @@ def test_nixl_encoder_handoff_preserves_prefill_phase(pair):
     producer, consumer = pair
     llm, seen = model()
     ref = producer.publish(native_result()[0], request(), llm)
-    phase = DisaggregatedParams(request_type="context_only")
+    phase = DisaggregatedParams(
+        request_type="context_only", disagg_request_id=71, ctx_usage={"prompt_tokens": 88}
+    )
     _, params = consumer.prepare(ref, request(), llm, None, phase)
-    assert params is phase
     assert params.request_type == "context_only"
+    assert params.disagg_request_id == phase.disagg_request_id
+    assert params.ctx_usage == phase.ctx_usage
     assert seen["hashes"] == [[2147483647] * 8]
     assert _writes(producer) == 1
     assert producer._used == consumer._used == 0

@@ -633,6 +633,11 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         prefill_exports = (
             PrefillResultExports(disaggregated_params) if format_state.is_context_only else None
         )
+        prefill_may_export = format_state.is_context_only and (
+            bool(prepared_input.media)
+            or encoder_action == "consume"
+            or getattr(inputs, "multimodal_params", None) is not None
+        )
 
         async def release_prefill_result(result: Any) -> None:
             if prefill_exports is not None and prefill_exports.has_exports(result):
@@ -841,13 +846,20 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 abort_request("response stream closed")
             if encoder_action == "encode" or (
                 prefill_exports is not None
-                and (abort_requested or prefill_exports.has_exports(result_handle))
+                and (
+                    (abort_requested and prefill_may_export)
+                    or prefill_exports.has_exports(result_handle)
+                )
             ):
 
                 async def reclaim_encoder(handle: Any) -> None:
                     try:
                         complete = getattr(handle, "aresult", None)
-                        if abort_requested and complete is not None:
+                        if (
+                            abort_requested
+                            and complete is not None
+                            and (encoder_action == "encode" or prefill_may_export)
+                        ):
                             await asyncio.wait_for(complete(), timeout=30)
                     except asyncio.TimeoutError:
                         self._encoder_cleanup_failed = True

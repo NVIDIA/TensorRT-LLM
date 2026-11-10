@@ -99,6 +99,72 @@ def native_result():
     return SimpleNamespace(disaggregated_params=params), tensors
 
 
+def _check_handoff_hash_initialization(producer, consumer, supplied):
+    llm, seen = model()
+    llm.input_processor.multimodal_hashing_supported = supplied
+    identities = []
+    for offset in (1, 2):
+        result, tensors = native_result()
+        tensors[0].add_(offset)
+        expected = [[offset] * 8] if supplied else None
+        result.disaggregated_params.multimodal_hashes = expected
+        ref = producer.publish(result, request(), llm)
+        incoming = DisaggregatedParams(
+            request_type="context_only",
+            disagg_request_id=37,
+            ctx_dp_rank=0,
+            ctx_info_endpoint="context.example:1234",
+            ctx_usage={"prompt_tokens": 88},
+        )
+        _, params = consumer.prepare(ref, request(), llm, None, incoming)
+        assert params.request_type == incoming.request_type
+        assert params.disagg_request_id == 37 and params.ctx_dp_rank == 0
+        assert params.ctx_info_endpoint == incoming.ctx_info_endpoint
+        assert params.ctx_usage == incoming.ctx_usage
+        assert incoming.multimodal_embedding_handles is None
+        assert torch.equal(seen["tensors"][0], tensors[0])
+        hashes = seen["hashes"]
+        assert isinstance(hashes, list) and len(hashes) == 1
+        assert len(hashes[0]) == 8 and all(isinstance(value, int) for value in hashes[0])
+        if supplied:
+            assert hashes == expected
+        identities.append(hashes)
+    assert identities[0] != identities[1]
+
+
+def _check_malformed_handoff_hashes(producer, consumer, hashes, monkeypatch):
+    llm, seen = model()
+    result, tensors = native_result()
+    result.disaggregated_params.multimodal_hashes = hashes
+    ref = producer.publish(result, request(), llm)
+    released = []
+    release = SharedTensorContainer.release_dict
+
+    def record(handle):
+        released.append(handle)
+        release(handle)
+
+    monkeypatch.setattr(SharedTensorContainer, "release_dict", record)
+    with pytest.raises(ValueError, match="invalid encoder handoff parameters"):
+        consumer.prepare(ref, request(), llm, None)
+    assert "hashes" not in seen
+    assert len(released) == len(tensors)
+
+
+@pytest.mark.parametrize("supplied", [False, True])
+def test_shared_handoff_restores_hash_validation_and_missing_hash_fallback(tmp_path, supplied):
+    cache = oe.EncoderCache(str(tmp_path))
+    _check_handoff_hash_initialization(cache, cache, supplied)
+
+
+@pytest.mark.parametrize("hashes", [[], [[1] * 7], [[1.0] * 8], ["bad"], 42, [[1] * 8] * 2])
+def test_shared_handoff_rejects_malformed_hashes_and_releases_exports(
+    tmp_path, monkeypatch, hashes
+):
+    cache = oe.EncoderCache(str(tmp_path))
+    _check_malformed_handoff_hashes(cache, cache, hashes, monkeypatch)
+
+
 def test_prefill_result_reclaims_new_exports_once_and_leaves_consumed_inputs(monkeypatch):
     incoming, _ = native_result()
     params = incoming.disaggregated_params
@@ -162,10 +228,13 @@ def test_shared_encoder_handoff_preserves_prefill_phase(tmp_path):
     cache = oe.EncoderCache(str(tmp_path))
     llm, seen = model()
     ref = cache.publish(native_result()[0], request(), llm)
-    phase = DisaggregatedParams(request_type="context_only")
+    phase = DisaggregatedParams(
+        request_type="context_only", disagg_request_id=71, ctx_usage={"prompt_tokens": 88}
+    )
     _, params = cache.prepare(ref, request(), llm, None, phase)
-    assert params is phase
     assert params.request_type == "context_only"
+    assert params.disagg_request_id == phase.disagg_request_id
+    assert params.ctx_usage == phase.ctx_usage
     assert seen["hashes"] == [[2147483647] * 8]
     assert not list(tmp_path.glob("*.safetensors"))
 

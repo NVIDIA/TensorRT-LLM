@@ -5,7 +5,6 @@ import asyncio
 import threading
 from types import SimpleNamespace
 
-import grpc
 import pytest
 from conftest import AbortError, FakeServicerContext
 from test_control import MODEL, _inference, _servicer
@@ -104,6 +103,10 @@ async def test_prefill_reclaims_native_mrope_results_on_every_exit(monkeypatch, 
             yield self
 
         async def aresult(self):
+            if ending == "cancelled":
+                pytest.fail(
+                    "already-released exports on a text-only request must not trigger a wait"
+                )
             assert self.aborted
             self.disaggregated_params = params
             return self
@@ -136,6 +139,12 @@ async def test_prefill_reclaims_native_mrope_results_on_every_exit(monkeypatch, 
     elif ending != "aggregate":
         req.extra.update({"request_type": "context_only"})
     inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
+    if ending == "abort_late":
+
+        async def load_multimodal_input(*args):
+            return SimpleNamespace(multimodal_params=SimpleNamespace())
+
+        monkeypatch.setattr(servicer, "_load_prepared_input", load_multimodal_input)
     if ending == "cancel_in_release":
 
         async def consume():
@@ -182,6 +191,63 @@ async def test_prefill_reclaims_native_mrope_results_on_every_exit(monkeypatch, 
         assert released == expected
         assert completed == expected
     assert not inference._encoder_cleanup_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("multimodal", [False, True])
+async def test_prefill_cancel_waits_for_late_exports_only_for_multimodal_inputs(
+    monkeypatch, multimodal
+):
+    llm, _ = model()
+    llm.args = SimpleNamespace(guided_decoding_backend=None)
+    llm.tokenizer = None
+    llm._check_health = lambda: True
+    waits = []
+
+    class Handle:
+        error = None
+        disaggregated_params = None
+
+        def __init__(self, cancel):
+            self.cancel = cancel
+            self.finished = not cancel
+
+        async def __aiter__(self):
+            if self.cancel:
+                raise asyncio.CancelledError
+            yield self
+
+        async def aresult(self):
+            waits.append(self)
+            raise asyncio.TimeoutError
+
+        def abort(self):
+            pass
+
+    handles = iter((Handle(True), Handle(False)))
+    llm.generate_async = lambda **kwargs: next(handles)
+
+    async def prepared_input(*args):
+        return SimpleNamespace(multimodal_params=SimpleNamespace()) if multimodal else "text"
+
+    monkeypatch.setattr(servicer, "_load_prepared_input", prepared_input)
+    monkeypatch.setattr(servicer, "_format_result", lambda *args: [])
+    monkeypatch.setattr(servicer, "_engine_error_response", lambda *args: None)
+    inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
+    assert not inference.encoder_role
+    req = request()
+    req.ClearField("media")
+    req.extra.update({"request_type": "context_only"})
+    with pytest.raises(asyncio.CancelledError):
+        _ = [value async for value in inference.Generate(req, FakeServicerContext())]
+    assert bool(waits) is multimodal
+    assert inference._encoder_cleanup_failed is multimodal
+    assert not inference.active_request_count() and not inference._encoder_cleanup_tasks
+    assert OpenEngineControlServicer(llm, "qwen", inference)._engine_is_healthy() is not multimodal
+    if not multimodal:
+        req.request_id = "later-prefill"
+        _ = [value async for value in inference.Generate(req, FakeServicerContext())]
+        assert not waits and not inference._encoder_cleanup_failed
 
 
 @pytest.mark.asyncio
