@@ -88,7 +88,6 @@ from __future__ import annotations
 
 import contextlib
 import math
-import os
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -245,6 +244,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
@@ -259,10 +259,9 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
 from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
-from tensorrt_llm._torch.utils import is_gdn_replay_enabled
+from tensorrt_llm._torch.utils import is_gdn_flashinfer_replay_enabled, is_gdn_replay_enabled
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.functional import AllReduceFusionOp
-from tensorrt_llm.logger import logger
+from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 if TYPE_CHECKING:
@@ -345,6 +344,7 @@ from .ops.ssm.flashinfer_chunk_gated_delta_rule import (
 from .ops.ssm.gdn_cached_replay_cute__verify import GEOMETRIES as _GDN_REPLAY_CUTE_GEOMETRIES
 from .ops.ssm.gdn_cached_replay_cute__verify import conv_fold_supported as gdn_conv_fold_supported
 from .ops.ssm.gdn_cached_replay_cute__verify import gdn_cached_replay_cute
+from .ops.ssm.gdn_cached_replay_cute__verify import precompile as gdn_replay_precompile
 from .ops.ssm.gdn_in_proj_conv__verify import CONV_DIM as _GDN_IN_PROJ_CONV_DIM
 from .ops.ssm.gdn_in_proj_conv__verify import N_OUT as _GDN_IN_PROJ_N_OUT
 from .ops.ssm.gdn_in_proj_conv__verify import fused_tactic as _gdn_in_proj_conv_fused_tactic
@@ -364,6 +364,41 @@ _QUANT_ALGO = QuantAlgo.FP8_BLOCK_SCALES
 # its vision tower's (depth, hidden, heads, merge, out_hidden, num_pos, deepstack_indexes, act).
 _TEXT_SHAPE = (48, 2560, 512, 24, 48, 248320)
 _VISION_SHAPE = (27, 1152, 16, 2, 2560, 2304, (), "gelu_pytorch_tanh")
+
+# The checkpoint's settings that change what it computes without changing a weight's shape,
+# at the values the target implements: a fine-tune of the same shape that changed one would
+# load and run with wrong logits and no error. Read off the text config as the target reads
+# them (`_text_settings`).
+_TEXT_SETTINGS = {
+    # The routed experts: Renormalize routing over the top 10 and a SiLU activation.
+    "norm_topk_prob": True,
+    "num_experts_per_tok": 10,
+    "hidden_act": "silu",
+    # Attention: two KV heads of 256, no projection bias, a sigmoid output gate on every head
+    # (absent `attn_output_gate` reads as gated), and an output head of its own.
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "attention_bias": False,
+    "output_gate_type": "sigmoid",
+    "attn_output_gate": True,
+    "tie_word_embeddings": False,
+    # Rope: a quarter of the head (64 dims), theta 1e7, interleaved mRoPE over sections
+    # 11 / 11 / 10, unscaled.
+    "rope_theta": 1e7,
+    "partial_rotary_factor": 0.25,
+    "mrope_section": (11, 11, 10),
+    "mrope_interleaved": True,
+    "rope_factor": None,
+    # The MTP module: one full-attention layer on the trunk's embedding that reads the end of
+    # the stack (`mtp_use_hidden_state_from_layer: null`). The `mtp.` fields are the `mtp`
+    # block's, a mapping or a config object; a field it omits reads as the value here. (Its
+    # own rope theta the target reads.)
+    "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": False,
+    "mtp.num_hidden_layers": 1,
+    "mtp.layer_types": ("full_attention",),
+    "mtp.mtp_use_hidden_state_from_layer": None,
+}
 
 # Rows per request of the widest verify step (`max_draft_len + 1`).
 _MAX_VERIFY_WIDTH = _pool.MAX_VERIFY_WIDTH
@@ -448,8 +483,9 @@ _ROUTING_METHOD_RENORM = 1
 _ACT_TYPE_SWIGLU = 0
 _PAD_SLOT_ID = -1
 #: Whether a decode step's `low_m_bf16_mm` projections launch with PDL (the FlashInfer kernels
-#: stream the weight before waiting on the producer; the cuBLAS branch ignores it).
-_DECODE_PROJ_PDL = True
+#: stream the weight before waiting on the producer; the cuBLAS branch ignores it). Off with
+#: TRTLLM_ENABLE_PDL=0.
+_DECODE_PROJ_PDL = get_env_enable_pdl()
 #: (request x value head) pairs a verify step up to which the CuTe cached replay launches with PDL
 #: and the conv before it triggers at its start, so the replay streams the checkpoint and history
 #: (nothing earlier in the step writes them) while the conv runs.
@@ -459,13 +495,14 @@ _GDN_REPLAY_PDL_MAX_HEAD_ROWS = 24
 _GDN_REPLAY_HT_GEOMETRY = (8, 24)
 _GDN_REPLAY_HT_MIN_REQUESTS = 16
 #: `(max requests, pdl, CuTe replay mapping or None for its default)` for a tp2/tep2 HT verify
-#: batch. The mappings (`gdn_cached_replay_cute.default_config`'s knobs) only move where a tile is
-#: loaded and which CTA runs it, so every choice is bitwise the default launch.
+#: batch (PDL off throughout with TRTLLM_ENABLE_PDL=0). The mappings
+#: (`gdn_cached_replay_cute.default_config`'s knobs) only move where a tile is loaded and which
+#: CTA runs it, so every choice is bitwise the default launch.
 _GDN_REPLAY_HT_LAUNCH = (
-    (24, True, dict(tpc=8, warps=4, pf=0, minb=5, early_acc=True)),
-    (40, True, dict(tpc=8, warps=4, pf=1, minb=6)),
-    (56, True, dict(tpc=8, warps=4, pf=0, minb=5, early_acc=True)),
-    (80, True, None),
+    (24, get_env_enable_pdl(), dict(tpc=8, warps=4, pf=0, minb=5, early_acc=True)),
+    (40, get_env_enable_pdl(), dict(tpc=8, warps=4, pf=1, minb=6)),
+    (56, get_env_enable_pdl(), dict(tpc=8, warps=4, pf=0, minb=5, early_acc=True)),
+    (80, get_env_enable_pdl(), None),
     (1 << 30, False, dict(tpc=8, warps=4, pf=0, minb=5, early_acc=True)),
 )
 #: Requests up to which a tp2/tep2 HT verify batch folds the conv into the CuTe replay
@@ -474,7 +511,8 @@ _GDN_REPLAY_HT_LAUNCH = (
 _GDN_VERIFY_CONV_FOLD_MAX_REQUESTS = 24
 #: Whether a verify step's conv (`causal_conv1d_token_major`) is a PDL dependent of the input
 #: projection: it reads the slots and the conv pool before `griddepcontrol.wait`, the q|k|v after.
-_GDN_CONV_PDL_WAIT = True
+#: Off with TRTLLM_ENABLE_PDL=0.
+_GDN_CONV_PDL_WAIT = get_env_enable_pdl()
 #: Whether a decode step's QSA index scoring (`_decode_index_selection`) launches with PDL: its
 #: kernels wait before their first read and the decode prologue triggers at its start.
 _INDEX_SCORES_PDL = get_env_enable_pdl()
@@ -568,6 +606,11 @@ _SELECTION_PIECES = 4
 #: Rows from which a context chunk's selection over a wide score table takes the row top-k kernel
 #: (`qsa_topk_rows`) instead of the family's wide kernel; same bits.
 _TOPK_ROWS_MIN_ROWS = 256
+#: Elements of one score table: the index scores write their output rows and the selection
+#: kernels address theirs with int32 arithmetic (row times the table's width), so a call scores
+#: fewer rows than this over the table's columns: at `max_seq_len` 262144 (65568 columns) a
+#: context part past 32752 rows is scored in chunks.
+_SCORE_TABLE_ELEMENTS = 2**31
 
 
 def _context_index_scores(q, index_cache, block_table, positions, requests, tpb, cr, context_rows):
@@ -635,14 +678,15 @@ _INDEX_SPLIT_LAMPORT_ROWS = 768
 # Over an fp8 pool the launch reads its requests' pages widened into a bf16 scratch; a launch
 # whose scratch would pass this many bytes stays on the per-row kernel.
 _FP8_ROWTILE_MAX_SCRATCH = 1 << 30  # capacity: fixed: bounds a per-call scratch allocation
-#: Opt-in (`1`, `true`, `yes` or `on`): a context step over an fp8 pool whose pages would widen
+#: Opt-in switch (`weights.switch`): a context step over an fp8 pool whose pages would widen
 #: past `_FP8_ROWTILE_MAX_SCRATCH` runs one row-tile launch per group of requests that fits
 #: (`_rowtile_scratch_groups`) instead of the per-row kernel. Off by default because such steps'
 #: outputs then move by rounding. Read once, when the target is built.
 ROWTILE_SCRATCH_GROUPS_ENV = "TRTLLM_MODELING_V2_ROWTILE_SCRATCH_GROUPS"
-#: Under attention DP, 1 runs the MoE round trip as an all-to-all dispatch / combine
-#: (`moe_a2a__dp_dispatch_combine`): a reference path, not a faster one. Needs MPI and MNNVL;
-#: elsewhere the all-gather / reduce-scatter stays. Read once, when the target is built.
+#: Opt-in switch (`weights.switch`): under attention DP, the MoE round trip runs as an all-to-all
+#: dispatch / combine (`moe_a2a__dp_dispatch_combine`): a reference path, not a faster one. Needs
+#: MPI, attention DP and MNNVL; `check_deployment` declines it elsewhere. Read once, when the
+#: target is built.
 MOE_ALLTOALL_ENV = "TRTLLM_MODELING_V2_MOE_ALLTOALL"
 # Rows per FP8 runner call over an attention-DP group's gathered rows (`_routed_experts`): one
 # call reads the window's weights once, bitwise the `_MOE_MAX_ROWS`-row calls; the router, its
@@ -779,14 +823,16 @@ class _HcArInject(NamedTuple):
     workspace: torch.Tensor
     rank: int
     nranks: int
+    #: rows whose `nranks * rows * hidden * 2` bytes fit one of the workspace's sub-buffers
+    max_rows: int
 
 
 def _hc_ar_inject_defers(core, rows: int) -> bool:
     """Whether `_tp_partial` leaves a decode block's partial of `rows` rows to the next site."""
-    return (
-        getattr(core, "hc_ar_inject", None) is not None
-        and max(_HC_AR_INJECT_MIN_ROWS, _HC_ROWS_TC_MAX_ROWS + 1) <= rows < _HC_RSTD_MIN_ROWS
-    )
+    fused = getattr(core, "hc_ar_inject", None)
+    return fused is not None and max(
+        _HC_AR_INJECT_MIN_ROWS, _HC_ROWS_TC_MAX_ROWS + 1
+    ) <= rows < min(_HC_RSTD_MIN_ROWS, fused.max_rows + 1)
 
 
 def _tp_partial(core, x: torch.Tensor):
@@ -837,6 +883,8 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         self.mapping = mapping
         # Ranks the attention and recurrent heads are split over (1 under attention DP).
         self.attn_tp_size = _pool.attention_tp_size(mapping)
+        # The engine's all-reduce strategy for the TP sums; the fused IPC paths need AUTO.
+        self.allreduce_strategy = int(model_config.allreduce_strategy)
         # Under attention DP each rank serves its own requests; MoE runs over the TP group's rows.
         self.dp_size = mapping.tp_size if mapping.enable_attention_dp else 1
         self.dp_rank = mapping.tp_rank
@@ -1140,7 +1188,12 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         torch.cuda.synchronize(device)
 
     def post_load_weights(self) -> None:
-        """Derive load-time tensors and build the targets; a shell hook, not an override."""
+        """Derive load-time tensors and build the targets; a shell hook, not an override.
+
+        Reached twice per load (the shell's hook and the loader's module walk): the targets are
+        built once, until the shell's `load_weights` clears them for a reload."""
+        if self._prefill is not None:
+            return
         w = self.w
         device = w["embed"].device
         # The delta-rule kernels read A_log and dt_bias as contiguous fp32; the checkpoint is bf16.
@@ -1203,7 +1256,7 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         """Return the attention-TP sum of block partials, bit-identical on every rank."""
         if self.attn_tp_size == 1:
             return lambda x: x
-        group = allreduce_group_args(self.mapping)
+        group = allreduce_group_args(self.mapping, self.allreduce_strategy)
 
         def tp_sum(x: torch.Tensor) -> torch.Tensor:
             return allreduce(
@@ -1218,7 +1271,9 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
                 **group,
             )
 
-        if not MNNVLAllReduce.is_mnnvl(self.mapping, torch.bfloat16, explicitly_requested=True):
+        if self.allreduce_strategy != int(AllReduceStrategy.AUTO) or not MNNVLAllReduce.is_mnnvl(
+            self.mapping, torch.bfloat16, explicitly_requested=True
+        ):
             return tp_sum
         # A collective over the TP group: every rank builds the workspace here, in order.
         mnnvl = mnnvl_workspace_args(
@@ -1241,14 +1296,22 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             and self.mapping.world_size == self.attn_tp_size
             and self.hidden == 2560
             and self.hc_count == 4
+            and self.allreduce_strategy == int(AllReduceStrategy.AUTO)
+            and can_access_peer(self.mapping)
         ):
             return None
-        group = allreduce_group_args(self.mapping)
+        group = allreduce_group_args(self.mapping, self.allreduce_strategy)
         if group["workspace"] is None:
             return None
         members = list(self.mapping.tp_group)
         rank = members.index(self.mapping.rank)
-        return _HcArInject(group["workspace"], rank, len(members))
+        # `get_allreduce_workspace` sized each IPC sub-buffer `size * tp_size` with this call;
+        # the fused kernel's span in one is `nranks * rows * hidden * 2` bytes.
+        size = CustomAllReduceHelper.max_workspace_size_auto(
+            self.mapping.tp_size, support_deterministic=False
+        )
+        max_rows = size * self.mapping.tp_size // (self.hidden * 2 * len(members))
+        return _HcArInject(group["workspace"], rank, len(members), max_rows)
 
     def _expert_sum_op(self):
         """Return `expert_sum(run, x, padding)`: this rank's rows of a MoE block's output.
@@ -1276,17 +1339,15 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             gathered = allgather(x, sizes, group, process_group)
             return reducescatter(run(gathered), sizes, group, process_group)
 
-        a2a = os.environ.get(MOE_ALLTOALL_ENV, "0").strip().lower() in ("1", "true", "yes")
-        strategy = (
-            None if not a2a or mpi_disabled() else _build_moe_a2a(self.mapping, self.max_num_tokens)
-        )
-        if strategy is None:
-            if a2a:
-                logger.warning(
-                    f"{MOE_ALLTOALL_ENV}=1 needs MPI and MNNVL; the attention-DP MoE runs the "
-                    "all-gather / reduce-scatter round trip"
-                )
+        if not _weights.switch(MOE_ALLTOALL_ENV):
             return round_trip
+        strategy = None if mpi_disabled() else _build_moe_a2a(self.mapping, self.max_num_tokens)
+        if strategy is None:
+            # `check_deployment` declines this deployment; reached only when routing is bypassed.
+            raise RuntimeError(
+                f"{MOE_ALLTOALL_ENV}=1 needs MPI and MNNVL, which this deployment lacks; unset it "
+                "to run the attention-DP MoE as the all-gather / reduce-scatter round trip"
+            )
         self.moe_a2a = strategy
 
         def alltoall_round_trip(run, x: torch.Tensor, padding: _DpPadding | None) -> torch.Tensor:
@@ -1369,10 +1430,6 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             f"KV addressing over {len(pools)} pools is not certified; layer->pool ids "
             f"{sorted(pools)}"
         )
-        assert self.quant_mode != QM_NVFP4_KV_CACHE or md.use_paged_context_fmha, (
-            "an NVFP4 KV cache is read by the paged-context attention kernels only, which the "
-            "engine enables for chunked prefill, KV cache block reuse or speculative decoding"
-        )
         g = _pool.pool_geometry(
             self.model_config.pretrained_config,
             self.mapping,
@@ -1428,10 +1485,10 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
                 [rank_pools.index_cache[i] for i in self.attn_layers]
             )
         if self.mtp_enabled:
-            bound = bound._replace(**self._bind_step_buffers(cm, g, rank_pools))
+            bound = bound._replace(**self._bind_step_buffers(cm, g, rank_pools, md))
         self._bound = bound
 
-    def _bind_step_buffers(self, cm, g: _pool.PoolGeometry, pools: _pool.RankPools) -> dict:
+    def _bind_step_buffers(self, cm, g: _pool.PoolGeometry, pools: _pool.RankPools, md) -> dict:
         """Bind the verify step's per-step buffers and return the `_Bound` fields they add.
 
         Per-row conv windows feed `update_mamba_states`; the recurrent state uses cached replay."""
@@ -1474,6 +1531,21 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             old[i] = (cache.old_x, cache.old_B, cache.old_dt, cache.old_dA_cumsum)
             _pool.check_replay_history(g, i, history, ssm0.shape[0], *old[i][:3])
         replay = _Replay(old, meta.cache_buf_idx, meta.prev_num_accepted_tokens, history, width)
+        if ssm0.dtype == torch.bfloat16 and ssm0.is_cuda:
+            # The CuTe replay kernels of the default mapping a verify step launches, compiled
+            # here: a compile costs 5-10 s, and the padded decode graphs skip the request counts
+            # an eager mixed step carries. PDL up to `_GDN_REPLAY_PDL_MAX_HEAD_ROWS`
+            # (request x value head) pairs; a tp2/tep2 HT batch takes its own mapping, compiled
+            # on its first launch (`_gdn_replay_launch`).
+            heads = (width, self.num_k_heads, self.num_v_heads)
+            partition_from = CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+            requests = md.max_num_requests
+            if heads[1:] == _GDN_REPLAY_HT_GEOMETRY:
+                requests = min(requests, _GDN_REPLAY_HT_MIN_REQUESTS - 1)
+            pdl_requests = min(requests, _GDN_REPLAY_PDL_MAX_HEAD_ROWS // self.num_v_heads)
+            if get_env_enable_pdl() and pdl_requests > 0:
+                gdn_replay_precompile(*heads, pdl_requests, pdl=True, partition_from=partition_from)
+            gdn_replay_precompile(*heads, requests, pdl=False, partition_from=partition_from)
         return dict(int_idx=int_idx, int_conv=int_conv, replay=replay)
 
     def _bind_draft_cache_manager(self, md) -> None:
@@ -2001,7 +2073,7 @@ def _gdn_replay_launch(core, n: int) -> tuple:
         for bound, pdl, mapping in _GDN_REPLAY_HT_LAUNCH:
             if n <= bound:
                 return pdl, mapping
-    return n * core.num_v_heads <= _GDN_REPLAY_PDL_MAX_HEAD_ROWS, None
+    return get_env_enable_pdl() and n * core.num_v_heads <= _GDN_REPLAY_PDL_MAX_HEAD_ROWS, None
 
 
 def _draft_positions(position_ids: torch.Tensor) -> tuple:
@@ -2311,6 +2383,11 @@ def _routed_experts(
     `pad_mask` (`[T, 1]` bool) routes a prefill graph bucket's padding rows to expert -1, so
     they come back zero instead of all landing on the first window's ten lowest experts."""
     mm = mm or cublas_mm
+    if getattr(core, "dp_size", 1) > 1:
+        # Attention DP routes the same gathered rows on every rank, whose steps may pick another
+        # `mm`: `_decode_projection`'s low-M kernels and cuBLAS differ in the last bits, and a
+        # reordered top-k is a different MoE sum. One router kernel on every rank.
+        mm = cublas_mm
     rows = x.shape[0]
     if pad_mask is None and mm is _decode_projection and 0 < rows <= _MOE_FRONT_MAX_ROWS:
         if before_runner is not None:
@@ -2766,7 +2843,7 @@ def _hc_site(
         fused = getattr(core, "hc_ar_inject", None)
         if (
             fused is not None
-            and hc.shape[0] < _HC_RSTD_MIN_ROWS
+            and hc.shape[0] < min(_HC_RSTD_MIN_ROWS, fused.max_rows + 1)
             and _hc_ar_inject_operands_fit(hc, partial, inject, shared, gate_logits)
         ):
             warps = 2 if hc.shape[0] >= _HC_INJECT_FEW_WARPS_MIN_ROWS else _HC_INJECT_WARPS
@@ -3837,10 +3914,12 @@ def _copy_positions(position_ids: torch.Tensor) -> torch.Tensor:
     return pos3
 
 
-def _step_args(md: TrtllmAttentionMetadata, num_contexts, num_ctx_tokens) -> dict:
+def _step_args(md: TrtllmAttentionMetadata, num_contexts, num_ctx_tokens, paged_context) -> dict:
     """thop_attention's batch state off the prepared metadata.
 
-    Tensors are engine-owned buffers refreshed in place; ints are per-capture constants."""
+    Tensors are engine-owned buffers refreshed in place; ints are per-capture constants.
+    `paged_context` forces the paged-context path the engine enables only for chunked prefill
+    or KV cache block reuse: an NVFP4 pool's context kernels exist on it alone."""
     return dict(
         sequence_length=md.kv_lens_cuda_runtime,
         host_past_key_value_lengths=md.kv_lens_runtime,
@@ -3860,7 +3939,7 @@ def _step_args(md: TrtllmAttentionMetadata, num_contexts, num_ctx_tokens) -> dic
         num_contexts=num_contexts,
         num_ctx_tokens=num_ctx_tokens,
         trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
-        use_paged_context_fmha=md.use_paged_context_fmha,
+        use_paged_context_fmha=md.use_paged_context_fmha or paged_context,
         beam_width=md.effective_beam_width,
         cache_indirection=md.cache_indirection,
         block_ids_per_seq=md.block_ids_per_seq,
@@ -3956,12 +4035,7 @@ class PrefillTarget:
                 core.mapping.tp_group_pg.boxed() if mpi_disabled() else None,
             )
         self._selection_split = split
-        self._rowtile_groups = os.environ.get(ROWTILE_SCRATCH_GROUPS_ENV, "0").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
+        self._rowtile_groups = _weights.switch(ROWTILE_SCRATCH_GROUPS_ENV)
         self._sequence_parallel = split
         # TP sum, or reduce-scatter under SP; set by `forward`, a capture-time constant per bucket.
         self._block_sum = core.tp_sum
@@ -4132,7 +4206,9 @@ class PrefillTarget:
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto thop_attention's batch state."""
-        return _step_args(md, md.num_contexts, md.num_ctx_tokens)
+        return _step_args(
+            md, md.num_contexts, md.num_ctx_tokens, self.core.quant_mode == QM_NVFP4_KV_CACHE
+        )
 
     # --------------------------------------------------------------- blocks ---
 
@@ -4331,28 +4407,38 @@ class PrefillTarget:
                 device=proj.device,
             )
 
+            # A call scores fewer than `_SCORE_TABLE_ELEMENTS / columns` rows (whole query
+            # tiles): a row's scores and selection read only its query, position and request,
+            # so the chunks select what one call would; below the bound a part is one call.
+            columns = block_table.shape[1] * tokens_per_block // core.compress_ratio
+            chunk = max(1, (_SCORE_TABLE_ELEMENTS - 1) // columns)
+            if chunk >= _SELECTION_CUT_ALIGN:
+                chunk -= chunk % _SELECTION_CUT_ALIGN
+
             def score_and_select(lo, hi, context_rows, out):
-                scores = _context_index_scores(
-                    q_index[lo:hi],
-                    core._bound.pools.index_cache[i],
-                    block_table,
-                    logical[lo:hi],
-                    req_idx[lo:hi],
-                    tokens_per_block,
-                    core.compress_ratio,
-                    context_rows,
-                )
-                _selection(
-                    core,
-                    scores,
-                    visible_blocks[lo:hi],
-                    logical[lo:hi],
-                    seq_lens_q[lo:hi],
-                    topk_indices[lo:hi],
-                    topk_row_starts[lo:hi],
-                    out,
-                    context=context_rows,
-                )
+                for a in range(lo, hi, chunk):
+                    b = min(a + chunk, hi)
+                    scores = _context_index_scores(
+                        q_index[a:b],
+                        core._bound.pools.index_cache[i],
+                        block_table,
+                        logical[a:b],
+                        req_idx[a:b],
+                        tokens_per_block,
+                        core.compress_ratio,
+                        context_rows,
+                    )
+                    _selection(
+                        core,
+                        scores,
+                        visible_blocks[a:b],
+                        logical[a:b],
+                        seq_lens_q[a:b],
+                        topk_indices[a:b],
+                        topk_row_starts[a:b],
+                        out[a - lo : b - lo],
+                        context=context_rows,
+                    )
 
             for lo, hi, context_rows in parts:
                 if context_rows and self._split_context_rows(hi - lo):
@@ -5542,7 +5628,12 @@ class DecodeTarget:
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """See PrefillTarget.step_args. Context counts are stated, not read: routing
         guarantees them, and a decode-only CUDA graph would freeze whatever it read."""
-        return _step_args(md, num_contexts=0, num_ctx_tokens=0)
+        return _step_args(
+            md,
+            num_contexts=0,
+            num_ctx_tokens=0,
+            paged_context=self.core.quant_mode == QM_NVFP4_KV_CACHE,
+        )
 
     def _verify_qsl(self, seq_lens, batch: int, p: int, device) -> torch.Tensor:
         """PLE segmentation `[0, p, ..., batch * p]` of a generation-only verify step, cached
@@ -5806,8 +5897,9 @@ class DecodeTarget:
             rows,
             conv_input=conv_input,
             inject_block=inject_block,
-            # The three launches chain through PDL; the norm weights are read before the wait.
-            pdl=True,
+            # The three launches chain through PDL (off with TRTLLM_ENABLE_PDL=0); the norm
+            # weights are read before the wait.
+            pdl=get_env_enable_pdl(),
             # every sequence here is a generation request the commit rewrites
             publish_end=0 if from_pool else None,
         )
@@ -6565,6 +6657,42 @@ class _WideningLogitsProcessor(LogitsProcessor):
         )
 
 
+def _field(block, name: str, default=None):
+    """`block`'s `name` -- a mapping's entry or an object's attribute -- or `default` where it
+    is absent or null."""
+    value = block.get(name) if isinstance(block, dict) else getattr(block, name, None)
+    return default if value is None else value
+
+
+def _text_settings(text) -> dict:
+    """`_TEXT_SETTINGS`' entries as `text` declares them. The rope fields are the target's
+    reading: the `rope_parameters` dict, or the flattened `rope_scaling` with the theta and
+    the partial factor at the top level."""
+    rope = getattr(text, "rope_parameters", None) or getattr(text, "rope_scaling", None) or {}
+    settings = {name: getattr(text, name, None) for name in _TEXT_SETTINGS}
+    settings.update(
+        rope_theta=rope.get("rope_theta", getattr(text, "rope_theta", None)),
+        partial_rotary_factor=rope.get(
+            "partial_rotary_factor", getattr(text, "partial_rotary_factor", None)
+        ),
+        mrope_section=tuple(rope.get("mrope_section") or ()),
+        mrope_interleaved=rope.get("mrope_interleaved"),
+        rope_factor=rope.get("factor"),
+        attn_output_gate=_field(text, "attn_output_gate", True),
+        mtp_num_hidden_layers=_field(text, "mtp_num_hidden_layers", 1),
+        mtp_use_dedicated_embeddings=_field(text, "mtp_use_dedicated_embeddings", False),
+    )
+    mtp = getattr(text, "mtp", None)
+    settings.update(
+        {
+            "mtp.num_hidden_layers": _field(mtp, "num_hidden_layers", 1),
+            "mtp.layer_types": tuple(_field(mtp, "layer_types", ("full_attention",))),
+            "mtp.mtp_use_hidden_state_from_layer": _field(mtp, "mtp_use_hidden_state_from_layer"),
+        }
+    )
+    return settings
+
+
 class ModelingV2Qwen38FlashNextFp8Sm103Unified(
     DecoderModelForCausalLM[Qwen4ExpUnifiedModelingV2, PretrainedConfig]
 ):
@@ -6612,6 +6740,30 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
                 f"text shape {shape}, vision shape {vshape}; the target is Qwen3.8-Flash-Next's "
                 f"{_TEXT_SHAPE}, vision {_VISION_SHAPE}"
             )
+        differs = {k: v for k, v in _text_settings(text).items() if v != _TEXT_SETTINGS[k]}
+        if differs:
+            raise NoTarget(
+                f"the checkpoint has Qwen3.8-Flash-Next's shape but declares {differs}; the "
+                f"target implements { ({k: _TEXT_SETTINGS[k] for k in differs}) }"
+            )
+        # The opt-in switches, read here so a misspelled value fails before the build.
+        mapping = model_config.mapping
+        _weights.moe_tpb_requested()
+        _weights.switch(ROWTILE_SCRATCH_GROUPS_ENV)
+        if _weights.switch(MOE_ALLTOALL_ENV):
+            from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
+                NVLinkOneSided,
+            )
+
+            if (
+                mpi_disabled()
+                or not mapping.enable_attention_dp
+                or not NVLinkOneSided.is_platform_supported()
+            ):
+                raise NoTarget(
+                    f"{MOE_ALLTOALL_ENV}=1 at {layout}: the all-to-all MoE round trip needs MPI, "
+                    "attention DP and MNNVL on this node"
+                )
         spec = model_config.spec_config
         if spec is not None:
             # One linear MTP chain, verified at `max_draft_len + 1` rows on the GDN cached replay.
@@ -6644,6 +6796,12 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
                     "MTP with TRTLLM_USE_GDN_REPLAY=0: the verify step runs the GDN cached replay, "
                     "not the legacy per-step recurrent states; leave TRTLLM_USE_GDN_REPLAY unset"
                 )
+            if is_gdn_flashinfer_replay_enabled() and spec.max_draft_len + 1 in (4, 8):
+                raise NoTarget(
+                    f"TRTLLM_USE_GDN_FLASHINFER_REPLAY with max_draft_len={spec.max_draft_len}: "
+                    "the manager lays the replay history out for the FlashInfer ring kernel, "
+                    "which the verify step does not run"
+                )
         prefill_graph = str(llm_args.prefill_cuda_graph_backend.value)
         if prefill_graph == "piecewise":
             raise NoTarget(
@@ -6651,11 +6809,25 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
                 "which the target does not implement; 'breakable' runs the prefill step as a "
                 "breakable CUDA graph"
             )
-        if model_config.mapping.enable_attention_dp and prefill_graph == "breakable":
+        if mapping.enable_attention_dp and prefill_graph == "breakable":
             raise NoTarget(
                 f"prefill_cuda_graph_backend='breakable' with attention DP ({layout}): the engine "
                 "pads every rank to one prefill bucket, so a rank holding only generation "
                 "requests is handed more rows than its batch, which the decode step refuses"
+            )
+        windows = llm_args.kv_cache_config.max_attention_window
+        full = llm_args.max_seq_len or model_config.max_seq_len
+        if windows is not None and (
+            any(w < full for w in windows) if full else len(set(windows)) > 1
+        ):
+            raise NoTarget(
+                f"kv_cache_config.max_attention_window={windows}; the target implements no "
+                "sliding window: every attention layer's window is max_seq_len"
+            )
+        if getattr(llm_args.multimodal_config, "vision_gpu_normalize", False):
+            raise NoTarget(
+                "multimodal_config.vision_gpu_normalize: the input processor then ships uint8 "
+                "pixels, and the vision tower runs at the bf16 activation dtype"
             )
         kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
         if kv_cache_quant_algo not in (None, QuantAlgo.FP8, QuantAlgo.NVFP4):
@@ -6671,6 +6843,12 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
             raise NoTarget(
                 f"moe_config.backend={model_config.moe_backend_requested!r}; the target runs the "
                 f"routed experts on {', '.join(_TRUNK_MOE_BACKENDS)}"
+            )
+        if llm_args.moe_config.load_balancer is not None and mapping.moe_ep_size > 1:
+            raise NoTarget(
+                f"moe_config.load_balancer (EPLB) at {layout}: the target runs fixed contiguous "
+                "expert windows and registers no layer with the balancer, so the placement "
+                "would do nothing"
             )
         state_dtype = effective_mamba_ssm_cache_dtype(
             model_config, llm_args.kv_cache_config.mamba_ssm_cache_dtype
@@ -6859,6 +7037,8 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
         )
 
     def load_weights(self, weights, *args, **kwargs):
+        # A reload re-derives everything `post_load_weights` builds from the weights.
+        self.model._prefill = self.model._decode = None
         _weights.MODEL_WEIGHTS.load(self, weights)
 
     def post_load_weights(self):
@@ -6867,6 +7047,7 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
         self.vision_tower = _vision.VisionTower(self.model.w, self.model.vision_config)
         # The CPU-only load checks build the shell over host weights; they launch nothing.
         if self.lm_head.weight.is_cuda:
+            self.vision_tower.warm_up()
             self._load_eager_gemm_kernels()
 
     def _load_eager_gemm_kernels(self) -> None:
