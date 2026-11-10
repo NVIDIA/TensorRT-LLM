@@ -18,6 +18,7 @@ import copy
 import fcntl
 import glob
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -40,6 +41,7 @@ from test_common.perf_sanity_matching import get_test_case_match_keys
 
 from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info, print_warning
+from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT
@@ -1641,6 +1643,24 @@ def force_num_accepted_tokens_from_env_str(env_vars: str) -> int:
     return int(float(val)) if val is not None else 0
 
 
+def get_node_address() -> str:
+    """Return the address this node's servers bind and publish to the other roles.
+
+    An IP rather than the hostname, so neither binding it nor dialing a published
+    address needs DNS. get_local_ip() returns loopback when it finds no routable
+    interface, and its hostname-lookup fallback can return a link-local address;
+    other nodes cannot dial either, so the hostname is used instead.
+    """
+    hostname = socket.gethostname()
+    ip = get_local_ip()
+    address = ipaddress.ip_address(ip)
+    if address.is_loopback or address.is_link_local:
+        print_warning(f"No routable IP found on {hostname}; using the hostname instead")
+        return hostname
+    print_info(f"Using {ip} as the server address of {hostname}")
+    return ip
+
+
 def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     """Add host and port to command."""
     return cmd + ["--host", host, "--port", str(port)]
@@ -1666,9 +1686,16 @@ def reserve_multi_frontend_port(host: str) -> int:
     between the probe and the server's bind. So the socket stays bound instead.
     In multi-frontend mode every frontend binds with SO_REUSEPORT (see
     launch_server), and Linux lets same-uid SO_REUSEPORT sockets share a port
-    provided the *first* binder set the flag, which this one does. So the
-    reservation is transparent to the server while still refusing a plain bind()
-    from any unrelated process on the node.
+    provided the *first* binder set the flag, which this one does. Before that,
+    the launcher probes the port with a plain SO_REUSEADDR bind to refuse a port
+    another server already uses (_reserve_multi_frontend_port in serve.py). That
+    probe fails with EADDRINUSE against a bound socket that did not set
+    SO_REUSEADDR, so this one sets it too; another server still fails the probe,
+    because its sockets are listening. So the reservation is transparent to the
+    server while still refusing a bind() without SO_REUSEADDR from an unrelated
+    process on the node. The reservation is not exclusive: a process that sets
+    SO_REUSEADDR can bind the port too, and if it then listens, the launcher's
+    probe fails loudly.
 
     The socket is deliberately never listen()ed: only *listening* SO_REUSEPORT
     sockets join the kernel's accept load-balancing group, so a bound-only socket
@@ -1684,10 +1711,13 @@ def reserve_multi_frontend_port(host: str) -> int:
     )
     sock = socket.socket(family, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, 0))
     port = sock.getsockname()[1]
     _RESERVED_PORT_SOCKETS.append(sock)
-    print_info(f"Reserved multi-frontend port {host}:{port} (holding SO_REUSEPORT socket)")
+    print_info(
+        f"Reserved multi-frontend port {host}:{port} (holding SO_REUSEPORT+SO_REUSEADDR socket)"
+    )
     return port
 
 
@@ -4777,7 +4807,7 @@ class PerfSanityTestConfig:
             disagg_config = DisaggConfig(
                 name=f"{test_label}-{config_file_base_name}",
                 disagg_serving_type=disagg_serving_type,
-                hostname=socket.gethostname(),
+                hostname=get_node_address(),
                 numa_bind=numa_bind,
                 timeout=timeout,
                 benchmark_mode=benchmark_mode,

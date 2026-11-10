@@ -40,6 +40,10 @@ from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 pytestmark = pytest.mark.cpu_only
 
 
+def test_nemotron_vision_gpu_normalize_remains_opted_out():
+    assert NemotronHMultimodalModel.supports_vision_gpu_normalize is False
+
+
 def make_tiler(**overrides):
     """Create a DynamicResolutionImageTiler with sensible defaults."""
     defaults = {
@@ -678,6 +682,40 @@ class TestGetVideoTargetSizeAndFeatureSize:
 
 class TestVideoToPixelValues:
     """Tests for `video_to_pixel_values`."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("image_mode", ["RGB", "L"])
+    @pytest.mark.parametrize(
+        "mean, std",
+        [
+            ((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+            ((0.123, 0.456, 0.789), (0.321, 0.654, 0.987)),
+        ],
+        ids=["checkpoint", "custom"],
+    )
+    def test_float_resize_cannot_be_represented_as_uint8(self, dtype, image_mode, mean, std):
+        values = np.arange(256, dtype=np.uint8).reshape(16, 16)
+        image = Image.fromarray(values)
+        if image_mode == "RGB":
+            image = Image.merge(
+                "RGB", (image, image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), image)
+            )
+        norm_mean = torch.tensor(mean).reshape(3, 1, 1)
+        norm_std = torch.tensor(std).reshape(3, 1, 1)
+        expected = video_to_pixel_values(
+            [image], input_size=20, norm_mean=norm_mean, norm_std=norm_std
+        )
+
+        raw = torch.from_numpy(np.array(image.convert("RGB"))).permute(2, 0, 1).float()
+        resized = torch.nn.functional.interpolate(
+            raw.unsqueeze(0), size=(20, 20), mode="bicubic", align_corners=False, antialias=True
+        ).clamp(0, 255)
+        quantized = resized.round().to(torch.uint8).float().div_(255.0)
+        quantized = quantized.sub_(norm_mean).div_(norm_std)
+
+        # Bicubic interpolation produces fractional pixels before normalization.
+        assert torch.any(resized != resized.round())
+        assert not torch.equal(expected.to(dtype), quantized.to(dtype))
 
     @pytest.mark.parametrize(
         "image_func",

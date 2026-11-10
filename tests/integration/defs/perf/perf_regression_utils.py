@@ -33,7 +33,13 @@ from .open_search_db_utils import add_id, get_history_data, post_new_perf_data
 POST_MERGE_THRESHOLD = 0.05
 PRE_MERGE_THRESHOLD = 0.1
 
-_URM_BASE = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main"
+# Where people open a run's outputs, by the location that the pipeline publishes test results to
+# (globalVars["llm_artifacts_primary"], aws when unset). artifactory.nvidia.com is opened in its
+# native browser, which signs people in; urm serves direct links.
+_ARTIFACT_BASES = {
+    "aws": "https://artifactory.nvidia.com/ui/native/sw-tensorrt-llm-generic-local/llm-artifacts/LLM/main",
+    "urm": "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main",
+}
 
 
 def get_job_info():
@@ -65,6 +71,8 @@ def get_job_info():
     raw_branch = global_vars.get("build_branch")
     branch = raw_branch if isinstance(raw_branch, str) else ""
     commit = os.getenv("gitlabCommit", "")
+    primary = global_vars.get("llm_artifacts_primary") or "aws"
+    artifact_base = _ARTIFACT_BASES.get(primary, _ARTIFACT_BASES["aws"])
 
     # Initialize PR-specific fields
     trigger_mr_user = ""
@@ -95,9 +103,11 @@ def get_job_info():
 
         # Set trigger_mr_commit to commit
         trigger_mr_commit = commit
-        artifact_url = f"{_URM_BASE}/L0_MergeRequest_PR/{job_id}" if job_id else ""
+        artifact_url = (
+            f"{artifact_base}/L0_MergeRequest_PR/{job_id}/test-results/" if job_id else ""
+        )
     else:
-        artifact_url = f"{_URM_BASE}/L0_PostMerge/{job_id}" if job_id else ""
+        artifact_url = f"{artifact_base}/L0_PostMerge/{job_id}/test-results/" if job_id else ""
 
     return {
         "b_is_baseline": False,

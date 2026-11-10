@@ -17,7 +17,7 @@ class CausalConv1dFwd(OpWrapper):
     inputs into `conv_states[cache_indices[b]]`. Returns None.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(

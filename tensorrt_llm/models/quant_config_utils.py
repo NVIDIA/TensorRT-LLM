@@ -73,7 +73,7 @@ def update_quant_config_from_compressed_tensors(
         quant_config.group_size = group_size
         hf_exclude_modules = hf_quant_config.get("modules_to_not_convert", None)
         quant_config.exclude_modules = list(
-            set((hf_exclude_modules or []) + hf_quant_config.get("ignore", []))
+            dict.fromkeys((hf_exclude_modules or []) + hf_quant_config.get("ignore", []))
         )
         return
 
@@ -126,7 +126,7 @@ def update_quant_config_from_compressed_tensors(
     hf_exclude_modules = hf_quant_config.get("modules_to_not_convert", None)
     if hf_exclude_modules is not None:
         quant_config.exclude_modules = list(
-            set(hf_exclude_modules + hf_quant_config.get("ignore", []))
+            dict.fromkeys(hf_exclude_modules + hf_quant_config.get("ignore", []))
         )
     else:
         quant_config.exclude_modules = hf_quant_config.get("ignore", [])

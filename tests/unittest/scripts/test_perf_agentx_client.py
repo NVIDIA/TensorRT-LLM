@@ -69,10 +69,10 @@ def test_max_output_tokens_must_be_positive(client: ModuleType):
         client.parse_args(_BASE_ARGS + ["--max-output-tokens", "0"])
 
 
-def test_prefill_only_reports_absent_decode_intervals_as_zero(client: ModuleType, capsys):
+def test_prefill_only_reports_absent_decode_intervals_as_zero(client: ModuleType, capfd):
     client.report_metrics(_export(client, with_decode_intervals=False), prefill_only=True)
     lines = dict(
-        line.rsplit(":", 1) for line in capsys.readouterr().out.splitlines() if line.strip()
+        line.rsplit(":", 1) for line in capfd.readouterr().out.splitlines() if line.strip()
     )
     for stat in ("Mean", "Median", "P99"):
         assert float(lines[f"{stat} TPOT (ms)"]) == 0.0
@@ -82,9 +82,9 @@ def test_prefill_only_reports_absent_decode_intervals_as_zero(client: ModuleType
     assert float(lines["P99 E2EL (ms)"]) == 9.0
 
 
-def test_prefill_only_still_reports_measured_decode_intervals(client: ModuleType, capsys):
+def test_prefill_only_still_reports_measured_decode_intervals(client: ModuleType, capfd):
     client.report_metrics(_export(client, with_decode_intervals=True), prefill_only=True)
-    assert "Mean TPOT (ms):                          5.00" in capsys.readouterr().out
+    assert "Mean TPOT (ms):                          5.00" in capfd.readouterr().out
 
 
 def test_missing_decode_intervals_fail_outside_prefill_only(client: ModuleType):

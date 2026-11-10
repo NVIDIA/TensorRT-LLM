@@ -569,8 +569,11 @@ private:
             inputPtr = windowBuffer0.ptr;
         }
 
-        // Use window-backed output buffer
-        auto [normOut, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
+        // A window-backed output only pairs with a window-backed input: an unregistered send buffer next to a
+        // registered receive buffer returns wrong sums, so that call gets plain ncclAllReduce buffers.
+        auto [normOut, windowBuffer1] = windowBuffer0.isValid()
+            ? createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type())
+            : std::make_pair(torch::Tensor(), tensorrt_llm::common::nccl_util::NCCLWindowBuffer());
         torch::Tensor outputTensor = windowBuffer1.isValid() ? normOut : torch::empty_like(inputTensor);
         void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
         if (!windowBuffer1.isValid())
@@ -2222,7 +2225,8 @@ bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
 
 std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::optional<torch::Tensor> const& gamma,
     torch::optional<torch::Tensor> const& residual_in, torch::optional<double> epsilon, torch::Tensor& comm_buffer,
-    torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_)
+    torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_,
+    bool fp8_payload)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
@@ -2329,6 +2333,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     allreduce_params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
     allreduce_params.input = input.const_data_ptr();
     allreduce_params.pattern = pattern;
+    allreduce_params.fp8Payload = fp8_payload;
     allreduce_params.layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED;
 
     if (fusionOp == AllReduceFusionOp::NONE)
@@ -2508,7 +2513,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         // CUDA graphs). Ordering comes from the input/output data deps.
         "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
         "float? epsilon, Tensor comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
-        "Tensor? scale=None, int fusion_op=0) -> "
+        "Tensor? scale=None, int fusion_op=0, bool fp8_payload=False) -> "
         "Tensor[]");
     m.def(
         "allreduce("
@@ -2609,6 +2614,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "end_nccl_window_tensor_scope.tracked(Tensor[] inputs, Tensor[] outputs, bool failed, int entry_depth) -> ()");
     m.def("set_nccl_window_graph_owner(int owner) -> ()");
     m.def("release_nccl_window_graph_owner(int owner) -> ()");
+    m.def("set_nccl_window_allocation_suppressed(bool suppressed) -> bool");
     m.def("get_nccl_window_buffer_release_epoch() -> int");
     m.def("promote_nccl_window_buffer_releases(int device, int release_epoch) -> ()");
     m.def(
@@ -2671,6 +2677,12 @@ TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
     m.impl("release_nccl_window_graph_owner",
         [](int64_t owner)
         { tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().releaseGraphPoolOwner(owner); });
+    m.impl("set_nccl_window_allocation_suppressed",
+        [](bool suppressed)
+        {
+            return tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().setWindowAllocationSuppressed(
+                suppressed);
+        });
     m.impl("get_nccl_window_buffer_release_epoch",
         []()
         {
@@ -2687,6 +2699,7 @@ TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
 #else
     m.impl("set_nccl_window_graph_owner", [](int64_t) {});
     m.impl("release_nccl_window_graph_owner", [](int64_t) {});
+    m.impl("set_nccl_window_allocation_suppressed", [](bool) { return false; });
     m.impl("get_nccl_window_buffer_release_epoch", []() { return int64_t{0}; });
     m.impl("promote_nccl_window_buffer_releases", [](int64_t, int64_t) {});
 #endif

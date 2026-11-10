@@ -1,10 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Symmetric-heap peer pointer mapping carried in kernel arguments."""
 
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from packaging.version import Version
 
 import cutlass
 import cutlass.cute as cute
@@ -15,7 +14,7 @@ from cutlass.base_dsl.runtime.jit_arg_adapters import JitArgAdapterRegistry
 from cutlass.base_dsl.typing import get_c_pointers
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int32, Int64, dsl_user_op
-from packaging.version import Version
+
 
 try:
     from cutlass.base_dsl.typing import MLIR_DYNAMIC_INDEX
@@ -64,9 +63,7 @@ class SymmetricBufferDevice:
         return [ir.DictAttr.get({})]
 
     @cute.jit
-    def map(
-        self, local_address: Int64, destination_rank: Int32, byte_offset: Int64 = Int64(0)
-    ) -> Int64:
+    def map(self, local_address: Int64, destination_rank: Int32, byte_offset: Int64 = Int64(0)) -> Int64:
         if cutlass.const_expr(self.max_ranks <= _byval_rank_limit):
             i64_type = ir.Type.parse("i64")
             offset_pointer = llvm.getelementptr(
@@ -89,10 +86,7 @@ class SymmetricBufferDevice:
         if cutlass.const_expr(byte_alignment is None):
             byte_alignment = pointer.max_alignment
         return cute.make_ptr(
-            pointer.dtype,
-            self.map(pointer.toint(), destination_rank),
-            pointer.memspace,
-            assumed_align=byte_alignment,
+            pointer.dtype, self.map(pointer.toint(), destination_rank), pointer.memspace, assumed_align=byte_alignment
         )
 
 
@@ -119,27 +113,11 @@ class SymmetricBufferHost:
             pointer_type = ir.Type.parse("!llvm.ptr")
             struct_type = _byval_struct_type(self.max_ranks)
             i64_type = ir.Type.parse("i64")
-            one = arith.constant(
-                value=ir.IntegerAttr.get(i64_type, 1), result=i64_type, loc=loc, ip=ip
-            )
-            buffer = llvm.alloca(
-                res=pointer_type,
-                elem_type=struct_type,
-                array_size=one,
-                alignment=64,
-                loc=loc,
-                ip=ip,
-            )
+            one = arith.constant(value=ir.IntegerAttr.get(i64_type, 1), result=i64_type, loc=loc, ip=ip)
+            buffer = llvm.alloca(res=pointer_type, elem_type=struct_type, array_size=one, alignment=64, loc=loc, ip=ip)
             for index, offset in enumerate(offsets):
                 slot = llvm.getelementptr(
-                    pointer_type,
-                    buffer,
-                    [],
-                    [index],
-                    i64_type,
-                    no_wrap_flags="None",
-                    loc=loc,
-                    ip=ip,
+                    pointer_type, buffer, [], [index], i64_type, no_wrap_flags="None", loc=loc, ip=ip
                 )
                 llvm.store(self._as_int64(offset).ir_value(), slot, loc=loc, ip=ip)
             return SymmetricBufferDevice(buffer, self.max_ranks)
@@ -148,12 +126,8 @@ class SymmetricBufferHost:
         vector_type = ir.Type.parse(f"vector<{self.max_ranks}xi64>")
         vector = llvm.mlir_zero(vector_type, loc=loc, ip=ip)
         for index, offset in enumerate(offsets):
-            element_index = arith.constant(
-                value=ir.IntegerAttr.get(i32_type, index), result=i32_type, loc=loc, ip=ip
-            )
-            vector = llvm.insertelement(
-                vector, self._as_int64(offset).ir_value(), element_index, loc=loc, ip=ip
-            )
+            element_index = arith.constant(value=ir.IntegerAttr.get(i32_type, index), result=i32_type, loc=loc, ip=ip)
+            vector = llvm.insertelement(vector, self._as_int64(offset).ir_value(), element_index, loc=loc, ip=ip)
         return SymmetricBufferDevice(vector, self.max_ranks)
 
 
@@ -163,14 +137,8 @@ class _SymmetricBufferHostAdapter:
         self._argument = argument
         offsets = tuple(argument.offsets)
         if len(offsets) != int(argument.max_ranks):
-            raise ValueError(
-                f"Expected {int(argument.max_ranks)} peer offsets, got {len(offsets)}."
-            )
-        self._fields = (
-            Int64(argument.base_address),
-            *(Int64(offset) for offset in offsets),
-            Int32(argument.rank),
-        )
+            raise ValueError(f"Expected {int(argument.max_ranks)} peer offsets, got {len(offsets)}.")
+        self._fields = (Int64(argument.base_address), *(Int64(offset) for offset in offsets), Int32(argument.rank))
 
     def __c_pointers__(self) -> list[Any]:
         pointers: list[Any] = []
@@ -195,9 +163,7 @@ class _SymmetricBufferHostAdapter:
         rebuilt = []
         for field in self._fields:
             field_value_count = len(get_mlir_types(field))
-            rebuilt.append(
-                new_from_mlir_values(field, values[value_index : value_index + field_value_count])
-            )
+            rebuilt.append(new_from_mlir_values(field, values[value_index : value_index + field_value_count]))
             value_index += field_value_count
         if value_index != len(values):
             raise ValueError(f"Consumed {value_index} MLIR values, got {len(values)}.")

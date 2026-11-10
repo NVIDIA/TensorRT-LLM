@@ -209,8 +209,9 @@ def test_every_rank_votes_even_when_no_rank_has_errors() -> None:
     for h in ranks:
         h.active.append(_running_gen(1))
 
-    group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
+    flush_required = group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
 
+    assert flush_required == [False, False]
     assert [h.dist.calls for h in ranks] == [[_vote()], [_vote()]]
     assert [h.effects.failed for h in ranks] == [[], []]
 
@@ -223,8 +224,9 @@ def test_peer_error_without_a_local_replica_still_enters_the_error_path() -> Non
     ranks[0].active.append(_running_gen(8))
     ranks[1].active.append(_failed_gen(7))
 
-    group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
+    flush_required = group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
 
+    assert flush_required == [True, True]
     assert ranks[0].effects.failed == [(_VOTE_MSG, [], False)]
     assert [requests for _, requests, _ in ranks[1].effects.failed] == [[ranks[1].active[0]]]
 
@@ -260,8 +262,9 @@ def test_a_locally_blocked_request_vetoes_the_vote_on_every_rank(blocker: str) -
     blocked.state = LlmRequestState.DISAGG_TRANS_ERROR
     ranks[1].active.append(_failed_gen(7))
 
-    group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
+    flush_required = group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
 
+    assert flush_required == [False, False]
     assert ranks[0].dist.calls == [_vote(error_ids=[7], blocked_ids=[7])]
     assert ranks[1].dist.calls == [_vote(error_ids=[7])]
     assert [h.effects.failed for h in ranks] == [[], []]

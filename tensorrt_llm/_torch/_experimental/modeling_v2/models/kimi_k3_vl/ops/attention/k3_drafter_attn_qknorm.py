@@ -15,7 +15,7 @@ class K3DrafterAttnQknorm(OpWrapper):
     """``k3_drafter_attn`` after RMSNorm (``q_w`` / ``k_w``, ``eps``) and NeoX RoPE (``rope_base``, one position per
     row of ``qkv``) of every q and k head, computed in the kernel; ``qkv`` is not modified. Returns None."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"R={r}, T={t}: "

@@ -25,6 +25,8 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import Decoder
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
+from tensorrt_llm._torch.speculative.dspark_schedule import DSparkScheduleConfig
+from tensorrt_llm._torch.speculative.dspark_select import select_windows_device
 from tensorrt_llm._torch.speculative.ragged_helpers import ragged_gather_index_lists
 
 
@@ -164,6 +166,7 @@ def _warmup_metadata(position_helper, mask_helper):
         },
         compressed_mask_cuda={ratio: torch.empty(48, dtype=torch.bool) for ratio in ratios},
         batch_size_cuda=torch.tensor([17], dtype=torch.int32),
+        gen_position_params_cuda=torch.tensor([3, 2, 1], dtype=torch.int32),
         _compute_gen_compressed_position_ids=position_helper,
         _compute_compressed_mask=mask_helper,
     )
@@ -174,7 +177,7 @@ def test_ragged_compressor_warmup_primes_and_cleans_intermediate_shape(monkeypat
     mask_calls = []
 
     def record_positions(*args):
-        position_calls.append((torch.is_inference_mode_enabled(), args[3:]))
+        position_calls.append((torch.is_inference_mode_enabled(), args[3].tolist(), args[4]))
 
     def record_mask(new_comp, cu_new_comp, compressed_mask, batch_size, compress_ratios):
         mask_calls.append((torch.is_inference_mode_enabled(), batch_size.tolist(), compress_ratios))
@@ -190,9 +193,10 @@ def test_ragged_compressor_warmup_primes_and_cleans_intermediate_shape(monkeypat
 
     DecoderMetadata._warmup_dspark_ragged_compressor_metadata(engine)
 
-    assert position_calls == [(True, (0, 7, 6, [1, 4], {1: 0, 4: 0}))]
+    assert position_calls == [(True, [0, 7, 6], [1, 4])]
     assert mask_calls == [(True, [7], [1, 4])]
     assert metadata.batch_size_cuda.tolist() == [17]
+    assert metadata.gen_position_params_cuda.tolist() == [3, 2, 1]
     for ratio, token_count in ((1, 42), (4, 14)):
         assert not metadata.past_kv_lens_cuda[ratio][:7].any()
         assert not metadata.new_comp_kv_lens_cuda[ratio][:7].any()
@@ -224,6 +228,7 @@ def test_ragged_compressor_warmup_cleans_after_helper_failure(monkeypatch):
     assert not metadata.compressed_position_ids_cuda[1][:18].any()
     assert not metadata.compressed_mask_cuda[1][:18].any()
     assert metadata.batch_size_cuda.tolist() == [17]
+    assert metadata.gen_position_params_cuda.tolist() == [3, 2, 1]
 
 
 @pytest.mark.parametrize("fail_after_mask", [False, True])
@@ -246,6 +251,7 @@ def test_ragged_compressor_warmup_calls_current_metadata_helpers(monkeypatch, fa
         DeepseekV4TrtllmAttentionMetadata._compute_gen_compressed_position_ids, mask
     )
     original_storage = metadata.batch_size_cuda.data_ptr()
+    original_gen_storage = metadata.gen_position_params_cuda.data_ptr()
     engine = SimpleNamespace(
         _ragged_verification_enabled=True,
         attn_metadata=metadata,
@@ -259,7 +265,9 @@ def test_ragged_compressor_warmup_calls_current_metadata_helpers(monkeypatch, fa
     else:
         DecoderMetadata._warmup_dspark_ragged_compressor_metadata(engine)
     assert metadata.batch_size_cuda.data_ptr() == original_storage
+    assert metadata.gen_position_params_cuda.data_ptr() == original_gen_storage
     assert metadata.batch_size_cuda.tolist() == [17]
+    assert metadata.gen_position_params_cuda.tolist() == [3, 2, 1]
     for ratio, token_count in ((1, 42), (4, 14)):
         assert not metadata.past_kv_lens_cuda[ratio][:7].any()
         assert not metadata.new_comp_kv_lens_cuda[ratio][:7].any()
@@ -551,6 +559,41 @@ def test_device_window_prologue_declines_an_unavailable_planner(
     assert decoder._dspark_device_budget is None
 
 
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_device_reranking_takes_tp_rank_zero_rows(monkeypatch, enable_attention_dp) -> None:
+    from tensorrt_llm._torch import distributed
+
+    rows_by_rank = [
+        torch.tensor([[10.0] * 5, [-10.0] * 5]),
+        torch.tensor([[-10.0] * 5, [10.0] * 5]),
+    ]
+
+    def allgather(rows, mapping, dim):
+        assert dim == 0 and torch.equal(rows, rows_by_rank[mapping.tp_rank])
+        return torch.cat(rows_by_rank)
+
+    monkeypatch.setattr(distributed, "allgather", allgather)
+    verify_lens = []
+    for rank, rows in enumerate(rows_by_rank):
+        decoder = object.__new__(DecoderInputPreparer)
+        decoder.mapping = SimpleNamespace(tp_size=2, tp_rank=rank)
+        decoder._config = SimpleNamespace(enable_attention_dp=enable_attention_dp)
+        result = select_windows_device(
+            confidence_logits=rows,
+            slot_idx=torch.tensor([0, 1]),
+            num_real=torch.tensor(2),
+            budget=torch.tensor(2),
+            graph_num_tokens=6,
+            cfg=DSparkScheduleConfig(block_size=5, min_verify_len=1),
+            sync_rows=decoder._dspark_tp_rank0_rows(),
+        )
+        verify_lens.append(result.verify_lens.tolist())
+
+    # With attention DP each rank keeps its own layout; otherwise both ranks
+    # must build TP rank 0's.
+    assert verify_lens == ([[4, 2], [2, 4]] if enable_attention_dp else [[4, 2], [4, 2]])
+
+
 def test_confidence_without_an_sps_table_is_eager_only() -> None:
     decoder = object.__new__(DecoderInputPreparer)
     decoder.cuda_graph_runner = SimpleNamespace(enabled=False)
@@ -611,6 +654,8 @@ def test_overlap_offsets_follow_the_packed_prefix(
     decoder._dspark_device_windows = False
     decoder._prepare_inputs_fast_path = lambda *_args, **_kwargs: None
     decoder._can_use_steady_gen_fast_prepare = lambda *_args: False
+    decoder._steady_mtp = None
+    decoder.breakable_cuda_graph_runner = None
     decoder._new_extra_inputs = lambda: SimpleNamespace(
         add_generation_request=lambda _request: None, build=lambda *_args: {}
     )
@@ -730,7 +775,7 @@ def test_overlap_offsets_follow_the_packed_prefix(
 def test_graph_overlap_offset_zeroing_preserves_ragged_bucket_padding(trims: bool) -> None:
     decoder = object.__new__(DecoderInputPreparer)
     decoder._config = SimpleNamespace(
-        max_num_tokens=16, max_beam_width=1, disable_overlap_scheduler=False
+        max_num_tokens=16, max_beam_width=1, disable_overlap_scheduler=False, is_spec_decode=True
     )
     decoder._dspark_trims_submitted_tokens = trims
     decoder._staged_previous_batch_indices = None

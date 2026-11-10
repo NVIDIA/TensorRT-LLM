@@ -7,10 +7,12 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from .mnnvl_workspace import MnnvlWorkspace
+
+native_ops = load_family_ops(__name__)
 
 
 class MnnvlAllreduceAttnRes(OpWrapper):
@@ -18,7 +20,7 @@ class MnnvlAllreduceAttnRes(OpWrapper):
     sum alone without ``prefix_sum``), ``normed`` = RMSNorm(attn_res(block_residual..., updated)). Advances
     ``workspace`` by one call: every rank of the group makes the same calls on it in the same order."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=(
@@ -140,7 +142,7 @@ class MnnvlAllreduceAttnRes(OpWrapper):
         output_rms_eps: float,
         workspace: MnnvlWorkspace,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        normed, updated = torch.ops.trtllm.mnnvl_allreduce_attn_res(
+        normed, updated = native_ops.mnnvl_allreduce_attn_res(
             input,
             prefix_sum,
             block_residual,

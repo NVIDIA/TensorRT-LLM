@@ -506,7 +506,8 @@ def test_minimax_h3_text_encoder_tp_lpips(tmp_path, monkeypatch, world_size):
 
 
 @pytest.mark.parametrize(
-    "ulysses_size,vae_size,backend", [(2, 2, "VANILLA"), (4, 3, "VANILLA"), (2, 2, "FA4")]
+    "ulysses_size,vae_size,backend",
+    [(2, 2, "VANILLA"), (4, 3, "VANILLA"), (2, 2, "FA4"), (2, 2, "TRTLLM"), (2, 2, "FLASHINFER")],
 )
 def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size, backend):
     """Compare real Ulysses + tiled VAE collectives with a fresh one-GPU baseline."""

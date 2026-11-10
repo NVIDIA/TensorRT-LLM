@@ -34,6 +34,7 @@ aux_stream_name_list = [
     'MlaIndexer',
     'MlaIndexerAux',
     'MlaCompressor',
+    'MoeSharedGate',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -238,6 +239,22 @@ class Fp4QuantizedTensor:
     @property
     def shape(self):
         return self.fp4_tensor.shape
+
+
+@dataclass
+class Fp8PerTokenQuantizedTensor:
+    """FP8 E4M3 activation with an FP32 scale per token.
+
+    ``unquantized_hidden_states`` optionally keeps the BF16/FP16 source for
+    non-FP8 consumers of the same input.
+    """
+    fp8_tensor: torch.Tensor
+    per_token_scale: torch.Tensor  # [num_tokens, 1], fp32
+    unquantized_hidden_states: Optional[torch.Tensor] = None
+
+    @property
+    def shape(self):
+        return self.fp8_tensor.shape
 
 
 @dataclass
@@ -471,11 +488,13 @@ def deep_gemm_jit_warmup_buckets(max_m: int):
     return tuple(low) + tuple(dense) + (max_m, )
 
 
-def fp4_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+def fp4_scale_infer_shape(input_shapes: List[List[int]],
+                          sf_vec_size: int = 16) -> int:
     """Calculate the swizzled scale size for a packed FP4 input tensor."""
     unpacked_shape = list(input_shapes[0])
     unpacked_shape[-1] *= 2
-    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape, sf_vec_size=16)
+    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape,
+                                             sf_vec_size=sf_vec_size)
     return scale_shape
 
 

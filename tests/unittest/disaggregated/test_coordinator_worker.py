@@ -224,6 +224,15 @@ def test_coordinator_rejects_unknown_role():
         coordinator._router_for_role("typo")
 
 
+def test_coordinator_rejects_non_loopback_http_cluster_storage():
+    config = _make_config([], [], "round_robin", "round_robin")
+    config.hostname = "0.0.0.0"
+    config.disagg_cluster_config = DisaggClusterConfig(cluster_uri="http://127.0.0.1:18000")
+
+    with pytest.raises(ValueError, match="loopback-only"):
+        DisaggCoordinatorService(config, _client_factory)
+
+
 def test_kv_router_rejects_mixed_prepared_hash_algorithms():
     router = KvCacheAwareRouter(server_role=ServerRole.CONTEXT, servers=["server-a", "server-b"])
     router._prepared_ready_servers.update(router.servers)
@@ -559,6 +568,26 @@ def test_prefix_token_cache_retokenizes_extended_text():
     assert block_hashing._encode_with_prefix_cache("abc", 1, tokenizer) == [2]
     assert block_hashing._encode_with_prefix_cache("abc", 1, tokenizer) == [2]
     assert tokenizer.calls == ["ab", "abc"]
+
+
+def test_router_tokenization_cache_reuses_cached_prompt_prefix():
+    class CharTokenizer:
+        is_fast = True
+
+        def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+            return {
+                "input_ids": [ord(c) for c in text],
+                "offset_mapping": [(i, i + 1) for i in range(len(text))],
+            }
+
+    tokenizer = CharTokenizer()
+    block_hashing = SharedBlockHashMixin()
+    block_hashing._init_block_hashing(enable_tokenization_cache=True)
+    previous = "system prompt and tools. " * 400
+    for prompt in (previous, previous + "<|im_start|>user\nmore"):
+        ids = block_hashing._encode_with_prefix_cache(prompt, 1, tokenizer)
+        assert ids == [ord(c) for c in prompt]
+    assert block_hashing._prefix_token_cache(tokenizer).hits == 1
 
 
 def test_stateless_router_places_locally_in_worker():

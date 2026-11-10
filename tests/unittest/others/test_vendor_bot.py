@@ -305,7 +305,7 @@ def test_unpaired_and_template() -> None:
 
 def _git(repo: Path, *arguments: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=True
+        ["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=True, timeout=60
     )
     return result.stdout.strip()
 
@@ -2771,6 +2771,7 @@ def test_daemon_launch_status_stop_without_systemd(tmp_path: Path) -> None:
             capture_output=True,
             text=True,
             check=True,
+            timeout=60,
         )
         state = json.loads(status.stdout)
         assert state["running"]

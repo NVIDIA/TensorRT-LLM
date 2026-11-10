@@ -538,18 +538,17 @@ class CuteDslMlaFmha(PhasedFmha):
         # The same failure without Helix: an FP8-KV multi-token verify group
         # (e.g. DSpark under attention DP, where every rank keeps all 96 heads)
         # is not in the FP8 perf table, and on SM100/SM103 the next library is
-        # FlashInfer TRTLLM-Gen, which rejects these head counts. The kernel
-        # packs (token, head) rows into 128-row M tiles, so any H <= 128 with a
+        # FlashInfer TRTLLM-Gen, which rejects these head counts. SM107 has no
+        # TRTLLM-Gen FMHA, so there the next library is the generic fallback,
+        # which is several times slower on these groups. The kernel packs
+        # (token, head) rows into 128-row M tiles, so any H <= 128 with a
         # linear-chain causal verify is valid (can_implement below still has the
-        # final say). SM107 is left out on purpose: TRTLLM-Gen FMHA is
-        # unavailable there and such a request already reaches the default
-        # TRTLLM path.
+        # final say).
         fp8_wide_head_verify_group = (
             64 < attn.num_heads < 128
             and seq_len_q > 1
             and meta.helix_position_offsets is None
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
-            and get_sm_version() in (100, 103)
         )
         if not (helix_h96_verify_group or fp8_wide_head_verify_group or exclusive_page_size):
             # Perf gate (NOT a correctness limit).
@@ -604,6 +603,12 @@ class CuteDslMlaFmha(PhasedFmha):
         params: FmhaParams,
         kernel_dtype: torch.dtype,
     ) -> None:
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            KVCacheManagerV2,
+            Role,
+        )
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
         attn = params.attn
         meta = params.meta
 
@@ -680,6 +685,21 @@ class CuteDslMlaFmha(PhasedFmha):
         page_table = self._generation_page_table(
             page_table_layer, meta.num_contexts, batch_size, layer_in_pool
         )
+        if (
+            layers_in_pool == 1
+            and isinstance(meta.kv_cache_manager, KVCacheManagerV2)
+            and meta.kv_cache_manager._use_per_layer_page_tables
+        ):
+            # V2 per-layer indices include the layer offset, but get_buffers()
+            # already starts at this layer's KEY buffer. Apply the offset once.
+            converter = meta.kv_cache_manager.impl.get_page_index_converter(
+                local_layer_idx, Role.KEY
+            )
+            layer_offset = int(converter.layer_offset)
+            if layer_offset:
+                page_table = torch.where(
+                    page_table == BAD_PAGE_INDEX, page_table, page_table - layer_offset
+                )
 
         # KVCacheManager exposes NHD pages as [num_pages, 1, page_size, 1, head_dim].
         # The CuTe DSL kernel consumes a paged [page_size, dim, num_pages] view

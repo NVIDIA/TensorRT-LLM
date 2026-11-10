@@ -61,7 +61,6 @@ worker_config:
     cache_transceiver_config:
       backend: NIXL
       kv_cache_bounce_size_mb: 512
-      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: false
     num_postprocess_workers: 4
     stream_interval: 20
@@ -85,5 +84,4 @@ worker_config:
     cache_transceiver_config:
       backend: NIXL
       kv_cache_bounce_size_mb: 512
-      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: false

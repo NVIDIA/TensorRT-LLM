@@ -1,11 +1,11 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Local MegaMoE kernel composition for Rubin."""
+
+import hashlib
 
 from typing import ClassVar, Optional, Tuple
 
 import cuda.bindings.driver as cuda
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -15,30 +15,27 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cutlass_dsl import Int32
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .....api import (
-    ImplDesc,
-    KernelClass,
-    OptionalRequirement,
-    ProblemDesc,
-    StaticOrRuntimeIntegerType,
-)
-from .....helpers.cute_py_helpers import (
-    Tcgen05MmaInstruction,
-    make_tcgen05_tmem_plan,
-    tcgen05_block_scaled_acc_dtype,
-)
+from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
+from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
+from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
 from .....helpers.iket_compat import iket
+from .....helpers.megamoe_aot import make_megamoe_aot_callable
 from .....helpers.smem_workspace import SmemWorkspace
+from .....helpers.topk_reduce import TopkReduce
 from .....helpers.utils import ceil_div, round_up
+from .....helpers.helper_weight_ready_gate import (
+    derive_helper_weight_ready_topology,
+    make_helper_weight_ready_generation_gate,
+)
 from .....quant_def import CombineFormat, QuantKind
-from ....blackwell.inference.mega.topk_reduce import TopkReduce
 from ....schedulers.base import WorkIdAcquisitionMode
 from ....schedulers.fc12_scheduler import BlackwellFusedFc12Scheduler, PhaseInterleavedFc12Scheduler
-from ..mega.block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGatedActEpilogue
+from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .block_scaled_swap_ab_fc12_mainloop import BlockScaledSwapAbFc12Mainloop
 from .local_routing import LocalRouting, LocalRoutingArgs
+
 
 _aot_symbol_prefix = "rubin_local_mega_moe_aot"
 
@@ -97,10 +94,16 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             "launch_cluster_count": int,
             "routing_flag_batch": int,
             "reduce_topk_in_kernel": bool,
+            "helper_expert_count": OptionalRequirement(int),
+            "total_helper_slots": OptionalRequirement(int),
+            "weight_ready_source_count": OptionalRequirement(int),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+        problem_desc, impl_desc = resolve_dlb_expert_counts(
+            problem_desc, impl_desc, world_size=1
+        )
 
         self.expert_count = problem_desc["expert_count"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
@@ -141,6 +144,9 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         self.launch_cluster_count = impl_desc["launch_cluster_count"]
         self.routing_flag_batch = impl_desc["routing_flag_batch"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
+        self.helper_expert_count = impl_desc.get("helper_expert_count", 0)
+        self.weight_ready_source_count = impl_desc.get("weight_ready_source_count", 1)
+        self._validate_helper_configuration()
 
         self.occupancy = 1
         self.architecture = "sm_107"
@@ -170,9 +176,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
                 "promised_launchable_sm_count": (
                     self.launch_cluster_count * self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
                 ),
-                "router_smem_limit_bytes": cutlass.memory.get_smem_capacity_in_bytes(
-                    self.architecture
-                ),
+                "router_smem_limit_bytes": utils.get_smem_capacity_in_bytes(self.architecture),
             }
         )
         resolved_problem_desc = ProblemDesc(
@@ -185,9 +189,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         self.local_routing = LocalRouting(resolved_problem_desc, local_routing_impl_desc)
         self.max_routed_tokens = self.local_routing.worst_case_token_count
 
-        fc12_problem_desc = ProblemDesc(
-            {**resolved_problem_desc, "expert_count": self.expert_count}
-        )
+        fc12_problem_desc = ProblemDesc({**resolved_problem_desc, "expert_count": self.expert_count})
         resolved_impl_desc = ImplDesc(
             {
                 **impl_desc,
@@ -201,9 +203,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             }
         )
         scheduler_type = (
-            BlackwellFusedFc12Scheduler
-            if self.schedule_mode == "grouped"
-            else PhaseInterleavedFc12Scheduler
+            BlackwellFusedFc12Scheduler if self.schedule_mode == "grouped" else PhaseInterleavedFc12Scheduler
         )
         self.scheduler = scheduler_type(fc12_problem_desc, resolved_impl_desc)
         self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
@@ -214,14 +214,18 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         if self.epilogue.sf_vec_size != self.sf_vec_size:
             raise ValueError("Epilogue and Mainloop scale vector sizes must match.")
         self._device_workspace = self._build_device_workspace()
-        self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(
-            fc12_problem_desc, resolved_impl_desc
-        )
+        self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
         self._topk_reduce = (
-            None
-            if self.reduce_topk_in_kernel
-            else TopkReduce(self.hidden_size, self.topk, self.combine_format)
+            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format)
         )
+
+    def _validate_helper_configuration(self) -> None:
+        if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
+            raise ValueError("helper_expert_count must be a non-negative exact int")
+        if type(self.weight_ready_source_count) is not int or self.weight_ready_source_count <= 0:
+            raise ValueError("weight_ready_source_count must be a positive exact int")
+        if self.helper_expert_count > 0:
+            derive_helper_weight_ready_topology(self.expert_count, self.helper_expert_count)
 
     def _validate_geometry(self) -> None:
         static_expert_dimensions = (
@@ -230,21 +234,15 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             isinstance(self.hidden_size, int),
         )
         if any(static_expert_dimensions) and not all(static_expert_dimensions):
-            raise ValueError(
-                "Local MegaMoE expert dimensions must be either all static or all runtime."
-            )
+            raise ValueError("Local MegaMoE expert dimensions must be either all static or all runtime.")
         if not all(static_expert_dimensions):
-            raise NotImplementedError(
-                "The Local MegaMoE kernel currently requires static expert dimensions."
-            )
+            raise NotImplementedError("The Local MegaMoE kernel currently requires static expert dimensions.")
         if self.expert_count <= 0 or self.intermediate_gateup_size <= 0 or self.hidden_size <= 0:
             raise ValueError("Local MegaMoE expert dimensions must be positive.")
         if self.topk <= 0 or self.topk > self.expert_count:
             raise ValueError("topk must be positive and no greater than expert_count.")
         if self.topk_index_dtype not in (cutlass.Int32, cutlass.Int64):
-            raise ValueError(
-                f"topk_index_dtype must be Int32 or Int64, got {self.topk_index_dtype}."
-            )
+            raise ValueError(f"topk_index_dtype must be Int32 or Int64, got {self.topk_index_dtype}.")
         if self.reduce_topk_in_kernel and not self.apply_topk_at_fc1:
             raise ValueError("In-kernel top-k reduction requires apply_topk_at_fc1=True.")
         if self.intermediate_gateup_size % 2 != 0:
@@ -261,12 +259,8 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             raise ValueError(
                 f"schedule_policy mode must be 'grouped' or 'phase_interleave', got {self.schedule_mode!r}."
             )
-        if self.hint is not None and (
-            isinstance(self.hint, bool) or not isinstance(self.hint, int) or self.hint <= 0
-        ):
-            raise ValueError(
-                f"schedule_policy hint must be a positive Python int, got {self.hint!r}."
-            )
+        if self.hint is not None and (isinstance(self.hint, bool) or not isinstance(self.hint, int) or self.hint <= 0):
+            raise ValueError(f"schedule_policy hint must be a positive Python int, got {self.hint!r}.")
         if self.schedule_mode == "phase_interleave" and self.work_id_mode != "atomic_counter":
             raise ValueError("phase_interleave currently requires work_id_mode='atomic_counter'.")
         if not 1 <= self.fc1_epi_flag_batch <= len(self.epilogue_warp_ids):
@@ -282,17 +276,12 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         ):
             if len(dimensions) != expected_rank:
                 raise ValueError(f"{field_name} must contain {expected_rank} dimensions.")
-            if not all(
-                isinstance(dimension, int) and not isinstance(dimension, bool)
-                for dimension in dimensions
-            ):
+            if not all(isinstance(dimension, int) and not isinstance(dimension, bool) for dimension in dimensions):
                 raise TypeError(f"{field_name} dimensions must be Python integers.")
             if any(dimension <= 0 for dimension in dimensions):
                 raise ValueError(f"{field_name} dimensions must be positive.")
         if self.mma_k_mode != "2x":
-            raise ValueError(
-                f"Rubin Local MegaMoE requires mma_k_mode='2x', got {self.mma_k_mode!r}."
-            )
+            raise ValueError(f"Rubin Local MegaMoE requires mma_k_mode='2x', got {self.mma_k_mode!r}.")
 
         mma_m, mma_n, mma_k = self.mma_tiler_mnk
         instruction_m, instruction_n, instruction_k = self.mma_instruction_mnk
@@ -309,9 +298,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
                 f"{self.quant_kind} requires Rubin 2x instruction K={expected_instruction_k}, got {instruction_k}."
             )
         if (instruction_m, instruction_n) != (mma_m, mma_n):
-            raise NotImplementedError(
-                "Rubin Local MegaMoE does not implement M/N instruction repetition or B-reuse."
-            )
+            raise NotImplementedError("Rubin Local MegaMoE does not implement M/N instruction repetition or B-reuse.")
         if mma_n not in (64, 128, 256):
             raise ValueError(f"mma_tiler N must be 64, 128, or 256, got {mma_n}.")
         if mma_k % instruction_k != 0:
@@ -323,9 +310,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
                 "Rubin Local MegaMoE excludes NVFP4 N256 K512 because its multi-window path has no measured gain."
             )
         if self.intermediate_gateup_size % (self.sf_vec_size * 4) != 0:
-            raise ValueError(
-                "The intermediate dimension must be divisible by four scale-factor vectors."
-            )
+            raise ValueError("The intermediate dimension must be divisible by four scale-factor vectors.")
         if cluster_n != 1:
             raise ValueError(f"The swap-AB FC12 path requires cluster N=1, got {cluster_n}.")
         if cluster_m <= 0 or cluster_m > 4 or cluster_m & (cluster_m - 1):
@@ -342,9 +327,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         blocks_fc1 = ceil_div(self.intermediate_gateup_size, cluster_feature_tile)
         blocks_fc2 = ceil_div(self.hidden_size, cluster_feature_tile)
         # Cover the worst token-block alignment of one full persistent-cluster FC2 claim wave.
-        max_dependent_token_blocks = ceil_div(
-            self.launch_cluster_count + blocks_fc2 - 1, blocks_fc2
-        )
+        max_dependent_token_blocks = ceil_div(self.launch_cluster_count + blocks_fc2 - 1, blocks_fc2)
         required_fc1_work = max_dependent_token_blocks * blocks_fc1
         raw_minimum_hint = max(1, ceil_div(required_fc1_work, self.launch_cluster_count))
         minimum_safe_hint = round_up(raw_minimum_hint, self.fc1_epi_flag_batch)
@@ -419,6 +402,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
             f"sfvec{self.sf_vec_size}_a{self.a_major_mode.name.lower()}_b{self.b_major_mode.name.lower()}_"
             f"e{self.expert_count}_topk{self.topk}_"
+            f"helpers{self.helper_expert_count}_weightsources{self.weight_ready_source_count}_"
             f"topkidx{dtype_name(self.topk_index_dtype)}_"
             f"h{self.hidden_size}_i{self.intermediate_gateup_size}_maxtoken{self.max_tokens}_"
             f"inst{instruction}_{self.mma_k_mode}_tile{tile}_"
@@ -435,6 +419,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
+            + ("_dlb_v1" if self.helper_expert_count > 0 else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -453,14 +438,10 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
 
         def fake_tensor(dtype, shape, stride_order, dynamic_axes, alignment):
             extents = tuple(
-                sym_int64(divisibility=math.gcd(int(extent), 128))
-                if axis in dynamic_axes
-                else int(extent)
+                sym_int64(divisibility=math.gcd(int(extent), 128)) if axis in dynamic_axes else int(extent)
                 for axis, extent in enumerate(shape)
             )
-            return make_fake_compact_tensor(
-                dtype, extents, stride_order=stride_order, assumed_align=alignment
-            )
+            return make_fake_compact_tensor(dtype, extents, stride_order=stride_order, assumed_align=alignment)
 
         tokens = self.max_tokens
         hidden = self.hidden_size
@@ -469,20 +450,14 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         experts = self.expert_count
         sf_vec_size = self.sf_vec_size
         # Weight SF is atom-swizzled and opaque, so its extent is whatever the caller staged, not a kernel choice.
-        fc1_weight_sf_columns = round_up(intermediate_gateup, 128) * round_up(
-            hidden // sf_vec_size, 4
-        )
-        fc2_weight_sf_columns = round_up(hidden, 128) * round_up(
-            intermediate_downproj // sf_vec_size, 4
-        )
+        fc1_weight_sf_columns = round_up(intermediate_gateup, 128) * round_up(hidden // sf_vec_size, 4)
+        fc2_weight_sf_columns = round_up(hidden, 128) * round_up(intermediate_downproj // sf_vec_size, 4)
         # TopkReduce and the in-kernel REDG both take their output dtype from this tensor.
         output_dtype = cutlass.BFloat16
 
         fake_arguments = dict(
             # Swap-AB puts the weights on the MMA A operand, so activation uses the routing input dtype.
-            activation=fake_tensor(
-                self.local_routing.activation_dtype, (tokens, hidden), (1, 0), {0}, 16
-            ),
+            activation=fake_tensor(self.local_routing.activation_dtype, (tokens, hidden), (1, 0), {0}, 16),
             activation_sf=fake_tensor(
                 self.local_routing.activation_sf_dtype,
                 (tokens, self.local_routing.activation_sf_hidden_padded),
@@ -492,18 +467,10 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             ),
             topk_indices=fake_tensor(self.topk_index_dtype, (tokens, self.topk), (1, 0), {0}, 16),
             topk_scores=fake_tensor(cutlass.Float32, (tokens, self.topk), (1, 0), {0}, 4),
-            fc1_weight=fake_tensor(
-                self.a_dtype, (experts, hidden, intermediate_gateup), (2, 0, 1), {0, 2}, 16
-            ),
-            fc1_weight_sf=fake_tensor(
-                self.sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16
-            ),
-            fc2_weight=fake_tensor(
-                self.a_dtype, (experts, intermediate_downproj, hidden), (2, 0, 1), {0, 2}, 16
-            ),
-            fc2_weight_sf=fake_tensor(
-                self.sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {0}, 16
-            ),
+            fc1_weight=fake_tensor(self.a_dtype, (experts, hidden, intermediate_gateup), (2, 0, 1), {0, 2}, 16),
+            fc1_weight_sf=fake_tensor(self.sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16),
+            fc2_weight=fake_tensor(self.a_dtype, (experts, intermediate_downproj, hidden), (2, 0, 1), {0, 2}, 16),
+            fc2_weight_sf=fake_tensor(self.sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {0}, 16),
             output_activation=fake_tensor(output_dtype, (tokens, hidden), (1, 0), {0}, 16),
             # Opaque byte workspaces: a bare base pointer, like to_cute_ptr. The 128-byte promise matches the
             # alignment the registered regions assume, so the caller must hand over 128-byte-aligned bases.
@@ -517,24 +484,34 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
         )
 
+        if self.helper_expert_count > 0:
+            fake_arguments.update(
+                hot_expert_weight_ready_flags=make_ptr(
+                    cutlass.Uint64, 0, AddressSpace.gmem, assumed_align=8
+                ),
+                hot_expert_weight_ready_generation=cutlass.Uint64(1),
+            )
+
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)
         if out_path is None:
             return compiled
-        compiled.export_to_c(
-            out_path, function_name=_aot_symbol_prefix, export_only_tvm_ffi_symbols=True
-        )
+        compiled.export_to_c(out_path, function_name=self._aot_symbol_name(), export_only_tvm_ffi_symbols=True)
         return out_path
 
-    @staticmethod
-    def load_compiled(path: str):
+    def _aot_symbol_name(self) -> str:
+        identity = hashlib.sha256(self.name().encode()).hexdigest()[:16]
+        return f"{_aot_symbol_prefix}_{identity}"
+
+    def load_compiled(self, path: str):
         from cutlass.cute.runtime import load_module
 
-        return load_module(path, enable_tvm_ffi=True)[_aot_symbol_prefix]
+        function = getattr(load_module(path, enable_tvm_ffi=True), self._aot_symbol_name())
+        return make_megamoe_aot_callable(function, self)
 
     def _build_mainloop_and_smem(
         self, problem_desc: ProblemDesc, resolved_impl_desc: ImplDesc
     ) -> Tuple[BlockScaledSwapAbFc12Mainloop, SmemWorkspace]:
-        smem_limit = cutlass.memory.get_smem_capacity_in_bytes(self.architecture) // self.occupancy
+        smem_limit = utils.get_smem_capacity_in_bytes(self.architecture) // self.occupancy
         smem_workspace = SmemWorkspace()
         self.local_routing.register_smem_regions(smem_workspace)
         self.scheduler.register_smem_regions(smem_workspace)
@@ -545,9 +522,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         if mainloop_smem_budget_bytes <= 0:
             raise ValueError("Fixed kernel components leave no SMEM budget for the Mainloop.")
 
-        mainloop_impl_desc = ImplDesc(
-            {**resolved_impl_desc, "mainloop_smem_budget_bytes": mainloop_smem_budget_bytes}
-        )
+        mainloop_impl_desc = ImplDesc({**resolved_impl_desc, "mainloop_smem_budget_bytes": mainloop_smem_budget_bytes})
         mainloop = BlockScaledSwapAbFc12Mainloop(problem_desc, mainloop_impl_desc)
 
         mainloop.register_smem_regions(smem_workspace)
@@ -572,16 +547,28 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc2_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
+        hot_expert_weight_ready_flags: Optional[cute.Pointer] = None,  # uint64[weight_ready_source_count]
+        hot_expert_weight_ready_generation: Optional[cutlass.Uint64] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
+
+        helper_ready_bundle = (
+            hot_expert_weight_ready_flags,
+            hot_expert_weight_ready_generation,
+        )
+        if cutlass.const_expr(
+            (self.helper_expert_count > 0 and not all(value is not None for value in helper_ready_bundle))
+            or (self.helper_expert_count == 0 and any(value is not None for value in helper_ready_bundle))
+        ):
+            raise ValueError(
+                "helper READY flags/generation must both be present iff helper_expert_count > 0"
+            )
 
         def rewrite_tensor_shape(tensor: cute.Tensor, shape: Tuple) -> cute.Tensor:
             return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=tensor.stride))
 
         if cutlass.const_expr(topk_indices.element_type is not self.topk_index_dtype):
-            raise TypeError(
-                f"topk_indices must be the declared {self.topk_index_dtype}, got {topk_indices.dtype}."
-            )
+            raise TypeError(f"topk_indices must be the declared {self.topk_index_dtype}, got {topk_indices.dtype}.")
         for operand_name, operand, expected_dtype in (
             ("activation", activation, self.b_dtype),
             ("activation_sf", activation_sf, self.sf_dtype),
@@ -654,19 +641,14 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         padded_intermediate_gateup = cute.round_up(intermediate_gateup, sf_vec_size * 4)
         expected_fc1_weight_sf_columns = padded_intermediate_gateup * padded_hidden // sf_vec_size
         if cutlass.const_expr(
-            isinstance(fc1_weight_sf.shape[1], int)
-            and isinstance(expected_fc1_weight_sf_columns, int)
+            isinstance(fc1_weight_sf.shape[1], int) and isinstance(expected_fc1_weight_sf_columns, int)
         ):
             if cutlass.const_expr(fc1_weight_sf.shape[1] != expected_fc1_weight_sf_columns):
                 raise ValueError("fc1_weight_sf has an incompatible column count.")
         fc1_sfa = cute.make_tensor(
             fc1_weight_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (
-                    cutlass.Int32(padded_intermediate_gateup),
-                    cutlass.Int32(padded_hidden),
-                    cutlass.Int32(experts),
-                ),
+                (cutlass.Int32(padded_intermediate_gateup), cutlass.Int32(padded_hidden), cutlass.Int32(experts)),
                 sf_vec_size,
             ),
         )
@@ -684,31 +666,21 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         padded_fc2_intermediate = cute.round_up(intermediate_fc2, sf_vec_size * 4)
         expected_fc2_weight_sf_columns = padded_fc2_hidden * padded_fc2_intermediate // sf_vec_size
         if cutlass.const_expr(
-            isinstance(fc2_weight_sf.shape[1], int)
-            and isinstance(expected_fc2_weight_sf_columns, int)
+            isinstance(fc2_weight_sf.shape[1], int) and isinstance(expected_fc2_weight_sf_columns, int)
         ):
             if cutlass.const_expr(fc2_weight_sf.shape[1] != expected_fc2_weight_sf_columns):
                 raise ValueError("fc2_weight_sf has an incompatible column count.")
         fc2_sfa = cute.make_tensor(
             fc2_weight_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (
-                    cutlass.Int32(padded_fc2_hidden),
-                    cutlass.Int32(padded_fc2_intermediate),
-                    cutlass.Int32(experts_fc2),
-                ),
+                (cutlass.Int32(padded_fc2_hidden), cutlass.Int32(padded_fc2_intermediate), cutlass.Int32(experts_fc2)),
                 sf_vec_size,
             ),
         )
         fc2_sfb = cute.make_tensor(
             fc1_output_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (
-                    fc1_output_sf.shape[0],
-                    cutlass.Int32(fc1_output_sf.shape[1] * sf_vec_size),
-                    singleton,
-                ),
-                sf_vec_size,
+                (fc1_output_sf.shape[0], cutlass.Int32(fc1_output_sf.shape[1] * sf_vec_size), singleton), sf_vec_size
             ),
         )
         if cutlass.const_expr(self.reduce_topk_in_kernel):
@@ -716,21 +688,14 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
                 output_activation.iterator,
                 cute.make_layout(
                     (self.max_tokens, 1, hidden),
-                    stride=(
-                        output_activation.stride[0],
-                        output_activation.stride[0],
-                        output_activation.stride[1],
-                    ),
+                    stride=(output_activation.stride[0], output_activation.stride[0], output_activation.stride[1]),
                 ),
             )
         else:
-            pre_reduced_activation = self.local_routing.pre_reduced_activation_tensor(
-                self._device_workspace
-            )
+            pre_reduced_activation = self.local_routing.pre_reduced_activation_tensor(self._device_workspace)
 
         fc2_output = rewrite_tensor_shape(
-            pre_reduced_activation,
-            (pre_reduced_activation.shape[0], pre_reduced_activation.shape[1], hidden),
+            pre_reduced_activation, (pre_reduced_activation.shape[0], pre_reduced_activation.shape[1], hidden)
         )
 
         self._mainloop.materialize_codegen_members()
@@ -762,9 +727,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             fc2_sfb=fc2_sfb,
         )
 
-        fc1_output_tma_atom, fc1_output_tma_tensor = self.epilogue.prepare_tma_store_params(
-            fc1_output_gemm
-        )
+        fc1_output_tma_atom, fc1_output_tma_tensor = self.epilogue.prepare_tma_store_params(fc1_output_gemm)
 
         grid = self.scheduler.get_grid_shape(max_active_clusters=self.launch_cluster_count)
         self._device_workspace.remove_device_members()
@@ -797,6 +760,8 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             fc1_alpha,
             fc2_alpha,
             fc1_norm_const,
+            hot_expert_weight_ready_flags,
+            hot_expert_weight_ready_generation,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -807,9 +772,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         )
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
-            self._topk_reduce(
-                pre_reduced_activation, None, output_activation, reduce_scores, stream
-            )
+            self._topk_reduce(pre_reduced_activation, None, output_activation, reduce_scores, stream)
 
     @cute.kernel
     def _kernel(
@@ -842,6 +805,8 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor],
         fc2_alpha: Optional[cute.Tensor],
         fc1_norm_const: Optional[cute.Tensor],
+        hot_expert_weight_ready_flags: Optional[cute.Pointer],
+        hot_expert_weight_ready_generation: Optional[cutlass.Uint64],
     ):
         """Compose local routing, scheduler, mainloop, and epilogue."""
         self._mainloop.materialize_codegen_members()
@@ -863,8 +828,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         fc1_output_sf = cute.make_tensor(
             fc1_output_sf_storage.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (fc1_output_sf_storage.shape[0], intermediate_gateup // 2, cutlass.Int32(1)),
-                self.epilogue.sf_vec_size,
+                (fc1_output_sf_storage.shape[0], intermediate_gateup // 2, cutlass.Int32(1)), self.epilogue.sf_vec_size
             ),
         )
 
@@ -918,22 +882,24 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         )
         scheduler = self.scheduler
 
-        fc2_spin_threshold = (
-            intermediate_gateup + self._mainloop.cta_tile_m - 1
-        ) // self._mainloop.cta_tile_m
+        fc2_spin_threshold = (intermediate_gateup + self._mainloop.cta_tile_m - 1) // self._mainloop.cta_tile_m
+        helper_weight_ready_gate = None
+        if cutlass.const_expr(self.helper_expert_count > 0):
+            helper_weight_ready_gate = make_helper_weight_ready_generation_gate(
+                memory_slot_count=self.expert_count,
+                helper_count=self.helper_expert_count,
+                source_count=self.weight_ready_source_count,
+                terminal_flags=hot_expert_weight_ready_flags,
+                expected_generation=hot_expert_weight_ready_generation,
+            )
         kernel_extension = BlockScaledSwapAbFc12Extension(
             sf_vec_size=self.sf_vec_size,
             fc1_done_counter_pointer=fc1_done_counter.iterator,
             fc2_spin_threshold=fc2_spin_threshold,
-            fc1_ready_counter_pointer=self.local_routing.fc1_ready_counter_pointer(
-                self._device_workspace
-            ),
+            fc1_ready_counter_pointer=self.local_routing.fc1_ready_counter_pointer(self._device_workspace),
         )
         optional_epilogue_args = GatedActEpilogueArgs(
-            fc1_alpha=fc1_alpha,
-            fc2_alpha=fc2_alpha,
-            fc1_norm_const=fc1_norm_const,
-            topk_scores=pool_topk_scores,
+            fc1_alpha=fc1_alpha, fc2_alpha=fc2_alpha, fc1_norm_const=fc1_norm_const, topk_scores=pool_topk_scores
         )
 
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -951,9 +917,15 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             iket.range_push("scheduler.gen_work")
             work_tile = scheduler.gen_next_work()
             iket.range_pop()
+            helper_ready_latched = Int32(0)
             while work_tile.is_valid_tile:
                 iket.range_push("scheduler.publish_work")
-                scheduler.publish_work(kernel_extension.prepare_work_tile(work_tile))
+                prepared_tile = kernel_extension.prepare_work_tile(work_tile)
+                if cutlass.const_expr(helper_weight_ready_gate is not None):
+                    helper_ready_latched = helper_weight_ready_gate.wait_before_first_helper_publish(
+                        prepared_tile.expert_idx, helper_ready_latched
+                    )
+                scheduler.publish_work(prepared_tile)
                 iket.range_pop()
                 iket.range_push("scheduler.gen_work")
                 work_tile = scheduler.gen_next_work()
@@ -1043,9 +1015,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
                 optional_epilogue_args,
             )
             tmem_allocator.relinquish_alloc_permit()
-            tmem_allocator.free(
-                tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols
-            )
+            tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
             iket.range_pop()
 
         if warp_idx >= Int32(self.transfer_warp_idx_start):
@@ -1074,9 +1044,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         iket.range_push("local_mega.kernel_tail_wait")
         cute.arch.sync_threads()
         iket.range_pop()
-        if (warp_idx >= Int32(self.transfer_warp_idx_start)) & (
-            warp_idx < Int32(self.token_in_end_warp_idx)
-        ):
+        if (warp_idx >= Int32(self.transfer_warp_idx_start)) & (warp_idx < Int32(self.token_in_end_warp_idx)):
             iket.range_push("local_mega.tail_reset")
             self.local_routing.reset_tail()
             iket.range_pop()

@@ -32,6 +32,7 @@ from ._router_index import (
     NoTarget,
     modeling_v2_resolve,
     modeling_v2_resolve_on_all_ranks,
+    resolved_mode,
     step_contract_enabled,
 )
 
@@ -40,6 +41,7 @@ __all__ = [
     "ModelingV2Mode",
     "NoTarget",
     "modeling_v2_resolve",
+    "resolved_mode",
     "modeling_v2_resolve_on_all_ranks",
     "step_contract_enabled",
 ]

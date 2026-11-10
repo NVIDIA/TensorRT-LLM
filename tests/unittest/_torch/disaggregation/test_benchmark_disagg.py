@@ -905,6 +905,7 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
         ex.active_requests = []
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None
@@ -1317,6 +1318,7 @@ class TestFailFastDuringBenchmarkFill:
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None
@@ -1700,6 +1702,7 @@ class TestFillPhaseEndToEnd:
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None

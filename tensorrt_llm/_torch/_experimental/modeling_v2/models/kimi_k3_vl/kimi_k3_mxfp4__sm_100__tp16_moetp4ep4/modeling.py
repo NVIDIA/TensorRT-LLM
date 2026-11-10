@@ -93,6 +93,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Opti
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
     k3_mla_decode_view,
 )
@@ -156,6 +157,8 @@ from . import spec_worker as _spec_worker
 from . import weights as _weights
 from .ops.ssm.k3_kda_attn import k3_kda_attn
 from .ops.ssm.k3_kda_verify import k3_kda_verify
+
+native_ops = load_family_ops(__name__)
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -226,8 +229,7 @@ REQUIRED_ENGINE_FIELDS = {
 }
 
 #: Stock code the generic path runs outside the catalog, declared so it is not consumed silently: every
-#: tensorrt_llm import of this module that computes (test_modeling_v2_claims.py checks the list both ways). An entry
-#: leaves the list when a catalog entry replaces it.
+#: tensorrt_llm import of this module that computes. An entry leaves the list when a catalog entry replaces it.
 UNCERTIFIED_GENERIC_CALLS = (
     # The checkpoint load and the engine hooks this target inherits, and the causal LM around the text model.
     "tensorrt_llm._torch.models.modeling_kimi_linear.KimiLinearForCausalLM",
@@ -640,13 +642,9 @@ def _apply_attn_res_rmsnorm_fused(
     if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("attn_res+norm", False, M, H, N)
         return None
-    try:
-        attn_res_rmsnorm_op = torch.ops.trtllm.k3_attn_res_rmsnorm_fwd
-    except (AttributeError, RuntimeError):
-        return None
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    output = attn_res_rmsnorm_op(
+    output = native_ops.k3_attn_res_rmsnorm_fwd(
         layer_kernel,
         block_kernel,
         proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
@@ -714,14 +712,10 @@ def _apply_attn_res_add_rmsnorm_fused(
     if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("add+attn_res+norm", False, M, H, N)
         return None
-    try:
-        attn_res_add_rmsnorm_op = torch.ops.trtllm.k3_attn_res_add_rmsnorm_fwd
-    except (AttributeError, RuntimeError):
-        return None
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     addend_kernel = addend.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    updated_prefix_sum, output = attn_res_add_rmsnorm_op(
+    updated_prefix_sum, output = native_ops.k3_attn_res_add_rmsnorm_fwd(
         layer_kernel,
         addend_kernel,
         block_kernel,
@@ -2335,11 +2329,23 @@ class K3DecodeKDA(KimiKDALinearAttention):
         slot_indices,
         output: Optional[torch.Tensor] = None,
         allow_prequantized_output: bool = False,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'."""
+        """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'.
+
+        ``prequantized_input`` (the MXFP8 form of ``x2d``) goes to the built-in verify; the decode kernels read
+        ``x2d``.
+        """
         if not (self._has_kda_replay_caches(layer_cache) and layer_cache.kda_state_tok is not None):
             return super().forward_verify(
-                x2d, num_steps, layer_cache, conv_pool, ssm_pool, slot_indices, output=output
+                x2d,
+                num_steps,
+                layer_cache,
+                conv_pool,
+                ssm_pool,
+                slot_indices,
+                output=output,
+                prequantized_input=prequantized_input,
             )
         assert self.takes_k3_kernels and self.k3_buffers is not None, (
             f"Kimi K3 KDA layer {self.layer_idx}: the cache manager keeps the per-token verify states, which only "

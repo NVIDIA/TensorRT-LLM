@@ -16,12 +16,14 @@ import datetime
 import enum
 import gc
 import json
+import os
 import time
 import traceback
 import uuid
 import weakref
 from pathlib import Path
 from queue import Empty, Queue
+from threading import Lock
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
@@ -29,24 +31,27 @@ import torch
 from tensorrt_llm.logger import logger
 
 from .._torch.peft.lora.manager import LoraManager
-from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
+from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
+                                                PythonRequestInputs)
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..bindings.BuildInfo import check_cuda_architecture_supported
+from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
+                                        configure_moe_launch_queues,
+                                        uses_collective_shutdown)
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
-from ..runtime import ModelConfig
 from ..sampling_params import SamplingParams
 from .executor import GenerationExecutor
 from .ipc import IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
-from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
+from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_prompt_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
@@ -98,6 +103,18 @@ class BaseWorker(GenerationExecutor):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
     ) -> None:
+        # Direct worker construction also bypasses BaseLLM/worker_main.
+        launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
+        if llm_args is not None and llm_args.env_overrides:
+            os.environ.update(llm_args.env_overrides)
+        if llm_args is not None and llm_args.backend == "pytorch":
+            queue_overrides = configure_moe_launch_queues(
+                getattr(llm_args, "moe_config", None),
+                llm_args.env_overrides,
+                initial_setting=launch_queues)
+            if queue_overrides is not llm_args.env_overrides:
+                llm_args.env_overrides = queue_overrides
+
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
             num_postprocess_workers=postproc_config.num_postprocess_workers,
@@ -131,6 +148,12 @@ class BaseWorker(GenerationExecutor):
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
         self._lora_config = llm_args.lora_config if llm_args is not None else None
+        # Maps adapter ID to (canonical path, checkpoint source).
+        self._lora_adapter_identities: dict[str, tuple[str, str]] = {}
+        # Weak values avoid retaining locks for failed, one-off adapter IDs.
+        self._lora_adapter_id_locks = weakref.WeakValueDictionary()
+        # Ensures concurrent requests for one adapter ID share the same lock.
+        self._lora_adapter_id_locks_guard = Lock()
         self._resource_governor_queue = None
 
         if global_mpi_size() > 1:
@@ -160,13 +183,13 @@ class BaseWorker(GenerationExecutor):
 
 
         from tensorrt_llm._torch.pyexecutor.model_loader import \
-            _construct_checkpoint_loader
+            construct_checkpoint_loader
         from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
             create_py_executor
 
         self._configure_device()
         self.mapping = self.llm_args.parallel_config.to_mapping()
-        self.checkpoint_loader = _construct_checkpoint_loader(
+        self.checkpoint_loader = construct_checkpoint_loader(
             self.llm_args.checkpoint_loader,
             self.llm_args.checkpoint_format,
             mx_config=self.llm_args.mx_config,
@@ -189,8 +212,6 @@ class BaseWorker(GenerationExecutor):
             self.max_seq_len = self.engine.max_seq_len
 
         self._lora_manager: Optional[LoraManager] = None
-        self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
-        self._runtime_model_config: Optional[ModelConfig] = None
 
         if self._lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
@@ -321,22 +342,55 @@ class BaseWorker(GenerationExecutor):
     def _load_lora_adapter(self, lora_request: LoRARequest) -> None:
         """Ensure the adapter is loaded into the local cache."""
         adapter_id = str(lora_request.adapter_id)
-        self._lora_manager.load_from_ckpt([lora_request.path],
-                                          model_config=self._lora_model_config,
-                                          uids=[adapter_id],
-                                          ckpt_source=lora_request.ckpt_source)
+        with self._lora_adapter_id_locks_guard:
+            adapter_lock = self._lora_adapter_id_locks.get(adapter_id)
+            if adapter_lock is None:
+                adapter_lock = Lock()
+                self._lora_adapter_id_locks[adapter_id] = adapter_lock
 
-    def _load_prompt_adapter(self,
-                             prompt_adapter_request: PromptAdapterRequest):
-        self._prompt_adapter_manager.load_from_ckpt(
-            [prompt_adapter_request.local_path],
-            model_config=self._runtime_model_config,
-            uids=[str(prompt_adapter_request.adapter_id)])
+        with adapter_lock:
+            previous = self._lora_adapter_identities.get(adapter_id)
+            identity = (lora_request.path, lora_request.ckpt_source)
+            # An empty path retains the trusted API's ID-only cache lookup.
+            if lora_request.path:
+                same_source = (previous is not None
+                               and previous[1] == lora_request.ckpt_source)
+                if previous is None or (same_source and previous != identity):
+                    # Preserve path-alias support while avoiding filesystem
+                    # access for the common exact-identity reuse case.
+                    identity = (str(Path(lora_request.path).resolve()),
+                                lora_request.ckpt_source)
+                if previous is not None and previous != identity:
+                    logger.warning(
+                        "Rejecting conflicting LoRA adapter identity for ID %s: "
+                        "existing=%r, requested=%r", adapter_id, previous,
+                        identity)
+                    raise ValueError(
+                        f"LoRA adapter ID {adapter_id} is already bound to a "
+                        "different path or checkpoint source; use a new ID.")
+            loaded = False
+            try:
+                self._lora_manager.load_from_ckpt(
+                    [lora_request.path],
+                    model_config=self._lora_model_config,
+                    uids=[adapter_id],
+                    ckpt_source=lora_request.ckpt_source)
+                loaded = True
+            finally:
+                # Failed lookups are retryable unless the loader published UID
+                # state. Keep bindings for partial loads and across eviction.
+                if (loaded or adapter_id in self._lora_manager.cpp_lora_weights
+                        or adapter_id in self._lora_manager.cpp_lora_config):
+                    self._lora_adapter_identities.setdefault(
+                        adapter_id, identity)
 
     def _enqueue_request(self,
                          request: GenerationRequest,
                          result_wait_queue=None) -> int:
         assert request.id is not None
+        if request.prompt_adapter_request is not None:
+            raise RequestError(
+                "Prompt adapters are not supported by the PyTorch executor.")
         py_lora_path = None
         py_lora_ckpt_source = None
         if self._lora_manager is not None and request.lora_request is not None:
@@ -360,27 +414,16 @@ class BaseWorker(GenerationExecutor):
         # rode along on the wire (GenerationRequest._prompt_token_ids_i32), hand
         # THAT to the C++ Request ctor (memcpy) instead of the list -- this avoids
         # the O(ISL) list copy + element-wise nanobind cast on the GIL-held submit
-        # thread. No buffer (in-process, or prompt-adapter prepend) -> list path.
+        # thread. No buffer (in-process) -> list path.
         # If both forms exist, they are assumed to describe the same token ids;
         # in-place mutations of request.prompt_token_ids must clear the i32 buffer.
         i32_buf = getattr(request, "_prompt_token_ids_i32", None)
-        if i32_buf is not None and request.prompt_adapter_request is None:
+        if i32_buf is not None:
             prompt_token_ids = i32_buf
         else:
             prompt_token_ids = list(request.prompt_token_ids)
-        prompt_tuning_config = None
-        if request.prompt_adapter_request is not None:
-            self._load_prompt_adapter(request.prompt_adapter_request)
-            uid = str(request.prompt_adapter_request.adapter_id)
-            prompt_tuning_config = tllm.PromptTuningConfig(
-                self._prompt_adapter_manager.uid_to_weights[uid])
-            vocab_size = self._runtime_model_config.vocab_size
-            pa_length = prompt_tuning_config.embedding_table.size(0)
-            prompt_token_ids = list(range(
-                vocab_size, vocab_size + pa_length)) + prompt_token_ids
-
         # MULTIMODAL
-        # NOTE: Since, we only support PyTorch backend for multimodal, we will send multimodal_data through the 'py_multimodal_data' field
+        # NOTE: Since, we only support PyTorch backend for multimodal, we send multimodal_data through the internal Python input payload
         # except `multimodal_input` as it needs to go through the C++ runtime.
         multimodal_input = None
         if request.multimodal_params is not None and request.multimodal_params.has_content(
@@ -388,7 +431,7 @@ class BaseWorker(GenerationExecutor):
             if request.multimodal_params.multimodal_input is not None:
                 multimodal_input = request.multimodal_params.multimodal_input.to_binding(
                     tllm)
-            # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
+            # NOTE: Setting to None here to avoid sending multimodal_input again through the Python input payload
             request.multimodal_params.multimodal_input = None
 
         context_phase_params = None
@@ -431,6 +474,16 @@ class BaseWorker(GenerationExecutor):
                     # use max_tokens if can't deduce default_max_tokens
                     return max_tokens
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
+            if not self.engine.is_generation_model:
+                # The prompt runs in one forward and nothing is generated, so
+                # it may fill max_seq_len; max_tokens=1 has the request
+                # complete with that forward in every executor loop.
+                if len(prompt_token_ids) > max_seq_len * cp_size:
+                    raise ValueError(
+                        context_length_exceeded_message(
+                            max_context_length=max_seq_len * cp_size,
+                            num_prompt_tokens=len(prompt_token_ids)))
+                return 1
             default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
                 # Reject (never truncate): the prompt leaves no room for even
@@ -477,7 +530,6 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params._get_stop_words(),
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
-                prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
                 mrope_config=None,
                 kv_cache_retention_config=request.kv_cache_retention_config,
@@ -487,43 +539,35 @@ class BaseWorker(GenerationExecutor):
                 disagg_request_id=disagg_request_id,
                 cache_salt=request.cache_salt,
                 priority=request.priority)
-            executor_request.py_original_end_id = request.sampling_params.end_id
-            executor_request.py_num_logprobs = request.sampling_params.logprobs
-            executor_request.py_lora_path = py_lora_path
-            executor_request.py_lora_ckpt_source = py_lora_ckpt_source
-            executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
-            executor_request.py_logprobs_simple_format = (
-                request.sampling_params.logprobs_simple_format)
-            executor_request.py_return_routed_experts = (
-                request.sampling_params.return_routed_experts)
-
-            # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
-            if request.disaggregated_params is not None:
-                executor_request.py_disaggregated_params = request.disaggregated_params
             if request.multimodal_params is not None:
-                if request.multimodal_params.multimodal_data is not None:
-                    # Resolve SharedTensorContainer dicts inside multimodal_data, including
-                    # E/P handoff embedding handles parked under "multimodal_embedding".
-                    request.multimodal_params.to_tensor("multimodal_data")
-                    executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
-
-            if request.sampling_params.logits_processor:
-                # For PyTorch backend, we attach logits processors as a dynamic Python attribute
-                # instead of using the C++ binding, since the latter will cause PyCapsule pickling issues.
-                lp = request.sampling_params.logits_processor
-                executor_request.py_logits_post_processors = lp if isinstance(
-                    lp, list) else [lp]
-
-            executor_request.py_scheduling_params = None
-            if request.scheduling_params is not None:
-                executor_request.py_scheduling_params = request.scheduling_params
-
-            executor_request.py_conversation_params = None
-            if request.conversation_params is not None:
-                executor_request.py_conversation_params = request.conversation_params
-
-            if request.arrival_time is not None:
-                executor_request.py_arrival_time = request.arrival_time
+                # Resolve worker-handoff handles before constructing the input envelope.
+                request.multimodal_params.to_tensor("multimodal_data")
+            processors = request.sampling_params.logits_processor
+            executor_request = ExecutorRequest(
+                executor_request,
+                PythonRequestInputs(
+                    original_end_id=request.sampling_params.end_id,
+                    num_logprobs=request.sampling_params.logprobs,
+                    lora_path=py_lora_path,
+                    lora_ckpt_source=py_lora_ckpt_source,
+                    logprobs_mode=request.sampling_params.logprobs_mode,
+                    logprobs_simple_format=request.sampling_params.
+                    logprobs_simple_format,
+                    return_routed_experts=request.sampling_params.
+                    return_routed_experts,
+                    disaggregated_params=request.disaggregated_params,
+                    multimodal_data=(request.multimodal_params.multimodal_data
+                                     if request.multimodal_params is not None
+                                     else None),
+                    logits_post_processors=(processors if isinstance(
+                        processors, list) else [processors])
+                    if processors else None,
+                    scheduling_params=request.scheduling_params,
+                    conversation_params=request.conversation_params,
+                    kv_hints=request.kv_hints,
+                    arrival_time=request.arrival_time,
+                ),
+            )
 
             if result_wait_queue is not None:
                 req_id = self.engine.enqueue_request(
@@ -560,7 +604,13 @@ class BaseWorker(GenerationExecutor):
 
         self._results[client_id] = result
 
-        request_id = self._enqueue_request(request)
+        enqueued = False
+        try:
+            request_id = self._enqueue_request(request)
+            enqueued = True
+        finally:
+            if not enqueued:
+                self._results.pop(client_id, None)
         # request_id returned from backend is necessary for the abort_request method.
         self._client_id_to_request_id[client_id] = request_id
 
@@ -1066,8 +1116,60 @@ class BaseWorker(GenerationExecutor):
     def shutdown(self):
         if self.doing_shutdown:
             return
-        else:
-            self.doing_shutdown = True
+        if not uses_collective_shutdown(getattr(self, "llm_args", None)):
+            self._shutdown_rank_local()
+            return
+        self.doing_shutdown = True
+
+        try:
+            if self.engine is not None:
+                engine = self.engine
+                engine_shutdown_completed = bool(
+                    getattr(self, "_engine_shutdown_completed", False))
+                can_shutdown = getattr(engine, "can_shutdown", None)
+                if can_shutdown is None:
+                    can_shutdown = engine.can_enqueue_requests
+                # PyExecutor separates leader-only shutdown publication from the
+                # all-rank join/finalize path. Other backends retain their gate.
+                # A retry must bypass that gate once shutdown already completed.
+                if (engine_shutdown_completed
+                        or getattr(engine, "shutdown_all_ranks", False)
+                        or can_shutdown()):
+                    shutdown_error = None
+                    local_safe = engine_shutdown_completed
+                    if not local_safe:
+                        try:
+                            engine.shutdown()
+                            self._engine_shutdown_completed = True
+                            local_safe = True
+                        except BaseException as error:
+                            shutdown_error = error
+                    terminal_cleanup = getattr(engine, "terminal_cleanup", None)
+                    if terminal_cleanup is not None:
+                        try:
+                            if getattr(engine, "shutdown_all_ranks", False):
+                                terminal_cleanup(local_safe=local_safe)
+                            elif local_safe:
+                                terminal_cleanup()
+                        except BaseException as error:
+                            if shutdown_error is None:
+                                shutdown_error = error
+                    if shutdown_error is not None:
+                        raise shutdown_error
+                    self.engine = None
+                    self._engine_shutdown_completed = False
+        except BaseException:
+            # Keep the engine reachable so a caller can retry a failed
+            # collective terminal cleanup in this long-lived worker process.
+            # Only an explicit call retries it; see __del__.
+            self.doing_shutdown = False
+            self._collective_shutdown_failed = True
+            raise
+        self._collective_shutdown_failed = False
+
+    def _shutdown_rank_local(self):
+        """Best-effort teardown for configurations without collective EP resources."""
+        self.doing_shutdown = True
 
         if self.engine is not None:
             can_shutdown = getattr(self.engine, "can_shutdown", None)
@@ -1075,6 +1177,9 @@ class BaseWorker(GenerationExecutor):
                 can_shutdown = self.engine.can_enqueue_requests
             if can_shutdown():
                 self.engine.shutdown()
+                local_cleanup = getattr(self.engine, "local_cleanup", None)
+                if local_cleanup is not None:
+                    local_cleanup()
                 self.engine = None
 
     def get_disaggregated_params(self) -> dict:
@@ -1252,6 +1357,10 @@ class BaseWorker(GenerationExecutor):
         return exc_type is None or exc_type == self.WorkerExit
 
     def __del__(self):
+        # Finalizers run at a different time on each rank, so they must not
+        # retry a failed collective shutdown.
+        if getattr(self, "_collective_shutdown_failed", False):
+            return
         self.shutdown()
 
 
@@ -1563,9 +1672,16 @@ def _compute_pytorch_prompt_logprobs(
         if cached is not None:
             return LogProbsResult(prompt=cached)
     context_logits = response.result.context_logits
-    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
     result = response.result.get_result()
     assert result is not None, "result must not be None when prompt_logprobs is requested."
+    if (context_logits is None and result.is_sequence_final
+            and result.finish_reasons
+            and all(reason == tllm.FinishReason.CANCELLED
+                    for reason in result.finish_reasons)):
+        # Cancellation before execution has no prompt logits to report. Keep
+        # cached streaming logprobs above, but do not invent them for queued work.
+        return None
+    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
     # Single element list
     first_generation_token = result.output_token_ids[0][:1]
     assert first_generation_token, "first generation token must not be empty when prompt_logprobs is requested."
