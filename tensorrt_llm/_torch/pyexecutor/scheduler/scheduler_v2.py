@@ -2207,13 +2207,20 @@ class KVCacheV2Scheduler(RequestScheduler):
         # frees GPU memory. A suspended request's pages move to the lower tier
         # whenever that tier has room, so it is worth preempting only once the
         # tier is full and its pages are stuck on GPU; take one only when no
-        # active request is left to give.
+        # active request is left to give and some GPU page is still evictable.
+        # Otherwise every suspended page already sits below GPU, and a teardown
+        # would cost a re-prefill without freeing anything here.
+        kv_cache_manager = self.kv_cache_manager
         active = [
             victim
             for victim in candidates
-            if self.kv_cache_manager.is_request_active(victim.py_request_id)
+            if kv_cache_manager.is_request_active(victim.py_request_id)
         ]
-        if active or not self.kv_cache_manager.has_cache_tier_below_gpu:
+        if (
+            active
+            or not kv_cache_manager.has_cache_tier_below_gpu
+            or not kv_cache_manager.has_evictable_gpu_pages()
+        ):
             candidates = active
         for victim in candidates:
             if not self._preempt_or_defer(victim, recompute_paused):
@@ -2476,6 +2483,21 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         return self._is_started_request(req)
 
+    def _recompute_pause_frees_gpu(self, req: LlmRequest) -> bool:
+        """Whether tearing *req* down gives GPU pages back.
+
+        An active request holds its pages on GPU, and so does a suspended one
+        when there is no tier below GPU. With such a tier, a suspended
+        request's pages move down while it has room, so tearing one down helps
+        only while some GPU page is still evictable.
+        """
+        kv_cache_manager = self.kv_cache_manager
+        return (
+            kv_cache_manager.is_request_active(req.py_request_id)
+            or not kv_cache_manager.has_cache_tier_below_gpu
+            or kv_cache_manager.has_evictable_gpu_pages()
+        )
+
     def _preempt_or_defer(self, req: LlmRequest, recompute_paused: RequestList) -> bool:
         """Give up *req*'s pages for another request, if they are free to give.
 
@@ -2576,8 +2598,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                 candidate = requests_list[i]
                 was_evicted = any(evicted_req is candidate for evicted_req in evicted)
                 if (
-                    self.kv_cache_manager.can_evict or not was_evicted
-                ) and self._is_recompute_pause_candidate(candidate, inflight_request_ids):
+                    (self.kv_cache_manager.can_evict or not was_evicted)
+                    and self._is_recompute_pause_candidate(candidate, inflight_request_ids)
+                    and self._recompute_pause_frees_gpu(candidate)
+                ):
                     victim_idx = i
                     break
 
@@ -2587,6 +2611,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                         candidate
                         for candidate in evicted
                         if self._is_recompute_pause_candidate(candidate, inflight_request_ids)
+                        and self._recompute_pause_frees_gpu(candidate)
                     ),
                     None,
                 )

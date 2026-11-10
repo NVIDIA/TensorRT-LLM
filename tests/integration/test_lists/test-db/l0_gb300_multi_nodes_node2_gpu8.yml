@@ -33,6 +33,13 @@ l0_gb300_multi_nodes_node2_gpu8:
   # drafter on aggregated Helix, FP8 KV. Measured about 36 min per case on 2x4 GB300.
   - accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv[tp4cp2] TIMEOUT (60)
   - accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv[tp1cp8] TIMEOUT (60)
+  # Same recipe with block reuse on: asserts reuse depth and that the drafter
+  # keeps its acceptance length on a reused recall prompt.
+  - accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv_block_reuse[tp4cp2] TIMEOUT (60)
+  - accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv_block_reuse[tp1cp8] TIMEOUT (60)
+  # Same recipe with a KV pool too small for the batch: requests suspend to the
+  # host tier and resume, and GSM8K plus the acceptance-length gate must hold.
+  - accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv_kv_pressure TIMEOUT (60)
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp8]
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[dep8]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[tp8_moetp2_ep4]

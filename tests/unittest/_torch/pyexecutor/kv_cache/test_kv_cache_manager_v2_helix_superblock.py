@@ -607,14 +607,18 @@ def test_scheduler_allocation_failure_suspends_under_agg_helix_with_host_tier() 
     assert ladder_calls == ["evict", "recompute_pause", "self_suspend"]
 
 
-def _host_tier_preempt_scheduler(preempted: list) -> SimpleNamespace:
-    """Agg helix scheduler with a host tier, where every request holds pages."""
+def _host_tier_preempt_scheduler(
+    preempted: list, active: bool = True, gpu_evictable: bool = True
+) -> SimpleNamespace:
+    """Agg helix scheduler with a host tier, where every request is *active* or
+    every request is suspended."""
     sched = SimpleNamespace(
         has_cp_helix=True,
         enable_recompute_pause=True,
         kv_cache_manager=SimpleNamespace(
             has_cache_tier_below_gpu=True,
-            is_request_active=lambda request_id: True,
+            is_request_active=lambda request_id: active,
+            has_evictable_gpu_pages=lambda: gpu_evictable,
         ),
     )
     sched._is_recompute_pause_candidate = lambda req, inflight_request_ids: True
@@ -675,6 +679,24 @@ def test_context_preempt_falls_back_under_agg_helix_with_host_tier() -> None:
     ]
     assert _try_preempt_for_pages(sched, requests_list)
     assert [r.py_request_id for r in preempted] == [3]
+
+
+@pytest.mark.parametrize("gpu_evictable", [True, False], ids=["stuck_on_gpu", "all_on_host"])
+def test_context_preempt_skips_suspended_victims_once_gpu_has_nothing_evictable(
+    gpu_evictable: bool,
+) -> None:
+    """A suspended victim is torn down only while some GPU page is still
+    evictable: once every suspended page sits in the host tier, a teardown
+    frees nothing on GPU and only costs a re-prefill."""
+    preempted = []
+    sched = _host_tier_preempt_scheduler(preempted, active=False, gpu_evictable=gpu_evictable)
+    requests_list = [
+        _preempt_req(1, in_generation=False),
+        _preempt_req(2, in_generation=False),
+        _preempt_req(3, in_generation=False),
+    ]
+    assert _try_preempt_for_pages(sched, requests_list) == gpu_evictable
+    assert [r.py_request_id for r in preempted] == ([3] if gpu_evictable else [])
 
 
 def _context_resize_mgr(is_disagg: bool, resizes: list) -> SimpleNamespace:
@@ -750,19 +772,30 @@ def _rank_batch(
     )
 
 
-def _check_schedules(rank_batches: list) -> None:
+def _check_schedules(rank_batches: list, draft_depths: Optional[list] = None) -> None:
     """Run the executor's helix schedule check on every simulated CP rank, with
-    an allgather that hands each rank the summaries of all of them."""
+    an allgather that hands each rank the summaries of all of them.
+
+    draft_depths, one per rank, pairs a draft pool whose cache for the context
+    request has committed that many tokens.
+    """
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
+    def executor(cp_allgather, rank: int) -> SimpleNamespace:
+        stub = SimpleNamespace(dist=SimpleNamespace(cp_allgather=cp_allgather))
+        if draft_depths is not None:
+            stub.enable_joint_kv_cache_reuse = True
+            stub.draft_kv_cache_manager = SimpleNamespace(
+                kv_cache_map={1: SimpleNamespace(num_committed_tokens=draft_depths[rank])}
+            )
+        return stub
+
     summaries = []
-    collect = SimpleNamespace(
-        dist=SimpleNamespace(cp_allgather=lambda s: summaries.append(s) or [s])
-    )
-    for batch in rank_batches:
+    for rank, batch in enumerate(rank_batches):
+        collect = executor(lambda s: summaries.append(s) or [s], rank)
         PyExecutor._check_helix_schedule_consistency(collect, batch)
-    gather = SimpleNamespace(dist=SimpleNamespace(cp_allgather=lambda s: list(summaries)))
-    for batch in rank_batches:
+    for rank, batch in enumerate(rank_batches):
+        gather = executor(lambda s: list(summaries), rank)
         PyExecutor._check_helix_schedule_consistency(gather, batch)
 
 
@@ -784,6 +817,17 @@ def test_helix_schedule_check_raises_on_divergence(rank1_batch: SimpleNamespace)
     reuse different prefix depths would desynchronize the next CP collective."""
     with pytest.raises(RuntimeError, match="disagree on the schedule"):
         _check_schedules([_rank_batch(), rank1_batch])
+
+
+def test_helix_schedule_check_passes_matching_draft_depth() -> None:
+    _check_schedules([_rank_batch(), _rank_batch()], draft_depths=[128, 128])
+
+
+def test_helix_schedule_check_raises_on_draft_depth_divergence() -> None:
+    """The draft pool is not CP-sharded: ranks that agree on the target cursor
+    but reuse different draft prefixes would draft from different K/V."""
+    with pytest.raises(RuntimeError, match="disagree on the schedule"):
+        _check_schedules([_rank_batch(), _rank_batch()], draft_depths=[128, 64])
 
 
 def test_helix_schedule_check_raises_on_sliced_prompt() -> None:
