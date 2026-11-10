@@ -519,7 +519,9 @@ class DecoderWarmup:
             gc.collect()
             torch.cuda.empty_cache()
         with self._warmup_timer.phase("cuda_graph_capture"):
-            # The KV-cache profiling pass keeps both passes, so the memory it measures is unchanged.
+            # The KV-cache estimation executor always captures with both passes, so the peak memory
+            # it measures, and with it the KV-cache size, does not depend on
+            # TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS.
             self._graphs.warmup_and_capture(
                 resource_manager,
                 allow_single_pass=not getattr(kv_cache_manager, "is_estimating_kv_cache", False),
