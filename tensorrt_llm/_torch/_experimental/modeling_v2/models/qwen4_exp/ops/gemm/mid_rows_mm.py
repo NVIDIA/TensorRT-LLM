@@ -281,14 +281,17 @@ def _mbar_expect_tx(addr, nbytes, *, loc=None, ip=None):
 
 @dsl_user_op
 def _mbar_wait(addr, parity, *, loc=None, ip=None):
-    """Wait for a phase of this CTA's mailbox barrier with `.acquire.cluster` semantics: the
+    """Wait for a phase of this CTA's mailbox barrier and acquire the peers' mailbox writes: the
     mailbox is filled by the peers' `st.async`, whose complete-tx releases at cluster scope, and
-    the default `.acquire.cta` wait does not synchronize with threads of another CTA."""
+    the default `.acquire.cta` wait does not synchronize with threads of another CTA. A relaxed
+    cluster-scope wait followed by an acquire fence restricted to `shared::cluster` is the ISA's
+    acquire pattern for this case and, unlike `.acquire.cluster` on the wait itself, does not make
+    ptxas invalidate L1 (CCTL.IVALL) on every try_wait: the mailbox is shared memory only."""
     _asm(
         T.i32(),
         [cutlass.Int32(addr), cutlass.Int32(parity)],
-        "{ .reg .pred p; WAIT: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], $2; "
-        "@!p bra WAIT; mov.u32 $0, 0; }",
+        "{ .reg .pred p; WAIT: mbarrier.try_wait.parity.relaxed.cluster.shared::cta.b64 p, [$1], $2; "
+        "@!p bra WAIT; fence.acquire.sync_restrict::shared::cluster.cluster; mov.u32 $0, 0; }",
         "=r,r,r",
         loc,
         ip,
