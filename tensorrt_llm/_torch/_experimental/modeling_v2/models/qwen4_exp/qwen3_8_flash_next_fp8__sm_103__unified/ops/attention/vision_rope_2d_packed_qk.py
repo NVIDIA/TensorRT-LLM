@@ -53,7 +53,7 @@ _BLOCK_H = 4
 _BLOCK_M = 8
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["seqlen", "seqlen_ro"])
 def _rotary_neox_inplace_kernel(
     X,
     COS,

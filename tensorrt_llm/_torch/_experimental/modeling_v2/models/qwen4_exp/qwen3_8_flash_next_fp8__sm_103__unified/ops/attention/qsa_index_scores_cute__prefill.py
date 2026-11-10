@@ -51,6 +51,8 @@ EPI_COLS = 32
 MAX_ITEMS = 64
 THREADS = 32 * (EPI_WARPS + 1 + LOAD_WARPS)
 LOAD_THREADS = 32 * LOAD_WARPS
+#: Keys a page holds: one load thread's two token rows (`__init__`'s assert).
+KEYS_PER_PAGE = 2 * (LOAD_THREADS // 16)
 
 
 @dsl_user_op
@@ -70,7 +72,7 @@ class _IndexScoresKernel:
         self.cr = compress_ratio
         self.kpp = tokens_per_block // compress_ratio  # keys a page
         assert BM % self.kpp == 0 and BM // self.kpp <= 32
-        assert self.kpp == 2 * (LOAD_THREADS // 16), "a thread's keys: two token rows of each page"
+        assert self.kpp == KEYS_PER_PAGE, "a thread's keys: two token rows of each page"
         self.pages_per_tile = BM // self.kpp
 
     @cute.jit
@@ -890,7 +892,7 @@ def supports(q, index_cache, tokens_per_block, compress_ratio) -> bool:
         and index_cache.stride(0) % 8 == 0
         and index_cache.data_ptr() % 16 == 0
         and tokens_per_block % compress_ratio == 0
-        and BM % (tokens_per_block // compress_ratio) == 0
+        and tokens_per_block // compress_ratio == KEYS_PER_PAGE
         and torch.cuda.get_device_capability(q.device) == (10, 3)
     )
 

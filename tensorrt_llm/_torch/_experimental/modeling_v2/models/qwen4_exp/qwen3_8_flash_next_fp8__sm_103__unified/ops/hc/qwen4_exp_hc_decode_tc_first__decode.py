@@ -101,20 +101,6 @@ def _bulk_to_peer(dst, src, nbytes, mbar, peer, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _bulk_commit_wait_read(*, loc=None, ip=None):
-    """Commit this thread's bulk copies and wait until they have read their sources."""
-    _asm(
-        T.i32(),
-        [],
-        "{ cp.async.bulk.commit_group; cp.async.bulk.wait_group.read 0; mov.u32 $0, 0; }",
-        "=r",
-        loc,
-        ip,
-        side_effects=True,
-    )
-
-
-@dsl_user_op
 def _lds_v4_f32(addr, *, loc=None, ip=None):
     """16 bytes of this CTA's shared memory; side-effecting, so it stays behind the
     cluster barrier that makes them valid."""
@@ -597,8 +583,11 @@ class HcDecodeTcFirstKernel:
                             _bf16x2(injs[0], injs[1]),
                             _bf16x2(injs[2], injs[3]),
                         )
-        if tidx == 0:
-            _bulk_commit_wait_read()
+        # No CTA may exit (releasing its shared memory) while a peer's push out of it is still
+        # reading it: every CTA arrives only after all pushes into it landed, so the cluster
+        # barrier completes once every push has read its source.
+        cute.arch.cluster_arrive_relaxed()
+        cute.arch.cluster_wait()
 
     def _rows_of(self, owner, nreal):
         """Real rows of the tile that cluster CTA `owner` reduces (0 past the real rows)."""
