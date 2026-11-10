@@ -2958,6 +2958,70 @@ def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
     _is_cutedsl_unavailable(),
     reason="requires Rubin SM107 and the CuTeDSL runtime",
 )
+@pytest.mark.parametrize("masked", [False, True], ids=["full-tiles", "causal-tail"])
+def test_fp4_mla_rowmax_readers_wait_for_correction_warps(
+    monkeypatch: pytest.MonkeyPatch, masked: bool
+) -> None:
+    """Delaying the second score half must not expose the next tile's row max."""
+    from collections import OrderedDict
+
+    import cutlass as ctm
+    import cutlass.cute as cute
+    from cutlass.experimental import primitives as prims
+
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_mufu16 as kernel
+
+    original_load = kernel._load_p4_n256_atomic_running_rowmax
+    original_load_with_validity = kernel._load_p4_n256_atomic_running_rowmax_with_validity
+
+    @cute.jit
+    def delayed_load(
+        row_max: ctm.Array,
+        warp_idx: ctm.Int32,
+        tidx: ctm.Int32,
+        producer_warp_base: ctm.Int32,
+    ) -> ctm.Float32:
+        if warp_idx >= ctm.Int32(4):
+            prims.nanosleep(ctm.Int32(1000000))
+        return original_load(row_max, warp_idx, tidx, producer_warp_base)
+
+    @cute.jit
+    def delayed_load_with_validity(
+        row_max: ctm.Array,
+        warp_idx: ctm.Int32,
+        tidx: ctm.Int32,
+        producer_warp_base: ctm.Int32,
+    ) -> tuple[ctm.Float32, ctm.Boolean]:
+        if warp_idx >= ctm.Int32(4):
+            prims.nanosleep(ctm.Int32(1000000))
+        return original_load_with_validity(row_max, warp_idx, tidx, producer_warp_base)
+
+    monkeypatch.setattr(kernel, "_load_p4_n256_atomic_running_rowmax", delayed_load)
+    monkeypatch.setattr(
+        kernel, "_load_p4_n256_atomic_running_rowmax_with_validity", delayed_load_with_validity
+    )
+    # Force compilation of the delayed helpers and keep that executable out of other tests.
+    monkeypatch.setattr(kernel, "_FUSED_COMPILE_CACHE", {})
+    monkeypatch.setattr(kernel, "_FUSED_EXECUTOR_CACHE", OrderedDict())
+    monkeypatch.setattr(kernel, "_PREPARED_FUSED_CALL_CACHE", OrderedDict())
+    for seed in (41, 53, 67):
+        _assert_fp4_mla_attention_decode_accuracy(
+            monkeypatch,
+            backend="cutedsl",
+            fused_v_transpose=False,
+            num_heads=128,
+            seq_lens=[258 if masked else 512],
+            seed=seed,
+            query_len_per_seq=4 if masked else 1,
+            packed_queries=True,
+            split_kv=1,
+        )
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
+)
 def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
     monkeypatch,
 ) -> None:

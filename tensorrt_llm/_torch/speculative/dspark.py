@@ -685,6 +685,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 warmup_fused_dsv4_dspark_attention(
                     block_size,
                     eps=float(draft_model._attn_params["eps"]),
+                    num_heads=int(draft_model._attn_params["n_heads"]),
                 )
         self._attention_warmup_attempted = True
 
@@ -741,6 +742,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self.verify_planner = DSparkVerifyPlanner(
             cfg=cfg,
             apply_calibration=apply_calibration,
+            device_windows=bool(
+                getattr(self.spec_config, "enable_fused_confidence_scheduler", False)
+            ),
         )
         logger.info(
             f"DSpark verify planner: max_verify_len={self.verify_planner.max_verify_len}, "
@@ -1288,6 +1292,15 @@ class DSparkWorker(DFlashWorker):
         ):
             self._markov_tp_exchange = tp_pair_exchange(mapping, AllReduceStrategy.NCCL)
 
+    @staticmethod
+    def block_width_for(spec_config, *, shift_label: bool = True) -> int:
+        """Block slots a DSpark worker computes for ``spec_config``.
+
+        The ``shift_label`` convention reads slots 0..K-1; a checkpoint that
+        turns it off reads slots 1..K and needs K+1 positions.
+        """
+        return spec_config.max_draft_len + (0 if shift_label else 1)
+
     def _draft_block_width(self, draft_model) -> int:
         """Block width under the dspark ``shift_label`` convention.
 
@@ -1296,9 +1309,9 @@ class DSparkWorker(DFlashWorker):
         checkpoint at max_draft_len=7, which is how both published DSpark
         drafters are meant to run.
         """
-        if getattr(draft_model, "_dspark_shift_label", False):
-            return self.max_draft_len
-        return super()._draft_block_width(draft_model)
+        return self.block_width_for(
+            self.spec_config, shift_label=getattr(draft_model, "_dspark_shift_label", False)
+        )
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int

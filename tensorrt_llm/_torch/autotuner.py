@@ -22,6 +22,7 @@ import itertools
 import json
 import os
 import time
+import zlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -34,8 +35,8 @@ from cuda.bindings import driver
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.nccl_window_graph import (
-    abandon_nccl_window_graph_owner, nccl_window_graph_capture,
-    release_nccl_window_graph_owner)
+    abandon_nccl_window_graph_owner, nccl_window_allocation_suppressed,
+    nccl_window_graph_capture, release_nccl_window_graph_owner)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     nccl_window_tensor_scope
 from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
@@ -523,13 +524,25 @@ class AutoTunerProfilingCache:
             [is_cache_hit, runner_id, tactic, stored_profile]
             runner_id is the index in the current runners list
         """
+        # Under PARALLEL each rank of the tuning group times a share of the
+        # (runner, tactic) pairs and records its own fastest, so after the
+        # merge a shape can hold one entry per runner: the winner is the
+        # fastest of them, not the first runner in the list.
+        parallel = (tuning_config.distributed_tuning_strategy ==
+                    DistributedTuningStrategy.PARALLEL)
+        found = None
         for idx, r in enumerate(runners):
             if (cache_key := self.get_cache_key(
                     custom_op, r, input_shapes, tuning_config,
                     apply_map_to_tuning_buckets)) in self.cache:
                 # Return the current index in runners list, not the cached runner_id
                 cached_runner_id, tactic, min_time = self.cache[cache_key]
-                return True, idx, tactic, min_time
+                if not parallel:
+                    return True, idx, tactic, min_time
+                if found is None or min_time < found[3]:
+                    found = (True, idx, tactic, min_time)
+        if found is not None:
+            return found
 
         return False, *self.fallback_entry()
 
@@ -1339,7 +1352,14 @@ class AutoTuner:
         tuning_config: TuningConfig,
         **kwargs,
     ) -> float:
-        with nccl_window_tensor_scope(input_tensors) as scope:
+        # PARALLEL ranks profile different tactics, so window requests here would diverge the
+        # per-rank pools and let a later request register a window collectively on some ranks only.
+        window_guard = (nccl_window_allocation_suppressed()
+                        if tuning_config.distributed_tuning_strategy
+                        == DistributedTuningStrategy.PARALLEL
+                        and self._is_distributed() else
+                        contextlib.nullcontext())
+        with window_guard, nccl_window_tensor_scope(input_tensors) as scope:
             scope.escape(input_tensors)
             if tuning_config.inputs_pre_hook is not None:
                 input_tensors = tuning_config.inputs_pre_hook(input_tensors)
@@ -1365,6 +1385,9 @@ class AutoTuner:
         min_time = float('inf')
         has_tuning_failure_occurred = False
         best_runner_id, best_tactic = None, None
+        # (runner, tactic) pairs this rank profiles: all of them, or under
+        # PARALLEL its share of the deal, which can be empty.
+        local_pairs = 0
         # Pre-walk the runners so we know the total candidate (runner, tactic)
         # pair count before deciding whether to short-circuit profiling. The
         # count is taken BEFORE distributed-strategy splitting; the PARALLEL
@@ -1402,6 +1425,7 @@ class AutoTuner:
             runner_id, runner, runner_arg_names, valid_tactics = next(
                 c for c in candidates if len(c[3]) == 1)
             tac = valid_tactics[0]
+            local_pairs = 1
             if "do_preparation" in runner_arg_names:
                 runner(input_tensors, tactic=-1, do_preparation=True, **kwargs)
             try:
@@ -1439,10 +1463,21 @@ class AutoTuner:
                 f"time={(0.0 if best_runner_id is not None else float('inf')):.3f}ms"
             )
         else:
+            # PARALLEL deals the (runner, tactic) pairs of all runners round
+            # robin, so every rank of the group gets an even share even when
+            # one runner has many tactics and the others few. The deal starts
+            # at a rank taken from the op and the shape, the same on every
+            # rank, so a runner's costly tactics do not fall on the same ranks
+            # at every shape.
+            pair_offset = self._parallel_deal_start(
+                custom_op, profile, tuning_config.distributed_tuning_strategy)
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
                 valid_tactics = self._maybe_parallelize_tactics(
                     all_valid_tactics,
-                    tuning_config.distributed_tuning_strategy)
+                    tuning_config.distributed_tuning_strategy,
+                    offset=pair_offset)
+                pair_offset += len(all_valid_tactics)
+                local_pairs += len(valid_tactics)
                 if "do_preparation" in runner_arg_names and len(
                         valid_tactics) > 0:
                     runner(
@@ -1525,6 +1560,12 @@ class AutoTuner:
                                                min_time)
 
             self.stats.tuned_op_profiled_configs[custom_op] += 1
+        elif local_pairs == 0 and total_pairs > 0:
+            # The PARALLEL deal left this rank no pair to profile; the merge
+            # brings in the winner the other ranks of the group find.
+            self._debug_logger(
+                f"[Autotuner] No (runner, tactic) pair dealt to this rank for custom_op={custom_op}, "
+                f"input_shapes={profile.get_opt_shapes()}.")
         else:
             logger.warning_once(
                 f"[Autotuner] No valid runner/tactic was found for custom_op={custom_op}, input_shapes={profile.get_opt_shapes()}. "
@@ -2171,19 +2212,38 @@ class AutoTuner:
         """Check if we're in a distributed environment."""
         return self._dist is not None and self._tuning_group()[0] > 1
 
-    def _maybe_parallelize_tactics(
-            self, all_valid_tactics: List[Any],
-            strategy: DistributedTuningStrategy) -> List[Any]:
-        """Split tactics across the tuning group if strategy is PARALLEL."""
+    def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,
+                             strategy: DistributedTuningStrategy) -> int:
+        """Where a PARALLEL deal of ``profile``'s (runner, tactic) pairs starts.
+
+        Derived from the op and the shapes with a stable hash (not ``hash``,
+        which differs between processes), so every rank deals the same way.
+        """
+        if strategy != DistributedTuningStrategy.PARALLEL or not self._is_distributed(
+        ):
+            return 0
+        key = repr((custom_op, profile.get_opt_shapes())).encode()
+        return zlib.crc32(key) % self._tuning_group()[0]
+
+    def _maybe_parallelize_tactics(self,
+                                   all_valid_tactics: List[Any],
+                                   strategy: DistributedTuningStrategy,
+                                   offset: int = 0) -> List[Any]:
+        """Split tactics across the tuning group if strategy is PARALLEL.
+
+        ``offset`` is where this runner's pairs start in the profile's deal:
+        the deal's start plus the pairs of the runners before this one.
+        """
         if strategy == DistributedTuningStrategy.PARALLEL and self._is_distributed(
         ):
             # Each rank of the tuning group only tunes its share of tactics;
             # _merge_cache_data then keeps the fastest across the group.
             group_size, group_index = self._tuning_group()
-            return [
+            tactics = [
                 tactic for idx, tactic in enumerate(all_valid_tactics)
-                if idx % group_size == group_index
+                if (offset + idx) % group_size == group_index
             ]
+            return tactics
         else:
             return all_valid_tactics
 
