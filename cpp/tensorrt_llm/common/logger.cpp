@@ -21,11 +21,55 @@
 #include "tensorrt_llm/common/tllmException.h"
 #include <algorithm>
 #include <cuda_runtime.h>
+#include <map>
+#include <mutex>
+#include <set>
+#include <shared_mutex>
 
 TRTLLM_NAMESPACE_BEGIN
 
 namespace common
 {
+
+namespace
+{
+
+// getLogger() returns a thread-local Logger, so the log-once registry is shared by all Logger
+// instances. Keys are grouped by module (the top-level source directory) so equal key texts from
+// different modules stay independent, while keys must be unique within a module. The registry is
+// intentionally leaked: log-once calls from static destructors at exit must not touch an
+// already-destroyed container.
+struct LogOnceRegistry
+{
+    std::shared_mutex mutex;
+    std::map<std::string, std::set<std::string, std::less<>>, std::less<>> keys;
+};
+
+LogOnceRegistry& logOnceRegistry()
+{
+    static auto* registry = new LogOnceRegistry();
+    return *registry;
+}
+
+} // namespace
+
+bool Logger::consumeLogOnceKey(std::string_view module, std::string_view key)
+{
+    auto& registry = logOnceRegistry();
+    // Fast path: an already recorded pair only needs a shared (read) lock.
+    {
+        std::shared_lock<std::shared_mutex> lock(registry.mutex);
+        auto const moduleIt = registry.keys.find(module);
+        if (moduleIt != registry.keys.end() && moduleIt->second.find(key) != moduleIt->second.end())
+        {
+            return false;
+        }
+    }
+    // First occurrence (or a concurrent race): take the exclusive lock and re-check.
+    std::unique_lock<std::shared_mutex> lock(registry.mutex);
+    auto const moduleIt = registry.keys.try_emplace(std::string(module)).first;
+    return moduleIt->second.emplace(key).second;
+}
 
 int Logger::detectRank()
 {

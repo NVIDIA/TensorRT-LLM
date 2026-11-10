@@ -229,6 +229,10 @@ def generate_serve_schema() -> dict:
         {**per_layer_dynamic, "required": ["mode"]},
         {"type": ["string", "null"]},
     ]
+    # The model validator allows at most one non-null preemption bound.
+    schema["$defs"]["GenPreemptionConfig"]["anyOf"] = [
+        {"properties": {name: {"type": "null"}}} for name in ("tpot_budget", "target_output_tps")
+    ]
     # Mirror DwdpConfig._validate_modes(): without expert DWDP, dense DWDP is on and the expert
     # fields keep their defaults; contention_opt, which selects batched copies, rules out another
     # copy_mode; and gather_kernel needs copy_mode gather.
