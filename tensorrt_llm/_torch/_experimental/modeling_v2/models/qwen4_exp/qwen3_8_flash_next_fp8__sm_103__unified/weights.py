@@ -44,6 +44,7 @@ and bare names otherwise.
 consumed or predicted by `expected_unconsumed`.
 """
 
+import mmap
 import os
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -65,6 +66,26 @@ ALL_LAYERS = object()
 
 Cut = tuple[slice, ...]
 
+#: The spellings of a `TRTLLM_MODELING_V2_*` switch: these turn it on, these off.
+SWITCH_ON = frozenset({"1", "true", "yes", "on"})
+SWITCH_OFF = frozenset({"0", "false", "no", "off"})
+
+
+def switch(env: str, on: frozenset = SWITCH_ON) -> bool:
+    """A `TRTLLM_MODELING_V2_*` switch, default off: unset, empty or a `SWITCH_OFF` spelling is
+    off, an `on` spelling on; any other value raises."""
+    raw = os.environ.get(env, "")
+    value = raw.strip().lower()
+    if not value or value in SWITCH_OFF:
+        return False
+    if value in on:
+        return True
+    raise ValueError(
+        f"{env}={raw!r}: expected {' / '.join(sorted(on))} (on) or "
+        f"{' / '.join(sorted(SWITCH_OFF))} (off)"
+    )
+
+
 #: Opt-in (`rr`; default off) block-major copy of every MoE layer's routed experts for
 #: `ops/moe/moe_tpb_decode` (attention TP4 only): expert e's 128-row intermediate block b on rank
 #: (e + b) % 4, plus this rank's slice of the shared expert. The whole-expert window stays for
@@ -72,12 +93,13 @@ Cut = tuple[slice, ...]
 MOE_TPB_ENV = "TRTLLM_MODELING_V2_DECODE_MOE_TPB"
 
 
+def moe_tpb_requested() -> bool:
+    """Whether `MOE_TPB_ENV` asks for the block-major copy (`rr`); another value raises."""
+    return switch(MOE_TPB_ENV, on=frozenset({"rr"}))
+
+
 def moe_tpb_enabled(mapping) -> bool:
-    raw = os.environ.get(MOE_TPB_ENV, "").strip().lower()
-    if raw in ("", "0", "false", "off", "no"):
-        return False
-    assert raw == "rr", f"{MOE_TPB_ENV}={raw!r}: expected off or rr"
-    return mapping.tp_size == 4 and not mapping.enable_attention_dp
+    return moe_tpb_requested() and mapping.tp_size == 4 and not mapping.enable_attention_dp
 
 
 @dataclass(frozen=True)
@@ -159,10 +181,15 @@ def _local_cpus(device) -> set | None:
 
 
 class _RegisteredHostBuffer:
-    """Pageable CPU memory registered (pinned, mapped) for the device.
+    """A pageable CPU mapping of its own, registered (pinned, mapped) for the device.
 
-    Unregistered before the storage is freed, since glibc returns this size to the OS with
-    `munmap`. Not torch's pinned allocator, which rounds the 47.7 GiB table up to 64 GiB.
+    Unregistered before its pages are unmapped: freeing registered pages would leave the
+    driver mapping memory the OS may hand out again. The mapping is advised `MADV_HUGEPAGE`
+    before the registration faults it in, so the table sits on transparent huge pages whatever
+    torch's CPU allocator does (TensorRT LLM imports torch with mimalloc's THP advice off): on
+    GB300 the device's random row gathers from 64 KiB pages run 2.5x (64 tokens) to 23x
+    (1024 tokens) slower. Not torch's pinned allocator, which rounds the 47.7 GiB table up to
+    64 GiB.
     """
 
     def __init__(self, nbytes: int, device=None) -> None:
@@ -173,7 +200,16 @@ class _RegisteredHostBuffer:
         if local:
             os.sched_setaffinity(0, local)
         try:
-            self._storage = torch.empty(nbytes, dtype=torch.uint8)
+            self._mapping = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+            try:
+                self._mapping.madvise(mmap.MADV_HUGEPAGE)
+            except OSError as error:  # a kernel without transparent huge pages
+                logger.warning(
+                    f"madvise(MADV_HUGEPAGE) failed for the host-resident PLE table ({error}); "
+                    "the device's row gathers from its base pages run several times slower"
+                )
+            # Shares the mapping's pages, and keeps the mapping alive while it lives.
+            self._storage = torch.frombuffer(self._mapping, dtype=torch.uint8)
             self.pointer = self._storage.data_ptr()
             CUASSERT(
                 cudart.cudaHostRegister(

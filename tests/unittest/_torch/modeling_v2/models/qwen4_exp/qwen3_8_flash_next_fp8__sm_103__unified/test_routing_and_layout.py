@@ -30,7 +30,9 @@ from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_
 from tensorrt_llm.llmapi import QSASparseAttentionConfig
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
+    MoeConfig,
     MTPDecodingConfig,
+    MultimodalConfig,
     NGramDecodingConfig,
     TorchLlmArgs,
 )
@@ -97,10 +99,27 @@ def on_sm103(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    for env in (
+        "TRTLLM_USE_GDN_FLASHINFER_REPLAY",
+        M.MOE_ALLTOALL_ENV,
+        M.ROWTILE_SCRATCH_GROUPS_ENV,
+        W.MOE_TPB_ENV,
+    ):
+        monkeypatch.delenv(env, raising=False)
 
 
 def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
     return TorchLlmArgs(model=_DUMMY_MODEL, modeling_v2=mode, **kwargs)
+
+
+# The checkpoint's `mtp` block.
+_MTP_BLOCK = dict(
+    hybrid=True,
+    layer_types=["full_attention"],
+    mtp_use_hidden_state_from_layer=None,
+    num_hidden_layers=1,
+    rope_theta=10000000,
+)
 
 
 def _qwen4_exp_config(text_overrides=None, composite_overrides=None, **vision_overrides):
@@ -112,6 +131,22 @@ def _qwen4_exp_config(text_overrides=None, composite_overrides=None, **vision_ov
         num_attention_heads=24,
         linear_num_value_heads=48,
         vocab_size=248320,
+        # The settings the target pins (`modeling._TEXT_SETTINGS`), as the normalized config
+        # carries them: rope theta and partial factor flattened to the top level.
+        norm_topk_prob=True,
+        num_experts_per_tok=10,
+        hidden_act="silu",
+        num_key_value_heads=2,
+        head_dim=256,
+        attention_bias=False,
+        output_gate_type="sigmoid",
+        tie_word_embeddings=False,
+        rope_theta=10000000,
+        partial_rotary_factor=0.25,
+        rope_scaling=dict(type="mrope", mrope_section=[11, 11, 10], mrope_interleaved=True),
+        mtp=dict(_MTP_BLOCK),
+        mtp_num_hidden_layers=1,
+        mtp_use_dedicated_embeddings=False,
     )
     text.update(text_overrides or {})
     vision = dict(
@@ -276,6 +311,41 @@ _MTP3 = MTPDecodingConfig(max_draft_len=3)
             {},
             "torch.float16",
         ),
+        (
+            dict(member="tep4", pretrained_config=_qwen4_exp_config(dict(norm_topk_prob=False))),
+            {},
+            "'norm_topk_prob'",
+        ),
+        (
+            dict(member="tep4", pretrained_config=_qwen4_exp_config(dict(rope_theta=1e6))),
+            {},
+            "'rope_theta'",
+        ),
+        (
+            dict(
+                member="tep4",
+                pretrained_config=_qwen4_exp_config(
+                    dict(mtp=dict(_MTP_BLOCK, layer_types=["linear_attention"]))
+                ),
+            ),
+            {},
+            "'mtp.layer_types'",
+        ),
+        (
+            dict(member="tep4"),
+            dict(max_seq_len=8192, kv_cache_config=KvCacheConfig(max_attention_window=[4096])),
+            "sliding window",
+        ),
+        (
+            dict(member="tep4"),
+            dict(moe_config=MoeConfig(load_balancer={"num_slots": 512})),
+            r"load_balancer \(EPLB\)",
+        ),
+        (
+            dict(member="tep4"),
+            dict(multimodal_config=MultimodalConfig(vision_gpu_normalize=True)),
+            "vision_gpu_normalize",
+        ),
     ],
     ids=[
         "dep2-mtp",
@@ -293,6 +363,12 @@ _MTP3 = MTPDecodingConfig(max_draft_len=3)
         "tep8",
         "text-shape",
         "fp16-model",
+        "other-routing-setting",
+        "other-rope-theta",
+        "other-mtp-layer",
+        "sliding-window",
+        "eplb",
+        "vision-gpu-normalize",
     ],
 )
 def test_what_the_target_does_not_run_declines(on_sm103, config_kwargs, llm_args_kwargs, match):
@@ -315,6 +391,32 @@ def test_another_moe_backend_or_gpu_or_no_gdn_replay_declines(on_sm103, monkeypa
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 0))
     with pytest.raises(ValueError, match=r"compute capability \(10, 0\)"):
         modeling_v2_resolve(_routed_config("tep4"), _llm_args("require"))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY")
+    monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "1")
+    with pytest.raises(ValueError, match="TRTLLM_USE_GDN_FLASHINFER_REPLAY"):
+        modeling_v2_resolve(_routed_config("tep4", _MTP3), _llm_args("require"))
+    monkeypatch.delenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY")
+    # An all-to-all MoE the deployment cannot run: no attention DP, or no MNNVL.
+    monkeypatch.setenv(M.MOE_ALLTOALL_ENV, "1")
+    with pytest.raises(ValueError, match=M.MOE_ALLTOALL_ENV):
+        modeling_v2_resolve(_routed_config("tep4"), _llm_args("require"))
+    with mock.patch(
+        "tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided.NVLinkOneSided"
+        ".is_platform_supported",
+        return_value=False,
+    ):
+        with pytest.raises(ValueError, match=M.MOE_ALLTOALL_ENV):
+            modeling_v2_resolve(_routed_config("dep4"), _llm_args("require"))
+    # A misspelled switch raises rather than routing as if it were off.
+    monkeypatch.setenv(M.MOE_ALLTOALL_ENV, "enabled")
+    with pytest.raises(ValueError, match=f"{M.MOE_ALLTOALL_ENV}='enabled'"):
+        modeling_v2_resolve(_routed_config("tep4"), _llm_args("auto"))
+    monkeypatch.delenv(M.MOE_ALLTOALL_ENV)
+    monkeypatch.setenv(W.MOE_TPB_ENV, "1")
+    with pytest.raises(ValueError, match=f"{W.MOE_TPB_ENV}='1': expected rr"):
+        modeling_v2_resolve(_routed_config("tep4"), _llm_args("auto"))
+    monkeypatch.delenv(W.MOE_TPB_ENV)
 
 
 @pytest.mark.cpu_only
