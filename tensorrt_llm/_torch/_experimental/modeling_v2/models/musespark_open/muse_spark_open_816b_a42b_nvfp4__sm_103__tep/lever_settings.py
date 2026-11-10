@@ -96,6 +96,11 @@ def apply(plan: "_dispatch.Plan") -> None:
         ),
         # Attention.
         (
+            "ops.attention.swa_block",
+            dict(single_early_loads=on("swa_block_single_early_loads")),
+            dict(single_early_loads=False),
+        ),
+        (
             "ops.attention.multi_request_split_kv",
             dict(combine_gate=on("multi_request_combine_gate")),
             dict(combine_gate=False),

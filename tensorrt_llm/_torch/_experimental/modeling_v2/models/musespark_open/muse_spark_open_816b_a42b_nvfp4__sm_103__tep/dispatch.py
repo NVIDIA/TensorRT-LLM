@@ -431,6 +431,13 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("drafter_block_decode",),
     ),
     FastPath(
+        "swa_block_single_early_loads",
+        "the one-request sliding-window block's split and combine issuing their operand loads "
+        "at once",
+        "construct",
+        ("swa_block",),
+    ),
+    FastPath(
         "tep8_attn_block_splitk",
         "the TP8 attention block's QKV and o_proj of 9..32-row decode calls on batch split-K "
         "cells, each staging its weight tile before its dependency wait",

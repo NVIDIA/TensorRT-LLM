@@ -1135,6 +1135,24 @@ def gate_head_stride(gate: torch.Tensor) -> int:
     return gate.stride(1) if gate.ndim == 3 else HEAD_DIM
 
 
+#: ``swa_block_single_early_loads``, pushed here by ``lever_settings.apply`` (default off):
+#: ``swa_block_attention`` (decode steps of one sequence) builds its split kernel with
+#: ``EARLY_LOADS`` -- with the fused prep, every projection load the program makes after its
+#: wait is issued at once (the query rows, the key block's step K/V rows and, in program
+#: (0, h, 0), the step's K/V rows it writes to the cache) before any prep arithmetic: one
+#: dependent round trip, not one per prep -- and its combine with ``EARLY_LOADS``: the partial O
+#: is loaded with the (max, sum) words and, with the gate, the gate head before its wait (the
+#: projection that wrote it completed before the split, which launches the combine, passed its
+#: own wait). The same statements on the same values: the same bits.
+_SINGLE_EARLY_LOADS = False
+
+
+def configure(*, single_early_loads: bool = False) -> None:
+    """Set this module's lever-backed settings (``lever_settings.apply``), once per process."""
+    global _SINGLE_EARLY_LOADS
+    _SINGLE_EARLY_LOADS = bool(single_early_loads)
+
+
 class SwaBlockAttention(OpWrapper):
     """A sliding-window layer's decode attention block, with fewer launches, the same bits.
 
@@ -1303,6 +1321,9 @@ class SwaBlockAttention(OpWrapper):
         part_ml = torch.empty(
             (num_splits * num_kv_heads * group_rows, 2), dtype=torch.float32, device=qkv.device
         )
+        # ``swa_block_single_early_loads``: the one-request block's two launches issue their
+        # operand loads at once. The blocks-per-program split keeps the served launch.
+        early = _SINGLE_EARLY_LOADS and blocks_per_program <= 1
         if blocks_per_program > 1:
             launch_split_bpp(
                 qkv, kv_pool, block_tables, block_tables.stride(0), seq_lens, kv_scale_orig_quant,
@@ -1313,6 +1334,17 @@ class SwaBlockAttention(OpWrapper):
                 blocks_per_program=blocks_per_program, max_registers=split_max_registers,
             )  # fmt: skip
         else:
+            if early:
+                from tensorrt_llm.logger import logger
+
+                logger.info_once(
+                    "[musespark_open] swa_block_single_early_loads: early loads on the "
+                    "one-request block (split: one round trip for its projection loads"
+                    f"{'' if fused_prep else ' -- off without the fused prep'}; combine: O with "
+                    f"the (max, sum) words"
+                    f"{', the gate before its wait' if gate is not None else ''})",
+                    key="musespark_open.swa_block.single_early_loads",
+                )
             _swa_split_kernel[
                 (num_splits, num_kv_heads, triton.cdiv(group_rows, ROWS_PER_PROGRAM))
             ](
@@ -1347,6 +1379,9 @@ class SwaBlockAttention(OpWrapper):
                 num_warps=NUM_WARPS,
                 num_stages=NUM_STAGES,
                 launch_pdl=enable_pdl,
+                # Passed only when on: the default launch is the kernel as before. The split's
+                # early loads are the fused prep's operands, so they need it.
+                **({"EARLY_LOADS": True} if early and fused_prep else {}),
             )
         _swa_combine_kernel[(group_rows, num_kv_heads)](
             part_o,
@@ -1367,6 +1402,7 @@ class SwaBlockAttention(OpWrapper):
             LAUNCH_WITH_PDL=enable_pdl,
             num_warps=4,
             launch_pdl=enable_pdl,
+            **({"EARLY_LOADS": True} if early else {}),
         )
         return out
 

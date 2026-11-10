@@ -140,6 +140,9 @@ RETIRED: Mapping[str, str] = types.MappingProxyType(
         "TRTLLM_MUSESPARK_DRAFTER_FINISH_NORM": PREFIX + "DRAFTER_FINISH_NORM=on",
         "TRTLLM_MUSESPARK_DRAFTER_SILU_EPILOGUE": PREFIX + "DRAFTER_SILU_EPILOGUE=on",
         "TRTLLM_MUSESPARK_TEP8_ATTN_BLOCK_SPLITK": PREFIX + "TEP8_ATTN_BLOCK_SPLITK=on",
+        "TRTLLM_MUSESPARK_SWA_BLOCK_SINGLE_EARLY_LOADS": (
+            PREFIX + "SWA_BLOCK_SINGLE_EARLY_LOADS=on"
+        ),
         "TRTLLM_MUSESPARK_DRAFTER_MULTI_REQUEST_CELLS": (PREFIX + "DRAFTER_MULTI_REQUEST_CELLS=on"),
     }
 )
@@ -725,6 +728,7 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "drafter_finish_norm": _ported(Kind.BITWISE),
         "drafter_silu_epilogue": _ported(Kind.BITWISE),
         "tep8_attn_block_splitk": _ported(Kind.BITWISE),
+        "swa_block_single_early_loads": _ported(Kind.BITWISE),
         # The qkv / gate_up / coefficient cells keep their row's split_k and are bitwise the
         # table's row; the o_proj and down_proj cells reproduced cuBLAS's bits on every checked
         # shape, which cannot be proven against a closed library.
