@@ -412,7 +412,7 @@ def test_pixtral_encoder_backend_keeps_decoder(
     assert config.attn_backend == "FLASHINFER"
 
 
-@pytest.mark.parametrize("override", [None, "VANILLA", "FLASHINFER"])
+@pytest.mark.parametrize("override", [None, "VANILLA", "TRTLLM"])
 def test_radio_encoder_backend_keeps_decoder(
     override: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -437,15 +437,15 @@ def test_radio_encoder_backend_keeps_decoder(
     pretrained_config.torch_dtype = torch.float32
     config = ModelConfig(
         pretrained_config=pretrained_config,
-        attn_backend="FLASHINFER",
+        attn_backend="TRTLLM",
         multimodal_config=_multimodal_config(override),
     )
 
     modeling_nemotron_h_multimodal.NemotronHVisionEncoder(config)
 
-    # The RADIO default is TRTLLM regardless of the decoder backend.
-    assert built["vision"][1]["vision_attn_backend"] == (override or "TRTLLM")
-    assert config.attn_backend == "FLASHINFER"
+    # The RADIO default is FLASHINFER regardless of the decoder backend.
+    assert built["vision"][1]["vision_attn_backend"] == (override or "FLASHINFER")
+    assert config.attn_backend == "TRTLLM"
 
 
 @pytest.mark.parametrize(

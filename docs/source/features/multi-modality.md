@@ -91,7 +91,7 @@ The table covers every registered multimodal model implementation; model aliases
 | `WhisperForConditionalGeneration` | `audio` | Not supported |
 <!-- encoder-attention-backends:end -->
 
-For MiniCPM-V 4.6, the selection applies to its TensorRT-LLM attention layers; its fixed window-merger attention is unchanged. The Nemotron-H RADIO vision encoder defaults to `TRTLLM`, and `VANILLA` and `FLASHINFER` remain selectable.
+For MiniCPM-V 4.6, the selection applies to its TensorRT-LLM attention layers; its fixed window-merger attention is unchanged. The Nemotron-H RADIO vision encoder keeps its `FLASHINFER` default, and `VANILLA` and `TRTLLM` remain selectable.
 
 Supported entries use TensorRT-LLM's `Attention` and apply encoder overrides explicitly. Other encoders keep their fixed implementation, including Hugging Face attention, direct SDPA, and custom attention paths. Overrides for entries marked "Not supported" fail during initialization, even if the requested value is `VANILLA`. Unknown encoder names and unsupported backends also fail during initialization; Hugging Face `attn_implementation` names are not accepted. With `disable_mm_encoder=True`, encoders that the model skips do not use the setting, so text-only runs can reuse a serving configuration.
 
