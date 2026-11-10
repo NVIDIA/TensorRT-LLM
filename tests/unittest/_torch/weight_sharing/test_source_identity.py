@@ -36,14 +36,19 @@ from _source_identity_fakes import (
 
 import tensorrt_llm._torch.weight_sharing as weight_sharing
 import tensorrt_llm._torch.weight_sharing.post_transform_profiles as post_transform_profiles
+from tensorrt_llm import _utils as utils_mod
+from tensorrt_llm._torch import model_config as model_config_mod
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
     IdentityCheckPolicy,
     SourceIdentity,
     SourceIdentityMismatchError,
     check_weight_sharing_compatibility,
 )
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -241,6 +246,47 @@ def test_quant_mismatch_flags_global():
 def test_quant_model_dump_uses_python_mode():
     identity = identity_from(FakeModelConfig(quant_config=FakeQuantConfigWithPythonOnlyField()))
     assert identity.quant_fingerprint
+
+
+def _excluding(patterns: list[str]) -> QuantConfig:
+    return QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, exclude_modules=patterns)
+
+
+@pytest.mark.parametrize(
+    "patterns",
+    [
+        pytest.param(["*eh_proj", "*kv_b_proj*", "*k_b_proj*"], id="reordered"),
+        pytest.param(["*kv_b_proj*", "*k_b_proj*", "*eh_proj", "*kv_b_proj*"], id="repeated"),
+    ],
+)
+def test_quant_fingerprint_hashes_exclude_modules_as_a_set(patterns: list[str]) -> None:
+    """Exclusion patterns match as a set, so their order and repeats do not change the identity.
+
+    The config keeps its patterns in the order its producer wrote them.
+    """
+    reference = identity_from(
+        FakeModelConfig(quant_config=_excluding(["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]))
+    )
+    quant_config = _excluding(list(patterns))
+
+    identity = identity_from(FakeModelConfig(quant_config=quant_config))
+
+    assert identity.quant_fingerprint == reference.quant_fingerprint
+    assert quant_config.exclude_modules == patterns
+    fewer = identity_from(FakeModelConfig(quant_config=_excluding(["*kv_b_proj*", "*k_b_proj*"])))
+    assert fewer.quant_fingerprint != reference.quant_fingerprint
+
+
+def test_quant_fingerprint_hashes_layer_exclude_modules_as_a_set() -> None:
+    """Per-layer quantization configs hash their exclusion patterns as a set too."""
+
+    def identity(patterns: list[str]) -> SourceIdentity:
+        config = FakeModelConfig()
+        config.quant_config_dict = {"model.layers.0.mlp": _excluding(patterns)}
+        return identity_from(config)
+
+    assert identity(["b", "a"]).quant_fingerprint == identity(["a", "b"]).quant_fingerprint
+    assert identity(["a"]).quant_fingerprint != identity(["a", "b"]).quant_fingerprint
 
 
 def test_parallel_size_mismatch_flags_global():
@@ -500,3 +546,50 @@ def test_format_version_mismatch_never_matches():
     assert not result.matched
     assert "format_version" in result.mismatched_fields
     assert enforce_decision.should_share is False
+
+
+def _fp8_block_config(**kwargs: object) -> FakeModelConfig:
+    return FakeModelConfig(quant_config=FakeQuantConfig("FP8_BLOCK_SCALES"), **kwargs)
+
+
+def _fp8_block_identity_on_device(
+    monkeypatch: pytest.MonkeyPatch, sm_version: int
+) -> tuple[str, SourceIdentity]:
+    """Resolve the AUTO MoE backend and build an FP8 block-scale identity on `sm_version`."""
+
+    def _is_sm_100f(*_args: object, **_kwargs: object) -> bool:
+        return 100 <= sm_version < 110
+
+    for module in (utils_mod, model_config_mod):
+        monkeypatch.setattr(module, "get_sm_version", lambda: sm_version)
+        monkeypatch.setattr(module, "is_sm_100f", _is_sm_100f)
+    # `OVERRIDE_QUANT_ALGO=NVFP4_PLUS` would resolve AUTO to CUTEDSL before the FP8 rule.
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
+    moe_backend = model_config_mod.ModelConfig.resolve_moe_backend(
+        "AUTO",
+        "Qwen3ForCausalLM",
+        QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+    )
+    identity = identity_from(
+        _fp8_block_config(moe_backend=moe_backend),
+        transform_abi_id=QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
+    return moe_backend, identity
+
+
+def test_fp8_block_identity_does_not_record_the_device_sm(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SM90 and SM120 resolve the same backends, so their identities must
+    # serialize identically: SourceIdentity records no SM version.
+    sm90_backend, sm90 = _fp8_block_identity_on_device(monkeypatch, 90)
+    sm120_backend, sm120 = _fp8_block_identity_on_device(monkeypatch, 120)
+    sm100_backend, sm100 = _fp8_block_identity_on_device(monkeypatch, 100)
+
+    assert (sm90_backend, sm120_backend, sm100_backend) == ("CUTLASS", "CUTLASS", "TRTLLM")
+    assert sm90.to_dict() == sm120.to_dict()
+    assert not any("sm" in key.split("_") for key in sm90.to_dict())
+    assert sm90.matches(sm120).matched
+    # A default SM100-family device differs only through the MoE backend that
+    # AUTO resolves for FP8 block scales.
+    sm100_result = sm90.matches(sm100)
+    assert not sm100_result.matched
+    assert sm100_result.mismatched_fields == ["backend_fingerprint"]

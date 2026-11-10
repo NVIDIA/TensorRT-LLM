@@ -11,6 +11,8 @@ The things worth proving:
 
 * ``off`` changes nothing. This is the whole safety argument for making the
   decision in the model loader at all.
+* a ``@disable_v2_by_default`` target is built only when the deployment sets
+  ``modeling_v2`` itself; left at its default, the built-in implementation runs.
 * a matching configuration resolves to the target class itself, imported
   from its own directory; no registry lookup stands between the decision and
   the class.
@@ -33,8 +35,10 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     _RESOLVED_MODES,
+    _ROUTES,
     ModelingV2Mode,
     NoTarget,
+    disable_v2_by_default,
     modeling_v2_resolve,
     resolved_mode,
 )
@@ -215,16 +219,56 @@ _DEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_atten
 _TEP4 = dict(_DEP4, enable_attention_dp=False)
 
 
-@pytest.mark.parametrize("mode", [None, "off"], ids=["default", "off"])
-def test_off_resolves_nothing(mode):
-    """The default must be indistinguishable from modeling_v2 not existing.
-
-    Leaving the argument alone and an explicit "off" have to behave
-    identically: the common case is that nobody has heard of this package.
-    """
-    args = TorchLlmArgs(model=_DUMMY_MODEL) if mode is None else _llm_args(mode)
+def test_off_resolves_nothing():
+    """``off`` must be indistinguishable from modeling_v2 not existing, even for a deployment a target claims."""
     config = _model_config(_gpt_oss_config())
-    assert modeling_v2_resolve(config, args) is None
+    assert modeling_v2_resolve(config, _llm_args("off")) is None
+
+
+class _TargetUsedByDefault:
+    """A target the default mode builds."""
+
+
+@disable_v2_by_default
+class _TargetDisabledByDefault:
+    """A target the default mode declines."""
+
+
+def _claimed_by(monkeypatch, target):
+    """A config whose architecture's ``route`` claims every deployment for ``target``."""
+    arch = "ModelingV2TestForCausalLM"
+    monkeypatch.setitem(_ROUTES, arch, lambda *_: target)
+    return _model_config(PretrainedConfig(architectures=[arch]))
+
+
+def test_the_default_mode_builds_a_claiming_target(monkeypatch):
+    config = _claimed_by(monkeypatch, _TargetUsedByDefault)
+    assert modeling_v2_resolve(config, TorchLlmArgs(model=_DUMMY_MODEL)) is _TargetUsedByDefault
+
+
+def test_the_default_mode_declines_a_target_disabled_by_default(monkeypatch):
+    config = _claimed_by(monkeypatch, _TargetDisabledByDefault)
+    assert modeling_v2_resolve(config, TorchLlmArgs(model=_DUMMY_MODEL)) is None
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_a_set_mode_builds_a_target_disabled_by_default(monkeypatch, mode):
+    """Setting ``modeling_v2`` is the opt-in, including to the value it defaults to."""
+    config = _claimed_by(monkeypatch, _TargetDisabledByDefault)
+    assert modeling_v2_resolve(config, _llm_args(mode)) is _TargetDisabledByDefault
+
+
+@pytest.mark.parametrize(
+    "pretrained_config, expected",
+    [(_gpt_oss_config, _GPT_OSS_DEFAULT_TARGET), (_r1_config, _R1_DEFAULT_TARGET)],
+    ids=["gpt_oss", "deepseek_r1"],
+)
+def test_gpt_oss_and_r1_run_builtin_unless_modeling_v2_is_set(pretrained_config, expected):
+    """Both default targets are ``@disable_v2_by_default``: a deployment they claim keeps the built-in model
+    until it sets ``modeling_v2``."""
+    config = _model_config(pretrained_config(), **_layout(4, False))
+    assert modeling_v2_resolve(config, TorchLlmArgs(model=_DUMMY_MODEL)) is None
+    assert _qualified(modeling_v2_resolve(config, _llm_args("auto"))) == expected
 
 
 def test_off_still_reaches_the_builtin_implementation():
@@ -491,8 +535,8 @@ def test_an_unknown_mode_is_rejected_when_the_arguments_are_built():
         _llm_args("yes")
 
 
-def test_the_default_mode_is_off():
-    assert TorchLlmArgs(model=_DUMMY_MODEL).modeling_v2 == "off"
+def test_the_default_mode_is_auto():
+    assert TorchLlmArgs(model=_DUMMY_MODEL).modeling_v2 == "auto"
 
 
 def test_no_target_is_a_value_error():
@@ -964,8 +1008,8 @@ def test_minimax_m3_kv_cache_dtype_overrides_the_checkpoint(monkeypatch):
 @pytest.mark.usefixtures("_minimax_m3_sm")
 @pytest.mark.parametrize("tp", [4, 8])
 @pytest.mark.parametrize("role", ["aggregated", "context", "generation"])
-def test_minimax_m3_requires_explicit_opt_in(monkeypatch, tp: int, role: str) -> None:
-    """Every serving role stays on the built-in model unless modeling_v2 is requested."""
+def test_minimax_m3_is_claimed_in_every_serving_role(monkeypatch, tp: int, role: str) -> None:
+    """Every serving role builds the target, under the default mode as under a set one."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
@@ -974,11 +1018,14 @@ def test_minimax_m3_requires_explicit_opt_in(monkeypatch, tp: int, role: str) ->
     kwargs = dict(kv_cache_config=dict(dtype="nvfp4"))
     if role != "aggregated":
         kwargs["cache_transceiver_config"] = CacheTransceiverConfig()
-    assert modeling_v2_resolve(config, TorchLlmArgs(model=_DUMMY_MODEL, **kwargs)) is None
-    for mode in ("auto", "require"):
-        target = modeling_v2_resolve(config, _llm_args(mode, **kwargs))
+    for args in (
+        TorchLlmArgs(model=_DUMMY_MODEL, **kwargs),
+        _llm_args("auto", **kwargs),
+        _llm_args("require", **kwargs),
+    ):
+        target = modeling_v2_resolve(config, args)
         assert target.__name__ == f"ModelingV2MiniMaxM3Nvfp4Sm103Tp{tp}"
-        assert resolved_mode(target) is ModelingV2Mode(mode)
+        assert resolved_mode(target) is ModelingV2Mode(args.modeling_v2)
 
 
 _SM100 = (10, 0)

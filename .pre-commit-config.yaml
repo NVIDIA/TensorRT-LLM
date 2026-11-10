@@ -1527,7 +1527,7 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard,indx,therefrom", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*", "--skip", "tensorrt_llm/_torch/visual_gen/jit_kernels/*"]
+        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard,indx,therefrom,alog", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*", "--skip", "tensorrt_llm/_torch/visual_gen/jit_kernels/*"]
         exclude: 'scripts/attribution/data/cas/.*$'
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
@@ -1558,6 +1558,12 @@ repos:
         entry: python scripts/vendor/manage.py check
         language: python
         additional_dependencies: [PyYAML]
+        always_run: true
+        pass_filenames: false
+    -   id: version-records-check
+        name: verify every version record matches tensorrt_llm/version.py
+        entry: python scripts/bump_version.py --check
+        language: python
         always_run: true
         pass_filenames: false
     -   id: openengine-bindings-check
