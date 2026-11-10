@@ -154,12 +154,19 @@ def _beam_meta(manager, *, beam_width=4, request_ids=(7, 9), kv_lens=(11, 7),
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("fa4_layout", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("tail_len", [0, 1, 3])
 @pytest.mark.parametrize("group", [1, 2, 4, 8])
-def test_fused_tail_and_merge_matches_unfused_reference(group, tail_len, head_dim, dtype):
-    """The fused kernel reproduces the unfused tail attention and merge, and the KV write."""
+def test_fused_tail_and_merge_matches_unfused_reference(
+    group, tail_len, head_dim, dtype, fa4_layout
+):
+    """The fused kernel reproduces the unfused tail attention and merge, and the KV write.
+
+    ``fa4_layout`` hands it the prefix state the way ``Fa4Prefix`` leaves it: natural-log LSE
+    [heads, capacity] and an output buffer larger than the batch.
+    """
     torch.manual_seed(0)
     device = "cuda"
     num_kv_heads, tokens_per_block, rows = 2, 16, 24
@@ -219,18 +226,30 @@ def test_fused_tail_and_merge_matches_unfused_reference(group, tail_len, head_di
     )
 
     output = torch.empty(rows, num_heads, head_dim, device=device, dtype=dtype)
+    lse_scale = 1.0
+    if fa4_layout:
+        capacity = rows + 8
+        lse_buffer = torch.randn(num_heads, capacity, device=device)
+        lse_buffer[:, :rows] = (prefix_lse / _LOG2E).t()
+        out_buffer = torch.randn(capacity, num_heads, head_dim, device=device).to(dtype)
+        out_buffer[:rows] = prefix_out
+        prefix_out_arg, prefix_lse_arg, lse_scale = out_buffer[:rows], lse_buffer, _LOG2E
+    else:
+        prefix_out_arg, prefix_lse_arg = prefix_out, prefix_lse
     fused_tail_and_merge(
         q,
         k,
         v,
         pool,
         indices,
-        prefix_out,
-        prefix_lse,
+        prefix_out_arg,
+        prefix_lse_arg,
         output,
         tail_len=tail_len,
         num_kv_heads=num_kv_heads,
         sm_scale=sm_scale,
+        lse_scale=lse_scale,
+        lse_heads_first=fa4_layout,
     )
     torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(pool[write_page, 0, :, write_slot, :], k, atol=0, rtol=0)
@@ -315,6 +334,9 @@ def _run_beam_search(
             kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.3),
             cuda_graph_config=CudaGraphConfig(batch_sizes=[len(prompts)]),
             skip_tokenizer_init=True,
+            # The autotuner times GEMM tactics at warmup; a different pick changes the model's
+            # bf16 numerics from process to process, which would mask what these tests compare.
+            enable_autotuner=False,
         )
         with llm:
             sampling = SamplingParams(
@@ -340,7 +362,7 @@ def _run_beam_search(
                 os.environ[key] = value
 
 
-def _assert_beams_match(reference, candidate, beam_width):
+def _assert_beams_match(reference, candidate, beam_width, min_overlap=0.9):
     for ref_beams, cand_beams in zip(reference, candidate):
         assert len(cand_beams) == beam_width
         ref_tokens = [tokens for tokens, _ in ref_beams]
@@ -348,7 +370,7 @@ def _assert_beams_match(reference, candidate, beam_width):
         # Kernel numerics differ slightly, so allow the ranking of a few
         # near-tied beams to move; the sets must agree almost entirely.
         overlap = len(set(ref_tokens) & set(cand_tokens)) / beam_width
-        assert overlap >= 0.9, (overlap, ref_tokens, cand_tokens)
+        assert overlap >= min_overlap, (overlap, ref_tokens, cand_tokens)
         assert cand_tokens[0] == ref_tokens[0]
         # Compare each beam present in both runs by its tokens: a near-tied pair
         # that swaps rank must not pair up unrelated beams.
@@ -395,6 +417,50 @@ def test_beam_shared_prefix_matches_fallback_e2e():
     )
 
     _assert_beams_match(reference, candidate, beam_width)
+
+
+def _fa4_prefix_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix import _fa4_supported
+
+    return _fa4_supported(128, torch.bfloat16, None)
+
+
+@pytest.mark.skipif(not _fa4_prefix_available(), reason="needs SM90 and the FA4 kernels")
+@pytest.mark.skipif(_qwen3_small_path() is None, reason="Qwen3-0.6B checkpoint not available")
+@pytest.mark.threadleak(enabled=False)
+def test_beam_shared_prefix_fa4_backend_matches_fallback_e2e():
+    """The FlashAttention-4 prefix backend reproduces the fallback kernel's beams, graphs on."""
+    model_path = _qwen3_small_path()
+    vocab = 150000
+    prompts = [
+        [1024 + ((17 * i + 13 * p) % (vocab - 1024)) for p in range(n)]
+        for i, n in enumerate((300, 173))
+    ]
+    beam_width, max_tokens = 16, 3
+
+    base_env = {"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}
+    reference = _run_beam_search(model_path, prompts, beam_width, max_tokens, base_env)
+    candidate = _run_beam_search(
+        model_path,
+        prompts,
+        beam_width,
+        max_tokens,
+        base_env
+        | {
+            "TLLM_FMHA_LIBS": f"+{LIB_NAME}",
+            "TLLM_BEAM_SHARED_PREFIX_BACKEND": "fa4",
+            "TLLM_BEAM_SHARED_PREFIX_CHECK": "1",
+            "TLLM_BEAM_SHARED_PREFIX_MAX_TAIL": str(max_tokens - 1),
+        },
+    )
+
+    # FA4's bf16 rounding differs from the fallback's by a few hundredths of a nat per beam, as
+    # accurate against an fp32 reference. Beam search prunes at near-ties, so up to a few of the 16
+    # beams can be different but equally good ones; the top beam and the scores of the shared
+    # beams must still agree.
+    _assert_beams_match(reference, candidate, beam_width, min_overlap=0.75)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
