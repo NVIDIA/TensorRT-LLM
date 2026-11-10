@@ -3526,8 +3526,10 @@ def _s34_q_rows_to_tmem(sQ, sQSF, base: ctm.Int32, wq: ctm.Int32, lane: ctm.Int3
     even = ctm.inttoptr(tail_ptr + offset, 3, ctm.Int32).load()
     odd = ctm.inttoptr(tail_ptr + offset + ctm.Int64(512), 3, ctm.Int32).load()
     for ck in ctm.range_constexpr(2):
+        # tail_k128: the tail image is [Qr | Qm]: column + 8 = the four residual scales (odd bytes), + 9 = the main
+        # ones.
         selector: ctm.Constexpr = (
-            TRTLLM_QSF_EVEN_PRMT_SELECTOR if ck == 0 else TRTLLM_QSF_ODD_PRMT_SELECTOR
+            TRTLLM_QSF_ODD_PRMT_SELECTOR if ck == 0 else TRTLLM_QSF_EVEN_PRMT_SELECTOR
         )
         word = prims.prmt(even, selector, prims.PermuteMode.DEFAULT, hi=odd)
         prims.tcgen05_st(
@@ -3539,18 +3541,25 @@ def _s34_q_rows_to_tmem(sQ, sQSF, base: ctm.Int32, wq: ctm.Int32, lane: ctm.Int3
     tail = sQ.subview(128 * 512 // 2 // 4)
     swizzle = ctm.Swizzle.from_name("s64b")
     ptr = tail.data_ptr() + row * ctm.Int32(16)
-    w1 = (ptr + ctm.Int32(2)).load_swizzled(swizzle, alignment=8, count=2)
-    w2 = (ptr + ctm.Int32(4)).load_swizzled(swizzle, alignment=8, count=2)
-    w4 = (ptr + ctm.Int32(8)).load_swizzled(swizzle, alignment=8, count=2)
-    w3 = (ptr + ctm.Int32(6)).load_swizzled(swizzle, alignment=8, count=2)
-    w5 = (ptr + ctm.Int32(10)).load_swizzled(swizzle, alignment=8, count=2)
-    w6 = (ptr + ctm.Int32(12)).load_swizzled(swizzle, alignment=8, count=2)
-    (ptr + ctm.Int32(8)).store_swizzled(w1, swizzle=swizzle, alignment=8)
-    (ptr + ctm.Int32(2)).store_swizzled(w2, swizzle=swizzle, alignment=8)
-    (ptr + ctm.Int32(4)).store_swizzled(w4, swizzle=swizzle, alignment=8)
-    (ptr + ctm.Int32(10)).store_swizzled(w3, swizzle=swizzle, alignment=8)
-    (ptr + ctm.Int32(12)).store_swizzled(w5, swizzle=swizzle, alignment=8)
-    (ptr + ctm.Int32(6)).store_swizzled(w6, swizzle=swizzle, alignment=8)
+    # tail_k128: raw 8-B units [m0, r0, m1, r1, m2, r2, m3, r3] -> [r0, r1, r2, r3 | m0, m1, m2, m3] = [Qr | Qm]:
+    # position p takes raw unit (1, 3, 5, 7, 0, 2, 4, 6)[p] = the cycles (0 1 3 7 6 4)(2 5). The 6-cycle is issued as
+    # six loads then six stores (the base shape: at most six units live), then the 2-cycle.
+    u1 = (ptr + ctm.Int32(2)).load_swizzled(swizzle, alignment=8, count=2)
+    u3 = (ptr + ctm.Int32(6)).load_swizzled(swizzle, alignment=8, count=2)
+    u7 = (ptr + ctm.Int32(14)).load_swizzled(swizzle, alignment=8, count=2)
+    u6 = (ptr + ctm.Int32(12)).load_swizzled(swizzle, alignment=8, count=2)
+    u4 = (ptr + ctm.Int32(8)).load_swizzled(swizzle, alignment=8, count=2)
+    u0 = (ptr + ctm.Int32(0)).load_swizzled(swizzle, alignment=8, count=2)
+    (ptr + ctm.Int32(0)).store_swizzled(u1, swizzle=swizzle, alignment=8)
+    (ptr + ctm.Int32(2)).store_swizzled(u3, swizzle=swizzle, alignment=8)
+    (ptr + ctm.Int32(6)).store_swizzled(u7, swizzle=swizzle, alignment=8)
+    (ptr + ctm.Int32(14)).store_swizzled(u6, swizzle=swizzle, alignment=8)
+    (ptr + ctm.Int32(12)).store_swizzled(u4, swizzle=swizzle, alignment=8)
+    (ptr + ctm.Int32(8)).store_swizzled(u0, swizzle=swizzle, alignment=8)
+    u5 = (ptr + ctm.Int32(10)).load_swizzled(swizzle, alignment=8, count=2)
+    u2 = (ptr + ctm.Int32(4)).load_swizzled(swizzle, alignment=8, count=2)
+    (ptr + ctm.Int32(4)).store_swizzled(u5, swizzle=swizzle, alignment=8)
+    (ptr + ctm.Int32(10)).store_swizzled(u2, swizzle=swizzle, alignment=8)
     cute.arch.fence_view_async_tmem_store()
 
 
@@ -5542,30 +5551,50 @@ def ordered_v30_six_yield_kernel(
                                     << ctm.Int16(pair_id * ctm.Int32(2)),
                                     group=prims.CTAGroup.CTA_2,
                                 )
-                        for tail in ctm.range_constexpr(3):
-                            ak: ctm.Constexpr = FIRST_ORDER_TAIL_A_LOCAL_KBLOCKS[tail]
-                            bk: ctm.Constexpr = FIRST_ORDER_TAIL_B_LOCAL_KBLOCKS[tail]
-                            # Tail1 reuses the B0 scales copied by tail0 in this same issuer.
-                            # Preserve all three MMA operations and their accumulation order.
-                            if cutlass.const_expr(tail != 1):
-                                _eq_copy_bsf_elected(sKSF, base_i, DS_KSF_TMEM, 1, first_ck=8 + bk)
-                            _eq_mma_elected(
-                                sQ,
-                                sK,
-                                base_i,
-                                0,
-                                0,
-                                DS_QSF_TMEM + 8 + ak,
-                                DS_KSF_TMEM,
-                                8 + ak,
-                                False,
-                                ctm.Boolean(False),
-                                False,
-                                a_byte=128 * 512 // 2 + ak * 32,
-                                b_byte=128 * 512 // 2 + bk * 32,
-                                swizzle64=True,
-                                shared_q=True,
-                            )
+                        # tail_k128: the three K64 RoPE first-order tail MMAs (Qm.Kt, Qr.Kt, Qm.Kr) become one K64
+                        # (Qm.Kt) and one K128 ([Qr | Qm] . [Kt | Kr] = Qr.Kt + Qm.Kr). The kernel-start permutation
+                        # writes the Q tail rows as [Qr | Qm] and the two tail QSF columns as (+8 residual, +9 main);
+                        # K / KSF are untouched. Same terms in the same order; Qr.Kt + Qm.Kr is rounded once instead
+                        # of twice (rounding order). One 4-copy SFB group serves both steps: chunk 8 (Kt) ->
+                        # [DS_KSF_TMEM, +8), chunk 9 (Kr) -> [+8, +16).
+                        _eq_copy_bsf_elected(sKSF, base_i, DS_KSF_TMEM, 2, first_ck=8)
+                        # tail0 = K64 Qm.Kt: A = second half of the [Qr | Qm] rows, SFA = main scales, B = Kt,
+                        # SFB = chunk 8.
+                        _eq_mma_elected(
+                            sQ,
+                            sK,
+                            base_i,
+                            0,
+                            0,
+                            DS_QSF_TMEM + 9,
+                            DS_KSF_TMEM,
+                            9,
+                            False,
+                            ctm.Boolean(False),
+                            False,
+                            a_byte=128 * 512 // 2 + 32,
+                            b_byte=128 * 512 // 2,
+                            swizzle64=True,
+                            shared_q=True,
+                        )
+                        # tail12 = ONE K128 over the whole tail rows: [Qr | Qm] . [Kt | Kr].
+                        _eq_mma_elected(
+                            sQ,
+                            sK,
+                            base_i,
+                            0,
+                            0,
+                            DS_QSF_TMEM + 8,
+                            DS_KSF_TMEM,
+                            8,
+                            True,
+                            ctm.Boolean(False),
+                            False,
+                            a_byte=128 * 512 // 2,
+                            b_byte=128 * 512 // 2,
+                            swizzle64=True,
+                            shared_q=True,
+                        )
                         prims.tcgen05_commit(
                             bars.subview(ctm.Int32(15) + bank),
                             multicast_mask=ctm.Int16(3) << ctm.Int16(pair_id * ctm.Int32(2)),
