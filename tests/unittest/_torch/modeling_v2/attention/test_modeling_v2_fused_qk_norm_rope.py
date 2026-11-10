@@ -419,14 +419,16 @@ def test_guard_refuses_a_position_id_count_that_is_not_the_token_count() -> None
             op(qkv, **kwargs)
 
 
-@pytest.mark.parametrize("ramp", [8.0, 8.5], ids=["integer", "half"])
+@pytest.mark.parametrize("ramp", [8.0, 8.5, 8.9995], ids=["integer", "half", "below_integer"])
 @pytest.mark.parametrize("is_neox", [True, False], ids=["neox", "interleaved"])
 def test_yarn_degenerate_ramp(is_neox: bool, ramp: float, certifying) -> None:  # noqa: F811
     """`low == high` takes the kernel's ramp-singularity guard (`high += 0.001F`).
 
     No shipped target reaches it, and gpt-oss runs neox only, so this drives the
-    guard on both pairings. The reference mirrors the guard; at `low == high`
-    the ramp is a step at `low`, so the guard's exact epsilon does not matter.
+    guard on both pairings. The reference mirrors the guard. At 8.0 and 8.5 the
+    guarded ramp is the same step the unguarded clamp produces; at 8.9995,
+    half-dimension 9 lies inside `[low, low + 0.001]` and gets a blended
+    frequency only when the guard runs.
     """
     certifying(op)
     spec = dict(
