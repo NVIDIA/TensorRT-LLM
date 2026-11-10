@@ -278,7 +278,10 @@ class TrtllmModelingV2Workflow:
             f"Read `{self.host_facts_path}` before you debug anything about this "
             f"machine. It carries what this host does differently — `pytest`'s exit "
             f"code, the `TMPDIR` bound, the launch rules, which errors are noise. If "
-            f"you learn a new one, append it under `## Learned during this run`."
+            f"you learn a new one, append it under `## Learned during this run`.\n\n"
+            f"The workflow running this task, its checks included, is the package at "
+            f"`{Path(__file__).resolve().parents[1]}`. An `agent-flow/` directory in your "
+            f"worktree is another copy of it, which may differ: read the running one."
         )
 
     def _materialize_skills(self) -> Path:

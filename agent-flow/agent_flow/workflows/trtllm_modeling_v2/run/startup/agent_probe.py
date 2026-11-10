@@ -187,6 +187,12 @@ _CLI_REFUSED = re.compile(
 )
 _SANDBOX = re.compile(r"\bEPERM\b|srt-mux|operation not permitted|sandbox", re.I)
 _READ_ONLY = re.compile(r"session ran read-only")
+#: Claude Code's own command checks refusing the command (no one approves it in an unattended turn).
+_PERMISSION_BLOCKED = re.compile(
+    r"blocked by the Bash tool|Command was blocked|expansion obfuscation|requires approval|"
+    r"permission to use Bash|haven't granted it yet",
+    re.I,
+)
 _AUTH = re.compile(
     r"not logged in|/login|\bEROFS\b|credentials\.lock|invalid api key|unauthori[sz]ed|"
     r"authentication|\b401\b",
@@ -215,6 +221,14 @@ def hint_for(evidence: str, *, environ: Mapping[str, str] | None = None) -> str:
             "The native CLI session is read-only. Configure the required workspace access "
             "in the CLI or its deployment environment, then rerun the probe. The workflow "
             "does not select a more permissive sandbox or approve requests on your behalf."
+        )
+    elif _PERMISSION_BLOCKED.search(evidence):
+        hints.append(
+            "The CLI's permission policy refused the command, and no one approves it in an "
+            "unattended turn. Configure the CLI the run launches to run commands without "
+            'approval, e.g. `{"permissions": {"defaultMode": "bypassPermissions"}}` in '
+            "the settings.json of its CLAUDE_CONFIG_DIR (Claude Code refuses that mode as root "
+            "unless IS_SANDBOX=1); the workflow does not change that policy."
         )
     elif _SANDBOX.search(evidence):
         nested = [name for name in NESTED_SESSION_ENV if env.get(name)]
