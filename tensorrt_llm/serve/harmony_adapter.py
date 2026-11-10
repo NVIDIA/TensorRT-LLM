@@ -111,14 +111,25 @@ class HarmonyStreamState:
         """
         raw_deltas = []
         self.tokens_processed += len(tokens)
+        num_rejected = 0
 
         for token in tokens:
             # Store previous state for transition detection
             prev_channel = self.parser.current_channel
             prev_recipient = self.parser.current_recipient
 
-            # Process the token
-            self.parser.process(token)
+            # Reject only the offending token and keep the deltas already
+            # produced by this batch, so the output does not depend on how
+            # tokens are grouped into batches (speculative decoding delivers
+            # several tokens per step).
+            try:
+                self.parser.process(token)
+            except (HarmonyError, UnicodeDecodeError, ValueError) as e:
+                num_rejected += 1
+                logger.debug(
+                    f"Request {self.request_id}: harmony parser rejected token {token}: {e}"
+                )
+                continue
 
             # Detect channel/recipient transitions AFTER processing each token
             channel_changed = prev_channel != self.parser.current_channel
@@ -148,6 +159,12 @@ class HarmonyStreamState:
                 delta = self._create_delta_from_parser_state()
                 if delta:
                     raw_deltas.append(delta)
+
+        if num_rejected:
+            logger.error(
+                f"Streaming: harmony parser rejected {num_rejected} of "
+                f"{len(tokens)} token(s) in batch for request {self.request_id}"
+            )
 
         return self._merge_consecutive_deltas(raw_deltas)
 
@@ -217,8 +234,14 @@ class HarmonyStreamState:
             prev_channel = self.parser.current_channel
             prev_recipient = self.parser.current_recipient
 
-            # Process the token
-            self.parser.process(token)
+            # Reject only the offending token; see process_token_batch.
+            try:
+                self.parser.process(token)
+            except (HarmonyError, UnicodeDecodeError, ValueError) as e:
+                logger.debug(
+                    f"Request {self.request_id}: harmony parser rejected token {token}: {e}"
+                )
+                continue
 
             # Detect channel/recipient transitions AFTER processing each token
             channel_changed = prev_channel != self.parser.current_channel
