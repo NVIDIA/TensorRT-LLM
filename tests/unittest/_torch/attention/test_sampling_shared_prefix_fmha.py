@@ -17,8 +17,8 @@ KV cache manager V2, SM90).
 
 The grouping and the cost model run on the host; the planner and the FlashAttention-4 kernels need
 an SM90 GPU and are checked against float64 references; the end-to-end tests run EAGLE-3 n-sampling
-with and without the library and need the checkpoints named by ``TLLM_TEST_EAGLE3_TARGET`` /
-``TLLM_TEST_EAGLE3_DRAFT``.
+with and without the library on Qwen2.5-7B-Instruct and an EAGLE-3 draft trained for it, loaded
+from ``llm_models_root()`` (they skip when the checkpoints are not staged there).
 """
 
 import contextlib
@@ -29,6 +29,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.attention.backends.fmha import sampling_shared_prefix as lib
 
@@ -1098,19 +1099,24 @@ def _accepted_drafts():
         PyExecutor._update_iter_stats = original
 
 
+EAGLE3_TARGET = "Qwen2.5-7B-Instruct"
+EAGLE3_DRAFT = "EAGLE3-Qwen2.5-7B-Instruct"
+
+
 def _eagle3_paths():
-    """(target, draft) checkpoints of the EAGLE-3 e2e tests, from the environment."""
-    target = os.environ.get("TLLM_TEST_EAGLE3_TARGET")
-    draft = os.environ.get("TLLM_TEST_EAGLE3_DRAFT")
-    if target and draft and os.path.isdir(target) and os.path.isdir(draft):
-        return target, draft
+    """(target, draft) checkpoints of the EAGLE-3 e2e tests under ``llm_models_root()``."""
+    root = llm_models_root()
+    if root is None:
+        return None
+    target, draft = root / EAGLE3_TARGET, root / EAGLE3_DRAFT
+    if target.is_dir() and draft.is_dir():
+        return str(target), str(draft)
     return None
 
 
 needs_eagle3 = pytest.mark.skipif(
     _eagle3_paths() is None,
-    reason="set TLLM_TEST_EAGLE3_TARGET / TLLM_TEST_EAGLE3_DRAFT (e.g. Qwen2.5-7B-Instruct and its "
-    "EAGLE-3 head)",
+    reason=f"needs {EAGLE3_TARGET} and {EAGLE3_DRAFT} under llm_models_root()",
 )
 _LIBRARY_ENV = {
     "TLLM_FMHA_LIBS": f"+{lib.LIB_NAME}",
