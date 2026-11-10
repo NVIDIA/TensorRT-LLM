@@ -286,7 +286,7 @@ class CuteDslMlaFmha(PhasedFmha):
         if tokens_per_block in getattr(kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()):
             return False
         return not (
-            get_sm_version() in PrimsTSFmha.SUPPORTED_SMS
+            get_sm_version() in PrimsTSFmha.SUPPORTED_MLA_SMS
             and tokens_per_block in PrimsTSFmha.SUPPORTED_PAGE_SIZES
             and getattr(kv_cache_manager, "dtype", None) in (DataType.FP8, DataType.BF16)
         )

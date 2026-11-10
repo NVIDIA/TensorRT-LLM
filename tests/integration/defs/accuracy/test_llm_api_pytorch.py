@@ -3089,9 +3089,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    def test_prims_ts_bfloat16(self, mocker):
-        if get_sm_version() not in (100, 103):
-            pytest.skip("PrimTS requires SM100 or SM103")
+    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"],
+                             ids=["bf16-kv", "fp8-kv"])
+    def test_prims_ts_bfloat16(self, mocker, kv_cache_dtype):
+        if get_sm_version() not in (100, 103, 107):
+            pytest.skip("PrimTS requires SM100, SM103, or SM107")
 
         calls = _count_prims_ts_phase_calls(mocker)
         env = {
@@ -3099,6 +3101,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
         }
         kv_cache_config = KvCacheConfig(
+            dtype=kv_cache_dtype,
             free_gpu_memory_fraction=0.75,
             tokens_per_block=32,
             use_kv_cache_manager_v2=True,
@@ -3109,6 +3112,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                      kv_cache_config=kv_cache_config,
                      disable_overlap_scheduler=True,
                      cuda_graph_config=None) as llm:
+                if kv_cache_dtype == "fp8":
+                    assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
                 calls.update({name: 0 for name in calls})
                 task = CnnDailymail(self.MODEL_NAME)
                 task.evaluate(llm)
