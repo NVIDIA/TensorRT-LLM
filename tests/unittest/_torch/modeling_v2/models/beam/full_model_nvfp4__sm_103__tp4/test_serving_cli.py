@@ -222,7 +222,9 @@ def _counting_reader(monkeypatch):
         calls.append(path)
         return read(path)
 
-    monkeypatch.setattr(weights, "read_kv_cache_scales", counted)
+    from tensorrt_llm._torch.models.checkpoints.beam import checkpoint_loader
+
+    monkeypatch.setattr(checkpoint_loader, "read_kv_cache_scales", counted)
     return calls
 
 
