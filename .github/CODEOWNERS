@@ -424,14 +424,6 @@
 /tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/__init__.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/clc_tile_scheduler.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/kernel.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/__init__.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_blockscaled_implicit_gemm_fprop.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_gemm_persistent_dynamic.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_gemm_persistent_dynamic_preferred_cluster.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_implicit_gemm_fprop.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/visual_gen/kernels/blackwell/pertoken_adaln/__init__.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/visual_gen/kernels/blackwell/pertoken_adaln/pertoken_adaln.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/visual_gen/kernels/blackwell/pertoken_adaln/reduce.py @NVIDIA/trt-llm-kernels-devs
 /tests/unittest/_torch/disaggregation/test_kv_cache_transceiver_creation.py @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-disagg-devs
 /tests/unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp4_quant.py @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py @NVIDIA/trt-llm-runtime-devs
@@ -443,9 +435,6 @@
 /tests/unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-kv-cache-manager-devs
 /tests/unittest/_torch/pyexecutor/kv_cache/test_kvv2_host_tier_sizing.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-kv-cache-manager-devs
 /tests/unittest/_torch/pyexecutor/kv_cache/test_per_layer_head_dim.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-kv-cache-manager-devs
-/tests/unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_gate_resid_norm_shift_scale.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-visual-gen-devs
-/tests/unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_layernorm_shift_scale.py @NVIDIA/trt-llm-kernels-devs
-/tests/unittest/_torch/visual_gen/kernels/test_nvfp4_conv3d.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-visual-gen-devs
 
 # ===== DISAGG BLAST-RADIUS CO-OWNS (Tier-1) =====
 # Last-match cross-cutting: adds disagg-devs to shared files that can silently break disagg e2e.
