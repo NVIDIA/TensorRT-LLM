@@ -421,12 +421,9 @@ def test_nccl_ep_downgrades_unsupported_low_precision_combine(
     assert not strategy.use_low_precision_combine
 
 
-@pytest.mark.parametrize("capturing", [False, True])
 @pytest.mark.parametrize("window_available", [False, True])
-def test_nccl_ep_dispatch_window(
-    monkeypatch: pytest.MonkeyPatch, capturing: bool, window_available: bool
-):
-    """Dispatch uses a registered window or its persistent fallback, including capture."""
+def test_nccl_ep_dispatch_window(monkeypatch: pytest.MonkeyPatch, window_available: bool):
+    """Dispatch uses a registered window or the persistent output on allocation refusal."""
 
     class FakeTensor:
         def __init__(self, tensor, **kwargs):
@@ -435,6 +432,7 @@ def test_nccl_ep_dispatch_window(
 
     class FakeHandle:
         def dispatch(self, _, outputs, **__):
+            """Check dispatch's selected destination and emulate its output write."""
             if window_available:
                 assert outputs.tokens.window.handle == 123
                 assert outputs.tokens.window_offset == 0
@@ -480,13 +478,13 @@ def test_nccl_ep_dispatch_window(
     comm._dispatch_state = {}
     monkeypatch.setattr(comm, "_get_context", lambda: context)
     monkeypatch.setattr(comm, "_setup_handle", lambda *_: FakeHandle())
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     window_tokens = torch.zeros_like(persistent_tokens)
-    window_kind = int(BufferKind.NCCL_WINDOW) if window_available else 0
+    window_kind = int(BufferKind.NCCL_WINDOW if window_available else BufferKind.DEFAULT)
+    allocate = Mock(return_value=(window_tokens, window_kind, 123 if window_available else 0))
     monkeypatch.setattr(
         torch.ops.trtllm,
         "allocate_output_with_nccl_window",
-        lambda *_: (window_tokens, window_kind, 123 if window_available else 0),
+        allocate,
     )
 
     recv_hs, *_ = comm.dispatch(
@@ -498,6 +496,7 @@ def test_nccl_ep_dispatch_window(
     )
 
     assert torch.equal(recv_hs, torch.full_like(recv_hs, 7))
+    allocate.assert_called_once()
     expected = window_tokens if window_available else persistent_tokens
     assert recv_hs.data_ptr() == expected.data_ptr()
     assert context.output_tokens_buf is persistent_tokens

@@ -32,6 +32,10 @@ contributions back to the home rank.
 Persistent handle: ``Group.create_handle`` is called ONCE (first dispatch);
 subsequent dispatches call ``handle.update(topk_idx, ...)`` to rebind routing.
 CUDA-graph capture is supported once the handle exists.
+Pooled capture must use nccl_window_graph_capture / nccl_window_graph_owner. Missing
+ownership and invalid lease cleanup intentionally trigger pool lifecycle diagnostics.
+Release warmup leases before capture to make their windows reusable; supported
+NCCL runtimes can register additional windows during capture when needed.
 """
 
 from types import SimpleNamespace
@@ -302,8 +306,9 @@ class NcclEP(Communication):
         topk_nd = Tensor(topk_idx_dev)
         dispatch_outputs = ctx.dispatch_outputs
         window_tokens = None
-        # Borrow the destination in eager execution and during graph capture.
-        # The pool retains registration and graph ownership.
+        # Capture requires an explicit NCCL window graph-pool owner. The pool
+        # intentionally diagnoses missing ownership and invalid lease cleanup;
+        # graph ownership retains these windows until graph teardown.
         if ctx.zerocopy_enabled:
             window_tokens, actual_kind, window_handle = (
                 torch.ops.trtllm.allocate_output_with_nccl_window(

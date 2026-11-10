@@ -86,7 +86,14 @@ from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import (
     is_nccl_ep_installed,
     nccl_ep_supports_version,
 )
-from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
+from tensorrt_llm._torch.nccl_window_graph import (
+    nccl_window_graph_capture,
+    release_nccl_window_graph_owner,
+)
+from tensorrt_llm._torch.nccl_window_tensor_scope import (
+    discard_nccl_window_tensor_outputs,
+    nccl_window_tensor_scope,
+)
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -1214,6 +1221,7 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
     comm = None
+    graph = pool = None
     try:
         mapping = Mapping(
             rank=rank,
@@ -1248,9 +1256,8 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             experts_per_rank=experts_per_rank,
         )
 
-        with nccl_window_tensor_scope(hidden_states):
-            # Initialize the context and handle eagerly. Capture is intentionally
-            # rejected before this point, matching production graph setup.
+        # Release the warmup lease before capture claims its graph-owned window.
+        with discard_nccl_window_tensor_outputs(hidden_states):
             comm.dispatch(
                 hidden_states,
                 None,
@@ -1258,11 +1265,13 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
                 weights,
                 all_rank_num_tokens,
             )
-            torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
+        with nccl_window_tensor_scope(hidden_states):
             static_routes = local_routes.clone()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            pool = torch.cuda.graph_pool_handle()
+            with nccl_window_graph_capture(graph, pool):
                 recv_hs, _, recv_slots, recv_scales = comm.dispatch(
                     hidden_states,
                     None,
@@ -1272,6 +1281,8 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
                 )
             torch.cuda.synchronize()
 
+            uses_window = recv_hs.data_ptr() != comm._ctx.output_tokens_buf.data_ptr()
+            assert uses_window == comm._ctx.zerocopy_enabled
             assert recv_scales.dtype == routing_dtype
 
             def replay_and_check(expected_sender: int, expected_weight: float) -> dict:
@@ -1298,6 +1309,11 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
         traceback.print_exc()
         raise
     finally:
+        torch.cuda.synchronize()
+        if graph is not None:
+            graph.reset()
+        if pool is not None:
+            release_nccl_window_graph_owner(pool)
         if comm is not None:
             comm.destroy()
 
