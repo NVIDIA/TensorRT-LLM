@@ -2263,9 +2263,10 @@ def test_unified_estimation_scales_by_target_pool_groups_only(
     target_groups = 1 if target_window is None else 2
 
     assert _get_num_storage_pool_groups(specs, tpb) == target_groups + 1
-    assert unified._get_token_num_for_estimation() == (
-        target_groups + (0 if hosting else 1)
-    ) * baseline._get_token_num_for_estimation()
+    assert (
+        unified._get_token_num_for_estimation()
+        == (target_groups + (0 if hosting else 1)) * baseline._get_token_num_for_estimation()
+    )
 
 
 def test_unified_fp8_target_bf16_draft_in_one_life_cycle_is_one_pool_group():

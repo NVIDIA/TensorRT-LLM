@@ -1746,7 +1746,8 @@ class KvCacheCreator:
                 # lifecycle its own pages, as a separate draft pool's quota would.
                 hosts_draft_layers = self._kv_cache_manager_hosts_draft_layers()
                 num_pool_groups = _get_num_storage_pool_groups([
-                    spec for spec in unified_layer_specs if not hosts_draft_layers
+                    spec
+                    for spec in unified_layer_specs if not hosts_draft_layers
                     or spec.owner is KVCacheLayerOwner.TARGET
                 ], self._tokens_per_block)
             else:
