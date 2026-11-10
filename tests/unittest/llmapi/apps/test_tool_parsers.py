@@ -8602,3 +8602,31 @@ def test_finish_reports_every_call_of_a_reply_in_one_increment(
 
     assert len(streamed) > 1
     assert streamed == _whole_calls(test.make_parser(), text, sample_tools)
+
+
+@pytest.mark.parametrize("test_class",
+                         [TestDeepSeekV3Parser, TestDeepSeekV31Parser])
+@pytest.mark.parametrize("last_increment",
+                         ["reply", "both_calls", "second_call_tail"])
+def test_deepseek_streaming_reports_each_call_of_the_last_increment(
+        sample_tools, test_class, last_increment):
+    """Calls that arrive together keep their own names and arguments.
+
+    The last increment brings the whole reply, both calls, or the second call
+    from its separator on. The calls are those detect_and_parse reads from the
+    same text.
+    """
+    test = test_class()
+    text = test.make_tool_parser_test_cases().detect_and_parse_multiple_tools[0]
+    call_begin, sep = "<｜tool▁call▁begin｜>", "<｜tool▁sep｜>"
+    cut = {
+        "reply": 0,
+        "both_calls": text.index(call_begin),
+        "second_call_tail": text.index(sep, text.rindex(call_begin)) + len(sep),
+    }[last_increment]
+    increments = [text[:cut], text[cut:]] if cut else [text]
+
+    streamed = _streamed_calls(test.make_parser(), increments, sample_tools)
+
+    assert len(streamed) > 1
+    assert streamed == _whole_calls(test.make_parser(), text, sample_tools)
