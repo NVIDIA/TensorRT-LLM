@@ -67,10 +67,10 @@ goal words cannot say.
 | workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192) | |
 
 **The smallest contract that covers the request.** Every check loads the model (minutes on a
-large checkpoint), and every change to the target runs the stale checks again, so the contract's
-size is paid once per fix, not once per run. Prove each requested feature **once**, at the member
-the request validates fully, and accept the rest in `coverage.accept`, where the delivery report
-states it:
+large checkpoint). The workers run their own unit's checks while they build, and the certification
+runs the whole contract once on the final commit, and again after each repair. Prove each
+requested feature **once**, at the member the request validates fully, and accept the rest in
+`coverage.accept`, where the delivery report states it:
 
 - A storage or scheduling variant (a KV dtype, `chunked`, `reuse`) takes `gates: [accuracy]`.
   The accuracy check loads the same engine and fails unless each rank reports the variant's
@@ -126,13 +126,12 @@ benchmark you start by hand runs captured too.
 - **Anchors.** Each unit's anchor is a row of `reference_yaml` under `accuracy.model_key`, which
   the spec states (`org/model`; the checkpoint path's last two components are no model's name):
   the user's score, else the reference implementation's (HuggingFace `transformers`, where it
-  runs the checkpoint natively), else an earlier run's. Without any, record a **low
-  placeholder** (e.g. 10 on GSM8K, in percent): it lets a working target integrate and catches an
-  engine that answers nothing. The first benchmark that passes on the placeholder at a member
-  keeps its score as the unit's anchor there (`anchors.json`), and every later benchmark of the
-  unit at that member is held to it, as a variant is to its unit's score. Commit the row to the
-  run's branch: each check measures a snapshot of a commit and reads its anchor table there, and
-  preflight refuses an uncommitted one.
+  runs the checkpoint natively), else an earlier run's. **Get a real anchor before launch.** The
+  certification holds each benchmark to the row as written: no score the run measures replaces
+  it. A low placeholder (e.g. 10 on GSM8K, in percent) only catches an engine that answers
+  nothing, so a run delivered on it certifies no accuracy, and the lint warns. Commit the row to
+  the checkout: the certification reads the anchor table from the commit it measures and refuses
+  a checkout with uncommitted changes.
 - **Datasets.** Staged from preflight on, beside the first turns: the spec's
   `accuracy.dataset_path`, else the copy under `$LLM_MODELS_ROOT/datasets/` (where the tree's
   `accuracy_core.py` reads it), else a download into the workspace. A gate waits for one being
@@ -159,10 +158,6 @@ benchmark you start by hand runs captured too.
 
 - `environment.python` exists before launch: the editable install the gates measure, or an
   interpreter the image already has. Every gate's command runs under it.
-- `environment.substrate_checkpoint` is required when the stock modeling path does not register the
-  checkpoint's architecture (the lint checks): a small checkpoint the stock path supports, on this
-  cluster. Preflight's substrate gate boots it instead; skipping the gate also drops its MPI and
-  NVRTC checks.
 - `environment.kind` is `local`: every command runs on the orchestrator's host. On a cluster,
   launch the workflow inside the allocation that holds the GPUs.
 
@@ -196,9 +191,9 @@ what the roles need while they work:
 - **Reference** — where it is, what it supports, how it loads this checkpoint's weights.
 - **Architecture** — layer pattern, attention kinds with head dims, sparse/indexer configuration,
   MoE (experts, top-k, clamps, router), norm and residual dtypes, towers.
-- **Prior art in this tree worth surveying** — the top leads of each kind in `intake.report.md`
+- **Prior art in this tree worth surveying** — the leads in `intake.report.md` that hold
   (attention backends, custom ops, other targets' `ops/`, catalog entries), one line each named by
-  its `<dir>/<file>.py`: what it offers, or why it does not fit.
+  its `<dir>/<file>.py`: what it offers.
 - **Engine constraints** — from `intake.report.md` and the design they imply.
 - **Scope decisions** — what is gated where, what is checked outside the flow, and why.
 - **References outside the tree** — where you know them: another engine's implementation of
@@ -220,8 +215,8 @@ trtllm-modeling-v2 intake lint --task task.yaml --report intake.report.md
 Fix every `block` and every `warn`, or keep one on purpose with a line in `notes`:
 `intake-accept: <rule>[, <rule>] -- <why>`. A `block` is what preflight or the first boot would stop
 on (a requested cell no check covers, a KV-cache dtype the engine does not load) and cannot be
-accepted, except a cross product of variants the request names and an accuracy check run eager on
-purpose. The report also prints the contract size; a contract past ~30 checks
-deserves a second look. Then `--dry-run`, then launch. Preflight journals the same lint, so the run's record shows
-what was accepted. Once it runs, steer it only through `feedback` (the README's "While it runs"):
-cancelling the run's own jobs proves nothing and costs them again.
+accepted, except an accuracy check run eager on purpose. The report also prints the contract
+size; a contract past ~30 checks deserves a second look. Then `--dry-run` (it touches no GPU and
+exits 0 when preflight passes), then launch. Preflight journals the same lint, so the run's record
+shows what was accepted. Once it runs, steer it only through `feedback` (the README's "While it
+runs").

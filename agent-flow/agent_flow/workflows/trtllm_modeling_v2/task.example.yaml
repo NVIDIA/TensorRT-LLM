@@ -119,11 +119,6 @@ environment:
     TMPDIR: /path/to/scratch/tmp
     CLAUDE_CODE_TMPDIR: /path/to/scratch/tmp
 
-  # A checkpoint the STOCK modeling path supports, booted by the substrate gate when the stock path
-  # does not know the run's own architecture (and only then). Prefer it to `--skip-substrate-gate`,
-  # which also gives up the MPI spawn and NVRTC checks.
-  # substrate_checkpoint: /path/to/Qwen3-30B-A3B
-
   # gpus_per_node: 4                        # the devices this host holds
   # gpu_memory_gib: 288                     # per device: the lint sizes engines and disagg by it
   # The image the GPU jobs run in, if any, and how host paths appear inside it: the intake lint
@@ -164,10 +159,10 @@ accuracy:
   # (`dep4`). A configuration variant's runs at one member either way (attention DP first).
   # benchmark_members: every
 
-  # Anchors are in percent; one of 1 or less is refused. Where no written or measured anchor exists
-  # yet, record a low placeholder (e.g. 10 on GSM8K) and replace it when one is measured (the
-  # user's, the reference's on this hardware, or the onboarding's). Commit the rows: each check
-  # reads the anchor table from the commit it measures. Replacing a row runs the checks again.
+  # Anchors are in percent; one of 1 or less is refused. The certification holds each benchmark to
+  # the row as written, so write a measured anchor before launch (the user's, or the reference's
+  # on this hardware): a low placeholder passes any engine that answers. Commit the rows: the
+  # certification reads the anchor table from the commit it measures.
 
   # The reference_yaml row's model, stated (`org/model`); default: the checkpoint path's last two
   # components, which name no model when config.json states no `_name_or_path`.
@@ -235,7 +230,7 @@ accuracy:
   # Long inputs are exactly max_seq_len - max_tokens - 1 tokens, capped at max_num_tokens - 1
   # without chunked prefill. Needs explicit max_seq_len; long_prompts: 0 disables long inputs.
   # Submitted concurrency is at most max_batch_size, not proof of actual scheduler batches or
-  # CUDA graph execution. Cache reuse stays as declared. Stock-path substrate boots omit these.
+  # CUDA graph execution. Cache reuse stays as declared.
   # envelope:
   #   enabled: true
   #   max_tokens: 16               # default
@@ -280,7 +275,7 @@ accuracy:
 # session or the environment, and a role with no stated model stops the run before any worker starts.
 # `roles.<name>` overrides `defaults` per field: backend (claude-code | codex, default claude-code),
 # model, reasoning_effort, extra_mcp_servers. A role on another backend than defaults states its own
-# model. Models are pinned once for probes, primers and all stages; an unset effort is the backend's.
+# model. Models are pinned once for the probe and every turn; an unset effort is the backend's.
 # agents:
 #   defaults: {backend: claude-code, model: <your-model-id>, reasoning_effort: <your-effort>}
 #   roles:
@@ -289,10 +284,13 @@ accuracy:
 
 # ----------------------------------------------------------- commit policy
 # What a task's commits may touch, audited before each integration and over the branch at delivery.
+# By default a run commits only its own paths: the target's family directory, the tests that mirror
+# it, the two family registries and tests/integration/. Code other models run is refused; a shared
+# catalog entry is served by a local variant in the target's own ops/.
 # Every commit is authored and signed off as the repository's user (or MV2FLOW_GIT_NAME /
 # MV2FLOW_GIT_EMAIL); an added symlink, a sandbox placeholder and the workspace are always refused.
 # commit_policy:
-#   allowed_paths: [tensorrt_llm/, tests/, cpp/, examples/]   # the default
+#   allowed_paths: [tensorrt_llm/, tests/]   # instead of the run's own paths: say why in notes
 #   allow_co_authors: false    # the default
 #   base_ref: origin/main      # delivery audits merge-base(HEAD, base_ref)..HEAD; default
 #                              # origin/main, else upstream/main, else main

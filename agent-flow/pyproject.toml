@@ -48,14 +48,7 @@ include = ["agent_flow*"]
     "agents/prompts/templates/**/*.md.j2",
     "README.md",
     "spec/INTAKE.md",
-    # The compute sessions' shell wrappers, run by path inside and outside
-    # the container.
-    "infra/compute/scripts/*.sh",
-    # Not a package: the scheduler puts this directory on every job's
-    # PYTHONPATH so its sitecustomize records which checkout each process
-    # imported.
-    "infra/compute/resolvehook/*.py",
-    # Not a package either: the engine gates put this directory first on
+    # Not a package: the engine gates put this directory first on
     # PYTHONPATH so every rank's worker prints what its engine runs.
     "checks/harness/rankhook/*.py",
 ]
