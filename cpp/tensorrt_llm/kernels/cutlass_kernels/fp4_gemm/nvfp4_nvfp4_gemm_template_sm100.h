@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 
 #include "cutlass/arch/arch.h"
+#include "cutlass/arch/grid_dependency_control.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/gemm.h"
@@ -185,6 +186,10 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
             {                                                                                                          \
                 if constexpr (tensorrt_llm::kernels::arch::is_major_v<10>)                                             \
                 {                                                                                                      \
+                    if constexpr (std::is_same_v<Arch, cutlass::arch::Sm103>)                                          \
+                    {                                                                                                  \
+                        cutlass::arch::wait_on_dependent_grids();                                                      \
+                    }                                                                                                  \
                     this->Base::operator()(params, smem_buf);                                                          \
                 }                                                                                                      \
                 else                                                                                                   \

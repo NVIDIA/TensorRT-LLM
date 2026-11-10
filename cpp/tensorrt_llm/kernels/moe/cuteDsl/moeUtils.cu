@@ -532,8 +532,6 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    __threadfence();
-    __syncthreads();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
