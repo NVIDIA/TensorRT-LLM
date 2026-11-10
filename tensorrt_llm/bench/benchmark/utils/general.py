@@ -7,14 +7,11 @@ from typing import Dict, List, Union
 import yaml
 
 from tensorrt_llm._errors import ConfigInputError
-from tensorrt_llm._torch.pyexecutor.model_loader import \
-    validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
+from tensorrt_llm.bench.tuning import settings
 from tensorrt_llm.bench.tuning.dataclasses import (NemotronHybridConfig,
                                                    Qwen3HybridConfig)
-from tensorrt_llm.bench.tuning.settings import (get_benchmark_engine_settings,
-                                                get_model_config)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.version import __version__
@@ -27,14 +24,21 @@ _KV_CACHE_MAP = {
 ALL_SUPPORTED_BACKENDS = ["pytorch"]
 
 
-def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
-                 model_path: Union[Path, None]) -> Dict[str, Union[str, int]]:
+def get_settings(
+        params: dict,
+        dataset_metadata: DatasetMetadata,
+        model: str,
+        model_path: Union[Path, None],
+        *,
+        explicit_cli_keys: set[str] | None = None
+) -> Dict[str, Union[str, int]]:
     """Retrieve basic runtime config for pytorch backend path
 
     Args:
         params (dict): Configuration parameters.
         model (str): Model name.
         model_path (Union[Path, None]): Path to the model.
+        explicit_cli_keys: LLM argument names set explicitly on the CLI.
     Returns:
         Dict[str, Union[str, int]]: Properties for runtime config.
     """
@@ -45,6 +49,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     kv_cache_dtype = "auto"
     mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")
     kv_cache_config = {}
+    llm_args_dict = {}
     if extra_llm_api_options:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
@@ -81,7 +86,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             f"Initial settings: max_batch_size={max_batch_size} (user-provided), "
             f"max_num_tokens={max_num_tokens} (user-provided).")
     else:
-        model_config = get_model_config(model, model_path)
+        model_config = settings.get_model_config(model, model_path)
 
         if isinstance(model_config,
                       (NemotronHybridConfig, Qwen3HybridConfig
@@ -98,9 +103,28 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             kv_cache_dtype = _KV_CACHE_MAP.get(
                 tllm_model_config.quant_config.quant_algo, "auto")
 
-        validate_and_set_kv_cache_quant(tllm_model_config, kv_cache_dtype)
+        tllm_model_config = settings.resolve_benchmark_kv_cache_quant(
+            tllm_model_config,
+            model,
+            kv_cache_dtype,
+            {
+                "model": model,
+                "trust_remote_code": True,
+                "skip_tokenizer_init": True,
+                "tensor_parallel_size": mapping["tp_size"],
+                "pipeline_parallel_size": mapping["pp_size"],
+                "moe_expert_parallel_size": mapping["moe_ep_size"],
+                "moe_cluster_parallel_size": mapping["moe_cluster_size"],
+                "gpus_per_node": mapping["gpus_per_node"],
+                "kv_cache_config": {
+                    "dtype": kv_cache_dtype
+                },
+            },
+            extra_options=llm_args_dict,
+            explicit_cli_keys=explicit_cli_keys,
+        )
 
-        max_batch_size, max_num_tokens = get_benchmark_engine_settings(
+        max_batch_size, max_num_tokens = settings.get_benchmark_engine_settings(
             model_config,
             tllm_model_config.quant_config,
             params.get("tp"),

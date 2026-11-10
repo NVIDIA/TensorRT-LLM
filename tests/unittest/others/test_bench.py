@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import io
+import os
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import get_args
 from unittest import mock
 
 import pytest
+import torch
 
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, ReportUtility, StatsKeeper
@@ -353,6 +356,106 @@ def _perf_item(rid, num_out, decoding_iteration):
         decoding_iteration=decoding_iteration,
         time_on_first_token=100,
     )
+
+
+@pytest.mark.parametrize("caller", ["sizing", "reporting"])
+@pytest.mark.parametrize(
+    ("mode", "attention_dp", "autotune", "expected"),
+    [
+        ("auto", True, False, QuantAlgo.NVFP4),
+        ("require", True, False, QuantAlgo.NVFP4),
+        ("auto", False, False, QuantAlgo.FP8),
+        ("auto", True, True, QuantAlgo.FP8),
+        ("off", True, False, QuantAlgo.FP8),
+    ],
+)
+def test_bench_kv_cache_quant_uses_modeling_v2_target(
+    tmp_path, monkeypatch, caller, mode, attention_dp, autotune, expected
+):
+    from tensorrt_llm._torch._experimental.modeling_v2 import _router_index
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.pyexecutor import model_loader
+    from tensorrt_llm.bench.benchmark.utils import general
+    from tensorrt_llm.bench.tuning import settings as tuning_settings
+
+    class Nvfp4Target:
+        supports_nvfp4_kv_cache = True
+
+    def route(config, llm_args, capability):
+        assert capability == (10, 7)
+        assert config.mapping.tp_size == config.mapping.moe_ep_size == 4
+        assert config.moe_backend == "MEGAMOE_CUTEDSL"
+        assert llm_args.kv_cache_config.dtype == "nvfp4"
+        if not config.mapping.enable_attention_dp:
+            raise _router_index.NoTarget("requires attention DP")
+        if os.environ.get("MEGAMOE_TACTIC_AUTOTUNE") == "1":
+            raise _router_index.NoTarget("incompatible with tactic autotune")
+        return Nvfp4Target
+
+    def load_config(model, trust_remote_code=True, **kwargs):
+        return ModelConfig(
+            pretrained_config=SimpleNamespace(
+                architectures=["BenchTestArchitecture"], torch_dtype=torch.bfloat16
+            ),
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(ModelConfig, "from_pretrained", load_config)
+    monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
+    monkeypatch.setattr(
+        _router_index, "registered_routes", lambda: {"BenchTestArchitecture": route}
+    )
+    monkeypatch.setattr(_router_index, "_RESOLVED_MODES", {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 7))
+    monkeypatch.setattr(tuning_settings, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(model_loader, "get_sm_version", lambda: 107)
+    # Exercise the validator's SM107 capability gate without loading a CUDA target.
+    monkeypatch.setattr(
+        model_loader,
+        "supports_fp4_mla_attention",
+        lambda config: config.modeling_v2_target is Nvfp4Target,
+    )
+
+    metadata = mock.Mock(max_isl=8, avg_isl=8, avg_osl=4)
+    yaml_options = tmp_path / "extra.yaml"
+    yaml_options.write_text(
+        f"modeling_v2: '{mode}'\nenable_attention_dp: {str(attention_dp).lower()}\n"
+        "moe_config: {backend: MEGAMOE_CUTEDSL}\nkv_cache_config: {dtype: nvfp4}\n"
+        "tensor_parallel_size: 2\nmoe_expert_parallel_size: 2\n"
+        f"env_overrides: {{MEGAMOE_TACTIC_AUTOTUNE: '{int(autotune)}'}}\n"
+    )
+    params = {
+        "tp": 4,
+        "ep": 4,
+        "pp": 1,
+        "gpus_per_node": 4,
+        "extra_llm_api_options": yaml_options,
+    }
+    cli_keys = {"tensor_parallel_size", "moe_expert_parallel_size"}
+    if caller == "sizing":
+        monkeypatch.setattr(tuning_settings, "get_model_config", mock.Mock())
+        size = mock.Mock(return_value=(8, 128))
+        monkeypatch.setattr(tuning_settings, "get_benchmark_engine_settings", size)
+        general.get_settings(params, metadata, "model", None, explicit_cli_keys=cli_keys)
+        actual = size.call_args.args[1].kv_cache_quant_algo
+    else:
+        params.update(max_batch_size=8, max_num_tokens=128)
+        settings = general.get_settings(params, metadata, "model", None)
+        runtime = RuntimeConfig(
+            **settings,
+            model="model",
+            extra_llm_api_options=str(yaml_options),
+            explicit_cli_keys=cli_keys,
+        )
+        keeper = StatsKeeper()
+        keeper.register_request_perf_item(_perf_item(0, num_out=4, decoding_iteration=3))
+        report = ReportUtility(keeper, metadata, runtime, mock.Mock(), runtime.get_llm_args())
+        monkeypatch.setattr(report, "_query_gpu_info", lambda: {})
+        actual = report.get_statistics_dict()["engine"]["kv_cache_dtype"]
+    assert actual == expected
+    assert "MEGAMOE_TACTIC_AUTOTUNE" not in os.environ
 
 
 def test_acceptance_length_weighted_by_iterations():
