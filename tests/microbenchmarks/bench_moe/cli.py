@@ -25,7 +25,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from tensorrt_llm._torch.moe.fused_moe.routing import (
+    DeepSeekV3MoeRoutingMethod,
+    DeepSeekV4MoeRoutingMethod,
+)
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType
@@ -72,7 +75,9 @@ def _resolve_benchmark_context(args: argparse.Namespace) -> _BenchmarkContext:
     search = _resolve_search_from_args(args, base_config)
     act_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     routing_logits_dtype = (
-        torch.float32 if model.routing_method_cls is DeepSeekV3MoeRoutingMethod else act_dtype
+        torch.float32
+        if model.routing_method_cls in (DeepSeekV3MoeRoutingMethod, DeepSeekV4MoeRoutingMethod)
+        else act_dtype
     )
     return _BenchmarkContext(
         model=model,
