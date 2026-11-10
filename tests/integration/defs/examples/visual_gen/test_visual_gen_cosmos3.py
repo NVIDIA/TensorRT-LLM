@@ -900,12 +900,18 @@ COSMOS3_EDGE_T2I_LPIPS_PROMPT = (
 )
 COSMOS3_EDGE_T2I_LPIPS_STEPS = 50
 COSMOS3_EDGE_T2I_LPIPS_THRESHOLD = 0.05
+# Staged by llm-models !635. Seven steps is the smallest count that runs the
+# W8A16 windows (first 3 and last 3) and one W8A8 middle step.
+COSMOS3_EDGE_FP8_SUBPATH = "Cosmos3-Edge-FP8/cosmos3-edge-fp8-04112026"
+COSMOS3_EDGE_FP8_SMOKE_STEPS = 7
+COSMOS3_EDGE_FP8_SMOKE_FRAMES = 9
 
 
-def _run_cosmos3_edge_lpips_pipeline(**forward_kwargs):
-    """Run the Cosmos3-Edge pipeline and return the PipelineOutput.
+def _run_cosmos3_edge_lpips_pipeline(model_subpath="Cosmos3-Edge", **forward_kwargs):
+    """Run a Cosmos3-Edge pipeline and return the PipelineOutput.
 
     VANILLA attention, compile-off; guardrails disabled for the run.
+    ``model_subpath`` selects the checkpoint under the CI model root.
     """
     guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
     previous_guardrails_env = os.environ.get(guardrails_env_key)
@@ -919,8 +925,8 @@ def _run_cosmos3_edge_lpips_pipeline(**forward_kwargs):
             VisualGenArgs,
         )
 
-        model_path = _lpips_model_path("Cosmos3-Edge")
-        _require_exists(model_path, "Cosmos3-Edge checkpoint", is_dir=True)
+        model_path = _lpips_model_path(model_subpath)
+        _require_exists(model_path, f"{model_subpath} checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         args = VisualGenArgs(
             model=model_path,
@@ -1065,3 +1071,73 @@ def test_cosmos3_edge_t2i_lpips_against_golden(request, tmp_path):
         "cosmos3_edge_t2i_lpips_golden.png",
     )
     _assert_lpips_below_threshold(score, COSMOS3_EDGE_T2I_LPIPS_THRESHOLD)
+
+
+def _drop_unit_batch(tensor):
+    """Drop a leading batch of 1 from ``(1, T, H, W, C)`` or ``(1, H, W, C)``."""
+    if tensor.ndim in (4, 5) and tensor.shape[0] == 1:
+        return tensor[0]
+    return tensor
+
+
+def _assert_finite_media(tensor, shape):
+    media = _drop_unit_batch(tensor)
+    assert tuple(media.shape) == shape, tuple(media.shape)
+    assert media.numel() > 0
+    assert torch.isfinite(media.float()).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_edge_fp8_t2i_smoke():
+    """Edge-FP8 text-to-image: shape, finite pixels, and a non-empty tensor.
+
+    Seven denoising steps cover both W8A16 windows and one W8A8 middle step.
+    """
+    result = _run_cosmos3_edge_lpips_pipeline(
+        COSMOS3_EDGE_FP8_SUBPATH,
+        prompt=COSMOS3_EDGE_T2I_LPIPS_PROMPT,
+        height=640,
+        width=640,
+        num_inference_steps=COSMOS3_EDGE_FP8_SMOKE_STEPS,
+        guidance_scale=4.0,
+        output_type="image",
+    )
+    assert result is not None and result.image is not None, "Edge-FP8 T2I produced no image"
+    _assert_finite_media(result.image, (640, 640, 3))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_edge_fp8_t2v_smoke():
+    """Edge-FP8 text-to-video at the native 832x480 canvas, nine frames."""
+    result = _run_cosmos3_edge_lpips_pipeline(
+        COSMOS3_EDGE_FP8_SUBPATH,
+        prompt=COSMOS3_EDGE_T2V_LPIPS_PROMPT,
+        height=480,
+        width=832,
+        num_frames=COSMOS3_EDGE_FP8_SMOKE_FRAMES,
+        num_inference_steps=COSMOS3_EDGE_FP8_SMOKE_STEPS,
+        guidance_scale=5.0,
+        frame_rate=COSMOS3_EDGE_LPIPS_FRAME_RATE,
+    )
+    assert result is not None and result.video is not None, "Edge-FP8 T2V produced no video"
+    _assert_finite_media(result.video, (COSMOS3_EDGE_FP8_SMOKE_FRAMES, 480, 832, 3))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_edge_fp8_i2v_smoke(tmp_path):
+    """Edge-FP8 image-to-video from a deterministic 832x480 conditioning frame."""
+    image_path = tmp_path / "cosmos3_edge_fp8_conditioning.png"
+    _write_cosmos3_edge_conditioning_image(image_path)
+    result = _run_cosmos3_edge_lpips_pipeline(
+        COSMOS3_EDGE_FP8_SUBPATH,
+        prompt=COSMOS3_EDGE_I2V_LPIPS_PROMPT,
+        image=image_path.read_bytes(),
+        height=480,
+        width=832,
+        num_frames=COSMOS3_EDGE_FP8_SMOKE_FRAMES,
+        num_inference_steps=COSMOS3_EDGE_FP8_SMOKE_STEPS,
+        guidance_scale=5.0,
+        frame_rate=COSMOS3_EDGE_LPIPS_FRAME_RATE,
+    )
+    assert result is not None and result.video is not None, "Edge-FP8 I2V produced no video"
+    _assert_finite_media(result.video, (COSMOS3_EDGE_FP8_SMOKE_FRAMES, 480, 832, 3))
