@@ -1990,6 +1990,7 @@ class Sender(SenderBase):
                 and info.unique_rid in self._pre_cancelled_rids
             )
             refused = False
+            retired = False
             if session is None and not fenced:
                 # A retried generation request carries a fresh unique_rid, so the
                 # context-side id names the retired session as well.

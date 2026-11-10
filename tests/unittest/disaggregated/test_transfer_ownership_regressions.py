@@ -2264,6 +2264,7 @@ def test_stale_context_first_request_data_is_answered_when_swept(
         slice_id=0,
         context_first=context_first,
     )
+    info.kv_result_report_token = _KV_RESULT_REPORT_TOKEN
     sender._peer_requests = {rid: {info.instance_rank: info}}
     sender._peer_requests_timestamps = {rid: clock["t"]}
 
@@ -2274,7 +2275,9 @@ def test_stale_context_first_request_data_is_answered_when_swept(
     while not sender._send_task_queues[0].empty():
         queued.append(sender._send_task_queues[0].get_nowait())
     if answered:
-        make_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
+        make_result.assert_called_once_with(
+            5, rid, 0, True, AgentResult.FAILED, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+        )
         assert queued == [("gen", [MessageType.KV_AGENT_RESULT, b"failed"])]
     else:
         make_result.assert_not_called()
