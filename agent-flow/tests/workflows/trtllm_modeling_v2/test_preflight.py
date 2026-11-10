@@ -331,3 +331,22 @@ def test_a_memory_limited_host_is_told_to_bound_the_kv_host_tier(
     assert bool(said) is warned
     if warned:
         assert "690 GiB" in said[0] and "64 GiB" in said[0] and "host_cache_size" in said[0]
+
+
+def test_the_memory_limit_is_read_from_the_process_own_cgroup(tmp_path):
+    root = tmp_path / "cgroup"
+    step = root / "system.slice" / "slurmstepd.scope" / "job_7" / "step_0"
+    step.mkdir(parents=True)
+    (root / "system.slice" / "memory.max").write_text("max\n")
+    (step / "memory.max").write_text(str(280 << 30) + "\n")
+    (step.parent / "memory.max").write_text(str(900 << 30) + "\n")
+    v2 = "0::/system.slice/slurmstepd.scope/job_7/step_0\n"
+    assert preflight.cgroup_memory_limit(v2, root) == 280 << 30
+    # v1: the memory controller's own hierarchy; a huge number means no limit.
+    mem = root / "memory" / "slurm" / "uid_1" / "job_7"
+    mem.mkdir(parents=True)
+    (mem / "memory.limit_in_bytes").write_text(str(64 << 30))
+    (root / "memory" / "memory.limit_in_bytes").write_text("9223372036854771712")
+    v1 = "12:cpuset:/slurm/uid_1/job_7\n9:memory:/slurm/uid_1/job_7\n"
+    assert preflight.cgroup_memory_limit(v1, root) == 64 << 30
+    assert preflight.cgroup_memory_limit("0::/\n", tmp_path / "none") is None

@@ -638,28 +638,65 @@ def check_capture_lists(task_data: Mapping[str, Any]) -> list[str]:
 
 
 #: Where a process's memory limit is, under cgroup v2 and v1.
-CGROUP_MEMORY_LIMITS = (
-    Path("/sys/fs/cgroup/memory.max"),
-    Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
-)
+#: Where the cgroup hierarchies are mounted, and each version's limit file.
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+_V2_LIMIT, _V1_LIMIT = "memory.max", "memory.limit_in_bytes"
+
+
+def _limit_at(path: Path) -> int | None:
+    """The memory limit a cgroup file states, in bytes; ``None`` for none or unreadable."""
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    # v2 writes "max", v1 a page-aligned huge number, for no limit.
+    return int(text) if text.isdigit() and int(text) < 1 << 60 else None
+
+
+def cgroup_memory_limit(proc_cgroup: str | None = None, root: Path = CGROUP_ROOT) -> int | None:
+    """The tightest memory limit on this process's own cgroup and its ancestors, in bytes.
+
+    Reads the process's cgroup paths from ``/proc/self/cgroup`` (v2 ``0::<path>``, v1
+    ``<n>:<controllers with memory>:<path>``) and walks each up to the root of its mount: a
+    container or a Slurm step sets the limit on a cgroup of its own, not on the mount's root.
+    """
+    if proc_cgroup is None:
+        try:
+            proc_cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+        except OSError:
+            proc_cgroup = ""
+    candidates: list[Path] = []
+    for line in proc_cgroup.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, controllers, rel = parts
+        rel = rel.strip().lstrip("/")
+        if controllers == "":
+            base, name = root, _V2_LIMIT
+        elif "memory" in controllers.split(","):
+            base, name = root / "memory", _V1_LIMIT
+        else:
+            continue
+        here = base / rel if rel else base
+        while True:
+            candidates.append(here / name)
+            if here == base:
+                break
+            here = here.parent
+    # A cgroup namespace shows its own cgroup at the mount's root.
+    candidates += [root / _V2_LIMIT, root / "memory" / _V1_LIMIT]
+    limits = [limit for limit in map(_limit_at, candidates) if limit is not None]
+    return min(limits) if limits else None
 
 
 def memory_limit_and_free() -> tuple[int | None, int | None]:
     """This process's cgroup memory limit and the node's free memory, in bytes; ``None`` if unknown."""
-    limit = None
-    for path in CGROUP_MEMORY_LIMITS:
-        try:
-            text = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        if text.isdigit() and int(text) < 1 << 60:  # v1 writes a huge number for "none"
-            limit = int(text)
-        break
     try:
         free = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
     except (ValueError, OSError):
         free = None
-    return limit, free
+    return cgroup_memory_limit(), free
 
 
 def check_kv_cache_configs(
