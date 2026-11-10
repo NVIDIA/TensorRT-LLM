@@ -242,9 +242,10 @@ REASK_PROTOCOLS = ("anthropic-messages", "chat-completions")
 OVERLENGTH_WORDS = ("context_length_exceeded", "prompt is too long", "context length",
                     "maximum context", "too many tokens", "prompt_too_long", "too long")  # fmt: skip
 COUNT_TOKENS = "/v1/messages/count_tokens"
-# The engine request id inside a reply id: Chat's chatcmpl-<id>, Completions' cmpl-<id>, an
-# Anthropic message named msg_<id>_<hex>, and a Responses reply named resp_<id>_<hex> (a
-# disaggregated server names it after its disagg_request_id; the usual resp_<hex> names none).
+# The request id inside a reply id: Chat's chatcmpl-<id>, Completions' cmpl-<id>, an Anthropic
+# message named msg_<id>_<hex>, and a Responses reply named resp_<id>_<hex> (raw_keys reads each).
+# A random resp_<hex> names none, nor does a request_id the client set, which the reply carries
+# unchanged.
 ENGINE_ID = re.compile(
     r'"id"\s*:\s*"(?:(?:chatcmpl|cmpl)-(\d+)|msg_(\d+)_[0-9a-f]+|resp_(\d+)_[0-9a-f]+)"'
 )
@@ -355,6 +356,36 @@ def delivered_as_answer(reply) -> bool:
     terminal event is not one: the client drops what it received.
     """
     return reply.terminal.get("kind") in ("completed", "incomplete")
+
+
+def raw_keys(rec: dict) -> list:
+    """The ids a reply joins its raw record by, in the order join_raw tries them.
+
+    ``rec`` is the reply's response record. A ``d:`` key is the orchestrator's
+    ``disagg_request_id``, an ``r:`` key an engine request id (a raw record's ``request_id``):
+    - the ``disagg_request_id`` the trace recorded;
+    - the number in a Responses reply's id ``resp_<id>_<hex>``. trtllm-serve names the reply after
+      the executor's request id, a disaggregated server after its latest ``disagg_request_id``.
+      The number is read as a ``disagg_request_id`` first: that is unique across the instance,
+      where an engine id names a record on each generation worker. A single server's raw records
+      carry no ``disagg_request_id``, so there the engine id joins;
+    - the number in a Chat or Messages reply's id (``chatcmpl-<id>``, ``msg_<id>_<hex>``): the
+      generation worker's engine id. A server that names replies after the orchestrator's
+      ``disagg_request_id`` instead is read last, so that reading changes no join an engine id
+      makes.
+    A reply id of another shape names no record (ENGINE_ID).
+    """
+    keys = []
+    if rec.get("disagg_request_id") not in (None, ""):
+        keys.append("d:" + str(rec["disagg_request_id"]))
+    body = (rec.get("response") or {}).get("body")
+    match = ENGINE_ID.search(body if isinstance(body, str) else json.dumps(body or {})[:400])
+    if match and match.group(3):
+        keys += ["d:" + match.group(3), "r:" + match.group(3)]
+    elif match:
+        number = match.group(1) or match.group(2)
+        keys += ["r:" + number, "d:" + number]
+    return keys
 
 
 def join_raw(index: dict, keys: list, window, reported: Optional[int]) -> tuple:
@@ -933,28 +964,7 @@ class Pipeline:
         if self.native is None:
             self.counts["C-13:no_native_reader"] += 1
             return None
-        # The keys a reply joins by, in this order (join_raw): the disagg_request_id the trace
-        # recorded, the one a Responses name carries, then engine ids, which repeat across
-        # generation workers where a disagg_request_id does not.
-        keys = []
-        if rec.get("disagg_request_id") not in (None, ""):
-            keys.append("d:" + str(rec["disagg_request_id"]))
-        body = (rec.get("response") or {}).get("body")
-        match = ENGINE_ID.search(body if isinstance(body, str) else json.dumps(body or {})[:400])
-        if match and match.group(3):
-            # A Responses reply named resp_<id>_<hex> was named by a disaggregated server after its
-            # disagg_request_id; no server names one after an engine id, so the number is read
-            # only so: as an engine id it could join another request's record by coincidence.
-            keys.append("d:" + match.group(3))
-        # The engine id the reply's header named (record_requests.py ENGINE_ID_HEADER).
-        if rec.get("engine_request_id") not in (None, ""):
-            keys.append("r:" + str(rec["engine_request_id"]))
-        if match and not match.group(3):
-            # The id in a Chat or Messages reply's name is the generation worker's engine id. A
-            # server that names replies after the orchestrator's disagg_request_id instead is
-            # read last, so that reading changes no join an engine id makes.
-            number = match.group(1) or match.group(2)
-            keys += ["r:" + number, "d:" + number]
+        keys = raw_keys(rec)
         completed = reply.terminal.get("kind") == "completed"
         reported = usage_mod.output_tokens(request.protocol, reply.usage) if completed else None
         # A request for several choices has one raw record per choice under one engine id, and

@@ -1567,19 +1567,20 @@ def responses_reasoning_echo_cases(work):
                 fields = {e.get("field") for e in json.load(fh)["examples"].get("C-03", [])}
             ok = ok and "reasoning" in fields
         results.append({"case": case, "ok": ok})
-    # X-90: a Responses reply names its engine request only in a header (its id is a random resp_
-    # id); recorded as engine_request_id, it joins the reply to its raw record, and C-13 reads it.
-    # X-90b: without that field nothing joins, and C-13 is BLOCKED.
+    # X-90: trtllm-serve names a Responses reply resp_<engine id>_<hex>; the number joins the raw
+    # record with that request_id, and C-13 reads it. X-90b: the same reply under a random
+    # resp_<hex> id, which names no request: the record is there, nothing joins, C-13 is BLOCKED.
     eos = "<\uff5cend\u2581of\u2581sentence\uff5c>"
-    for case, engine_id, status in (("X-90", "7", "PASS"), ("X-90b", None, "BLOCKED")):
+    for case, name, status in (
+        ("X-90", "resp_7_00ff00ff00ff00ff", "PASS"),
+        ("X-90b", "resp_0123456789abcdef0123456789abcdef", "BLOCKED"),
+    ):
         directory = os.path.join(work, case.lower())
         items = [{"id": "rs_9", "type": "reasoning", "summary": [], "status": "completed",
                   "content": [{"type": "reasoning_text", "text": "Plan."}]},
                  {"id": "msg_9", "type": "message", "role": "assistant", "status": "completed",
                   "content": [{"type": "output_text", "text": "Done.", "annotations": []}]}]  # fmt: skip
-        reply = _sse_response("r1", sse(items))
-        if engine_id is not None:
-            reply["engine_request_id"] = engine_id
+        reply = _sse_response("r1", sse(items).replace('"id": "r"', f'"id": "{name}"'))
         req = request("r1", [user], "2026-01-01T00:00:01Z")
         req["body"]["reasoning"] = {"summary": "auto"}
         _write_trace(directory, [(req, reply)])
@@ -1590,10 +1591,10 @@ def responses_reasoning_echo_cases(work):
         c13 = next(r for r in v["checks"] if r["id"] == "C-13")
         results.append({"case": case, "ok": c13["status"] == status
                         and (status != "PASS" or c13["denominator"] == 1)})  # fmt: skip
-    # X-90c: a disaggregated server names a Responses reply resp_<disagg_request_id>_<hex> (its
-    # proxy drops the workers' headers); the name joins the record that carries that
-    # disagg_request_id, not the one whose engine id it is not. X-90d: the usual resp_<hex> name
-    # carries no id, and nothing joins.
+    # X-90c: a disaggregated server names a Responses reply resp_<disagg_request_id>_<hex>; the
+    # number is read as a disagg_request_id before it is read as an engine id, so the name joins
+    # the record that carries that disagg_request_id, not the one whose engine id is the same
+    # number. X-90d: a random resp_<hex> name carries no id, and nothing joins.
     for case, name, status in (
         ("X-90c", "resp_9001_00ff00ff00ff00ff", "PASS"),
         ("X-90d", "resp_0123456789abcdef0123456789abcdef", "BLOCKED"),
@@ -2212,15 +2213,18 @@ def pi_profile_cases(work):
 CODEX_HOSTED = os.path.join(SKILL, "profiles", "harness", "codex-hosted.yaml")
 
 
-def _responses_stream(items, input_tokens=3, output_tokens=2):
-    """A Responses stream that delivers ``items`` and completes, billing the given tokens."""
-    opened = {"response": {"id": "r", "model": "x", "status": "in_progress", "output": []}}
+def _responses_stream(items, input_tokens=3, output_tokens=2, reply_id="r"):
+    """A Responses stream that delivers ``items`` and completes, billing the given tokens.
+
+    ``reply_id`` is the response's id, e.g. ``resp_<engine id>_<hex>`` as trtllm-serve names it.
+    """
+    opened = {"response": {"id": reply_id, "model": "x", "status": "in_progress", "output": []}}
     frames = [("response.created", opened), ("response.in_progress", opened)]
     for index, item in enumerate(items):
         frames += [("response.output_item.added", {"output_index": index, "item": item}),
                    ("response.output_item.done", {"output_index": index, "item": item})]  # fmt: skip
     frames.append(("response.completed", {"response": {
-        "id": "r", "model": "x", "status": "completed", "output": items,
+        "id": reply_id, "model": "x", "status": "completed", "output": items,
         "usage": {"input_tokens": input_tokens, "input_tokens_details": {"cached_tokens": 0},
                   "output_tokens": output_tokens, "output_tokens_details": {"reasoning_tokens": 0},
                   "total_tokens": input_tokens + output_tokens}}}))  # fmt: skip
@@ -2334,8 +2338,8 @@ def glm_codex_full_tier_cases(work):
                      "content": [{"type": "reasoning_text", "text": "Plan."}]}  # fmt: skip
         planned = {"id": "fc_9", "type": "function_call", "name": "update_plan", "call_id": "c9",
                    "arguments": json.dumps({"status": delivered}), "status": "completed"}  # fmt: skip
-        reply = dict(_sse_response("t1", _responses_stream([reasoning, planned])),
-                     engine_request_id="7")  # fmt: skip
+        stream = _responses_stream([reasoning, planned], reply_id="resp_7_00ff00ff00ff00ff")
+        reply = _sse_response("t1", stream)
         raw = {"request_id": "7", "text": "Plan.</think><tool_call>update_plan<arg_key>status"
                                           f"</arg_key>{written}</tool_call>"}  # fmt: skip
         v, checks, counts = judged(case, [(_codex_request("t1", [user], "2026-01-01T00:00:01Z",
@@ -2378,7 +2382,8 @@ def glm_codex_full_tier_cases(work):
     # the hook wrote no raw record for its aborted generation; the third is an HTTP error.
     reasoning = {"id": "rs_1", "type": "reasoning", "summary": [], "status": "completed",
                  "content": [{"type": "reasoning_text", "text": "Plan."}]}  # fmt: skip
-    opened = {"response": {"id": "r", "model": "x", "status": "in_progress", "output": []}}
+    opened = {"response": {"id": "resp_8_00ff00ff00ff00ff", "model": "x", "status": "in_progress",
+                           "output": []}}  # fmt: skip
     cut = "".join(f"event: {n}\ndata: {json.dumps(dict(opened, type=n, sequence_number=i))}\n\n"
                   for i, n in enumerate(("response.created", "response.in_progress")))  # fmt: skip
     unavailable = {"event": "response", "trace_id": "e1", "status": "completed", "http_status": 503,
@@ -2386,9 +2391,10 @@ def glm_codex_full_tier_cases(work):
                        "message": "Service unavailable", "type": "server_error", "code": None}}}}  # fmt: skip
     _, checks, _ = judged("X-118", [
         (_codex_request("t1", [user], "2026-01-01T00:00:01Z", [run]),
-         dict(_sse_response("t1", _responses_stream([reasoning, call])), engine_request_id="7")),
+         _sse_response("t1", _responses_stream([reasoning, call],
+                                               reply_id="resp_7_00ff00ff00ff00ff"))),
         (_codex_request("t2", [user, sent_back, output], "2026-01-01T00:00:02Z", [run]),
-         dict(_sse_response("t2", cut, status="client_disconnected"), engine_request_id="8")),
+         _sse_response("t2", cut, status="client_disconnected")),
         (_codex_request("e1", [user], "2026-01-01T00:00:03Z", [run], session="s2"), unavailable),
     ], raw=[{"request_id": "7", "text": "Plan.</think><tool_call>exec_command<arg_key>cmd</arg_key>"
                                         "<arg_value>ls</arg_value></tool_call>"}])  # fmt: skip
@@ -2507,8 +2513,9 @@ def k3_codex_full_tier_cases(work):
 
     X-122 to X-122c: Kimi-K3's usage leaves the 3-token generation opener out on the Chat route
     (and Messages, which runs through it) only; USG-07 reads the offset the model profile
-    declares for the reply's protocol. X-90e/X-90f: the number in a Responses reply named
-    ``resp_<n>_<hex>`` is its disagg_request_id, read before any engine id and never as one.
+    declares for the reply's protocol. X-90e/X-90f: a Responses reply names a request only by an
+    id of the form ``resp_<n>_<hex>``; a number there that names no disagg_request_id is read as an
+    engine id.
     """
     results = []
     codex = write_profile(os.path.join(work, "x122-responses.yaml"), CONTROL_PROFILES["responses"])
@@ -2543,9 +2550,10 @@ def k3_codex_full_tier_cases(work):
         c14 = next(r for r in v["checks"] if r["id"] == "C-14")
         results.append({"case": case, "ok": ("USG-07" in v["tripped"]) == trips
                         and c14["usage_vs_trace_prompt"] == 1})  # fmt: skip
-    # X-90e: a reply named resp_9001_<hex> whose header names engine id 5, and engine id 5 names
-    # one record, another request's: the record with disagg_request_id 9001 joins. X-90f: no
-    # record carries disagg_request_id 9001, and one record's engine id is 9001: nothing joins.
+    # X-90e: a reply named 7, a request_id the client set, which the reply carries unchanged: no
+    # server named it, so it names no request, and the record with engine id 7 is not joined.
+    # X-90f: a reply named resp_9001_<hex>; no record carries disagg_request_id 9001, and the
+    # record whose engine id is 9001 is this reply's: it joins.
     eos = "<\uff5cend\u2581of\u2581sentence\uff5c>"
     exact = write_profile(os.path.join(work, "x90e.yaml"), dict(
         CONTROL_PROFILES["responses"], echo={"text": "exact", "reasoning": "exact"}))  # fmt: skip
@@ -2554,18 +2562,12 @@ def k3_codex_full_tier_cases(work):
     message = {"id": "msg_9", "type": "message", "role": "assistant", "status": "completed",
                "content": [{"type": "output_text", "text": "Done.", "annotations": []}]}  # fmt: skip
     mine = "Plan.</think>Done." + eos
-    other = "Other.</think>Text." + eos
-    for case, header, records, status in (
-        ("X-90e", "5", [{"request_id": "5", "text": other},
-                        {"request_id": "77", "disagg_request_id": "9001", "text": mine}], "PASS"),
-        ("X-90f", None, [{"request_id": "9001", "text": other}], "BLOCKED"),
+    for case, name, records, status in (
+        ("X-90e", "7", [{"request_id": "7", "text": mine}], "BLOCKED"),
+        ("X-90f", "resp_9001_00ff00ff00ff00ff", [{"request_id": "9001", "text": mine}], "PASS"),
     ):  # fmt: skip
         directory = os.path.join(work, case.lower())
-        named = _responses_stream([reasoning, message]).replace(
-            '"id": "r"', '"id": "resp_9001_00ff00ff00ff00ff"')  # fmt: skip
-        reply = _sse_response("r1", named)
-        if header is not None:
-            reply["engine_request_id"] = header
+        reply = _sse_response("r1", _responses_stream([reasoning, message], reply_id=name))
         request = _codex_request("r1", [user], "2026-01-01T00:00:01Z", [])
         _write_trace(directory, [(request, reply)])
         with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:

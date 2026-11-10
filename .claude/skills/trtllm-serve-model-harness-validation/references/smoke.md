@@ -486,7 +486,7 @@ one is in main, drop its item:
 | Item | PR | What it adds | Without it |
 |---|---|---|---|
 | `raw-hook` | #21605 | The raw-output hook (section 3c): per output, the text, the streamed frames and the generated token ids | No raw view: C-13 cannot be judged, and M-02 cannot see a degenerate token the model profile names only by id |
-| `responses-ids` | #21602 | `/v1/responses` replies carry their engine request id in `x-trtllm-engine-request-id`, which the recorder stores; disaggregated ones are named `resp_<disagg_request_id>_<hex>`, which the validator reads first | A Responses reply joins no raw record: its id is a random `resp_` id, and generation workers number their requests independently |
+| `responses-ids` | #21602 | `/v1/responses` replies are named after their request, `resp_<id>_<hex>`: on `trtllm-serve` the engine request id (the raw records' `request_id`), on `trtllm-serve disaggregated` the latest `disagg_request_id`. The validator reads the number from the reply's id, as it reads a Messages id | A Responses reply joins no raw record: its id is a random `resp_<hex>` that names no request |
 | `messages-ids` | #20936 | Messages replies and non-streamed Chat Completions replies are named after their engine request | Those replies join no raw record. A streamed Chat Completions reply is already named `chatcmpl-<engine id>` on main |
 
 Add only what the cell serves: `messages-ids` for a Messages or non-streamed Chat harness,

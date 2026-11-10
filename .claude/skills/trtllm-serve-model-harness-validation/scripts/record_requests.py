@@ -81,10 +81,6 @@ import aiohttp
 from aiohttp import web
 
 SECRET_HEADER = re.compile(r"(authorization|cookie|key|token|secret|password)", re.I)
-# A reply header naming the engine request that produced it, which the raw-output records carry
-# too: recorded as engine_request_id, so a reply whose body has no engine id (a Responses id is a
-# random resp_ id) can still be joined to what the model wrote.
-ENGINE_ID_HEADER = "x-trtllm-engine-request-id"
 HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -185,7 +181,6 @@ async def handle(request):
     app["req_out"].write(json.dumps(record_in, ensure_ascii=False) + "\n")
     app["req_out"].flush()
     recorded = []
-    meta = {}  # from the upstream reply's headers, once it arrives
 
     def record(status, http_status, kind, payload, timing=None):
         recorded.append(status)
@@ -199,7 +194,6 @@ async def handle(request):
                     "http_status": http_status,
                     "response": {"kind": kind, "body": payload},
                     "timing": dict(timing or {}, total_s=round(time.monotonic() - start, 4)),
-                    **meta,
                     **({"build_id": app["build_id"]} if app["build_id"] else {}),
                 },
                 ensure_ascii=False,
@@ -228,8 +222,6 @@ async def handle(request):
     url = upstream.rstrip("/") + request.path_qs
     try:
         async with app["client"].request(request.method, url, data=raw, headers=headers) as up:
-            if up.headers.get(ENGINE_ID_HEADER):
-                meta["engine_request_id"] = up.headers[ENGINE_ID_HEADER]
             ctype = up.headers.get("content-type", "")
             timing = {"headers_s": round(time.monotonic() - start, 4)}
             if "text/event-stream" in ctype:

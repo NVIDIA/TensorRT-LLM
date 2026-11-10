@@ -146,13 +146,13 @@ them.
   - `tests/fixtures/native_goldens.json` holds renders made by those encoders
     (`scripts/validate/native_goldens.py`). Every one must read back exactly, and the DSML
     reader must agree with DeepSeek's own completion parser.
-  - A raw record joins its reply by `disagg_request_id` (as the trace recorded it, or in a
-    disaggregated server's Responses id `resp_<id>_<hex>`), or else by an engine id: the one the
-    reply header names, or the one inside a Chat `chatcmpl-<id>` or an Anthropic `msg_<id>_<hex>`
-    from a server that names its messages after the engine request (`validate.md`, C-13, has the
-    order). An engine id that names several raw records (one per
-    generation worker) joins the one that ran inside the reply's window with the reply's output
-    count, or none (`validate.md`, C-13). A `disagg_request_id` that names two joins nothing.
+  - A raw record joins its reply by the ids the reply carries: the `disagg_request_id` the trace
+    recorded, and the number in the reply's id, read as an engine id or a `disagg_request_id`. A
+    Responses `resp_<id>_<hex>`, a Chat `chatcmpl-<id>` and an Anthropic `msg_<id>_<hex>` carry
+    one, from a server that names its replies after the request (`validate.md`, C-13, has the
+    order). An engine id that names several raw records (one per generation worker) joins the one
+    that ran inside the reply's window with the reply's output count, or none (`validate.md`,
+    C-13). A `disagg_request_id` that names two joins nothing.
   - A reading with anomalies (the model broke its own format) is the model's: it is flagged as
     M-07, and C-13 does not compare that reply (`not_judged`, outside its denominator). A slip
     that serving repairs and the model profile declares (`native.repairs`) is read the way

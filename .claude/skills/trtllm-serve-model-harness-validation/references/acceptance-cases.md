@@ -301,12 +301,12 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-87 a carrier dropped | Same item id, no `encrypted_content` | C-03 FAIL (field `reasoning`) |
 | X-88 reasoning echo not declared | `echo.reasoning: TODO` | C-03 BLOCKED, `reasoning_echo_unchecked` 1 |
 | X-89 a reasoning item left out | The next request has the call but not the reasoning item | C-03 PASS, `reasoning_echo_missing` 1 |
-| X-90 a Responses reply joined by its header | `engine_request_id` recorded from `x-trtllm-engine-request-id`, a raw record with that `request_id` | C-13 PASS over 1 joined reply |
-| X-90b the same reply without it | No engine id anywhere in the reply | C-13 BLOCKED (nothing joined) |
-| X-90c a disaggregated Responses reply named `resp_<disagg_request_id>_<hex>` | One raw record with that `disagg_request_id`, another whose engine `request_id` is the same number | C-13 PASS over 1 reply, joined to the record with the `disagg_request_id` |
-| X-90d the usual `resp_<hex>` name | No id in the name, no header | C-13 BLOCKED (nothing joined) |
-| X-90e a disagg id in the name, an engine id in the header | The reply is `resp_9001_<hex>` and its header names engine id 5; engine id 5 names one record, another request's, and disagg id 9001 names this reply's | C-13 PASS over 1, joined to the record with the `disagg_request_id`: a disagg id comes before any engine id |
-| X-90f the name's number is never an engine id | `resp_9001_<hex>`, no header; no record carries disagg id 9001, and one record's engine id is 9001 | Nothing joins: C-13 BLOCKED, `unjoined` 1, no RAW-* |
+| X-90 a Responses reply joined by its id | The reply is `resp_7_<hex>`, as `trtllm-serve` names it after its engine request; a raw record with `request_id` 7 | C-13 PASS over 1 joined reply |
+| X-90b the same reply under a random id | The reply is `resp_<32 hex>`, which names no request; the same raw record | C-13 BLOCKED (nothing joined) |
+| X-90c a disaggregated Responses reply named `resp_<disagg_request_id>_<hex>` | One raw record with that `disagg_request_id`, another whose engine `request_id` is the same number | C-13 PASS over 1 reply, joined to the record with the `disagg_request_id`: the number is read as a disagg id before it is read as an engine id |
+| X-90d a random `resp_<hex>` name | No id in the name; the records of X-90c | C-13 BLOCKED (nothing joined) |
+| X-90e a reply id the client set | The reply is `7`, a `request_id` the client set, which the reply carries unchanged; a raw record with `request_id` 7 | Nothing joins: C-13 BLOCKED, `unjoined` 1, no RAW-* |
+| X-90f the name's number read as an engine id | `resp_9001_<hex>`; no record carries disagg id 9001, and the record whose engine id is 9001 is this reply's | C-13 PASS over 1, no RAW-* |
 | X-91 an argument the harness tolerates | `exec_command` with an undeclared argument; profile `tools.tolerated_payload: [additionalProperties]` | M-01:payload_invalid 0, `tolerated` 1 |
 | X-91b the same without the tolerance | Same call, profile without it | M-01:payload_invalid 1 |
 | X-91c tolerated only when every violation is | Undeclared argument and a wrong type | M-01:payload_invalid 1 |

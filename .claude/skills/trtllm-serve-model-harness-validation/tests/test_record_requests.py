@@ -70,38 +70,6 @@ def test_a_completed_stream_is_recorded(tmp_path):
     assert record["status"] == "completed"
     assert record["response"]["body"] == b"".join(CHUNKS).decode()
     assert "first_byte_s" in record["timing"]
-    assert "engine_request_id" not in record
-
-
-def test_the_engine_request_id_header_is_recorded(tmp_path):
-    """The engine id a reply's header names lands in its record: it joins the reply to its raw output."""
-
-    async def upstream(request):
-        resp = web.StreamResponse(
-            status=200,
-            headers={"content-type": "text/event-stream", record_requests.ENGINE_ID_HEADER: "4242"},
-        )
-        await resp.prepare(request)
-        await resp.write(CHUNKS[0])
-        await resp.write_eof()
-        return resp
-
-    async def run():
-        upstream_app = web.Application()
-        upstream_app.router.add_route("POST", "/v1/responses", upstream)
-        async with TestServer(upstream_app) as up:
-            recorder = record_requests.build_app(str(tmp_path), forward=str(up.make_url("")))
-            async with TestServer(recorder) as server:
-                async with aiohttp.ClientSession() as client:
-                    url = server.make_url("/v1/responses")
-                    async with client.post(url, json={"stream": True}) as reply:
-                        await reply.read()
-        with open(os.path.join(tmp_path, "responses-capture.jsonl")) as fh:
-            return [json.loads(line) for line in fh]
-
-    (record,) = asyncio.run(run())
-
-    assert record["engine_request_id"] == "4242"
 
 
 def test_each_request_reaches_the_upstream_on_a_new_connection(tmp_path):

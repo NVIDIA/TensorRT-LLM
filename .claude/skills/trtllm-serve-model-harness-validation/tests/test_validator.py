@@ -448,6 +448,36 @@ def test_stamps_of_each_writer_bound_the_reply_window():
     assert pipeline.reply_window(None, {"finished_at": arrived}) is None
 
 
+CREATED = ('event: response.created\ndata: {"type":"response.created","sequence_number":0,'
+           '"response":{"id":"resp_7_00ff00ff00ff00ff","object":"response","status":"in_progress"}}'
+           "\n\n")  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "body, keys",
+    [
+        # trtllm-serve names a Responses reply after its engine request, a disaggregated server
+        # after its disagg_request_id: the number is read as a disagg id first.
+        ({"id": "resp_7_00ff00ff00ff00ff", "object": "response"}, ["d:7", "r:7"]),
+        (CREATED, ["d:7", "r:7"]),
+        ({"id": "resp_1099511627777_00ff00ff00ff00ff", "object": "response"},
+         ["d:1099511627777", "r:1099511627777"]),
+        # A random resp_<hex>, and a request_id the client set, name no request.
+        ({"id": "resp_0123456789abcdef0123456789abcdef", "object": "response"}, []),
+        ({"id": "7", "object": "response"}, []),
+        # A Messages id is read as an engine id first.
+        ({"id": "msg_5_0123456789abcdef", "type": "message"}, ["r:5", "d:5"]),
+    ],
+    ids=["responses", "responses-streamed", "responses-disagg", "random-id", "client-set-id",
+         "messages"],
+)  # fmt: skip
+def test_a_reply_names_its_raw_record_by_the_number_in_its_id(body, keys):
+    """The ids C-13 joins a reply's raw record by: the trace's disagg id, then its id's number."""
+    response = {"kind": "sse_text" if isinstance(body, str) else "json", "body": body}
+    assert pipeline.raw_keys({"response": response}) == keys
+    assert pipeline.raw_keys({"disagg_request_id": 9001, "response": response}) == ["d:9001"] + keys
+
+
 def test_sdk_versions_are_pinned():
     pins = sdk_diff.pinned()
     assert pins["anthropic"] and pins["openai"]
