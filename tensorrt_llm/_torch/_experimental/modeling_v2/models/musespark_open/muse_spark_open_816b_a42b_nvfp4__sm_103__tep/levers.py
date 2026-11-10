@@ -505,10 +505,37 @@ def _ported(kind: Kind, params: Tuple[Param, ...] = ()) -> Rule:
     """A switch of the sm103 decode stack, ported from an environment variable: default off.
 
     Every one of them gates a decode step of at most a few hundred rows, so the serving region
-    is ``LL``; none is on under ``auto`` or ``baseline`` (``_knob_only``, and a non-upstream
+    is ``LL``; it is off under ``auto`` and ``baseline`` (``_knob_only``, and a non-upstream
     origin), so a deployment that sets no knob runs exactly the paths it ran before.
     """
     return Rule("LL", kind, _knob_only, params=params)
+
+
+def _tep8_decode(what: str) -> RuleFn:
+    """On for the decode steps of a tep8 server; off elsewhere, and on its knob only.
+
+    The levers that use it were written for the sm103 tep8 decode step and are bitwise the
+    path they replace, checked by running the model: each reproduced the served arm's decode
+    step structure exactly, which a lever that moved a single sampled token could not.
+    """
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if not d.decodes():
+            return False, _NO_DECODE
+        if d.tp != 8:
+            return False, f"tep{d.tp}: on only by its knob (the tep8 composition's path)"
+        return True, what
+
+    return rule
+
+
+def _ported_on(kind: Kind, what: str, params: Tuple[Param, ...] = ()) -> Rule:
+    """A ported switch this target now serves by default on a tep8 decode server.
+
+    ``baseline`` still turns it off (the origin is not ``upstream``), so a deployment can ask
+    for the pre-port paths with one knob.
+    """
+    return Rule("LL", kind, _tep8_decode(what), params=params)
 
 
 def _hot_replicas(requires_decode: bool) -> RuleFn:
@@ -723,10 +750,17 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "tep8_experts_interleaved_fetch": _ported_tep8(
             Kind.FLAGGED, "the expert kernel's interleaved weight fetch"
         ),
-        # New this round: default off, not covered by the TP8 default-on gate.
-        "drafter_conv_epilogue": _ported(Kind.BITWISE),
-        "drafter_finish_norm": _ported(Kind.BITWISE),
-        "drafter_silu_epilogue": _ported(Kind.BITWISE),
+        "drafter_conv_epilogue": _ported_on(
+            Kind.BITWISE, "9..32-row drafter blocks on a tep8 decode server"
+        ),
+        "drafter_finish_norm": _ported_on(
+            Kind.BITWISE, "drafter blocks the drafter hops do not take, tep8 decode"
+        ),
+        # +560 MiB per generation rank for the interleaved gate_up copy, which comes out of
+        # the KV cache at a fixed free_gpu_memory_fraction.
+        "drafter_silu_epilogue": _ported_on(
+            Kind.BITWISE, "9..32-row drafter blocks on a tep8 decode server"
+        ),
         # The o_proj half is bitwise: split_k 1 reproduces the built-in cuBLAS call, checked
         # on this target. The QKV half is not, at TEP8. It replaces the 9..32-row call with a
         # split_k 4 cell on the premise that the served call there is already that cell -- true
@@ -735,7 +769,9 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         # cuBLAS, so the summation order changes and the decoded text moves with it, which a
         # batch-4 run makes plain. Lossless-numeric, and it needs a gate before it is on.
         "tep8_attn_block_splitk": _ported(Kind.NUMERIC),
-        "swa_block_single_early_loads": _ported(Kind.BITWISE),
+        "swa_block_single_early_loads": _ported_on(
+            Kind.BITWISE, "the one-request sliding-window block on a tep8 decode server"
+        ),
         # The qkv / gate_up / coefficient cells keep their row's split_k and are bitwise the
         # table's row; the o_proj and down_proj cells reproduced cuBLAS's bits on every checked
         # shape, which cannot be proven against a closed library.
