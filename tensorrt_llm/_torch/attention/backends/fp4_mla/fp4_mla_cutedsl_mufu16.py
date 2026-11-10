@@ -612,7 +612,6 @@ SMEM_P4_CONTROL_MBAR_COUNT = (
     + NUM_QK_Q_PIPELINE_STAGE * 2
     + SMEM_P4_QK_BARRIER_STAGES * 2
     + SMEM_P4_V_PIPELINE_STAGES * 2
-    + SMEM_P4_TMEM_SCORE_PIPELINE_STAGES * 2
     + SMEM_P4_P4_CONTROL_MBAR_STAGES * 2
     + SMEM_P4_PAIR_OVERLAP_MBAR_COUNT
     + SMEM_P4_QK_SCORE_RING_SLOTS
@@ -923,8 +922,6 @@ TMEM_BAR_ID = 1
 # TMEM allocation is published to the producers and the PV issue warp.
 TMEM_BAR_THREADS = 32 * (2 + SMEM_P4_TOTAL_PRODUCER_WARPS)
 O_STORE_BAR_ID = 2
-SMEM_P4_P4_SLOT0_BAR_ID = 6
-SMEM_P4_P4_SLOT1_BAR_ID = 7
 SMEM_P4_QK1_SPLIT_ARM_BAR_ID = 8
 SMEM_P4_QK1_SPLIT_ARM_BAR_THREADS = 32 * 2
 SMEM_P4_QSF_OWNER_BAR_ID = 9
@@ -3570,28 +3567,6 @@ def _arrive_smem_p4_mapped_leader_mbar(leader_mbar) -> None:
 
 
 @cute.jit
-def _store_smem_p4_n256_rowsum_part(
-    sRowSumParts,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-    bank_idx: ctm.Int32,
-    score_half_idx: ctm.Int32,
-    value: ctm.Float32,
-) -> None:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    row_band = local_warp_idx & ctm.Int32(1)
-    col_band = local_warp_idx >> ctm.Int32(1)
-    local_row = row_band * ctm.Int32(32) + lane_idx
-    slot_idx = bank_idx * ctm.Int32(SMEM_P4_SCORE_SLOTS_PER_KV_TILE) + score_half_idx
-    row_state_offset = slot_idx * ctm.Int32(
-        SMEM_P4_SCORE_SLOT_ROW_STATE_STRIDE
-    ) + col_band * ctm.Int32(SMEM_P4_BMM1_M)
-    sRowSumParts[row_state_offset + local_row] = value
-
-
-@cute.jit
 def _smem_p4_qk_score_group_col(
     score_slot_idx: ctm.Constexpr, col_band: ctm.Int32, local_group_idx: ctm.Constexpr
 ) -> ctm.Int32:
@@ -5190,369 +5165,6 @@ def _runtime_t336_prepare_p_source(
 
 
 @cute.jit
-def _runtime_t336_producer_tile(
-    sAtomicRunningRowMax,
-    sP,
-    sPSF,
-    sScoreSlotRowMax,
-    sRowScaleRing,
-    qk_full_mbar,
-    pair_overlap_sync_mbars,
-    leader_pair_overlap_sync_mbars,
-    leader_pair_overlap_sync_mbars_dsmem,
-    p4_smem_slot0_producer,
-    p4_smem_slot0_mbar_ptr,
-    tmem_score_slot0_consumer,
-    tmem_score_slot0_mbar_ptr,
-    pv_full_mbar,
-    corr_o_acc_tmem,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    p4_tmem_base_col_id: ctm.Int32,
-    p4_tmem_base_row_id: ctm.Int32,
-    valid_k_for_l: ctm.Int32,
-    softmax_scale_log2: ctm.Float32,
-    pv_psf_rescale: ctm.Float32,
-    running_row_max: ctm.Float32,
-    running_row_anchor: ctm.Float32,
-    carried_dq1024: ctm.Int32,
-    carried_old_scale: ctm.Float32,
-    stream_li_idx: ctm.Int32,
-    has_previous_tile: ctm.Constexpr,
-    tail_needs_mask: ctm.Boolean,
-    is_final_tile: ctm.Constexpr,
-    use_mixed_imlp: ctm.Constexpr,
-) -> tuple:
-    bank_idx = stream_li_idx % ctm.Int32(SMEM_P4_TMEM_BANKS)
-    qk_phase = (
-        stream_li_idx
-        // ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
-        % ctm.Int32(SMEM_P4_MBAR_PARITY_PHASES)
-    )
-    rowsum_full_mbar = pair_overlap_sync_mbars.subview(SMEM_P4_PAIR_P4_READY_MBAR_OFFSET + bank_idx)
-    pair_rowmax_read_done_mbar = pair_overlap_sync_mbars.subview(
-        SMEM_P4_PAIR_ROWMAX_READ_DONE_MBAR_OFFSET + bank_idx
-    )
-    direct_p_ready_mbar = pair_overlap_sync_mbars.subview(
-        SMEM_P4_PAIR_DIRECT_P_READY_MBAR_OFFSET + bank_idx
-    )
-    leader_pair_p_source_ready_mbar = leader_pair_overlap_sync_mbars.subview(
-        SMEM_P4_PAIR_P_SOURCE_READY_MBAR_OFFSET + bank_idx
-    )
-    leader_pair_p_source_ready_dsmem_mbar = leader_pair_overlap_sync_mbars_dsmem.subview(
-        SMEM_P4_PAIR_P_SOURCE_READY_MBAR_OFFSET + bank_idx
-    )
-    qk_score_chunk_col_offset = ctm.Int32(SMEM_P4_QK_ACC_COL_OFFSET) + bank_idx * ctm.Int32(
-        SMEM_P4_QK_PIPELINE_SLOT_STRIDE
-    )
-    p_stage_base = bank_idx * ctm.Int32(SMEM_P4_SCORE_SLOTS_PER_KV_TILE)
-    score_half_idx = warp_idx >> ctm.Int32(2)
-    producer_warp_base = score_half_idx << ctm.Int32(2)
-    producer_local_warp_idx = warp_idx & ctm.Int32(3)
-    producer_row_band = producer_local_warp_idx & ctm.Int32(1)
-    producer_col_band = producer_local_warp_idx >> ctm.Int32(1)
-    is_compute_warp = score_half_idx == ctm.Int32(0)
-    score_tmem_addresses = _prepare_p4_n256_score_half_tmem_addresses(
-        warp_idx, p4_tmem_base_col_id, p4_tmem_base_row_id, qk_score_chunk_col_offset
-    )
-    next_running_row_max = running_row_max
-    next_running_row_anchor = running_row_anchor
-    next_carried_dq1024 = carried_dq1024
-    next_carried_old_scale = carried_old_scale
-    if is_compute_warp:
-        tmem_score_slot0_consumer.wait()
-    if cutlass.const_expr(is_final_tile):
-        score_values, group_max_values, group_valid_values = (
-            _runtime_load_final_p4_n256_score_half_from_tmem(
-                sAtomicRunningRowMax,
-                qk_full_mbar.subview(bank_idx),
-                score_tmem_addresses,
-                producer_col_band,
-                warp_idx,
-                tidx,
-                kv_tile_idx=stream_li_idx,
-                valid_k=valid_k_for_l,
-                tail_needs_mask=tail_needs_mask,
-                qk_phase=qk_phase,
-                producer_warp_base=producer_warp_base,
-                score_half_idx=score_half_idx,
-            )
-        )
-    else:
-        score_values, group_max_values, group_valid_values = _load_p4_n256_score_half_from_tmem(
-            sAtomicRunningRowMax,
-            qk_full_mbar.subview(bank_idx),
-            score_tmem_addresses,
-            producer_col_band,
-            warp_idx,
-            tidx,
-            kv_tile_idx=stream_li_idx,
-            valid_k=valid_k_for_l,
-            mask_valid_k=False,
-            qk_phase=qk_phase,
-            wait_for_qk_full=True,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-        )
-    packed_p4_words = ctm.Vector.from_elements(
-        tuple((ctm.Int32(0) for _ in range(8))), dtype=ctm.Int32
-    )
-    group_p_sums = ctm.Vector.from_elements(
-        tuple((ctm.Float32(0.0) for _ in range(4))), dtype=ctm.Float32
-    )
-    if cutlass.const_expr(is_final_tile):
-        # ``tail_needs_mask`` is CTA-uniform.  Keep the NaN-safe validity path
-        # for a genuinely partial final tile, but do not execute its per-SF16
-        # predicates for a full final tile.  Both cases remain in one runtime-KV
-        # binary; no request-dependent valid_k value enters the JIT key.
-        if tail_needs_mask:
-            packed_p4_words, group_p_sums = _prepack_p4_n256_score_half_before_rowmax(
-                score_values,
-                group_max_values,
-                group_valid_values,
-                warp_idx,
-                softmax_scale_log2,
-                kv_tile_idx=stream_li_idx,
-                valid_k=valid_k_for_l,
-                producer_warp_base=producer_warp_base,
-                score_half_idx=score_half_idx,
-                mask_valid_k=True,
-                use_mixed_imlp=use_mixed_imlp,
-            )
-        else:
-            packed_p4_words, group_p_sums = _prepack_p4_n256_score_half_before_rowmax(
-                score_values,
-                group_max_values,
-                group_valid_values,
-                warp_idx,
-                softmax_scale_log2,
-                kv_tile_idx=stream_li_idx,
-                valid_k=valid_k_for_l,
-                producer_warp_base=producer_warp_base,
-                score_half_idx=score_half_idx,
-                mask_valid_k=False,
-                use_mixed_imlp=use_mixed_imlp,
-            )
-    else:
-        packed_p4_words, group_p_sums = _prepack_p4_n256_score_half_before_rowmax(
-            score_values,
-            group_max_values,
-            group_valid_values,
-            warp_idx,
-            softmax_scale_log2,
-            kv_tile_idx=stream_li_idx,
-            valid_k=valid_k_for_l,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-            mask_valid_k=False,
-            use_mixed_imlp=use_mixed_imlp,
-        )
-    if is_compute_warp:
-        p4_smem_slot0_producer.acquire()
-    prims.barrier(
-        barrier_id=SMEM_P4_DUAL_HALF_BAR_ID,
-        number_of_threads=SMEM_P4_DUAL_HALF_BAR_THREADS,
-    )
-    new_row_max = running_row_max
-    new_row_valid = ctm.Boolean(True)
-    if cutlass.const_expr(is_final_tile):
-        if tail_needs_mask:
-            new_row_max, new_row_valid = _load_p4_n256_atomic_running_rowmax_with_validity(
-                sAtomicRunningRowMax,
-                warp_idx,
-                tidx,
-                producer_warp_base=producer_warp_base,
-            )
-        else:
-            new_row_max = _load_p4_n256_atomic_running_rowmax(
-                sAtomicRunningRowMax,
-                warp_idx,
-                tidx,
-                producer_warp_base=producer_warp_base,
-            )
-    else:
-        new_row_max = _load_p4_n256_atomic_running_rowmax(
-            sAtomicRunningRowMax, warp_idx, tidx, producer_warp_base=producer_warp_base
-        )
-    if is_compute_warp:
-        if prims.elect_sync():
-            prims.mbarrier_arrive(pair_rowmax_read_done_mbar)
-    lane_rebase = ctm.Boolean(False)
-    anchor_delta_log2 = ctm.Float32(0.0)
-    if cutlass.const_expr(is_final_tile):
-        if tail_needs_mask:
-            next_running_row_anchor, lane_rebase, anchor_delta_log2 = (
-                _select_smem_p4_lazy_anchor_with_validity(
-                    new_row_max,
-                    new_row_valid,
-                    running_row_anchor,
-                    softmax_scale_log2,
-                )
-            )
-        else:
-            next_running_row_anchor, lane_rebase, anchor_delta_log2 = (
-                _select_smem_p4_lazy_anchor_runtime(
-                    new_row_max,
-                    running_row_anchor,
-                    softmax_scale_log2,
-                    has_previous_tile,
-                )
-            )
-    _store_prepacked_p4_n256_score_half_to_direct_a(
-        sP,
-        packed_p4_words,
-        warp_idx,
-        tidx,
-        producer_warp_base=producer_warp_base,
-        p_stage_base=p_stage_base,
-        score_half_idx=score_half_idx,
-    )
-    if prims.elect_sync():
-        prims.mbarrier_arrive(direct_p_ready_mbar)
-    if cutlass.const_expr(not is_final_tile):
-        next_running_row_anchor, lane_rebase, anchor_delta_log2 = (
-            _select_smem_p4_lazy_anchor_runtime(
-                new_row_max, running_row_anchor, softmax_scale_log2, has_previous_tile
-            )
-        )
-    current_old_scale = ctm.Float32(1.0)
-    warp_rebase = cute.arch.vote_any_sync(lane_rebase)
-    next_running_row_max = new_row_max
-    if cutlass.const_expr(is_final_tile):
-        owned_psf_word, prequant_row_sum = _runtime_finalize_final_p4_n256_score_half_psf_source(
-            sPSF,
-            group_max_values,
-            group_valid_values,
-            group_p_sums,
-            next_running_row_anchor,
-            warp_idx,
-            tidx,
-            softmax_scale_log2,
-            pv_psf_rescale,
-            tail_needs_mask=tail_needs_mask,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-            bank_idx=bank_idx,
-            use_mixed_imlp=use_mixed_imlp,
-        )
-    else:
-        owned_psf_word, prequant_row_sum = _finalize_p4_n256_score_half_psf_source(
-            sPSF,
-            group_max_values,
-            group_p_sums,
-            next_running_row_anchor,
-            warp_idx,
-            tidx,
-            softmax_scale_log2,
-            pv_psf_rescale,
-            kv_tile_idx=stream_li_idx,
-            valid_k=valid_k_for_l,
-            mask_valid_k=False,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-            bank_idx=bank_idx,
-            use_mixed_imlp=use_mixed_imlp,
-        )
-    if has_previous_tile:
-        common_source_ready_pred = prims.elect_sync() & ~warp_rebase
-        if common_source_ready_pred:
-            prims.mbarrier_arrive(
-                leader_pair_p_source_ready_dsmem_mbar,
-                count=1,
-                scope=prims.MemScope.CLUSTER,
-                relaxed=True,
-            )
-        if warp_rebase:
-            pv_done_li_idx = stream_li_idx - ctm.Int32(1)
-            pv_done_slot = pv_done_li_idx % ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
-            pv_done_phase = (
-                pv_done_li_idx
-                // ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
-                % ctm.Int32(SMEM_P4_MBAR_PARITY_PHASES)
-            )
-            while not prims.mbarrier_try_wait_parity(
-                pv_full_mbar.subview(pv_done_slot), pv_done_phase, time_limit=10000000
-            ):
-                pass
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            current_old_scale = _compute_smem_p4_lazy_rebase_scale(lane_rebase, anchor_delta_log2)
-            _rescale_smem_p4_resident_o_in_tmem(corr_o_acc_tmem, current_old_scale)
-            if prims.elect_sync():
-                _arrive_smem_p4_mapped_leader_mbar(leader_pair_p_source_ready_mbar)
-    elif prims.elect_sync():
-        _arrive_smem_p4_mapped_leader_mbar(leader_pair_p_source_ready_mbar)
-    if is_compute_warp:
-        if cutlass.const_expr(not is_final_tile):
-            while not prims.mbarrier_try_wait_parity(
-                direct_p_ready_mbar, qk_phase, time_limit=10000000
-            ):
-                pass
-            cute.arch.mbarrier_arrive(
-                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.current_handle().index,
-                cutlass.Int32(0),
-            )
-            p4_smem_slot0_producer.advance()
-            cute.arch.mbarrier_arrive(
-                tmem_score_slot0_mbar_ptr
-                + SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-                + tmem_score_slot0_consumer.current_handle().index,
-                cutlass.Int32(0),
-            )
-            tmem_score_slot0_consumer.advance()
-    if is_compute_warp:
-        prims.barrier(
-            barrier_id=SMEM_P4_P4_SLOT0_BAR_ID,
-            number_of_threads=SMEM_P4_SCORE_SLOT_PRODUCER_THREADS,
-        )
-    else:
-        prims.barrier(
-            barrier_id=SMEM_P4_P4_SLOT1_BAR_ID,
-            number_of_threads=SMEM_P4_CORRECTION_THREADS,
-        )
-    row_sum = prequant_row_sum
-    rowsum_empty_mbar = pair_overlap_sync_mbars.subview(
-        SMEM_P4_PAIR_HALF1_ROWSUM_READY_MBAR_OFFSET + bank_idx
-    )
-    if stream_li_idx >= ctm.Int32(SMEM_P4_TMEM_BANKS):
-        previous_rowsum_phase = (
-            (stream_li_idx - ctm.Int32(SMEM_P4_TMEM_BANKS))
-            // ctm.Int32(SMEM_P4_TMEM_BANKS)
-            % ctm.Int32(SMEM_P4_MBAR_PARITY_PHASES)
-        )
-        while not prims.mbarrier_try_wait_parity(
-            rowsum_empty_mbar, previous_rowsum_phase, time_limit=10000000
-        ):
-            pass
-    _store_smem_p4_n256_rowsum_part(
-        sScoreSlotRowMax,
-        warp_idx,
-        tidx,
-        producer_warp_base=producer_warp_base,
-        bank_idx=bank_idx,
-        score_half_idx=score_half_idx,
-        value=row_sum,
-    )
-    if is_compute_warp & (producer_col_band == ctm.Int32(0)):
-        row_state_local_row = producer_row_band * ctm.Int32(32) + (tidx & ctm.Int32(31))
-        sRowScaleRing[bank_idx * ctm.Int32(SMEM_P4_BMM1_M) + row_state_local_row] = (
-            current_old_scale
-        )
-    if prims.elect_sync():
-        prims.mbarrier_arrive(rowsum_full_mbar)
-    if not is_compute_warp:
-        while not prims.mbarrier_try_wait_parity(
-            pair_rowmax_read_done_mbar, qk_phase, time_limit=10000000
-        ):
-            pass
-    return (
-        next_running_row_max,
-        next_running_row_anchor,
-        next_carried_dq1024,
-        next_carried_old_scale,
-    )
-
-
-@cute.jit
 def _issue_pipelined_score_loads(
     qk_full_mbar: ctm.Array,
     stream_li_idx: ctm.Int32,
@@ -5709,9 +5321,10 @@ def _finalize_pipelined_tile(
 ) -> tuple:
     """Finish tile ``stream_li_idx`` from its prepacked P words.
 
-    Same steps as ``_runtime_t336_prepare_p_source`` from the dual-half barrier on followed by the
-    tail of ``_runtime_t336_producer_tile_v23``: row anchor, P and PSF stores, lazy O rescale and
-    the P_SOURCE_READY arrive.
+    Follows ``_runtime_t336_prepare_p_source`` from the dual-half barrier on and the tail of
+    ``_runtime_t336_producer_tile_v23`` (row anchor, P and PSF stores, lazy O rescale and the
+    P_SOURCE_READY arrive), except that it reads the parity-indexed ``sPipelinedRowMax``, never
+    masks K, and does not wait on ``pair_rowmax_read_done``.
     """
     bank_idx = stream_li_idx % ctm.Int32(SMEM_P4_TMEM_BANKS)
     p_stage_base = bank_idx * ctm.Int32(SMEM_P4_SCORE_SLOTS_PER_KV_TILE)
@@ -6481,7 +6094,7 @@ def _run_mla_decode_body(
         space=ctm.AddressSpace.smem,
         alignment=128,
     )
-    sScoreSlotRowMax = ctm.Array(
+    sRowSumParts = ctm.Array(
         ctm.Float32,
         SMEM_P4_STAGE_ROW_STATE_SMEM_FLOATS,
         space=ctm.AddressSpace.smem,
@@ -6580,18 +6193,6 @@ def _run_mla_decode_body(
             for pv_full_mbar_idx in ctm.range_constexpr(SMEM_P4_QK_PIPELINE_SLOTS):
                 prims.mbarrier_init(pv_full_mbar.subview(pv_full_mbar_idx), 1)
             for pair_slot_idx in ctm.range_constexpr(SMEM_P4_QK_PIPELINE_SLOTS):
-                prims.mbarrier_init(
-                    pair_overlap_sync_mbars.subview(
-                        SMEM_P4_PAIR_P4_READY_MBAR_OFFSET + pair_slot_idx
-                    ),
-                    SMEM_P4_TOTAL_PRODUCER_WARPS,
-                )
-                prims.mbarrier_init(
-                    pair_overlap_sync_mbars.subview(
-                        SMEM_P4_PAIR_HALF1_ROWSUM_READY_MBAR_OFFSET + pair_slot_idx
-                    ),
-                    1,
-                )
                 prims.mbarrier_init(
                     pair_overlap_sync_mbars.subview(
                         SMEM_P4_PAIR_FINAL_PV_ISSUED_MBAR_OFFSET + pair_slot_idx
@@ -7376,7 +6977,7 @@ def _run_mla_decode_body(
         part_local_warp_idx = warp_idx & ctm.Int32(3)
         part_idx = (warp_idx >> ctm.Int32(2)) * ctm.Int32(2) + (part_local_warp_idx >> ctm.Int32(1))
         part_row = (part_local_warp_idx & ctm.Int32(1)) * ctm.Int32(32) + (tidx & ctm.Int32(31))
-        sScoreSlotRowMax[part_idx * ctm.Int32(SMEM_P4_BMM1_M) + part_row] = running_part_sum
+        sRowSumParts[part_idx * ctm.Int32(SMEM_P4_BMM1_M) + part_row] = running_part_sum
         prims.barrier(
             barrier_id=SMEM_P4_DUAL_HALF_BAR_ID,
             number_of_threads=SMEM_P4_DUAL_HALF_BAR_THREADS,
@@ -7384,11 +6985,11 @@ def _run_mla_decode_body(
         if is_correction_warp:
             final_row_state_local_row = corr_row_band * ctm.Int32(32) + (tidx & ctm.Int32(31))
             final_anchor_row_sum = (
-                sScoreSlotRowMax[final_row_state_local_row]
-                + sScoreSlotRowMax[ctm.Int32(2 * SMEM_P4_BMM1_M) + final_row_state_local_row]
+                sRowSumParts[final_row_state_local_row]
+                + sRowSumParts[ctm.Int32(2 * SMEM_P4_BMM1_M) + final_row_state_local_row]
             ) + (
-                sScoreSlotRowMax[ctm.Int32(SMEM_P4_BMM1_M) + final_row_state_local_row]
-                + sScoreSlotRowMax[ctm.Int32(3 * SMEM_P4_BMM1_M) + final_row_state_local_row]
+                sRowSumParts[ctm.Int32(SMEM_P4_BMM1_M) + final_row_state_local_row]
+                + sRowSumParts[ctm.Int32(3 * SMEM_P4_BMM1_M) + final_row_state_local_row]
             )
             # Packed rows may be empty while their tile is not (Helix tokens
             # whose KV lives on another rank); judge emptiness per row.
