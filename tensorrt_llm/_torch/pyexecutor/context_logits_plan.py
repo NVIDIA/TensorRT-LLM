@@ -64,7 +64,8 @@ def context_logits_rows(request: LlmRequest, *, context_logits_handled: bool) ->
 
     Args:
         request: A context request of the step.
-        context_logits_handled: Whether the plan stored the step's context logits.
+        context_logits_handled: Whether the step's context logits were already
+            stored, by the plan or from every-token rows.
 
     Returns:
         The number of rows.
@@ -100,7 +101,7 @@ def store_context_logits_from_full_rows(
             f"logits have {logits.shape[0]} rows, fewer than the "
             f"{num_context_tokens} scheduled context tokens"
         )
-    keep: list[int] = []
+    kept: list[torch.Tensor] = []
     start = 0
     for request in context_requests:
         end = start + request.context_chunk_size
@@ -108,10 +109,12 @@ def store_context_logits_from_full_rows(
             # Copied into the request's own storage before returning: logits
             # may be a graph's static output that the next replay overwrites.
             store_context_logits(request, logits[start:end], reusable=True)
-        keep.append(end - 1)
+        kept.append(logits[end - 1 : end])
         start = end
-    keep.extend(range(start, logits.shape[0]))
-    return logits.index_select(0, torch.tensor(keep, device=logits.device))
+    kept.append(logits[start:])
+    # Slices rather than an index tensor, whose host-to-device copy would wait
+    # for the forward to finish.
+    return torch.cat(kept)
 
 
 def _normalized_host_row(row: torch.Tensor) -> torch.Tensor:

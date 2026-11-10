@@ -150,6 +150,15 @@ class PrefillCompiledModel(torch.nn.Module):
             return getattr(super().__getattr__("eager_model"), name)
 
 
+def _holds_token_rows(logits: Any) -> bool:
+    """Whether ``logits`` is a plain ``[tokens, vocab]`` tensor.
+
+    Models that do not generate text, such as process reward models, return
+    other shapes, which the sampler handles as they are.
+    """
+    return isinstance(logits, torch.Tensor) and not logits.is_nested and logits.dim() == 2
+
+
 def _full_context_rows_need_storing(scheduled_requests: ScheduledRequests) -> bool:
     """Whether every-token logits must be stored and dropped before post-processing.
 
@@ -889,7 +898,7 @@ class DecoderRunner(ScheduledModelRunner):
                 and self._mapping.is_last_pp_rank()
                 and not (self._config.is_spec_decode or enable_spec_decode)
                 and isinstance(outputs, dict)
-                and outputs.get("logits") is not None
+                and _holds_token_rows(outputs.get("logits"))
                 and not outputs.get("context_logits_handled", False)
                 and _full_context_rows_need_storing(semantic_requests)
             ):
