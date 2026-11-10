@@ -884,6 +884,9 @@ class DecoderRunner(ScheduledModelRunner):
 
             if (
                 gather_context_logits
+                # Earlier pipeline stages hold placeholder logits; the last
+                # stage's context logits reach them as a result diff.
+                and self._mapping.is_last_pp_rank()
                 and not (self._config.is_spec_decode or enable_spec_decode)
                 and isinstance(outputs, dict)
                 and outputs.get("logits") is not None

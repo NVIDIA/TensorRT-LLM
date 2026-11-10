@@ -65,6 +65,9 @@ def context_logits_rows(request: LlmRequest, *, context_logits_handled: bool) ->
     Args:
         request: A context request of the step.
         context_logits_handled: Whether the plan stored the step's context logits.
+
+    Returns:
+        The number of rows.
     """
     if request.py_return_context_logits and not context_logits_handled:
         return request.context_chunk_size
@@ -88,8 +91,8 @@ def store_context_logits_from_full_rows(
             first; rows after the context tokens are kept as they are.
 
     Returns:
-        ``[num_contexts + other_rows, vocab]``: the last row of each context
-        chunk, then the remaining rows.
+        A new ``[num_contexts + other_rows, vocab]`` tensor: the last row of
+        each context chunk, then the remaining rows.
     """
     num_context_tokens = sum(request.context_chunk_size for request in context_requests)
     if num_context_tokens > logits.shape[0]:
@@ -102,12 +105,12 @@ def store_context_logits_from_full_rows(
     for request in context_requests:
         end = start + request.context_chunk_size
         if request.py_return_context_logits:
-            store_context_logits(request, logits[start:end])
+            # Copied into the request's own storage before returning: logits
+            # may be a graph's static output that the next replay overwrites.
+            store_context_logits(request, logits[start:end], reusable=True)
         keep.append(end - 1)
         start = end
     keep.extend(range(start, logits.shape[0]))
-    # A copy, so later in-place edits of the sampling rows cannot reach the
-    # stored context logits, which may still be views of ``logits``.
     return logits.index_select(0, torch.tensor(keep, device=logits.device))
 
 

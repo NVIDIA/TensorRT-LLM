@@ -32,11 +32,17 @@ def test_tinyllama_logits_processor_tp2pp2():
 
 @pytest.mark.gpu2
 @pytest.mark.part0
+@pytest.mark.parametrize("return_context_logits", [False, True])
 @pytest.mark.parametrize("tp_size, pp_size", [(1, 2), (2, 1)])
-def test_tinyllama_logits_processor_2gpu(tp_size: int, pp_size: int):
-    tinyllama_logits_processor_test_harness(backend="pytorch",
-                                            tensor_parallel_size=tp_size,
-                                            pipeline_parallel_size=pp_size)
+def test_tinyllama_logits_processor_2gpu(tp_size: int, pp_size: int,
+                                         return_context_logits: bool):
+    # With context logits, only the last pipeline stage holds real logits; the
+    # earlier stages must not store their placeholder rows.
+    tinyllama_logits_processor_test_harness(
+        backend="pytorch",
+        tensor_parallel_size=tp_size,
+        pipeline_parallel_size=pp_size,
+        return_context_logits=return_context_logits)
 
 
 @skip_ray

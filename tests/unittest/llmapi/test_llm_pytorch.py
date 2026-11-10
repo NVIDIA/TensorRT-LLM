@@ -93,10 +93,12 @@ def test_logits_processor_leaves_context_logits_unchanged():
         ])
     assert processed.outputs[0].token_ids == [biased_word_id] * 3
     assert torch.isfinite(processed.context_logits).all()
+    # The two prompts sit at different rows of one batch, so allow the BF16
+    # head's rounding; an edited row would hold -inf.
     torch.testing.assert_close(processed.context_logits,
                                plain.context_logits,
-                               rtol=0,
-                               atol=1e-3)
+                               rtol=0.02,
+                               atol=0.1)
 
 
 @skip_ray
