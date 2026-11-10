@@ -57,6 +57,7 @@ from typing import Any
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.math as cmath
+import cutlass.experimental.primitives as prims
 from cutlass import Int32, Int64, Uint32
 from cutlass._mlir.dialects import arith as mlir_arith
 from cutlass._mlir.dialects import llvm, nvvm
@@ -8838,14 +8839,20 @@ def _crc_push_hist(hist, recv, mbar, rank, tid, blk: cutlass.Constexpr, cs: cutl
 
 @cute.jit
 def _crc_mbar_wait_cluster(mbar_addr, parity):
-    """Wait for the mbarrier phase of ``parity`` at ``mbar_addr`` with a cluster-scope acquire.
+    """Wait for the mbarrier phase of ``parity`` at ``mbar_addr`` and acquire the peers' stores.
 
     The peers' ``st.async`` stores complete the barrier with a release at cluster scope; the
     default (CTA-scope) wait does not synchronize with it, so the merge could read stale bins.
+    A relaxed cluster-scope wait followed by an acquire fence restricted to ``shared::cluster``
+    is the PTX ISA acquire pattern for this case; unlike an ``.acquire.cluster`` wait it does
+    not make ptxas invalidate L1 on every poll.
     """
-    done = _mbar_try_wait_cluster__regclus(mbar_addr, parity)
-    while done == Int32(0):
-        done = _mbar_try_wait_cluster__regclus(mbar_addr, parity)
+    mbar = cute.make_ptr(Int64, mbar_addr, cute.AddressSpace.smem, assumed_align=8)
+    while not prims.mbarrier_try_wait_parity(
+        mbar, parity, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @cute.jit

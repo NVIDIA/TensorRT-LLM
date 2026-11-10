@@ -30,6 +30,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
+    import cutlass.experimental.primitives as prims
     from cutlass._mlir.dialects import llvm
     from cutlass.cute.arch.nvvm_wrappers import FULL_MASK
     from cutlass.cute.runtime import from_dlpack
@@ -115,29 +116,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
 
-    @dsl_user_op
-    def mbarrier_try_wait_cluster(
-        mbar_ptr: cute.Pointer, phase: Int, *, loc=None, ip=None
-    ) -> Int32:
-        """Try-wait with a cluster-scope acquire; returns 1 once ``phase`` has completed.
+    @cute.jit
+    def mbarrier_wait_cluster_acquire(mbar_ptr: cute.Pointer, phase: Int):
+        """Wait for ``phase`` of the mbarrier and acquire the peer CTAs' shared-memory stores.
 
         ``store_shared_remote`` from a peer CTA completes the barrier with a release at
-        cluster scope, which the default (CTA-scope) wait does not synchronize with.
+        cluster scope, which the default (CTA-scope) wait does not synchronize with. A relaxed
+        cluster-scope wait followed by an acquire fence restricted to ``shared::cluster`` is
+        the PTX ISA acquire pattern for this case; unlike an ``.acquire.cluster`` wait it does
+        not make ptxas invalidate L1 on every poll.
         """
-        mbar_ptr_i32 = mbar_ptr.toint(loc=loc, ip=ip).ir_value()
-        return Int32(
-            llvm.inline_asm(
-                T.i32(),
-                [mbar_ptr_i32, Int32(phase).ir_value(loc=loc, ip=ip)],
-                "{\n\t.reg .pred p;\n\t"
-                "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], $2;\n\t"
-                "selp.u32 $0, 1, 0, p;\n}",
-                "=r,r,r,~{memory}",
-                has_side_effects=True,
-                is_align_stack=False,
-                asm_dialect=llvm.AsmDialect.AD_ATT,
-            )
-        )
+        while not prims.mbarrier_try_wait_parity(
+            mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+        ):
+            pass
+        prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
     @cute.jit
     def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
@@ -550,10 +543,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     )
 
                 # The peers' st.async complete the barrier with a cluster-scope release:
-                # acquire at cluster scope before reading their values.
-                ready = mbarrier_try_wait_cluster(mbar_ptr, 0)
-                while ready == 0:
-                    ready = mbarrier_try_wait_cluster(mbar_ptr, 0)
+                # wait, then acquire at cluster scope before reading their values.
+                mbarrier_wait_cluster_acquire(mbar_ptr, 0)
                 block_reduce_val = -tXsX.element_type.inf
                 block_reduce_argmax = Int32(0xFFFFFFFF)
                 num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
