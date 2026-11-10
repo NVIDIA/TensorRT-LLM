@@ -52,7 +52,7 @@ from tensorrt_llm.commands._config_overrides import (ConfigOverride,
                                                      parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.mooncake import mooncake_master, mooncake_pool_report
-from tensorrt_llm.commands.serve_cli._net import (_bind_failure,
+from tensorrt_llm.commands.serve_cli._net import (_bind_listener,
                                                   _diagnose_port_in_use,
                                                   _listener_address_family,
                                                   _publish_bound_address)
@@ -720,30 +720,23 @@ def launch_server(
         os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
     address_family = _listener_address_family("server", host, port)
+    # port == 0 lets the kernel pick the port; the caller then needs a way
+    # to learn it, either by service discovery or by report_addr.
+    assert port > 0 or disagg_cluster_config is not None or report_addr, (
+        "Port must be specified unless disagg cluster config or "
+        "--report_addr is provided")
     port_lock = (_reserve_multi_frontend_port(host, port, address_family)
                  if multi_frontend.is_launcher else contextlib.nullcontext())
-    with port_lock, socket.socket(address_family, socket.SOCK_STREAM) as s:
-        # port == 0 lets the kernel pick the port; the caller then needs a way
-        # to learn it, either by service discovery or by report_addr.
-        assert port > 0 or disagg_cluster_config is not None or report_addr, (
-            "Port must be specified unless disagg cluster config or "
-            "--report_addr is provided")
-        # Without SO_REUSEADDR a restart is refused for the whole TIME_WAIT
-        # window (~60s) by the tombstones of connections this server accepted.
-        # The flag has to be set on the socket that owns the port first, since
-        # the TIME_WAIT entry inherits it -- setting it only on the later bind
-        # is not enough.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
-            # Every frontend process binds its own listening socket on the
-            # same port; the kernel load-balances accepts across them.
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        try:
-            s.bind((host, port))
-            if port == 0:
-                port = s.getsockname()[1]
-        except OSError as e:
-            raise _bind_failure("server", host, port, e) from e
+    # Every frontend process binds its own listening socket on the same port;
+    # the kernel load-balances accepts across them.
+    reuse_port = multi_frontend.is_launcher or multi_frontend.is_attached_frontend
+    with port_lock, _bind_listener("server",
+                                   host,
+                                   port,
+                                   family=address_family,
+                                   reuse_port=reuse_port) as s:
+        if port == 0:
+            port = s.getsockname()[1]
 
         # Only now is the address final, and the socket stays bound from here
         # until uvicorn takes it over, so no one can steal the port in between.
@@ -1012,15 +1005,8 @@ def launch_visual_gen_server(
     # the bind until uvicorn started, anything else on the host could grab the
     # port in that window and trtllm-serve would die at bind() time.
     address_family = _listener_address_family("VisualGen server", host, port)
-    with socket.socket(address_family, socket.SOCK_STREAM) as s:
-        # See launch_server: without this, TIME_WAIT tombstones from the
-        # connections this server accepted refuse a restart for ~60s.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind((host, port))
-        except OSError as e:
-            raise _bind_failure("VisualGen server", host, port, e) from e
-
+    with _bind_listener("VisualGen server", host, port,
+                        family=address_family) as s:
         logger.info(f"Initializing VisualGen ({model})")
 
         previous_sigterm_handler = signal.signal(signal.SIGTERM,
@@ -2312,17 +2298,16 @@ def disaggregated(
     # (c) num_workers==1, no external coordinator: a single disagg server with an
     # in-process (local) coordinator. Pre-bind the socket (validates port), serve.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = "server_coordinator"
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        # See launch_server: without this, TIME_WAIT tombstones from the
-        # connections this server accepted refuse a restart for ~60s.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind((disagg_cfg.hostname, disagg_cfg.port))
-            if disagg_cfg.port == 0:
-                disagg_cfg.port = s.getsockname()[1]
-        except OSError as e:
-            raise _bind_failure("disaggregated server", disagg_cfg.hostname,
-                                disagg_cfg.port, e) from e
+    address_family = _listener_address_family("disaggregated server",
+                                              disagg_cfg.hostname,
+                                              disagg_cfg.port,
+                                              policy="ipv4")
+    with _bind_listener("disaggregated server",
+                        disagg_cfg.hostname,
+                        disagg_cfg.port,
+                        family=address_family) as s:
+        if disagg_cfg.port == 0:
+            disagg_cfg.port = s.getsockname()[1]
 
         _publish_bound_address(report_addr, disagg_cfg.hostname,
                                disagg_cfg.port)
@@ -2506,13 +2491,14 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     # the kernel always rejects with "invalid argument", because the scope id can
     # only be derived from an interface name. Binding AF_INET here also surfaces a
     # port conflict with the same diagnostics as the other two listeners.
-    coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        coord_socket.bind((public_host, coord_port))
-    except OSError as e:
-        coord_socket.close()
-        raise _bind_failure("coordinator", public_host, coord_port, e) from e
+    coord_socket = _bind_listener("coordinator",
+                                  public_host,
+                                  coord_port,
+                                  family=_listener_address_family(
+                                      "coordinator",
+                                      public_host,
+                                      coord_port,
+                                      policy="ipv4"))
 
     # 1. Launch the delegating fleet pointed at the implicit coordinator we start
     #    below (port-1 for TCP; UDS for the hot path). Workers hold
@@ -2677,7 +2663,9 @@ def _run_fleet_worker_impl():
     server = _build_disagg_server_from_env()
     host, port = server._config.hostname, server._config.port
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = socket.socket(
+        _listener_address_family("fleet worker", host, port, policy="ipv4"),
+        socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # SO_REUSEPORT: every worker binds the same (host, port); the kernel spreads
     # connections across the workers' accept queues by 4-tuple hash.
