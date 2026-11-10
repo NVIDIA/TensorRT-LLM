@@ -151,9 +151,9 @@ void DiskCacheTierConfig::validate() const
     {
         throw std::invalid_argument("DiskCacheTierConfig: path '" + path + "' is not a directory");
     }
-    if (numIoThreads < 0)
+    if (numIoThreads < 0 || numIoThreads > kMaxIoThreads)
     {
-        throw std::invalid_argument("DiskCacheTierConfig: numIoThreads must be >= 0");
+        throw std::invalid_argument("DiskCacheTierConfig: numIoThreads must be between 0 and 256");
     }
     if (writeThrough && numIoThreads == 0)
     {
