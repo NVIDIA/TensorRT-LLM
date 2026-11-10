@@ -667,9 +667,7 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         self.vision_model = RADIOVisionModel(
             vision_model_config,
             disable_quantization=True,
-            # FlashInfer's cuDNN ragged-prefill plan build for a new image shape can stall
-            # indefinitely while the language model replays CUDA graphs, freezing the server.
-            vision_attn_backend=model_config.get_encoder_attention_backend("vision", "TRTLLM"),
+            vision_attn_backend=model_config.get_encoder_attention_backend("vision", "FLASHINFER"),
             encoder_cuda_graph_config=encoder_cuda_graph_config,
         )
 
