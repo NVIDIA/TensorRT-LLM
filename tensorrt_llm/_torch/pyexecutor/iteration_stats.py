@@ -35,9 +35,9 @@ class IterationStatsRecord(NamedTuple):
     # The record was taken without a forward pass: it reports the queues, and
     # its duration and per-loop timings are not measurements.
     is_queue_snapshot: bool = False
-    # Cumulative counters of the shared-prefix attention library; present only
-    # while that library is enabled.
-    shared_prefix_attn_stats: dict[str, int] | None = None
+    # Cumulative per-step counters of the enabled FMHA libraries that keep them,
+    # by row field (e.g. ``sharedPrefixAttnStats``).
+    fmha_step_stats: dict[str, dict[str, int]] | None = None
 
     @classmethod
     def from_tuple(cls, stats: tuple) -> IterationStatsRecord:
@@ -88,7 +88,6 @@ class IterationStatsRecord(NamedTuple):
             ("schedulerMode", self.scheduler_mode),
             ("multimodalEncoderStats", self.mm_encoder_stats),
             ("executorLoop", self.executor_loop),
-            ("sharedPrefixAttnStats", self.shared_prefix_attn_stats),
         )
         for name, value in optional_fields:
             if value is not None:
@@ -96,4 +95,7 @@ class IterationStatsRecord(NamedTuple):
         # Measured records do not have the key.
         if self.is_queue_snapshot:
             stats["isQueueSnapshot"] = True
+        # A non-dict value is an unknown trailing field of a newer producer.
+        if isinstance(self.fmha_step_stats, dict):
+            stats.update(self.fmha_step_stats)
         return stats
