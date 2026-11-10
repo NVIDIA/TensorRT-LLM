@@ -28,6 +28,7 @@ from ..modules.embedding import Embedding, LMHead, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
+from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..pyexecutor.dwdp import get_global_dwdp_manager
@@ -1917,6 +1918,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 mapping, model_config.max_num_tokens)
         self.spec_worker.enable_vocab_parallel_argmax(self.lm_head,
                                                       key_exchange)
+
+    @property
+    def spec_samples_sharded_temperature(self) -> bool:
+        """Whether the spec worker draws the target tokens of temperature-only
+        batches on the LM head's vocab shard, so the engine captures the
+        temperature-only CUDA graph variant for it. A model that replaces the
+        plain logits processor keeps the gathered logits (the worker checks
+        the processor per step), so it captures no variant it would not use.
+        Configuration only: identical on every TP rank."""
+        return (self.spec_worker is not None
+                and self.spec_worker.samples_sharded_temperature
+                and type(self.logits_processor) is LogitsProcessor)
 
     def setup_aliases(self) -> None:
         if (self.draft_model is not None

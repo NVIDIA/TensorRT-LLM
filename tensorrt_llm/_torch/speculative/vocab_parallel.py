@@ -76,17 +76,32 @@ _REDUCE_BLOCK_ROWS = 32
 # decode, so each row is split over several programs.
 _TARGET_PROGRAMS = 256
 
-# "0" turns off the vocab-parallel greedy argmax of the stock one-model
+# "0" turns off the vocab-parallel token selection of the stock one-model
 # speculative workers (SpecWorkerBase.enable_vocab_parallel_argmax): their
-# greedy target and draft tokens then come from the gathered logits again.
+# greedy and temperature-only target tokens and their greedy draft tokens then
+# come from the gathered logits again.
 VOCAB_PARALLEL_ARGMAX_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_ARGMAX"
+# "0" turns off only the temperature-only part: those workers keep the greedy
+# argmax on the shard (the same tokens as the gathered logits) but sample
+# temperature-only batches from the gathered logits with the stock sampler.
+# The Gumbel-max draw on the shard follows the same distribution but consumes
+# random numbers differently, so an unseeded request gets different tokens than
+# from the stock sampler (a request with its own seed always takes the latter).
+VOCAB_PARALLEL_TEMPERATURE_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE"
 
 
 def vocab_parallel_argmax_enabled() -> bool:
-    """Whether the stock one-model speculative workers take their greedy
-    tokens from vocab-sharded logits (``TLLM_SPEC_VOCAB_PARALLEL_ARGMAX``,
-    default on)."""
+    """Whether the stock one-model speculative workers take their tokens from
+    vocab-sharded logits (``TLLM_SPEC_VOCAB_PARALLEL_ARGMAX``, default on)."""
     return os.environ.get(VOCAB_PARALLEL_ARGMAX_ENV_VAR, "1").strip() != "0"
+
+
+def vocab_parallel_temperature_enabled() -> bool:
+    """Whether those workers also draw the target tokens of temperature-only
+    batches from vocab-sharded logits by Gumbel-max
+    (``TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE``, default on; it takes effect
+    only where :func:`vocab_parallel_argmax_enabled`)."""
+    return os.environ.get(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, "1").strip() != "0"
 
 
 def _gathers_even_vocab_shards(lm_head: LMHead) -> bool:

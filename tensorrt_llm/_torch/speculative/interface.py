@@ -55,7 +55,8 @@ from .greedy_argmax import greedy_argmax
 from .spec_tail_kernels import strict_accept
 from .vocab_parallel import (VocabParallelHead, VocabShardedLogits,
                              is_vocab_sharded_lm_head, shard_argmax,
-                             tp_pair_exchange)
+                             tp_pair_exchange,
+                             vocab_parallel_temperature_enabled)
 
 
 def supports_sharded_target_sampling(spec_config, mapping) -> bool:
@@ -1812,9 +1813,9 @@ class SpecWorkerBase(nn.Module, ABC):
     Provides common functionality for sampling and token handling.
     """
 
-    # Whether the worker's acceptance reads the target logits of a greedy
-    # batch only through ``_sample_tokens_for_batch``, so that
-    # ``target_logits`` may hand it this rank's vocab shard instead (see
+    # Whether the worker's acceptance reads the target logits of a greedy or
+    # temperature-only batch only through ``_sample_tokens_for_batch``, so
+    # that ``target_logits`` may hand it this rank's vocab shard instead (see
     # ``enable_vocab_parallel_argmax``). Workers whose acceptance reads the
     # logits otherwise (tree verification, block drafters with their own
     # selection) leave it False.
@@ -1826,8 +1827,9 @@ class SpecWorkerBase(nn.Module, ABC):
     _vocab_parallel_argmax: bool = False
     _target_pair_exchange = None
     # Whether temperature-only batches also select their target tokens from
-    # the shard (Gumbel-max in the key exchange); only workers that capture
-    # the temperature-only CUDA graph variant set it.
+    # the shard (Gumbel-max in the key exchange). The engine captures the
+    # temperature-only CUDA graph variant for a worker that sets it (see
+    # ``samples_sharded_temperature``).
     _samples_sharded_temperature: bool = False
 
     def __init__(self,
@@ -1985,13 +1987,19 @@ class SpecWorkerBase(nn.Module, ABC):
     def enable_vocab_parallel_argmax(self, lm_head, key_exchange) -> bool:
         """Select the greedy target tokens of this worker from the vocab
         shard of ``lm_head`` (and greedy draft tokens of a vocab-sharded draft
-        head through ``key_exchange``) instead of the gathered logits.
+        head through ``key_exchange``) instead of the gathered logits. With a
+        key exchange, the target tokens of temperature-only batches are drawn
+        on the shard too (Gumbel-max in the exchange, see
+        :meth:`_sample_sharded_temperature`), unless
+        ``TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=0`` or the acceptance reads
+        more than the selected target tokens.
 
         Collective over the TP group: every rank calls it at construction,
         with the same arguments. ``key_exchange`` is the TP group's
-        ``ll_exchange.TPKeyExchange`` or None; the NCCL pair exchange takes
-        the rows it cannot. Returns whether the worker takes the path; it
-        does not for a worker whose acceptance reads the logits otherwise
+        ``ll_exchange.TPKeyExchange`` or None (its setup agrees on failure
+        across the group); the NCCL pair exchange takes the greedy rows it
+        cannot. Returns whether the worker takes the path; it does not for a
+        worker whose acceptance reads the logits otherwise
         (``verifies_on_target_shard``) or a head that is not vocab-sharded.
         """
         if not (self.verifies_on_target_shard
@@ -2008,13 +2016,26 @@ class SpecWorkerBase(nn.Module, ABC):
         self._target_pair_exchange = tp_pair_exchange(lm_head.mapping,
                                                       AllReduceStrategy.NCCL)
         self._vocab_parallel_argmax = True
+        if (self.key_exchange is not None
+                and vocab_parallel_temperature_enabled()
+                and self._verifies_target_by_argmax()):
+            self._samples_sharded_temperature = True
         logger.info(
             f"{type(self).__name__}: vocab-parallel greedy argmax enabled "
             f"(tp={lm_head.mapping.tp_size}, shard={lm_head.out_features}, "
             f"key exchange="
-            f"{'none' if self.key_exchange is None else self.key_exchange.transport})"
-        )
+            f"{'none' if self.key_exchange is None else self.key_exchange.transport}, "
+            f"temperature-only sampling on the shard="
+            f"{self._samples_sharded_temperature})")
         return True
+
+    @property
+    def samples_sharded_temperature(self) -> bool:
+        """Whether temperature-only batches may draw their target tokens on
+        the vocab shard, so the engine captures the temperature-only CUDA
+        graph variant (``SpecMetadata.temperature_only_graphs``). Identical
+        on every TP rank."""
+        return self._samples_sharded_temperature
 
     def _shard_selection_allowed(self, spec_metadata) -> bool:
         """Whether this batch's sampling lets the target tokens come from the

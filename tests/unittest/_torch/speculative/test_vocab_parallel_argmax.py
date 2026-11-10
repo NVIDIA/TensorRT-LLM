@@ -12,35 +12,45 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The vocab-parallel greedy argmax of the stock one-model speculative workers.
+"""The vocab-parallel token selection of the stock one-model speculative workers.
 
 The greedy target tokens of a TP worker come from this rank's vocab shard of
 the target logits: each rank reduces its shard to (value, global id) pairs and
-the ranks agree on the global argmax. Here TP ranks are simulated on one GPU
-(every rank's pair buffer is computed, then summed as the all-reduce would),
-which checks the selected ids against ``torch.argmax`` over the gathered
-logits, ties included, and the host-side decision of when the worker takes
-the shard and when it keeps the gathered logits. The real exchanges over a TP
-group are covered by
-``tests/unittest/_torch/multi_gpu/test_vocab_parallel_selection.py``.
+the ranks agree on the global argmax. The target tokens of temperature-only
+batches are drawn the same way by Gumbel-max: the noise of a vocab entry is
+keyed by its global id, so the global maximum of ``logits / T + G`` is a
+sample of ``softmax(logits / T)`` whatever the sharding. Here TP ranks are
+simulated on one GPU (every rank's pair buffer is computed, then summed as the
+all-reduce would; every rank's Gumbel-max winner is computed, then combined as
+the key exchange does), which checks the selected ids against the gathered
+logits, ties included, the sampled distribution against ``softmax(logits /
+T)``, and the host-side decision of when the worker takes the shard and when
+it keeps the gathered logits. The real exchanges over a TP group are covered by
+``tests/unittest/_torch/multi_gpu/test_vocab_parallel_selection.py`` and
+``tests/unittest/_torch/multi_gpu/test_ll_exchange.py``.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
+from _torch.helpers import chi_square, gumbel_max_reference, gumbel_scores_reference
 
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
 from tensorrt_llm._torch.speculative import interface
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 from tensorrt_llm._torch.speculative.vocab_parallel import (
     VOCAB_PARALLEL_ARGMAX_ENV_VAR,
+    VOCAB_PARALLEL_TEMPERATURE_ENV_VAR,
     _PairExchange,
     is_vocab_sharded_lm_head,
     shard_argmax,
     vocab_parallel_argmax_enabled,
+    vocab_parallel_temperature_enabled,
 )
 from tensorrt_llm.mapping import Mapping
 
@@ -253,7 +263,7 @@ def test_greedy_batch_takes_the_shard(enabled_worker, gathered):
 @pytest.mark.parametrize(
     "case",
     [
-        "temperature_only",  # PR scope: greedy only for the newly covered workers
+        "temperature_only",  # no key exchange for the Gumbel-max draw
         "top_k_top_p",  # any other sampled batch (also rejection sampling)
         "penalties",
         "guided_decoding",
@@ -315,7 +325,8 @@ def test_heads_that_are_not_vocab_shards(case, monkeypatch, gathered):
         )
     assert not is_vocab_sharded_lm_head(head)
     worker = _Worker()
-    assert not worker.enable_vocab_parallel_argmax(head, key_exchange=None)
+    assert not worker.enable_vocab_parallel_argmax(head, key_exchange=_RecordingKeyExchange())
+    assert not worker.samples_sharded_temperature
     if case != "embedding":
         md = _greedy_md(sharded_target_logits=False)
         out, _ = _target_logits(worker, head, md)
@@ -491,3 +502,344 @@ def test_eagle3_draft_tokens_with_d2t(tp, monkeypatch):
     for r, worker in enumerate(workers):
         out = worker.sample_draft_tokens(_shard(full, tp, r), md, rows)
         assert torch.equal(out, expected), r
+
+
+# Temperature-only batches: Gumbel-max on the shard.
+
+
+class _RecordingKeyExchange:
+    """Stands in for ``ll_exchange.TPKeyExchange`` in one process: records the
+    launches of the target sampler (the exchange itself needs a TP group)."""
+
+    MAX_ROWS = 16
+    transport = "test"
+
+    def __init__(self):
+        self.calls = []
+
+    def argmax_logits(self, logits, vocab_offset, channel=1, temperature=None, seed=None, **kwargs):
+        self.calls.append(
+            dict(
+                rows=logits.shape[0],
+                vocab_offset=vocab_offset,
+                channel=channel,
+                temperature=None if temperature is None else temperature.clone(),
+                seed=None if seed is None else int(seed),
+                **kwargs,
+            )
+        )
+        return torch.zeros(logits.shape[0], dtype=torch.int32, device=logits.device)
+
+
+def _simulated_sharded_draw(full, temperatures, seed, tp):
+    """The target tokens ``TPKeyExchange.argmax_logits`` draws over ``tp``
+    simulated ranks: every rank takes the first maximum of ``logits / T + G``
+    over its shard, with the noise of global id ``i`` keyed by
+    ``row * vocab + i``; the exchange keeps the largest value, the lowest global
+    id on ties. Rows below the greedy threshold take the plain argmax."""
+    rows, vocab = full.shape
+    width = vocab // tp
+    sampled = temperatures >= GREEDY_TEMPERATURE_THRESHOLD
+    best_value = torch.full((rows,), -float("inf"), device=full.device)
+    best_id = torch.zeros(rows, dtype=torch.int64, device=full.device)
+    for rank in range(tp):
+        local = _shard(full, tp, rank)
+        scores = gumbel_scores_reference(local, temperatures, seed, rank * width, vocab)
+        scores = torch.where(sampled[:, None], scores, local.float())
+        local_first = torch.argmax(scores, dim=-1)  # the first maximum
+        value = scores.gather(1, local_first[:, None]).squeeze(1)
+        take = value > best_value  # strict: a lower rank keeps a tie
+        best_id = torch.where(take, local_first + rank * width, best_id)
+        best_value = torch.where(take, value, best_value)
+    return best_id.to(torch.int32)
+
+
+@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_sharded_gumbel_draw_is_the_single_shard_draw(tp, dtype):
+    """The noise of a token does not depend on the sharding, so the winner
+    over the shards is the draw over the gathered vocab, bit for bit, also for
+    rows that stay greedy inside a sampled batch."""
+    rows, vocab = 96, 1000 * tp
+    gen = torch.Generator(device="cuda").manual_seed(tp)
+    full = (torch.randn(rows, vocab, device="cuda", generator=gen) * 3).to(dtype)
+    temps = torch.tensor([0.05, 0.7, 1.0, 30.0, 0.5 * GREEDY_TEMPERATURE_THRESHOLD], device="cuda")
+    temps = temps.repeat(rows // temps.numel() + 1)[:rows].contiguous()
+    for step in range(1, 4):
+        seed = torch.tensor([step], dtype=torch.int64, device="cuda")
+        expected = gumbel_max_reference(full, temps, seed, GREEDY_TEMPERATURE_THRESHOLD)
+        tokens = _simulated_sharded_draw(full, temps, seed, tp)
+        assert torch.equal(tokens, expected), step
+    greedy = temps < GREEDY_TEMPERATURE_THRESHOLD
+    assert torch.equal(tokens[greedy].long(), torch.argmax(full.float(), dim=-1)[greedy])
+
+
+def _near_ties(vocab: int, temperature: float, gen: torch.Generator) -> torch.Tensor:
+    """fp32 logits whose ``softmax(logits / T)`` spreads over a few tokens
+    even for a tiny ``T``: a handful of tokens within a few ``T`` of the
+    maximum, in different shards, the rest far below (and random)."""
+    logits = torch.randn(vocab, device="cuda", generator=gen) * 3
+    if temperature < 0.1:
+        logits = logits - 50.0
+        ids = torch.randperm(vocab, device="cuda", generator=gen)[:6]
+        logits[ids] = 10.0 - temperature * torch.tensor(
+            [0.0, 0.3, 0.7, 1.2, 2.0, 3.5], device="cuda"
+        )
+    return logits
+
+
+@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize(
+    "temperature", [2.0 * GREEDY_TEMPERATURE_THRESHOLD, 0.01, 0.6, 1.0, 3.0, 100.0]
+)
+def test_sharded_temperature_draws_follow_softmax(tp, temperature):
+    """Draws of the sharded Gumbel-max sampler pass a chi-square test against
+    ``softmax(logits / T)`` (z = 5), from a temperature just above the greedy
+    threshold to a nearly uniform one, and their total-variation distance from
+    it stays within the sampling error."""
+    vocab, rows, steps = 512 * tp, 4096, 32
+    gen = torch.Generator(device="cuda").manual_seed(int(1000 * temperature) + tp)
+    logits = _near_ties(vocab, temperature, gen)
+    full = logits.expand(rows, vocab).contiguous()
+    temps = torch.full((rows,), temperature, device="cuda")
+    counts = torch.zeros(vocab, dtype=torch.int64, device="cuda")
+    for step in range(steps):
+        seed = torch.tensor([7919 * step + tp], dtype=torch.int64, device="cuda")
+        # Every row draws its own noise: the rows are independent samples.
+        counts += torch.bincount(
+            _simulated_sharded_draw(full, temps, seed, tp).long(), minlength=vocab
+        )
+    probs = torch.softmax(logits.double() / temperature, dim=-1)
+    stat, crit = chi_square(counts.cpu(), probs.cpu())
+    assert stat < crit, (stat, crit)
+    total = rows * steps
+    tv = 0.5 * float((counts.cpu().double() / total - probs.cpu()).abs().sum())
+    # E|count_i / n - p_i| <= sqrt(p_i (1 - p_i) / n), so E[TV] <= bound.
+    bound = 0.5 * float((probs.cpu() * (1 - probs.cpu()) / total).sqrt().sum())
+    assert tv < 1.5 * bound + 1e-3, (tv, bound)
+
+
+@pytest.fixture
+def temperature_worker(monkeypatch):
+    """A worker that went through enable_vocab_parallel_argmax with a key
+    exchange (recorded, single process), rank 1 of TP2."""
+    monkeypatch.delenv(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, raising=False)
+    monkeypatch.setattr(interface, "tp_pair_exchange", lambda mapping, strategy: "pairs")
+    worker = _Worker()
+    assert worker.enable_vocab_parallel_argmax(_lm_head(rank=1), _RecordingKeyExchange())
+    assert worker.samples_sharded_temperature
+    worker.cache_derived_state()
+    return worker
+
+
+def _temperature_md(**overrides):
+    md = _greedy_md(
+        is_all_greedy_sample=False,
+        temperature_only=True,
+        sharded_target_logits=False,
+        temperatures=torch.tensor([0.7, 1e-5, 1.3, 0.2] * 8, device="cuda"),
+    )
+    md.__dict__.update(overrides)
+    return md
+
+
+def test_temperature_only_batch_takes_the_shard(temperature_worker, gathered):
+    lm_head = _lm_head(rank=1)
+    md = _temperature_md()
+    out, hidden = _target_logits(temperature_worker, lm_head, md)
+    assert md.sharded_target_logits
+    torch.testing.assert_close(out, lm_head(hidden, gather_output=False), rtol=0, atol=0)
+    # Greedy batches still take it.
+    md = _greedy_md(sharded_target_logits=False)
+    out, _ = _target_logits(temperature_worker, lm_head, md)
+    assert md.sharded_target_logits and out is not gathered
+
+
+def test_temperature_only_tokens_come_from_the_key_exchange(temperature_worker):
+    """One Gumbel-max launch per step with the batch's temperatures, the
+    shard's vocab offset, the greedy threshold of the stock sampler and a
+    device seed every step advances (the same on every rank)."""
+    exchange = temperature_worker.key_exchange
+    shard = torch.randn(6, 2048, device="cuda", dtype=torch.bfloat16)
+    md = _temperature_md(sharded_target_logits=True)
+    for step in (1, 2, 3):
+        temperature_worker._sample_tokens_for_batch(shard, md, num_contexts=0, batch_size=6)
+        call = exchange.calls[-1]
+        assert call["rows"] == 6 and call["vocab_offset"] == 2048 and call["channel"] == 1
+        assert call["seed"] == step == int(temperature_worker._gumbel_seed)
+        assert torch.equal(call["temperature"], md.temperatures[:6])
+        assert call["greedy_threshold"] == GREEDY_TEMPERATURE_THRESHOLD
+    # A greedy batch takes the plain argmax launch and leaves the seed alone.
+    temperature_worker._sample_tokens_for_batch(shard, _greedy_md(), num_contexts=0, batch_size=6)
+    assert exchange.calls[-1]["temperature"] is None
+    assert int(temperature_worker._gumbel_seed) == 3
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "sampled_with_filters",  # top-k / top-p / min-p, a seeded request, rejection sampling
+        "penalties",
+        "guided_decoding",
+        "custom_logits_processor",
+        "relaxed_acceptance",
+        "rows_beyond_the_key_exchange",
+        "no_rows",
+    ],
+)
+def test_temperature_fallback_keeps_the_gathered_logits(case, temperature_worker, gathered):
+    lm_head = _lm_head(rank=1)
+    md = _temperature_md(sharded_target_logits=True)
+    processor = None
+    rows = 5
+    if case == "sampled_with_filters":
+        # _temperature_only (SpecMetadata) leaves the graph key bit off.
+        md.temperature_only = False
+    elif case == "penalties":
+        md.enable_penalty = True
+    elif case == "guided_decoding":
+        temperature_worker.guided_decoder = object()
+    elif case == "custom_logits_processor":
+
+        class _Scaled(LogitsProcessor):
+            pass
+
+        processor = _Scaled()
+    elif case == "relaxed_acceptance":
+        temperature_worker._verifies_target_by_argmax = lambda: False
+    elif case == "rows_beyond_the_key_exchange":
+        # Unlike the greedy argmax, the draw has no NCCL fallback.
+        rows = _RecordingKeyExchange.MAX_ROWS + 1
+    elif case == "no_rows":
+        rows = 0
+    out, _ = _target_logits(temperature_worker, lm_head, md, processor, rows)
+    assert out is gathered
+    assert not md.sharded_target_logits
+
+
+@pytest.mark.parametrize(
+    "case, samples",
+    [
+        ("default", True),
+        ("temperature_switch_off", False),
+        ("no_key_exchange", False),
+        ("relaxed_acceptance", False),
+    ],
+)
+def test_enable_decides_temperature_sampling(case, samples, monkeypatch, gathered):
+    """Temperature-only sampling on the shard needs the key exchange and
+    strict acceptance and can be turned off on its own; the greedy argmax on
+    the shard stays on in every case."""
+    monkeypatch.setattr(interface, "tp_pair_exchange", lambda mapping, strategy: "pairs")
+    monkeypatch.delenv(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, raising=False)
+    if case == "temperature_switch_off":
+        monkeypatch.setenv(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, "0")
+    worker = _Worker()
+    if case == "relaxed_acceptance":
+        worker._verifies_target_by_argmax = lambda: False
+    exchange = None if case == "no_key_exchange" else _RecordingKeyExchange()
+    lm_head = _lm_head()
+    assert worker.enable_vocab_parallel_argmax(lm_head, exchange)
+    assert worker.samples_sharded_temperature == samples
+    md = _temperature_md()
+    out, _ = _target_logits(worker, lm_head, md)
+    assert md.sharded_target_logits == samples and (out is gathered) != samples
+    if case != "relaxed_acceptance":
+        md = _greedy_md(sharded_target_logits=False)
+        out, _ = _target_logits(worker, lm_head, md)
+        assert md.sharded_target_logits and out is not gathered
+
+
+@pytest.mark.parametrize(
+    "value, enabled", [(None, True), ("1", True), ("0", False), (" 0 ", False)]
+)
+def test_temperature_switch(value, enabled, monkeypatch):
+    if value is None:
+        monkeypatch.delenv(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, value)
+    assert vocab_parallel_temperature_enabled() == enabled
+
+
+def test_model_reports_the_temperature_variant():
+    """The engine captures the temperature-only CUDA graph variant for a model
+    whose worker samples temperature-only batches on the shard, unless the
+    model replaced the plain logits processor (the worker then gathers)."""
+    from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+
+    def reports(samples=True, processor=None, worker=True):
+        model = SimpleNamespace(
+            spec_worker=SimpleNamespace(samples_sharded_temperature=samples) if worker else None,
+            logits_processor=processor or LogitsProcessor(),
+        )
+        return SpecDecOneEngineForCausalLM.spec_samples_sharded_temperature.fget(model)
+
+    class _Custom(LogitsProcessor):
+        pass
+
+    assert reports()
+    assert not reports(samples=False)
+    assert not reports(worker=False)
+    assert not reports(processor=_Custom())
+
+
+@pytest.mark.parametrize(
+    "cuda_graphs, worker, fast_paths, captured",
+    [
+        (True, True, False, True),
+        (False, True, False, False),  # eager decoding keeps the gathered sampler
+        (True, False, False, False),
+        (True, False, True, False),  # fast paths alone: MTP-Eagle only (none here)
+    ],
+)
+def test_temperature_graph_variant_follows_the_worker(
+    cuda_graphs, worker, fast_paths, captured, monkeypatch
+):
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import metadata
+
+    seen = {}
+    monkeypatch.setattr(
+        metadata, "get_spec_metadata", lambda *args, **kwargs: seen.update(kwargs) or "md"
+    )
+    config = SimpleNamespace(
+        spec_config=None,
+        max_batch_size=4,
+        max_num_tokens=64,
+        max_seq_len=128,
+        num_seq_slots=4,
+        cuda_graph_config=object() if cuda_graphs else None,
+        spec_decode_fast_paths=fast_paths,
+        spec_samples_sharded_temperature=worker,
+    )
+    assert metadata.create_spec_metadata(config, None, None, None) == "md"
+    assert seen["temperature_only_graphs"] is captured
+
+
+def test_graph_keys_separate_greedy_temperature_and_stock_sampling():
+    """Greedy, temperature-only and other sampled batches replay different
+    CUDA graphs: the temperature-only draw is never recorded into a greedy or
+    stock-sampler graph, nor the other way round."""
+    from _torch.pyexecutor.engine_test_utils import _make_request_stub
+
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, SampleType
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+
+    runner = Mock()
+    runner.config = SimpleNamespace()
+    runner._resolve_sample_type.return_value = SampleType.FULL
+    runner._get_seq_len_mode.return_value = False
+    runner._ragged_verify_bucket.return_value = None
+    batch = ScheduledRequests()
+    batch.generation_requests = [_make_request_stub(1), _make_request_stub(2)]
+
+    def key(greedy, temperature_only):
+        md = SimpleNamespace(is_all_greedy_sample=greedy, temperature_only=temperature_only)
+        return CUDAGraphRunner.get_graph_key(runner, batch, spec_metadata=md)
+
+    greedy, temperature, stock = key(True, False), key(False, True), key(False, False)
+    assert (greedy.is_all_greedy_sample, greedy.temperature_only) == (True, False)
+    assert (temperature.is_all_greedy_sample, temperature.temperature_only) == (False, True)
+    assert (stock.is_all_greedy_sample, stock.temperature_only) == (False, False)
+    assert len({greedy, temperature, stock}) == 3
+    # The bit only qualifies sampled batches.
+    assert key(True, True) == greedy

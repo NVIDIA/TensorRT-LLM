@@ -79,17 +79,29 @@ from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
 
-def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
-    """``spec_decode_fast_paths`` of the language model (the model itself, or a
-    multimodal model's language model): the one-engine speculative language
-    model's, or that of a model that builds its own speculative branch, such as
-    a Modeling V2 target; False for a model that does not set it."""
+def _language_model_flag(model: torch.nn.Module, name: str) -> bool:
+    """Boolean attribute ``name`` of the language model (the model itself, or a
+    multimodal model's language model); False for a model that does not set it."""
     if isinstance(model, MultimodalModelMixin):
         try:
             model = model.language_model
         except NotImplementedError:
             return False
-    return bool(getattr(model, "spec_decode_fast_paths", False))
+    return bool(getattr(model, name, False))
+
+
+def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
+    """``spec_decode_fast_paths`` of the language model: the one-engine
+    speculative language model's, or that of a model that builds its own
+    speculative branch, such as a Modeling V2 target."""
+    return _language_model_flag(model, "spec_decode_fast_paths")
+
+
+def _spec_samples_sharded_temperature(model: torch.nn.Module) -> bool:
+    """Whether the language model's one-engine spec worker draws temperature-only
+    target tokens on the LM head's vocab shard
+    (``SpecDecOneEngineForCausalLM.spec_samples_sharded_temperature``)."""
+    return _language_model_flag(model, "spec_samples_sharded_temperature")
 
 
 # Refit only needs the compile wrapper removed before weights are loaded: the
@@ -285,6 +297,7 @@ class ModelEngine:
         else:
             self.model = model
         self.spec_decode_fast_paths = _spec_decode_fast_paths(self.model)
+        self.spec_samples_sharded_temperature = _spec_samples_sharded_temperature(self.model)
 
     def _init_from_model(self) -> None:
         """Copy the loaded model's facts onto the engine, rewriting the requested
@@ -591,6 +604,7 @@ class ModelEngine:
                 and self.llm_args.lora_config.cuda_graph_specialize_lora
             ),
             spec_decode_fast_paths=self.spec_decode_fast_paths,
+            spec_samples_sharded_temperature=self.spec_samples_sharded_temperature,
             **extra_fields,
         )
 
