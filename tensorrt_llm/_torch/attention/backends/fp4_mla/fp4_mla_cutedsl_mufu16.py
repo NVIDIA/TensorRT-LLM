@@ -261,11 +261,9 @@ SMEM_P4_RUNTIME_MAX_KV = (
     (INT32_MAX - (KV_TILE - 1)) // SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT
 ) * SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT
 SMEM_P4_PAGE_ID_PLAN_INTS = SMEM_P4_PAGE_PLAN_PROFILE_KV // TRTLLM_PAGE_SIZE
-SMEM_P4_PAGE_ID_PLAN_BYTES = SMEM_P4_PAGE_ID_PLAN_INTS * ctm.Int32.bytes
 # softmax scale, PV rescale, producer mask bound (Int32 bits), pad.
 SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS = 4
 SMEM_P4_RUNTIME_MASK_BOUND_WORD = 2
-SMEM_P4_RUNTIME_SCALE_PAIR_BYTES = SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS * ctm.Float32.bytes
 SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 = _initial_float_from_argv("--lazy-anchor-threshold-log2", 1.0)
 if not 0.0 <= SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 <= 8.0:
     raise ValueError(
@@ -487,7 +485,6 @@ SMEM_P4_CORRECTION_WARP_ID_BEGIN = SMEM_P4_COMPUTE_WARP_ID_BEGIN + SMEM_P4_COMPU
 SMEM_P4_TOTAL_PRODUCER_WARPS = SMEM_P4_COMPUTE_WARPS + SMEM_P4_CORRECTION_WARPS
 SMEM_P4_STORE_WARPS = SMEM_P4_CORRECTION_WARPS
 SMEM_P4_COMPUTE_THREADS = 32 * SMEM_P4_COMPUTE_WARPS
-SMEM_P4_CORRECTION_THREADS = 32 * SMEM_P4_CORRECTION_WARPS
 SMEM_P4_SCORE_SLOT_PRODUCER_THREADS = SMEM_P4_COMPUTE_THREADS
 THREADS_PER_CTA = 32 * 12
 SMEM_P4_TMEM_ALLOC_EXCLUSIVE = True
@@ -605,21 +602,6 @@ SMEM_P4_KSF_COMPACT_RING_BYTES = SMEM_P4_QK_KTILE_RING_STAGES * SMEM_P4_KSF_COMP
 SMEM_P4_V_DATA_STAGE_BYTES = B_STAGE_BYTES * SMEM_P4_N_OUT_TILES
 SMEM_P4_V_SFB_TMA_STAGE_BYTES = SFA_TMA_STAGE_BYTES * SMEM_P4_PV_SFB_N_CHUNKS * SMEM_P4_N_OUT_TILES
 SMEM_P4_V_TILE_TMA_BYTES = SMEM_P4_V_DATA_STAGE_BYTES + SMEM_P4_V_SFB_TMA_STAGE_BYTES
-SMEM_P4_CONTROL_MBAR_COUNT = (
-    SMEM_P4_QK_COMPLETION_MBARS
-    + SMEM_P4_QK_PIPELINE_SLOTS
-    + 1
-    + NUM_QK_Q_PIPELINE_STAGE * 2
-    + SMEM_P4_QK_BARRIER_STAGES * 2
-    + SMEM_P4_V_PIPELINE_STAGES * 2
-    + SMEM_P4_P4_CONTROL_MBAR_STAGES * 2
-    + SMEM_P4_PAIR_OVERLAP_MBAR_COUNT
-    + SMEM_P4_QK_SCORE_RING_SLOTS
-    + 2
-    + SMEM_P4_QK_BULK_READY_MBARS
-)
-SMEM_P4_CONTROL_BYTES_RAW = SMEM_P4_CONTROL_MBAR_COUNT * 8 + 8
-SMEM_P4_CONTROL_AND_ALIGNMENT_BYTES = (SMEM_P4_CONTROL_BYTES_RAW + 127) // 128 * 128
 
 
 def _refresh_sf_vec_config(sf_vec_size: int) -> None:
@@ -749,32 +731,6 @@ def _refresh_sf_vec_config(sf_vec_size: int) -> None:
     stage_rowsum_tmem_cols = SMEM_P4_TMEM_BANKS * SMEM_P4_SCORE_SLOTS_PER_KV_TILE
     rowmeta_tmem_cols = stage_rowmax_tmem_cols + stage_rowsum_tmem_cols + running_rowmeta_tmem_cols
     rowmeta_tmem_col_offset = SMEM_P4_SCALE_FEED_TMEM_COLS[1]
-    q_compact_tile_bytes = SMEM_P4_QK_FULL_DATA_STAGES * QK_A_STAGE_BYTES + QK_TAIL_A_STAGE_BYTES
-    qsf_compact_tile_bytes = (
-        SMEM_P4_QK_FULL_DATA_STAGES * qk_sfa_stage_bytes + 512 * qk_tail_data_stage_sf_chunks
-    )
-    k_compact_slot_bytes = SMEM_P4_QK_FULL_DATA_STAGES * QK_B_STAGE_BYTES + QK_TAIL_B_STAGE_BYTES
-    ksf_compact_slot_bytes = (
-        SMEM_P4_QK_FULL_DATA_STAGES * qk_sfb_stage_bytes
-        + 512 * qk_k_tail_data_stage_sf_chunks * qk_sfb_n_chunks
-    )
-    static_smem_bytes = (
-        SMEM_P4_CONTROL_AND_ALIGNMENT_BYTES
-        + q_compact_tile_bytes
-        + SMEM_P4_QK_KTILE_RING_STAGES * k_compact_slot_bytes
-        + qsf_compact_tile_bytes
-        + SMEM_P4_QK_KTILE_RING_STAGES * ksf_compact_slot_bytes
-        + SMEM_P4_P4_SMEM_WORDS * 4
-        + SMEM_P4_V_PIPELINE_STAGES * B_STAGE_BYTES * SMEM_P4_N_OUT_TILES
-        + SMEM_P4_P4_OWNER_SMEM_SF_MAILBOX_WORDS * 4
-        + SMEM_P4_V_PIPELINE_STAGES * sfa_tma_stage_bytes * pv_sfb_n_chunks * SMEM_P4_N_OUT_TILES
-        + SMEM_P4_STAGE_ROW_STATE_SMEM_FLOATS * 4
-        + SMEM_P4_ATOMIC_RUNNING_ROWMAX_SMEM_ROWS * 4
-        # Row maxima of the pipelined leading tiles, by tile parity.
-        + 2 * SMEM_P4_ATOMIC_RUNNING_ROWMAX_SMEM_ROWS * 4
-        + SMEM_P4_PAGE_ID_PLAN_BYTES
-        + SMEM_P4_RUNTIME_SCALE_PAIR_BYTES
-    )
     globals().update(
         SF_VEC_SIZE=sf_vec_size,
         MMA_SCALE_CHUNK_K=mma_scale_chunk_k,
@@ -899,7 +855,6 @@ def _refresh_sf_vec_config(sf_vec_size: int) -> None:
             SMEM_P4_QK_FULL_DATA_STAGES * qk_sfb_stage_bytes
             + 512 * qk_k_tail_data_stage_sf_chunks * qk_sfb_n_chunks
         ),
-        SMEM_P4_STATIC_SMEM_BYTES=static_smem_bytes,
         SMEM_P4_V_DATA_STAGE_BYTES=B_STAGE_BYTES * SMEM_P4_N_OUT_TILES,
         SMEM_P4_V_SFB_TMA_STAGE_BYTES=sfa_tma_stage_bytes * pv_sfb_n_chunks * SMEM_P4_N_OUT_TILES,
         SMEM_P4_V_TILE_TMA_BYTES=B_STAGE_BYTES * SMEM_P4_N_OUT_TILES
@@ -3759,72 +3714,6 @@ def _load_p4_n256_score_half_from_tmem(
 
 
 @cute.jit
-def _runtime_load_final_p4_n256_score_half_from_tmem(
-    sAtomicRunningRowMax,
-    qk_full_mbar,
-    score_tmem_addresses,
-    producer_col_band: ctm.Int32,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    kv_tile_idx: ctm.Int32,
-    valid_k: ctm.Int32,
-    tail_needs_mask: ctm.Boolean,
-    qk_phase: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-    score_half_idx: ctm.Int32,
-) -> tuple:
-    score_half_n: ctm.Constexpr = SMEM_P4_BMM1_N // SMEM_P4_N256_SCORE_HALVES
-    score_half_groups_per_col_band: ctm.Constexpr = (
-        score_half_n // SF_VEC_SIZE // SMEM_P4_TMEM_WARP_N
-    )
-    score_value_count: ctm.Constexpr = score_half_groups_per_col_band * SF_VEC_SIZE
-    score_values = ctm.Vector.from_elements(
-        tuple((ctm.Float32(0.0) for _ in range(score_value_count))), dtype=ctm.Float32
-    )
-    group_max_values = ctm.Vector.from_elements(
-        tuple((ctm.Float32(-ctm.Float32.inf) for _ in range(score_half_groups_per_col_band))),
-        dtype=ctm.Float32,
-    )
-    group_valid_values = ctm.Vector.from_elements(
-        tuple((ctm.Boolean(False) for _ in range(score_half_groups_per_col_band))),
-        dtype=ctm.Boolean,
-    )
-    if tail_needs_mask:
-        score_values, group_max_values, group_valid_values = _load_p4_n256_score_half_from_tmem(
-            sAtomicRunningRowMax,
-            qk_full_mbar,
-            score_tmem_addresses,
-            producer_col_band,
-            warp_idx,
-            tidx,
-            kv_tile_idx=kv_tile_idx,
-            valid_k=valid_k,
-            mask_valid_k=True,
-            qk_phase=qk_phase,
-            wait_for_qk_full=True,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-        )
-    else:
-        score_values, group_max_values, group_valid_values = _load_p4_n256_score_half_from_tmem(
-            sAtomicRunningRowMax,
-            qk_full_mbar,
-            score_tmem_addresses,
-            producer_col_band,
-            warp_idx,
-            tidx,
-            kv_tile_idx=kv_tile_idx,
-            valid_k=valid_k,
-            mask_valid_k=False,
-            qk_phase=qk_phase,
-            wait_for_qk_full=True,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-        )
-    return (score_values, group_max_values, group_valid_values)
-
-
-@cute.jit
 def _load_p4_n256_atomic_running_rowmax(
     sAtomicRunningRowMax,
     warp_idx: ctm.Int32,
@@ -4099,116 +3988,6 @@ def _finalize_p4_n256_score_half_psf_source(
                 + ctm.Int32(local_group_idx * SF_VEC_SIZE)
             )
             group_valid = ctm.Boolean(group_base < valid_k)
-            sf_exact = ctm.Float32(0.0)
-            if group_valid:
-                sf_exact = cute.exp2(
-                    group_max_values[local_group_idx] * softmax_scale_log2 + sf_bias,
-                    fastmath=True,
-                )
-                prequant_row_sum += sf_exact * group_p_sums[local_group_idx]
-            if cutlass.const_expr(local_group_idx == 0):
-                sf_exact_0 = sf_exact
-            elif cutlass.const_expr(local_group_idx == 1):
-                sf_exact_1 = sf_exact
-            elif cutlass.const_expr(local_group_idx == 2):
-                sf_exact_2 = sf_exact
-            else:
-                sf_exact_3 = sf_exact
-        denominator_sf_word = _pack_e4m3x4_natural(sf_exact_0, sf_exact_1, sf_exact_2, sf_exact_3)
-        pv_sf_word = _pack_e4m3x4_natural(
-            sf_exact_0 * pv_psf_rescale,
-            sf_exact_1 * pv_psf_rescale,
-            sf_exact_2 * pv_psf_rescale,
-            sf_exact_3 * pv_psf_rescale,
-        )
-    elif cutlass.const_expr(use_mixed_imlp):
-        sf_h2_01 = _softmax_exp2_pair_packed_f16x2(
-            group_max_values[0], group_max_values[1], softmax_scale_log2, sf_bias
-        )
-        sf_h2_23 = _softmax_exp2_pair_packed_f16x2(
-            group_max_values[2], group_max_values[3], softmax_scale_log2, sf_bias
-        )
-        denominator_sf_word = _pack_e4m3x4_natural_from_f16x2(sf_h2_01, sf_h2_23)
-        pv_sf_word = _scale_pack_e4m3x4_natural_from_f16x2(sf_h2_01, sf_h2_23, pv_psf_rescale)
-        prequant_row_sum = _p4_n256_prequant_rowsum_from_f16x2_psf(sf_h2_01, sf_h2_23, group_p_sums)
-    else:
-        sf_args_01 = nvvm_fma_packed_f32x2(
-            (group_max_values[0], group_max_values[1]),
-            (softmax_scale_log2, softmax_scale_log2),
-            (sf_bias, sf_bias),
-        )
-        sf_args_23 = nvvm_fma_packed_f32x2(
-            (group_max_values[2], group_max_values[3]),
-            (softmax_scale_log2, softmax_scale_log2),
-            (sf_bias, sf_bias),
-        )
-        sf_exact_0 = cute.exp2(sf_args_01[0], fastmath=True)
-        sf_exact_1 = cute.exp2(sf_args_01[1], fastmath=True)
-        sf_exact_2 = cute.exp2(sf_args_23[0], fastmath=True)
-        sf_exact_3 = cute.exp2(sf_args_23[1], fastmath=True)
-        denominator_sf_word = _pack_e4m3x4_natural(sf_exact_0, sf_exact_1, sf_exact_2, sf_exact_3)
-        pv_sf_word = _pack_e4m3x4_natural(
-            sf_exact_0 * pv_psf_rescale,
-            sf_exact_1 * pv_psf_rescale,
-            sf_exact_2 * pv_psf_rescale,
-            sf_exact_3 * pv_psf_rescale,
-        )
-        row_sum_parts01 = nvvm_mul_packed_f32x2(
-            (sf_exact_0, sf_exact_1), (group_p_sums[0], group_p_sums[1])
-        )
-        row_sum_parts23 = nvvm_mul_packed_f32x2(
-            (sf_exact_2, sf_exact_3), (group_p_sums[2], group_p_sums[3])
-        )
-        prequant_row_sum = _sum_p4_n256_psf_row_parts(
-            row_sum_parts01[0],
-            row_sum_parts01[1],
-            row_sum_parts23[0],
-            row_sum_parts23[1],
-        )
-    psf_source_word_offset = _smem_p4_n256_psf_source_word_offset(
-        bank_idx, score_half_idx, local_warp_idx, lane_idx
-    )
-    sPSF[psf_source_word_offset] = pv_sf_word
-    prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-    return (denominator_sf_word, prequant_row_sum)
-
-
-@cute.jit
-def _runtime_finalize_final_p4_n256_score_half_psf_source(
-    sPSF,
-    group_max_values,
-    group_valid_values,
-    group_p_sums,
-    new_row_max: ctm.Float32,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    softmax_scale_log2: ctm.Float32,
-    pv_psf_rescale: ctm.Float32,
-    tail_needs_mask: ctm.Boolean,
-    producer_warp_base: ctm.Int32,
-    score_half_idx: ctm.Int32,
-    bank_idx: ctm.Int32,
-    use_mixed_imlp: ctm.Constexpr,
-) -> tuple:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    score_half_n: ctm.Constexpr = SMEM_P4_BMM1_N // SMEM_P4_N256_SCORE_HALVES
-    score_half_groups_per_col_band: ctm.Constexpr = (
-        score_half_n // SF_VEC_SIZE // SMEM_P4_TMEM_WARP_N
-    )
-    sf_bias = -new_row_max * softmax_scale_log2 - ctm.Float32(LOG2_6)
-    if cutlass.const_expr(score_half_groups_per_col_band != 4):
-        raise ValueError("packed P_SFA conversion requires four groups per col band")
-    denominator_sf_word = ctm.Int32(0)
-    pv_sf_word = ctm.Int32(0)
-    prequant_row_sum = ctm.Float32(0.0)
-    if tail_needs_mask:
-        sf_exact_0 = ctm.Float32(0.0)
-        sf_exact_1 = ctm.Float32(0.0)
-        sf_exact_2 = ctm.Float32(0.0)
-        sf_exact_3 = ctm.Float32(0.0)
-        for local_group_idx in ctm.range_constexpr(score_half_groups_per_col_band):
-            group_valid = group_valid_values[local_group_idx]
             sf_exact = ctm.Float32(0.0)
             if group_valid:
                 sf_exact = cute.exp2(
