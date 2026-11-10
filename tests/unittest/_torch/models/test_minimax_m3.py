@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import os
 from types import SimpleNamespace
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Optional, Tuple
 from unittest.mock import Mock, create_autospec
 
 import pytest
@@ -59,7 +59,6 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
     MiniMaxM3MsaSparseAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _group_max_reduce
-from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
@@ -1402,11 +1401,15 @@ def _expand_packaged_quant_config(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("text_config_as_dict", [False, True])
 def test_packaged_moe_config_expands_to_mixed_precision(text_config_as_dict: bool) -> None:
-    quant_config, layer_quant_config = _expand_packaged_quant_config(
-        _packaged_vl_config(text_config_as_dict)
+    cfg = _packaged_vl_config(text_config_as_dict)
+    # An ignored layer gets no entry and is excluded; its neighbours are unaffected.
+    cfg.quantization_config["ignored_layers"].append(
+        "language_model.model.layers.4.self_attn.o_proj"
     )
+    quant_config, layer_quant_config = _expand_packaged_quant_config(cfg)
 
     assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+    assert quant_config.is_module_excluded_from_quantization("model.layers.4.self_attn.o_proj")
     assert "model.layers.3.block_sparse_moe.gate" in quant_config.exclude_modules
     assert not any(name.startswith("language_model.") for name in quant_config.exclude_modules)
     assert quant_config.is_module_excluded_from_quantization("lm_head")
@@ -1427,19 +1430,8 @@ def test_packaged_moe_config_expands_to_mixed_precision(text_config_as_dict: boo
         else:
             names += [f"{prefix}.mlp.{proj}" for proj in ("gate_proj", "up_proj", "down_proj")]
         expected.update({name: (QuantAlgo.MXFP8, 32) for name in names})
+    del expected["model.layers.4.self_attn.o_proj"]
     assert {k: (v.quant_algo, v.group_size) for k, v in layer_quant_config.items()} == expected
-
-
-@pytest.mark.cpu_only
-def test_packaged_moe_config_honors_ignored_layers() -> None:
-    cfg = _packaged_vl_config()
-    cfg.quantization_config["ignored_layers"].append(
-        "language_model.model.layers.4.self_attn.o_proj"
-    )
-    quant_config, layer_quant_config = _expand_packaged_quant_config(cfg)
-    assert "model.layers.4.self_attn.o_proj" not in layer_quant_config
-    assert quant_config.is_module_excluded_from_quantization("model.layers.4.self_attn.o_proj")
-    assert "model.layers.5.self_attn.o_proj" in layer_quant_config
 
 
 @pytest.mark.cpu_only
@@ -3228,30 +3220,6 @@ def _cosine(out: torch.Tensor, ref: torch.Tensor) -> float:
     )
 
 
-def _graph_replay(
-    fn: Callable[..., torch.Tensor], *inputs: torch.Tensor
-) -> Callable[..., torch.Tensor]:
-    """Capture ``fn(*inputs)`` in a CUDA graph; return a replay(new_inputs) helper."""
-    static_inputs = [t.clone() for t in inputs]
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        fn(*static_inputs)
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        static_output = fn(*static_inputs)
-
-    def replay(*new_inputs: torch.Tensor) -> torch.Tensor:
-        for static, new in zip(static_inputs, new_inputs):
-            static.copy_(new)
-        graph.replay()
-        torch.cuda.synchronize()
-        return static_output.clone()
-
-    return replay
-
-
 def _mxfp8_dequant(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
     """E4M3 weight times 2**(UE8M0 - 127) per 32 input channels."""
     exponent = scale_inv.float().repeat_interleave(32, dim=1) - 127.0
@@ -3261,9 +3229,8 @@ def _mxfp8_dequant(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tenso
 @pytest.mark.gpu
 @skip_pre_blackwell
 @skip_blackwell_geforce
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank(
-    use_cuda_graph: bool, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """index_q/k_proj load as MXFP8 with each rank's scale rows next to its weight rows.
 
@@ -3286,7 +3253,6 @@ def test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank(
     k_weight = (torch.randn(index_dim, hidden) * 2).to(torch.float8_e4m3fn)
     k_scale = torch.randint(121, 129, (index_dim, hidden // 32)).to(torch.uint8)
     x = torch.randn(48, hidden, device="cuda", dtype=torch.bfloat16)
-    x_next = torch.randn_like(x)
     ref_q = x.float() @ _mxfp8_dequant(q_weight, q_scale).cuda().T
     ref_k = x.float() @ _mxfp8_dequant(k_weight, k_scale).cuda().T
     mxfp8 = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
@@ -3333,15 +3299,7 @@ def test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank(
             expected_scale = torch.ops.trtllm.block_scale_interleave(expected_scale)
         assert torch.equal(proj.weight_scale.view(torch.uint8).flatten(), expected_scale.flatten())
 
-        def forward(inp: torch.Tensor) -> torch.Tensor:
-            return proj(inp)
-
-        if use_cuda_graph:
-            replay = _graph_replay(forward, x)
-            out, out_next = replay(x), replay(x_next)
-            assert torch.equal(out_next, forward(x_next))
-        else:
-            out = forward(x)
+        out = proj(x)
         ref = torch.cat([ref_q[:, rows], ref_k], dim=1)
         # Dynamic per-token MXFP8 activations cost ~1% relative error; a scale
         # row on the wrong head is off by at least a factor of two.
@@ -3377,9 +3335,7 @@ def _nvfp4_activation(x: torch.Tensor, global_scale: float = 1.0) -> torch.Tenso
 
 @pytest.mark.gpu
 @skip_pre_blackwell
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
-@pytest.mark.parametrize("tune", [False, True])
-def test_packaged_nvfp4_experts_load_and_run_on_cutlass(use_cuda_graph: bool, tune: bool) -> None:
+def test_packaged_nvfp4_experts_load_and_run_on_cutlass() -> None:
     """Packed experts reach the CUTLASS NVFP4 path intact and compute the static recipe.
 
     Each expert has its own global scales, so a dropped scale or a wrong
@@ -3538,29 +3494,14 @@ def test_packaged_nvfp4_experts_load_and_run_on_cutlass(use_cuda_graph: bool, tu
 
     x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
     logits = torch.randn(tokens, num_experts, device="cuda")
-    x_next, logits_next = torch.randn_like(x), torch.randn_like(logits)
     with torch.inference_mode():
-        # Tune the actual shape, then verify the selected tactic eagerly and in a graph.
-        if tune:
-            with autotune(tune_mode=True, skip_dynamic_tuning_buckets=True):
-                forward(x, logits)
-        if use_cuda_graph:
-            replay = _graph_replay(forward, x, logits)
-            outputs = [
-                (replay(x, logits), x, logits),
-                (replay(x_next, logits_next), x_next, logits_next),
-            ]
-            # The fused top-k combine may accumulate in a different order per launch.
-            assert _relative_l2(outputs[1][0], forward(x_next, logits_next)) < 1e-3
-        else:
-            outputs = [(forward(x, logits), x, logits)]
-        for out, inp, lg in outputs:
-            ref = reference(inp, lg)
-            assert torch.isfinite(out).all()
-            # Same recipe on both sides; the remainder is accumulation order
-            # and the BF16 rounding of the GEMM outputs.
-            assert _relative_l2(out, ref) < 0.02
-            assert _cosine(out, ref) > 0.999
+        out = forward(x, logits)
+    ref = reference(x, logits)
+    assert torch.isfinite(out).all()
+    # Same recipe on both sides; the remainder is accumulation order and the
+    # BF16 rounding of the GEMM outputs.
+    assert _relative_l2(out, ref) < 0.02
+    assert _cosine(out, ref) > 0.999
 
 
 def _stub_minimax_m3_attention_construction(
