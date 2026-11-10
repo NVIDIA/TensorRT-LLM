@@ -134,7 +134,7 @@ class NonClcMixedCgaSchedulerWorker:
     cluster_broadcast_region = "non_clc_mixed_cga.cluster_broadcast"
     work_id_counter_region = "non_clc_mixed_cga.work_id_counters"
     fallback_registration_counter_region = "non_clc_mixed_cga.fallback_registration_counter"
-    fallback_group_token_region = "non_clc_mixed_cga.fallback_group_tokens"  # nosec B105
+    fallback_group_token_region = "non_clc_mixed_cga.fallback_group_tokens"
 
     def __init__(
         self,
@@ -309,6 +309,33 @@ class NonClcMixedCgaSchedulerWorker:
             cta_coord_in_active_cluster[1] + inner_cluster_n * Int32(self.config.fallback_cluster_shape[1]),
             Int32(0),
         )
+
+    @cute.jit
+    def finish_claim_channel(self) -> None:
+        """Scheduler warp, once after the last claim: the leader waits until every peer's remote arrive has landed.
+
+        Peers arrive on the leader's empty mbarrier over DSMEM after each broadcast (``sync_object_empty.arrive`` in
+        work_id_claim). The gen-phase kernel's last-arriver tail has no grid sync to keep the leader resident, so the
+        leader must not exit while an arrive is in flight; the kernel calls this under the decode scheduler. Its
+        grouped / phase_interleave builds exit without this drain; their atomic_counter builds share the same
+        in-flight-arrive hazard, which a separate change addresses for every schedule.
+        ``producer_tail`` waits for the empty phase of the last broadcast (all ``32 * cluster_size`` arrives). It cannot
+        deadlock: every scheduler warp consumes every broadcast, including the past-the-end ids. No-op without the
+        atomic_counter claim channel.
+        """
+        if cutlass.const_expr(self.work_id_mode == "atomic_counter"):
+            if cutlass.const_expr(self.config.is_mixed):
+                raise ValueError(
+                    "finish_claim_channel drains the physical-cluster claim channel; fixed fallback groups share one "
+                    "work id across split_factor clusters and are not supported by the early-exit tail."
+                )
+            # The else-branch re-assignment yields the state from the dynamic ``if``, carrying producer_tail's in-place
+            # producer_state advance.
+            work_id_state = self._work_id_state
+            if self._work_id_state.is_leader_cta:
+                self._work_id_state.cluster_pipeline.producer_tail(self._work_id_state.producer_state)
+            else:
+                self._work_id_state = work_id_state
 
     @cute.jit
     def get_atomic_counter_pointer(self, stream_index: Int32) -> cute.Pointer:

@@ -19,9 +19,58 @@ nothing pushes results back: FC1 gathers straight from the dense received plane,
 and the FC2 epilogue warps send results to their owning rank themselves through
 the bulk reduce-add. Twelve warps cover every role.
 
-The kernel owns the workspace tail reset. All warp roles finish before a grid
-barrier allows the epilogue to clear the counters. A final NVLink barrier makes
-the reset visible to every rank before the next launch reuses the workspace.
+The kernel owns the workspace tail reset. Every CTA joins its warp roles and
+arrives once; the last arriver clears the tail-reset counters (the scheduler's
+claim counters and the fc1_done slots among them), signals the peers
+(in-kernel reduce: one cross-rank barrier) and advances the epoch, which the next
+call's communication kernel reads. That kernel waits at entry until the epoch
+shows the previous call's tail complete (a standalone top-k reduce may end before
+the tail, and the next launch may start right after the reduce). The tail has no
+grid sync, so under the decode scheduler the scheduler warp drains the cluster
+claim channel and every CTA leaves through a cluster barrier (peers' remote
+arrives land before a CTA exits). The grouped and phase_interleave builds exit
+without the drain or the barrier: their atomic_counter builds share the same
+in-flight-arrive hazard (grid_stride has no claim channel, so only the barrier
+part applies), which a separate change addresses for every schedule.
+
+Residency: the communication kernel fires ``launch_dependents`` at entry, and a
+programmatic dependent is only released once every primary CTA has done so, so
+all of its CTAs are resident before this kernel starts; this kernel itself needs
+no co-residency of its own CTAs (arrivals do not block, tiles are claimed
+dynamically), except n_split, whose liveness needs a cluster on each die (the
+scheduler's K6; host guard: more CTAs than the larger die has SMs). Remaining
+timing assumptions are listed at the exchange's LL write in
+token_comm_gen_specialized.py.
+
+Schedules (``schedule_policy``). The die-blind build (``die_aware`` off) takes
+``("grouped", hint)`` (``BlackwellFusedFc12Scheduler``) and
+``("phase_interleave", hint)`` (``PhaseInterleavedFc12Scheduler``, hint None =
+the minimum safe hint), the tuned default, and, opt-in,
+``("decode", L)`` (``GenphaseDecodeFc12Scheduler``, L an optional static FC1
+lead, None = all FC1 tiles of a stream before its FC2 tiles). Decode is the only
+schedule of the die-aware forms. With a lead the claim layout is exact for each
+stream's token blocks K, which the scheduler warp counts once right after the
+``sizes_ready`` wait and before its first claim (``compute_stream_token_blocks``,
+mandatory in lead builds; no code without a lead or for grouped / phase_interleave),
+so no claim below the end of a stream maps to no tile (each cluster still claims
+one past-the-end id per counter it visits, as without a lead). The decode
+scheduler itself never waits for in-kernel progress; the scheduler warp's claim
+gate (``claim_gate_on_tma_a``, default on) claims unit j+1 only after this CTA's
+TMA-A has taken unit j. The only FC1 -> FC2 synchronization is still the FC2
+TMA-B wait on the fc1_done counters, and the claim order keeps that wait live
+(see the decode scheduler's docstring, blocking point W5 for the gate). The
+cluster shape is (4, 1); decode also takes (2, 1).
+
+The die-aware forms (decode only) split the work between the GPU's two dies; each die claims
+its own work first and then steals the other die's (n_split: only its FC2 tiles;
+see the scheduler's docstring).
+``{"die_aware": "on"}`` (n_split) halves every expert's weight rows: the weight
+and scale-factor operands are die-major, ``(2E, K, N/2)`` and ``(2E, cols/2)``
+with entry ``half * E + e`` placed on die ``half`` (needs both widths divisible
+by two cluster tiles; with a lead each die claims only its own tiles). ``{"die_aware": "expert_half"}`` halves
+the local expert list instead: standard operands, experts ``[0, E/2)`` placed
+on die 0 and ``[E/2, E)`` on die 1 (needs an even local expert count). A CTA
+reads its die from ``cute.arch.locality_domain_id``.
 """
 
 import hashlib
@@ -41,7 +90,10 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
-from .....helpers.helper_weight_ready_gate import derive_helper_weight_ready_topology, make_helper_weight_ready_generation_gate
+from .....helpers.helper_weight_ready_gate import (
+    derive_helper_weight_ready_topology,
+    make_helper_weight_ready_generation_gate,
+)
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
@@ -49,16 +101,18 @@ from .....helpers.dsl_helpers import spin_wait
 from .....helpers.iket_compat import iket
 from .....helpers.megamoe_aot import make_megamoe_aot_callable
 from .....helpers.smem_workspace import SmemWorkspace
-from .....helpers.software_sync import NvlinkBarrier
 from .....helpers.topk_reduce import TopkReduce
 from .....helpers.utils import ceil_div, round_up
 from .....quant_def import CombineFormat, QuantKind
 from ....schedulers.base import WorkIdAcquisitionMode
 from ....schedulers.fc12_scheduler import BlackwellFusedFc12Scheduler, PhaseInterleavedFc12Scheduler
+from ....schedulers.genphase_decode_scheduler import GenphaseDecodeFc12Scheduler
 from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGatedActEpilogue
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .block_scaled_swap_ab_fc12_mainloop_gen_specialized import BlockScaledSwapAbFc12MainloopGenSpecialized
 from .token_comm_gen_specialized import GenphaseTokenComm, GenphaseTokenCommArgs
+from .genphase_tail import GenphaseTail
+from .weight_prefetch import prefetch_span
 
 
 _aot_symbol_prefix = "rubin_genphase_mega_moe_aot"
@@ -82,19 +136,29 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
     epilogue_register_count: ClassVar[int] = 256
     other_warp_register_count: ClassVar[int] = 80
     tail_barrier_id: ClassVar[int] = 8
+    largest_die_sm_count: ClassVar[int] = 112  # upper bound on the SM count of one die
 
-    # Tuned for Rubin, not portable. VR200 carries 212 SMs and this kernel's 46
-    # four-CTA clusters occupy 184, leaving 28 for the communication grid; go over that
-    # and the main kernel loses its last cluster, which is not optional because the
-    # tail barrier needs every CTA resident at once. The communication exchange CTAs
-    # exit as soon as their count rows are published, so the resident set is one helper
-    # plus these pushers. Porting to Blackwell means deriving this number again from
-    # that part's SM count and cluster capacity.
+    # Tuned for Rubin, not portable. VR200 carries 212 SMs and this kernel's 184 CTAs
+    # (46 four-CTA or 92 two-CTA clusters) leave 28 for the communication grid; go over that
+    # and the main kernel's last cluster starts only once communication CTAs leave (the
+    # last-arriver tail needs no co-residency, tiles are claimed dynamically), except
+    # that n_split's liveness needs a cluster on each die (the scheduler's K6). The
+    # communication exchange CTAs exit as soon as their count rows are published, so the
+    # resident set is one helper plus these pushers. Porting to Blackwell means deriving
+    # this number again from that part's SM count and cluster capacity.
     pusher_cta_count: ClassVar[int] = 27
     refine_participant_groups: ClassVar[int] = 2
     refine_output_stages: ClassVar[int] = 4
 
-    cluster_shape_mn: ClassVar[Tuple[int, int]] = (4, 1)
+    # Cluster N carries no tokens under swap-AB, so only cluster M varies. A cluster tile is
+    # cta_tile_m x M weight rows; (2, 1) halves it to 256, which n_split needs where a die's
+    # half is not a whole number of 512-row tiles (e.g. hidden 3584). grouped and
+    # phase_interleave keep the fixed (4, 1); (2, 1) is a decode-scheduler option.
+    default_cluster_shape_mn: ClassVar[Tuple[int, int]] = (4, 1)
+    supported_cluster_shapes_mn: ClassVar[Tuple[Tuple[int, int], ...]] = ((4, 1), (2, 1))
+    # The class attribute, kept for callers that read the cluster shape off the class; a
+    # built kernel's own shape is the instance attribute set in __init__.
+    cluster_shape_mn: ClassVar[Tuple[int, int]] = default_cluster_shape_mn
     mma_k_mode: ClassVar[str] = "2x"
     a_major_mode: ClassVar[OperandMajorMode] = OperandMajorMode.K
     b_major_mode: ClassVar[OperandMajorMode] = OperandMajorMode.K
@@ -131,8 +195,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             "epi_flag_batches": tuple,
             "launch_cluster_count": int,
             "reduce_topk_in_kernel": bool,
+            "claim_gate_on_tma_a": OptionalRequirement(bool),
+            "sf_plain_transport": OptionalRequirement(bool),
             "helper_expert_count": OptionalRequirement(int),
             "total_helper_slots": OptionalRequirement(int),
+            # None = off; cluster_shape_mn is not declared here: it is checked by value below.
+            "die_aware": OptionalRequirement(Optional[str]),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -141,8 +209,24 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             problem_desc, impl_desc, world_size=problem_desc["world_size"]
         )
 
+        schedule_policy = impl_desc["schedule_policy"]
+        decode = len(schedule_policy) == 2 and schedule_policy[0] == "decode"
+        if decode:
+            supplied_cluster_shape_mn = impl_desc.get("cluster_shape_mn")
+            self.cluster_shape_mn = (
+                self.default_cluster_shape_mn if supplied_cluster_shape_mn is None else supplied_cluster_shape_mn
+            )
+            if self.cluster_shape_mn not in self.supported_cluster_shapes_mn:  # a list never equals a tuple
+                raise ValueError(
+                    f"The generation-phase kernel supports cluster_shape_mn in {self.supported_cluster_shapes_mn} "
+                    f"(default {self.default_cluster_shape_mn}) under the decode scheduler, got "
+                    f"{self.cluster_shape_mn}."
+                )
+        else:
+            # grouped / phase_interleave: the fixed cluster shape.
+            self.cluster_shape_mn = self.default_cluster_shape_mn
         for field_name, fixed_value, supplied_value in (
-            ("cluster_shape_mn", self.cluster_shape_mn, impl_desc.get("cluster_shape_mn")),
+            *(() if decode else (("cluster_shape_mn", self.cluster_shape_mn, impl_desc.get("cluster_shape_mn")),)),
             ("mma_k_mode", self.mma_k_mode, impl_desc.get("mma_k_mode")),
             ("a_major_mode", self.a_major_mode, problem_desc.get("a_major_mode")),
             ("b_major_mode", self.b_major_mode, problem_desc.get("b_major_mode")),
@@ -184,7 +268,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self.schedule_policy = impl_desc["schedule_policy"]
         if len(self.schedule_policy) != 2:
             raise ValueError("schedule_policy must contain a mode and hint.")
-        self.schedule_mode, self.hint = self.schedule_policy
+        # grouped / phase_interleave: (mode, hint); decode: ("decode", L) with the FC1 lead L (None = infinite).
+        self.schedule_mode, schedule_argument = self.schedule_policy
+        self.hint = None if decode else schedule_argument
+        self.decode_lead = schedule_argument if decode else None
         self.token_padding_block = impl_desc["token_padding_block"]
         self.sf_padding_block = impl_desc["sf_padding_block"]
         self.work_id_mode: WorkIdAcquisitionMode = impl_desc["work_id_mode"]
@@ -192,9 +279,27 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self.epi_flag_batches = impl_desc["epi_flag_batches"]
         self.launch_cluster_count = impl_desc["launch_cluster_count"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
+        # Scheduler claims wait for TMA-A to take the previous unit (on by default; a few tuned entries run faster without).
+        self.claim_gate_on_tma_a = impl_desc.get("claim_gate_on_tma_a", True)
         self.helper_expert_count = impl_desc.get("helper_expert_count", 0)
         if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
             raise ValueError("helper_expert_count must be a non-negative exact int")
+        self.die_aware = impl_desc.get("die_aware") or "off"
+        if self.die_aware not in ("off", "on", "expert_half"):
+            raise ValueError(f"die_aware must be off, on or expert_half, got {self.die_aware!r}.")
+        # on: each expert's weight rows are halved between the dies (die-major weights, n_split);
+        # expert_half: the local expert list is halved between the dies (standard weights).
+        self.n_split = self.die_aware == "on"
+        self.expert_half = self.die_aware == "expert_half"
+        if self.die_aware != "off" and not decode:
+            raise ValueError(
+                f"die_aware {self.die_aware!r} runs on the decode scheduler only: schedule_policy must be "
+                f"('decode', None) or ('decode', L), got {self.schedule_policy!r}."
+            )
+        if self.die_aware != "off" and self.helper_expert_count > 0:
+            # The per-die placement covers this rank's local experts; DLB helper slots are not placed or owned.
+            raise ValueError("die_aware is not supported together with DLB helper slots (helper_expert_count > 0).")
+
         self.occupancy = 1
         self.architecture = "sm_107"
         self.threads_per_cta = 12 * 32
@@ -207,6 +312,20 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             self.home_expert_count = self.local_expert_count
         self.cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
         self.promised_launchable_sm_count = self.launch_cluster_count * self.cluster_size
+
+        if self.die_aware != "off" and self.promised_launchable_sm_count <= self.largest_die_sm_count:
+            # Requiring more CTAs than one die can hold guarantees both dies only under K6's full-residency premise.
+            # n_split needs this for liveness; expert_half imposes the same guard for locality.
+            needs = (
+                "n_split needs more than {count} resident CTAs (K6: a cluster on each die)"
+                if self.n_split
+                else "expert_half is only supported with more than {count} resident CTAs (a cluster on each die; "
+                "liveness does not need it, the die-aware placement does)"
+            )
+            raise ValueError(
+                f"{needs.format(count=self.largest_die_sm_count)}, got {self.launch_cluster_count} x "
+                f"{self.cluster_size}."
+            )
 
         self._validate_geometry()
         self._resolve_schedule_hint()
@@ -236,17 +355,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self.token_comm = GenphaseTokenComm(problem_desc, token_comm_impl_desc)
         self.max_routed_rows = self.token_comm.worst_case_data_rows
         self._validate_communication_geometry()
-        self.tail_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.tail_barrier_id)
+        self.tail = GenphaseTail(world_size=self.world_size)
 
         fc12_problem_desc = ProblemDesc({**problem_desc, "expert_count": self.local_expert_count})
         resolved_impl_desc = ImplDesc(
             {
-                **impl_desc,
-                # Fixed here, but the scheduler and the epilogue read them from the
-                # descriptor, so they have to be forwarded rather than assumed.
+                # die_aware is forwarded below only when not off (an explicit None reads as off).
+                **{key: value for key, value in impl_desc.items() if key != "die_aware"},
+                # Resolved or fixed here, but the scheduler, the epilogue and the mainloop
+                # read them from the descriptor, so they have to be forwarded rather than assumed.
                 "cluster_shape_mn": self.cluster_shape_mn,
                 "mma_k_mode": self.mma_k_mode,
-                "hint": self.hint,
+                # Each scheduler reads its own key: the decode FC1 lead or the grouped / phase_interleave hint.
+                **({"decode_lead": self.decode_lead} if decode else {"hint": self.hint}),
                 "tmem_plan": tmem_plan,
                 "is_swap_ab": True,
                 "max_tokens": self.max_routed_rows,
@@ -257,12 +378,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 # take the local route and the FC2 store is always the peer-facing
                 # bulk reduce-add.
                 "token_back_push_data": False,
+                # The standalone reduce below polls the self-validating combine plane.
+                "combine_ll_encoded": not self.reduce_topk_in_kernel,
                 "fc1_epi_flag_batch": self.epi_flag_batches[0],
                 "fc2_epi_flag_batch": self.epi_flag_batches[1],
+                **({"die_aware": self.die_aware} if self.die_aware != "off" else {}),
             }
         )
         scheduler_type = (
-            BlackwellFusedFc12Scheduler if self.schedule_mode == "grouped" else PhaseInterleavedFc12Scheduler
+            GenphaseDecodeFc12Scheduler
+            if decode
+            else BlackwellFusedFc12Scheduler
+            if self.schedule_mode == "grouped"
+            else PhaseInterleavedFc12Scheduler
         )
         self.scheduler = scheduler_type(fc12_problem_desc, resolved_impl_desc)
         self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
@@ -281,8 +409,14 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             raise ValueError("The generation-phase communication component provides no token-back path.")
         self._device_workspace = self._build_device_workspace()
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
+        if self.epilogue.combine_ll_encoded != (not self.reduce_topk_in_kernel):
+            raise ValueError("The standalone top-k reduce expects the self-validating bf16 combine plane.")
         self._topk_reduce = (
-            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format)
+            None
+            if self.reduce_topk_in_kernel
+            else TopkReduce(
+                self.hidden_size, self.topk, self.combine_format, ll_encoded=True, num_experts=self.expert_count
+            )
         )
 
     # ------------------------------------------------------------------
@@ -333,14 +467,18 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             raise ValueError("token_padding_block must be a positive multiple of 64.")
         if self.launch_cluster_count <= 0:
             raise ValueError("launch_cluster_count must be positive.")
-        if self.schedule_mode not in ("grouped", "phase_interleave"):
+        # decode: the decode scheduler checks its lead and work_id_mode itself.
+        if self.schedule_mode not in ("grouped", "phase_interleave", "decode"):
             raise ValueError(
-                f"schedule_policy mode must be 'grouped' or 'phase_interleave', got {self.schedule_mode!r}."
+                f"schedule_policy mode must be 'grouped', 'phase_interleave' or 'decode', got {self.schedule_mode!r}."
             )
-        if self.hint is not None and (isinstance(self.hint, bool) or not isinstance(self.hint, int) or self.hint <= 0):
-            raise ValueError(f"schedule_policy hint must be a positive Python int, got {self.hint!r}.")
-        if self.schedule_mode == "phase_interleave" and self.work_id_mode != "atomic_counter":
-            raise ValueError("phase_interleave currently requires work_id_mode='atomic_counter'.")
+        if self.schedule_mode != "decode":
+            if self.hint is not None and (
+                isinstance(self.hint, bool) or not isinstance(self.hint, int) or self.hint <= 0
+            ):
+                raise ValueError(f"schedule_policy hint must be a positive Python int, got {self.hint!r}.")
+            if self.schedule_mode == "phase_interleave" and self.work_id_mode != "atomic_counter":
+                raise ValueError("phase_interleave currently requires work_id_mode='atomic_counter'.")
         if len(self.epi_flag_batches) != 2:
             raise ValueError("epi_flag_batches must contain FC1 and FC2 batch sizes.")
         if any(batch < 1 or batch > len(self.epilogue_warp_ids) for batch in self.epi_flag_batches):
@@ -475,7 +613,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         if not self.reduce_topk_in_kernel:
             # Peers write their contributions straight into this plane, one row per
             # (token, top-k slot), so it has to be symmetric. The standalone
-            # TopkReduce launch folds it into the caller's output afterwards.
+            # TopkReduce launch folds it into the caller's output afterwards. Cells
+            # are stored bit-inverted, so zero means "not arrived": zeroed once here,
+            # and re-zeroed by the reduce as it consumes them.
             device_workspace.register(
                 self.pre_reduced_activation_region,
                 self.combine_format.act_dtype,
@@ -483,9 +623,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 buffer_space="shared",
                 mem_order=(2, 1, 0),
                 byte_alignment=128,
+                reset="zero_on_first_allocate",
             )
         self.scheduler.register_device_workspace(device_workspace)
-        self.tail_barrier.register_device_workspace(device_workspace)
+        self.tail.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
         device_workspace.finalize()
         return device_workspace
@@ -499,6 +640,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         smem_workspace = SmemWorkspace()
         self.scheduler.register_smem_regions(smem_workspace)
         self.epilogue.register_smem_regions(smem_workspace)
+        smem_workspace.register_mbarrier(self.tma_a_progress_region, 1)
         fixed_component_bytes = smem_workspace.estimate_total_bytes()
         alignment_shift_bytes = max(region.byte_alignment for region in smem_workspace.regions())
         mainloop_smem_budget_bytes = smem_limit - fixed_component_bytes - alignment_shift_bytes
@@ -533,6 +675,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         tile = "x".join(str(dimension) for dimension in self.mma_tiler_mnk)
         cluster = "x".join(str(dimension) for dimension in self.cluster_shape_mn)
         epi_flags = "x".join(str(batch) for batch in self.epi_flag_batches)
+        # grouped / phase_interleave names (and so their AOT symbols) carry no decode or die tag.
+        schedule = (
+            f"scheddecode_lead{self.decode_lead}"
+            if self.schedule_mode == "decode"
+            else f"sched{self.schedule_mode}_hint{self.hint}"
+        )
+        die_tag = {"off": "", "on": "die_aware_", "expert_half": "die_aware_expert_half_"}[self.die_aware]
         return (
             f"sm107_block_scaled_swap_ab_gen_phase_specialized_moe_{self.quant_kind}_"
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
@@ -542,16 +691,17 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             f"h{self.hidden_size}_i{self.intermediate_gateup_size}_maxtoken{self.max_tokens_per_rank}_"
             f"inst{instruction}_{self.mma_k_mode}_tile{tile}_"
             f"cluster{cluster}_{'2cta' if self.use_2cta_instrs else '1cta'}_"
-            f"sched{self.schedule_mode}_hint{self.hint}_pad{self.token_padding_block}x{self.sf_padding_block}_"
+            f"{schedule}_pad{self.token_padding_block}x{self.sf_padding_block}_"
             f"work{self.work_id_mode}_"
             f"fc2store{'ublk' if self.epilogue.fc2_use_ublk else 'stg'}_"
             f"fc2tmastages{self.epilogue.fc2_tma_stages}_"
-            f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_"
+            f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_{die_tag}"
             f"pusher{self.pusher_cta_count}_refine{self.refine_participant_groups}x{self.refine_output_stages}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
             f"swiglua{self.swiglu_alpha}_swiglub{self.swiglu_beta}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_reduce' if self.reduce_topk_in_kernel else 'separate_reduce'}_"
+            f"claimgate{int(self.claim_gate_on_tma_a)}_sfplain{int(self.token_comm.sf_plain_transport)}_"
             f"abstages{self._mainloop.num_weight_ab_stages}x{self._mainloop.num_token_ab_stages}"
             + ("_dlb_v1" if self.helper_expert_count > 0 else "")
         )
@@ -582,9 +732,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         intermediate_downproj = intermediate_gateup // 2
         experts = self.local_expert_count
         sf_vec_size = self.sf_vec_size
+        # n_split: die-major weight (2E, K, N/2) and SF (2E, cols/2) tensors, expert' = half * E + e.
+        weight_experts = 2 * experts if self.n_split else experts
+        fc1_weight_rows = intermediate_gateup // 2 if self.n_split else intermediate_gateup
+        fc2_weight_rows = hidden // 2 if self.n_split else hidden
         # Weight SF is atom-swizzled and opaque, so its extent is whatever the caller staged.
-        fc1_weight_sf_columns = round_up(intermediate_gateup, 128) * round_up(hidden // sf_vec_size, 4)
-        fc2_weight_sf_columns = round_up(hidden, 128) * round_up(intermediate_downproj // sf_vec_size, 4)
+        fc1_weight_sf_columns = round_up(fc1_weight_rows, 128) * round_up(hidden // sf_vec_size, 4)
+        fc2_weight_sf_columns = round_up(fc2_weight_rows, 128) * round_up(intermediate_downproj // sf_vec_size, 4)
 
         fake_arguments = dict(
             activation=fake_tensor(
@@ -603,10 +757,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             ),
             topk_indices=fake_tensor(self.topk_index_dtype, (tokens, self.topk), (1, 0), {}, 16),
             topk_scores=fake_tensor(cutlass.Float32, (tokens, self.topk), (1, 0), {}, 4),
-            fc1_weight=fake_tensor(self.a_dtype, (experts, hidden, intermediate_gateup), (2, 0, 1), {1, 2}, 16),
-            fc1_weight_sf=fake_tensor(self.sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {1}, 16),
-            fc2_weight=fake_tensor(self.a_dtype, (experts, intermediate_downproj, hidden), (2, 0, 1), {1, 2}, 16),
-            fc2_weight_sf=fake_tensor(self.sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {1}, 16),
+            fc1_weight=fake_tensor(self.a_dtype, (weight_experts, hidden, fc1_weight_rows), (2, 0, 1), {1, 2}, 16),
+            fc1_weight_sf=fake_tensor(self.sf_dtype, (weight_experts, fc1_weight_sf_columns), (1, 0), {1}, 16),
+            fc2_weight=fake_tensor(
+                self.a_dtype, (weight_experts, intermediate_downproj, fc2_weight_rows), (2, 0, 1), {1, 2}, 16
+            ),
+            fc2_weight_sf=fake_tensor(self.sf_dtype, (weight_experts, fc2_weight_sf_columns), (1, 0), {1}, 16),
             output_activation=fake_tensor(cutlass.BFloat16, (tokens, hidden), (1, 0), {}, 16),
             local_workspace=make_ptr(cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=128),
             shared_workspace=make_ptr(cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=128),
@@ -660,6 +816,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         activation_sf: cute.Tensor,  # (max_tokens_per_rank, padded hidden / sf_vec_size)
         topk_indices: cute.Tensor,  # (max_tokens_per_rank, topk)
         topk_scores: cute.Tensor,  # (max_tokens_per_rank, topk)
+        # n_split: die-major tensors instead, (2 * local_experts, ...) with the last extent halved
         fc1_weight: cute.Tensor,  # (local_experts, hidden, intermediate_gateup)
         fc1_weight_sf: cute.Tensor,  # (local_experts, packed_fc1_scale_factors)
         fc2_weight: cute.Tensor,  # (local_experts, intermediate_downproj, hidden)
@@ -709,6 +866,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             ):
                 if cutlass.const_expr(scalar is None):
                     raise ValueError(f"{self.quant_kind} requires {scalar_name}.")
+        if cutlass.const_expr(self.die_aware != "off" and not hasattr(cute.arch, "locality_domain_id")):
+            raise RuntimeError(
+                "die_aware reads the die of each SM with cute.arch.locality_domain_id (PTX %locality_domain_id), "
+                "which this CuTe DSL build lacks: use one that provides cute.arch.locality_domain_id."
+            )
 
         local_rank = peer_rank_ptr_mapper_host.rank
         router_topk_scores = topk_scores if cutlass.const_expr(self.apply_topk_at_fc1) else None
@@ -739,8 +901,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         hidden = self.hidden_size
         intermediate_gateup = self.intermediate_gateup_size
         intermediate_downproj = intermediate_gateup // 2
-        fc1_weight = rewrite_tensor_shape(fc1_weight, (experts, hidden, intermediate_gateup))
-        fc2_weight = rewrite_tensor_shape(fc2_weight, (experts, intermediate_downproj, hidden))
+        # n_split: die-major weight and SF views; the extension adds half * E to the expert coordinate and rebases the
+        # row block into the half, so the scheduler and epilogues still address the full (E, N) problem.
+        weight_experts = 2 * experts if self.n_split else experts
+        fc1_weight_rows = intermediate_gateup // 2 if self.n_split else intermediate_gateup
+        fc2_weight_rows = hidden // 2 if self.n_split else hidden
+        fc1_weight = rewrite_tensor_shape(fc1_weight, (weight_experts, hidden, fc1_weight_rows))
+        fc2_weight = rewrite_tensor_shape(fc2_weight, (weight_experts, intermediate_downproj, fc2_weight_rows))
 
         singleton = cutlass.Int32(1)
         sf_vec_size = self.sf_vec_size
@@ -748,7 +915,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         fc1_a = cute.make_tensor(
             fc1_weight.iterator,
             cute.make_layout(
-                (cutlass.Int32(intermediate_gateup), cutlass.Int32(hidden), experts),
+                (cutlass.Int32(fc1_weight_rows), cutlass.Int32(hidden), weight_experts),
                 stride=(fc1_weight.stride[2], fc1_weight.stride[1], fc1_weight.stride[0]),
             ),
         )
@@ -777,7 +944,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 (self.token_comm.worst_case_sf_rows, cutlass.Int32(hidden), singleton), sf_vec_size
             ),
         )
-        padded_intermediate_gateup = cute.round_up(intermediate_gateup, sf_vec_size * 4)
+        padded_intermediate_gateup = cute.round_up(fc1_weight_rows, sf_vec_size * 4)
         expected_fc1_weight_sf_columns = padded_intermediate_gateup * hidden // sf_vec_size
         if cutlass.const_expr(
             isinstance(fc1_weight_sf.shape[1], int) and isinstance(expected_fc1_weight_sf_columns, int)
@@ -787,7 +954,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         fc1_sfa = cute.make_tensor(
             fc1_weight_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (cutlass.Int32(padded_intermediate_gateup), cutlass.Int32(hidden), cutlass.Int32(experts)), sf_vec_size
+                (cutlass.Int32(padded_intermediate_gateup), cutlass.Int32(hidden), cutlass.Int32(weight_experts)),
+                sf_vec_size,
             ),
         )
 
@@ -874,6 +1042,15 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         )
 
         grid = self.scheduler.get_grid_shape(max_active_clusters=self.launch_cluster_count)
+        # The last-arriver tail counts promised_launchable_sm_count arrivals; another grid size would never reset
+        # the tail span (or reset it while CTAs still run).
+        grid_cta_count = grid[0] * grid[1] * grid[2]
+        if cutlass.const_expr(grid_cta_count != self.promised_launchable_sm_count):
+            raise ValueError(
+                f"the last-arriver tail needs grid == launch_cluster_count * cluster_size == "
+                f"promised_launchable_sm_count, got grid {grid} ({grid_cta_count} CTAs), "
+                f"{self.launch_cluster_count} x {self.cluster_size}, {self.promised_launchable_sm_count}."
+            )
         self._device_workspace.remove_device_members()
         self._kernel(
             fc1_tma_a_tensor,
@@ -904,6 +1081,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             fc1_norm_const,
             hot_expert_weight_ready_flags,
             hot_expert_weight_ready_generation,
+            (fc1_weight.iterator.toint(), fc1_weight_sf.iterator.toint()),
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -914,7 +1092,141 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         )
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
-            self._topk_reduce(pre_reduced_activation, None, output_activation, reduce_scores, stream)
+            self._topk_reduce(
+                pre_reduced_activation,
+                None,
+                output_activation,
+                reduce_scores,
+                stream,
+                topk_indices=topk_indices,
+            )
+
+    # ------------------------------------------------------------------
+    # Weight prefetch
+    # ------------------------------------------------------------------
+
+    # Total across all clusters, issued once the payload flag is seen (see profiles/NOTES.md).
+    l2_prefetch_budget_bytes: ClassVar[int] = 64 << 20
+    l2_prefetch_chunk_bytes: ClassVar[int] = 16384
+    # TMA-A arrives once per work tile it takes; the scheduler claims unit j only after
+    # TMA-A has taken unit j - 1, so claims follow the order units start in.
+    tma_a_progress_region: ClassVar[str] = "genphase.smem.tma_a_progress"
+
+    @cute.jit
+    def _prefetch_first_waves(self, linear_cta_idx: Int32, weight_bases: Tuple[Int64, Int64]) -> None:
+        """Warm L2 with this CTA's share of the first FC1 claim waves (one warp).
+
+        Claims are dynamic, so a CTA does not prefetch what it will itself load:
+        CTA ``c`` covers slice ``c % cluster_size`` of FC1 unit ``c // cluster_size``
+        in every wave, and the waves together cover the first units in the order
+        the FC1 stream hands them out (slot-major, output block minor).
+
+        The die-aware forms have one FC1 stream per die (the decode scheduler's
+        per-die counters): unit ``u`` is unit ``u >> 1`` of die ``u & 1``'s stream,
+        so the waves cover the first units of both streams, half the budget each.
+        expert_half: a die's stream holds only the slots whose expert lies in that
+        die's half (the scheduler's ``_owner_owns_slot``), standard weight entries.
+        n_split: every slot, ``blocks_fc1`` units per token block, rows of the
+        die-major weight entry ``die * E + expert`` (``gateup / 2`` rows each).
+        """
+        hidden = self.hidden_size
+        gateup = self.intermediate_gateup_size
+        cluster_size = self.cluster_size
+        slice_rows = self.cta_tile_m
+        unit_rows = slice_rows * cluster_size
+        die_aware = self.die_aware != "off"
+        # Weight rows of one weight entry: n_split's die-major entries hold half an expert's rows.
+        entry_rows = gateup // 2 if self.n_split else gateup
+        blocks_fc1 = ceil_div(entry_rows, unit_rows)
+        token_block = self.cta_tile_n
+        # Weight row in bytes for this quant kind (NVFP4: hidden / 2, MXFP8: hidden).
+        row_bytes = hidden * int(self.a_dtype.width) // 8
+        expert_bytes = entry_rows * row_bytes
+        sf_block_bytes = 128 * round_up(hidden // self.sf_vec_size, 4)
+        sf_expert_bytes = round_up(entry_rows, 128) // 128 * sf_block_bytes
+        unit_bytes = unit_rows * row_bytes + cluster_size * sf_block_bytes
+        clusters = self.launch_cluster_count
+        prefetch_units = self.l2_prefetch_budget_bytes // unit_bytes
+        waves = ceil_div(prefetch_units, clusters)
+        # expert_half filters the slots per die, so it scans once per die; the other forms share one scan.
+        scans = 2 if self.expert_half else 1
+
+        lane_idx = cute.arch.lane_idx()
+        sizes_by_slot = self.token_comm.scheduler_expert_sizes_tensor(self._device_workspace)
+        slot_to_expert = self.token_comm.slot_to_expert_tensor(self._device_workspace)
+        part = linear_cta_idx % Int32(cluster_size)
+        slot_chunks = ceil_div(self.local_expert_count, 32)
+        # Each lane owns one slot per chunk: its unit range comes from a warp scan, and
+        # the slot holding a target unit is found by ballot, so no lane walks serially.
+        chunk_end = cute.make_rmem_tensor((scans * slot_chunks,), Int32)
+        chunk_units = cute.make_rmem_tensor((scans * slot_chunks,), Int32)
+        chunk_expert = cute.make_rmem_tensor((slot_chunks,), Int32)
+        for scan in cutlass.range_constexpr(scans):
+            carry = Int32(0)
+            for chunk in cutlass.range_constexpr(slot_chunks):
+                slot = Int32(chunk * 32) + lane_idx
+                units = Int32(0)
+                if cutlass.const_expr(scan == 0):
+                    chunk_expert[chunk] = Int32(-1)
+                if slot < Int32(self.local_expert_count):
+                    units = ceil_div(sizes_by_slot[slot], Int32(token_block)) * Int32(blocks_fc1)
+                    slot_expert = slot_to_expert[slot]
+                    if cutlass.const_expr(scan == 0):
+                        chunk_expert[chunk] = slot_expert
+                    if cutlass.const_expr(self.expert_half):
+                        if (slot_expert * Int32(2)) // Int32(self.local_expert_count) != Int32(scan):
+                            units = Int32(0)
+                inclusive = units
+                for step_log in cutlass.range_constexpr(5):
+                    step = Int32(1 << step_log)
+                    previous = Int32(cute.arch.shuffle_sync(inclusive, lane_idx - step))
+                    if lane_idx >= step:
+                        inclusive = inclusive + previous
+                chunk_end[scan * slot_chunks + chunk] = carry + inclusive
+                chunk_units[scan * slot_chunks + chunk] = units
+                carry = carry + Int32(cute.arch.shuffle_sync(inclusive, Int32(31)))
+
+        for wave in cutlass.range_constexpr(waves):
+            unit = linear_cta_idx // Int32(cluster_size) + Int32(wave * clusters)
+            stream_unit = unit
+            stream_die = Int32(0)
+            if cutlass.const_expr(die_aware):
+                stream_unit = unit >> Int32(1)
+                stream_die = unit & Int32(1)
+            expert = Int32(-1)
+            output_block = Int32(0)
+            for scan in cutlass.range_constexpr(scans):
+                for chunk in cutlass.range_constexpr(slot_chunks):
+                    index = scan * slot_chunks + chunk
+                    begin = chunk_end[index] - chunk_units[index]
+                    owns = (stream_unit >= begin) & (stream_unit < chunk_end[index])
+                    if cutlass.const_expr(scans > 1):
+                        owns = owns & (stream_die == Int32(scan))
+                    ballot = Int32(cute.arch.vote_ballot_sync(owns))
+                    if ballot != Int32(0):
+                        owner = Int32(cute.arch.popc((ballot & (-ballot)) - Int32(1)))
+                        owner_expert = Int32(cute.arch.shuffle_sync(chunk_expert[chunk], owner))
+                        owner_begin = Int32(cute.arch.shuffle_sync(begin, owner))
+                        expert = owner_expert
+                        output_block = (stream_unit - owner_begin) % Int32(blocks_fc1)
+            first_row = output_block * Int32(unit_rows) + part * Int32(slice_rows)
+            if expert >= Int32(0) and first_row < Int32(entry_rows) and unit < Int32(prefetch_units):
+                entry = expert
+                if cutlass.const_expr(self.n_split):
+                    entry = stream_die * Int32(self.local_expert_count) + expert
+                a_base = weight_bases[0] + Int64(entry) * Int64(expert_bytes) + Int64(first_row) * Int64(row_bytes)
+                sf_base = (
+                    weight_bases[1]
+                    + Int64(entry) * Int64(sf_expert_bytes)
+                    + Int64(first_row // Int32(128)) * Int64(sf_block_bytes)
+                )
+                if cutlass.const_expr(entry_rows % unit_rows == 0):
+                    prefetch_span(a_base, slice_rows * row_bytes, lane_idx, self.l2_prefetch_chunk_bytes)
+                    prefetch_span(sf_base, sf_block_bytes, lane_idx, self.l2_prefetch_chunk_bytes)
+                else:
+                    if first_row + Int32(slice_rows) <= Int32(entry_rows):
+                        prefetch_span(a_base, slice_rows * row_bytes, lane_idx, self.l2_prefetch_chunk_bytes)
+                        prefetch_span(sf_base, sf_block_bytes, lane_idx, self.l2_prefetch_chunk_bytes)
 
     # ------------------------------------------------------------------
     # Device entry
@@ -953,6 +1265,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         fc1_norm_const: Optional[cute.Tensor],
         hot_expert_weight_ready_flags: Optional[cute.Pointer],
         hot_expert_weight_ready_generation: Optional[cutlass.Uint64],
+        weight_bases: Tuple[Int64, Int64],
     ):
         """Compose scheduler, mainloop, epilogue, and the workspace tail reset."""
         self._mainloop.materialize_codegen_members()
@@ -993,7 +1306,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         token_src_metadata = self.token_comm.token_src_metadata_tensor(self._device_workspace)
         gather_index = self.token_comm.gather_index_tensor(self._device_workspace)
         pool_topk_scores = self.token_comm.fc1_topk_scores_tensor(self._device_workspace)
-        self.tail_barrier.assign_device_members(self._device_workspace, peer_rank_ptr_mapper)
 
         # Under the split-depth plan the weights and the tokens ride separate
         # pipelines of different depth; under the shared plan `token_pipeline` is
@@ -1023,24 +1335,44 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         tmem_allocator = self._mainloop.create_tmem_allocator(
             self._smem_workspace, smem_base, allocator_warp_id=self.epilogue_warp_ids[0]
         )
-        self.scheduler.assign_device_members(
-            expert_token_sizes=scheduler_expert_sizes,
-            expert_token_prefix_sum=None,
-            actual_expert_shape=actual_expert_shape,
-            block_idx=block_idx,
-            smem_workspace=self._smem_workspace,
-            smem_base=smem_base,
-            device_workspace=self._device_workspace,
-        )
+        if cutlass.const_expr(self.schedule_mode == "decode"):
+            # The scheduler enumerates slots; the extension maps a slot to its expert through this remap, and so
+            # does the expert_half scheduler to tell which die owns a slot.
+            expert_remap = self.token_comm.slot_to_expert_tensor(self._device_workspace)
+            die = None
+            if cutlass.const_expr(self.die_aware != "off"):
+                # %locality_domain_id is the die of this CTA's SM; a cluster lies within one GPC, so within one die.
+                die = cute.arch.make_warp_uniform(cute.arch.locality_domain_id())
+            self.scheduler.assign_device_members(
+                expert_token_sizes=scheduler_expert_sizes,
+                block_idx=block_idx,
+                smem_workspace=self._smem_workspace,
+                smem_base=smem_base,
+                device_workspace=self._device_workspace,
+                expert_remap=expert_remap,
+                die=die,
+            )
+        else:
+            # grouped / phase_interleave schedulers.
+            self.scheduler.assign_device_members(
+                expert_token_sizes=scheduler_expert_sizes,
+                expert_token_prefix_sum=None,
+                actual_expert_shape=actual_expert_shape,
+                block_idx=block_idx,
+                smem_workspace=self._smem_workspace,
+                smem_base=smem_base,
+                device_workspace=self._device_workspace,
+            )
         scheduler = self.scheduler
 
         fc2_spin_threshold = (intermediate_gateup + self._mainloop.cta_tile_m - 1) // self._mainloop.cta_tile_m
-        # The scheduler enumerates slots, so the tile it produces has to be
-        # rewritten into an expert index before any consumer sees it: the weights,
-        # their scale factors, the per-expert alphas and the per-expert
-        # scale-factor gate all address an expert. The row offsets it also carries
-        # are already resolved and stay as they are.
-        expert_remap = self.token_comm.slot_to_expert_tensor(self._device_workspace)
+        if cutlass.const_expr(self.schedule_mode != "decode"):
+            # The scheduler enumerates slots, so the tile it produces has to be
+            # rewritten into an expert index before any consumer sees it: the weights,
+            # their scale factors, the per-expert alphas and the per-expert
+            # scale-factor gate all address an expert. The row offsets it also carries
+            # are already resolved and stay as they are.
+            expert_remap = self.token_comm.slot_to_expert_tensor(self._device_workspace)
         # No FC1 ready counter: readiness is published per rank, not per tile, and
         # the waits below cover it once per warp.
         helper_weight_ready_gate = None
@@ -1058,11 +1390,20 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=None,
             expert_remap=expert_remap,
+            n_split=self.n_split,
+            local_expert_count=self.local_expert_count,
+            fc1_half_cta_tiles=(self.intermediate_gateup_size // 2) // self._mainloop.cta_tile_m,
+            fc2_half_cta_tiles=(self.hidden_size // 2) // self._mainloop.cta_tile_m,
         )
         optional_epilogue_args = GatedActEpilogueArgs(
             fc1_alpha=fc1_alpha, fc2_alpha=fc2_alpha, fc1_norm_const=fc1_norm_const, topk_scores=pool_topk_scores
         )
 
+        tma_a_progress = self._smem_workspace.ptr(self.tma_a_progress_region, smem_base)
+        if warp_idx == self.scheduler_warp_id:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(tma_a_progress, 1)
+        cute.arch.mbarrier_init_fence()
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
         self._mainloop.assign_device_members(
             self._smem_workspace, smem_base, cta_coord_in_cluster, hidden, intermediate_gateup
@@ -1079,11 +1420,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 self._device_workspace.ptr(self.token_comm.sizes_ready_region),
                 lambda value: value == Int32(1),
                 scope="gpu",
+                sleep_cycles=150,
             )
             iket.range_pop()
+            if cutlass.const_expr(self.schedule_mode == "decode" and self.decode_lead is not None):
+                # Mandatory for a decode lead: the exact layout's K per stream (decode scheduler docstring), once,
+                # all lanes, before the first claim. Without a lead and for grouped / PI: no code.
+                iket.range_push("scheduler.stream_token_blocks")
+                scheduler.compute_stream_token_blocks()
+                iket.range_pop()
             iket.range_push("scheduler.gen_work")
             work_tile = scheduler.gen_next_work()
             iket.range_pop()
+            published = Int32(0)
             helper_ready_latched = Int32(0)
             while work_tile.is_valid_tile:
                 iket.range_push("scheduler.publish_work")
@@ -1093,13 +1442,22 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                         prepared_tile.expert_idx, helper_ready_latched
                     )
                 scheduler.publish_work(prepared_tile)
+                published = published + Int32(1)
                 iket.range_pop()
+                # Unit j is claimed once TMA-A has taken unit j - 1 (waiting from unit 1 keeps the parity exact):
+                # one unit of lookahead for the weight stream, and claims in start order.
+                if cutlass.const_expr(self.claim_gate_on_tma_a):
+                    if published >= Int32(1):
+                        cute.arch.mbarrier_wait(tma_a_progress, (published - Int32(1)) % Int32(2))
                 iket.range_push("scheduler.gen_work")
                 work_tile = scheduler.gen_next_work()
                 iket.range_pop()
             iket.range_push("scheduler.publish_tail")
             scheduler.publish_work(work_tile)
             scheduler.produce_tail()
+            if cutlass.const_expr(self.schedule_mode == "decode"):
+                # Drain peers' DSMEM arrives before the leader can exit; see finish_claim_channel.
+                scheduler.finish_claim_channel()
             iket.range_pop()
             iket.range_pop()
 
@@ -1120,6 +1478,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 ab_pipeline_state=tma_a_pipeline_state,
                 sched_consumer=sched_consumer,
                 kernel_extension=kernel_extension,
+                trigger_dependents_when_drained=not self.reduce_topk_in_kernel,
+                progress_mbarrier=tma_a_progress if self.claim_gate_on_tma_a else None,
             )
             iket.range_pop()
 
@@ -1142,6 +1502,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 fc2_spin_threshold=fc2_spin_threshold,
                 fc1_sf_ready_pointer=self._device_workspace.ptr(self.token_comm.fc1_sf_ready_region),
                 expert_sizes=self._device_workspace.tensor(self.token_comm.expert_sizes_region),
+                fc1_sf_parts_per_block=self.token_comm.refine_parts_per_block,
             )
             iket.range_pop()
 
@@ -1179,6 +1540,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 self._device_workspace.ptr(self.token_comm.metadata_ready_region),
                 lambda value: value == Int32(self.token_comm.metadata_ready_target),
                 scope="gpu",
+                sleep_cycles=150,
             )
             iket.range_pop()
             sched_consumer = scheduler.make_consumer()
@@ -1214,6 +1576,23 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         if (warp_idx >= Int32(self.gather_b_warp_ids[0])) & (warp_idx <= Int32(self.gather_b_warp_ids[-1])):
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("genphase.gather_b1")
+            if warp_idx == Int32(self.gather_b_warp_ids[0]) and cutlass.const_expr(self.l2_prefetch_budget_bytes > 0):
+                iket.range_push("gather_b1.l2_prefetch")
+                spin_wait(
+                    self._device_workspace.ptr(self.token_comm.sizes_ready_region),
+                    lambda value: value == Int32(1),
+                    scope="gpu",
+                )
+                # Held until the metadata is ready: the weight stream then fills the idle
+                # window before the first MMA instead of slowing the dispatch's
+                # latency-bound memory round trips.
+                spin_wait(
+                    self._device_workspace.ptr(self.token_comm.metadata_ready_region),
+                    lambda value: value == Int32(self.token_comm.metadata_ready_target),
+                    scope="gpu",
+                )
+                self._prefetch_first_waves(linear_cta_idx, weight_bases)
+                iket.range_pop()
             iket.range_push("gather_b1.wait_input_ready")
             # `gather_index` is local, published by this rank's sort workers; the
             # payload flag is written by peers, hence the wider scope.
@@ -1221,11 +1600,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 self._device_workspace.ptr(self.token_comm.token_data_ready_region),
                 lambda value: value == Int32(self.token_comm.payload_ready_target),
                 scope="sys",
+                sleep_cycles=150,
             )
             spin_wait(
                 self._device_workspace.ptr(self.token_comm.metadata_ready_region),
                 lambda value: value == Int32(self.token_comm.metadata_ready_target),
                 scope="gpu",
+                sleep_cycles=150,
             )
             iket.range_pop()
             sched_consumer = scheduler.make_consumer()
@@ -1245,31 +1626,47 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         if warp_idx < len(self.epilogue_warp_ids):
             epilogue_thread_count = 32 * len(self.epilogue_warp_ids)
 
-            iket.range_push("tail.grid_sync_before_reset")
-            self.tail_barrier.sync(
-                epilogue_thread_count, Int32(self.promised_launchable_sm_count), linear_cta_idx, thread_idx
-            )
+            # Every epilogue warp of this CTA has drained its stores; one arrival per CTA.
+            iket.range_push("tail.arrive")
+            cute.arch.barrier(barrier_id=self.tail_barrier_id, number_of_threads=epilogue_thread_count)
             iket.range_pop()
+            # Release the top-k reduce launch: it is a programmatic dependent that waits
+            # for this grid's completion itself, so it can be resident before the tail ends.
+            cute.arch.griddepcontrol_launch_dependents()
+            if warp_idx == Int32(self.epilogue_warp_ids[0]):
+                lane_idx = cute.arch.lane_idx()
+                is_last = Int32(0)
+                if lane_idx == Int32(0):
+                    if self.tail.arrive(self._device_workspace, Int32(self.promised_launchable_sm_count)):
+                        is_last = Int32(1)
+                is_last = Int32(cute.arch.shuffle_sync(is_last, Int32(0)))
+                if is_last != Int32(0):
+                    # The last arriver has acquired every other CTA's arrival, so nothing on
+                    # this rank reads the tail span any more: reset it, then meet the peers.
+                    iket.range_push("tail.reset_workspace")
+                    self.tail.reset_tail_space(self._device_workspace, lane_idx, 32)
+                    cute.arch.sync_warp()
+                    iket.range_pop()
+                    iket.range_push("tail.nvlink_barrier")
+                    if lane_idx == Int32(0):
+                        epoch = self.tail.read_epoch(self._device_workspace)
+                        if cutlass.const_expr(self.reduce_topk_in_kernel):
+                            # Peers reduce-add straight into this rank's output, so the
+                            # call is complete only once every rank is through.
+                            self.tail.cross_rank_barrier(self._device_workspace, peer_rank_ptr_mapper, epoch)
+                        else:
+                            # The standalone reduce polls its cells itself, so nothing in
+                            # this call waits for the peers: only the next call's payload
+                            # flags do (wait_previous_done in the comm kernel's pushers).
+                            self.tail.signal_done(self._device_workspace, peer_rank_ptr_mapper, epoch)
+                    iket.range_pop()
 
-            iket.range_push("tail.reset_workspace")
-            total_reset_threads = self.promised_launchable_sm_count * epilogue_thread_count
-            global_reset_thread = linear_cta_idx * Int32(epilogue_thread_count) + thread_idx
-            self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
-            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
-            iket.range_pop()
-
-            iket.range_push("tail.nvlink_publish")
-            self.tail_barrier.arrive_and_wait(
-                epilogue_thread_count,
-                Int32(self.promised_launchable_sm_count),
-                linear_cta_idx,
-                thread_idx,
-                prologue_grid_sync=True,
-                epilogue_grid_sync=False,
-            )
-            iket.range_pop()
-
-        self.tail_barrier.remove_device_members()
+        if cutlass.const_expr(self.schedule_mode == "decode"):
+            # Release/acquire keeps each CTA's shared memory alive through its peers'
+            # remote operations. Post-tail liveness: decode scheduler module, "Tail".
+            # grouped / phase_interleave builds exit without this barrier.
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
         self._device_workspace.remove_device_members()
 
 

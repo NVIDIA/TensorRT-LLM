@@ -12,7 +12,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cutlass_dsl import Boolean, Int32
+from cutlass.cutlass_dsl import Boolean, Int32, Int64
 
 from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....communication.nvlink_domain.token_comm import TokenCommArgs, TokenCommNonDeterministic
@@ -21,6 +21,7 @@ from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
 from .....helpers.iket_compat import iket
 from .....helpers.megamoe_aot import make_megamoe_aot_callable
+from .....helpers.route_reset import ClearInvalidRoutes
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.topk_reduce import TopkReduce
 from .....helpers.utils import ceil_div, round_up
@@ -41,6 +42,17 @@ from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGate
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .block_scaled_swap_ab_fc12_mainloop import BlockScaledSwapAbFc12Mainloop
 
+# ImplDesc keys of the internode component; a kernel with internode=False (the default) rejects them.
+_INTERNODE_IMPL_KEYS = ("enable_nccl_gin", "relay_warp_count", "fc2_done_release_scope", "router_pack_cta_count", "phase_stamps")
+
+
+def _internode_component():
+    """The internode (GIN rail) component, imported only by a kernel that opts in: the NVLink-domain
+    kernel never loads communication/internode or the NCCL device bindings it reaches."""
+    from .....communication.internode.token_comm_internode import TokenCommInternodeGin
+
+    return TokenCommInternodeGin
+
 
 _aot_symbol_prefix = "blackwell_mega_moe_aot"
 
@@ -51,6 +63,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     fc1_output_region: ClassVar[str] = "blackwell.mega_moe.fc1_output"
     fc1_output_sf_region: ClassVar[str] = "blackwell.mega_moe.fc1_output_sf"
     fc1_done_counter_region: ClassVar[str] = "blackwell.mega_moe.fc1_done_counter"
+    topk_reduce_counter_region: ClassVar[str] = "blackwell.mega_moe.topk_reduce_counters"
     epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (0, 1, 2, 3)
     mma_warp_id: ClassVar[int] = 4
     tma_a_warp_id: ClassVar[int] = 5
@@ -73,12 +86,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "b_major_mode": OperandMajorMode,
             "combine_format": CombineFormat,
             "gate_up_clamp": Optional[float],
-            "swiglu_alpha": OptionalRequirement(Optional[float]),
-            "swiglu_beta": OptionalRequirement(Optional[float]),
             "situ_beta": OptionalRequirement(Optional[float]),
             "situ_linear_beta": OptionalRequirement(Optional[float]),
             # "swiglu" (default) or "quick_geglu"; validated by the epilogue, keyed in name().
             "gate_activation": OptionalRequirement(str),
+            "swiglu_alpha": OptionalRequirement(Optional[float]),
+            "swiglu_beta": OptionalRequirement(Optional[float]),
             "world_size": int,
             "topk": int,
             "topk_index_dtype": type,
@@ -110,8 +123,19 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "token_in_flag_batch": int,
             "token_back_mode": str,
             "reduce_topk_in_kernel": bool,
+            "skip_topk_reduce": OptionalRequirement(bool),
             "helper_expert_count": OptionalRequirement(int),
             "total_helper_slots": OptionalRequirement(int),
+            # Master switch of the internode code paths (False: main's NVLink-domain kernel), the
+            # component selection it implies ("nvlink" / "internode_gin") and the internode
+            # component's own keys; see communication/internode/token_comm_internode.py.
+            "internode": OptionalRequirement(bool),
+            "token_comm_kind": OptionalRequirement(str),
+            "ranks_per_node": OptionalRequirement(int),
+            "enable_nccl_gin": OptionalRequirement(bool),
+            "relay_warp_count": OptionalRequirement(int),
+            "fc2_done_release_scope": OptionalRequirement(str),
+            "topk_reduce_persistent": OptionalRequirement(bool),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -136,11 +160,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.b_major_mode = problem_desc["b_major_mode"]
         self.combine_format = problem_desc["combine_format"]
         self.gate_up_clamp = problem_desc["gate_up_clamp"]
-        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
-        self.swiglu_beta = problem_desc.get("swiglu_beta")
         self.situ_beta = problem_desc.get("situ_beta")
         self.situ_linear_beta = problem_desc.get("situ_linear_beta")
         self.gate_activation = problem_desc.get("gate_activation") or "swiglu"
+        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
+        self.swiglu_beta = problem_desc.get("swiglu_beta")
         self.world_size = problem_desc["world_size"]
         self.topk = problem_desc["topk"]
         self.topk_index_dtype = problem_desc["topk_index_dtype"]
@@ -164,9 +188,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode = impl_desc["token_back_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
+        self.skip_topk_reduce = impl_desc.get("skip_topk_reduce", False)
         self.helper_expert_count = impl_desc.get("helper_expert_count", 0)
         if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
             raise ValueError("helper_expert_count must be a non-negative exact int")
+        # Opt-in persistent scheduler for the separate top-k reduce.
+        self.topk_reduce_persistent = bool(
+            impl_desc.get("topk_reduce_persistent") and not self.reduce_topk_in_kernel
+        )
+
         self.occupancy = 1
         self.architecture = "sm_100"
         self.local_expert_count = self.expert_count // self.world_size
@@ -181,8 +211,28 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             # static M is required only when an S>0 helper boundary must be
             # compiled into the scheduler gate.
             self.home_expert_count = self.local_expert_count
-        self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32  # nosec B105
-        self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72  # nosec B105
+        # Master switch of every internode (multi-node) code path. False (the default) is the
+        # NVLink-domain kernel of main: the nvlink component, one logical node, no GIN handles, no
+        # relay warps, main's compile-cache name; the internode keys must be absent. True selects
+        # the internode_gin component (communication/internode/).
+        self.internode = bool(impl_desc.get("internode", False))
+        self.token_comm_kind = impl_desc.get("token_comm_kind", "internode_gin" if self.internode else "nvlink")
+        if self.token_comm_kind not in ("nvlink", "internode_gin"):
+            raise ValueError(f"token_comm_kind must be 'nvlink' or 'internode_gin', got {self.token_comm_kind!r}.")
+        if self.internode != (self.token_comm_kind == "internode_gin"):
+            raise ValueError(
+                "internode=True selects token_comm_kind='internode_gin' and internode=False (the default) "
+                f"'nvlink'; got internode={self.internode}, token_comm_kind={self.token_comm_kind!r}."
+            )
+        if not self.internode:
+            stray = [key for key in _INTERNODE_IMPL_KEYS if key in impl_desc]
+            if impl_desc.get("ranks_per_node", self.world_size) != self.world_size:
+                stray.append("ranks_per_node")
+            if stray:
+                raise ValueError(
+                    "internode=False compiles every internode code path out; the ImplDesc must not carry "
+                    f"{stray} (ranks_per_node, when given, must equal the world size)."
+                )
 
         self.mixed_cga_config = NonClcMixedCgaConfig(
             preferred_cluster_shape=self.cluster_shape_mn,
@@ -236,7 +286,30 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 "token_back_schedule_mode": ("atomic_counter" if self.work_id_mode == "atomic_counter" else "static"),
             }
         )
-        self.token_comm = TokenCommNonDeterministic(problem_desc, token_comm_impl_desc)
+        # One assignment on purpose: tests/test_dlb_contracts.py executes the constructor's
+        # self.token_comm binding in isolation, so the class choice cannot live in a local.
+        self.token_comm = (
+            _internode_component() if self.internode else TokenCommNonDeterministic
+        )(problem_desc, token_comm_impl_desc)
+        # CTA layout: 12 warps, or 16 when warps 12-15 host standalone token-back or the
+        # component's relay group. Both wide layouts use the standalone register budget
+        # (4 x 256 + 12 x 64 registers per thread-slot fits the 64K register file).
+        self.relay_warp_count = self.token_comm.relay_warp_count
+        if self.relay_warp_count not in (0, 4):
+            raise ValueError(f"relay_warp_count must be 0 or 4, got {self.relay_warp_count}.")
+        if self.relay_warp_count > 0 and self.token_back_mode == "standalone_warps":
+            raise ValueError("token_back_mode='standalone_warps' and a relay warp group both need warps 12-15.")
+        if self.relay_warp_count > 0:
+            # The internode combine gather also runs on the epilogue warps after their last tile.
+            epilogue_workers = getattr(self.token_comm, "combine_epilogue_worker_warps", None)
+            if epilogue_workers is not None and epilogue_workers != len(self.epilogue_warp_ids):
+                raise ValueError(
+                    "The component's combine_epilogue_worker_warps must equal the kernel's epilogue warp "
+                    f"count ({len(self.epilogue_warp_ids)})."
+                )
+        wide_layout = self.token_back_mode == "standalone_warps" or self.relay_warp_count > 0
+        self.threads_per_cta = 16 * 32 if wide_layout else 12 * 32
+        self.other_warp_register_count = 64 if wide_layout else 72
         self.max_tokens = self.token_comm.worst_case_token_count
 
         fc12_problem_desc = ProblemDesc({**problem_desc, "expert_count": self.local_expert_count})
@@ -257,6 +330,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 "fc1_epi_flag_batch": self.epi_flag_batches[0],
                 "epi_async_release": impl_desc.get("epi_async_release", True),
                 "fc2_epi_flag_batch": self.epi_flag_batches[1],
+                "fc2_done_release_scope": self.token_comm.fc2_done_release_scope,
+                # Optional int: absent when the component has no relay records (validation rejects None).
+                **(
+                    {"relay_record_topk_marker": self.token_comm.relay_record_topk_marker}
+                    if self.token_comm.relay_record_topk_marker is not None
+                    else {}
+                ),
+                "publish_fc2_done": self.token_comm.publishes_fc2_done,
             }
         )
         scheduler_type = (
@@ -272,11 +353,39 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError("Epilogue and Mainloop scale vector sizes must match.")
         self._device_workspace = self._build_device_workspace()
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
+        self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel and not self.internode
+        # With relay tokens the reduce adds one returned BF16 node partial per remote node (I11).
+        internode_reduce = (
+            (self.local_expert_count, self.token_comm.ranks_per_node, self.token_comm.relay_slot_count)
+            if self.token_comm.relay_slot_count > 0
+            else None
+        )
         self._topk_reduce = (
-            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format)
+            None
+            if self.reduce_topk_in_kernel or self.skip_topk_reduce
+            else TopkReduce(
+                self.hidden_size,
+                self.topk,
+                self.combine_format,
+                num_experts=self.expert_count,
+                internode=internode_reduce,
+                persistent=self.topk_reduce_persistent,
+            )
+        )
+        self._route_reset = ClearInvalidRoutes(
+            self.max_tokens_per_rank, self.topk, self.expert_count,
+            self.hidden_size * self.combine_format.act_dtype.width // 8,
+            self.token_comm.combine_sf_hidden_padded * self.combine_format.scale_dtype.width // 8
+            if self.combine_format.is_quantized else 0,
         )
 
     def _validate_geometry(self) -> None:
+        if self.skip_topk_reduce and self.internode:
+            raise ValueError("skip_topk_reduce does not expose internode partials.")
+        if self.skip_topk_reduce and self.topk_reduce_persistent:
+            raise ValueError("skip_topk_reduce and topk_reduce_persistent are mutually exclusive.")
+        if self.skip_topk_reduce and (self.reduce_topk_in_kernel or self.combine_format.is_quantized):
+            raise ValueError("skip_topk_reduce requires BF16 combine and reduce_topk_in_kernel=False.")
         static_expert_dimensions = (
             isinstance(self.expert_count, int),
             isinstance(self.intermediate_gateup_size, int),
@@ -418,6 +527,17 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             byte_alignment=16,
             reset="tail_reset",
         )
+        if self.topk_reduce_persistent:
+            # Work cursor of the persistent top-k reduce: tail-reset like the
+            # other per-launch counters, so it is zero before every reduce.
+            device_workspace.register(
+                self.topk_reduce_counter_region,
+                cutlass.Int32,
+                (1,),
+                buffer_space="local",
+                byte_alignment=16,
+                reset="tail_reset",
+            )
         self.scheduler.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
         device_workspace.finalize()
@@ -430,6 +550,32 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     @property
     def require_zero_workspace_leading_bytes(self) -> Tuple[int, int]:
         return self._device_workspace.require_zero_workspace_leading_bytes
+
+    def topk_reduce_input_region(self) -> dict:
+        """Describe borrowed BF16 partials in the shared workspace.
+
+        If apply_routing_weights is true, multiply by top-k scores before
+        summing. Otherwise the scores were already applied in FC1. For routes
+        outside [0, expert_count), mask both partials and scores to zero before
+        multiplying: zero times NaN or Inf is not zero. Caller scores are unchanged.
+        Consume on the launch stream before reusing or releasing the workspace.
+        """
+        if not self.skip_topk_reduce:
+            raise RuntimeError("skip_topk_reduce mode is not enabled")
+        region = self.token_comm.pre_reduced_activation_region
+        return {
+            "name": region,
+            "byte_offset": self._device_workspace.offset(region),
+            "nbytes": self._device_workspace.nbytes(region),
+            "shape": (self.max_tokens_per_rank, self.topk, self.hidden_size),
+            "stride": (self.topk * self.hidden_size, self.hidden_size, 1),
+            "dtype": "bfloat16",
+            "alignment": self._device_workspace.byte_alignment(region),
+            "apply_routing_weights": not self.apply_topk_at_fc1,
+        }
+
+    def skip_topk_reduce_region(self) -> dict:
+        return self.topk_reduce_input_region()
 
     def name(self) -> str:
         """Canonical encoding of every constexpr: the compiled-kernel cache key.
@@ -467,12 +613,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
             f"tokeninflag{self.token_in_flag_batch}_tokenback{self.token_back_mode}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
-            f"swiglua{self.swiglu_alpha}_swiglub{self.swiglu_beta}_"
             # The SiTU betas are codegen-time constants, so they must key the compiled kernel.
             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
+            f"swiglu{self.swiglu_alpha}x{self.swiglu_beta}_skipreduce{self.skip_topk_reduce}_"
+            f"persistent{self.topk_reduce_persistent}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
-            "_dlb_v1"
+            # Empty for the NVLink-domain component: the internode=False kernel keeps main's name.
+            + (f"_{self.token_comm.name_token}" if self.token_comm.name_token else "")
+            + "_dlb_v1"
             # Off / SwiGLU keep the historical name so existing compiled-kernel caches stay valid.
             + ("_fc1actscale" if self.fc1_activation_per_token_scale else "")
             + (f"_act{self.gate_activation}" if self.gate_activation != "swiglu" else "")
@@ -554,6 +703,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 ),
                 hot_expert_weight_ready_generation=cutlass.Uint64(1),
             )
+        if self.topk_reduce_persistent:
+            # The persistent reduce reads its token count from device memory, so
+            # the AOT ABI carries the int32[1] operand; static-reduce entries omit it.
+            fake_arguments.update(num_valid_tokens=fake_tensor(cutlass.Int32, (1,), (0,), set(), 4))
         if self.quant_kind.uses_global_scale:
             # nvfp4 carries per-expert dequant scalars. Under an e8m0 scale they do not exist at
             # all, and declaring them here would put three tensors in the ABI that the caller has
@@ -631,13 +784,38 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
         hot_expert_weight_ready_flags: Optional[cute.Pointer] = None,  # uint64[EP]
         hot_expert_weight_ready_generation: Optional[cutlass.Uint64] = None,
+        gin_dev_comm=None,  # nccl.core.device.cute.DevComm; internode component with enable_nccl_gin only
+        gin_window=None,  # nccl.core.device.cute.Window over the symmetric (LSA) workspace arena
+        gin_shared_window_offset: Optional[Int64] = None,  # byte offset of shared_workspace inside gin_window (None: 0)
         # (tokens,) fp32, this rank's own tokens, plain local memory (the router reads it here and
         # pushes it to the pool). Required iff the descriptor enables fc1_activation_per_token_scale.
         # Last on purpose: the AOT kwargs wrapper right-aligns its None defaults, so appending keeps
         # every existing positional caller valid.
         fc1_activation_per_token_scale: Optional[cute.Tensor] = None,
+        # Caller-owned int32[1] live-token count for persistent finalization.
+        num_valid_tokens: Optional[cute.Tensor] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
+        # One constexpr bool: the DSL preprocessor only treats a plain ``const_expr(...)`` test as
+        # static, so a ``raise`` under ``const_expr(a) or const_expr(b)`` is rejected as an early exit.
+        gin_argument_mismatch: cutlass.Constexpr = ((gin_dev_comm is None) != (gin_window is None)) or (
+            (gin_dev_comm is not None and gin_window is not None) != self.token_comm.requires_gin_resources
+        )
+        if cutlass.const_expr(gin_argument_mismatch):
+            raise ValueError(
+                "gin_dev_comm and gin_window must both be present iff the communication component enables NCCL GIN"
+            )
+        # ``None`` (AOT builds and single-domain JIT calls never pass it) means offset 0. The router
+        # and the fused kernel take the offset as a dynamic ``Int64`` operand, so resolve it here once
+        # instead of letting ``None`` reach a kernel argument cast.
+        # Without GIN resources no offset argument exists at all (router and component kernels keep main's
+        # signatures); with GIN the offset defaults to 0.
+        if cutlass.const_expr(not self.token_comm.requires_gin_resources):
+            shared_window_offset = None
+        elif cutlass.const_expr(gin_shared_window_offset is None):
+            shared_window_offset = Int64(0)
+        else:
+            shared_window_offset = gin_shared_window_offset
 
         def rewrite_tensor_shape(tensor: cute.Tensor, shape: Tuple) -> cute.Tensor:
             return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=tensor.stride))
@@ -710,6 +888,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     )
 
         router_topk_scores = topk_scores if cutlass.const_expr(self.apply_topk_at_fc1) else None
+        # The internode router packs the Stage 1 relay messages from the caller's FP4 rows and scale
+        # factors; the NVLink-domain router takes no payload inputs (keeps its specialization).
+        router_activation = activation if cutlass.const_expr(self.token_comm.requires_gin_resources) else None
+        router_activation_sf = activation_sf if cutlass.const_expr(self.token_comm.requires_gin_resources) else None
         local_rank = peer_rank_ptr_mapper_host.rank
         self.token_comm.launch_router(
             topk_indices,
@@ -720,15 +902,34 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             peer_rank_ptr_mapper_host,
             self._device_workspace,
             stream,
+            gin_dev_comm,
+            gin_window,
+            shared_window_offset,
+            router_activation,
+            router_activation_sf,
             fc1_activation_per_token_scale,
         )
 
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
         self._device_workspace.assign_device_members(local_workspace, shared_workspace)
+        # Only external partial-output consumers need invalid rows cleared.
+        if cutlass.const_expr(not self.reduce_topk_in_kernel and self.skip_topk_reduce):
+            self._route_reset(
+                topk_indices,
+                self.token_comm.pre_reduced_activation_tensor(self._device_workspace),
+                self.token_comm.pre_reduced_activation_sf_tensor(self._device_workspace),
+                stream,
+            )
         activation_pool = self.token_comm.fc1_activation_tensor(self._device_workspace)
         activation_sf_pool = self.token_comm.fc1_activation_sf_tensor(self._device_workspace)
         fc1_output = self._device_workspace.tensor(self.fc1_output_region)
         fc1_output_sf = self._device_workspace.tensor(self.fc1_output_sf_region)
+
+        topk_reduce_counters = (
+            self._device_workspace.tensor(self.topk_reduce_counter_region)
+            if cutlass.const_expr(self.topk_reduce_persistent)
+            else None
+        )
 
         experts = self.local_expert_count
         hidden = self.hidden_size
@@ -771,8 +972,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 (padded_token_rows, cutlass.Int32(padded_hidden), singleton), sf_vec_size
             ),
         )
-        padded_intermediate_gateup = cute.round_up(intermediate_gateup, sf_vec_size * 4)
-        expected_fc1_weight_sf_columns = padded_intermediate_gateup * padded_hidden // sf_vec_size
+        padded_intermediate_gateup = cute.round_up(intermediate_gateup, 128)
+        expected_fc1_weight_sf_columns = padded_intermediate_gateup * cute.round_up(hidden // sf_vec_size, 4)
         if cutlass.const_expr(
             isinstance(fc1_weight_sf.shape[1], int) and isinstance(expected_fc1_weight_sf_columns, int)
         ):
@@ -828,6 +1029,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         else:
             pre_reduced_activation = self.token_comm.pre_reduced_activation_tensor(self._device_workspace)
             pre_reduced_activation_sf = self.token_comm.pre_reduced_activation_sf_tensor(self._device_workspace)
+        # Internode combine inputs of TopkReduce, resolved while the workspace members are bound.
+        combine_landing = self.token_comm.combine_landing_tensor(self._device_workspace)
+        combine_message_index = self.token_comm.message_index_tensor(self._device_workspace)
 
         if cutlass.const_expr(self.token_comm.token_back_push_data):
             fc2_output = self.token_comm.fc2_activation_tensor(self._device_workspace)
@@ -909,6 +1113,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_norm_const,
             hot_expert_weight_ready_flags,
             hot_expert_weight_ready_generation,
+            gin_dev_comm,
+            gin_window,
+            shared_window_offset,
         )
         if cutlass.const_expr(self.mixed_cga_config.is_mixed):
             kernel.launch(
@@ -929,11 +1136,35 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 min_blocks_per_mp=self.occupancy,
                 use_pdl=True,
             )
-        if cutlass.const_expr(not self.reduce_topk_in_kernel):
+        if cutlass.const_expr(self.topk_reduce_persistent != (num_valid_tokens is not None)):
+            raise ValueError("num_valid_tokens is required exactly when topk_reduce_persistent=True.")
+        if cutlass.const_expr(not self.reduce_topk_in_kernel and not self.skip_topk_reduce):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
-            self._topk_reduce(
-                pre_reduced_activation, pre_reduced_activation_sf, output_activation, reduce_scores, stream
-            )
+            if cutlass.const_expr(self.topk_reduce_persistent):
+                # Fixed grid; the token count is read from device memory
+                # (num_valid_tokens), so one captured launch covers every T.
+                self._topk_reduce(
+                    pre_reduced_activation,
+                    pre_reduced_activation_sf,
+                    output_activation,
+                    reduce_scores,
+                    stream,
+                    counters=topk_reduce_counters,
+                    num_tokens_dev=num_valid_tokens,
+                    topk_indices=topk_indices,
+                )
+            else:
+                self._topk_reduce(
+                    pre_reduced_activation,
+                    pre_reduced_activation_sf,
+                    output_activation,
+                    reduce_scores,
+                    stream,
+                    remote_partials=combine_landing,
+                    message_index=combine_message_index,
+                    topk_indices=topk_indices,
+                    local_rank=local_rank,
+                )
 
     @cute.kernel
     def _kernel(
@@ -974,8 +1205,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_norm_const: Optional[cute.Tensor],
         hot_expert_weight_ready_flags: Optional[cute.Pointer],
         hot_expert_weight_ready_generation: Optional[cutlass.Uint64],
+        gin_dev_comm,
+        gin_window,
+        gin_shared_window_offset,  # Optional[Int64]: None without GIN resources
     ):
         """Compose TokenComm, Scheduler, Mainloop, and Epilogue."""
+        # First statement on purpose: a by-value NCCL DevComm argument must be materialized where it
+        # dominates the whole kernel; the component keeps only scalar pointers for nested JIT regions.
+        self.token_comm.prepare_device_resources(gin_dev_comm, gin_window, gin_shared_window_offset)
         self._mainloop.materialize_codegen_members()
         storage_type = self._smem_workspace.storage_class()
         smem_allocator = utils.SmemAllocator()
@@ -1089,7 +1326,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         pipeline_init_wait_mixed_cga(
             self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster
         )
-        finalize_barrier_thread_count = 12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32  # nosec B105
+        finalize_barrier_thread_count = 12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32
         finalize_barrier = pipeline.NamedBarrier(barrier_id=13, num_threads=finalize_barrier_thread_count)
 
         if warp_idx == self.scheduler_warp_id:
@@ -1205,10 +1442,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 fc2_output_sf,
                 peer_rank_ptr_mapper,
                 optional_epilogue_args,
+                self.token_comm.relay_landing_tensor(self._device_workspace),
+                self.token_comm.fc2_done_fanout(self._device_workspace, peer_rank_ptr_mapper),
             )
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
             iket.range_pop()
+            # Internode combine: the epilogue warps join the relay warps' gather after their last tile.
+            self.token_comm.epilogue_tail_body(self._smem_workspace, smem_base, warp_idx)
             finalize_barrier.arrive_unaligned()
 
         if warp_idx >= Int32(self.transfer_warp_idx_start):
@@ -1218,7 +1459,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 self.token_comm.token_in(self._smem_workspace, smem_base)
                 iket.range_pop()
                 if cutlass.const_expr(
-                    self.token_comm.token_back_enabled and self.token_back_mode != "standalone_warps"  # nosec B105
+                    self.token_comm.token_back_enabled and self.token_back_mode != "standalone_warps"
                 ):
                     iket.range_push("mega.token_back")
                     self.token_comm.token_back(self._smem_workspace, smem_base)
@@ -1227,10 +1468,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 iket.range_push("mega.tail_reset")
                 self.token_comm.reset_tail()
                 iket.range_pop()
-            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):  # nosec B105
+            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):
                 iket.range_push("mega.token_back_standalone")
                 self.token_comm.token_back(self._smem_workspace, smem_base)
                 iket.range_pop()
                 finalize_barrier.arrive_unaligned()
+            elif cutlass.const_expr(self.relay_warp_count > 0):
+                # Relay warps 12-15 of the internode component (no finalize-barrier participation).
+                self.token_comm.relay_warp_body(self._smem_workspace, smem_base)
         self.token_comm.remove_device_members()
         self._device_workspace.remove_device_members()

@@ -18,13 +18,7 @@ from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dsl_helpers import mark_alignment
 from .....helpers.flag_batch import make_flag_batch_tracker
 from .....helpers.iket_compat import iket
-from .....helpers.ptx_helpers import (
-    cp_async_bulk_s2g,
-    nanosleep,
-    stg_b64,
-    stg_f32,
-    tma_load_1d,
-)
+from .....helpers.ptx_helpers import cp_async_bulk_s2g, nanosleep, stg_b64, stg_f32, tma_load_1d
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.software_sync import SoftwareGridSync
 from .....helpers.utils import ceil_div, round_up
@@ -174,7 +168,7 @@ class _MetadataPushRouter(KernelComponent):
     sorted_metadata_region = "local_mega.routing.sorted_metadata"
     sorted_scores_region = "local_mega.routing.sorted_scores"
     pool_expert_base_region = "local_mega.routing.pool_expert_base"
-    token_src_metadata_region = "local_mega.routing.token_src_metadata"  # nosec B105
+    token_src_metadata_region = "local_mega.routing.token_src_metadata"
     fc1_topk_scores_region = "local_mega.routing.fc1_topk_scores"
     source_expert_base_region = "local_mega.routing.source_expert_base"
     sorted_metadata_ready_region = "local_mega.routing.sorted_metadata_ready"
@@ -1021,9 +1015,9 @@ class LocalRouting(KernelComponent):
     fc1_activation_sf_region = "local_mega.routing.fc1_activation_sf"
     pre_reduced_activation_region = "local_mega.routing.pre_reduced_activation"
 
-    token_in_mbarrier_region = "local_mega.routing.main_smem.token_in_mbarriers"  # nosec B105
+    token_in_mbarrier_region = "local_mega.routing.main_smem.token_in_mbarriers"
     expert_sizes_smem_region = "local_mega.routing.main_smem.expert_sizes"
-    token_in_sf_smem_region = "local_mega.routing.main_smem.token_in_sf"  # nosec B105
+    token_in_sf_smem_region = "local_mega.routing.main_smem.token_in_sf"
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
