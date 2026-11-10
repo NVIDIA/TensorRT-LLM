@@ -4635,7 +4635,7 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
     }
 }
 
-def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelExpress = false)
+def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelExpress = false, jetModel = false)
 {
     def targetCloud = "kubernetes-cpu"
     def selectors = """
@@ -4647,6 +4647,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
     def tolerations = ""
     def extraDeviceEnv = ""
     def serviceContainerConfig = ""
+    def jetModelMount = jetModel ? """
+                    - name: jet-models
+                      mountPath: /scratch.trt_llm_data/llm-models/llama-models-v2/TinyLlama-1.1B-Chat-v1.0
+                      subPath: artifacts/model/tinyllama_1.1b_chat_v1.0/safetensors_mode-instruct/hf-fe8a4ea_orig
+                      readOnly: true
+    """ : ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
@@ -4833,6 +4839,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                     - name: sw-tensorrt-pvc
                       mountPath: "/mnt/sw-tensorrt-pvc"
                       readOnly: false
+                    ${jetModelMount}
                     securityContext:
                       capabilities:
                         add:
@@ -4937,6 +4944,16 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                   nfs:
                     server: 10.59.164.111
                     path: /vol/scratch58/scratch.trt_llm_data
+        """
+    }
+
+    if (jetModel) {
+        llmModelVolume += """
+                - name: jet-models
+                  nfs:
+                    server: 10.59.164.111
+                    path: /vol/scratch119/scratch.svc-jet
+                    readOnly: true
         """
     }
 
@@ -7545,6 +7562,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-PyTorch-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-PyTorch-2": ["rtx-5080", "l0_gb203", 2, 2],
+        "RTX5080-PyTorch-JET-OnDemand-1": ["rtx-5080", "l0_gb203_jet", 1, 1],
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
         "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 4],
@@ -7576,7 +7594,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     ]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, values.size() > 5 ? values[5] : false, key == "RTX5080-PyTorch-JET-OnDemand-1"), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
