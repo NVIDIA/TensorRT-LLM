@@ -253,7 +253,7 @@ def test_v41_block32_dequant_uses_each_tile_scale():
             )
 
 
-def test_v41_draft_rejects_fp8_attention_projections(monkeypatch):
+def test_v41_draft_rejects_fp8_attention_projections(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRTLLM_DSPARK_LINEAR_BACKEND", "fp8")
     assert DSv41DSparkDraftModel.supports_fp8_attn_projections is False
     mapping = SimpleNamespace(tp_size=1, enable_attention_dp=False)

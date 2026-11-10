@@ -522,12 +522,58 @@ def dspark_attention_forward(
     block's own positions, attention-sink softmax, inverse-RoPE on the output, and a
     grouped low-rank O projection (``wo_a`` einsum + ``wo_b``).
 
-    Projections accept tensor weights or loaded projection modules; ``wo_a`` is the raw grouped weight matrix
-    ``[n_groups * o_lora_rank, n_heads * head_dim // n_groups]``. ``kv_cache`` is
-    ``[b, window_size, head_dim]`` and is updated functionally (cloned).
+    Projections accept tensor weights or loaded projection modules. Activations
+    and weights are BF16 unless stated otherwise.
+
+    Args:
+        x: ``[b, block, dim]`` block layer input.
+        main_x: ``[b, 1, dim]`` projected captured context.
+        start_pos: absolute decode position (> 0); the context K/V row is written
+            at ``start_pos % window_size``.
+        kv_cache: ``[b, window_size, head_dim]`` rolling captured-context window.
+            Cloned before the write unless ``persist`` is set.
+        wq_a: ``[q_lora_rank, dim]`` Q down-projection; may be None when
+            ``qkv_proj`` is given.
+        q_norm_w: ``[q_lora_rank]`` RMSNorm weight of the Q latent.
+        wq_b: ``[n_heads * head_dim, q_lora_rank]`` Q up-projection weight, or a
+            callable that applies it.
+        wkv: ``[head_dim, dim]`` MQA K/V projection shared by all heads; may be
+            None when ``qkv_proj`` is given.
+        kv_norm_w: ``[head_dim]`` RMSNorm weight of K/V.
+        wo_a: ``[n_groups * o_lora_rank, n_heads * head_dim // n_groups]`` raw
+            grouped O down-projection; may be None when ``o_a_proj`` is given.
+        wo_b: ``[dim, n_groups * o_lora_rank]`` O up-projection weight, or a
+            callable that applies it.
+        attn_sink: ``[n_heads]`` FP32 per-head sink logits.
+        n_heads: number of query heads.
+        head_dim: query/key/value head dimension (the MQA latent dimension).
+        rope_head_dim: number of trailing head dimensions that RoPE rotates.
+        n_groups: number of O-projection groups.
+        o_lora_rank: per-group rank of the O down-projection.
+        window_size: number of rows in the rolling context window.
+        eps: RMSNorm epsilon.
+        softmax_scale: attention logit scale.
+        freqs_cis: ``[maxlen, rope_head_dim // 2]`` complex plain-RoPE table;
+            must satisfy ``maxlen > start_pos + block``.
+        persist: write the context K/V row into ``kv_cache`` in place, for a
+            worker-owned window that carries across decode steps.
+        q_b_norm_enabled: apply the per-head RMS normalization after ``wq_b``.
+        qkv_proj: fused ``wq_a`` + ``wkv`` projection whose output is
+            ``[..., q_lora_rank + head_dim]``; replaces ``wq_a`` and ``wkv``.
+        o_a_proj: ``[n_groups, o_lora_rank, n_heads * head_dim // n_groups]``
+            grouped O down-projection, BF16 or FP8 E4M3; replaces ``wo_a``.
+        o_a_scale: FP32 block scales of an FP8 ``o_a_proj``.
+        o_a_dequant: optional dequantized ``o_a_proj`` passed to the FP8 grouped
+            BMM.
+        use_fused_output_projection: run the fused FP8 output projection with an
+            FP8 ``o_a_proj``; None decides from the weight shapes.
+        use_fused_qkv_input_projection: quantize the ``qkv_proj`` input to FP8 in
+            one fused producer.
+        use_fused_q_input_projection: produce the FP8 ``wq_b`` input with the
+            fused RMSNorm + FP8 quantization kernel.
 
     Returns:
-        ``[b, block_size, dim]`` attention output (residual stream contribution).
+        ``[b, block, dim]`` attention output (residual stream contribution).
     """
     assert start_pos > 0, "DSpark draft attention runs at generation (start_pos > 0)"
     b, block, _ = x.shape
@@ -1407,31 +1453,6 @@ class DSv4DSparkDraftModel(nn.Module):
         scale = scale.repeat_interleave(block, 1)[:, :input_features]
         return (weight * scale).to(torch.bfloat16)
 
-    def cache_attn_weights_from_checkpoint(self, ckpt_dir: str, weight_map: Dict[str, str]) -> None:
-        """Populate ``_dspark_attn`` by reading the ``mtp.{s}.attn.*`` tensors from the
-        checkpoint shards on disk, then dequantizing via :meth:`_bind_bf16_attn_projections`.
-        """
-        from safetensors import safe_open
-
-        prefixes = tuple(f"mtp.{s}.attn." for s in range(len(self.mtp_layers)))
-        shards: Dict[str, list] = {}
-        for k in weight_map:
-            if k.startswith(prefixes):
-                shards.setdefault(weight_map[k], []).append(k)
-        raw: Dict[str, torch.Tensor] = {}
-        for shard, ks in shards.items():
-            with safe_open(os.path.join(ckpt_dir, shard), framework="pt", device="cpu") as f:
-                for k in ks:
-                    raw[k] = f.get_tensor(k)
-        self._bind_bf16_attn_projections(raw)
-
-    def cache_attn_weights_from_state_dict(self, weights: Dict) -> None:
-        """Populate ``_dspark_attn`` from an already-loaded in-memory ``weights`` dict
-        (no extra disk I/O). DeepSeek-V4.1 DSpark loads its BF16 attention projections
-        this way; delegates to :meth:`_bind_bf16_attn_projections`.
-        """
-        self._bind_bf16_attn_projections(weights)
-
     def _dspark_freqs_table(self, device: torch.device) -> torch.Tensor:
         """Return the plain-RoPE table cached for ``(device, cap)``.
 
@@ -1909,8 +1930,8 @@ class DSv4DSparkDraftModel(nn.Module):
         assert start_pos > 0, "DSpark draft runs at generation (start_pos > 0)"
         if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
             raise RuntimeError(
-                "DSpark attention weights not cached; call "
-                "cache_attn_weights_from_checkpoint(ckpt_dir, weight_map) after loading."
+                "DSpark attention weights are not bound; load the draft checkpoint with "
+                "load_weights(weights) before running the drafter."
             )
         x, main_x, draft_ids = self.forward_embed(main_hidden, bonus_token_ids)
         main_x = main_x.unsqueeze(1)  # [T, 1, hidden] for the MQA K/V projection
@@ -1983,8 +2004,8 @@ class DSv4DSparkDraftModel(nn.Module):
         """
         if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
             raise RuntimeError(
-                "DSpark attention weights not cached; call "
-                "cache_attn_weights_from_checkpoint(ckpt_dir, weight_map) after loading."
+                "DSpark attention weights are not bound; load the draft checkpoint with "
+                "load_weights(weights) before running the drafter."
             )
         x, main_x, draft_ids = self.forward_embed(main_hidden, bonus_token_ids)
         main_x = main_x.unsqueeze(1)  # [G, 1, hidden] for the MQA K/V projection
@@ -2124,8 +2145,9 @@ class DSv4DSparkDraftModel(nn.Module):
 
         Dequantizes the raw ``mtp.{s}.attn.*`` checkpoint tensors with the
         checkpoint's FP8 block size and disables every FP8 projection path.
+        Only :meth:`post_load_weights` calls this, and only when the BF16
+        backend is selected.
         """
-        self._use_bf16_linear = True
         for stage_id, stage in enumerate(self.mtp_layers):
             prefix = f"mtp.{stage_id}.attn."
             device = stage.input_layernorm.weight.device
@@ -4474,7 +4496,13 @@ def _fused_fp8_output_projection_from_quantized(
 
 
 def _use_dspark_bf16_linear(mapping, fp8_supported: bool = True) -> bool:
-    """Keep BF16 outside Rubin unless FP8 is explicitly requested."""
+    """Return whether the DSpark draft attention projections run in BF16.
+
+    Without ``TRTLLM_DSPARK_LINEAR_BACKEND``, FP8 is used only on SM107 with
+    unsharded attention (TP=1 or attention DP). ``fp8_supported=False`` marks a
+    drafter that binds BF16 projections only (DeepSeek-V4.1); it always gets
+    BF16, and an explicit ``fp8`` request raises.
+    """
     requested = os.environ.get(_DSPARK_LINEAR_BACKEND_ENV)
     sharded = mapping.tp_size > 1 and not mapping.enable_attention_dp
     if requested is None:
@@ -4484,8 +4512,9 @@ def _use_dspark_bf16_linear(mapping, fp8_supported: bool = True) -> bool:
         raise ValueError(f"{_DSPARK_LINEAR_BACKEND_ENV} must be 'fp8' or 'bf16', got {backend!r}")
     if backend == "fp8" and not fp8_supported:
         raise ValueError(
-            f"{_DSPARK_LINEAR_BACKEND_ENV}=fp8 is not supported by this DSpark drafter; "
-            "it binds BF16 attention projections"
+            f"{_DSPARK_LINEAR_BACKEND_ENV}=fp8 is not supported by this DSpark drafter "
+            "(DeepSeek-V4.1 binds BF16 attention projections); unset "
+            f"{_DSPARK_LINEAR_BACKEND_ENV} or set it to bf16"
         )
     if backend == "fp8" and sharded:
         raise ValueError(f"{_DSPARK_LINEAR_BACKEND_ENV}=fp8 requires TP=1 or attention DP")

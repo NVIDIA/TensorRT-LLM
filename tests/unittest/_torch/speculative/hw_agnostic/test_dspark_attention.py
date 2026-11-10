@@ -561,20 +561,32 @@ def test_use_dspark_bf16_linear_rejects_sharded_fp8(monkeypatch):
         modeling_dspark._use_dspark_bf16_linear(mapping)
 
 
-@pytest.mark.parametrize("value,expected", [(None, True), ("bf16", True), ("fp8", None)])
-def test_use_dspark_bf16_linear_without_fp8_support(monkeypatch, value, expected):
+_DSPARK_MAPPINGS = [(1, False), (2, True), (2, False)]
+
+
+@pytest.mark.parametrize("tp_size,enable_attention_dp", _DSPARK_MAPPINGS)
+@pytest.mark.parametrize("value", [None, "bf16"])
+def test_use_dspark_bf16_linear_without_fp8_support(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, tp_size: int, enable_attention_dp: bool
+) -> None:
     monkeypatch.setattr(modeling_dspark, "get_sm_version", lambda: 107)
     if value is None:
         monkeypatch.delenv("TRTLLM_DSPARK_LINEAR_BACKEND", raising=False)
     else:
         monkeypatch.setenv("TRTLLM_DSPARK_LINEAR_BACKEND", value)
-    for tp_size, enable_attention_dp in ((1, False), (2, True), (2, False)):
-        mapping = types.SimpleNamespace(tp_size=tp_size, enable_attention_dp=enable_attention_dp)
-        if expected is None:
-            with pytest.raises(ValueError, match="not supported by this DSpark drafter"):
-                modeling_dspark._use_dspark_bf16_linear(mapping, fp8_supported=False)
-        else:
-            assert modeling_dspark._use_dspark_bf16_linear(mapping, fp8_supported=False)
+    mapping = types.SimpleNamespace(tp_size=tp_size, enable_attention_dp=enable_attention_dp)
+    assert modeling_dspark._use_dspark_bf16_linear(mapping, fp8_supported=False) is True
+
+
+@pytest.mark.parametrize("tp_size,enable_attention_dp", _DSPARK_MAPPINGS)
+def test_use_dspark_bf16_linear_without_fp8_support_rejects_fp8(
+    monkeypatch: pytest.MonkeyPatch, tp_size: int, enable_attention_dp: bool
+) -> None:
+    monkeypatch.setattr(modeling_dspark, "get_sm_version", lambda: 107)
+    monkeypatch.setenv("TRTLLM_DSPARK_LINEAR_BACKEND", "fp8")
+    mapping = types.SimpleNamespace(tp_size=tp_size, enable_attention_dp=enable_attention_dp)
+    with pytest.raises(ValueError, match="not supported by this DSpark drafter"):
+        modeling_dspark._use_dspark_bf16_linear(mapping, fp8_supported=False)
 
 
 def test_use_dspark_bf16_linear_rejects_invalid_backend(monkeypatch):
@@ -1027,54 +1039,12 @@ def test_post_load_weights_preserves_linear_backend_before_transform(
     assert events == ["transform", "bind"]
 
 
-def test_bind_bf16_attn_projections_disables_every_fp8_projection():
-    model = DSv4DSparkDraftModel.__new__(DSv4DSparkDraftModel)
-    torch.nn.Module.__init__(model)
-    model._context_wkv_fp8 = object()
-    stage = types.SimpleNamespace(input_layernorm=types.SimpleNamespace(weight=torch.ones(1)))
-    model.mtp_layers = [stage]
-    prefix = "mtp.0.attn."
-    shapes = {
-        "wq_a": (2, 4),
-        "wq_b": (6, 2),
-        "wkv": (3, 4),
-        "wo_a": (8, 3),
-        "wo_b": (4, 8),
-    }
-    weights = {
-        f"{prefix}q_norm.weight": torch.ones(2),
-        f"{prefix}kv_norm.weight": torch.ones(3),
-        f"{prefix}attn_sink": torch.zeros(6),
-    }
-    for index, (name, shape) in enumerate(shapes.items(), start=1):
-        weights[f"{prefix}{name}.weight"] = torch.full(shape, index, dtype=torch.float8_e4m3fn)
-        weights[f"{prefix}{name}.scale"] = torch.full((1, 1), index + 0.5)
-
-    model._bind_bf16_attn_projections(weights)
-
-    bound = stage._dspark_attn
-    for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
-        expected = model._block_dequant(
-            weights[f"{prefix}{name}.weight"], weights[f"{prefix}{name}.scale"]
-        )
-        assert bound[name].dtype == torch.bfloat16
-        torch.testing.assert_close(bound[name], expected)
-    assert bound["qkv_proj"] is None
-    assert bound["o_a_proj"] is None
-    assert bound["o_a_scale"] is None
-    assert bound["o_a_dequant"] is None
-    assert bound["use_fused_output_projection"] is False
-    assert bound["use_fused_qkv_input_projection"] is False
-    assert bound["use_fused_q_input_projection"] is False
-    assert model._context_wkv_fp8 is None
-
-
 @pytest.mark.parametrize("block", [128, 32])
-def test_bind_bf16_attn_projections_uses_checkpoint_block_size(block: int) -> None:
+def test_bind_bf16_attn_projections_disables_every_fp8_projection(block: int) -> None:
     model = DSv4DSparkDraftModel.__new__(DSv4DSparkDraftModel)
     torch.nn.Module.__init__(model)
     model.checkpoint_fp8_block_size = block
-    model._use_bf16_linear = False
+    model._context_wkv_fp8 = object()
     stage = types.SimpleNamespace(input_layernorm=types.SimpleNamespace(weight=torch.ones(1)))
     model.mtp_layers = [stage]
     prefix = "mtp.0.attn."
@@ -1094,13 +1064,22 @@ def test_bind_bf16_attn_projections_uses_checkpoint_block_size(block: int) -> No
 
     model._bind_bf16_attn_projections(weights)
 
-    assert model._use_bf16_linear is True
-    assert stage._dspark_context_wkv_slice is None
+    bound = stage._dspark_attn
     for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
         weight = weights[f"{prefix}{name}.weight"].float()
         scale = weights[f"{prefix}{name}.scale"]
         expected = weight * scale.repeat_interleave(block, 0).repeat_interleave(block, 1)
-        torch.testing.assert_close(stage._dspark_attn[name], expected.to(torch.bfloat16))
+        assert bound[name].dtype == torch.bfloat16
+        torch.testing.assert_close(bound[name], expected.to(torch.bfloat16))
+    assert bound["qkv_proj"] is None
+    assert bound["o_a_proj"] is None
+    assert bound["o_a_scale"] is None
+    assert bound["o_a_dequant"] is None
+    assert bound["use_fused_output_projection"] is False
+    assert bound["use_fused_qkv_input_projection"] is False
+    assert bound["use_fused_q_input_projection"] is False
+    assert stage._dspark_context_wkv_slice is None
+    assert model._context_wkv_fp8 is None
 
 
 def test_context_wkv_fp8_quantizes_once_per_window_write(monkeypatch):
