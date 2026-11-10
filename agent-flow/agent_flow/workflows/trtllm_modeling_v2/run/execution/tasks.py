@@ -43,7 +43,6 @@ from ...operators.coverage import QueueItem, VocabularyError, load_vocabulary, q
 from ...spec import lint as lint_mod
 from ...spec import variants as variants_mod
 from ...spec.task_schema import assembly_units, members_for, parse_parallel_segment
-from ...tune import stage as tune_stage
 from .. import graph as graph_mod
 from .. import inbox as inbox_mod
 from ..orchestrator import (
@@ -110,7 +109,6 @@ ROLE_BY_KIND = {
     "feature": "assembler",
     "integrate": "assembler",
     "investigate": "assembler",
-    "tune": "tuner",
 }
 #: Checks in flight at once on a run's sessions: each is a spool job, and the
 #: session's scheduler queues what its devices cannot start yet, by class.
@@ -137,11 +135,7 @@ class ExecutionStage:
         print_rule("[bold magenta]execution stage[/bold magenta]", log)
         contract = self.workflow._contract
         self.state = state
-        tune = self.workflow._tune_requested()
         units = assembly_units(self.workflow.task_data)
-        # The campaign tunes the core: it starts once the core's required checks have passed.
-        # The features' and variants' checks go on beside it; delivery still owes them.
-        core_owed = [c.key for c in contract_mod.core_checks(contract, units[0] if units else None)]
         core_boots = [
             c.key for c in contract.required() if units and c.unit == units[0] and c.gate == "boot"
         ]
@@ -188,8 +182,6 @@ class ExecutionStage:
             revision_cap=self.workflow.revision_cap,
             max_attempts=getattr(self.workflow, "max_attempts", graph_mod.MAX_ATTEMPTS),
             event_window_s=self.workflow.event_window_s,
-            required_kinds=("tune",) if tune else (),
-            start_after={"tune": core_owed} if core_owed else {},
             after_core=(feature_refs, core_boots),
             own_paths=self._own_paths,
             repo_root=self.workflow.task_data.get("trtllm_repo_path") or "",
@@ -790,17 +782,6 @@ class ExecutionStage:
     def _work_task_body(self, task: graph_mod.Task) -> TaskResult:
         receipts = self._dependency_receipts(task)
         envelope = self._envelope(task, receipts)
-        if task.kind == "tune":
-            decision, note = tune_stage.run_tune_task(
-                self.workflow, self.state, self.workflow._head(), attempt=task.attempts
-            )
-            # The tune stage's verdict, wherever the campaign ends: here, or past the
-            # onboarding's close (`workflow._campaign_after_onboarding`).
-            ended = tune_stage.campaign_verdict(decision)
-            if ended:
-                self.state.tune["verdict"] = ended
-            self.workflow._checkpoint(self.state)
-            return TaskResult(decision, note)
         if task.kind == "kernel":
             item = self._queue_item(task)
             if item is None:
@@ -1081,9 +1062,7 @@ class ExecutionStage:
 def held_gpus(task: Any) -> int:
     """The devices of the run's sessions ``task`` holds while it runs.
 
-    Its ``gpus``; none for a campaign (a ``tune`` task), whatever spools it measures on: its
-    jobs queue below every job of the onboarding (``executor.PERF``), so it keeps no task of
-    the onboarding from starting, here or on a session.
+    Its ``gpus``; none for a background kind.
     """
     return 0 if task.kind in graph_mod.BACKGROUND_KINDS else max(0, int(task.gpus or 0))
 

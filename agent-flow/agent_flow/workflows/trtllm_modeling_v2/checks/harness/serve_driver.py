@@ -75,8 +75,8 @@ _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def _load(name: str, path: Path) -> Any:
     """Import the file at ``path`` as module ``name``, without putting its directory on the path.
 
-    ``tune/`` holds a ``requests.py``: on ``sys.path`` it would shadow the
-    library of that name for the rest of the process.
+    A harness directory on ``sys.path`` would let a module of its own shadow a
+    library of the same name for the rest of the process.
     """
     module = sys.modules.get(name)
     if module is None:

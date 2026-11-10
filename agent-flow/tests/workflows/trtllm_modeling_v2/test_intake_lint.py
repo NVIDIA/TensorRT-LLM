@@ -72,7 +72,6 @@ _GOOD = {
     },
     "environment": {"kind": "session_spool", "gpus_per_node": 4},
     "accuracy": {"benchmark": "gsm8k"},
-    "perf": {"enabled": True, "workload": {"isl": 8192, "osl": 1024, "concurrency": [1, 128]}},
     # tp4 / tep4 are text-only: core alone. disagg's test runs once, at dep4.
     "coverage": {"accept": ["kv_fp8@tp4", "kv_fp8@tep4", "chunked@tp4", "chunked@tep4"]},
     "notes": "Architecture: toy. Prior art in this tree worth surveying: the QSA sparse ops.",
@@ -114,16 +113,6 @@ def _rules(report):
 def _finding(rule, task, **context):
     """The finding of ``rule`` the lint makes of ``task``, or ``None``."""
     return next((f for f in lint.lint_task(task, **context).findings if f.rule == rule), None)
-
-
-def test_a_batch_and_a_concurrency_are_both_global_totals():
-    task = copy.deepcopy(_GOOD)
-    task["members"] = {"default": ["dep4"]}
-    task["runtime"]["extra_flags"] = ["--max_seq_len=9216", "--max_batch_size=32"]
-    # Attention DP splits both alike: 32 in all is below 128 in all, whatever the ranks.
-    assert "runtime-batch-below-concurrency" in _rules(lint.lint_task(task))
-    task["runtime"]["extra_flags"] = ["--max_seq_len=9216", "--max_batch_size=128"]
-    assert "runtime-batch-below-concurrency" not in _rules(lint.lint_task(task))
 
 
 def test_an_accuracy_check_runs_eager_only_on_purpose():

@@ -494,9 +494,8 @@ def native_artifacts(repo: str | Path) -> list[str]:
 def repo_lock(repo: Path):
     """Serialize worktree creation on one repository.
 
-    Concurrent `git worktree add` on one repository (a campaign stacking a candidate
-    while a tuner request opens another) fails with `Could not reset index file to
-    revision 'HEAD'`.
+    Concurrent `git worktree add` on one repository (two tasks opening their worktrees at
+    once) fails with `Could not reset index file to revision 'HEAD'`.
     """
     path = Path(git_checked(repo, "rev-parse", "--git-common-dir"))
     if not path.is_absolute():

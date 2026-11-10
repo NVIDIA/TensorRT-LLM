@@ -26,7 +26,6 @@ from ..checks import accuracy_policy
 from ..infra.compute.environment import EnvironmentError, check_tmpdir
 from ..infra.compute.sessions import validate_sessions
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
-from ..tune.schema import validate_perf_block
 from .schema_keys import reject_unknown_keys
 from .variants import ANCHOR_RECORDED, ANCHOR_RELATIVE, VARIANTS_FIELD, validate_variants
 
@@ -179,7 +178,6 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     NOTES_FIELD,
     AGENTS_FIELD,
     COMMIT_POLICY_FIELD,
-    "perf",
     VARIANTS_FIELD,
     "coverage",
     "profile",
@@ -271,10 +269,6 @@ ANCHOR_STATES: tuple[str, ...] = (ANCHOR_RECORDED, ANCHOR_RELATIVE)
 #   every    (default) at every member.
 #   <member> at that member (`dep4`, ...), for each unit that has it.
 BENCHMARK_MEMBERS_EVERY = "every"
-#: The concurrencies a perf campaign measures when nothing says: low latency, middle, high
-#: throughput. An attention-DP member measures only the last. A concurrency, like a batch
-#: size, is the global total across the ranks (``check_config.share_batch``).
-DEFAULT_PERF_CONCURRENCY: tuple[int, ...] = (1, 32, 128)
 BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_EVERY,)
 
 # Boot workloads allow run-wide keys and per-unit overlays. Keywords match
@@ -1592,8 +1586,12 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
 
     validate_commit_policy_block(data.get(COMMIT_POLICY_FIELD), errors)
 
-    errors.extend(validate_perf_block(data))
-    reject_unknown_keys(data, TOP_LEVEL_KEYS, errors)
+    if "perf" in data:
+        errors.append(
+            "'perf' is not read: the flow has no tuning stage, and performance work runs "
+            "outside it on the delivered target; drop the block"
+        )
+    reject_unknown_keys({k: v for k, v in data.items() if k != "perf"}, TOP_LEVEL_KEYS, errors)
     errors.extend(validate_agents(data, ROLES))
 
     for name in REQUIRED_PATH_FIELDS:
@@ -1761,7 +1759,6 @@ __all__ = [
     "resolve_samples",
     "BENCHMARK_MEMBERS",
     "BENCHMARK_MEMBERS_EVERY",
-    "DEFAULT_PERF_CONCURRENCY",
     "derive_gate_defaults",
     "DISAGG_FEATURE",
     "DISAGG_KEYS",

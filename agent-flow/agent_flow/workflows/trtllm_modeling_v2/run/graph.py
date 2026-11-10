@@ -12,7 +12,7 @@ that was running when the last process stopped, then required tasks on the
 critical path, then other required tasks, then ``nice_to_have``
 tasks only on devices no waiting required task could use; never two running
 tasks that declare the same file, and nothing beside an ``exclusive`` task;
-and no task of a gated kind (``tune``, until the core's correctness checks
+and no task of a gated kind (none now, until the checks it waits for
 hold) at all.
 
 A soft dependency (``depends_on_soft``) lets a task start once the task it
@@ -40,10 +40,8 @@ from .workspace.integration import INTEGRATED_KINDS
 
 #: A task whose work is only contract checks, run with no agent turn.
 CHECK_KIND = "check"
-#: Task kinds that run for hours beside the graph on idle capacity: a performance
-#: campaign. Its result is an artifact of the run, never a step another task builds
-#: on, and it gives way to every other task (:func:`touches_conflict`).
-BACKGROUND_KINDS = frozenset({"tune"})
+#: Task kinds that run beside the graph on idle capacity; none since the tune stage left.
+BACKGROUND_KINDS: frozenset[str] = frozenset()
 KINDS: tuple[str, ...] = (
     "survey",
     "kernel",
@@ -51,7 +49,6 @@ KINDS: tuple[str, ...] = (
     "feature",
     "integrate",
     "investigate",
-    "tune",
     CHECK_KIND,
 )
 #: What a worker's task can be tagged with: every kind an agent's turn serves. A
@@ -440,8 +437,7 @@ def validate(
 ) -> list[str]:
     """Every reason ``graph`` is not admissible, batched.
 
-    ``required_kinds`` are kinds the run's goals need a task of, such as
-    ``tune`` when the task asks for performance work. ``known_checks`` are the
+    ``required_kinds`` are kinds the run's goals need a task of. ``known_checks`` are the
     contract's checks: a ``check`` task names only those, as it has nothing
     else to run, unless it is a regression check.
     """

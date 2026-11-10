@@ -29,7 +29,6 @@ A finding the spec keeps on purpose is accepted in ``notes`` with a line
 from __future__ import annotations
 
 import json
-import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,7 +40,6 @@ from ..checks import accuracy_policy, check_config
 from ..checks import disagg as disagg_checks
 from ..infra.compute.sessions import GATE_ROLES
 from ..operators import prior_art, tree_anchors
-from ..tune.schema import REMOVED_PERF_KEYS
 from . import variants as variants_mod
 from .task_schema import (
     assembly_units,
@@ -67,8 +65,6 @@ CONTRACT_REVIEW_SIZE = 30
 PLAUSIBLE_ANCHOR: dict[str, float] = {"gsm8k": 60.0}
 #: Output tokens a chat-template protocol needs for a model that reasons first.
 CHAT_TEMPLATE_MIN_OUTPUT = 1024
-#: A chunked-prefill engine splitting prompts finer than this pays a context step per chunk.
-SMALL_CHUNK_TOKENS = 4096
 #: The share of a device's memory one engine's weights may take: the rest holds the KV cache,
 #: activations and CUDA graphs. A member below the width this implies cannot serve the model.
 #: (A 344-GiB checkpoint has served disaggregated on two 277-GiB devices per engine: 62%.)
@@ -198,30 +194,6 @@ Rule = Callable[[LintContext], Iterable[Finding]]
 def _flags(runtime: Mapping[str, Any]) -> dict[str, Any]:
     options, _, _ = check_config.parse_runtime_flags(runtime.get("extra_flags") or ())
     return options
-
-
-def _perf_targets(task: Mapping[str, Any]) -> list[tuple[str | None, int, int | None, int | None]]:
-    """(member or None, max concurrency, isl, osl) the perf block asks for."""
-    perf = task.get("perf") or {}
-    found = []
-    workload = perf.get("workload") or {}
-    if workload.get("concurrency"):
-        found.append((None, max(workload["concurrency"]), workload.get("isl"), workload.get("osl")))
-    for config in perf.get("configs") or ():
-        load = config.get("workload") or {}
-        if load.get("concurrency"):
-            found.append(
-                (config.get("name"), max(load["concurrency"]), load.get("isl"), load.get("osl"))
-            )
-    return found
-
-
-def _as_member(name: Any) -> bool:
-    """Whether a perf config's name is a parallel member (``tp4``, ``dep4``)."""
-    try:
-        return bool(name) and parse_parallel_segment(str(name))[1] is not None
-    except Exception:
-        return False
 
 
 _gpus_per_node = gpus_per_node
@@ -374,28 +346,6 @@ def cuda_graph_rules(ctx: LintContext) -> Iterator[Finding]:
 def runtime_rules(ctx: LintContext) -> Iterator[Finding]:
     task = ctx.task
     runtime = check_config.resolve_runtime(task, None)
-    flags = _flags(runtime)
-    batch = flags.get("max_batch_size") or ctx.accuracy.get("max_batch_size")
-    seq = flags.get("max_seq_len") or ctx.accuracy.get("max_seq_len")
-    chunk = flags.get("max_num_tokens")
-    targets = _perf_targets(task)
-    # A batch size and a concurrency are both global totals: an attention-DP rank serves
-    # its share of each (``check_config.share_batch``), so they compare as they stand.
-    short: dict[str, int] = {}
-    for member, concurrency, _, _ in targets:
-        for name in [member] if _as_member(member) else members_for(task, "core", ctx.world):
-            if isinstance(batch, int) and batch < concurrency > short.get(name, 0):
-                short[name] = concurrency
-    for name, concurrency in short.items():
-        yield Finding(
-            "runtime-batch-below-concurrency",
-            WARN,
-            f"max_batch_size {batch} is below the concurrency {name} is measured at "
-            f"({concurrency}, a global total like the batch): the perf points queue instead of "
-            f"measuring, and the CUDA-graph capture list stops short",
-            f"size max_batch_size to the largest concurrency ({concurrency}), or drop the "
-            "concurrencies the target is not meant to serve",
-        )
     on = [name for name in ("chunked_prefill", "kv_cache_reuse") if runtime.get(name)]
     if on:
         yield Finding(
@@ -406,30 +356,6 @@ def runtime_rules(ctx: LintContext) -> Iterator[Finding]:
             "keep core to CUDA graphs and the overlap scheduler; turn it off in `runtime` and "
             "prove it with its own variant on core (`chunked`, `reuse`)",
         )
-    # One workload decides the envelope: the first that states both lengths.
-    workloads = [(i, o) for _, _, i, o in targets if isinstance(i, int) and isinstance(o, int)]
-    for isl, osl in workloads[:1]:
-        if isinstance(seq, int) and seq > 1.25 * (isl + osl):
-            yield Finding(
-                "runtime-max-seq-len-oversized",
-                WARN,
-                f"max_seq_len {seq} is well above the workload's {isl}+{osl}: KV pools and "
-                "boundary probes are sized for lengths nothing serves",
-                f"set max_seq_len to {isl + osl} (isl + osl) unless a longer context is requested",
-            )
-        if (
-            runtime.get("chunked_prefill")
-            and isinstance(chunk, int)
-            and chunk < min(isl, SMALL_CHUNK_TOKENS)
-        ):
-            yield Finding(
-                "runtime-small-chunk",
-                WARN,
-                f"max_num_tokens {chunk} splits every {isl}-token prompt into "
-                f"{math.ceil(isl / chunk)} context chunks in every gate",
-                "keep max_num_tokens at the workload's isl (or 8192) and prove chunking "
-                "with one `chunked` variant at a small max_num_tokens",
-            )
 
 
 def kv_cache_rules(ctx: LintContext) -> Iterator[Finding]:
@@ -447,11 +373,6 @@ def kv_cache_rules(ctx: LintContext) -> Iterator[Finding]:
         dtype = (launch.config or {}).get("dtype")
         if dtype is not None:
             asked.setdefault(str(dtype), []).append(launch.name)
-    for config in (ctx.task.get("perf") or {}).get("configs") or ():
-        options = config.get("llm_api_options") if isinstance(config, Mapping) else None
-        dtype = ((options or {}).get("kv_cache_config") or {}).get("dtype")
-        if dtype is not None:
-            asked.setdefault(str(dtype), []).append(f"perf {config.get('name')}")
     for dtype, where in sorted(asked.items()):
         if dtype not in values:
             yield Finding(
@@ -940,28 +861,6 @@ def tree_rules(ctx: LintContext) -> Iterator[Finding]:
 
 
 #: Every rule, in report order. A new feature, scope or launch check adds its function here.
-def perf_rules(ctx: LintContext) -> Iterator[Finding]:
-    """A ``perf`` key the campaign no longer reads, and a perf config whose decode runs eager.
-
-    A config with CUDA graphs off, or whose largest captured batch is below the live requests a
-    rank holds (``tune.spec.capture_shortfalls``), measures eager steps for the whole campaign.
-    """
-    from ..tune.spec import capture_shortfalls, serving_options
-
-    perf = ctx.task.get("perf")
-    if not isinstance(perf, Mapping):
-        return
-    for key in sorted(set(perf) & set(REMOVED_PERF_KEYS)):
-        yield Finding(
-            "perf-removed-key",
-            WARN,
-            f"`perf.{key}` is ignored: {REMOVED_PERF_KEYS[key]}",
-            f"drop `perf.{key}`",
-        )
-    for why, fix in capture_shortfalls(serving_options(ctx.task)):
-        yield Finding("perf-cuda-graph-coverage", WARN, why, fix)
-
-
 RULES: tuple[Rule, ...] = (
     cuda_graph_rules,
     runtime_rules,
@@ -980,7 +879,6 @@ RULES: tuple[Rule, ...] = (
     engine_rules,
     prior_art_rules,
     tree_rules,
-    perf_rules,
 )
 
 

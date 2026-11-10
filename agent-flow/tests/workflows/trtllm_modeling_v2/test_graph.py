@@ -16,7 +16,6 @@ from agent_flow.workflows.trtllm_modeling_v2.run.records.state import (
     load_state,
     save_state,
 )
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
 
 
 def _t(tid, kind="kernel", deps=(), touches=(), gpus=1, minutes=60, goal=None, **kw):
@@ -86,25 +85,6 @@ def test_a_regression_check_may_wait_for_a_nice_to_have_task_and_not_for_ever():
     assert g.ready(graph) == []
 
 
-def test_a_campaign_waits_for_the_cores_required_checks_only():
-    """A failing variant or feature does not hold the core's tuning back; delivery owes it."""
-    contract = c.Contract(
-        checks=(
-            c.Check("core", "boot", "tp4", c.TIER_INNER),
-            c.Check("core", "accuracy[gsm8k]", "dep4", c.TIER_INNER),
-            c.Check("core", "serve", "tep4", c.TIER_DELIVERY),
-            c.Check("core", "boot", "tp8", c.TIER_INNER, required=False),
-            c.Check("disagg", "disagg", "dep4", c.TIER_PROOF),
-            c.Check("kv_nvfp4", "accuracy[gsm8k]", "dep4", c.TIER_PROOF),
-        )
-    )
-    core = ["core:boot@tp4", "core:accuracy[gsm8k]@dep4", "core:serve@tep4"]
-    assert [k.key for k in c.core_checks(contract)] == core
-    assert [k.key for k in c.core_checks(contract, "core")] == core
-    assert [k.key for k in c.core_checks(contract, "disagg")] == ["disagg:disagg@dep4"]
-    assert c.core_checks(c.Contract(checks=())) == ()
-
-
 def test_round_trip_preserves_every_field_and_an_unknown_version_is_rejected(tmp_path):
     path = tmp_path / "state.json"
     original = WorkflowState(
@@ -114,7 +94,6 @@ def test_round_trip_preserves_every_field_and_an_unknown_version_is_rejected(tmp
         slug="qwen3-30b-a3b-sm_103-tp1",
         branch="trtllm-modeling-v2/qwen3-30b-a3b-sm_103-tp1",
         devices=[2, 3],
-        tune={"phase": "campaign"},
     )
     save_state(path, original)
     assert load_state(path) == original

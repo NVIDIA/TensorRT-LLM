@@ -185,8 +185,8 @@ def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environme
         substrate_reuse,
     )
 
-    def inputs(perf=None, **environment):
-        task = _task(tmp_path, environment=environment, perf=perf or {})
+    def inputs(**environment):
+        task = _task(tmp_path, environment=environment)
         return substrate_inputs(task, resolve_environment(task, world_size=4))
 
     gates = {"name": "gates", "spool": "/s/gates", "env": {"A": "1"}, "setup": ["source /e.sh"]}
@@ -204,7 +204,7 @@ def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environme
     ]
     resized = {**gates, "role": "gates", "nodes": 2, "gpus_per_node": 8, "handover_lead": "30m"}
     grown = {**block, "sessions": [{**resized, "scheduler": {"default_wall": "3h"}}, *perf]}
-    assert substrate_reuse(record, inputs({"dev_spools": ["/s/perf2"]}, **grown), now=60.0)[0]
+    assert substrate_reuse(record, inputs(**grown), now=60.0)[0]
     for changed in (
         {"container_image": "/images/other.sqsh"},
         {"mounts": ["/data:/data", "/models:/models"]},

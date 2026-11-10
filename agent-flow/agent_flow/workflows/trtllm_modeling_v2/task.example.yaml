@@ -94,7 +94,7 @@ trtllm_repo_path: /path/to/TensorRT-LLM
 #                              # `reuse` variant (kv_cache_config.enable_block_reuse: true)
 #   # Anything else the gate command needs, verbatim. Without --max_seq_len the engine sizes its
 #   # cache for `max_position_embeddings` (`Impossible to fit in any sequence in kvCache`).
-#   # max_seq_len = isl + osl; max_batch_size >= the per-rank concurrency the perf block claims.
+#   # max_seq_len = isl + osl; max_batch_size >= the concurrency the workload claims (a global total).
 #   extra_flags: [--max_seq_len=9216, --max_batch_size=64, --kv_cache_fraction=0.7]
 #
 # Per unit, layered over `default`: {default: {extra_flags: [...]}, multimodal: {...}}. A setting
@@ -315,7 +315,7 @@ accuracy:
 # agents:
 #   defaults: {backend: claude-code, model: <your-model-id>, reasoning_effort: <your-effort>}
 #   roles:
-#     tuner: {backend: codex, model: <your-codex-model-id>, reasoning_effort: high}
+#     planner: {backend: codex, model: <your-codex-model-id>, reasoning_effort: high}
 #   # defaults: {extra_mcp_servers: {knowledge-base: {type: http, url: https://example.test/mcp}}}
 
 # ----------------------------------------------------------- commit policy
@@ -327,85 +327,3 @@ accuracy:
 #   allow_co_authors: false    # the default
 #   base_ref: origin/main      # delivery audits merge-base(HEAD, base_ref)..HEAD; default
 #                              # origin/main, else upstream/main, else main
-
-# ------------------------------------------------------------- performance
-# The tune campaign (tune/stage.py): with `enabled: true`, a `tune` task that starts once the
-# core's correctness checks hold (on a target onboarded elsewhere, `trtllm-modeling-v2 tune --task
-# task.yaml --workspace W`). Perf is never a release gate. A micro/module candidate is judged by
-# its micro-bench, projected to e2e through `microbench.share`, with its outputs held roughly to
-# the control's; a win keeps at once. A checkpoint every few keeps measures e2e, the first output
-# token's distribution and the target's suite on the best tree, and a failure rolls those keeps
-# back. The accuracy benchmark runs once, on the final tree.
-# perf:
-#   enabled: true
-#   workload: {isl: 8192, osl: 1024, concurrency: [1, 32, 128]}   # default 1024, 1024, [1, 32, 128]
-#                                  # derive gives a dep member only the high point; a concurrency
-#                                  # and a batch size are global totals across attention-DP ranks
-#   identity_configs: [<LLM-API yaml>]   # default: derived from the workload
-#   configs:                       # instead of `workload`: serving validation workloads
-#     - name: chat                 # system-wide candidates and final cumulative e2e cover all
-#       workload: {isl: 1024, osl: 256, concurrency: [1, 16]}
-#       constraint: {tpot_ms_max: 30}          # breaking it is a loss (also ttft_ms_max)
-#     - name: batch
-#       workload: {isl: 8192, osl: 1024, concurrency: [128]}
-#       llm_api_options: {enable_chunked_prefill: true}   # over the derived serving config
-#     - name: agent                # `client: agentx` replays InferenceX's AgentX traces (multi-turn
-#       workload:                  # agent sessions sharing long prefixes) with its aiperf client
-#         client: agentx           # (agentx-harness 1.0.12 in a per-job uv venv, from PyPI);
-#         isl: 8192                # isl/osl only describe the requests
-#         osl: 1024
-#         concurrency: [1]
-#         duration_s: 900                      # default 900; per point
-#         dataset: semianalysis_cc_traces_weka_062126_256k   # the default corpus
-#         # warmup_per_lane: 3, max_context_length: 262144, extra_args: [...]: aiperf's own flags
-#         # hf_home: <corpus cache>            # default <workspace>/tune/agentx-cache/hf
-#       llm_api_options: {enable_chunked_prefill: true, kv_cache_config: {enable_block_reuse: true}}
-#       constraint: {kv_hit_pct_min: 95}       # prompt tokens served from the KV cache, percent
-#       # Its points rank as InferenceX ranks AgentX: tok_s_user = 1 / P90 full-response ITL,
-#       # throughputs over the profiling window (total_tok_s_gpu counts cached input too). MTP
-#       # results comparable with the published ones force its golden acceptance length in
-#       # env_script (TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS = AL - 1); without it the
-#       # campaign measures the acceptance the traces reach.
-#   goal: {ratio_to_baseline: 1.1}   # stop once every headline is 1.1x the baseline; or/and
-#                                    # pct_of_sol: 0.7, 70% of each headline's SOL ceiling
-#   sol:                           # public roofline turns; input schema: tune/sol.py
-#     enabled: true                # default; optional `gpu` is a label: capacities need public sources
-#     methods: [analytic, code, profile]   # independent analyses: config formulas, the code
-#                                  # as written, a profile (its counted traffic bounds the work)
-#     tolerance: 0.15              # ceilings this close agree (the highest is taken); the rest
-#                                  # is ruled on once, by choosing an analysis, or stays unknown
-#   spools: [<whole-node session spools for e2e measurements>]   # default: the sessions' spools
-#   dev_spools: [<sessions for 1-GPU tuner jobs and the correctness checks>]   # default: `spools`
-#   env_script: <sourced by every perf job>   # default <workspace>/tune/env.sh
-#   wall: 2h                       # default; one perf job's wall limit
-#   model: /path/to/checkpoint     # default checkpoint_path (and `target`: the run's target)
-#   source_workspace: <onboarding workspace>   # a standalone tune beside an onboarding of the
-#                                  # same checkout imports the commits the core's verdicts there
-#                                  # validate; default the tune's own workspace
-#   campaign:                      # every value shown is the default but max_hours (none)
-#     enabled: true                # false: the baseline only
-#     min_gain: 0.01               # an e2e win = max(min_gain, noise_factor x spread)
-#     min_projected_gain: 0.005    # a micro/module win: a point's projected e2e gain
-#     micro_noise: 0.02            # a micro-bench speedup this small counts as none
-#     module_tolerance: 0.05       # outputs farther than this (relative) from the control's
-#     checkpoint_keeps: 3          # a checkpoint every 3 keeps, or once they project
-#     checkpoint_gain: 0.05        # 5 % at a point; a LOSS or a correctness FAIL rolls them back
-#     logits: {top_k: 20, max_kl: 0.1, min_top1: 0.9, tie_margin: 0.15}   # and `prompts`
-#     noise_factor: 3.0
-#     ttft_tolerance: 0.1          # a first token this much slower at concurrency 1 is a loss
-#     max_parallel_tuners: 4
-#     max_iterations: 12
-#     split_variants: true         # a LOSS split by member asks for one member-gated variant
-#     max_consecutive_misses: 3
-#     max_roadmaps: 2              # a spent roadmap with budget left is refreshed on the best tree
-#     max_hours: 24                # the campaign's wall budget
-#     idle_settle_s: 120           # a measurement starts on a node idle this long
-#     retry_wait_s: 600            # a transient no-verdict (a job to finish, a session to come
-#     max_retries: 24              # back) is waited out in process this long, this many times;
-#                                  # past them the process ends and the next one resumes
-#     gate_tests: true             # the target's and the contract's tests, at each checkpoint
-#     kernel_ledger: require       # or off: no kernel ledger asked of a roadmap
-#     kernel_coverage_pct: 80      # the GPU time a roadmap's kernel ledger must cover
-#     accuracy: {unit: core, members: [dep4]}   # the final tree's; default the widest member;
-#                                  # {gate: off} also turns off the first-token check
-#   sister_engines: [<other engines' checkouts: prior art; kernels and strategies may be adapted>]

@@ -40,8 +40,6 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
 )
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.executor import (
     CANCELLED,
-    PERF,
-    TUNER,
     SpoolCommandExecutor,
 )
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.scheduler import (
@@ -74,7 +72,6 @@ from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap as pre
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
-from agent_flow.workflows.trtllm_modeling_v2.tune.measure import SpoolRunner
 
 from ._helpers import Script, _install, _state, healthy_smi
 
@@ -297,94 +294,6 @@ def test_a_device_that_never_releases_its_memory_is_quarantined(
     assert sched.snapshot(_spool_scheduler_clock.now)["quarantined"] == ["0"]
 
 
-def test_a_campaigns_job_never_ages_ahead_of_the_onboardings_nor_holds_one_back(
-    _spool_scheduler_spool, _spool_scheduler_clock
-):
-    """Background work (``priority=-1``) waits behind every other job, however long it waited."""
-    sched = _spool_scheduler_make(_spool_scheduler_spool, _spool_scheduler_clock)
-    _spool_scheduler_submit(
-        _spool_scheduler_spool,
-        "holder",
-        _spool_scheduler_blocking(_spool_scheduler_spool, "holder"),
-        header="gpus=1 wall=8h",
-    )
-    _spool_scheduler_pump(sched, lambda: "holder" in running(sched))
-    # The campaign's whole-node measurement cannot place beside the holder, and waits.
-    _spool_scheduler_submit(
-        _spool_scheduler_spool, "tune-measure", "echo measured", header="gpus=4 priority=-1"
-    )
-    sched.tick()
-    _spool_scheduler_clock.advance(3 * _spool_scheduler_scheduler.AGING_S)
-    # A check queued hours later still ranks first, and starts on the free devices.
-    _spool_scheduler_submit(
-        _spool_scheduler_spool,
-        "boot",
-        "echo started",
-        header="gpus=1 priority=1",
-        submitted=_spool_scheduler_clock.now,
-    )
-    _spool_scheduler_pump(
-        sched, lambda: _spool_scheduler_rc(_spool_scheduler_spool, "boot") is not None
-    )
-    assert (
-        _spool_scheduler_rc(_spool_scheduler_spool, "boot") == 0
-        and _spool_scheduler_rc(_spool_scheduler_spool, "tune-measure") is None
-    )
-    pending = {p["name"]: p for p in sched.snapshot(_spool_scheduler_clock.now)["pending"]}
-    assert pending["tune-measure"]["effective_priority"] == -1
-    _spool_scheduler_release(_spool_scheduler_spool, "holder")
-    _spool_scheduler_pump(
-        sched, lambda: _spool_scheduler_rc(_spool_scheduler_spool, "tune-measure") is not None
-    )
-
-
-def test_a_tuners_job_waits_behind_the_campaigns_measurement_queued_after_it(
-    _spool_scheduler_spool, _spool_scheduler_clock
-):
-    """The campaign measures one candidate at a time; a tuner's job never runs ahead of that."""
-    sched = _spool_scheduler_make(_spool_scheduler_spool, _spool_scheduler_clock)
-    _spool_scheduler_submit(
-        _spool_scheduler_spool,
-        "holder",
-        _spool_scheduler_blocking(_spool_scheduler_spool, "holder"),
-        header="gpus=4 wall=8h",
-    )
-    _spool_scheduler_pump(sched, lambda: "holder" in running(sched))
-    _spool_scheduler_submit(
-        _spool_scheduler_spool,
-        "tuner-ab",
-        "echo tuned",
-        header=f"gpus=4 priority={TUNER}",
-        submitted=_spool_scheduler_clock.now,
-    )
-    _spool_scheduler_clock.advance(_spool_scheduler_scheduler.AGING_S)
-    _spool_scheduler_submit(
-        _spool_scheduler_spool,
-        "tune-measure",
-        "echo measured",
-        header=f"gpus=4 priority={PERF}",
-        submitted=_spool_scheduler_clock.now,
-    )
-    sched.tick()
-    pending = {p["name"]: p for p in sched.snapshot(_spool_scheduler_clock.now)["pending"]}
-    assert pending["tuner-ab"]["effective_priority"] == TUNER
-    _spool_scheduler_release(_spool_scheduler_spool, "holder")
-    _spool_scheduler_pump(
-        sched,
-        lambda: (
-            "tune-measure" in running(sched)
-            or _spool_scheduler_rc(_spool_scheduler_spool, "tune-measure") is not None
-        ),
-    )
-    assert (
-        "tuner-ab" not in running(sched)
-        and _spool_scheduler_rc(_spool_scheduler_spool, "tuner-ab") is None
-    )
-    _spool_scheduler_pump(
-        sched, lambda: _spool_scheduler_rc(_spool_scheduler_spool, "tuner-ab") is not None
-    )
-
-
 def test_a_cancelled_job_measured_nothing_and_says_so(_spool_scheduler_spool, served):
     """Cancelled through the spool (by the operator, say): no verdict, and no lost session."""
     results = []
@@ -446,40 +355,18 @@ def test_a_long_wait_on_a_gate_job_is_said_once_per_period(tmp_path):
 
 @pytest.mark.usefixtures("_no_ambient_spool")
 def test_a_queued_job_names_what_runs_ahead_of_it_on_its_spool(tmp_path):
-    """A tune step sat 20 min behind a profiling job an agent had launched, and nothing said so."""
+    """A job sat 20 min behind a profiling job an agent had launched, and nothing said so."""
     work = session(tmp_path, "work-1")
     hold = "waiting for the whole node to drain"
-    _hold(work, "tune-t-sol", hold)
+    _hold(work, "gate-core", hold)
     running = SpoolPaths(work).running
     (running / "sol-profile.sh").write_text("true\n")
-    line = spoolctl.waiting_line(work, "tune-t-sol", time.time())
+    line = spoolctl.waiting_line(work, "gate-core", time.time())
     assert line.endswith(f"; held: {hold}; running there: sol-profile")
     for name in ("a", "b", "c"):
         (running / f"{name}.sh").write_text("true\n")
-    line = spoolctl.waiting_line(work, "tune-t-sol", time.time())
+    line = spoolctl.waiting_line(work, "gate-core", time.time())
     assert line.endswith("; running there: a, b, c and 1 more")
-
-
-@pytest.mark.usefixtures("_no_ambient_spool")
-def test_the_tune_runner_says_its_long_waits_at_most_once_per_period(tmp_path, monkeypatch):
-    monkeypatch.setattr(spoolctl, "WAIT_NOTE_S", 0.2)
-    work = session(tmp_path, "work-1")
-    lines: list[str] = []
-    runner = SpoolRunner([str(work)], prefix="tune", note=lines.append)
-    runner.submit(str(work), "t-sol", "true")
-    _hold(work, "tune-t-sol", "waiting for the whole node to drain")
-    runner.poll()
-    assert lines == []
-    time.sleep(0.25)
-    runner.poll()
-    runner.poll()
-    assert len(lines) == 1 and lines[0].startswith(f"tune-t-sol on {work} queued since ")
-    assert lines[0].endswith("; held: waiting for the whole node to drain")
-    (work / "done" / "tune-t-sol.rc").write_text("0\n")
-    assert [label for label, _, _ in runner.poll()] == ["t-sol"]
-    time.sleep(0.25)
-    runner.poll()
-    assert len(lines) == 1
 
 
 def _task(tmp_path):
@@ -519,9 +406,7 @@ def test_session_cli_prepares_a_missing_spool_without_submitting(tmp_path, monke
             session([removed, *options])
 
 
-def test_session_status_and_tune_host_follow_the_latest_watcher(tmp_path):
-    from agent_flow.workflows.trtllm_modeling_v2.tune.measure import spool_host
-
+def test_session_status_follows_the_latest_watcher(tmp_path):
     task = _task(tmp_path)
     spool = tmp_path / "spool-a"
     (spool / "watchers").mkdir(parents=True)
@@ -533,7 +418,6 @@ def test_session_status_and_tune_host_follow_the_latest_watcher(tmp_path):
     )
     status = sessions.session_status(task, now=200)[0]
     assert status["slurm_job"] == "2" and status["heartbeat_age_s"] == 10
-    assert spool_host(str(spool)) == "new-node"
 
 
 _spool_sessions_HOUR = 3600.0
@@ -1102,5 +986,5 @@ def test_the_first_units_inner_checks_go_ahead_of_every_other():
         ("mtp:boot@tp1", priority.FEATURE),
         ("mtp:acceptance@tp1", priority.FEATURE),
     ]
-    # Outside a check: the scheduler's default, never the campaign's background class.
-    assert priority.current_job_priority() == 0 > priority.PERF
+    # Outside a check: the scheduler's default, a worker's own jobs.
+    assert priority.current_job_priority() == 0

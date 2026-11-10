@@ -200,25 +200,18 @@ class Services:
 
 #: What a ``check`` task ends with once its checks are in; no worker writes it.
 CHECKED = "CHECKED"
-#: What a ``tune`` task ends with once its campaign wrapped up (``tune/stage.py``).
-TUNED = "TUNED"
 #: Decisions that mean the task did what it was asked: the roles' that finish
-#: a task in the decision table (``agents/decisions.py``), and the two the run
+#: a task in the decision table (``agents/decisions.py``), and the one the run
 #: writes itself.
-FINISHED = decision_table.finishing() | {TUNED, CHECKED}
+FINISHED = decision_table.finishing() | {CHECKED}
 
 
 def _not_the_task(decision: str) -> bool:
     """A decision that says the run's infrastructure failed, not the task's work.
 
-    The worker's turn raised, its finished branch could not be integrated, or
-    a tune campaign could not measure its baseline.
+    The worker's turn raised, or its finished branch could not be integrated.
     """
-    return (
-        decision.startswith("raised ")
-        or decision == "INTEGRATION_FAILED"
-        or (decision.startswith("TUNE_FAILED") and "tune-failed:baseline" in decision)
-    )
+    return decision.startswith("raised ") or decision == "INTEGRATION_FAILED"
 
 
 class ChecksRaised(Exception):
@@ -1167,15 +1160,6 @@ class GraphOrchestrator:
     def _finish(self, task: graph_mod.Task, decision: str, failed: list[str]) -> None:
         decision, _, note = decision.partition("\n")
         note = note.strip()
-        if task.kind == "tune" and decision == "TUNE_PENDING":
-            task.status = "pending"
-            self._deferred_campaigns.add(task.id)
-            self.s.log(
-                f"[tune] {task.id}: {note or 'measurement unavailable'}; resume from checkpoint"
-            )
-            self._save_graph()
-            self._persist("state", self.s.checkpoint)
-            return
         blocks_work = task.priority != "nice_to_have" and any(
             task.id in other.depends_on and other.status == "pending" for other in self.graph.tasks
         )

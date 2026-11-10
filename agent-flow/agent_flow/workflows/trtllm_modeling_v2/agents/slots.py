@@ -4,7 +4,7 @@
 """A shared agent-turn cap, acquired by ``Workflow._run_turn``.
 
 Priority is explicit (:func:`turn_priority`): planner, critical-path tasks,
-required tasks, side work, then background tune turns. The planner alone may
+required tasks, side work, then background turns. The planner alone may
 use the reserved slot; its occupancy there does not reduce task capacity.
 Side and background turns use capacity left idle by foreground work, but a
 side turn waiting ``side_max_wait_s`` may take the next unreserved slot.

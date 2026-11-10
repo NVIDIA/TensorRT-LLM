@@ -85,9 +85,7 @@ One priority queue per watcher, ordered by effective priority (``priority`` plus
 :data:`AGING_S` waited), then whole-node jobs before device-slot jobs, then submission order (the
 pending file's mtime), then name. A GPU job waiting for devices blocks every GPU job ranked below
 it, so a stream of single-device jobs never starves a whole-node or multi-device one; a job that
-holds no device never waits for one. A job of a negative priority is background work (the tune
-campaign's): it does not age, so every other job ranks ahead of it however long it has waited,
-and, ranked last, it holds none of them back.
+holds no device never waits for one.
 
 A GPU job starts only on devices whose memory has come back. An engine sizes its KV-cache and
 recurrent pools from the device memory it finds free, so one started beside memory a cancelled
@@ -928,9 +926,6 @@ class Scheduler:
     # ------------------------------------------------------------- admission
 
     def _effective_priority(self, spec: JobSpec, now: float) -> int:
-        if spec.priority < 0:
-            # Background work (the tune campaign's) never ages past anyone else's.
-            return spec.priority
         return spec.priority + int(max(0.0, now - spec.submitted) // AGING_S)
 
     def _rank_key(self, spec: JobSpec, now: float) -> tuple:

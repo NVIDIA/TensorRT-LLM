@@ -14,7 +14,7 @@ read the run's state and write the next version of the task graph.
   task's goal. A message does not change a contract check: where it asks for
   one to change, say in your `summary` which `task.yaml` key would change it;
 - the confirmed `task.yaml`: the goals, the features and their status, the
-  perf configs, the constraints and the user's notes;
+  constraints and the user's notes;
 - `contract.yaml` and `contract_status.jsonl`: every check the run must pass,
   and the latest verdict of each. The run is done when every required check
   passes on one tree. Nothing else counts as done;
@@ -56,8 +56,7 @@ Kinds:
 A worker is briefed by its task's tags: the kind, then `tags`. Tag a task
 with what it actually does, so a task that does two kinds of work carries
 both: a `feature` that must first find why its check failed is `tags:
-[investigate]`; a `kernel` task that must make its entry faster is `tags:
-[tune]`. A `check` task runs no worker and takes no tags.
+[investigate]`. A `check` task runs no worker and takes no tags.
 
 Each goal is one outcome, small enough for one worker in one sitting, and
 says what finished means: the test that passes, the gate, the number to
@@ -80,8 +79,6 @@ It refuses a graph that breaks any of these, and tells you why:
   follows every change outside the target;
 - `tags` are kinds of worker work, never on a `check` task;
 - a revision states its reason;
-- when `task.yaml` asks for performance work (`perf.enabled`), the graph has
-  one `tune` task;
 - a failed task runs at most the worker runs per task your request states; a
   revision that retries it again is refused;
 - `depends_on_soft` names tasks that land on the target (`kernel`, `assemble`,
@@ -205,8 +202,8 @@ task can use.
 ## How to plan
 
 **Only work the goal needs**, in this order: what proves a required check or
-unblocks it; the features `task.yaml` asks for; performance work, which the
-`tune` task does once the onboarding is complete. Nothing else: no task to
+unblocks it; the features `task.yaml` asks for. Performance work is not the
+flow's: it runs on the delivered target, outside it. Nothing else: no task to
 show a shared change harmless to other models (the regression checks and the
 pull request's CI do that), no extra reports, no polishing of finished work.
 **A suspected defect that does not affect delivering this model is recorded,
@@ -272,19 +269,10 @@ order. Work that builds on the core's code starts from it while its accuracy
 is still being debugged; a fix that lands later reaches it through
 integration.
 
-A `tune` task is background performance work for what the onboarding's
-workers leave; it never holds the onboarding back. Keep it in the graph from
-the start; it does not start until the core's required checks have passed (the
-features' and variants' checks do not hold it back and go on beside it), and it
-works on the commit the target is at then, in its own worktrees: one baseline,
-then the campaign. Give it empty `touches` and `resources.gpus: 0`: its jobs
-queue below every job of the onboarding and reserve none of its devices. No
-task depends on it, and none integrates its branch: its best branch is an
-artifact of the run. Once full support holds (every required check, the
+Once full support holds (every required check, the
 delivery files on disk, every landed change to shared code through a
 regression check, no local variant waiting), the orchestrator records that
-commit and the run is delivered at once; a campaign still running goes on
-after, and its outcome changes no verdict of yours. So plan the delivery
+commit and the run is delivered at once. So plan the delivery
 files as a task of their own once the first
 unit's assembly is done: the CI accuracy test, its entry on a test list and,
 when the accuracy anchor is written, the accuracy reference entry.
