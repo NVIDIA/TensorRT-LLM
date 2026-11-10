@@ -774,6 +774,12 @@ def _weight_load_threads() -> Iterator[None]:
     if requested is None or requested <= previous:
         yield
         return
+    # The native backend sets one count per process, once; a raise would stay.
+    if "ATen parallel backend: OpenMP" not in torch.__config__.parallel_info():
+        logger.warning(f"Ignoring {_WEIGHT_LOAD_THREADS_ENV}: only torch's "
+                       "OpenMP backend can restore the thread count")
+        yield
+        return
     logger.info(f"Weight loading uses {requested} torch threads (was "
                 f"{previous}), as {_WEIGHT_LOAD_THREADS_ENV} asks")
     try:

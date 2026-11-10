@@ -64,6 +64,9 @@ def _load(checkpoint_dir: str, monkeypatch: pytest.MonkeyPatch, load_threads: st
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_load_threads_same_bytes_and_restored(tmp_path, monkeypatch):
     """Unset keeps 1 thread; N raises model.load_weights only, and 1 is back after the load."""
+    # Skip on the native backend only; if the loader stops seeing OpenMP, this fails.
+    if "ATen parallel backend: native" in torch.__config__.parallel_info():
+        pytest.skip("torch's native backend keeps one thread count per process")
     config = LlamaConfig(
         hidden_size=256,
         intermediate_size=768,
