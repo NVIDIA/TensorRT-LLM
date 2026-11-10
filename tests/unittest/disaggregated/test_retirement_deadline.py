@@ -4,6 +4,7 @@
 
 import re
 import threading
+from collections.abc import Iterator
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -660,6 +661,240 @@ def _submit_piece(session: transfer_mod.TxSession, task: transfer_mod.SendTaskBa
     assert session._sender._begin_task_operation(task, 7)
     assert session._sender._submit_transfer(task, 7, _write_request()) == (True, None)
     task.complete()
+
+
+@pytest.fixture
+def operation_wait(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
+    """Keep session/ownership/adapter real; substitute only time and native I/O."""
+    agent_module = pytest.importorskip("tensorrt_llm._torch.disaggregation.nixl._agent_cpp")
+    now = [10.0]
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: now[0])
+    watchdog = RetirementWatchdog(Mock(), clock=lambda: now[0])
+    session = _tx_session(watchdog)
+    session.send(Chunk([], [], TokenRange(0, 16), True))
+    aux = session.send_aux()
+    cpp = Mock()
+    cpp.wait.return_value = agent_module.TransferState.SUCCESS
+    cpp.is_completed.return_value = False
+    status = agent_module.BindingsNixlTransferStatus(cpp)
+    session._sender._agent.submit_transfer_requests.return_value = status
+    session._sender._operation_timeout_ms = 1000
+    yield SimpleNamespace(
+        now=now,
+        watchdog=watchdog,
+        session=session,
+        sender=session._sender,
+        kv=session.kv_tasks[0],
+        aux=aux,
+        cpp=cpp,
+        status=status,
+        states=agent_module.TransferState,
+    )
+    watchdog.stop()
+
+
+def test_disabled_operation_timeout_keeps_legacy_wait_without_clock_reads(
+    monkeypatch: pytest.MonkeyPatch, operation_wait: SimpleNamespace
+) -> None:
+    """Disabled operation timing adds no clock read and retains the legacy wait."""
+    env = operation_wait
+    env.sender._operation_timeout_ms = None
+    assert env.sender._begin_task_operation(env.kv, 7)
+    operation_clock = Mock(side_effect=AssertionError("operation clock is disabled"))
+    monkeypatch.setattr(transfer_mod.time, "monotonic", operation_clock)
+
+    assert env.sender._submit_transfer(env.kv, 7, _write_request()) == (True, None)
+
+    env.cpp.wait.assert_called_once_with(-1)
+    operation_clock.assert_not_called()
+    assert env.session._retirement._request_deadline == 15.0
+
+
+@pytest.mark.parametrize("piece", ["kv", "aux"])
+def test_operation_budget_excludes_presubmission_wait_but_debits_callback(
+    operation_wait: SimpleNamespace, piece: str
+) -> None:
+    """Accepted-handle timing is distinct from queueing and first exposure."""
+    env = operation_wait
+    task = getattr(env, piece)
+    assert env.sender._begin_task_operation(task, 7)
+    env.now[0] = 11.0
+
+    def submit(_request: object) -> object:
+        env.now[0] = 12.0
+        return env.status
+
+    def callback() -> None:
+        env.now[0] = 12.25
+
+    env.sender._agent.submit_transfer_requests.side_effect = submit
+    assert env.sender._submit_transfer(task, 7, _write_request(), callback) == (True, None)
+
+    env.cpp.wait.assert_called_once_with(750)
+    assert env.session._deadline_monotonic_s == 15.0
+    assert env.session._retirement._request_deadline == 16.0
+    assert task.resources_drained
+
+
+@pytest.mark.parametrize("piece", ["kv", "aux"])
+@pytest.mark.parametrize("earlier_failure", [False, True])
+@pytest.mark.parametrize("callback_delay", [0.25, 1.25], ids=["backend-wait", "before-wait"])
+def test_operation_timeout_retains_roots_and_original_grace_until_late_completion(
+    operation_wait: SimpleNamespace,
+    piece: str,
+    earlier_failure: bool,
+    callback_delay: float,
+) -> None:
+    """Operation expiry cannot release KV/AUX, renew grace, or unpoison a sender."""
+    env = operation_wait
+    task = getattr(env, piece)
+    assert env.sender._begin_task_operation(task, 7)
+    request = _write_request()
+
+    def callback() -> None:
+        if earlier_failure:
+            env.now[0] = 10.125
+            task.fail(RuntimeError("earlier failure"))
+        env.now[0] = 10.0 + callback_delay
+
+    def wait(timeout_ms: int) -> object:
+        env.now[0] += timeout_ms / 1000
+        return env.states.IN_PROGRESS
+
+    env.cpp.wait.side_effect = wait
+    completed, detail = env.sender._submit_transfer(task, 7, request, callback)
+
+    assert not completed
+    assert "deadline_owner=native_operation" in detail
+    assert "timer_start=backend_accepted" in detail
+    assert "service_start=unknown" in detail
+    assert "limit_ms=1000" in detail
+    if callback_delay < 1.0:
+        env.cpp.wait.assert_called_once_with(750)
+    else:
+        env.cpp.wait.assert_not_called()
+    # Delivery's existing failure path commits the result independently of
+    # physical ownership; an earlier result must survive this later failure.
+    task.fail(TimeoutError(detail))
+    outcome = task.logical_outcome
+    assert outcome.status is SessionStatus.ERROR
+    if earlier_failure:
+        assert outcome.reason == "earlier failure"
+    operation = task._physical_operations[7]
+    assert operation.state is PhysicalOperationState.IN_DOUBT
+    assert operation.request is request
+    assert operation.status is env.status
+    assert not task.resources_drained
+    assert env.session.close() is False
+    assert not task.poll_in_doubt_physical_operation(7)
+    drain_started = 10.125 if earlier_failure else env.now[0]
+    assert env.session._retirement._request_deadline == 15.0
+    assert env.session._retirement._drain_started == drain_started
+    poison = env.sender._ownership_poisoned
+    assert isinstance(poison, TimeoutError)
+
+    env.now[0] += 0.25
+    env.cpp.is_completed.return_value = True
+    assert task.poll_in_doubt_physical_operation(7)
+    assert task.resources_drained
+    assert operation.request is None and operation.status is None
+    assert task.logical_outcome is outcome
+    assert env.sender._ownership_poisoned is poison
+    assert env.session._retirement._drain_started == drain_started
+    assert env.session.close()
+
+
+def test_later_operation_budget_does_not_extend_first_exposure_timeout(
+    operation_wait: SimpleNamespace,
+) -> None:
+    """A successful operation cannot overwrite an earlier session timeout."""
+    env = operation_wait
+    env.sender._operation_timeout_ms = 6000
+    assert env.sender._begin_task_operation(env.kv, 7)
+
+    def complete_late(_timeout_ms: int) -> object:
+        env.now[0] = 16.0
+        return env.states.SUCCESS
+
+    env.cpp.wait.side_effect = complete_late
+    assert env.sender._submit_transfer(env.kv, 7, _write_request()) == (True, None)
+    env.kv.complete()
+
+    assert env.session._retirement._request_deadline == 15.0
+    assert env.session._retirement._drain_started == 15.0
+    assert env.kv.logical_outcome.status is SessionStatus.ERROR
+    assert env.kv.logical_outcome.reason == "KV transfer timed out"
+    assert env.kv.resources_drained
+
+
+@pytest.mark.parametrize("piece", ["kv", "aux"])
+def test_operation_timeout_delivery_uses_existing_in_doubt_and_late_settlement(
+    monkeypatch: pytest.MonkeyPatch, operation_wait: SimpleNamespace, piece: str
+) -> None:
+    """Real delivery publishes failure promptly; late DONE proves only retirement."""
+    env = operation_wait
+    sender, task = env.sender, getattr(env, piece)
+    sender._instance_rank = sender._device_id = 0
+    sender._num_threads = 1
+    sender._pending_settlements = [{}]
+    dealer = Mock()
+    sender._get_result_dealer = Mock(return_value=dealer)
+    request = _write_request()
+    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", Mock(return_value=request))
+    assert sender._begin_task_operation(task, 7)
+    meta = transfer_mod.WriteMeta(
+        task,
+        1,
+        "receiver",
+        7,
+        "receiver",
+        4,
+        np.array([16], dtype=np.int64),
+        np.array([32], dtype=np.int64),
+        np.array([16], dtype=np.int64),
+        dst_device_id=0,
+        slice_id=0,
+        is_last_slice=True,
+        meta_type=transfer_mod.WriteMetaType.AUX
+        if piece == "aux"
+        else transfer_mod.WriteMetaType.KV,
+    )
+
+    def wait(timeout_ms: int) -> object:
+        env.now[0] += timeout_ms / 1000
+        return env.states.IN_PROGRESS
+
+    env.cpp.wait.side_effect = wait
+    deliver = sender._deliver_aux_to_agent if piece == "aux" else sender._deliver_kv_to_agent
+    deliver(meta)
+
+    outcome = task.logical_outcome
+    assert outcome.status is SessionStatus.ERROR
+    assert "deadline_owner=native_operation" in outcome.reason
+    assert task._physical_operations[7].request is request
+    assert not task.resources_drained
+    assert sender._pending_settlements[0]
+    assert dealer.send.call_count == 1
+    poison = sender._ownership_poisoned
+    env.cpp.is_completed.return_value = True
+    env.now[0] = 11.25
+    sender._poll_in_doubt_transfers(0)
+    sender._poll_in_doubt_transfers(0)
+
+    assert task.resources_drained
+    assert task.logical_outcome is outcome
+    assert sender._ownership_poisoned is poison
+    assert not sender._pending_settlements[0]
+    assert dealer.send.call_count == 2
+    messages = [call.args[0] for call in dealer.send.call_args_list]
+    if piece == "aux":
+        assert [message[-1].decode() for message in messages] == ["IN_DOUBT", "FAILED_QUIESCED"]
+    else:
+        results = [transfer_mod._KV_RESULT_FRAME.unpack(message[1]) for message in messages]
+        assert [transfer_mod._AGENT_RESULT_BY_CODE[result[4]] for result in results] == [
+            transfer_mod.AgentResult.IN_DOUBT,
+            transfer_mod.AgentResult.FAILED_QUIESCED,
+        ]
 
 
 def test_operation_snapshot_distinguishes_empty_and_retains_state_values() -> None:
