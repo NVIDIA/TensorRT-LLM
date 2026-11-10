@@ -22,6 +22,7 @@ they run on the CPU CI stage.
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -365,6 +366,111 @@ def test_verify_qa_test_lists_clears_stale_file(mod, tmp_path, monkeypatch):
     result = (llm_src / "qa_test.txt").read_text().splitlines()
     assert "accuracy/test_old.py::test_stale[b]" not in result
     assert result == ["accuracy/test_new.py::test_current[a]"]
+
+
+def test_list_test_db_names(mod, tmp_path):
+    """Entries from every block are merged, deduplicated and sorted; dynamic perf lists are skipped."""
+    (tmp_path / "l0_a.yml").write_text(
+        "version: 0.0.1\n"
+        "l0_a:\n"
+        "- condition: {terms: {stage: pre_merge}}\n"
+        "  tests:\n"
+        "  - b.py::test_b ISOLATION\n"
+        "  - a.py::test_a[x] TIMEOUT (60)\n"
+        "- condition: {terms: {stage: post_merge}}\n"
+        "  tests:\n"
+        "  - b.py::test_b ISOLATION\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "l0_perf_sanity.yml").write_text(
+        "version: 0.0.1\nl0_ps:\n- condition: {}\n  tests:\n  - perf/test_s.py::test_s\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "llm_perf_core.yml").write_text(
+        "l0_p:\n- tests:\n  - perf/test_p.py::test_p\n", encoding="utf-8"
+    )
+
+    assert mod.list_test_db_names(str(tmp_path)) == [
+        "a.py::test_a[x] TIMEOUT (60)",
+        "b.py::test_b ISOLATION",
+        "perf/test_s.py::test_s",
+    ]
+
+
+VALID_BLOCK = "- condition: {}\n  tests: [a.py::test_a]\n"
+
+
+@pytest.mark.parametrize(
+    "files, error",
+    [
+        pytest.param(
+            {
+                "l0_a.yml": "version: 0.0.1\n"
+                "l0_a:\n"
+                "- condition: {}\n"
+                "  tests: [a.py::test_a]\n"
+                "  tests: [a.py::test_b]\n"
+            },
+            "duplicate key 'tests'",
+            id="duplicate-key",
+        ),
+        pytest.param(
+            {"l0_a.yml": "l0_a:\n" + VALID_BLOCK},
+            "version must be '0.0.1', got None",
+            id="missing-version",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.2\nl0_a:\n" + VALID_BLOCK},
+            "version must be '0.0.1', got '0.0.2'",
+            id="unsupported-version",
+        ),
+        pytest.param(
+            {
+                "l0_a.yml": "version: 0.0.1\nl0_a:\n" + VALID_BLOCK,
+                "l0_b.yml": "version: 0.0.1\nl0_a:\n" + VALID_BLOCK,
+            },
+            "context 'l0_a' is already defined in",
+            id="context-in-two-files",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.1\nl0_a:\n  tests: [a.py::test_a]\n"},
+            "context 'l0_a' must be a list of blocks",
+            id="context-not-a-list",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.1\nl0_a:\n- a.py::test_a\n"},
+            "context 'l0_a' has a non-mapping block",
+            id="block-not-a-mapping",
+        ),
+        pytest.param(
+            {"l0_a.yml": "- a.py::test_a\n"},
+            "expected a mapping at the top level",
+            id="top-level-not-a-mapping",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.1\nl0_a:\n- tests: [a.py::test_a]\n"},
+            "context 'l0_a' has a block without 'condition'",
+            id="block-without-condition",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.1\nl0_a:\n- condition: {}\n"},
+            "context 'l0_a' has a block whose 'tests' is not a list",
+            id="block-without-tests",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.1\nl0_a:\n- condition: {}\n  tests:\n"},
+            "context 'l0_a' has a block whose 'tests' is not a list",
+            id="block-with-null-tests",
+        ),
+    ],
+)
+def test_list_test_db_names_rejects_invalid_input(mod, tmp_path, files, error):
+    """Input the test-db scheduler rejects fails here instead of being read leniently."""
+    for name, content in files.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=re.escape(error)):
+        mod.list_test_db_names(str(tmp_path))
 
 
 # --------------------------------------------------------------------------
