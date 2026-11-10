@@ -30,6 +30,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk
     beam_grouped_topk_router,
 )
 
+from .._constants import ROUTER_EPS as NORM_EPS
+from .._constants import SM as _SM
+
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately.
 SUPPORTED_CONFIG = {
@@ -43,11 +46,6 @@ SUPPORTED_CONFIG = {
 SUPPORTED_LAYER_IDX = 3
 #: The sparse blocks this router has been built for: the checkpoint's first three.
 SUPPORTED_LAYER_INDICES = (3, 4, 5)
-
-#: Added to the selected scores' sum before dividing, as the source model does.
-NORM_EPS = 1e-20
-
-_SM = (10, 3)
 
 
 def check_config(config, layer_idx: int) -> None:

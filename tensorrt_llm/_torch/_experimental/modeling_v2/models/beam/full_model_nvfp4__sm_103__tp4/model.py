@@ -53,12 +53,13 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
+from .._constants import SUPPORTED_CONFIG
 from . import _attention
 from .component import BeamCheckpointLayoutNvfp4Sm103Tp4
 from .limits import MAX_NUM_TOKENS
 
 #: Logical decoder layers, all executed by every call.
-NUM_LAYERS = 52
+NUM_LAYERS = SUPPORTED_CONFIG["num_hidden_layers"]
 #: KV cache page size of the supported deployment.
 TOKENS_PER_BLOCK = 32
 

@@ -36,6 +36,7 @@ from typing import Mapping
 import torch
 from torch import nn
 
+from .._constants import SM as _SM
 from ..full_model_nvfp4__sm_103__tp4 import dispatch_combine
 from ..moe_expert_bf16__sm_103__tp1.expert import WEIGHT_SHAPES as EXPERT_WEIGHT_SHAPES
 from ..moe_expert_bf16__sm_103__tp1.expert import BeamMoeExpertBf16Sm103Tp1
@@ -49,8 +50,6 @@ SUPPORTED_CONFIG = {
     "routed_scaling_factor": 2.5,
 }
 SUPPORTED_LAYER_IDX = 3
-
-_SM = (10, 3)
 
 
 def check_config(config, layer_idx: int) -> None:

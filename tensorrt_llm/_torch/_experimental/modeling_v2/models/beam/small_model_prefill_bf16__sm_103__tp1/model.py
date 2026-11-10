@@ -80,6 +80,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, LayerId, PageIndexMode
 
+from .._constants import SM as _SM
 from ..dense_block_bf16__sm_103__tp1 import block as dense_block
 from ..full_model_nvfp4__sm_103__tp4 import _attention
 from ..moe_bf16__sm_103__tp1.moe import check_weights
@@ -113,7 +114,6 @@ ATTENTION_WINDOWS = (512,) * 5 + (KV_CACHE["max_seq_len"],)
 #: length is bounded by its cache's ``max_seq_len``.
 MAX_TOKENS = KV_CACHE["max_seq_len"]
 
-_SM = (10, 3)
 
 #: Checkpoint names of the model's own tensors, beside its blocks'.
 EMBED = "model.embed_tokens.weight"

@@ -50,6 +50,7 @@ from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
+from .._constants import SM as _SM
 from .._load import load_failure_details
 from . import dispatch_combine
 from . import expert as nvfp4_expert
@@ -87,7 +88,6 @@ from .loader import (
     validate,
 )
 
-_SM = (10, 3)
 #: Bank fields of one projection kind of one sparse layer.
 BANK_FIELDS = ("weight", "weight_scale", "input_scale", "weight_scale_2", "g", "alpha")
 _KINDS = tuple(p.removesuffix("_proj") for p in PROJECTIONS)
@@ -145,7 +145,6 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         self.window = config["sliding_window"]
         self.rope_theta = config["rope_parameters"]["sliding_attention"]["rope_theta"]
         self.softcap = config["final_logit_softcapping"]
-        self.routed_scaling_factor = config["routed_scaling_factor"]
         self.vocab_interval = self.specs[EMBED].interval(self.rank)[1:]
         self.tensor_names: list = []
         self.bank_names: list = []

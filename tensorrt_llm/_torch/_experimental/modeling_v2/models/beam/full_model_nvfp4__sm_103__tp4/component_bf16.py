@@ -84,6 +84,8 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
+from .._constants import ROUTER_EPS
+from .._constants import SM as _SM
 from .._load import load_failure_details
 from . import _attention, dispatch_combine
 from .layout_bf16 import (
@@ -100,8 +102,6 @@ from .layout_bf16 import (
 )
 from .loader_bf16 import CheckpointFormatError, SafetensorsCatalog, TileReader, read_slice_into
 
-_SM = (10, 3)
-ROUTER_EPS = 1e-20
 #: Default tokens per call; the representative cases use at most 129. A caller that runs longer
 #: calls (a full-model prefill) passes its own ``max_tokens`` at construction.
 MAX_TOKENS = 1024
@@ -191,7 +191,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self.window = config["sliding_window"]
         self.rope_theta = config["rope_parameters"]["sliding_attention"]["rope_theta"]
         self.softcap = config["final_logit_softcapping"]
-        self.routed_scaling_factor = config["routed_scaling_factor"]
         self.vocab_interval = self.specs[EMBED].interval(self.rank)[1:]
         #: Storage is always resolved from the currently registered parameters, never from
         #: references taken here, so a replaced parameter or bank is what every call uses.

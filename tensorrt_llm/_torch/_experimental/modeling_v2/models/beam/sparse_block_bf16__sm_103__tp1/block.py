@@ -60,6 +60,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_r
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
+from .._constants import SM as _SM
 from ..full_model_nvfp4__sm_103__tp4 import _attention
 from ..moe_bf16__sm_103__tp1.moe import BeamMoeBf16Sm103Tp1, check_weights
 from ..moe_bf16__sm_103__tp1.moe import check_config as check_moe_config
@@ -88,7 +89,6 @@ SUPPORTED_ROPE = {"rope_type": "default", "rope_theta": 10000.0}
 #: calls are rejected; the request's whole KV length is bounded by its cache's capacity.
 MAX_TOKENS = 1024
 
-_SM = (10, 3)
 
 #: The MoE's tensors carry this prefix in the block's checkpoint names.
 MLP_PREFIX = "mlp."

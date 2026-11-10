@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from ..._router_index import NoTarget
+from ._constants import SM, SUPPORTED_CONFIG, WORLD_SIZE
 from .full_model_nvfp4__sm_103__tp4.limits import MAX_NUM_TOKENS
 
 if TYPE_CHECKING:
@@ -145,9 +146,12 @@ def route(
     engine = engine_refusal(llm_args)
     refusal = None
     if (
-        compute_capability == (10, 3)
-        and shape == (52, 5120, 256)
-        and layout == (4, 4, 1, 4, 1, False)
+        compute_capability == SM
+        and shape
+        == tuple(
+            SUPPORTED_CONFIG[key] for key in ("num_hidden_layers", "hidden_size", "num_experts")
+        )
+        and layout == (WORLD_SIZE, WORLD_SIZE, 1, WORLD_SIZE, 1, False)
         and quant_algo == "NVFP4"
         and speculation is None
         and engine is None
@@ -168,7 +172,7 @@ def route(
         f"KV cache {kv_cache_quant_algo or 'bf16'}; "
         f"{f'{engine}; ' if engine else ''}"
         "the one Beam target is the 52-layer NVFP4 checkpoint on sm103, attention TP4, MoE "
-        "TP4/EP1, PP1, with a BF16 or FP8 KV cache and without attention DP, at most 8192 "
+        f"TP4/EP1, PP1, with a BF16 or FP8 KV cache and without attention DP, at most {MAX_NUM_TOKENS} "
         "tokens per engine step, with speculative decoding "
         f"off or DFlash (TRTLLM draft attention, max_draft_len {DFLASH_MAX_DRAFT_LEN}, strict "
         "greedy verification, no overlap scheduler)"
