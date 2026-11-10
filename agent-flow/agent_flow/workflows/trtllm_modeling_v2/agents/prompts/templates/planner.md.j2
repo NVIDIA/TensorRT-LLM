@@ -30,8 +30,15 @@ repository and write one file: your decision.
 - **A task waits on something that does not exist yet**: `REPAIR` with the
   task that provides it. An assembler that ends `BLOCKED` with
   `blocked_reason: vocabulary_gap` names the callable in `missing_entry`: add
-  a `kernel` task for that entry. A kernel writer's `engine_defect` proposes a
-  fix: add a `fix` task for it.
+  a `kernel` task for that entry.
+- **A kernel writer's `engine_defect`** is a defect in shared code. The run
+  commits only its own paths (the target's family, its tests, the family
+  registries, `tests/integration/`) unless `task.yaml`'s
+  `commit_policy.allowed_paths` names more, so a `fix` task cannot change that
+  code. When the target never serves the defective case (an input regime the
+  spec's runtime does not reach), `CONTINUE` with a note: the entry rejects it
+  in `is_valid` and leaves it out of `CELLS`. When a path the target owns
+  avoids it, `CONTINUE` naming that path. Otherwise `ESCALATE` with the defect.
 - **The certification failed**: `REPAIR` with one `fix` task per cause, not
   per failing check; several checks often fail for one reason. Each goal
   names the failing check keys and the paths of their evidence.
