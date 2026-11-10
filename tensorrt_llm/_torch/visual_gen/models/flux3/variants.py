@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""BFL pre-quantized FLUX.3 transformers in a checkpoint's ``variants/<variant>/`` directory.
+"""BFL pre-quantized FLUX 3 transformers in a checkpoint's ``variants/<variant>/`` directory.
 
 Each holds BFL-named weights, a config.json and an hf_quant_config.json read as ModelOpt config.
 """
@@ -40,7 +40,7 @@ def check_variant(variant: Any) -> Optional[str]:
     """Return ``pipeline_config.variant`` if it is None or a known variant; else ValueError."""
     if variant is not None and (not isinstance(variant, str) or variant not in VARIANT_QUANT_ALGOS):
         raise ValueError(
-            "FLUX.3 pipeline_config.variant must be null or one of "
+            "FLUX 3 pipeline_config.variant must be null or one of "
             f"{sorted(VARIANT_QUANT_ALGOS)}, got {variant!r}."
         )
     return variant
@@ -52,7 +52,7 @@ def variant_dir(checkpoint_dir: str, variant: str) -> str:
 
 def _read_json(path: str) -> Dict[str, Any]:
     if not os.path.isfile(path):
-        raise ValueError(f"FLUX.3 variant file not found: {path}")
+        raise ValueError(f"FLUX 3 variant file not found: {path}")
     with open(path) as f:
         return json.load(f)
 
@@ -69,7 +69,7 @@ def collapse_exclusions(excluded: Iterable[str], modules: Iterable[str]) -> List
     modules, excluded = set(modules), set(excluded)
     unknown = sorted(excluded - modules)
     if unknown:
-        raise ValueError(f"FLUX.3 variant excludes modules it does not have: {unknown}")
+        raise ValueError(f"FLUX 3 variant excludes modules it does not have: {unknown}")
     names = set()
     for name in excluded:
         parts = name.split(".")
@@ -96,7 +96,7 @@ def variant_quantization_config(
     quant_algo = VARIANT_QUANT_ALGOS[variant]
     if quantization.get("quant_algo") != quant_algo:
         raise ValueError(
-            f"FLUX.3 {variant} variant needs quant_algo {quant_algo} in hf_quant_config.json, "
+            f"FLUX 3 {variant} variant needs quant_algo {quant_algo} in hf_quant_config.json, "
             f"got {quantization.get('quant_algo')!r}."
         )
     weights = {"dynamic": False}
@@ -104,7 +104,7 @@ def variant_quantization_config(
         group_size = quantization.get("group_size", NVFP4_GROUP_SIZE)
         if group_size != NVFP4_GROUP_SIZE:
             raise ValueError(
-                f"FLUX.3 nvfp4 variant needs group_size {NVFP4_GROUP_SIZE}, got {group_size}."
+                f"FLUX 3 nvfp4 variant needs group_size {NVFP4_GROUP_SIZE}, got {group_size}."
             )
         weights["group_size"] = group_size
     modules = [
@@ -126,7 +126,7 @@ def variant_quantization_config(
 def _check_variant_config(
     variant: str, bfl_config: Dict[str, Any], transformer_config: Dict[str, Any]
 ) -> None:
-    """Reject a variant exported from another FLUX.3 model than the Diffusers transformer."""
+    """Reject a variant exported from another FLUX 3 model than the Diffusers transformer."""
     dit = bfl_config.get("dit") or {}
     heads = transformer_config.get("num_attention_heads")
     head_dim = transformer_config.get("attention_head_dim")
@@ -148,7 +148,7 @@ def _check_variant_config(
     }
     if mismatched:
         raise ValueError(
-            f"FLUX.3 {variant} variant config.json does not match transformer/config.json, "
+            f"FLUX 3 {variant} variant config.json does not match transformer/config.json, "
             f"as (variant, transformer): {mismatched}"
         )
 
@@ -163,7 +163,7 @@ def resolve_variant_quantization_config(
     )
     weights_path = os.path.join(directory, "model.safetensors")
     if not os.path.isfile(weights_path):
-        raise ValueError(f"FLUX.3 variant file not found: {weights_path}")
+        raise ValueError(f"FLUX 3 variant file not found: {weights_path}")
     with safe_open(weights_path, framework="pt") as f:
         tensor_names = list(f.keys())
     hf_quant_config = _read_json(os.path.join(directory, "hf_quant_config.json"))
@@ -193,7 +193,7 @@ def check_variant_scales(
             ]
     if missing or unexpected:
         raise ValueError(
-            f"FLUX.3 {variant} weights do not match their quantization config: quantized layers "
+            f"FLUX 3 {variant} weights do not match their quantization config: quantized layers "
             f"miss {format_names(missing)}, BF16 layers carry {format_names(unexpected)}"
         )
 

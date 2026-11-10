@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FLUX.3 Klein text-to-image and reference-image generation.
+"""FLUX 3 Klein text-to-image and reference-image generation.
 
 Usage:
     python flux3.py
@@ -31,7 +31,7 @@ from tensorrt_llm.visual_gen import MediaRef
 
 def main():
     parser = argparse.ArgumentParser(
-        description="FLUX.3 Klein text-to-image and reference-image generation example"
+        description="FLUX 3 Klein text-to-image and reference-image generation example"
     )
     parser.add_argument(
         "--model",
@@ -61,7 +61,7 @@ def main():
             "amber sky glows behind a distant tree line, and the shallow depth of field blurs the "
             "background. Photorealistic wildlife photograph, sharp focus on the fox's eyes."
         ),
-        help="Text prompt; FLUX.3 encodes it as given, so pass a full scene caption",
+        help="Text prompt; FLUX 3 encodes it as given, so pass a full scene caption",
     )
     parser.add_argument(
         "--image",
@@ -120,7 +120,7 @@ def main():
         [MediaRef(content=path, format="path") for path in args.image] if args.image else None
     )
     if args.image:
-        # Let FLUX.3 derive omitted dimensions from the first processed reference.
+        # Let FLUX 3 derive omitted dimensions from the first processed reference.
         params.height = args.height
         params.width = args.width
     else:

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 1-GPU FLUX.3 Klein / Klein Base with BFL's pre-quantized NVFP4 transformer (variants/nvfp4).
+# 1-GPU FLUX 3 Klein / Klein Base with BFL's pre-quantized NVFP4 transformer (variants/nvfp4).
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
 pipeline_config:
   variant: nvfp4

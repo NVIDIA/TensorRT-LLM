@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU tests for the BFL <-> Diffusers FLUX.3 tensor name bijection."""
+"""CPU tests for the BFL <-> Diffusers FLUX 3 tensor name bijection."""
 
 from typing import Any, Callable, Optional
 
@@ -259,7 +259,7 @@ def test_norm_out_swap_needs_even_rows() -> None:
     ],
 )
 def test_unknown_tensor_names_raise(convert: Callable[[str], str], key: str) -> None:
-    with pytest.raises(ValueError, match="Unknown .* FLUX.3 tensor name"):
+    with pytest.raises(ValueError, match="Unknown .* FLUX 3 tensor name"):
         convert(key)
 
 
@@ -272,5 +272,5 @@ def test_unknown_tensor_names_raise(convert: Callable[[str], str], key: str) -> 
     ],
 )
 def test_unknown_module_names_raise(convert: Callable[[str], str], name: str) -> None:
-    with pytest.raises(ValueError, match="Unknown .* FLUX.3 module name"):
+    with pytest.raises(ValueError, match="Unknown .* FLUX 3 module name"):
         convert(name)

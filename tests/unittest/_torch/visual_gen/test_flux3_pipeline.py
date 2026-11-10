@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FLUX.3 pipeline tests: CPU cases are marked cpu_only; the rest run end to end on a GPU."""
+"""FLUX 3 pipeline tests: CPU cases are marked cpu_only; the rest run end to end on a GPU."""
 
 import copy
 import io
@@ -91,7 +91,7 @@ requires_sm100 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="SOL attention and VC-Attention need SM100 or SM103",
 )
-# The documented FLUX.3 SOL and VC-Attention recipes.
+# The documented FLUX 3 SOL and VC-Attention recipes.
 SOL_SETTINGS = dict(tau=1.0, disabled_until_timestep=0.96)
 VC_SETTINGS = dict(qk_dtype="fp8", v_dtype="fp8", vc_attention=True, vc_repair_budget=0.005)
 
@@ -109,7 +109,7 @@ def png_bytes(width: int, height: int, seed: int = 0) -> bytes:
 
 
 def config_stub(flow_map: bool = False, **overrides) -> SimpleNamespace:
-    """The DiffusionPipelineConfig fields the FLUX.3 pipeline reads, set to supported values."""
+    """The DiffusionPipelineConfig fields the FLUX 3 pipeline reads, set to supported values."""
     values = dict(
         primary_pretrained_config=SimpleNamespace(flow_map=flow_map, num_attention_heads=24),
         cpu_offload_config=SimpleNamespace(enable=False),

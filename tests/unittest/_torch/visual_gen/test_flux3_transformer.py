@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""GPU tests of the packed FLUX.3 transformer forward against an independent Diffusers-math one."""
+"""GPU tests of the packed FLUX 3 transformer forward against an independent Diffusers-math one."""
 
 from types import SimpleNamespace
 from typing import Optional
@@ -27,7 +27,7 @@ from tensorrt_llm.visual_gen.args import (
     SolAttentionConfig,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="FLUX.3 forward needs CUDA")
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="FLUX 3 forward needs CUDA")
 
 DEVICE = "cuda"
 MODALITIES = ("image", "image_cond", "text")

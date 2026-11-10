@@ -663,7 +663,7 @@ def _is_flux3_lora(
 def _normalize_flux3_pairs(
     pairs: Iterable[_LoRAPair], *, strip_prefixes: Tuple[str, ...]
 ) -> List[_LoRAPair]:
-    # FLUX.3 adapters use BFL-native or Diffusers names; BFL orders output-norm rows shift, scale.
+    # FLUX 3 adapters use BFL-native or Diffusers names; BFL orders output-norm rows shift, scale.
     from .models.flux3.transformer_flux3 import BFL_NORM_OUT, swap_norm_out_halves
 
     normalized: Dict[str, _LoRAPair] = {}
@@ -673,7 +673,7 @@ def _normalize_flux3_pairs(
         if target in normalized:
             raise ValueError(
                 f"Runtime LoRA tensors {normalized[target].name!r} and {pair.name!r} both "
-                f"target FLUX.3 module {target!r}"
+                f"target FLUX 3 module {target!r}"
             )
         b = swap_norm_out_halves(pair.b) if name == BFL_NORM_OUT else pair.b
         prefix = pair.name[: len(pair.name) - len(name)]

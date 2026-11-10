@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FLUX.3 pre-quantized BFL variants and load-time quantization.
+"""FLUX 3 pre-quantized BFL variants and load-time quantization.
 
 CPU cases are cpu_only, the rest need a GPU.
 """
@@ -261,7 +261,7 @@ def test_hub_download_fetches_only_the_selected_variant(monkeypatch, tmp_path, v
         return tmp_path
 
     def download_full(*args, **kwargs):
-        raise AssertionError("FLUX.3 must not download the whole repository")
+        raise AssertionError("FLUX 3 must not download the whole repository")
 
     monkeypatch.setattr(pipeline_loader_module, "download_hf_partial", download_partial)
     monkeypatch.setattr(pipeline_loader_module, "download_hf_model", download_full)
@@ -409,7 +409,7 @@ def test_variant_quantization_reaches_the_transformer(no_cuda, tmp_path, flow_ma
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_variant_rejects_an_explicit_quant_algo(tmp_path, variant, quant_config):
     write_variant_checkpoint(tmp_path, True, variant)
-    message = f"FLUX.3 variant '{variant}' is pre-quantized; remove quant_config.quant_algo"
+    message = f"FLUX 3 variant '{variant}' is pre-quantized; remove quant_config.quant_algo"
     with pytest.raises(ValueError, match=re.escape(message)):
         load_config(tmp_path, pipeline_config={"variant": variant}, quant_config=quant_config)
 
@@ -595,7 +595,7 @@ def test_unsupported_load_time_quant_is_rejected_naming_the_supported_algorithms
     config = tiny_config(flow_map=True)
     write_checkpoint(tmp_path, config, diffusers_weights(config))
     message = (
-        "FLUX.3 quantizes BF16 weights on load with quant_config.quant_algo FP8, "
+        "FLUX 3 quantizes BF16 weights on load with quant_config.quant_algo FP8, "
         f"FP8_BLOCK_SCALES, FP8_PER_CHANNEL_PER_TOKEN, NVFP4, got {quant_algo}."
     )
     with pytest.raises(ValueError, match=re.escape(message)):

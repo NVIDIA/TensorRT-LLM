@@ -255,7 +255,7 @@ class AutoPipeline:
             # Generic Wan (T2V)
             if "Wan" in class_name:
                 return "WanPipeline"
-            # Check FLUX.3 before FLUX.2 and FLUX.1 (more specific match first)
+            # Check FLUX 3 before FLUX.2 and FLUX.1 (more specific match first)
             if "Flux3" in class_name:
                 return "Flux3ModularPipeline"
             # Check FLUX.2 before FLUX.1 (more specific match first)

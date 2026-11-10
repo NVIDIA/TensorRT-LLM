@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FLUX.3 transformer, loaded from Diffusers-format checkpoints.
+"""FLUX 3 transformer, loaded from Diffusers-format checkpoints.
 
 Per-mode blocks run within each modality; single blocks then attend jointly within each sample.
 """
@@ -112,7 +112,7 @@ _JOINT_FIELDS = ("tokens", "single_shift", "single_scale", "single_gate")
 
 @dataclasses.dataclass(frozen=True)
 class Flux3TransformerConfig:
-    """FLUX.3 architecture, read strictly from ``transformer/config.json``."""
+    """FLUX 3 architecture, read strictly from ``transformer/config.json``."""
 
     attention_head_dim: int
     axes_dims_rope: Tuple[int, ...]
@@ -132,7 +132,7 @@ class Flux3TransformerConfig:
     def from_pretrained_config(cls, pretrained_config: Any) -> "Flux3TransformerConfig":
         """Build from a Diffusers config namespace; unknown or missing keys raise ValueError."""
         if pretrained_config is None:
-            raise ValueError("FLUX.3 transformer needs the checkpoint's transformer/config.json")
+            raise ValueError("FLUX 3 transformer needs the checkpoint's transformer/config.json")
         values = {
             key: value
             for key, value in vars(pretrained_config).items()
@@ -147,7 +147,7 @@ class Flux3TransformerConfig:
         unknown = sorted(values.keys() - {field.name for field in fields})
         if missing or unknown:
             raise ValueError(
-                f"FLUX.3 transformer config: missing keys {missing}, unsupported keys {unknown}"
+                f"FLUX 3 transformer config: missing keys {missing}, unsupported keys {unknown}"
             )
         values["axes_dims_rope"] = tuple(values["axes_dims_rope"])
         config = cls(**values)
@@ -158,10 +158,10 @@ class Flux3TransformerConfig:
         """Check the relations between config values that the model relies on."""
         axes = self.axes_dims_rope
         if len(axes) != NUM_POSITION_AXES or any(dim % 2 for dim in axes):
-            raise ValueError(f"FLUX.3 needs {NUM_POSITION_AXES} even RoPE axis dims, got {axes}")
+            raise ValueError(f"FLUX 3 needs {NUM_POSITION_AXES} even RoPE axis dims, got {axes}")
         if sum(axes) != self.attention_head_dim:
             raise ValueError(
-                f"FLUX.3 RoPE axis dims {axes} must sum to attention_head_dim "
+                f"FLUX 3 RoPE axis dims {axes} must sum to attention_head_dim "
                 f"{self.attention_head_dim}"
             )
 
@@ -286,7 +286,7 @@ class _Direction:
     def module(self, name: str) -> str:
         prefix, rest, modules = self._split(name)
         if rest not in modules:
-            raise ValueError(f"Unknown {self.source} FLUX.3 module name: {name!r}")
+            raise ValueError(f"Unknown {self.source} FLUX 3 module name: {name!r}")
         return prefix + modules[rest]
 
     def key(self, key: str) -> str:
@@ -298,7 +298,7 @@ class _Direction:
             suffix = rest[len(module_name) + 1 :]
             if rest.startswith(module_name + ".") and _SUFFIX.fullmatch(suffix):
                 return f"{prefix}{modules[module_name]}.{suffix}"
-        raise ValueError(f"Unknown {self.source} FLUX.3 tensor name: {key!r}")
+        raise ValueError(f"Unknown {self.source} FLUX 3 tensor name: {key!r}")
 
 
 _BFL_TO_DIFFUSERS = _Direction("BFL", 0)
@@ -308,7 +308,7 @@ _DIFFUSERS_TO_BFL = _Direction("Diffusers", 1)
 def bfl_to_diffusers_module(name: str) -> str:
     """Map a BFL module name, e.g. ``single_blocks.3.q_proj``, to Diffusers.
 
-    Raises ValueError if ``name`` is not a FLUX.3 BFL module.
+    Raises ValueError if ``name`` is not a FLUX 3 BFL module.
     """
     return _BFL_TO_DIFFUSERS.module(name)
 
@@ -316,7 +316,7 @@ def bfl_to_diffusers_module(name: str) -> str:
 def diffusers_to_bfl_module(name: str) -> str:
     """Map a Diffusers module name, e.g. ``single_transformer_blocks.3.attn.to_q``, to BFL.
 
-    Raises ValueError if ``name`` is not a FLUX.3 Diffusers module.
+    Raises ValueError if ``name`` is not a FLUX 3 Diffusers module.
     """
     return _DIFFUSERS_TO_BFL.module(name)
 
@@ -338,7 +338,7 @@ def swap_norm_out_halves(value: TensorT) -> TensorT:
     """
     rows = value.shape[0]
     if rows % 2:
-        raise ValueError(f"FLUX.3 output-norm tensor needs an even row count, got {rows}")
+        raise ValueError(f"FLUX 3 output-norm tensor needs an even row count, got {rows}")
     # Rolling dim 0 by half its length swaps the two halves.
     return value.roll(rows // 2, dims=0)
 
@@ -353,7 +353,7 @@ def _convert_state_dict(
             if suffix in _NORM_OUT_SWAPPED_SUFFIXES:
                 value = swap_norm_out_halves(value)
             elif suffix not in _NORM_OUT_UNCHANGED_SUFFIXES:
-                raise ValueError(f"No shift/scale order transform for FLUX.3 tensor {key!r}")
+                raise ValueError(f"No shift/scale order transform for FLUX 3 tensor {key!r}")
         converted[convert_key(key)] = value
     return converted
 
@@ -485,7 +485,7 @@ class Flux3AdaLayerNorm(nn.Module):
 
 
 class Flux3Attention(Attention):
-    """FLUX.3 self-attention with per-head QK-norm and RoPE, attending within packed samples."""
+    """FLUX 3 self-attention with per-head QK-norm and RoPE, attending within packed samples."""
 
     def __init__(
         self,
@@ -771,7 +771,7 @@ def format_names(names: List[str], limit: int = 10) -> str:
 
 
 class Flux3Transformer2DModel(BaseDiffusionModel):
-    """FLUX.3 image DiT over packed modalities with per-sample joint attention.
+    """FLUX 3 image DiT over packed modalities with per-sample joint attention.
 
     ``model_config.pretrained_config`` holds the checkpoint's transformer/config.json.
     """
@@ -887,20 +887,20 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         """Validate the packed layout, ``timestep`` and every input tensor this call reads."""
         names = tuple(name for name, _ in layout)
         if names != PACKED_MODALITIES:
-            raise ValueError(f"FLUX.3 packed layout must list {PACKED_MODALITIES}, got {names}")
+            raise ValueError(f"FLUX 3 packed layout must list {PACKED_MODALITIES}, got {names}")
         num_samples = len(layout[0][1])
         if timestep is None:
-            raise ValueError("FLUX.3 transformer inputs need timestep, the image flow time")
+            raise ValueError("FLUX 3 transformer inputs need timestep, the image flow time")
         if tuple(timestep.shape) not in ((), (1,), (num_samples,)):
             raise ValueError(
-                f"FLUX.3 timestep must be a scalar or have shape ({num_samples},), "
+                f"FLUX 3 timestep must be a scalar or have shape ({num_samples},), "
                 f"got {tuple(timestep.shape)}"
             )
         for name, lengths in layout:
             if len(lengths) != num_samples:
-                raise ValueError(f"FLUX.3 layout lists {num_samples} samples, {name} has {lengths}")
+                raise ValueError(f"FLUX 3 layout lists {num_samples} samples, {name} has {lengths}")
             if name not in OPTIONAL_MODALITIES and not all(lengths):
-                raise ValueError(f"Every FLUX.3 sample needs {name} tokens, got {lengths}")
+                raise ValueError(f"Every FLUX 3 sample needs {name} tokens, got {lengths}")
             if not any(lengths):
                 continue
             expected = {}
@@ -910,17 +910,17 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
                 expected[f"x_{name}_ids"] = (sum(lengths), NUM_POSITION_AXES)
             for key, shape in expected.items():
                 if key not in inputs:
-                    raise ValueError(f"FLUX.3 transformer inputs need {key}")
+                    raise ValueError(f"FLUX 3 transformer inputs need {key}")
                 if tuple(inputs[key].shape) != shape:
                     raise ValueError(
-                        f"FLUX.3 {key} must have shape {shape}, got {tuple(inputs[key].shape)}"
+                        f"FLUX 3 {key} must have shape {shape}, got {tuple(inputs[key].shape)}"
                     )
 
     def _local_layout(self, layout: Layout) -> Layout:
         size = self.sharder.size
         if any(length % size for _, lengths in layout for length in lengths):
             raise ValueError(
-                "FLUX.3 sequence parallelism requires each sample's modality length "
+                "FLUX 3 sequence parallelism requires each sample's modality length "
                 "to be divisible by the sequence-parallel size"
             )
         return tuple(
@@ -1053,7 +1053,7 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         """
         self._check_inputs(inputs, layout, timestep)
         if (target_timestep is not None) != self.flow_map:
-            raise ValueError("target_timestep is required by, and only by, a flow-map FLUX.3 DiT")
+            raise ValueError("target_timestep is required by, and only by, a flow-map FLUX 3 DiT")
         output_tokens = inputs[f"x_{OUTPUT_MODALITY}"]
         target = None
         if target_timestep is not None:
@@ -1119,7 +1119,7 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         return {"x_" + OUTPUT_MODALITY: output}
 
     def load_weights(self, weights: Dict[str, Tensor]) -> None:
-        """Load a Diffusers-format FLUX.3 transformer state dict.
+        """Load a Diffusers-format FLUX 3 transformer state dict.
 
         Raises ValueError, naming the checkpoint tensors, if it misses or adds any tensor.
         """
@@ -1159,7 +1159,7 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         missing = sorted({_checkpoint_key(key) for key in missing})
         if missing or unexpected:
             raise ValueError(
-                "FLUX.3 checkpoint does not match the transformer: "
+                "FLUX 3 checkpoint does not match the transformer: "
                 f"missing {format_names(missing)}, unexpected {format_names(unexpected)}"
             )
         for name, module, weight_dicts in linear_loads:

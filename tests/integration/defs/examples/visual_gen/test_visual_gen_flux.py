@@ -392,7 +392,7 @@ def test_flux2_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp
 
 
 def test_flux3_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run the FLUX.3 Klein example with the supported single-GPU NVFP4 config."""
+    """Run the FLUX 3 Klein example with the supported single-GPU NVFP4 config."""
     model_path = get_checkpoint("flux-3-image-klein")
 
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "flux3_example")
@@ -421,13 +421,13 @@ def test_flux3_example(_visual_gen_deps, llm_root, llm_venv):
     )
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
     with PIL.Image.open(output_path) as image:
-        assert image.size == (1024, 1024), f"Unexpected FLUX.3 output size {image.size}"
+        assert image.size == (1024, 1024), f"Unexpected FLUX 3 output size {image.size}"
         pixels = np.asarray(image.convert("RGB"), dtype=np.float32)
-    assert pixels.std() > 5.0, "FLUX.3 example produced a blank image"
+    assert pixels.std() > 5.0, "FLUX 3 example produced a blank image"
 
 
 def test_flux3_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp_path):
-    """Run the FLUX.3 Klein example with a reference image that is padded and cropped back."""
+    """Run the FLUX 3 Klein example with a reference image that is padded and cropped back."""
     model_path = get_checkpoint("flux-3-image-klein")
     # A 600 x 400 reference pads to a 608 x 400 canvas, and the output is cropped back to it.
     pixels = np.random.default_rng(0).integers(0, 256, (400, 600, 3), dtype=np.uint8)
@@ -462,6 +462,6 @@ def test_flux3_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp
     )
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
     with PIL.Image.open(output_path) as image:
-        assert image.size == (600, 400), f"Unexpected FLUX.3 edit size {image.size}"
+        assert image.size == (600, 400), f"Unexpected FLUX 3 edit size {image.size}"
         output = np.asarray(image.convert("RGB"), dtype=np.float32)
-    assert output.std() > 5.0, "FLUX.3 reference-image example produced a blank image"
+    assert output.std() > 5.0, "FLUX 3 reference-image example produced a blank image"

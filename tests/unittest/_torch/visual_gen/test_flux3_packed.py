@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU tests for packing FLUX.3 samples into mode-major tokens."""
+"""CPU tests for packing FLUX 3 samples into mode-major tokens."""
 
 import pytest
 import torch
@@ -69,17 +69,17 @@ def test_absent_modality_is_empty_with_input_dtypes() -> None:
         pytest.param([{"text": None}], "nonempty packed conditioning", id="all_empty"),
         pytest.param(
             [{"video": (torch.zeros(2, 8), torch.zeros(2, 4))}],
-            "Unknown FLUX.3 packed modality",
+            "Unknown FLUX 3 packed modality",
             id="unknown_modality",
         ),
         pytest.param(
             [{"image": (torch.zeros(2, 9), torch.zeros(2, 4))}],
-            "Invalid packed FLUX.3 image",
+            "Invalid packed FLUX 3 image",
             id="wrong_width",
         ),
         pytest.param(
             [{"image": (torch.zeros(2, 8), torch.zeros(2, 3))}],
-            "Invalid packed FLUX.3 image",
+            "Invalid packed FLUX 3 image",
             id="wrong_ids",
         ),
     ],
