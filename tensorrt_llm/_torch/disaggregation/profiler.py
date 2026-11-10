@@ -337,7 +337,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
             req, "receive", self._transceiver.request_and_receive_sync, synchronous=True
         )
 
-    def _observe_request_terminal(self, record: _KvTransferRecord) -> None:
+    def _observe_request_terminal(
+        self, record: _KvTransferRecord, *, require_unowned: bool = False
+    ) -> None:
         """Settle terminal request states unless the resource owner still
         reports ownership.
         """
@@ -358,7 +360,7 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
                     "trtllm::kv_transfer", "kv", "terminal ownership", error
                 )
                 return
-            if owned is not True:
+            if owned is False or (not require_unowned and owned is not True):
                 outcome: SendTerminalOutcome = (
                     "complete"
                     if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
@@ -398,7 +400,23 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         """Return native generation status and preserve failed receive
         outcomes.
         """
-        result = self._transceiver.check_gen_transfer_status(at_least_request_num)
+        try:
+            result = self._transceiver.check_gen_transfer_status(at_least_request_num)
+        except BaseException:
+            # A failed poll can have retired earlier receives without returning their ids.
+            try:
+                if self._observation_active():
+                    for record in list(self._records.values()):
+                        if record.direction == "receive":
+                            try:
+                                self._observe_request_terminal(record, require_unowned=True)
+                            except BaseException:
+                                # One failed observation must not strand later retired receives.
+                                pass
+            except BaseException:
+                # Observational recovery must preserve the original delegate exception.
+                pass
+            raise
         if not self._observation_active() or not self._records:
             return result
         for req in result.cancelled_requests:

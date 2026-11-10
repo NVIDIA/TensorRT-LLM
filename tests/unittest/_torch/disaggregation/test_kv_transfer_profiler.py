@@ -27,7 +27,7 @@ from profiler_test_utils import decode_profiler_metadata
 
 from tensorrt_llm import _profiler
 from tensorrt_llm._torch.disaggregation import kv_cache_transceiver as factory
-from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     BindKvCacheTransceiver,
     CtxTransferStatus,
@@ -322,6 +322,152 @@ def test_v2_failed_receive_safe_cancellation_preserves_failure(
     ]
     assert events[0][1] is events[1][1]
     assert not wrapper._records
+
+
+def test_v2_poll_failure_settles_only_already_retired_receive(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    """Observe partial V2 retirement without changing the failed poll or its retry."""
+    owner = object.__new__(KvCacheTransceiverV2)
+    owner._ever_had_recv_session = True
+    owner._gen_need_sync = owner._gen_idle_agreed = owner._gen_idle_poll_skip = False
+    owner._gen_deferred_receives = 0
+    owner._gen_allgather = Mock(side_effect=AssertionError("unexpected collective"))
+    owner._send_sessions = {}
+    owner._recv_sessions = {}
+    owner._recv_reqs = {}
+    monkeypatch.delenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", raising=False)
+    monkeypatch.setattr(owner, "_need_aux_transfer", lambda req: False)
+    monkeypatch.setattr(owner, "_assert_disagg_history_declared", lambda req: None)
+    monkeypatch.setattr(
+        owner,
+        "request_and_receive_async",
+        lambda req: setattr(req, "state", LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS),
+    )
+    wrapper = _wrap(owner, monkeypatch)
+    first, second = _request(5, 17), _request(6, 18)
+    for req in (first, second):
+        wrapper.request_and_receive_async(req)
+        req.set_kv_cache_size = Mock()
+        session = Mock(
+            status=SessionStatus.TRANSFERRED,
+            transfer_end_time=None,
+            kv_cache_size_bytes=0,
+            _enforce_physical_ownership=False,
+        )
+        session.is_completed.return_value = True
+        session.wait_complete.return_value = WaitResult.COMPLETED
+        session.kv_write_verified.return_value = True
+        session.close.return_value = req is first
+        owner._recv_sessions[req.py_request_id] = session
+        owner._recv_reqs[req.py_request_id] = req
+    first_session, second_session = owner._recv_sessions.values()
+    delegate_errors: list[RuntimeError] = []
+    poll = owner.check_gen_transfer_status
+
+    def observed_poll(bound: int | None) -> GenTransferStatus:
+        try:
+            return poll(bound)
+        except RuntimeError as error:
+            delegate_errors.append(error)
+            raise
+
+    monkeypatch.setattr(owner, "check_gen_transfer_status", observed_poll)
+    with pytest.raises(RuntimeError, match="session close refused") as raised:
+        wrapper.check_gen_transfer_status(0)
+    assert raised.value is delegate_errors[0]
+    assert first.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert second.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert owner._recv_reqs == {18: second}
+    assert wrapper.transfer_resource_ownership(first) is False
+    assert wrapper.transfer_resource_ownership(second) is True
+    assert set(wrapper._records) == {(id(second), "receive")}
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_complete",
+    ]
+    assert events[2][1] is events[0][1]
+    first_session.close.assert_called_once_with()
+    second_session.close.assert_called_once_with()
+
+    second_session.close.return_value = True
+    assert wrapper.check_gen_transfer_status(0).completed_request_ids == [18]
+    assert wrapper.check_gen_transfer_status(0).completed_request_ids == []
+    assert [name for name, _ in events[2:]] == ["trtllm::kv_transfer_complete"] * 2
+    assert events[3][1] is events[1][1]
+    assert not wrapper._records and not owner._recv_sessions
+    first_session.close.assert_called_once_with()
+    assert second_session.close.call_count == 2
+    owner._gen_allgather.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "observation", ["inflight", "owned", "unknown", "ownership-error", "metadata-error"]
+)
+def test_receive_poll_failure_preserves_error_when_retirement_is_unproven_or_observation_fails(
+    monkeypatch: pytest.MonkeyPatch, events: list, observation: str
+) -> None:
+    """Preserve the poll error and require terminal state plus explicit release."""
+    backend = _ScriptedTransceiver()
+    wrapper = _wrap(backend, monkeypatch)
+    req = _request()
+    wrapper.request_and_receive_async(req)
+    req.state = (
+        LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        if observation == "inflight"
+        else LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    )
+    backend.owned = {"owned": True, "unknown": None}.get(observation, False)
+    error = RuntimeError("original receive poll failure")
+    backend.check_gen_transfer_status = Mock(side_effect=error)
+    if observation == "ownership-error":
+        monkeypatch.setattr(
+            backend, "transfer_resource_ownership", Mock(side_effect=RuntimeError("ownership"))
+        )
+    elif observation == "metadata-error":
+        monkeypatch.setattr(wrapper, "_metadata", Mock(side_effect=KeyboardInterrupt("metadata")))
+    with pytest.raises(RuntimeError) as raised:
+        wrapper.check_gen_transfer_status(0)
+    assert raised.value is error
+    assert [name for name, _ in events] == ["trtllm::kv_transfer_submit"]
+    assert bool(wrapper._records) is (observation != "metadata-error")
+    backend.check_gen_transfer_status.assert_called_once_with(0)
+
+
+def test_receive_poll_failure_continues_after_an_observation_fails(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    """Settle later released receives even when the first observation raises."""
+    backend = _ScriptedTransceiver()
+    wrapper = _wrap(backend, monkeypatch)
+    first, second = _request(5, 17), _request(6, 18)
+    for req in (first, second):
+        wrapper.request_and_receive_async(req)
+        req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    error = RuntimeError("original receive poll failure")
+    backend.check_gen_transfer_status = Mock(side_effect=error)
+    backend.transfer_resource_ownership = Mock(return_value=False)
+    metadata = wrapper._metadata
+
+    def failing_first_metadata(record):
+        if record.key == (id(first), "receive"):
+            raise KeyboardInterrupt("first observation")
+        return metadata(record)
+
+    monkeypatch.setattr(wrapper, "_metadata", failing_first_metadata)
+    with pytest.raises(RuntimeError) as raised:
+        wrapper.check_gen_transfer_status(0)
+    assert raised.value is error
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_complete",
+    ]
+    assert events[2][1] is events[1][1]
+    assert not wrapper._records
+    backend.check_gen_transfer_status.assert_called_once_with(0)
+    assert backend.transfer_resource_ownership.call_count == 2
 
 
 def test_cancelled_receive_status_preserves_existing_failure_once(
