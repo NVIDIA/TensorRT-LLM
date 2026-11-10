@@ -272,3 +272,57 @@ def test_sentinel_step_selection(payload_format: str) -> None:
     assert not carries(1, hidden, sf, weights.half(), None)  # other 2-byte weights
     comm._sentinel_row, comm.sentinel_max_tokens = None, 0
     assert not carries(1, hidden, sf, weights, None)
+
+
+def test_sentinel_formats_share_a_live_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A layer whose sentinel format differs from a live workspace of the same base layout shares
+    that workspace without sentinel steps instead of allocating a second one."""
+    from tensorrt_llm.bindings import internal as _tllm_internal
+
+    thop = _tllm_internal.thop
+    ep_size, top_k, capacity, hidden_size = 8, 8, 256, 7168
+    monkeypatch.setattr(NVLinkOneSided, "_SENTINEL_VOTES", {})
+    monkeypatch.setattr(NVLinkOneSided, "_SENTINEL_FIRST_VOTE_KEYS", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {})
+    monkeypatch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+    monkeypatch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
+
+    def vote(self, metainfo, hidden, dtype, payload_format, fault_tolerant):
+        torch.ops.trtllm.moe_a2a_sentinel_extend_workspace_layout(
+            metainfo,
+            160,
+            int(getattr(thop, f"MOE_A2A_SENTINEL_FORMAT_{payload_format}")),
+            hidden,
+        )
+        return 160, payload_format, tuple(metainfo.tolist())
+
+    monkeypatch.setattr(NVLinkOneSided, "_vote_sentinel", vote)
+
+    def layer(payload_format: str) -> tuple[NVLinkOneSided, torch.Tensor]:
+        comm = NVLinkOneSided.__new__(NVLinkOneSided)
+        comm.ep_rank, comm.ep_size, comm.num_experts, comm.top_k = 0, ep_size, 256, top_k
+        comm.max_num_tokens_per_rank = capacity
+        comm.use_low_precision_combine = False
+        comm.sentinel_max_tokens, comm._sentinel_format, comm._sentinel_row = 0, None, None
+        metainfo = NVLinkOneSided._make_workspace_layout(
+            ep_size, top_k, capacity, hidden_size, torch.bfloat16, None, 0
+        )
+        comm._setup_sentinel(metainfo, hidden_size, torch.bfloat16, payload_format, False)
+        return comm, metainfo
+
+    nvfp4, nvfp4_layout = layer("NVFP4")
+    assert nvfp4.sentinel_max_tokens == 160
+    NVLinkOneSided._WORKSPACES[("live",)] = {"metainfo": nvfp4_layout}
+
+    # While the NVFP4 workspace is alive, a BF16 layer takes its layout without sentinel steps.
+    bf16, bf16_layout = layer("BF16")
+    assert torch.equal(bf16_layout, nvfp4_layout)
+    assert bf16.sentinel_max_tokens == 0 and bf16._sentinel_row is None
+    # A layer of the same format keeps its sentinel steps.
+    assert layer("NVFP4")[0].sentinel_max_tokens == 160
+
+    # Once that workspace is gone, a BF16 layer gets its own BF16 sentinel layout.
+    NVLinkOneSided._WORKSPACES.clear()
+    bf16, bf16_layout = layer("BF16")
+    assert bf16.sentinel_max_tokens == 160 and bf16._sentinel_format == "BF16"
+    assert not torch.equal(bf16_layout, nvfp4_layout)

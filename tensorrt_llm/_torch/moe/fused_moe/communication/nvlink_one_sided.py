@@ -295,6 +295,11 @@ class NVLinkOneSided(Communication):
     # after the vote). Layers sharing a layout vote once; every rank builds its layers in the same
     # order, so every rank hits or misses alike.
     _SENTINEL_VOTES: Dict[Tuple[object, ...], Tuple[int, Optional[str], Tuple[int, ...]]] = {}
+    # The vote key whose layout a workspace was allocated with, per layout and settings with the
+    # payload format left out. While that workspace is alive, a layer that differs only in its
+    # sentinel format shares it, as it would without sentinel regions, and takes no sentinel steps
+    # (as on main, where only the first CFT workspace could use counted writes).
+    _SENTINEL_FIRST_VOTE_KEYS: Dict[Tuple[object, ...], Tuple[object, ...]] = {}
     _WORKSPACE: dict | None = None
 
     # MetaInfo indices - initialized from C++ constants
@@ -715,12 +720,35 @@ class NVLinkOneSided(Communication):
             tuple(metainfo.tolist()),
             _sentinel_env(),
         )
+        base_key = tuple(item for i, item in enumerate(key) if i != 7)  # without payload_format
+        first_key = NVLinkOneSided._SENTINEL_FIRST_VOTE_KEYS.get(base_key)
+        first_vote = (
+            NVLinkOneSided._SENTINEL_VOTES.get(first_key)
+            if first_key is not None and first_key != key
+            else None
+        )
+        if first_vote is not None and any(
+            state and tuple(state["metainfo"].tolist()) == first_vote[2]
+            for state in NVLinkOneSided._WORKSPACES.values()
+        ):
+            # A live workspace was laid out for another sentinel format: share it without sentinel
+            # steps rather than allocate a second workspace. Every rank builds its layers in the
+            # same order, so every rank takes this branch alike.
+            _, first_format, layout = first_vote
+            metainfo.copy_(torch.tensor(layout, dtype=metainfo.dtype))
+            message = (
+                f"NVLinkOneSided: a layer with {payload_format} payloads shares the workspace laid "
+                f"out for {first_format} sentinel rows, so it uses the fence transport"
+            )
+            tllm_logger.info_once(message, key=message)
+            return
         vote = NVLinkOneSided._SENTINEL_VOTES.get(key)
         if vote is None:
             vote = self._vote_sentinel(
                 metainfo.clone(), hidden_size, dtype, payload_format, fault_tolerant
             )
             NVLinkOneSided._SENTINEL_VOTES[key] = vote
+        NVLinkOneSided._SENTINEL_FIRST_VOTE_KEYS[base_key] = key
         max_tokens, payload_format, layout = vote
         metainfo.copy_(torch.tensor(layout, dtype=metainfo.dtype))
         if max_tokens:
