@@ -39,6 +39,17 @@ import torch
 import triton
 import triton.language as tl
 
+from . import flash_attn4_kernels
+from .flash_attn4_kernels import (
+    FA4_NUM_THREADS,
+    FA4_TILE_MN,
+    allocate_split_workspace,
+    fa4_forward,
+    fa4_paged_generation_split,
+    split_tables,
+    write_kv_paged,
+)
+
 _NEG = tl.constexpr(-1.0e30)
 
 
@@ -80,8 +91,6 @@ def prefix_request_tables(
     near-equal runs of the group's pages (possibly empty).
     Returns ``(block_tables, seq_lens, cum_q, cum_kv)`` as int32 arrays.
     """
-    from .flash_attn4_generation import MIN_SPLIT_TOKENS
-
     qo = groups.qo_indptr
     pages_ptr = groups.prefix_indptr
     pages = groups.prefix_indices
@@ -102,7 +111,8 @@ def prefix_request_tables(
             kv_len = (count - 1) * tokens_per_block + int(last[group]) if count else 0
             if splits > 1:
                 # Runs of at least MIN_SPLIT_TOKENS: a short prompt uses fewer (non-empty) runs.
-                per = max(-(-count // splits), -(-MIN_SPLIT_TOKENS // tokens_per_block))
+                min_split_tokens = flash_attn4_kernels.MIN_SPLIT_TOKENS
+                per = max(-(-count // splits), -(-min_split_tokens // tokens_per_block))
                 lo = min(split * per, count)
                 hi = min(lo + per, count)
                 first, stop = first + lo, first + hi
@@ -216,9 +226,7 @@ class Fa4Prefix:
         return self.block_tables, self.seq_lens, self.cum_q, self.cum_kv
 
     def run(self, pool: torch.Tensor, sm_scale: float) -> None:
-        from .flash_attn4_generation import _fa4_forward
-
-        _fa4_forward()(
+        fa4_forward()(
             self.q,
             pool[:, 0].transpose(1, 2),
             pool[:, 1].transpose(1, 2),
@@ -374,6 +382,11 @@ class Fa4Tail:
         self.q_len = q_len
         self.splits = splits
         self.split_tables = None
+        self.split_workspace = (
+            allocate_split_workspace(rows, splits, q_len, num_heads, head_dim, dtype, device)
+            if splits > 1
+            else None
+        )
         self.table = torch.zeros((rows, max_pages), dtype=torch.int32, device=device)
         self.tail_lens = torch.zeros((rows,), dtype=torch.int32, device=device)
         self.out = torch.empty((rows * q_len, num_heads, head_dim), dtype=dtype, device=device)
@@ -406,8 +419,6 @@ class Fa4Tail:
             width, page_div, TPB=tokens_per_block, BLOCK=block, HAS_PERM=perm is not None,
         )  # fmt: skip
         if self.splits > 1:
-            from .flash_attn4_generation import split_tables
-
             self.split_tables = split_tables(
                 self.table, self.tail_lens, self.q_len, self.splits, tokens_per_block
             )
@@ -421,19 +432,10 @@ class Fa4Tail:
         sm_scale: float,
     ) -> None:
         """Attend the private pages; ``k`` None: the step's K/V is already in them."""
-        from .flash_attn4_generation import (
-            FA4_NUM_THREADS,
-            FA4_TILE_MN,
-            _fa4_forward,
-            write_kv_paged,
-        )
-
         tokens, num_heads, head_dim = q.shape
         if k is not None:
             write_kv_paged(pool, k, v, self.table, self.tail_lens, self.q_len)
         if self.splits > 1:
-            from .flash_attn4_generation import fa4_paged_generation_split
-
             fa4_paged_generation_split(
                 pool,
                 q,
@@ -442,10 +444,11 @@ class Fa4Tail:
                 self.q_len,
                 self.splits,
                 sm_scale,
+                self.split_workspace,
                 lse=self.lse,
             )
             return
-        _fa4_forward()(
+        fa4_forward()(
             q.view(self.rows, self.q_len, num_heads, head_dim),
             pool[:, 0].transpose(1, 2),
             pool[:, 1].transpose(1, 2),
@@ -492,9 +495,7 @@ def fa4_supported(head_dim: int, dtype: torch.dtype, device=None) -> bool:
         return False
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(device) != (9, 0):
         return False
-    from .flash_attn4_generation import _fa4_forward
-
-    return _fa4_forward() is not None
+    return fa4_forward() is not None
 
 
 def fa4_shared_prefix_attention(

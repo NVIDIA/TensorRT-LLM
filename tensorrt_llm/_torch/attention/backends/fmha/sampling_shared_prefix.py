@@ -73,10 +73,17 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .flash_attn4_kernels import (
+    fused_rope_supported,
+    generation_splits,
+    page_layout,
+    rope_write_kv_paged,
+    rotary_dim,
+)
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 from .shared_prefix_fa4 import (
@@ -135,19 +142,6 @@ not measured and take the rule of their attention type."""
 
 def _is_v2_manager(kv_cache_manager) -> bool:
     return hasattr(kv_cache_manager, "index_mapper")
-
-
-def _page_layout(metadata: "TrtllmAttentionMetadata", layer_idx: int) -> tuple[int, int, int]:
-    """(pool index, scale, divisor) of a layer of a V2 manager: the page of the
-    layer's pool view (``get_buffers``) that a host block-table entry names is
-    ``entry * scale // divisor``.
-
-    V2 entries are base page indices that the device-side copy multiplies by the
-    pool's index scale, and ``get_buffers`` folds K and V into one page.
-    """
-    manager = metadata.kv_cache_manager
-    pool_index = int(manager.layer_to_pool_mapping_dict[manager.layer_offsets[layer_idx]])
-    return pool_index, manager.get_layer_page_index_scale(layer_idx), int(manager.kv_factor)
 
 
 def _table_rows(metadata: "TrtllmAttentionMetadata", num_rows: int) -> torch.Tensor:
@@ -639,8 +633,6 @@ class _StepBuffers:
         tokens_per_block: int,
         device: torch.device,
     ) -> "_StepBuffers":
-        from .flash_attn4_generation import generation_splits
-
         num_heads, num_kv_heads, head_dim = shape
         num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         num_groups = min(max_groups, rows // 2) + 1
@@ -916,7 +908,7 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
     if state is None:
         kv_cache_manager = metadata.kv_cache_manager
         first_layer = min(kv_cache_manager.layer_offsets)
-        pool_index, page_scale, page_div = _page_layout(metadata, first_layer)
+        pool_index, page_scale, page_div = page_layout(metadata, first_layer)
         pool = kv_cache_manager.get_buffers(first_layer, kv_layout="HND")
         state = _SamplingState(
             pool_index=pool_index,
@@ -1010,29 +1002,6 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
         )
 
 
-def _rotary_dim(attn: "TrtllmAttention") -> int:
-    return int(attn.rope_params.dim)
-
-
-def _fused_rope_supported(attn: "TrtllmAttention") -> bool:
-    """Whether the rotary embedding the attention op would apply is one that
-    ``rope_write_kv_paged`` reproduces (see the module docstring)."""
-    if int(attn.position_embedding_type) != int(PositionEmbeddingType.rope_gpt_neox):
-        return False
-    rope = attn.rope_params
-    if rope.scale_type not in (RotaryScalingType.none, RotaryScalingType.linear):
-        return False
-    if rope.duplicate_data or getattr(attn, "rotary_cos_sin", None) is None:
-        return False
-    dim = _rotary_dim(attn)
-    half = dim // 2
-    if dim <= 0 or dim % 2 or half & (half - 1) or dim > attn.head_dim:
-        return False
-    # The table is [positions][dim] float32 on the device.
-    table = attn.rotary_cos_sin
-    return table.dtype == torch.float32 and table.numel() % dim == 0
-
-
 class SamplingSharedPrefixFmha(PhasedFmha):
     """Generation-phase library for n-sample requests; see the module docstring."""
 
@@ -1077,7 +1046,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
             return False
         position_type = PositionEmbeddingType(getattr(attn, "position_embedding_type", 0))
         if position_type.is_rope():
-            if not _fused_rope_supported(attn):
+            if not fused_rope_supported(attn):
                 return False
         elif position_type != PositionEmbeddingType.learned_absolute:
             # ALiBi, relative, GLM and deferred embeddings are applied inside the attention op,
@@ -1106,7 +1075,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
             # The rotary table must cover every position the batch can reach.
             max_seq_len = metadata.max_seq_len
             if max_seq_len is None or max_seq_len > (
-                self.attn.rotary_cos_sin.numel() // _rotary_dim(self.attn)
+                self.attn.rotary_cos_sin.numel() // rotary_dim(self.attn)
             ):
                 return False
         if forward_args.attention_input_type == AttentionInputType.context_only:
@@ -1184,7 +1153,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
             )
         self._bind_manager(metadata)
         if self._layout is None:
-            self._layout = _page_layout(metadata, attn.layer_idx)
+            self._layout = page_layout(metadata, attn.layer_idx)
         if self._layout != (state.pool_index, state.page_scale, state.page_div):
             raise RuntimeError(
                 f"{type(self).__name__} supports a single KV pool layout per model; layer "
@@ -1219,8 +1188,6 @@ class SamplingSharedPrefixFmha(PhasedFmha):
         if capturing:
             state.captured = True
 
-        from .flash_attn4_generation import rope_write_kv_paged
-
         rope = PositionEmbeddingType(attn.position_embedding_type).is_rope()
         # RoPE on Q (in place) and K, and the step's K/V into the rows' private pages, in one
         # launch; only the pool is read for K/V from here on.
@@ -1233,7 +1200,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            rotary_dim=_rotary_dim(attn) if rope else head_dim,
+            rotary_dim=rotary_dim(attn) if rope else head_dim,
             q_len=q_len,
             page_lens=tail.tail_lens,
         )

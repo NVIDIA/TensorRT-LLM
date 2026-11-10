@@ -21,7 +21,7 @@ from typing import Callable, Optional
 
 import torch
 
-from tensorrt_llm._torch.cute_dsl_utils import install_cutlass_dsl_compatibility
+from tensorrt_llm._torch.cute_dsl_utils import load_flash_attn_cute_forward
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
@@ -76,14 +76,12 @@ def get_dflash_paged_append() -> Callable[..., None]:
 def get_dflash_fa4_fwd() -> Callable[..., tuple]:
     """Load the FlashAttention-4 (CuTe DSL) forward."""
     try:
-        install_cutlass_dsl_compatibility()
-        from flash_attn.cute.interface import _flash_attn_fwd
+        return load_flash_attn_cute_forward()
     except (ImportError, OSError, AttributeError) as error:
         raise RuntimeError(
             "DFlash FA4 attention requires a flash-attn build with the CuTe DSL "
             "interface (flash_attn.cute)."
         ) from error
-    return _flash_attn_fwd
 
 
 def validate_dflash_fa4_runtime(
