@@ -370,7 +370,11 @@ cuda_graph_config:
 
 - Without `temperature_only`, temperature-only batches replay the `advanced` graphs.
 - Without `greedy`, greedy batches replay the sampled graphs (`temperature_only` if listed, else `advanced`)
-  and still decode greedily.
+  and still decode greedily, at a cost: they lose the argmax fast paths (the vocabulary-sharded target argmax
+  and, with rejection sampling, argmax drafting and its LM-head-TP path), add sampling-parameter and RNG-state
+  uploads, take the sampled path in eager steps too, and on the `advanced` graphs exact ties can break
+  differently than on the `greedy` graphs. With MTP-Eagle one-model decoding and tensor parallelism, listing
+  `temperature_only` keeps the exact vocabulary-sharded argmax for greedy batches.
 - Without `advanced`, a sampled batch that `temperature_only` does not serve runs eagerly, and the first one
   logs a warning. Under attention DP, every rank then runs that step eagerly.
 
