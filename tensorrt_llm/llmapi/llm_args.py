@@ -274,9 +274,9 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
             description=
             "Sampling variants captured as CUDA graphs with one-engine speculative "
             "decoding. 'greedy' serves decode batches whose requests all decode "
-            "greedily; 'advanced' serves batches with a sampled request (temperature, "
-            "top-k, top-p, min-p, seeds, penalties or rejection sampling); "
-            "'temperature_only' serves sampled batches whose sampled requests set only "
+            "greedily; 'advanced' serves batches with a sampled request, one whose "
+            "temperature, top-k, top-p or min-p does not resolve to greedy decoding "
+            "(a seed or a penalty alone does not); 'temperature_only' serves sampled batches whose sampled requests set only "
             "a temperature (MTP-Eagle one-model decoding with tensor parallelism, "
             "without attention DP, relaxed acceptance, rejection sampling or "
             "penalties). By default every variant the engine supports is captured. "

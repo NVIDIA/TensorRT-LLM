@@ -355,8 +355,9 @@ The field name `speculative_model_dir` can also be used as an alias for `specula
 ### CUDA graph sampling variants
 
 One-engine speculative decoding captures its decode CUDA graphs once per sampling variant: `greedy` for
-batches whose requests all decode greedily, `advanced` for batches with a sampled request, and
-`temperature_only` for sampled batches whose sampled requests set only a temperature (MTP-Eagle one-model
+batches whose requests all decode greedily, `advanced` for batches with a sampled request (one whose
+temperature, top-k, top-p or min-p does not resolve to greedy decoding; a seed or a penalty alone does not),
+and `temperature_only` for sampled batches whose sampled requests set only a temperature (MTP-Eagle one-model
 decoding with tensor parallelism, without attention DP, relaxed acceptance, rejection sampling or penalties).
 `cuda_graph_config.sampling_variants` (prototype) captures only the listed variants, which shortens startup
 and saves graph memory:
