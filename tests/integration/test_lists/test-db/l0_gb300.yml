@@ -95,6 +95,8 @@ l0_gb300:
   - unittest/_torch/modules/mamba/test_gdn_kernel_optimizations.py
   - unittest/_torch/moe/test_moe_decode_front.py
   - unittest/_torch/moe/test_draft_experts_nvfp4.py
+  # Adaptive EPLB route and statistics kernels against their host versions, incl. a CUDA graph.
+  - unittest/_torch/moe/test_adaptive_eplb_kernels.py
   - unittest/_torch/modules/test_embedding_lookup.py
   # GQA decode FMHA libraries (SM100 runs them with unittest/_torch/attention in l0_b200).
   - unittest/_torch/attention/test_gqa_decode_fmha.py

@@ -79,6 +79,7 @@ l0_b300:
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
+  - unittest/_torch/moe/test_adaptive_eplb_kernels.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- Kimi K3 NVFP4: expert loading + SiTU ---------------

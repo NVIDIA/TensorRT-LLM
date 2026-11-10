@@ -2,5 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Adaptive expert load balancing during decode (``moe_load_balancer`` mode ``adaptive``).
 
-Modules: ``policy`` (time model, layout planner, install decisions; numpy only).
+Modules: ``policy`` (time model, layout planner, install decisions, and the route tables, shares and
+statistics buffers of the ops).
 """

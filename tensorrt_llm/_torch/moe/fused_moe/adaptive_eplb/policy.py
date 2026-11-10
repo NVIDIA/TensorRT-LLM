@@ -1,19 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Decision policy of adaptive EPLB: the time model, the layout planner and the install decisions.
+"""Decision policy of adaptive EPLB: the time model, the layout planner and the install decisions,
+and the operands of the ops that apply them (route tables, shares, statistics buffers).
 
 The functions compute in a fixed order on inputs that all EP ranks share, so every rank reaches the
 same decision. A layout is the expert of every slot (rank-major, ``-1`` when free); a slot's share is
 the fraction of its expert's rows (routed tokens) it receives; ``[L, ...]`` arrays have a row per layer.
+The module imports numpy only: the operands import torch where they call the ops.
 """
 
+from __future__ import annotations
+
 import heapq
+import itertools
 import math
 import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import torch
 
 _ExpertSlots = list[tuple[int, ...]]
 
@@ -551,3 +560,119 @@ class EvaluationScheduler:
             interval = min(interval, max(min_interval, int(math.ceil(steps_left))))
         open_after = max(1, interval - int(next_window_calls) - calls_since_gather)
         return EvaluationPlan(interval, open_after)
+
+
+# ------------------------------------------------------------------------------------------------
+# Operands of the ops: the route op (``trtllm::adaptive_eplb_route_into``) maps every routed expert
+# to one of its slots by the tables of build_route_tables and adds the routes to statistics laid out
+# by statistics_buffers; the record op (``trtllm::adaptive_eplb_record``) adds routes alone; the
+# share solver (``trtllm::adaptive_eplb_solve_shares``) splits the rows of replicated experts.
+# ------------------------------------------------------------------------------------------------
+
+_UINT32_MAX = (1 << 32) - 1
+
+
+def solve_shares(load_rows: np.ndarray, layout: np.ndarray, geometry: ExpertGeometry) -> np.ndarray:
+    """``[num_slots]`` shares of ``layout`` that minimize the busiest GPU's ``load_rows``."""
+    import torch
+
+    load = np.ascontiguousarray(load_rows, dtype=np.float64)
+    slots = np.asarray(layout)
+    if not np.issubdtype(slots.dtype, np.integer):
+        raise ValueError("layout must hold integers")
+    slots = torch.from_numpy(np.ascontiguousarray(slots, dtype=np.int64))
+    solve = torch.ops.trtllm.adaptive_eplb_solve_shares
+    return solve(torch.from_numpy(load), slots, geometry.ep_size).numpy()
+
+
+class RouteTables(NamedTuple):
+    """Route tables of one layout: copies (``counts``) and first table entry (``starts``) of every
+    expert, the slot of every entry, and the Q32 cumulative shares ``cumulative_shares`` of replicated experts."""
+
+    counts: list[int]
+    starts: list[int]
+    slots: list[int]
+    cumulative_shares: list[int]
+
+    def packed(self) -> list[int]:
+        """``counts | starts | slots | cumulative_shares`` as int32 values."""
+        cumulative_shares = [
+            value - (1 << 32) if value >> 31 else value for value in self.cumulative_shares
+        ]
+        return self.counts + self.starts + self.slots + cumulative_shares
+
+
+def build_route_tables(
+    layout: Sequence[int], shares: Sequence[float] | None, num_experts: int, num_slots: int
+) -> RouteTables:
+    """Route tables of a ``[num_slots]`` layout and the ``shares`` of its slots; without
+    ``shares``, every expert's rows split evenly over its copies."""
+    layout = [int(e) for e in (layout.tolist() if hasattr(layout, "tolist") else layout)]
+    shares = [1.0] * num_slots if shares is None else shares
+    shares = [float(s) for s in (shares.tolist() if hasattr(shares, "tolist") else shares)]
+    expert_slots: list[list[int]] = [[] for _ in range(num_experts)]
+    for slot, expert in enumerate(layout):
+        if expert >= 0:
+            expert_slots[expert].append(slot)
+    counts = [len(copies) for copies in expert_slots]
+    if 0 in counts:
+        raise ValueError(f"expert {counts.index(0)} has no copy")
+    starts = list(itertools.accumulate(counts, initial=0))[:-1]
+    slots = [slot for copies in expert_slots for slot in copies] + [-1] * layout.count(-1)
+    cumulative_shares = [_UINT32_MAX] * num_slots
+    for copies, start in zip(expert_slots, starts):
+        weights = [max(0.0, shares[slot]) for slot in copies]
+        total = sum(weights)
+        if total <= 0.0:
+            weights, total = [1.0] * len(copies), float(len(copies))
+        acc = 0.0
+        bound = 0
+        for k in range(len(copies) - 1):
+            acc += weights[k]
+            bound = min(max(int(acc / total * 4294967296.0 + 0.5), bound), _UINT32_MAX)
+            cumulative_shares[start + k] = bound
+    return RouteTables(counts, starts, slots, cumulative_shares)
+
+
+def statistics_buffers(layers: int, num_experts: int, device: torch.device | str) -> dict:
+    """Every layer's statistics in one contiguous ``storage`` of bytes, so that a window opens with
+    one zeroing and closes with one copy: ``rows`` ``[L, E]`` float32 (the rows routed to every
+    expert, exact below 2^24), then ``forwards`` ``[L, 1]`` int64 from the next 8-byte boundary."""
+    import torch
+
+    rows_bytes = layers * num_experts * 4
+    forwards_at = -(-rows_bytes // 8) * 8
+    storage = torch.zeros(forwards_at + layers * 8, dtype=torch.uint8, device=device)
+    return dict(
+        rows=storage[:rows_bytes].view(torch.float32).view(layers, num_experts),
+        forwards=storage[forwards_at:].view(torch.int64).view(layers, 1),
+        storage=storage,
+    )
+
+
+class ExpertStatistics(NamedTuple):
+    """One layer's statistics in the ops' argument order, and the ``[1]`` flag that the ops read at
+    every launch, so that a captured CUDA graph records statistics only while the flag is set."""
+
+    rows: torch.Tensor
+    forwards: torch.Tensor
+    enabled: torch.Tensor
+
+    @classmethod
+    def of(cls, buffers: dict, layer: int, enabled: torch.Tensor) -> ExpertStatistics:
+        """The statistics of layer ``layer`` in buffers made by :func:`statistics_buffers`."""
+        return cls(buffers["rows"][layer], buffers["forwards"][layer], enabled)
+
+    def record(
+        self,
+        token_selected_experts: torch.Tensor,
+        first_call: bool = True,
+        live_row_word: torch.Tensor | None = None,
+    ) -> None:
+        """Add ``[tokens, top_k]`` expert ids to the statistics, of the live rows of
+        ``live_row_word`` only; only a forward's first call counts the forward."""
+        import torch
+
+        torch.ops.trtllm.adaptive_eplb_record(
+            token_selected_experts, *self, first_call, live_row_word
+        )
