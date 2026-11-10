@@ -58,6 +58,11 @@ class DecoderRunnerConfig(RunnerConfig):
     # (SpecDecOneEngineForCausalLM.spec_decode_fast_paths); False for a config
     # built without it. Keyword-only, so subclasses may still add required fields.
     spec_decode_fast_paths: bool = field(default=False, kw_only=True)
+    # The one-engine spec worker draws the target tokens of temperature-only
+    # batches on the LM head's vocab shard
+    # (SpecDecOneEngineForCausalLM.spec_samples_sharded_temperature), so the
+    # decode CUDA graphs capture the temperature-only variant.
+    spec_samples_sharded_temperature: bool = field(default=False, kw_only=True)
     watermark_config: "WatermarkConfig | None" = field(default=None, kw_only=True)
     # The executor serves disaggregated (a cache transceiver is configured).
     is_disagg: bool = field(kw_only=True)

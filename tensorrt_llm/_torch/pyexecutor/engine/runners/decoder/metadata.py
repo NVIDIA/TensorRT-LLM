@@ -335,14 +335,21 @@ def get_spec_managers(
 
 
 def supports_temperature_only_graphs(config: DecoderRunnerConfig, mapping: Mapping | None) -> bool:
-    """Whether the MTP-Eagle fast paths' decode CUDA graphs can capture the temperature-only variant."""
+    """Whether the decode CUDA graphs can capture the temperature-only variant: the spec worker
+    draws temperature-only target tokens on the LM head's vocabulary shard, on the MTP-Eagle fast
+    paths or through the stock workers' vocab-parallel selection."""
     # It draws the sampled rows on vocabulary-sharded logits without the watermark, so a
     # watermark configuration keeps the ordinary sampler.
     return (
         config.cuda_graph_config is not None
-        and config.spec_decode_fast_paths
         and config.watermark_config is None
-        and supports_sharded_target_sampling(config.spec_config, mapping)
+        and (
+            config.spec_samples_sharded_temperature
+            or (
+                config.spec_decode_fast_paths
+                and supports_sharded_target_sampling(config.spec_config, mapping)
+            )
+        )
     )
 
 
