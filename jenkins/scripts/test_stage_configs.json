@@ -6,7 +6,7 @@
       "slurm": false,
       "platform": "cpu",
       "testDB": "l0_cpu",
-      "splits": 1
+      "splits": 2
     },
     {
       "name": "DGX_H100-4_GPUs-CPP",
@@ -173,14 +173,6 @@
       "slurm": false,
       "platform": "h100-cr",
       "testDB": "l0_h100",
-      "splits": 1
-    },
-    {
-      "name": "H100_PCIe-PyTorch-Perf",
-      "arch": "x86",
-      "slurm": false,
-      "platform": "h100-cr",
-      "testDB": "l0_perf",
       "splits": 1
     },
     {
@@ -422,17 +414,6 @@
       "runWithSbatch": true
     },
     {
-      "name": "DGX_B200-8_GPUs-PyTorch-Ray",
-      "arch": "x86",
-      "slurm": true,
-      "platform": "auto:dgx-b200-flex",
-      "testDB": "l0_dgx_b200",
-      "splits": 1,
-      "gpuCount": 8,
-      "nodeCount": 1,
-      "runWithSbatch": true
-    },
-    {
       "name": "B300-PyTorch",
       "arch": "x86",
       "slurm": true,
@@ -504,7 +485,7 @@
       "slurm": true,
       "platform": "auto:dgx-b200-flex",
       "testDB": "l0_b200_multi_gpus_perf_sanity",
-      "splits": 3,
+      "splits": 1,
       "gpuCount": 8,
       "nodeCount": 1,
       "runWithSbatch": true
@@ -518,12 +499,23 @@
       "splits": 1
     },
     {
+      "name": "DGX_B300-2_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY",
+      "arch": "x86",
+      "slurm": true,
+      "platform": "b300-flex-aws-pdx",
+      "testDB": "l0_dgx_b300_efa_multi_nodes",
+      "splits": 1,
+      "gpuCount": 2,
+      "nodeCount": 2,
+      "runWithSbatch": true
+    },
+    {
       "name": "CPU-Generic-arm",
       "arch": "SBSA",
       "slurm": false,
       "platform": "cpu",
       "testDB": "l0_cpu",
-      "splits": 1
+      "splits": 2
     },
     {
       "name": "GH200-PyTorch-Post-Merge",
@@ -557,7 +549,7 @@
       "slurm": true,
       "platform": "auto:gb200-x4",
       "testDB": "l0_gb200_multi_gpus",
-      "splits": 1,
+      "splits": 2,
       "gpuCount": 4,
       "nodeCount": 1
     },
@@ -592,17 +584,6 @@
       "runWithSbatch": true
     },
     {
-      "name": "GB300-4_GPUs-PyTorch-PerfSanity",
-      "arch": "SBSA",
-      "slurm": true,
-      "platform": "auto:gb300-x4",
-      "testDB": "l0_gb300_multi_gpus_perf_sanity",
-      "splits": 1,
-      "gpuCount": 4,
-      "nodeCount": 1,
-      "runWithSbatch": true
-    },
-    {
       "name": "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge",
       "arch": "SBSA",
       "slurm": true,
@@ -617,7 +598,7 @@
       "slurm": true,
       "platform": "auto:gb300-x4",
       "testDB": "l0_gb300_multi_gpus_perf_sanity",
-      "splits": 6,
+      "splits": 7,
       "gpuCount": 4,
       "nodeCount": 1,
       "runWithSbatch": true
@@ -707,17 +688,6 @@
       "platform": "auto:gb200-flex",
       "testDB": "l0_gb200_multi_nodes_perf_sanity_gen1_node2_gpu8",
       "splits": 1,
-      "gpuCount": 8,
-      "nodeCount": 2
-    },
-    {
-      "name": "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
-      "arch": "SBSA",
-      "slurm": true,
-      "target": "multiNodesSBSA",
-      "platform": "auto:gb300-flex",
-      "testDB": "l0_gb300_multi_nodes_perf_sanity_node2_gpu8",
-      "splits": 2,
       "gpuCount": 8,
       "nodeCount": 2
     },
@@ -827,7 +797,7 @@
       "target": "multiNodesSBSA",
       "platform": "auto:gb300-flex",
       "testDB": "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
-      "splits": 1,
+      "splits": 2,
       "gpuCount": 8,
       "nodeCount": 2
     },
@@ -841,28 +811,6 @@
       "splits": 2,
       "gpuCount": 28,
       "nodeCount": 7
-    },
-    {
-      "name": "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX2-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
-      "arch": "SBSA",
-      "slurm": true,
-      "target": "multiNodesSBSA",
-      "platform": "gb300-flex-aws-cmh",
-      "testDB": "l0_gb300_multi_nodes_perf_sanity_ctx2_node2_gpu8_gen1_node2_gpu8",
-      "splits": 1,
-      "gpuCount": 24,
-      "nodeCount": 6
-    },
-    {
-      "name": "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX3-NODE2-GPU8-GEN1-NODE4-GPU16-Post-Merge",
-      "arch": "SBSA",
-      "slurm": true,
-      "target": "multiNodesSBSA",
-      "platform": "gb300-flex-aws-cmh",
-      "testDB": "l0_gb300_multi_nodes_perf_sanity_ctx3_node2_gpu8_gen1_node4_gpu16",
-      "splits": 1,
-      "gpuCount": 40,
-      "nodeCount": 10
     }
   ],
   "disabled_configs": [
@@ -902,17 +850,6 @@
       "splits": 2,
       "gpuCount": 4,
       "reason": "Disabled: some RTXPro6000D nodes are offline temporarily."
-    },
-    {
-      "name": "DGX_B200-4_GPUs-Verl-Post-Merge",
-      "arch": "x86",
-      "slurm": true,
-      "platform": "auto:dgx-b200-flex",
-      "testDB": "l0_verl",
-      "splits": 1,
-      "gpuCount": 4,
-      "runWithSbatch": true,
-      "reason": "Disabled while https://nvbugs/6759612 is open. The verl_setup fixture clones verl and pip-installs it; verl hard-pins numpy<2.0.0, which is mutually exclusive with the numpy>=2.0.0 TensorRT-LLM asks for, so the install downgrades numpy out from under the interpreter. Importing tensorrt_llm then fails and every test in the stage goes with it, which makes the whole stage noise rather than signal."
     }
   ]
 }
