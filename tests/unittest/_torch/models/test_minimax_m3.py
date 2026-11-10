@@ -3209,8 +3209,7 @@ def test_minimax_m3_dense_backend_library_order(
 # ---------------------------------------------------------------------------
 #
 # The references below are written from the checkpoint format (E4M3 / UE8M0 /
-# E2M1 definitions) without calling TensorRT-LLM quantizers. Each forward is
-# checked eagerly and again through CUDA graph capture and replay.
+# E2M1 definitions) without calling TensorRT-LLM quantizers.
 
 _E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
