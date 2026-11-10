@@ -690,7 +690,7 @@ def _compile_dspark_rmsnorm_fp8_quant(hidden_dim: int, eps: float):
         cutlass.Float8E4M3FN, (rows, hidden_dim), stride_order=(1, 0)
     )
     scale_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float8E8M0FNU, (scale_elems,), stride_order=(0,)
+        cutlass.Uint8, (scale_elems,), stride_order=(0,)
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = DSparkRMSNormFP8QuantKernel(hidden_dim, eps)
@@ -730,7 +730,7 @@ def _compile_dspark_concat_fp8_quant(hidden_dim: int):
         cutlass.Float8E4M3FN, (output_rows, hidden_dim), stride_order=(1, 0)
     )
     scale_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float8E8M0FNU, (scale_elems,), stride_order=(0,)
+        cutlass.Uint8, (scale_elems,), stride_order=(0,)
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = DSparkConcatFP8QuantKernel(hidden_dim)
@@ -765,7 +765,7 @@ def cute_dsl_dspark_rmsnorm_fp8_quant(
         x_flat,
         weight,
         output,
-        output_scale.view(torch.float8_e8m0fnu),
+        output_scale,
     )
     return output, output_scale
 
@@ -805,7 +805,7 @@ def cute_dsl_dspark_concat_fp8_quant(
         first,
         second,
         output,
-        output_scale.view(torch.float8_e8m0fnu),
+        output_scale,
     )
     return output, output_scale
 
