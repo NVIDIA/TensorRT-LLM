@@ -837,36 +837,59 @@ def test_draft_load_reads_only_the_shards_holding_draft_keys(
     monkeypatch.setattr(weight_loader_module, "local_mpi_barrier", lambda: None)
     monkeypatch.setattr(weight_loader_module, "effective_available_host_memory", lambda: 1 << 40)
     monkeypatch.setattr(read_ahead, "effective_available_host_memory", lambda: 1 << 40)
+    read_files = []
+    load_file = HfWeightLoader._load_safetensors_file
+    monkeypatch.setattr(
+        HfWeightLoader,
+        "_load_safetensors_file",
+        staticmethod(lambda path: read_files.append(Path(path).name) or load_file(path)),
+    )
     shards = {
-        "model-00001-of-00004.safetensors": {
+        "model-00001-of-00005.safetensors": {
             "embed.weight": torch.randn(16, 8),
             "layers.0.attn.wq.weight": torch.randn(8, 8, dtype=torch.bfloat16),
+            "mtp.1.confidence_head.proj.weight": torch.randn(1, 8),
         },
-        "model-00002-of-00004.safetensors": {
+        "model-00002-of-00005.safetensors": {
             "layers.1.ffn.experts.0.w1.weight": torch.randint(0, 256, (8, 4), dtype=torch.uint8),
         },
-        "model-00003-of-00004.safetensors": {
+        "model-00003-of-00005.safetensors": {
             "layers.2.attn.wq.weight": torch.randn(8, 8, dtype=torch.bfloat16),
             "mtp.0.attn.wq.weight": torch.randn(8, 8, dtype=torch.bfloat16),
             "mtp.0.ffn.experts.0.w1.weight": torch.randint(0, 256, (8, 4), dtype=torch.uint8),
         },
-        "model-00004-of-00004.safetensors": {
+        "model-00004-of-00005.safetensors": {
             "mtp.1.norm.weight": torch.randn(8),
             "mtp.1.ffn.experts.0.w1.scale": torch.randint(0, 256, (8, 1), dtype=torch.uint8),
+        },
+        "model-00005-of-00005.safetensors": {
+            "mtp.2.norm.weight": torch.randn(8),
         },
     }
     checkpoint_dir = tmp_path / "checkpoint"
     checkpoint_dir.mkdir()
     for file_name, tensors in shards.items():
         save_file(tensors, str(checkpoint_dir / file_name))
-    weight_map = {key: file_name for file_name, tensors in shards.items() for key in tensors}
+    # The index omits the first shard's draft key; selection reads the shards' own headers.
+    weight_map = {
+        key: file_name
+        for file_name, tensors in shards.items()
+        for key in tensors
+        if not key.startswith("mtp.1.confidence_head.")
+    }
     (checkpoint_dir / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": weight_map})
     )
     draft_prefixes = ("mtp.0.", "mtp.1.")
+    holders = [
+        "model-00001-of-00005.safetensors",
+        "model-00003-of-00005.safetensors",
+        "model-00004-of-00005.safetensors",
+    ]
 
     def load_draft(key_prefixes: tuple[str, ...] | None) -> dict[str, torch.Tensor]:
         received = {}
+        read_files.clear()
         model = SimpleNamespace(
             draft_config=None,
             draft_model=SimpleNamespace(checkpoint_key_prefixes=key_prefixes),
@@ -897,19 +920,9 @@ def test_draft_load_reads_only_the_shards_holding_draft_keys(
             )
 
     full = load_draft(None)
+    assert sorted(read_files) == sorted(shards)
+    assert set(full) == {key for tensors in shards.values() for key in tensors}
     draft = load_draft(draft_prefixes)
-    assert set(full) == set(weight_map)
-    assert set(draft) == (
-        set(shards["model-00003-of-00004.safetensors"])
-        | set(shards["model-00004-of-00004.safetensors"])
-    )
-    assert_same_draft_tensors(draft, full)
-
-    # The index does not cover a file that holds a draft key, so every file is read.
-    save_file(
-        {"mtp.1.extra.weight": torch.randn(4)}, str(checkpoint_dir / "model-extra.safetensors")
-    )
-    full = load_draft(None)
-    draft = load_draft(draft_prefixes)
-    assert set(draft) == set(full) == set(weight_map) | {"mtp.1.extra.weight"}
+    assert sorted(read_files) == holders
+    assert set(draft) == {key for name in holders for key in shards[name]}
     assert_same_draft_tensors(draft, full)
