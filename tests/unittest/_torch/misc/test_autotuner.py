@@ -2478,6 +2478,34 @@ def test_jit_share_wrapper_stays_where_only_this_user_can_replace_it(
     assert jit_share._wrapper_dirs(str(private)) == [str(private / "bin")]
 
 
+def test_jit_share_install_moves_past_an_unusable_wrapper_directory(
+        tmp_path, monkeypatch):
+    """install() writes DeepGEMM's compiler wrapper to the first of its
+    directories that can hold it and makes that wrapper DeepGEMM's compiler."""
+    if os.statvfs(tmp_path).f_flag & os.ST_NOEXEC:
+        pytest.skip("the temporary directory does not allow executing files")
+    bad, good = str(tmp_path / "bad"), str(tmp_path / "good")
+    write = jit_share._write_wrapper
+    monkeypatch.setattr(jit_share, "_wrapper_dirs",
+                        lambda share_dir: [bad, good])
+    monkeypatch.setattr(jit_share, "_write_wrapper", lambda d: None
+                        if d == bad else write(d))
+    monkeypatch.setattr(jit_share, "_installed", False)
+    compiler = tmp_path / "nvcc"
+    compiler.write_text("#!/bin/sh\n")
+    compiler.chmod(0o700)
+    # install() sets these; registering them first makes the test restore them.
+    for name in ("DG_JIT_NVCC_COMPILER", "DG_JIT_CACHE_DIR",
+                 jit_share._SALT_ENV, jit_share._PROCESS_ENV):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path / "share"))
+    monkeypatch.setenv(jit_share._REAL_COMPILER_ENV, str(compiler))
+    assert jit_share.install()
+    assert os.path.dirname(os.environ["DG_JIT_NVCC_COMPILER"]) == good
+    assert os.environ[jit_share._REAL_COMPILER_ENV] == str(compiler)
+
+
 def test_shared_kernel_cache_exports_and_loads(monkeypatch, tmp_path):
     """A CuTe DSL kernel stored in a shared runner cache is exported, and the
     cache of another process (a second instance here) loads it instead of
