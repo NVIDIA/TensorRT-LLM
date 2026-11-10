@@ -75,6 +75,27 @@ This configures an active NVFP4 KV cache on the GPU. To keep the active GPU KV
 cache in its normal runtime type and use NVFP4 only while Pages reside in Host
 or Disk storage, see [KV Cache Compression](kv-cache-compression.md).
 
+#### MLA Latent Scale for Quantized KV Caches
+
+MLA models (DeepSeek-V3 family, GLM) store one latent per token in the KV cache.
+Its magnitude is set by `kv_a_layernorm.weight`, which some checkpoints train far
+below one in a few layers: GLM-5.3 has an RMS of 0.003 to 0.01 in its first eight
+layers. Such values fall under the smallest normal E4M3 number (2^-6), so an FP8
+latent, and the block scales of an NVFP4 latent, keep almost no precision there.
+
+When the KV cache is quantized, the PyTorch backend therefore multiplies
+`kv_a_layernorm.weight` of each layer by a power of two that brings the latent to
+an RMS of about one, and divides `kv_b_proj` by the same factor while loading the
+weights. The model output is unchanged; only the values the cache stores move
+into the range the quantized formats resolve. Layers whose `kv_b_proj` is itself
+quantized are left as they are.
+
+`TRTLLM_MLA_LATENT_SCALE` controls this: `auto` (default) targets an RMS of 1.0,
+a positive number sets another target, and `off` loads the weights unchanged.
+The setting changes the values stored in the KV cache, so servers that exchange
+KV caches, such as the context and generation servers of a disaggregated
+deployment, must use the same one.
+
 #### NVFP4_PLUS MoE from MXFP4 Checkpoints
 
 On Rubin (SM107), the routed experts of an MXFP4 checkpoint can run as NVFP4_PLUS:

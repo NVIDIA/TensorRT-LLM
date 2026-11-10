@@ -47,6 +47,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -160,6 +161,49 @@ def _static_nvfp4_input_scale(linear):
     if is_static_nvfp4_input_eligible(linear):
         return linear.input_scale
     return None
+
+
+_MLA_LATENT_SCALE_ENV = "TRTLLM_MLA_LATENT_SCALE"
+_MLA_LATENT_SCALE_DEFAULT = "auto"
+
+
+def _mla_latent_scales(weights, kv_cache_quantized: bool) -> Dict[str, float]:
+    """Per attention module, a power of two for its NoPE latent.
+
+    ``kv_a_layernorm.weight`` sets the magnitude of the latent that the KV
+    cache stores. Checkpoints may train it far below one in some layers, where
+    an E4M3 value or NVFP4 block scale has no precision left. Multiplying that
+    weight by a power of two and ``kv_b_proj`` by its inverse leaves the model
+    output unchanged and moves the latent into the range a quantized KV cache
+    resolves.
+
+    ``TRTLLM_MLA_LATENT_SCALE`` selects the RMS the latent is brought to:
+    ``auto`` (default) for 1.0, a number, or ``off``. Modules are left alone
+    when the KV cache is not quantized or when their ``kv_b_proj`` is
+    quantized itself.
+    """
+    mode = os.environ.get(_MLA_LATENT_SCALE_ENV, _MLA_LATENT_SCALE_DEFAULT)
+    if mode == "off" or not kv_cache_quantized:
+        return {}
+    target = 1.0 if mode == "auto" else float(mode)
+    if not target > 0:
+        raise ValueError(
+            f"{_MLA_LATENT_SCALE_ENV} must be 'auto', 'off' or a positive "
+            f"number, got {mode!r}")
+    suffix = ".kv_a_layernorm.weight"
+    float_dtypes = (torch.bfloat16, torch.float16, torch.float32)
+    scales = {}
+    for key in list(weights.keys()):
+        if not key.endswith(suffix):
+            continue
+        module_name = key[:-len(suffix)]
+        projection = weights.get(f"{module_name}.kv_b_proj.weight")
+        if projection is None or projection.dtype not in float_dtypes:
+            continue
+        rms = weights[key][:].float().pow(2).mean().sqrt().item()
+        if rms > 0:
+            scales[module_name] = 2.0**round(math.log2(target / rms))
+    return scales
 
 
 class DeepseekV3WeightLoader:
@@ -371,6 +415,14 @@ class DeepseekV3WeightLoader:
             return model_nextn > (ckpt_num_nextn_predict_layers or 0) > 0
 
         has_shared_mtp_weights = detect_shared_mtp_weights()
+        latent_scales = _mla_latent_scales(
+            weights,
+            self.model_config.quant_config.layer_quant_mode.has_kv_cache_quant(
+            ))
+        if any(scale != 1.0 for scale in latent_scales.values()):
+            logger.info("MLA latent scales: " + ", ".join(
+                f"{name}:{scale:g}"
+                for name, scale in latent_scales.items() if scale != 1.0))
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
@@ -402,6 +454,10 @@ class DeepseekV3WeightLoader:
                     else:
                         kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans(
                             name, is_scale=False)
+                    latent_scale = latent_scales.get('.'.join(names[:-1]), 1.0)
+                    if latent_scale != 1.0:
+                        kv_b_proj = kv_b_proj / latent_scale
+                        k_b_proj_trans = k_b_proj_trans / latent_scale
                     module.weight.data.copy_(
                         kv_b_proj.reshape(module.weight.shape))
 
@@ -628,6 +684,12 @@ class DeepseekV3WeightLoader:
                     continue
                 else:
                     module_weights = filter_weights(name, weights)
+                    if names[-1] == "kv_a_layernorm":
+                        latent_scale = latent_scales.get(
+                            '.'.join(names[:-1]), 1.0)
+                        if latent_scale != 1.0:
+                            module_weights["weight"] = module_weights[
+                                "weight"][:] * latent_scale
                     if hasattr(module, 'load_weights'):
                         module.load_weights(weights=[module_weights])
                     else:
