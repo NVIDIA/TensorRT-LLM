@@ -11,11 +11,12 @@ from tensorrt_llm._torch.pyexecutor._util import (
 )
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
-from tensorrt_llm._torch.pyexecutor.llm_request import ExecutorRequest, LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -49,6 +50,9 @@ def _admission_executor(
         _kv_connector_moves_kv=False,
         _kv_connector_deadlines={},
         kv_cache_transceiver=None,
+        _cancel_queued_context_requests=lambda queue: None,
+        request_broadcaster=SimpleNamespace(deliver_prompts=lambda requests: None),
+        track_unique_tokens=False,
         _should_exclude_last_generation_logits=lambda: False,
         observed_live_counts=[],
     )
@@ -94,7 +98,7 @@ def _enqueue_cohort(queues: list[FCFSWaitingQueue], first_id: int, count: int) -
         queue.add_requests(
             RequestQueueItem(
                 request_id,
-                ExecutorRequest(input_token_ids=[1, 2], max_tokens=1),
+                tllm_executor.Request(input_token_ids=[1, 2], max_tokens=1),
             )
             for request_id in range(first_id, first_id + count)
         )
