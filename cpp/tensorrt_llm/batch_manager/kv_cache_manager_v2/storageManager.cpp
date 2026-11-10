@@ -1142,21 +1142,43 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
         {
             previousEvents.push_back(page->readyEvent);
         }
+        // The required GPU -> host eviction has already succeeded, so a failure here only costs the early copy:
+        // give back the disk slots not yet retained and let these pages be written on their host -> disk eviction.
         std::optional<std::vector<Slot>> slots;
+        size_t added = 0;
+        try
         {
-            BackgroundDiskWriteScope const background;
-            slots = _batchedMigrate(diskLevel, hostLevel, batch, /*updateSrc=*/false, MigrationRecorder{});
+            {
+                BackgroundDiskWriteScope const background;
+                slots = _batchedMigrate(diskLevel, hostLevel, batch, /*updateSrc=*/false, MigrationRecorder{});
+            }
+            for (size_t i = 0; i < take; ++i)
+            {
+                batch[i]->readyEvent = std::move(previousEvents[i]);
+            }
+            TLLM_CHECK(slots.has_value() && slots->size() == take);
+            for (; added < take; ++added)
+            {
+                addRetainedCopy(*batch[added], diskLevel, pgIdx, std::move(slots->at(added)));
+            }
         }
-        for (size_t i = 0; i < take; ++i)
+        catch (std::exception const& e)
         {
-            batch[i]->readyEvent = std::move(previousEvents[i]);
+            // A page whose ready event was not restored waits for the failed copy as well, which is only slower.
+            if (slots.has_value())
+            {
+                for (auto& slot : *slots)
+                {
+                    if (slot.hasValidSlot())
+                    {
+                        poolGroup(diskLevel, pgIdx).release(std::move(slot));
+                    }
+                }
+            }
+            mWriteThroughSkipped += take - added;
+            TLLM_LOG_WARNING("[KVCacheManagerV2] Disk write-through of %zu pages skipped: %s", take - added, e.what());
         }
-        TLLM_CHECK(slots.has_value() && slots->size() == take);
-        for (size_t i = 0; i < take; ++i)
-        {
-            addRetainedCopy(*batch[i], diskLevel, pgIdx, std::move(slots->at(i)));
-        }
-        mWriteThroughPages += take;
+        mWriteThroughPages += added;
     }
 }
 
