@@ -4,7 +4,12 @@
 
 import pytest
 
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvPoolRebalanceConfig
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
+    KvCacheConfig,
+    KvPoolRebalanceConfig,
+    TorchLlmArgs,
+)
 
 
 def _config(rebalance: bool, copy_based: bool, in_place: bool = False) -> KvCacheConfig:
@@ -30,3 +35,15 @@ def test_fp8_ds_mla_copy_based_rebalance_allowed(in_place):
 
 def test_fp8_ds_mla_without_rebalance_allowed():
     assert not _config(rebalance=False, copy_based=False).enable_kv_pool_rebalance
+
+
+@pytest.mark.parametrize("disagg", [False, True])
+def test_copy_based_rebalancing_rejected_with_disaggregated_serving(tmp_path, disagg):
+    """The arena's pools all start at its base, so per-pool NIXL registrations would overlap."""
+    kwargs = dict(model=str(tmp_path), kv_cache_config=_config(rebalance=True, copy_based=True))
+    if disagg:
+        kwargs["cache_transceiver_config"] = CacheTransceiverConfig(backend="NIXL")
+        with pytest.raises(ValueError, match="not supported with disaggregated serving"):
+            TorchLlmArgs(**kwargs)
+    else:
+        TorchLlmArgs(**kwargs)
