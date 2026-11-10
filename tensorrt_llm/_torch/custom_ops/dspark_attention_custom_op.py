@@ -21,6 +21,11 @@ from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..kernels.blackwell.utils import make_ptr
 from ..utils import next_positive_power_of_2
 from .dspark_rmsnorm_rope_custom_op import (
+    _DSV4_DSPARK_BLOCK_SIZES,
+    _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE,
+    _DSV4_DSPARK_HEAD_DIM,
+    _DSV4_DSPARK_ROPE_DIM,
+    _DSV4_DSPARK_WINDOW_SIZE,
     _get_dspark_arch_str,
     cute_dsl_dspark_rmsnorm_rope_cache_write,
     cute_dsl_dspark_rmsnorm_rope_draft_block,
@@ -44,12 +49,9 @@ def _gen_dspark_context_wkv_m_profiles(max_m: int) -> Tuple[int, ...]:
     return tuple(buckets)
 
 
+# Attention-only limits; the shared DSpark shape contract (head and RoPE dims, window,
+# draft block sizes and storage) comes from dspark_rmsnorm_rope_custom_op.
 _DSV4_DSPARK_SUPPORTED_NUM_HEADS = (64, 128)
-_DSV4_DSPARK_HEAD_DIM = 512
-_DSV4_DSPARK_WINDOW_SIZE = 128
-_DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
-_DSV4_DSPARK_BLOCK_SIZES = (5, 6)
-_DSV4_DSPARK_ROPE_DIM = 64
 _DSV4_DSPARK_PAGE_SIZES = (16, 32, 64, 128, 256)
 
 
@@ -135,7 +137,10 @@ def _compile_dspark_attention(
     return compiled
 
 
-def _run_paged_dspark_attention(
+@torch.library.custom_op(
+    "trtllm::fused_dsv4_dspark_attention", mutates_args=(), device_types="cuda"
+)
+def fused_dsv4_dspark_attention(
     q: torch.Tensor,
     draft_block: torch.Tensor,
     kv_pages: torch.Tensor,
@@ -152,15 +157,21 @@ def _run_paged_dspark_attention(
     if arch_str is None:
         raise RuntimeError("Embedded DSpark attention requires SM100, SM103, or SM107")
     batch, block, heads, dim = q.shape
-    page_size = kv_pages.shape[1]
     if block not in _DSV4_DSPARK_BLOCK_SIZES:
         raise ValueError(
             f"DSpark block size must be one of {_DSV4_DSPARK_BLOCK_SIZES}, got {block}"
         )
     if heads not in _DSV4_DSPARK_SUPPORTED_NUM_HEADS:
-        raise ValueError(f"DSpark requires {_DSV4_DSPARK_SUPPORTED_NUM_HEADS} heads, got {heads}")
+        raise ValueError(
+            f"DSpark num_heads must be one of {_DSV4_DSPARK_SUPPORTED_NUM_HEADS}, got {heads}"
+        )
     if dim != _DSV4_DSPARK_HEAD_DIM:
         raise ValueError(f"DSpark head_dim must be {_DSV4_DSPARK_HEAD_DIM}, got {dim}")
+    if kv_pages.ndim != 3 or kv_pages.shape[2] != dim:
+        raise ValueError(
+            f"DSpark pages must have shape [pages, page_size, {dim}], got {tuple(kv_pages.shape)}"
+        )
+    page_size = kv_pages.shape[1]
     if page_size not in _DSV4_DSPARK_PAGE_SIZES:
         raise ValueError(
             f"DSpark page size must be one of {_DSV4_DSPARK_PAGE_SIZES}, got {page_size}"
@@ -172,10 +183,6 @@ def _run_paged_dspark_attention(
     if draft_block.shape != expected_draft_shape:
         raise ValueError(
             f"DSpark draft KV must have shape {expected_draft_shape}, got {tuple(draft_block.shape)}"
-        )
-    if kv_pages.ndim != 3 or kv_pages.shape[2] != dim:
-        raise ValueError(
-            f"DSpark pages must have shape [pages, page_size, {dim}], got {tuple(kv_pages.shape)}"
         )
     if block_tables.dtype != torch.int32 or block_tables.stride(1) != 1:
         raise ValueError(
@@ -263,35 +270,6 @@ def _run_paged_dspark_attention(
         softmax_scale,
     )
     return output
-
-
-@torch.library.custom_op(
-    "trtllm::fused_dsv4_dspark_attention", mutates_args=(), device_types="cuda"
-)
-def fused_dsv4_dspark_attention(
-    q: torch.Tensor,
-    draft_block: torch.Tensor,
-    kv_pages: torch.Tensor,
-    block_tables: torch.Tensor,
-    positions: torch.Tensor,
-    valid_lengths: torch.Tensor,
-    capacities: torch.Tensor,
-    attn_sink: torch.Tensor,
-    inverse_rope_freqs: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    return _run_paged_dspark_attention(
-        q,
-        draft_block,
-        kv_pages,
-        block_tables,
-        positions,
-        valid_lengths,
-        capacities,
-        attn_sink,
-        inverse_rope_freqs,
-        softmax_scale,
-    )
 
 
 @torch.library.register_fake("trtllm::fused_dsv4_dspark_attention")

@@ -184,7 +184,7 @@ def test_fused_dsv4_dspark_attention_support_gate_logs_rejection(monkeypatch, in
     [
         ("q_dtype", "must use BF16"),
         ("block_size", "block size must be one of"),
-        ("heads", r"requires \(64, 128\) heads"),
+        ("heads", r"num_heads must be one of \(64, 128\), got 24"),
         ("page_size", "page size must be one of"),
         ("page_stride", "positive 16-byte-aligned page stride"),
         ("draft_shape", "draft KV must have shape"),

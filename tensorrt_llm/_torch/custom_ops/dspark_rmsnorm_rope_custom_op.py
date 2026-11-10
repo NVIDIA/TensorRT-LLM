@@ -644,7 +644,11 @@ def _validate_dspark_preparation(
             f"got {freqs.dtype} {tuple(freqs.shape)}"
         )
     for name, tensor in (("input", x), ("weight", weight), ("frequencies", freqs)):
-        if not tensor.is_cuda or tensor.device != x.device:
+        if not tensor.is_cuda:
+            raise ValueError(
+                f"DSpark preparation {name} must be a CUDA tensor, got {tensor.device}"
+            )
+        if tensor.device != x.device:
             raise ValueError(
                 f"DSpark preparation {name} must be on {x.device}, got {tensor.device}"
             )
