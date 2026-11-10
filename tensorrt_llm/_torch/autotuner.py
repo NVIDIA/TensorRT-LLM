@@ -1765,6 +1765,8 @@ class AutoTuner:
                             torch.cuda.synchronize()
                         except Exception:
                             pass
+                        if jit_share.is_busy(e):
+                            raise  # Not a failure: the caller runs this profile later.
 
                         # Handle None tensors for optional inputs
                         shapes = self._get_input_sizes(input_tensors)

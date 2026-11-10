@@ -2360,6 +2360,63 @@ def test_share_jit_builds_sets_aside_profiles_built_elsewhere(
     assert jit_share._DEADLINE_ENV not in os.environ
 
 
+def test_share_jit_builds_sets_aside_a_timed_profile_whose_kernel_is_busy(
+        monkeypatch, tmp_path):
+    """The ranks split a sweep by profile when its first profile has one tactic.
+    A later profile with several tactics is timed, and a tactic whose kernel
+    another rank is building does not fail there either: the profile is set
+    aside and timed again, every tactic, after the others."""
+    calls: List[tuple] = []
+
+    class MixedTacticsRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0] if inputs[0].shape[0] == 1 else [0, 1]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    **kwargs) -> torch.Tensor:
+            m = inputs[0].shape[0]
+            calls.append((m, tactic))
+            if (m, tactic) == (2, 0) and calls.count((2, 0)) == 1:
+                raise RuntimeError(
+                    f"command failed with exit code 75:\n{jit_share.BUSY_MARK} 0"
+                )
+            if tactic == 1:
+                torch.cuda._sleep(1_000_000)  # The slower tactic.
+            return inputs[0] + 1
+
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
+    monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    op = "autotuner_test::share_jit_builds_timed_busy"
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, (1, 2, 4)), ),
+                          share_jit_builds=True)
+    runners = [MixedTacticsRunner()]
+    with autotune():
+        tuner.choose_one(op, runners, config,
+                         [torch.zeros(4, 64, device="cuda")])
+    assert not tuner.stats.failed_profiling_count[op]
+    after_m4 = max(i for i, (m, _) in enumerate(calls) if m == 4)
+    assert {t for m, t in calls[after_m4:] if m == 2} == {0, 1}, calls
+    assert len(tuner.profiling_cache.get_specific_custom_op(op)) == 3
+    _, tactic = tuner.choose_one(op, runners, config,
+                                 [torch.zeros(2, 64, device="cuda")])
+    assert tactic == 0
+    tuner.clear_cache()
+
+
 def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path, monkeypatch):
     """DeepGEMM's compiler wrapper builds a kernel in the process that claims
     it. Others copy the published cubin, report busy while it is being built if
