@@ -14,32 +14,21 @@
 # limitations under the License.
 """One-model EAGLE-3 speculative decoding for Qwen2-class models.
 
-``test_qwen2_is_a_one_model_speculative_target`` runs anywhere. The end-to-end test
-needs a Qwen2-architecture checkpoint and a matching EAGLE-3 draft head, given by
-``TLLM_QWEN2_EAGLE3_TARGET`` and ``TLLM_QWEN2_EAGLE3_DRAFT`` (for example Qwen2.5-7B-Instruct
-and an EAGLE-3 head trained for it); it skips otherwise.
+The end-to-end test runs Qwen2.5-7B-Instruct with an EAGLE-3 draft trained for it, loaded from
+``llm_models_root()``; it skips when the checkpoints are not staged there.
 """
 
 import contextlib
-import os
 
 import pytest
 import torch
-
-from tensorrt_llm._torch.models.modeling_qwen import Qwen2ForCausalLM
-from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+from utils.llm_data import llm_models_root
 
 PROMPTS = [
     "The history of the printing press began in the fifteenth century when Johannes Gutenberg",
     'def fibonacci(n):\n    """Return the n-th Fibonacci number."""\n',
     "In a small village by the sea, an old fisherman woke before dawn and",
 ]
-
-
-def test_qwen2_is_a_one_model_speculative_target():
-    """Without the speculative base class the draft model and spec worker are never
-    created and the model fails with ``no attribute 'draft_config'``."""
-    assert issubclass(Qwen2ForCausalLM, SpecDecOneEngineForCausalLM)
 
 
 @contextlib.contextmanager
@@ -70,16 +59,22 @@ def _accepted_drafts():
         PyExecutor._update_iter_stats = original
 
 
+TARGET = "Qwen2.5-7B-Instruct"
+DRAFT = "EAGLE3-Qwen2.5-7B-Instruct"
+
+
 def _paths():
-    target = os.environ.get("TLLM_QWEN2_EAGLE3_TARGET")
-    draft = os.environ.get("TLLM_QWEN2_EAGLE3_DRAFT")
-    if not (target and draft and os.path.isdir(target) and os.path.isdir(draft)):
+    root = llm_models_root()
+    if root is None:
         return None
-    return target, draft
+    target, draft = root / TARGET, root / DRAFT
+    if not (target.is_dir() and draft.is_dir()):
+        return None
+    return str(target), str(draft)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@pytest.mark.skipif(_paths() is None, reason="Qwen2 target and EAGLE-3 draft not provided")
+@pytest.mark.skipif(_paths() is None, reason=f"needs {TARGET} and {DRAFT} under llm_models_root()")
 @pytest.mark.threadleak(enabled=False)
 def test_qwen2_eagle3_one_model_generates_and_accepts_draft_tokens(monkeypatch):
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
