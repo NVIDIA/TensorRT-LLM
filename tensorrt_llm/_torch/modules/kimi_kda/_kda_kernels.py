@@ -214,6 +214,119 @@ _PREFILL_MODULE: Optional[ModuleType] = None
 _PREFILL_IMPORT_ERROR: Optional[Exception] = None
 
 
+@triton.jit(do_not_specialize=["num_requests"])
+def _record_kda_replay_acceptance_kernel(
+    prev_num_accepted_ptr,
+    prev_num_accepted_stride,
+    state_indices_ptr,
+    num_accepted_ptr,
+    is_dummy_ptr,
+    num_requests,
+    num_bonus_tokens,
+    HAS_DUMMY: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = rows < num_requests
+    if HAS_DUMMY:
+        mask = mask & (tl.load(is_dummy_ptr + rows, mask=mask, other=1) == 0)
+    slots = tl.load(state_indices_ptr + rows, mask=mask, other=0).to(tl.int64)
+    num_accepted = tl.load(num_accepted_ptr + rows, mask=mask, other=0)
+    accepted_drafts = tl.maximum((num_accepted - num_bonus_tokens).to(tl.int32), 0)
+    tl.store(prev_num_accepted_ptr + slots * prev_num_accepted_stride, accepted_drafts, mask=mask)
+
+
+_KDA_ACCEPTANCE_INDEX_DTYPES = (torch.int32, torch.int64)
+_KDA_ACCEPTANCE_BLOCK = 256
+
+
+def _is_dense_vector(tensor: torch.Tensor, device: torch.device, dtypes: tuple) -> bool:
+    return (
+        tensor.device == device
+        and tensor.dtype in dtypes
+        and tensor.dim() == 1
+        and (tensor.stride(0) == 1 or tensor.numel() <= 1)
+    )
+
+
+def can_record_kda_replay_acceptance(
+    prev_num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted: torch.Tensor,
+    is_dummy_request: Optional[torch.Tensor],
+) -> bool:
+    """Whether ``record_kda_replay_acceptance`` handles these tensors' layout.
+
+    It needs CUDA tensors on one device: an int32 ``prev_num_accepted_tokens``
+    vector of any stride, contiguous int32/int64 ``state_indices`` and
+    ``num_accepted`` vectors of equal length, and an optional contiguous bool
+    ``is_dummy_request`` vector of that length.
+    """
+    device = prev_num_accepted_tokens.device
+    return (
+        device.type == "cuda"
+        and prev_num_accepted_tokens.dtype == torch.int32
+        and prev_num_accepted_tokens.dim() == 1
+        and _is_dense_vector(state_indices, device, _KDA_ACCEPTANCE_INDEX_DTYPES)
+        and _is_dense_vector(num_accepted, device, _KDA_ACCEPTANCE_INDEX_DTYPES)
+        and num_accepted.numel() == state_indices.numel()
+        and (
+            is_dummy_request is None
+            or (
+                _is_dense_vector(is_dummy_request, device, (torch.bool,))
+                and is_dummy_request.numel() == state_indices.numel()
+            )
+        )
+    )
+
+
+def record_kda_replay_acceptance(
+    prev_num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted: torch.Tensor,
+    is_dummy_request: Optional[torch.Tensor],
+    num_bonus_tokens: int,
+) -> None:
+    """Record each request's accepted drafts for the next KDA replay in one launch.
+
+    For every request ``i`` that is not a dummy,
+    ``prev_num_accepted_tokens[state_indices[i]] =
+    max(int32(num_accepted[i] - num_bonus_tokens), 0)``; a dummy request's slot
+    keeps its value. The launch shape depends only on the host-side length, so
+    the call is CUDA-graph capturable.
+
+    Args:
+        prev_num_accepted_tokens: ``[num_slots]`` int32, may be strided (a
+            column of a per-slot state pool).
+        state_indices: ``[batch]`` int32/int64 destination slots, contiguous.
+        num_accepted: ``[batch]`` int32/int64 accepted counts, contiguous.
+        is_dummy_request: ``[batch]`` bool, contiguous, or None (no dummies).
+        num_bonus_tokens: subtracted from ``num_accepted`` to get the
+            accepted drafts (1 for accepted-token counts that include the
+            target's own token, 0 for draft counts).
+    """
+    if not can_record_kda_replay_acceptance(
+        prev_num_accepted_tokens, state_indices, num_accepted, is_dummy_request
+    ):
+        raise ValueError("record_kda_replay_acceptance: unsupported tensor layout")
+    num_requests = state_indices.numel()
+    if num_requests == 0:
+        return
+    has_dummy = is_dummy_request is not None
+    with torch.cuda.device(prev_num_accepted_tokens.device.index):
+        _record_kda_replay_acceptance_kernel[(triton.cdiv(num_requests, _KDA_ACCEPTANCE_BLOCK),)](
+            prev_num_accepted_tokens,
+            prev_num_accepted_tokens.stride(0),
+            state_indices,
+            num_accepted,
+            is_dummy_request if has_dummy else state_indices,
+            num_requests,
+            num_bonus_tokens,
+            HAS_DUMMY=has_dummy,
+            BLOCK=_KDA_ACCEPTANCE_BLOCK,
+        )
+
+
 def _load_prefill_module() -> ModuleType:
     """Import the in-tree prefill custom-op module (registers the op)."""
     global _PREFILL_MODULE, _PREFILL_IMPORT_ERROR
