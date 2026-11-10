@@ -82,6 +82,12 @@ from .genphase_tail import GenphaseTail
 
 
 @cute.jit
+def _stride_mismatch_trap() -> None:
+    """Stop the launch: a plane's runtime row stride differs from the padded stride the kernel addresses."""
+    llvm.inline_asm(None, [], "trap;", "", has_side_effects=True, is_align_stack=False, asm_dialect=0)
+
+
+@cute.jit
 def st_relaxed_sys_b64(address: Int64, value: Int64) -> None:
     """Single-copy-atomic 8-byte store: one LL word (value in the low half, call tag in the high half)."""
     llvm.inline_asm(
@@ -1288,6 +1294,16 @@ class GenphaseTokenComm(KernelComponent):
         linear_cta_idx = cluster_idx * Int32(self.launch_cluster_width) + cta_idx_in_cluster
         thread_idx, _, _ = cute.arch.thread_idx()
 
+        # launch() checks the padded row strides only when they are static; a dynamic layout
+        # is checked here, since every row access below assumes them (aligned 8-byte LL loads,
+        # whole-row bulk copies).
+        if linear_cta_idx == Int32(0):
+            if thread_idx == Int32(0):
+                if Int64(activation.layout.stride[0]) != Int64(self.plain_activation_row_elements):
+                    _stride_mismatch_trap()
+                if Int64(activation_sf.layout.stride[0]) != Int64(self.plain_activation_sf_row_elements):
+                    _stride_mismatch_trap()
+
         # Cluster padding: these CTAs hold no role and are counted by no readiness
         # target, so they leave before allocating anything rather than falling
         # through the whole body. The predicate is CTA-uniform and no barrier here
@@ -1536,11 +1552,12 @@ class GenphaseTokenComm(KernelComponent):
         epoch = cute.arch.load(device_workspace.ptr(GenphaseTail.epoch_region), Int32, sem="relaxed", scope="gpu")
         tag = epoch + Int32(1)
         # A zero tag would make a never-written (zero-initialized) word look present. The 32-bit
-        # epoch wraps after 2^32 calls (about two weeks of continuous decode), so map that one
-        # call's tag to 2: it differs from both neighbours (-1 before, 1 after), which is all the
-        # protocol needs since only the previous call's words can still sit in an inbox.
+        # epoch wraps after 2^32 calls (about two weeks of continuous decode), and the call at
+        # the wrap needs another nonzero tag. Some inboxes (plain_sf_ll, refine_row_source_ll)
+        # are only rewritten for routed tokens / live rows, so a word may survive many calls:
+        # reuse the tag of the call 2^31 calls back (0x80000000), not one of a nearby call.
         if tag == Int32(0):
-            tag = Int32(2)
+            tag = Int32(-(1 << 31))
         return tag
 
     @cute.jit
