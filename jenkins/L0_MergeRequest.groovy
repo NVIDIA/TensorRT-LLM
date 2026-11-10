@@ -2938,7 +2938,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
                     return
                 }
-                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scanning")) {
                     echo "Skipping x86_64 tests (PLC container scanning)"
                     return
                 }
@@ -3125,7 +3125,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
 
-                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scanning")) {
                     echo "Skipping SBSA tests (PLC container scanning)"
                     return
                 }
@@ -3488,7 +3488,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             stages.remove("SBSA-Linux")
             echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
         }
-        if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+        if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scanning")) {
             runContainerScanning = true
             testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")
             echo "Will run job to build ngc containers and running in-pipeline scanning for them"
