@@ -1110,14 +1110,15 @@ class MultimodalScheduler(RequestScheduler):
         """
         ready_context_requests: RequestList = []
         protected_items: set[tuple[int, int]] = set()
+        # KV reuse can start a prefill past outputs that were bound while it was at zero.
+        for chunk in chunks:
+            release_consumed_mm_items(chunk.request, self.encoder_cache)
         for chunk in chunks:
             request = chunk.request
             state = request.py_mm_encoder_state
             if state is None:
                 ready_context_requests.append(request)
                 continue
-            # KV reuse can start a prefill past outputs that were bound while it was at zero.
-            release_consumed_mm_items(request, self.encoder_cache)
             begin = chunk.start
             chunk_items = get_mm_items_for_chunk(request, begin, chunk.end)
             item_cache_keys, retain_after_release = self._get_request_item_cache_keys(
