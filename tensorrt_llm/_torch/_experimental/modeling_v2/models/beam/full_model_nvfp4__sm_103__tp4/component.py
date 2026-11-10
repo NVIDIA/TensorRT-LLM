@@ -50,6 +50,7 @@ from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
+from .._load import load_failure_details
 from . import dispatch_combine
 from . import expert as nvfp4_expert
 from .component_bf16 import (
@@ -332,9 +333,9 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
             validate(catalog, stored_entries(full), complete=True)
         except Exception as exc:  # Keep rank-local failures inside the collective protocol.
             error = exc
-        if not self._agree(error is None):
+        if failure := load_failure_details(self.mapping, error is None, error):
             raise LoadError(
-                f"rank {self.rank}: checkpoint rejected before loading: {error!r}"
+                f"rank {self.rank}: checkpoint rejected before loading: {failure}"
             ) from error
 
         self.usable = False
@@ -384,10 +385,10 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         complete = (
             error is None and list(coverage) == [s.name for s in order] and list(scalars) == sparse
         )
-        if not self._agree(complete):
+        if failure := load_failure_details(self.mapping, complete, error):
             self._shared_fc1 = {}
             raise LoadError(
-                f"rank {self.rank}: load did not complete on every rank: {error!r}"
+                f"rank {self.rank}: load did not complete on every rank: {failure}"
             ) from error
         self.load_record = {
             "rank": self.rank,
