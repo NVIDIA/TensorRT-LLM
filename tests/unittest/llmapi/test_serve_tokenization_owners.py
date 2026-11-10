@@ -83,10 +83,11 @@ class _SlowTokenizer(_CharTokenizer):
         super().__init__()
         self.delay_s = delay_s
         self.entered = threading.Event()
+        self.release = threading.Event()
 
     def __call__(self, text: str, **kwargs: Any) -> dict[str, Any]:
         self.entered.set()
-        time.sleep(self.delay_s)
+        self.release.wait(self.delay_s)
         return super().__call__(text, **kwargs)
 
 
@@ -267,10 +268,16 @@ def test_close_does_not_wait_long_for_a_handler_in_the_middle_of_a_prompt(ipc_di
         asking = threading.Thread(target=ask, daemon=True)
         asking.start()
         assert slow.entered.wait(5.0)
+        handlers = list(owner._server.handlers.values())
         start = time.monotonic()
         owner.close(timeout_s=0.2)
         # Up to the serve_forever poll interval (0.5 s) plus the shared deadline.
         assert time.monotonic() - start < 1.5
+        # close() left the handler tokenizing; finish it so no thread outlives the test.
+        slow.release.set()
+        for thread in [asking, *handlers]:
+            thread.join(5.0)
+            assert not thread.is_alive()
 
 
 def test_routed_prompts_count_toward_the_periodic_log_line(ipc_dir) -> None:
