@@ -932,7 +932,17 @@ void StorageManager::addRetainedCopy(Page const& page, CacheLevel level, PoolGro
         eraseRetainedCopy(it->second);
     }
     mRetainedCopies.push_back(RetainedCopy{&page, level, pgIdx, std::move(slot), false});
-    mRetainedByPage.emplace(&page, std::prev(mRetainedCopies.end()));
+    try
+    {
+        mRetainedByPage.emplace(&page, std::prev(mRetainedCopies.end()));
+    }
+    catch (...)
+    {
+        // Without its map entry the node would outlive the page; give the slot back instead.
+        mLevels.at(level).storage->release(pgIdx, std::move(mRetainedCopies.back().slot));
+        mRetainedCopies.pop_back();
+        throw;
+    }
     ++mNumRetainedCopies.at(level).at(pgIdx);
     ++mKeepCopyStats.created;
 }
@@ -1796,6 +1806,21 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
     {
         if (updateSrc && !defrag && !mRetainedByPage.empty())
         {
+            // Check for room before taking any copy: a failure after taking them would have to put them back.
+            SlotCount numUsable = 0;
+            for (auto const& page : srcPages)
+            {
+                auto it = mRetainedByPage.find(page.get());
+                if (it != mRetainedByPage.end() && it->second->level == dstLevel
+                    && (it->second->pinned || validateRetainedCopy(*page, dstLevel)))
+                {
+                    ++numUsable;
+                }
+            }
+            if (dstPoolGroup.numFreeSlots() < numSlots - numUsable)
+            {
+                throw OutOfPagesError("Not enough free slots for migration");
+            }
             for (std::size_t i = 0; i < srcPages.size(); ++i)
             {
                 if (auto kept = takeRetainedCopy(*srcPages.at(i), dstLevel))
@@ -1807,7 +1832,9 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
             }
         }
         if (dstPoolGroup.numFreeSlots() < numNewSlots)
+        {
             throw OutOfPagesError("Not enough free slots for migration");
+        }
         auto freshSlots = dstPoolGroup.allocateMultiple(numNewSlots);
         TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(freshSlots.size()) == numNewSlots, "dst_slots size mismatch");
         std::size_t nextFresh = 0;
@@ -1847,7 +1874,6 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
             pageIndices.push_back(PageIndexPair{
                 slotIdToPageIndexValue(dstSlots.at(i).slotId()), slotIdToPageIndexValue(srcPages.at(i)->slotId())});
         }
-        mKeepCopyStats.reused += numReused;
 
         std::vector<CUevent> priorEvents;
         priorEvents.reserve(2 * srcPages.size());
@@ -1935,6 +1961,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                     scheduleForEviction(*srcPages.at(i));
             }
         }
+        mKeepCopyStats.reused += numReused;
         return updateSrc ? std::nullopt : std::optional<std::vector<Slot>>{std::move(dstSlots)};
     }
     catch (...)
