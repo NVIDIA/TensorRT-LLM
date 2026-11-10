@@ -25,6 +25,7 @@ from cutlass import Float32, Int32, Uint32
 
 from cutlass.experimental import primitives as prims
 
+from ...separate_reduction import merge_log2_lse
 from ..fmha_decode_config import FmhaDecodeConfig
 from .helpers_common import (
     Constexpr,
@@ -451,3 +452,24 @@ def _attention_sink_for_scale_idx(
         num_heads_kv,
         local_head_idx,
     )
+
+
+@cute.jit
+def _final_output_lse(cfg, sink_ptr, lse_ptr, mass_lse, output_row, head, writer):
+    """Merge a sink once in log space and publish unamplified final LSE.
+
+    Input mass includes the internal FP8 P amplification. Partial statistics
+    remain in that domain; only the externally visible final store removes it.
+    """
+    weight = Float32(1.0)
+    if cutlass.const_expr(cfg.use_attention_sinks or cfg.lse_mode != "none"):
+        value = mass_lse
+        if cutlass.const_expr(cfg.use_fp8_pv):
+            value -= Float32(cfg.fp8_p_quant_log2_scale)
+        if cutlass.const_expr(cfg.use_attention_sinks):
+            sink = (sink_ptr + cutlass.Int64(head)).load() * Float32(1.4426950408889634)
+            value, weight, _ = merge_log2_lse(value, sink)
+        if cutlass.const_expr(cfg.lse_mode != "none"):
+            if writer:
+                (lse_ptr + cutlass.Int64(output_row)).store(value)
+    return weight

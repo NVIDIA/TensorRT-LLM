@@ -38,6 +38,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video (3-step distilled) |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `Lightricks/LTX-2.3` | Text-to-Video (with Audio), Video-to-Video (with Audio) |
+| `FastVideo/FastVideo-FastH3-8-Step-V2` | Text-to-Video (with Audio, 8-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -68,6 +69,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 | **LTX-2.3** | Yes | Yes | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
+| **FastH3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
@@ -174,7 +176,7 @@ Tile geometry and blending follow the loaded Diffusers VAE.
 Tensor parallelism shards the DiT attention and gated MLP weights via
 `parallel_config.tp_size`. The text encoder, AdaLN modulation, and media
 input/output projections remain replicated. TP can be combined with Ulysses;
-Ulysses requires VANILLA or FA4 attention. CFG, ring, and Attention2D parallelism
+Ulysses supports VANILLA, FA4, TRTLLM, and FLASHINFER attention. CFG, ring, and Attention2D parallelism
 are not supported. See the
 [2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml).
 
@@ -189,6 +191,22 @@ are not supported. See the
   model-specific restriction, not a general VisualGen backend requirement.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
+
+- FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
+  distilled 8-step V2 checkpoint. Model-specific VSA is the supported inference path
+  for this checkpoint and is selected by default with the TRTLLM backend and the
+  checkpoint's sparsity (80% for V2). Explicit incompatible backends
+  or sparse attention algorithms are rejected. Dense attention omits the trained
+  compression gate and is not equivalent to this checkpoint's VSA inference.
+  The example reads nine sigma-grid points (eight transformer forwards) from
+  `fastvideo_inference.json` and uses its trained DMD ladder with video/audio
+  scheduler shifts of 10/3. Changing only the step count is not equivalent.
+  For single-GPU text-to-video with audio, see
+  `fasth3-bf16-trtllm-vsa-1gpu.yaml`. To use CUTEDSL instead, set
+  `attention_config.backend: CUTEDSL` in that config.
+  Both backends preserve the trained compression gate and dense text/audio routes.
+  CUTEDSL VSA requires supported Blackwell hardware and at most 4096 tiles;
+  unsupported shapes fail explicitly rather than silently running dense attention.
 
 ## Optimizations
 
@@ -441,10 +459,15 @@ pipeline.wake_up()
 ```
 
 `CPU` uses pageable host backing; `PINNED` uses pinned host backing. Host backups
-remain allocated after wake and are reused on later sleeps. Budget host RAM for
+remain allocated after wake by default and are reused on later sleeps. Budget host RAM for
 each instance's captured allocation pool, which can include cached loading and
 quantization buffers in addition to weights. This is process-local offload:
 the process, CUDA context, host memory, and node must remain alive.
+
+Set `sleep_release_host_backup=True` alongside `sleep_restore_mode` when loading
+to free the instance's host backups before wake returns. This synchronous cleanup
+can increase wake latency, and each subsequent sleep must allocate fresh backups.
+Host RAM must still hold the full backup while asleep. The default is `False`.
 
 Sleep rejects new generation and waits for the active call to finish before
 releasing memory. Sleep/wake transitions are serialized per instance; overlapping

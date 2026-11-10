@@ -46,13 +46,22 @@
               },
               "oneOf": [
                 {
-                  "$ref": "#/$defs/SkipSoftmaxAttentionConfig"
+                  "$ref": "#/$defs/SkipSoftmaxAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/VideoSparseAttentionConfig"
+                  "$ref": "#/$defs/VideoSparseAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/SolAttentionConfig"
+                  "$ref": "#/$defs/SolAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 }
               ]
             },
@@ -1023,7 +1032,7 @@
       "type": "object"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc3/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -1044,10 +1053,16 @@
           },
           "oneOf": [
             {
-              "$ref": "#/$defs/TeaCacheConfig"
+              "$ref": "#/$defs/TeaCacheConfig",
+              "required": [
+                "cache_backend"
+              ]
             },
             {
-              "$ref": "#/$defs/CacheDiTConfig"
+              "$ref": "#/$defs/CacheDiTConfig",
+              "required": [
+                "cache_backend"
+              ]
             }
           ]
         },
@@ -1147,6 +1162,6 @@
       "status": "prototype"
     }
   },
-  "title": "TensorRT-LLM 1.4.0rc3 trtllm-serve --visual_gen_args",
+  "title": "TensorRT-LLM 1.4.0rc4 trtllm-serve --visual_gen_args",
   "type": "object"
 }

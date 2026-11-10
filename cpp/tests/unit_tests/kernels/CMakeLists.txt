@@ -71,8 +71,6 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;rope;gpu")
-add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
-add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_tllm_gtest(
   mlaPreprocessTest
   OWNER
@@ -121,35 +119,6 @@ add_tllm_gtest(
   Threads::Threads
   LABELS
   "unit;kernels;moe-communication;gpu")
-
-add_gtest(
-  gemmSwigluRunnerTest
-  fused_gated_gemm/gemmSwigluRunnerTest.cu
-  ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/kernels/fused_gated_gemm/gemm_swiglu_e4m3.cu
-  NO_GTEST_MAIN)
-add_gtest(gemmSwigluKernelTestSm90Fp8
-          fused_gated_gemm/gemmSwigluKernelTestSm90Fp8.cu NO_GTEST_MAIN
-          NO_TLLM_LINKAGE)
-
-foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
-  set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-
-  if("90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
-    # No kernels should be parsed, unless hopper is specified. This is a build
-    # time improvement
-    target_compile_definitions(${target_name} PRIVATE COMPILE_HOPPER_TMA_GEMMS)
-    target_compile_definitions(${target_name}
-                               PRIVATE COMPILE_HOPPER_TMA_GROUPED_GEMMS)
-  endif()
-
-  # Suppress GCC note: the ABI for passing parameters with 64-byte alignment has
-  # changed in GCC 4.6 This note appears for kernels using TMA and clutters the
-  # compilation output.
-  if(NOT WIN32)
-    target_compile_options(
-      ${target_name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
-  endif()
-endforeach()
 
 set(ROUTING_KERNEL_TEST_SRC
     moe/routing/routingTest.cpp moe/routing/routingLlama4Test.cpp
@@ -237,6 +206,21 @@ add_tllm_gtest(
   FULL_STACK
   LABELS
   "unit;kernels;fmha;full-stack;gpu")
+add_tllm_gtest(
+  fmhaDispatcherTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDispatcherTest.cpp
+  LINK_LIBRARIES
+  kernels_src
+  context_attention_src
+  trtllm_gen_fmha
+  ${CUDA_DRV_LIB}
+  tllm::common_environment
+  tllm::common_logging
+  LABELS
+  "unit;kernel;host")
 
 add_tllm_gtest(
   nvfp4ColdPageKernelsTest
