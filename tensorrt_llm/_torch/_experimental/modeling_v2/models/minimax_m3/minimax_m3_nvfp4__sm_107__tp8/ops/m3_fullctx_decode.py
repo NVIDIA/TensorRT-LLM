@@ -77,8 +77,8 @@ class FullCtxPlan(FullCtxPlanBase):
         if self.own_reducer:
             reduce = _reduce_op()
             args = (
-                self.partial_o,
-                self.partial_stats,
+                self.workspace.partial_o,
+                self.workspace.partial_stats,
                 seq_lens,
                 output,
                 self.qlen,

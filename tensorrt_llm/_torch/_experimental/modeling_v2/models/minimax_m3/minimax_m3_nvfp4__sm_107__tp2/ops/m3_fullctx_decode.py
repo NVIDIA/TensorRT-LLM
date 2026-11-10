@@ -68,11 +68,12 @@ class FullCtxPlan(FullCtxPlanBase):
         sm_scale: float,
         output: torch.Tensor,
     ) -> None:
+        """Run the pinned decode and write its reduced attention output."""
         self._run_primts(q, k_pages, v_pages, block_table, seq_lens, sm_scale)
         if self.own_reducer:
             torch.ops.trtllm.minimax_m3_sm107_tp2_fullctx_reduce(
-                self.partial_o,
-                self.partial_stats,
+                self.workspace.partial_o,
+                self.workspace.partial_stats,
                 seq_lens,
                 output,
                 self.qlen,

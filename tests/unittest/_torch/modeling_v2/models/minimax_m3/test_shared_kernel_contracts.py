@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
@@ -76,6 +77,67 @@ def test_shared_state_default_reserves_shared_ctas(monkeypatch):
     monkeypatch.setattr(moe, "_kernel_module", kernel)
     with pytest.raises(ReachedKernelSelection):
         moe.M3MoeState(torch.device("cuda", 0), num_tokens=6, shared=True)
+
+
+@pytest.mark.cpu_only
+def test_full_context_plan_runs_primts_runtime_contract_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise plan construction and runtime operands without CUDA kernels."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (
+        m3_fullctx_decode,
+    )
+    from tensorrt_llm._torch.attention.backends.prims_ts import decode as tsdec
+    from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_decode import (
+        fmha_decode_config,
+    )
+
+    def compiled_main(
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        key_scales: torch.Tensor | None,
+        value_scales: torch.Tensor | None,
+        output: torch.Tensor,
+        *runtime_args: object,
+    ) -> None:
+        """Stand in for the compiled attention kernel."""
+        assert query.is_contiguous()
+        output.fill_(1.0)
+
+    def compiled_reducer(output: torch.Tensor, *runtime_args: object) -> None:
+        """Make the standalone reducer's output observable."""
+        output.add_(2.0)
+
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(
+        fmha_decode_config, "get_max_active_clusters_for_cluster_size", lambda cluster_size: 1
+    )
+    monkeypatch.setattr(
+        tsdec, "_get_compiled_decode", lambda spec: (compiled_main, compiled_reducer)
+    )
+    plan = m3_fullctx_decode.FullCtxPlan(
+        torch.device("cpu", 0),
+        qlen=1,
+        nreq=1,
+        max_kv_len=1 << 20,
+        recipe={"splits": 2},
+        own_reducer=False,
+        pdl=False,
+    )
+    geometry = plan.GEOMETRY
+    query = torch.ones(1, 2 * geometry.heads, geometry.head_dim).to(torch.float8_e4m3fn)[:, ::2]
+    key_pages = torch.zeros(1, geometry.kv_heads, geometry.page, geometry.head_dim).to(
+        torch.float8_e4m3fn
+    )
+    value_pages = torch.zeros_like(key_pages)
+    block_table = torch.zeros(1, 1, dtype=torch.int32)
+    sequence_lengths = torch.tensor([geometry.page], dtype=torch.int32)
+    output = torch.empty(query.shape, dtype=torch.bfloat16)
+
+    plan.run(query, key_pages, value_pages, block_table, sequence_lengths, 1.0, output)
+
+    torch.testing.assert_close(output, torch.full_like(output, 3.0))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA tensor storage required")

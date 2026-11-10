@@ -35,6 +35,7 @@ class FullCtxPlanBase:
         own_reducer: bool,
         pdl: bool,
     ) -> None:
+        """Build the pinned recipe with capacity-strided split scratch."""
         from tensorrt_llm._torch.attention.backends.prims_ts import decode as tsdec
         from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_decode.fmha_decode_config import (
             get_max_active_clusters_for_cluster_size,
@@ -90,7 +91,6 @@ class FullCtxPlanBase:
             head_dim=self.GEOMETRY.head_dim,
             seq_len_q=qlen,
             max_active_clusters=int(max_active),
-            requested_splits=splits,
         )
         compile_spec = tsdec._make_decode_compile_spec(
             spec,
@@ -121,15 +121,17 @@ class FullCtxPlanBase:
         self.workspace.cu_seqlens_q.zero_()
         self.workspace.attention_sinks.zero_()
         rows = self.GEOMETRY.heads_per_kv * qlen
-        partial_shape = (
+        if tuple(self.workspace.partial_o.shape) != (
             nreq,
             self.GEOMETRY.kv_heads,
             splits,
             rows,
             self.GEOMETRY.head_dim,
-        )
-        self.partial_o = self.workspace.partial_o.view(partial_shape)
-        self.partial_stats = self.workspace.partial_stats.view(partial_shape[:-1])
+        ):
+            raise RuntimeError(
+                f"PrimTS split scratch {tuple(self.workspace.partial_o.shape)} is not the "
+                f"[requests, KV heads, splits, {rows} rows, {self.GEOMETRY.head_dim}] layout the BF16 merge reads"
+            )
         self.own_reducer = own_reducer
         self.q_tokens_per_cta = max(int(cfg.q_tokens_per_cta), 1)
         self.tile_kv = int(cfg.tile_size_kv)
@@ -152,6 +154,7 @@ class FullCtxPlanBase:
         softmax_scale: float,
     ) -> None:
         """Launch the pinned plan through PrimTS's runtime decode ABI."""
+        # The kernel takes a compact query; a column view of the fused QKV projection is copied once.
         query = query.reshape(self.staging.shape).contiguous()
         runtime = self._tsdec._prepare_decode_runtime_unchecked(
             query,
@@ -170,7 +173,6 @@ class FullCtxPlanBase:
             workspace=self.workspace,
             compiled_main=self._main,
             compiled_reducer=None if self.own_reducer else self._primts_reducer,
-            requested_splits=int(self.recipe["splits"]),
             max_kv_len=self.max_kv_len,
             max_q_len=self.qlen,
         )

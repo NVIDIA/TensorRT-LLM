@@ -77,8 +77,8 @@ class FullCtxPlan(FullCtxPlanBase):
         self._run_primts(q, k_pages, v_pages, block_table, seq_lens, sm_scale)
         if self.own_reducer:
             args = (
-                self.partial_o,
-                self.partial_stats,
+                self.workspace.partial_o,
+                self.workspace.partial_stats,
                 seq_lens,
                 output,
                 self.qlen,
