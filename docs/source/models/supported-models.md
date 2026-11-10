@@ -318,12 +318,13 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes |
 | **FastH3** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image 2.1** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No | No |
+| **Qwen-Image 2.1** | Yes | Yes | No | Yes | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 
-Qwen-Image 2.1 supports single-GPU BF16 text-to-image generation with conditioning
-prefix KV caching. This cache is distinct from TeaCache. The original Qwen-Image feature
+Qwen-Image 2.1 supports BF16 text-to-image generation with conditioning-prefix KV
+caching and optional two-GPU CFG parallelism. CFG requires `guidance_scale > 1`
+and a provided `negative_prompt`. This cache is distinct from TeaCache. The original Qwen-Image feature
 row does not apply to Qwen-Image 2.1. See the
 [VisualGen examples](../../../examples/visual_gen/README.md) for usage.

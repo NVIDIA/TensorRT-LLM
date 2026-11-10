@@ -72,7 +72,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
 | **FastH3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
-| **Qwen-Image 2.1** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
+| **Qwen-Image 2.1** | Yes | Yes | No | No | No | Yes | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No |
@@ -80,6 +80,15 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
 
 Qwen-Image 2.1's conditioning-prefix KV cache is distinct from TeaCache and Cache-DiT.
+Negative-prompt CFG is enabled only when `guidance_scale > 1` and
+`negative_prompt` is provided (an empty string also enables the negative branch).
+The default `guidance_scale: 1.0` disables CFG and ignores negative prompts,
+matching Diffusers. The direct pipeline API also accepts `true_cfg_scale`, which
+overrides `negative_prompt_cfg_scale`. Positive and negative branches maintain
+separate prefix KV caches; their predictions use the plain CFG formula without
+the norm rescaling applied by the original Qwen-Image pipeline.
+Set `parallel_config.cfg_size: 2` to split the positive and negative branches
+across two GPUs when CFG is enabled.
 
 \* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
 
