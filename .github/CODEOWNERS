@@ -430,17 +430,17 @@
 /cpp/tests/unit_tests/kernels/moe/routing/routingLlama4Test.cpp @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
 /cpp/tests/unit_tests/kernels/moe/routing/routingTest.cpp @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
 /cpp/tests/unit_tests/kernels/moe/routing/routingTest.h @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/__init__.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention_kernel.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/dspark_rmsnorm_rope.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/mla/__init__.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp16.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp8.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_helpers.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/__init__.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/clc_tile_scheduler.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/kernel.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/__init__.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention_kernel.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/dspark_rmsnorm_rope.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/__init__.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp16.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp8.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_helpers.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/__init__.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/clc_tile_scheduler.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/kernel.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py @NVIDIA/trt-llm-kernels-devs
 /tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm.py @NVIDIA/trt-llm-kernels-devs
 /tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py @NVIDIA/trt-llm-kernels-devs
