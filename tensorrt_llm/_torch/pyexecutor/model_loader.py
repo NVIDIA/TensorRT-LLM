@@ -7,6 +7,7 @@ import os
 import sys
 import traceback
 import warnings
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
 from enum import Enum
@@ -1932,8 +1933,10 @@ class ModelLoader:
         """Name the checkpoint key prefixes the draft reads, so loaders may skip files without them."""
         key_prefixes = getattr(getattr(model, "draft_model", None),
                                "checkpoint_key_prefixes", None)
-        if isinstance(key_prefixes, tuple) and key_prefixes:
-            return {"key_prefixes": key_prefixes}
+        if isinstance(key_prefixes, str):
+            key_prefixes = (key_prefixes, )
+        if isinstance(key_prefixes, Sequence) and key_prefixes:
+            return {"key_prefixes": tuple(key_prefixes)}
         return {}
 
     def _load_separate_draft_weights(
