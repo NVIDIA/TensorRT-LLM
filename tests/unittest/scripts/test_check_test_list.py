@@ -409,7 +409,6 @@ def test_verify_qa_yaml_membership_and_waives(mod, tmp_path, monkeypatch):
         f"defaults:\n  launch:\n    mode: mpi\n    world_size: 16\ntests:\n  - case: '{case}'\n",
         encoding="utf-8",
     )
-    (qa_dir / "other.yml").write_text("other: []\n", encoding="utf-8")
     (qa_dir.parent / "waives.txt").write_text(f"{case} SKIP reason\n", encoding="utf-8")
     collected = []
 
@@ -424,6 +423,24 @@ def test_verify_qa_yaml_membership_and_waives(mod, tmp_path, monkeypatch):
     assert mod.load_collectable_entries(str(tmp_path)) == {mod.parse_test_entry(case)}
     mod.verify_waive_list(str(tmp_path), mod.argparse.Namespace(l0=False, qa=True))
     assert not (tmp_path / "nonexits_cases.json").exists()
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["", "[]\n", "test: []\n", "tests: null\n", "tests: {}\n", "tests: invalid\n"],
+    ids=["empty", "sequence", "misspelled-key", "null-tests", "mapping-tests", "scalar-tests"],
+)
+def test_verify_qa_yaml_rejects_invalid_structure(mod, tmp_path, monkeypatch, content):
+    qa_dir = tmp_path / "tests" / "integration" / "test_lists" / "qa"
+    qa_dir.mkdir(parents=True)
+    test_list = qa_dir / "invalid.yml"
+    test_list.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+
+    with pytest.raises(ValueError, match="expected a mapping with a 'tests' list") as exc:
+        mod.verify_qa_test_lists(str(tmp_path))
+
+    assert str(test_list) in str(exc.value)
 
 
 # --------------------------------------------------------------------------

@@ -1067,8 +1067,11 @@ def verify_qa_test_lists(llm_src):
                     import yaml
 
                     data = yaml.safe_load(test_file)
-                    if not isinstance(data, dict) or "tests" not in data:
-                        continue
+                    if not isinstance(data, dict) or not isinstance(
+                            data.get("tests"), list):
+                        raise ValueError(
+                            f"Invalid QA test list {test_def_file}: "
+                            "expected a mapping with a 'tests' list")
                     lines = [entry["case"] for entry in data["tests"]]
                     collection_list = os.path.join(
                         text_lists_dir,
