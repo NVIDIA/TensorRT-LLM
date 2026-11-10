@@ -68,40 +68,105 @@ _SENTINEL_MIN_DEFAULT_MAX_TOKENS = 159
 _SENTINEL_MAX_DEFAULT_REGION_BYTES = 64 << 20
 
 
+class NVLinkOneSidedConfigError(ValueError):
+    """An invalid NVLinkOneSided environment setting. Raised on every EP rank alike, and not
+    treated by the communication factory as "NVLinkOneSided unavailable"."""
+
+
+# CFT counted writes are gone; these variables shipped in v1.4.0rc1 / rc2 and are no longer read.
+# FORCE_CFT=0 pinned the fence path, so it still selects fence (with a warning) for one release.
+_REMOVED_FORCE_CFT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT"
+_REMOVED_CFT_ENVS = (
+    _REMOVED_FORCE_CFT_ENV,
+    "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH",
+    "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE",
+)
+_WORKSPACE_MB_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB"
+
+
+def _sentinel_env() -> tuple[str | None, ...]:
+    """The raw settings the sentinel vote reads; every EP rank must see the same ones."""
+    return tuple(
+        os.environ.get(name)
+        for name in (
+            SYNC_PROTOCOL_ENV,
+            SENTINEL_MAX_TOKENS_ENV,
+            _WORKSPACE_MB_ENV,
+            *_REMOVED_CFT_ENVS,
+        )
+    )
+
+
 def get_sync_protocol() -> str:
-    """``TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL``: "auto" (also when unset), "fence" or "sentinel"."""
-    value = os.environ.get(SYNC_PROTOCOL_ENV, "").strip().lower() or "auto"
+    """``TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL``: "auto" (also when unset), "fence" or "sentinel".
+
+    Raises:
+        NVLinkOneSidedConfigError: If the value is none of these.
+    """
+    for name in _REMOVED_CFT_ENVS:
+        if os.environ.get(name) is not None and not (
+            name == _REMOVED_FORCE_CFT_ENV and os.environ.get(name) == "0"
+        ):
+            tllm_logger.warning_once(
+                f"{name} is no longer read: CFT counted writes were removed from NVLinkOneSided. "
+                f"Use {SYNC_PROTOCOL_ENV}=fence|sentinel|auto.",
+                key=f"nvlink_one_sided_removed_{name}",
+            )
+    value = os.environ.get(SYNC_PROTOCOL_ENV, "").strip().lower()
+    if not value and os.environ.get(_REMOVED_FORCE_CFT_ENV) == "0":
+        tllm_logger.warning_once(
+            f"{_REMOVED_FORCE_CFT_ENV}=0 is deprecated and will stop working in a future release; "
+            f"it now selects the fence path, as {SYNC_PROTOCOL_ENV}=fence does.",
+            key="nvlink_one_sided_force_cft_0",
+        )
+        return "fence"
+    value = value or "auto"
     if value not in SYNC_PROTOCOLS:
-        raise ValueError(
+        raise NVLinkOneSidedConfigError(
             f"{SYNC_PROTOCOL_ENV} must be one of {', '.join(SYNC_PROTOCOLS)}, got {value!r}"
         )
     return value
 
 
-def _get_sentinel_max_tokens() -> int | None:
-    env_value = os.environ.get(SENTINEL_MAX_TOKENS_ENV)
+def get_sentinel_max_tokens() -> int | None:
+    """``TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS``: a positive token limit, or None when unset.
+
+    Raises:
+        NVLinkOneSidedConfigError: If the value is not a positive integer.
+    """
+    env_value = os.environ.get(SENTINEL_MAX_TOKENS_ENV, "").strip()
     if not env_value:
         return None
     try:
         max_tokens = int(env_value)
     except ValueError as e:
-        raise ValueError(f"{SENTINEL_MAX_TOKENS_ENV} must be an integer") from e
+        raise NVLinkOneSidedConfigError(
+            f"{SENTINEL_MAX_TOKENS_ENV} must be a positive integer, got {env_value!r}"
+        ) from e
     if max_tokens <= 0:
-        raise ValueError(f"{SENTINEL_MAX_TOKENS_ENV} must be positive")
+        raise NVLinkOneSidedConfigError(
+            f"{SENTINEL_MAX_TOKENS_ENV} must be a positive integer, got {env_value!r} "
+            f"(use {SYNC_PROTOCOL_ENV}=fence to turn the sentinel transport off)"
+        )
     return max_tokens
 
 
-def sentinel_payload_format(quant_algo: QuantAlgo | None) -> str:
-    """Sentinel payload format of the rows MoE backends dispatch for ``quant_algo``.
+def sentinel_payload_format(quant_algo: QuantAlgo | None) -> str | None:
+    """Sentinel payload format of the rows a MoE layer of ``quant_algo`` dispatches, or None when
+    the transport carries no such rows.
 
-    NVFP4 and MXFP8-activation formats dispatch quantized rows with their block
-    scales; the others dispatch BF16 activations (FP8 block-scale backends
-    quantize after dispatch). A step whose rows differ takes another transport.
+    NVFP4 (and its AWQ / ARC calibrations) and the MXFP8-activation formats dispatch quantized rows
+    with their block scales; FP8 per-tensor activations (FP8, W4A8_MXFP4_FP8, W4A8_NVFP4_FP8) travel
+    as e4m3 bytes without block scales, a format the kernels do not carry. The others dispatch BF16
+    activations (FP8 block-scale backends quantize after dispatch). Pass the layer's own quant algo:
+    a mixed-precision checkpoint overrides it per layer.
     """
-    if quant_algo == QuantAlgo.NVFP4:
+    if quant_algo in (QuantAlgo.NVFP4, QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC):
         return "NVFP4"
     if quant_algo in (QuantAlgo.MXFP8, QuantAlgo.W4A8_MXFP4_MXFP8):
         return "MXFP8"
+    if quant_algo in (QuantAlgo.FP8, QuantAlgo.W4A8_MXFP4_FP8, QuantAlgo.W4A8_NVFP4_FP8):
+        return None
     return "BF16"
 
 
@@ -153,37 +218,36 @@ def _sentinel_unsupported_reason(
     num_slots: int,
     hidden_size: int,
     dtype: torch.dtype,
-    payload_format: str,
+    payload_format: str | None,
     use_low_precision_combine: bool,
     fault_tolerant: bool,
 ) -> str | None:
     """Why this rank cannot use the sentinel transport, or ``None`` if it can.
 
-    Never raises: every rank must reach the collective sentinel vote.
+    Every unsupported configuration is a reason, not an exception, so that every rank reaches the
+    collective sentinel vote.
     """
     thop = _tllm_internal.thop
+    if payload_format is None:
+        return "the layer dispatches FP8 per-tensor rows, which it does not carry"
+    if not torch.ops.trtllm.moe_a2a_sentinel_available():
+        return "its kernels are not built for this GPU (SM100, SM103 and SM107 only)"
+    if ep_size > int(thop.MOE_A2A_SENTINEL_MAX_RANKS):
+        return f"it supports at most {int(thop.MOE_A2A_SENTINEL_MAX_RANKS)} EP ranks"
+    if num_slots % ep_size != 0:
+        return "it needs the expert slots to split evenly across EP ranks"
+    if dtype != torch.bfloat16:
+        return "it combines BF16 expert outputs only"
+    if use_low_precision_combine:
+        return "it has no FP8 combine"
+    if fault_tolerant:
+        return "the AlltoAll watchdog and rank-mask recovery observe fence completion flags only"
+    if payload_format not in SENTINEL_PAYLOAD_FORMATS:
+        return f"it does not carry the payload format {payload_format}"
     try:
-        if not torch.ops.trtllm.moe_a2a_sentinel_available():
-            return "its kernels are not built for this GPU (SM100, SM103 and SM107 only)"
-        if ep_size > int(thop.MOE_A2A_SENTINEL_MAX_RANKS):
-            return f"it supports at most {int(thop.MOE_A2A_SENTINEL_MAX_RANKS)} EP ranks"
-        if top_k > int(thop.MOE_A2A_SENTINEL_MAX_TOP_K):
-            return f"it supports top_k <= {int(thop.MOE_A2A_SENTINEL_MAX_TOP_K)}"
-        if num_slots % ep_size != 0:
-            return "it needs the expert slots to split evenly across EP ranks"
-        if dtype != torch.bfloat16:
-            return "it combines BF16 expert outputs only"
-        if use_low_precision_combine:
-            return "it has no FP8 combine"
-        if fault_tolerant:
-            return (
-                "the AlltoAll watchdog and rank-mask recovery observe fence completion flags only"
-            )
-        if payload_format not in SENTINEL_PAYLOAD_FORMATS:
-            return f"it does not carry the payload format {payload_format}"
         sentinel_row(payload_format, hidden_size, top_k)
-    except Exception as error:  # CUDA queries and the native row checks alike
-        return f"the sentinel support probe failed: {type(error).__name__}: {error}"
+    except RuntimeError as error:  # the native row check (TORCH_CHECK)
+        return f"it does not carry hidden size {hidden_size} in {payload_format}: {error}"
     return None
 
 
@@ -220,6 +284,10 @@ class NVLinkOneSided(Communication):
     # Shared workspaces/memory across the process, keyed by payload layout.
     _WORKSPACES: Dict[Tuple[object, ...], dict] = {}
     _WORKSPACE_REFCOUNTS: Dict[Tuple[object, ...], int] = {}
+    # Outcome of the sentinel vote per layout and settings: (token limit, payload format, layout
+    # after the vote). Layers sharing a layout vote once; every rank builds its layers in the same
+    # order, so every rank hits or misses alike.
+    _SENTINEL_VOTES: Dict[Tuple[object, ...], Tuple[int, Optional[str], Tuple[int, ...]]] = {}
     _WORKSPACE: dict | None = None
 
     # MetaInfo indices - initialized from C++ constants
@@ -334,7 +402,7 @@ class NVLinkOneSided(Communication):
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         alltoall_watchdog_on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
-        sentinel_payload_format: Optional[str] = None,
+        sentinel_payload_format: Optional[str] = "BF16",
     ) -> None:
         """
         Initialize NVLinkOneSided with workspace allocation.
@@ -389,7 +457,8 @@ class NVLinkOneSided(Communication):
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
             alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
             sentinel_payload_format: Dispatch payload format whose small steps the sentinel transport carries,
-                one of SENTINEL_PAYLOAD_FORMATS (see sentinel_payload_format()); None means "BF16". Needs
+                one of SENTINEL_PAYLOAD_FORMATS (see sentinel_payload_format()), or None when the layer
+                dispatches rows the transport does not carry (no sentinel regions then). Needs
                 hidden_size and dtype.
         """
         super().__init__(mapping)
@@ -450,12 +519,12 @@ class NVLinkOneSided(Communication):
                 metainfo,
                 hidden_size,
                 dtype,
-                sentinel_payload_format or "BF16",
+                sentinel_payload_format,
                 fault_tolerant=ep_group_health is not None
                 or alltoall_watchdog_timeout_s is not None,
             )
             auto_workspace_size = int(metainfo[self.WORKSPACE_SIZE_INDEX])
-        workspace_mb_env = os.environ.get("TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB")
+        workspace_mb_env = os.environ.get(_WORKSPACE_MB_ENV)
         if workspace_mb_env:
             self.workspace_size_per_rank = int(workspace_mb_env) * 1024 * 1024
             msg = f"NVLinkOneSided: Forcing workspace size to {self.workspace_size_per_rank} bytes (TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB={workspace_mb_env})."
@@ -617,60 +686,108 @@ class NVLinkOneSided(Communication):
         metainfo: torch.Tensor,
         hidden_size: int,
         dtype: torch.dtype,
-        payload_format: str,
+        payload_format: Optional[str],
         fault_tolerant: bool,
     ) -> None:
         """Vote on the sentinel transport and, where every rank takes it, append its regions to ``metainfo``.
 
-        Collective over the EP group: every rank votes its own decision, its SM
-        count (for the default token limit), its sync protocol and its explicit
-        token limit.
+        Collective over the EP group, once per layout and settings (see ``_SENTINEL_VOTES``).
         """
-        protocol = get_sync_protocol()
-        reason = None
-        num_sms = None
-        if protocol != "fence":
-            reason = _sentinel_unsupported_reason(
-                ep_size=self.ep_size,
-                top_k=self.top_k,
-                num_slots=self.num_experts,
-                hidden_size=hidden_size,
-                dtype=dtype,
-                payload_format=payload_format,
-                use_low_precision_combine=self.use_low_precision_combine,
-                fault_tolerant=fault_tolerant,
-            )
-            if reason is None:
-                num_sms = torch.cuda.get_device_properties(
-                    torch.cuda.current_device()
-                ).multi_processor_count
-        max_tokens_request = _get_sentinel_max_tokens()
-        votes = MnnvlMemory.get_comm(self.mapping).allgather(
-            (protocol != "fence" and reason is None, num_sms, protocol, max_tokens_request)
+        key = (
+            self.ep_rank,
+            self.ep_size,
+            self.num_experts,
+            self.top_k,
+            self.max_num_tokens_per_rank,
+            hidden_size,
+            dtype,
+            payload_format,
+            fault_tolerant,
+            self.use_low_precision_combine,
+            tuple(metainfo.tolist()),
+            _sentinel_env(),
         )
-        for index, env in ((2, SYNC_PROTOCOL_ENV), (3, SENTINEL_MAX_TOKENS_ENV)):
-            if len({vote[index] for vote in votes}) > 1:
-                raise ValueError(
-                    f"{env} must be the same on every EP rank, got "
-                    + ", ".join(sorted({repr(vote[index]) for vote in votes}))
-                )
+        vote = NVLinkOneSided._SENTINEL_VOTES.get(key)
+        if vote is None:
+            vote = self._vote_sentinel(
+                metainfo.clone(), hidden_size, dtype, payload_format, fault_tolerant
+            )
+            NVLinkOneSided._SENTINEL_VOTES[key] = vote
+        max_tokens, payload_format, layout = vote
+        metainfo.copy_(torch.tensor(layout, dtype=metainfo.dtype))
+        if max_tokens:
+            self.sentinel_max_tokens = max_tokens
+            self._sentinel_format = payload_format
+            self._sentinel_row = sentinel_row(payload_format, hidden_size, self.top_k)
+
+    def _vote_sentinel(
+        self,
+        metainfo: torch.Tensor,
+        hidden_size: int,
+        dtype: torch.dtype,
+        payload_format: Optional[str],
+        fault_tolerant: bool,
+    ) -> Tuple[int, Optional[str], Tuple[int, ...]]:
+        """The collective sentinel vote: (token limit, 0 when off; payload format; layout).
+
+        Every rank votes its own support and SM count (for the default token limit) along with its
+        raw settings, and parses the settings only after seeing that every rank has the same ones,
+        so an invalid or mismatched setting raises on every rank instead of stranding the others in
+        the collective.
+        """
+        reason = _sentinel_unsupported_reason(
+            ep_size=self.ep_size,
+            top_k=self.top_k,
+            num_slots=self.num_experts,
+            hidden_size=hidden_size,
+            dtype=dtype,
+            payload_format=payload_format,
+            use_low_precision_combine=self.use_low_precision_combine,
+            fault_tolerant=fault_tolerant,
+        )
+        num_sms = (
+            torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+            if reason is None
+            else None
+        )
+        votes = MnnvlMemory.get_comm(self.mapping).allgather(
+            (reason is None, num_sms, _sentinel_env())
+        )
+        if len({vote[2] for vote in votes}) > 1:
+            raise NVLinkOneSidedConfigError(
+                "NVLinkOneSided settings must be the same on every EP rank "
+                f"({SYNC_PROTOCOL_ENV}, {SENTINEL_MAX_TOKENS_ENV}, {_WORKSPACE_MB_ENV} and the removed "
+                f"CFT variables), got {sorted({repr(vote[2]) for vote in votes})}"
+            )
+        protocol = get_sync_protocol()
+        max_tokens_request = get_sentinel_max_tokens()
+        off = (0, None, tuple(metainfo.tolist()))
+        if protocol == "fence":
+            return off
         if not all(vote[0] for vote in votes):
-            if protocol != "fence":
-                log = tllm_logger.warning if protocol == "sentinel" else tllm_logger.info
-                log(
-                    "NVLinkOneSided AlltoAll: sentinel transport disabled: "
-                    f"{reason or 'another EP rank does not support it or turned it off'}"
-                )
-            return
+            log = tllm_logger.warning_once if protocol == "sentinel" else tllm_logger.info_once
+            message = (
+                "NVLinkOneSided AlltoAll: sentinel transport disabled: "
+                f"{reason or 'another EP rank does not support it'}"
+            )
+            log(message, key=message)
+            return off
 
         thop = _tllm_internal.thop
         row = sentinel_row(payload_format, hidden_size, self.top_k)
+        cap = int(thop.MOE_A2A_SENTINEL_MAX_TOKENS_PER_RANK)
         if max_tokens_request is None:
             max_tokens = default_sentinel_max_tokens(
                 self.ep_size, min(vote[1] for vote in votes), row
             )
         else:
-            max_tokens = min(max_tokens_request, int(thop.MOE_A2A_SENTINEL_MAX_TOKENS_PER_RANK))
+            if max_tokens_request > cap:
+                tllm_logger.warning_once(
+                    f"{SENTINEL_MAX_TOKENS_ENV}={max_tokens_request} exceeds the sentinel "
+                    f"transport's {cap} tokens per rank; using {cap}",
+                    key="nvlink_one_sided_sentinel_max_tokens_clamped",
+                )
+            max_tokens = min(max_tokens_request, cap)
         max_tokens = min(max_tokens, self.max_num_tokens_per_rank)
         size_before = int(metainfo[self.WORKSPACE_SIZE_INDEX])
         torch.ops.trtllm.moe_a2a_sentinel_extend_workspace_layout(
@@ -679,15 +796,24 @@ class NVLinkOneSided(Communication):
             int(getattr(thop, f"MOE_A2A_SENTINEL_FORMAT_{payload_format}")),
             hidden_size,
         )
-        self.sentinel_max_tokens = max_tokens
-        self._sentinel_format = payload_format
-        self._sentinel_row = row
-        tllm_logger.info(
+        size_after = int(metainfo[self.WORKSPACE_SIZE_INDEX])
+        workspace_mb = os.environ.get(_WORKSPACE_MB_ENV)
+        if workspace_mb and int(workspace_mb) * (1 << 20) < size_after:
+            # The same setting on every rank (checked above), so every rank turns it off alike.
+            message = (
+                f"NVLinkOneSided AlltoAll: sentinel transport disabled: {_WORKSPACE_MB_ENV}="
+                f"{workspace_mb} leaves no room for its {(size_after - size_before) / (1 << 20):.1f} "
+                "MiB of regions per rank"
+            )
+            tllm_logger.warning_once(message, key=message)
+            return off
+        message = (
             f"NVLinkOneSided AlltoAll: sentinel transport for {payload_format} steps of up to "
-            f"{max_tokens} tokens per rank, "
-            f"{(int(metainfo[self.WORKSPACE_SIZE_INDEX]) - size_before) / (1 << 20):.1f} MiB "
+            f"{max_tokens} tokens per rank, {(size_after - size_before) / (1 << 20):.1f} MiB "
             "of workspace per rank"
         )
+        tllm_logger.info_once(message, key=message)
+        return max_tokens, payload_format, tuple(metainfo.tolist())
 
     def use_sentinel_for_dispatch(
         self,
@@ -1140,6 +1266,12 @@ class NVLinkOneSided(Communication):
         recover from a forward that called ``dispatch`` but did not reach
         ``combine`` — e.g. because an OOM aborted the forward. Without this,
         the next ``dispatch`` would raise ``dispatch called twice``.
+
+        It resets this Python state machine only. After a sentinel dispatch
+        without its combine, the native op still holds the round open, and the
+        peers' rows of that round are still in flight; only re-initializing
+        the workspace (``moe_a2a_initialize``, collective) recovers it. The
+        in-tree caller (the warmup OOM handler) runs only without peers.
         """
         self._dispatch_state = {"phase": "idle"}
 

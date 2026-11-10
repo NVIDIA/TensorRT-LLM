@@ -28,7 +28,10 @@ from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
     SENTINEL_MAX_TOKENS_ENV,
     SYNC_PROTOCOL_ENV,
     NVLinkOneSided,
+    NVLinkOneSidedConfigError,
     default_sentinel_max_tokens,
+    get_sentinel_max_tokens,
+    get_sync_protocol,
     sentinel_payload_format,
     sentinel_row,
 )
@@ -933,11 +936,35 @@ def test_sentinel_payload_format() -> None:
     from tensorrt_llm.quantization.mode import QuantAlgo
 
     assert sentinel_payload_format(QuantAlgo.NVFP4) == "NVFP4"
+    assert sentinel_payload_format(QuantAlgo.NVFP4_AWQ) == "NVFP4"  # a calibration of NVFP4
     assert sentinel_payload_format(QuantAlgo.W4A8_MXFP4_MXFP8) == "MXFP8"
     assert sentinel_payload_format(QuantAlgo.MXFP8) == "MXFP8"
     # FP8 block-scale backends quantize after dispatch.
     assert sentinel_payload_format(QuantAlgo.FP8_BLOCK_SCALES) == "BF16"
     assert sentinel_payload_format(None) == "BF16"
+    # FP8 per-tensor rows carry no block scales: no sentinel format.
+    assert sentinel_payload_format(QuantAlgo.FP8) is None
+
+
+@pytest.mark.cpu_only
+def test_sync_protocol_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+    monkeypatch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
+    assert get_sync_protocol() == "auto"
+    assert get_sentinel_max_tokens() is None
+    # The removed CFT pin keeps selecting fence for one release.
+    monkeypatch.setenv("TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT", "0")
+    assert get_sync_protocol() == "fence"
+    monkeypatch.setenv(SYNC_PROTOCOL_ENV, " Sentinel ")
+    assert get_sync_protocol() == "sentinel"  # an explicit protocol wins
+    for name, value, parse in (
+        (SYNC_PROTOCOL_ENV, "off", get_sync_protocol),
+        (SENTINEL_MAX_TOKENS_ENV, "0", get_sentinel_max_tokens),
+        (SENTINEL_MAX_TOKENS_ENV, "many", get_sentinel_max_tokens),
+    ):
+        monkeypatch.setenv(name, value)
+        with pytest.raises(NVLinkOneSidedConfigError):
+            parse()
 
 
 @pytest.mark.cpu_only
@@ -985,8 +1012,8 @@ def _run_watchdog_worker(_unused: int) -> dict:
 
     import torch
 
-    # Pin the policy: a rank-mask communicator keeps the sentinel transport off anyway.
-    os.environ[SYNC_PROTOCOL_ENV] = "fence"
+    # The default policy: a watchdog communicator must keep the sentinel transport off by itself.
+    os.environ.pop(SYNC_PROTOCOL_ENV, None)
 
     from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import EPGroupHealth
 
@@ -1041,6 +1068,7 @@ def _run_watchdog_worker(_unused: int) -> dict:
             "flags": flags,
             "expected_flag": expected,
             "timeouts": [t.missing_ranks for t in timeouts],
+            "sentinel_max_tokens": comm.sentinel_max_tokens,
         }
     finally:
         comm.destroy()
@@ -1072,5 +1100,8 @@ def test_dispatch_publishes_watchdog_flags(ep_size: int) -> None:
             assert result["timeouts"] == [], (
                 f"rank {rank}: watchdog reported {result['timeouts']} on a healthy collective"
             )
+            # Sentinel steps write no completion flags, so the watchdog keeps them off.
+            assert result["sentinel_max_tokens"] == 0, f"rank {rank}: sentinel on with a watchdog"
+
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
