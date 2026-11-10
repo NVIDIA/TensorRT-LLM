@@ -3,15 +3,18 @@
 """``KernelBuilder``: kernels built on worker threads before the calls that need them.
 
 An op whose kernels compile on first use, and that does not go through the autotuner,
-registers them here. On the first call of each call signature inside a build pass, the
-op lists every kernel that signature reaches over its runtime shapes; worker threads
-then build them in parallel. The op's own later call finds a kernel built, or waits on
-the op's own lock for a build that is still running.
+registers them here, the way an op that does registers its tactics with the autotuner.
+The forward supplies the largest shape; the op sweeps its own shape space from it. Inside
+a build pass, the op's ``BuildConfig`` turns the shape a call has into the shapes to build
+for, as a ``TuningConfig`` turns it into tuning buckets, and the op lists the kernels of
+those its call signature has not listed yet. Worker threads then build them in parallel.
+The op's own later call finds a kernel built, or waits on the op's own lock for a build
+that is still running.
 
-A rehearsal is a build pass over forwards on dummy weights, run before the checkpoint
-loads: the ops list their kernels without building or launching them, and the pass does
-not wait, so the builds run while the weights load. It runs for a model that one of the
-op families in ``_FAMILIES`` reaches.
+A rehearsal is a build pass over the autotuner warmup's forwards on dummy weights, run
+before the checkpoint loads: the ops list their kernels without building or launching
+them, and the pass does not wait, so the builds run while the weights load. It runs for
+a model that one of the op families in ``_FAMILIES`` reaches.
 
 ``TLLM_KERNEL_BUILDER=0`` turns it off: no pass is active and nothing is submitted.
 ``TLLM_KERNEL_BUILDER_REHEARSAL=0`` keeps the builds but not the rehearsal: they start
@@ -24,17 +27,30 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import importlib
+import itertools
 import os
 import queue
 import threading
 import time
-from typing import Any, Callable, Dict, Hashable, Iterable, Iterator, List, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 
 from tensorrt_llm.logger import logger
 
-__all__ = ["KernelBuilder"]
+__all__ = ["BuildConfig", "DynamicSpec", "KernelBuilder"]
 
 _ENV = "TLLM_KERNEL_BUILDER"
 _REHEARSAL_ENV = "TLLM_KERNEL_BUILDER_REHEARSAL"
@@ -55,6 +71,39 @@ _FAMILIES = {
 Build = Callable[[], bool]
 
 _QUEUED, _DONE, _FAILED = "queued", "done", "failed"
+
+
+@dataclasses.dataclass(frozen=True)
+class DynamicSpec:
+    """A dimension an op's kernels depend on, swept as the autotuner sweeps a
+    ``DynamicTensorSpec``.
+
+    Args:
+        name: The dimension's key in the shape a call has and in the shapes swept.
+        gen_buckets: The values to build for: a tuple, or a function of the value the
+            call has (the largest a forward supplies) returning them. The call's own
+            value is always one of them.
+    """
+
+    name: str
+    gen_buckets: Union[Tuple[int, ...], Callable[[int], Iterable[int]]]
+
+
+@dataclasses.dataclass(frozen=True)
+class BuildConfig:
+    """The dimensions an op's kernels depend on, as a ``TuningConfig`` declares its own."""
+
+    dynamic_specs: Tuple[DynamicSpec, ...] = ()
+
+    def shapes(self, observed: Mapping[str, int]) -> List[Dict[str, int]]:
+        """Every combination of the dimensions' buckets for a call that has ``observed``."""
+        axes = []
+        for spec in self.dynamic_specs:
+            value = observed[spec.name]
+            buckets = spec.gen_buckets(value) if callable(spec.gen_buckets) else spec.gen_buckets
+            axes.append(sorted(set(buckets) | {value}))
+        names = [spec.name for spec in self.dynamic_specs]
+        return [dict(zip(names, point)) for point in itertools.product(*axes)]
 
 
 @dataclasses.dataclass
@@ -116,7 +165,8 @@ class KernelBuilder:
         self._passes = 0
         self._rehearsals = 0
         self._pending = 0
-        self._signatures: set = set()
+        # The shapes listed so far for each (op, call signature).
+        self._listed: Dict[Tuple[str, Hashable], set] = {}
         self._states: Dict[Tuple[str, Hashable], str] = {}
         self._stats: Dict[str, _OpStats] = {}
 
@@ -132,8 +182,8 @@ class KernelBuilder:
 
     @contextlib.contextmanager
     def build_pass(self, name: str, wait: bool = True) -> Iterator[None]:
-        """Ops list their kernels on first sight inside. The outermost pass logs what was
-        built at its end, after waiting for the builds unless ``wait`` is False."""
+        """Inside, ops list the kernels of the shapes they sweep. The outermost pass logs
+        what was built at its end, after waiting for the builds unless ``wait`` is False."""
         if not self.enabled:
             yield
             return
@@ -200,22 +250,29 @@ class KernelBuilder:
         self,
         op: str,
         signature: Hashable,
-        list_builds: Callable[[], Iterable[Tuple[Hashable, Build]]],
+        config: BuildConfig,
+        observed: Mapping[str, int],
+        list_builds: Callable[[List[Dict[str, int]]], Iterable[Tuple[Hashable, Build]]],
     ) -> None:
-        """On the first sight of ``(op, signature)`` in a build pass, submit every build
-        ``list_builds()`` returns as ``(key, build)``.
+        """In a build pass, submit every build ``list_builds(shapes)`` returns as
+        ``(key, build)``, where ``shapes`` are those ``config`` sweeps for a call that has
+        ``observed`` and that no earlier call of ``(op, signature)`` swept.
 
         A failure to list leaves the kernels to the op.
         """
         if not self.active():
             return
+        swept = config.shapes(observed)
         with self._lock:
-            if (op, signature) in self._signatures:
+            listed = self._listed.setdefault((op, signature), set())
+            new_signature = not listed
+            shapes = [shape for shape in swept if tuple(sorted(shape.items())) not in listed]
+            if not shapes:
                 return
-            self._signatures.add((op, signature))
+            listed.update(tuple(sorted(shape.items())) for shape in shapes)
         t0 = time.perf_counter()
         try:
-            builds = list(list_builds())
+            builds = list(dict(list_builds(shapes)).items())
         except Exception as e:  # noqa: BLE001 - the op still builds what it needs on first use
             logger.warning(
                 f"[KernelBuilder] {op}: listing the kernels of a call signature failed; the op "
@@ -226,11 +283,12 @@ class KernelBuilder:
         queued = sum(self.submit(op, key, build) for key, build in self._rotated(builds))
         with self._lock:
             stats = self._op_stats(op)
-            stats.signatures += 1
+            stats.signatures += new_signature
             stats.list_s += list_s
         logger.info(
-            f"[KernelBuilder] {op}: {len(builds)} kernels for a new call signature, "
-            f"{queued} queued ({list_s:.1f}s to list)"
+            f"[KernelBuilder] {op}: {len(builds)} kernels over {len(shapes)} new shapes of "
+            f"{'a new' if new_signature else 'a'} call signature, {queued} queued "
+            f"({list_s:.1f}s to list)"
         )
 
     def submit(self, op: str, key: Hashable, build: Build) -> bool:

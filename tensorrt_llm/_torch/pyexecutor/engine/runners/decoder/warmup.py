@@ -301,15 +301,17 @@ class DecoderWarmup:
         # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
         warmup_named_allreduce_topologies(self.model)
         # Retain a partial summary when a phase raises. Ops list their kernels for
-        # KernelBuilder on first sight; the pass waits for the builds at its end.
+        # KernelBuilder as calls reach new shapes; the pass waits for the builds at its end.
         with self._warmup_timer, KernelBuilder.get().build_pass("warmup"):
             return self._warmup_scheduled(resource_manager, kv_cache_manager)
 
     def rehearse(self, resource_manager: ResourceManager) -> None:
-        """The MSA indexer prewarm and the attention warmup forwards, run eagerly on
+        """The autotuner warmup's forwards, run eagerly and outside the autotuner on
         whatever weights the model holds, inside the caller's KernelBuilder rehearsal.
 
-        Every rank calls it. Its requests are released and its workspaces freed.
+        They supply the largest shapes: each op the forwards reach sweeps its own shapes
+        down from them. Every rank calls it. Its requests are released and its workspaces
+        freed.
         """
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
@@ -319,10 +321,8 @@ class DecoderWarmup:
         if self.mapping.cp_size > 1 and self.mapping.cp_config.get("cp_type") != CpType.HELIX:
             return
         AutoTuner.get()
-        can_run_general_warmup = self._agreement.agree_flag(
-            not self.mapping.has_cp_helix()
-            and self.guided_decoder is None
-            and not isinstance(kv_cache_manager, MambaHybridCacheManager)
+        warmup_configs, _ = _autotuner_warmup_configs(
+            self, resource_manager, generation_only=self.mapping.has_cp_helix()
         )
         from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
 
@@ -335,9 +335,10 @@ class DecoderWarmup:
                 torch.compiler.set_stance("force_eager"),
                 self._torch_compile_bypass(),
                 nccl_window_allocation_suppressed(),
+                self._graphs.no_cuda_graph(),
             ):
-                self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)
-                self._run_attention_warmup(resource_manager, can_run_general_warmup)
+                for num_tokens, num_gen_requests in warmup_configs:
+                    self._rehearse_batch(resource_manager, num_tokens, num_gen_requests)
         except BaseException:
             self._reset_moe_alltoall_state()
             raise
@@ -347,6 +348,36 @@ class DecoderWarmup:
             clear_memory_buffers()
             gc.collect()
             torch.cuda.empty_cache()
+
+    def _rehearse_batch(
+        self, resource_manager: ResourceManager, num_tokens: int, num_gen_requests: int
+    ) -> None:
+        """One forward of the rehearsal, on a batch as the autotuner warmup builds it."""
+        warmup_request = self._dummy_requests.create_warmup_request(
+            resource_manager, num_tokens, num_gen_requests
+        )
+        with self._dummy_requests.release_batch_context(warmup_request, resource_manager) as batch:
+            if not self._agreement.should_run_warmup_batch(
+                batch,
+                num_tokens,
+                f"rehearsal, num_tokens={num_tokens}, num_gen_requests={num_gen_requests}",
+            ):
+                return
+            with self._warmup_timer.phase(
+                f"rehearsal shape num_tokens={num_tokens}, num_gen_requests={num_gen_requests}",
+                record=False,
+                log_start=True,
+            ):
+                with discard_nccl_window_tensor_outputs(
+                    (getattr(self, "_warmup_inputs", None), batch)
+                ):
+                    self._forward_warmup(
+                        batch,
+                        resource_manager,
+                        enable_spec_decode=self._config.is_spec_decode,
+                        runtime_draft_len=get_static_draft_len(self._config.spec_config),
+                    )
+                torch.cuda.synchronize()
 
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager
@@ -1281,25 +1312,9 @@ class DecoderWarmup:
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
 
-        kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER
+        warmup_configs, curr_max_num_tokens = _autotuner_warmup_configs(
+            self, resource_manager, generation_only
         )
-        if generation_only:
-            tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
-            num_gen_requests = min(
-                self._config.max_batch_size,
-                self._config.max_num_tokens // tokens_per_gen_request,
-            )
-            curr_max_num_tokens = num_gen_requests * tokens_per_gen_request
-        else:
-            token_num_upper_bound = min(
-                self._config.max_num_tokens,
-                self._config.max_batch_size * (self._config.max_seq_len - 1),
-            )
-            curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
-                token_num_upper_bound=token_num_upper_bound,
-                max_num_draft_tokens=self._config.original_max_draft_len,
-            )
 
         # The warmup runs again after the KV cache is rebuilt; when the token
         # shape is unchanged and no MXFP8 tuning is pending, the profiling
@@ -1328,18 +1343,6 @@ class DecoderWarmup:
             f"native MXFP8={enable_native_mxfp8_autotuner}, "
             f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})..."
         )
-
-        if generation_only:
-            warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
-        else:
-            warmup_configs = [(curr_max_num_tokens, 0)]
-            if (
-                self.guided_decoder is None
-                and not self.mapping.has_pp()
-                and not is_context_only_kv_cache(kv_cache_manager)
-            ):
-                # Add generation request to warmup the autotuner cache.
-                warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
 
         def run_autotuner_pass(autotune_context: Any, synchronize_trtllm_cache: bool) -> bool:
             """Run one isolated tuning pass with fresh synthetic batches."""
@@ -1756,3 +1759,42 @@ class DecoderWarmup:
         if self.mapping.tp_size > 1 and self.dist is not None:
             self.dist.tp_allgather(1)
         logger.info("MiniMax-M3 MSA indexer prewarm complete")
+
+
+def _autotuner_warmup_configs(
+    warmup: DecoderWarmup, resource_manager: ResourceManager, generation_only: bool = False
+) -> tuple[list[tuple[int, int]], int]:
+    """The autotuner warmup's batches as ``(num_tokens, num_gen_requests)``, and its
+    largest token count. A function of the warmup, not a method: tests run the warmup's
+    methods on stand-in objects.
+
+    A context batch of the most tokens this rank's KV cache holds, and one generation
+    request with its draft tokens; with ``generation_only``, one batch of
+    ``max_batch_size`` generation requests instead.
+    """
+    kv_cache_manager = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+    if generation_only:
+        tokens_per_gen_request = 1 + warmup._config.max_total_draft_tokens
+        num_gen_requests = min(
+            warmup._config.max_batch_size,
+            warmup._config.max_num_tokens // tokens_per_gen_request,
+        )
+        curr_max_num_tokens = num_gen_requests * tokens_per_gen_request
+        return [(curr_max_num_tokens, num_gen_requests)], curr_max_num_tokens
+    token_num_upper_bound = min(
+        warmup._config.max_num_tokens,
+        warmup._config.max_batch_size * (warmup._config.max_seq_len - 1),
+    )
+    curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+        token_num_upper_bound=token_num_upper_bound,
+        max_num_draft_tokens=warmup._config.original_max_draft_len,
+    )
+    warmup_configs = [(curr_max_num_tokens, 0)]
+    if (
+        warmup.guided_decoder is None
+        and not warmup.mapping.has_pp()
+        and not is_context_only_kv_cache(kv_cache_manager)
+    ):
+        # Add generation request to warmup the autotuner cache.
+        warmup_configs.append((1 + warmup._config.max_total_draft_tokens, 1))
+    return warmup_configs, curr_max_num_tokens

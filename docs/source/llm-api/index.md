@@ -205,10 +205,12 @@ curl http://localhost:8000/server_info
 
 ### Kernel builds ahead of first use
 
-An op that compiles its kernels on first use lists them the first time it runs, and worker
-threads build them in parallel. For a model with such an op, the engine first loads dummy
-weights and runs the attention warmup forwards on them, then loads the checkpoint while the
-kernels build. The startup log shows these as the `rehearsal` and `checkpoint` phases, which
+An op that compiles its kernels on first use lists them when it runs, for every shape it
+sweeps down from that call's and has not listed yet, as the autotuner sweeps its tuning
+buckets; worker threads build them in parallel. For a model with such an op, the engine first loads dummy
+weights and runs the autotuner warmup's two forwards on them (a context batch at the maximum
+token count and one generation request), then loads the checkpoint while the kernels build.
+The startup log shows these as the `rehearsal` and `checkpoint` phases, which
 `model_engine_creation_seconds` then does not include. Supported ops: MiniMax-M3's MSA
 attention (`fmha_sm100`).
 

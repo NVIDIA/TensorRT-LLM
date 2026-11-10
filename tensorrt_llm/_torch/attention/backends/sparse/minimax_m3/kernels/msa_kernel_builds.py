@@ -5,15 +5,16 @@
 fmha_sm100 compiles one kernel per variant (dtype, query tile, single warp group, sparse
 mode, page size, split KV, pack factor) on first use, one variant at a time per process.
 Its plan picks the variant from the longest query segment and the split count; the call
-site fixes the rest.
+site fixes the rest. These two are its build dimensions (``_CONFIG``, ``_PROXY_CONFIG``).
 
-``install`` wraps the package's ``fmha_sm100_plan`` and ``fmha_sm100``. On the first run
-of each call signature in a build pass, the plan and the run are replayed for one query
-segment of every length in ``_QUERY_LENS``, with the package's variant lookup recording
-the variant it is asked for instead of compiling it. Each variant found is submitted to
-``KernelBuilder``, whose workers compile it in the directory and under the file lock the
-package's own lookup uses. The plan, split-KV reduction and sparse top-k modules need
-nothing from a call: ``reaches`` submits them, or else the first run in a build pass.
+``install`` wraps the package's ``fmha_sm100_plan`` and ``fmha_sm100``. On a run in a
+build pass, the plan and the run are replayed for one query segment of each shape the
+dimensions sweep from that call's and no earlier run of its call signature swept, with
+the package's variant lookup recording the variant it is asked for instead of compiling
+it. Each variant found is submitted to ``KernelBuilder``, whose workers compile it in the
+directory and under the file lock the package's own lookup uses. The plan, split-KV
+reduction and sparse top-k modules need nothing from a call: ``reaches`` submits them, or
+else the first run in a build pass.
 
 In a rehearsal every run is such a replay: it compiles and launches nothing, and its
 outputs hold zeros and an empty maximum score.
@@ -29,15 +30,28 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.kernel_builder import KernelBuilder
+from tensorrt_llm._torch.kernel_builder import BuildConfig, DynamicSpec, KernelBuilder
 from tensorrt_llm.logger import logger
 
 _OP = "fmha_sm100"
-# One query segment of each length: up to 129 crosses every boundary of the pack factor,
-# the single warp group and the 128-row query tile; 256 takes the 256-row tile.
-_QUERY_LENS = tuple(range(1, 130)) + (256,)
-# Plan options a replay does not pass through: it plans its own lengths and offsets.
-_PLAN_SKIP = ("qo_offset", "device", "stream")
+
+
+def _query_len_buckets(longest: int) -> Tuple[int, ...]:
+    """Query segment lengths up to the longest a call has: each length up to 129 crosses a
+    boundary of the pack factor, the single warp group or the 128-row query tile; 256 takes
+    the 256-row tile."""
+    return tuple(range(1, min(longest, 129) + 1)) + ((256,) if longest >= 256 else ())
+
+
+_QUERY_LEN = DynamicSpec("qo_len", _query_len_buckets)
+# A call's query segment lengths.
+_CONFIG = BuildConfig((_QUERY_LEN,))
+# The MSA indexer's maximum-score pass also chooses whether to split KV, per batch
+# (msa_indexer._proxy_kv_splits); a variant depends only on whether it splits.
+_PROXY_CONFIG = BuildConfig((_QUERY_LEN, DynamicSpec("num_kv_splits", (1, 2))))
+# Plan options a replay does not pass through: it plans its own lengths and offsets, and a
+# swept split count.
+_PLAN_SKIP = ("qo_offset", "device", "stream", "num_kv_splits")
 # Run options that do not choose the variant.
 _RUN_SKIP = ("sm_scale", "q_scale", "k_scale", "v_scale", "o_scale", "check_input_valid")
 # Run options a replay replaces: its query is its own, and its outputs are discarded.
@@ -99,9 +113,10 @@ class _Package:
     def plan(self, qo_segment_lens, kv_segment_lens, *args, **kwargs):
         plan_info = self.plan_fn(qo_segment_lens, kv_segment_lens, *args, **kwargs)
         options = {key: value for key, value in kwargs.items() if key not in _PLAN_SKIP}
+        num_kv_splits = kwargs.get("num_kv_splits", 1)
         for sub_plan in plan_info[3:]:
             if isinstance(sub_plan, dict):
-                sub_plan[_PLAN_ARGS] = (args, options)
+                sub_plan[_PLAN_ARGS] = (args, options, qo_segment_lens, num_kv_splits)
         return plan_info
 
     def submit_modules(self) -> None:
@@ -128,8 +143,10 @@ class _Package:
                 None,
             )
             if planned is not None:
-                plan_args, plan_options = planned
+                plan_args, plan_options, qo_segment_lens, num_kv_splits = planned
                 run_options = {key: v_ for key, v_ in kwargs.items() if key not in _RUN_SKIP}
+                proxy = run_options.get("output_o") is False and plan_options.get("output_maxscore")
+                config = _PROXY_CONFIG if proxy else _CONFIG
                 signature = (
                     tuple(_tag(arg) for arg in plan_args),
                     tuple(sorted((key, _tag(value)) for key, value in plan_options.items())),
@@ -138,11 +155,20 @@ class _Package:
                     k.dtype,
                     tuple(k.shape[1:]),
                     tuple(sorted((key, _tag(value)) for key, value in run_options.items())),
+                    None if proxy else num_kv_splits,
                 )
+                lens = torch.as_tensor(qo_segment_lens)
+                observed = {"qo_len": max(int(lens.max()), 1) if lens.numel() else 1}
+                if proxy:
+                    observed["num_kv_splits"] = num_kv_splits
                 builder.prebuild(
                     _OP,
                     signature,
-                    functools.partial(self._list, q, k, v, plan_args, plan_options, run_options),
+                    config,
+                    observed,
+                    functools.partial(
+                        self._list, q, k, v, plan_args, plan_options, num_kv_splits, run_options
+                    ),
                 )
         if builder.rehearsing():
             return self._rehearse(q, k, v, plan_info, *args, **kwargs)
@@ -167,10 +193,13 @@ class _Package:
                 tensor.fill_(value)
         return result
 
-    def _list(self, q, k, v, plan_args, plan_options, run_options) -> List[Tuple[str, Callable]]:
-        """Replay the plan and the run for each query length; return the variants asked for.
+    def _list(
+        self, q, k, v, plan_args, plan_options, num_kv_splits, run_options, shapes
+    ) -> List[Tuple[str, Callable]]:
+        """Replay the plan and the run for one query segment of each shape; return the
+        variants asked for.
 
-        A length the package rejects is skipped: a call of that shape would fail too.
+        A shape the package rejects is skipped: a call of that shape would fail too.
         """
         options = {key: value for key, value in run_options.items() if key not in _RUN_REPLACED}
         sparse = plan_options.get("kv_block_num", -1) > 0
@@ -178,7 +207,8 @@ class _Package:
         found: Dict[str, dict] = {}
         _replay.found = found
         try:
-            for qo_len in _QUERY_LENS:
+            for shape in shapes:
+                qo_len = shape["qo_len"]
                 if sparse and (
                     sparse_mode == "prefill"
                     or (sparse_mode == "auto" and qo_len > self.sparse_prefill_min_len)
@@ -187,11 +217,14 @@ class _Package:
                     continue
                 lens = torch.tensor([qo_len], dtype=torch.int32)
                 q_replay = torch.empty((qo_len, *q.shape[1:]), dtype=q.dtype, device=q.device)
+                splits = shape.get("num_kv_splits", num_kv_splits)
                 try:
-                    plan_info = self.plan_fn(lens, lens.clone(), *plan_args, **plan_options)
+                    plan_info = self.plan_fn(
+                        lens, lens.clone(), *plan_args, num_kv_splits=splits, **plan_options
+                    )
                     self.run_fn(q_replay, k, v, plan_info, **options)
                 except (ValueError, RuntimeError, AssertionError) as e:
-                    logger.debug(f"[KernelBuilder] {_OP}: no variant for {qo_len} query rows: {e}")
+                    logger.debug(f"[KernelBuilder] {_OP}: no variant for {shape}: {e}")
         finally:
             _replay.found = None
         # The package loads its two source templates on the first compile, unlocked: load

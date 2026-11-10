@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""KernelBuilder: builds listed by an op on first sight, run on worker threads."""
+"""KernelBuilder: builds an op lists for the shapes it sweeps, run on worker threads."""
 
 import sys
 import threading
@@ -9,9 +9,14 @@ import types
 import pytest
 
 from tensorrt_llm._torch import kernel_builder
-from tensorrt_llm._torch.kernel_builder import KernelBuilder
+from tensorrt_llm._torch.kernel_builder import BuildConfig, DynamicSpec, KernelBuilder
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _prebuild(builder, signature, list_builds):
+    """``prebuild`` for an op without build dimensions."""
+    builder.prebuild("op", signature, BuildConfig(), {}, lambda shapes: list_builds())
 
 
 def _recorder(built, key, compiled=True):
@@ -30,14 +35,14 @@ def test_kernels_are_listed_once_per_signature_inside_a_pass():
         listed.append(True)
         return [(name, _recorder(built, name)) for name in ("a", "b", "c")]
 
-    builder.prebuild("op", "sig", list_builds)
+    _prebuild(builder, "sig", list_builds)
     assert listed == []  # no pass, no listing
 
     with builder.build_pass("test"):
-        builder.prebuild("op", "sig", list_builds)
-        builder.prebuild("op", "sig", list_builds)
+        _prebuild(builder, "sig", list_builds)
+        _prebuild(builder, "sig", list_builds)
         # A kernel another signature also reaches is built once.
-        builder.prebuild("op", "sig2", lambda: [("a", _recorder(built, "a"))])
+        _prebuild(builder, "sig2", lambda: [("a", _recorder(built, "a"))])
     # The pass waited for the builds.
     assert listed == [True]
     assert sorted(built) == ["a", "b", "c"]
@@ -59,7 +64,7 @@ def test_a_failed_build_is_left_to_the_op():
 
     builds = [("bad", fail), ("exit", exit_), ("good", _recorder(built, "good"))]
     with builder.build_pass("test"):
-        builder.prebuild("op", "sig", lambda: builds)
+        _prebuild(builder, "sig", lambda: builds)
     # The pass ended: even an item raising outside Exception was settled.
     assert built == ["good"]
     assert builder.state("op", "bad") == builder.state("op", "exit") == "failed"
@@ -76,7 +81,7 @@ def test_a_listing_failure_leaves_the_kernels_to_the_op():
         raise ValueError("unsupported shape")
 
     with builder.build_pass("test"):
-        builder.prebuild("op", "sig", list_builds)
+        _prebuild(builder, "sig", list_builds)
     assert builder.state("op", "anything") is None
 
 
@@ -100,6 +105,42 @@ def test_the_op_waits_for_a_build_in_flight():
     assert (stats.built, stats.waited, stats.waited_s, stats.late) == (1, 1, 5.0, 0)
 
 
+def test_an_op_builds_the_shapes_its_dimensions_sweep_from_the_call():
+    config = BuildConfig(
+        (
+            DynamicSpec("m", lambda m: [x for x in (1, 2, 4, 8) if x <= m]),
+            DynamicSpec("splits", (1, 2)),
+        )
+    )
+    # A function's buckets come from the call's value, a tuple's are fixed, and the call's
+    # own value is always one of them.
+    assert config.shapes({"m": 6, "splits": 1}) == [
+        {"m": m, "splits": splits} for m in (1, 2, 4, 6) for splits in (1, 2)
+    ]
+    builder = KernelBuilder(threads=2, enabled=True)
+    swept, built = [], []
+
+    def list_builds(shapes):
+        swept.extend(shapes)
+        # Shapes that reach the same kernel list it once.
+        return [(shape["m"], _recorder(built, shape["m"])) for shape in shapes]
+
+    with builder.build_pass("test"):
+        builder.prebuild("op", "sig", config, {"m": 6, "splits": 1}, list_builds)
+        # A smaller call of the signature sweeps nothing new; a larger one only its new shapes.
+        builder.prebuild("op", "sig", config, {"m": 4, "splits": 1}, list_builds)
+        assert len(swept) == 8
+        builder.prebuild("op", "sig", config, {"m": 9, "splits": 1}, list_builds)
+    assert swept[8:] == [
+        {"m": 8, "splits": 1},
+        {"m": 8, "splits": 2},
+        {"m": 9, "splits": 1},
+        {"m": 9, "splits": 2},
+    ]
+    assert sorted(built) == [1, 2, 4, 6, 8, 9]
+    assert builder.stats("op").signatures == 1
+
+
 def test_a_rehearsal_leaves_its_builds_running_for_the_next_pass():
     builder = KernelBuilder(threads=1, enabled=True)
     release = threading.Event()
@@ -111,14 +152,14 @@ def test_a_rehearsal_leaves_its_builds_running_for_the_next_pass():
     assert not builder.rehearsing()
     with builder.rehearsal():
         assert builder.rehearsing() and builder.active()
-        builder.prebuild("op", "sig", lambda: [("k", slow)])
+        _prebuild(builder, "sig", lambda: [("k", slow)])
     # The rehearsal did not wait: the build is still running.
     assert not builder.rehearsing() and not builder.active()
     assert builder.state("op", "k") == "queued"
     release.set()
     with builder.build_pass("warmup"):
         # The signature was listed in the rehearsal.
-        builder.prebuild("op", "sig", lambda: pytest.fail("listed twice"))
+        _prebuild(builder, "sig", lambda: pytest.fail("listed twice"))
     # The warmup pass waited for it.
     assert builder.state("op", "k") == "done"
 
@@ -142,7 +183,7 @@ def test_disabled():
     listed = []
     with builder.build_pass("test"):
         assert not builder.active()
-        builder.prebuild("op", "sig", lambda: listed.append(True) or [])
+        _prebuild(builder, "sig", lambda: listed.append(True) or [])
     with builder.rehearsal():
         assert not builder.rehearsing()
     assert listed == []
