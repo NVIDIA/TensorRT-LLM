@@ -1302,7 +1302,7 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     )
     native_preprocess = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "mla_context_preprocess", native_preprocess)
-    wrapper = Mock()
+    wrapper = create_autospec(prims_context_module.BatchPrefillTSWrapper, instance=True)
     factory = Mock(return_value=wrapper)
     monkeypatch.setattr(prims_context_module, "BatchPrefillTSWrapper", factory)
     fmha.run_mla_context(params)
@@ -1336,7 +1336,7 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     assert wrapper.plan.call_args.kwargs["head_dim"] == head_dim
     assert wrapper.plan.call_args.kwargs["head_dim_vo"] == v_head_dim
     assert wrapper.plan.call_args.kwargs["store_softmax_stats"] is store_softmax_stats
-    assert wrapper.plan.call_args.kwargs["max_seq_len_q"] == (256 if head_dim == 192 else 4)
+    assert wrapper.plan.call_args.kwargs["max_q_len"] == (256 if head_dim == 192 else 4)
     assert wrapper.plan.call_args.kwargs["max_kv_len"] == (128 if head_dim == 192 else 8)
     processed_dtype = torch.float8_e4m3fn if fp8 else q.dtype
     for name in ("q_dtype", "k_dtype", "v_dtype"):
@@ -1351,22 +1351,18 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     ):
         bmm1_scale, bmm2_scale = preprocess_call.args[-2:]
         softmax_scale = run_call.kwargs["softmax_scale"]
-        scale_softmax_log2 = run_call.kwargs["scale_softmax_log2"]
         output_scale = run_call.kwargs["output_scale"]
-        if fp8 and store_softmax_stats:
+        if fp8:
             assert softmax_scale.shape == (1,)
             assert softmax_scale.data_ptr() == bmm1_scale.data_ptr()
-        else:
-            assert softmax_scale is None
-        if fp8:
-            assert scale_softmax_log2.shape == (1,)
-            assert scale_softmax_log2.data_ptr() == (
-                bmm1_scale.data_ptr() + bmm1_scale.element_size()
-            )
             assert output_scale.data_ptr() == bmm2_scale.data_ptr()
+            assert (
+                wrapper.plan.call_args.kwargs["softmax_scale"].data_ptr() == bmm1_scale.data_ptr()
+            )
+            assert wrapper.plan.call_args.kwargs["output_scale"].data_ptr() == bmm2_scale.data_ptr()
         else:
-            assert scale_softmax_log2 is None
-            assert output_scale is None
+            assert softmax_scale == pytest.approx(fmha._get_bmm1_scale(attn))
+            assert output_scale == 1.0
     assert wrapper.run.call_args.kwargs["validate"] is False
 
 
@@ -2573,7 +2569,7 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     assert workspace_size.call_args.kwargs["q_dtype"] == kernel_dtype
     assert workspace_size.call_args.kwargs["kv_dtype"] == kernel_dtype
     assert workspace_size.call_args.kwargs["out_dtype"] == torch.bfloat16
-    assert workspace_size.call_args.kwargs["max_seq_len_q"] == query_width
+    assert workspace_size.call_args.kwargs["max_q_len"] == query_width
     assert workspace_size.call_args.kwargs["store_softmax_stats"] == with_stats
     assert workspace.numel() == 48
 
@@ -2670,7 +2666,7 @@ def test_mla_workspace_size_cache_tracks_request_geometry(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     workspace_size = Mock(
         side_effect=lambda batch, heads, latent, rope, page, capacity, **kwargs: (
-            32 * batch * kwargs["max_seq_len_q"] + capacity
+            32 * batch * kwargs["max_q_len"] + capacity
         )
     )
     monkeypatch.setattr(

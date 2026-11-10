@@ -3,13 +3,14 @@
 """Startup planning contracts without importing the TensorRT-LLM extension."""
 
 import ast
+import importlib
 import importlib.util
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from functools import partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
@@ -38,7 +39,7 @@ def _geometry(**overrides: object) -> SimpleNamespace:
     fields = dict(
         device=torch.device("cuda:0"),
         batch_size=4,
-        max_seq_len_q=2048,
+        max_q_len=2048,
         max_seq_len_k=2048,
         num_qo_heads=96,
         num_kv_heads=96,
@@ -46,8 +47,8 @@ def _geometry(**overrides: object) -> SimpleNamespace:
         head_dim_vo=128,
         qk_dtype=torch.float8_e4m3fn,
         pv_dtype=torch.float8_e4m3fn,
-        output_dtype=torch.bfloat16,
-        packed=True,
+        out_dtype=torch.bfloat16,
+        packed_query=True,
         uniform_packed_lengths=False,
         mask_type="causal",
         window_left=-1,
@@ -58,6 +59,8 @@ def _geometry(**overrides: object) -> SimpleNamespace:
 
 def _capacities() -> Callable[[int, int], tuple[int, int]]:
     geometry = vars(_geometry())
+    geometry["output_dtype"] = geometry.pop("out_dtype")
+    geometry["packed"] = geometry.pop("packed_query")
     fields = (
         "head_dim",
         "head_dim_vo",
@@ -143,7 +146,7 @@ def test_context_profiles_respect_staging_and_cache_modes() -> None:
 
 
 @pytest.fixture
-def planners(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+def planners(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
     for name in (
         "tensorrt_llm",
         "tensorrt_llm._torch",
@@ -155,24 +158,40 @@ def planners(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         module = ModuleType(name)
         module.__path__ = []
         monkeypatch.setitem(sys.modules, name, module)
-    context = SimpleNamespace()
-    context._resolve_context_plan_geometry = Mock(side_effect=lambda **kwargs: kwargs)
-    context._context_compile_spec = Mock(
-        side_effect=lambda geometry: ("context", tuple(sorted(geometry.items())))
+    package = sys.modules["tensorrt_llm._torch.attention.backends.prims_ts"]
+    package.__path__ = [str(_FMHA.parent / "prims_ts")]
+    context_api = importlib.import_module(f"{package.__name__}.context")
+    decode_api = importlib.import_module(f"{package.__name__}.mla_decode")
+    context_api._context_compile_spec.cache_clear()
+    monkeypatch.setattr(
+        context_api,
+        "_resolve_cuda_device",
+        lambda device: (torch.device(device), torch.device(device).index),
     )
-    context.plan = Mock()
+    monkeypatch.setattr(
+        context_api, "_resolve_context_scheduler", lambda geometry: "clc_dynamic_persistent"
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 7))
+    context = SimpleNamespace()
+    context._resolve_context_plan_geometry = context_api._resolve_context_plan_geometry
+    context._context_compile_spec = context_api._context_compile_spec
+    context.plan = create_autospec(context_api.BatchPrefillTSWrapper, instance=True).plan
     context.BatchPrefillTSWrapper = Mock(side_effect=lambda: SimpleNamespace(plan=context.plan))
     decode = SimpleNamespace()
     decode._dtype_key = str
-    decode._resolve_mla_decode_launch_spec = Mock(side_effect=lambda *args: (args[1] % 3, args[0]))
-    decode._make_mla_decode_compile_spec = Mock(
-        side_effect=lambda launch, **kwargs: ("decode", launch, tuple(sorted(kwargs.items())))
+    decode._resolve_mla_decode_launch_spec = create_autospec(
+        decode_api._resolve_mla_decode_launch_spec,
+        side_effect=lambda *args, **kwargs: (args[1] % 3, args[0], tuple(sorted(kwargs.items()))),
     )
-    decode.plan = Mock()
+    decode._make_mla_decode_compile_spec = create_autospec(
+        decode_api._make_mla_decode_compile_spec,
+        side_effect=lambda launch, **kwargs: ("decode", launch, tuple(sorted(kwargs.items()))),
+    )
+    decode.plan = create_autospec(decode_api.BatchMLADecodePagedTSWrapper, instance=True).plan
+    decode.MLAAttentionTuning = decode_api.MLAAttentionTuning
     decode.BatchMLADecodePagedTSWrapper = Mock(
         side_effect=lambda: SimpleNamespace(plan=decode.plan)
     )
-    package = sys.modules["tensorrt_llm._torch.attention.backends.prims_ts"]
     package.context, package.mla_decode = context, decode
 
     class MLA:
@@ -204,7 +223,7 @@ def planners(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     log.logger = SimpleNamespace(info=Mock())
     monkeypatch.setitem(sys.modules, log.__name__, log)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    return SimpleNamespace(
+    yield SimpleNamespace(
         context=context,
         decode=decode,
         MLA=MLA,
@@ -212,26 +231,31 @@ def planners(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         metadata=Metadata(),
         provider=PrimsTSFmha,
     )
+    context_api._context_compile_spec.cache_clear()
 
 
 def _decode_state(**overrides: object) -> SimpleNamespace:
     fields = dict(
         device=torch.device("cuda:0"),
         batch_size=1,
-        num_heads=96,
+        num_qo_heads=96,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
         page_size=128,
         max_kv_len=4608,
-        max_seq_len_q=6,
+        max_q_len=6,
         packed_query=False,
         q_dtype=torch.float8_e4m3fn,
         kv_dtype=torch.float8_e4m3fn,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         mask_type="causal",
         store_softmax_stats=False,
         use_kv_bounds=False,
         workspace_buffer=object(),
+        softmax_scale=1.0,
+        output_scale=1.0,
+        softmax_rescale_threshold_log2=0.0,
+        lse_mode="none",
     )
     return SimpleNamespace(**(fields | overrides))
 
@@ -239,17 +263,36 @@ def _decode_state(**overrides: object) -> SimpleNamespace:
 def test_context_normal_planning_and_full_spec_dedup(planners: SimpleNamespace) -> None:
     warmer = _warmup.PrimsTSDenseMlaWarmup()
     args = dict(max_num_tokens=2048, max_seq_len=4608)
-    assert warmer._prewarm_context(_geometry(), planners.metadata, **args) == 38
+    assert warmer._prewarm_context(_geometry(), planners.metadata, **args) == 3
     assert warmer._prewarm_context(_geometry(batch_size=16), planners.metadata, **args) == 0
-    assert planners.context.plan.call_count == 38
+    assert planners.context.plan.call_count == 3
     for call in planners.context.plan.call_args_list:
         assert call.kwargs["batch_size"] == 1
         assert call.kwargs["q_dtype"] == torch.float8_e4m3fn
     assert (
         warmer._prewarm_context(_geometry(device=torch.device("cuda:1")), planners.metadata, **args)
-        == 38
+        == 3
     )
-    assert warmer._prewarm_context(_geometry(packed=False), planners.metadata, **args) == 0
+    assert warmer._prewarm_context(_geometry(packed_query=False), planners.metadata, **args) == 0
+    scale = torch.tensor([0.25])
+    assert (
+        warmer._prewarm_context(
+            _geometry(), planners.metadata, softmax_scale=scale, output_scale=scale, **args
+        )
+        == 3
+    )
+    assert planners.context.plan.call_args.kwargs["softmax_scale"] is scale
+    assert planners.context.plan.call_args.kwargs["output_scale"] is scale
+    assert (
+        warmer._prewarm_context(
+            _geometry(),
+            planners.metadata,
+            softmax_scale=scale.clone(),
+            output_scale=scale.clone(),
+            **args,
+        )
+        == 0
+    )
 
 
 def test_failed_plan_is_retried(planners: SimpleNamespace) -> None:

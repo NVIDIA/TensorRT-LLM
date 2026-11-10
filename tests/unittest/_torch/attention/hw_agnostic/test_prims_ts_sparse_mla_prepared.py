@@ -41,7 +41,7 @@ def test_prepared_sparse_mla_matches_full_launch_abi(extra_pool: bool, has_works
     secondary = torch.full_like(primary, 2) if extra_pool else primary
     core = torch.empty(1024 if has_workspace else 0, dtype=torch.int8)
     lse = torch.empty(rows, 1, heads, dtype=torch.float32)
-    scales_and_sinks = (torch.tensor([0.5]), torch.tensor([1.0]), torch.zeros(heads))
+    sinks = torch.zeros(heads)
     split_kv = 2 if has_workspace else 1
     calls = []
 
@@ -61,6 +61,7 @@ def test_prepared_sparse_mla_matches_full_launch_abi(extra_pool: bool, has_works
         softmax_scale: float,
         output_scale: float,
         output_quant_args: tuple | None,
+        max_q_len: int,
         softmax_stats: torch.Tensor | None,
         kv_bounds: torch.Tensor | None,
     ) -> None:
@@ -82,6 +83,7 @@ def test_prepared_sparse_mla_matches_full_launch_abi(extra_pool: bool, has_works
                 softmax_scale,
                 output_scale,
                 output_quant_args,
+                max_q_len,
                 softmax_stats,
                 kv_bounds,
             )
@@ -89,13 +91,13 @@ def test_prepared_sparse_mla_matches_full_launch_abi(extra_pool: bool, has_works
 
     wrapper = object.__new__(mla_decode.BatchSparseMLADecodePagedTSWrapper)
     wrapper._state = dict(
-        batch=rows,
-        heads=heads,
+        batch_size=rows,
+        num_qo_heads=heads,
         device=query.device,
-        dtype=query.dtype,
-        splits=split_kv,
+        q_dtype=query.dtype,
+        requested_splits=split_kv,
         buffers={"core": core, "public_lse": lse},
-        compiled_static=compiled,
+        compiled=compiled,
     )
     prepared = dict(
         ks=topk,
@@ -104,7 +106,7 @@ def test_prepared_sparse_mla_matches_full_launch_abi(extra_pool: bool, has_works
         default_cl=extra_lengths,
         c_latent=primary.permute(1, 2, 0),
         c_rope=secondary.permute(1, 2, 0),
-        scalars=scales_and_sinks,
+        sinks=sinks,
         bmm=(0.5, 1.0),
     )
     assert (
@@ -120,27 +122,28 @@ def test_prepared_sparse_mla_matches_full_launch_abi(extra_pool: bool, has_works
         is out
     )
     assert len(calls) == 1
-    assert calls[0][-3:] == (None, None, None)
+    assert calls[0][-4:] == (None, 1, None, None)
 
     runtime = mla_decode._MLARuntime(
         query=query,
         normalized_cache=primary,
         out=out,
         num_physical_pages=primary.shape[0],
-        bmm1_scale=0.5,
-        bmm2_scale=1.0,
+        softmax_scale=0.5,
+        output_scale=1.0,
         extra_cache=secondary,
-        sparse_inputs=(indices, extra_indices, lengths, extra_lengths, *scales_and_sinks),
+        sparse_inputs=(indices, extra_indices, lengths, extra_lengths, sinks, 1.0),
     )
     assert (
         mla_decode._launch_mla_decode(
             runtime,
             block_tables=indices,
-            seq_lens=lengths,
+            seq_lens_kv=lengths,
             qo_indptr=None,
             packed_query=False,
             kv_lora_rank=512,
             split_kv=split_kv,
+            max_q_len=1,
             workspace=mla_decode._MLAWorkspaceViews(core if has_workspace else None, lse),
             compiled=compiled,
         )
