@@ -90,13 +90,9 @@ def route(
             "speculative decoding with attention DP (dep2): no draft acceptance was measured at "
             "this layout; MTP under attention DP is admitted at dep4"
         )
-    # One line on purpose: the claims suite reads the routed target off the
-    # `from .<target>.modeling import <Class>` line.
-    # fmt: off
-    # isort: off
-    from .qwen3_8_flash_next_nvfp4__sm_103__default.modeling import ModelingV2Qwen38FlashNextNvfp4Sm103Default
-    # isort: on
-    # fmt: on
+    from .qwen3_8_flash_next_nvfp4__sm_103__default.modeling import (
+        ModelingV2Qwen38FlashNextNvfp4Sm103Default,
+    )
 
     ModelingV2Qwen38FlashNextNvfp4Sm103Default.check_deployment(model_config, llm_args, member)
     return ModelingV2Qwen38FlashNextNvfp4Sm103Default

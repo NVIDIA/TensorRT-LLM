@@ -82,6 +82,20 @@ class _ServeSchemaGeneratorMixin:
                         properties[name] = copy.deepcopy(properties[names[0]])
         return result
 
+    def tagged_union_schema(self, schema: core_schema.TaggedUnionSchema) -> JsonSchemaValue:
+        result = super().tagged_union_schema(schema)
+        # Pydantic emits the tag's JSON name (alias resolved) only for field discriminators.
+        tag = result.get("discriminator", {}).get("propertyName")
+        if tag is not None:
+            # Validation reads the tag before choosing a branch, so a mapping without it is
+            # rejected even when the branch model defaults the field. Require it on the union
+            # branches only; the shared definitions keep their Python defaults.
+            for branch in result.get("oneOf", []):
+                required = branch.setdefault("required", [])
+                if tag not in required:
+                    required.append(tag)
+        return result
+
     def dataclass_schema(self, schema: core_schema.DataclassSchema) -> JsonSchemaValue:
         result = super().dataclass_schema(schema)
         # These configs are constructed with **yaml_dict, which rejects unknown arguments.
@@ -214,6 +228,10 @@ def generate_serve_schema() -> dict:
         standard,
         {**per_layer_dynamic, "required": ["mode"]},
         {"type": ["string", "null"]},
+    ]
+    # The model validator allows at most one non-null preemption bound.
+    schema["$defs"]["GenPreemptionConfig"]["anyOf"] = [
+        {"properties": {name: {"type": "null"}}} for name in ("tpot_budget", "target_output_tps")
     ]
     # Mirror DwdpConfig._validate_modes(): without expert DWDP, dense DWDP is on and the expert
     # fields keep their defaults; contention_opt, which selects batched copies, rules out another
