@@ -1664,6 +1664,14 @@ def _register_fake():
         del out_shape[cp_dim]
         return gathered_o.new_empty(*out_shape)
 
+    @torch.library.register_fake("trtllm::lm_head_argmax")
+    def _(input: torch.Tensor, weight: torch.Tensor, vocab_offset: int,
+          round_logits: bool, scratch: torch.Tensor,
+          exchange_epoch: Optional[torch.Tensor], peer_buffers: List[int],
+          exchange_words: int, rank: int, tokens: torch.Tensor):
+        # Writes the greedy tokens into ``tokens`` in place.
+        return None
+
     @torch.library.register_fake("trtllm::tinygemm2")
     def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
         # input [M, K], weight [N, K], bias [N]

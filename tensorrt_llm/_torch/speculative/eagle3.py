@@ -18,6 +18,7 @@ from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..attention.backends.sparse.params import MTPIndexShareMetadata
 from ..model_config import ModelConfig
+from ..modules.bf16_draft_head import is_plain_mtp_shared_head
 from ..modules.logits_processor import LogitsProcessor
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
@@ -541,6 +542,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 and type(draft_model.logits_processor) is LogitsProcessor
                 and is_vocab_sharded_lm_head(draft_model.lm_head))
 
+    def _fused_draft_lm_head(self, draft_model):
+        # MTP Eagle projects with its MTP layer's shared head; only a plain
+        # one makes the draft logits the LM head's shard of the layer output.
+        # Eagle3 projects with its own (possibly reduced-vocab) head.
+        if self.is_mtp_eagle:
+            mtp_layers = getattr(draft_model, "mtp_layers", None)
+            if not mtp_layers or not is_plain_mtp_shared_head(
+                    mtp_layers[0].shared_head):
+                return None
+        elif type(getattr(draft_model, "logits_processor",
+                          None)) is not LogitsProcessor:
+            return None
+        return getattr(draft_model, "lm_head", None)
+
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
         batch_size = attn_metadata.num_seqs
@@ -1002,6 +1017,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # Set where this step projects only this rank's vocab shard
                 # of the draft head, for the greedy sampler.
                 draft_logits_are_shard = None
+                fused_draft_head = None
                 if (self.is_mtp_eagle and not lm_head_tp_in_adp_configured
                         and not advanced_draft_sampling
                         and self.guided_decoder is None and self._d2t is None
@@ -1009,9 +1025,23 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         and self.draft_head.supports(
                             request_hidden_states.shape[0])):
                     draft_head = self.draft_head
+                elif not lm_head_tp_in_adp_configured:
+                    # BF16 LM-head shard GEMV + argmax + key exchange in one
+                    # launch; Eagle3 applies d2t after the global argmax.
+                    fused_draft_head = self._fused_draft_head_for(
+                        request_hidden_states.shape[0]
+                        if self.is_mtp_eagle else batch_size, spec_metadata)
                 if draft_head is not None:
                     new_draft_token = draft_head.sample(
                         request_hidden_states,
+                        out=token_buffer[i + 1]
+                        if token_buffer is not None else None)
+                    next_draft_tokens.append(new_draft_token)
+                elif fused_draft_head is not None:
+                    new_draft_token = self._fused_draft_tokens(
+                        fused_draft_head,
+                        request_hidden_states
+                        if self.is_mtp_eagle else hidden_states[gather_ids],
                         out=token_buffer[i + 1]
                         if token_buffer is not None else None)
                     next_draft_tokens.append(new_draft_token)
@@ -1075,7 +1105,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         hidden_states[gather_ids], draft_model.lm_head,
                         attn_metadata, True)
 
-                if draft_head is None:
+                if draft_head is None and fused_draft_head is None:
                     if self.guided_decoder is not None:
                         if self.is_mtp_eagle:
                             self.guided_decoder.execute_draft_batch(

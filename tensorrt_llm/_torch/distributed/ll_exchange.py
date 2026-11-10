@@ -38,7 +38,7 @@ nodes of one NVLink domain. Without either, ``create`` returns None and callers 
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import triton
@@ -456,10 +456,10 @@ class TPKeyExchange:
         )
         self._ticket = torch.zeros(num_channels, dtype=torch.int32, device=device)
         self._num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-        table = [
+        self._peer_table = [
             [p + c * self.channel_bytes for p in buffers.peer_ptrs] for c in range(num_channels)
         ]
-        self._peers = torch.tensor(table, dtype=torch.int64, device=device)
+        self._peers = torch.tensor(self._peer_table, dtype=torch.int64, device=device)
         from ..flashinfer_utils import get_env_enable_pdl
 
         self._pdl = get_env_enable_pdl()
@@ -496,6 +496,15 @@ class TPKeyExchange:
         if buffers is None:
             return None
         return cls(mapping.tp_rank, mapping.tp_size, buffers, num_channels, max_rows)
+
+    def channel_protocol_args(self, channel: int) -> Tuple[torch.Tensor, List[int], int]:
+        """What a kernel that runs this exchange's protocol itself needs for ``channel``
+        (``trtllm::lm_head_argmax``): the channel's epoch counter (int32 [1] view), every rank's
+        receive region of the channel (addresses, by rank) and the packets per rank and slot. Such a
+        kernel shares the channel with the launches here, in any order every rank follows."""
+        if not 0 <= channel < self.num_channels:
+            raise ValueError(f"channel {channel} out of range [0, {self.num_channels})")
+        return self._state[channel : channel + 1], list(self._peer_table[channel]), self._words
 
     def _check(self, m: int, channel: int):
         if not 1 <= m <= self.MAX_ROWS:

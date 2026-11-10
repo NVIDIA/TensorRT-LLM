@@ -34,6 +34,7 @@ from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..distributed import AllReduceStrategy
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..modules.bf16_draft_head import BF16DraftHead, build_bf16_draft_head
 from ..modules.logits_processor import LogitsProcessor
 from ..pyexecutor import step_inputs
 from ..pyexecutor.resource_manager import ResourceManagerType
@@ -1872,6 +1873,9 @@ class SpecWorkerBase(nn.Module, ABC):
         self._gumbel_seed: Optional[torch.Tensor] = None
         self._auxiliary_state_handlers: list[
             AuxiliarySpeculativeStateHandler] = []
+        # Fused BF16 LM head + argmax + key exchange for greedy draft steps
+        # (see build_fused_draft_head); None keeps the GEMM path.
+        self.fused_draft_head: Optional[BF16DraftHead] = None
 
     def cache_derived_state(self) -> None:
         if self.key_exchange is not None and self._gumbel_seed is None:
@@ -2100,6 +2104,61 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    channel=1)
         return shard_argmax(logits, vocab_offset, self._target_pair_exchange,
                             torch.int32)
+
+    def _fused_draft_lm_head(self, draft_model) -> Optional[nn.Module]:
+        """The vocab-sharded LM head whose greedy draft tokens the fused draft
+        head may produce in this worker's draft loop, or None. Workers whose
+        draft loop calls :meth:`_fused_draft_head_for` override this."""
+        del draft_model
+        return None
+
+    def build_fused_draft_head(self, draft_model) -> None:
+        """(Re)build :attr:`fused_draft_head` from the current weights of the
+        draft LM head (``trtllm::lm_head_argmax``: the shard GEMV, argmax and
+        key exchange in one launch, no draft logits), where the vocab-parallel
+        greedy argmax is enabled and the worker's draft head allows it.
+
+        Every TP rank reaches the same decision (configuration and device
+        type); the head reuses the key exchange's peer buffers."""
+        self.fused_draft_head = None
+        if not self._vocab_parallel_argmax or draft_model is None:
+            return
+        lm_head = self._fused_draft_lm_head(draft_model)
+        if lm_head is not None and is_vocab_sharded_lm_head(lm_head):
+            self.fused_draft_head = build_bf16_draft_head(
+                lm_head, self.key_exchange)
+
+    def _fused_draft_head_for(self, rows: int,
+                              spec_metadata) -> Optional[BF16DraftHead]:
+        """The fused draft head when this draft step can take it: argmax
+        draft tokens (no advanced draft sampling), no guided decoding (it
+        masks the full draft logits) and at most the kernel's rows. Host-side
+        and identical on every TP rank."""
+        head = self.fused_draft_head
+        if (head is None or spec_metadata.wants_advanced_draft_sampling
+                or self.guided_decoder is not None or not head.supports(rows)):
+            return None
+        logger.info_once(
+            f"{type(self).__name__}: greedy draft tokens from the fused BF16 "
+            f"draft head (lm_head_argmax, up to {head.max_rows} rows)",
+            key=("spec_fused_draft_head", type(self).__name__))
+        return head
+
+    def _fused_draft_tokens(self,
+                            head: BF16DraftHead,
+                            hidden_states: torch.Tensor,
+                            out: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Greedy draft tokens (int32, target vocab) of ``hidden_states``
+        ``[rows, hidden]`` from the fused head, d2t applied; into ``out`` when
+        given."""
+        if self._d2t is None:
+            return head.sample(hidden_states, out=out)
+        tokens = head.sample(hidden_states)
+        tokens = (self._d2t[tokens] + tokens).to(torch.int32)
+        if out is None:
+            return tokens
+        out.copy_(tokens)
+        return out
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         """Restore attn-metadata spec-dec state if a failure skipped it.

@@ -156,11 +156,11 @@ def _greedy_md(**overrides):
     return SimpleNamespace(**md)
 
 
-def _lm_head(tp=2, rank=0, vocab=4096, adp=False, gather_output=True, padded=False):
+def _lm_head(tp=2, rank=0, vocab=4096, adp=False, gather_output=True, padded=False, hidden=HIDDEN):
     mapping = Mapping(world_size=tp, tp_size=tp, rank=rank, enable_attention_dp=adp)
     head = LMHead(
         vocab + (1 if padded else 0),
-        HIDDEN,
+        hidden,
         dtype=torch.bfloat16,
         mapping=mapping,
         tensor_parallel_mode=TensorParallelMode.COLUMN,
@@ -565,3 +565,141 @@ def test_eagle3_draft_tokens_with_d2t(monkeypatch):
     for r, worker in enumerate(workers):
         out = worker.sample_draft_tokens(_shard(full, tp, r), md, rows)
         assert torch.equal(out, expected), r
+
+
+class _StubKeyExchange:
+    """What BF16DraftHead reads from a TPKeyExchange (no peer memory; nothing is launched)."""
+
+    transport = "stub"
+
+    def __init__(self, nranks=2):
+        self.nranks = nranks
+        self.epoch = torch.ones(1, dtype=torch.int32, device="cuda")
+
+    def channel_protocol_args(self, channel):
+        assert channel == 0
+        return self.epoch, [0] * self.nranks, 1024
+
+
+def _fused_head_worker(monkeypatch, lm_head):
+    monkeypatch.setattr(interface, "tp_pair_exchange", lambda mapping, strategy: "pairs")
+    worker = _Worker()
+    worker._fused_draft_lm_head = lambda draft_model: draft_model.lm_head
+    assert worker.enable_vocab_parallel_argmax(lm_head, key_exchange=_StubKeyExchange())
+    return worker
+
+
+def _fused_capable():
+    from tensorrt_llm._torch.modules.bf16_draft_head import max_rows
+
+    return max_rows(1024, torch.cuda.current_device()) > 0
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "enabled",
+        "kill_switch",
+        "no_vocab_parallel",
+        "no_lm_head",
+        "tp1",
+        "attention_dp",
+        "padded",
+        "hidden_size",
+        "fp32_weight",
+        "small_shard",
+    ],
+)
+def test_fused_draft_head_build(case, monkeypatch):
+    """The worker builds the fused BF16 draft head only for a vocab-sharded BF16 draft head the
+    kernel supports, with the vocab-parallel argmax on and the head's kill switch not set."""
+    from tensorrt_llm._torch.modules import bf16_draft_head
+    from tensorrt_llm._torch.modules.bf16_draft_head import FUSED_DRAFT_HEAD_ENV_VAR
+
+    if case == "enabled" and not _fused_capable():
+        pytest.skip("trtllm::lm_head_argmax needs SM 90+")
+    head = _lm_head(hidden=1024)
+    worker = _fused_head_worker(monkeypatch, head)
+    if case != "small_shard":  # the test head is far below the production minimum
+        monkeypatch.setattr(bf16_draft_head, "MIN_SHARD_BYTES", 0)
+    draft_lm_head = head
+    if case == "kill_switch":
+        monkeypatch.setenv(FUSED_DRAFT_HEAD_ENV_VAR, "0")
+    elif case == "no_vocab_parallel":
+        worker._vocab_parallel_argmax = False
+    elif case == "no_lm_head":
+        worker._fused_draft_lm_head = lambda draft_model: None
+    elif case == "tp1":
+        draft_lm_head = _lm_head(tp=1, hidden=1024)
+    elif case == "attention_dp":
+        draft_lm_head = _lm_head(adp=True, hidden=1024)
+    elif case == "padded":
+        draft_lm_head = _lm_head(padded=True, hidden=1024)
+    elif case == "hidden_size":
+        draft_lm_head = _lm_head()  # 64: not a multiple of the kernel's 256
+    elif case == "fp32_weight":
+        draft_lm_head.weight.data = draft_lm_head.weight.data.float()
+    worker.build_fused_draft_head(SimpleNamespace(lm_head=draft_lm_head))
+    fused = worker.fused_draft_head
+    if case != "enabled":
+        assert fused is None
+        return
+    assert fused is not None and fused.max_rows == 8
+    assert fused.vocab_offset == 0 and fused.round_logits
+    md = SimpleNamespace(wants_advanced_draft_sampling=False)
+    assert all(worker._fused_draft_head_for(rows, md) is fused for rows in range(1, 9))
+    # Fallbacks decided per step.
+    assert worker._fused_draft_head_for(9, md) is None
+    assert worker._fused_draft_head_for(0, md) is None
+    assert (
+        worker._fused_draft_head_for(1, SimpleNamespace(wants_advanced_draft_sampling=True)) is None
+    )
+    worker.guided_decoder = object()
+    assert worker._fused_draft_head_for(1, md) is None
+    # A rebuild (weights reloaded) replaces it; the kill switch then drops it.
+    monkeypatch.setenv(FUSED_DRAFT_HEAD_ENV_VAR, "0")
+    worker.build_fused_draft_head(SimpleNamespace(lm_head=draft_lm_head))
+    assert worker.fused_draft_head is None
+
+
+def test_fused_draft_head_draft_lm_head_choice():
+    """Which LM head the stock draft loops may fuse: MTP (vanilla and Eagle) through a plain
+    DeepseekV3MTPHead projection of the shared head, Eagle3 through its own head and the plain
+    logits processor."""
+    from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3MTPHead
+    from tensorrt_llm._torch.modules.bf16_draft_head import is_plain_mtp_shared_head
+    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
+    from tensorrt_llm._torch.speculative.mtp import MTPWorker
+
+    class _InheritsForward(DeepseekV3MTPHead):
+        pass
+
+    class _NormalizesInput(DeepseekV3MTPHead):
+        def forward(self, hidden_states, lm_head, attn_metadata, return_context_logits=False):
+            raise NotImplementedError
+
+    plain = object.__new__(_InheritsForward)
+    custom = object.__new__(_NormalizesInput)
+    assert is_plain_mtp_shared_head(plain) and not is_plain_mtp_shared_head(custom)
+
+    head = object()
+
+    def mtp_model(*shared_heads):
+        return SimpleNamespace(
+            lm_head=head, mtp_layers=[SimpleNamespace(shared_head=h) for h in shared_heads]
+        )
+
+    def eagle(is_mtp_eagle, draft_model):
+        worker = SimpleNamespace(is_mtp_eagle=is_mtp_eagle)
+        return Eagle3OneModelWorker._fused_draft_lm_head(worker, draft_model)
+
+    assert MTPWorker._fused_draft_lm_head(None, mtp_model(plain, plain)) is head
+    assert MTPWorker._fused_draft_lm_head(None, mtp_model(plain, custom)) is None
+    assert eagle(True, mtp_model(plain)) is head
+    assert eagle(True, mtp_model(custom)) is None
+
+    class _Custom(LogitsProcessor):
+        pass
+
+    assert eagle(False, SimpleNamespace(lm_head=head, logits_processor=LogitsProcessor())) is head
+    assert eagle(False, SimpleNamespace(lm_head=head, logits_processor=_Custom())) is None

@@ -1945,6 +1945,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
     def cache_derived_state(self) -> None:
         super().cache_derived_state()
+        if self.spec_worker is not None:
+            # Fused BF16 LM head + argmax + key exchange for greedy draft
+            # steps, from the current draft LM head weights.
+            self.spec_worker.build_fused_draft_head(self.draft_model)
         spec_config = self.spec_config
         if (self.spec_worker is not None and spec_config is not None
                 and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
