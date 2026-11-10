@@ -31,12 +31,10 @@
 #endif
 
 // Device code for the 10.x targets carries the kernels; other targets get kernels that trap. TRT-LLM
-// builds sm_10x as the sm_100f family by default, so usually only the __CUDA_ARCH__ == 1000 branch is
-// compiled, and GPUs of compute capability 10.3 and 10.7 run that image; 1030 and 1070 apply to
-// builds that list those architectures (e.g. --cuda_architectures "107-real"). Which GPUs may use the
-// transport is decided at run time by moeA2ASentinelKernelsAvailable(), not here. (FlashInfer
-// builds native sm_107a for these kernels, noting that the driver rejects the sm_100f fallback on
-// SM107; if it does, the availability probe below fails and the transport stays off.)
+// compiles compute capability 10.0, 10.3 and 10.7 as one sm_100f (family) image, so the
+// __CUDA_ARCH__ == 1000 branch is the one built, and 10.3 and 10.7 GPUs run it (the Rubin
+// validation ran that image). Which GPUs use the transport is decided at run time by
+// moeA2ASentinelKernelsAvailable(), not here.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070)
 #define MOE_A2A_SENTINEL_COMPILE 1
 #else
