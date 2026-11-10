@@ -233,8 +233,18 @@ def test_rejects_unsupported_inputs():
         torch.ops.trtllm.fp8_block_scale_low_m_gemm(
             torch.zeros((4, k), device="cuda", dtype=torch.bfloat16), w_fp8, packed.contiguous()
         )
+
+
+def test_max_m_for_measured_shape_and_alignment(monkeypatch):
+    """A shape measured on every architecture is in range, and misaligned N or K gives 0 even
+    where the table has a limit for it (SM107 selects only measured shapes)."""
+    mod = _kernel_module()
+    n, k = 7168, 768
     assert 1 <= mod.max_m_for(n, k) <= mod.MAX_M
-    assert mod.max_m_for(n + 8, k) == 0
+    # N - 8 rounds up to the measured 7168-row tile.
+    assert mod.max_m_for(n - 8, k) == 0
+    # No table key has a misaligned K: give one a limit.
+    monkeypatch.setitem(mod._tables().max_m, (n, k + 64), mod.MAX_M)
     assert mod.max_m_for(n, k + 64) == 0
 
 
