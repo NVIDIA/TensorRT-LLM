@@ -86,14 +86,31 @@ def _start(script, cache_dir):
     )
 
 
-def _finish(proc):
-    """The child's cache outcomes for the kernel, its output digest, and the tail of its log."""
-    out, _ = proc.communicate(timeout=900)
-    log = out[-6000:]
-    assert proc.returncode == 0, log
-    result = _RESULT.search(out)
-    assert result, log
-    return _OUTCOME.findall(out), json.loads(result.group(1))["digest"], log
+def _finish(*procs):
+    """Each child's cache outcomes for the kernel, its output digest, and the tail of its log."""
+    outs = {}
+    try:
+        for proc in procs:
+            try:
+                outs[proc] = proc.communicate(timeout=900)[0]
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                raise AssertionError(f"child timed out:\n{proc.communicate()[0][-6000:]}") from None
+    finally:
+        # A child left running would keep its GPU memory after the test.
+        for proc in procs:
+            if proc not in outs and proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+    results = []
+    for proc in procs:
+        log = outs[proc][-6000:]
+        assert proc.returncode == 0, log
+        result = _RESULT.search(outs[proc])
+        assert result, log
+        digest = json.loads(result.group(1))["digest"]
+        results.append((_OUTCOME.findall(outs[proc]), digest, log))
+    return results
 
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="needs the CuTe DSL")
@@ -104,9 +121,9 @@ def test_cute_compile_reused_across_processes(tmp_path):
     cache = tmp_path / "cache"
 
     # Two processes race on the empty cache; then a third loads the stored compile.
-    cold = [_finish(p) for p in [_start(script, cache), _start(script, cache)]]
-    warm = _finish(_start(script, cache))
-    stock = _finish(_start(script, None))
+    cold = _finish(_start(script, cache), _start(script, cache))
+    (warm,) = _finish(_start(script, cache))
+    (stock,) = _finish(_start(script, None))
 
     for outcomes, _, log in cold:
         assert outcomes in (["miss"], ["hit"]), log
