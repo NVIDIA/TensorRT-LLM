@@ -165,6 +165,7 @@ perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_8_flash_next_fp4_blackwell-
 perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on] SKIP (https://nvbugs/6759009)
 test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (bug pending, tracked in PR 17414)
 test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity SKIP (https://nvbugs/7016339)
+unittest/_torch/attention/sparse/csa2/test_module.py::test_fused_native_index_q_and_graph SKIP (https://nvbugs/7039506)
 unittest/_torch/disaggregation/test_disagg_idle_cancellation.py::test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary[False-already-complete] SKIP (https://nvbugs/7071872)
 unittest/_torch/disaggregation/test_disagg_idle_cancellation.py::test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary[False-cancelled] SKIP (https://nvbugs/7071872)
 unittest/_torch/disaggregation/test_disagg_idle_cancellation.py::test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary[True-already-complete] SKIP (https://nvbugs/7071872)
