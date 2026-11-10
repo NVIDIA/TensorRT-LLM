@@ -434,10 +434,19 @@ class TestInflightBatchingStats:
 class TestSpecDecodingStats:
     """Test speculative decoding stats are correctly exposed."""
 
-    def test_verification_rounds_support_aggregate_acceptance_length(self, collector):
+    _COUNTER_NAMES = (
+        "trtllm_spec_decode_num_draft_tokens_total",
+        "trtllm_spec_decode_num_accepted_tokens_total",
+        "trtllm_spec_decode_num_drafts_total",
+    )
+
+    def test_verification_rounds_support_aggregate_acceptance_length(
+        self, collector: MetricsCollector
+    ) -> None:
         """Accumulate rounds to compute a round-weighted acceptance length."""
         assert (
-            REGISTRY.get_sample_value("trtllm_spec_decode_num_drafts_total", collector.labels) == 0
+            REGISTRY.get_sample_value("trtllm_spec_decode_num_drafts_total", collector.labels)
+            is None
         )
         for accepted, rounds in ((3, 2), (8, 4)):
             collector.log_iteration_stats(
@@ -456,14 +465,33 @@ class TestSpecDecodingStats:
         assert rounds == 6
         assert 1 + accepted / rounds == pytest.approx(1 + 11 / 6)
 
-    def test_rejected_drafts_expose_zero_acceptance(self, collector):
-        """Expose zero accepted tokens so all-rejected rounds have length one."""
-        for metric_name in (
-            "trtllm_spec_decode_num_draft_tokens_total",
-            "trtllm_spec_decode_num_accepted_tokens_total",
-            "trtllm_spec_decode_num_drafts_total",
-        ):
+    @pytest.mark.parametrize(
+        "spec_stats",
+        [{}, {"numRequestsWithDraftTokens": 0}, {"numDraftTokens": 0}],
+        ids=["empty", "zero-rounds", "zero-draft-tokens"],
+    )
+    def test_zero_spec_report_initializes_counters(
+        self, collector: MetricsCollector, spec_stats: dict[str, int]
+    ) -> None:
+        """Expose all three zero series on the first speculative report."""
+        collector.log_iteration_stats({"specDecodingStats": spec_stats})
+
+        for metric_name in self._COUNTER_NAMES:
             assert REGISTRY.get_sample_value(metric_name, collector.labels) == 0
+
+    def test_copied_rank1_stats_do_not_initialize_counters(
+        self, collector: MetricsCollector
+    ) -> None:
+        """Wait for rank 0 before exposing copied speculative measurements."""
+        collector.log_iteration_stats({**SAMPLE_ITERATION_STATS, "attentionDpRank": 1})
+
+        for metric_name in self._COUNTER_NAMES:
+            assert REGISTRY.get_sample_value(metric_name, collector.labels) is None
+
+    def test_rejected_drafts_expose_zero_acceptance(self, collector: MetricsCollector) -> None:
+        """Expose zero accepted tokens so all-rejected rounds have length one."""
+        for metric_name in self._COUNTER_NAMES:
+            assert REGISTRY.get_sample_value(metric_name, collector.labels) is None
 
         collector.log_iteration_stats(
             {
@@ -491,10 +519,18 @@ class TestSpecDecodingStats:
         assert _get_gauge_value(collector, "spec_decode_acceptance_length") == pytest.approx(4.75)
         assert _get_gauge_value(collector, "spec_decode_draft_overhead") == pytest.approx(1.2)
 
-    def test_missing_spec_decoding_stats(self, collector):
-        """No error when specDecodingStats is absent."""
+    @pytest.mark.parametrize("include_none", [False, True], ids=["absent", "null"])
+    def test_missing_spec_decoding_stats(
+        self, collector: MetricsCollector, include_none: bool
+    ) -> None:
+        """Keep speculative counter series absent without a speculative report."""
         stats = {k: v for k, v in SAMPLE_ITERATION_STATS.items() if k != "specDecodingStats"}
+        if include_none:
+            stats["specDecodingStats"] = None
         collector.log_iteration_stats(stats)
+
+        for metric_name in self._COUNTER_NAMES:
+            assert REGISTRY.get_sample_value(metric_name, collector.labels) is None
 
 
 class TestPartialStats:

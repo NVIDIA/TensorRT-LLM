@@ -501,21 +501,18 @@ class MetricsCollector:
             name=self.metric_prefix + "spec_decode_num_draft_tokens_total",
             documentation="Total number of draft tokens in speculative decoding",
             labelnames=self.labels.keys())
-        self.counter_spec_decode_num_draft_tokens.labels(**self.labels)
         self.counter_spec_decode_num_accepted_tokens = Counter(
             name=self.metric_prefix + "spec_decode_num_accepted_tokens_total",
             documentation=
             "Total number of accepted tokens in speculative decoding",
             labelnames=self.labels.keys())
-        self.counter_spec_decode_num_accepted_tokens.labels(**self.labels)
         self.counter_spec_decode_num_drafts = Counter(
             name=self.metric_prefix + "spec_decode_num_drafts_total",
-            documentation=(
-                "Total request verification rounds with draft tokens. "
-                "Use with spec_decode_num_accepted_tokens_total to compute "
-                "mean acceptance length: 1 + accepted / rounds."),
+            documentation=
+            ("Total request verification rounds with draft tokens reported by rank 0. "
+             "Use with spec_decode_num_accepted_tokens_total to compute "
+             "mean acceptance length: 1 + accepted / rounds."),
             labelnames=self.labels.keys())
-        self.counter_spec_decode_num_drafts.labels(**self.labels)
         self.spec_decode_acceptance_length = Gauge(
             name=self.metric_prefix + "spec_decode_acceptance_length",
             documentation="Acceptance length in speculative decoding",
@@ -1066,7 +1063,12 @@ class MetricsCollector:
                                 ifb_stats["avgNumDecodedTokensPerIter"])
 
         # Speculative decoding stats are copied from rank 0 by ADP fanout.
-        if spec_stats := iteration_stats.get("specDecodingStats"):
+        spec_stats = iteration_stats.get("specDecodingStats")
+        if spec_stats is not None:
+            # Expose zero counters even when the report contains only rejected drafts.
+            self.counter_spec_decode_num_draft_tokens.labels(**self.labels)
+            self.counter_spec_decode_num_accepted_tokens.labels(**self.labels)
+            self.counter_spec_decode_num_drafts.labels(**self.labels)
             rounds = spec_stats.get("numRequestsWithDraftTokens", 0)
             if rounds > 0:
                 self._log_counter(self.counter_spec_decode_num_drafts, {},
