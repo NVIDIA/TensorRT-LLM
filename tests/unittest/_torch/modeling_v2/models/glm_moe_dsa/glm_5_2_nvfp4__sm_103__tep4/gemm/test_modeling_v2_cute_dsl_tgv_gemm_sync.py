@@ -32,7 +32,7 @@ import pytest
 
 import tensorrt_llm
 
-_KERNEL = (
+_GEMM_KERNELS = (
     Path(tensorrt_llm.__file__).parent
     / "_torch"
     / "_experimental"
@@ -42,8 +42,22 @@ _KERNEL = (
     / "glm_5_2_nvfp4__sm_103__tep4"
     / "kernels"
     / "gemm"
-    / "tgv_gemm_dsl.py"
 )
+_KERNEL = _GEMM_KERNELS / "tgv_gemm_dsl.py"
+
+# The other split-K reductions of this folder: (file, kernel function, mailbox barrier,
+# text that identifies a read of the mailbox). Their peers scatter with
+# ``_compat48.store_async`` and the owner reads the mailbox after the wait.
+_SIBLING_SPLIT_K = [
+    ("_projection_tcgen05_template.py", "kernel", "reduce_full", "reduce_mailbox"),
+    ("moe_prefill_shared_splitk.py", "shared_splitk_kernel", "reduce_full", "reduce_mailbox"),
+    (
+        "self_attn_indexer_pre_indexer_proj_m64_n160_k6144_tf32.py",
+        "_indexer_splitk_kernel",
+        "recv_mbar",
+        "recv_ptr",
+    ),
+]
 
 _ALLOC_BAR = "tmem_alloc_result_bar"
 _MAILBOX_BAR = "dsmem_mailbox_mbar"
@@ -201,6 +215,45 @@ def test_split_k_mailbox_wait_acquires_at_cluster_scope(module) -> None:
         and "dsmem_mailbox_ptr" in ast.unparse(c.func.value)
     ]
     assert scatters and reads, "the split-K scatter and the mailbox reads could not be located"
+    assert (
+        max(c.lineno for c in scatters) < wait.lineno < fence.lineno < min(c.lineno for c in reads)
+    )
+
+
+@pytest.mark.parametrize(("filename", "kernel", "barrier", "mailbox"), _SIBLING_SPLIT_K)
+def test_sibling_split_k_mailbox_waits_acquire_at_cluster_scope(
+    filename: str, kernel: str, barrier: str, mailbox: str
+) -> None:
+    """Same protocol in the other split-K kernels: relaxed cluster wait, acquire fence, then reads."""
+    path = _GEMM_KERNELS / filename
+    fn = _function(ast.parse(path.read_text(), filename=str(path)), kernel)
+    calls = _calls(fn)
+
+    wait = _only(
+        [c for c in calls if _callee(c) == _WAIT and _first_arg(c) == barrier],
+        f"{_WAIT} on {barrier} in {filename}",
+    )
+    assert isinstance(wait.args[1], ast.Constant) and wait.args[1].value == 0
+    keywords = {k.arg: ast.unparse(k.value) for k in wait.keywords}
+    assert keywords.get("scope") == "prims.MBarrierScope.CLUSTER", keywords
+    assert keywords.get("order") == "prims.MemOrder.RELAXED", keywords
+
+    fence = _only(
+        [c for c in calls if _callee(c) == _FENCE and _first_arg(c) == "prims.MemOrder.ACQUIRE"],
+        f"{_FENCE}(prims.MemOrder.ACQUIRE) in {filename}",
+    )
+
+    scatters = [c for c in calls if _callee(c) == "_compat48.store_async"]
+    reads = [
+        c
+        for c in calls
+        if isinstance(c.func, ast.Attribute)
+        and c.func.attr == "load"
+        and mailbox in ast.unparse(c.func.value)
+    ]
+    assert scatters and reads, (
+        f"the scatter and the mailbox reads could not be located in {filename}"
+    )
     assert (
         max(c.lineno for c in scatters) < wait.lineno < fence.lineno < min(c.lineno for c in reads)
     )
