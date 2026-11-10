@@ -372,6 +372,12 @@ def test_disagg_draft_layers_need_the_hnd_layout() -> None:
         _manager(specs, dtype=DataType.FP8, implementation="triton", is_disagg=True)
 
 
+class _HostingKVCacheManagerV2(KVCacheManagerV2):
+    """A plain V2 manager that sizes its hosted draft lifecycle as a hosting manager does."""
+
+    hosts_unified_draft_layers = True
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
 def test_window_sized_draft_pool_admits_a_full_context_chunk() -> None:
     """Allocation rounds the window-sized draft share, but one full chunk still fits."""
@@ -392,7 +398,7 @@ def test_window_sized_draft_pool_admits_a_full_context_chunk() -> None:
             (1, KVCacheLayerOwner.DRAFT, HEADS, DRAFT_WINDOW),
         )
     )
-    manager = KVCacheManagerV2(
+    manager = _HostingKVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=1 << 30,
             host_cache_size=0,
