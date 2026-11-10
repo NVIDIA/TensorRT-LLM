@@ -460,8 +460,16 @@ def test_batch_dummy_counts_mapping_and_microbatch_metadata(
 
 
 @pytest.mark.parametrize("warmup_only", [False, True])
+@pytest.mark.parametrize(
+    "temperature_only,ragged_verify_bucket",
+    [(False, None), (True, None), (False, 12), (True, 12)],
+)
 def test_decoder_capture_and_replay_named_capacity(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, warmup_only: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    warmup_only: bool,
+    temperature_only: bool,
+    ragged_verify_bucket: int | None,
 ) -> None:
     """Actual graph owners must not present padded token rows as live requests."""
     monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
@@ -479,7 +487,12 @@ def test_decoder_capture_and_replay_named_capacity(
     monkeypatch.setattr(
         cuda_graph_runner, "nccl_window_graph_capture", lambda *args, **kwargs: nullcontext()
     )
-    key = cuda_graph_runner.KeyType(batch_size=4, draft_len=2)
+    key = cuda_graph_runner.KeyType(
+        batch_size=4,
+        draft_len=2,
+        temperature_only=temperature_only,
+        ragged_verify_bucket=ragged_verify_bucket,
+    )
     attn = object()
     inputs = {
         "input_ids": torch.arange(12),
@@ -547,6 +560,8 @@ def test_decoder_capture_and_replay_named_capacity(
         assert fields["workflow.graph.key.batch_size"] == 4
         assert fields["workflow.graph.key.draft_len"] == 2
         assert fields["workflow.graph.key.short_seq_len_mode"] is False
+        assert fields["workflow.graph.key.temperature_only"] is temperature_only
+        assert fields["workflow.graph.key.ragged_verify_bucket"] == ragged_verify_bucket
         assert "workflow.graph.key.is_first_draft" not in fields
         assert fields["workflow.graph.key.sample_type"] == "FULL"
         assert fields["workflow.graph.batch_capacity"] == 4

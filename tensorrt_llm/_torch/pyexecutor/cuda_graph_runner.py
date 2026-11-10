@@ -195,6 +195,10 @@ def _decoder_graph_workflow_metadata(
         if key.peft_cache_data_type is not None else None,
         "workflow.graph.key.use_lora_graph":
         key.use_lora_graph,
+        "workflow.graph.key.temperature_only":
+        key.temperature_only,
+        "workflow.graph.key.ragged_verify_bucket":
+        key.ragged_verify_bucket,
     }
     for name, field_name in (("input_ids", "input_token_rows"),
                              ("encoder_hidden_states",
