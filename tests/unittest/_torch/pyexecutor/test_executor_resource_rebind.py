@@ -179,7 +179,7 @@ def test_release_exits_a_bound_dwdp_manager_after_the_caches(
 
     ex.release_resources()
 
-    assert events[-2:] == ["cache", field]
+    assert events[-3:] == ["cache", "unregister", field]
     assert getattr(ex, field) is None
     ex.shutdown()
     manager.__exit__.assert_called_once_with(None, None, None)
