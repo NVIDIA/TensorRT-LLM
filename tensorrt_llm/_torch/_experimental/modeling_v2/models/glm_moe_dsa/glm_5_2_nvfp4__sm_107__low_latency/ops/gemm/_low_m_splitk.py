@@ -43,6 +43,7 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
@@ -485,36 +486,23 @@ def _store_shared_remote_v4(
     )
 
 
-@dsl_user_op
-def _mbarrier_wait_acquire_cluster(
-    mbar_ptr: "cute.Pointer", phase: int, *, loc=None, ip=None
-) -> None:
-    """Spin until ``phase`` of a local mbarrier completes, acquiring at cluster scope.
+@cute.jit
+def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: cutlass.Constexpr[int]) -> None:
+    """Spin until ``phase`` of a local mbarrier completes and acquire the peers' payload at cluster scope.
 
     ``cute.arch.mbarrier_wait`` acquires at CTA scope. A barrier completed by peer CTAs'
     ``st.async ... mbarrier::complete_tx`` (``_store_shared_remote_v4``) is released at
-    cluster scope, and only a cluster-scope acquire orders the peers' payload before the
-    reads that follow the wait.
+    cluster scope, so the wait has to synchronize at cluster scope before the reads that
+    follow it. A ``.acquire.cluster`` wait makes ptxas invalidate L1 after every poll; a
+    relaxed cluster-scope wait followed by ``fence.acquire.sync_restrict::shared::cluster``
+    is the PTX ISA's acquire pattern for shared memory published through the generic proxy
+    and costs no extra instruction.
     """
-    llvm.inline_asm(
-        None,
-        [
-            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
-            Int32(phase).ir_value(loc=loc, ip=ip),
-        ],
-        "{\n"
-        ".reg .pred P1;\n"
-        "LAB_WAIT:\n"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [$0], $1;\n"
-        "@P1 bra DONE;\n"
-        "bra LAB_WAIT;\n"
-        "DONE:\n"
-        "}",
-        "r,r,~{memory}",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @dsl_user_op
