@@ -579,6 +579,44 @@ def test_max_tokens_quota_pays_for_the_index_k_pages() -> None:
         manager.shutdown()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_only_a_hosting_manager_sizes_the_draft_lifecycle() -> None:
+    """A plain V2 manager with a windowed draft lifecycle keeps the backend's pool split."""
+    torch.cuda.init()
+    specs = tuple(
+        replace(spec, dtype=DataType.BF16, buffer_roles=(Role.KEY, Role.VALUE)) for spec in _specs()
+    )
+    plain = KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=64 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=NUM_TARGET,
+        num_kv_heads=HEADS,
+        head_dim=HEAD_DIM,
+        tokens_per_block=128,
+        max_seq_len=1024,
+        max_batch_size=2,
+        max_num_tokens=256,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.BF16,
+        vocab_size=16,
+        layer_specs=specs,
+    )
+    try:
+        assert plain.kv_cache_manager_py_config.initial_pool_ratio is None
+    finally:
+        plain.shutdown()
+    unified = _manager(_specs())
+    try:
+        assert unified.kv_cache_manager_py_config.initial_pool_ratio is not None
+    finally:
+        unified.shutdown()
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("pp_size", [1, 2])
 def test_window_sized_draft_ratio(pp_size: int) -> None:
@@ -601,6 +639,7 @@ def test_window_sized_draft_ratio(pp_size: int) -> None:
     manager.max_num_tokens = 256
     manager.mapping = Mapping(world_size=pp_size, rank=0, pp_size=pp_size)
     manager.is_disagg = False
+    manager._disable_overlap_scheduler = False
     manager._generation_kv_capacity_headroom = 1
     manager.num_extra_kv_tokens = 0
     configs = _configs(manager.layer_specs)
@@ -616,6 +655,12 @@ def test_window_sized_draft_ratio(pp_size: int) -> None:
         draft_bytes_per_token
     )
     assert windows_and_chunk <= draft_ratio * quota < token_share * quota
+    # Without the overlap scheduler a single-stage batch's retiring request frees its KV at once,
+    # so half as many sequences hold a window.
+    manager._disable_overlap_scheduler = True
+    no_overlap_ratio = manager._windowed_draft_pool_ratio(configs, quota, 128)[1]
+    assert (no_overlap_ratio < draft_ratio) if pp_size == 1 else (no_overlap_ratio == draft_ratio)
+    manager._disable_overlap_scheduler = False
     # Resume refuses a pool above its watermark, so a lower watermark needs a larger share.
     assert manager._windowed_draft_pool_ratio(configs, quota, 128, 0.5)[1] > draft_ratio
     # A quota too small for every window keeps the bytes-per-token split.

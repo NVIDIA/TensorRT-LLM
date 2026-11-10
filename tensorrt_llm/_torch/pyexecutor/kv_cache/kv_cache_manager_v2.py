@@ -1969,6 +1969,8 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
+        # Read by _windowed_draft_pool_ratio, which runs before max_admissible_sequences is set.
+        self._disable_overlap_scheduler = disable_overlap_scheduler
         self.kv_connector_manager = kv_connector_manager
         codec_config = getattr(cold_page_codec_provider, "config", None)
         self._has_lossy_cold_page_codec = (
@@ -3956,7 +3958,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
                 for local_layer_id, layer in enumerate(self.layer_specs)
             ]
-            if initial_pool_ratio is None and typical_step is None:
+            # Only a manager hosting draft layers sizes their windowed lifecycle itself; other
+            # layer-spec managers keep the backend's split.
+            if (
+                self.hosts_unified_draft_layers
+                and initial_pool_ratio is None
+                and typical_step is None
+            ):
                 initial_pool_ratio = self._windowed_draft_pool_ratio(
                     layer_configs,
                     cache_tiers[0].quota,
@@ -4125,9 +4133,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
         Without a pool ratio or typical step the backend splits the hot tier for one 2048-token
         request, which says nothing about how many sequences hold a draft window at once. The
-        draft layers need every admissible sequence's window plus one context chunk, which is
-        what the KV cache cost already charges for them, over the resume watermark and capped
-        at an equal-token share.
+        draft layers get a window for every sequence that can hold KV at once (as
+        max_admissible_sequences counts them, which can exceed the max_batch_size windows the KV
+        cache cost charges) plus one context chunk, over the resume watermark and capped at an
+        equal-token share.
         """
         if self.max_num_tokens is None or gpu_quota <= 0:
             # Without a context-chunk bound or a quota the backend's split is the safe one.
@@ -4163,13 +4172,12 @@ class KVCacheManagerV2(BaseResourceManager):
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
             layer_specs=draft_specs,
         )
-        # Sequences that can hold KV at once (see max_admissible_sequences), counting the overlap
-        # scheduler's retiring request: the pool is sized before the scheduler mode is known.
-        num_sequences = (
-            self.max_batch_size
-            * self.mapping.pp_size
-            * (2 if self.is_disagg or not self.mapping.has_pp() else 1)
+        # Sequences that can hold KV at once, as max_admissible_sequences counts them: transfers
+        # in flight (disagg) or the overlap scheduler's retiring request double them.
+        needs_extra_leases = self.is_disagg or (
+            not self._disable_overlap_scheduler and not self.mapping.has_pp()
         )
+        num_sequences = self.max_batch_size * self.mapping.pp_size * (2 if needs_extra_leases else 1)
         draft_bytes = (
             window_bytes_per_sequence * num_sequences + sum(draft_sizes) * self.max_num_tokens
         ) / max_util_for_resume
