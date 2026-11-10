@@ -1138,6 +1138,34 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently() -
     assert cache.stats() == stats
 
 
+def test_termination_between_chunks_releases_each_remaining_reference_once() -> None:
+    """Per-chunk release already returned the consumed item's reference, so a
+    request cancelled between two prefill chunks must not release it again."""
+    request = make_mm_request(1, [4, 4, 4], interleaved=True)
+    state = request.py_mm_encoder_state
+    cache = TensorLRUCache(16)
+    for item_idx in range(3):
+        cache_key = ("mm_transient", request.request_id, item_idx)
+        cache.acquire(cache_key, 4, retain_after_release=False)
+        # Item 2 is still being encoded, so its entry is only reserved.
+        if item_idx < 2:
+            cache.commit(cache_key, torch.ones(1))
+        state.set_item_cache_key(item_idx, cache_key, ready=item_idx < 2)
+
+    # The first chunk covered item 0, which sits at prompt position 1.
+    request.context_current_position = 2
+    release_consumed_mm_items(request, cache)
+    stats = cache.stats()
+    assert (stats.item_count, stats.in_use_bytes, stats.reserved_bytes) == (2, 4, 4)
+
+    executor = SimpleNamespace(model_engine=SimpleNamespace(mm_encoder_cache=cache))
+    PyExecutor._release_multimodal_resources(executor, request)
+    stats = cache.stats()
+    assert (stats.item_count, stats.in_use_bytes, stats.reserved_bytes) == (0, 0, 0)
+    PyExecutor._release_multimodal_resources(executor, request)
+    assert cache.stats() == stats
+
+
 def test_weight_invalidation_rejects_live_references():
     invalidations = []
     executor = object.__new__(PyExecutor)
