@@ -51,6 +51,7 @@ from tensorrt_llm._torch.autotuner import (
     TuningConfig,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.moe.live_rows import all_rows_word
 from tensorrt_llm._torch.utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
@@ -2319,6 +2320,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # Set by the op right after construction; never a codegen input.
             self._helper_ready_flags = None
             self._helper_ready_generation = 0
+            self._live_row_word = None  # per launch, like the READY bundle
 
         def unique_id(self):
             # local_rank is intentionally excluded: every EP rank must run the
@@ -2968,6 +2970,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 runtime_kwargs["hot_expert_weight_ready_generation"] = cutlass.Uint64(
                     int(self._helper_ready_generation)
                 )
+            # Every launch of a kernel that reads the live-row word passes one: one compiled ABI.
+            if getattr(kernel, "reads_live_row_word", False):
+                live_row_word = self._live_row_word
+                if live_row_word is None:
+                    live_row_word = all_rows_word(activation.device)
+                runtime_kwargs["live_row_word"] = _to_cute_ptr_cached(
+                    live_row_word, assumed_align=4
+                )
             # unique_id() includes helper_expert_count, separating cached ABIs.
             cached = self.__class__.kernel_cache.get(cache_key)
             if cached is None:
@@ -3106,6 +3116,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        # The forward's live-row word (moe/live_rows.py): rows past the live ones are dropped.
+        live_row_word: Optional[torch.Tensor] = None,
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -3172,6 +3184,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # values across calls, even when the runner itself is cached.
         runner._helper_ready_flags = hot_expert_weight_ready_flags
         runner._helper_ready_generation = int(hot_expert_weight_ready_generation)
+        runner._live_row_word = live_row_word
         inputs = [
             activation,
             activation_sf,
@@ -3203,6 +3216,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 # Release the cached runner reference to this generation's terminal tensor.
                 # The next call supplies fresh READY inputs.
                 runner._helper_ready_flags = None
+                runner._live_row_word = None
             return
         tuner = AutoTuner.get()
         # Opt-IN: in tuning mode the MERGE lockstep sweep runs (made safe by
@@ -3261,6 +3275,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
         finally:
             runner._helper_ready_flags = None
+            runner._live_row_word = None
 
     # Eager callers may call ``run_cute_dsl_megamoe_nvfp4_blackwell`` directly
     # and skip the custom-op dispatch; traced code must use the registered op.
@@ -3312,5 +3327,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        # The forward's live-row word (moe/live_rows.py): rows past the live ones are dropped.
+        live_row_word: Optional[torch.Tensor] = None,
     ) -> None:
         return None

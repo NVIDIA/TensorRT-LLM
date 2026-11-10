@@ -32,6 +32,7 @@ from cutlass._mlir.dialects import llvm
 from ..quant_def import CombineFormat
 from .constants import Nvfp4E2M1RcpLimit
 from .dsl_helpers import mark_alignment
+from .live_rows import live_row_count
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +193,8 @@ class TopkReduce:
         reduced_output: cute.Tensor,  # (token, hidden)
         topk_score: Optional[cute.Tensor],  # (token, topk)
         stream: cuda.CUstream,
+        # live_rows.py; rows past the live ones were dropped, so their cells are stale: write zeros.
+        live_row_word: Optional[cute.Pointer] = None,
     ):
         threads = self._threads
         total_workers = reduced_output.shape[0] * self.hidden_tiles
@@ -212,7 +215,9 @@ class TopkReduce:
             )
 
         if cutlass.const_expr(not self.combine_format.is_quantized):
-            self._reduce_bf16(combine_quant, topk_score, reduced_output).launch(grid=grid, block=block, stream=stream)
+            self._reduce_bf16(combine_quant, topk_score, reduced_output, live_row_word).launch(
+                grid=grid, block=block, stream=stream
+            )
             return
 
         # The mega kernel hands sf in already as the depth-2 broadcast layout; a
@@ -236,18 +241,38 @@ class TopkReduce:
             )
 
         if cutlass.const_expr(self.combine_format.act_dtype is cutlass.Float8E4M3FN):
-            self._reduce_mxfp8(combine_quant, sf, topk_score, reduced_output).launch(
+            self._reduce_mxfp8(combine_quant, sf, topk_score, reduced_output, live_row_word).launch(
                 grid=grid, block=block, stream=stream
             )
         else:
-            self._reduce_fp4(combine_quant, sf, topk_score, reduced_output).launch(
+            self._reduce_fp4(combine_quant, sf, topk_score, reduced_output, live_row_word).launch(
                 grid=grid, block=block, stream=stream
             )
+
+    @cute.jit
+    def _store_zero_slice(self, reduced_output: cute.Tensor, token_idx: Int32, hidden_tile_idx: Int32):
+        hidden_per_thread = self.hidden_per_thread
+        out_dtype = reduced_output.element_type
+        dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
+        zeros = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+        zeros.fill(0.0)
+        store_bits = hidden_per_thread * out_dtype.width
+        cute.copy(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=store_bits),
+            zeros,
+            mark_alignment(dst, store_bits // 8),
+        )
 
     # -- kernels --------------------------------------------------------------
 
     @cute.kernel
-    def _reduce_bf16(self, combine_output: cute.Tensor, topk_score: Optional[cute.Tensor], reduced_output: cute.Tensor):
+    def _reduce_bf16(
+        self,
+        combine_output: cute.Tensor,
+        topk_score: Optional[cute.Tensor],
+        reduced_output: cute.Tensor,
+        live_row_word: Optional[cute.Pointer],
+    ):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
@@ -263,7 +288,10 @@ class TopkReduce:
         score_dtype = topk_score.dtype if cutlass.const_expr(topk_score is not None) else cutlass.Float32
         score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
 
-        if (not needs_guard) or token_idx < reduced_output.shape[0]:
+        live_rows = Int32(reduced_output.shape[0])
+        if cutlass.const_expr(live_row_word is not None):
+            live_rows = live_row_count(live_row_word, live_rows)
+        if token_idx < live_rows:
             # (token, topk, hidden) -> (topk, hidden_per_thread)
             terms = cute.zipped_divide(combine_output[token_idx, None, None], (num_topk, hidden_per_thread))[
                 (None, None), (0, hidden_tile_idx)
@@ -307,6 +335,8 @@ class TopkReduce:
                 out,
                 mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
             )
+        elif (not needs_guard) or token_idx < reduced_output.shape[0]:
+            self._store_zero_slice(reduced_output, token_idx, hidden_tile_idx)
 
     @cute.kernel
     def _reduce_mxfp8(
@@ -315,6 +345,7 @@ class TopkReduce:
         combine_sf: cute.Tensor,  # depth-2 broadcast view: logical (token, topk, hidden) e8m0
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
+        live_row_word: Optional[cute.Pointer],
     ):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
@@ -332,7 +363,10 @@ class TopkReduce:
         score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
         scale_reg = cute.make_rmem_tensor((num_topk,), cutlass.Float8E8M0FNU)
 
-        if (not needs_guard) or token_idx < reduced_output.shape[0]:
+        live_rows = Int32(reduced_output.shape[0])
+        if cutlass.const_expr(live_row_word is not None):
+            live_rows = live_row_count(live_row_word, live_rows)
+        if token_idx < live_rows:
             # (token, topk, hidden) -> (topk, hidden_per_thread)
             codes = cute.zipped_divide(combine_quant[token_idx, None, None], (num_topk, hidden_per_thread))[
                 (None, None), (0, hidden_tile_idx)
@@ -389,6 +423,8 @@ class TopkReduce:
                 out,
                 mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
             )
+        elif (not needs_guard) or token_idx < reduced_output.shape[0]:
+            self._store_zero_slice(reduced_output, token_idx, hidden_tile_idx)
 
     @cute.kernel
     def _reduce_fp4(
@@ -397,6 +433,7 @@ class TopkReduce:
         combine_sf: cute.Tensor,  # depth-2 broadcast view: logical (token, topk, hidden) bf16 amax
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
+        live_row_word: Optional[cute.Pointer],
     ):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
@@ -414,7 +451,10 @@ class TopkReduce:
         score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
         scale_reg = cute.make_rmem_tensor((num_topk,), cutlass.BFloat16)
 
-        if (not needs_guard) or token_idx < reduced_output.shape[0]:
+        live_rows = Int32(reduced_output.shape[0])
+        if cutlass.const_expr(live_row_word is not None):
+            live_rows = live_row_count(live_row_word, live_rows)
+        if token_idx < live_rows:
             # (token, topk, hidden) -> (topk, hidden_per_thread)
             codes = cute.zipped_divide(combine_quant[token_idx, None, None], (num_topk, hidden_per_thread))[
                 (None, None), (0, hidden_tile_idx)
@@ -480,3 +520,5 @@ class TopkReduce:
                 out,
                 mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
             )
+        elif (not needs_guard) or token_idx < reduced_output.shape[0]:
+            self._store_zero_slice(reduced_output, token_idx, hidden_tile_idx)
