@@ -50,6 +50,8 @@ _DEFAULT_MAX_CHUNK = 8192
 # is as fast or faster; from 64K on the fused path wins for every supported indexer geometry
 # (DS-V3.2, GLM-5.x, DSV4-Flash/Pro; FP32 and BF16 logits; 4K and 8K query rows).
 _DEFAULT_MIN_CONTEXT = 65536
+# Query rows of the synthetic chunk ``ThrowawayPrefillTopK.warmup`` runs.
+_WARMUP_QUERY_ROWS = 128
 _FP8_KEY_ALIGNMENT = 128
 _MXFP4_KEY_ALIGNMENT = 256
 _LOGITS_DTYPES = {
@@ -186,6 +188,9 @@ class ThrowawayPrefillTopK:
             )
             self._k_scale_stage = torch.empty(self.num_keys, dtype=torch.float32, device=device)
         self._device = device
+        self._n_heads = n_heads
+        self._index_topk = index_topk
+        self._compress_ratio = compress_ratio
         self._pool_prepared = False
         self._failed = False
         # (kv_prefix_len, rows) of the plan the wrapper currently holds, or None.
@@ -294,6 +299,55 @@ class ThrowawayPrefillTopK:
                 q_scale=None if q_scale is None else q_scale[begin:end],
             )
         return True
+
+    def warmup(self) -> bool:
+        """Compiles the kernels and allocates their workspace with one synthetic chunk.
+
+        Otherwise the first chunk that reaches the min-context gate pays for both inside a live
+        request. The chunk holds all-zero inputs with more keys than ``index_topk``, so it takes
+        the full selection path.
+
+        Returns:
+            True if the kernels are built; False if this runner is disabled (e.g. the workspace
+            did not fit).
+        """
+        if self._failed:
+            return False
+        if self._pool_prepared:
+            return True
+        num_k = min(self.num_keys, 4 * self._index_topk)
+        num_q = min(_WARMUP_QUERY_ROWS, num_k * self._compress_ratio)
+        kv_prefix_len = num_k * self._compress_ratio - num_q
+        device = self._device
+        if self._mxfp4:
+            q = torch.zeros(
+                (num_q, self._n_heads, _HEAD_DIM // 2), dtype=torch.uint8, device=device
+            )
+            q_scale = torch.zeros((num_q, self._n_heads), dtype=torch.int32, device=device)
+            k = torch.zeros((num_k, _HEAD_DIM // 2), dtype=torch.uint8, device=device)
+            k_scale = torch.zeros((num_k, 4), dtype=torch.uint8, device=device)
+        else:
+            q = torch.zeros(
+                (num_q, self._n_heads, _HEAD_DIM), dtype=torch.float8_e4m3fn, device=device
+            )
+            q_scale = None
+            k = torch.zeros((num_k, _HEAD_DIM), dtype=torch.float8_e4m3fn, device=device)
+            k_scale = torch.ones(num_k, dtype=torch.float32, device=device)
+        weights = torch.zeros((num_q, self._n_heads), dtype=torch.float32, device=device)
+        out = torch.empty((num_q, self._index_topk), dtype=torch.int32, device=device)
+        ran = self.run_chunk(
+            q,
+            weights,
+            k,
+            k_scale,
+            out,
+            kv_prefix_len=kv_prefix_len,
+            plan_cache={},
+            q_scale=q_scale,
+        )
+        # The plan tensors lived in the local cache above; make the next chunk plan again.
+        self._planned_key = None
+        return ran
 
     def _disable(self, error: torch.OutOfMemoryError) -> None:
         """Releases this runner's buffers so the unfused path gets the memory back."""

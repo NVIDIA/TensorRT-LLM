@@ -667,6 +667,30 @@ def test_workspace_oom_disables_the_runner(monkeypatch):
     assert runner._k_stage is None  # buffers released
 
 
+@skip_not_sm100
+@pytest.mark.parametrize("config,qkv", [("ds_v32", "fp8"), ("dsv4_flash", "mxfp4")])
+def test_warmup_builds_the_kernels_before_the_first_chunk(monkeypatch, config, qkv):
+    """warmup() compiles the kernels and allocates the workspace, so the first real chunk does
+    neither, and its selection is still exact."""
+    heads, top_k, ratio = CONFIGS[config]
+    runner = ThrowawayPrefillTopK(
+        n_heads=heads,
+        index_topk=top_k,
+        compress_ratio=ratio,
+        max_context_length=65536,
+        device=torch.device("cuda"),
+        qkv_dtype=qkv,
+    )
+    assert runner.warmup()
+    assert runner.warmup()  # already warm: no second build
+
+    def prepare_pool(*args, **kwargs):
+        pytest.fail("the first chunk after warmup must not build the kernels")
+
+    monkeypatch.setattr(runner._wrapper, "prepare_pool", prepare_pool)
+    _check(config, 256, 12288, qkv=qkv, seed=41, runner=runner)
+
+
 # ---------------------------------------------------------------------------------------------
 # Dispatch (CPU only): Indexer._run_throwaway_chunk with a fake runner.
 # ---------------------------------------------------------------------------------------------
@@ -770,6 +794,50 @@ def test_dispatch_routes_short_context_to_unfused_path(kv_prefix_len, q_end, han
     )
     assert result is handled
     assert len(runner.calls) == int(handled)
+
+
+class _WarmableRunner:
+    def __init__(self, ready=True):
+        self._ready = ready
+        self.warmups = 0
+
+    def warmup(self):
+        self.warmups += 1
+        return self._ready
+
+
+@pytest.mark.parametrize(
+    "enabled,failed,ready,expected,warmups",
+    [
+        (True, False, True, True, 1),
+        (True, False, False, False, 1),  # the workspace did not fit
+        (False, False, True, False, 0),  # not opted in
+        (True, True, True, False, 0),  # creation failed earlier
+    ],
+)
+def test_prewarm_builds_the_shared_runner_and_warms_it(
+    monkeypatch, enabled, failed, ready, expected, warmups
+):
+    runner = _WarmableRunner(ready=ready)
+    built = []
+
+    def get_runner(**kwargs):
+        built.append(kwargs)
+        return runner
+
+    monkeypatch.setattr(indexer_module, "get_throwaway_prefill_topk", get_runner)
+    indexer = _fake_indexer(None, enabled=enabled, failed=failed)
+    indexer.compress_ratio = 4
+    indexer.use_fp4 = True
+    indexer._build_throwaway_topk = Indexer._build_throwaway_topk.__get__(indexer)
+    assert Indexer.prewarm_throwaway_topk(indexer, 1 << 20, torch.device("cuda", 0)) is expected
+    assert runner.warmups == warmups
+    if warmups:
+        assert built[0]["compress_ratio"] == 4
+        assert built[0]["max_context_length"] == 1 << 20
+        assert built[0]["qkv_dtype"] == "mxfp4"
+        assert built[0]["device"] == torch.device("cuda", 0)
+        assert indexer._throwaway_topk is runner  # the forward reuses the warmed runner
 
 
 def test_min_context_env(monkeypatch):

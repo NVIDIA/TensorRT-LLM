@@ -1697,6 +1697,45 @@ class Indexer(nn.Module):
             row_ends=row_ends,
         )
 
+    def _build_throwaway_topk(
+        self, compress_ratio: int, max_seq_len: int, device: torch.device
+    ) -> bool:
+        """Gets the runner shared by the layers of this configuration; False if unavailable."""
+        self._throwaway_topk = get_throwaway_prefill_topk(
+            n_heads=self.n_heads,
+            index_topk=self.index_topk,
+            compress_ratio=compress_ratio,
+            max_context_length=max_seq_len,
+            device=device,
+            qkv_dtype="mxfp4" if self.use_fp4 else "fp8",
+        )
+        self._throwaway_topk_failed = self._throwaway_topk is None
+        return not self._throwaway_topk_failed
+
+    def prewarm_throwaway_topk(self, max_seq_len: int, device: torch.device) -> bool:
+        """Builds the fused indexer + Top-K runner and compiles its kernels before serving.
+
+        Without this, the first prefill chunk that reaches the min-context gate compiles the
+        kernels inside a live request. Layers of the same configuration share one runner, so
+        only the first call per configuration compiles.
+
+        Args:
+            max_seq_len: Max sequence length of the KV cache manager, as at run time.
+            device: CUDA device the layer runs on.
+
+        Returns:
+            True if the runner is ready; False if the fused path is off or unavailable.
+        """
+        if not self._use_throwaway_topk or self._throwaway_topk_failed:
+            return False
+        if self._throwaway_topk is None and not self._build_throwaway_topk(
+            _effective_compress_ratio_divisor(self.compress_ratio),
+            max_seq_len,
+            device,
+        ):
+            return False
+        return self._throwaway_topk.warmup()
+
     def _run_throwaway_chunk(
         self,
         metadata: DSAtrtllmAttentionMetadata,
@@ -1750,16 +1789,9 @@ class Indexer(nn.Module):
             compress_ratio = _effective_compress_ratio_divisor(
                 _select_indexer_compress_ratio(metadata.compress_ratios)
             )
-            self._throwaway_topk = get_throwaway_prefill_topk(
-                n_heads=self.n_heads,
-                index_topk=self.index_topk,
-                compress_ratio=compress_ratio,
-                max_context_length=metadata.kv_cache_manager.max_seq_len,
-                device=q_fp8.device,
-                qkv_dtype="mxfp4" if self.use_fp4 else "fp8",
-            )
-            self._throwaway_topk_failed = self._throwaway_topk is None
-            if self._throwaway_topk_failed:
+            if not self._build_throwaway_topk(
+                compress_ratio, metadata.kv_cache_manager.max_seq_len, q_fp8.device
+            ):
                 return False
         if not self._throwaway_topk.can_run(chunk_k_fp8.shape[0]):
             logger.info_once(
