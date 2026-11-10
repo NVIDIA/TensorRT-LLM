@@ -32,6 +32,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.dflash_attention import DFLASH_CONTEXT_LOWERING
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -84,13 +86,14 @@ def _manager(
     max_gpu_total_bytes: int = 64 << 20,
     max_seq_len: int = 1024,
     max_batch_size: int = 2,
+    enable_block_reuse: bool = False,
 ) -> MiniMaxM3KVCacheManagerV2:
     """A MiniMax-M3 manager (hybrid NVFP4 MSA by default), with or without draft layer specs."""
     return MiniMaxM3KVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=max_gpu_total_bytes,
             host_cache_size=0,
-            enable_block_reuse=False,
+            enable_block_reuse=enable_block_reuse,
             enable_swa_scratch_reuse=False,
         ),
         CacheType.SELF,
@@ -110,6 +113,7 @@ def _manager(
         ),
         layer_specs=layer_specs,
         is_disagg=is_disagg,
+        enable_stats=enable_block_reuse,
     )
 
 
@@ -397,6 +401,92 @@ def test_window_sized_draft_pool_admits_a_full_context_chunk() -> None:
         manager.free_resources(requests[0])
     finally:
         manager.shutdown()
+
+
+def _prefill_once(manager: MiniMaxM3KVCacheManagerV2, request: LlmRequest) -> int:
+    """Claim, allocate and run one request's whole context like the scheduler; return its reuse."""
+    assert manager.prepare_context(request)
+    reused_blocks = int(
+        manager.kv_cache_map[request.py_request_id].commit_pending_stats().reused_blocks
+    )
+    assert manager.resize_context(request, request.context_remaining_length)
+    batch = ScheduledRequests()
+    batch.append_context_request(request)
+    manager.prepare_resources(batch)
+    return reused_blocks
+
+
+def _finish_context(manager: MiniMaxM3KVCacheManagerV2, request: LlmRequest) -> None:
+    """Advance the request past its context and commit its blocks for reuse."""
+    batch = ScheduledRequests()
+    batch.append_context_request(request)
+    request.context_chunk_size = request.context_remaining_length
+    request.move_to_next_context_chunk()
+    manager.update_context_resources(batch)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_a_prefix_hit_hands_back_the_draft_layers_pages() -> None:
+    """A prefix hit reuses the draft lifecycle's live-window pages with their contents.
+
+    The second prompt shares the first one's first five pages and then diverges, after the first
+    request ran three more pages past them. The target claims the same prefix as a target-only
+    manager, and every draft page the drafter's window reads at the claimed end is the first
+    request's page, still holding what the first request stored.
+    """
+    torch.cuda.init()
+    shared = list(range(5000, 5000 + 5 * 128))
+    first_prompt = shared + list(range(20000, 20000 + 3 * 128 + 17))
+    second_prompt = shared + list(range(30000, 30000 + 3 * 128 + 17))
+
+    def request(request_id: int, tokens: list[int]) -> LlmRequest:
+        return LlmRequest(
+            request_id=request_id,
+            max_new_tokens=4,
+            input_tokens=tokens,
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+            return_perf_metrics=True,
+        )
+
+    claims = {}
+    for arm, specs in (("target_only", _specs()[:NUM_TARGET]), ("unified", _specs())):
+        manager = _manager(specs, enable_block_reuse=True, max_seq_len=4096)
+        try:
+            first = request(1, first_prompt)
+            _prefill_once(manager, first)
+            stored = {}
+            for layer in manager.draft_layer_ids:
+                view = manager.get_buffers(layer, kv_layout="HND")
+                rows = manager.get_batch_cache_indices([1], layer_idx=layer)[0]
+                for ordinal, row in enumerate(rows):
+                    if row >= 0:
+                        view[row].fill_(10 + ordinal)
+                stored[layer] = rows
+            torch.cuda.synchronize()
+            _finish_context(manager, first)
+            manager.free_resources(first)
+
+            second = request(2, second_prompt)
+            reused_blocks = _prefill_once(manager, second)
+            claims[arm] = (second.context_current_position, reused_blocks)
+            claimed_pages = second.context_current_position // 128
+            for layer in manager.draft_layer_ids:
+                view = manager.get_buffers(layer, kv_layout="HND")
+                rows = manager.get_batch_cache_indices([2], layer_idx=layer)[0]
+                window_pages = range(claimed_pages - DRAFT_WINDOW // 128, claimed_pages)
+                for ordinal in window_pages:
+                    assert rows[ordinal] == stored[layer][ordinal], (layer, ordinal)
+                    assert float(view[rows[ordinal]].float().mean()) == 10 + ordinal
+            _finish_context(manager, second)
+            manager.free_resources(second)
+        finally:
+            manager.shutdown()
+    assert claims["unified"][0] == claims["target_only"][0] == len(shared)
+    # Per-request reused blocks sum over attention lifecycles: the draft lifecycle adds the pages
+    # it holds at the claimed end (sink-free window), so hosting the drafter raises the count.
+    target_pages = claims["target_only"][1]
+    assert claims["unified"][1] == target_pages + DRAFT_WINDOW // 128
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
