@@ -629,3 +629,23 @@ def test_shared_draft_kv_checks_a_one_sided_config_for_its_own_side(
     ]
     blocker = _shared_draft_kv_blocker(configs)
     assert (blocker is not None) == blocked
+
+
+@pytest.mark.parametrize(
+    "roles, blocker, expected",
+    [(("ctx", "gen"), None, "auto"), (("ctx", "ctx"), None, "0"),
+     (("gen", ), None, "0"), (("ctx", "gen"), "a reason", "0")],
+)
+def test_launcher_shares_draft_kv_by_default_only_when_both_sides_are_listed(
+        roles, blocker, expected):
+    """A one-sided config leaves sharing off unless it is asked for.
+
+    A DWDP context MPI world lists only its context servers and cannot see
+    how the generation side is launched.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_default
+
+    configs = [SimpleNamespace(type=role, other_args={}) for role in roles]
+    assert _shared_draft_kv_default(configs, blocker) == expected

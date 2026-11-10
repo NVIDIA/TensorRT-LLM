@@ -2988,6 +2988,20 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
     return None
 
 
+def _shared_draft_kv_default(server_configs, blocker: Optional[str]) -> str:
+    """Default TRTLLM_DISAGG_SHARED_DRAFT_KV value set by the launcher.
+
+    The launcher sets it when the variable is unset or "auto". Only a config
+    that lists both sides and passes the check turns sharing on.
+    A one-sided config cannot see how the other side is launched, and a
+    generation server started with the variable unset keeps a separate draft
+    KV cache, so it gets "0"; sharing across separate launches needs the
+    variable set to "1" on both.
+    """
+    sides = {cfg.type for cfg in server_configs}
+    return "auto" if blocker is None and sides == {"ctx", "gen"} else "0"
+
+
 @click.command("disaggregated_mpi_worker")
 @stability_option(
     "-c",
@@ -3043,8 +3057,8 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
     if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in (None, "auto"):
-        os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = ("0"
-                                                       if blocker else "auto")
+        os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = _shared_draft_kv_default(
+            disagg_cfg.server_configs, blocker)
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.

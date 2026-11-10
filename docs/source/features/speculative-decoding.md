@@ -186,9 +186,11 @@ In disaggregated serving, direct worker launches require
 `TRTLLM_DISAGG_SHARED_DRAFT_KV=1` (or `auto`, which shares wherever the layout
 allows it) on both the context and generation workers to enable shared
 draft-KV transfer. The `disaggregated_mpi_worker` launcher enables this setting
-automatically when both servers enable compatible speculation and shard
-attention alike: the same `tensor_parallel_size`, where `enable_attention_dp`
-counts as 1 because every rank keeps all KV heads.
+automatically when its config lists both context and generation servers, both
+enable compatible speculation, and they shard attention alike: the same
+`tensor_parallel_size`, where `enable_attention_dp` counts as 1 because every
+rank keeps all KV heads. A config that lists only one side (for example, a
+context-only MPI world) leaves sharing off unless the variable is `1`.
 
 When sharing is enabled, the context server's draft pages are transferred to
 the generation server with the target pages, so the drafter starts generation

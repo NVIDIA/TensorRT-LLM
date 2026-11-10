@@ -660,6 +660,7 @@ def _make_receiver_for_view_validation(
     [
         ("missing_heads", "must publish a positive num_kv_heads"),
         ("pool_roles", "has no peer view with the same roles"),
+        ("draft_layers", "unified draft KV layer count differs"),
     ],
 )
 def test_receiver_rejects_view_mismatch_before_registration(
@@ -690,8 +691,11 @@ def test_receiver_rejects_view_mismatch_before_registration(
     bad_view = bad_ri.page_table.layer_groups[0].pool_views[1]
     if mismatch == "missing_heads":
         bad_view.num_kv_heads = None
-    else:
+    elif mismatch == "pool_roles":
         bad_view.pool_role = frozenset({"other_kv"})
+    else:
+        # A sender sharing draft KV with a receiver that keeps a separate cache.
+        bad_ri.num_draft_layers = 2
     bad_ri.sender_endpoints = ["tcp://bad-sender"]
     good_ri.sender_endpoints = ["tcp://good-sender"]
     bad_endpoint = "tcp://bad-info"
