@@ -2166,6 +2166,96 @@ def _compile(key, kern):
     return fn
 
 
+def _kernel_kw(
+    n: int,
+    t: int,
+    h: int,
+    hv: int,
+    *,
+    commit: bool,
+    pdl: bool,
+    l2norm: bool,
+    gating: bool,
+    g_f32: bool,
+    b_f32: bool,
+    work_items: bool,
+    config: Optional[dict] = None,
+    fold: bool = False,
+    norm_eps: Optional[float] = None,
+) -> dict:
+    """The kernel's compile-time parameters for a call of `n` requests: its key in `_COMPILED`.
+    `fold` is a `conv_fold` call, `norm_eps` a `gated_norm` call's epsilon."""
+    cfg = dict(default_config(n, t, commit))
+    if config:
+        cfg.update(config)
+    if fold:
+        if cfg.get("tpc") not in (8, 24):
+            # small batches' mappings split a value head over CTAs: take the whole-head ones
+            whole = (
+                dict(tpc=8, warps=4, pf=1, minb=5)
+                if n > 16
+                else dict(tpc=24, warps=8, pf=1, minb=2)
+            )
+            cfg.update(whole)
+            cfg.pop("early_acc", None)
+        cfg["fold"] = True
+    if norm_eps is not None:
+        if cfg.get("tpc") != 8 or cfg.get("warps") != 4:
+            cfg.update(tpc=8, warps=4)
+            cfg["pf"] = min(int(cfg.get("pf", 1)), 2)
+            cfg.setdefault("minb", 5)
+        cfg["norm"] = True
+        cfg["norm_eps"] = norm_eps
+    # PDL: state / history before the wait; without it, the step's own inputs first
+    cfg.setdefault("qk_first", not pdl)
+    cfg["use_wi"] = bool(cfg.pop("use_wi", True)) and work_items
+    return dict(
+        T=t,
+        h=h,
+        hv=hv,
+        commit=commit,
+        pdl=pdl,
+        l2norm=l2norm,
+        gating=gating,
+        g_f32=g_f32,
+        b_f32=b_f32,
+        **cfg,
+    )
+
+
+def precompile(
+    t: int, h: int, hv: int, max_requests: int, *, pdl: bool, partition_from: int
+) -> int:
+    """Compile every kernel a verify step of 1..`max_requests` requests launches through the
+    default mapping, the way a target calls this entry: work items, and with them no in-kernel
+    commit, from `partition_from` requests on; the q/k L2 norm and the gating in-kernel; bf16
+    `a` / `b`; no `config`, `conv_fold` or `gated_norm`. A compile costs 5-10 s, so a target
+    runs this at bind, before any step: the captured decode graphs do not reach every mapping
+    (padded graphs skip 9 to 15 requests, which an eager mixed step carries). Returns the
+    number of distinct kernels."""
+    keys = set()
+    for n in range(1, max_requests + 1):
+        partitioned = n >= partition_from
+        kw = _kernel_kw(
+            n,
+            t,
+            h,
+            hv,
+            commit=not partitioned,
+            pdl=pdl,
+            l2norm=True,
+            gating=True,
+            g_f32=False,
+            b_f32=False,
+            work_items=partitioned,
+        )
+        key = tuple(sorted(kw.items()))
+        if key not in keys:
+            keys.add(key)
+            _compile(key, _Replay(**kw))
+    return len(keys)
+
+
 def conv_fold_supported(x, weight, pool, window) -> bool:
     """Whether `cached_replay_update(conv_fold=...)` takes these operands: bf16, the layouts it
     reads, and 16-byte alignment of every 8-channel group (vector loads / stores)."""
@@ -2280,9 +2370,6 @@ def cached_replay_update(
         ap, dp = A_log.data_ptr(), dt_bias.data_ptr()
     else:
         ap = dp = 0
-    cfg = dict(default_config(N, T, commit))
-    if config:
-        cfg.update(config)
     fold_args = (0,) * 9
     if conv_fold is not None:
         cx, cw, cs = conv_fold["x"], conv_fold["weight"], conv_fold["pool"]
@@ -2297,21 +2384,12 @@ def cached_replay_update(
         assert conv_fold_supported(cx, cw, cs, win), (
             "conv_fold operands: layout / 16-byte alignment"
         )
-        if cfg.get("tpc") not in (8, 24):
-            # small batches' mappings split a value head over CTAs: take the whole-head ones
-            whole = (
-                dict(tpc=8, warps=4, pf=1, minb=5)
-                if N > 16
-                else dict(tpc=24, warps=8, pf=1, minb=2)
-            )
-            cfg.update(whole)
-            cfg.pop("early_acc", None)
-        cfg["fold"] = True
         fold_args = (
             cx.data_ptr(), cx.stride(0), cw.data_ptr(), cs.data_ptr(), cs.stride(0),
             win.data_ptr(), win.stride(0), win.stride(1), wrows.data_ptr(),
         )  # fmt: skip
     norm_args = (0,) * 4
+    norm_eps = None
     if gated_norm is not None:
         zn, gw = gated_norm["z"], gated_norm["weight"]
         assert T <= 4, "the folded norm takes a warp a row"
@@ -2320,30 +2398,25 @@ def cached_replay_update(
         )
         assert gw.shape == (V,) and gw.is_contiguous() and gw.dtype == torch.bfloat16
         assert zn.data_ptr() % 8 == 0 and zn.stride(0) % 4 == 0 and gw.data_ptr() % 8 == 0
-        if cfg.get("tpc") != 8 or cfg.get("warps") != 4:
-            cfg.update(tpc=8, warps=4)
-            cfg["pf"] = min(int(cfg.get("pf", 1)), 2)
-            cfg.setdefault("minb", 5)
-        cfg["norm"] = True
-        cfg["norm_eps"] = float(gated_norm["eps"])
+        norm_eps = float(gated_norm["eps"])
         norm_args = (zn.data_ptr(), zn.stride(0), gw.data_ptr(), output.data_ptr())
-    # PDL: state / history before the wait; without it, the step's own inputs first
-    cfg.setdefault("qk_first", not bool(launch_with_pdl))
-    use_wi = bool(cfg.pop("use_wi", True)) and replay_work_items is not None
-    cfg["use_wi"] = use_wi
-    pdl = bool(launch_with_pdl)
-    kw = dict(
-        T=T,
-        h=H,
-        hv=HV,
+    kw = _kernel_kw(
+        N,
+        T,
+        H,
+        HV,
         commit=commit,
-        pdl=pdl,
+        pdl=bool(launch_with_pdl),
         l2norm=bool(use_qk_l2norm_in_kernel),
         gating=gating,
         g_f32=g.dtype == torch.float32,
         b_f32=beta.dtype == torch.float32,
-        **cfg,
+        work_items=replay_work_items is not None,
+        config=config,
+        fold=conv_fold is not None,
+        norm_eps=norm_eps,
     )
+    use_wi = kw["use_wi"]
     key = tuple(sorted(kw.items()))
     fn = _COMPILED.get(key)
     if fn is None:

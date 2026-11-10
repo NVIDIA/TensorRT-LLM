@@ -533,7 +533,10 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     4/12 heads on each path they reach. Not certified: fp32 / fp16 pools, `scale` other than the
     default, other head layouts, K or V other than 128, 2 context sequences on CP at 4/12, a
     carried sequence on CP at 8/24, the measured slot counts of tp4, tp2 and tep2 (stand-ins
-    above), a call inside a CUDA graph (the target calls it eagerly).
+    above). The CP in-place path runs inside the breakable prefill graph
+    (`PrefillTarget._gdn_core_graph`), covered end to end by the `tep4_fp8_kv_breakable` CI
+    case; a captured call is not certified for 2-sequence CP at 4/12, a carried sequence at
+    8/24, or padded rows at those head counts.
     """
 
     def __call__(

@@ -1465,7 +1465,7 @@ CASES = [
     pytest.param(
         entry, cell, check,
         id=f"{type(entry).__name__}: {cell.why[:44]}",
-        marks=[pytest.mark.large] if cell.spec.get("large") else [],
+        marks=[pytest.mark.high_cuda_memory] if cell.spec.get("large") else [],
     )
     for entry, cells, check in _ENTRIES
     for cell in cells
@@ -1815,6 +1815,8 @@ def _family_index_scores_prefill(requests, monkeypatch) -> None:
     pos = torch.cat([torch.arange(p, p + r, dtype=torch.int32) for p, r in requests]).to(DEV)
     q = torch.randn(pos.numel(), 6, 128, generator=gen, device=DEV).to(torch.bfloat16)[:, :4]
     assert _isc.supports(q, cache, 32, 4)
+    assert not _isc.supports(q, cache, 64, 4)
+    assert _isc.supports(q, cache, 16, 2)
     fam = M.qsa_paged_index_scores(
         q, cache, table, pos, req, 32, 4, only_visible_blocks=True, context_rows=True
     )

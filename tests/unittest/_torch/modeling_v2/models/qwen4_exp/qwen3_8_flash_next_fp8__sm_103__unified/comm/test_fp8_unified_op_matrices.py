@@ -40,4 +40,9 @@ def _sm103_devices(world: int) -> int:
 def test_op_matrix(entry: str, world: int) -> None:
     if _sm103_devices(world) < world:
         pytest.skip(f"the {entry} matrix at world {world} runs on {world} sm_103 GPUs in one node")
+    if entry == "moe_a2a__dp_dispatch_combine":
+        from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+
+        if not NVLinkOneSided.is_platform_supported():
+            pytest.skip(f"the {entry} matrix needs MNNVL, which this platform lacks")
     _rank_job.run(entry, world_size=world, directory=_HERE)

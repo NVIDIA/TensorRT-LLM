@@ -249,7 +249,7 @@ def _tp_partial():
     x_lo = torch.zeros(lo, HIDDEN, dtype=torch.bfloat16, device=DEV)
     x16 = torch.zeros(16, HIDDEN, dtype=torch.bfloat16, device=DEV)
     off = SimpleNamespace(tp_sum=tp_sum)
-    on = SimpleNamespace(hc_ar_inject=object(), tp_sum=tp_sum)
+    on = SimpleNamespace(hc_ar_inject=SimpleNamespace(max_rows=1 << 30), tp_sum=tp_sum)
     assert not isinstance(M._tp_partial(off, x_lo), M._TpPartial)
     assert isinstance(M._tp_partial(on, x_lo), M._TpPartial)
     assert not isinstance(M._tp_partial(on, x16), M._TpPartial)

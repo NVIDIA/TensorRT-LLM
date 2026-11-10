@@ -1275,22 +1275,32 @@ def sparse_gqa_decode(
     )
     if n_splits == 1:
         return out
-    mkey = ("merge", num_q_heads, n_splits, gated, gate_t.dim(), use_pdl)
-    mfn = _COMPILED.get(mkey)
-    if mfn is None:
-        mfn = cute.compile(
-            _MergeKernel(heads=num_q_heads, splits=n_splits, gated=gated, pdl=use_pdl),
-            from_dlpack(gate_t, assumed_align=16).mark_layout_dynamic(leading_dim=gate_t.dim() - 1),
+
+    def _compile_merge(merge_gated, gate, stride):
+        return cute.compile(
+            _MergeKernel(heads=num_q_heads, splits=n_splits, gated=merge_gated, pdl=use_pdl),
+            from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=gate.dim() - 1),
             _ptr(part, cutlass.Float32),
             _ptr(lse, cutlass.Float32, 4),
             _ptr(out, cutlass.BFloat16),
             cutlass.Int32(rows),
-            cutlass.Int32(gate_stride),
+            cutlass.Int32(stride),
             cutlass.Int32(gate_hs),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--opt-level 2 --enable-tvm-ffi",
         )
+
+    mkey = ("merge", num_q_heads, n_splits, gated, gate_t.dim(), use_pdl)
+    mfn = _COMPILED.get(mkey)
+    if mfn is None:
+        mfn = _compile_merge(gated, gate_t, gate_stride)
         _COMPILED[mkey] = mfn
+        # A mixed step's generation rows (and a draft-extend step's) call the merge ungated at
+        # the geometry a decode step calls it gated: compile that flavour now as well, so it
+        # never compiles inside a served step. Ungated, the gate operand is `q` (3-D).
+        ukey = ("merge", num_q_heads, n_splits, False, q.dim(), use_pdl)
+        if gated and ukey not in _COMPILED:
+            _COMPILED[ukey] = _compile_merge(False, q, 0)
     mfn(gate_t, part.data_ptr(), lse.data_ptr(), out.data_ptr(), rows, gate_stride, gate_hs)
     return out
 
