@@ -474,7 +474,7 @@ class Pipeline:
                 result.error = f"vocabulary.yaml does not validate: {exc}"
             return result
         if tree is not None:
-            problems = self._static_problems(task, tree)
+            problems = self._static_problems(task, tree, data)
             if problems:
                 # The final certification would refuse it: one short turn now, no GPU.
                 said = "; ".join(problems)
@@ -488,7 +488,7 @@ class Pipeline:
                         "turn asked to put it right did not finish"
                     )
                 result = TurnResult(str(data["decision"]), data)
-                problems = self._static_problems(task, tree)
+                problems = self._static_problems(task, tree, data)
                 if problems:
                     result.error = f"its landed work is not deliverable: {'; '.join(problems)}"
                     return result
@@ -496,7 +496,7 @@ class Pipeline:
             result.error = self._integrate(task, role, tree, block)
         return result
 
-    def _static_problems(self, task: Task, tree: Path) -> list[str]:
+    def _static_problems(self, task: Task, tree: Path, data: Mapping[str, Any]) -> list[str]:
         """What the final certification's static checks would refuse in a landed task.
 
         A kernel task's entry by the one entry rule; a unit, variant or fix task's tree by
@@ -505,13 +505,20 @@ class Pipeline:
         commits, which certification and integration check.
         """
         if task.kind == "kernel":
-            return self._entry_problems(task, tree)
+            return self._entry_problems(task, tree, data)
         if task.kind in ("assemble", "feature", "variant", "fix") and self.w._preflight:
             return certify_mod.static_delivery_failures(self.w, tree)
         return []
 
-    def _entry_problems(self, task: Task, tree: Path) -> list[str]:
-        """What the delivery check would refuse in a kernel task's entry, read statically."""
+    def _entry_problems(
+        self, task: Task, tree: Path, data: Mapping[str, Any] | None = None
+    ) -> list[str]:
+        """What the delivery check would refuse in a kernel task's entry, read statically.
+
+        The entry is the module the decision file names (`entry`, which a landing states), else
+        where the queue row places it; the delivery check reads the modules the target imports,
+        whatever their names.
+        """
         item = self._queue_item(task)
         if item is None:
             return []
@@ -519,8 +526,14 @@ class Pipeline:
         paths = entry_paths(item, target_rel, self.w.task_data.get("trtllm_repo_path") or None)
         if not paths:
             return []
-        module = Path(tree) / paths[0]
+        named = str((data or {}).get("entry") or "").strip()
+        stated = Path(tree) / named if named else None
+        module = stated if stated is not None and stated.is_file() else Path(tree) / paths[0]
         if not module.is_file():
+            if named:
+                return [
+                    f"neither `{named}` (your decision's `entry`) nor `{paths[0]}` is in your worktree"
+                ]
             return [f"`{paths[0]}` is not in your worktree"]
         return entry_problems(module, str(self.w.task_data.get("arch") or ""))[0]
 

@@ -992,6 +992,13 @@ def test_a_landed_entry_is_read_as_the_certification_reads_it(tmp_path):
     assert problems() == ["ARCHS names sm_100, not sm_103"]
     entry.write_text(head + cells + "    ARCHS = frozenset({Arch.SM_103})\n")
     assert problems() == []
+    # The module the decision names counts, whatever its name (the target imports it).
+    named = f"{target}/ops/norm/rms__r1.py"
+    entry.rename(tmp_path / named)
+    assert Pipeline._entry_problems(fake, task, tmp_path, {"entry": named}) == []
+    assert Pipeline._entry_problems(fake, task, tmp_path, {"entry": "nope.py"}) == [
+        f"neither `nope.py` (your decision's `entry`) nor `{target}/ops/norm/rms.py` is in your worktree"
+    ]
     block = static_repair_block(["Rms declares no CELLS: nothing is certified"], entry=True)
     assert "Do not start the task again" in block and "- Rms declares no CELLS" in block
     assert "`CELLS` name the cells" in block
