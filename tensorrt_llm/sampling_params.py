@@ -166,7 +166,7 @@ class BatchedLogitsProcessor(ABC):
         req_ids: List[int],
         logits: List[torch.Tensor],
         token_ids: List[List[List[int]]],
-        stream_ptr: Optional[int],
+        stream_ptr: int,
         client_ids: List[Optional[int]],
     ) -> None:
         """Batched logits processing callback. The callback is expected to inplace modify the logits.
@@ -182,9 +182,7 @@ class BatchedLogitsProcessor(ABC):
             token_ids (List[List[List[int]]]): A batch of the token ids produced by the requests so far.
                 The shape is batch * beam_width * sequence_length. Each entry is what the
                 request's own ``LogitsProcessor`` would receive (see its ``token_ids``).
-            stream_ptr (int, optional): The operation stream used by the logits tensors.
-                On the PyTorch backend this is the CUDA stream the logits live on,
-                or None when they are not on a CUDA device.
+            stream_ptr (int): The operation stream used by the logits tensors.
             client_ids (List[Optional[int]]): A batch of optional client ids.
         """
         pass  # noqa

@@ -1060,13 +1060,10 @@ class DecoderRunner(ScheduledModelRunner):
         Each logits entry is the request's rows viewed as [beam_width, 1,
         vocab], the shape its own processors see, and a view into the step's
         logits tensor, so the callback's in-place edits land there. The stream
-        is the one the logits live on (None off CUDA, which only tests do),
-        for processors that synchronize on it as the interface documents.
+        is the one the logits live on, for processors that synchronize on it as
+        the interface documents.
         """
-        device = logits[0].device
-        stream_ptr = (
-            torch.cuda.current_stream(device).cuda_stream if device.type == "cuda" else None
-        )
+        stream_ptr = torch.cuda.current_stream(logits[0].device).cuda_stream
         self.batched_logits_processor(req_ids, logits, token_ids, stream_ptr, client_ids)
 
     def _start_beam_histories(
