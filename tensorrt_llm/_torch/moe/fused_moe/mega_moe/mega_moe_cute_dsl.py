@@ -114,6 +114,7 @@ from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import NVFP4MegaMoECuteDslMethod
 from ..routing import BaseMoeRoutingMethod
+from .ugpu_weights import LocalizedMegaMoEWeights, localize_megamoe_weights
 
 __all__ = [
     "MegaMoECuteDsl",
@@ -442,6 +443,17 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # Legal combine wire formats; must stay in sync with
     # ``CombineFormat.parse`` in the kernel package's token_comm.py.
     _SUPPORTED_COMBINE_FORMATS = frozenset({"bf16", "32e4m3xe8m0", "16e2m1xbf16"})
+    # Opt-in uGPU localization (MEGAMOE_UGPU_LAYOUT): the packed bank that
+    # moves into die-local VMM memory. The VMM owner is never freed: it lives until
+    # process exit, because a captured CUDA graph may still use the memory.
+    _UGPU_PACKED_PARAMS = (
+        "mega_fc1_weight",
+        "mega_fc1_weight_sf",
+        "mega_fc2_weight",
+        "mega_fc2_weight_sf",
+    )
+    _ugpu_weight_layout: str = "none"
+    _ugpu_weight_owner: Optional[LocalizedMegaMoEWeights] = None
 
     # ------------------------------------------------------------------
     # Capability gating
@@ -916,6 +928,42 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # ------------------------------------------------------------------
     # Weight lifecycle
     # ------------------------------------------------------------------
+    def _configure_ugpu_localization(self, layout: str) -> None:
+        """Select a die-aware weight layout before any weights or providers exist."""
+        if self._weights_created or self._ugpu_weight_layout != "none":
+            raise RuntimeError("Configure uGPU localization once, before create_weights")
+        if layout not in ("expert_half", "n_split"):
+            raise ValueError(f"MEGAMOE_UGPU_LAYOUT must be expert_half or n_split, got {layout!r}")
+        if get_sm_version() != 107 or (self.dtype or torch.bfloat16) != torch.bfloat16:
+            raise ValueError("Localized MegaMoE requires SM107 and BF16 output")
+        if self.combine_format != "bf16" or self.tactic_autotune:
+            raise ValueError("Localized MegaMoE requires BF16 combine and fixed tactics")
+        if self.layer_load_balancer is not None or self.ep_size == 1:
+            raise ValueError("Localized MegaMoE requires static experts and ep_size > 1")
+        self._ugpu_weight_layout = layout
+
+    def _install_ugpu_localized_weights(self) -> None:
+        """Move this layer's packed bank into die-local VMM memory, once."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Install localized MegaMoE weights before CUDA graph capture")
+        originals = {name: self._parameters[name] for name in self._UGPU_PACKED_PARAMS}
+        owner = localize_megamoe_weights(*originals.values(), mode=self._ugpu_weight_layout)
+        committed = False
+        try:
+            aliases = (owner.fc1_weight, owner.fc1_weight_sf, owner.fc2_weight, owner.fc2_weight_sf)
+            replacements = [torch.nn.Parameter(alias, requires_grad=False) for alias in aliases]
+            # The placement copies are asynchronous; finish them before setattr
+            # releases the original bank.
+            torch.cuda.synchronize()
+            for name, parameter in zip(self._UGPU_PACKED_PARAMS, replacements):
+                setattr(self, name, parameter)
+            committed = True
+        finally:
+            if not committed:
+                self._parameters.update(originals)
+                owner.close()
+        self._ugpu_weight_owner = owner
+
     def _get_quant_method(self):
         if self.quant_config is None or not self.quant_config.layer_quant_mode.has_nvfp4():
             raise NotImplementedError("MegaMoECuteDsl supports NVFP4 quantization only.")
@@ -942,6 +990,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """
         if self._weights_created:
             return
+        # Opt-in uGPU localization. Like MEGAMOE_COMBINE_FORMAT it must be
+        # identical on every rank; only AUTO-loaded weights (no sleep/GMS) are
+        # supported because the bank moves into VMM memory after loading.
+        layout = os.environ.get("MEGAMOE_UGPU_LAYOUT", "none")
+        if layout != "none" and self._ugpu_weight_layout == "none":
+            self._configure_ugpu_localization(layout)
         # Step 1: build-time symmetric memory allocation (multi-rank only).
         # Single-rank degenerate uses local CUDA tensors and skips here.
         if self.ep_size > 1:
@@ -1021,6 +1075,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 ),
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
+                ugpu_weight_layout=self._ugpu_weight_layout,
             )
             if supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
@@ -1034,6 +1089,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 output_dtype=self.dtype or torch.bfloat16,
                 combine_format=self.combine_format,
                 shared_workspace_bytes=shared_workspace_bytes,
+                ugpu_weight_layout=self._ugpu_weight_layout,
             )
             self._symm_providers[max_T] = provider
             # AutoTuner profiling scratch: record only the request kwargs
@@ -1099,6 +1155,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if self.quant_method is None:
             self.create_weights()
         super().transform_weights()
+        # Both the model loader and bench_moe reach this after packing.
+        if self._ugpu_weight_layout != "none" and self._ugpu_weight_owner is None:
+            self._install_ugpu_localized_weights()
 
     def cache_derived_state(self) -> None:
         # A weights-removed reader runs materialize -> this hook and never
@@ -1412,6 +1471,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 ),
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
+                ugpu_weight_layout=self._ugpu_weight_layout,
             )
             if supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
@@ -1722,6 +1782,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 helper_expert_count=_S_active,
                 hot_expert_weight_ready_flags=helper_ready_flags,
                 hot_expert_weight_ready_generation=int(helper_ready_generation),
+                ugpu_weight_layout=self._ugpu_weight_layout,
             )
         finally:
             # Always clear: a raising op call must not leave the factory
@@ -1770,6 +1831,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             str(device),
             output_dtype,
         )
+        if self._ugpu_weight_layout != "none":
+            key += (self._ugpu_weight_layout,)
         if key in _MEGAMOE_PRIMED_LADDERS:
             return
         primed = []
@@ -1872,6 +1935,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         single-rank short-circuits ``num_tokens == 0`` because no peer
         is waiting.
         """
+        if self._ugpu_weight_layout != "none" and (
+            self._ugpu_weight_owner is None or self._ugpu_weight_owner.closed
+        ):
+            raise RuntimeError("Localized MegaMoE launched before its weights were installed")
         # Pick and consume the adaptive bucket; un-hinted callers default to
         # the full bucket.
         launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
