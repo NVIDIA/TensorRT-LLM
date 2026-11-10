@@ -311,7 +311,9 @@ def test_a_grpc_server_checks_the_role_its_environment_holds(
     )
     monkeypatch.setattr(serve, "find_spec", lambda name: object())
     monkeypatch.setattr(serve, "get_is_diffusion_only_model", lambda model: False)
-    monkeypatch.setattr(serve, "_apply_effective_telemetry_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        serve, "_apply_effective_telemetry_config", lambda llm_args, **kwargs: llm_args
+    )
     monkeypatch.setattr(
         "tensorrt_llm.usage.usage_lib._capture_startup_context", lambda **kwargs: None
     )
