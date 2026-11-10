@@ -428,7 +428,7 @@ class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
         req_ids: List[int],
         logits: List[torch.Tensor],
         token_ids: List[List[List[int]]],
-        stream_ptr: Optional[int],
+        stream_ptr: int,
         client_ids: List[Optional[int]]
     ) -> None:
         for rows in logits:

@@ -714,12 +714,10 @@ class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
         self.biased_word_id = biased_word_id
 
     def __call__(self, req_ids: List[int], logits: List[torch.Tensor],
-                 ids: List[List[List[int]]], stream_ptr: Optional[int],
+                 ids: List[List[List[int]]], stream_ptr: int,
                  client_ids: List[Optional[int]]):
         assert len(req_ids) == len(logits) == len(ids) == len(client_ids)
-        stream = None if stream_ptr is None else torch.cuda.ExternalStream(
-            stream_ptr)
-        with torch.cuda.stream(stream):
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
             for rows in logits:
                 rows[:] = float("-inf")
                 rows[..., self.biased_word_id] = 0

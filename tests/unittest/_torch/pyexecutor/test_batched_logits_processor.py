@@ -62,6 +62,18 @@ def _request(
     )
 
 
+# The tests' logits are CPU tensors, so stand in for the CUDA stream the
+# engine hands the callback.
+_STREAM_PTR = 1234
+
+
+@pytest.fixture(autouse=True)
+def _cuda_stream(monkeypatch):
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device=None: SimpleNamespace(cuda_stream=_STREAM_PTR)
+    )
+
+
 def _engine(processor, *, attention_dp=False, vocab_size=None):
     engine = object.__new__(DecoderRunner)
     engine._mapping = SimpleNamespace(
@@ -103,7 +115,7 @@ def test_flagged_requests_share_one_call_in_scheduling_order():
     assert client_ids == [101, 103]
     assert token_ids == [[[4, 5]], [[6, 7, 8]]]
     assert [tuple(r.shape) for r in rows] == [(1, 1, VOCAB), (1, 1, VOCAB)]
-    assert stream_ptr is None  # the logits are not on a CUDA device
+    assert stream_ptr == _STREAM_PTR
     # The callback's in-place edits land in the step's logits; the other request's row is untouched.
     assert torch.equal(logits[:, 0], torch.tensor([1.0, 1.0, 3.0]))
 
