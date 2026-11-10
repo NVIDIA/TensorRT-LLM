@@ -109,6 +109,8 @@ l0_cpu:
   # The qwen4_exp default target's cpu_only tests (its routing among them); this stage runs
   # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
+  # The qwen4_exp FP8 target's cpu_only tests, likewise.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified
   - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_routing.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
