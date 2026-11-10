@@ -611,9 +611,15 @@ class DFlashForCausalLM(nn.Module):
         """Whether the block decode reads the context KV from a KV cache
         manager's pages of ``tokens_per_block`` tokens.
 
-        The worker validates the TRTLLM kernels' page sizes when it binds them.
+        The TRTLLM block decode takes only the page sizes its trtllm-gen
+        kernels support; at any other size the drafter keeps its own pool.
         """
-        return self.dflash_attention_backend == "TRTLLM"
+        from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+
+        return (
+            self.dflash_attention_backend == "TRTLLM"
+            and tokens_per_block in FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK
+        )
 
     @property
     def reads_helix_sharded_ctx_pages(self) -> bool:

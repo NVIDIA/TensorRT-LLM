@@ -666,3 +666,17 @@ def test_launcher_checks_all_peer_configs(
         draft=_model_config(kv_heads=8, head_dim=128),
     )
     assert creator._should_unify_dflash_kv_cache() is shared
+
+
+@pytest.mark.parametrize(
+    "backend, tokens_per_block, reads",
+    [("TRTLLM", 32, True), ("TRTLLM", 64, True), ("TRTLLM", 128, False), ("FA4", 32, False)],
+)
+def test_dflash_drafter_reads_managed_pages_only_at_trtllm_gen_page_sizes(
+    backend: str, tokens_per_block: int, reads: bool
+) -> None:
+    from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
+
+    # GQA DSpark drafters inherit this; at 128-token pages they keep their own pool.
+    drafter = SimpleNamespace(dflash_attention_backend=backend)
+    assert DFlashForCausalLM.reads_managed_ctx_pages(drafter, tokens_per_block) is reads
