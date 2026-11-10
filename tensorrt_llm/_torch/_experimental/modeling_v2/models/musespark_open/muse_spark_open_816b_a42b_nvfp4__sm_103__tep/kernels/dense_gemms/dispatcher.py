@@ -40,7 +40,13 @@ at the cells ``SM103_TP8_ATTN_BLOCK_KERNELS`` names: the attention output projec
 are loaded into shared memory before its ``griddepcontrol.wait``, under the attention that
 launches it early (the sliding-window cluster block, the full layers' combine); and QKV at split_k
 4 (flashinfer's K slices and order) with a deeper ring where the copy's reduce-scatter mailbox
-leaves room. Every row keeps its bits; the forks and joins are the served ones.
+leaves room. The forks and joins are the served ones.
+
+Bits: the o_proj cells reproduce the built-in cuBLAS call. **The QKV cells do not, wherever the
+served 9..32-row call is that same cuBLAS call** -- they sum K in four slices instead of one. They
+keep the served bits only where a wide table is armed at those rows with a split_k 4 cell, and on
+sm103 the path that arms one (``wide_projection_gathers``) is TEP4-only, so at TEP8 this lever
+changes the decoded text. Its lever is lossless-numeric for that reason, not bitwise.
 
 With ``dense_gemm_prefetch`` a projection that ran also forks a side stream that asks the L2 to
 fetch the next projection's weight (QKV -> the same layer's attention output ->
@@ -1391,7 +1397,8 @@ def install(
         logger.info(
             f"[musespark_open] tep8_attn_block_splitk: TP8 calls of {WIDE_MIN_ROWS}.."
             f"{WIDE_MAX_ROWS} rows by {steps} (o_proj split_k 1: the built-in cuBLAS call's bits, "
-            "its weight loaded before its dependency wait under the attention; QKV split_k 4: the "
-            "served cell's bits)"
+            "its weight loaded before its dependency wait under the attention; QKV split_k 4: "
+            "the served cell's bits only where a wide table is armed at these rows, else four K "
+            "slices where the built-in call uses one)"
         )
     return plan

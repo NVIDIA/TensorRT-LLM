@@ -727,7 +727,14 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "drafter_conv_epilogue": _ported(Kind.BITWISE),
         "drafter_finish_norm": _ported(Kind.BITWISE),
         "drafter_silu_epilogue": _ported(Kind.BITWISE),
-        "tep8_attn_block_splitk": _ported(Kind.BITWISE),
+        # The o_proj half is bitwise: split_k 1 reproduces the built-in cuBLAS call, checked
+        # on this target. The QKV half is not, at TEP8. It replaces the 9..32-row call with a
+        # split_k 4 cell on the premise that the served call there is already that cell -- true
+        # only where a wide table is armed, and the path that arms one
+        # (``wide_projection_gathers``) is TEP4-only on sm103. At TEP8 the served call is
+        # cuBLAS, so the summation order changes and the decoded text moves with it, which a
+        # batch-4 run makes plain. Lossless-numeric, and it needs a gate before it is on.
+        "tep8_attn_block_splitk": _ported(Kind.NUMERIC),
         "swa_block_single_early_loads": _ported(Kind.BITWISE),
         # The qkv / gate_up / coefficient cells keep their row's split_k and are bitwise the
         # table's row; the o_proj and down_proj cells reproduced cuBLAS's bits on every checked
