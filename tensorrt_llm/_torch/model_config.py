@@ -423,6 +423,8 @@ class ModelConfig(Generic[TConfig]):
         if backend == self.attn_backend:
             return self
         config = copy.copy(self)
+        # The copy keeps ``_frozen``, so ``setattr`` would raise on a config
+        # from ``from_pretrained``. ``object.__setattr__`` changes only the copy.
         object.__setattr__(config, "attn_backend", backend)
         return config
 
