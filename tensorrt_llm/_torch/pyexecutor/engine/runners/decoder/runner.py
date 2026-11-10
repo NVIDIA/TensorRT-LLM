@@ -29,7 +29,11 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
+from tensorrt_llm._torch.pyexecutor.context_logits_plan import (
+    ContextLogitsPlan,
+    context_logits_rows,
+    keep_sampled_context_rows,
+)
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
@@ -863,6 +867,21 @@ class DecoderRunner(ScheduledModelRunner):
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
+            if (
+                gather_context_logits
+                and not (self._config.is_spec_decode or enable_spec_decode)
+                and isinstance(outputs, dict)
+                and outputs.get("logits") is not None
+                and not outputs.get("context_logits_handled", False)
+            ):
+                # Without the plan the LM head projected every context token of
+                # every context request; keep the rows the sampler reads.
+                outputs = {
+                    **outputs,
+                    "logits": keep_sampled_context_rows(
+                        semantic_requests.context_requests, outputs["logits"]
+                    ),
+                }
             if isinstance(outputs, dict) and outputs.get(GREEDY_TOKENS_KEY) is not None:
                 outputs = self._logits_for_greedy_tokens(semantic_requests, outputs)
             self._execute_logit_post_processors(semantic_requests, outputs, pending_beam_histories)
@@ -1108,6 +1127,7 @@ class DecoderRunner(ScheduledModelRunner):
                 id(request): histories for request, histories in zip(beam_requests, pending.wait())
             }
 
+        context_logits_handled = outputs.get("context_logits_handled", False)
         logits_row_offset = 0
         request_groups = (
             (scheduled_requests.context_requests, True),
@@ -1118,7 +1138,9 @@ class DecoderRunner(ScheduledModelRunner):
             for request in requests:
                 if is_context_request:
                     beam_width = 1
-                    row_stride = 1
+                    row_stride = context_logits_rows(
+                        request, context_logits_handled=context_logits_handled
+                    )
                 else:
                     # Generation rows are laid out at the static admission
                     # width, so that is the stride between requests, while
@@ -1148,8 +1170,11 @@ class DecoderRunner(ScheduledModelRunner):
                         token_ids = [prompt + history for history in histories]
                     else:
                         token_ids = [request.get_tokens(beam_idx) for beam_idx in range(beam_width)]
-                    if is_context_request and request.py_orig_prompt_len < len(token_ids[0]):
-                        # Skip as we only need to apply logit processor on the last context request
+                    if is_context_request and not request.is_last_context_chunk:
+                        # Only the last chunk's row is sampled from. get_tokens(0)
+                        # is the whole prompt during chunked prefill, and after a
+                        # pause the prompt also holds the tokens generated so far,
+                        # so the token count does not tell the chunks apart.
                         logits_row_offset += row_stride
                         continue
 
@@ -1159,7 +1184,10 @@ class DecoderRunner(ScheduledModelRunner):
                         logits_tensor,
                         beam_width,
                         token_ids,
-                        logits_row_offset,
+                        # A context request is sampled from the last of its rows.
+                        logits_row_offset + row_stride - 1
+                        if is_context_request
+                        else logits_row_offset,
                     )
                 logits_row_offset += row_stride
 

@@ -55,6 +55,59 @@ def store_context_logits(
         request.py_result.set_prompt_last_logprobs(_normalized_host_row(logits[-1:]))
 
 
+def context_logits_rows(request: LlmRequest, *, context_logits_handled: bool) -> int:
+    """Rows a context request occupies in a step's logits, as the sampler reads them.
+
+    A request that returns context logits keeps its whole chunk, unless the
+    context-logits plan already stored them; every other context request keeps
+    only its last row, the one sampled from.
+
+    Args:
+        request: A context request of the step.
+        context_logits_handled: Whether the plan stored the step's context logits.
+    """
+    if request.py_return_context_logits and not context_logits_handled:
+        return request.context_chunk_size
+    return 1
+
+
+def keep_sampled_context_rows(
+    context_requests: Sequence[LlmRequest], logits: torch.Tensor
+) -> torch.Tensor:
+    """Drop the context rows the sampler does not read from logits that hold every token.
+
+    Without the context-logits plan, a step that gathers context logits projects
+    every scheduled context token, for every context request. The sampler and
+    the logits post-processors expect only the requesting requests' chunks plus
+    one row for each other context request (see `context_logits_rows`).
+
+    Args:
+        context_requests: The step's context requests, in row order.
+        logits: ``[context_tokens + other_rows, vocab]`` with all context rows
+            first; rows after the context tokens are kept as they are.
+
+    Returns:
+        ``logits`` itself when nothing is dropped, otherwise a new tensor.
+    """
+    keep: list[int] = []
+    start = 0
+    for request in context_requests:
+        chunk_size = request.context_chunk_size
+        if request.py_return_context_logits:
+            keep.extend(range(start, start + chunk_size))
+        else:
+            keep.append(start + chunk_size - 1)
+        start += chunk_size
+    if len(keep) == start:
+        return logits
+    if start > logits.shape[0]:
+        raise ValueError(
+            f"logits have {logits.shape[0]} rows, fewer than the {start} scheduled context tokens"
+        )
+    keep.extend(range(start, logits.shape[0]))
+    return logits.index_select(0, torch.tensor(keep, device=logits.device))
+
+
 def _normalized_host_row(row: torch.Tensor) -> torch.Tensor:
     """Log-softmax ``row`` on its own device, like the other prompt rows, and copy it to host.
 
