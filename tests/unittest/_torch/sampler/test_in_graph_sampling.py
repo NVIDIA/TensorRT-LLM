@@ -319,6 +319,21 @@ class TestStaging:
         assert staged.live_seq_slots_host.dtype == torch.int32
         assert staged.single_step_greedy
 
+    def test_releasing_a_staged_request_drops_the_staged_batch(self, sampler):
+        """A finished request of the staged batch is released: the batch can never be reused, and
+        keeping it would keep the request alive. Releasing any other request keeps it."""
+        sampler._finish_reasons_handler = SimpleNamespace(release_request=lambda request: None)
+        live = [
+            make_request(py_request_id=1, py_seq_slot=3),
+            make_request(py_request_id=2, py_seq_slot=5),
+        ]
+        self._stage(sampler, self._batch(*live), SampleType.FAST)
+
+        sampler.release_request(make_request(py_request_id=7, py_seq_slot=6))
+        assert sampler._staged_batch is not None
+        sampler.release_request(live[1])
+        assert sampler._staged_batch is None
+
     def test_multi_token_stop_words_need_the_finish_reason_kernel(self, sampler):
         batch = self._batch(
             make_request(py_request_id=1, py_seq_slot=3),

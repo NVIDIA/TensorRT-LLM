@@ -1426,6 +1426,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     @override
     def release_request(self, request: LlmRequest) -> None:
         self._finish_reasons_handler.release_request(request)
+        # The staged batch is reused only by the same requests on a later step, which a released
+        # request never joins again; dropping it keeps it from holding the request (and the
+        # outputs it owns, such as generation logits) after its output was returned.
+        staged = self._staged_batch
+        if staged is not None and request.py_request_id in staged.live_request_ids:
+            self._staged_batch = None
 
     @override
     @nvtx_range("setup_sampler_step")
