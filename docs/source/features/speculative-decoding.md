@@ -352,6 +352,27 @@ The field name `speculative_model_dir` can also be used as an alias for `specula
       speculative_model_dir: /path/to/draft/model
 ```
 
+### CUDA graph sampling variants
+
+One-engine speculative decoding captures its decode CUDA graphs once per sampling variant: `greedy` for
+batches whose requests all decode greedily, `advanced` for batches with a sampled request, and
+`temperature_only` for sampled batches whose sampled requests set only a temperature (MTP-Eagle one-model
+decoding with tensor parallelism, without attention DP, relaxed acceptance, rejection sampling or penalties).
+`cuda_graph_config.sampling_variants` (prototype) captures only the listed variants, which shortens startup
+and saves graph memory:
+
+```yaml
+cuda_graph_config:
+  enable_padding: true
+  sampling_variants: [advanced]
+```
+
+- Without `temperature_only`, temperature-only batches replay the `advanced` graphs.
+- Without `greedy`, greedy batches replay the sampled graphs (`temperature_only` if listed, else `advanced`)
+  and still decode greedily.
+- Without `advanced`, a sampled batch that `temperature_only` does not serve runs eagerly, and the first one
+  logs a warning. Under attention DP, every rank then runs that step eagerly.
+
 ### DSpark attention projection precision
 
 `TRTLLM_DSPARK_LINEAR_BACKEND=bf16|fp8` selects the attention projection

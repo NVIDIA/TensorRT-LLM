@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""cuda_graph_config.sampling_variants on one-engine Eagle3: fewer graphs, an unlisted variant runs eagerly."""
+"""cuda_graph_config.sampling_variants on one-engine Eagle3: only the listed graphs, with their fallbacks."""
 
 import pytest
 import torch
@@ -27,10 +27,17 @@ PROMPTS = [
     "The president of the United States is",
     "What is the capital of Australia?",
 ]
+GREEDY = SamplingParams(max_tokens=10, temperature=0)
+# Seeded, so two engines that both run it eagerly draw the same tokens.
+SAMPLED = SamplingParams(max_tokens=16, temperature=0.8, top_p=0.9, seed=7)
 
 
-def _generate_greedy(cuda_graph_config):
-    """Return the captured graph keys, the greedy tokens and the keys of the eager-variant notices."""
+def _graph_config(variants):
+    return CudaGraphConfig(batch_sizes=[1, 2, 4], enable_padding=True, sampling_variants=variants)
+
+
+def _generate(cuda_graph_config, *calls):
+    """Return the captured graph keys, each call's tokens and the keys of the eager-variant notices."""
     models_path = llm_models_root()
     notices = set()
     warning_once = logger.warning_once
@@ -53,8 +60,11 @@ def _generate_greedy(cuda_graph_config):
             kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.5),
         ) as llm:
             keys = set(llm._executor.engine.model_engine.cuda_graph_runner.graphs)
-            outputs = llm.generate(PROMPTS, SamplingParams(max_tokens=24, temperature=0))
-    return keys, [list(output.outputs[0].token_ids) for output in outputs], notices
+            tokens = [
+                [list(output.outputs[0].token_ids) for output in llm.generate(prompts, params)]
+                for prompts, params in calls
+            ]
+    return keys, tokens, notices
 
 
 @pytest.mark.high_cuda_memory
@@ -62,16 +72,22 @@ def _generate_greedy(cuda_graph_config):
 def test_sampling_variants_capture_only_the_listed_graphs():
     if torch.cuda.get_device_properties(0).total_memory / 1e9 < 35:
         pytest.skip("Not enough memory to load target + draft model")
-    keys, _, notices = _generate_greedy(CudaGraphConfig(batch_sizes=[1, 2, 4], enable_padding=True))
-    assert {key.is_all_greedy_sample for key in keys} == {True, False}
-    assert notices == set()
-
-    listed_keys, listed_tokens, listed_notices = _generate_greedy(
-        CudaGraphConfig(batch_sizes=[1, 2, 4], enable_padding=True, sampling_variants=["advanced"])
+    greedy_keys, (greedy_tokens, greedy_sampled), greedy_notices = _generate(
+        _graph_config(["greedy"]), (PROMPTS, GREEDY), (PROMPTS[:1], SAMPLED)
     )
-    assert listed_keys == {key for key in keys if not key.is_all_greedy_sample}
-    assert listed_notices == {"uncaptured_sampling_variant_greedy"}
+    advanced_keys, (advanced_tokens,), advanced_notices = _generate(
+        _graph_config(["advanced"]), (PROMPTS, GREEDY)
+    )
+    # Each engine captures one variant of the same graph shapes.
+    assert greedy_keys and all(key.is_all_greedy_sample for key in greedy_keys)
+    assert not any(key.is_all_greedy_sample for key in advanced_keys)
+    assert {key._replace(is_all_greedy_sample=True) for key in advanced_keys} == greedy_keys
 
-    # The unlisted greedy requests run eagerly: the same tokens as an engine without CUDA graphs.
-    _, eager_tokens, _ = _generate_greedy(cuda_graph_config=None)
-    assert listed_tokens == eager_tokens
+    # Without greedy graphs, greedy requests replay the advanced ones and still decode greedily.
+    assert advanced_notices == set()
+    assert advanced_tokens == greedy_tokens
+
+    # Without advanced graphs, the sampled request runs eagerly, as on an engine without CUDA graphs.
+    assert greedy_notices == {"uncaptured_sampling_variant_advanced"}
+    _, (eager_sampled,), _ = _generate(None, (PROMPTS[:1], SAMPLED))
+    assert greedy_sampled == eager_sampled

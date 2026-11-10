@@ -277,12 +277,15 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
             "greedily; 'advanced' serves batches with a sampled request (temperature, "
             "top-k, top-p, min-p, seeds, penalties or rejection sampling); "
             "'temperature_only' serves sampled batches whose sampled requests set only "
-            "a temperature, on models that sample vocabulary-sharded logits (tensor "
-            "parallelism without attention DP), and when it is not listed those batches "
-            "use 'advanced'. By default every variant the engine supports is captured. "
-            "A decode batch of an unlisted variant runs eagerly, so list every variant "
-            "the workload sends; under attention DP the whole step then runs eagerly "
-            "on every rank.",
+            "a temperature (MTP-Eagle one-model decoding with tensor parallelism, "
+            "without attention DP, relaxed acceptance, rejection sampling or "
+            "penalties). By default every variant the engine supports is captured. "
+            "Without 'temperature_only', temperature-only batches use 'advanced'. "
+            "Without 'greedy', greedy batches use the sampled graphs "
+            "('temperature_only' if listed, else 'advanced') and still decode "
+            "greedily. Without 'advanced', a sampled batch that 'temperature_only' "
+            "does not serve runs eagerly; under attention DP the whole step then runs "
+            "eagerly on every rank.",
             status="prototype")
 
     @field_validator("sampling_variants")

@@ -342,7 +342,7 @@ def create_spec_metadata(
     mapping: Mapping | None = None,
 ) -> SpecMetadata | None:
     """Create speculative metadata sized by the runner capacities."""
-    return get_spec_metadata(
+    spec_metadata = get_spec_metadata(
         config.spec_config,
         pretrained_config,
         config.max_batch_size,
@@ -354,6 +354,10 @@ def create_spec_metadata(
         temperature_only_graphs=captures_temperature_only_graphs(config, mapping),
         watermark_config=config.watermark_config,
     )
+    if spec_metadata is not None:
+        listed = getattr(config.cuda_graph_config, "sampling_variants", None)
+        spec_metadata.greedy_graphs = listed is None or "greedy" in listed
+    return spec_metadata
 
 
 def update_spec_metadata(
