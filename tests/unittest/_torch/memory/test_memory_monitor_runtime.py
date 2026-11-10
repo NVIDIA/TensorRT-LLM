@@ -306,3 +306,47 @@ def test_a_reply_nobody_collects_does_not_hold_up_shutdown(monkeypatch):
         box.setdefault((1, 0, ranks._REPLY_TAG), []).append((7, "late"))
     reporters[0].stop()
     assert not box[(1, 0, ranks._REPLY_TAG)], "drained when rank 0 stops"
+
+
+@pytest.mark.cpu_only
+def test_bounded_receive_is_shared_with_the_sleep_wakeup_acks(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import mpi_polling
+    from tensorrt_llm._torch.pyexecutor import py_executor as pe
+
+    box, lock = {}, threading.Lock()
+    rank0, rank1 = _FakeComm(0, box, lock), _FakeComm(1, box, lock)
+
+    # Rejected messages are received and dropped; the first kept one returns.
+    for message in ("stale", "late", "current"):
+        rank1.send(message, dest=0, tag=7)
+    assert mpi_polling.try_recv(rank0, 1, 7, accept=lambda m: m == "current") == (
+        True,
+        "current",
+    ), "stale messages before the current one are dropped"
+    assert mpi_polling.try_recv(rank0, 1, 7) == (False, None), "nothing left"
+
+    # A deadline already passed raises, naming what was awaited.
+    with pytest.raises(TimeoutError, match="timed out waiting for report from rank 1"):
+        mpi_polling.recv_until(rank0, 1, 7, time.monotonic(), poll_interval_s=0.001, what="report")
+
+    # The lower-case object API is used when present.
+    lower = SimpleNamespace(iprobe=lambda source, tag: True)
+    assert mpi_polling.message_ready(lower, 1, 7), "iprobe is consulted"
+    with pytest.raises(RuntimeError):
+        mpi_polling.message_ready(object(), 1, 7)
+
+    # Sleep/wakeup ACKs for another operation or phase are dropped; the
+    # matching one is returned and the timeout text is unchanged.
+    warnings = []
+    monkeypatch.setattr(pe.logger, "warning", warnings.append)
+    ack = pe._SleepWakeupTag.ACK
+    rank1.send({"op_id": "old", "phase": "sleep"}, dest=0, tag=ack)
+    rank1.send({"op_id": "new", "phase": "prepare"}, dest=0, tag=ack)
+    rank1.send({"op_id": "new", "phase": "sleep", "status": "ok"}, dest=0, tag=ack)
+    got = pe._recv_sleep_wakeup_ack_until(
+        rank0, 1, time.monotonic() + 5, expected_op_id="new", expected_phase="sleep"
+    )
+    assert got["status"] == "ok", "the matching ACK is returned"
+    assert len(warnings) == 2 and all("Ignoring stale sleep/wakeup ACK" in w for w in warnings)
+    with pytest.raises(TimeoutError, match="timed out waiting for sleep/wakeup ACK from rank 1"):
+        pe._recv_sleep_wakeup_ack(rank0, 1, 0.0)

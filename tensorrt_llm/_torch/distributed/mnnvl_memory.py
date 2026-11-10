@@ -244,6 +244,11 @@ class _MnnvlAllocationState(Enum):
     BROKEN = "broken"
 
 
+#: The states an allocation in ``MnnvlMemory.allocated_map`` can be in, for
+#: readers outside this module such as the memory monitor.
+MnnvlAllocationState = _MnnvlAllocationState
+
+
 @dataclass
 class _MnnvlAllocationRecord:
     comm: Any

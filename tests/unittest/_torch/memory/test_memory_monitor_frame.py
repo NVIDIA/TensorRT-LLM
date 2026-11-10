@@ -24,16 +24,19 @@ CPU only: the frame is a pure function over injected readings.
 """
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.memory.monitor.capability import Capability
+from tensorrt_llm._torch.memory.monitor.capture import read_torch
 from tensorrt_llm._torch.memory.monitor.frame import (
     DeviceReading,
     TorchReading,
     build_frame,
     derived_entries,
 )
-from tensorrt_llm._torch.memory.monitor.report import UNAVAILABLE, render, summarize_by_category
+from tensorrt_llm._torch.memory.monitor.report import UNAVAILABLE, render
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Entry, Placement, Source
+from tensorrt_llm._torch.memory.monitor.summary import group_totals
 
 pytestmark = pytest.mark.cpu_only
 
@@ -47,9 +50,6 @@ def _capability(**overrides) -> Capability:
         alloc_conf_var=None,
         expandable_segments=False,
         metadata_supported=True,
-        history_api_present=True,
-        snapshot_api_present=True,
-        oom_observer_present=True,
         nvml_available=True,
     )
     defaults.update(overrides)
@@ -125,14 +125,13 @@ def test_frame_balances_and_keeps_a_negative_residual():
 
 def test_unknown_is_not_zero(monkeypatch):
     """``None`` and ``0`` must stay distinguishable all the way to the page."""
-    import tensorrt_llm._torch.memory.monitor as mon
 
     frame = _frame(
         entries=[_entry(Category.DWDP_PAGES, None, Placement.NON_TORCH, source=Source.COMPONENT)]
     )
     assert frame.nontorch_known == 0, "an unknown entry is excluded from sums"
     assert Category.DWDP_PAGES in frame.unknown_categories
-    assert summarize_by_category(frame)[Category.DWDP_PAGES] is None, "survives aggregation"
+    assert group_totals(frame).unmeasured, "survives aggregation as unmeasured"
     text = render(frame, _capability())
     assert UNAVAILABLE.strip() in text
     # The detail row for the category itself, not the summary row that
@@ -176,12 +175,12 @@ def test_unknown_is_not_zero(monkeypatch):
     assert "meaningless" not in text and "not reported" not in text
 
     monkeypatch.setattr(
-        mon.torch.cuda, "memory_stats", lambda i: {"allocated_bytes.all.current": 40 * GIB}
+        torch.cuda, "memory_stats", lambda i: {"allocated_bytes.all.current": 40 * GIB}
     )
-    monkeypatch.setattr(mon.torch.cuda, "memory_reserved", lambda i: 0)
-    assert mon._read_torch(0).reserved is None, "reserved below live is refused"
-    monkeypatch.setattr(mon.torch.cuda, "memory_reserved", lambda i: 50 * GIB)
-    assert mon._read_torch(0).reserved == 50 * GIB
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda i: 0)
+    assert read_torch(0).reserved is None, "reserved below live is refused"
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda i: 50 * GIB)
+    assert read_torch(0).reserved == 50 * GIB
 
 
 def test_report_wording_and_columns():
@@ -200,7 +199,7 @@ def test_report_wording_and_columns():
     assert remainder.category is Category.UNATTRIBUTED_LIVE
     assert "NOT activation" in remainder.note
     assert remainder.source is Source.DERIVED
-    assert summarize_by_category(frame)[Category.UNATTRIBUTED_LIVE] == 40 * GIB
+    assert remainder.size_bytes == 40 * GIB
 
     # Renaming LEDGER to the longer COMPONENT once filled the source
     # column exactly and ran it into the basis column.

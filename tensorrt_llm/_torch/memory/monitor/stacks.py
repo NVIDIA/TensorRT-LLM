@@ -46,6 +46,9 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from .capability import tagging_supported
+from .settings import STACKS_ENV_VAR, full_mode, stacks_requested
+
 __all__ = [
     "ENV_VAR",
     "site_of",
@@ -55,7 +58,7 @@ __all__ = [
     "stop_stack_recording",
 ]
 
-ENV_VAR = "TLLM_MEM_MONITOR_STACKS"
+ENV_VAR = STACKS_ENV_VAR
 
 #: Frames from these paths say how memory was allocated, not who wanted it.
 _SKIP = ("/torch/", "/memory/monitor/", "<frozen", "/contextlib.py", "/functools.py")
@@ -66,9 +69,6 @@ _LIBRARY_PATHS = ("/site-packages/", "/dist-packages/", "/lib/python3")
 
 def stacks_enabled() -> bool:
     """Whether stack recording was asked for and can work here."""
-    from . import full_mode, stacks_requested
-    from .tagging import tagging_supported
-
     return stacks_requested() and full_mode() and tagging_supported()
 
 
@@ -122,7 +122,7 @@ def _is_library(path: str) -> bool:
     return any(part in path for part in _LIBRARY_PATHS)
 
 
-def site_of(frames) -> str | None:
+def site_of(frames: list[dict]) -> str | None:
     """A short name for the code that made an allocation.
 
     The innermost frame that is either TensorRT-LLM or the user's own code

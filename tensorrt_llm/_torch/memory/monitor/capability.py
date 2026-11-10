@@ -35,7 +35,14 @@ from dataclasses import dataclass
 
 import torch
 
-__all__ = ["NVML_UNAVAILABLE", "Capability", "nvml_process_usage", "probe_capability"]
+__all__ = [
+    "NVML_UNAVAILABLE",
+    "Capability",
+    "metadata_supported",
+    "nvml_process_usage",
+    "probe_capability",
+    "tagging_supported",
+]
 
 #: ``PYTORCH_CUDA_ALLOC_CONF`` wins over ``PYTORCH_ALLOC_CONF``; the two are
 #: not merged (first match wins in c10's AllocatorConfig).
@@ -51,9 +58,6 @@ class Capability:
     alloc_conf_var: str | None
     expandable_segments: bool
     metadata_supported: bool
-    history_api_present: bool
-    snapshot_api_present: bool
-    oom_observer_present: bool
     nvml_available: bool
 
     def describe(self) -> str:
@@ -66,6 +70,40 @@ class Capability:
         if self.alloc_conf:
             parts.append(f"{self.alloc_conf_var}={self.alloc_conf!r}")
         return " ".join(parts)
+
+
+def metadata_supported() -> bool:
+    """Whether the allocator keeps the metadata a tag is stored in.
+
+    A process-wide pluggable allocator answers by raising rather than
+    returning False; that is read as unsupported.
+    """
+    probe = getattr(torch.cuda.memory, "_memory_metadata_supported", None)
+    if probe is None:
+        return False
+    try:
+        return bool(probe())
+    except RuntimeError:
+        return False
+
+
+def tagging_supported() -> bool:
+    """Whether a tag set here would actually be recorded.
+
+    Returns False rather than raising, but never reports a tag total of zero
+    on an allocator that drops tags -- the caller is expected to render the
+    whole section as unsupported.
+    """
+    memory = torch.cuda.memory
+    if not metadata_supported():
+        return False
+    if not hasattr(memory, "_set_memory_metadata"):
+        return False
+    if not hasattr(memory, "_record_memory_history"):
+        return False
+    # Anything but the native caching allocator accepts the call and
+    # discards the tag.
+    return torch.cuda.get_allocator_backend() == "native"
 
 
 def _alloc_conf() -> tuple[str, str | None]:
@@ -96,6 +134,7 @@ def nvml_process_usage(device_index: int) -> tuple[int | None, str]:
     """
     unavailable = (None, NVML_UNAVAILABLE)
     try:
+        # pynvml is optional; without it the report says NVML is unavailable.
         import pynvml
 
         from tensorrt_llm import profiler
@@ -135,6 +174,7 @@ def _nvml_available() -> bool:
     query fails.
     """
     try:
+        # pynvml is optional; without it the report says NVML is unavailable.
         import pynvml
 
         from tensorrt_llm import profiler
@@ -159,27 +199,11 @@ def probe_capability(nvml_available: bool | None = None) -> Capability:
     pass the answer instead of opening a second NVML session.
     """
     conf, conf_var = _alloc_conf()
-    backend = torch.cuda.get_allocator_backend()
-
-    memory = torch.cuda.memory
-    metadata_supported = False
-    probe = getattr(memory, "_memory_metadata_supported", None)
-    if probe is not None:
-        try:
-            metadata_supported = bool(probe())
-        except RuntimeError:
-            # A pluggable allocator installed process-wide answers by
-            # raising rather than returning False.
-            metadata_supported = False
-
     return Capability(
-        allocator_backend=backend,
+        allocator_backend=torch.cuda.get_allocator_backend(),
         alloc_conf=conf,
         alloc_conf_var=conf_var,
         expandable_segments="expandable_segments:True" in conf,
-        metadata_supported=metadata_supported,
-        history_api_present=hasattr(memory, "_record_memory_history"),
-        snapshot_api_present=hasattr(memory, "_snapshot"),
-        oom_observer_present=hasattr(torch._C, "_cuda_attach_out_of_memory_observer"),
+        metadata_supported=metadata_supported(),
         nvml_available=_nvml_available() if nvml_available is None else nvml_available,
     )

@@ -25,6 +25,7 @@ import torch
 
 import tensorrt_llm._torch.memory.monitor as mon
 from tensorrt_llm._torch.memory.monitor import pools, startup, tagging
+from tensorrt_llm._torch.memory.monitor import triggers as triggers_module
 from tensorrt_llm._torch.memory.monitor.schema import Category
 from tensorrt_llm._torch.memory.monitor.summary import Group, group_totals
 
@@ -242,7 +243,7 @@ def test_startup_problems_are_logged_not_raised(monkeypatch):
 
     # The warmup report never raises.
     with monkeypatch.context() as m:
-        m.setattr(mon, "capture", broken)
+        m.setattr(triggers_module, "capture", broken)
         trace_log_utils._maybe_log_monitor_report("warmup")
 
     # Startup history that wrapped the ring buffer is reported.
@@ -364,9 +365,9 @@ def test_summary_edge_cases():
 
     # The released note uses readable, merged names.
     pools_ = (
-        PoolUsage((0, 1), "mempool", "sleep: model_weights", gib, gib, released=True),
-        PoolUsage((0, 2), "mempool", "sleep: model", 20 * MB, 10 * MB, released=True),
-        PoolUsage((0, 3), "mempool", "sleep: model", 1 * MB, 0, released=True),
+        PoolUsage((0, 1), "mempool", "sleep: model_weights", gib, gib, True, "model_weights"),
+        PoolUsage((0, 2), "mempool", "sleep: model", 20 * MB, 10 * MB, True, "model"),
+        PoolUsage((0, 3), "mempool", "sleep: model", 1 * MB, 0, True, "model"),
     )
     frame = build_frame(
         DeviceReading(total=178 * gib, free=170 * gib, process_used=2 * gib),

@@ -51,7 +51,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from .._experimental.modeling_v2 import modeling_v2_resolve_on_all_ranks
 from ..locality_domain.policy import LocalityDomainPolicy
-from ..memory.monitor.tagging import claim_module_memory as monitor_claim_memory
+from ..memory.monitor.claims import claim_module_memory as monitor_claim_memory
+from ..memory.monitor.names import WEIGHTS as MONITOR_WEIGHTS_LABEL
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -1850,7 +1851,7 @@ class ModelLoader:
             prepare_low_m_gemm(model)
         # Attribute the parameters the model ended up with, whichever load
         # path produced them. Only a weak reference; read when reporting.
-        monitor_claim_memory(model, "WEIGHTS")
+        monitor_claim_memory(model, MONITOR_WEIGHTS_LABEL)
         return model, moe_load_balancer
 
     def _check_gms_source_identity(self, gms_backend) -> None:

@@ -26,7 +26,17 @@ Covered elsewhere:
   by the C++ code that creates them: :class:`~.native.NativeMemoryProvider`.
 """
 
+from __future__ import annotations
+
+from typing import Callable
+
+import torch
+
+from tensorrt_llm._ipc_utils import IpcMemory
+
+from ..claims import claimed_modules
 from ..schema import Basis, Category, Entry, Placement, Source
+from .trtllm_ops import trtllm_op
 
 __all__ = ["IpcMemoryProvider", "McastAllReduceProvider", "NcclWindowProvider", "SymmMemProvider"]
 
@@ -44,13 +54,9 @@ class SymmMemProvider:
     category = Category.COMM_SYMM_MEM
 
     def available(self) -> bool:
-        from ..tagging import claimed_modules
-
         return bool(claimed_modules())
 
     def collect(self) -> list[Entry]:
-        from ..tagging import claimed_modules
-
         buffers: dict[int, int] = {}
         for model in claimed_modules():
             for module in model.modules():
@@ -92,6 +98,7 @@ class McastAllReduceProvider:
         return True
 
     def collect(self) -> list[Entry]:
+        # Imported here: ``distributed.ops`` imports this package for its regions.
         from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 
         workspaces = list(MNNVLAllReduce.allreduce_mnnvl_workspaces.values())
@@ -134,20 +141,13 @@ class NcclWindowProvider:
     category = Category.COMM_NCCL_WINDOW
 
     @staticmethod
-    def _op():
-        import torch
-
-        try:
-            return torch.ops.trtllm.get_nccl_window_usage
-        except (AttributeError, RuntimeError):
-            return None
+    def _op() -> Callable | None:
+        return trtllm_op("get_nccl_window_usage")
 
     def available(self) -> bool:
         return self._op() is not None
 
     def collect(self) -> list[Entry]:
-        import torch
-
         op = self._op()
         if op is None:
             return []
@@ -185,10 +185,6 @@ class IpcMemoryProvider:
         return True
 
     def collect(self) -> list[Entry]:
-        import torch
-
-        from tensorrt_llm._ipc_utils import IpcMemory
-
         usage = IpcMemory.live_allocations(torch.cuda.current_device())
         return [
             Entry(

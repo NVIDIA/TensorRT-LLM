@@ -47,6 +47,8 @@ import gc
 from dataclasses import dataclass
 from typing import Iterable
 
+import torch
+
 from tensorrt_llm.logger import logger
 
 __all__ = [
@@ -147,8 +149,6 @@ def _live_mempool_ids() -> set[tuple[int, int]]:
     ``weakref.proxy`` raises on ``isinstance``, and a class with a custom
     ``__getattribute__`` may warn or raise on attribute access.
     """
-    import torch
-
     mem_pool = torch.cuda.MemPool
     ids = set()
     objects = gc.get_objects()
@@ -191,7 +191,7 @@ def classify_all(pool_ids: Iterable) -> dict[tuple[int, int], tuple[str, str]]:
     if new:
         try:
             live = _live_mempool_ids()
-        except Exception as exc:  # noqa: BLE001 - a diagnostic must not break the report
+        except Exception as exc:  # a diagnostic must not break the report
             logger.debug(f"memory monitor: could not classify pools ({type(exc).__name__}: {exc})")
             return {k: _seen.get(k) or (UNCLASSIFIED if k in new else classify(k)) for k in keys}
         for key in new:
@@ -206,8 +206,6 @@ def prime() -> None:
     during startup are classified here instead of inside the first report,
     which may run on the executor thread in the middle of an OOM.
     """
-    import torch
-
     if not torch.cuda.is_available():
         return
     try:
@@ -229,6 +227,8 @@ class PoolUsage:
     allocated: int
     #: A sleep-mode pool whose physical memory is currently released.
     released: bool = False
+    #: The sleep-mode tag whose memory the pool holds, if it is a sleep pool.
+    sleep_tag: str | None = None
 
     @property
     def free(self) -> int:
@@ -248,6 +248,8 @@ def pool_usage(segments: Iterable[dict]) -> list[PoolUsage]:
     usage = []
     for key, (reserved, allocated) in totals.items():
         kind, label = kinds[key]
-        usage.append(PoolUsage(key, kind, label, reserved, allocated, is_released(key)))
+        usage.append(
+            PoolUsage(key, kind, label, reserved, allocated, is_released(key), _sleep_tags.get(key))
+        )
     usage.sort(key=lambda p: -p.reserved)
     return usage

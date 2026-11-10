@@ -46,9 +46,6 @@ def _capability():
         alloc_conf_var=None,
         expandable_segments=False,
         metadata_supported=True,
-        history_api_present=True,
-        snapshot_api_present=True,
-        oom_observer_present=True,
         nvml_available=True,
     )
 
@@ -71,7 +68,8 @@ def _frame(free=150 * GIB, kv=16 * GIB):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the executor monitor reads the device")
 def test_executor_memory_monitor_feeds_the_report(monkeypatch):
-    from tensorrt_llm._torch.memory.monitor import _advice, tagging, triggers
+    from tensorrt_llm._torch.memory.monitor import tagging, triggers
+    from tensorrt_llm._torch.memory.monitor.capture import _advice
     from tensorrt_llm._torch.memory.monitor.summary import Group
     from tensorrt_llm._torch.pyexecutor.py_executor_creator import _ExecutorMemoryMonitor
     from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
@@ -186,7 +184,7 @@ def test_steps_only_in_startup_reports():
 def test_every_scoped_step_has_a_category():
     # allocation_scope accepts exactly the steps that have a metric name;
     # one without a category would report under its raw value.
-    from tensorrt_llm._torch.memory.monitor import _TAG_CATEGORIES
+    from tensorrt_llm._torch.memory.monitor.capture import _TAG_CATEGORIES
     from tensorrt_llm._torch.pyexecutor.py_executor_creator import _ExecutorMemoryMonitor
 
     missing = [
@@ -199,7 +197,8 @@ def test_every_scoped_step_has_a_category():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="reads a real allocator snapshot")
 def test_creation_steps_tag_their_allocations():
-    from tensorrt_llm._torch.memory.monitor import _tag_entries, tagging
+    from tensorrt_llm._torch.memory.monitor import tagging
+    from tensorrt_llm._torch.memory.monitor.capture import _tag_entries
     from tensorrt_llm._torch.pyexecutor.py_executor_creator import _ExecutorMemoryMonitor
     from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 

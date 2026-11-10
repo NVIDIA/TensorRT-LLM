@@ -20,7 +20,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.memory.monitor as mon
-from tensorrt_llm._torch.memory.monitor import startup, tagging, triggers
+from tensorrt_llm._torch.memory.monitor import settings, startup, tagging, triggers
 
 pytestmark = pytest.mark.cpu_only
 
@@ -58,7 +58,7 @@ def test_values(monkeypatch):
     from tensorrt_llm.logger import logger
 
     monkeypatch.setattr(logger, "warning", warnings.append)
-    monkeypatch.setattr(mon, "_warned", set())
+    monkeypatch.setattr(settings, "_warned", set())
     assert mon.mode() == "oom"
     assert mon.mode() == "oom"
     assert len(warnings) == 1 and "is not one of 0, oom, 1" in warnings[0], "warned once"

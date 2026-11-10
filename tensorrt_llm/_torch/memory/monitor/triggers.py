@@ -85,7 +85,23 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from .capture import capture, render_capture
+from .settings import (
+    DIR_VAR,
+    OOM_INTERVAL_VAR,
+    PERIODIC_INTERVAL_VAR,
+    full_mode,
+    mode,
+    oom_reports_enabled,
+    seconds_setting,
+    selected_ranks,
+    setting,
+    stacks_requested,
+    warn_once,
+)
+
 __all__ = [
+    "DIR_VAR",
     "OOM_INTERVAL_VAR",
     "PERIODIC_INTERVAL_VAR",
     "install_oom_reporter",
@@ -96,16 +112,10 @@ __all__ = [
     "uninstall_oom_reporter",
 ]
 
-#: Directory reports are also written to, one file each.
-DIR_VAR = "TLLM_MEM_MONITOR_DIR"
-
-#: Seconds between periodic reports in full mode; unset or ``0`` for none.
-PERIODIC_INTERVAL_VAR = "TLLM_MEM_MONITOR_INTERVAL"
 #: Shortest periodic interval; each report takes an allocator snapshot.
 MIN_PERIODIC_INTERVAL_S = 1.0
 
-#: Minimum seconds between two OOM reports. ``0`` reports every one.
-OOM_INTERVAL_VAR = "TLLM_MEM_MONITOR_OOM_INTERVAL"
+#: Minimum seconds between two OOM reports when none is configured.
 _DEFAULT_OOM_INTERVAL_S = 60.0
 
 #: A failed PyTorch allocation older than this is not linked to an error.
@@ -188,15 +198,11 @@ _last_failed_allocation: _FailedAllocation | None = None
 
 
 def _oom_interval_s() -> float:
-    from . import seconds_setting
-
     return seconds_setting(OOM_INTERVAL_VAR, _DEFAULT_OOM_INTERVAL_S)
 
 
 def _periodic_interval_s() -> float:
     """Seconds between periodic reports; ``0`` for none."""
-    from . import seconds_setting, setting, warn_once
-
     interval = seconds_setting(PERIODIC_INTERVAL_VAR, 0.0)
     if 0 < interval < MIN_PERIODIC_INTERVAL_S:
         warn_once(
@@ -210,8 +216,6 @@ def _periodic_interval_s() -> float:
 
 def _check_settings() -> None:
     """Read every setting once, so an invalid one is reported when arming."""
-    from . import mode, selected_ranks, stacks_requested
-
     mode()
     selected_ranks()
     stacks_requested()
@@ -242,8 +246,6 @@ def report_now(
     ``device_index`` is the device to describe, by default the calling
     thread's current one; the report is built with it selected.
     """
-    from . import capture, render_capture
-
     selected = (
         torch.cuda.device(device_index) if device_index is not None else contextlib.nullcontext()
     )
@@ -281,8 +283,6 @@ _UNSAFE_FILE_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 
 def _save(text: str, tag: str, rank: int | None) -> str | None:
     """Write a report to ``TLLM_MEM_MONITOR_DIR``; the path, or ``None``."""
-    from . import setting
-
     directory = (setting(DIR_VAR) or "").strip()
     if not directory:
         return None
@@ -453,7 +453,7 @@ def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
 
 def _install_error_hooks() -> None:
     global _previous_thread_hook
-    py_logger = logger._logger
+    py_logger = logger.python_logger
     if _log_filter not in py_logger.filters:
         py_logger.addFilter(_log_filter)
     if threading.excepthook is not _thread_excepthook:
@@ -463,7 +463,7 @@ def _install_error_hooks() -> None:
 
 def _remove_error_hooks() -> None:
     global _previous_thread_hook
-    logger._logger.removeFilter(_log_filter)
+    logger.python_logger.removeFilter(_log_filter)
     if threading.excepthook is _thread_excepthook:
         threading.excepthook = _previous_thread_hook or threading.__excepthook__
         _previous_thread_hook = None
@@ -543,8 +543,6 @@ def install_oom_reporter(rank: int | None = None, device: int | None = None) -> 
     observer it is handed and cannot remove one.
     """
     global _attached, _enabled_flag, _armed_count, _device
-
-    from . import full_mode, oom_reports_enabled
 
     _check_settings()
     if not oom_reports_enabled(rank):

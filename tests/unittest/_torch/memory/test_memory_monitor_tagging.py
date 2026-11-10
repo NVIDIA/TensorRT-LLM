@@ -323,7 +323,8 @@ def test_capture_builds_tag_entries(window, monkeypatch):
         pytest.skip("tagging unsupported here")
     monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
 
-    from tensorrt_llm._torch.memory.monitor import _tag_entries, capture, render_capture
+    from tensorrt_llm._torch.memory.monitor import capture, render_capture
+    from tensorrt_llm._torch.memory.monitor.capture import _tag_entries
     from tensorrt_llm._torch.memory.monitor.schema import Placement
     from tensorrt_llm._torch.memory.monitor.tagging import set_frozen_map
 

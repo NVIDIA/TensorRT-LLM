@@ -42,14 +42,17 @@ bytes.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 
 from strenum import StrEnum
 
 __all__ = [
     "GIB",
+    "GROUP_OF",
     "Basis",
     "Category",
     "Entry",
+    "Group",
     "Placement",
     "Source",
 ]
@@ -201,3 +204,48 @@ class Entry:
     @property
     def is_unknown(self) -> bool:
         return self.size_bytes is None
+
+
+class Group(Enum):
+    """What a block of memory is for, in the reader's terms."""
+
+    KV_CACHE = "KV cache"
+    WEIGHTS = "Model weights"
+    WORKSPACE = "Runtime buffers"
+    TORCH_UNATTRIBUTED = "PyTorch, unattributed"
+    TORCH_CACHE = "PyTorch cache (free)"
+    CUDA_GRAPHS = "CUDA graphs"
+    COMMUNICATION = "Communication buffers"
+    OVERHEAD = "CUDA and library overhead"
+    OTHER = "Other tagged memory"
+
+
+#: Every category that can count toward a total, by the group it belongs to.
+#: ``None`` marks a category that is shown for diagnosis but never summed.
+GROUP_OF: dict[Category, Group | None] = {
+    Category.KV_CACHE_POOL: Group.KV_CACHE,
+    Category.KV_CACHE_AUX: Group.KV_CACHE,
+    Category.WEIGHTS: Group.WEIGHTS,
+    Category.DWDP_PAGES: Group.WEIGHTS,
+    Category.SAMPLER: Group.WORKSPACE,
+    Category.SPECULATIVE: Group.WORKSPACE,
+    Category.MODEL_RUNTIME: Group.WORKSPACE,
+    Category.EXECUTOR_RUNTIME: Group.WORKSPACE,
+    Category.GUIDED_DECODER: Group.WORKSPACE,
+    Category.UNATTRIBUTED_LIVE: Group.TORCH_UNATTRIBUTED,
+    Category.COMM_MNNVL: Group.COMMUNICATION,
+    Category.COMM_SYMM_MEM: Group.COMMUNICATION,
+    Category.COMM_DEEPEP: Group.COMMUNICATION,
+    Category.COMM_NVLS: Group.COMMUNICATION,
+    Category.COMM_NCCL_WINDOW: Group.COMMUNICATION,
+    Category.COMM_NCCL: Group.COMMUNICATION,
+    Category.COMM_IPC: Group.COMMUNICATION,
+    Category.COMM_ULYSSES: Group.COMMUNICATION,
+    Category.NATIVE_WORKSPACE: Group.WORKSPACE,
+    # Expert weight slots the load balancer moved out of PyTorch.
+    Category.EPLB: Group.WEIGHTS,
+    Category.NONTORCH_RESIDUAL: Group.OVERHEAD,
+    Category.TAGGED_OTHER: Group.OTHER,
+    Category.CUDA_GRAPHS: Group.CUDA_GRAPHS,
+    Category.CPP_BUFFERS: None,
+}

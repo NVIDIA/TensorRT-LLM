@@ -18,6 +18,7 @@ from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.communicator import init_pp_comm
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.memory.monitor.names import REGION_USERBUFFERS
 from tensorrt_llm._torch.memory.monitor.startup import region as monitor_region
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
@@ -227,7 +228,7 @@ def _init_userbuffers(
         return False
     # Allocated outside PyTorch with no size exposed to Python; the memory
     # monitor names it by measuring.
-    with monitor_region("userbuffers"):
+    with monitor_region(REGION_USERBUFFERS):
         ub.initialize_userbuffers_manager(
             mapping.tp_size,
             mapping.pp_size,

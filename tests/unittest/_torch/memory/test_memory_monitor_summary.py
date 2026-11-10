@@ -49,9 +49,6 @@ def _capability():
         alloc_conf_var=None,
         expandable_segments=False,
         metadata_supported=True,
-        history_api_present=True,
-        snapshot_api_present=True,
-        oom_observer_present=True,
         nvml_available=True,
     )
 

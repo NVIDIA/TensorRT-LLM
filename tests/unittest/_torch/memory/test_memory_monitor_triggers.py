@@ -27,6 +27,7 @@ import types
 import pytest
 import torch
 
+from tensorrt_llm._torch.memory.monitor import settings, startup
 from tensorrt_llm._torch.memory.monitor.providers import (
     clear_registered_providers,
     collect_all,
@@ -56,7 +57,7 @@ class _FakeManager:
     def __init__(self, *stats):
         self._stats = list(stats)
 
-    def _get_storage_statistics(self, level):
+    def get_storage_statistics(self, level):
         return self._stats
 
 
@@ -125,15 +126,15 @@ def test_reports_only_where_enabled(monkeypatch):
 
     monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
     monkeypatch.setenv("TLLM_MEM_MONITOR_RANKS", "0")
-    monkeypatch.setattr(monitor, "current_rank", lambda: 3)
+    monkeypatch.setattr(settings, "current_rank", lambda: 3)
     # Every call site passes no rank; resolving it here is what makes the
     # filter do anything at all.
     assert monitor.full_mode() is False
     assert monitor.full_mode_requested() is True, "the rank-independent check"
-    monkeypatch.setattr(monitor, "current_rank", lambda: 0)
+    monkeypatch.setattr(settings, "current_rank", lambda: 0)
     assert monitor.full_mode() is True
     # An unknown rank does not silently skip.
-    monkeypatch.setattr(monitor, "current_rank", lambda: None)
+    monkeypatch.setattr(settings, "current_rank", lambda: None)
     assert monitor.full_mode() is True
 
 
@@ -142,8 +143,8 @@ def test_rank_filter_is_parsed_strictly(monkeypatch):
     from tensorrt_llm._torch.memory import monitor
 
     warnings = []
-    monkeypatch.setattr(monitor.logger, "warning", warnings.append)
-    monkeypatch.setattr(monitor, "_warned", set())
+    monkeypatch.setattr(settings.logger, "warning", warnings.append)
+    monkeypatch.setattr(settings, "_warned", set())
     for raw, expected, warns in [
         ("0,4", frozenset({0, 4}), False),
         (" 1 , 2 ", frozenset({1, 2}), False),
@@ -171,8 +172,8 @@ def test_settings_are_validated(monkeypatch):
     from tensorrt_llm._torch.memory.monitor import triggers
 
     warnings = []
-    monkeypatch.setattr(monitor.logger, "warning", warnings.append)
-    monkeypatch.setattr(monitor, "_warned", set())
+    monkeypatch.setattr(settings.logger, "warning", warnings.append)
+    monkeypatch.setattr(settings, "_warned", set())
     for raw, expected in [("abc", 60.0), ("-1", 60.0), ("nan", 60.0), ("inf", 60.0), ("5", 5.0)]:
         monkeypatch.setenv(triggers.OOM_INTERVAL_VAR, raw)
         assert triggers._oom_interval_s() == expected, raw
@@ -407,14 +408,12 @@ def test_report_files_have_safe_names(monkeypatch, tmp_path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_report_now(monkeypatch):
-    from tensorrt_llm._torch.memory import monitor
-
     monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
     monkeypatch.delenv("TLLM_MEM_MONITOR_RANKS", raising=False)
     text = report_now(tag="unit", rank=0)
     assert text is not None and "memory monitor" in text
 
-    monkeypatch.setattr(monitor, "current_rank", lambda: 5)
+    monkeypatch.setattr(settings, "current_rank", lambda: 5)
     text = report_now(tag="unit")
     assert "rank=5" in text, "interleaved multi-rank logs must be separable"
 
@@ -544,7 +543,7 @@ def test_baseline_is_taken_when_startup_completes(monkeypatch):
         with pytest.raises(RuntimeError):
             with tagging.startup_window():
                 raise RuntimeError("load failed")
-        assert monitor._baseline is None
+        assert startup.baseline() is None
         assert "since warmup" not in report_now(tag="later"), "after a failed startup"
 
         texts = []
@@ -585,7 +584,7 @@ def test_executor_error_handler_passes_its_message_on(monkeypatch):
     import tensorrt_llm._torch.pyexecutor.py_executor as pe
 
     seen = []
-    monkeypatch.setattr(pe, "monitor_notify_error", seen.append)
+    monkeypatch.setattr(pe.gpu_memory_triggers, "notify_error", seen.append)
     try:
         pe.PyExecutor._handle_errors(mock.MagicMock(), "CUDA error: out of memory")
     except Exception:  # only the first statement matters here

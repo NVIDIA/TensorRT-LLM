@@ -168,7 +168,7 @@ def test_sleep_listener_reports_a_failed_wakeup(monkeypatch):
 
     reported = []
     monkeypatch.setattr(virtual_memory, "materialize_with_tag", materialize)
-    monkeypatch.setattr(mod, "monitor_notify_error", reported.append)
+    monkeypatch.setattr(mod.gpu_memory_triggers, "notify_error", reported.append)
     monkeypatch.setattr(mod, "set_thread_local_mpi_comm", lambda *_: None)
     monkeypatch.setattr(mod, "CUASSERT", lambda *_: None)
     monkeypatch.setattr(mod, "cudart", SimpleNamespace(cudaSetDevice=lambda *_: None))

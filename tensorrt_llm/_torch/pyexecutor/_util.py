@@ -51,6 +51,7 @@ from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
 from ..hostfunc import set_low_latency_dispatch
 from ..memory.monitor import startup as _monitor_startup
+from ..memory.monitor.names import REGION_KV_TRANSFER_BUFFERS
 from ..memory.monitor.providers import \
     register_provider as _monitor_register_provider
 from ..memory.monitor.providers.kv_cache import \
@@ -4977,7 +4978,7 @@ def create_py_executor_resources(
 
     # Disaggregated serving's KV transfer buffers are allocated in C++ with
     # no size exposed to Python; the memory monitor names them by measuring.
-    with _monitor_startup.region("KV cache transfer buffers"):
+    with _monitor_startup.region(REGION_KV_TRANSFER_BUFFERS):
         kv_cache_transceiver = create_kv_cache_transceiver(
             mapping, dist, kv_cache_manager, attention_type,
             cache_transceiver_config, mamba_cache_manager)

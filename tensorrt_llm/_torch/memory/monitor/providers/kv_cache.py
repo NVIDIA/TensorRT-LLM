@@ -29,34 +29,30 @@ conservation check into a tautology.
 
 import dataclasses
 import weakref
+from typing import Any
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
 
+from ..pools import is_tag_released
 from ..schema import Basis, Category, Entry, Placement, Source
 
 __all__ = ["KvCacheProvider", "kv_pool_group_stats"]
 
-GPU_LEVEL_FALLBACK = 0
 
-
-def _slot_bytes(stats) -> int:
+def _slot_bytes(stats: Any) -> int:
     """Bytes per block: every pool in the group contributes one slot."""
     return sum(int(size) for size in stats.slot_sizes)
 
 
-def kv_pool_group_stats(manager) -> list[dict]:
+def kv_pool_group_stats(manager: Any) -> list[dict]:
     """Per-pool-group figures in bytes, derived only from stored fields.
 
     Returned rather than logged so the conservation checks and the monitor
     entries work from one reading; sampling twice would let the pool change
     underneath a comparison.
     """
-    try:
-        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import GPU_LEVEL
-    except ImportError:
-        GPU_LEVEL = GPU_LEVEL_FALLBACK
-
-    per_group = manager._get_storage_statistics(GPU_LEVEL)
+    per_group = manager.get_storage_statistics(GPU_LEVEL)
 
     rows = []
     for pool_id, stats in enumerate(per_group):
@@ -112,7 +108,7 @@ class KvCacheProvider:
 
     category = Category.KV_CACHE_POOL
 
-    def __init__(self, manager=None, role: str = "main") -> None:
+    def __init__(self, manager: Any = None, role: str = "main") -> None:
         self.role = role
         self.name = f"kv_cache.{role}"
         self._ref = None
@@ -135,7 +131,7 @@ class KvCacheProvider:
                 f"referenced weakly; the {role} KV cache pool will be absent"
             )
 
-    def _v1_entry(self, manager) -> Entry:
+    def _v1_entry(self, manager: Any) -> Entry:
         """KV cache manager V1: its own count of the primary (device) pools.
 
         ``KvCacheStats.allocated_bytes`` sums the primary pools' volume when
@@ -165,7 +161,7 @@ class KvCacheProvider:
         )
 
     @property
-    def _manager(self):
+    def _manager(self) -> Any:
         return self._ref() if self._ref is not None else None
 
     def available(self) -> bool:
@@ -186,8 +182,6 @@ class KvCacheProvider:
         tag is released the GPU no longer backs it, while the manager still
         reports it; it is then listed as released and left out of the totals.
         """
-        from ..pools import is_tag_released
-
         if not is_tag_released(KV_CACHE_SLEEP_TAG):
             return entries
         return [
@@ -202,8 +196,8 @@ class KvCacheProvider:
             for e in entries
         ]
 
-    def _collect(self, manager) -> list[Entry]:
-        if not hasattr(manager, "_get_storage_statistics"):
+    def _collect(self, manager: Any) -> list[Entry]:
+        if not hasattr(manager, "get_storage_statistics"):
             return [self._v1_entry(manager)]
 
         entries = []

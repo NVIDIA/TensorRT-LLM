@@ -24,14 +24,13 @@ reports mislead in practice:
 * A negative residual is printed with its sign and flagged, not clamped.
 """
 
-from typing import TYPE_CHECKING
+from __future__ import annotations
 
 from .capability import Capability
+from .checks import CheckResult
 from .frame import Frame, derived_entries
-from .schema import GIB, Category, Entry, Placement
-
-if TYPE_CHECKING:
-    from .checks import CheckResult
+from .schema import GIB, Category, Entry, Group, Placement
+from .summary import group_totals, render_summary
 
 __all__ = ["UNAVAILABLE", "UNSUPPORTED", "render"]
 
@@ -70,20 +69,18 @@ def render(
     capability: Capability,
     *,
     tag: str = "",
-    trigger: str = "",
     pid: int | None = None,
     rank: int | None = None,
     device_index: int | None = None,
-    checks: "list[CheckResult] | None" = None,
+    checks: list[CheckResult] | None = None,
     headline: str = "",
-    baseline: "dict | None" = None,
-    advice: "dict | None" = None,
+    baseline: dict[Group, int | None] | None = None,
+    advice: dict[Group, str] | None = None,
     suggestion: str = "",
     startup_steps: bool = False,
-    unattributed_sites: "dict | None" = None,
+    unattributed_sites: dict[str, int] | None = None,
 ) -> str:
     """Render a human-readable report: a summary first, allocator detail after."""
-    from .summary import group_totals, render_summary
 
     device, torch_r = frame.device, frame.torch
     out: list[str] = []
@@ -101,8 +98,6 @@ def render(
         ident.append(f"rank={rank}")
     if device_index is not None:
         ident.append(f"device={device_index}")
-    if trigger:
-        ident.append(f"trigger={trigger}")
     if ident:
         add("  " + " ".join(ident))
     out.extend(
@@ -242,25 +237,3 @@ def render(
             add(f"  {'info':<7s}{check.name:<28s}{check.detail}")
 
     return "\n".join(out)
-
-
-def summarize_by_category(frame: Frame) -> dict[Category, int | None]:
-    """Collapse entries to one value per category.
-
-    Categories whose providers reported unavailable map to ``None`` so the
-    distinction survives aggregation.
-    """
-    totals: dict[Category, int | None] = {}
-    for entry in frame.entries:
-        if not entry.counts_toward_total:
-            continue
-        if entry.size_bytes is None:
-            # An unknown part makes the category's total unknown.
-            totals[entry.category] = None
-            continue
-        if entry.category in totals and totals[entry.category] is None:
-            continue
-        totals[entry.category] = entry.size_bytes + (totals.get(entry.category) or 0)
-    for entry in derived_entries(frame):
-        totals[entry.category] = entry.size_bytes
-    return totals

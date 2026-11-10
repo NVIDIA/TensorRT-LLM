@@ -57,7 +57,7 @@ class _Manager:
     def __init__(self, *stats):
         self._stats = list(stats)
 
-    def _get_storage_statistics(self, level):
+    def get_storage_statistics(self, level):
         return self._stats
 
 

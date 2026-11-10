@@ -177,7 +177,7 @@ def test_sleep_mode_pools_are_named_and_released_memory_leaves_the_footprint():
 
 
 def test_graph_memory_is_cuda_graphs_not_reusable_cache():
-    from tensorrt_llm._torch.memory.monitor import _tag_entries
+    from tensorrt_llm._torch.memory.monitor.capture import _tag_entries
     from tensorrt_llm._torch.memory.monitor.schema import Category
 
     # Capture runs inside an executor creation step, whose tag would

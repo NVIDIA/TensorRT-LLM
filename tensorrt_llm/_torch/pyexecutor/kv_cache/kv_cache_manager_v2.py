@@ -7314,6 +7314,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_storage_statistics(self, cache_level: CacheLevel):
         return self.impl.get_storage_statistics(cache_level)
 
+    def get_storage_statistics(self, cache_level: CacheLevel) -> list:
+        """Per-pool-group storage statistics at ``cache_level``, as the storage reports them."""
+        return self._get_storage_statistics(cache_level)
+
     def _cold_pool_group_membership(self) -> tuple[tuple[int, frozenset[int]], ...]:
         """Cached ``(cold pool group id, life cycle ids)`` pairs shared by all cold levels.
 

@@ -30,10 +30,10 @@ mapping is required to be total (and a test enforces it).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 
-from .frame import Frame
-from .schema import GIB, Category, Source
+from . import startup
+from .frame import DeviceReading, Frame, derived_entries
+from .schema import GIB, GROUP_OF, Group, Source
 
 __all__ = ["GROUP_OF", "Group", "GroupTotals", "group_totals", "render_summary"]
 
@@ -41,20 +41,6 @@ _GIB = float(GIB)
 
 #: Rows smaller than this print as 0.00 GiB and are left out.
 _SHOWN = 5 << 20
-
-
-class Group(Enum):
-    """What a block of memory is for, in the reader's terms."""
-
-    KV_CACHE = "KV cache"
-    WEIGHTS = "Model weights"
-    WORKSPACE = "Runtime buffers"
-    TORCH_UNATTRIBUTED = "PyTorch, unattributed"
-    TORCH_CACHE = "PyTorch cache (free)"
-    CUDA_GRAPHS = "CUDA graphs"
-    COMMUNICATION = "Communication buffers"
-    OVERHEAD = "CUDA and library overhead"
-    OTHER = "Other tagged memory"
 
 
 _NOTES = {
@@ -67,36 +53,6 @@ _NOTES = {
     Group.COMMUNICATION: "multi-GPU communication buffers",
     Group.OVERHEAD: "CUDA context, cuBLAS, NCCL internals and other driver memory",
     Group.OTHER: "tagged with a name the report does not group",
-}
-
-#: Every category that can count toward a total, by the group it belongs to.
-#: ``None`` marks a category that is shown for diagnosis but never summed.
-GROUP_OF: dict[Category, Group | None] = {
-    Category.KV_CACHE_POOL: Group.KV_CACHE,
-    Category.KV_CACHE_AUX: Group.KV_CACHE,
-    Category.WEIGHTS: Group.WEIGHTS,
-    Category.DWDP_PAGES: Group.WEIGHTS,
-    Category.SAMPLER: Group.WORKSPACE,
-    Category.SPECULATIVE: Group.WORKSPACE,
-    Category.MODEL_RUNTIME: Group.WORKSPACE,
-    Category.EXECUTOR_RUNTIME: Group.WORKSPACE,
-    Category.GUIDED_DECODER: Group.WORKSPACE,
-    Category.UNATTRIBUTED_LIVE: Group.TORCH_UNATTRIBUTED,
-    Category.COMM_MNNVL: Group.COMMUNICATION,
-    Category.COMM_SYMM_MEM: Group.COMMUNICATION,
-    Category.COMM_DEEPEP: Group.COMMUNICATION,
-    Category.COMM_NVLS: Group.COMMUNICATION,
-    Category.COMM_NCCL_WINDOW: Group.COMMUNICATION,
-    Category.COMM_NCCL: Group.COMMUNICATION,
-    Category.COMM_IPC: Group.COMMUNICATION,
-    Category.COMM_ULYSSES: Group.COMMUNICATION,
-    Category.NATIVE_WORKSPACE: Group.WORKSPACE,
-    # Expert weight slots the load balancer moved out of PyTorch.
-    Category.EPLB: Group.WEIGHTS,
-    Category.NONTORCH_RESIDUAL: Group.OVERHEAD,
-    Category.TAGGED_OTHER: Group.OTHER,
-    Category.CUDA_GRAPHS: Group.CUDA_GRAPHS,
-    Category.CPP_BUFFERS: None,
 }
 
 
@@ -116,8 +72,6 @@ class GroupTotals:
 
 
 def group_totals(frame: Frame) -> GroupTotals:
-    from .frame import derived_entries
-
     sizes: dict[Group, int | None] = {}
     unmeasured: list[str] = []
     members: dict[Group, dict[str, int]] = {}
@@ -162,9 +116,7 @@ def group_totals(frame: Frame) -> GroupTotals:
     # the startup measurements are per process and would not reconcile with
     # a device-wide figure.
     if not frame.device.process_used_is_upper_bound:
-        from .startup import residual_breakdown
-
-        parts = residual_breakdown(frame.nontorch_residual)
+        parts = startup.residual_breakdown(frame.nontorch_residual)
         if parts:
             members[Group.OVERHEAD] = dict(parts)
 
@@ -181,12 +133,10 @@ def group_totals(frame: Frame) -> GroupTotals:
 
 def _released_parts(frame: Frame) -> dict[str, int]:
     """What sleep mode has released, by the name a reader knows it under."""
-    from . import startup
-
     parts: dict[str, int] = {}
     for pool in frame.torch.pools or ():
         if pool.released and pool.reserved:
-            tag = pool.label.removeprefix("sleep: ")
+            tag = pool.sleep_tag or pool.label
             name = startup.step_name(tag)
             if name == tag:
                 name = tag.replace("_", " ").capitalize()
@@ -242,8 +192,6 @@ def render_summary(
     ``suggestion`` replaces the advice that would follow from the focus
     group, for when the cause is already known (a startup step that failed).
     """
-    from . import startup
-
     if unattributed_sites:
         # Parts sum to the row: whatever no recorded stack covers -- blocks
         # allocated before recording began -- is listed as such.
@@ -288,7 +236,7 @@ def render_summary(
         header += f"{'since warmup':>15s}"
     out.append(header)
 
-    def sort_key(item):
+    def sort_key(item: tuple[Group, int | None]) -> int:
         return -(item[1] or 0)
 
     for group, size in sorted(totals.sizes.items(), key=sort_key):
@@ -364,7 +312,7 @@ def _conclusion(
     baseline: dict[Group, int | None] | None,
     advice: dict[Group, str],
     suggestion: str = "",
-    device=None,
+    device: DeviceReading | None = None,
     sites: dict[str, int] | None = None,
     alarm: bool = False,
 ) -> list[str]:
@@ -443,8 +391,6 @@ _GROWTH_WORTH_NAMING = 1 << 30
 
 def _profiled_activation() -> int | None:
     """PyTorch memory the profiled forward pass allocated, if startup measured it."""
-    from . import startup
-
     plan = startup.memory_plan()
     return plan.activation if plan is not None else None
 

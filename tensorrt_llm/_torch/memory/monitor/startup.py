@@ -48,8 +48,14 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 from dataclasses import dataclass
+from typing import Iterator
 
-from .schema import GIB
+import torch
+
+from .capability import nvml_process_usage
+from .providers import collect_all
+from .schema import GIB, Group, Placement
+from .settings import full_mode
 
 __all__ = [
     "MemoryPlan",
@@ -61,9 +67,12 @@ __all__ = [
     "begin_stage",
     "StageSample",
     "advice_for_stage",
+    "baseline",
     "clear",
+    "clear_baseline",
     "failed_stage",
     "memory_plan",
+    "record_baseline",
     "record_failed_stage",
     "record_memory_plan",
     "record_stage",
@@ -141,24 +150,20 @@ _advice: dict[str, str] = {}
 _plan: MemoryPlan | None = None
 
 
-def _on() -> bool:
-    from . import full_mode
+#: Group totals recorded once startup (including warmup) completes. Later
+#: reports show each group's change against it.
+_baseline: dict[Group, int | None] | None = None
 
+
+def _on() -> bool:
     return full_mode()
 
 
 def _process_used() -> int | None:
-    import torch
-
-    from . import _nvml_process_used
-
-    return _nvml_process_used(torch.cuda.current_device())
+    return nvml_process_usage(torch.cuda.current_device())[0]
 
 
 def _known_outside_torch() -> int:
-    from .providers import collect_all
-    from .schema import Placement
-
     return sum(
         e.size_bytes
         for e in collect_all()
@@ -167,8 +172,6 @@ def _known_outside_torch() -> int:
 
 
 def _reading() -> Reading | None:
-    import torch
-
     process = _process_used()
     if process is None:
         return None
@@ -196,7 +199,7 @@ def begin_stage(stage: str | None = None) -> Reading | None:
 
 
 @contextlib.contextmanager
-def region(name: str):
+def region(name: str) -> Iterator[None]:
     """Attribute unexplained memory that appears inside this block to ``name``.
 
     For code that allocates outside PyTorch and keeps no account of its own,
@@ -280,6 +283,23 @@ def record_failed_stage(
     _active_stage = None
 
 
+def record_baseline(sizes: dict[Group, int | None]) -> None:
+    """Keep the group totals of the report taken when startup completed."""
+    global _baseline
+    _baseline = dict(sizes)
+
+
+def baseline() -> dict[Group, int | None] | None:
+    """Group totals when startup completed, or ``None`` before that."""
+    return _baseline
+
+
+def clear_baseline() -> None:
+    """Forget the post-warmup baseline."""
+    global _baseline
+    _baseline = None
+
+
 def record_memory_plan(non_kv_peak: int, activation: int | None) -> None:
     global _plan
     if _on():
@@ -308,8 +328,8 @@ def advice_for_stage(stage: str) -> str | None:
 
 
 def clear() -> None:
-    """Forget everything recorded; called as each executor's startup begins."""
-    global _failed, _plan, _first, _active_stage
+    """Forget everything recorded, the baseline included; called as each executor's startup begins."""
+    global _failed, _plan, _first, _active_stage, _baseline
     _stages.clear()
     _regions.clear()
     _open_regions.clear()
@@ -319,6 +339,7 @@ def clear() -> None:
     _active_stage = None
     _names.clear()
     _advice.clear()
+    _baseline = None
 
 
 def render_stage_lines() -> list[str]:

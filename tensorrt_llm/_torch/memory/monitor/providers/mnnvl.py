@@ -69,14 +69,16 @@ class MnnvlProvider:
         if self._memory_cls is not None:
             return True
         try:
+            # Resolved on first use: the module needs the CUDA driver bindings,
+            # and a process without them simply has no MNNVL memory.
             from tensorrt_llm._torch.distributed.mnnvl_memory import (
+                MnnvlAllocationState,
                 MnnvlMemory,
-                _MnnvlAllocationState,
             )
         except ImportError:
             return False
         self._memory_cls = MnnvlMemory
-        self._state_cls = _MnnvlAllocationState
+        self._state_cls = MnnvlAllocationState
         return True
 
     def available(self) -> bool:

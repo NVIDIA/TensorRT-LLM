@@ -26,8 +26,12 @@ remainder.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
+
+import torch
 
 from ..schema import Basis, Category, Entry, Placement, Source
+from .trtllm_ops import trtllm_op
 
 __all__ = ["LABELS", "NativeMemoryProvider"]
 
@@ -100,21 +104,13 @@ class NativeMemoryProvider:
     category = Category.TAGGED_OTHER
 
     @staticmethod
-    def _op():
-        import torch
-
-        try:
-            return torch.ops.trtllm.get_native_memory_usage
-        except (AttributeError, RuntimeError):
-            # Not built into this TensorRT-LLM.
-            return None
+    def _op() -> Callable | None:
+        return trtllm_op("get_native_memory_usage")
 
     def available(self) -> bool:
         return self._op() is not None
 
     def collect(self) -> list[Entry]:
-        import torch
-
         op = self._op()
         if op is None:
             return []

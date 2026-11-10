@@ -101,6 +101,7 @@ def test_site_names():
 @pytest.mark.cpu_only
 def test_off_by_default_and_handed_over_when_asked(monkeypatch):
     monkeypatch.setattr(tagging, "tagging_supported", lambda: True)
+    monkeypatch.setattr(stacks, "tagging_supported", lambda: True)
     monkeypatch.setattr(tagging, "freeze_tag_map", lambda: tagging.TagSnapshot(supported=True))
     monkeypatch.setattr(tagging, "_log_window_result", lambda *a, **k: None)
     calls = []

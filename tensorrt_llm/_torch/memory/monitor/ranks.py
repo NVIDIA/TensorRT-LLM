@@ -40,6 +40,7 @@ import threading
 import time
 from typing import Any
 
+from tensorrt_llm._torch.pyexecutor.mpi_polling import message_ready, try_recv
 from tensorrt_llm.logger import logger
 
 __all__ = ["RankReporter"]
@@ -48,6 +49,7 @@ _REQUEST_TAG = 2626
 _REPLY_TAG = 2627
 _POLL_S = 0.2
 _SEND_POLL_S = 0.05
+_GATHER_POLL_S = 0.05
 _DEFAULT_TIMEOUT_S = 30.0
 
 
@@ -62,7 +64,7 @@ class RankReporter:
         self._stop = threading.Event()
         self._gather_lock = threading.Lock()
         self._sequence = itertools.count(1)
-        self._thread = None
+        self._thread: threading.Thread | None = None
         if rank != 0:
             self._thread = threading.Thread(
                 target=self._listen, name="memory-monitor-rank-listener", daemon=True
@@ -78,7 +80,7 @@ class RankReporter:
             torch.cuda.set_device(self._device)
         while not self._stop.is_set():
             try:
-                if not self._comm.Iprobe(source=0, tag=_REQUEST_TAG):
+                if not message_ready(self._comm, 0, _REQUEST_TAG):
                     self._stop.wait(_POLL_S)
                     continue
                 sequence = self._comm.recv(source=0, tag=_REQUEST_TAG)
@@ -91,7 +93,7 @@ class RankReporter:
                 )
                 self._stop.wait(_POLL_S)
 
-    def _deliver(self, request) -> bool:
+    def _deliver(self, request: Any) -> bool:
         """Wait for a reply to be received; ``False`` if stopped first."""
         while not request.Test():
             if self._stop.wait(_SEND_POLL_S):
@@ -112,17 +114,20 @@ class RankReporter:
             replies: dict[int, str] = {}
             deadline = time.monotonic() + timeout
             pending = set(range(1, self._world_size))
+
+            def current(reply: tuple[int, str | None]) -> bool:
+                # A reply to an earlier request that timed out is dropped.
+                return reply[0] == sequence
+
             while pending and time.monotonic() < deadline:
                 for source in sorted(pending):
-                    if not self._comm.Iprobe(source=source, tag=_REPLY_TAG):
+                    received, reply = try_recv(self._comm, source, _REPLY_TAG, current)
+                    if not received:
                         continue
-                    answered, report = self._comm.recv(source=source, tag=_REPLY_TAG)
-                    if answered != sequence:
-                        continue  # a late answer to an earlier request
-                    replies[source] = report or f"rank {source}: the report could not be built"
+                    replies[source] = reply[1] or f"rank {source}: the report could not be built"
                     pending.discard(source)
                 if pending:
-                    time.sleep(0.05)
+                    time.sleep(_GATHER_POLL_S)
             for source in pending:
                 replies[source] = f"rank {source}: no report within {timeout:g} s"
             return [replies[source] for source in sorted(replies)]
@@ -130,8 +135,7 @@ class RankReporter:
     def _drain_replies(self) -> None:
         """Receive replies nobody waits for any more, so no send stays pending."""
         for source in range(1, self._world_size):
-            while self._comm.Iprobe(source=source, tag=_REPLY_TAG):
-                self._comm.recv(source=source, tag=_REPLY_TAG)
+            try_recv(self._comm, source, _REPLY_TAG, accept=lambda _reply: False)
 
     def stop(self) -> None:
         """End this rank's listener. Each rank stops its own."""

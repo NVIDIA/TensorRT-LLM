@@ -71,12 +71,20 @@ import bisect
 import contextlib
 import itertools
 import time
-import weakref
 from dataclasses import dataclass, field
+from typing import Callable, Iterator
 
 import torch
 
 from tensorrt_llm.logger import logger
+
+from . import startup
+from .capability import tagging_supported
+from .claims import claim_module_memory, claimed_modules, claimed_storages, clear_claims
+from .names import CUDA_GRAPHS, UNTAGGED
+from .pools import classify_all, is_released
+from .settings import full_mode
+from .stacks import site_of, stacks_enabled, start_stack_recording
 
 __all__ = [
     "CUDA_GRAPHS",
@@ -97,9 +105,6 @@ __all__ = [
     "tag",
     "tagging_supported",
 ]
-
-#: Label for live memory that no frozen tag claims. Always reported.
-UNTAGGED = "untagged"
 
 _FREE_ACTIONS = ("free_completed", "segment_free")
 
@@ -124,34 +129,8 @@ def history_recording_active() -> bool:
     return bool(probe())
 
 
-def tagging_supported() -> bool:
-    """Whether a tag set here would actually be recorded.
-
-    Returns False rather than raising, but never reports a tag total of zero
-    on an allocator that drops tags -- the caller is expected to render the
-    whole section as unsupported.
-    """
-    memory = torch.cuda.memory
-    probe = getattr(memory, "_memory_metadata_supported", None)
-    if probe is None:
-        return False
-    try:
-        if not probe():
-            return False
-    except RuntimeError:
-        # A process-wide pluggable allocator answers by raising.
-        return False
-    if not hasattr(memory, "_set_memory_metadata"):
-        return False
-    if not hasattr(memory, "_record_memory_history"):
-        return False
-    # The docstring's own caveat: anything but the native caching allocator
-    # accepts the call and discards the tag.
-    return torch.cuda.get_allocator_backend() == "native"
-
-
 @contextlib.contextmanager
-def tag(name: str):
+def tag(name: str) -> Iterator[None]:
     """Label allocations made inside this block.
 
     Restores the previous label rather than clearing it, so nesting a
@@ -161,8 +140,6 @@ def tag(name: str):
     A no-op when the monitor is off or tagging is unsupported, so call
     sites need no guard.
     """
-    from . import full_mode
-
     if not full_mode() or not tagging_supported():
         yield
         return
@@ -200,7 +177,9 @@ def tag(name: str):
 _windows: list[tuple[float, float, str]] = []
 
 
-def _window_lookup(windows):
+def _window_lookup(
+    windows: list[tuple[float, float, str]],
+) -> Callable[[float], str | None]:
     """Map a timestamp to the innermost window containing it, or ``None``.
 
     Flattened once into sorted boundaries, so each lookup is a bisection.
@@ -216,7 +195,7 @@ def _window_lookup(windows):
         inside = [w for w in windows if w[0] <= middle < w[1]]
         labels.append(max(inside)[2] if inside else None)
 
-    def lookup(t):
+    def lookup(t: float) -> str | None:
         position = bisect.bisect_right(bounds, t) - 1
         if 0 <= position < len(labels):
             return labels[position]
@@ -349,14 +328,8 @@ def freeze_tag_map() -> TagSnapshot:
     )
 
 
-#: Label for live blocks in a CUDA graph's private pool. Applied from the
-#: pool, not from a tag: capture happens inside a creation step whose tag
-#: would otherwise claim the graph's memory as that step's.
-CUDA_GRAPHS = "CUDA_GRAPHS"
-
-
 def _live_blocks(
-    segments: list | None = None,
+    segments: list[dict] | None = None,
 ) -> list[tuple[int, int, bool, list, int]] | None:
     """Sorted ``(address, size, in_graph_pool, frames, requested)`` of every live block.
 
@@ -365,16 +338,12 @@ def _live_blocks(
     the allocation asked for, which is what trace events record.
     ``segments`` is an allocator snapshot already taken; one is taken if not.
     """
-    from .pools import classify_all
-
     if segments is None:
         try:
             segments = torch.cuda.memory._snapshot()["segments"]
         except RuntimeError as exc:
             logger.debug(f"memory monitor: snapshot failed while reading tags ({exc})")
             return None
-    from .pools import is_released
-
     kinds = classify_all(segment.get("segment_pool_id", (0, 0)) for segment in segments)
     blocks = []
     for segment in segments:
@@ -403,7 +372,7 @@ def live_bytes_by_tag(snapshot: TagSnapshot) -> dict[str, int]:
 
 
 def live_attribution(
-    snapshot: TagSnapshot, segments: list | None = None
+    snapshot: TagSnapshot, segments: list[dict] | None = None
 ) -> tuple[dict[str, int], dict[str, int]]:
     """Live torch memory by label, and the untagged part by allocating code.
 
@@ -417,7 +386,7 @@ def live_attribution(
     a measurement. ``segments`` is an allocator snapshot the caller already
     holds, so the tags describe the same moment as its other figures.
     """
-    claims = _claimed_storages()
+    claims = claimed_storages()
     blocks = _live_blocks(segments)
     if blocks is None:
         return {}, {}
@@ -439,8 +408,6 @@ def live_attribution(
 
     # Precedence: a claimed module, then the graph pool a block sits in, then
     # the creation step's tag.
-    from .stacks import site_of
-
     totals: dict[str, int] = {UNTAGGED: 0}
     # What is left untagged, by the code that allocated it -- populated only
     # when stack recording is on, since blocks carry frames only then.
@@ -459,14 +426,6 @@ def live_attribution(
 
 _frozen: TagSnapshot = TagSnapshot(supported=False)
 
-#: Modules whose parameters and buffers belong to a label, held weakly.
-#: Resolved to storages each time a report is built rather than once at
-#: load: an address recorded once keeps its label after the block is freed
-#: and reused by an unrelated allocation, while walking the module sees only
-#: the storage it holds now -- including after sleep/wake or a weight
-#: update has replaced it.
-_claimed_modules: list[tuple["weakref.ref", str]] = []
-
 
 def set_frozen_map(snapshot: TagSnapshot) -> None:
     """Publish the map captured at the end of the startup window."""
@@ -479,61 +438,8 @@ def get_frozen_map() -> TagSnapshot:
     return _frozen
 
 
-def claim_module_memory(module, label: str) -> bool:
-    """Attribute ``module``'s parameters and buffers to ``label``.
-
-    Needs no history recording and does no work beyond taking a weak
-    reference; the storages are resolved when a report is built. Recorded
-    whether or not the monitor is on, so a report asked for later
-    (``LLM.get_memory_report``) still names the weights; holding a weak
-    reference costs nothing. Returns whether the claim was recorded.
-    """
-    try:
-        reference = weakref.ref(module)
-    except TypeError:
-        logger.debug(f"memory monitor: cannot weakly reference {type(module).__name__}")
-        return False
-    _claimed_modules[:] = [
-        (ref, name) for ref, name in _claimed_modules if ref() is not None and ref() is not module
-    ]
-    _claimed_modules.append((reference, label))
-    return True
-
-
-def claimed_modules() -> list:
-    """Claimed modules that are still alive.
-
-    Lets a provider whose objects hang off the model -- with no registry of
-    their own -- walk it without holding it.
-    """
-    return [module for module in (ref() for ref, _ in list(_claimed_modules)) if module is not None]
-
-
-def clear_claims() -> None:
-    """Forget every claimed module."""
-    _claimed_modules.clear()
-
-
-def _claimed_storages() -> list[tuple[int, str]]:
-    """``(storage pointer, label)`` for every CUDA tensor a claimed module holds now."""
-    found = []
-    for reference, label in list(_claimed_modules):
-        module = reference()
-        if module is None:
-            continue
-        try:
-            tensors = itertools.chain(module.parameters(), module.buffers())
-            for tensor in tensors:
-                if tensor.is_cuda:
-                    found.append((tensor.untyped_storage().data_ptr(), label))
-        except (RuntimeError, NotImplementedError) as exc:
-            # A tensor subclass without plain storage; skip the module, not the report.
-            logger.debug(f"memory monitor: could not walk the {label!r} module ({exc})")
-    return found
-
-
 @contextlib.contextmanager
-def startup_window(rank: int | None = None):
+def startup_window(rank: int | None = None) -> Iterator[bool]:
     """Record tags for the duration of startup, then freeze, stop and report.
 
     The report is emitted whenever the monitor is on, whether or not tagging
@@ -546,8 +452,6 @@ def startup_window(rank: int | None = None):
     startup that raises part way through still publishes what it managed to
     tag and still reports, which is exactly when a breakdown is worth having.
     """
-    from . import clear_baseline, full_mode, startup
-
     if not full_mode(rank):
         yield False
         return
@@ -555,7 +459,6 @@ def startup_window(rank: int | None = None):
     # A process can build more than one executor; what the previous one
     # recorded would otherwise be reported as this one's.
     startup.clear()
-    clear_baseline()
     recording = start_tagging_window()
     failed = interrupted = out_of_memory = False
     try:
@@ -579,8 +482,6 @@ def startup_window(rank: int | None = None):
             )
         finally:
             if recording:
-                from .stacks import stacks_enabled, start_stack_recording
-
                 # Either way the event history ends here; stack mode keeps
                 # only each live block's allocating stack from now on.
                 if not (stacks_enabled() and start_stack_recording()):
@@ -641,7 +542,8 @@ def _log_window_result(
     except Exception as exc:  # diagnostic boundary: never fail startup over a log line
         logger.debug(f"memory monitor: startup summary failed ({type(exc).__name__}: {exc})")
 
-    from . import startup
+    # Imported here: ``triggers`` builds reports through ``capture``, which
+    # reads this module's tags.
     from .triggers import report_now
 
     tag_name = "startup_failed" if failed else "startup_complete"

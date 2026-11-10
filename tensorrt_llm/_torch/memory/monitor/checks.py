@@ -28,6 +28,8 @@ list it as ``info`` and leave it out of the pass/fail count.
 
 from dataclasses import dataclass
 
+from .names import UNTAGGED
+
 __all__ = [
     "CheckResult",
     "check_kv_pool_conservation",
@@ -94,8 +96,6 @@ def check_tag_coverage(by_tag: dict[str, int], torch_live_bytes: int) -> list[Ch
     activations are never tagged, so it is expected to be non-zero, and a
     tag breakdown read without it looks complete when it is not.
     """
-    from .tagging import UNTAGGED
-
     if not by_tag:
         return [
             CheckResult(

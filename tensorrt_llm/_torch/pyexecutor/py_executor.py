@@ -78,7 +78,6 @@ from ..memory.monitor import providers as gpu_memory_providers
 from ..memory.monitor import stacks as gpu_memory_stacks
 from ..memory.monitor import triggers as gpu_memory_triggers
 from ..memory.monitor.ranks import RankReporter
-from ..memory.monitor.triggers import notify_error as monitor_notify_error
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -121,6 +120,7 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           initialize_multimodal_encoder_request,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
 from .model_engine import ModelEngine
+from .mpi_polling import recv_until
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
@@ -435,45 +435,39 @@ _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 KV_POOL_REBALANCE_CHECK_INTERVAL = 10
 
 
-def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
-    """Return whether an ACK is ready without blocking on recv."""
-    if hasattr(comm, "iprobe"):
-        return comm.iprobe(source=source, tag=tag)
-    if hasattr(comm, "Iprobe"):
-        return comm.Iprobe(source=source, tag=tag)
-    raise RuntimeError(
-        "_sleep_wakeup_comm does not support nonblocking ACK probe")
-
-
 def _recv_sleep_wakeup_ack_until(comm,
                                  source: int,
                                  deadline: float,
                                  expected_op_id: Optional[str] = None,
                                  expected_phase: Optional[str] = None) -> dict:
-    """Receive a sleep/wakeup ACK before an absolute monotonic deadline."""
-    while True:
-        if _sleep_wakeup_ack_ready(comm, source, _SleepWakeupTag.ACK):
-            ack = comm.recv(source=source, tag=_SleepWakeupTag.ACK)
-            if (expected_op_id is not None
-                    and ack.get("op_id") != expected_op_id):
-                logger.warning(
-                    f"Ignoring stale sleep/wakeup ACK from rank {source} for "
-                    f"op_id={ack.get('op_id')} (expected op_id={expected_op_id})."
-                )
-                continue
-            ack_phase = ack.get("phase")
-            if (expected_phase is not None and ack_phase is not None
-                    and ack_phase != expected_phase):
-                logger.warning(
-                    f"Ignoring stale sleep/wakeup ACK from rank {source} for "
-                    f"phase={ack_phase} (expected phase={expected_phase}).")
-                continue
-            return ack
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"timed out waiting for sleep/wakeup ACK from rank {source} "
-                f"by deadline {deadline:.6f}")
-        time.sleep(_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S)
+    """Receive a sleep/wakeup ACK before an absolute monotonic deadline.
+
+    ACKs for another operation or phase are stale: they are logged and
+    dropped, and the wait continues.
+    """
+
+    def accept(ack: dict) -> bool:
+        if expected_op_id is not None and ack.get("op_id") != expected_op_id:
+            logger.warning(
+                f"Ignoring stale sleep/wakeup ACK from rank {source} for "
+                f"op_id={ack.get('op_id')} (expected op_id={expected_op_id}).")
+            return False
+        ack_phase = ack.get("phase")
+        if (expected_phase is not None and ack_phase is not None
+                and ack_phase != expected_phase):
+            logger.warning(
+                f"Ignoring stale sleep/wakeup ACK from rank {source} for "
+                f"phase={ack_phase} (expected phase={expected_phase}).")
+            return False
+        return True
+
+    return recv_until(comm,
+                      source,
+                      _SleepWakeupTag.ACK,
+                      deadline,
+                      poll_interval_s=_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S,
+                      accept=accept,
+                      what="sleep/wakeup ACK")
 
 
 def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
@@ -4517,7 +4511,7 @@ class PyExecutor:
                     # The ERROR above reaches the monitor only when the log
                     # level lets ERROR through; this call does regardless,
                     # and the monitor's rate limit keeps it to one report.
-                    monitor_notify_error(str(exc))
+                    gpu_memory_triggers.notify_error(str(exc))
                 finally:
                     # Always ACK so rank-0 does not deadlock; carry error
                     # details so rank-0 can raise after all ranks respond.
@@ -10757,7 +10751,7 @@ class PyExecutor:
         # memory monitor reports it, whether PyTorch or native code (cuBLAS,
         # NCCL, C++ pools) failed to allocate. A no-op with
         # TLLM_MEM_MONITOR=0 or when the error is unrelated.
-        monitor_notify_error(error_msg)
+        gpu_memory_triggers.notify_error(error_msg)
         connector = getattr(self, "kv_connector_manager", None)
         if self.enable_attention_dp and connector is not None:
             pending = connector.get_pending_transfer_requests()

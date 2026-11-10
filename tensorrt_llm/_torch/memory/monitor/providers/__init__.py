@@ -28,11 +28,14 @@ Collection never raises into the caller: a diagnostic that breaks the process
 it is diagnosing is worse than a missing line.
 """
 
+from __future__ import annotations
+
 from typing import Protocol, runtime_checkable
 
 from tensorrt_llm.logger import logger
 
-from ..schema import Basis, Category, Entry, Placement, Source
+from .. import pools
+from ..schema import GROUP_OF, Basis, Category, Entry, Placement, Source
 from .comm import IpcMemoryProvider, McastAllReduceProvider, NcclWindowProvider, SymmMemProvider
 from .misc import (
     DeepEpProvider,
@@ -80,7 +83,7 @@ class MonitorProvider(Protocol):
 #: ``SymmetricMemoryAllReduce`` is a model submodule; neither has a
 #: process-wide accessor, so the code that builds them registers them
 #: instead of this module guessing where to look.
-_registered: list[tuple[object | None, "MonitorProvider"]] = []
+_registered: list[tuple[object | None, MonitorProvider]] = []
 #: The executor being built; registrations made meanwhile belong to it.
 _current_executor: object | None = None
 
@@ -109,12 +112,10 @@ def end_executor(token: object) -> None:
     if _current_executor is token:
         _current_executor = None
     if not any(owner is not None for owner, _ in _registered):
-        from .. import pools
-
         pools.forget_released_tags()
 
 
-def register_provider(provider: "MonitorProvider") -> None:
+def register_provider(provider: MonitorProvider) -> None:
     """Add a provider built by code that owns the component it reads.
 
     Registering the same ``name`` twice for one executor replaces the
@@ -157,10 +158,8 @@ def default_providers() -> list[MonitorProvider]:
     ]
 
 
-def _failed_entry(provider: "MonitorProvider", exc: Exception) -> Entry:
+def _failed_entry(provider: MonitorProvider, exc: Exception) -> Entry:
     """A provider that raised, listed as unmeasured rather than left out."""
-    from ..summary import GROUP_OF
-
     category = getattr(provider, "category", None)
     if GROUP_OF.get(category) is None:
         category = Category.TAGGED_OTHER
@@ -187,7 +186,7 @@ def collect_all(providers: list[MonitorProvider] | None = None) -> list[Entry]:
             if not provider.available():
                 continue
             entries.extend(provider.collect())
-        except Exception as exc:  # noqa: BLE001 - one provider must not break the report
+        except Exception as exc:  # one provider must not break the report
             # TensorRT-LLM's logger is not the stdlib one and takes no
             # exc_info; formatting here keeps the handler itself from
             # raising, which would defeat the point of catching.

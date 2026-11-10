@@ -21,7 +21,18 @@ released. Summing those with physical backing produces a plausible, wrong
 total.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from tensorrt_llm._torch.modules.dwdp.page_pool import unreleased_page_bytes
+from tensorrt_llm.bindings import MemoryCounters
+
 from ..schema import Basis, Category, Entry, Placement, Source
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.modules.dwdp.page_pool import PagePool
+    from tensorrt_llm._torch.pyexecutor.dwdp import DwdpManager
 
 __all__ = [
     "DeepEpProvider",
@@ -46,10 +57,10 @@ class DeepEpProvider:
     category = Category.COMM_DEEPEP
 
     def available(self) -> bool:
-        try:
-            from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import deep_ep_installed
-        except ImportError:
-            return False
+        # Imported on use: it pulls in the MoE communication stack, which a
+        # process without DeepEP never loads.
+        from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import deep_ep_installed
+
         return bool(deep_ep_installed)
 
     def collect(self) -> list[Entry]:
@@ -66,8 +77,8 @@ class DeepEpProvider:
                 buffer = getattr(wrapper, "buffer", None)
                 if buffer is None:
                     continue
-                total += int(getattr(buffer, "num_nvl_bytes", 0))
-                total += int(getattr(buffer, "num_rdma_bytes", 0))
+                total += int(buffer.num_nvl_bytes)
+                total += int(buffer.num_rdma_bytes)
 
         return [
             Entry(
@@ -82,12 +93,11 @@ class DeepEpProvider:
         ]
 
 
-def _dwdp_manager():
+def _dwdp_manager() -> DwdpManager | None:
     """The process's DWDP manager, or None without DWDP."""
-    try:
-        from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
-    except ImportError:
-        return None
+    # Imported on use: the executor package imports this one.
+    from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
+
     return get_global_dwdp_manager()
 
 
@@ -107,7 +117,7 @@ class DwdpPagePoolProvider:
     category = Category.DWDP_PAGES
 
     @staticmethod
-    def _pool():
+    def _pool() -> PagePool | None:
         manager = _dwdp_manager()
         weight_manager = manager.weight_manager if manager is not None else None
         if weight_manager is None:
@@ -116,8 +126,6 @@ class DwdpPagePoolProvider:
 
     @staticmethod
     def _unreleased() -> int:
-        from tensorrt_llm._torch.modules.dwdp.page_pool import unreleased_page_bytes
-
         return unreleased_page_bytes()
 
     def available(self) -> bool:
@@ -173,10 +181,9 @@ class DwdpLocalWeightsProvider:
         weight_manager = manager.weight_manager if manager is not None else None
         if weight_manager is not None:
             parts.append(("DWDP expert shards", weight_manager.local_weight_bytes))
-        try:
-            from tensorrt_llm._torch.modules.dwdp.dense.manager import get_global_dense_dwdp_manager
-        except ImportError:
-            return parts
+        # Imported on use, like the DWDP manager above.
+        from tensorrt_llm._torch.modules.dwdp.dense.manager import get_global_dense_dwdp_manager
+
         dense_manager = get_global_dense_dwdp_manager()
         dense = dense_manager.dense if dense_manager is not None else None
         if dense is not None:
@@ -227,17 +234,9 @@ class MemoryCountersProvider:
     category = Category.CPP_BUFFERS
 
     def available(self) -> bool:
-        try:
-            from tensorrt_llm.bindings import MemoryCounters  # noqa: F401
-        except ImportError:
-            return False
         return True
 
     def collect(self) -> list[Entry]:
-        if not self.available():
-            return []
-        from tensorrt_llm.bindings import MemoryCounters
-
         return [
             Entry(
                 category=Category.CPP_BUFFERS,

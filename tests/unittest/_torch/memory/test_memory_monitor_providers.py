@@ -41,7 +41,7 @@ MB = 1 << 20
 
 
 class _State:
-    """Stand-in for ``_MnnvlAllocationState``."""
+    """Stand-in for ``MnnvlAllocationState``."""
 
     MAPPED = "mapped"
     PREPARING = "preparing"
@@ -79,7 +79,7 @@ def _install_fake_mnnvl(monkeypatch, base_map, subclass_map=None):
 
     module = types.ModuleType("tensorrt_llm._torch.distributed.mnnvl_memory")
     module.MnnvlMemory = MnnvlMemory
-    module._MnnvlAllocationState = _State
+    module.MnnvlAllocationState = _State
     monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.distributed.mnnvl_memory", module)
     return created
 
