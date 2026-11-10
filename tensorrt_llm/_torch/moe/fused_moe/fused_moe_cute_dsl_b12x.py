@@ -76,10 +76,23 @@ _ACTIVATION_MAP = {
 # executor init (nvbug 6721561). FlashInfer 0.7.2 fixes the re-pin: it calls
 # ``_candidate_tile_fits(..., enforce_search_floor=False)``. This shim accepts
 # the ultra tile in the re-validation of the releases before that, under the
-# same rule that produced it, and stands aside on a validator that takes
-# ``enforce_search_floor``.
+# same rule that produced it. It installs only over the validator signature of
+# those releases, which it mirrors, and stands aside on any other, such as
+# 0.7.2's with ``enforce_search_floor``.
 _FLASHINFER_W4A16_ULTRA_WIDE_FC2_TILE = (512, 32, 256)  # (tile_n, tile_k, cta_threads)
 _FLASHINFER_W4A16_ULTRA_WIDE_FC2_SINCE = Version("0.6.17")
+_FLASHINFER_W4A16_PRE_FIX_FITS_PARAMS = (
+    "problem_n",
+    "problem_k",
+    "cta_m_blocks",
+    "tile_n",
+    "tile_k",
+    "cta_threads",
+    "max_shared_mem",
+    "scale_format",
+    "weight_layout",
+    "allow_logical_tail",
+)
 
 
 def _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() -> bool:
@@ -105,7 +118,7 @@ def _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() -> bool:
         return False
     if getattr(upstream_fits, "_trtllm_ultra_wide_fc2_shim", False):
         return True
-    if "enforce_search_floor" in inspect.signature(upstream_fits).parameters:
+    if tuple(inspect.signature(upstream_fits).parameters) != _FLASHINFER_W4A16_PRE_FIX_FITS_PARAMS:
         return False
 
     def candidate_tile_fits(
