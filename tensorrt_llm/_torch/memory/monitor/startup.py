@@ -27,24 +27,36 @@ measuring again:
 Those producers push into this module; nothing here reaches back into them.
 
 The executor's own step figures are device-wide (``total - free``), so on a
-shared GPU another process freeing memory mid-step makes the step look
-cheaper -- two runs of the same model reported the weight-loading step as
-1.08 GiB and 0.06 GiB. Each step is therefore also measured per process
-through NVML, and that figure is the one shown whenever it is available.
-The KV sizing plan is device-wide too, so it is compared only with
-device-wide usage.
+shared GPU another process allocating or freeing memory mid-step changes
+what the step appears to take. Each step is therefore also measured per
+process through NVML, and that figure is the one shown whenever it is
+available. The KV sizing plan is device-wide too, so it is compared only
+with device-wide usage.
+
+A startup that sizes the KV cache builds a temporary executor first and
+releases it before building the final one. Regions entered while building
+the temporary one are marked released when it goes (:func:`release_regions`)
+and leave the breakdown, so memory that existed only during sizing is not
+listed next to the final executor's.
+
+The module holds one startup's record. ``startup_window`` clears it when an
+executor's startup begins; :func:`clear` is the reset.
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 from dataclasses import dataclass
+
+from .schema import GIB
 
 __all__ = [
     "MemoryPlan",
     "Reading",
     "RegionSample",
     "region",
+    "release_regions",
     "residual_breakdown",
     "begin_stage",
     "StageSample",
@@ -59,8 +71,6 @@ __all__ = [
     "stages",
     "step_name",
 ]
-
-_GIB = float(1 << 30)
 
 
 @dataclass(frozen=True)
@@ -112,6 +122,10 @@ class RegionSample:
     residual_taken: int
     #: Recorded before the first step's reading, which therefore includes it.
     before_first: bool = False
+    #: Its memory was released with the temporary sizing executor.
+    released: bool = False
+    #: The step that was running when it was released, if any.
+    released_in: str | None = None
 
 
 _stages: list[StageSample] = []
@@ -128,9 +142,9 @@ _plan: MemoryPlan | None = None
 
 
 def _on() -> bool:
-    from . import enabled
+    from . import full_mode
 
-    return enabled()
+    return full_mode()
 
 
 def _process_used() -> int | None:
@@ -138,10 +152,7 @@ def _process_used() -> int | None:
 
     from . import _nvml_process_used
 
-    try:
-        return _nvml_process_used(torch.cuda.current_device())
-    except Exception:  # noqa: BLE001
-        return None
+    return _nvml_process_used(torch.cuda.current_device())
 
 
 def _known_outside_torch() -> int:
@@ -163,7 +174,7 @@ def _reading() -> Reading | None:
         return None
     try:
         return Reading(process, torch.cuda.memory_reserved(), _known_outside_torch())
-    except Exception:  # noqa: BLE001 - never break startup over a reading
+    except RuntimeError:
         return None
 
 
@@ -211,6 +222,21 @@ def region(name: str):
                 _open_regions[-1] += taken
 
 
+def release_regions(stages: tuple[str, ...]) -> None:
+    """Mark the regions recorded during ``stages`` as released.
+
+    For the temporary executor KV cache sizing builds: its regions measured
+    resources it gave back, so they leave the breakdown. The breakdown still
+    sums exactly: the release is credited to the step running now, or, when
+    no step is, cancels out in the remainder after startup.
+    """
+    for position, sample in enumerate(_regions):
+        if sample.stage in stages and not sample.released:
+            _regions[position] = dataclasses.replace(
+                sample, released=True, released_in=_active_stage
+            )
+
+
 def set_stage_advice(names: dict[str, str], advice: dict[str, str]) -> None:
     """Adopt the executor's step names and tuning advice, keyed by step value."""
     _names.update(names)
@@ -239,10 +265,19 @@ def record_stage(
 def record_failed_stage(
     stage: str, free_before: int, process_before: Reading | None = None
 ) -> None:
+    """Record the step that failed and what this process took in it before failing."""
     global _failed, _active_stage
-    if _on():
-        _failed = StageSample(stage, _names.get(stage, stage), free_before, None)
-        _active_stage = None
+    if not _on():
+        return
+    after = _reading() if process_before is not None else None
+    process_taken = residual_taken = None
+    if after is not None:
+        process_taken = after.process - process_before.process
+        residual_taken = after.residual - process_before.residual
+    _failed = StageSample(
+        stage, _names.get(stage, stage), free_before, None, process_taken, residual_taken
+    )
+    _active_stage = None
 
 
 def record_memory_plan(non_kv_peak: int, activation: int | None) -> None:
@@ -273,7 +308,7 @@ def advice_for_stage(stage: str) -> str | None:
 
 
 def clear() -> None:
-    """Forget everything recorded. For tests."""
+    """Forget everything recorded; called as each executor's startup begins."""
     global _failed, _plan, _first, _active_stage
     _stages.clear()
     _regions.clear()
@@ -301,11 +336,16 @@ def render_stage_lines() -> list[str]:
     for sample in _stages:
         taken = sample.process_taken if per_process else sample.device_taken
         # Value first: step names vary too much in length to align after them.
-        out.append(f"    {taken / _GIB:+8.2f} GiB  {sample.name}")
+        out.append(f"    {taken / GIB:+8.2f} GiB  {sample.name}")
     if _failed is not None:
+        taken = (
+            f"; this process took {_failed.process_taken / GIB:+.2f} GiB in it before failing"
+            if _failed.process_taken is not None
+            else ""
+        )
         out.append(
             f"      FAILED      {_failed.name} "
-            f"(free device memory before it: {_failed.free_before / _GIB:.2f} GiB)"
+            f"(free device memory before it: {_failed.free_before / GIB:.2f} GiB{taken})"
         )
     return out
 
@@ -330,20 +370,20 @@ def render_plan_lines(
     planned = _plan.non_kv_peak + (kv_capacity or 0)
     in_use = device_used - (reusable or 0)
     over = in_use - planned
-    kv = f" + KV cache {kv_capacity / _GIB:.2f} GiB" if kv_capacity else ""
-    cache = f", excluding {reusable / _GIB:.2f} GiB of free PyTorch cache" if reusable else ""
+    kv = f" + KV cache {kv_capacity / GIB:.2f} GiB" if kv_capacity else ""
+    cache = f", excluding {reusable / GIB:.2f} GiB of free PyTorch cache" if reusable else ""
     out.append(
-        f"  Startup plan: peak outside the KV cache {_plan.non_kv_peak / _GIB:.2f} GiB{kv} "
-        f"= {planned / _GIB:.2f} GiB; device now {in_use / _GIB:.2f} GiB{cache} ({over / _GIB:+.2f})."
+        f"  Startup plan: peak outside the KV cache {_plan.non_kv_peak / GIB:.2f} GiB{kv} "
+        f"= {planned / GIB:.2f} GiB; device now {in_use / GIB:.2f} GiB{cache} ({over / GIB:+.2f})."
     )
     if _plan.activation is not None:
         out.append(
-            f"    of which the profiled forward pass allocated {_plan.activation / _GIB:.2f} GiB "
+            f"    of which the profiled forward pass allocated {_plan.activation / GIB:.2f} GiB "
             "in PyTorch."
         )
     if over > _PLAN_TOLERANCE:
         out.append(
-            f"  Usage exceeds the startup plan by {over / _GIB:.2f} GiB: the workload needs more "
+            f"  Usage exceeds the startup plan by {over / GIB:.2f} GiB: the workload needs more "
             "than profiling measured, or another process grew."
         )
     return out
@@ -365,14 +405,28 @@ def residual_breakdown(current_residual: int) -> list[tuple[str, int]]:
     early = sum(r.residual_taken for r in _regions if r.before_first)
     parts = [("before the first startup step", _first.residual - early)]
     for region_sample in _regions:
-        parts.append((region_sample.name, region_sample.residual_taken))
+        if not region_sample.released:
+            parts.append((region_sample.name, region_sample.residual_taken))
     for sample in _stages:
         if sample.residual_taken is None:
             continue
+        # Every region inside the step comes out of it, released or not; a
+        # released region's memory is credited back to the step that freed it.
         inside = sum(r.residual_taken for r in _regions if r.stage == sample.stage)
-        parts.append(
-            (f"{sample.name} (other)" if inside else sample.name, sample.residual_taken - inside)
+        listed = sum(
+            r.residual_taken for r in _regions if r.stage == sample.stage and not r.released
         )
+        given_back = sum(
+            r.residual_taken for r in _regions if r.released and r.released_in == sample.stage
+        )
+        parts.append(
+            (
+                f"{sample.name} (other)" if listed else sample.name,
+                sample.residual_taken - inside + given_back,
+            )
+        )
+    # The remainder is what the parts leave over, so the parts always sum to
+    # the residual; a release outside every step cancels out inside it.
     remainder = current_residual - sum(size for _, size in parts)
     parts.append(("since startup" if remainder >= 0 else "released since startup", remainder))
     # A region entered more than once -- one workspace per mapping, say --

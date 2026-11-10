@@ -14,7 +14,9 @@
 # limitations under the License.
 """GPU memory monitor: where did the device memory go?
 
-Enabled with ``TLLM_MEM_MONITOR=1``; off by default and zero-cost when off.
+``TLLM_MEM_MONITOR`` selects a mode (see :func:`mode`). By default only an
+out-of-memory error produces a report, and nothing runs until one happens;
+``TLLM_MEM_MONITOR=1`` also records startup and reports when it completes.
 
 Usage::
 
@@ -24,20 +26,24 @@ Usage::
     if snapshot is not None:
         print(render_capture(snapshot))
 
-The monitor only reads. It never calls ``empty_cache()``, never synchronises,
-and never resets peak stats -- ``_util.configure_kv_cache_capacity`` already
-resets the global peak, and a second resetter would silently corrupt its
-measurements.
+Reading memory never changes it: the monitor never calls ``empty_cache()``,
+never synchronises, and never resets peak stats --
+``_util.configure_kv_cache_capacity`` resets the global peak, and a second
+resetter would corrupt its measurements. In full mode it does configure
+PyTorch's allocation-history recording during startup (see ``tagging``).
 """
 
+import math
 import os
+import re
 from dataclasses import dataclass
 
 import torch
+from strenum import StrEnum
 
 from tensorrt_llm.logger import logger
 
-from .capability import Capability, probe_capability
+from .capability import NVML_UNAVAILABLE, Capability, nvml_process_usage, probe_capability
 from .checks import CheckResult
 from .frame import DeviceReading, Frame, TorchReading, build_frame
 from .report import render, summarize_by_category
@@ -54,22 +60,72 @@ __all__ = [
     "capture",
     "clear_baseline",
     "current_rank",
-    "enabled",
+    "full_mode",
+    "full_mode_requested",
+    "Mode",
     "mode",
-    "oom_enabled",
+    "oom_reports_enabled",
     "render_capture",
+    "stacks_requested",
     "summarize_by_category",
 ]
 
 ENV_VAR = "TLLM_MEM_MONITOR"
 RANK_ENV_VAR = "TLLM_MEM_MONITOR_RANKS"
+STACKS_ENV_VAR = "TLLM_MEM_MONITOR_STACKS"
 
-#: ``TLLM_MEM_MONITOR`` modes.
-OFF, OOM, FULL = "off", "oom", "full"
-_MODE_VALUES = {"0": OFF, "oom": OOM, "1": FULL}
+
+class Mode(StrEnum):
+    """``TLLM_MEM_MONITOR`` modes; see :func:`mode`."""
+
+    OFF = "off"
+    OOM = "oom"
+    FULL = "full"
+
+
+OFF, OOM, FULL = Mode.OFF, Mode.OOM, Mode.FULL
+_MODE_VALUES = {
+    "0": OFF,
+    "off": OFF,
+    "false": OFF,
+    "no": OFF,
+    "oom": OOM,
+    "1": FULL,
+    "full": FULL,
+    "true": FULL,
+    "on": FULL,
+    "yes": FULL,
+}
 #: Unset: report out-of-memory errors, which costs nothing until one happens.
 DEFAULT_MODE = OOM
-_warned_values: set[str] = set()
+_ON_VALUES = frozenset({"1", "on", "true", "yes"})
+_OFF_VALUES = frozenset({"", "0", "off", "false", "no"})
+_RANK_TOKEN = re.compile(r"(\d+)(?:-(\d+))?")
+#: ``(variable, value)`` pairs already warned about.
+_warned: set[tuple[str, str]] = set()
+
+
+def warn_once(var: str, raw: str, problem: str) -> None:
+    """Log one warning per invalid ``var=raw`` setting for the process."""
+    if (var, raw) in _warned:
+        return
+    _warned.add((var, raw))
+    logger.warning(f"memory monitor: {var}={raw!r} {problem}")
+
+
+def seconds_setting(var: str, default: float) -> float:
+    """A non-negative number of seconds from ``var``; ``default`` if unset or invalid."""
+    raw = os.environ.get(var, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        warn_once(var, raw, f"is not a non-negative number of seconds; using {default:g}")
+        return default
+    return value
 
 
 @dataclass(frozen=True)
@@ -109,85 +165,121 @@ def current_rank() -> int | None:
         from tensorrt_llm._utils import mpi_rank
 
         return int(mpi_rank())
-    except Exception:  # noqa: BLE001 - launch environments vary widely
+    except (ImportError, RuntimeError, ValueError):
+        # mpi4py errors derive from RuntimeError.
         return None
 
 
 def mode() -> str:
     """The monitor's mode from ``TLLM_MEM_MONITOR``.
 
-    * ``0`` -- off: no reports are produced on their own.
+    * ``0`` (also ``off``, ``false``, ``no``) -- off: no reports are
+      produced on their own.
     * ``oom`` (the default, also when unset) -- a report when memory runs out,
       and nothing else. No work is done until an allocation fails, so the
       default costs nothing while serving; the report has every row but no
       startup-step breakdown and no comparison with warmup, which need
       recording during startup.
-    * ``1`` -- full: also records startup, reports when it completes, and
-      enables the periodic report, stack mode, every-rank gathering under MPI
-      and ``trtllm-serve``'s ``/memory_report``.
+    * ``1`` (also ``full``, ``on``, ``true``, ``yes``) -- full: also records
+      startup, reports when it completes, and enables the periodic report,
+      stack mode, every-rank gathering under MPI and ``trtllm-serve``'s
+      ``/memory_report``.
 
-    An unrecognised value falls back to the default, with a warning.
+    An unrecognised value falls back to the default, with one warning.
     """
     raw = os.environ.get(ENV_VAR, "").strip().lower()
     if not raw:
         return DEFAULT_MODE
     if raw in _MODE_VALUES:
         return _MODE_VALUES[raw]
-    if raw not in _warned_values:
-        _warned_values.add(raw)
-        from tensorrt_llm.logger import logger
-
-        logger.warning(
-            f"memory monitor: unknown {ENV_VAR}={raw!r}; expected 0, oom or 1. "
-            f"Using {DEFAULT_MODE!r}."
-        )
+    warn_once(ENV_VAR, raw, f"is not one of 0, oom, 1 (or off, full); using {DEFAULT_MODE}")
     return DEFAULT_MODE
 
 
-def requested() -> bool:
+def full_mode_requested() -> bool:
     """Whether full mode is set, regardless of the rank filter.
 
     For setup every rank must agree on, such as a collective communicator
-    duplication; :func:`enabled` can differ between ranks.
+    duplication, and for the ``trtllm-serve`` frontend, which is rank 0 and
+    serves every rank's report; :func:`full_mode` can differ between ranks.
     """
     return mode() == FULL
 
 
-def enabled(rank: int | None = None) -> bool:
-    """Whether the full monitor should run in this process (``TLLM_MEM_MONITOR=1``).
+def full_mode(rank: int | None = None) -> bool:
+    """Whether the full monitor runs in this process (``TLLM_MEM_MONITOR=1``).
 
-    ``TLLM_MEM_MONITOR_RANKS`` optionally restricts collection to a
-    comma-separated rank list, so a multi-rank job can pay the cost on one
-    rank only. ``rank`` defaults to :func:`current_rank`; when no rank can be
-    determined the filter is not applied, so the report is produced rather
-    than silently skipped.
+    ``TLLM_MEM_MONITOR_RANKS`` optionally restricts it to some ranks, so a
+    multi-rank job can pay the cost on one rank only. ``rank`` defaults to
+    :func:`current_rank`; when no rank can be determined the filter is not
+    applied, so the report is produced rather than silently skipped.
     """
     return mode() == FULL and _rank_selected(rank)
 
 
-def oom_enabled(rank: int | None = None) -> bool:
+def oom_reports_enabled(rank: int | None = None) -> bool:
     """Whether out-of-memory errors are reported: the default and full modes."""
     return mode() != OFF and _rank_selected(rank)
 
 
+def stacks_requested() -> bool:
+    """Whether ``TLLM_MEM_MONITOR_STACKS`` asks for allocation stacks."""
+    raw = os.environ.get(STACKS_ENV_VAR, "").strip().lower()
+    if raw in _ON_VALUES:
+        return True
+    if raw not in _OFF_VALUES:
+        warn_once(STACKS_ENV_VAR, raw, "is not 0 or 1; stacks are not recorded")
+    return False
+
+
+def selected_ranks() -> frozenset[int] | None:
+    """Ranks ``TLLM_MEM_MONITOR_RANKS`` selects, or ``None`` for every rank.
+
+    Accepts ranks and inclusive ranges separated by commas, e.g. ``0,4`` or
+    ``0-3,8``. A value that selects nothing or cannot be parsed is reported
+    once and then ignored, so a typo costs the filter rather than every
+    report.
+    """
+    raw = os.environ.get(RANK_ENV_VAR)
+    if raw is None or not raw.strip():
+        if raw is not None and raw != "":
+            warn_once(RANK_ENV_VAR, raw, "selects no rank; reporting on every rank")
+        return None
+    wanted: set[int] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        match = _RANK_TOKEN.fullmatch(token)
+        low = int(match.group(1)) if match else 0
+        high = int(match.group(2)) if match and match.group(2) else low
+        if match is None or high < low:
+            warn_once(
+                RANK_ENV_VAR,
+                raw,
+                "is not a comma-separated list of ranks or ranges such as 0,4 or 0-3; "
+                "reporting on every rank",
+            )
+            return None
+        wanted.update(range(low, high + 1))
+    if not wanted:
+        warn_once(RANK_ENV_VAR, raw, "selects no rank; reporting on every rank")
+        return None
+    return frozenset(wanted)
+
+
 def _rank_selected(rank: int | None) -> bool:
-    ranks = os.environ.get(RANK_ENV_VAR, "")
-    if not ranks:
+    wanted = selected_ranks()
+    if wanted is None:
         return True
     if rank is None:
         rank = current_rank()
-    if rank is None:
-        return True
-    try:
-        wanted = {int(part) for part in ranks.split(",") if part.strip()}
-    except ValueError:
-        return True
-    return rank in wanted
+    return rank is None or rank in wanted
 
 
 def _read_device(device_index: int) -> DeviceReading:
     free, total = torch.cuda.mem_get_info(device_index)
-    used, reason = _nvml_process_lookup(device_index)
+    used, reason = nvml_process_usage(device_index)
     return DeviceReading(
         total=total, free=free, process_used=used, process_missing_reason=reason or ""
     )
@@ -195,61 +287,7 @@ def _read_device(device_index: int) -> DeviceReading:
 
 def _nvml_process_used(device_index: int) -> int | None:
     """This process's device memory according to NVML, or ``None``."""
-    return _nvml_process_lookup(device_index)[0]
-
-
-#: NVML answered, but not for this process.
-_NOT_LISTED = (
-    "this process is not in NVML's process list -- in a container without the "
-    "host PID namespace NVML reports host PIDs"
-)
-
-
-def _nvml_process_lookup(device_index: int) -> tuple[int | None, str]:
-    """This process's device memory according to NVML, and why not if not.
-
-    ``None`` when NVML cannot answer. Falling back to ``total - free`` would
-    silently attribute colocated processes' memory to us; TensorRT-LLM
-    supports several colocated configurations, so that is a real hazard
-    rather than a theoretical one. The reason says which of the different
-    failures it was, since they call for different fixes.
-    """
-    unavailable = (None, "NVML unavailable")
-    try:
-        from tensorrt_llm import profiler
-    except ImportError:
-        return unavailable
-    pynvml_context = getattr(profiler, "pynvml_context", None)
-    if pynvml_context is None:
-        return unavailable
-    try:
-        import pynvml
-    except ImportError:
-        return unavailable
-    try:
-        # By UUID, not by index: torch numbers only the devices
-        # CUDA_VISIBLE_DEVICES exposes, NVML numbers every device on the
-        # host, and the two disagree whenever the variable remaps them.
-        # Measured with three devices visible and CUDA_VISIBLE_DEVICES=2:
-        # torch device 0 is NVML device 2, and index 0 is another GPU.
-        uuid = f"GPU-{torch.cuda.get_device_properties(device_index).uuid}"
-    except Exception:  # noqa: BLE001
-        return unavailable
-    try:
-        with pynvml_context():
-            handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
-            pid = os.getpid()
-            for proc in pynvml.nvmlDeviceGetComputeRunningProcesses_v3(handle):
-                if proc.pid == pid:
-                    used = proc.usedGpuMemory
-                    # NVML reports None/0 for this field on some platforms;
-                    # treat that as "unknown" rather than "nothing".
-                    if used:
-                        return int(used), ""
-                    return None, "NVML reports no per-process usage on this platform"
-    except Exception:  # noqa: BLE001 - NVML raises many unrelated types
-        return unavailable
-    return None, _NOT_LISTED
+    return nvml_process_usage(device_index)[0]
 
 
 def _read_torch(device_index: int, segments: list | None = None) -> TorchReading:
@@ -292,7 +330,7 @@ def _segments(device_index: int) -> list | None:
     """This device's allocator segments, or ``None`` if they cannot be read."""
     try:
         segments = torch.cuda.memory._snapshot()["segments"]
-    except Exception:  # noqa: BLE001
+    except (RuntimeError, KeyError):
         return None
     return [s for s in segments if s.get("device", device_index) == device_index]
 
@@ -358,40 +396,44 @@ def _tag_entries(by_tag: dict[str, int] | None = None) -> list[Entry]:
     return entries
 
 
+def _check_failed(name: str, exc: Exception) -> CheckResult:
+    return CheckResult(
+        name=name,
+        passed=True,
+        detail=f"could not run ({type(exc).__name__}: {exc})",
+        informational=True,
+    )
+
+
 def _run_checks(by_tag: dict[str, int], torch_live: int) -> tuple:
-    """Conservation checks over this reading, never raising.
+    """Conservation checks over this reading; a check that cannot run is listed, not raised.
 
     Each compares figures that come from independent sources, so a failure
     means the sources disagree -- which is worth more than any single number
-    in the report.
+    in the report. Check C reads the pool statistics the KV cache provider
+    collected for this same report, so the check and the KV row describe
+    one reading.
     """
     from .checks import check_kv_pool_conservation, check_tag_coverage
     from .providers import default_providers
-    from .providers.kv_cache import KvCacheProvider, kv_pool_group_stats
+    from .providers.kv_cache import KvCacheProvider
 
     results = []
     try:
         results.extend(check_tag_coverage(by_tag, torch_live))
-    except Exception as exc:  # noqa: BLE001 - a check must not break the report
-        logger.debug(f"memory monitor: tag check failed ({type(exc).__name__}: {exc})")
+    except (KeyError, TypeError, ValueError) as exc:
+        results.append(_check_failed("B:tag_coverage", exc))
 
     for provider in default_providers():
         if not isinstance(provider, KvCacheProvider):
             continue
-        manager = provider._manager
-        if manager is None or not hasattr(manager, "_get_storage_statistics"):
-            continue
         try:
-            for result in check_kv_pool_conservation(kv_pool_group_stats(manager)):
-                results.append(
-                    type(result)(
-                        name=result.name.replace("C:kv_pool_group", f"C:{provider.name}"),
-                        passed=result.passed,
-                        detail=result.detail,
-                    )
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"memory monitor: KV check failed ({type(exc).__name__}: {exc})")
+            rows = provider.last_pool_group_rows
+            if rows is None:
+                continue
+            results.extend(check_kv_pool_conservation(rows, name=provider.name))
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+            results.append(_check_failed(f"C:{provider.name}", exc))
     return tuple(results)
 
 
@@ -426,7 +468,7 @@ def capture(
     """
     if rank is None:
         rank = current_rank()
-    if not force and not enabled(rank):
+    if not force and not full_mode(rank):
         return None
     if not torch.cuda.is_available():
         return None
@@ -460,7 +502,9 @@ def capture(
 
     return MonitorCapture(
         frame=frame,
-        capability=probe_capability(),
+        capability=probe_capability(
+            nvml_available=frame.device.process_missing_reason != NVML_UNAVAILABLE
+        ),
         tag=tag,
         trigger=trigger,
         pid=os.getpid(),
@@ -476,7 +520,7 @@ def capture(
 
 
 def clear_baseline() -> None:
-    """Forget the post-warmup baseline. For tests."""
+    """Forget the post-warmup baseline, as each executor's startup does."""
     global _baseline
     _baseline = None
 

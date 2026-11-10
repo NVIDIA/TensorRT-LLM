@@ -39,7 +39,6 @@ l0_h100:
   # GPU memory monitor: CPU-only cases carry pytest.mark.cpu_only and run on the CPU stage;
   # this stage's "not cpu_only" selection runs the ones that need a real allocator and device.
   - unittest/_torch/memory
-  - unittest/_torch/modules/dwdp/test_page_pool_statistics.py
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_rms_norm_fp8_per_token.py

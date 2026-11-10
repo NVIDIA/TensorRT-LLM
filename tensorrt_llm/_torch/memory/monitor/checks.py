@@ -21,6 +21,9 @@ whose disagreement it would catch.
 
 Checks report rather than raise. A monitor that aborts the process it is
 monitoring is worse than one that prints a suspicious number.
+
+An informational result describes the reading without judging it; reports
+list it as ``info`` and leave it out of the pass/fail count.
 """
 
 from dataclasses import dataclass
@@ -34,21 +37,27 @@ __all__ = [
 
 @dataclass(frozen=True)
 class CheckResult:
+    """One check's outcome."""
+
     name: str
     passed: bool
     detail: str
+    #: Describes the reading rather than testing it; never counted as a pass.
+    informational: bool = False
 
 
-def check_kv_pool_conservation(rows: list[dict]) -> list[CheckResult]:
+def check_kv_pool_conservation(rows: list[dict], name: str = "kv_pool_group") -> list[CheckResult]:
     """Check C: a pool group's free and evictable slots fit inside its total.
 
     Non-vacuous because the three come from separate subsystems: ``free``
-    from the slot allocator's free list (``storage/core.cpp:95``),
-    ``evictable`` from the eviction controller's LRU container
-    (``evictionController.cpp:238``), and ``total`` from the pool group's
-    configured capacity (``storage/core.cpp:725``). Nothing in the code
+    from the slot allocator (``SlotAllocator::numFreeSlots``), ``evictable``
+    from the eviction controller's LRU container, and ``total`` from the pool
+    group's capacity (``PoolGroupBase::numSlots``). Nothing in the code
     constrains the first two to sum within the third; double counting a block
     as both free and evictable breaks it.
+
+    ``name`` labels the results, ``C:<name>[<pool group>]``, so the pools of
+    several managers (target, draft, cross) stay apart.
 
     Deliberately reads only the stored fields. ``StorageStatistics`` also
     offers ``available()`` and ``unavailable()``, but they are derived from
@@ -66,7 +75,7 @@ def check_kv_pool_conservation(rows: list[dict]) -> list[CheckResult]:
         in_use = total - free - evictable
         results.append(
             CheckResult(
-                name=f"C:kv_pool_group[{row['pool_group_id']}]",
+                name=f"C:{name}[{row['pool_group_id']}]",
                 passed=in_use >= 0,
                 detail=(f"total={total} free={free} evictable={evictable} -> in_use={in_use}"),
             )
@@ -75,18 +84,15 @@ def check_kv_pool_conservation(rows: list[dict]) -> list[CheckResult]:
 
 
 def check_tag_coverage(by_tag: dict[str, int], torch_live_bytes: int) -> list[CheckResult]:
-    """Check B: tagged bytes fit inside what torch says is live.
+    """B: how much of PyTorch's live memory the startup tags account for.
 
-    Non-vacuous because the two are counted independently: the tag totals
-    come from replaying ``device_traces`` against snapshot blocks, while
-    ``torch_live_bytes`` comes from ``memory_allocated()``. A stale frozen
-    tag -- an address reused by an untagged allocation whose reuse event the
-    ring buffer dropped -- inflates the first without touching the second.
-
-    The second result reports how much live memory no tag claims. It is not
-    a pass/fail condition: untagged memory is expected in steady state,
-    since activations are never tagged. It is surfaced because a tag
-    breakdown read without it looks complete when it is not.
+    Informational. In a report both figures come from one allocator
+    snapshot -- the tags split its live blocks -- so ``tagged <= live``
+    holds by construction there and cannot flag a mislabelled block; the
+    comparison only means something when ``torch_live_bytes`` is read
+    separately. The second result says how much live memory no tag claims:
+    activations are never tagged, so it is expected to be non-zero, and a
+    tag breakdown read without it looks complete when it is not.
     """
     from .tagging import UNTAGGED
 
@@ -96,6 +102,7 @@ def check_tag_coverage(by_tag: dict[str, int], torch_live_bytes: int) -> list[Ch
                 name="B:tag_coverage",
                 passed=True,
                 detail="tagging unsupported or no window recorded; not reported as zero",
+                informational=True,
             )
         ]
 
@@ -106,7 +113,8 @@ def check_tag_coverage(by_tag: dict[str, int], torch_live_bytes: int) -> list[Ch
         CheckResult(
             name="B:tag_coverage",
             passed=tagged <= torch_live_bytes,
-            detail=(f"tagged={tagged} torch_live={torch_live_bytes} (tagged must fit inside live)"),
+            detail=f"tagged={tagged} torch_live={torch_live_bytes}",
+            informational=True,
         )
     ]
 
@@ -115,10 +123,11 @@ def check_tag_coverage(by_tag: dict[str, int], torch_live_bytes: int) -> list[Ch
     results.append(
         CheckResult(
             name="B:tag_untagged_share",
-            passed=True,  # informational: activations are never tagged
+            passed=True,
             detail=(
                 f"untagged={untagged} of {total} ({share:.1%}); expected non-zero in steady state"
             ),
+            informational=True,
         )
     )
     return results

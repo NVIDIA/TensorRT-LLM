@@ -75,6 +75,16 @@ set_target_properties(
                               CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(tllm_common_cuda 89)
 
+add_library(tllm_common_native_memory STATIC nativeMemory.cpp)
+add_library(tllm::common_native_memory ALIAS tllm_common_native_memory)
+target_link_libraries(
+  tllm_common_native_memory
+  PUBLIC tllm::common_headers
+  PRIVATE CUDA::cudart)
+target_compile_features(tllm_common_native_memory PUBLIC cxx_std_20)
+set_target_properties(tllm_common_native_memory
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(tllm_common_environment STATIC envUtils.cpp ipUtils.cpp)
 add_library(tllm::common_environment ALIAS tllm_common_environment)
 target_link_libraries(tllm_common_environment PUBLIC tllm::common_cuda)
@@ -105,7 +115,8 @@ set_source_files_properties(
 add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_link_libraries(common_src PUBLIC trtllm_gen_fmha_interface)
+target_link_libraries(common_src PUBLIC trtllm_gen_fmha_interface
+                                        tllm::common_native_memory)
 
 if(ENABLE_CUBLASLT_FP4_GEMM)
   target_compile_definitions(common_src PRIVATE ENABLE_CUBLASLT_FP4_GEMM)

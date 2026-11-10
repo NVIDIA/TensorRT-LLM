@@ -28,33 +28,37 @@ block, for memory that no module owns. ``_set_memory_metadata`` does not put
 the label on the block: snapshot blocks carry only ``address``, ``size``,
 ``requested_size``, ``state`` and ``frames``, and the label lives on the
 *allocation event* in ``device_traces`` as ``user_metadata``. Attributing
-live memory therefore means replaying the trace. Two measured properties
-shape how:
+live memory therefore means replaying the trace, and two properties of the
+trace shape how:
 
-* The trace is a ring buffer. With ``max_entries=200`` and 2000 later
-  allocations, a 128 MiB tagged block dropped out of the trace entirely and
-  reappeared as untraced memory, with nothing announcing it. The
-  address-to-tag map is therefore **frozen once, while the trace is still
-  intact**, and reused afterwards.
-* Recording is only affordable without stacks. See
-  :func:`start_tagging_window` for the numbers; recording is confined to
-  startup and stopped before the startup report is built.
+* The trace is a ring buffer: once it wraps, the earliest events are gone
+  and the blocks they allocated carry no label. The address-to-tag map is
+  therefore **frozen once, while the trace is still intact**, and reused
+  afterwards. Each frozen owner keeps the size of the block it labelled, and
+  a live block is labelled only while address and size both still match, so
+  a block allocated after the freeze at a freed block's address is not
+  mistaken for it.
+* Recording stack-free events is cheap; recording stacks is not. Recording
+  is confined to startup and stopped before the startup report is built.
 
-The label is per thread (measured: an allocation made by a worker thread
-while the main thread held a tag carried none). Startup steps hand work to
-thread pools -- weight loading, for one -- so each tag's time window is kept
-too, and an allocation event that carries no label but falls inside a window
+The label is per thread: an allocation made by a worker thread while the
+main thread holds a tag carries none. Startup steps hand work to thread
+pools -- weight loading, for one -- so each tag's time window is kept too,
+and an allocation event that carries no label but falls inside a window
 takes the innermost window's label. Trace events carry wall-clock
-``time_us``, the same clock as ``time.time()`` (measured). Memory a
-background thread allocates while a step runs is therefore named after that
-step; an explicit label and a claimed module still take precedence.
+``time_us``, the same clock as ``time.time()``. Memory a background thread
+allocates while a step runs is therefore named after that step; an explicit
+label and a claimed module still take precedence.
 
 Tags survive a ``torch.cuda.MemPool``, including the pluggable-allocator
-pool behind ``virtual_memory.scope`` (measured). They do not survive a
-process-wide non-native backend such as ``cudaMallocAsync``, where the
-native caching allocator and its trace are not in use at all;
-:func:`tagging_supported` refuses up front there rather than produce a
-small, plausible, wrong number.
+pool behind ``virtual_memory.scope``. They do not survive a process-wide
+non-native backend such as ``cudaMallocAsync``, where the native caching
+allocator and its trace are not in use at all; :func:`tagging_supported`
+refuses up front there rather than produce a small, plausible, wrong number.
+
+A history recording that someone else started -- a user or a framework
+calling ``_record_memory_history`` before building the executor -- is left
+alone: tagging is skipped for that startup rather than replacing it.
 
 Whatever is live but carries no label is always reported as ``untagged``
 rather than dropped. A breakdown that omits it cannot be checked against
@@ -83,6 +87,7 @@ __all__ = [
     "TagSnapshot",
     "freeze_tag_map",
     "get_frozen_map",
+    "history_recording_active",
     "live_attribution",
     "live_bytes_by_tag",
     "set_frozen_map",
@@ -96,13 +101,27 @@ __all__ = [
 #: Label for live memory that no frozen tag claims. Always reported.
 UNTAGGED = "untagged"
 
-_ALLOC_ACTIONS = ("alloc", "segment_alloc")
 _FREE_ACTIONS = ("free_completed", "segment_free")
 
 #: Generous enough for a typical startup; a wrap is detected and reported.
 #: The buffer is discarded as soon as the map is frozen, so the cost is
 #: bounded and temporary.
 _DEFAULT_MAX_ENTRIES = 1_000_000
+
+#: Ring size of the recording in progress, so a wrap is judged against it.
+_max_entries: int = _DEFAULT_MAX_ENTRIES
+
+
+def history_recording_active() -> bool:
+    """Whether PyTorch is recording allocator history right now, by anyone.
+
+    Asks only once CUDA is initialised: the query reads allocator state that
+    does not exist before then, and nothing can be recording before it.
+    """
+    probe = getattr(torch._C, "_cuda_isHistoryEnabled", None)
+    if probe is None or not torch.cuda.is_initialized():
+        return False
+    return bool(probe())
 
 
 def tagging_supported() -> bool:
@@ -142,22 +161,27 @@ def tag(name: str):
     A no-op when the monitor is off or tagging is unsupported, so call
     sites need no guard.
     """
-    from . import enabled
+    from . import full_mode
 
-    if not enabled() or not tagging_supported():
+    if not full_mode() or not tagging_supported():
         yield
         return
 
     memory = torch.cuda.memory
     try:
         previous = memory._get_memory_metadata()
-    except Exception:  # noqa: BLE001 - never break the annotated code
+    except RuntimeError:
         previous = ""
 
     try:
         memory._set_memory_metadata(name)
-    except Exception:  # noqa: BLE001
+        applied = True
+    except RuntimeError:
         logger.debug(f"memory monitor: could not set tag {name!r}")
+        applied = False
+    # Yielded outside the handler, so an exception from the tagged code does
+    # not carry the monitor's error as its context.
+    if not applied:
         yield
         return
 
@@ -168,7 +192,7 @@ def tag(name: str):
         _windows.append((start_us, time.time() * 1e6, name))
         try:
             memory._set_memory_metadata(previous)
-        except Exception:  # noqa: BLE001
+        except RuntimeError:
             logger.debug("memory monitor: could not restore the previous tag")
 
 
@@ -208,27 +232,36 @@ def start_tagging_window(max_entries: int = _DEFAULT_MAX_ENTRIES) -> bool:
 
     ``context=None`` records the allocate/free events and their
     ``user_metadata`` without a stack per event. The tag survives either
-    way; the stacks are what make it expensive. Measured on 8000 events:
-    a snapshot took 2643 ms with the defaults and 4.8 ms without stacks,
-    and 4000 allocations took 16.3 ms against 9.2 ms (7.8 ms unrecorded).
+    way; per-event stacks are what make recording and snapshots expensive.
+
+    Does nothing, and returns False, while a recording someone else started
+    is active: replacing it would discard their trace.
     """
+    global _max_entries
     if not tagging_supported():
+        return False
+    if history_recording_active():
+        logger.info(
+            "memory monitor: allocator history is already being recorded; leaving it alone "
+            "and skipping startup tagging, so PyTorch rows are not split by startup step"
+        )
         return False
     try:
         torch.cuda.memory._record_memory_history(context=None, max_entries=max_entries)
-        _windows.clear()
-    except Exception:  # noqa: BLE001
-        logger.debug("memory monitor: could not start history recording")
+    except RuntimeError as exc:
+        logger.debug(f"memory monitor: could not start history recording ({exc})")
         return False
+    _windows.clear()
+    _max_entries = max_entries
     return True
 
 
 def stop_tagging_window() -> None:
-    """Stop recording. Safe to call when it was never started."""
+    """Stop recording and discard the trace. Safe to call when it was never started."""
     try:
         torch.cuda.memory._record_memory_history(None)
-    except Exception:  # noqa: BLE001
-        logger.debug("memory monitor: could not stop history recording")
+    except RuntimeError as exc:
+        logger.debug(f"memory monitor: could not stop history recording ({exc})")
 
 
 @dataclass(frozen=True)
@@ -242,9 +275,23 @@ class TagSnapshot:
 
     supported: bool
     owners: dict[int, str] = field(default_factory=dict)
+    #: Requested size of the allocation each owner labelled. A live block at
+    #: an owner's address takes the label only if its requested size matches;
+    #: an owner without a recorded size matches any size.
+    sizes: dict[int, int] = field(default_factory=dict)
 
     def __bool__(self) -> bool:
         return self.supported
+
+    def owner_of(self, address: int, size: int) -> str | None:
+        """The label of the block at ``address``, if it is still that block."""
+        label = self.owners.get(address)
+        if label is None:
+            return None
+        expected = self.sizes.get(address)
+        if expected is not None and expected != size:
+            return None
+        return label
 
 
 def freeze_tag_map() -> TagSnapshot:
@@ -259,18 +306,19 @@ def freeze_tag_map() -> TagSnapshot:
 
     try:
         snapshot = torch.cuda.memory._snapshot()
-    except Exception:  # noqa: BLE001
-        logger.debug("memory monitor: snapshot failed while freezing tags")
+    except RuntimeError as exc:
+        logger.debug(f"memory monitor: snapshot failed while freezing tags ({exc})")
         return TagSnapshot(supported=False)
 
     owners: dict[int, str] = {}
+    sizes: dict[int, int] = {}
     window_label = _window_lookup(list(_windows))
     for device_trace in snapshot.get("device_traces") or []:
-        if len(device_trace) >= _DEFAULT_MAX_ENTRIES:
+        if len(device_trace) >= _max_entries:
             # The ring buffer kept only the latest events; blocks allocated
             # before them carry no tag and are reported as unattributed.
             logger.warning(
-                f"memory monitor: startup made more than {_DEFAULT_MAX_ENTRIES} allocation "
+                f"memory monitor: startup made more than {_max_entries} allocation "
                 "events; the earliest are not attributed to a startup step"
             )
         for event in device_trace:
@@ -278,20 +326,27 @@ def freeze_tag_map() -> TagSnapshot:
             address = event.get("addr")
             if address is None:
                 continue
-            if action in _ALLOC_ACTIONS:
+            if action == "alloc":
                 label = event.get("user_metadata") or ""
                 if not label and event.get("time_us") is not None:
                     label = window_label(event["time_us"]) or ""
                 if label:
                     owners[address] = label
+                    sizes[address] = event.get("size")
                 else:
                     # An untagged reuse must clear the previous owner, or the
                     # block would keep a tag it no longer belongs to.
                     owners.pop(address, None)
+                    sizes.pop(address, None)
             elif action in _FREE_ACTIONS:
                 owners.pop(address, None)
+                sizes.pop(address, None)
 
-    return TagSnapshot(supported=True, owners=owners)
+    return TagSnapshot(
+        supported=True,
+        owners=owners,
+        sizes={address: size for address, size in sizes.items() if size is not None},
+    )
 
 
 #: Label for live blocks in a CUDA graph's private pool. Applied from the
@@ -300,10 +355,14 @@ def freeze_tag_map() -> TagSnapshot:
 CUDA_GRAPHS = "CUDA_GRAPHS"
 
 
-def _live_blocks(segments: list | None = None) -> list[tuple[int, int, bool, list]] | None:
-    """Sorted ``(address, size, in_graph_pool, frames)`` of every live block, or ``None``.
+def _live_blocks(
+    segments: list | None = None,
+) -> list[tuple[int, int, bool, list, int]] | None:
+    """Sorted ``(address, size, in_graph_pool, frames, requested)`` of every live block.
 
-    ``frames`` is the allocating stack when stack recording is on, else empty.
+    ``None`` if the allocator could not be read. ``frames`` is the allocating
+    stack when stack recording is on, else empty. ``requested`` is the size
+    the allocation asked for, which is what trace events record.
     ``segments`` is an allocator snapshot already taken; one is taken if not.
     """
     from .pools import classify_all
@@ -311,8 +370,8 @@ def _live_blocks(segments: list | None = None) -> list[tuple[int, int, bool, lis
     if segments is None:
         try:
             segments = torch.cuda.memory._snapshot()["segments"]
-        except Exception:  # noqa: BLE001
-            logger.debug("memory monitor: snapshot failed while reading tags")
+        except RuntimeError as exc:
+            logger.debug(f"memory monitor: snapshot failed while reading tags ({exc})")
             return None
     from .pools import is_released
 
@@ -326,7 +385,13 @@ def _live_blocks(segments: list | None = None) -> list[tuple[int, int, bool, lis
         for block in segment["blocks"]:
             if block["state"] == "active_allocated":
                 blocks.append(
-                    (block["address"], block["size"], in_graph, block.get("frames") or [])
+                    (
+                        block["address"],
+                        block["size"],
+                        in_graph,
+                        block.get("frames") or [],
+                        block.get("requested_size", block["size"]),
+                    )
                 )
     blocks.sort()
     return blocks
@@ -356,11 +421,11 @@ def live_attribution(
     blocks = _live_blocks(segments)
     if blocks is None:
         return {}, {}
-    in_graphs = any(graph for _, _, graph, _ in blocks)
-    with_stacks = any(frames for _, _, _, frames in blocks)
+    in_graphs = any(block[2] for block in blocks)
+    with_stacks = any(block[3] for block in blocks)
     if not snapshot.supported and not claims and not in_graphs and not with_stacks:
         return {}, {}
-    addresses = [address for address, _, _, _ in blocks]
+    addresses = [block[0] for block in blocks]
 
     # Each snapshot block is one allocation, so a storage lies inside exactly
     # one block, and storages sharing a block (tied weights) claim it once.
@@ -368,7 +433,7 @@ def live_attribution(
     for pointer, label in claims:
         position = bisect.bisect_right(addresses, pointer) - 1
         if position >= 0:
-            address, size, _, _ = blocks[position]
+            address, size = blocks[position][:2]
             if pointer < address + size:
                 claimed.setdefault(address, label)
 
@@ -380,10 +445,10 @@ def live_attribution(
     # What is left untagged, by the code that allocated it -- populated only
     # when stack recording is on, since blocks carry frames only then.
     untagged_sites: dict[str, int] = {}
-    for address, size, in_graph, frames in blocks:
+    for address, size, in_graph, frames, requested in blocks:
         label = claimed.get(address)
         if label is None:
-            label = CUDA_GRAPHS if in_graph else snapshot.owners.get(address, UNTAGGED)
+            label = CUDA_GRAPHS if in_graph else (snapshot.owner_of(address, requested) or UNTAGGED)
         totals[label] = totals.get(label, 0) + size
         if label == UNTAGGED:
             site = site_of(frames)
@@ -445,7 +510,7 @@ def claimed_modules() -> list:
 
 
 def clear_claims() -> None:
-    """Forget every claimed module. For tests."""
+    """Forget every claimed module."""
     _claimed_modules.clear()
 
 
@@ -461,8 +526,9 @@ def _claimed_storages() -> list[tuple[int, str]]:
             for tensor in tensors:
                 if tensor.is_cuda:
                     found.append((tensor.untyped_storage().data_ptr(), label))
-        except Exception:  # noqa: BLE001 - a report must not break on one module
-            logger.debug(f"memory monitor: could not walk the {label!r} module")
+        except (RuntimeError, NotImplementedError) as exc:
+            # A tensor subclass without plain storage; skip the module, not the report.
+            logger.debug(f"memory monitor: could not walk the {label!r} module ({exc})")
     return found
 
 
@@ -480,9 +546,9 @@ def startup_window(rank: int | None = None):
     startup that raises part way through still publishes what it managed to
     tag and still reports, which is exactly when a breakdown is worth having.
     """
-    from . import clear_baseline, enabled, startup
+    from . import clear_baseline, full_mode, startup
 
-    if not enabled(rank):
+    if not full_mode(rank):
         yield False
         return
 
@@ -491,11 +557,12 @@ def startup_window(rank: int | None = None):
     startup.clear()
     clear_baseline()
     recording = start_tagging_window()
-    failed = interrupted = False
+    failed = interrupted = out_of_memory = False
     try:
         yield recording
-    except Exception:
+    except Exception as exc:
         failed = True
+        out_of_memory = _is_out_of_memory(exc)
         raise
     except BaseException:
         # Ctrl-C or exit: nobody is waiting for a memory report.
@@ -506,7 +573,7 @@ def startup_window(rank: int | None = None):
         try:
             if recording:
                 snapshot = freeze_tag_map()
-        except Exception as exc:  # noqa: BLE001 - must not replace startup's own error
+        except Exception as exc:  # diagnostic boundary: must not replace startup's own error
             logger.warning(
                 f"memory monitor: could not read startup tags ({type(exc).__name__}: {exc})"
             )
@@ -520,11 +587,35 @@ def startup_window(rank: int | None = None):
                     stop_tagging_window()
         set_frozen_map(snapshot)
         if not interrupted:
-            _log_window_result(snapshot, rank, failed=failed)
+            _log_window_result(snapshot, rank, failed=failed, out_of_memory=out_of_memory)
+
+
+#: Messages of failures that mean the device ran out of memory: CUDA's and
+#: PyTorch's, the executor's own explanation of a failed creation step, and
+#: the NCCL form a failed communicator allocation takes.
+_OOM_MESSAGES = ("out of memory", "insufficient gpu memory", "unhandled cuda error")
+
+
+def _is_out_of_memory(exc: BaseException) -> bool:
+    """Whether ``exc``, or an exception it was raised from, is a device OOM."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, torch.OutOfMemoryError):
+            return True
+        message = str(current).lower()
+        if any(text in message for text in _OOM_MESSAGES):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _log_window_result(
-    snapshot: TagSnapshot, rank: int | None = None, failed: bool = False
+    snapshot: TagSnapshot,
+    rank: int | None = None,
+    failed: bool = False,
+    out_of_memory: bool = False,
 ) -> None:
     """State what startup attributed, then emit the full startup breakdown.
 
@@ -547,7 +638,7 @@ def _log_window_result(
                 "memory monitor: startup attributed no bytes; torch-side rows "
                 "will be absent rather than zero"
             )
-    except Exception as exc:  # noqa: BLE001 - never fail startup over a log line
+    except Exception as exc:  # diagnostic boundary: never fail startup over a log line
         logger.debug(f"memory monitor: startup summary failed ({type(exc).__name__}: {exc})")
 
     from . import startup
@@ -561,7 +652,9 @@ def _log_window_result(
             f"STARTUP FAILED while creating: {step.name} "
             f"(free device memory before it: {step.free_before / (1 << 30):.2f} GiB)."
         )
-        suggestion = startup.advice_for_stage(step.stage) or ""
+        # A step's tuning advice is about its memory; any other failure
+        # (a missing checkpoint key, say) gets none.
+        suggestion = (startup.advice_for_stage(step.stage) or "") if out_of_memory else ""
     elif failed:
         headline = "STARTUP FAILED."
     # A completed startup, warmup included, is the baseline later reports

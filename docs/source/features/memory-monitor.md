@@ -27,9 +27,9 @@ The memory monitor is a prototype and its report format may change.
 
 | Value | Mode | What it does |
 |---|---|---|
-| unset or `oom` | out-of-memory reports (default) | A report when an allocation runs out of memory, and nothing else. No work is done until an allocation fails. |
-| `1` | full | Also records startup and reports when it finishes, compares later reports with that point, and enables the options below. |
-| `0` | off | No reports are produced on their own. |
+| unset or `oom` | out-of-memory reports (default) | A report when an allocation fails once the executor has started, and nothing else. |
+| `1` (or `full`) | full | Also records startup and reports when it finishes, compares later reports with that point, and enables periodic reports and `GET /memory_report`. |
+| `0` (or `off`) | off | No reports are produced on their own. |
 
 ```bash
 TLLM_MEM_MONITOR=1 trtllm-serve <model> ...
@@ -37,7 +37,8 @@ TLLM_MEM_MONITOR=1 trtllm-serve <model> ...
 
 Out-of-memory errors are reported whether they fail in PyTorch or in native
 code such as NCCL, cuBLAS or TensorRT-LLM's own C++ pools, and whether they
-happen on the executor thread or a background thread.
+happen on the executor thread or a background thread. They are reported only
+once the executor has been created; see [Limitations](#limitations).
 
 In the default mode a report has every row, but no breakdown by startup step
 and no comparison with warmup: both need startup to be recorded, which only
@@ -47,23 +48,26 @@ reports:
 * once startup has finished, including warmup and CUDA graph capture;
 * every `TLLM_MEM_MONITOR_INTERVAL` seconds, if set.
 
-Reports go to the log at INFO (startup, periodic) or WARNING (out of memory)
-level.
+Out-of-memory reports go to the log at ERROR level, so they are visible at
+TensorRT-LLM's default log level. Startup and periodic reports go at INFO
+level, and a failed startup at WARNING: set `TLLM_LOG_LEVEL=info` to see
+them, on every rank -- the LLM API raises the level for rank 0 only.
 
-| Variable | Default | Effect |
-|---|---|---|
-| `TLLM_MEM_MONITOR` | `oom` | `0`, `oom` or `1`; see above. |
-| `TLLM_MEM_MONITOR_RANKS` | all ranks | Comma-separated ranks that report, e.g. `0` or `0,4`. |
-| `TLLM_MEM_MONITOR_OOM_INTERVAL` | `60` | Minimum seconds between two out-of-memory reports; a retry loop that fails repeatedly produces one report per interval. |
-| `TLLM_MEM_MONITOR_INTERVAL` | unset | Report every this many seconds while serving, to watch memory that grows slowly. |
-| `TLLM_MEM_MONITOR_DIR` | unset | Also write every report to its own file in this directory, named by rank, process and time. Logs from several ranks interleave and are often cut short when a job dies; the files survive. |
-| `TLLM_MEM_MONITOR_STACKS` | unset | `1` records the allocating Python stack of every live PyTorch block, so that the "PyTorch, unattributed" row is broken down by the code that allocated it. Slows PyTorch allocations; turn it on to reproduce a problem, not in production. |
+| Variable | Modes | Default | Effect |
+|---|---|---|---|
+| `TLLM_MEM_MONITOR` | | `oom` | `0`, `oom` or `1`; see above. An unrecognised value is reported once and the default is used. |
+| `TLLM_MEM_MONITOR_RANKS` | default, full | all ranks | Ranks that report, e.g. `0`, `0,4` or `0-3`. |
+| `TLLM_MEM_MONITOR_OOM_INTERVAL` | default, full | `60` | Minimum seconds between two out-of-memory reports; a retry loop that fails repeatedly produces one report per interval. |
+| `TLLM_MEM_MONITOR_DIR` | default, full | unset | Also write each startup, periodic and out-of-memory report to its own file in this directory, named by rank, process and time. Logs from several ranks interleave and are often cut short when a job dies; the files survive. |
+| `TLLM_MEM_MONITOR_INTERVAL` | full | unset | Report every this many seconds while serving, to watch memory that grows slowly. At least 1 second. |
+| `TLLM_MEM_MONITOR_STACKS` | full | unset | `1` records the allocating Python stack of every live PyTorch block, so that the "PyTorch, unattributed" row is broken down by the code that allocated it. Needs PyTorch's native allocator. Slows PyTorch allocations; turn it on to reproduce a problem, not in production. |
 
 ## Asking for a report
 
-`LLM.get_memory_report()` (also on `AsyncLLM`) returns one report per rank,
+`LLM.get_memory_report()` (also on `AsyncLLM`) returns one entry per rank,
 rank 0 first, in every mode. Under the default MPI executor the other ranks
-answer only with `TLLM_MEM_MONITOR=1`; otherwise only rank 0 reports.
+send their reports only with `TLLM_MEM_MONITOR=1`; otherwise their entries
+say that they were not gathered.
 
 ```python
 from tensorrt_llm import LLM
@@ -77,34 +81,49 @@ with LLM(model="Qwen/Qwen2-0.5B-Instruct") as llm:
 Without `TLLM_MEM_MONITOR=1` for the run, the report has no startup-step
 breakdown and no comparison with warmup, but every row is still there.
 
-A `trtllm-serve` started with `TLLM_MEM_MONITOR=1` answers the same request
-at `GET /memory_report`, with `{"reports": [...]}`. The route exists only
-in that mode.
+A `trtllm-serve` started with `TLLM_MEM_MONITOR=1` and its runtime-control
+endpoints enabled also answers at `GET /memory_report`, with
+`{"reports": [...]}`. The route takes the runtime-control API key, like
+`/memory_status`: a report shows process IDs, other processes' GPU usage and,
+with `TLLM_MEM_MONITOR_STACKS=1`, source paths, and each request makes every
+rank build a report.
 
 ## Reading a report
 
-An out-of-memory report from a run whose logits processor kept allocating:
+An out-of-memory report with `TLLM_MEM_MONITOR=1`, from rank 0 of a
+Llama-3.1-8B-Instruct run at TP=2, where a logits processor kept 4 GiB per
+step:
 
 ```text
 === TensorRT-LLM GPU memory monitor: out_of_memory ===
-  pid=856 rank=0 device=0
-  OUT OF MEMORY: PyTorch could not allocate 150.56 GiB on device 0 (the caller may still recover).
-  This process uses 27.79 GiB of 178.34 GiB (other processes 0.72 GiB, free 149.83 GiB).
+  pid=858 rank=0 device=0
+  OUT OF MEMORY: PyTorch could not allocate 72.75 GiB on device 0 (the caller may still recover).
+  This process uses 106.09 GiB of 178.39 GiB (other processes 0.83 GiB, free 71.47 GiB).
 
                                       size   share   since warmup
-  KV cache                       17.56 GiB   63.2%      +0.00 GiB   allocated up front; free blocks stay resident
-  PyTorch, unattributed           8.00 GiB   28.8%      +8.00 GiB   in use by PyTorch, owner not identified; typically activations
-  CUDA and library overhead       1.07 GiB    3.8%      +0.00 GiB   CUDA context, cuBLAS, NCCL internals and other driver memory
-  Model weights                   0.92 GiB    3.3%      +0.00 GiB   parameters and buffers of the loaded model(s)
-  Runtime buffers                 0.14 GiB    0.5%      +0.00 GiB   buffers owned by named runtime components
-  CUDA graphs                     0.05 GiB    0.2%      +0.00 GiB   held by captured CUDA graphs for replay; not reusable
-  PyTorch cache (free)            0.05 GiB    0.2%      -0.26 GiB   held by the PyTorch allocator but not in use; reusable
+  KV cache                       83.03 GiB   78.3%      +0.00 GiB   allocated up front; free blocks stay resident
+  PyTorch, unattributed          12.00 GiB   11.3%     +12.00 GiB   in use by PyTorch, owner not identified; typically activations
+  Model weights                   7.48 GiB    7.1%      +0.00 GiB   parameters and buffers of the loaded model(s)
+  CUDA and library overhead       1.78 GiB    1.7%      +0.06 GiB   CUDA context, cuBLAS, NCCL internals and other driver memory
+                                of which (GiB): before the first startup step 0.60, custom allreduce workspace 0.50, Additional executor resources (temporary for KV cache size estimation) 0.39, Model (other) 0.10, Sampler 0.07, +2 more
+  Communication buffers           1.51 GiB    1.4%      +0.00 GiB   multi-GPU communication buffers
+                                of which (GiB): NCCL communicators 0.94, NCCLWindowAllocator 0.56
+  Runtime buffers                 0.23 GiB    0.2%      +0.00 GiB   buffers owned by named runtime components
+                                of which (GiB): Additional executor resources 0.10, Model 0.06, Additional executor resources (temporary for KV cache size estimation) 0.03, Model resources created during usage 0.03
+  CUDA graphs                     0.05 GiB    0.1%      +0.00 GiB   held by captured CUDA graphs for replay; not reusable
+                                of which (GiB): in use by graphs 0.03, free in graph pools 0.02
+  PyTorch cache (free)            0.01 GiB    0.0%      -0.72 GiB   held by the PyTorch allocator but not in use; reusable
 
-  Startup plan: peak outside the KV cache 3.02 GiB + KV cache 17.56 GiB = 20.58 GiB; device now 28.47 GiB, ...
-  Usage exceeds the startup plan by 7.89 GiB: the workload needs more than profiling measured, or another process grew.
+  Startup plan: peak outside the KV cache 12.89 GiB + KV cache 83.03 GiB = 95.92 GiB; device now 106.91 GiB, excluding 0.01 GiB of free PyTorch cache (+10.99).
+    of which the profiled forward pass allocated 0.67 GiB in PyTorch.
+  Usage exceeds the startup plan by 10.99 GiB: the workload needs more than profiling measured, or another process grew.
 
-  Conclusion: since warmup, PyTorch, unattributed grew the most (+8.00 GiB).
+  Conclusion: since warmup, PyTorch, unattributed grew the most (+12.00 GiB).
+  Suggestion: PyTorch memory with no known owner grew 12.00 GiB after warmup, 11.33 GiB more than the profiled forward pass allocated (0.67 GiB), so something may be holding on to memory (a cache, a callback, a leak); rerun with TLLM_MEM_MONITOR_STACKS=1 to name the code that allocated it; to reduce activation memory, reduce max_num_tokens.
 ```
+
+Below the summary, a section breaks the same memory down by allocator and
+pool, followed by consistency checks between independent readings.
 
 * **The total** is this process's own GPU memory, as the driver reports it.
   Memory held by other processes on the same GPU is shown separately; when
@@ -120,9 +139,11 @@ An out-of-memory report from a run whose logits processor kept allocating:
     context, cuBLAS, NCCL internals and code loaded on demand. It is split by
     when it appeared -- before startup, in each startup step, or since.
 * **since warmup** compares with the report taken when startup finished. The
-  row that grew is usually the one to look at; growth in *PyTorch,
-  unattributed* while serving points at activations or at memory something
-  keeps allocating, which `TLLM_MEM_MONITOR_STACKS=1` attributes to code.
+  row that grew is usually the one to look at. The warmup report is taken at
+  rest, while an out-of-memory report is taken inside a forward pass, so
+  growth in *PyTorch, unattributed* up to what the profiled forward pass
+  allocated is that step's activations; only growth beyond it is called held
+  memory, which `TLLM_MEM_MONITOR_STACKS=1` attributes to code.
 * **Startup plan** compares the memory in use with what KV cache sizing
   planned for when the engine started.
 * **Suggestion** appears for an out-of-memory error or a failed startup and
@@ -132,12 +153,32 @@ While parts of the runtime are released with `LLM.release()`, the rows show
 only memory that is resident, and one line lists what is released and returns
 on resume.
 
+## Limitations
+
+* **Out-of-memory errors during startup are not reported in the default
+  mode.** Loading weights, sizing the KV cache, warmup and CUDA graph capture
+  deliberately run allocations until they fail and recover, so reporting is
+  armed only once the executor has been created. With `TLLM_MEM_MONITOR=1` a
+  startup that fails is reported, with the step that failed.
+* **The process total needs NVML to see this process.** In a container
+  without the host PID namespace (for example `docker run` without
+  `--pid=host`) NVML lists host PIDs, and the report falls back to the whole
+  device's usage, marked as an upper bound. Other processes' memory on the
+  same GPU then shows up in *CUDA and library overhead*.
+* **No comparison with warmup in the default mode.** The rows and the total
+  are the same, but *since warmup*, the startup plan and the split of the
+  overhead row by startup step need `TLLM_MEM_MONITOR=1`.
+* **Allocation stacks need PyTorch's native allocator.** With
+  `PYTORCH_ALLOC_CONF=backend:cudaMallocAsync` or a pluggable allocator,
+  `TLLM_MEM_MONITOR_STACKS=1` records nothing.
+
 ## Cost
 
-In the default `oom` mode nothing runs until an allocation fails; the first
-report after it may take a few hundred milliseconds while it classifies the
-process's memory pools. With `TLLM_MEM_MONITOR=1`, allocation history is
-recorded during startup only, and a report takes about a millisecond once
-startup has finished. Neither mode adds work to the executor loop.
-`TLLM_MEM_MONITOR_STACKS=1` is the exception and slows every PyTorch
-allocation while it is on.
+In the default `oom` mode no work is done while serving until an allocation
+fails. When startup completes, the process's memory pools are classified
+once, which walks the Python heap (about 100 ms per million objects), so
+that a later report does not have to. With `TLLM_MEM_MONITOR=1`, allocation
+history is recorded during startup only, and a report takes about a
+millisecond once startup has finished. Neither mode adds work to the
+executor loop. `TLLM_MEM_MONITOR_STACKS=1` is the exception and slows every
+PyTorch allocation while it is on.

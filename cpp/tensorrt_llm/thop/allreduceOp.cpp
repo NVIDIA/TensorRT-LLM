@@ -2543,7 +2543,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("set_nccl_window_allocation_suppressed(bool suppressed) -> bool");
     m.def("get_nccl_window_buffer_release_epoch() -> int");
     m.def("get_nccl_window_usage(int device) -> int[]");
-    m.def("get_native_memory_usage(int device) -> (str[], int[], int[])");
+    m.def("get_native_memory_usage(int device) -> (str[], int[], int[], int[])");
+    m.def("get_native_memory_labels() -> str[]");
     m.def("promote_nccl_window_buffer_releases(int device, int release_epoch) -> ()");
     m.def(
         "minimax_allreduce_rms("
@@ -2649,13 +2650,21 @@ TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
             std::vector<std::string> labels;
             std::vector<int64_t> counts;
             std::vector<int64_t> bytes;
+            std::vector<int64_t> unmeasured;
             for (auto const& [label, usage] : tensorrt_llm::common::getNativeMemoryUsage(static_cast<int>(device)))
             {
                 labels.push_back(label);
                 counts.push_back(usage.count);
                 bytes.push_back(usage.bytes);
+                unmeasured.push_back(usage.unmeasured);
             }
-            return std::make_tuple(labels, counts, bytes);
+            return std::make_tuple(labels, counts, bytes, unmeasured);
+        });
+    m.impl("get_native_memory_labels",
+        []()
+        {
+            auto const& all = tensorrt_llm::common::native_memory_label::kAll;
+            return std::vector<std::string>(all.begin(), all.end());
         });
 }
 

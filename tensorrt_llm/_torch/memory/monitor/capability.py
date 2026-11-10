@@ -23,9 +23,9 @@ reporting nothing.
 The probe records configuration rather than judging it. One combination is
 worth recording explicitly: TensorRT-LLM's own guidance recommends
 ``expandable_segments:True``, while the sleep/virtual-memory and GMS paths
-install ``MemPool``\\ s backed by pluggable allocators. Measured on torch 2.14,
-the two coexist without error, but expandable segments are silently disabled
-inside such a pool (its segments report ``is_expandable=False``). That is a
+install ``MemPool``\\ s backed by pluggable allocators. The two coexist
+without error, but expandable segments are silently disabled inside such a
+pool (its segments report ``is_expandable=False``). That is a
 silent downgrade, not a conflict, so the probe reports the facts and does not
 warn.
 """
@@ -35,7 +35,7 @@ from dataclasses import dataclass
 
 import torch
 
-__all__ = ["Capability", "probe_capability"]
+__all__ = ["NVML_UNAVAILABLE", "Capability", "nvml_process_usage", "probe_capability"]
 
 #: ``PYTORCH_CUDA_ALLOC_CONF`` wins over ``PYTORCH_ALLOC_CONF``; the two are
 #: not merged (first match wins in c10's AllocatorConfig).
@@ -76,12 +76,63 @@ def _alloc_conf() -> tuple[str, str | None]:
     return "", None
 
 
-def _nvml_available() -> bool:
-    """Whether NVML can actually be queried here.
+#: Why :func:`nvml_process_usage` has no figure when NVML cannot be queried.
+NVML_UNAVAILABLE = "NVML unavailable"
 
-    Checks that the library initialises and reports at least one device,
-    rather than only that a helper is importable -- the helper always is,
-    which made this report ``nvml=yes`` on hosts where every query failed.
+#: NVML answered, but not for this process.
+_NOT_LISTED = (
+    "this process is not in NVML's process list -- in a container without the "
+    "host PID namespace NVML reports host PIDs"
+)
+
+
+def nvml_process_usage(device_index: int) -> tuple[int | None, str]:
+    """This process's device memory according to NVML, and why not if not.
+
+    ``None`` when NVML cannot answer, with :data:`NVML_UNAVAILABLE` or a
+    more specific reason, since the failures call for different fixes.
+    Falling back to ``total - free`` would silently attribute colocated
+    processes' memory to this one.
+    """
+    unavailable = (None, NVML_UNAVAILABLE)
+    try:
+        import pynvml
+
+        from tensorrt_llm import profiler
+    except ImportError:
+        return unavailable
+    pynvml_context = getattr(profiler, "pynvml_context", None)
+    if pynvml_context is None:
+        return unavailable
+    try:
+        # By UUID, not by index: torch numbers only the devices
+        # CUDA_VISIBLE_DEVICES exposes, NVML numbers every device on the
+        # host, and the two disagree whenever the variable remaps them.
+        uuid = f"GPU-{torch.cuda.get_device_properties(device_index).uuid}"
+    except (AssertionError, RuntimeError):
+        return unavailable
+    try:
+        with pynvml_context():
+            handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+            pid = os.getpid()
+            for proc in pynvml.nvmlDeviceGetComputeRunningProcesses_v3(handle):
+                if proc.pid == pid:
+                    used = proc.usedGpuMemory
+                    # NVML reports None/0 for this field on some platforms;
+                    # treat that as "unknown" rather than "nothing".
+                    if used:
+                        return int(used), ""
+                    return None, "NVML reports no per-process usage on this platform"
+    except pynvml.NVMLError:
+        return unavailable
+    return None, _NOT_LISTED
+
+
+def _nvml_available() -> bool:
+    """Whether NVML initialises and reports at least one device.
+
+    An importable helper is not enough: on some hosts it imports while every
+    query fails.
     """
     try:
         import pynvml
@@ -95,16 +146,17 @@ def _nvml_available() -> bool:
     try:
         with context():
             return pynvml.nvmlDeviceGetCount() > 0
-    except Exception:  # noqa: BLE001 - NVML raises many unrelated types
+    except pynvml.NVMLError:
         return False
 
 
-def probe_capability() -> Capability:
+def probe_capability(nvml_available: bool | None = None) -> Capability:
     """Probe the allocator without perturbing it.
 
     Performs no allocation, no cache release and no synchronisation: a
     diagnostic that changes the thing it measures is worse than no
-    diagnostic.
+    diagnostic. ``nvml_available`` lets a caller that has just queried NVML
+    pass the answer instead of opening a second NVML session.
     """
     conf, conf_var = _alloc_conf()
     backend = torch.cuda.get_allocator_backend()
@@ -129,5 +181,5 @@ def probe_capability() -> Capability:
         history_api_present=hasattr(memory, "_record_memory_history"),
         snapshot_api_present=hasattr(memory, "_snapshot"),
         oom_observer_present=hasattr(torch._C, "_cuda_attach_out_of_memory_observer"),
-        nvml_available=_nvml_available(),
+        nvml_available=_nvml_available() if nvml_available is None else nvml_available,
     )

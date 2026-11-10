@@ -408,7 +408,8 @@ class _PeerBuffers:
         if use_ipc:
             ipc = None
             try:
-                ipc = IpcMemory(mapping, nbytes, True)  # cudaMalloc + memset 0 + handle all-gather
+                # cudaMalloc + memset 0 + handle all-gather
+                ipc = IpcMemory(mapping, nbytes, True, "TP peer exchange buffers")
                 ok = ipc.open_ipc
             except RuntimeError as e:
                 logger.warning(f"[ll_exchange] IPC peer buffers failed: {e}")

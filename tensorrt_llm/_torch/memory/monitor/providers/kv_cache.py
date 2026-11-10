@@ -116,6 +116,10 @@ class KvCacheProvider:
         self.role = role
         self.name = f"kv_cache.{role}"
         self._ref = None
+        #: Pool-group rows the last ``collect`` read; check C runs on these so
+        #: the check and the KV row describe one reading. ``None`` when the
+        #: last collect had no storage statistics to read.
+        self.last_pool_group_rows: list[dict] | None = None
         if manager is None:
             return
         try:
@@ -143,7 +147,8 @@ class KvCacheProvider:
         size = None
         try:
             size = int(manager.get_kv_cache_stats().allocated_bytes)
-        except Exception:  # noqa: BLE001 - absent or failing accessor: unknown
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            # An absent or failing accessor leaves the size unknown.
             pass
         return Entry(
             category=Category.KV_CACHE_POOL,
@@ -167,6 +172,7 @@ class KvCacheProvider:
         return self._manager is not None
 
     def collect(self) -> list[Entry]:
+        self.last_pool_group_rows = None
         manager = self._manager
         if manager is None:
             return []
@@ -201,7 +207,9 @@ class KvCacheProvider:
             return [self._v1_entry(manager)]
 
         entries = []
-        for row in kv_pool_group_stats(manager):
+        rows = kv_pool_group_stats(manager)
+        self.last_pool_group_rows = rows
+        for row in rows:
             owner = f"kv_cache.{self.role}.pool_group[{row['pool_group_id']}]"
             in_use = row["in_use_bytes"]
             consistent = in_use >= 0

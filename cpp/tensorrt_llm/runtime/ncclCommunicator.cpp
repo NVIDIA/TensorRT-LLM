@@ -144,7 +144,8 @@ void NcclCommunicator::receive(
 #endif // ENABLE_MULTI_DEVICE
 }
 
-ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm const& mpiComm)
+ncclComm_t NcclCommunicator::createComm(
+    int worldSize, int rank, mpi::MpiComm const& mpiComm, common::NativeMemoryRecord& nativeMemory)
 {
 #if ENABLE_MULTI_DEVICE
 
@@ -179,7 +180,8 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
     ncclComm_t comm;
     auto const freeBefore = tensorrt_llm::common::currentDeviceFreeBytes();
     TLLM_NCCL_CHECK(ncclCommInitRank(&comm, worldSize, id, rank));
-    tensorrt_llm::common::recordNativeAllocationMeasured("nccl_communicators", freeBefore);
+    nativeMemory = tensorrt_llm::common::recordNativeAllocationMeasured(
+        tensorrt_llm::common::native_memory_label::kNcclCommunicators, freeBefore);
     return comm;
 #else
     // Python runtime requires instantiation of a communicator even though it may never be used to enable
@@ -195,5 +197,6 @@ NcclCommunicator::~NcclCommunicator()
     {
         TLLM_LOG_WARNING("Failed to destroy NCCL communicator.");
     }
+    tensorrt_llm::common::recordNativeRelease(mNativeMemory);
 #endif // ENABLE_MULTI_DEVICE
 }

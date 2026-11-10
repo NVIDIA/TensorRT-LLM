@@ -166,8 +166,9 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
         ++groupRank;
     }
     TLLM_CHECK(static_cast<size_t>(groupRank) < group.size());
+    auto nativeMemory = std::make_shared<tensorrt_llm::common::NativeMemoryRecord>();
     std::shared_ptr<ncclComm_t> ncclComm(new ncclComm_t,
-        [](ncclComm_t* comm)
+        [nativeMemory](ncclComm_t* comm)
         {
             if (!comm)
             {
@@ -204,18 +205,19 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 
             // STEP 2: Always free the pointer memory (regardless of whether *comm was valid)
             delete comm;
+            tensorrt_llm::common::recordNativeRelease(*nativeMemory);
         });
+    auto const freeBefore = tensorrt_llm::common::currentDeviceFreeBytes();
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
     config.graphUsageMode = 1;
-    auto const freeBefore = tensorrt_llm::common::currentDeviceFreeBytes();
     NCCLCHECK_THROW(ncclCommInitRankConfig(ncclComm.get(), group.size(), id, groupRank, &config));
 #else
-    auto const freeBefore = tensorrt_llm::common::currentDeviceFreeBytes();
     NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
-    // NCCL_RUNTIME_CONNECT=0 above: NCCL allocates the connection buffers here, and reports no size.
-    tensorrt_llm::common::recordNativeAllocationMeasured("nccl_communicators", freeBefore);
+    // With NCCL_RUNTIME_CONNECT=0 (set above) NCCL allocates its connection buffers here and reports no size.
+    *nativeMemory = tensorrt_llm::common::recordNativeAllocationMeasured(
+        tensorrt_llm::common::native_memory_label::kNcclCommunicators, freeBefore);
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
     if (common::nccl_util::isNcclWindowSupported())
     {
@@ -457,92 +459,5 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
         });
     return creator();
 }
-
-namespace common
-{
-namespace
-{
-struct NativeMemoryLedger
-{
-    std::mutex mutex;
-    // device -> label -> usage. Labels are string literals from the allocation sites.
-    std::map<int, std::map<std::string, NativeMemoryUsage>> usage;
-};
-
-// Never destroyed: releases are recorded from destructors that may run during static destruction, after a
-// namespace-scope map would already be gone.
-NativeMemoryLedger& nativeMemoryLedger()
-{
-    static auto* ledger = new NativeMemoryLedger();
-    return *ledger;
-}
-
-void addNativeMemory(char const* label, int device, std::int64_t count, std::int64_t bytes) noexcept
-{
-    try
-    {
-        auto& ledger = nativeMemoryLedger();
-        std::lock_guard<std::mutex> lock(ledger.mutex);
-        auto& usage = ledger.usage[device][label];
-        usage.count += count;
-        usage.bytes += bytes;
-    }
-    catch (...)
-    {
-        // Bookkeeping for a diagnostic must never fail an allocation.
-    }
-}
-} // namespace
-
-void recordNativeAllocation(char const* label, int device, std::int64_t bytes) noexcept
-{
-    addNativeMemory(label, device, 1, bytes);
-}
-
-void recordNativeRelease(char const* label, int device, std::int64_t bytes) noexcept
-{
-    addNativeMemory(label, device, -1, -bytes);
-}
-
-std::int64_t currentDeviceFreeBytes() noexcept
-{
-    std::size_t freeBytes = 0;
-    std::size_t totalBytes = 0;
-    if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess)
-    {
-        cudaGetLastError();
-        return -1;
-    }
-    return static_cast<std::int64_t>(freeBytes);
-}
-
-void recordNativeAllocationMeasured(char const* label, std::int64_t freeBefore) noexcept
-{
-    int device = 0;
-    if (freeBefore < 0 || cudaGetDevice(&device) != cudaSuccess)
-    {
-        cudaGetLastError();
-        return;
-    }
-    auto const freeAfter = currentDeviceFreeBytes();
-    if (freeAfter >= 0)
-    {
-        addNativeMemory(label, device, 1, freeBefore - freeAfter);
-    }
-}
-
-std::vector<std::pair<std::string, NativeMemoryUsage>> getNativeMemoryUsage(int device)
-{
-    auto& ledger = nativeMemoryLedger();
-    std::lock_guard<std::mutex> lock(ledger.mutex);
-    std::vector<std::pair<std::string, NativeMemoryUsage>> usage;
-    auto const it = ledger.usage.find(device);
-    if (it != ledger.usage.end())
-    {
-        usage.assign(it->second.begin(), it->second.end());
-    }
-    return usage;
-}
-} // namespace common
 
 TRTLLM_NAMESPACE_END

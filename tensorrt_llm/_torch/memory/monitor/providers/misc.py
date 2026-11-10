@@ -23,7 +23,12 @@ total.
 
 from ..schema import Basis, Category, Entry, Placement, Source
 
-__all__ = ["DeepEpProvider", "DwdpPagePoolProvider", "MemoryCountersProvider"]
+__all__ = [
+    "DeepEpProvider",
+    "DwdpLocalWeightsProvider",
+    "DwdpPagePoolProvider",
+    "MemoryCountersProvider",
+]
 
 
 class DeepEpProvider:
@@ -77,71 +82,123 @@ class DeepEpProvider:
         ]
 
 
+def _dwdp_manager():
+    """The process's DWDP manager, or None without DWDP."""
+    try:
+        from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
+    except ImportError:
+        return None
+    return get_global_dwdp_manager()
+
+
 class DwdpPagePoolProvider:
     """DWDP page pool.
 
-    Reads ``held_pages``, the handles the pool owns now, not
-    ``num_pages``/``configured_pages``, which keep their value after
-    ``release()`` has handed every page back. Measured on a live pool: after
-    releasing every page, ``sum(num_pages(s)) * page_size`` still reported
-    128 MiB while the device had taken all 128 MiB back.
+    Reads ``held_pages``, the handles the pool owns now, not ``num_pages``,
+    which keeps its value after ``release()`` has handed every page back.
 
-    A handle whose release raised is no longer held but may still be mapped,
-    so a non-zero ``release_failed`` turns the figure into a lower bound and
-    the note says so.
+    Page handles whose release raised may still be mapped after their pool
+    is gone. Their bytes are listed separately for diagnosis and not summed:
+    whether the GPU still backs them is unknown, and if it does they are
+    already inside the process's NVML figure.
     """
 
     name = "dwdp_page_pool"
     category = Category.DWDP_PAGES
 
-    def _pool(self):
-        try:
-            from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
-        except ImportError:
-            return None
-        manager = get_global_dwdp_manager()
-        if manager is None:
-            return None
-        # DwdpManager keeps the weight manager private; there is no public
-        # accessor to go through.
-        weight_manager = getattr(manager, "_weight_manager", None)
+    @staticmethod
+    def _pool():
+        manager = _dwdp_manager()
+        weight_manager = manager.weight_manager if manager is not None else None
         if weight_manager is None:
             return None
-        buffer = getattr(weight_manager, "weight_buffer", None)
-        if buffer is None:
-            return None
-        return getattr(buffer, "_page_pool", None)
+        return weight_manager.weight_buffer.page_pool
+
+    @staticmethod
+    def _unreleased() -> int:
+        from tensorrt_llm._torch.modules.dwdp.page_pool import unreleased_page_bytes
+
+        return unreleased_page_bytes()
 
     def available(self) -> bool:
-        return self._pool() is not None
+        return self._pool() is not None or self._unreleased() > 0
 
     def collect(self) -> list[Entry]:
+        entries = []
         pool = self._pool()
-        if pool is None:
-            return []
-        held = sum(pool.held_pages(slot) for slot in range(pool.num_slots))
-        failed = pool.release_failed
-
-        note = None
-        if failed:
-            # release() drops a handle it could not free, so held_pages stops
-            # counting memory that is plausibly still mapped. Reporting the
-            # smaller number without saying so would read as a clean release.
-            note = (
-                f"at least this much: {failed} handle(s) failed to release "
-                "and are no longer tracked, so the true figure may be higher"
+        if pool is not None:
+            held = sum(pool.held_pages(slot) for slot in range(pool.num_slots))
+            entries.append(
+                Entry(
+                    category=Category.DWDP_PAGES,
+                    size_bytes=held * pool.page_size,
+                    source=Source.COMPONENT,
+                    placement=Placement.NON_TORCH,
+                    basis=Basis.PHYSICAL_BACKING,
+                    owner="dwdp.PagePool",
+                )
             )
+        unreleased = self._unreleased()
+        if unreleased:
+            entries.append(
+                Entry(
+                    category=Category.DWDP_PAGES,
+                    size_bytes=unreleased,
+                    source=Source.COMPONENT,
+                    placement=Placement.NON_TORCH,
+                    basis=Basis.REQUESTED,
+                    owner="dwdp.PagePool, failed to release",
+                    note="page handles whose release raised; may still be resident",
+                    counts_toward_total=False,
+                )
+            )
+        return entries
 
+
+class DwdpLocalWeightsProvider:
+    """This rank's own DWDP weight shards.
+
+    DWDP moves each rank's expert chunks and dense shards out of PyTorch into
+    fabric handles it creates itself, which peers then import. Only the
+    local handles are counted: an imported handle is a peer's memory.
+    """
+
+    name = "dwdp_local_weights"
+    category = Category.WEIGHTS
+
+    @staticmethod
+    def _sources() -> list[tuple[str, int]]:
+        parts = []
+        manager = _dwdp_manager()
+        weight_manager = manager.weight_manager if manager is not None else None
+        if weight_manager is not None:
+            parts.append(("DWDP expert shards", weight_manager.local_weight_bytes))
+        try:
+            from tensorrt_llm._torch.modules.dwdp.dense.manager import get_global_dense_dwdp_manager
+        except ImportError:
+            return parts
+        dense_manager = get_global_dense_dwdp_manager()
+        dense = dense_manager.dense if dense_manager is not None else None
+        if dense is not None:
+            parts.append(("DWDP dense shards", dense.local_store_bytes))
+        return parts
+
+    def available(self) -> bool:
+        return any(size for _, size in self._sources())
+
+    def collect(self) -> list[Entry]:
         return [
             Entry(
-                category=Category.DWDP_PAGES,
-                size_bytes=held * pool.page_size,
+                category=Category.WEIGHTS,
+                size_bytes=size,
                 source=Source.COMPONENT,
                 placement=Placement.NON_TORCH,
                 basis=Basis.PHYSICAL_BACKING,
-                owner="dwdp.PagePool",
-                note=note,
+                owner=owner,
+                note="this rank's shards, in local fabric handles",
             )
+            for owner, size in self._sources()
+            if size
         ]
 
 
@@ -149,17 +206,15 @@ class MemoryCountersProvider:
     """C++ ``MemoryCounters``.
 
     Reported for diagnosis only -- ``counts_toward_total=False`` -- because it
-    overlaps ``torch_reserved`` rather than adding to it. Measured: allocating
-    512 MiB inside a ``virtual_memory.scope`` raised ``MemoryCounters.gpu``
-    *and* ``torch_reserved`` by 512 MiB each while the device consumed 512 MiB
-    once. Summing them would have doubled the figure.
+    overlaps ``torch_reserved`` rather than adding to it: an allocation inside
+    a ``virtual_memory.scope`` raises both by its size while the device
+    consumes it once.
 
-    Its real value is as a physical-truth correction. After
-    ``release_with_tag()`` the device gave back 512 MiB and ``MemoryCounters``
-    followed, while ``torch_reserved`` did not move at all: torch keeps
-    accounting for a VMM-backed pool whose pages are gone. So the two are the
-    physical and the logical view of the same bytes, and during sleep the
-    torch view overstates occupancy by the full released amount.
+    The two are the physical and the logical view of the same bytes. After
+    ``release_with_tag()`` the device gets the memory back and
+    ``MemoryCounters`` follows, while ``torch_reserved`` keeps accounting for
+    the VMM-backed pool whose pages are gone, so during sleep the torch view
+    overstates occupancy by the released amount.
 
     Two further caveats before this could ever become additive: it is a single
     process-wide counter with no device dimension, and

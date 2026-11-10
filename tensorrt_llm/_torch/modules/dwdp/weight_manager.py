@@ -315,6 +315,16 @@ class DWDPWeightManager:
         return self._weight_buffer
 
     @property
+    def local_weight_bytes(self) -> int:
+        """Device memory of this rank's own expert shards, held outside PyTorch.
+
+        The shards live in local fabric handles once the transport is set up;
+        0 before that and after :meth:`release`.
+        """
+        transport = self._transport
+        return transport.local_bytes if transport is not None else 0
+
+    @property
     def dwdp_rank(self) -> int:
         """This instance's DWDP rank."""
         return self._dwdp_rank

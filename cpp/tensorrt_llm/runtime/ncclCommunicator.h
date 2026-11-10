@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -31,11 +32,12 @@ namespace tensorrt_llm::runtime
 class NcclCommunicator
 {
 public:
+    //! \brief Adopt `comm`. The adopter did not record its memory, so destruction releases none.
     explicit NcclCommunicator(ncclComm_t comm)
         : mComm{comm} {};
 
     explicit NcclCommunicator(int worldSize, int rank, mpi::MpiComm const& mpiComm = COMM_SESSION)
-        : mComm{createComm(worldSize, rank, mpiComm)} {};
+        : mComm{createComm(worldSize, rank, mpiComm, mNativeMemory)} {};
 
     explicit NcclCommunicator(WorldConfig const& worldConfig, mpi::MpiComm const& mpiComm = COMM_SESSION)
         : NcclCommunicator{worldConfig.getSize(), worldConfig.getRank(), mpiComm} {};
@@ -63,8 +65,11 @@ private:
     void receive(
         void* sendbuff, size_t count, tensorrt_llm::DataType dataType, int peer, CudaStream const& stream) const;
 
-    static ncclComm_t createComm(int worldSize, int rank, mpi::MpiComm const& mpiComm);
+    static ncclComm_t createComm(
+        int worldSize, int rank, mpi::MpiComm const& mpiComm, common::NativeMemoryRecord& nativeMemory);
 
+    //! Memory recorded for mComm in the native-memory ledger. Declared before mComm, whose initializer fills it.
+    common::NativeMemoryRecord mNativeMemory;
     ncclComm_t mComm;
 };
 

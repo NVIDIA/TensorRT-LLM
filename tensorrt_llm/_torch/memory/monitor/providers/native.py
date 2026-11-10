@@ -17,8 +17,10 @@
 Allocation sites in C++ record into a ledger by label
 (``tensorrt_llm/common/nativeMemory.h``), and ``trtllm::get_native_memory_usage``
 returns the totals for a device. This module says what each label is in the
-report's terms. A label it does not know is still reported, under its own
-name, rather than dropped into the unexplained remainder.
+report's terms; ``LABELS`` has exactly the labels the C++ header declares
+(``trtllm::get_native_memory_labels``). A label it does not know is still
+reported, under its own name, rather than dropped into the unexplained
+remainder.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from ..schema import Basis, Category, Entry, Placement, Source
 __all__ = ["LABELS", "NativeMemoryProvider"]
 
 _MEASURED = "measured as the drop in free device memory across creation, device-wide"
+_UNMEASURED = "the size of {n} of them could not be measured"
 
 
 @dataclass(frozen=True)
@@ -44,8 +47,8 @@ class _Label:
 
 
 LABELS: dict[str, _Label] = {
-    # NCCL_RUNTIME_CONNECT=0 makes NCCL allocate connection buffers inside
-    # ncclCommInitRank; NCCL reports no size.
+    # NCCL allocates its connection buffers inside ncclCommInitRank
+    # (NCCL_RUNTIME_CONNECT=0) and reports no size.
     "nccl_communicators": _Label(
         Category.COMM_NCCL, "NCCL communicators", Basis.PHYSICAL_BACKING, _MEASURED
     ),
@@ -53,7 +56,7 @@ LABELS: dict[str, _Label] = {
         Category.COMM_NVLS,
         "fused GEMM+allreduce NVLS workspace",
         Basis.PHYSICAL_BACKING,
-        _MEASURED,
+        "output buffer and barriers, at the multicast-rounded size",
     ),
     "ulysses_a2a_slots": _Label(
         Category.COMM_ULYSSES,
@@ -103,6 +106,7 @@ class NativeMemoryProvider:
         try:
             return torch.ops.trtllm.get_native_memory_usage
         except (AttributeError, RuntimeError):
+            # Not built into this TensorRT-LLM.
             return None
 
     def available(self) -> bool:
@@ -114,25 +118,28 @@ class NativeMemoryProvider:
         op = self._op()
         if op is None:
             return []
-        labels, counts, sizes = op(torch.cuda.current_device())
+        labels, counts, sizes, unmeasured = op(torch.cuda.current_device())
         entries = []
-        for label, count, size in zip(labels, counts, sizes):
+        for label, count, size, missing in zip(labels, counts, sizes, unmeasured):
             if not count:
                 continue
             known = LABELS.get(label)
             if known is None:
                 known = _Label(Category.TAGGED_OTHER, label, Basis.REQUESTED, "native allocation")
+            note = f"{count} allocation(s); {known.note}"
+            if missing:
+                note += "; " + _UNMEASURED.format(n=missing)
             entries.append(
                 Entry(
                     category=known.category,
-                    # A measured creation that coincided with memory being
-                    # freed elsewhere on the device reads as negative: no size.
-                    size_bytes=size if size >= 0 else None,
+                    # Any allocation of unknown size makes the total unknown,
+                    # not the sum of the ones that were measured.
+                    size_bytes=None if missing or size < 0 else size,
                     source=Source.COMPONENT,
                     placement=Placement.NON_TORCH,
                     basis=known.basis,
                     owner=known.owner,
-                    note=f"{count} allocation(s); {known.note}",
+                    note=note,
                     counts_toward_total=known.counts,
                 )
             )

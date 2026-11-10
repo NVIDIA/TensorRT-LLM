@@ -169,9 +169,10 @@ public:
         if (handle == nullptr)
         {
             TLLM_LOG_DEBUG("Creating allreduce workspace for %s", key.toString().c_str());
-            // Multicast mappings are rounded to the multicast granularity and come with barrier buffers, so the
-            // memory taken is measured rather than computed.
-            auto const freeBefore = tensorrt_llm::common::currentDeviceFreeBytes();
+            // Every NVLS allocation below (the output buffer and the workspace's barriers) is recorded, at its
+            // rounded size, under this label until it is freed.
+            tensorrt_llm::common::NativeMemoryLabelScope const nativeMemoryLabel(
+                tensorrt_llm::common::native_memory_label::kGemmAllreduceNvls);
             handle = std::make_shared<IpcNvlsHandleWrapper>(preferredWorkspaceSize, key.group);
             GemmAllReduceImplInterface::ProblemArgs tmpArgs;
             int maxN = 16384;
@@ -181,7 +182,6 @@ public:
                 .argLaunchConfig(runner->getSupportedLaunchConfigs()[0]);
             auto workspace = runner->getPersistentWorkspace(tmpArgs);
             workspace->allocate();
-            tensorrt_llm::common::recordNativeAllocationMeasured("gemm_allreduce_nvls", freeBefore);
             mWorkspaces[key] = workspace;
             mHandles[key] = handle;
         }

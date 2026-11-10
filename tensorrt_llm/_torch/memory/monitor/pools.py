@@ -22,9 +22,8 @@ both "free, reusable" overstates the headroom by the size of every captured
 graph.
 
 Snapshot segments carry ``segment_pool_id``, but graph pools and MemPools
-draw ids from the same counter (measured on torch 2.14: graph handles
-``(0, 1)``, ``(0, 2)``, then ``MemPool().id == (0, 3)``), so the id alone
-does not say which is which. torch makes private pools in exactly two ways
+draw ids from the same counter (graph handles ``(0, 1)``, ``(0, 2)``, then
+``MemPool().id == (0, 3)``), so the id alone does not say which is which. torch makes private pools in exactly two ways
 -- graph capture and ``torch.cuda.MemPool`` -- so a pool is classified as a
 MemPool if a live ``MemPool`` object has its id, and as a graph pool
 otherwise. That holds for MemPools created by code that never registers
@@ -35,12 +34,20 @@ Looking for live ``MemPool`` objects walks the garbage collector's heap, so
 each pool is classified once, when first seen, and remembered. Pool ids are
 never reused and a ``MemPool`` exists before any of its segments, so the
 first answer stays right -- even after the ``MemPool`` object is collected
-while its blocks are still in use.
+while its blocks are still in use. :func:`prime` classifies every pool that
+exists when startup completes, so the walk happens before serving rather
+than inside the first report; it runs again only for a pool created later.
+If the walk fails, the new pools are reported as unclassified for that
+report and classified on the next one.
 """
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
+from typing import Iterable
+
+from tensorrt_llm.logger import logger
 
 __all__ = [
     "DEFAULT_POOL",
@@ -48,11 +55,13 @@ __all__ = [
     "classify",
     "classify_all",
     "clear_registered_pools",
+    "forget_released_tags",
     "is_released",
     "is_tag_released",
     "mark_materialized",
     "mark_released",
     "pool_usage",
+    "prime",
     "register_pool",
 ]
 
@@ -63,15 +72,15 @@ _mem_pools: dict[tuple[int, int], str] = {}
 #: MemPool id -> the sleep-mode tag whose memory it holds.
 _sleep_tags: dict[tuple[int, int], str] = {}
 #: Sleep-mode tags whose physical memory is currently released. torch keeps
-#: accounting for those pools -- measured: after release_with_tag the device
-#: got 512 MiB back while memory_reserved() did not move -- so without this
-#: a sleeping process looks larger than it is and the residual goes negative.
+#: counting a released pool in ``memory_reserved()`` while the GPU no longer
+#: backs it, so without this a sleeping process looks larger than it is and
+#: the residual goes negative.
 _released_tags: set[str] = set()
 #: Pools already classified as graph or unregistered MemPool.
 _seen: dict[tuple[int, int], tuple[str, str]] = {}
 
 
-def register_pool(pool_id, label: str, sleep_tag: str | None = None) -> None:
+def register_pool(pool_id: Iterable[int], label: str, sleep_tag: str | None = None) -> None:
     """Record that ``pool_id`` is a ``torch.cuda.MemPool`` serving ``label``.
 
     ``sleep_tag`` marks a sleep-mode pool, whose memory can be released and
@@ -87,12 +96,24 @@ def register_pool(pool_id, label: str, sleep_tag: str | None = None) -> None:
         _sleep_tags[key] = sleep_tag
 
 
-def mark_released(tags) -> None:
+def mark_released(tags: Iterable[str]) -> None:
+    """Record that sleep mode has released the memory of ``tags``."""
     _released_tags.update(tags)
 
 
-def mark_materialized(tags) -> None:
+def mark_materialized(tags: Iterable[str]) -> None:
+    """Record that the memory of ``tags`` is backed again."""
     _released_tags.difference_update(tags)
+
+
+def forget_released_tags() -> None:
+    """Forget which tags are released.
+
+    For when the executor that released them shuts down: its pools are gone,
+    and a tag left marked would make the next executor's pools under the
+    same tag look released.
+    """
+    _released_tags.clear()
 
 
 def is_tag_released(tag: str) -> bool:
@@ -100,7 +121,8 @@ def is_tag_released(tag: str) -> bool:
     return tag in _released_tags
 
 
-def is_released(pool_id) -> bool:
+def is_released(pool_id: Iterable[int]) -> bool:
+    """Whether ``pool_id`` is a sleep-mode pool whose memory is released."""
     tag = _sleep_tags.get(tuple(pool_id))
     return tag is not None and tag in _released_tags
 
@@ -113,27 +135,40 @@ def clear_registered_pools() -> None:
     _seen.clear()
 
 
+UNCLASSIFIED = ("unclassified", "unclassified")
+
+
 def _live_mempool_ids() -> set[tuple[int, int]]:
     """Ids of every live ``torch.cuda.MemPool``.
 
     Walks the garbage collector's objects, which costs on the order of
     100 ms per million objects, so it runs only for a pool not seen before.
+    The type is read with ``type()``, which never touches the object: a dead
+    ``weakref.proxy`` raises on ``isinstance``, and a class with a custom
+    ``__getattribute__`` may warn or raise on attribute access.
     """
-    import gc
-
     import torch
 
+    mem_pool = torch.cuda.MemPool
     ids = set()
-    for obj in gc.get_objects():
-        if isinstance(obj, torch.cuda.MemPool):
+    objects = gc.get_objects()
+    try:
+        for obj in objects:
+            if not issubclass(type(obj), mem_pool):
+                continue
             try:
                 ids.add(tuple(obj.id))
-            except Exception:  # noqa: BLE001
+            except (AttributeError, RuntimeError, TypeError):
                 continue
+    finally:
+        # The list holds every tracked object; let them go promptly.
+        del objects
     return ids
 
 
-def classify(pool_id, live_mempools: set | frozenset = frozenset()) -> tuple[str, str]:
+def classify(
+    pool_id: Iterable[int], live_mempools: set | frozenset = frozenset()
+) -> tuple[str, str]:
     """``(kind, label)`` with kind one of ``default``, ``mempool``, ``graph``."""
     key = tuple(pool_id)
     if key == DEFAULT_POOL:
@@ -145,19 +180,48 @@ def classify(pool_id, live_mempools: set | frozenset = frozenset()) -> tuple[str
     return "graph", "CUDA graph pool"
 
 
-def classify_all(pool_ids) -> dict[tuple[int, int], tuple[str, str]]:
-    """Classify several pools, looking for live MemPools only for new ones."""
+def classify_all(pool_ids: Iterable) -> dict[tuple[int, int], tuple[str, str]]:
+    """Classify several pools, looking for live MemPools only for new ones.
+
+    If looking fails, the new pools are ``unclassified`` and are not
+    remembered, so the next call tries again.
+    """
     keys = {tuple(p) for p in pool_ids}
     new = [k for k in keys if k != DEFAULT_POOL and k not in _mem_pools and k not in _seen]
     if new:
-        live = _live_mempool_ids()
+        try:
+            live = _live_mempool_ids()
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not break the report
+            logger.debug(f"memory monitor: could not classify pools ({type(exc).__name__}: {exc})")
+            return {k: _seen.get(k) or (UNCLASSIFIED if k in new else classify(k)) for k in keys}
         for key in new:
             _seen[key] = classify(key, live)
     return {k: _seen.get(k) or classify(k) for k in keys}
 
 
+def prime() -> None:
+    """Classify every pool that exists now, so later reports need not walk.
+
+    Meant for when startup has completed: CUDA graphs and MemPools made
+    during startup are classified here instead of inside the first report,
+    which may run on the executor thread in the middle of an OOM.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    try:
+        segments = torch.cuda.memory_snapshot()
+    except RuntimeError as exc:
+        logger.debug(f"memory monitor: no allocator snapshot to classify ({exc})")
+        return
+    classify_all(segment.get("segment_pool_id", DEFAULT_POOL) for segment in segments)
+
+
 @dataclass(frozen=True)
 class PoolUsage:
+    """Reserved and allocated bytes of one PyTorch pool."""
+
     pool_id: tuple[int, int]
     kind: str
     label: str
@@ -168,10 +232,11 @@ class PoolUsage:
 
     @property
     def free(self) -> int:
+        """Reserved but not handed out."""
         return max(self.reserved - self.allocated, 0)
 
 
-def pool_usage(segments) -> list[PoolUsage]:
+def pool_usage(segments: Iterable[dict]) -> list[PoolUsage]:
     """Reserved and allocated bytes per pool, from snapshot segments."""
     totals: dict[tuple[int, int], list[int]] = {}
     for segment in segments:

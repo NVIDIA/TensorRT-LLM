@@ -2016,10 +2016,13 @@ class _TorchLLM(BaseLLM):
 
         Every rank reports with the Ray executor. With the default MPI
         executor, every rank reports while ``TLLM_MEM_MONITOR=1`` is set for
-        the run, and only rank 0 otherwise.
+        the run; otherwise rank 0 reports and every other rank is listed as
+        not gathered.
 
         Returns:
-            list[str]: One report per rank that answered, rank 0 first.
+            list[str]: One entry per rank, rank 0 first: its report, or one
+            line saying why there is none (not gathered, not answered in
+            time, or the report could not be built).
         """
         replies = self._collective_rpc("get_memory_report")
         return [

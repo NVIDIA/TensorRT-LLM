@@ -32,6 +32,16 @@ pytestmark = pytest.mark.cpu_only
 GIB = 1 << 30
 
 
+@pytest.fixture(autouse=True)
+def _no_recorded_startup():
+    """Suggestions read the startup plan; start each test without one."""
+    from tensorrt_llm._torch.memory.monitor import startup
+
+    startup.clear()
+    yield
+    startup.clear()
+
+
 def _capability():
     return Capability(
         allocator_backend="native",
@@ -204,8 +214,8 @@ def test_suggestions():
     text = summary(grown(8 * GIB), headline="OUT OF MEMORY")
     assert "grew 8.00 GiB after warmup" in text
     assert "TLLM_MEM_MONITOR_STACKS=1" in text
-    # The executor's own advice stays, as the fallback.
-    assert "if it is activation memory, reduce max_num_tokens" in text
+    # The executor's own advice stays, for the part that is activations.
+    assert "to reduce activation memory, reduce max_num_tokens" in text
 
     sites = {"my_app/processors.py:__call__": 6 * GIB, "modules/linear.py:forward": GIB}
     text = summary(grown(8 * GIB), headline="OUT OF MEMORY", unattributed_sites=sites)
@@ -219,3 +229,71 @@ def test_suggestions():
 
     text = summary(_typical(process=23 * GIB), headline="OUT OF MEMORY")
     assert "memory outside PyTorch grew 3.00 GiB after warmup" in text
+
+
+def test_activations_of_the_failing_step_are_not_called_held_memory(monkeypatch):
+    """The baseline is at rest; an OOM report is taken inside a forward pass."""
+    from tensorrt_llm._torch.memory.monitor import summary as summary_module
+    from tensorrt_llm._torch.memory.monitor.summary import render_summary
+
+    advice = {Group.TORCH_UNATTRIBUTED: "reduce max_num_tokens"}
+
+    def oom_summary(unattributed, activation):
+        monkeypatch.setattr(summary_module, "_profiled_activation", lambda: activation)
+        frame = _typical(
+            process=20 * GIB + unattributed,
+            reserved=2 * GIB + unattributed,
+            live=GIB + unattributed,
+        )
+        return "\n".join(
+            render_summary(
+                frame,
+                group_totals(frame),
+                baseline=_baseline(),
+                advice=advice,
+                headline="OUT OF MEMORY",
+            )
+        )
+
+    text = oom_summary(3 * GIB, activation=4 * GIB)
+    assert "within the 4.00 GiB the profiled forward pass allocated" in text, "activations"
+    assert "leak" not in text and "TLLM_MEM_MONITOR_STACKS" not in text
+    assert "reduce max_num_tokens" in text
+
+    text = oom_summary(10 * GIB, activation=4 * GIB)
+    assert "6.00 GiB more than the profiled forward pass allocated (4.00 GiB)" in text, "excess"
+    assert "TLLM_MEM_MONITOR_STACKS=1" in text
+
+    # Without a failure, growth is named only when the part beyond the
+    # activations is large.
+    def periodic(unattributed, activation):
+        monkeypatch.setattr(summary_module, "_profiled_activation", lambda: activation)
+        frame = _typical(
+            process=20 * GIB + unattributed,
+            reserved=2 * GIB + unattributed,
+            live=GIB + unattributed,
+        )
+        return "\n".join(
+            render_summary(frame, group_totals(frame), baseline=_baseline(), advice=advice)
+        )
+
+    assert "Suggestion" not in periodic(2 * GIB, activation=4 * GIB), "within activations"
+    assert "Suggestion" in periodic(6 * GIB, activation=4 * GIB), "2 GiB beyond activations"
+
+
+def test_a_group_absent_at_warmup_counts_as_grown_from_zero():
+    from tensorrt_llm._torch.memory.monitor.summary import render_summary
+
+    frame = _typical(process=28 * GIB, reserved=10 * GIB, live=9 * GIB)
+    baseline = _baseline()
+    baseline.pop(Group.TORCH_UNATTRIBUTED, None)
+    text = "\n".join(render_summary(frame, group_totals(frame), baseline=baseline))
+    row = next(line for line in text.splitlines() if "PyTorch, unattributed" in line)
+    grown = group_totals(frame).sizes[Group.TORCH_UNATTRIBUTED]
+    assert f"{grown / GIB:+.2f} GiB" in row, "the table shows the whole row as growth"
+    assert "PyTorch, unattributed grew the most" in text, "and so does the conclusion"
+
+    # An unknown baseline value is not zero: no growth is claimed for it.
+    baseline[Group.TORCH_UNATTRIBUTED] = None
+    text = "\n".join(render_summary(frame, group_totals(frame), baseline=baseline))
+    assert "PyTorch, unattributed grew" not in text

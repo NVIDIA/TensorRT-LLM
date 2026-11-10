@@ -73,8 +73,11 @@ from ..disaggregation.orchestration.pp_termination import \
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
-from ..memory.monitor import requested as monitor_requested
-from ..memory.monitor.ranks import RankReporter as MemoryReportRanks
+from ..memory import monitor as gpu_memory_monitor
+from ..memory.monitor import providers as gpu_memory_providers
+from ..memory.monitor import stacks as gpu_memory_stacks
+from ..memory.monitor import triggers as gpu_memory_triggers
+from ..memory.monitor.ranks import RankReporter
 from ..memory.monitor.triggers import notify_error as monitor_notify_error
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
@@ -1616,8 +1619,14 @@ class PyExecutor:
         self._sleep_wakeup_comm = None
         self._sleep_wakeup_listener_thread: Optional[threading.Thread] = None
         # Gathers GPU memory reports from every rank for rank 0; set up in
-        # start_worker() when the memory monitor is on and ranks span MPI.
-        self._memory_report_ranks = None
+        # start_worker() in the monitor's full mode when ranks span MPI.
+        self._memory_report_ranks: Optional[RankReporter] = None
+        # Whether this executor armed the monitor's OOM reporting, which
+        # shutdown() then releases. Set by the executor's creator.
+        self._oom_reporter_armed = False
+        # This executor's registrations with the memory monitor, dropped at
+        # shutdown. Set by the executor's creator.
+        self._memory_monitor_token: Optional[object] = None
         # Serialises concurrent sleep/wakeup calls so that the control_action
         # + _sleep_wakeup_comm send/recv sequence is never interleaved.  Without
         # this, two concurrent RPC calls could both pass control_request_barrier
@@ -2195,12 +2204,15 @@ class PyExecutor:
                         self._sleep_wakeup_listener_thread.start()
                 # A report request reaches rank 0 only; rank 0 asks the
                 # others over their own communicator. Dup() is collective, so
-                # the condition must not depend on the rank.
-                if (self.dist.world_size > 1 and not self._disable_mpi
-                        and monitor_requested()):
-                    self._memory_report_ranks = MemoryReportRanks(
-                        mpi_comm().Dup(), self.dist.rank, self.dist.world_size,
-                        self.device_id)
+                # every rank follows rank 0's setting rather than its own
+                # environment.
+                if self.dist.world_size > 1 and not self._disable_mpi:
+                    gather_reports = mpi_comm().bcast(
+                        gpu_memory_monitor.full_mode_requested(), root=0)
+                    if gather_reports:
+                        self._memory_report_ranks = RankReporter(
+                            mpi_comm().Dup(), self.dist.rank,
+                            self.dist.world_size, self.device_id)
                 if self.dist.pp_size > 1 and not self._disable_mpi:
                     self._start_mpi_progress_thread()
                 self.worker_thread = threading.Thread(
@@ -2256,12 +2268,22 @@ class PyExecutor:
     def gather_memory_reports(self) -> list[str]:
         """GPU memory reports of ranks 1..N-1, gathered by rank 0.
 
-        Empty unless the memory monitor is on and ranks span MPI.
+        Only rank 0 answers report requests under MPI. Without the monitor's
+        full mode the other ranks have no listener, and each gets a line
+        saying so; with Ray every worker answers for itself and this is
+        empty.
         """
         memory_report_ranks = getattr(self, "_memory_report_ranks", None)
-        if memory_report_ranks is None:
+        if memory_report_ranks is not None:
+            return memory_report_ranks.gather()
+        dist = getattr(self, "dist", None)
+        if (dist is None or dist.world_size <= 1 or dist.rank != 0
+                or getattr(self, "_disable_mpi", True)):
             return []
-        return memory_report_ranks.gather()
+        return [
+            f"rank {rank}: not gathered; set TLLM_MEM_MONITOR=1 for the run "
+            "to get every rank's report" for rank in range(1, dist.world_size)
+        ]
 
     def _shutdown_sleep_wakeup_listeners(self) -> None:
         """Signal sleep/wakeup listener threads to exit and drain bounded ACKs."""
@@ -2646,6 +2668,15 @@ class PyExecutor:
         memory_report_ranks = getattr(self, "_memory_report_ranks", None)
         if memory_report_ranks is not None:
             memory_report_ranks.stop()
+        if getattr(self, "_oom_reporter_armed", False):
+            self._oom_reporter_armed = False
+            gpu_memory_triggers.release_oom_reporter()
+        memory_monitor_token = getattr(self, "_memory_monitor_token", None)
+        if memory_monitor_token is not None:
+            self._memory_monitor_token = None
+            gpu_memory_providers.end_executor(memory_monitor_token)
+        # Stops only a stack recording the monitor itself started.
+        gpu_memory_stacks.stop_stack_recording()
         encoder_launch_executor = getattr(self, "encoder_launch_executor", None)
         if encoder_launch_executor is not None:
             encoder_launch_executor.shutdown(wait=True)
@@ -4482,6 +4513,9 @@ class PyExecutor:
                     logger.error(f"Sleep/wakeup listener: {error_msg}")
                     # Rematerializing on wakeup allocates outside PyTorch, and
                     # this handler, not _handle_errors, catches its failure.
+                    # The ERROR above reaches the monitor only when the log
+                    # level lets ERROR through; this call does regardless,
+                    # and the monitor's rate limit keeps it to one report.
                     monitor_notify_error(str(exc))
                 finally:
                     # Always ACK so rank-0 does not deadlock; carry error
@@ -10718,9 +10752,10 @@ class PyExecutor:
         """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
-        # Allocations outside the PyTorch allocator (cuBLAS, NCCL, C++ pools)
-        # fail with a plain error that lands here rather than in torch's OOM
-        # observer. A no-op unless TLLM_MEM_MONITOR is set.
+        # An out-of-memory error that reaches here escaped its caller, so the
+        # memory monitor reports it, whether PyTorch or native code (cuBLAS,
+        # NCCL, C++ pools) failed to allocate. A no-op with
+        # TLLM_MEM_MONITOR=0 or when the error is unrelated.
         monitor_notify_error(error_msg)
         connector = getattr(self, "kv_connector_manager", None)
         if self.enable_attention_dp and connector is not None:

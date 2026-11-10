@@ -33,7 +33,7 @@ from tensorrt_llm._torch.memory.monitor.providers.misc import (
     MemoryCountersProvider,
 )
 from tensorrt_llm._torch.memory.monitor.providers.mnnvl import MnnvlProvider
-from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Source
+from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Placement, Source
 
 pytestmark = pytest.mark.cpu_only
 
@@ -178,37 +178,76 @@ def test_mnnvl_reads_local_backing_and_address_space_without_double_counting(mon
 class _DwdpPool:
     page_size = 16 * MB
     num_slots = 2
-    release_failed = 0
 
     def num_pages(self, slot):
         return 4  # configured; unchanged by release()
-
-    def configured_pages(self, slot):
-        return 4
 
     def held_pages(self, slot):
         return 0  # everything released
 
 
-def test_dwdp_reads_held_pages_not_configured(monkeypatch):
+def test_dwdp_page_pool_reads_held_pages_and_lists_failed_releases_apart(monkeypatch):
     """``num_pages()`` keeps reporting capacity after the pages are gone."""
+    import tensorrt_llm._torch.modules.dwdp.page_pool as page_pool
+
+    monkeypatch.setattr(page_pool, "_unreleased_bytes", 0)
     pool = _DwdpPool()
     provider = DwdpPagePoolProvider()
     monkeypatch.setattr(provider, "_pool", lambda: pool)
-    entry = provider.collect()[0]
+    (entry,) = provider.collect()
     # 8 configured pages * 16 MiB = 128 MiB would be invented out of nothing.
     assert entry.size_bytes == 0
     assert entry.basis is Basis.PHYSICAL_BACKING
 
-    pool.release_failed = 3
-    assert "at least" in (provider.collect()[0].note or ""), "release failures: a lower bound"
+    monkeypatch.setattr(page_pool, "_unreleased_bytes", 3 * MB)
+    held, failed = provider.collect()
+    assert failed.size_bytes == 3 * MB and failed.counts_toward_total is False, (
+        "pages that failed to release may or may not be resident, so they are not summed"
+    )
+
+
+def test_dwdp_local_weight_shards_are_weights(monkeypatch):
+    """Each rank's own DWDP shards live in fabric handles outside PyTorch."""
+    from tensorrt_llm._torch.memory.monitor.providers import misc
+    from tensorrt_llm._torch.modules.dwdp.dense import manager as dense_manager
+
+    provider = misc.DwdpLocalWeightsProvider()
+    monkeypatch.setattr(misc, "_dwdp_manager", lambda: None)
+    monkeypatch.setattr(dense_manager, "get_global_dense_dwdp_manager", lambda: None)
+    assert not provider.available() and provider.collect() == [], "no DWDP, no row"
+
+    experts = types.SimpleNamespace(
+        weight_manager=types.SimpleNamespace(local_weight_bytes=96 * MB)
+    )
+    dense = types.SimpleNamespace(dense=types.SimpleNamespace(local_store_bytes=32 * MB))
+    monkeypatch.setattr(misc, "_dwdp_manager", lambda: experts)
+    monkeypatch.setattr(dense_manager, "get_global_dense_dwdp_manager", lambda: dense)
+    entries = {e.owner: e for e in provider.collect()}
+    assert entries["DWDP expert shards"].size_bytes == 96 * MB
+    assert entries["DWDP dense shards"].size_bytes == 32 * MB
+    for entry in entries.values():
+        assert entry.category is Category.WEIGHTS and entry.placement is Placement.NON_TORCH
+        assert entry.basis is Basis.PHYSICAL_BACKING and entry.counts_toward_total
+
+
+def test_dwdp_local_bytes_exclude_imported_peer_handles():
+    from tensorrt_llm._torch.modules.dwdp.transport import DWDPTransport
+
+    transport = object.__new__(DWDPTransport)
+    transport._released = False
+    # Only this rank's chunks are in the handle set; imported handles are not.
+    transport._handle_set = types.SimpleNamespace(sizes={(0, "w1"): 64 * MB, (1, "w1"): 32 * MB})
+    transport._imported_handles = [11, 12, 13]
+    assert transport.local_bytes == 96 * MB
+    transport._released = True
+    assert transport.local_bytes == 0, "released"
 
 
 class TestMemoryCountersIsDiagnosticOnly:
     def test_never_counts_toward_total(self, monkeypatch):
-        # Measured: 512 MiB inside a virtual_memory.scope raises both
-        # MemoryCounters.gpu and torch_reserved by 512 MiB while the device
-        # consumes 512 MiB once. Summing them doubles the figure.
+        # An allocation inside a virtual_memory.scope raises both
+        # MemoryCounters.gpu and torch_reserved by its size while the device
+        # consumes it once, so summing the two would double it.
         provider = MemoryCountersProvider()
         monkeypatch.setattr(provider, "available", lambda: True)
         fake = types.SimpleNamespace(
@@ -258,5 +297,48 @@ class TestCollectAllIsFaultTolerant:
                 ]
 
         entries = collect_all([_Boom(), _Fine()])
-        assert len(entries) == 1
-        assert entries[0].size_bytes == MB
+        fine, failed = sorted(entries, key=lambda e: e.size_bytes is None)
+        assert fine.size_bytes == MB, "the other providers still report"
+        # The failure is listed as unmeasured under the provider's name, not dropped.
+        assert failed.size_bytes is None and failed.owner == "boom"
+        assert failed.category is Category.COMM_MNNVL and "provider exploded" in failed.note
+
+
+def test_registrations_belong_to_their_executor():
+    from tensorrt_llm._torch.memory.monitor import pools
+    from tensorrt_llm._torch.memory.monitor import providers as reg
+
+    class _Kv:
+        name = "kv_cache.main"
+        category = Category.KV_CACHE_POOL
+
+        def __init__(self, size):
+            self.size = size
+
+    def kv_sizes():
+        return sorted(p.size for p in reg.default_providers() if isinstance(p, _Kv))
+
+    reg.clear_registered_providers()
+    pools.forget_released_tags()
+    try:
+        first = reg.begin_executor()
+        reg.register_provider(_Kv(10))
+        reg.register_provider(_Kv(20))  # rebuilt by the same executor: replaces
+        assert kv_sizes() == [20]
+
+        second = reg.begin_executor()
+        reg.register_provider(_Kv(30))  # another executor's KV cache is kept
+        assert kv_sizes() == [20, 30]
+
+        pools.mark_released(["kv_cache"])
+        reg.end_executor(first)
+        assert kv_sizes() == [30]
+        assert pools.is_tag_released("kv_cache"), "the second executor still sleeps"
+
+        reg.end_executor(second)
+        assert kv_sizes() == []
+        # Nothing left that released memory: a new executor starts awake.
+        assert not pools.is_tag_released("kv_cache")
+    finally:
+        reg.clear_registered_providers()
+        pools.forget_released_tags()

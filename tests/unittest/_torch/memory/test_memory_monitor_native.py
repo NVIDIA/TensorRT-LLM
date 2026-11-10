@@ -32,17 +32,15 @@ MB = 1 << 20
 
 
 def _ledger():
-    labels, counts, sizes = torch.ops.trtllm.get_native_memory_usage(torch.cuda.current_device())
+    labels, counts, sizes, _ = torch.ops.trtllm.get_native_memory_usage(torch.cuda.current_device())
     return {label: (count, size) for label, count, size in zip(labels, counts, sizes)}
 
 
 def _with_fake_ledger(monkeypatch, rows):
-    labels = [r[0] for r in rows]
-    counts = [r[1] for r in rows]
-    sizes = [r[2] for r in rows]
-    monkeypatch.setattr(
-        NativeMemoryProvider, "_op", staticmethod(lambda: lambda _device: (labels, counts, sizes))
-    )
+    """``rows`` of (label, count, bytes[, unmeasured])."""
+    rows = [tuple(r) + (0,) * (4 - len(r)) for r in rows]
+    columns = tuple([r[i] for r in rows] for i in range(4))
+    monkeypatch.setattr(NativeMemoryProvider, "_op", staticmethod(lambda: lambda _device: columns))
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
 
@@ -78,9 +76,14 @@ def test_ledger_labels_become_rows_in_their_groups(monkeypatch):
 
     assert collect([("moe_gemm_profiler_workspace", 0, 0)]) == [], "released labels are not listed"
 
-    # Memory freed elsewhere on the device during creation.
+    # One communicator measured, one whose reading came out negative (memory
+    # freed elsewhere on the device during its creation): the measured bytes
+    # are a lower bound, so the size is unknown rather than 900 MiB.
+    (entry,) = collect([("nccl_communicators", 2, 900 * MB, 1)])
+    assert entry.size_bytes is None, "an unmeasured allocation makes the label's size unknown"
+    assert "1 of them could not be measured" in entry.note
     (entry,) = collect([("nccl_communicators", 1, -4 * MB)])
-    assert entry.size_bytes is None, "a negative measurement is unknown, not zero"
+    assert entry.size_bytes is None, "a negative total is unknown, not a size"
 
     (entry,) = collect([("eplb_managed", 1, 64 * MB)])
     assert entry.counts_toward_total is False, "memory that may not be device usage"
@@ -97,6 +100,12 @@ def _has_ledger():
 needs_ledger = pytest.mark.skipif(
     not torch.cuda.is_available() or not _has_ledger(), reason="needs a GPU and the C++ ledger"
 )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _has_ledger(), reason="needs the C++ ledger")
+def test_python_describes_exactly_the_labels_cpp_records():
+    assert set(torch.ops.trtllm.get_native_memory_labels()) == set(LABELS)
 
 
 @needs_ledger

@@ -136,8 +136,8 @@ def test_capacity_is_physical_and_in_use_is_logical():
     inconsistent = _manager(_stats(100, 70, 50))
     entries = KvCacheProvider(inconsistent).collect()
     physical = [e for e in entries if e.basis is Basis.PHYSICAL_BACKING]
-    # Raising on the negative split used to drop the whole pool from the
-    # report, at the one moment its accounting was worth looking at.
+    # A negative split must not drop the pool: its accounting is most worth
+    # seeing exactly when it is inconsistent.
     assert physical and physical[0].size_bytes == 100 * MB, "an inconsistent pool keeps capacity"
     assert "withheld" in physical[0].note
     logical = [e for e in entries if e.basis is Basis.LOGICAL]
@@ -215,7 +215,7 @@ def test_main_draft_and_cross_pools_are_registered_once_each():
 
 @pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="capture reads the device")
 class TestChecksRunInRealReports:
-    """The checks used to be called only from tests, so no report ran them."""
+    """Every report runs the checks, not only callers that ask for them."""
 
     @pytest.fixture(autouse=True)
     def _monitor_on(self, monkeypatch):

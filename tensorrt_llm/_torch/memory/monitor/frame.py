@@ -188,11 +188,13 @@ def build_frame(
     frame = Frame(device=device, torch=torch, entries=list(entries))
 
     for entry in entries:
+        if not entry.counts_toward_total:
+            # Diagnostic entries never reach a sum, so an unknown one is not
+            # memory missing from the total.
+            frame.excluded_total += entry.size_bytes or 0
+            continue
         if entry.size_bytes is None:
             frame.unknown_categories.append(entry.category)
-            continue
-        if not entry.counts_toward_total:
-            frame.excluded_total += entry.size_bytes
             continue
         if entry.placement is Placement.NON_TORCH:
             frame.nontorch_known += entry.size_bytes

@@ -88,7 +88,7 @@ public:
     void memcpyToDevice(void* dst, void const* src, size_t size);
 
 private:
-    // Label under which an allocation is reported to the native memory ledger, by backing.
+    //! \brief Native-memory ledger label for an allocation; `gdr` is true for GDRCopy-backed device memory.
     char const* nativeMemoryLabel(bool gdr) const;
 
     struct AllocationInfo

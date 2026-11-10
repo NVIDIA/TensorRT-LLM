@@ -22,12 +22,15 @@ block, the Python stack that allocated it, and that part of the report is
 broken down by allocating code. Memory a C++ op allocates through
 ``torch::empty`` is named by the Python call site of the op.
 
-Off by default because it is not free. It records allocator *state*, not an
-event history: each live block keeps its stack and nothing else is kept, so
-there is no ring buffer to wrap and a snapshot stays cheap. Measured on
-torch 2.14 with 20000 small allocations: 41.1 ms against 32.5 ms
-unrecorded (+26%), and a snapshot in 6 ms -- against 47.7 ms and 2279 ms
-when the full event history is kept as well.
+Off by default because it slows every PyTorch allocation. It records
+allocator *state*, not an event history: each live block keeps its stack
+and nothing else is kept, so there is no event ring to grow and a snapshot
+stays cheap. Switching to it first stops the startup recording, which
+discards that recording's event ring: PyTorch keeps a ring it is no longer
+sized for otherwise, and writes past its end once it has wrapped.
+
+Recording runs until :func:`stop_stack_recording`, which executor shutdown
+calls, so the slowdown does not outlive the executor that asked for it.
 
 Only allocations made after recording starts carry a stack, so turn it on
 before reproducing the problem; it cannot be applied to an OOM after the
@@ -37,14 +40,20 @@ CUDA directly is outside its reach.
 
 from __future__ import annotations
 
-import os
 import re
 
 import torch
 
 from tensorrt_llm.logger import logger
 
-__all__ = ["ENV_VAR", "site_of", "start_stack_recording", "stacks_enabled"]
+__all__ = [
+    "ENV_VAR",
+    "site_of",
+    "start_stack_recording",
+    "stack_recording_active",
+    "stacks_enabled",
+    "stop_stack_recording",
+]
 
 ENV_VAR = "TLLM_MEM_MONITOR_STACKS"
 
@@ -57,30 +66,53 @@ _LIBRARY_PATHS = ("/site-packages/", "/dist-packages/", "/lib/python3")
 
 def stacks_enabled() -> bool:
     """Whether stack recording was asked for and can work here."""
-    from . import enabled
+    from . import full_mode, stacks_requested
     from .tagging import tagging_supported
 
-    return os.environ.get(ENV_VAR, "") == "1" and enabled() and tagging_supported()
+    return stacks_requested() and full_mode() and tagging_supported()
+
+
+#: Whether this module started the recording in progress.
+_recording = False
+
+
+def stack_recording_active() -> bool:
+    """Whether stack recording started here is still on."""
+    return _recording
 
 
 def start_stack_recording() -> bool:
     """Keep each live block's Python allocation stack from now on.
 
-    Replaces any history recording in progress -- the startup tagging window
-    hands over to this once its map is frozen.
+    Takes over from the startup tagging window once its map is frozen. The
+    window's recording is stopped first, which discards its event ring.
     """
+    global _recording
     try:
+        torch.cuda.memory._record_memory_history(None)
         torch.cuda.memory._record_memory_history(enabled="state", context="alloc", stacks="python")
-    except Exception as exc:  # noqa: BLE001 - a diagnostic must not break serving
-        logger.warning(
-            f"memory monitor: could not start stack recording ({type(exc).__name__}: {exc})"
-        )
+    except RuntimeError as exc:
+        logger.warning(f"memory monitor: could not start stack recording ({exc})")
         return False
+    _recording = True
     logger.info(
         "memory monitor: recording allocation stacks (TLLM_MEM_MONITOR_STACKS=1); "
         "PyTorch allocations are slower while this is on"
     )
     return True
+
+
+def stop_stack_recording() -> None:
+    """Stop stack recording if it was started here; otherwise do nothing."""
+    global _recording
+    if not _recording:
+        return
+    try:
+        torch.cuda.memory._record_memory_history(None)
+    except RuntimeError as exc:
+        logger.warning(f"memory monitor: could not stop stack recording ({exc})")
+        return
+    _recording = False
 
 
 def _is_library(path: str) -> bool:

@@ -263,19 +263,25 @@ def test_nvml_is_read_for_the_right_device_and_only_trusted_when_it_answers(monk
     import sys
     import types
 
-    import tensorrt_llm._torch.memory.monitor as mon
     from tensorrt_llm import profiler
-    from tensorrt_llm._torch.memory.monitor.capability import _nvml_available
+    from tensorrt_llm._torch.memory.monitor import capability
+    from tensorrt_llm._torch.memory.monitor.capability import _nvml_available, nvml_process_usage
 
     monkeypatch.setattr(profiler, "pynvml_context", contextlib.nullcontext)
 
-    def broken():
-        raise RuntimeError("NVML_ERROR_UNINITIALIZED")
+    class NVMLError(Exception):
+        pass
 
-    monkeypatch.setitem(sys.modules, "pynvml", types.SimpleNamespace(nvmlDeviceGetCount=broken))
-    # The helper is always importable; that alone used to yield nvml=yes.
+    def broken():
+        raise NVMLError("NVML_ERROR_UNINITIALIZED")
+
+    def nvml(**functions):
+        return types.SimpleNamespace(NVMLError=NVMLError, **functions)
+
+    # Importable is not enough: the library has to answer.
+    monkeypatch.setitem(sys.modules, "pynvml", nvml(nvmlDeviceGetCount=broken))
     assert _nvml_available() is False
-    monkeypatch.setitem(sys.modules, "pynvml", types.SimpleNamespace(nvmlDeviceGetCount=lambda: 1))
+    monkeypatch.setitem(sys.modules, "pynvml", nvml(nvmlDeviceGetCount=lambda: 1))
     assert _nvml_available() is True
 
     looked_up = []
@@ -284,7 +290,7 @@ def test_nvml_is_read_for_the_right_device_and_only_trusted_when_it_answers(monk
     def by_index(i):
         raise AssertionError("looked up by index; that is the wrong GPU when remapped")
 
-    fake = types.SimpleNamespace(
+    fake = nvml(
         nvmlDeviceGetHandleByIndex=by_index,
         nvmlDeviceGetHandleByUUID=lambda u: looked_up.append(u) or "handle",
         nvmlDeviceGetComputeRunningProcesses_v3=lambda h: [proc],
@@ -292,9 +298,45 @@ def test_nvml_is_read_for_the_right_device_and_only_trusted_when_it_answers(monk
     )
     monkeypatch.setitem(sys.modules, "pynvml", fake)
     monkeypatch.setattr(
-        mon.torch.cuda,
+        capability.torch.cuda,
         "get_device_properties",
         lambda i: types.SimpleNamespace(uuid="6b4fa2a7-2f22-4b34-1f72-7e6c4a551774"),
     )
-    assert mon._nvml_process_used(0) == 7 * GIB
+    assert nvml_process_usage(0) == (7 * GIB, "")
     assert looked_up == ["GPU-6b4fa2a7-2f22-4b34-1f72-7e6c4a551774"]
+
+    # A process NVML does not list (another PID namespace) is unknown, with the reason.
+    proc.pid = -1
+    used, reason = nvml_process_usage(0)
+    assert used is None and "not in NVML's process list" in reason
+    # So is NVML failing outright.
+    fake.nvmlDeviceGetComputeRunningProcesses_v3 = lambda h: broken()
+    assert nvml_process_usage(0) == (None, capability.NVML_UNAVAILABLE)
+
+
+def test_an_unknown_diagnostic_entry_is_not_an_unmeasured_provider():
+    """An inconsistent KV pool: capacity counted, its in-use split unknown."""
+    entries = [
+        _entry(Category.KV_CACHE_POOL, 16 * GIB, owner="kv_cache.main"),
+        _entry(
+            Category.KV_CACHE_POOL,
+            None,
+            owner="kv_cache.main",
+            basis=Basis.LOGICAL,
+            counts_toward_total=False,
+        ),
+    ]
+    frame = build_frame(
+        DeviceReading(total=80 * GIB, free=60 * GIB, process_used=20 * GIB),
+        TorchReading(reserved=2 * GIB, live=GIB),
+        entries,
+    )
+    assert frame.unknown_categories == []
+    text = render(frame, _capability())
+    assert "[unmeasured]" not in text
+
+    # A counted entry of unknown size is listed, by owner.
+    entries.append(_entry(Category.COMM_MNNVL, None, owner="mnnvl"))
+    frame = build_frame(frame.device, frame.torch, entries)
+    text = render(frame, _capability())
+    assert "[unmeasured]" in text and "mnnvl (comm.mnnvl)" in text

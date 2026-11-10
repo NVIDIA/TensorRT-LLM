@@ -31,7 +31,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, ContextSchedulingPolicy,
-    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig,
+    ExecutorMemoryType, KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig,
     MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
     SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
@@ -2076,8 +2076,11 @@ class KvCacheCreator:
                 "the first penalized request.")
 
         # calculate max memory from peak memory and free gpu memory fraction
-        # The memory monitor compares later usage against this plan.
-        _monitor_startup.record_memory_plan(peak_memory, activation_bytes)
+        # The memory monitor compares later usage against this plan. The
+        # profiled peak still holds the temporary sizing KV pool, which the
+        # final KV cache replaces, so it is taken out of the non-KV peak.
+        _monitor_startup.record_memory_plan(peak_memory - allocated_bytes,
+                                            activation_bytes)
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
@@ -3717,6 +3720,11 @@ class KvCacheCreator:
             cross_kv_cache_manager.shutdown()
         if ResourceManagerType.CROSS_KV_CACHE_MANAGER in resources:
             del resources[ResourceManagerType.CROSS_KV_CACHE_MANAGER]
+        # The sizing executor's resources are gone; what the memory monitor
+        # measured while creating them no longer exists.
+        _monitor_startup.release_regions(
+            (ExecutorMemoryType.INIT_KV_CACHE.value,
+             ExecutorMemoryType.INIT_EXTRA_RESOURCES.value))
 
 
 def _build_per_layer_num_kv_heads(

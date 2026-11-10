@@ -33,6 +33,7 @@ def _clean(monkeypatch):
     tagging.clear_claims()
     yield
     torch.cuda.memory._record_memory_history(None) if torch.cuda.is_available() else None
+    monkeypatch.setattr(stacks, "_recording", False)
     tagging.clear_claims()
     tagging.set_frozen_map(tagging.TagSnapshot(supported=False))
 
@@ -118,9 +119,44 @@ def test_off_by_default_and_handed_over_when_asked(monkeypatch):
     calls.clear()
     with tagging.startup_window():
         pass
-    # State only: each live block keeps its stack, no event history.
+    # State only: each live block keeps its stack, no event history. The
+    # startup recording is stopped first, which discards its event ring.
+    assert calls[-2][0] == (None,), "the startup trace must be discarded before switching"
     assert calls[-1][1].get("enabled") == "state"
     assert calls[-1][1].get("stacks") == "python"
+
+    # Shutdown stops what was started here, once, and nothing else.
+    calls.clear()
+    stacks.stop_stack_recording()
+    stacks.stop_stack_recording()
+    assert calls == [((None,), {})], "stopped exactly once"
+    assert stacks.stack_recording_active() is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_switching_after_the_startup_ring_wrapped_is_safe(monkeypatch):
+    from tensorrt_llm.logger import logger
+
+    if not tagging.tagging_supported():
+        pytest.skip("tagging unsupported here")
+    warnings = []
+    monkeypatch.setattr(logger, "warning", warnings.append)
+    assert tagging.start_tagging_window(max_entries=100)
+    with tagging.tag("STEP"):
+        blocks = [torch.empty(1024, device="cuda") for _ in range(137)]
+    del blocks
+    tagging.freeze_tag_map()
+    assert any("more than 100 allocation events" in w for w in warnings), "wrap judged by its ring"
+    assert stacks.start_stack_recording()
+    # Allocations after the switch must not write past the old ring; with
+    # the startup trace kept, this loop corrupts the heap.
+    for _ in range(3):
+        churn = [torch.empty(1024 + n, device="cuda") for n in range(2000)]
+        del churn
+    traces = torch.cuda.memory._snapshot()["device_traces"]
+    assert sum(len(t) for t in traces) <= 1, "the startup trace is gone"
+    stacks.stop_stack_recording()
+    assert not tagging.history_recording_active()
 
 
 def _allocate_in_moe_forward():

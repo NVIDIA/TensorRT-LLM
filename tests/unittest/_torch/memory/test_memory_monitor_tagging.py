@@ -14,10 +14,11 @@
 # limitations under the License.
 """Tag-based attribution of torch-visible memory.
 
-The traps these pin down were all found by measurement, and each is silent:
-the ring buffer drops the earliest tags (which are the weights), a non-native
-allocator accepts a tag and discards it, and an unsupported setup produces a
-breakdown of zeros that reads exactly like a process holding nothing.
+Each trap pinned here is silent: the ring buffer drops the earliest tags
+(which are the weights), a non-native allocator accepts a tag and discards
+it, an unsupported setup produces a breakdown of zeros that reads exactly
+like a process holding nothing, and a block allocated after the map is
+frozen can sit at the address of a tagged block that was freed.
 
 Needs a GPU: the attribution is read back out of a real allocator snapshot.
 """
@@ -193,8 +194,7 @@ def test_claimed_module_memory(window):
     clear_claims()
 
     # Tied embeddings: two parameters, one storage. Summing their
-    # logical sizes double counts; claiming by block does not. Measured
-    # on Qwen2-0.5B, this is a 259.7 MiB difference.
+    # logical sizes double counts; claiming by block counts it once.
     shared = torch.empty(8 * MB, dtype=torch.uint8, device="cuda")
 
     class Tied(torch.nn.Module):
@@ -240,6 +240,46 @@ def test_freed_weights_do_not_label_their_successor(window):
         assert after == 4 * MB, f"expected only the new weight, got {after / MB} MiB"
     finally:
         del activation, module
+
+
+def test_frozen_label_does_not_follow_a_reused_address(window):
+    if not window:
+        pytest.skip("tagging unsupported here")
+    with tag("SAMPLER"):
+        freed = torch.empty(64 * MB, dtype=torch.uint8, device="cuda")
+    address = freed.untyped_storage().data_ptr()
+    frozen = freeze_tag_map()
+    assert live_bytes_by_tag(frozen).get("SAMPLER", 0) >= 64 * MB, "labelled while it lives"
+    del freed
+    torch.cuda.synchronize()
+    successor = torch.empty(32 * MB, dtype=torch.uint8, device="cuda")
+    try:
+        if successor.untyped_storage().data_ptr() != address:
+            pytest.skip("the allocator placed the new block elsewhere")
+        totals = live_bytes_by_tag(frozen)
+        assert totals.get("SAMPLER", 0) == 0, "a block at a freed owner's address is not its owner"
+        assert totals[UNTAGGED] >= 32 * MB
+    finally:
+        del successor
+
+
+def test_a_recording_someone_else_started_is_left_alone(monkeypatch):
+    from tensorrt_llm._torch.memory.monitor.tagging import history_recording_active
+
+    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+    if not tagging_supported():
+        pytest.skip("tagging unsupported here")
+    torch.cuda.memory._record_memory_history(context=None, max_entries=10_000)
+    try:
+        theirs = torch.empty(MB, dtype=torch.uint8, device="cuda")
+        assert start_tagging_window() is False, "must not replace another recording"
+        assert history_recording_active(), "their recording is still on"
+        traces = torch.cuda.memory._snapshot()["device_traces"]
+        address = theirs.untyped_storage().data_ptr()
+        assert any(e.get("addr") == address for t in traces for e in t), "their trace is intact"
+        del theirs
+    finally:
+        torch.cuda.memory._record_memory_history(None)
 
 
 def test_nothing_happens_when_off(monkeypatch):

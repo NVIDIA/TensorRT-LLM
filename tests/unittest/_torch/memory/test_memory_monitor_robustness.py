@@ -213,6 +213,7 @@ def test_startup_state_does_not_leak(monkeypatch):
 @pytest.mark.cpu_only
 def test_nvml_lookup_says_why_the_process_is_missing(monkeypatch):
     from tensorrt_llm import profiler
+    from tensorrt_llm._torch.memory.monitor.capability import nvml_process_usage
 
     proc = types.SimpleNamespace(pid=os.getpid(), usedGpuMemory=7 * MB)
     fake = types.SimpleNamespace(
@@ -222,13 +223,13 @@ def test_nvml_lookup_says_why_the_process_is_missing(monkeypatch):
     monkeypatch.setitem(sys.modules, "pynvml", fake)
     monkeypatch.setattr(profiler, "pynvml_context", contextlib.nullcontext)
     monkeypatch.setattr(
-        mon.torch.cuda, "get_device_properties", lambda i: types.SimpleNamespace(uuid="x")
+        torch.cuda, "get_device_properties", lambda i: types.SimpleNamespace(uuid="x")
     )
 
-    assert mon._nvml_process_lookup(0) == (7 * MB, ""), "found process has no reason"
+    assert nvml_process_usage(0) == (7 * MB, ""), "found process has no reason"
     # Another PID namespace: NVML lists the host PID, never ours.
     proc.pid = os.getpid() + 100000
-    used, reason = mon._nvml_process_lookup(0)
+    used, reason = nvml_process_usage(0)
     assert used is None and "PID namespace" in reason
 
 
@@ -247,12 +248,76 @@ def test_startup_problems_are_logged_not_raised(monkeypatch):
     # Startup history that wrapped the ring buffer is reported.
     warnings = []
     monkeypatch.setattr(tagging, "tagging_supported", lambda: True)
-    monkeypatch.setattr(tagging, "_DEFAULT_MAX_ENTRIES", 2)
+    monkeypatch.setattr(tagging, "_max_entries", 2)
     events = [{"action": "alloc", "addr": i, "user_metadata": "model"} for i in range(2)]
     monkeypatch.setattr(torch.cuda.memory, "_snapshot", lambda *a, **k: {"device_traces": [events]})
     monkeypatch.setattr(tagging.logger, "warning", warnings.append)
     tagging.freeze_tag_map()
     assert warnings and "not attributed" in warnings[0]
+
+
+@pytest.mark.cpu_only
+def test_tagging_failures_stay_out_of_the_tagged_code(monkeypatch):
+    # A frozen owner labels a live block only while it is still that block.
+    frozen = tagging.TagSnapshot(True, owners={1: "A", 2: "B"}, sizes={1: 100})
+    assert frozen.owner_of(1, 100) == "A"
+    assert frozen.owner_of(1, 50) is None, "same address, different allocation"
+    assert frozen.owner_of(2, 7) == "B", "no recorded size matches any size"
+    assert frozen.owner_of(3, 100) is None
+
+    # A tag that could not be set does not become the context of the tagged
+    # code's own exception.
+    def refuse(_name):
+        raise RuntimeError("metadata unavailable")
+
+    monkeypatch.setattr(tagging, "tagging_supported", lambda: True)
+    monkeypatch.setattr(torch.cuda.memory, "_get_memory_metadata", lambda: "", raising=False)
+    monkeypatch.setattr(torch.cuda.memory, "_set_memory_metadata", refuse, raising=False)
+    with pytest.raises(ValueError) as raised:
+        with tagging.tag("STEP"):
+            raise ValueError("the step's own failure")
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.cpu_only
+def test_sleep_tags_are_marked_as_each_call_succeeds(monkeypatch):
+    from tensorrt_llm._torch import virtual_memory
+
+    class Manager:
+        def __init__(self, failing):
+            self.failing = failing
+
+        def release_with_tag(self, tag):
+            if tag == self.failing:
+                raise RuntimeError("release failed")
+            return 1
+
+        def materialize_with_tag(self, tag):
+            if tag == self.failing:
+                raise RuntimeError("out of memory")
+            return 1
+
+    pools.forget_released_tags()
+    try:
+        # Waking sorted tags: kv_cache comes back, then the weights fail and
+        # roll back. Only the weights are still released.
+        pools.mark_released(("kv_cache", "model_weights"))
+        monkeypatch.setattr(
+            virtual_memory, "get_virtual_memory_manager", lambda: Manager("model_weights")
+        )
+        with pytest.raises(RuntimeError):
+            virtual_memory.materialize_with_tag("kv_cache", "model_weights")
+        assert not pools.is_tag_released("kv_cache"), "materialized before the failure"
+        assert pools.is_tag_released("model_weights"), "rolled back"
+
+        # A release that fails part way has still released the failing tag.
+        pools.forget_released_tags()
+        monkeypatch.setattr(virtual_memory, "get_virtual_memory_manager", lambda: Manager("a"))
+        with pytest.raises(RuntimeError):
+            virtual_memory.release_with_tag("a", "b")
+        assert pools.is_tag_released("a") and not pools.is_tag_released("b")
+    finally:
+        pools.forget_released_tags()
 
 
 @needs_gpu

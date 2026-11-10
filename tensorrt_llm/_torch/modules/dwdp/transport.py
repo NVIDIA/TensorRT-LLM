@@ -753,6 +753,16 @@ class DWDPTransport:
         """VMM page granularity in bytes."""
         return self._granularity
 
+    @property
+    def local_bytes(self) -> int:
+        """Device memory of this rank's own expert chunks, held in local fabric handles.
+
+        Handles imported from peers are not counted. 0 once released.
+        """
+        if self._released:
+            return 0
+        return sum(self._handle_set.sizes.values())
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------

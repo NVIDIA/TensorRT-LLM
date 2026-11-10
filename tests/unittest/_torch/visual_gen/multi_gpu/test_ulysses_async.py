@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Multi-rank tests for the async Ulysses A2A op.
 
 Exercises the production ``ulysses_a2a_async_prepare`` / ``ulysses_a2a_async_push``
@@ -221,18 +235,35 @@ def _slot_memory_logic(rank: int, world_size: int):
     device = torch.device(f"cuda:{rank}")
 
     def recorded():
-        labels, counts, sizes = torch.ops.trtllm.get_native_memory_usage(rank)
+        labels, counts, sizes, _ = torch.ops.trtllm.get_native_memory_usage(rank)
         usage = dict(zip(labels, zip(counts, sizes)))
         return usage.get("ulysses_a2a_slots", (0, 0))
 
+    def prepare(t):
+        torch.ops.trtllm.ulysses_a2a_async_prepare(t, pg.boxed())
+        torch.cuda.synchronize()
+
     B, S_local, H, D = 2, 64, world_size * 8, 128
     x = torch.randn(B, S_local, H, D, dtype=torch.bfloat16, device=device)
+    small = x.numel() * x.element_size()
     # A group of its own gets a fresh slot ring, whatever ran in this worker before.
     pg = dist.new_group(ranks=list(range(world_size)))
     count, size = recorded()
-    torch.ops.trtllm.ulysses_a2a_async_prepare(x, pg.boxed())
-    torch.cuda.synchronize()
-    assert recorded() == (count + 1, size + 2 * x.numel() * x.element_size())
+    prepare(x)
+    assert recorded() == (count + 1, size + 2 * small)
+    # Fill the ring (three slots), then grow every slot in turn.
+    prepare(x)
+    prepare(x)
+    assert recorded() == (count + 3, size + 6 * small)
+    big = torch.randn(B, 2 * S_local, H, D, dtype=torch.bfloat16, device=device)
+    large = big.numel() * big.element_size()
+    # The first slot's handle is kept for barriers, so its receive buffer stays
+    # mapped after the resize: only the send buffer is released.
+    prepare(big)
+    assert recorded() == (count + 3, size + 5 * small + 2 * large)
+    # Any other slot releases both of its buffers.
+    prepare(big)
+    assert recorded() == (count + 3, size + 3 * small + 4 * large)
 
 
 def _run(world_size: int, test_fn: Callable):

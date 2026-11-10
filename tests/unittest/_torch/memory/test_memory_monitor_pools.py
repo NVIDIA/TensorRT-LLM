@@ -212,3 +212,56 @@ def test_graph_memory_is_cuda_graphs_not_reusable_cache():
         assert rows and rows[0].owner == "in use by graphs", "graph rows use a readable owner"
     finally:
         del graph, kept
+
+
+def test_pools_are_classified_ahead_of_reports_and_the_walk_cannot_break_them(monkeypatch):
+    import weakref
+
+    class _Gone:
+        pass
+
+    class _Hostile:
+        def __getattribute__(self, name):
+            raise RuntimeError("touched")
+
+    pool_mod.clear_registered_pools()
+    gone = _Gone()
+    # Alive during the walk: a dead proxy raises on isinstance, a hostile
+    # object on any attribute access.
+    odd = [weakref.proxy(gone), _Hostile()]
+    del gone
+    unregistered = torch.cuda.MemPool()
+    with torch.cuda.use_mem_pool(unregistered):
+        held = torch.empty(16 * MB, dtype=torch.uint8, device="cuda")
+    graph, pool, kept = _capture_graph(16 * MB)
+    later = torch.cuda.MemPool()
+    try:
+        pool_mod.prime()
+
+        def walked():
+            raise AssertionError("pools seen at startup must not be walked for again")
+
+        monkeypatch.setattr(pool_mod, "_live_mempool_ids", walked)
+        usage = {p.pool_id: p.kind for p in pool_mod.pool_usage(_segments())}
+        assert usage[tuple(unregistered.id)] == "mempool", "primed, without a walk"
+        assert usage[tuple(pool)] == "graph"
+
+        # A pool created later is walked for; if the walk fails, it is
+        # unclassified for this report and retried on the next one.
+        with torch.cuda.use_mem_pool(later):
+            late = torch.empty(16 * MB, dtype=torch.uint8, device="cuda")
+
+        def failing():
+            raise RuntimeError("walk failed")
+
+        monkeypatch.setattr(pool_mod, "_live_mempool_ids", failing)
+        usage = {p.pool_id: p.kind for p in pool_mod.pool_usage(_segments())}
+        assert usage[tuple(later.id)] == "unclassified"
+        assert usage[tuple(pool)] == "graph", "pools already classified keep their kind"
+        monkeypatch.undo()
+        usage = {p.pool_id: p.kind for p in pool_mod.pool_usage(_segments())}
+        assert usage[tuple(later.id)] == "mempool", "retried once the walk works"
+        assert odd  # kept alive through every walk above
+        del late
+    finally:
+        del held, graph, kept

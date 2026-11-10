@@ -15,7 +15,7 @@
 """Read-only statistics on :class:`PagePool`.
 
 The distinction under test is between what a pool is *sized for* and what it
-currently *holds*. ``configured_pages`` keeps its value for the pool's whole
+currently *holds*. ``num_pages`` keeps its value for the pool's whole
 lifetime; ``held_pages`` goes to zero the moment ``release()`` hands the
 pages back. Conflating them reports a full pool's worth of memory that the
 driver has already taken back.
@@ -48,134 +48,99 @@ def _device_used() -> int:
     return total - free
 
 
-class TestConfiguredVersusHeld:
-    def test_both_agree_before_release(self, pool):
-        for slot in range(pool.num_slots):
-            assert pool.held_pages(slot) == pool.configured_pages(slot)
-            assert pool.held_pages(slot) > 0
+@pytest.fixture
+def unreleased(monkeypatch):
+    """The process-level count of bytes that failed to release, starting at 0."""
+    import tensorrt_llm._torch.modules.dwdp.page_pool as mod
 
-    def test_held_drops_to_zero_and_configured_does_not(self, pool):
-        configured = [pool.configured_pages(s) for s in range(pool.num_slots)]
-        assert sum(configured) > 0
-
-        pool.release()
-
-        assert [pool.held_pages(s) for s in range(pool.num_slots)] == [0] * pool.num_slots, (
-            "held_pages must track the handles actually owned; reporting the "
-            "configured count here invents a full pool of memory that the "
-            "driver has already taken back"
-        )
-        assert [pool.configured_pages(s) for s in range(pool.num_slots)] == configured
-
-    def test_held_pages_matches_the_device(self, pool):
-        before = _device_used()
-        pool.release()
-        torch.cuda.synchronize()
-        returned = before - _device_used()
-
-        # The pages were really handed back, so a non-zero occupancy report
-        # after this point would contradict the device itself.
-        expected = sum(pool.configured_pages(s) for s in range(pool.num_slots))
-        assert returned >= expected * pool.page_size * 0.9
-        assert sum(pool.held_pages(s) for s in range(pool.num_slots)) == 0
-
-    def test_num_pages_still_means_configured(self, pool):
-        # Kept for back-compat and deliberately *not* repurposed: callers
-        # reading it expect a configuration value.
-        pool.release()
-        for slot in range(pool.num_slots):
-            assert pool.num_pages(slot) == pool.configured_pages(slot)
+    monkeypatch.setattr(mod, "_unreleased_bytes", 0)
+    return mod.unreleased_page_bytes
 
 
-class TestReleaseFailuresAreCounted:
-    def test_zero_on_a_clean_release(self, pool):
-        pool.release()
-        assert pool.release_failed == 0
+def _fail_every(monkeypatch, nth: int) -> None:
+    """Make every ``nth`` handle release raise."""
+    import tensorrt_llm._torch.modules.dwdp.page_pool as mod
 
-    def test_counts_handles_that_raised(self, monkeypatch, pool):
-        # release() logs and continues so one bad handle cannot derail
-        # teardown; the count is what keeps that from being invisible.
-        import tensorrt_llm._torch.modules.dwdp.page_pool as mod
+    calls = {"n": 0}
+    real = mod.release_handle
 
-        calls = {"n": 0}
-        real = mod.release_handle
+    def flaky(handle):
+        calls["n"] += 1
+        if calls["n"] % nth == 0:
+            raise RuntimeError("synthetic release failure")
+        return real(handle)
 
-        def flaky(handle):
-            calls["n"] += 1
-            if calls["n"] % 2 == 0:
-                raise RuntimeError("synthetic release failure")
-            return real(handle)
-
-        monkeypatch.setattr(mod, "release_handle", flaky)
-
-        total = sum(pool.configured_pages(s) for s in range(pool.num_slots))
-        pool.release()
-
-        assert pool.release_failed == total // 2
-        assert sum(pool.held_pages(s) for s in range(pool.num_slots)) == 0
-
-    def test_release_stays_idempotent_after_failures(self, monkeypatch, pool):
-        import tensorrt_llm._torch.modules.dwdp.page_pool as mod
-
-        monkeypatch.setattr(
-            mod, "release_handle", lambda h: (_ for _ in ()).throw(RuntimeError("x"))
-        )
-
-        pool.release()
-        first = pool.release_failed
-        pool.release()  # must not re-walk the handles
-        assert pool.release_failed == first
+    monkeypatch.setattr(mod, "release_handle", flaky)
 
 
-class TestSlotCountSurvivesRelease:
-    def test_num_slots_unchanged(self, pool):
-        before = pool.num_slots
-        pool.release()
-        assert pool.num_slots == before
+def test_held_pages_follow_release_and_num_pages_does_not(pool):
+    configured = [pool.num_pages(s) for s in range(pool.num_slots)]
+    assert all(n > 0 for n in configured)
+    assert [pool.held_pages(s) for s in range(pool.num_slots)] == configured
 
-    def test_three_slots_do_not_collapse_to_two(self):
-        # release() used to reset the handles to a fixed-length [[], []],
-        # which silently reshaped any pool that was not double buffered.
-        p = PagePool.create(slot_sizes=[16 * MB] * 3, device_id=0)
-        try:
-            assert p.num_slots == 3
-            p.release()
-            assert p.num_slots == 3
-            assert [p.held_pages(s) for s in range(3)] == [0, 0, 0]
-        finally:
-            p.release()
+    before = _device_used()
+    pool.release()
+    torch.cuda.synchronize()
+    returned = before - _device_used()
+
+    assert [pool.held_pages(s) for s in range(pool.num_slots)] == [0] * pool.num_slots, (
+        "held_pages counts the handles actually owned"
+    )
+    assert [pool.num_pages(s) for s in range(pool.num_slots)] == configured, (
+        "num_pages is the configuration and survives release"
+    )
+    # The pages really went back to the driver, which is what held_pages says.
+    assert returned >= sum(configured) * pool.page_size * 0.9
 
 
-class TestMonitorProviderUsesHeldPages:
-    def test_reports_zero_after_release(self, monkeypatch, pool):
-        from tensorrt_llm._torch.memory.monitor.providers.misc import DwdpPagePoolProvider
-        from tensorrt_llm._torch.memory.monitor.schema import Basis
+def test_release_failures_are_counted_per_pool_and_per_process(monkeypatch, pool, unreleased):
+    clean = PagePool.create(slot_sizes=[16 * MB], device_id=0)
+    clean.release()
+    assert clean.num_release_failures == 0 and unreleased() == 0, "a clean release counts nothing"
 
-        provider = DwdpPagePoolProvider()
-        monkeypatch.setattr(provider, "_pool", lambda: pool)
+    _fail_every(monkeypatch, 2)
+    total = sum(pool.num_pages(s) for s in range(pool.num_slots))
+    pool.release()
+    assert pool.num_release_failures == total // 2
+    assert unreleased() == total // 2 * pool.page_size
+    assert sum(pool.held_pages(s) for s in range(pool.num_slots)) == 0
 
-        entry = provider.collect()[0]
-        assert entry.basis is Basis.PHYSICAL_BACKING
-        assert entry.size_bytes > 0
+    pool.release()  # idempotent: the handles are not walked again
+    assert pool.num_release_failures == total // 2
+    assert unreleased() == total // 2 * pool.page_size
 
-        pool.release()
-        assert provider.collect()[0].size_bytes == 0
 
-    def test_release_failure_is_surfaced_as_a_lower_bound(self, monkeypatch, pool):
-        import tensorrt_llm._torch.modules.dwdp.page_pool as mod
-        from tensorrt_llm._torch.memory.monitor.providers.misc import DwdpPagePoolProvider
+def test_slot_count_survives_release():
+    # release() empties every slot it was created with, however many there are.
+    p = PagePool.create(slot_sizes=[16 * MB] * 3, device_id=0)
+    try:
+        assert p.num_slots == 3
+        p.release()
+        assert p.num_slots == 3
+        assert [p.held_pages(s) for s in range(3)] == [0, 0, 0]
+    finally:
+        p.release()
 
-        monkeypatch.setattr(
-            mod, "release_handle", lambda h: (_ for _ in ()).throw(RuntimeError("x"))
-        )
-        pool.release()
 
-        provider = DwdpPagePoolProvider()
-        monkeypatch.setattr(provider, "_pool", lambda: pool)
-        entry = provider.collect()[0]
+def test_monitor_reports_held_pages_and_lists_failed_releases_apart(monkeypatch, pool, unreleased):
+    from tensorrt_llm._torch.memory.monitor.providers.misc import DwdpPagePoolProvider
+    from tensorrt_llm._torch.memory.monitor.schema import Basis
 
-        # The pages are untracked but plausibly still mapped, so a bare 0
-        # would read as a clean release.
-        assert "at least" in (entry.note or ""), (
-            "a lost handle must not be reported as a clean zero"
-        )
+    provider = DwdpPagePoolProvider()
+    monkeypatch.setattr(provider, "_pool", lambda: pool)
+
+    (entry,) = provider.collect()
+    assert entry.basis is Basis.PHYSICAL_BACKING and entry.size_bytes > 0
+
+    _fail_every(monkeypatch, 1)
+    pool.release()
+    held, failed = provider.collect()
+    assert held.size_bytes == 0, "released pages are no longer held"
+    # Whether the GPU still backs these is unknown, so they are listed, not summed.
+    assert failed.size_bytes == unreleased() > 0
+    assert failed.counts_toward_total is False
+
+    # The pool is dropped after release in production; the failed bytes stay visible.
+    monkeypatch.setattr(provider, "_pool", lambda: None)
+    assert provider.available()
+    assert [e.size_bytes for e in provider.collect()] == [unreleased()]

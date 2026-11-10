@@ -141,8 +141,14 @@ def release_with_tag(*tags: str) -> int:
     :return: Number of memory blobs released
     """
     manager = get_virtual_memory_manager()
-    released_blobs = sum(manager.release_with_tag(tag) for tag in tags)
-    mark_released(tags)
+    released_blobs = 0
+    for tag in tags:
+        try:
+            released_blobs += manager.release_with_tag(tag)
+        finally:
+            # A failing release still releases the tag's other blobs and drops
+            # the failing one, so the tag is no longer backed either way.
+            mark_released((tag, ))
     return released_blobs
 
 
@@ -153,8 +159,12 @@ def materialize_with_tag(*tags: str) -> int:
     :return: Number of memory blobs materialized
     """
     manager = get_virtual_memory_manager()
-    materialized_blobs = sum(manager.materialize_with_tag(tag) for tag in tags)
-    mark_materialized(tags)
+    materialized_blobs = 0
+    for tag in tags:
+        # A failing materialize rolls its tag back to released, so a tag is
+        # marked backed only once its own call has succeeded.
+        materialized_blobs += manager.materialize_with_tag(tag)
+        mark_materialized((tag, ))
     return materialized_blobs
 
 

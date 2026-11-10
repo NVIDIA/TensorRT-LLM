@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,8 @@ import array
 import ctypes
 import struct
 import sys
-from typing import List, Tuple
+import weakref
+from typing import Dict, List, Tuple
 
 try:
     from cuda.bindings import driver as cuda
@@ -96,21 +97,57 @@ def can_access_peer(mapping: Mapping) -> bool:
     return True
 
 
+def _ipc_aligned_size(size: int) -> int:
+    """The size ``open_ipc_memory`` allocates for a request of ``size`` bytes."""
+    # See allocateIpcMemory in cpp/tensorrt_llm/runtime/ipcUtils.cpp for the 2 MiB alignment.
+    alignment = 1 << 21
+    return -(-size // alignment) * alignment
+
+
 class IpcMemory:
+    """A buffer on this GPU that the other ranks of the TP group map through CUDA IPC."""
+
     # WARNING: Must in sync with FLAGS_SIZE in cpp/include/tensorrt_llm/runtime/ipcUtils.h
     # (Max all reduce blocks + 1) * sizeof(int)
     IPC_BARRIERS_SIZE_PER_GPU = (24 + 1) * 4
 
-    def __init__(self, mapping: Mapping, size: int, open_ipc: bool = True):
+    #: Instances whose local buffer is allocated, for ``live_allocations``.
+    _live: "weakref.WeakSet[IpcMemory]" = weakref.WeakSet()
+
+    def __init__(
+        self, mapping: Mapping, size: int, open_ipc: bool = True, label: str = "IPC peer buffers"
+    ):
+        """``label`` names what the buffer is for in memory reports."""
         self.mapping = mapping
         self.open_ipc = open_ipc and mapping.tp_size <= mapping.gpus_per_node
         self.peer_ptrs = [0] * mapping.tp_size
         self.local_ptr = 0
+        self.label = label
+        self.nbytes = 0
+        self.device = -1
 
         if self.open_ipc:
             self.peer_ptrs, self.local_ptr = IpcMemory.open_ipc_memory(self.mapping, size, True)
+            self.nbytes = _ipc_aligned_size(size)
+            error, self.device = cudart.cudaGetDevice()
+            _raise_if_error(error)
+            IpcMemory._live.add(self)
+
+    @staticmethod
+    def live_allocations(device: int) -> Dict[str, Tuple[int, int]]:
+        """``label -> (count, bytes)`` of the local buffers allocated on ``device`` and not yet freed.
+
+        Peer mappings are not counted: they map memory another rank allocated.
+        """
+        usage: Dict[str, Tuple[int, int]] = {}
+        for ipc in list(IpcMemory._live):
+            if ipc.device == device:
+                count, nbytes = usage.get(ipc.label, (0, 0))
+                usage[ipc.label] = (count + 1, nbytes + ipc.nbytes)
+        return usage
 
     def __del__(self):
+        IpcMemory._live.discard(self)
         if not sys.is_finalizing() and self.open_ipc:
             IpcMemory.close_ipc_memory(self.mapping, self.peer_ptrs)
 
@@ -130,18 +167,11 @@ class IpcMemory:
         Call close_ipc_handle with the *buffer*.
         """
 
-        def align_size(size, alignment):
-            if (size % alignment) != 0:
-                size += alignment - (size % alignment)
-            return size
-
         from tensorrt_llm._torch.distributed.communicator import Distributed
 
         dist = Distributed.get(mapping)
 
-        # see allocateIpcMemory in cpp/tensorrt_llm/runtime/ipcUtils.cpp for alignment reason
-        # 1 << 21 is 2MB
-        aligned_size = align_size(size, 1 << 21)
+        aligned_size = _ipc_aligned_size(size)
         error, local_ptr = cudart.cudaMalloc(aligned_size)
         _raise_if_error(error)
         if set_to_zero:

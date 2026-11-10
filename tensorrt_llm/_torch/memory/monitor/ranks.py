@@ -26,7 +26,11 @@ some MPI implementations implement by spinning a CPU core.
 
 A rank that does not answer in time is reported as such rather than holding
 up the others; its late answer is recognised by its sequence number and
-dropped.
+dropped. A report is larger than MPI's eager limit, so a reply only
+completes once rank 0 receives it; replies are therefore sent without
+blocking, and a listener that is stopped while its reply is uncollected
+abandons it instead of waiting in MPI. Rank 0 drains uncollected replies
+when it stops.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from __future__ import annotations
 import itertools
 import threading
 import time
+from typing import Any
 
 from tensorrt_llm.logger import logger
 
@@ -42,13 +47,14 @@ __all__ = ["RankReporter"]
 _REQUEST_TAG = 2626
 _REPLY_TAG = 2627
 _POLL_S = 0.2
+_SEND_POLL_S = 0.05
 _DEFAULT_TIMEOUT_S = 30.0
 
 
 class RankReporter:
     """Rank 0 gathers; every other rank answers from a listener thread."""
 
-    def __init__(self, comm, rank: int, world_size: int, device: int | None) -> None:
+    def __init__(self, comm: Any, rank: int, world_size: int, device: int | None) -> None:
         self._comm = comm
         self._rank = rank
         self._world_size = world_size
@@ -76,13 +82,24 @@ class RankReporter:
                     self._stop.wait(_POLL_S)
                     continue
                 sequence = self._comm.recv(source=0, tag=_REQUEST_TAG)
-                report = report_now(tag="on_demand", rank=self._rank, force=True)
-                self._comm.send((sequence, report), dest=0, tag=_REPLY_TAG)
-            except Exception as exc:  # noqa: BLE001 - a diagnostic must not kill the rank
+                report = report_now(tag="on_demand", rank=self._rank, force=True, save=False)
+                if not self._deliver(self._comm.isend((sequence, report), dest=0, tag=_REPLY_TAG)):
+                    return
+            except Exception as exc:  # a diagnostic must not kill the rank
                 logger.warning(
                     f"memory monitor: rank listener failed ({type(exc).__name__}: {exc})"
                 )
                 self._stop.wait(_POLL_S)
+
+    def _deliver(self, request) -> bool:
+        """Wait for a reply to be received; ``False`` if stopped first."""
+        while not request.Test():
+            if self._stop.wait(_SEND_POLL_S):
+                logger.warning(
+                    f"memory monitor: rank {self._rank} stopped before rank 0 collected its report"
+                )
+                return False
+        return True
 
     def gather(self, timeout: float = _DEFAULT_TIMEOUT_S) -> list[str]:
         """Reports from ranks 1..N-1, in rank order. Rank 0 only."""
@@ -110,8 +127,26 @@ class RankReporter:
                 replies[source] = f"rank {source}: no report within {timeout:g} s"
             return [replies[source] for source in sorted(replies)]
 
+    def _drain_replies(self) -> None:
+        """Receive replies nobody waits for any more, so no send stays pending."""
+        for source in range(1, self._world_size):
+            while self._comm.Iprobe(source=source, tag=_REPLY_TAG):
+                self._comm.recv(source=source, tag=_REPLY_TAG)
+
     def stop(self) -> None:
         """End this rank's listener. Each rank stops its own."""
         self._stop.set()
+        # A gather still running receives its own replies.
+        if self._rank == 0 and self._gather_lock.acquire(blocking=False):
+            try:
+                self._drain_replies()
+            finally:
+                self._gather_lock.release()
         if self._thread is not None:
-            self._thread.join(timeout=2 * _POLL_S + 5)
+            timeout = 2 * _POLL_S + 5
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                logger.warning(
+                    f"memory monitor: rank {self._rank}'s report listener did not stop "
+                    f"within {timeout:g} s"
+                )

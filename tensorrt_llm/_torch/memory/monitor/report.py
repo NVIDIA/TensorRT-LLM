@@ -28,14 +28,14 @@ from typing import TYPE_CHECKING
 
 from .capability import Capability
 from .frame import Frame, derived_entries
-from .schema import Category, Entry, Placement
+from .schema import GIB, Category, Entry, Placement
 
 if TYPE_CHECKING:
     from .checks import CheckResult
 
 __all__ = ["UNAVAILABLE", "UNSUPPORTED", "render"]
 
-_GIB = float(1 << 30)
+_GIB = float(GIB)
 
 UNKNOWN = "       unknown"
 UNAVAILABLE = "   unavailable"
@@ -205,12 +205,14 @@ def render(
         for entry in excluded:
             add(_entry_line(entry))
 
-    if frame.unknown_categories:
+    unmeasured = [e for e in frame.entries if e.counts_toward_total and e.size_bytes is None]
+    if unmeasured:
         add("")
         add("[unmeasured]")
-        add(f"  {len(frame.unknown_categories)} provider(s) reported unavailable rather than zero:")
-        for category in frame.unknown_categories:
-            add(f"    {category}")
+        add(f"  {len(unmeasured)} entr(ies) reported unavailable rather than zero:")
+        for entry in unmeasured:
+            note = f" -- {entry.note}" if entry.note else ""
+            add(f"    {entry.owner or entry.category} ({entry.category}){note}")
 
     if frame.residual_is_negative:
         add("")
@@ -225,13 +227,19 @@ def render(
         add("          precisely the case worth investigating.")
 
     if checks:
-        failed = [c for c in checks if not c.passed]
+        # An informational check reports a figure and cannot fail, so it is
+        # not counted as passed.
+        info = [c for c in checks if getattr(c, "informational", False)]
+        verdicts = [c for c in checks if not getattr(c, "informational", False)]
+        failed = [c for c in verdicts if not c.passed]
         add("")
-        add(f"[checks] {len(checks) - len(failed)} passed, {len(failed)} FAILED")
+        add(f"[checks] {len(verdicts) - len(failed)} passed, {len(failed)} FAILED")
         # Failures first: a check that fails means two independent readings
         # disagree, which is the most important line in the report.
-        for check in failed + [c for c in checks if c.passed]:
+        for check in failed + [c for c in verdicts if c.passed]:
             add(f"  {'FAILED' if not check.passed else 'ok':<7s}{check.name:<28s}{check.detail}")
+        for check in info:
+            add(f"  {'info':<7s}{check.name:<28s}{check.detail}")
 
     return "\n".join(out)
 
@@ -247,10 +255,12 @@ def summarize_by_category(frame: Frame) -> dict[Category, int | None]:
         if not entry.counts_toward_total:
             continue
         if entry.size_bytes is None:
-            totals.setdefault(entry.category, None)
+            # An unknown part makes the category's total unknown.
+            totals[entry.category] = None
             continue
-        current = totals.get(entry.category)
-        totals[entry.category] = entry.size_bytes + (current or 0)
+        if entry.category in totals and totals[entry.category] is None:
+            continue
+        totals[entry.category] = entry.size_bytes + (totals.get(entry.category) or 0)
     for entry in derived_entries(frame):
         totals[entry.category] = entry.size_bytes
     return totals

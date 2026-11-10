@@ -14,9 +14,12 @@
 # limitations under the License.
 """``trtllm-serve``'s ``GET /memory_report``.
 
-The route exists only while the GPU memory monitor is on.
+The route exists only in the monitor's full mode with the runtime-control
+endpoints enabled, and takes their authentication.
 """
 
+import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,17 +29,26 @@ from fastapi.testclient import TestClient
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.runtime_control_auth import (
+    RuntimeControlReplayCache,
+    build_runtime_control_auth_headers,
+)
 
 pytestmark = pytest.mark.cpu_only
 
+_KEY = "test-runtime-control-key"
 
-def _server(monkeypatch, *, monitor: bool, asynchronous: bool = False):
-    if monitor:
-        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
-    else:
+
+def _server(monkeypatch, *, monitor="1", runtime_control=True, asynchronous=False):
+    if monitor is None:
         monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_MEM_MONITOR", monitor)
     server = object.__new__(OpenAIServer)
     server.app = FastAPI()
+    server._enable_runtime_control_endpoints = runtime_control
+    server._runtime_control_api_key = _KEY if runtime_control else None
+    server._runtime_control_replay_cache = RuntimeControlReplayCache()
     server.generator = object.__new__(AsyncLLM if asynchronous else LLM)
     factory = AsyncMock if asynchronous else MagicMock
     server.generator.get_memory_report = factory(return_value=["rank 0 report"])
@@ -44,26 +56,68 @@ def _server(monkeypatch, *, monitor: bool, asynchronous: bool = False):
     return server
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
-def test_returns_each_workers_report(monkeypatch, asynchronous):
-    server = _server(monkeypatch, monitor=True, asynchronous=asynchronous)
-    with TestClient(server.app) as client:
-        response = client.get("/memory_report")
-    assert response.status_code == 200
-    assert response.json() == {"reports": ["rank 0 report"]}
+def _get(client):
+    headers = build_runtime_control_auth_headers(_KEY, "GET", "/memory_report", b"")
+    return client.get("/memory_report", headers=headers)
 
 
-def test_absent_when_the_monitor_is_off(monkeypatch):
-    # Off costs nothing and exposes nothing; sleep mode is not involved.
-    server = _server(monkeypatch, monitor=False)
+def test_returns_each_workers_report(monkeypatch):
+    for asynchronous in (False, True):
+        server = _server(monkeypatch, asynchronous=asynchronous)
+        with TestClient(server.app) as client:
+            response = _get(client)
+        assert response.status_code == 200, f"asynchronous={asynchronous}"
+        assert response.json() == {"reports": ["rank 0 report"]}
+
+
+def test_requires_authentication(monkeypatch):
+    server = _server(monkeypatch)
     with TestClient(server.app) as client:
-        assert client.get("/memory_report").status_code == 404
+        assert client.get("/memory_report").status_code == 401
+
+
+def test_exists_only_in_full_mode_with_runtime_control(monkeypatch):
+    for monitor, runtime_control in [(None, True), ("0", True), ("1", False)]:
+        server = _server(monkeypatch, monitor=monitor, runtime_control=runtime_control)
+        with TestClient(server.app) as client:
+            assert _get(client).status_code == 404, f"{monitor=} {runtime_control=}"
+
+    # The frontend is rank 0 and serves every rank's report, so a rank
+    # filter that leaves rank 0 out does not remove the route.
+    monkeypatch.setenv("TLLM_MEM_MONITOR_RANKS", "1")
+    server = _server(monkeypatch)
+    with TestClient(server.app) as client:
+        assert _get(client).status_code == 200
 
 
 def test_failure_is_an_internal_error(monkeypatch):
-    server = _server(monkeypatch, monitor=True)
+    server = _server(monkeypatch)
     server.generator.get_memory_report.side_effect = RuntimeError("worker gone")
     with TestClient(server.app) as client:
-        response = client.get("/memory_report")
+        response = _get(client)
     assert response.status_code == 500
     assert "worker gone" in response.json()["error"]["message"]
+
+
+def test_concurrent_requests_share_one_gather(monkeypatch):
+    server = _server(monkeypatch)
+    calls = []
+    release = threading.Event()
+
+    def slow_report():
+        calls.append(1)
+        release.wait(5)
+        return ["rank 0 report"]
+
+    server.generator.get_memory_report = slow_report
+
+    async def two_requests():
+        first = asyncio.ensure_future(server.memory_report())
+        second = asyncio.ensure_future(server.memory_report())
+        await asyncio.sleep(0.1)
+        release.set()
+        return await asyncio.gather(first, second)
+
+    responses = asyncio.run(two_requests())
+    assert [r.status_code for r in responses] == [200, 200]
+    assert len(calls) == 1, "one gather served both requests"

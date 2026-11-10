@@ -350,15 +350,17 @@ public:
     // Get the number of buffers in use for a communicator
     size_t getBufferInUseCount(ncclComm_t comm) const;
 
-    // Buffers held on one device across all communicators. Sizes are as requested; ncclMemAlloc
-    // rounds each allocation up to its granularity.
+    //! \brief Window buffers held on one device across all communicators.
+    //!
+    //! Sizes are as requested; ncclMemAlloc rounds each allocation up to its granularity.
     struct DeviceUsage
     {
-        size_t bufferCount{0};
-        size_t totalBytes{0};
-        size_t inUseBytes{0};
+        size_t bufferCount{0}; //!< Buffers pooled on the device, checked out or not.
+        size_t totalBytes{0};  //!< Requested bytes of those buffers.
+        size_t inUseBytes{0};  //!< Requested bytes of the buffers currently checked out.
     };
 
+    //! \brief Usage on `device`; all zero for a device with no buffers.
     DeviceUsage getDeviceUsage(int device) const;
 
     // Check if a communicator is valid (non-null)

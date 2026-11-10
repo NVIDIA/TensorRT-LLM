@@ -31,15 +31,22 @@ Three orthogonal axes describe every entry, and they must stay orthogonal:
 A fourth axis, ``source``, records how the number was obtained, so a reader can
 tell a measured value from a subtracted one.
 
+Whether an entry is summed into the process total is decided by
+``counts_toward_total`` alone. ``basis`` and ``source`` describe the number
+for the reader and are shown in the detail section; they do not change any
+sum.
+
 Unknown is represented by ``None`` and never by ``0``. A provider that cannot
 find its host object reports ``available() is False``; it does not report zero
 bytes.
 """
 
 from dataclasses import dataclass
-from enum import Enum
+
+from strenum import StrEnum
 
 __all__ = [
+    "GIB",
     "Basis",
     "Category",
     "Entry",
@@ -48,11 +55,7 @@ __all__ = [
 ]
 
 
-class StrEnum(str, Enum):
-    """``str``-valued enum (``enum.StrEnum`` needs Python 3.11+)."""
-
-    def __str__(self) -> str:
-        return str(self.value)
+GIB = 1 << 30
 
 
 class Category(StrEnum):
@@ -78,6 +81,9 @@ class Category(StrEnum):
     COMM_NVLS = "comm.nvls"
     COMM_NCCL_WINDOW = "comm.nccl_window"
     COMM_NCCL = "comm.nccl"
+    #: CUDA IPC buffers shared with peer ranks, such as the custom allreduce
+    #: workspace.
+    COMM_IPC = "comm.ipc"
     COMM_ULYSSES = "comm.ulysses"
     NATIVE_WORKSPACE = "native.workspace"
     EPLB = "eplb"
@@ -138,10 +144,11 @@ class Placement(StrEnum):
 class Basis(StrEnum):
     """What the number measures.
 
-    The distinction is load bearing. DeepEP reports the size it asked for
-    rather than the heap actually reserved, and a KV pool's in-use split is
-    a division of memory already counted as physical. Mixing these with
-    physical backing produces a plausible, wrong total.
+    DeepEP reports the size it asked for rather than the heap actually
+    reserved, and a KV pool's in-use split is a division of memory already
+    counted as physical. A provider whose number is not physical backing of
+    its own sets ``counts_toward_total=False`` on that entry; the basis tells
+    the reader why.
     """
 
     #: Device memory actually backed by physical pages right now.

@@ -24,13 +24,11 @@ Covered elsewhere:
 * MoE all-to-all workspaces are ``MnnvlMemory``: :class:`~.mnnvl.MnnvlProvider`.
 * NCCL communicators and the fused GEMM+allreduce NVLS workspace are recorded
   by the C++ code that creates them: :class:`~.native.NativeMemoryProvider`.
-* Custom-allreduce IPC workspaces expose no allocation size, so they are
-  measured as a named region around their creation instead.
 """
 
 from ..schema import Basis, Category, Entry, Placement, Source
 
-__all__ = ["McastAllReduceProvider", "NcclWindowProvider", "SymmMemProvider"]
+__all__ = ["IpcMemoryProvider", "McastAllReduceProvider", "NcclWindowProvider", "SymmMemProvider"]
 
 
 class SymmMemProvider:
@@ -38,9 +36,8 @@ class SymmMemProvider:
 
     Each instance belongs to an ``AllReduce`` submodule and there is no
     registry, so this reuses the model the weights were claimed from. torch
-    symmetric memory bypasses the caching allocator: measured on torch 2.14,
-    a 256 MiB ``symm_mem.empty`` raised ``memory_reserved()`` by 0 and device
-    usage by 258 MiB.
+    symmetric memory bypasses the caching allocator, so these buffers are in
+    device usage but not in ``memory_reserved()``.
     """
 
     name = "comm.symm_mem"
@@ -91,22 +88,14 @@ class McastAllReduceProvider:
     name = "comm.mcast_allreduce"
     category = Category.COMM_NVLS
 
-    def _cls(self):
-        try:
-            from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-        except ImportError:
-            return None
-        return MNNVLAllReduce
-
     def available(self) -> bool:
-        return self._cls() is not None
+        return True
 
     def collect(self) -> list[Entry]:
-        cls = self._cls()
-        if cls is None:
-            return []
-        workspaces = list(getattr(cls, "allreduce_mnnvl_workspaces", {}).values())
-        for retired in getattr(cls, "allreduce_mnnvl_retired_workspaces", {}).values():
+        from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+
+        workspaces = list(MNNVLAllReduce.allreduce_mnnvl_workspaces.values())
+        for retired in MNNVLAllReduce.allreduce_mnnvl_retired_workspaces.values():
             workspaces.extend(retired)
 
         total = 0
@@ -178,4 +167,38 @@ class NcclWindowProvider:
                     "requested size, ncclMemAlloc rounds up"
                 ),
             )
+        ]
+
+
+class IpcMemoryProvider:
+    """Buffers allocated through ``IpcMemory``, by what they are for.
+
+    Covers the custom and low-precision allreduce workspaces and the TP peer
+    exchange buffers. ``IpcMemory`` knows the exact size it allocated on this
+    GPU; the peers' buffers it maps are theirs and are not counted here.
+    """
+
+    name = "comm.ipc"
+    category = Category.COMM_IPC
+
+    def available(self) -> bool:
+        return True
+
+    def collect(self) -> list[Entry]:
+        import torch
+
+        from tensorrt_llm._ipc_utils import IpcMemory
+
+        usage = IpcMemory.live_allocations(torch.cuda.current_device())
+        return [
+            Entry(
+                category=Category.COMM_IPC,
+                size_bytes=nbytes,
+                source=Source.COMPONENT,
+                placement=Placement.NON_TORCH,
+                basis=Basis.PHYSICAL_BACKING,
+                owner=label,
+                note=f"{count} CUDA IPC buffer(s) on this GPU; 2 MiB-aligned size",
+            )
+            for label, (count, nbytes) in sorted(usage.items())
         ]

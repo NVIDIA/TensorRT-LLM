@@ -486,14 +486,7 @@ public:
 
     ~FusedMoeRunner()
     {
-        if (mProfileWorkspace != nullptr)
-        {
-            auto const cu_free_status = cudaFree(mProfileWorkspace);
-            TORCH_CHECK(
-                cu_free_status == cudaSuccess, "Can't free profile workspace during FusedMoeRunner destruction.");
-            tensorrt_llm::common::recordNativeRelease(
-                kProfileWorkspaceLabel, mProfileWorkspaceDevice, static_cast<std::int64_t>(mProfileWorkspaceSize));
-        }
+        freeProfileWorkspace();
     }
 
     FusedMoeRunner(FusedMoeRunner const&) = delete;
@@ -1278,7 +1271,8 @@ private:
     // Held from a profiling preparation until the next MoE run, preparation or destruction.
     size_t mProfileWorkspaceSize = 0;
     int mProfileWorkspaceDevice = 0;
-    static constexpr char const* kProfileWorkspaceLabel = "moe_gemm_profiler_workspace";
+    static constexpr char const* kProfileWorkspaceLabel
+        = tensorrt_llm::common::native_memory_label::kMoeGemmProfilerWorkspace;
     std::map<std::pair<int, cudaStream_t>, WorkspaceInfo> mStreamWorkspaces;
     ActivationParamBuffers mActivationParamBuffers;
 
@@ -1432,8 +1426,7 @@ private:
         if (mProfileWorkspace != nullptr)
         {
             auto const cu_free_status = cudaFree(mProfileWorkspace);
-            TORCH_CHECK(cu_free_status == cudaSuccess,
-                "Can't free profile workspace for MoE GEMM profile during memory reallocation.");
+            TORCH_CHECK(cu_free_status == cudaSuccess, "Can't free the MoE GEMM profile workspace.");
             mProfileWorkspace = nullptr;
             tensorrt_llm::common::recordNativeRelease(
                 kProfileWorkspaceLabel, mProfileWorkspaceDevice, static_cast<std::int64_t>(mProfileWorkspaceSize));

@@ -33,11 +33,11 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .frame import Frame
-from .schema import Category, Source
+from .schema import GIB, Category, Source
 
 __all__ = ["GROUP_OF", "Group", "GroupTotals", "group_totals", "render_summary"]
 
-_GIB = float(1 << 30)
+_GIB = float(GIB)
 
 #: Rows smaller than this print as 0.00 GiB and are left out.
 _SHOWN = 5 << 20
@@ -88,6 +88,7 @@ GROUP_OF: dict[Category, Group | None] = {
     Category.COMM_NVLS: Group.COMMUNICATION,
     Category.COMM_NCCL_WINDOW: Group.COMMUNICATION,
     Category.COMM_NCCL: Group.COMMUNICATION,
+    Category.COMM_IPC: Group.COMMUNICATION,
     Category.COMM_ULYSSES: Group.COMMUNICATION,
     Category.NATIVE_WORKSPACE: Group.WORKSPACE,
     # Expert weight slots the load balancer moved out of PyTorch.
@@ -209,6 +210,11 @@ def _released_line(frame: Frame) -> str:
     return f"  Released by sleep mode, returns on wakeup (not in the rows above): {listed}."
 
 
+def _baseline_of(baseline: dict[Group, int | None], group: Group) -> int | None:
+    """A group's size at warmup: absent means it held nothing, ``None`` unknown."""
+    return baseline.get(group, 0)
+
+
 def _size(value: int | None) -> str:
     return "     unknown" if value is None else f"{value / _GIB:8.2f} GiB"
 
@@ -286,9 +292,9 @@ def render_summary(
         return -(item[1] or 0)
 
     for group, size in sorted(totals.sizes.items(), key=sort_key):
-        changed = (
-            has_baseline and size is not None and abs(size - (baseline.get(group) or 0)) >= _SHOWN
-        )
+        before = _baseline_of(baseline, group) if has_baseline else None
+        changed = has_baseline and size is not None and before is not None
+        changed = changed and abs(size - before) >= _SHOWN
         if size is not None and abs(size) < _SHOWN and not changed:
             continue
         share = (
@@ -298,7 +304,7 @@ def render_summary(
         )
         line = f"  {group.value:<28s}{_size(size):>12s}{share}"
         if has_baseline:
-            line += f"{_delta(size, baseline.get(group, 0)):>15s}"
+            line += f"{_delta(size, before):>15s}"
         note = _NOTES[group]
         if group is Group.OVERHEAD and totals.unmeasured:
             note += "; also holds what could not be measured: " + ", ".join(totals.unmeasured)
@@ -374,9 +380,9 @@ def _conclusion(
         # The allocator's free cache is left out: warmup can leave it large
         # or small, so its change says little about what the workload did.
         growth = {
-            g: s - (baseline.get(g) or 0)
+            g: s - _baseline_of(baseline, g)
             for g, s in known.items()
-            if g is not Group.TORCH_CACHE and baseline.get(g) is not None
+            if g is not Group.TORCH_CACHE and _baseline_of(baseline, g) is not None
         }
         # Growth too small to print is not growth; naming it would point
         # the reader at a row showing +0.00.
@@ -416,10 +422,14 @@ def _conclusion(
     # Growth after warmup, which already ran the largest batch, is the most
     # specific evidence a report has; when it is large or memory ran out it
     # outranks the generic advice for the row.
-    explained = _growth_suggestion(focus, grew, advice.get(focus), sites)
+    activation = _profiled_activation()
+    explained = _growth_suggestion(focus, grew, advice.get(focus), sites, activation)
+    unexplained = grew
+    if focus is Group.TORCH_UNATTRIBUTED and activation:
+        unexplained = grew - activation
     if suggestion:
         lines.append(f"  Suggestion: {suggestion}.")
-    elif explained and (alarm or grew >= _GROWTH_WORTH_NAMING):
+    elif explained and (alarm or unexplained >= _GROWTH_WORTH_NAMING):
         lines.append(f"  Suggestion: {explained}.")
     elif focus in advice:
         lines.append(f"  Suggestion: {advice[focus]}.")
@@ -431,27 +441,57 @@ def _conclusion(
 _GROWTH_WORTH_NAMING = 1 << 30
 
 
+def _profiled_activation() -> int | None:
+    """PyTorch memory the profiled forward pass allocated, if startup measured it."""
+    from . import startup
+
+    plan = startup.memory_plan()
+    return plan.activation if plan is not None else None
+
+
 def _growth_suggestion(
-    focus: Group, grew: int, advice: str | None, sites: dict[str, int] | None
+    focus: Group,
+    grew: int,
+    advice: str | None,
+    sites: dict[str, int] | None,
+    activation: int | None = None,
 ) -> str:
-    """What to do about a row that grew since warmup, or ``""``."""
+    """What to do about a row that grew since warmup, or ``""``.
+
+    The warmup baseline is taken at rest, while a report from inside a
+    forward pass also holds that step's activations, untagged. Growth in
+    PyTorch memory with no owner is therefore called held memory only beyond
+    what the profiled forward pass allocated.
+    """
     if not grew:
         return ""
     amount = f"{grew / _GIB:.2f} GiB"
     if focus is Group.TORCH_UNATTRIBUTED:
-        fallback = f"; if it is activation memory, {advice}" if advice else ""
+        to_reduce = f"; to reduce activation memory, {advice}" if advice else ""
+        if activation and grew - activation < _SHOWN:
+            return (
+                f"PyTorch memory with no known owner grew {amount} after warmup, within the "
+                f"{activation / _GIB:.2f} GiB the profiled forward pass allocated, so it is most "
+                f"likely activations of the step in flight{to_reduce}"
+            )
+        if activation:
+            beyond = (
+                f"{(grew - activation) / _GIB:.2f} GiB more than the profiled forward pass "
+                f"allocated ({activation / _GIB:.2f} GiB)"
+            )
+        else:
+            beyond = "and no forward pass was profiled to tell activations apart"
         if sites:
             site, size = max(sites.items(), key=lambda kv: kv[1])
             return (
-                f"PyTorch memory with no known owner grew {amount} after warmup, which already "
-                f"ran the largest batch; most of it was allocated by {site} "
-                f"({size / _GIB:.2f} GiB) and is still held{fallback}"
+                f"PyTorch memory with no known owner grew {amount} after warmup, {beyond}; most "
+                f"of it was allocated by {site} ({size / _GIB:.2f} GiB) and is still held"
+                f"{to_reduce}"
             )
         return (
-            f"PyTorch memory with no known owner grew {amount} after warmup, which already ran "
-            "the largest batch, so something is holding on to memory (a cache, a callback, a "
-            "leak); rerun with TLLM_MEM_MONITOR_STACKS=1 to name the code that allocated it"
-            f"{fallback}"
+            f"PyTorch memory with no known owner grew {amount} after warmup, {beyond}, so "
+            "something may be holding on to memory (a cache, a callback, a leak); rerun with "
+            f"TLLM_MEM_MONITOR_STACKS=1 to name the code that allocated it{to_reduce}"
         )
     if focus is Group.OVERHEAD:
         return (

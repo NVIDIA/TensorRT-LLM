@@ -15,10 +15,10 @@
 """Communication buffers outside the PyTorch allocator.
 
 Multicast buffers need several GPUs to create, so the providers' reading of
-the owning objects is checked against stand-ins shaped like them. That
-symmetric memory bypasses the caching allocator was measured separately on
-torch 2.14 (256 MiB requested: memory_reserved +0, device +258 MiB).
+the owning objects is checked against stand-ins shaped like them.
 """
+
+import weakref
 
 import pytest
 import torch
@@ -26,13 +26,12 @@ import torch
 from tensorrt_llm._torch.memory.monitor import tagging
 from tensorrt_llm._torch.memory.monitor.providers import default_providers
 from tensorrt_llm._torch.memory.monitor.providers.comm import (
+    IpcMemoryProvider,
     McastAllReduceProvider,
     SymmMemProvider,
 )
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category
 from tensorrt_llm._torch.memory.monitor.summary import GROUP_OF, Group
-
-pytestmark = pytest.mark.cpu_only
 
 MB = 1 << 20
 
@@ -56,6 +55,7 @@ class _AllReduce(torch.nn.Module):
         self.symm_mem_allreduce = inst
 
 
+@pytest.mark.cpu_only
 def test_symm_mem_walks_the_claimed_model_and_counts_shared_buffers_once():
     assert SymmMemProvider().available() is False, "no claimed model, nothing to walk"
 
@@ -80,11 +80,12 @@ def _workspace(nbytes):
     return {"uc_buffer": torch.empty(nbytes // 4, dtype=torch.float32), "buffer_size_bytes": 0}
 
 
+@pytest.mark.cpu_only
 def test_mcast_allreduce_counts_active_and_retired_workspaces(monkeypatch):
     from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 
     kinds = {type(p) for p in default_providers()}
-    assert SymmMemProvider in kinds and McastAllReduceProvider in kinds
+    assert {SymmMemProvider, McastAllReduceProvider, IpcMemoryProvider} <= kinds
 
     def workspaces(active, retired):
         monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", active)
@@ -106,6 +107,7 @@ def test_mcast_allreduce_counts_active_and_retired_workspaces(monkeypatch):
     assert workspaces({"tp0": ws}, {})[0].size_bytes == 12 * MB
 
 
+@pytest.mark.cpu_only
 def test_nccl_window_counts_pooled_buffers_whether_or_not_checked_out(monkeypatch):
     from tensorrt_llm._torch.memory.monitor.providers.comm import NcclWindowProvider
 
@@ -118,3 +120,53 @@ def test_nccl_window_counts_pooled_buffers_whether_or_not_checked_out(monkeypatc
     assert entry.size_bytes == 96 * MB
     assert GROUP_OF[entry.category] is Group.COMMUNICATION
     assert collect([0, 0, 0]) == [], "no buffers, no row"
+
+
+def _ipc_stand_in(label, device, nbytes):
+    from tensorrt_llm._ipc_utils import IpcMemory
+
+    ipc = object.__new__(IpcMemory)
+    ipc.label, ipc.device, ipc.nbytes, ipc.open_ipc = label, device, nbytes, False
+    return ipc
+
+
+@pytest.mark.cpu_only
+def test_ipc_buffers_are_counted_by_purpose_on_this_device(monkeypatch):
+    from tensorrt_llm._ipc_utils import IpcMemory
+
+    monkeypatch.setattr(IpcMemory, "_live", weakref.WeakSet())
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    held = [
+        _ipc_stand_in("custom allreduce workspace", 0, 64 * MB),
+        _ipc_stand_in("custom allreduce workspace", 0, 2 * MB),
+        _ipc_stand_in("TP peer exchange buffers", 0, 4 * MB),
+        # Another rank's GPU in the same process is not this device's memory.
+        _ipc_stand_in("custom allreduce workspace", 1, 64 * MB),
+    ]
+    for ipc in held:
+        IpcMemory._live.add(ipc)
+    entries = {e.owner: e for e in IpcMemoryProvider().collect()}
+    assert entries["custom allreduce workspace"].size_bytes == 66 * MB
+    assert entries["TP peer exchange buffers"].size_bytes == 4 * MB
+    assert GROUP_OF[entries["TP peer exchange buffers"].category] is Group.COMMUNICATION
+    assert entries["TP peer exchange buffers"].basis is Basis.PHYSICAL_BACKING
+    held.clear()
+    assert IpcMemoryProvider().collect() == [], "freed buffers leave the report"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_ipc_memory_records_the_size_it_allocated():
+    from tensorrt_llm._ipc_utils import IpcMemory
+    from tensorrt_llm.mapping import Mapping
+
+    device = torch.cuda.current_device()
+    before = IpcMemory.live_allocations(device).get("unit", (0, 0))
+    free_before = torch.cuda.mem_get_info()[0]
+    ipc = IpcMemory(Mapping(world_size=1, rank=0, tp_size=1), 3 * MB, True, "unit")
+    assert ipc.open_ipc
+    count, nbytes = IpcMemory.live_allocations(device)["unit"]
+    # Rounded up to the 2 MiB IPC alignment, and as much as the device lost.
+    assert (count, nbytes) == (before[0] + 1, before[1] + 4 * MB)
+    assert free_before - torch.cuda.mem_get_info()[0] >= 4 * MB
+    del ipc
+    assert IpcMemory.live_allocations(device).get("unit", (0, 0)) == before

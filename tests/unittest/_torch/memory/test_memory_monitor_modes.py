@@ -40,7 +40,11 @@ def test_values(monkeypatch):
         ("oom", "oom"),
         ("OOM", "oom"),
         ("0", "off"),
+        ("off", "off"),
+        ("false", "off"),
         ("1", "full"),
+        ("full", "full"),
+        ("on", "full"),
     ]:
         if value is None:
             monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
@@ -54,15 +58,16 @@ def test_values(monkeypatch):
     from tensorrt_llm.logger import logger
 
     monkeypatch.setattr(logger, "warning", warnings.append)
-    mon._warned_values.discard("yes-please")
+    monkeypatch.setattr(mon, "_warned", set())
     assert mon.mode() == "oom"
-    assert warnings and "expected 0, oom or 1" in warnings[0]
+    assert mon.mode() == "oom"
+    assert len(warnings) == 1 and "is not one of 0, oom, 1" in warnings[0], "warned once"
 
 
 class TestDefaultReportsOnlyOutOfMemory:
     def test_reports_only_out_of_memory(self, monkeypatch):
         monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
-        monkeypatch.setenv(triggers.INTERVAL_VAR, "0.05")
+        monkeypatch.setenv(triggers.PERIODIC_INTERVAL_VAR, "1")
         seen = []
         monkeypatch.setenv("TLLM_MEM_MONITOR_OOM_INTERVAL", "0")
         monkeypatch.setattr(

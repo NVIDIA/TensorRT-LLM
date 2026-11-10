@@ -141,7 +141,7 @@ def test_memory_plan(monkeypatch):
     assert "Usage exceeds the startup plan by 3.00 GiB" in text
 
     # Sizing measured after emptying the cache, and the workload can
-    # reuse it. Counting it flagged a healthy startup as over plan.
+    # reuse it, so free PyTorch cache is not usage against the plan.
     # In use 180 - 153.5 = 26.5 GiB; 1 GiB of it is free cache; plan 26.
     text = rendered(10 * GIB, None, free=int(153.5 * GIB), kv=16 * GIB)
     assert "exceeds the startup plan" not in text, "free PyTorch cache counted against the plan"
@@ -168,8 +168,8 @@ def test_steps_only_in_startup_reports():
     assert "Memory taken by each startup step" in text
     assert "+1.00 GiB  Model" in text
 
-    # Device-wide deltas let another process's frees hide a step's cost;
-    # two runs once showed the weight-loading step as 1.08 and 0.06 GiB.
+    # A device-wide delta includes other processes' allocations and frees,
+    # so this process's own figure is shown whenever it is known.
     startup.clear()
     startup.set_stage_advice({"model": "Model"}, {})
     startup._stages.append(startup.StageSample("model", "Model", 100 * GIB, 100 * GIB, GIB))
@@ -250,11 +250,156 @@ def test_residual_breakdown(monkeypatch):
     parts = dict(startup.residual_breakdown(9 * GIB))
     assert parts["released since startup"] == -GIB, "freed parts are a negative remainder"
 
+    # A region of the temporary sizing executor leaves the breakdown once it
+    # is released; the step that released it no longer shows the release,
+    # and the parts still sum exactly.
+    startup.clear()
+    startup._first = startup.Reading(process=10 * GIB, torch=3 * GIB, known=2 * GIB)
+    startup._regions.append(startup.RegionSample("KV cache transfer buffers", "init", GIB))
+    startup._stages.append(startup.StageSample("init", "Sizing", 0, 0, residual_taken=GIB))
+    startup._active_stage = "extra"
+    startup.release_regions(("init",))
+    startup._stages.append(startup.StageSample("extra", "Extra", 0, 0, residual_taken=-GIB))
+    startup._regions.append(startup.RegionSample("KV cache transfer buffers", "kv", GIB))
+    startup._stages.append(startup.StageSample("kv", "KV cache", 0, 0, residual_taken=GIB))
+    parts = dict(startup.residual_breakdown(6 * GIB))
+    assert sum(parts.values()) == 6 * GIB, "parts sum to the residual"
+    assert parts["KV cache transfer buffers"] == GIB, "listed once, for the final executor"
+    assert parts["Sizing"] == 0 and parts["Extra"] == 0, "the temporary pair cancels out"
+    # Released outside every step: the remainder absorbs it, still exact.
+    startup.clear()
+    startup._first = startup.Reading(process=10 * GIB, torch=3 * GIB, known=2 * GIB)
+    startup._regions.append(startup.RegionSample("LoRA device cache", "init", GIB))
+    startup._stages.append(startup.StageSample("init", "Sizing", 0, 0, residual_taken=GIB))
+    startup.release_regions(("init",))
+    parts = dict(startup.residual_breakdown(5 * GIB))
+    assert sum(parts.values()) == 5 * GIB
+    assert "LoRA device cache" not in parts and parts["Sizing"] == 0
+    assert parts["since startup"] == 0, "released between steps cancels in the remainder"
+
     startup.clear()
     monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
     with startup.region("anything"):
         pass
     assert startup._regions == [], "a region is a no-op while off"
+
+
+@pytest.mark.cpu_only
+def test_failed_step_gets_its_advice_only_for_an_out_of_memory_failure(monkeypatch):
+    from tensorrt_llm._torch.memory.monitor import tagging, triggers
+
+    # The failed step keeps what this process took in it before failing.
+    readings = iter(
+        [
+            startup.Reading(process=10 * GIB, torch=4 * GIB, known=0),
+            startup.Reading(process=13 * GIB, torch=6 * GIB, known=0),
+        ]
+    )
+    monkeypatch.setattr(startup, "_reading", lambda: next(readings))
+    before = startup.begin_stage("kv_cache")
+    startup.record_failed_stage("kv_cache", 3 * GIB, before)
+    failed = startup.failed_stage()
+    assert (failed.process_taken, failed.residual_taken) == (3 * GIB, GIB)
+    assert "this process took +3.00 GiB in it before failing" in "\n".join(
+        startup.render_stage_lines()
+    )
+
+    calls = []
+    monkeypatch.setattr(triggers, "report_now", lambda **kw: calls.append(kw) or None)
+    startup.set_stage_advice({"kv_cache": "KV cache"}, {"kv_cache": "reduce the fraction"})
+    for out_of_memory, expected in ((True, "reduce the fraction"), (False, "")):
+        calls.clear()
+        tagging._log_window_result(
+            tagging.TagSnapshot(supported=False), failed=True, out_of_memory=out_of_memory
+        )
+        assert calls[0]["suggestion"] == expected, f"out_of_memory={out_of_memory}"
+
+    oom = torch.OutOfMemoryError("CUDA out of memory")
+    try:
+        raise RuntimeError("Executor creation failed") from oom
+    except RuntimeError as wrapped:
+        chained = wrapped
+    cases = [
+        (oom, True),
+        (chained, True),
+        (RuntimeError("Executor creation failed due to insufficient GPU memory."), True),
+        (RuntimeError("Failed, NCCL error: 'unhandled cuda error (run with NCCL_DEBUG)'"), True),
+        (KeyError("model.layers.0.weight"), False),
+    ]
+    for exc, expected in cases:
+        assert tagging._is_out_of_memory(exc) is expected, repr(exc)
+
+
+@pytest.mark.cpu_only
+def test_memory_plan_leaves_out_the_temporary_sizing_pool():
+    """The non-KV peak excludes the sizing KV pool the final cache replaces."""
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
+    model_engine = Mock()
+    model_engine.model.model_config.attn_backend = "TRTLLM"
+    model_engine.model.model_config.is_encoder_decoder = False
+    model_engine.mm_encoder_output_budget_bytes = None
+    model_engine.mm_encoder_cache = None
+    with patch.object(
+        KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=KVCacheManagerV2
+    ):
+        creator = KvCacheCreator(
+            model_engine=model_engine,
+            mapping=Mapping(),
+            net_max_seq_len=4096,
+            kv_connector_manager=None,
+            max_num_tokens=256,
+            max_beam_width=1,
+            tokens_per_block=128,
+            max_seq_len=4096,
+            max_batch_size=8,
+            kv_cache_config=KvCacheConfig(max_tokens=1024),
+            llm_args=Mock(cache_transceiver_config=None, enable_chunked_prefill=False),
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=False,
+        )
+    py_executor = Mock()
+    py_executor.warmup_scope.return_value = nullcontext()
+    py_executor.dist.mapping.rank = 0
+    py_executor.dist.broadcast.side_effect = lambda value, root: value
+    py_executor.await_responses.return_value = []
+    kv_manager = Mock()
+    sizing_pool = 300
+    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=sizing_pool)
+    py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
+    with (
+        # Sizing proper starts here; the plan has been recorded by then.
+        patch.object(creator, "_cal_max_memory", side_effect=RuntimeError("stop here")) as cal,
+        patch.object(torch.cuda, "mem_get_info", return_value=(400, 1024)),
+        patch.object(
+            torch.cuda,
+            "memory_stats",
+            return_value={"allocated_bytes.all.current": 128, "allocated_bytes.all.peak": 500},
+        ),
+        patch.object(creator, "_encode_dummy_inputs", return_value=None),
+        patch.object(creator, "_get_multimodal_encoder_memory_reserve", return_value=0),
+        patch.object(creator, "_get_penalty_workspace_reserve", return_value=0),
+        patch.object(torch.cuda, "empty_cache"),
+        patch.object(torch.cuda, "reset_peak_memory_stats"),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_fixed_bytes",
+            return_value=0,
+        ),
+        pytest.raises(RuntimeError, match="stop here"),
+    ):
+        creator.configure_kv_cache_capacity(py_executor)
+    peak, allocated = cal.call_args.args[0], cal.call_args.args[3]
+    assert allocated == sizing_pool
+    assert startup.memory_plan().non_kv_peak == peak - sizing_pool
 
 
 @pytest.mark.cpu_only

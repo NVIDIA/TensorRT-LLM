@@ -291,7 +291,7 @@ private:
     }
 
     // Neither buffer comes from the PyTorch caching allocator.
-    static constexpr char const* kSlotMemoryLabel = "ulysses_a2a_slots";
+    static constexpr char const* kSlotMemoryLabel = tensorrt_llm::common::native_memory_label::kUlyssesA2aSlots;
 
     // Lazy collective allocator. Cached when size is sufficient; reallocates
     // (releasing the old handle) on size-up. All ranks must reach this in the
@@ -355,9 +355,12 @@ private:
         if (slot.sendBuf != nullptr)
         {
             (void) cudaFree(slot.sendBuf);
-            // The send buffer and the symmetric receive buffer, both slot.size bytes.
+            // A slot holds a send buffer and a symmetric receive buffer, both slot.size bytes. mCanonicalHandle keeps
+            // the receive buffer of the handle it was taken from mapped, so replacing that slot frees only the send
+            // buffer.
+            bool const receiveStaysMapped = slot.handle.get() == mCanonicalHandle.get();
             tensorrt_llm::common::recordNativeRelease(
-                kSlotMemoryLabel, currentDev, 2 * static_cast<std::int64_t>(slot.size));
+                kSlotMemoryLabel, currentDev, (receiveStaysMapped ? 1 : 2) * static_cast<std::int64_t>(slot.size));
         }
         tensorrt_llm::common::recordNativeAllocation(
             kSlotMemoryLabel, currentDev, 2 * static_cast<std::int64_t>(requiredSize));

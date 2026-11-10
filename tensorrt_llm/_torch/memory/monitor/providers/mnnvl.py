@@ -14,7 +14,7 @@
 # limitations under the License.
 """MNNVL provider.
 
-Two things make a naive rollup wrong, and both have bitten us:
+Two things make a naive rollup wrong:
 
 **Filtering on ``MAPPED`` hides memory that is definitely resident.** Backing
 is created *after* the record moves to ``RESTORING``
