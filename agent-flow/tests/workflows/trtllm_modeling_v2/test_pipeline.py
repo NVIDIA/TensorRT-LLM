@@ -994,3 +994,22 @@ def test_a_landed_entry_is_read_as_the_certification_reads_it(tmp_path):
     assert problems() == []
     block = entry_repair_block(["Rms declares no CELLS: nothing is certified"])
     assert "Do not start the task again" in block and "- Rms declares no CELLS" in block
+
+
+def test_the_report_lists_what_the_workers_left_uncertified(tmp_path):
+    from agent_flow.workflows.trtllm_modeling_v2.run.certify import uncertified_lines
+
+    decisions = tmp_path / "decisions"
+    decisions.mkdir()
+    (decisions / "k1-rms-1.yaml").write_text("decision: LANDED\nuncertified: [old attempt]\n")
+    (decisions / "k1-rms-2.yaml").write_text(
+        "decision: LANDED\nuncertified:\n  - cached-prefix context (31+33 tokens) fails in shared code\n"
+    )
+    (decisions / "core-1.yaml").write_text(
+        "decision: UNIT_READY\nuncertified: |\n  lm_head at M=8192\n"
+    )
+    (decisions / "planner-3.yaml").write_text("decision: CONTINUE\nuncertified: [not a task]\n")
+    assert uncertified_lines(tmp_path) == [
+        "- `core`: lm_head at M=8192",
+        "- `k1-rms`: cached-prefix context (31+33 tokens) fails in shared code",
+    ]

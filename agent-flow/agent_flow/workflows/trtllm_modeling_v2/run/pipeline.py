@@ -12,8 +12,8 @@ The order is the code's, not an agent's::
     one task per configuration variant
     certification of the final commit (run/certify.py)
 
-Tasks run one at a time, but for a unit's kernel tasks, which run beside each
-other. Each task is one agent turn in its own worktree; when the worker says
+Tasks run one at a time, each from the commits of the ones before it (queue rows in
+dependency order). Each task is one agent turn in its own worktree; when the worker says
 it finished, its branch is audited and integrated (run/integration.py). The
 worker's conclusion is trusted: no check runs between tasks. Every check of
 the contract runs once, on the final commit.
@@ -64,7 +64,7 @@ from ..agents.prompts.survey import capture_lists_block
 from ..agents.prompts.tags import tag_section, task_tags
 from ..agents.turns import TurnTimeout
 from ..checks import gate_cli
-from ..checks.delivery import entry_contract
+from ..checks.delivery import entry_problems
 from ..infra.files import write_text_atomic
 from ..operators.coverage import (
     QueueItem,
@@ -136,8 +136,6 @@ class Task:
     #: A kernel task's vocabulary queue row, or ``<mode>:<entry>[@<site>]``.
     ref: str = ""
     goal: str = ""
-    #: Kernel tasks that must have ended before this one starts (queue row dependencies).
-    after: list[str] = field(default_factory=list)
     status: str = PENDING
     attempts: int = 0
     #: The decision its last turn wrote; empty when the turn wrote none.
@@ -286,7 +284,6 @@ class Pipeline:
                         unit=unit,
                         ref=str(item.n),
                         goal=f"{item.mode} `{item.target}` as vocabulary queue row {item.n} says",
-                        after=[row_task[n] for n in item.depends_on if n in row_task],
                     )
                 )
             kind = "assemble" if unit == first else "feature"
@@ -506,12 +503,7 @@ class Pipeline:
         module = Path(tree) / paths[0]
         if not module.is_file():
             return [f"`{paths[0]}` is not in your worktree"]
-        contract = entry_contract(module)
-        problems = list(contract.problems)
-        arch = str(self.w.task_data.get("arch") or "")
-        if arch and contract.archs and arch not in contract.archs:
-            problems.append(f"ARCHS names {', '.join(contract.archs)}, not {arch}")
-        return problems
+        return entry_problems(module, str(self.w.task_data.get("arch") or ""))[0]
 
     def _integrate(self, task: Task, role: str, tree: Path, block: str) -> str:
         """Audit and integrate ``task``'s branch; why it did not go in, or ``""``.

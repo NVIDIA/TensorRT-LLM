@@ -346,6 +346,7 @@ def delivery_report(workflow, commit: str, round: int = 0) -> DeliveryReport:
         ),
         model_key=resolve_model_key(task),
         accuracy_test=accuracy_test_path(repo, workflow._preflight.family, Path(target_rel).name),
+        arch=str(workflow.task_data.get("arch") or ""),
         commit_policy=workflow._commit_policy(),
     )
     checks = list(report.checks)
@@ -442,6 +443,35 @@ def _test_job(workflow, command: str, tree: Path, timeout_s: int) -> tuple[int, 
 # ------------------------------------------------------------------------------ the report
 
 
+def uncertified_lines(workspace: Path) -> list[str]:
+    """Each task's `uncertified` list from its last decision file, one line per item.
+
+    A worker states there what it measured and left out of an entry's `CELLS` or what a
+    unit calls outside them; the report is where the reader finds it.
+    """
+    last: dict[str, tuple[tuple[int, int], Path]] = {}
+    for path in sorted((workspace / "decisions").glob("*.yaml")):
+        task, _, token = path.stem.rpartition("-")
+        attempt, _, turn = token.partition(".")
+        if not task or not attempt.isdigit() or task == "planner":
+            continue
+        key = (int(attempt), int(turn) if turn.isdigit() else 1)
+        if task not in last or key > last[task][0]:
+            last[task] = (key, path)
+    lines: list[str] = []
+    for task, (_, path) in sorted(last.items()):
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, UnicodeError, yaml.YAMLError):
+            continue
+        items = data.get("uncertified") if isinstance(data, dict) else None
+        if isinstance(items, str):
+            items = [line for line in items.splitlines() if line.strip()]
+        for item in items or ():
+            lines.append(f"- `{task}`: {str(item).strip()}")
+    return lines
+
+
 def write_report(workflow, verdict: str, certification: Certification | None, tasks: str) -> Path:
     """``delivery_report.md``: the run's verdict, what was certified on which commit, and how.
 
@@ -490,6 +520,9 @@ def write_report(workflow, verdict: str, certification: Certification | None, ta
             "",
             matrix.render(),
         ]
+    left = uncertified_lines(workflow.workspace)
+    if left:
+        lines += ["", "## What the workers left uncertified", "", *left]
     lines += ["", "## Tasks", "", tasks or "(none ran)", ""]
     path = workflow.workspace / REPORT_FILENAME
     write_text_atomic(path, "\n".join(lines))

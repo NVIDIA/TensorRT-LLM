@@ -187,11 +187,18 @@ def _contract_detail(contract: EntryContract) -> str:
     return f"{'/'.join(contract.classes)}: {contract.cells} cell(s) on {', '.join(contract.archs)}"
 
 
-def _entry_problems(wrapper: Path) -> tuple[list[str], EntryContract | None]:
+def entry_problems(wrapper: Path, arch: str = "") -> tuple[list[str], EntryContract | None]:
+    """What makes an entry not certified: its contract read statically, and ``arch`` in ``ARCHS``.
+
+    The one rule a landing kernel task and the delivery check both apply.
+    """
     if not wrapper.is_file():
         return [f"entry missing: {wrapper}"], None
     contract = entry_contract(wrapper)
-    return list(contract.problems), contract
+    problems = list(contract.problems)
+    if arch and contract.archs and arch not in contract.archs:
+        problems.append(f"ARCHS names {', '.join(contract.archs)}, not {arch}")
+    return problems, contract
 
 
 def check_model_ops(
@@ -213,7 +220,7 @@ def check_model_ops(
                 )
             )
             continue
-        problems, contract = _entry_problems(repo_root / target_rel / rel)
+        problems, contract = entry_problems(repo_root / target_rel / rel)
         checks.append(
             Check(
                 name=f"ops:{rel}",
@@ -268,7 +275,7 @@ def _test_check(repo_root: Path, tests_dir: str, label: str, category: str, name
     )
 
 
-def _dependency_checks(repo_root: Path, target_rel: str) -> list[Check]:
+def _dependency_checks(repo_root: Path, target_rel: str, arch: str = "") -> list[Check]:
     """Audit static imports within the target, its family and catalog reexports.
 
     This is an import dependency check, not a runtime call graph: dynamic imports
@@ -422,7 +429,7 @@ def _dependency_checks(repo_root: Path, target_rel: str) -> list[Check]:
                             required = alias.name not in exported and "*" not in exported
                         follow(child, source, node.lineno, required=required)
     for entry in sorted(entries):
-        problems, contract = _entry_problems(entry)
+        problems, contract = entry_problems(entry, arch)
         rel = entry.relative_to(repo_root)
         checks.append(
             Check(f"entry:{rel}", not problems, "; ".join(problems) or _contract_detail(contract))
@@ -695,13 +702,14 @@ def verify_delivery(
     model_key: str,
     accuracy_test: str,
     commit_policy: CommitPolicy | None = None,
+    arch: str = "",
 ) -> DeliveryReport:
     """Run every mechanical delivery check and return the report."""
     root = Path(repo_root)
     checks: list[Check] = []
 
     checks.extend(check_target(root, target_rel))
-    checks.extend(_dependency_checks(root, target_rel))
+    checks.extend(_dependency_checks(root, target_rel, arch))
     checks.extend(check_routing(root, family, target_rel))
     checks.extend(check_accuracy_reference(root, reference_yaml, model_key))
     checks.extend(check_test_registration(root, accuracy_test))
