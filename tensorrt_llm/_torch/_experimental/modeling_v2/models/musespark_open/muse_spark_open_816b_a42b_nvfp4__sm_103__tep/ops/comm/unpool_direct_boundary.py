@@ -56,11 +56,14 @@ Ownership and reuse (cuFlow):
   keeps polling): a call sequence that differs between ranks, or a peer that
   stopped, shows up there, and ``start_guard_watch`` logs it from the host.
 
-Wide transport (TP4, ``max_rows=WIDE_MAX_ROWS``): the decode steps of two to four
-requests (16..32 rows) take a separate workspace whose slots hold 32
-rows (``3 buffers x 4 source ranks x 32 rows x 2048``), with its own buffer sequence;
-the kernel is the gather boundary's at those row counts (a cluster of 4 CTAs, one per
-peer slice) with the slot stride of 32 rows. The 8-row layout is unchanged.
+Wide transport (``max_rows=WIDE_MAX_ROWS``): the decode steps of two to four
+requests (16..32 rows) take a separate workspace whose slots hold 32 rows
+(``3 buffers x TP source ranks x 32 rows x 8192 / TP``), with its own buffer sequence;
+the kernel is the gather boundary's at those row counts (a cluster of 4 CTAs of 256
+threads: one peer slice per CTA at TP4, two at TP8 -- each thread picks its one peer from
+its own columns, ``unpool_gather_boundary._UnpoolGatherBoundaryKernel``) with the slot stride of
+32 rows. TP8 takes it under ``wide_direct_transports`` (sm103 TEP8,
+behind ``tep8_wide_direct_transports``). The 8-row layout is unchanged.
 
 PDL memory order: before ``griddepcontrol.wait`` the kernel touches shared
 memory and the cluster barrier only (and, with ``trigger="entry"``, releases
@@ -115,11 +118,10 @@ def workspace_bytes(max_rows: int = MAX_ROWS) -> int:
 
 
 def check_layout(world: int, max_rows: int) -> None:
-    """Raise unless ``(world, max_rows)`` is a served layout: 8 rows at TP4 or TP8, 32 rows at TP4."""
+    """Raise unless ``(world, max_rows)`` is a served layout: 8 or ``WIDE_MAX_ROWS`` rows per slot
+    at TP4 or TP8 (the gather boundary feeds both TP sizes at 9..32 rows)."""
     if world not in WORLDS or max_rows not in (MAX_ROWS, WIDE_MAX_ROWS):
         raise ValueError(f"no direct unpool layout for TP{world} and {max_rows} rows")
-    if max_rows == WIDE_MAX_ROWS and world != 4:
-        raise ValueError("the wide direct unpool layout is TP4 only")
 
 
 #: Per-rank control words, in pinned host memory the kernel stores to at system scope:
@@ -590,7 +592,7 @@ class UnpoolDirectWorkspace:
     ``slot(buffer, rows)`` is this rank's ``[rows, 8192 / TP]`` BF16 slot of buffer
     ``buffer`` on the multicast address: a GEMM given it as its output publishes
     into every rank's copy. ``max_rows`` is the slots' row capacity: 8, or
-    ``WIDE_MAX_ROWS`` for the wide layout (TP4). ``kernel(variant)`` is the compiled boundary for a
+    ``WIDE_MAX_ROWS`` for the wide layout. ``kernel(variant)`` is the compiled boundary for a
     call's settings. Construction is collective over the group (fabric
     allocation and sentinel fill), and so is ``build_variants``; both succeed on
     every rank or raise on every rank. Nothing compiles inside a CUDA graph

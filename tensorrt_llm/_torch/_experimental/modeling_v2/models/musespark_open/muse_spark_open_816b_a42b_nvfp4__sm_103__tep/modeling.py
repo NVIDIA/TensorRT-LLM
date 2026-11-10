@@ -414,6 +414,7 @@ from tensorrt_llm.logger import logger
 
 from . import dispatch as _dispatch
 from . import layers as _layers
+from . import lever_settings as _lever_settings
 from . import weights as _weights
 from .attention import DecodeAttentionPlan
 from .layers import _NO_ALLREDUCE, PostAttnHopCall
@@ -447,6 +448,8 @@ class MuseSparkOpenTepModelingV2(MuseSparkOpenModel):
     _finalize_two_shot: Optional[object]
     _wide_hop: Optional[object]
     _hot_replicas: Optional[object] = None
+    #: ``tep8_wide_direct_transports`` (``kernels/wide_direct_transports``), or None.
+    _wide_direct: Optional[object] = None
 
     @classmethod
     def adopt(
@@ -489,6 +492,7 @@ class MuseSparkOpenTepModelingV2(MuseSparkOpenModel):
         model._wide_hop = adopted.wide_hop
         model._wide_projections = adopted.wide_projections
         model._published_projections = adopted.published_projections
+        model._wide_direct = adopted.wide_direct
         model._batch_dense_gemms = adopted.batch_dense_gemms
         model._prefill = PrefillTarget(model, _dispatch.sm_of(compute_capability))
         model._decode = DecodeTarget(model)
@@ -734,6 +738,7 @@ class DecodeTarget:
         self.wide_projections = getattr(core, "_wide_projections", None)
         self.published_projections = getattr(core, "_published_projections", None)
         self.batch_dense_gemms = getattr(core, "_batch_dense_gemms", None)
+        self.wide_direct = getattr(core, "_wide_direct", None)
 
     def forward(
         self,
@@ -798,6 +803,10 @@ class DecodeTarget:
         wide_ar_armed = wide_ar is not None and wide_ar.takes(rows)
         wide_proj = self.wide_projections
         wide_proj_armed = wide_proj is not None and wide_proj.takes(rows)
+        # tep8_wide_direct_transports: 16/24/32-row steps of the wide projection
+        # chain publish the pool / unpool slices from their GEMMs (kernels/wide_direct_transports).
+        wide_direct = self.wide_direct
+        wide_direct_armed = wide_proj_armed and wide_direct is not None and wide_direct.takes(rows)
         published = self.published_projections
         published_armed = published is not None and published.takes(rows)
         two_shot = self.finalize_two_shot
@@ -824,6 +833,7 @@ class DecodeTarget:
             kv_splits.armed() if kv_splits_armed else contextlib.nullcontext(),
             wide_ar.armed() if wide_ar_armed else contextlib.nullcontext(),
             wide_proj.armed() if wide_proj_armed else contextlib.nullcontext(),
+            wide_direct.armed(rows) if wide_direct_armed else contextlib.nullcontext(),
             published.armed(rows) if published_armed else contextlib.nullcontext(),
             two_shot.armed() if two_shot_armed else contextlib.nullcontext(),
             hot.armed() if hot_armed else contextlib.nullcontext(),
@@ -875,30 +885,39 @@ _TEP4_ONLY_PATHS = frozenset(
 #: verify head of 16..1024-row decode steps on each rank's own vocabulary shard over the
 #: tray's multicast, and the drafter hops of 9..56-row block decodes on a wide one-shot
 #: transport.
+#: ``wide_drafter_hops`` and ``finalize_two_shot`` left this set when they became levers of
+#: both compositions (``levers._tep4_only``: on at tep4 as before, on its knob at tep8).
+#: The levers of the tep4 paths above are listed with them: the multi-request combine's
+#: norm-gate, the staged router GEMM and the wide direct transports of the sharded pool and
+#: unpool slices (whose ``wide_projection_gathers`` no tep8 composition serves).
 _SM103_TEP4_ONLY_PATHS = frozenset(
     {
         "hot_replicas",
         "multi_request_prep_append",
         "drafter_window_compact",
         "router_gemm",
+        "router_staged_gemm",
         "multi_request_split_kv",
+        "multi_request_combine_gate",
         "decode_kv_splits",
         "wide_moe_allreduce",
         "multi_request_post_attention_hop",
         "wide_projection_gathers",
+        "tep8_wide_direct_transports",
         "projection_publish",
         "context_sequence_parallel",
-        "finalize_two_shot",
         "batch_dense_gemms",
         "wide_drafter_window_attention",
         "wide_draft_topk",
         "wide_split_sampler",
         "context_prep",
         "vocab_parallel_head",
-        "wide_drafter_hops",
     }
 )
-#: TEP8: every base fast path (``dispatch.BASE_PATH_NAMES``) but the TP4-only ones.
+#: TEP8: every base fast path (``dispatch.BASE_PATH_NAMES``) but the TP4-only ones. The
+#: levers of the sm103 decode stack are base paths too, so this serves them; each is off
+#: until its knob is set (``levers.RULES``), ``wide_drafter_hops`` and ``finalize_two_shot``
+#: among them.
 _TEP8_PATHS = _dispatch.BASE_PATH_NAMES - _TEP4_ONLY_PATHS - _SM103_TEP4_ONLY_PATHS
 #: The fast paths written for any rank count whose output is bitwise the built-in
 #: model's.
@@ -973,6 +992,13 @@ _SM103_TEP4_PATHS = (
             "capture_fold",
             "moe_prologue",
             "finalize_transport",
+            # The two paths this composition has always carried; the wider one serves them
+            # too now, on its knob (``levers._tep4_only``).
+            "wide_drafter_hops",
+            "finalize_two_shot",
+            # The levers both compositions serve, each off until its knob is set.
+            "finalize_entry_trigger",
+            "drafter_fused_prep",
         }
     )
 )
@@ -988,6 +1014,12 @@ _PREFETCH_LEVERS = frozenset({"graph_start_qkv_prefetch"})
 #: DFlash drafting a linear chain of ``dispatch.DRAFT_LEN`` tokens on an NVFP4
 #: checkpoint; every other deployment runs the built-in modules only. The lever table
 #: (``dispatch.compose``) decides which served levers a deployment is built with.
+#: At TEP8 ``finalize_two_shot`` is the expert finalize and all-reduce of decode steps of
+#: 24..``TP8_MAX_ROWS`` rows (3 to 19 requests) as one two-shot kernel over the two trays'
+#: fabric (``kernels/finalize_two_shot``), in place of the built-in one-shot fused kernel at
+#: 24..128 rows (bitwise its result) and of the unfused combine, BF16 cast and MNNVL two-shot
+#: above (the fused kernel's rounding there, within one BF16 place of the unfused path's). The
+#: composition serves it; its lever leaves it off there until its knob is set.
 TARGET_PATHS = {
     (103, 8): _dispatch.TargetPaths(
         served=_TEP8_PATHS | _PREFETCH_LEVERS, topology=_dispatch.TWO_TRAYS_OF_4
@@ -1091,6 +1123,8 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
         )
         self._plan = plan
         self._mapping = getattr(model_config, "mapping", None)
+        # Before any installer: the kernel modules read these settings when they build.
+        _lever_settings.apply(plan)
         if plan and self._runtime_hooks is None:
             # Every composition serves both executor fast paths
             # (dispatch.TargetPaths); NO_PATHS declares no hooks.

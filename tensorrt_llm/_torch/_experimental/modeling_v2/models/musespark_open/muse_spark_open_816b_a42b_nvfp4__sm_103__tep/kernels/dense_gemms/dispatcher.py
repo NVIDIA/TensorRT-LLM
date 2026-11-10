@@ -27,6 +27,10 @@ Above 32 rows the built-in ``Linear`` never asks a low-M dispatcher, so a fast p
 that acts on larger decode steps arms the plan instead (``DenseGemmPlan.batch``, set
 for one decode forward by ``batch_dense_gemms``): while it is set, a re-classed
 projection's ``apply_linear`` hands the call to it with the built-in GEMM as a callable.
+With ``tep8_batch_splitk`` (``batch_splitk``, sm103 TEP8 only) and no such
+path armed, ``apply_linear`` runs a 33..160-row call of a site ``SM103_TP8_BATCH_KERNELS``
+names on ``ops/gemm/batch_splitk_gemm`` instead of the built-in cuBLAS call; the pooler and
+unpooler slices of those rows run it through ``projection_publish`` (``batch_splitk_apply``).
 
 With ``dense_gemm_prefetch`` a projection that ran also forks a side stream that asks the L2 to
 fetch the next projection's weight (QKV -> the same layer's attention output ->
@@ -144,6 +148,144 @@ TP4_REPLICATED_PROJECTION_KERNELS_BY_SM: Mapping[
 ] = {
     (10, 3): TP4_REPLICATED_PROJECTION_KERNELS,
 }
+
+
+#: ``batch_splitk``: the switch (read once, at ``install``). Off by default; on sm103 at TP8 with
+#: the sharded pooler and unpooler, ``1`` runs the 33..160-row decode calls (5..20 requests at
+#: K = 7) of the sites ``SM103_TP8_BATCH_KERNELS`` names on ``ops/gemm/batch_splitk_gemm`` (a
+#: cluster split-K kernel whose kernel-N tile holds up to 256 rows, reducing in DSMEM) instead
+#: of the built-in cuBLAS call (a split-K ``nvjet`` kernel plus ``cublasLt::splitKreduce`` for
+#: most of these shapes and rows). Anywhere else it changes nothing but a warning.
+#: The row band of ``batch_splitk``: above the 9..32-row wide band, up to the 20-request step.
+BATCH_MIN_ROWS = WIDE_MAX_ROWS + 1
+BATCH_MAX_ROWS = 160
+#: ``tep8_batch_splitk``: whether ``install`` builds that table. Off keeps the built-in calls.
+_BATCH_SPLITK = False
+
+
+def configure(*, batch_splitk: bool = False) -> None:
+    """Set whether ``install`` arms the batched split-K table.
+
+    ``lever_settings.apply`` sets it from the model's plan before any install; the default
+    keeps the built-in cuBLAS calls at every row count above the wide band.
+
+    Args:
+        batch_splitk: the ``tep8_batch_splitk`` lever (``_BATCH_SPLITK``).
+    """
+    global _BATCH_SPLITK
+    _BATCH_SPLITK = bool(batch_splitk)
+
+
+#: ``batch_splitk`` on sm103 at TP8 (per-rank QKV ``[2304, 8192]``, pooler slice ``[512, 8192]``,
+#: unpooler slice ``[1024, 4096]``), as ``(last row count, kernel)`` steps from 33 rows; rows past
+#: a site's last step keep the built-in call. ``bsplitk:<mma_m>,<mma_n>,<split_k>,<stages>``:
+#: ``mma_n`` public rows per CTA (a call takes ``ceil(rows / mma_n)`` row tiles). Every cell is
+#: split_k 4, the split_k of each site's 8-row cell in ``DEFAULT_KERNELS`` and of the 9..32-row
+#: kernels: K is summed in the same four slices in the same order, so every row gets the bits it
+#: gets in a one-request step (``install`` checks the split_k). Chosen in 62-layer chains of cold
+#: weights against the served cuBLAS call on one GB300 (microbench ``mb-h58-bsk-2``, each cell
+#: the fastest split_k-4 tactic launched without PDL; checked through the overlay in
+#: ``mb-h58-bsk-verify``): QKV one row tile (144 CTAs, the most clusters of 4 that fit) up to 128
+#: rows, -0.1..+2.2 us against cuBLAS without PDL and +1.1..+3.4 us with it (from 136 rows
+#: cuBLAS's two-CTA tiles tie or win); the pooler slice four row tiles (128 CTAs) and the
+#: unpooler slice two (128 CTAs), +0.2..+2.6 us without PDL at every row count. The attention
+#: output projection is not named: its split_k 1 cells (cuBLAS's bits) are slower than cuBLAS
+#: without PDL at every row count.
+SM103_TP8_BATCH_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": (
+        (40, "bsplitk:64,40,4,8"),
+        (48, "bsplitk:64,48,4,7"),
+        (56, "bsplitk:64,56,4,7"),
+        (64, "bsplitk:64,64,4,6"),
+        (72, "bsplitk:64,72,4,6"),
+        (80, "bsplitk:64,80,4,5"),
+        (88, "bsplitk:64,88,4,5"),
+        (96, "bsplitk:64,96,4,5"),
+        (104, "bsplitk:64,104,4,4"),
+        (112, "bsplitk:64,112,4,4"),
+        (120, "bsplitk:64,120,4,4"),
+        (128, "bsplitk:64,128,4,4"),
+    ),
+    "pool": (
+        (48, "bsplitk:64,24,4,10"),
+        (64, "bsplitk:64,16,4,11"),
+        (96, "bsplitk:64,24,4,10"),
+        (128, "bsplitk:64,32,4,9"),
+        (160, "bsplitk:64,40,4,8"),
+    ),
+    "unpool": (
+        (48, "bsplitk:64,24,4,8"),
+        (64, "bsplitk:64,32,4,8"),
+        (80, "bsplitk:64,40,4,8"),
+        (96, "bsplitk:64,48,4,7"),
+        (112, "bsplitk:64,56,4,7"),
+        (128, "bsplitk:64,64,4,6"),
+        (144, "bsplitk:64,72,4,6"),
+        (160, "bsplitk:64,80,4,5"),
+    ),
+}
+
+#: The ``batch_splitk`` table of each ``(compute capability, TP size)`` it is measured for.
+BATCH_KERNELS_BY_SM_TP: Mapping[
+    Tuple[Tuple[int, int], int], Mapping[str, Tuple[Tuple[int, str], ...]]
+] = {((10, 3), 8): SM103_TP8_BATCH_KERNELS}
+
+
+def batch_kernels(
+    table: Mapping[str, Tuple[Tuple[int, str], ...]] = SM103_TP8_BATCH_KERNELS,
+) -> Dict[str, Tuple[Optional[str], ...]]:
+    """The kernel of each site of a ``batch_splitk`` table per row count ``BATCH_MIN_ROWS..
+    BATCH_MAX_ROWS`` (index ``rows - BATCH_MIN_ROWS``); ``None`` past the site's last step."""
+    out = {}
+    for site, steps in table.items():
+        kernels: List[Optional[str]] = []
+        first = BATCH_MIN_ROWS
+        for last, kernel in steps:
+            assert first <= last <= BATCH_MAX_ROWS, steps
+            kernels += [kernel] * (last - first + 1)
+            first = last + 1
+        kernels += [None] * (BATCH_MAX_ROWS - first + 1)
+        out[site] = tuple(kernels)
+    return out
+
+
+def batch_kernel_table(
+    capability: Tuple[int, int],
+    tp_size: int,
+    sharded: bool,
+    kernels: Mapping[str, Tuple[str, ...]],
+) -> Dict[str, Tuple[Optional[str], ...]]:
+    """``batch_splitk``'s kernel per row count 33..160 of each site its table names on ``capability``
+    at ``tp_size``, checked against ``kernels`` (the plan's 1..8-row table): every cell must be a
+    split-K tactic with the ``split_k`` of its site's 8-row cell. Reads only the tables.
+
+    Raises:
+        ValueError: if ``BATCH_KERNELS_BY_SM_TP`` has no table for ``(capability, tp_size)``, the
+            projections are not ``sharded``, or a cell does not sum the K slices of its site's
+            8-row cell.
+    """
+    from ...ops.gemm import batch_splitk_gemm as _bsk
+
+    key = (tuple(capability), int(tp_size))
+    steps = BATCH_KERNELS_BY_SM_TP.get(key)
+    if steps is None or not sharded:
+        raise ValueError(
+            f"[musespark_open] batch_splitk is measured for SM {(10, 3)} at TP8 with the sharded "
+            f"pooler and unpooler; got SM {key[0]} at TP{key[1]}, "
+            f"{'sharded' if sharded else 'replicated'} projections"
+        )
+    table = batch_kernels(steps)
+    for role, cells in table.items():
+        family, fields = parse_kernel(kernels[role][MAX_ROWS - 1])
+        for kernel in cells:
+            if kernel is None:
+                continue
+            if family != SPLITK or _bsk.parse(kernel).split_k != fields[2]:
+                raise ValueError(
+                    f"[musespark_open] batch_splitk: {role} kernel {kernel} does not sum the K "
+                    f"slices of the {MAX_ROWS}-row kernel {kernels[role][MAX_ROWS - 1]}"
+                )
+    return table
 
 
 def _by_rows(steps: Tuple[Tuple[int, str], ...]) -> List[str]:
@@ -374,6 +516,10 @@ class DenseGemmPlan:
         #: ``BatchDenseGemms``), whose ``projection`` every re-classed projection's
         #: ``apply_linear`` calls; ``None`` otherwise.
         self.batch = None
+        #: ``batch_splitk``: the kernel of a site's 33..160-row calls
+        #: (``batch_splitk[site][rows - BATCH_MIN_ROWS]``, ``None`` past its last step); empty
+        #: when off (``set_batch_splitk_kernels``).
+        self.batch_splitk: Dict[str, Tuple[Optional[str], ...]] = {}
         self.prefetch = prefetch
         self.enable_pdl = enable_pdl
         #: The compute capability of the device the plan serves (``install`` reads it once);
@@ -409,6 +555,28 @@ class DenseGemmPlan:
     def kernel(self, role: str, rows: int) -> Optional[str]:
         """``kernel_for``: the kernel of a ``role`` call of ``rows`` rows, or ``None``."""
         return self.kernel_for(role, rows)
+
+    def batch_kernel_for(self, role: str, rows: int) -> Optional[str]:
+        """``batch_splitk``'s kernel of a 33..160-row ``role`` call, or ``None`` (the built-in call)."""
+        cells = self.batch_splitk.get(role)
+        if cells is None or not BATCH_MIN_ROWS <= rows <= BATCH_MAX_ROWS:
+            return None
+        return cells[rows - BATCH_MIN_ROWS]
+
+    def set_batch_splitk_kernels(self, kernels: Mapping[str, Tuple[Optional[str], ...]]) -> None:
+        """Give sites a ``batch_splitk`` kernel per row count 33..160 (``batch_kernel_table``).
+
+        Raises:
+            ValueError: for an unknown site or a table that does not cover 33..160 rows.
+        """
+        rows = BATCH_MAX_ROWS - BATCH_MIN_ROWS + 1
+        for role, table in kernels.items():
+            if role not in SITES or len(table) != rows:
+                raise ValueError(
+                    f"[musespark_open] dense_gemms: a batch_splitk table names {rows} kernels per "
+                    f"site of {SITES}, got {role!r} with {len(table)}"
+                )
+        self.batch_splitk = {role: tuple(table) for role, table in kernels.items()}
 
     def set_wide_kernels(self, kernels: Mapping[str, Tuple[str, ...]]) -> None:
         """Give sites a kernel per row count 9..32 (``kernels[site][rows - WIDE_MIN_ROWS]``).
@@ -687,6 +855,58 @@ class DenseGemmDispatcher:
             self.site.plan.fork_prefetch(self.site.next_weight())
         return product.view(*input_tensor.shape[:-1], int(weight.shape[0]))
 
+    def batch_splitk_apply(
+        self,
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        out: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """A 33..160-row call on the plan's ``batch_splitk`` kernel for its rows, or ``None`` (the caller
+        runs the built-in call): BF16, no bias, the site's shape, contiguous, 32-byte aligned, not
+        compiled or differentiated. ``out`` (``projection_publish``'s transport slot) receives the
+        product; the kernel stores each element of it once, after the reduction. Joins the plan's
+        forks the site's dispatcher would have joined before its GEMM."""
+        plan = self.site.plan
+        if not plan.batch_splitk or bias is not None:
+            return None
+        if torch.is_grad_enabled() or torch.compiler.is_compiling():
+            return None
+        if not (
+            input_tensor.is_cuda
+            and input_tensor.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and weight.dim() == 2
+            and input_tensor.dim() >= 1
+            and (int(weight.shape[1]), int(weight.shape[0])) == self.site.shape
+            and int(input_tensor.shape[-1]) == int(weight.shape[1])
+            and input_tensor.is_contiguous()
+            and weight.is_contiguous()
+            and input_tensor.data_ptr() % 32 == 0
+            and weight.data_ptr() % 32 == 0
+        ):
+            return None
+        k = int(weight.shape[1])
+        rows = input_tensor.numel() // k
+        kernel = plan.batch_kernel_for(self.site.role, rows)
+        if kernel is None:
+            return None
+        from ...ops.gemm import batch_splitk_gemm as _bsk
+
+        plan.join()
+        if plan.named_forks:
+            plan.join_role(self.site.role)
+        x = input_tensor.view(-1, k)
+        if out is None:
+            out = torch.empty((rows, int(weight.shape[0])), dtype=x.dtype, device=x.device)
+        _bsk.run(x, weight, out, _bsk.parse(kernel), plan.enable_pdl)
+        logger.info_once(
+            f"[musespark_open] batch_splitk: a {rows}-row {self.site.role} call (layer "
+            f"{self.site.layer_idx}) ran {kernel}",
+            key=f"musespark_open.batch_splitk.{self.site.role}",
+        )
+        return out.view(*input_tensor.shape[:-1], int(weight.shape[0]))
+
     def _apply_publish(
         self,
         module: torch.nn.Module,
@@ -775,6 +995,10 @@ class MuseSparkOpenTepDenseLinear(Linear):
         batch = dispatcher.site.plan.batch
         lora = getattr(self, "lora", None) is not None and bool(lora_params)
         if batch is None or lora:
+            if dispatcher.site.plan.batch_splitk and not lora and _builtin_is_cublas(self):
+                out = dispatcher.batch_splitk_apply(input, self.weight, bias)
+                if out is not None:
+                    return out
             return Linear.apply_linear(self, input, bias, lora_params, layer_idx)
         return batch.projection(
             dispatcher.site,
@@ -810,6 +1034,18 @@ class MuseSparkOpenTepDenseLinear(Linear):
         linear.__dict__["_low_m_dispatcher"] = dispatcher
         dispatcher.builtin = builtin
         return linear
+
+
+def _builtin_is_cublas(linear: Linear) -> bool:
+    """Whether the built-in call of ``linear`` above 32 rows is ``F.linear`` on its BF16 weight
+    (``UnquantizedLinearMethod.apply``): no custom cuBLAS GEMM, no CuTe DSL BF16 GEMM."""
+    from tensorrt_llm._torch.modules.linear import UnquantizedLinearMethod
+
+    return (
+        isinstance(getattr(linear, "quant_method", None), UnquantizedLinearMethod)
+        and not getattr(linear, "use_custom_cublas_mm", False)
+        and not getattr(linear, "use_cute_dsl_bf16_gemm", False)
+    )
 
 
 def _projection_weight(moe, linear: Linear, sharded: bool) -> Callable[[], torch.Tensor]:
@@ -865,8 +1101,20 @@ def install(
             "(MUSESPARK_OPEN_SHARDED_PROJECTIONS=1); without them the pooler GEMM reads the "
             "whole replicated weight"
         )
+    batch_table: Mapping[str, Tuple[Optional[str], ...]] = {}
+    if _BATCH_SPLITK:
+        if (tuple(capability), tp_size) in BATCH_KERNELS_BY_SM_TP and sharded:
+            batch_table = batch_kernel_table(capability, tp_size, sharded, kernels)
+        else:
+            logger.warning(
+                "[musespark_open] tep8_batch_splitk is measured for SM (10, 3) at "
+                f"TP8 with the sharded pooler and unpooler; SM {tuple(capability)} at TP{tp_size} "
+                f"({'sharded' if sharded else 'replicated'}) keeps the built-in calls"
+            )
     plan = DenseGemmPlan(kernels, prefetch=prefetch, enable_pdl=LAUNCH_PDL, capability=capability)
     plan.tp_size = tp_size
+    if batch_table:
+        plan.set_batch_splitk_kernels(batch_table)
 
     layers = list(model.layers)
     planned = []
@@ -899,6 +1147,18 @@ def install(
                     raise ValueError(
                         f"{where}: kernel {kernel} cannot serve {rows} x {shape}: {error}"
                     )
+            if index == 0 and role in batch_table:
+                from ...ops.gemm import batch_splitk_gemm as _bsk
+
+                for rows, kernel in enumerate(batch_table[role], start=BATCH_MIN_ROWS):
+                    if kernel is None:
+                        continue
+                    try:
+                        _bsk.validate(_bsk.parse(kernel), rows, shape[1], shape[0])
+                    except ValueError as error:
+                        raise ValueError(
+                            f"{where}: kernel {kernel} cannot serve {rows} x {shape}: {error}"
+                        ) from error
             planned.append((index, role, modules[role], shape, weights))
 
     next_of = {"qkv": "o_proj", "o_proj": "pool"}
@@ -920,4 +1180,14 @@ def install(
         f"{MAX_ROWS} rows by {describe(kernels)}; "
         f"L2 prefetch of the next weight {'on' if prefetch else 'off'}"
     )
+    if batch_table:
+        table = BATCH_KERNELS_BY_SM_TP[(tuple(capability), tp_size)]
+        steps = "; ".join(
+            f"{site}=" + ", ".join(f"{k}@..{last}" for last, k in table[site]) for site in table
+        )
+        logger.info(
+            f"[musespark_open] tep8_batch_splitk: TP8 calls of {BATCH_MIN_ROWS}.."
+            f"{BATCH_MAX_ROWS} rows by {steps} (split_k 4, each row the bits of its {MAX_ROWS}-row "
+            "kernel); o_proj and the rows past each site's last step keep the built-in cuBLAS call"
+        )
     return plan

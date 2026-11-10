@@ -100,6 +100,11 @@ WORLD = 4
 WORLDS = (4, 8)
 #: The decode rows the transports serve: five to 64 requests at K = 7 (and the counts between).
 MIN_ROWS, MAX_ROWS = 33, 512
+#: The row capacity of a wide transport: the decode steps of two to four requests at K = 7
+#: (16..32 rows), whose slice GEMMs are flashinfer's split-K cells of ``wide_projection_gathers``
+#: (``wide_direct_transports``, sm103 TEP8, behind ``tep8_wide_direct_transports``).
+#: Its own allocation: the 33..512-row transports are unchanged.
+WIDE_TRANSPORT_ROWS = 32
 #: Width of the pooled (expert) activation and of the residual stream.
 POOL_HIDDEN, UNPOOL_HIDDEN = 4096, 8192
 #: Buffers of a transport (``buffer_sequence``).
@@ -240,8 +245,10 @@ class PublishTransport:
         world = mapping.tp_size
         if columns not in (local_columns(POOL_HIDDEN, world), local_columns(UNPOOL_HIDDEN, world)):
             raise ValueError(f"no projection site has {columns} columns per rank at TP{world}")
-        if not MIN_ROWS <= max_rows <= MAX_ROWS:
-            raise ValueError(f"max_rows must be in {MIN_ROWS}..{MAX_ROWS}, got {max_rows}")
+        if not (max_rows == WIDE_TRANSPORT_ROWS or MIN_ROWS <= max_rows <= MAX_ROWS):
+            raise ValueError(
+                f"max_rows must be {WIDE_TRANSPORT_ROWS} or in {MIN_ROWS}..{MAX_ROWS}, got {max_rows}"
+            )
         self.rank = mapping.tp_rank
         self.world = mapping.tp_size
         self.columns = int(columns)

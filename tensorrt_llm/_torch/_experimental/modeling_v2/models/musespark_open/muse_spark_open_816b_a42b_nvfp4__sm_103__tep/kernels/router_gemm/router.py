@@ -67,7 +67,11 @@ class RouterGemmCall:
             return
         self._reported.add((rows, served))
         if served:
-            logger.info(f"[musespark_open] router_gemm: a {rows}-row decode step runs the op")
+            build = _op.staged() if _op.staged_takes(rows) else None
+            logger.info(
+                f"[musespark_open] router_gemm: a {rows}-row decode step runs the op"
+                + (f" (router_staged_gemm {build}: the staged GEMM)" if build is not None else "")
+            )
         else:
             logger.warning(
                 f"[musespark_open] router_gemm: an armed {rows}-row router call keeps the built-in "
@@ -137,7 +141,9 @@ def install(
     model: torch.nn.Module, min_rows: int = _op.MIN_ROWS, staged_epilogue: Optional[str] = None
 ) -> RouterGemmCall:
     """Re-class every layer's MoE with ``RouterGemmMoE`` in front; returns the call to arm
-    on decode steps of ``min_rows..MAX_ROWS`` rows. ``staged_epilogue`` is ignored.
+    on decode steps of ``min_rows..MAX_ROWS`` rows. ``staged_epilogue`` is ignored (this
+    target selects the staged GEMM per process from the ``router_staged_gemm`` lever
+    (``ops/moe/router_gemm.configure``), over its own row band).
 
     Every layer is checked before any is re-classed; a layer already carrying the
     mixin is re-pointed at the returned call.
@@ -171,4 +177,15 @@ def install(
         f"(2 x 128-row tiles)"
         + f") in {len(layers)} MoE layers; other steps keep the built-in router"
     )
+    build = _op.staged()
+    if build is not None:
+        # Every rank logs it: the lever is resolved per process (router_staged_gemm).
+        epilogue, prewait = _op.STAGED_BUILDS[build]
+        logger.info(
+            f"[musespark_open] router_staged_gemm {build}: calls of "
+            f"{max(min_rows, _op.STAGED_MIN_ROWS)}..{_op.STAGED_MAX_ROWS} rows run the staged GEMM "
+            f"({epilogue} epilogue through shared memory"
+            + (", weight tiles loaded before griddepcontrol.wait" if prewait else "")
+            + "; same partials bit for bit)"
+        )
     return call

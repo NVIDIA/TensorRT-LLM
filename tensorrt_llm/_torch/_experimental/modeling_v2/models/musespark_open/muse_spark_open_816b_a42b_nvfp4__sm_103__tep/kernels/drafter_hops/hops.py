@@ -395,6 +395,10 @@ def install_wide(draft_model: Optional[nn.Module], mapping=None) -> None:
     norms += [layer.input_layernorm for layer in layers[1:]] + [draft_model.model.norm]
     eps = sorted({float(norm.variance_epsilon) for norm in norms})
     rows = _hop.wide_served_rows()
+    if narrow.ranks == _hop.MAX_RANKS:
+        # TP8 has no WIDE_SERVED_ROWS_BY_SM entry: the lever's TP8_MAX_ROWS names the bound
+        # (drafter_hop.configure, from lever_settings).
+        rows = _hop.tp8_wide_rows()
     call.wide = _hop.DrafterHopWorkspace(
         layers[0].self_attn.o_proj.mapping,
         sites=narrow.sites,

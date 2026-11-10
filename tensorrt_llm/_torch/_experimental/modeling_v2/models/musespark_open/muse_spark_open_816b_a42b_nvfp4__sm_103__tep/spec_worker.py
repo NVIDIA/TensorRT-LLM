@@ -104,6 +104,43 @@ from .ops.spec.dflash_accept import (
 #: (prefill chunks, batched decode) run the built-in. TP4 has no row bound.
 FC_SHARD_MAX_ROWS = 8
 
+#: Tokens the TP8 projection gather's workspace holds (``musespark_open_projection_gather``).
+FC_SHARD_TP8_ROW_CAPACITY = 128
+#: ``tep8_fc_shard_wide``: the TP8 row bound this module installs, ``FC_SHARD_MAX_ROWS``
+#: until ``configure`` raises it. Above the default, decode steps of two to five requests
+#: (16..40 rows at K = 7) shard ``fc`` too: per step the rank reads its 84 MB slice instead
+#: of the 671 MB weight.
+_FC_SHARD_TP8_MAX_ROWS = FC_SHARD_MAX_ROWS
+
+
+def configure(*, fc_shard_tp8_max_rows: int = FC_SHARD_MAX_ROWS) -> None:
+    """Set the TP8 row bound of the sharded ``fc``.
+
+    ``lever_settings.apply`` sets it from the model's plan before any install; the default
+    is the stock bound, where only the batch-1 decode step (K + 1 <= 8 rows) shards.
+
+    Args:
+        fc_shard_tp8_max_rows: the most rows a TP8 call may have and still shard
+            (``_FC_SHARD_TP8_MAX_ROWS``), ``FC_SHARD_MAX_ROWS``..``FC_SHARD_TP8_ROW_CAPACITY``.
+
+    Raises:
+        ValueError: for a bound outside that range.
+    """
+    global _FC_SHARD_TP8_MAX_ROWS
+    rows = int(fc_shard_tp8_max_rows)
+    if not FC_SHARD_MAX_ROWS <= rows <= FC_SHARD_TP8_ROW_CAPACITY:
+        raise ValueError(
+            f"[musespark_open] drafter_fc_shard TP8 row bound {rows}: expected "
+            f"{FC_SHARD_MAX_ROWS}..{FC_SHARD_TP8_ROW_CAPACITY}"
+        )
+    _FC_SHARD_TP8_MAX_ROWS = rows
+
+
+def fc_shard_tp8_max_rows() -> int:
+    """The TP8 row bound ``configure`` set, else ``FC_SHARD_MAX_ROWS``."""
+    return _FC_SHARD_TP8_MAX_ROWS
+
+
 #: The TP widths the sharded ``fc`` is written for: 8 gathers over the fabric
 #: projection-gather workspace, 4 with the built-in NCCL all-gather.
 FC_SHARD_WORLDS = (4, 8)
@@ -295,8 +332,15 @@ def install_sharded_fc(
         gather=gather,
         enable_pdl=enable_pdl,
         world=world,
-        max_rows=FC_SHARD_MAX_ROWS if world == 8 else None,
+        max_rows=fc_shard_tp8_max_rows() if world == 8 else None,
     )
+    if world == 8 and draft_model._fc_shard.max_rows > FC_SHARD_MAX_ROWS:
+        from tensorrt_llm.logger import logger
+
+        logger.info(
+            f"[musespark_open] tep8_fc_shard_wide: the TP8 sharded fc takes calls of up to "
+            f"{draft_model._fc_shard.max_rows} rows"
+        )
     draft_model.project_target_hidden = types.MethodType(sharded_project_target_hidden, draft_model)
     return None
 

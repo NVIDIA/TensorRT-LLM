@@ -66,13 +66,17 @@ from ..projection_gathers.gathers import MuseSparkOpenTepGatedResidual, MuseSpar
 MIN_ROWS, MAX_ROWS = _publish.MIN_ROWS, 448
 
 
-def _pool_args(moe) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+def _pool_args(
+    moe, max_rows: int = MAX_ROWS
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """(gain, global scale) exactly when the built-in ``prepare_expert_input`` would quantize a
-    BF16 ``[33..448, 4096]`` pool output with flashinfer's fused ``rmsnorm_fp4quant``; else None.
+    BF16 ``[1..max_rows, 4096]`` pool output with flashinfer's fused ``rmsnorm_fp4quant``; else None.
 
     The built-in's conditions that do not depend on the call's tensor (which is a fresh,
-    contiguous BF16 CUDA tensor of 33..448 rows on the armed path). Reads nothing that
-    differs between ranks.
+    contiguous BF16 CUDA tensor of at most ``max_rows`` rows on the armed path). Reads nothing
+    that differs between ranks. ``max_rows`` defaults to this path's own bound (448), so the
+    33..448-row publish asks exactly what it asked before; ``wide_direct_transports`` passes
+    its own 32 (an expert op admitting 32 tokens need not admit 448).
     """
     from tensorrt_llm._torch.modules.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant_available
     from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import TRTLLMOpBackend
@@ -84,7 +88,7 @@ def _pool_args(moe) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         or not isinstance(getattr(backend, "op_backend", None), TRTLLMOpBackend)
         or not getattr(backend, "has_nvfp4", False)
         or getattr(backend, "fc31_act_scale", None) is not None
-        or MAX_ROWS > getattr(moe.experts, "moe_max_num_tokens", MAX_ROWS)
+        or max_rows > getattr(moe.experts, "moe_max_num_tokens", max_rows)
         or moe.expert_hidden_size != _pool.HIDDEN
         or not rmsnorm_fp4_quant_available()
     ):
@@ -352,7 +356,13 @@ class PublishedProjections:
         weight = module.weight[begin : begin + columns]
         if site == "pool" and getattr(_publish, "TEP8_POOL_PROGRAMMATIC", False):
             self._programmatic_pool_fork(moe, hidden_states, weight, slot)
-        _publish.publish_projection(hidden_states, weight, slot)
+        # ``batch_splitk`` (dense_gemms, tep8_batch_splitk): its kernel stores
+        # each element of the slot once, after its reduction, as the cuBLAS producer does; every
+        # rank takes the same branch (the switch and the plan's table are the same on every rank).
+        dispatcher = module.__dict__.get("_low_m_dispatcher")
+        batch = getattr(dispatcher, "batch_splitk_apply", None)
+        if batch is None or batch(hidden_states, weight, None, out=slot) is None:
+            _publish.publish_projection(hidden_states, weight, slot)
         self._unconsumed += 1
         self._report(site, rows)
         return slot

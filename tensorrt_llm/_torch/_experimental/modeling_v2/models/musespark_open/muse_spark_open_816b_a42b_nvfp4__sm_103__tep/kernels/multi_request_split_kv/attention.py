@@ -154,6 +154,13 @@ class MultiRequestCall:
     window: int
     launched: bool = False
     fallback: Optional[str] = None
+    #: ``COMBINE_GATE``: launch the split only; ``pending`` launches the combine (the layer's
+    #: output gate does, with the gate fused when the built-in would run its Triton norm-gate).
+    defer: bool = False
+    pending: Optional[object] = None
+    out_ptr: int = 0
+    out_shape: Tuple[int, ...] = ()
+    out_stride: int = 0
 
     def decline(self, kwargs: dict) -> Optional[str]:
         """Why this decode FMHA call is not the plain case, or ``None``. Host-side reads only."""
@@ -250,17 +257,24 @@ class MultiRequestCall:
     def launch(self, kwargs: dict) -> None:
         query = kwargs["query"]
         rows = query.shape[0]
-        _mr.multi_request_split_kv(
+        out = kwargs["out"].view(rows, -1)
+        result = _mr.multi_request_split_kv(
             query.view(rows, -1),
             kwargs["kv_cache"][0],
             kwargs["block_tables"],
             kwargs["seq_lens"],
             kwargs["bmm1_scale"],
             kwargs["bmm2_scale"],
-            kwargs["out"].view(rows, -1),
+            out,
             window=self.window,
             enable_pdl=bool(kwargs["enable_pdl"]),
+            defer_combine=self.defer,
         )
+        if self.defer:
+            self.pending = result
+            self.out_ptr = out.data_ptr()
+            self.out_shape = tuple(out.shape)
+            self.out_stride = out.stride(0)
         self.launched = True
 
 
@@ -323,6 +337,10 @@ class MultiRequestSplitKvAttention:
     _mr_kv_heads: int = 4
     _mr_min_requests: int = 2
     _mr_census: Optional[MultiRequestCensus] = None
+    #: ``COMBINE_GATE``: this call's output gate (``forward_impl``) and the deferred combine
+    #: (``_attn_impl``), which ``apply_output_gate`` launches.
+    _mr_gate: Optional[torch.Tensor] = None
+    _mr_pending: Optional[MultiRequestCall] = None
 
     def forward(self, position_ids, hidden_states, attn_metadata, *args, **kwargs):
         census = self._mr_census
@@ -333,12 +351,30 @@ class MultiRequestSplitKvAttention:
             census.end()
         return result
 
+    def forward_impl(self, *args, output_gate=None, **kwargs):
+        self._mr_gate = output_gate
+        try:
+            return super().forward_impl(*args, output_gate=output_gate, **kwargs)
+        finally:
+            self._mr_gate = None
+            call, self._mr_pending = self._mr_pending, None
+            if call is not None:
+                # No output gate consumed the deferred combine: the attention output still
+                # has to be written, before anything reads it.
+                call.pending()
+
     def _attn_impl(self, q, k, v, attn_metadata, *args, **kwargs):
         if not takes_step(attn_metadata, self._mr_min_requests):
             return super()._attn_impl(q, k, v, attn_metadata, *args, **kwargs)
-        call = MultiRequestCall(kv_heads=self._mr_kv_heads, window=self._mr_window)
+        call = MultiRequestCall(
+            kv_heads=self._mr_kv_heads,
+            window=self._mr_window,
+            defer=_mr.COMBINE_GATE and self._mr_gate is not None,
+        )
         with intercepting(call):
             result = super()._attn_impl(q, k, v, attn_metadata, *args, **kwargs)
+        if call.launched and call.pending is not None:
+            self._mr_pending = call
         census = self._mr_census
         if census is not None:
             if call.launched:
@@ -346,6 +382,51 @@ class MultiRequestSplitKvAttention:
             else:
                 census.record(self.layer_idx, BUILTIN, call.fallback or "the FMHA was not called")
         return result
+
+    def apply_output_gate(self, attention_output, gate):
+        call, self._mr_pending = self._mr_pending, None
+        if call is None:
+            return super().apply_output_gate(attention_output, gate)
+        if self._fits_fused_gate(call, attention_output, gate):
+            trigger = getattr(self, "_norm_gate_trigger", None) or "exit"
+            logger.info_once(
+                "[musespark_open] multi_request_combine_gate: the "
+                f"combine applies the output norm-gate ({attention_output.shape[0]} rows, "
+                f"trigger {trigger})",
+                key=f"musespark_open.multi_request_split_kv.combine_gate_{attention_output.shape[0]}",
+            )
+            return call.pending(gate, self.o_head_norm.variance_epsilon, trigger)
+        call.pending()
+        return super().apply_output_gate(attention_output, gate)
+
+    def _fits_fused_gate(self, call: MultiRequestCall, attention_output, gate) -> bool:
+        """Exactly when the built-in ``apply_output_gate`` (or the PDL norm-gate copy) would run
+        its Triton kernel on this call's attention output (at most 128 rows), so the fused gate's
+        bits are that kernel's."""
+        rows = call.out_shape[0] if call.out_shape else 0
+        return (
+            isinstance(attention_output, torch.Tensor)
+            and type(attention_output) is torch.Tensor
+            and attention_output.is_cuda
+            and attention_output.dtype == torch.bfloat16
+            and attention_output.ndim == 2
+            and attention_output.data_ptr() == call.out_ptr
+            and tuple(attention_output.shape) == call.out_shape
+            and attention_output.stride(0) == call.out_stride
+            and attention_output.stride(-1) == 1
+            and 0 < rows <= _mr.COMBINE_GATE_MAX_ROWS
+            and not torch.compiler.is_compiling()
+            and self.head_dim == _mr.HEAD_DIM
+            and attention_output.shape[1] % self.head_dim == 0
+            and isinstance(gate, torch.Tensor)
+            and gate.is_cuda
+            and gate.dtype == torch.bfloat16
+            and gate.ndim in (2, 3)
+            and gate.stride(-1) == 1
+            and gate.shape[0] == rows
+            and gate.numel() == attention_output.numel()
+            and (gate.ndim == 2 or gate.shape[-1] == self.head_dim)
+        )
 
 
 @functools.lru_cache(maxsize=None)

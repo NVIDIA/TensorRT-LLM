@@ -310,6 +310,27 @@ def precompile(
 COMBINE_MAX_SLOTS = 256
 COMBINE_SHAPES = ((4, 64, 8), (64, 16, 4), (128, 16, 4))
 
+#: Combine + output norm-gate in one launch (off by default, ``multi_request_combine_gate``):
+#: on, the call site hands the call the layer's output gate (``gate``), and the combine stores
+#: the built-in norm-gate of the attention output it merged -- the bits of the combine followed
+#: by ``_attention_norm_gate_kernel`` -- so the norm-gate launch is gone.
+COMBINE_GATE = False
+#: Rows a fused gate is certified for: those the built-in output gate runs its Triton kernel on.
+COMBINE_GATE_MAX_ROWS = 128
+
+
+def configure(*, combine_gate: bool = False) -> None:
+    """Set whether the combine also stores the attention output's norm-gate.
+
+    ``lever_settings.apply`` sets it from the model's plan before any install; off, the
+    default, keeps the separate norm-gate launch.
+
+    Args:
+        combine_gate: the ``multi_request_combine_gate`` lever (``COMBINE_GATE``).
+    """
+    global COMBINE_GATE
+    COMBINE_GATE = bool(combine_gate)
+
 
 @triton.jit(do_not_specialize=["num_requests", "num_work", "rows", "out_stride", "out_scale"])
 def _combine_kernel(
@@ -335,17 +356,41 @@ def _combine_kernel(
     MAX_SLOTS: tl.constexpr,
     DEVICE_SCALE: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    gate_ptr=None,
+    gate_token_stride=0,
+    gate_head_stride=0,
+    gate_eps=0.0,
+    FUSED_GATE: tl.constexpr = False,
+    TRIGGER_AFTER_WAIT: tl.constexpr = False,
 ):
     """One program per (request, token, group of GH query heads): the request's slots,
     recomputed from ``seq_lens`` as the split kernel cuts the pages, merged in two passes (the
     maximum log2-sum-exp over all slots, then the weighted sum of O in chunks of CHUNK slots).
     The first chunk's loads are issued with the log2-sum-exp loads, before the maximum is
-    known."""
+    known.
+
+    ``FUSED_GATE``: the stored rows are the built-in output norm-gate of the BF16 attention
+    output (``_attention_norm_gate_kernel``'s statements on each of the GH heads, its summation
+    tree written out), not the attention output; the gate heads are loaded right after the
+    wait. ``TRIGGER_AFTER_WAIT``: the dependent may launch once this grid has passed its wait
+    (the PDL norm-gate's ``after_wait``)."""
     b = tl.program_id(0)
     tok = tl.program_id(1)
     hg = tl.program_id(2)
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
+        if TRIGGER_AFTER_WAIT:
+            tl.extra.cuda.gdc_launch_dependents()
+    if FUSED_GATE:
+        # The prep's gate copy (complete before the split kernel passed its wait).
+        g_row = b * rows + tok
+        g_heads = hg * GH + tl.arange(0, GH)
+        gate = tl.load(
+            gate_ptr
+            + g_row * gate_token_stride
+            + g_heads[:, None] * gate_head_stride
+            + tl.arange(0, D)[None, :]
+        )
     ib = tl.arange(0, BLOCK_B)
     okb = ib < num_requests
     L = tl.load(seq_lens_ptr + ib, mask=okb, other=0)
@@ -415,7 +460,32 @@ def _combine_kernel(
         scale = out_scale
     res = acc * (scale / den)[:, None]
     row = b * rows + tok
-    tl.store(out_ptr + row * out_stride + hh[:, None] * D + dd[None, :], res.to(tl.bfloat16))
+    if FUSED_GATE:
+        # The built-in _attention_norm_gate_kernel's statements on each head of the BF16
+        # attention output this program would store.
+        x = res.to(tl.bfloat16).to(tl.float32)
+        variance = _heads_sum_of_squares(x, GH) / D
+        normed = (x * tl.rsqrt(variance + gate_eps)[:, None]).to(tl.bfloat16)
+        sigmoid = tl.sigmoid(gate.to(tl.float32)).to(tl.bfloat16)
+        result = normed.to(tl.float32) * sigmoid.to(tl.float32)
+        tl.store(out_ptr + row * out_stride + hh[:, None] * D + dd[None, :], result)
+    else:
+        tl.store(out_ptr + row * out_stride + hh[:, None] * D + dd[None, :], res.to(tl.bfloat16))
+
+
+@triton.jit
+def _heads_sum_of_squares(x, GH: tl.constexpr):
+    """``sum(x * x)`` of each of ``GH`` 64-wide heads ``[GH, 64]``, in the built-in norm-gate
+    kernel's add order (``swa_block._norm_gate_sum_of_squares`` per head): element
+    ``32 w + 16 b4 + 8 b3 + 4 b2 + 2 b1 + b0`` of a head paired over ``b4``, ``b3``, ``b2``,
+    ``b1``, ``b0``, then ``w``; each size-2 sum is one IEEE add, which commutes."""
+    sq = tl.reshape(x * x, [GH, 2, 2, 2, 2, 2, 2])
+    sq = tl.sum(sq, axis=2)  # b4
+    sq = tl.sum(sq, axis=2)  # b3
+    sq = tl.sum(sq, axis=2)  # b2
+    sq = tl.sum(sq, axis=2)  # b1
+    sq = tl.sum(sq, axis=2)  # b0
+    return tl.sum(sq, axis=1)  # w
 
 
 class MultiRequestSplitKv(OpWrapper):
@@ -439,6 +509,15 @@ class MultiRequestSplitKv(OpWrapper):
     COMBINE_MAX_SLOTS)``; one sm_103 device. The first
     call per device and build compiles the kernel, which must not happen inside a CUDA-graph
     capture (``precompile``).
+
+    ``gate`` (BF16 ``[rows, H 64]`` or ``[rows, H, 64]``, unit last stride, at most
+    ``COMBINE_GATE_MAX_ROWS`` rows): ``out`` holds the built-in output norm-gate of the attention
+    output (``bf16(rmsnorm(head, gate_eps)) * bf16(sigmoid(gate head))``, the bits of
+    ``_attention_norm_gate_kernel`` on it) instead of the attention output; ``gate_trigger``
+    ``after_wait`` lets the dependent launch once the combine has passed its wait.
+    ``defer_combine``: only the split kernel is launched; the call returns
+    ``combine(gate=None, gate_eps=0.0, gate_trigger="exit")``, which launches the combine (and
+    returns ``out``) and must be the next launch on the stream.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -471,6 +550,10 @@ class MultiRequestSplitKv(OpWrapper):
         workspace: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         num_work: Optional[int] = None,
         nq: int = NQ,
+        gate: Optional[torch.Tensor] = None,
+        gate_eps: float = 0.0,
+        gate_trigger: str = "exit",
+        defer_combine: bool = False,
     ) -> torch.Tensor:
         q2 = q.reshape(q.shape[0], -1) if q.dim() == 3 else q
         rows = q2.shape[0] if q2.dim() == 2 else 0
@@ -594,33 +677,77 @@ class MultiRequestSplitKv(OpWrapper):
             cuda.CUstream(stream.cuda_stream),
         )
         chunk, warps = next(s[1:] for s in COMBINE_SHAPES if requests <= s[0])
-        _combine_kernel[(requests, per, kv_heads)](
-            part_o,
-            part_lse,
-            seq_lens,
-            out2,
-            out2.stride(0),
-            1.0 if device_scale else float(bmm2_scale),
-            bmm2_scale if device_scale else part_lse,
-            requests,
-            num_work,
-            per,
-            HQ=hq,
-            GH=Q_PER_KV,
-            D=HEAD_DIM,
-            SLOT_ROWS=MAX_ROWS * hq,
-            BLOCK_B=request_build(requests),
-            P=PAGE,
-            WINDOW=window,
-            MIN_P=MIN_PAGES,
-            CHUNK=chunk,
-            MAX_SLOTS=COMBINE_MAX_SLOTS,
-            DEVICE_SCALE=device_scale,
-            LAUNCH_WITH_PDL=enable_pdl,
-            num_warps=warps,
-            launch_pdl=enable_pdl,
-        )
-        return out
+
+        def combine(gate=None, gate_eps=0.0, gate_trigger="exit"):
+            """The combine launch into ``out`` (with ``gate``: its norm-gate, ``COMBINE_GATE``)."""
+            fused_gate = {}
+            if gate is not None:
+                if (
+                    gate.dtype != torch.bfloat16
+                    or gate.device != q.device
+                    or gate.ndim not in (2, 3)
+                    or gate.stride(-1) != 1
+                    or gate.shape[0] != rows
+                    or gate.numel() != rows * hq * HEAD_DIM
+                    or (gate.ndim == 3 and gate.shape[-1] != HEAD_DIM)
+                    or rows > COMBINE_GATE_MAX_ROWS
+                    or gate_trigger not in ("exit", "after_wait")
+                ):
+                    raise ValueError(
+                        f"multi_request_split_kv's gate must be BF16 [rows, H * {HEAD_DIM}] or "
+                        f"[rows, H, {HEAD_DIM}] with unit last stride on the query's device, at "
+                        f"most {COMBINE_GATE_MAX_ROWS} rows, trigger exit or after_wait; got "
+                        f"{gate.dtype} {tuple(gate.shape)} strides {tuple(gate.stride())}, "
+                        f"trigger {gate_trigger!r}"
+                    )
+                fused_gate = dict(
+                    gate_ptr=gate,
+                    gate_token_stride=gate.stride(0),
+                    gate_head_stride=gate.stride(1) if gate.ndim == 3 else HEAD_DIM,
+                    gate_eps=gate_eps,
+                    FUSED_GATE=True,
+                    TRIGGER_AFTER_WAIT=enable_pdl and gate_trigger == "after_wait",
+                )
+                from tensorrt_llm.logger import logger
+
+                logger.info_once(
+                    f"[musespark_open] multi_request_split_kv: combine + output norm-gate in one "
+                    f"launch ({requests} requests x {per} rows, trigger {gate_trigger})",
+                    key=f"musespark_open.multi_request_split_kv.combine_gate_{requests}_{per}",
+                )
+            _combine_kernel[(requests, per, kv_heads)](
+                part_o,
+                part_lse,
+                seq_lens,
+                out2,
+                out2.stride(0),
+                1.0 if device_scale else float(bmm2_scale),
+                bmm2_scale if device_scale else part_lse,
+                requests,
+                num_work,
+                per,
+                HQ=hq,
+                GH=Q_PER_KV,
+                D=HEAD_DIM,
+                SLOT_ROWS=MAX_ROWS * hq,
+                BLOCK_B=request_build(requests),
+                P=PAGE,
+                WINDOW=window,
+                MIN_P=MIN_PAGES,
+                CHUNK=chunk,
+                MAX_SLOTS=COMBINE_MAX_SLOTS,
+                DEVICE_SCALE=device_scale,
+                LAUNCH_WITH_PDL=enable_pdl,
+                num_warps=warps,
+                launch_pdl=enable_pdl,
+                **fused_gate,
+            )
+            return out
+
+        if defer_combine:
+            # The caller launches it (``combine(...)``) as the next kernel on this stream.
+            return combine
+        return combine(gate, gate_eps, gate_trigger)
 
     def reference(
         self,
@@ -636,6 +763,10 @@ class MultiRequestSplitKv(OpWrapper):
         workspace: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         num_work: Optional[int] = None,
         nq: int = NQ,
+        gate: Optional[torch.Tensor] = None,
+        gate_eps: float = 0.0,
+        gate_trigger: str = "exit",
+        defer_combine: bool = False,
     ) -> torch.Tensor:
         """fp32 attention over the cache with the op's Q (an E4M3 Q as is; a BF16 Q as
         ``Q_hi + Q_lo``, or one E4M3 term for ``nq=1``, formed exactly as the kernel forms them),
@@ -686,6 +817,16 @@ class MultiRequestSplitKv(OpWrapper):
                         result[b * rows + t, h * Q_PER_KV : (h + 1) * Q_PER_KV] = (
                             torch.softmax(s, dim=-1) @ v[lo : pos + 1, h]
                         ) * bmm2_scale
+        if gate is not None:
+            # The output norm-gate in float64 between its BF16 rounding points, on the BF16
+            # attention output.
+            x = result.to(torch.bfloat16).double()
+            normed = (x * torch.rsqrt(x.square().mean(-1, keepdim=True) + gate_eps)).to(
+                torch.bfloat16
+            )
+            g = gate.reshape(result.shape).double()
+            sigmoid = torch.sigmoid(g).to(torch.bfloat16)
+            result = (normed.double() * sigmoid.double()).float()
         return result.reshape(q2.shape[0], -1)
 
     def is_valid(
@@ -702,6 +843,10 @@ class MultiRequestSplitKv(OpWrapper):
         workspace: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         num_work: Optional[int] = None,
         nq: int = NQ,
+        gate: Optional[torch.Tensor] = None,
+        gate_eps: float = 0.0,
+        gate_trigger: str = "exit",
+        defer_combine: bool = False,
     ) -> None:
         """Inputs the kernels take and answer wrongly, with no error.
 

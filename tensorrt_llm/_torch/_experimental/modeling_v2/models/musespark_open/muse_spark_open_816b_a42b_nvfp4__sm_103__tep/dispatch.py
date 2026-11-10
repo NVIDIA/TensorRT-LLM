@@ -117,6 +117,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "construct",
     ),
     FastPath(
+        "multi_request_combine_gate",
+        "the multi-request decode FMHA combine storing the attention output's norm-gate",
+        "construct",
+        ("multi_request_split_kv",),
+    ),
+    FastPath(
         "multi_request_prep_append",
         "every layer's K/V append folded into the decode prep of steps with two or more requests",
         "construct",
@@ -129,6 +135,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     # Dense projections and prefetch.
     FastPath("dense_gemms", "dense projections on one named kernel per shape", "construct"),
+    FastPath(
+        "tep8_batch_splitk",
+        "TP8 decode projections of 33..160 rows on batched split-K kernels",
+        "construct",
+        ("dense_gemms",),
+    ),
     FastPath(
         "dense_gemm_prefetch",
         "L2 prefetch of the next dense projection's weight",
@@ -196,6 +208,13 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("projection_gathers", "dense_gemms"),
     ),
     FastPath(
+        "tep8_wide_direct_transports",
+        "pool and unpool slices published from their split-K GEMMs into 32-row multicast "
+        "transports, 16/24/32-row decode steps",
+        "construct",
+        ("wide_projection_gathers",),
+    ),
+    FastPath(
         "projection_publish",
         "sharded pool/unpool GEMMs publishing into multicast transports their consumers poll, "
         "33..512-row decode steps",
@@ -210,10 +229,28 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("projection_gathers", "post_attention_hop"),
     ),
     FastPath(
+        "tep8_router_shard",
+        "the TP8 MoE prologue's router shard and fused unpool gather on 16..32-row decode steps",
+        "construct",
+        ("moe_prologue",),
+    ),
+    FastPath(
+        "tep8_router_shard_wide",
+        "that router shard on the built-in wide bits instead of each row's one-request bits",
+        "construct",
+        ("tep8_router_shard",),
+    ),
+    FastPath(
         "pool_into_route",
         "pool projection and router shard writing into the routed kernel's transport",
         "construct",
         ("moe_prologue", "dense_gemms"),
+    ),
+    FastPath(
+        "tep8_wide_direct_pool",
+        "the pool GEMM publishing into the TP8 wide route transport, 16..32-row decode steps",
+        "load",
+        ("pool_into_route", "tep8_router_shard"),
     ),
     FastPath(
         "finalize_transport",
@@ -221,9 +258,27 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "construct",
     ),
     FastPath(
+        "finalize_entry_trigger",
+        "the fused finalize releasing its dependent at its own dependency wait",
+        "construct",
+        ("finalize_transport",),
+    ),
+    FastPath(
+        "tep8_finalize_transport_wide",
+        "the TP8 finalize transport laid out for calls of 17..40 tokens",
+        "construct",
+        ("finalize_transport",),
+    ),
+    FastPath(
         "router_gemm",
         "router logits of 9..512-row calls as a BF16x3 split-K tensor-core GEMM",
         "construct",
+    ),
+    FastPath(
+        "router_staged_gemm",
+        "router logits of 129..256-row calls on the staged BF16x3 GEMM",
+        "construct",
+        ("router_gemm",),
     ),
     FastPath(
         "wide_moe_allreduce",
@@ -249,9 +304,52 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("preattn_prep",),
     ),
     FastPath("replicated_experts", "ring-buddy expert replication, balanced", "load"),
+    FastPath(
+        "tep8_ring_buddy_wide",
+        "the balanced tep8 stacked path on decode calls above its 16-row cap",
+        "load",
+        ("replicated_experts",),
+    ),
+    FastPath(
+        "tep8_wide_balance",
+        "the NVFP4 layers' balanced placement above the stacked cap, on the wide assign program",
+        "load",
+        ("replicated_experts",),
+    ),
+    FastPath(
+        "ring_buddy_stats",
+        "a placement census per call, reported on an interval by TP rank 0",
+        "load",
+        ("replicated_experts",),
+    ),
     # persistent_experts and bf16_routed_experts run over the ring-buddy stack with
     # replicated_experts, else over the rank's own expert block (the owner-only window).
     FastPath("persistent_experts", "NVFP4 experts as one persistent launch", "load"),
+    FastPath(
+        "tep8_persistent_batch_experts",
+        "stacked NVFP4 expert calls of 9..32 rows on the persistent kernel's batch builds",
+        "load",
+        ("persistent_experts", "replicated_experts"),
+    ),
+    FastPath(
+        "tep8_experts_in_kernel_placement",
+        "the batch builds placing the step's selection themselves, with no assign launch",
+        "load",
+        ("tep8_persistent_batch_experts",),
+    ),
+    FastPath(
+        "tep8_experts_interleaved_fetch",
+        "the batch builds' two fetch warps moving the FC2 operand's k-blocks alternately",
+        "load",
+        ("tep8_persistent_batch_experts",),
+    ),
+    FastPath(
+        "tep8_experts_early_start",
+        "the expert assignment triggering the persistent kernel's batch builds at its own "
+        "dependency wait",
+        "load",
+        ("tep8_persistent_batch_experts",),
+    ),
     FastPath(
         "half_window_experts",
         "the ring predecessor's upper expert half on each TP4 rank, balanced per step",
@@ -305,9 +403,21 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("draft_head",),
     ),
     FastPath("drafter_fc_shard", "drafter fc projection column-sharded", "draft"),
+    FastPath(
+        "tep8_fc_shard_wide",
+        "the sharded drafter fc projection on TP8 calls of 9..128 rows",
+        "draft",
+        ("drafter_fc_shard",),
+    ),
     FastPath("fused_accept", "acceptance and forced acceptance in one launch", "draft"),
     FastPath("drafter_fixed_gemms", "drafter GEMMs on fixed low-M tactics", "draft"),
     FastPath("context_kv_fork", "drafter context-K/V store on a side stream", "draft"),
+    FastPath(
+        "drafter_fused_prep",
+        "the drafter's page-table refresh, context K/V store and commit as fused launches",
+        "draft",
+        ("context_kv_fork",),
+    ),
     FastPath(
         "drafter_window_compact",
         "windowed drafter arena compaction in place, one read and write per window",

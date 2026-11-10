@@ -15,7 +15,9 @@ the built-in loader finished, so the copy is bitwise the owner's -- stacked as
 parameters are re-bound as views of the stack's first half, so the own block
 is stored once.
 
-Each decode step (``M <= 16`` rows), the routing method's call additionally
+Each decode step of at most ``max_rows`` rows (``MAX_ROWS``, 16, or what
+``tep8_ring_buddy_wide`` sets on the tep8 ring, ``max_rows_for``),
+the routing method's call additionally
 runs ``ops/moe/ring_buddy_assign`` on the main stream. In the built-in MoE
 input schedule it overlaps the pool/quantize work of the preparation stream;
 where the main stream is the longer branch instead (the router after the pool
@@ -35,6 +37,14 @@ which expert rows share a partial. Expert selection is unchanged.
 
 Prefill rows and any call the stacked path does not cover take the built-in
 expert call, which now reads the own-block views.
+
+``tep8_wide_balance``'s ``MAX_ROWS`` (``wide_balance_rows``, tep8; default
+off) raises the NVFP4 layers' cap to ``rows`` (up to 256): above the cap, a decode step
+otherwise runs owner-only and every layer waits in the MoE all-reduce for the rank that
+streams the most experts. Those layers' placements of more than 64 rows run on
+``ring_buddy_assign``'s wide program (the same placement in about 2 us, where the
+``[SLOTS, RANKS]`` program takes 3.5 us at 1024 slots and 5.8 us at 2048). Their stacked calls
+keep the runner's default tactic, as below the cap. The two BF16 layers keep the cap.
 
 This module is a load-time installer, not an op: it patches the built-in
 modules once the weights are final, so it sits beside ``modeling.py`` and is
@@ -89,8 +99,10 @@ call stays TRTLLM-gen's.
 
 from __future__ import annotations
 
+import threading
+import time
 import types
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -104,14 +116,199 @@ from ...ops.moe.ring_buddy_assign import (
     BLOCK,
     EXPERTS,
     HALF_SPAN,
+    MAX_SLOTS,
+    PLACEMENT_STATS_FIELDS,
     RANKS,
     TOP_K,
+    WIDE_MIN_SLOTS,
+    accumulate_placement_stats,
     block_of,
     ring_buddy_assign,
+    wide_balance_rows,
 )
 
 #: Decode rows the stacked path serves; larger calls keep the built-in path.
 MAX_ROWS = 16
+
+#: ``tep8_ring_buddy_wide``'s ``MAX_ROWS`` replaces ``MAX_ROWS`` on the tep8 ring (32-expert
+#: blocks, the ring whose balanced placement spreads a step's hot experts over the ranks): the
+#: stacked path then balances the decode calls of up to this many rows, ``8 * B`` for a verify
+#: step of ``B`` requests at K = 7 (128 for 16 requests, 160 for 20), up to ``MAX_SLOTS //
+#: TOP_K`` (256: the rows of one ``ring_buddy_assign`` program; ``install`` refuses more). Off
+#: (the default), ``MAX_ROWS`` stands.
+_TEP8_MAX_ROWS: Optional[int] = None
+
+#: ``tep8_experts_in_kernel_placement`` (sm103 tep8, the persistent kernel's batch builds): the
+#: NVFP4 layers' stacked calls of 9..``persistent_rows`` rows skip ``ring_buddy_assign`` and
+#: hand the step's selection to the batch build, which computes the same balanced placement for
+#: its rank (``persistent_experts``' ``place_rank``). Read at ``install``. Not with the
+#: placement statistics (``ring_buddy_stats``), which read the program's census: where they are
+#: on, ``_State.current`` keeps the launch (its ``_stats is None``) and this does nothing.
+_IN_KERNEL_PLACEMENT = False
+
+#: ``ring_buddy_stats``' ``INTERVAL_S``: whole seconds between reports, or None (off).
+_STATS_INTERVAL_S: Optional[int] = None
+
+
+def configure(
+    *,
+    in_kernel_placement: bool = False,
+    tep8_max_rows: Optional[int] = None,
+    wide_balance_rows: Optional[int] = None,
+    stats_interval_s: Optional[int] = None,
+) -> None:
+    """Set the settings this module reads at ``install`` and on its decode calls.
+
+    ``lever_settings.apply`` sets them from the model's plan before any install; the defaults
+    are the stock path (the 16-row cap, no in-kernel placement, no wide band, no census).
+
+    Args:
+        in_kernel_placement: ``tep8_experts_in_kernel_placement`` (``_IN_KERNEL_PLACEMENT``).
+        tep8_max_rows: ``tep8_ring_buddy_wide``'s ``MAX_ROWS``; None keeps ``MAX_ROWS``.
+        wide_balance_rows: ``tep8_wide_balance``'s ``MAX_ROWS``, handed to
+            ``ring_buddy_assign.configure``; None keeps the band off.
+        stats_interval_s: ``ring_buddy_stats``' ``INTERVAL_S``; None counts nothing.
+
+    Raises:
+        ValueError: for a row cap outside ``1..MAX_SLOTS // TOP_K`` or an interval below 1 s.
+    """
+    global _IN_KERNEL_PLACEMENT, _TEP8_MAX_ROWS, _STATS_INTERVAL_S
+    if tep8_max_rows is not None:
+        rows = int(tep8_max_rows)
+        if not 0 < rows <= MAX_SLOTS // TOP_K:
+            raise ValueError(
+                f"[musespark_open] tep8_ring_buddy_wide MAX_ROWS {rows}: the row cap is placed "
+                f"by one ring_buddy_assign program, so it is at most {MAX_SLOTS // TOP_K} rows "
+                f"({MAX_SLOTS} slots)"
+            )
+        tep8_max_rows = rows
+    if stats_interval_s is not None:
+        seconds = int(stats_interval_s)
+        if seconds < 1:
+            raise ValueError(
+                f"[musespark_open] ring_buddy_stats INTERVAL_S {seconds}: expected whole "
+                "seconds between reports, at least 1"
+            )
+        stats_interval_s = seconds
+    _IN_KERNEL_PLACEMENT = bool(in_kernel_placement)
+    _TEP8_MAX_ROWS = tep8_max_rows
+    _STATS_INTERVAL_S = stats_interval_s
+    _configure_wide_balance(wide_balance_rows)
+
+
+def _configure_wide_balance(rows: Optional[int]) -> None:
+    """Hand ``tep8_wide_balance``'s ``MAX_ROWS`` to the assign module, which owns the band.
+
+    One ``configure`` reaches this module (``lever_settings``), and the band belongs to
+    ``ring_buddy_assign``; this keeps both in step without a second entry in the settings
+    table. ``_wide_rows_here`` reads it back.
+    """
+    from ...ops.moe.ring_buddy_assign import configure as _assign_configure
+
+    _assign_configure(wide_balance_rows=rows)
+
+
+#: A placement's stats slot when the expert call places it
+#: (``tep8_experts_in_kernel_placement``): its ids are then the step's selection and its
+#: weights the routing's FP32 ones.
+_PLACED_IN_KERNEL = "placed in the expert kernel"
+
+
+def _in_kernel_placement() -> bool:
+    """Whether ``tep8_experts_in_kernel_placement`` is on (``configure``)."""
+    return _IN_KERNEL_PLACEMENT
+
+
+#: ``(the built-in cap, the cap tep8_ring_buddy_wide set)`` once ``max_rows_for`` applied the
+#: lever in this process, else None.
+_override: Optional[Tuple[int, int]] = None
+_override_logged = False
+
+
+def max_rows_for(ranks: Optional[int]) -> int:
+    """The stacked path's row cap on a ring of ``ranks``.
+
+    ``MAX_ROWS``, which ``tep8_ring_buddy_wide``'s ``MAX_ROWS`` (``configure``) replaces on the
+    tep8 ring when it is on; on any other ring the lever is ignored, with a warning. A
+    half-window layer keeps ``HALF_MAX_ROWS`` either way.
+    """
+    global _override
+    rows = _TEP8_MAX_ROWS
+    if rows is None:
+        return MAX_ROWS
+    if ranks != 8:
+        logger.warning(
+            f"[musespark_open] tep8_ring_buddy_wide MAX_ROWS={rows} has no effect on a ring of "
+            f"{ranks} ranks: it replaces the row cap of the tep8 ring only; the stacked path "
+            f"keeps {MAX_ROWS} rows"
+        )
+        return MAX_ROWS
+    _override = (MAX_ROWS, rows)
+    logger.info(
+        f"[musespark_open] replicated_experts: tep8_ring_buddy_wide MAX_ROWS={rows} sets the "
+        f"balanced placement's row cap at tep{ranks} (the built-in {MAX_ROWS}): decode calls of "
+        f"up to {rows} rows take the stacked path, each placed by one ring_buddy_assign program"
+    )
+    return rows
+
+
+def _log_override_served(rows: int, rank: int) -> None:
+    """Once per process: the first placement of a call above the built-in cap (``_override``)."""
+    global _override_logged
+    if _override_logged:
+        return
+    _override_logged = True
+    stock, cap = _override
+    logger.info(
+        f"[musespark_open] replicated_experts: the balanced placement serves a {rows}-row decode "
+        f"call on TP rank {rank}, above the built-in {stock} rows (tep8_ring_buddy_wide "
+        f"MAX_ROWS={cap}; logged "
+        "once per process)"
+    )
+
+
+_wide_logged = False
+
+
+def _log_wide_served(rows: int, rank: int, base: int) -> None:
+    """Once per process: the first placement of a call in the band ``tep8_wide_balance`` adds."""
+    global _wide_logged
+    if _wide_logged:
+        return
+    _wide_logged = True
+    logger.info(
+        f"[musespark_open] replicated_experts: the balanced placement serves a {rows}-row "
+        f"({rows * TOP_K}-slot) decode call of an NVFP4 layer on TP rank {rank} on the wide "
+        f"ring_buddy_assign program, above the {base}-row cap (tep8_wide_balance; logged once "
+        "per process)"
+    )
+
+
+def _wide_layer(kind: str, windows: int, half: bool, balance: bool, ranks: Optional[int]) -> bool:
+    """Whether ``tep8_wide_balance`` extends a layer: an NVFP4 layer's balanced two-window
+    placement on the tep8 ring (the BF16 layers, the owner-only window and the half window
+    keep their caps)."""
+    return kind == "nvfp4" and windows >= 2 and not half and bool(balance) and ranks == 8
+
+
+def _wide_rows_here(ranks: Optional[int]) -> Optional[int]:
+    """``tep8_wide_balance``'s cap where it applies (the tep8 ring of this sm103 target), else
+    None, with a warning when it is set elsewhere.
+
+    Raises:
+        ValueError: for a malformed value (``wide_balance_rows``), on every rank alike.
+    """
+    rows = wide_balance_rows()
+    if rows is None:
+        return None
+    if ranks != 8:
+        logger.warning(
+            f"[musespark_open] tep8_wide_balance MAX_ROWS={rows} has no effect on a ring of "
+            f"{ranks} ranks: it extends the tep8 balanced placement only"
+        )
+        return None
+    return rows
+
 
 #: Decode rows the stacked path serves on a half-window layer (``half_window_experts``):
 #: up to four requests' verify steps, the slots of one ``ring_buddy_assign`` program.
@@ -256,6 +453,7 @@ class _State:
         windows: int = 2,
         ranks: int = RANKS,
         half: bool = False,
+        max_rows: Optional[int] = None,
     ):
         self.kind = kind
         self.stacks = stacks
@@ -279,7 +477,8 @@ class _State:
         # The half window (``half_window_experts``): the owner-only placement over the
         # stack's own block, and the prologue's half-window placement over all of it.
         self.half = half
-        self.max_rows = HALF_MAX_ROWS if half else MAX_ROWS
+        # ``install``'s ``max_rows_for`` (``tep8_ring_buddy_wide``), else the built-in cap.
+        self.max_rows = HALF_MAX_ROWS if half else (MAX_ROWS if max_rows is None else max_rows)
         if half:
             self.default_window = self.block
             self.by_window = {
@@ -298,6 +497,24 @@ class _State:
         # The per-rank loads (before, after) of the last placement; kept across
         # memo clears for the shadow validation mode.
         self.last_stats = None
+        # ``tep8_wide_balance``: the placements run ``ring_buddy_assign(wide=True)``, and calls
+        # above ``wide_base`` rows (the cap without the switch) are the band it adds.
+        self.wide = False
+        self.wide_base = self.max_rows
+        # Early start (``tep8_experts_early_start``, ``_patch_experts``): the
+        # stacked calls of ``early_start_rows`` (first, last) rows launch the placement with
+        # its early trigger, and the persistent kernel's early-start variant behind it.
+        # Only a placement the expert forward itself launches (``in_forward``; its ``x`` was
+        # written before) does; ``early_ids`` is that placement's ``local_ids`` until the same
+        # forward's expert call takes it.
+        self.early_start_rows: Optional[Tuple[int, int]] = None
+        self.in_forward = False
+        self.early_ids = None
+        # In-kernel placement (``tep8_experts_in_kernel_placement``): a placement the forward
+        # itself makes for a
+        # stacked call of ``place_rows`` (first, last) rows hands the selection to the batch
+        # build (its stats slot is ``_PLACED_IN_KERNEL``).
+        self.place_rows: Optional[Tuple[int, int]] = None
 
     def current(self, router_logits: torch.Tensor):
         """The placement computed from ``router_logits`` as it is now, or None."""
@@ -405,6 +622,28 @@ def _patch_routing(moe, state: _State) -> None:
             and weights.is_contiguous()
             and not torch.compiler.is_compiling()
         ):
+            if (
+                state.in_forward
+                and state.place_rows is not None
+                and state.place_rows[0] <= router_logits.shape[0] <= state.place_rows[1]
+                and _stats is None
+            ):
+                # In-kernel placement: no placement launch; this forward's expert call hands
+                # the selection to the batch build, which places it for this rank.
+                state.early_ids = None
+                state.placement = (
+                    router_logits,
+                    _version(router_logits),
+                    selected,
+                    weights,
+                    _PLACED_IN_KERNEL,
+                )
+                return selected, weights
+            early = (
+                state.in_forward
+                and state.early_start_rows is not None
+                and state.early_start_rows[0] <= router_logits.shape[0] <= state.early_start_rows[1]
+            )
             local_ids, weights_bf16, stats = ring_buddy_assign(
                 selected,
                 weights,
@@ -413,7 +652,10 @@ def _patch_routing(moe, state: _State) -> None:
                 state.static_from,
                 ranks=state.ranks,
                 half=state.half,
+                **({"wide": True} if state.wide else {}),
+                **({"early_trigger": True} if early else {}),
             )
+            state.early_ids = local_ids if early else None
             state.placement = (
                 router_logits,
                 _version(router_logits),
@@ -424,6 +666,13 @@ def _patch_routing(moe, state: _State) -> None:
             if state.half:
                 state.placement += (HALF_SPAN,)
             state.last_stats = stats
+            rows = router_logits.shape[0]
+            if _override is not None and rows > _override[0]:
+                _log_override_served(rows, state.rank)
+            if state.wide and rows > state.wide_base:
+                _log_wide_served(rows, state.rank, state.wide_base)
+            if _stats is not None:
+                _stats.add(stats, rows)
         return selected, weights
 
     def clear_routing_memo(self):
@@ -434,7 +683,16 @@ def _patch_routing(moe, state: _State) -> None:
     routing.clear_routing_memo = types.MethodType(clear_routing_memo, routing)
 
 
-def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persistent_rows=8):
+def _nvfp4_call(
+    backend,
+    routing,
+    persistent: bool = False,
+    stacks=None,
+    persistent_rows=8,
+    persistent_batch: bool = False,
+    persistent_early_start: bool = False,
+    persistent_place_rank: Optional[int] = None,
+):
     """The stacked call for the native NVFP4 leaf, as its ``run_moe`` makes the built-in one.
 
     ``persistent`` (``persistent_experts``): calls of up to ``persistent_experts``'s
@@ -450,6 +708,27 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persist
 
     The call's window is the leading dim of the stacks it is given; the
     ``local_expert_offset=0`` TRTLLM-gen call runs over exactly that window.
+
+    ``persistent_rows`` (``wide_persistent_experts``: ``persistent_experts.WIDE_MAX_ROWS``):
+    calls of up to that many rows on a window of at most 64 experts go to the persistent
+    kernel's wide build. (Restored here: #21754 / 736cfdc7 moved the sm107 wide lever out of
+    this tree and dropped the sm103 wiring with it; without the gate below, no stacked call
+    above ``persistent_experts.MAX_ROWS`` can reach the persistent kernel at all.)
+
+    ``persistent_batch`` (sm103 tep8, ``tep8_persistent_batch_experts``):
+    those 9..``persistent_rows``-row calls go to the persistent kernel's batch builds
+    (``persistent_experts.BATCH_NTOKS``) instead of the wide build.
+
+    ``persistent_early_start`` (with ``persistent_batch``,
+    ``tep8_experts_early_start``): the batch builds' early-start variants are
+    compiled too, and a batch call made with ``early_start=True`` (the forward launched its
+    placement with the early trigger) runs that variant.
+
+    ``persistent_place_rank`` (with ``persistent_batch``,
+    ``tep8_experts_in_kernel_placement``): the batch builds'
+    in-kernel placement variants for this rank are compiled too, and a call made with
+    ``place_rank`` (its ids are the step's selection, its weights the routing's FP32 ones) runs
+    them; a call the batch builds do not serve is placed by ``ring_buddy_assign`` here first.
     """
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
         fp4_block_scale_moe_runner,
@@ -476,14 +755,25 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persist
             # One compiled kernel per window the layer's placements address.
             for window in sorted(persistent_windows):
                 window_stacks = stacks[window]
+                widen = {}
+                if persistent_rows > _persistent.MAX_ROWS and window <= 64:
+                    if persistent_batch:
+                        widen = {"batch_rows": persistent_rows}
+                        if persistent_early_start:
+                            widen["early_start"] = True
+                        if persistent_place_rank is not None and window == 64:
+                            widen["place_rank"] = persistent_place_rank
+                    else:
+                        widen = {"wide": True}
                 _persistent.persistent_experts.prepare(
                     window_stacks["w3_w1_weight"],
                     window_stacks["w3_w1_weight_scale"].view(torch.float8_e4m3fn),
                     window_stacks["w2_weight"],
                     window_stacks["w2_weight_scale"].view(torch.float8_e4m3fn),
+                    **widen,
                 )
 
-    def call(stacks, x, local_ids, weights_bf16):
+    def call(stacks, x, local_ids, weights_bf16, early_start=False, place_rank=None):
         if not isinstance(x, Fp4QuantizedTensor) or x.is_sf_swizzled:
             return None
         x_sf = x.scaling_factor.reshape(-1).view(torch.float8_e4m3fn)
@@ -491,8 +781,19 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persist
         served = (
             persistent_op is not None
             and window in persistent_windows
-            and x.fp4_tensor.shape[0] <= persistent_op.MAX_ROWS
+            and x.fp4_tensor.shape[0]
+            <= (persistent_rows if window <= 64 else persistent_op.MAX_ROWS)
         )
+        if place_rank is not None and not (
+            served
+            and persistent_batch
+            and persistent_place_rank is not None
+            and window == 64
+            and x.fp4_tensor.shape[0] > persistent_op.MAX_ROWS
+        ):
+            # Only the batch builds place in the kernel: place the selection here first.
+            local_ids, weights_bf16, _ = ring_buddy_assign(local_ids, weights_bf16, place_rank)
+            place_rank = None
         if window > two_windows and not served:
             # The three-window placement runs only where the persistent kernel serves the
             # call (the prologue's steps of at most 8 rows); every rank shares this shape.
@@ -501,6 +802,16 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persist
                 f"of {x.fp4_tensor.shape[0]} rows the persistent expert kernel does not serve"
             )
         if served:
+            batch = {}
+            if persistent_batch and x.fp4_tensor.shape[0] > persistent_op.MAX_ROWS:
+                batch = {"batch": True}
+                _log_batch_once(x.fp4_tensor.shape[0], window)
+                if place_rank is not None:
+                    batch["place_rank"] = place_rank
+                    _log_placed_once(x.fp4_tensor.shape[0], window)
+                elif early_start and persistent_early_start:
+                    batch["early_start"] = True
+                    _log_early_start_once(x.fp4_tensor.shape[0], window)
             return persistent_op.persistent_experts(
                 x.fp4_tensor,
                 x_sf,
@@ -513,6 +824,7 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persist
                 stacks["fc31_scale_c"],
                 stacks["fc31_alpha"],
                 stacks["fc2_alpha"],
+                **batch,
             )
         tactic = None
         if not AutoTuner.get().is_tuning_mode:
@@ -594,6 +906,75 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persist
         )
 
     return call
+
+
+_BATCH_LOGGED: List[bool] = []
+_EARLY_START_LOGGED: List[bool] = []
+_PLACED_LOGGED: List[bool] = []
+_PLACEMENT_INSTALL_LOGGED: List[bool] = []
+
+
+def _log_placed_once(rows: int, window: int) -> None:
+    """One INFO line per process: the first stacked call the in-kernel placement serves."""
+    if _PLACED_LOGGED:
+        return
+    _PLACED_LOGGED.append(True)
+    logger.info(
+        f"[musespark_open] persistent_experts: a {rows}-row stacked NVFP4 call on the "
+        f"{window}-expert window runs the batch build's in-kernel placement, with no "
+        "ring_buddy_assign launch (tep8_experts_in_kernel_placement; logged once per process)"
+    )
+
+
+def _log_placement_install_once(placed: bool) -> None:
+    """One line per process at install: the in-kernel placement is on (INFO), or the switch is
+    set where it does nothing (WARNING)."""
+    if _PLACEMENT_INSTALL_LOGGED:
+        return
+    _PLACEMENT_INSTALL_LOGGED.append(True)
+    if placed:
+        logger.info(
+            "[musespark_open] replicated_experts: tep8_experts_in_kernel_placement: the NVFP4 "
+            "layers' stacked "
+            "calls the persistent kernel's batch builds serve skip ring_buddy_assign; the batch "
+            "builds compute the balanced tep8 placement from the selection themselves"
+        )
+    else:
+        logger.warning(
+            "[musespark_open] replicated_experts: tep8_experts_in_kernel_placement has no effect "
+            "here: it "
+            "needs sm103 tep8 with the persistent kernel's batch builds on the balanced "
+            "two-window ring-buddy stack (tep8_persistent_batch_experts)"
+        )
+
+
+def _log_early_start_once(rows: int, window: int) -> None:
+    """One INFO line per process: the first stacked call the early-start variant serves."""
+    if _EARLY_START_LOGGED:
+        return
+    _EARLY_START_LOGGED.append(True)
+    logger.info(
+        f"[musespark_open] persistent_experts: a {rows}-row stacked NVFP4 call on the "
+        f"{window}-expert window runs the batch build's early-start variant behind "
+        "ring_buddy_assign's early trigger (tep8_experts_early_start; logged "
+        "once per process)"
+    )
+
+
+def _log_batch_once(rows: int, window: int) -> None:
+    """One INFO line per process: the first stacked call a persistent batch build serves.
+
+    Python runs at eager warmup and graph capture only, so this marks the graphs captured
+    on the batch path.
+    """
+    if _BATCH_LOGGED:
+        return
+    _BATCH_LOGGED.append(True)
+    logger.info(
+        f"[musespark_open] persistent_experts: a {rows}-row stacked NVFP4 call on the "
+        f"{window}-expert window runs the persistent kernel's batch build "
+        "(tep8_persistent_batch_experts; logged once per process)"
+    )
 
 
 def _bf16_call(backend, routing, unpacked: bool = False):
@@ -678,19 +1059,52 @@ def _patch_experts(
     persistent: bool = False,
     bf16_unpacked: bool = False,
     persistent_rows: int = 8,
+    persistent_batch: bool = False,
+    persistent_early_start: bool = False,
 ) -> None:
     experts = moe.experts
     backend = _backend(moe)
     builtin_forward = experts.forward
     routing = experts.routing_method
     if state.kind == "nvfp4" and persistent:
+        # Early start: only where the batch builds serve the layer's 9..persistent_rows-row
+        # calls (the two-window stack of an NVFP4 leaf the persistent kernel computes).
+        early_start = bool(
+            persistent_early_start
+            and persistent_batch
+            and persistent_rows > _persistent_max_rows()
+            and not state.half
+            and state.default_window <= 64
+            and persistent_eligible(backend)
+        )
+        # In-kernel placement: where the batch builds serve the balanced two-window tep8 stack.
+        placed = bool(
+            _in_kernel_placement()
+            and persistent_batch
+            and persistent_rows > _persistent_max_rows()
+            and not state.half
+            and state.default_window == 2 * state.block
+            and state.ranks == RANKS
+            and state.balance
+            and state.static_from == state.block
+            and persistent_eligible(backend)
+        )
+        if _in_kernel_placement():
+            _log_placement_install_once(placed)
         stacked_call = _nvfp4_call(
             backend,
             routing,
             persistent=True,
             stacks=state.by_window,
             persistent_rows=persistent_rows,
+            persistent_batch=persistent_batch,
+            persistent_early_start=early_start,
+            persistent_place_rank=state.rank if placed else None,
         )
+        if early_start:
+            state.early_start_rows = (_persistent_max_rows() + 1, persistent_rows)
+        if placed:
+            state.place_rows = (_persistent_max_rows() + 1, persistent_rows)
     elif state.kind == "nvfp4":
         stacked_call = _nvfp4_call(backend, routing)
     elif bf16_unpacked:
@@ -703,18 +1117,43 @@ def _patch_experts(
     def forward(self, x, router_logits, *args, do_finalize=True, **kwargs):
         if not state.active or do_finalize or args or not 0 < x.shape[0] <= state.max_rows:
             return builtin_forward(x, router_logits, *args, do_finalize=do_finalize, **kwargs)
-        routing.apply(router_logits)
+        # Early start pairs a placement this call launches (``x`` was written before it)
+        # with this call's expert launch only.
+        state.early_ids = None
+        state.in_forward = True
+        try:
+            routing.apply(router_logits)
+        finally:
+            state.in_forward = False
         placement = state.current(router_logits)
         if placement is None:
+            state.early_ids = None
             return builtin_forward(x, router_logits, *args, do_finalize=do_finalize, **kwargs)
         local_ids, weights_bf16 = placement[2], placement[3]
         window = placement[5] if len(placement) > 5 else default_window
-        outputs = stacked_call(by_window[window], x, local_ids, weights_bf16)
+        early = state.early_ids is not None and state.early_ids is local_ids
+        placed = placement[4] is _PLACED_IN_KERNEL
+        state.early_ids = None
+        if placed:
+            outputs = stacked_call(
+                by_window[window], x, local_ids, weights_bf16, place_rank=state.rank
+            )
+        elif early:
+            outputs = stacked_call(by_window[window], x, local_ids, weights_bf16, early_start=True)
+        else:
+            outputs = stacked_call(by_window[window], x, local_ids, weights_bf16)
         if outputs is None:
             return builtin_forward(x, router_logits, *args, do_finalize=do_finalize, **kwargs)
         return outputs
 
     experts.forward = types.MethodType(forward, experts)
+
+
+def _persistent_max_rows() -> int:
+    """The persistent kernel's 8-row build bound (``persistent_experts.MAX_ROWS``)."""
+    from ...ops.moe import persistent_experts as _persistent
+
+    return _persistent.MAX_ROWS
 
 
 def _act_type(backend) -> int:
@@ -769,6 +1208,8 @@ def install(
     persistent_rows: int = 8,
     windows: int = 2,
     half: bool = False,
+    persistent_batch: bool = False,
+    persistent_early_start: bool = False,
 ) -> List[int]:
     """Replicate and patch every eligible MoE layer of ``text_model``; returns their indices.
 
@@ -789,7 +1230,12 @@ def install(
     ``bf16_unpacked`` are served without replication.
     ``persistent=True``
     (``persistent_experts``) serves the NVFP4 layers' stacked calls of up to 8 rows with the
-    persistent expert kernel (``ops/moe/persistent_experts.py``).
+    persistent expert kernel (``ops/moe/persistent_experts.py``);
+    ``persistent_rows`` above 8 also its calls of up to that many rows on a window of at
+    most 64 experts, on the wide build or, with ``persistent_batch``, on the batch builds;
+    with ``persistent_early_start`` as well, those batch calls launch their placement with
+    its early trigger and run the batch builds' early-start variants
+    (``tep8_experts_early_start``).
     ``bf16_unpacked=True`` (``bf16_routed_experts``) gives the two BF16 layers'
     stacked calls unpacked routing (``ops/moe/bf16_routed_experts.py``):
     bitwise the packed call, without its three packing launches.
@@ -823,9 +1269,19 @@ def install(
     refusal = _install_refusal(
         text_model, windows, persistent, balance, bf16_unpacked, ranks, static_from, half
     )
+    max_rows = MAX_ROWS
+    wide_rows = None
+    if refusal is None:
+        try:
+            max_rows = max_rows_for(ranks)
+            wide_rows = _wide_rows_here(ranks)
+        except ValueError as error:
+            refusal = str(error)
     refusal = _tp_agreement.agreed_refusal(mapping, refusal)
     if refusal is not None:
         raise ValueError(refusal)
+    if wide_rows is not None and wide_rows <= max_rows:
+        wide_rows = None  # the cap already covers the band
     # A mapping outside the served rings skips every layer (``eligible``); the
     # block only names the static placement in the log line then.
     block = block_of(ranks) if ranks is not None else BLOCK
@@ -833,6 +1289,7 @@ def install(
         static_from = block
     failed: Optional[str] = None
     installed, refreshed = [], []
+    widened_rows: List[int] = []
     widened = []
     halved = []
     skipped = {}
@@ -850,6 +1307,8 @@ def install(
             _refresh(moe, state, mapping)
             state.balance = balance
             state.static_from = static_from
+            state.max_rows = HALF_MAX_ROWS if state.half else max_rows
+            _apply_wide(state, wide_rows, widened_rows)
             refreshed.append(index)
             continue
         reason = eligible(moe, mapping)
@@ -867,13 +1326,30 @@ def install(
         stacks = _replicate(moe, kind, mapping, layer_windows, layer_half)
         added += sum(t[block:].numel() * t.element_size() for t in stacks.values())
         state = _State(
-            kind, stacks, mapping.tp_rank, balance, static_from, layer_windows, ranks, layer_half
+            kind,
+            stacks,
+            mapping.tp_rank,
+            balance,
+            static_from,
+            layer_windows,
+            ranks,
+            layer_half,
+            max_rows=max_rows,
         )
+        _apply_wide(state, wide_rows, widened_rows)
         moe._replicated_experts = state
         if failed is None:
             _patch_routing(moe, state)
             try:
-                _patch_experts(moe, state, persistent, bf16_unpacked, persistent_rows)
+                _patch_experts(
+                    moe,
+                    state,
+                    persistent,
+                    bf16_unpacked,
+                    persistent_rows,
+                    persistent_batch,
+                    persistent_early_start,
+                )
             except Exception as error:  # noqa: BLE001 - every failure must reach the agreement
                 failed = f"layer {index}: {error!r}"
         installed.append(index)
@@ -913,7 +1389,9 @@ def install(
         f"{'(persistent NVFP4 expert kernel) ' if persistent else ''}"
         f"{'(unpacked BF16 routing) ' if bf16_unpacked else ''}"
         f"{f'(three ring windows on {len(widened)} layers) ' if windows == 3 else ''}"
-        f"({placement} placement, "
+        f"({placement} placement, ring-buddy max_rows={max_rows}"
+        f"{f' ({HALF_MAX_ROWS} on the half-window layers)' if halved else ''}"
+        f"{f' ({wide_rows} on {len(widened_rows)} NVFP4 layers)' if widened_rows else ''}, "
         f"{dict(sorted(kinds.items()))}), refreshed in place on {len(refreshed)}; "
         f"per rank: replicated experts +{added / 2**30:.2f} GiB, torch allocated "
         f"+{allocated_added / 2**30:.2f} GiB, device +{device_added / 2**30:.2f} GiB, of "
@@ -921,7 +1399,31 @@ def install(
         f"communicator buffers); built-in path kept for layers {sorted(skipped)}: "
         f"{sorted(set(skipped.values()))}"
     )
+    if widened_rows:
+        logger.info(
+            f"[musespark_open] replicated_experts: tep8_wide_balance MAX_ROWS={wide_rows}: the "
+            f"balanced placement of {len(widened_rows)} NVFP4 layers serves decode calls of up to "
+            f"{wide_rows} rows ({wide_rows * TOP_K} slots; the cap was {max_rows}), placed by "
+            f"ring_buddy_assign's wide program above {WIDE_MIN_SLOTS // TOP_K} rows; the other "
+            f"layers keep {max_rows}"
+        )
+    if balance:
+        _start_stats(mapping, ranks, max_rows, len(installed) + len(refreshed))
     return sorted(installed + refreshed)
+
+
+def _apply_wide(state: "_State", wide_rows: Optional[int], widened: List[int]) -> None:
+    """``tep8_wide_balance`` on one installed layer: its cap and the wide program, where
+    ``_wide_layer`` admits it; any other layer, or the switch unset, is left as it is."""
+    state.wide = False
+    state.wide_base = state.max_rows
+    if wide_rows is None or not _wide_layer(
+        state.kind, state.windows, state.half, state.balance, state.ranks
+    ):
+        return
+    state.wide = True
+    state.max_rows = max(state.max_rows, wide_rows)
+    widened.append(state.max_rows)
 
 
 def _install_refusal(
@@ -986,3 +1488,98 @@ def _install_refusal(
         except ImportError as error:
             return f"bf16_routed_experts calls flashinfer.fused_moe.trtllm_bf16_routed_moe: {error}"
     return None
+
+
+#: ``ring_buddy_stats``' ``INTERVAL_S`` seconds: every placement this process computes also
+#: adds its census to a pinned host accumulator
+#: (``ring_buddy_assign.accumulate_placement_stats``: one more one-program launch per
+#: placement, diagnostics only), and TP rank 0 logs the totals at that interval. Off (the
+#: default), nothing is counted.
+_STATS_TAG = "ring_buddy_stats"
+
+_stats: Optional["_PlacementStats"] = None
+
+
+class _PlacementStats:
+    """Placement census totals in pinned host memory, in two bands of
+    ``PLACEMENT_STATS_FIELDS``: calls of at most ``split`` rows (band 0) and above (band 1).
+
+    The device adds to it in stream order (graph replays included); the host reads it
+    without a CUDA call, so the reader cannot disturb a graph capture on another thread.
+    """
+
+    def __init__(self, interval: float, split: int, ranks: int, rank: int):
+        self.interval = interval
+        self.split = split
+        self.ranks = ranks
+        self.rank = rank
+        self.layers = 0
+        self.failed = False
+        self.acc = torch.zeros(2 * PLACEMENT_STATS_FIELDS, dtype=torch.int64, pin_memory=True)
+
+    def add(self, stats: torch.Tensor, rows: int) -> None:
+        if self.failed:
+            return
+        band = int(rows > self.split) * PLACEMENT_STATS_FIELDS
+        try:
+            accumulate_placement_stats(
+                stats, self.acc[band : band + PLACEMENT_STATS_FIELDS], rows, ranks=self.ranks
+            )
+        except Exception as error:  # noqa: BLE001 - diagnostics must not stop serving
+            self.failed = True
+            logger.warning(
+                f"[musespark_open] {_STATS_TAG}: placement stats off on TP rank {self.rank}: "
+                f"{error!r}"
+            )
+
+    def summary(self) -> str:
+        values = self.acc.tolist()
+        parts = []
+        for band, name in ((1, f"above {self.split} rows"), (0, f"up to {self.split} rows")):
+            calls, rows, owner, placed, distinct = values[
+                band * PLACEMENT_STATS_FIELDS : band * PLACEMENT_STATS_FIELDS + 5
+            ]
+            if not calls:
+                parts.append(f"{name}: none")
+                continue
+            mean = max(distinct, 1) / self.ranks
+            parts.append(
+                f"{name}: {calls} placements (about {calls / max(self.layers, 1):.0f} decode steps "
+                f"over {self.layers} MoE layers), {rows / calls:.1f} rows each; the busiest rank's "
+                f"distinct experts {owner / calls:.2f} owner-only -> {placed / calls:.2f} placed, "
+                f"the mean rank's {mean / calls:.2f} (busiest/mean {owner / mean:.3f} -> "
+                f"{placed / mean:.3f})"
+            )
+        head = f"[musespark_open] replicated_experts placement stats (TP rank {self.rank}): "
+        return head + "; ".join(parts)
+
+    def _report(self) -> None:
+        last = None
+        while True:
+            time.sleep(self.interval)
+            line = self.summary()
+            if line != last:
+                logger.info(line)
+                last = line
+
+    def start(self) -> None:
+        if self.rank == 0:
+            threading.Thread(target=self._report, name="ring-buddy-stats", daemon=True).start()
+
+
+def _start_stats(mapping: Mapping, ranks: Optional[int], max_rows: int, layers: int) -> None:
+    """``install``'s ``ring_buddy_stats``: the process's accumulator and its reporter (once)."""
+    global _stats
+    interval = _STATS_INTERVAL_S
+    if interval is None or ranks is None or layers == 0:
+        return
+    if _stats is None:
+        split = _override[0] if _override is not None else max_rows
+        _stats = _PlacementStats(float(interval), split, ranks, mapping.tp_rank)
+        _stats.start()
+        logger.info(
+            f"[musespark_open] {_STATS_TAG} INTERVAL_S={interval}: placement census of {layers} "
+            f"MoE layers, bands up to and above {split} rows, reported every {interval} s by TP "
+            "rank 0"
+        )
+    _stats.layers = layers

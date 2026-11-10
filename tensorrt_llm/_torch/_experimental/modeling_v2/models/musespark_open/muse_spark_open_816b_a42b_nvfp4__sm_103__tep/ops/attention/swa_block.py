@@ -146,6 +146,55 @@ def _prep_rows(
 
 
 @triton.jit
+def _prep_rows_load(ptr, row_off, col_off, mask, N: tl.constexpr):
+    """``_prep_rows``' loads alone (BF16, as stored), so a caller can issue them early."""
+    d = tl.arange(0, 64)
+    lane = tl.arange(0, 8)
+    head = ptr + row_off[:, None] + col_off[:, None]
+    m = mask[:, None]
+    x0 = tl.load(head + lane[None, :] * 8 + 0, mask=m, other=0.0)
+    x1 = tl.load(head + lane[None, :] * 8 + 1, mask=m, other=0.0)
+    x2 = tl.load(head + lane[None, :] * 8 + 2, mask=m, other=0.0)
+    x3 = tl.load(head + lane[None, :] * 8 + 3, mask=m, other=0.0)
+    x4 = tl.load(head + lane[None, :] * 8 + 4, mask=m, other=0.0)
+    x5 = tl.load(head + lane[None, :] * 8 + 5, mask=m, other=0.0)
+    x6 = tl.load(head + lane[None, :] * 8 + 6, mask=m, other=0.0)
+    x7 = tl.load(head + lane[None, :] * 8 + 7, mask=m, other=0.0)
+    x = tl.load(head + d[None, :], mask=m, other=0.0)
+    return x0, x1, x2, x3, x4, x5, x6, x7, x
+
+
+@triton.jit
+def _prep_rows_math(x0, x1, x2, x3, x4, x5, x6, x7, x, cos, sin, scale, eps, N: tl.constexpr,
+                    APPLY_ROPE: tl.constexpr):  # fmt: skip
+    """``_prep_rows``' arithmetic, statement for statement, on ``_prep_rows_load``'s values."""
+    x0 = x0.to(tl.float32)
+    x1 = x1.to(tl.float32)
+    x2 = x2.to(tl.float32)
+    x3 = x3.to(tl.float32)
+    x4 = x4.to(tl.float32)
+    x5 = x5.to(tl.float32)
+    x6 = x6.to(tl.float32)
+    x7 = x7.to(tl.float32)
+    s = libdevice.add_rn(x0 * x0, x1 * x1)
+    s = libdevice.add_rn(s, x2 * x2)
+    s = libdevice.add_rn(s, x3 * x3)
+    s = libdevice.add_rn(s, x4 * x4)
+    s = libdevice.add_rn(s, x5 * x5)
+    s = libdevice.add_rn(s, x6 * x6)
+    s = libdevice.add_rn(s, x7 * x7)
+    s = tl.reshape(s, [N, 2, 2, 2])
+    total = tl.sum(tl.sum(tl.sum(s, axis=3), axis=2), axis=1)
+    inverse_rms = _rsqrt_approx_ftz(total / 64.0 + eps)
+    y = _normalize(x.to(tl.float32), inverse_rms[:, None], scale)
+    if APPLY_ROPE:
+        even, odd = tl.split(tl.reshape(y, [N, 32, 2]))
+        even, odd = _rotate(even, odd, cos, sin)
+        y = tl.reshape(tl.join(even, odd), [N, 64])
+    return y.to(tl.bfloat16)
+
+
+@triton.jit
 def _rope_rows(cos_sin_ptr, positions_ptr, index, mask, APPLY_ROPE: tl.constexpr):
     """``(cos, sin)`` ``[N, 32]`` of the positions ``positions[index]`` (zeros where masked)."""
     half = tl.arange(0, 32)
@@ -191,6 +240,7 @@ def _swa_split_kernel(
     APPLY_ROPE: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     REQS: tl.constexpr = 1,
+    EARLY_LOADS: tl.constexpr = False,
 ):
     G: tl.constexpr = HQ // HKV
     PAGE: tl.constexpr = HKV * P * D
@@ -288,9 +338,33 @@ def _swa_split_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
+    if EARLY_LOADS:
+        # Every operand load of this program at once, right after the wait (with the fused
+        # prep: the query rows, the key block's step K/V rows, the writer's step K/V rows;
+        # masked rows load nothing): one dependent round trip instead of one per prep. The
+        # arithmetic below is the same statements on the same values.
+        e_q = _prep_rows_load(qkv_ptr, t * qkv_stride, (h * G + r % G) * q_stride, row_ok, R)
+        e_k = _prep_rows_load(qkv_ptr, new_row * qkv_stride, tl.zeros([BLOCK], tl.int32) + k_col,
+                              new, BLOCK)  # fmt: skip
+        e_v = tl.load(
+            qkv_ptr + new_row[:, None] * qkv_stride + v_col + d[None, :],
+            mask=new[:, None],
+            other=0.0,
+        )
+        e_wk = _prep_rows_load(qkv_ptr, tok * qkv_stride, tl.zeros([8], tl.int32) + k_col, write_ok, 8)
+        e_wv = tl.load(
+            qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :],
+            mask=write_ok[:, None],
+            other=0.0,
+        )
+
     if writer:
         # The step's K/V into the paged cache: what applyBiasRopeUpdateKVCacheV2 stores.
-        if FUSED_PREP:
+        if EARLY_LOADS:
+            wk0, wk1, wk2, wk3, wk4, wk5, wk6, wk7, wkx = e_wk
+            k_new = _prep_rows_math(wk0, wk1, wk2, wk3, wk4, wk5, wk6, wk7, wkx, cos_w, sin_w, 1.0,
+                                    prep_eps, 8, APPLY_ROPE)  # fmt: skip
+        elif FUSED_PREP:
             k_new = _prep_rows(
                 qkv_ptr,
                 tok * qkv_stride,
@@ -309,11 +383,14 @@ def _swa_split_kernel(
                 mask=tok_ok[:, None],
                 other=0.0,
             )
-        v_new = tl.load(
-            qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :],
-            mask=tok_ok[:, None],
-            other=0.0,
-        )
+        if EARLY_LOADS:
+            v_new = e_wv
+        else:
+            v_new = tl.load(
+                qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :],
+                mask=tok_ok[:, None],
+                other=0.0,
+            )
         tl.store(
             pool_ptr + (w_page_k * PAGE + slot)[:, None] + d[None, :],
             _to_cache_fp8(k_new, scale_bf16),
@@ -326,7 +403,12 @@ def _swa_split_kernel(
         )
 
     q_head = h * G + r % G
-    if FUSED_PREP:
+    if EARLY_LOADS:
+        qx0, qx1, qx2, qx3, qx4, qx5, qx6, qx7, qxx = e_q
+        q = _prep_rows_math(qx0, qx1, qx2, qx3, qx4, qx5, qx6, qx7, qxx, cos_q, sin_q, q_scale, prep_eps, R,
+                            APPLY_ROPE)  # fmt: skip
+        q = tl.where(row_ok[:, None], q, 0.0)
+    elif FUSED_PREP:
         q = _prep_rows(
             qkv_ptr,
             t * qkv_stride,
@@ -357,7 +439,13 @@ def _swa_split_kernel(
     # Whether this program's key block holds any of the step's own keys.
     has_new = base + b0 * BLOCK + BLOCK > past
     for b in range(b0, b1):  # at most once: one key block per program
-        if FUSED_PREP:
+        if EARLY_LOADS:
+            k_new = tl.zeros([BLOCK, D], tl.bfloat16)
+            if has_new:
+                kx0, kx1, kx2, kx3, kx4, kx5, kx6, kx7, kxx = e_k
+                k_new = _prep_rows_math(kx0, kx1, kx2, kx3, kx4, kx5, kx6, kx7, kxx, cos_k, sin_k, 1.0,
+                                        prep_eps, BLOCK, APPLY_ROPE)  # fmt: skip
+        elif FUSED_PREP:
             k_new = tl.zeros([BLOCK, D], tl.bfloat16)
             if has_new:
                 k_new = _prep_rows(
@@ -378,11 +466,14 @@ def _swa_split_kernel(
                 mask=new[:, None],
                 other=0.0,
             )
-        v_new = tl.load(
-            qkv_ptr + new_row[:, None] * qkv_stride + v_col + d[None, :],
-            mask=new[:, None],
-            other=0.0,
-        )
+        if EARLY_LOADS:
+            v_new = e_v
+        else:
+            v_new = tl.load(
+                qkv_ptr + new_row[:, None] * qkv_stride + v_col + d[None, :],
+                mask=new[:, None],
+                other=0.0,
+            )
         k = tl.where(new[:, None], _to_cache_fp8(k_new, scale_bf16), k_old)
         v = tl.where(new[:, None], _to_cache_fp8(v_new, scale_bf16), v_old)
         s = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * qk_scale
@@ -967,6 +1058,7 @@ def _swa_combine_kernel(
     FUSED_GATE: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     REQS: tl.constexpr = 1,
+    EARLY_LOADS: tl.constexpr = False,
 ):
     G: tl.constexpr = HQ // HKV
     row = tl.program_id(0)  # token * G + query head within the KV group
@@ -979,6 +1071,16 @@ def _swa_combine_kernel(
         out_ptr += req * M * out_stride
         if FUSED_GATE:
             gate_ptr += req * M * gate_token_stride
+    if EARLY_LOADS:
+        if FUSED_GATE:
+            # Before the wait: the gate is the QKV projection's (or the prep's), complete
+            # before this grid launched -- the split launches it only after its own wait,
+            # which returns once that kernel has completed. Read at L2.
+            g_early = tl.load(
+                gate_ptr + (row // G) * gate_token_stride + (h * G + row % G) * gate_head_stride
+                + tl.arange(0, D),
+                cache_modifier=".cg",
+            )  # fmt: skip
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
         if FUSED_GATE:
@@ -991,10 +1093,14 @@ def _swa_combine_kernel(
     part = (sp * HKV + h) * (M * G) + row
     m_split = tl.load(part_ml_ptr + part * 2, mask=s_ok, other=-1.0e30)
     l_split = tl.load(part_ml_ptr + part * 2 + 1, mask=s_ok, other=0.0)
+    if EARLY_LOADS:
+        # The partial O with the (max, sum) words: one dependent round trip.
+        o = tl.load(part_o_ptr + part[:, None] * D + d[None, :], mask=s_ok[:, None], other=0.0)
     m_max = tl.max(m_split, 0)
     w = tl.where(s_ok & (l_split > 0), tl.math.exp2(m_split - m_max), 0.0)
     den = tl.sum(w * l_split, 0)
-    o = tl.load(part_o_ptr + part[:, None] * D + d[None, :], mask=s_ok[:, None], other=0.0)
+    if not EARLY_LOADS:
+        o = tl.load(part_o_ptr + part[:, None] * D + d[None, :], mask=s_ok[:, None], other=0.0)
     num = tl.sum(o * w[:, None], 0)
     t = row // G
     head = h * G + row % G
@@ -1004,7 +1110,10 @@ def _swa_combine_kernel(
         x = attention.to(tl.float32)
         variance = _norm_gate_sum_of_squares(x) / D
         normed = (x * tl.rsqrt(variance + gate_eps)).to(tl.bfloat16)
-        g = tl.load(gate_ptr + t * gate_token_stride + head * gate_head_stride + d).to(tl.float32)
+        if EARLY_LOADS:
+            g = g_early.to(tl.float32)
+        else:
+            g = tl.load(gate_ptr + t * gate_token_stride + head * gate_head_stride + d).to(tl.float32)
         sigmoid = tl.sigmoid(g).to(tl.bfloat16)
         result = normed.to(tl.float32) * sigmoid.to(tl.float32)
         tl.store(out_ptr + t * out_stride + head * D + d, result)

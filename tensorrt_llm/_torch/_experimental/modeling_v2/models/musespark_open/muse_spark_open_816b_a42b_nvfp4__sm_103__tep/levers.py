@@ -82,7 +82,62 @@ DEFAULT_VALUES = (AUTO, BASELINE)
 SOURCES = ("structural", "dependency", "knob", "baseline", "auto", "gate")
 
 #: Retired switches and what replaced them. Setting one, to any value, raises.
-RETIRED: Mapping[str, str] = types.MappingProxyType({})
+#:
+#: Every switch of the sm103 decode stack became a lever; a deployment that still exports one
+#: of these names is told which knob to set instead, rather than running with the switch
+#: silently ignored. A row-bound or mode switch names its lever's parameter knob, which has
+#: no effect on its own: set the lever too.
+RETIRED: Mapping[str, str] = types.MappingProxyType(
+    {
+        "TRTLLM_MUSESPARK_TEP8_FC_SHARD_MAX_ROWS": (
+            PREFIX + "TEP8_FC_SHARD_WIDE=on, with its MAX_ROWS"
+        ),
+        "MUSESPARK_OPEN_TEP8_PERSISTENT_EXPERTS_MAX_ROWS": (
+            PREFIX + "TEP8_PERSISTENT_BATCH_EXPERTS=on, with its MAX_ROWS"
+        ),
+        "TRTLLM_MUSESPARK_TEP8_EXPERTS_EARLY_START": PREFIX + "TEP8_EXPERTS_EARLY_START=on",
+        "MUSESPARK_OPEN_TEP8_ROUTER_SHARD": (
+            PREFIX + "TEP8_ROUTER_SHARD=on (and " + PREFIX + "TEP8_ROUTER_SHARD_WIDE=on for wide)"
+        ),
+        "MUSESPARK_OPEN_TEP8_WIDE_DIRECT_TRANSPORTS": (
+            PREFIX + "TEP8_WIDE_DIRECT_TRANSPORTS=on, with its SITES"
+        ),
+        "MUSESPARK_OPEN_TEP8_WIDE_DIRECT_POOL": PREFIX + "TEP8_WIDE_DIRECT_POOL=on",
+        "MUSESPARK_OPEN_DRAFTER_WIDE_HOPS": (
+            PREFIX + "WIDE_DRAFTER_HOPS=on, with its TP8_MAX_ROWS"
+        ),
+        "TRTLLM_MUSESPARK_TEP8_FINALIZE_TWO_SHOT": PREFIX + "FINALIZE_TWO_SHOT=on",
+        "TRTLLM_MUSESPARK_TEP8_FINALIZE_TWO_SHOT_MAX_ROWS": (
+            PREFIX + "FINALIZE_TWO_SHOT=on, with its TP8_MAX_ROWS"
+        ),
+        "TRTLLM_MUSESPARK_TEP8_FINALIZE_TRANSPORT_MAX_TOKENS": (
+            PREFIX + "TEP8_FINALIZE_TRANSPORT_WIDE=on, with its MAX_TOKENS"
+        ),
+        "TRTLLM_MUSESPARK_FINALIZE_TRANSPORT_TRIGGER": PREFIX + "FINALIZE_ENTRY_TRIGGER=on",
+        "TRTLLM_MUSESPARK_TEP8_BATCH_SPLITK": PREFIX + "TEP8_BATCH_SPLITK=on",
+        "TRTLLM_MUSESPARK_MULTI_REQUEST_COMBINE_GATE": (PREFIX + "MULTI_REQUEST_COMBINE_GATE=on"),
+        "TRTLLM_MUSESPARK_ROUTER_STAGED_GEMM": (PREFIX + "ROUTER_STAGED_GEMM=on, with its BUILD"),
+        "MUSESPARK_OPEN_DRAFTER_FUSED_PREP": PREFIX + "DRAFTER_FUSED_PREP=on",
+        "MUSESPARK_OPEN_DRAFTER_FUSED_PREP_MIN_REQUESTS": (
+            PREFIX + "DRAFTER_FUSED_PREP=on, with its MIN_REQUESTS"
+        ),
+        "MUSESPARK_OPEN_RING_BUDDY_MAX_ROWS": (
+            PREFIX + "TEP8_RING_BUDDY_WIDE=on, with its MAX_ROWS"
+        ),
+        "TRTLLM_MUSESPARK_TEP8_WIDE_BALANCE_ROWS": (
+            PREFIX + "TEP8_WIDE_BALANCE=on, with its MAX_ROWS"
+        ),
+        "MUSESPARK_OPEN_RING_BUDDY_STATS": (
+            PREFIX + "RING_BUDDY_STATS=on, with its INTERVAL_S (whole seconds)"
+        ),
+        "TRTLLM_MUSESPARK_TEP8_EXPERTS_IN_KERNEL_PLACEMENT": (
+            PREFIX + "TEP8_EXPERTS_IN_KERNEL_PLACEMENT=on"
+        ),
+        "TRTLLM_MUSESPARK_TEP8_EXPERTS_INTERLEAVED_FETCH": (
+            PREFIX + "TEP8_EXPERTS_INTERLEAVED_FETCH=on"
+        ),
+    }
+)
 #: Name prefixes only retired switches carry; any other name under them raises too.
 RETIRED_PREFIXES: Mapping[str, str] = types.MappingProxyType({})
 
@@ -384,6 +439,37 @@ def _always(why: str) -> RuleFn:
     return rule
 
 
+def _knob_only(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+    """Off under ``auto``: on only by its knob, until this target gates it."""
+    return False, "flagged: on only by its knob, until it is gated on this target"
+
+
+def _tep4_only(what: str) -> RuleFn:
+    """On at TP4, where the composition carries the path; off at any other size by its knob only.
+
+    The two paths that read it (``wide_drafter_hops``, ``finalize_two_shot``) are the sm103 TP4
+    composition's own, served there under ``auto`` as before; the wider composition serves them
+    too, but leaves them to their knob.
+    """
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if d.tp == 4:
+            return True, what
+        return False, f"tep{d.tp}: on only by its knob (the tep4 composition's path)"
+
+    return rule
+
+
+def _ported(kind: Kind, params: Tuple[Param, ...] = ()) -> Rule:
+    """A switch of the sm103 decode stack, ported from an environment variable: default off.
+
+    Every one of them gates a decode step of at most a few hundred rows, so the serving region
+    is ``LL``; none is on under ``auto`` or ``baseline`` (``_knob_only``, and a non-upstream
+    origin), so a deployment that sets no knob runs exactly the paths it ran before.
+    """
+    return Rule("LL", kind, _knob_only, params=params)
+
+
 def _hot_replicas(requires_decode: bool) -> RuleFn:
     def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
         if requires_decode and not d.decodes():
@@ -398,15 +484,60 @@ def _hot_replicas(requires_decode: bool) -> RuleFn:
 LL_MAX_BATCH = 8
 
 
-#: The TP4 paths: on wherever served under ``auto``.
+#: The TP4 paths: on wherever served under ``auto``. ``wide_drafter_hops`` was one until the
+#: wider composition began to serve it too; it has its own rule now (``_tep4_only``).
 TEP4_PATHS = (
     "multi_request_prep_append",
     "multi_request_split_kv",
     "multi_request_post_attention_hop",
-    "wide_drafter_hops",
     "router_gemm",
     "projection_publish",
 )
+
+# --------------------------------------------------------------------------
+# The parameter defaults of the ported switches
+# --------------------------------------------------------------------------
+# Each is the value its environment variable named, or the bound the module it configures
+# already serves. They are literals because this resolver imports no module of the target.
+#
+#: ``wide_drafter_hops__TP8_MAX_ROWS``: the rows the sm103 tep4 composition serves
+#: (``ops/allreduce/drafter_hop.WIDE_SERVED_ROWS_BY_SM[(10, 3)]``), the drafter blocks of
+#: 2..7 requests at K = 7.
+WIDE_DRAFTER_HOPS_TP8_ROWS = 56
+#: ``finalize_two_shot__TP8_MAX_ROWS``: the last row of the tep8 band as
+#: ``kernels/finalize_two_shot/install.ROWS_BY_SM_TP[(103, 8)]`` declares it (19 requests).
+FINALIZE_TWO_SHOT_TP8_ROWS = 152
+#: ``tep8_fc_shard_wide__MAX_ROWS``: the five-request decode step (40 rows at K = 7) the
+#: sharded ``fc``'s note names; its capacity is 128 (``spec_worker.FC_SHARD_TP8_ROW_CAPACITY``).
+FC_SHARD_TP8_ROWS = 40
+#: ``tep8_persistent_batch_experts__MAX_ROWS``: the largest stacked call the persistent
+#: kernel's batch builds serve (``ops/moe/persistent_experts.BATCH_MAX_ROWS``).
+PERSISTENT_BATCH_ROWS = 32
+#: ``tep8_wide_direct_transports__SITES``: the sites the path can publish
+#: (``kernels/wide_direct_transports/transports.SITES``); both, as its ``1`` meant.
+WIDE_DIRECT_SITES = ("pool", "unpool")
+#: ``tep8_finalize_transport_wide__MAX_TOKENS``: the widest TP8 layout
+#: (``ops/moe/finalize_allreduce_transport.TP8_WIDE_MAX_TOKENS``), five requests at K = 7.
+FINALIZE_TRANSPORT_TOKENS = 40
+#: ``router_staged_gemm__BUILD``: the staged GEMM's builds and the one its ``1`` selected
+#: (``ops/moe/router_gemm.STAGED_BUILDS``, ``STAGED_DEFAULT``). Exactly one is named.
+ROUTER_STAGED_BUILDS = ("bulk", "v4", "bulk-prewait", "v4-prewait")
+ROUTER_STAGED_BUILD = "bulk-prewait"
+#: ``drafter_fused_prep__MIN_REQUESTS``: ``ops/spec/drafter_step_prep.DEFAULT_MIN_REQUESTS``.
+DRAFTER_PREP_MIN_REQUESTS = 2
+#: ``tep8_ring_buddy_wide__MAX_ROWS``: the stacked path's row cap on the tep8 ring, replacing
+#: ``kernels/replicated_experts/ring_buddy.MAX_ROWS`` (16). 128 is ``8 * B`` for a 16-request
+#: verify step at K = 7; the ceiling is one ``ring_buddy_assign`` program's rows
+#: (``ops/moe/ring_buddy_assign.MAX_SLOTS // TOP_K``), which ``install`` refuses to exceed.
+RING_BUDDY_MAX_ROWS = 128
+RING_BUDDY_ROW_CEILING = 256
+#: ``tep8_wide_balance__MAX_ROWS``: the band the balanced NVFP4 placement adds above the
+#: stacked cap, from ``ring_buddy_assign.WIDE_BALANCE_MIN_ROWS`` (129) to the same ceiling.
+WIDE_BALANCE_ROWS = 256
+WIDE_BALANCE_MIN_ROWS = 129
+#: ``ring_buddy_stats__INTERVAL_S``: seconds between the placement-census reports TP rank 0
+#: logs. Whole seconds only (the knob grammar has no fractional parameter).
+RING_BUDDY_STATS_INTERVAL_S = 60
 
 
 def _tep4_path_rule() -> Rule:
@@ -459,6 +590,64 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 Param("MIN_ROWS", 16, 8, 16),
             ),
         ),
+        # The two tep4 composition paths the wider composition also serves, on its knob only.
+        # ``TP8_MAX_ROWS`` is read only where the tep8 workspace is built; at tep4 each path
+        # keeps the rows its own composition serves.
+        "wide_drafter_hops": Rule(
+            "upstream",
+            Kind.COMPOSITION,
+            _tep4_only("9..56-row block decodes"),
+            params=(Param("TP8_MAX_ROWS", WIDE_DRAFTER_HOPS_TP8_ROWS, 9, 64),),
+        ),
+        "finalize_two_shot": Rule(
+            "upstream",
+            Kind.COMPOSITION,
+            _tep4_only("72..512-row decode steps"),
+            params=(Param("TP8_MAX_ROWS", FINALIZE_TWO_SHOT_TP8_ROWS, 24, 152),),
+        ),
+        # The sm103 decode-stack switches, ported from environment variables: default off.
+        "tep8_fc_shard_wide": _ported(
+            Kind.FLAGGED, (Param("MAX_ROWS", FC_SHARD_TP8_ROWS, 9, 128),)
+        ),
+        "tep8_persistent_batch_experts": _ported(
+            Kind.FLAGGED, (Param("MAX_ROWS", PERSISTENT_BATCH_ROWS, 9, 32),)
+        ),
+        "tep8_experts_early_start": _ported(Kind.FLAGGED),
+        "tep8_router_shard": _ported(Kind.FLAGGED),
+        "tep8_router_shard_wide": _ported(Kind.FLAGGED),
+        "tep8_wide_direct_pool": _ported(Kind.FLAGGED),
+        "tep8_wide_direct_transports": _ported(
+            Kind.FLAGGED, (Param("SITES", WIDE_DIRECT_SITES, choices=WIDE_DIRECT_SITES),)
+        ),
+        "tep8_batch_splitk": _ported(Kind.BITWISE),
+        "finalize_entry_trigger": _ported(Kind.BITWISE),
+        "tep8_finalize_transport_wide": _ported(
+            Kind.FLAGGED, (Param("MAX_TOKENS", FINALIZE_TRANSPORT_TOKENS, 17, 40),)
+        ),
+        "multi_request_combine_gate": _ported(Kind.BITWISE),
+        "router_staged_gemm": _ported(
+            Kind.FLAGGED,
+            (Param("BUILD", (ROUTER_STAGED_BUILD,), choices=ROUTER_STAGED_BUILDS),),
+        ),
+        "drafter_fused_prep": _ported(
+            Kind.FLAGGED, (Param("MIN_REQUESTS", DRAFTER_PREP_MIN_REQUESTS, 1, 64),)
+        ),
+        "tep8_ring_buddy_wide": _ported(
+            Kind.FLAGGED, (Param("MAX_ROWS", RING_BUDDY_MAX_ROWS, 1, RING_BUDDY_ROW_CEILING),)
+        ),
+        "tep8_wide_balance": _ported(
+            Kind.FLAGGED,
+            (Param("MAX_ROWS", WIDE_BALANCE_ROWS, WIDE_BALANCE_MIN_ROWS, RING_BUDDY_ROW_CEILING),),
+        ),
+        # Diagnostics: one extra assign launch per placement, and the in-kernel placement
+        # stands aside for it (``ring_buddy``'s ``_stats is None``), so it is never on by
+        # itself under ``auto``.
+        "ring_buddy_stats": _ported(
+            Kind.FLAGGED,
+            (Param("INTERVAL_S", RING_BUDDY_STATS_INTERVAL_S, 1, 86400),),
+        ),
+        "tep8_experts_in_kernel_placement": _ported(Kind.FLAGGED),
+        "tep8_experts_interleaved_fetch": _ported(Kind.FLAGGED),
         **{name: _tep4_path_rule() for name in TEP4_PATHS},
     }
 )
