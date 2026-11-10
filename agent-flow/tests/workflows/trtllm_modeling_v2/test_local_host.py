@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import subprocess
 import time
+from unittest import mock
 
 import pytest
 import yaml
@@ -187,9 +189,19 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
     _git(repo, "commit", "-q", "-m", "base")
     for name in ("MV2FLOW_GIT_NAME", "MV2FLOW_GIT_EMAIL"):
         monkeypatch.delenv(name, raising=False)
+    # The CLI pins its identity in the process environment and starts a heartbeat thread:
+    # neither outlives this test.
+    before = dict(os.environ)
+    beats: list[str] = []
+
+    class _Heartbeat:
+        def mark_exit(self):
+            beats.append("exit")
+
+    monkeypatch.setattr(cli, "start_orchestrator_heartbeat", lambda workspace, period: _Heartbeat())
 
     def run(*argv):
-        with pytest.raises(SystemExit) as exited:
+        with mock.patch.dict(os.environ), pytest.raises(SystemExit) as exited:
             cli.main(list(argv))
         return exited.value.code
 
@@ -215,3 +227,4 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
     failed = tmp_path / "ws-no-anchor"
     assert run("--task", str(task_file), "--workspace", str(failed), "--dry-run") == 1
     assert "preflight failed" in (failed / "journal.md").read_text()
+    assert dict(os.environ) == before
