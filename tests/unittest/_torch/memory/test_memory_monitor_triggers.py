@@ -26,6 +26,7 @@ import types
 
 import pytest
 import torch
+from memory_monitor_test_utils import MB, FakeKvManager, kv_stats
 
 from tensorrt_llm._torch.memory.monitor import settings, startup
 from tensorrt_llm._torch.memory.monitor.providers import (
@@ -41,33 +42,7 @@ from tensorrt_llm._torch.memory.monitor.triggers import (
     release_oom_reporter,
     report_now,
     suspend_reporting,
-    uninstall_oom_reporter,
 )
-
-MB = 1 << 20
-
-
-def _stats(total, free, evictable, slot_sizes=(MB,)):
-    return types.SimpleNamespace(
-        total=total, free=free, evictable=evictable, slot_sizes=tuple(slot_sizes)
-    )
-
-
-class _FakeManager:
-    def __init__(self, *stats):
-        self._stats = list(stats)
-
-    def get_storage_statistics(self, level):
-        return self._stats
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    clear_registered_providers()
-    uninstall_oom_reporter()
-    yield
-    clear_registered_providers()
-    uninstall_oom_reporter()
 
 
 @pytest.mark.cpu_only
@@ -84,15 +59,15 @@ def test_registry():
     assert not any(isinstance(p, KvCacheProvider) for p in default_providers())
     assert not [e for e in collect_all() if e.category is Category.KV_CACHE_POOL]
 
-    manager = _FakeManager(_stats(100, 40, 10))
+    manager = FakeKvManager(kv_stats(100, 40, 10))
     register_provider(KvCacheProvider(manager))
     kv = [e for e in collect_all() if e.category is Category.KV_CACHE_POOL]
     assert kv, "a registered provider must reach the report"
     assert physical()[0].size_bytes == 100 * MB
 
     clear_registered_providers()
-    first = _FakeManager(_stats(100, 0, 0))
-    second = _FakeManager(_stats(200, 0, 0))
+    first = FakeKvManager(kv_stats(100, 0, 0))
+    second = FakeKvManager(kv_stats(200, 0, 0))
     register_provider(KvCacheProvider(first))
     register_provider(KvCacheProvider(second))
     assert len(physical()) == 1, "a rebuilt manager must supersede the old one"
@@ -102,7 +77,7 @@ def test_registry():
 @pytest.mark.cpu_only
 def test_manager_is_held_weakly():
     """The pool is the largest allocation in the process."""
-    manager = _FakeManager(_stats(100, 0, 0))
+    manager = FakeKvManager(kv_stats(100, 0, 0))
     provider = KvCacheProvider(manager)
     register_provider(provider)
     assert provider.available()

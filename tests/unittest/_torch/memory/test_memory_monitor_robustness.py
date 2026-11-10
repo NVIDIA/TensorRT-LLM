@@ -22,6 +22,7 @@ import weakref
 
 import pytest
 import torch
+from memory_monitor_test_utils import MB, capture_graph, needs_gpu
 
 import tensorrt_llm._torch.memory.monitor as mon
 from tensorrt_llm._torch.memory.monitor import pools, startup, tagging
@@ -29,32 +30,10 @@ from tensorrt_llm._torch.memory.monitor import triggers as triggers_module
 from tensorrt_llm._torch.memory.monitor.schema import Category
 from tensorrt_llm._torch.memory.monitor.summary import Group, group_totals
 
-MB = 1 << 20
-needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-
 
 @pytest.fixture(autouse=True)
 def _monitor_on(monkeypatch):
     monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
-    tagging.clear_claims()
-    startup.clear()
-    yield
-    tagging.clear_claims()
-    startup.clear()
-    mon.clear_baseline()
-
-
-def _capture_graph(size):
-    graph = torch.cuda.CUDAGraph()
-    warm = torch.ones(1024, device="cuda")
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        warm * 2
-    torch.cuda.current_stream().wait_stream(side)
-    with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle()):
-        kept = torch.empty(size, dtype=torch.uint8, device="cuda")
-    return graph, kept
 
 
 @needs_gpu
@@ -73,7 +52,7 @@ def test_report_cost(monkeypatch):
 
     # The heap is walked once per new pool, not per report: the graph pool
     # is classified when first seen and remembered.
-    graph, kept = _capture_graph(8 * MB)
+    graph, _, kept = capture_graph(8 * MB)
     walks = []
     real_walk = pools._live_mempool_ids
     try:

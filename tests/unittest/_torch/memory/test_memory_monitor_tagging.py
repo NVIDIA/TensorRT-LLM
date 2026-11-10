@@ -25,6 +25,7 @@ Needs a GPU: the attribution is read back out of a real allocator snapshot.
 
 import pytest
 import torch
+from memory_monitor_test_utils import MB
 
 from tensorrt_llm._torch.memory.monitor.checks import check_tag_coverage
 from tensorrt_llm._torch.memory.monitor.tagging import (
@@ -41,8 +42,6 @@ from tensorrt_llm._torch.memory.monitor.tagging import (
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="reads a real allocator snapshot"
 )
-
-MB = 1 << 20
 
 
 @pytest.fixture

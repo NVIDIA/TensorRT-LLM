@@ -21,33 +21,17 @@ that could drift from them.
 
 import pytest
 import torch
+from memory_monitor_test_utils import GIB, capability
 
 from tensorrt_llm._torch.memory.monitor import startup
-from tensorrt_llm._torch.memory.monitor.capability import Capability
 from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
 from tensorrt_llm._torch.memory.monitor.report import render
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Entry, Placement, Source
-
-GIB = 1 << 30
 
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
-    startup.clear()
-    yield
-    startup.clear()
-
-
-def _capability():
-    return Capability(
-        allocator_backend="native",
-        alloc_conf="",
-        alloc_conf_var=None,
-        expandable_segments=False,
-        metadata_supported=True,
-        nvml_available=True,
-    )
 
 
 def _frame(free=150 * GIB, kv=16 * GIB):
@@ -124,7 +108,7 @@ def test_memory_plan(monkeypatch):
     def rendered(non_kv_peak, activation, free, kv):
         startup.clear()
         startup.record_memory_plan(non_kv_peak=non_kv_peak, activation=activation)
-        return render(_frame(free=free, kv=kv), _capability())
+        return render(_frame(free=free, kv=kv), capability())
 
     # Device in use: 180 - 165 = 15 GiB, against 10 + 6 planned.
     text = rendered(10 * GIB, 2 * GIB, free=165 * GIB, kv=6 * GIB)
@@ -149,7 +133,7 @@ def test_memory_plan(monkeypatch):
     assert "exceeds the startup plan" not in text, "sampling noise called out"
 
     startup.clear()
-    assert "Startup plan" not in render(_frame(), _capability()), "no plan, no line"
+    assert "Startup plan" not in render(_frame(), capability()), "no plan, no line"
 
     monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
     startup.record_memory_plan(non_kv_peak=10 * GIB, activation=None)
@@ -161,8 +145,8 @@ def test_memory_plan(monkeypatch):
 def test_steps_only_in_startup_reports():
     startup.set_stage_advice({"model": "Model"}, {})
     startup.record_stage("model", 100 * GIB, 99 * GIB)
-    assert "Memory taken by each startup step" not in render(_frame(), _capability())
-    text = render(_frame(), _capability(), startup_steps=True)
+    assert "Memory taken by each startup step" not in render(_frame(), capability())
+    text = render(_frame(), capability(), startup_steps=True)
     assert "Memory taken by each startup step" in text
     assert "+1.00 GiB  Model" in text
 
@@ -171,12 +155,12 @@ def test_steps_only_in_startup_reports():
     startup.clear()
     startup.set_stage_advice({"model": "Model"}, {})
     startup._stages.append(startup.StageSample("model", "Model", 100 * GIB, 100 * GIB, GIB))
-    text = render(_frame(), _capability(), startup_steps=True)
+    text = render(_frame(), capability(), startup_steps=True)
     assert "(this process)" in text and "+1.00 GiB  Model" in text, "per-process preferred"
 
     startup.clear()
     startup._stages.append(startup.StageSample("model", "Model", 100 * GIB, 99 * GIB, None))
-    text = render(_frame(), _capability(), startup_steps=True)
+    text = render(_frame(), capability(), startup_steps=True)
     assert "device-wide" in text
 
 
@@ -421,7 +405,7 @@ def test_rows_list_their_parts():
             tagged(Category.SAMPLER, GIB // 2, "Sampler"),
         ],
     )
-    text = render(frame, _capability())
+    text = render(frame, capability())
     assert "of which (GiB): Additional executor resources 1.00, Sampler 0.50" in text
 
     startup._first = startup.Reading(process=10 * GIB, torch=0, known=0)
@@ -431,7 +415,7 @@ def test_rows_list_their_parts():
         TorchReading(reserved=0, live=0),
         [],
     )
-    text = render(frame, _capability())
+    text = render(frame, capability())
     assert "before the first startup step 10.00" in text
     assert "custom allreduce workspace 2.00" in text
 
@@ -442,7 +426,7 @@ def test_rows_list_their_parts():
         TorchReading(reserved=0, live=0),
         [],
     )
-    assert "before the first startup step" not in render(frame, _capability())
+    assert "before the first startup step" not in render(frame, capability())
 
 
 def _cuda_runtime():

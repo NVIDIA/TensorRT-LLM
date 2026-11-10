@@ -25,6 +25,7 @@ CPU only: the statistics objects are fakes shaped like the real binding.
 import types
 
 import pytest
+from memory_monitor_test_utils import MB, FakeKvManager, kv_stats
 
 from tensorrt_llm._torch.memory.monitor.checks import check_kv_pool_conservation
 from tensorrt_llm._torch.memory.monitor.providers.kv_cache import (
@@ -33,70 +34,39 @@ from tensorrt_llm._torch.memory.monitor.providers.kv_cache import (
 )
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category
 
-MB = 1 << 20
-
-
-def _stats(total, free, evictable, slot_sizes=(MB,)):
-    """Shaped like the nanobind StorageStatistics, derived props included."""
-    obj = types.SimpleNamespace(
-        total=total,
-        free=free,
-        evictable=evictable,
-        slot_sizes=tuple(slot_sizes),
-    )
-    # Present so a test can prove the checks do not lean on them.
-    obj.available = lambda: obj.free + obj.evictable
-    obj.unavailable = lambda: obj.total - obj.available()
-    return obj
-
-
-class _Manager:
-    """A real class, not a SimpleNamespace: the provider holds it weakly and
-    SimpleNamespace forbids weak references."""
-
-    def __init__(self, *stats):
-        self._stats = list(stats)
-
-    def get_storage_statistics(self, level):
-        return self._stats
-
-
-def _manager(*stats):
-    return _Manager(*stats)
-
 
 @pytest.mark.cpu_only
 def test_check_c_can_fail_and_does_not_read_the_derived_properties():
     """The reason this check exists at all."""
 
     def check(*stats):
-        return check_kv_pool_conservation(kv_pool_group_stats(_manager(*stats)))
+        return check_kv_pool_conservation(kv_pool_group_stats(FakeKvManager(*stats)))
 
-    assert all(r.passed for r in check(_stats(100, 30, 20))), "a consistent pool passes"
+    assert all(r.passed for r in check(kv_stats(100, 30, 20))), "a consistent pool passes"
 
     # Double counting a block as both free and evictable produces exactly
     # this. If no input could make the check fail, it would be worthless.
-    results = check(_stats(100, 70, 50))
+    results = check(kv_stats(100, 70, 50))
     assert not results[0].passed
     assert "in_use=-20" in results[0].detail
 
-    assert check(_stats(100, 60, 40))[0].passed, "the boundary is allowed"
+    assert check(kv_stats(100, 60, 40))[0].passed, "the boundary is allowed"
 
     # available()/unavailable() are computed from total/free/evictable,
     # so a check written against them passes by construction. Poison
     # them: a check that consults them would now disagree with itself.
-    stats = _stats(100, 70, 50)
+    stats = kv_stats(100, 70, 50)
     stats.available = lambda: 0
     stats.unavailable = lambda: 100
     assert not check(stats)[0].passed, "the check must read the stored fields, not the derived ones"
 
-    results = check(_stats(100, 30, 20), _stats(100, 70, 50))
+    results = check(kv_stats(100, 30, 20), kv_stats(100, 70, 50))
     assert [r.passed for r in results] == [True, False], "each pool group is checked separately"
 
 
 @pytest.mark.cpu_only
 def test_capacity_is_physical_and_in_use_is_logical():
-    rows = kv_pool_group_stats(_manager(_stats(10, 2, 3, slot_sizes=(MB, 2 * MB))))
+    rows = kv_pool_group_stats(FakeKvManager(kv_stats(10, 2, 3, slot_sizes=(MB, 2 * MB))))
     # Every pool in the group contributes a slot.
     assert rows[0]["slot_bytes"] == 3 * MB
     assert rows[0]["capacity_bytes"] == 30 * MB
@@ -104,7 +74,7 @@ def test_capacity_is_physical_and_in_use_is_logical():
 
     # The provider holds the manager weakly, so the caller keeps it
     # alive -- in production the ResourceManager owns it.
-    manager = _manager(_stats(100, 60, 20))
+    manager = FakeKvManager(kv_stats(100, 60, 20))
     entries = KvCacheProvider(manager).collect()
     physical = [e for e in entries if e.basis is Basis.PHYSICAL_BACKING]
     assert len(physical) == 1
@@ -123,17 +93,20 @@ def test_capacity_is_physical_and_in_use_is_logical():
             e.size_bytes for e in KvCacheProvider(m).collect() if e.basis is Basis.PHYSICAL_BACKING
         )
 
-    busy_manager, idle_manager = _manager(_stats(100, 0, 0)), _manager(_stats(100, 100, 0))
+    busy_manager, idle_manager = (
+        FakeKvManager(kv_stats(100, 0, 0)),
+        FakeKvManager(kv_stats(100, 100, 0)),
+    )
     # The device has not taken anything back, so neither may the monitor.
     assert physical_of(busy_manager) == physical_of(idle_manager) == 100 * MB
 
-    small = _manager(_stats(8, 1, 1))
+    small = FakeKvManager(kv_stats(8, 1, 1))
     entries = KvCacheProvider(small).collect()
     assert all(e.category is Category.KV_CACHE_POOL for e in entries)
     assert "pool_group[0]" in entries[0].owner
 
     # free + evictable > total is what check C exists to catch.
-    inconsistent = _manager(_stats(100, 70, 50))
+    inconsistent = FakeKvManager(kv_stats(100, 70, 50))
     entries = KvCacheProvider(inconsistent).collect()
     physical = [e for e in entries if e.basis is Basis.PHYSICAL_BACKING]
     # A negative split must not drop the pool: its accounting is most worth
@@ -189,7 +162,7 @@ def test_main_draft_and_cross_pools_are_registered_once_each():
     from tensorrt_llm._torch.memory.monitor import providers as reg
     from tensorrt_llm._torch.pyexecutor._util import _register_kv_cache_monitor_providers
 
-    a, b = _manager(_stats(10, 0, 0)), _manager(_stats(20, 0, 0))
+    a, b = FakeKvManager(kv_stats(10, 0, 0)), FakeKvManager(kv_stats(20, 0, 0))
     assert KvCacheProvider(a, "main").name != KvCacheProvider(b, "draft").name
 
     def physical():
@@ -201,7 +174,7 @@ def test_main_draft_and_cross_pools_are_registered_once_each():
 
     reg.clear_registered_providers()
     try:
-        main, draft, cross = (_manager(_stats(n, 0, 0)) for n in (100, 20, 5))
+        main, draft, cross = (FakeKvManager(kv_stats(n, 0, 0)) for n in (100, 20, 5))
         _register_kv_cache_monitor_providers(main, draft, cross)
         # A shared fixed name would have let the registry keep only one.
         assert physical() == [5 * MB, 20 * MB, 100 * MB]
@@ -231,7 +204,10 @@ class TestChecksRunInRealReports:
         from tensorrt_llm._torch.memory.monitor.providers import register_provider
 
         # Providers hold their manager weakly; keep both alive.
-        inconsistent, consistent = _manager(_stats(100, 70, 50)), _manager(_stats(100, 30, 20))
+        inconsistent, consistent = (
+            FakeKvManager(kv_stats(100, 70, 50)),
+            FakeKvManager(kv_stats(100, 30, 20)),
+        )
         register_provider(KvCacheProvider(inconsistent, "main"))
         register_provider(KvCacheProvider(consistent, "draft"))
         snapshot = capture(tag="unit")

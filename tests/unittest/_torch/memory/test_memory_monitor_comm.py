@@ -22,6 +22,7 @@ import weakref
 
 import pytest
 import torch
+from memory_monitor_test_utils import MB
 
 from tensorrt_llm._torch.memory.monitor import tagging
 from tensorrt_llm._torch.memory.monitor.providers import default_providers
@@ -32,8 +33,6 @@ from tensorrt_llm._torch.memory.monitor.providers.comm import (
 )
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category
 from tensorrt_llm._torch.memory.monitor.summary import GROUP_OF, Group
-
-MB = 1 << 20
 
 
 @pytest.fixture(autouse=True)

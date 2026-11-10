@@ -25,8 +25,8 @@ CPU only: the frame is a pure function over injected readings.
 
 import pytest
 import torch
+from memory_monitor_test_utils import GIB, capability
 
-from tensorrt_llm._torch.memory.monitor.capability import Capability
 from tensorrt_llm._torch.memory.monitor.capture import read_torch
 from tensorrt_llm._torch.memory.monitor.frame import (
     DeviceReading,
@@ -39,21 +39,6 @@ from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Entry, Pl
 from tensorrt_llm._torch.memory.monitor.summary import group_totals
 
 pytestmark = pytest.mark.cpu_only
-
-GIB = 1 << 30
-
-
-def _capability(**overrides) -> Capability:
-    defaults = dict(
-        allocator_backend="native",
-        alloc_conf="",
-        alloc_conf_var=None,
-        expandable_segments=False,
-        metadata_supported=True,
-        nvml_available=True,
-    )
-    defaults.update(overrides)
-    return Capability(**defaults)
 
 
 def _entry(
@@ -119,7 +104,7 @@ def test_frame_balances_and_keeps_a_negative_residual():
     residual = derived_entries(negative)[1]
     assert residual.size_bytes == -10 * GIB
     assert "NEGATIVE" in (residual.note or "")
-    text = render(negative, _capability())
+    text = render(negative, capability())
     assert "-" in text and "negative" in text.lower(), "the report flags a negative residual"
 
 
@@ -132,7 +117,7 @@ def test_unknown_is_not_zero(monkeypatch):
     assert frame.nontorch_known == 0, "an unknown entry is excluded from sums"
     assert Category.DWDP_PAGES in frame.unknown_categories
     assert group_totals(frame).unmeasured, "survives aggregation as unmeasured"
-    text = render(frame, _capability())
+    text = render(frame, capability())
     assert UNAVAILABLE.strip() in text
     # The detail row for the category itself, not the summary row that
     # names it among the unmeasured (whose "50.00 GiB" contains "0.00 GiB").
@@ -147,7 +132,7 @@ def test_unknown_is_not_zero(monkeypatch):
     assert device.process_used_is_upper_bound
     text = render(
         build_frame(device, TorchReading(reserved=0, live=0), []),
-        _capability(nvml_available=False),
+        capability(nvml_available=False),
     )
     assert "UPPER BOUND" in text
 
@@ -156,7 +141,7 @@ def test_unknown_is_not_zero(monkeypatch):
     # torch 2.14 populates it under cudaMallocAsync, older versions leave it
     # at zero -- so it is judged from the data, not from the backend name.
     frame = _frame(reserved=None)
-    text = render(frame, _capability(allocator_backend="cudaMallocAsync"))
+    text = render(frame, capability(allocator_backend="cudaMallocAsync"))
     assert (
         "torch reserved" in text
         and "0.00 GiB" not in text.split("torch reserved")[1].splitlines()[0]
@@ -166,10 +151,10 @@ def test_unknown_is_not_zero(monkeypatch):
     # memory into "unexplained".
     assert frame.nontorch_residual == 60 * GIB
     assert frame.residual_is_upper_bound
-    assert "UPPER BOUND" in render(frame, _capability())
+    assert "UPPER BOUND" in render(frame, capability())
 
     frame = _frame()
-    text = render(frame, _capability(allocator_backend="cudaMallocAsync"))
+    text = render(frame, capability(allocator_backend="cudaMallocAsync"))
     assert frame.nontorch_residual == 50 * GIB, "a populated reserved is trusted on any backend"
     assert not frame.residual_is_upper_bound
     assert "meaningless" not in text and "not reported" not in text
@@ -189,7 +174,7 @@ def test_report_wording_and_columns():
     # torch's snapshot distinguishes active_allocated /
     # active_awaiting_free / inactive. Calling it fragmentation implies
     # it is immediately reusable.
-    text = render(frame, _capability())
+    text = render(frame, capability())
     assert "fragmentation" not in text.lower()
     assert "not handed out" in text
 
@@ -331,11 +316,11 @@ def test_an_unknown_diagnostic_entry_is_not_an_unmeasured_provider():
         entries,
     )
     assert frame.unknown_categories == []
-    text = render(frame, _capability())
+    text = render(frame, capability())
     assert "[unmeasured]" not in text
 
     # A counted entry of unknown size is listed, by owner.
     entries.append(_entry(Category.COMM_MNNVL, None, owner="mnnvl"))
     frame = build_frame(frame.device, frame.torch, entries)
-    text = render(frame, _capability())
+    text = render(frame, capability())
     assert "[unmeasured]" in text and "mnnvl (comm.mnnvl)" in text

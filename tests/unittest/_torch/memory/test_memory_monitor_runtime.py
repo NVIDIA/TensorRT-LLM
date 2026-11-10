@@ -22,21 +22,16 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from memory_monitor_test_utils import MB, needs_gpu
 
 from tensorrt_llm._torch.memory.monitor import tagging, triggers
 from tensorrt_llm.logger import logger
-
-MB = 1 << 20
-needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 
 @pytest.fixture(autouse=True)
 def _armed_cleanly(monkeypatch):
     monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
     monkeypatch.setenv("TLLM_MEM_MONITOR_OOM_INTERVAL", "0")
-    triggers.uninstall_oom_reporter()
-    yield
-    triggers.uninstall_oom_reporter()
 
 
 @pytest.fixture

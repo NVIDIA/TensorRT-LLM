@@ -20,37 +20,14 @@ every number or, worse, not notice. CPU only.
 """
 
 import pytest
+from memory_monitor_test_utils import GIB, capability
 
-from tensorrt_llm._torch.memory.monitor.capability import Capability
 from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
 from tensorrt_llm._torch.memory.monitor.report import render
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Entry, Placement, Source
 from tensorrt_llm._torch.memory.monitor.summary import GROUP_OF, Group, group_totals
 
 pytestmark = pytest.mark.cpu_only
-
-GIB = 1 << 30
-
-
-@pytest.fixture(autouse=True)
-def _no_recorded_startup():
-    """Suggestions read the startup plan; start each test without one."""
-    from tensorrt_llm._torch.memory.monitor import startup
-
-    startup.clear()
-    yield
-    startup.clear()
-
-
-def _capability():
-    return Capability(
-        allocator_backend="native",
-        alloc_conf="",
-        alloc_conf_var=None,
-        expandable_segments=False,
-        metadata_supported=True,
-        nvml_available=True,
-    )
 
 
 def _entry(category, size, placement=Placement.NON_TORCH, **kw):
@@ -121,7 +98,7 @@ def test_groups_add_up_and_every_category_has_a_group():
 
 
 def test_summary_is_readable_without_allocator_terms():
-    text = render(_typical(), _capability())
+    text = render(_typical(), capability())
     summary, _, details = text.partition("--- details by allocator ---")
     assert details, "allocator detail must still be there, below the summary"
     for plain in ("KV cache", "Model weights", "Communication buffers"):
@@ -134,38 +111,38 @@ def test_summary_is_readable_without_allocator_terms():
     assert sorted(order, key=summary.index)[0] == "KV cache", "largest first"
 
     # advice=None with a headline once raised TypeError on the OOM path.
-    text = render(_typical(), _capability(), headline="OUT OF MEMORY: example")
+    text = render(_typical(), capability(), headline="OUT OF MEMORY: example")
     assert text.index("OUT OF MEMORY") < text.index("KV cache"), "headline above the table"
 
     # Its bytes are not missing from the device -- they fall into the
     # residual. Without the note, an unmeasured KV pool would read as
     # CUDA overhead.
     frame = _frame([_entry(Category.KV_CACHE_POOL, None, owner="kv_cache.main (KVCacheManager)")])
-    summary = render(frame, _capability()).partition("--- details")[0]
+    summary = render(frame, capability()).partition("--- details")[0]
     overhead = next(line for line in summary.splitlines() if Group.OVERHEAD.value in line)
     assert "could not be measured" in overhead and "kv_cache.main" in overhead
 
     frame = _frame([_entry(Category.KV_CACHE_POOL, 16 * GIB), _entry(Category.COMM_MNNVL, 1024)])
-    assert Group.COMMUNICATION.value not in render(frame, _capability()).partition("---")[0], (
+    assert Group.COMMUNICATION.value not in render(frame, capability()).partition("---")[0], (
         "rows that round to zero are left out"
     )
 
 
 def test_conclusion_names_what_grew_since_warmup():
-    text = render(_typical(), _capability())
+    text = render(_typical(), capability())
     assert "Largest: KV cache" in text, "without a baseline it names the largest"
     assert "since warmup" not in text
 
-    text = render(_typical(reserved=6 * GIB, live=5 * GIB), _capability(), baseline=_baseline())
+    text = render(_typical(reserved=6 * GIB, live=5 * GIB), capability(), baseline=_baseline())
     assert "since warmup" in text
     assert "PyTorch, unattributed grew the most (+4.00 GiB)" in text
 
     # Warmup can leave the allocator's free cache large or small; its
     # change says little about what the workload did.
-    text = render(_typical(reserved=4 * GIB, live=1 * GIB), _capability(), baseline=_baseline())
+    text = render(_typical(reserved=4 * GIB, live=1 * GIB), capability(), baseline=_baseline())
     assert "PyTorch cache (free) grew" not in text
 
-    text = render(_typical(), _capability(), baseline=_baseline())
+    text = render(_typical(), capability(), baseline=_baseline())
     assert "nothing has grown since warmup" in text
 
     # Seen on a real run: "grew the most (+0.00 GiB)".
@@ -173,7 +150,7 @@ def test_conclusion_names_what_grew_since_warmup():
     for group in baseline:
         if baseline[group] is not None and group is not Group.TORCH_CACHE:
             baseline[group] -= 1 << 20
-    text = render(_typical(), _capability(), baseline=baseline)
+    text = render(_typical(), capability(), baseline=baseline)
     assert "grew the most" not in text, "growth too small to print is not named"
     assert "nothing has grown since warmup" in text
 
@@ -183,13 +160,13 @@ def test_suggestions():
 
     text = render(
         _typical(),
-        _capability(),
+        capability(),
         advice={Group.KV_CACHE: "reduce X"},
         headline="OUT OF MEMORY: example",
     )
     assert "Suggestion: reduce X." in text, "advice follows the focus group on a failure"
     # A KV cache that is the largest part is the design, not a problem.
-    text = render(_typical(), _capability(), advice={Group.KV_CACHE: "reduce X"})
+    text = render(_typical(), capability(), advice={Group.KV_CACHE: "reduce X"})
     assert "Suggestion" not in text, "no advice for a healthy report"
 
     # Growth after warmup, which already ran the largest batch, is specific

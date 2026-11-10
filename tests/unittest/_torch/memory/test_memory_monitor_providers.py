@@ -27,6 +27,7 @@ import sys
 import types
 
 import pytest
+from memory_monitor_test_utils import MB
 
 from tensorrt_llm._torch.memory.monitor.providers.misc import (
     DwdpPagePoolProvider,
@@ -36,8 +37,6 @@ from tensorrt_llm._torch.memory.monitor.providers.mnnvl import MnnvlProvider
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Placement, Source
 
 pytestmark = pytest.mark.cpu_only
-
-MB = 1 << 20
 
 
 class _State:

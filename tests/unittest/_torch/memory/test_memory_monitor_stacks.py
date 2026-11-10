@@ -21,10 +21,9 @@ on each live block.
 
 import pytest
 import torch
+from memory_monitor_test_utils import GIB, MB
 
 from tensorrt_llm._torch.memory.monitor import stacks, tagging
-
-MB = 1 << 20
 
 
 @pytest.fixture(autouse=True)
@@ -192,18 +191,19 @@ def test_unattributed_memory_is_named_by_its_allocating_code(monkeypatch):
         text = render_capture(snapshot)
         # Named even as the only part: that is the point of the mode.
         assert "_allocate_in_moe_forward" in text
-        # Parts must add up to the row, so what predates recording is
-        # listed rather than silently missing.
-        assert "no stack recorded 0.03" in text
 
         totals = group_totals(snapshot.frame)
         lines = render_summary(
             snapshot.frame, totals, unattributed_sites=snapshot.unattributed_sites
         )
         row = totals.sizes[Group.TORCH_UNATTRIBUTED]
-        parts = dict(snapshot.unattributed_sites)
-        remainder = row - sum(parts.values())
-        assert sum(parts.values()) + remainder == row
+        recorded = sum(sites.values())
+        assert recorded <= row, "recorded sites never exceed the row"
+        # What predates recording, `earlier` included, is listed as the
+        # remainder rather than silently missing, so the parts add up.
+        remainder = row - recorded
+        assert remainder >= 32 * MB, "memory allocated before recording is the remainder"
+        assert f"no stack recorded {remainder / GIB:.2f}" in text
         assert any("of which" in line for line in lines)
     finally:
         del held, earlier

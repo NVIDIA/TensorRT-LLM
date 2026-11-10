@@ -23,12 +23,11 @@ import gc
 
 import pytest
 import torch
+from memory_monitor_test_utils import MB
 
 from tensorrt_llm._torch.memory.monitor.providers.native import LABELS, NativeMemoryProvider
 from tensorrt_llm._torch.memory.monitor.schema import Category
 from tensorrt_llm._torch.memory.monitor.summary import GROUP_OF, Group
-
-MB = 1 << 20
 
 
 def _ledger():

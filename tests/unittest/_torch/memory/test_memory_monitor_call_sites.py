@@ -27,10 +27,9 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from memory_monitor_test_utils import MB
 
 from tensorrt_llm._torch.memory.monitor import startup
-
-MB = 1 << 20
 
 
 class _Boom(Exception):

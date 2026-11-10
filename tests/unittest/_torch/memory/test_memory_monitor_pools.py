@@ -22,6 +22,7 @@ numbers and reports those pools.
 
 import pytest
 import torch
+from memory_monitor_test_utils import MB, capture_graph
 
 from tensorrt_llm._torch.memory.monitor import pools as pool_mod
 from tensorrt_llm._torch.memory.monitor import tagging
@@ -29,31 +30,12 @@ from tensorrt_llm._torch.memory.monitor.summary import Group, group_totals
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-MB = 1 << 20
-
 
 @pytest.fixture(autouse=True)
 def _monitor_on(monkeypatch):
     monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
     yield
     tagging.set_frozen_map(tagging.TagSnapshot(supported=False))
-
-
-def _capture_graph(size):
-    """Capture a graph that allocates ``size`` bytes, and free its output."""
-    graph = torch.cuda.CUDAGraph()
-    pool = torch.cuda.graph_pool_handle()
-    warm = torch.ones(1024, device="cuda")
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        warm * 2
-    torch.cuda.current_stream().wait_stream(side)
-    with torch.cuda.graph(graph, pool=pool):
-        kept = torch.empty(size, dtype=torch.uint8, device="cuda")
-        scratch = torch.empty(size, dtype=torch.uint8, device="cuda")
-        del scratch  # freed inside capture: held by the pool, not reusable
-    return graph, pool, kept
 
 
 def _capture():
@@ -88,7 +70,7 @@ def test_pools_are_classified_by_kind():
     finally:
         del held
 
-    graph, pool, kept = _capture_graph(32 * MB)
+    graph, pool, kept = capture_graph(32 * MB, scratch=True)
     try:
         kinds = pool_mod.classify_all([tuple(unregistered.id), tuple(pool)])
         assert kinds[tuple(pool)][0] == "graph", "graph pools are still graph pools"
@@ -186,7 +168,7 @@ def test_graph_memory_is_cuda_graphs_not_reusable_cache():
         pytest.skip("tagging unsupported here")
     try:
         with tagging.tag("executor_extra"):
-            graph, pool, kept = _capture_graph(32 * MB)
+            graph, pool, kept = capture_graph(32 * MB, scratch=True)
         frozen = tagging.freeze_tag_map()
     finally:
         tagging.stop_tagging_window()
@@ -194,7 +176,7 @@ def test_graph_memory_is_cuda_graphs_not_reusable_cache():
     assert by_tag.get(tagging.CUDA_GRAPHS, 0) >= 32 * MB, "graph blocks inside a tagged step"
     del graph, kept
 
-    graph, pool, kept = _capture_graph(64 * MB)
+    graph, pool, kept = capture_graph(64 * MB, scratch=True)
     try:
         totals = group_totals(_capture().frame)
         graph_pool = max(
@@ -233,7 +215,7 @@ def test_pools_are_classified_ahead_of_reports_and_the_walk_cannot_break_them(mo
     unregistered = torch.cuda.MemPool()
     with torch.cuda.use_mem_pool(unregistered):
         held = torch.empty(16 * MB, dtype=torch.uint8, device="cuda")
-    graph, pool, kept = _capture_graph(16 * MB)
+    graph, pool, kept = capture_graph(16 * MB, scratch=True)
     later = torch.cuda.MemPool()
     try:
         pool_mod.prime()
