@@ -8,6 +8,7 @@ activations for decode-sized batches on SM90.
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 _BLOCK_SHAPE = [128, 128]  # [group_k, group_n] for FP8 block-scale
 _BLOCK_SIZE_M = 16
@@ -638,8 +639,9 @@ def run_triton_fp8_block_scale_moe(
 # ---------------------------------------------------------------------------
 # FP8-activation path for decode-sized batches (SM90)
 # ---------------------------------------------------------------------------
-_FP8_GROUP_SIZE = 128
-_FP8_E4M3_MAX = 448.0
+# The activation quantizers' group is the GEMMs' group_k.
+_FP8_GROUP_SIZE = _BLOCK_SHAPE[0]
+_FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 # Largest (token, expert) pair count aligned by the single-program kernel.
 _SMALL_ALIGN_MAX_PAIRS = 128
 
@@ -673,6 +675,13 @@ def _per_token_group_quant_fp8_kernel(
 
 
 @triton.jit
+def _silu_ieee(x):
+    """``x / (1 + expf(-x))`` as the CUTLASS SiLU computes it: accurate ``expf``
+    and a correctly rounded division, where ``tl.sigmoid`` approximates both."""
+    return x * tl.math.div_rn(1.0, 1.0 + libdevice.exp(-x))
+
+
+@triton.jit
 def _swiglu_quant_fp8_kernel(
     ic1_ptr,
     q_ptr,
@@ -691,8 +700,9 @@ def _swiglu_quant_fp8_kernel(
 
     With a limit, ``up`` is clamped to [-limit, limit] and ``gate`` to at most
     ``limit`` before SiLU (or the SiLU output, with CLAMP_AFTER_SILU), as the
-    CUTLASS MoE activation does. Like its epilogue, the result is rounded to
-    BF16 and then quantized as in :func:`_per_token_group_quant_fp8_kernel`.
+    CUTLASS MoE activation does. Like its epilogue, SiLU uses an accurate
+    ``expf`` and division, and the result is rounded to BF16 and then quantized
+    as in :func:`_per_token_group_quant_fp8_kernel`.
     """
     row = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1)
@@ -702,19 +712,21 @@ def _swiglu_quant_fp8_kernel(
     if HAS_LIMIT:
         up = tl.minimum(tl.maximum(up, -limit), limit)
         if CLAMP_AFTER_SILU:
-            act = tl.minimum(gate * tl.sigmoid(gate), limit)
+            act = tl.minimum(_silu_ieee(gate), limit)
         else:
-            gate = tl.minimum(gate, limit)
-            act = gate * tl.sigmoid(gate)
+            act = _silu_ieee(tl.minimum(gate, limit))
     else:
-        act = gate * tl.sigmoid(gate)
+        act = _silu_ieee(gate)
     y = (act * up).to(tl.bfloat16).to(tl.float32)
     quant_scale = tl.math.div_rn(FP8_MAX, tl.maximum(tl.max(tl.abs(y)), 1e-10))
     tl.store(q_ptr + row * stride_qm + offs, (y * quant_scale).to(tl.float8e4nv))
     tl.store(s_ptr + row * stride_sm + group, tl.math.div_rn(1.0, quant_scale))
 
 
-@triton.jit
+# ``num_valid_tokens`` changes with the batch and only bounds a mask; left
+# specialized, every new value that is 1 or not a multiple of 16 would compile
+# another kernel in the middle of serving.
+@triton.jit(do_not_specialize=["num_valid_tokens"])
 def _fused_moe_fp8act_fp8w_kernel(
     a_ptr,
     a_scale_ptr,
@@ -750,7 +762,9 @@ def _fused_moe_fp8act_fp8w_kernel(
 
     One program per (expert block of BLOCK_SIZE_M sorted rows, BLOCK_SIZE_N
     output columns); C row ``r`` holds the (token, expert) slot ``r``.
-        C[m, n] = sum_k dot(A_fp8[m, k], B_fp8[k, n]) * A_scale[m, k] * B_scale[n, k]
+        C[m, n] = sum_k dot(A_fp8[m, k], B_fp8[k, n]) * (A_scale[m, k] * B_scale[n, k])
+    The two scales are multiplied first, as the DeepGEMM kernel does, so FP32
+    (non-power-of-two) weight scales round the same way.
     """
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -781,7 +795,7 @@ def _fused_moe_fp8act_fp8w_kernel(
         offs_ks = (k * BLOCK_SIZE_K) // group_k
         a_scale = tl.load(a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0)
         b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
-        accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+        accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale[None, :])
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -791,7 +805,9 @@ def _fused_moe_fp8act_fp8w_kernel(
     tl.store(c_ptrs, accumulator.to(tl.bfloat16), mask=c_mask)
 
 
-@triton.jit
+# The pair and slot counts change with the batch and only bound masks and the
+# padding fill; their power-of-two ceilings are the compile-time classes.
+@triton.jit(do_not_specialize=["num_pairs", "num_slots"])
 def _moe_align_small_kernel(
     flat_ids_ptr,
     sorted_token_ids_ptr,
@@ -930,8 +946,9 @@ def _invoke_fp8act_fp8w_moe_kernel(
     b: (E, N, K) FP8, b_scale: (E, N // 128, K // 128) FP32, c: (num_valid_tokens, N) BF16.
     """
     N, K = b.shape[1], b.shape[2]
-    # Measured on H200 at GLM-5.3-Flash TP4 shapes: narrower N tiles feed more SMs when few
-    # expert blocks stream a long K.
+    # With few expert blocks and a long K, each program streams a long weight
+    # panel; narrower N tiles (with a deeper pipeline) spread those panels over
+    # more programs, so more SMs share the weight read.
     if K >= 2048 and num_m_blocks <= 32:
         block_n, num_warps, num_stages = 64, 4, 4
     else:
@@ -991,9 +1008,13 @@ def run_triton_fp8_block_scale_moe_fp8_act(
     are quantized per 1 x 128 group, and each GEMM launches only as many expert
     blocks as the batch can occupy, so the cost follows the routed experts
     rather than the expert count. The rounding steps follow the CUTLASS MoE
-    path (BF16 FC1 and FC2 outputs, BF16 activation before its quantization,
-    routing weights applied in FP32 to the BF16 expert outputs), so batches on
-    either side of the dispatch threshold get the same numerics.
+    path: activation quantization by a correctly rounded ``448 / amax``,
+    weight and activation scales multiplied before they scale the GEMM
+    accumulator, BF16 FC1 and FC2 outputs, an accurate SiLU rounded to BF16
+    before its quantization, and routing weights applied in FP32 to the BF16
+    expert outputs. The FP8 GEMMs accumulate in a different order than the
+    fused op's, so the two agree to within about one BF16 ulp rather than bit
+    for bit.
 
     Args:
         x: (T, H) BF16 input activations.
