@@ -57,7 +57,8 @@ from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
                            get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
-from ..speculative.dflash_attention import dflash_trtllm_supports_page_size
+from ..speculative.dflash_attention import (DFLASH_FOLDED_DECODE_LOWERING,
+                                            dflash_trtllm_supports_page_size)
 from ..speculative.spec_sampler_base import SpecSampler
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
@@ -2389,9 +2390,11 @@ class KvCacheCreator:
                             None)
         # Every mask a drafter reports lowers to decode; without that report,
         # assume the non-causal context kernel.
-        return dflash_trtllm_supports_page_size(tokens_per_block,
-                                                has_context_attention=lowerings
-                                                is None)
+        return dflash_trtllm_supports_page_size(
+            tokens_per_block,
+            has_context_attention=lowerings is None,
+            has_folded_decode=lowerings is not None
+            and DFLASH_FOLDED_DECODE_LOWERING in lowerings())
 
     def _check_shared_draft_kv_request(self) -> None:
         """Fail at startup when TRTLLM_DISAGG_SHARED_DRAFT_KV=1 cannot be honored."""

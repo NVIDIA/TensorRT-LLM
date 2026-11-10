@@ -34,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.dflash_attention import DFLASH_FOLDED_DECODE_LOWERING
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MiniMaxM3SparseAttentionConfig
@@ -795,9 +796,16 @@ def _gate_creator(
     pp_size: int = 1,
     full_attention_drafter: bool = False,
     omit_draft_window_metadata: bool = False,
+    folded_decode: bool = False,
 ) -> KvCacheCreator:
     """``_dspark_creator`` with one setting changed, for the unify-gate table."""
     creator = _dspark_creator(is_disagg=is_disagg, context_kernel=context_kernel)
+    if folded_decode:
+        # A full non-causal draft layer lowers to the folded decode.
+        creator._model_engine.model.draft_model.validate_block_attention_windows = lambda: [
+            "causal decode + future-block merge",
+            DFLASH_FOLDED_DECODE_LOWERING,
+        ]
     creator._tokens_per_block = tokens_per_block
     draft = creator._get_draft_kv_model_config()
     if nvfp4_draft:
@@ -844,6 +852,9 @@ _GATE_CASES = [
     ("context-kernel-128", _BOTH, "1", dict(context_kernel=True), False, "128-token pages"),
     ("page-96", _BOTH, "1", dict(tokens_per_block=96), False, "96-token pages"),
     ("page-256", _BOTH, "1", dict(tokens_per_block=256), True, None),
+    # The folded decode keeps the fixed page sizes: it is not validated on dynamic pages.
+    ("folded-decode-64", _BOTH, "1", dict(tokens_per_block=64, folded_decode=True), True, None),
+    ("folded-decode-128", _BOTH, "1", dict(folded_decode=True), False, "128-token pages"),
     ("nvfp4-draft", _BOTH, "1", dict(nvfp4_draft=True), False, "NVFP4 draft layers"),
     # Settings each disaggregated worker sets on its own: aggregated serving and an explicit
     # opt-out fall back to the separate draft KV cache; otherwise the worker refuses to start.
