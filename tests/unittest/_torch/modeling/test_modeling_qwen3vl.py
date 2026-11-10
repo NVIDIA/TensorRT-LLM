@@ -16,7 +16,7 @@ from _torch.helpers import create_mock_cuda_graph_runner
 from PIL import Image
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from test_modeling_qwen2vl import _make_vision_attention
-from transformers import Qwen3VLConfig
+from transformers import PretrainedConfig, Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
 from utils.llm_data import llm_models_root
 
@@ -28,13 +28,17 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     normalize_vision_pixels,
     vision_normalization_from_processor,
 )
+from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModel,
+    Qwen3VisionModelBase,
     Qwen3VLInputProcessorBase,
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
 )
+from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.pyexecutor.model_loader import _validate_encoder_attention_backend_support
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
@@ -2233,10 +2237,6 @@ class _RecordingVisionEncoder(torch.nn.Module):
     [("TRTLLM", None), ("TRTLLM", "VANILLA"), ("FLASHINFER", "VANILLA")],
 )
 def test_qwen_encoder_backend_preserves_decoder(decoder_backend: str, override: str | None) -> None:
-    from transformers import PretrainedConfig
-
-    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VisionModelBase
-
     config = ModelConfig(
         pretrained_config=PretrainedConfig(
             text_config=PretrainedConfig(dtype=torch.float32),
@@ -2262,8 +2262,6 @@ def test_qwen_encoder_backend_preserves_decoder(decoder_backend: str, override: 
 def test_qwen2_5_vl_encoder_override_drops_decoder_kv_cache_quant(
     override: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from transformers import PretrainedConfig
-
     monkeypatch.setattr(modeling_qwen2vl, "Qwen2_5_VisionModel", _RecordingVisionEncoder)
     pretrained_config = PretrainedConfig(vision_config=PretrainedConfig(num_heads=1))
     pretrained_config.torch_dtype = torch.float32
@@ -2287,13 +2285,6 @@ def test_qwen2_5_vl_encoder_override_drops_decoder_kv_cache_quant(
 
 @pytest.mark.cpu_only
 def test_qwen_encoder_backend_declarations_preserve_fixed_hf_encoder() -> None:
-    from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
-    from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
-    from tensorrt_llm._torch.pyexecutor.model_loader import (
-        _validate_encoder_attention_backend_support,
-    )
-    from tensorrt_llm.llmapi.llm_args import MultimodalConfig
-
     public_backends = frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})
     for model_cls in (Qwen2_5_VLModel, Qwen3VLModel, Qwen3MoeVLModel):
         assert model_cls.supported_encoder_attention_backends == {"vision": public_backends}
