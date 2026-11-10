@@ -32,6 +32,19 @@ Scope: this directory and its descendants. Supplements the repository-root
   H100_PCIe-PyTorch-1
   ```
 
+- `DGX_B200-*` matches all DGX B200 stages, including single-GPU, multi-GPU,
+  and post-merge variants. `DGX_B200-*_GPUs-*` matches only multi-GPU variants,
+  such as `DGX_B200-2_GPUs-PyTorch-1` and `DGX_B200-4_GPUs-PyTorch-Post-Merge-1`.
+  `DGX_B200-PyTorch-2` matches exactly that stage; append `*` only if runtime
+  suffixes such as `-cbts` should also match. Only `*` is a wildcard, not `?`,
+  character ranges, regular expressions, or exclusion rules.
+- During severe resource scarcity, temporarily list selected stages to reduce
+  demand while retaining representative coverage. For example, exact entries for
+  `DGX_B200-PyTorch-2` through `DGX_B200-PyTorch-9` leave
+  `DGX_B200-PyTorch-1` eligible to run. List each name on its own line; do not
+  write a range. Ensure no other pattern matches stages you intend to retain;
+  `DGX_B200-*` would disable them too. Explain the capacity constraint in the
+  shared reason and remove these entries when capacity recovers.
 - Matching stages show `Skip - Maintenance` and the reason, without launching
   a test agent. The nested stage is red to show missing coverage, but the skip
   alone does not fail the overall build. Previously successful stages may show
