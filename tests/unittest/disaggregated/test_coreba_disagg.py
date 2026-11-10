@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU tests for disaggregated serving on copy-based rebalancing (CoReba): bound-pool slot translation
-(ArenaPoolBindings) and its wire format (RecvReqInfo.bound_pool_block_ids)."""
+"""CPU tests for disaggregated serving on copy-based rebalancing (CoReba).
+
+Bound-pool slot translation (ArenaPoolBindings) and its wire format (RecvReqInfo.bound_pool_block_ids).
+"""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -39,11 +41,16 @@ class _Impl:
 
 def _page_table():
     kind = CacheKind.PAGED
-    return SimpleNamespace(layer_groups=[
-        SimpleNamespace(kind=kind, pool_group_idx=0,
-                        pool_views=[SimpleNamespace(pool_idx=0), SimpleNamespace(pool_idx=1)]),
-        SimpleNamespace(kind=kind, pool_group_idx=1, pool_views=[SimpleNamespace(pool_idx=0)]),
-    ])
+    return SimpleNamespace(
+        layer_groups=[
+            SimpleNamespace(
+                kind=kind,
+                pool_group_idx=0,
+                pool_views=[SimpleNamespace(pool_idx=0), SimpleNamespace(pool_idx=1)],
+            ),
+            SimpleNamespace(kind=kind, pool_group_idx=1, pool_views=[SimpleNamespace(pool_idx=0)]),
+        ]
+    )
 
 
 def test_translate_bound_pool_keeps_holes():
@@ -98,9 +105,14 @@ def test_only_arena_pool_bindings_translate():
 
 @pytest.mark.parametrize("bound", [None, {"0:1": np.array([5, -1, 9], dtype=np.int64)}])
 def test_recv_req_info_round_trip(bound):
-    info = RecvReqInfo(sender_req_id=1, instance_name="gen", instance_rank=0,
-                       block_ids_per_layer_groups=[np.array([0, -1, 4], dtype=np.int64)], unique_rid=7,
-                       bound_pool_block_ids=bound)
+    info = RecvReqInfo(
+        sender_req_id=1,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[np.array([0, -1, 4], dtype=np.int64)],
+        unique_rid=7,
+        bound_pool_block_ids=bound,
+    )
     back = RecvReqInfo.from_bytes(info.to_bytes())
     assert back.block_ids_per_layer_groups[0].tolist() == [0, -1, 4]
     if bound is None:
