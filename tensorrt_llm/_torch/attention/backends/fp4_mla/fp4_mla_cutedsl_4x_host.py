@@ -86,18 +86,11 @@ V_PACK_BLOCK = (
 KSF_PAYLOAD_BYTES = PAGE_SIZE * K_SF_GROUPS  # 5120 (X79:10345)
 VSF_PAYLOAD_BYTES = OUT_COLS * (PAGE_SIZE // 16)  # 4096 (X79:10356)
 CUDA_GRID_Z_MAX = 65535  # X79:37
-V_PAGE_BYTES = OUT_COLS * (
-    PAGE_SIZE // 2
-)  # 32768: one physical page of the V pack (512 rows x 64 B)
-# vpfl (warp-11 LSU L2 prefetch of V/VSF): fine while the V pool spans <= ~1 GB, stalls the V issuer 70x at a 1.7 GB
-# span (REPORT.md section 5; measured fine at 0.8 GB, cliff at >= 1.25 GB).  The host disables it above this span;
-# MLA4X_VPFL_MAX_V_SPAN_MB overrides the threshold (0 = always off), ``use_vpfl=`` forces it per call.
-VPFL_MAX_V_SPAN_ENV = "TRTLLM_FP4_MLA_4X_VPFL_MAX_V_SPAN_MB"
-VPFL_MAX_V_SPAN_BYTES = int(float(os.environ.get(VPFL_MAX_V_SPAN_ENV, "1024")) * 1024 * 1024)
 MIN_SM_COUNT = 4 * FULL_ONLY_MAX_PAIRS  # 184: one wave of 46 four-CTA clusters must be co-resident
-# Shared memory one CTA of the kernel declares (bytes).  A device whose blocks cannot have that much keeps every call
-# on the 2x kernel (``device_unsupported_reason``).
-SMEM_BYTES_PER_CTA = 231712
+# Shared memory one CTA of the kernel declares (bytes; the kernel's DS_SMEM_BYTES, checked at load).  It is above the
+# 227 KiB a block may opt into by default, so the device must offer the oversized shared-memory mode; one that does
+# not keeps every call on the 2x kernel (``device_unsupported_reason``).
+SMEM_BYTES_PER_CTA = 276480
 # --- split mode (Milestone 2): plan-driven KV split tasks + FP32 partials merged by fp4_mla_packed_reduce ----------
 SPLIT_ENV = "TRTLLM_FP4_MLA_4X_SPLIT"  # default on; 0 keeps the one-wave FULL-only kernel (and its envelope) only
 SPLIT_MAX_PAIRS = 512  # partial workspace bound (<= ~0.5 GB of FP32 partials at 128 heads x q4)
@@ -188,6 +181,7 @@ _REQUIRED_KERNEL_NAMES = (
     "TRTLLM_V_HEAD_DIM",
     "SMEM_P4_RUNTIME_MAX_KV",
     "LOG2_E",
+    "DS_SMEM_BYTES",
 )
 
 
@@ -255,6 +249,7 @@ def kernel_module():
             "TRTLLM_V_HEAD_DIM": OUT_COLS,
             "SMEM_P4_RUNTIME_MAX_KV": PHYSICAL_K,
             "KV_TILE": KV_TILE,
+            "DS_SMEM_BYTES": SMEM_BYTES_PER_CTA,
         }
         bad = {
             k: (getattr(module, k), v) for k, v in checks.items() if int(getattr(module, k)) != v
@@ -973,22 +968,14 @@ def device_unsupported_reason(device: torch.device) -> str | None:
 
 
 def vpfl_decision(geom: EnvelopeGeometry, use_vpfl: bool | None) -> tuple[bool, str]:
-    """(enable, reason) for the V L2 prefetch.  None = automatic: on iff the V pool's address span
-    (num_v_cache_pages x 32 KiB, an upper bound of the spread of the referenced V pages) is <= VPFL_MAX_V_SPAN_BYTES."""
+    """(enable, reason) for the V L2 prefetch: off unless forced.  The four-bank V ring issues every V load a full
+    round before its PV, which is what the prefetch used to buy, without the prefetch requests."""
+    del geom
     if use_vpfl is not None:
         if type(use_vpfl) is not bool:
             raise TypeError("use_vpfl must be a bool or None")
         return use_vpfl, "forced"
-    span = geom.num_v_cache_pages * V_PAGE_BYTES
-    if span <= VPFL_MAX_V_SPAN_BYTES:
-        return (
-            True,
-            f"auto: V pool span {span / 2**20:.0f} MiB <= {VPFL_MAX_V_SPAN_BYTES / 2**20:.0f} MiB",
-        )
-    return (
-        False,
-        f"auto: V pool span {span / 2**20:.0f} MiB > {VPFL_MAX_V_SPAN_BYTES / 2**20:.0f} MiB",
-    )
+    return False, "off: the V ring loads a round ahead"
 
 
 def _scalar_args(geom: EnvelopeGeometry, stream, *, exemplar: bool = False) -> tuple:
