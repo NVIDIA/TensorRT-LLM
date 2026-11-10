@@ -62,8 +62,8 @@ def task_file(tmp_path, repo, checkpoint):
 
 
 @pytest.fixture(autouse=True)
-def _planned_runs_start_from_the_planners_graph(monkeypatch):
-    """A scripted planner here writes the whole graph; the survey is not started for it."""
+def _runs_start_past_the_survey(monkeypatch):
+    """A scripted run here starts from the workspace's vocabulary; a survey test turns it on."""
     from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
 
     monkeypatch.setattr(TrtllmModelingV2Workflow, "survey_first", False)
@@ -99,7 +99,7 @@ def _no_agent_probe(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_dataset_downloads(monkeypatch):
-    """Keep the run's dataset staging off the network; ``test_datasets.py`` calls it itself."""
-    from agent_flow.workflows.trtllm_modeling_v2.run.startup import datasets
+    """Keep the run's dataset staging off the network; its own tests call ``stage`` themselves."""
+    from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
 
     monkeypatch.setattr(datasets, "start", lambda *args, **kwargs: None)

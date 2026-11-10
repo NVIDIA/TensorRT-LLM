@@ -13,7 +13,7 @@ found it missing there lost its benchmarks to it.
 dataset's repository into the workspace (``datasets/<repo>``), first from the local
 HuggingFace cache. ``datasets/status.json`` says where each stands. A gate that needs one
 still being staged waits for it (:func:`wait`); one that could not be staged runs as
-before, and the journal says why. Where the models root lacks the dataset, a root that
+before, and the journal says why. :func:`staged_spec` is how a check reads it. Where the models root lacks the dataset, a root that
 holds it beside the models (:func:`models_root`) is what the tree's own tests read.
 """
 
@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from ...infra.files import write_text_atomic
+from ..infra.files import write_text_atomic
 
 DIRNAME = "datasets"
 STATUS_FILENAME = "status.json"
@@ -201,6 +201,40 @@ def models_root(workspace: Path, root: str, benchmark: str, path: str) -> str:
     except OSError:
         return root
     return str(overlay)
+
+
+def staged_spec(spec: Mapping[str, Any], gate: str, workspace: str | Path | None) -> Any:
+    """``spec`` with the staged dataset ``gate`` reads, once it is ready; ``spec`` itself otherwise.
+
+    A benchmark gets it as ``accuracy.dataset_path`` (``trtllm-eval --dataset_path``); the
+    disaggregated test, which reads it under ``$LLM_MODELS_ROOT``, a models root that holds
+    it. A dataset still being staged is waited for; one that could not be is left out, and
+    the gate runs as it would without it.
+    """
+    if workspace is None:
+        return spec
+    workspace = Path(workspace)
+    accuracy = dict(spec.get("accuracy") or {})
+    benchmark = gate[len("accuracy[") : -1] if gate.startswith("accuracy[") else "gsm8k"
+    if benchmark not in status(workspace):
+        return spec
+    path = wait(workspace, benchmark)
+    if not path:
+        return spec
+    if gate == "disagg":
+        block = dict(accuracy.get("disagg") or {})
+        env = dict(block.get("env") or {})
+        outer = (spec.get("environment") or {}).get("env") or {}
+        root = env.get("LLM_MODELS_ROOT") or outer.get("LLM_MODELS_ROOT") or ""
+        staged = models_root(workspace, str(root), benchmark, path)
+        if not staged or staged == root:
+            return spec
+        accuracy["disagg"] = {**block, "env": {**env, "LLM_MODELS_ROOT": staged}}
+    elif not accuracy.get("dataset_path"):
+        accuracy["dataset_path"] = path
+    else:
+        return spec
+    return {**spec, "accuracy": accuracy}
 
 
 __all__ = ["DIRNAME", "KNOWN", "benchmarks", "models_root", "stage", "start", "status", "wait"]

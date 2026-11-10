@@ -31,14 +31,12 @@ from agent_flow.workflows.trtllm_modeling_v2.checks import (
     disagg,
     divergence,
     gate_cli,
-    gate_records,
     test_results,
 )
 from agent_flow.workflows.trtllm_modeling_v2.checks import serve as sg
 from agent_flow.workflows.trtllm_modeling_v2.checks import test_results as tc
 from agent_flow.workflows.trtllm_modeling_v2.checks import verdict as check_result
 from agent_flow.workflows.trtllm_modeling_v2.checks.delivery import Check as DeliveryCheck
-from agent_flow.workflows.trtllm_modeling_v2.checks.delivery import DeliveryReport
 from agent_flow.workflows.trtllm_modeling_v2.checks.gate_records import (
     KIND_STOCK_UNAVAILABLE,
     GateRecords,
@@ -56,19 +54,14 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
     resolve_environment,
 )
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
-from agent_flow.workflows.trtllm_modeling_v2.run.execution import handoff as handoff_mod
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import regression
-from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
-from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
+from agent_flow.workflows.trtllm_modeling_v2.run import certify
+from agent_flow.workflows.trtllm_modeling_v2.run import contract as contract_mod
+from agent_flow.workflows.trtllm_modeling_v2.run.certify import (
     target_test_modules_check as target_tests,
-)
-from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
-    tests_check as delivered_tests,
 )
 from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
 
-from ._helpers import _ENTRY, _REPO_ROOT, TARGET_REL, _build_repo, _verify, _workflow, _write_entry
+from ._helpers import _ENTRY, _REPO_ROOT, TARGET_REL, _build_repo, _verify, _write_entry
 
 _gates_TASK = {
     "checkpoint_path": "/ckpt/Qwen3-30B-A3B",
@@ -101,32 +94,6 @@ def _gates_recorder(result: CommandResult | list[CommandResult]):
 
     run.seen = seen  # type: ignore[attr-defined]
     return run
-
-
-def test_a_cancelled_gate_has_no_verdict_and_is_not_queued_again_at_once(tmp_path):
-    """A gate job cancelled through the spool raises: missing, not FAIL, and no re-run here."""
-    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
-    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.executor import CANCELLED
-    from agent_flow.workflows.trtllm_modeling_v2.run.validation import check_runner
-    from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
-
-    workflow = TrtllmModelingV2Workflow(workspace=tmp_path / "ws")
-    workflow.environment = RunEnvironment(kind="local", python="python3", world_size=1)
-    workflow.task_data = dict(_gates_TASK, trtllm_repo_path=str(tmp_path))
-    runner = check_runner.CheckRunner(workflow)
-    runner._await_session = lambda log: pytest.fail("a cancelled gate waits for no session")
-    cancelled = f"{CANCELLED}: cancelled before it started"
-    runs = []
-
-    def run():
-        runs.append(1)
-        return SimpleNamespace(
-            name="accuracy[gsm8k]", member="dep4", passed=False, infrastructure=cancelled
-        )
-
-    with pytest.raises(check_runner._SessionLost, match="measured nothing"):
-        runner._gate_until_verdict(run, None)
-    assert runs == [1]
 
 
 def test_normalization_preserves_source_skip_template_order_and_image_requests(tmp_path):
@@ -1333,37 +1300,6 @@ def _verdict(member, measured, reference=_ANCHOR, se=0.734):
     )
 
 
-def test_delivery_refuses_open_findings_first(tmp_path):
-    """Before the delivery report, and as a remediable verdict a relaunch re-enters."""
-    from agent_flow.workflows.trtllm_modeling_v2.run.validation import completion, contract
-
-    wf = _workflow(tmp_path)
-    wf.task_data = {"accuracy": dict(_statistical_floor_TASK["accuracy"])}
-    accuracy_checks.note_systematic_shift(
-        gate_records.records_for(wf.workspace),
-        [_verdict("tep4", 91.0), _verdict("tp4", 91.1)],
-        wf.task_data["accuracy"],
-        "dspark",
-    )
-    closed = []
-    wf._close_run = lambda state, log, verdict: closed.append(verdict)
-    wf._contract = contract.Contract(checks=())
-    wf.environment = SimpleNamespace(world_size=1)
-    wf._target_marker = lambda: ""
-    verdict = contract.evaluate(wf._contract, wf._contract_status(), marker="")
-    assert (
-        completion.run_deliver_phase(
-            wf,
-            SimpleNamespace(units_done=["core"]),
-            None,
-            lambda files: completion.assess(verdict, files=files),
-        )
-        is False
-    )
-    assert closed == ["delivery-failed:findings"]
-    assert "delivery blocked" in wf.journal.path.read_text(encoding="utf-8")
-
-
 def _spec(tmp_path) -> dict:
     checkpoint, repo = tmp_path / "ckpt", tmp_path / "repo"
     checkpoint.mkdir(exist_ok=True)
@@ -1416,69 +1352,6 @@ def _load(tmp_path, spec) -> dict:
     return task_schema.load_and_validate_task_yaml(path)
 
 
-def test_each_member_is_launched_and_scheduled_at_its_own_width(tmp_path):
-    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
-    from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
-
-    workflow = TrtllmModelingV2Workflow(workspace=tmp_path / "ws")
-    workflow.environment = RunEnvironment(
-        kind="session_spool", python="python3", world_size=4, spool=str(tmp_path / "spool")
-    )
-    workflow.task_data = {"trtllm_repo_path": str(tmp_path)}
-    runner = CheckRunner(workflow)
-    assert runner._member_env("tp1").world_size == 1
-    assert "mpirun -n 2" in runner._member_env("tep2").command("python x.py")
-    assert "mpirun" not in runner._member_env("tp1").command("python x.py")
-    assert runner._member_runner("tp1") is runner._member_runner("tp1")
-    runner._member_runner("tep2")
-    one = runner._member_runner("tep2", "all")
-    two = runner._member_runner("tep2", "all", nodes=2)
-    assert one is not two
-    assert two is runner._member_runner("tep2", "all", nodes=2)
-    # Keep node count separate when the per-node width and queue class match.
-    assert sorted(runner._member_runners) == [
-        ("1", 0, 1),
-        ("2", 0, 1),
-        ("all", 0, 1),
-        ("all", 0, 2),
-    ]
-
-
-def test_a_unit_on_a_placeholder_is_anchored_to_its_first_measured_score(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
-    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
-    from agent_flow.workflows.trtllm_modeling_v2.run.validation import anchors
-    from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
-
-    data = _load(tmp_path, _spec(tmp_path))
-    contract = contract_mod.compile_contract(data, world_size=4)
-    check = next(c for c in contract.checks if c.key == "core:accuracy[gsm8k]@tp1")
-    workflow = TrtllmModelingV2Workflow(workspace=tmp_path / "ws")
-    workflow.environment = RunEnvironment(kind="local", python="python3", world_size=1)
-    workflow.task_data, workflow._contract = data, contract
-    runner = CheckRunner(workflow)
-    runner._reference_score = lambda unit, spec=None: 10.0  # a placeholder
-    calls = []
-
-    def gate(env, *, reference, unit, relative=False, **kwargs):
-        calls.append((reference, relative))
-        return SimpleNamespace(passed=True, measured=93.3, infrastructure="", detail="d",
-                               tree_state="abc", summary=str)  # fmt: skip
-
-    monkeypatch.setattr(accuracy_checks, "run_accuracy_gate", gate)
-    runner._gate_call(check)(None)
-    assert anchors.measured(workflow.workspace, "core", check.gate, "tp1").score == 93.3
-    # The next benchmark of core at tp1 is held to that score, not to the placeholder.
-    monkeypatch.setattr(
-        "agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner.replace",
-        lambda result, **changes: {**vars(result), **changes},
-    )
-    second = runner._gate_call(check)(None)
-    assert calls == [(10.0, False), (93.3, True)]
-    assert "replaced the placeholder 10" in second["detail"]
-
-
 def test_an_attention_dp_rank_serves_its_share_of_the_global_batch():
     options = {
         "max_batch_size": 128,
@@ -1512,7 +1385,51 @@ def test_the_stock_leg_is_asked_once_per_checkpoint(tmp_path, monkeypatch):
     assert "not run again" in result.detail
 
 
+def test_each_member_is_launched_at_its_own_width(tmp_path):
+    """One shared runner resolves a check: a wider member's command starts its own ranks."""
+    data = _load(tmp_path, _spec(tmp_path))
+    data["environment"] = {"kind": "local", "python": "/usr/bin/python3", "env": {}}
+    seen: dict[str, list[str]] = {}
+    for member in ("tp1", "tep2"):
+        runner = _gates_recorder(CommandResult(returncode=0, stdout=""))
+        result = gate_cli.run_check(
+            data, "boot", "core", member, workdir=tmp_path / "w", runner=runner
+        )
+        assert result.member == member
+        seen[member] = runner.seen
+    assert any("mpirun -n 2" in command for command in seen["tep2"])
+    assert not any("mpirun" in command for command in seen["tp1"])
+    # Every command runs from inside the tree it measures, with it first on PYTHONPATH.
+    tree = str((tmp_path / "repo").resolve())
+    assert all(c.startswith(f"cd {tree} && export PYTHONPATH={tree}") for c in seen["tp1"])
+    assert "CUDA_VISIBLE_DEVICES=0,1" in seen["tep2"][0]
+    assert "CUDA_VISIBLE_DEVICES=0 " in seen["tp1"][0]
+
+
+def test_every_member_under_its_reference_is_a_finding_unless_the_spec_acknowledges_it():
+    """Each member can clear its own floor while all of them sit low: the round's verdicts say."""
+
+    def verdict(member, measured, unit="dspark"):
+        return contract_mod.Verdict(
+            unit, "accuracy[gsm8k]", member, True, measured=measured, reference=_ANCHOR, se=0.734
+        )
+
+    low = {v.key: v for v in (verdict("tep4", 91.0), verdict("tp4", 91.1))}
+    task = {"accuracy": dict(_statistical_floor_TASK["accuracy"])}
+    [finding] = certify.shift_findings(task, low)
+    assert finding.startswith("accuracy finding:") and "dspark" in finding
+    # One member within an SE of the reference: no systematic shift.
+    mixed = {**low, "dspark:accuracy[gsm8k]@tp4": verdict("tp4", _ANCHOR - 0.5)}
+    assert certify.shift_findings(task, mixed) == []
+    task["accuracy"]["floor"] = {"acknowledge": {"dspark": "the block drafter trades 1 point"}}
+    assert certify.shift_findings(task, low) == []
+
+
 class _Delivery:
+    """What the delivered-tests check reads of a workflow."""
+
+    _shell_runner_override = None
+
     def __init__(self, tmp_path: Path, head: str = "c0ffee1234567890"):
         self.task_data = {"trtllm_repo_path": str(tmp_path)}
         self.workspace = tmp_path / "ws"
@@ -1520,12 +1437,10 @@ class _Delivery:
         self._git = lambda repo, *args: head + "\n"
 
 
-def test_delivery_runs_the_delivered_tests_at_head_and_holds_on_their_passing(
+def test_delivery_runs_the_delivered_tests_at_the_commit_and_holds_on_their_passing(
     tmp_path, monkeypatch
 ):
-    report = DeliveryReport(
-        checks=(DeliveryCheck("test:gemm/x", True, str(tmp_path / "tests/test_modeling_v2_x.py")),)
-    )
+    checks = (DeliveryCheck("test:gemm/x", True, str(tmp_path / "tests/test_modeling_v2_x.py")),)
     test = "tests/test_modeling_v2_x.py"
     asked = {}
 
@@ -1535,31 +1450,31 @@ def test_delivery_runs_the_delivered_tests_at_head_and_holds_on_their_passing(
 
     results = test_results.Results("c0ffee1234567890", "env", collected={test: ["test_a"]})
     monkeypatch.setattr(test_results, "list_test_files", list_test_files)
-    monkeypatch.setattr(test_results, "recorded", lambda cache, commit, env_digest="": results)
-    stage = _Delivery(tmp_path)
-    # Not run at HEAD yet: nothing to say before delivery runs it.
-    assert delivered_tests(stage, report) is None
-    assert asked["paths"][1] == test
     jobs = []
 
-    def record_at(commit, files, **job):
-        jobs.append((commit, list(files)))
-        results.tests[f"{test}::test_a"] = {"outcome": "passed"}
+    def run_at(commit, files, **job):
+        jobs.append((commit, list(files), job["tree"], job["python"]))
         return results, 1, 0, ""
 
-    monkeypatch.setattr(regression, "job_runner", lambda workflow, name: (None, None, "python"))
-    monkeypatch.setattr(regression, "record_at", record_at)
-    check = delivered_tests(stage, report, run=True)
-    assert check.passed and jobs == [("c0ffee1234567890", [test])]
-    heads = iter(["c0ffee1234567890", "a-new-head"])
-    stage._git = lambda *args: next(heads)
-    changed = delivered_tests(stage, report, run=True)
-    assert not changed.passed and "HEAD changed" in changed.detail
-    stage._git = lambda *args: "c0ffee1234567890"
-    # One that fails at HEAD fails the cheap read too.
+    monkeypatch.setattr(test_results, "run_at", run_at)
+    stage = _Delivery(tmp_path)
+    # Nothing passed yet: an unrun test never holds the check.
+    check = certify.tests_check(stage, checks, "c0ffee1234567890")
+    assert not check.passed and check.detail.startswith("INCOMPLETE")
+    assert asked["paths"][1] == test
+    assert jobs == [("c0ffee1234567890", [test], tmp_path, "python3")]
+    results.tests[f"{test}::test_a"] = {"outcome": "passed"}
+    check = certify.tests_check(stage, checks, "c0ffee1234567890")
+    assert check.passed and "1 test job(s) ran at c0ffee1234" in check.detail
     results.tests[f"{test}::test_a"] = {"outcome": "failed", "message": "wrong"}
-    check = delivered_tests(stage, report)
+    check = certify.tests_check(stage, checks, "c0ffee1234567890")
     assert not check.passed and check.detail.startswith("FAILING")
+    # A probe that could not run leaves no verdict to reuse.
+    monkeypatch.setattr(
+        test_results, "run_at", lambda *a, **k: (test_results.Results("c0ffee"), 0, 1, "no gpu")
+    )
+    check = certify.tests_check(stage, checks, "c0ffee1234567890")
+    assert not check.passed and check.detail == "INCOMPLETE (exit 1): no gpu"
 
 
 def test_delivery_counts_the_targets_test_modules_and_warns_past_twenty(tmp_path):
@@ -1622,250 +1537,6 @@ def _run(command: str) -> tuple[int, str]:
     return done.returncode, done.stdout + done.stderr
 
 
-def _regression_repo(root: Path) -> tuple[Path, Path, str]:
-    """A repository whose base commit's ``test_a`` and ``test_b`` are recorded, and the workspace."""
-    repo, workspace = root / "repo", root / "ws"
-    files = {
-        "pkg/__init__.py": "",
-        "pkg/mod.py": "def f():\n    return 1\n",
-        "tests/test_a.py": "from pkg.mod import f\n\n\ndef test_f():\n    assert f() == 1\n",
-        "tests/test_b.py": "def test_alone():\n    assert True\n",
-        "tests/test_broken.py": "def test_broken():\n    assert False, 'broken before the run'\n",
-    }
-    for path, content in files.items():
-        (repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (repo / path).write_text(content, encoding="utf-8")
-    (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    base = _git(repo, "rev-parse", "HEAD")
-    cache = workspace / tc.CACHE_DIRNAME
-    _run(f"{sys.executable} {drv.__file__} run --cache {cache} --repo {repo} tests/test_a.py "
-         "tests/test_b.py -- -q -p no:cacheprovider")  # fmt: skip
-    # The last check cleared the base: the next one compares against it.
-    handoff_mod.write(
-        workspace / "tasks",
-        {"task": "regression", "kind": "check", "cleared": base, "written_at": "1"},
-    )
-    return repo, workspace, base
-
-
-def _check(repo: Path, workspace: Path, head: str, root: Path):
-    ran = []
-
-    @contextlib.contextmanager
-    def tree_at(commit):
-        tree = root / f"tree-{commit[:8]}-{len(ran)}"
-        _git(repo, "worktree", "add", "-q", "--detach", str(tree), commit)
-        try:
-            yield tree
-        finally:
-            _git(repo, "worktree", "remove", "--force", str(tree))
-
-    def run_job(command, tree, timeout_s=None):
-        ran.append(command)
-        return _run(command)
-
-    result = regression.run_regression_check(
-        workspace=workspace,
-        repo=repo,
-        head=head,
-        tree_at=tree_at,
-        run_job=run_job,
-        python=sys.executable,
-        name="regression-2",
-        paths=["tests"],
-    )
-    return result, ran
-
-
-@_requires_git
-def test_environment_change_cannot_reuse_a_pass_and_probe_failure_is_incomplete(
-    tmp_path, monkeypatch
-):
-    repo, workspace, base = _regression_repo(tmp_path)
-    monkeypatch.setenv("TRTLLM_TEST_CACHE_ENV", "A")
-    first, _ = _check(repo, workspace, base, tmp_path)
-    assert first.verdict == "CLEAN"
-    a = tc.recorded(workspace / tc.CACHE_DIRNAME, base).env_digest
-    monkeypatch.setenv("TRTLLM_TEST_CACHE_ENV", "B")
-    second, ran = _check(repo, workspace, base, tmp_path)
-    assert second.verdict == "CLEAN" and len(ran) == 2
-    assert tc.recorded(workspace / tc.CACHE_DIRNAME, base).env_digest != a
-    results, jobs, code, tail = regression.record_at(
-        base,
-        ["tests/test_a.py"],
-        cache_dir=workspace / tc.CACHE_DIRNAME,
-        out=tmp_path / "failed-probe",
-        tree_at=lambda commit: contextlib.nullcontext(repo),
-        run_job=lambda command, tree, timeout_s=None: (1, "unavailable"),
-        python=sys.executable,
-    )
-    assert not results.env_digest and results.unrun(["tests/test_a.py"])
-    assert jobs == 0 and code == 1 and "environment probe failed" in tail
-
-
-@_requires_git
-def test_a_test_that_fails_at_the_base_is_not_run_at_a_later_head(tmp_path):
-    """Kimi-K3's 4-GPU cases time out at the base too: each head paid 54 min for no signal."""
-    repo, workspace, base = _regression_repo(tmp_path)
-    cache = workspace / tc.CACHE_DIRNAME
-    _run(f"{sys.executable} {drv.__file__} run --cache {cache} --repo {repo} tests/test_broken.py "
-         "-- -q -p no:cacheprovider")  # fmt: skip
-    (repo / "pkg" / "mod.py").write_text(
-        "def f():\n    return 1  # same answer\n", encoding="utf-8"
-    )
-    _git(repo, "commit", "-qam", "shared change")
-    head = _git(repo, "rev-parse", "HEAD")
-
-    result, ran = _check(repo, workspace, head, tmp_path)
-
-    assert result.verdict == "CLEAN", result.failures
-    assert "1 test(s) failing at the base not run" in result.scope
-    at_head = tc.recorded(cache, head)
-    assert at_head.result("tests/test_a.py::test_f").outcome == "passed"
-    assert at_head.result("tests/test_broken.py::test_broken") is None
-    assert len(ran) == 2, "the probe and one test job at the head; nothing at the base"
-
-
-@_requires_git
-def test_a_change_reaches_the_tests_that_import_it_through_other_files(tmp_path):
-    """``catalog/_op.py`` reaches a test through the entry that imports it, or the helper that does."""
-    repo = tmp_path / "repo"
-    catalog, tests = regression.CATALOG_DIR, regression.CATALOG_TESTS_DIR
-    dotted = catalog.replace("/", ".")
-    files = {
-        f"{catalog}/_op.py": "class OpWrapper:\n    pass\n",
-        f"{catalog}/gemm/mm.py": "from .._op import OpWrapper\n",
-        f"{catalog}/norm/rms.py": "X = 1\n",
-        f"{tests}/_validating.py": f"from {dotted}._op import OpWrapper\n",
-        f"{tests}/gemm/test_mm.py": f"from {dotted}.gemm import mm\n",
-        f"{tests}/norm/test_rms.py": f"from _validating import validating\nfrom {dotted}.norm.rms import X\n",
-        f"{tests}/norm/test_untouched.py": f"from {dotted}.norm.rms import X\n",
-        # A rank matrix the test starts by file path, through a launcher it imports.
-        f"{tests}/comm/_rank_job.py": "import subprocess\n",
-        f"{tests}/comm/_mm_matrix.py": f"def body():\n    from {dotted}.gemm import mm\n",
-        f"{tests}/comm/test_mm_matrix.py": "import _rank_job\n",
-        f"{tests}/test_modeling_v2_claims.py": "",
-    }
-    for path, content in files.items():
-        (repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (repo / path).write_text(content, encoding="utf-8")
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    base = _git(repo, "rev-parse", "HEAD")
-    listed = sorted(p for p in files if "/test_" in p)
-    head = _commit(repo, base, {f"{catalog}/_op.py": "class OpWrapper:\n    x = 1\n"})
-    picked, why = regression.affected_files(repo, base, head, listed)
-    assert picked == [
-        f"{tests}/comm/test_mm_matrix.py",
-        f"{tests}/gemm/test_mm.py",
-        f"{tests}/norm/test_rms.py",
-        f"{tests}/test_modeling_v2_claims.py",
-    ]
-    assert why == "4 of 5 test files reach what changed"
-
-
-@_requires_git
-def test_a_target_init_reaches_its_importers_and_integration_changes_reach_none(tmp_path):
-    """A target's ``__init__.py`` reaches the tests importing its modules, not the package."""
-    repo = tmp_path / "repo"
-    models, tests = f"{regression.MODELING_V2_PACKAGE}/models", regression.CATALOG_TESTS_DIR
-    dotted = models.replace("/", ".")
-    files = {
-        f"{models}/fam/__init__.py": "",
-        f"{models}/fam/tgt/__init__.py": '"""A target."""\n',
-        f"{models}/fam/tgt/modeling.py": "X = 1\n",
-        f"{models}/other/__init__.py": "",
-        f"{models}/other/tgt/__init__.py": "",
-        f"{models}/other/tgt/modeling.py": "Y = 1\n",
-        f"{tests}/models/fam/tgt/test_modeling.py": f"import {dotted}.fam.tgt.modeling\n",
-        f"{tests}/models/other/tgt/test_modeling.py": f"from {dotted}.other.tgt import modeling\n",
-        f"{tests}/test_modeling_v2_claims.py": "",
-        "tests/integration/defs/test_fam.py": "Z = 1\n",
-    }
-    for path, content in files.items():
-        (repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (repo / path).write_text(content, encoding="utf-8")
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    base = _git(repo, "rev-parse", "HEAD")
-    listed = sorted(p for p in files if p.startswith(tests) and "/test_" in p)
-    head = _commit(
-        repo,
-        base,
-        {
-            f"{models}/fam/tgt/__init__.py": '"""The target."""\n',
-            f"{tests}/models/fam/tgt/__init__.py": "",
-        },
-    )
-    picked, why = regression.affected_files(repo, base, head, listed)
-    assert picked == [
-        f"{tests}/models/fam/tgt/test_modeling.py",
-        f"{tests}/test_modeling_v2_claims.py",
-    ]
-    assert why == "2 of 3 test files reach what changed"
-    only_integration = _commit(repo, head, {"tests/integration/defs/test_fam.py": "Z = 2\n"})
-    picked, why = regression.affected_files(repo, head, only_integration, listed)
-    assert picked == [f"{tests}/test_modeling_v2_claims.py"]
-    assert "no unit test reaches what changed" in why
-    shared = _commit(repo, only_integration, {f"{models}/__init__.py": "W = 1\n"})
-    picked, why = regression.affected_files(repo, only_integration, shared, listed)
-    assert picked == listed and "is shared by the package" in why
-
-
-@_requires_git
-def test_a_target_imported_in_a_function_reaches_its_routing_tests_not_the_package(tmp_path):
-    """``models/__init__`` imports every routing; a routing imports its targets when called."""
-    repo = tmp_path / "repo"
-    models, tests = f"{regression.MODELING_V2_PACKAGE}/models", regression.CATALOG_TESTS_DIR
-    dotted = models.replace("/", ".")
-    files = {
-        f"{models}/__init__.py": "from .fam import routing\nfrom .other import routing as o\n",
-        f"{models}/fam/__init__.py": "",
-        f"{models}/fam/routing.py": (
-            "import torch\n\n\ndef pick():\n    from .tgt.modeling import Model\n    return Model\n"
-        ),
-        f"{models}/fam/tgt/__init__.py": "",
-        f"{models}/fam/tgt/modeling.py": "class Model:\n    pass\n",
-        f"{models}/other/__init__.py": "",
-        f"{models}/other/routing.py": "X = 1\n",
-        f"{models}/other/tgt/__init__.py": "",
-        f"{models}/other/tgt/modeling.py": "Y = 1\n",
-        f"{tests}/models/fam/test_routing.py": f"from {dotted}.fam import routing\n",
-        f"{tests}/models/fam/tgt/test_modeling.py": f"from {dotted}.fam.tgt.modeling import Model\n",
-        f"{tests}/models/other/tgt/test_modeling.py": f"from {dotted}.other.tgt import modeling\n",
-        f"{tests}/test_modeling_v2_claims.py": "",
-    }
-    for path, content in files.items():
-        (repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (repo / path).write_text(content, encoding="utf-8")
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    base = _git(repo, "rev-parse", "HEAD")
-    listed = sorted(p for p in files if p.startswith(tests) and "/test_" in p)
-    head = _commit(repo, base, {f"{models}/fam/tgt/modeling.py": "class Model:\n    x = 1\n"})
-    picked, why = regression.affected_files(repo, base, head, listed)
-    assert picked == [
-        f"{tests}/models/fam/test_routing.py",
-        f"{tests}/models/fam/tgt/test_modeling.py",
-        f"{tests}/test_modeling_v2_claims.py",
-    ]
-    assert why == "3 of 4 test files reach what changed"
-
-
 @_requires_git
 def test_a_module_that_skips_itself_on_import_has_a_result_not_a_hole(tmp_path):
     repo = tmp_path / "repo"
@@ -1892,7 +1563,30 @@ def test_a_module_that_skips_itself_on_import_has_a_result_not_a_hole(tmp_path):
     assert results.unrun(["tests/test_other_arch.py"]) == []
     skip = results.result("tests/test_other_arch.py")
     assert skip.outcome == "skipped" and "sm_100 only" in skip.message
-    report = tc.compare(
-        results, results, ["tests/test_other_arch.py"], ["tests/test_other_arch.py"]
+    found = tc.head_results(results, ["tests/test_other_arch.py"])
+    assert found.not_run == [] and found.skipped == ["tests/test_other_arch.py"]
+
+    # The same file through the delivered-tests runner: probe, then one job, then nothing left.
+    ran: list[str] = []
+
+    def run_job(command, tree, timeout_s):
+        ran.append(command)
+        return _run(f"cd {tree} && {command}")
+
+    # A cache of its own, so nothing the direct run above recorded is there to reuse.
+    fresh = tmp_path / "ws" / "fresh_cache"
+    job = dict(cache_dir=fresh, out=tmp_path / "out", tree=repo, run_job=run_job)
+    results, jobs, code, _ = tc.run_at(
+        head, ["tests/test_other_arch.py"], python=sys.executable, **job
     )
-    assert report.verdict == "CLEAN" and report.not_run == []
+    assert results.env_digest and jobs == 1 and results.unrun(["tests/test_other_arch.py"]) == []
+    again, jobs, _, _ = tc.run_at(head, ["tests/test_other_arch.py"], python=sys.executable, **job)
+    assert jobs == 0 and len(ran) == 3  # the probe alone: its results in this environment stand
+    failed = tc.run_at(
+        head,
+        ["tests/test_other_arch.py"],
+        python=sys.executable,
+        **{**job, "run_job": lambda command, tree, timeout_s: (1, "unavailable")},
+    )
+    assert not failed[0].env_digest and failed[1:3] == (0, 1)
+    assert "environment probe failed" in failed[3]

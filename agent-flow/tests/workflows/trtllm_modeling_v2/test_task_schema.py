@@ -159,7 +159,7 @@ def test_the_goal_overrides_what_the_checkpoint_and_the_site_say(tmp_path):
     assert spec["features"] == ["multimodal", "disagg"] and spec["arch"] == "sm_103"
     assert spec["profile"] == {"default": "standard", "multimodal": "smoke"}
     # The CI files are owed while one unit is standard, not by a smoke or bringup run.
-    from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import ci_waiver
+    from agent_flow.workflows.trtllm_modeling_v2.run.certify import ci_waiver
 
     assert ci_waiver(spec) == ""
     assert ci_waiver({**spec, "profile": "bringup"}) == "not owed by the bringup profile"

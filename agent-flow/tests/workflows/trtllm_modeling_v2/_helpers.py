@@ -17,8 +17,7 @@ from agent_flow.workflows.trtllm_modeling_v2.checks.harness import workload_io
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as vocab
-from agent_flow.workflows.trtllm_modeling_v2.run.records.state import load_state
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
+from agent_flow.workflows.trtllm_modeling_v2.run.state import load_state
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
 
 TARGET_REL = f"{catalog_paths.MODELING_V2_PACKAGE}/models/gpt_oss/gpt_oss_120b__sm_103__tp1"
@@ -195,21 +194,25 @@ class FakeLayer:
 
 
 class Script:
-    """Per-role scripted decisions, keyed by role and turn number."""
+    """Per-role scripted decisions, keyed by role and turn number.
 
-    def __init__(self, ctx, plan=("DRAFT_READY",), **roles):
+    A role given as a callable ``(turn, prompt) -> decision mapping | None`` answers for
+    itself. Unscripted, every worker finishes its task, and the planner, which a run whose
+    tasks all finish never asks, escalates so that a test that did not expect it fails loudly.
+    """
+
+    def __init__(self, ctx=None, **roles):
         self.ctx = ctx
-        self.plan = list(plan)
         self.roles = roles
 
     def __call__(self, role, turn, prompt):
         override = self.roles.get(role)
-        if role == "planner" and not callable(override):
-            return plan_every_unit(turn, prompt)
-        if role == "surveyor" and not callable(override):
-            return {"decision": self.plan[min(turn, len(self.plan)) - 1], "summary": "drafted"}
         if callable(override):
             return override(turn, prompt)
+        if role == "planner":
+            return {"decision": "ESCALATE", "summary": "an unscripted planner was asked"}
+        if role == "surveyor":
+            return {"decision": "DRAFT_READY", "summary": "drafted"}
         if role == "kernel_writer":
             target = _target_from(prompt)
             return {"decision": "LANDED", "summary": f"landed {target}", "entry": target}
@@ -228,9 +231,7 @@ def _target_from(prompt: str) -> str:
 def _install(monkeypatch, workflow, script):
     calls: list[tuple[str, str]] = []
 
-    def fake_make_agent(
-        self, name, system_prompt, *, requires_decision=True, session_mode="stateless"
-    ):
+    def fake_make_agent(self, name, system_prompt):
         return FakeLayer(name, script, calls)
 
     monkeypatch.setattr(TrtllmModelingV2Workflow, "_make_agent", fake_make_agent)
@@ -309,8 +310,6 @@ def _workflow(tmp_path, **kwargs):
     # The substrate gate issues a boot-shaped command of its own, which a shell
     # scripted to fail a specific boot would answer; its test turns it on.
     kwargs.setdefault("skip_substrate_gate", True)
-    # A primer turn per role would answer from the same scripted agents.
-    kwargs.setdefault("primers", False)
     return TrtllmModelingV2Workflow(workspace=tmp_path / "ws", **kwargs)
 
 
@@ -328,54 +327,6 @@ def _write_vocabulary(workspace: Path, queue):
         "queue": queue,
     }
     (workspace / "vocabulary.yaml").write_text(yaml.safe_dump(doc), encoding="utf-8")
-
-
-_GRAPH_PATH = re.compile(r"Write the next graph to `([^`]+)`")
-
-
-def planner_graph_path(prompt: str) -> Path:
-    match = _GRAPH_PATH.search(prompt)
-    assert match, "the planner's request names no graph path"
-    return Path(match.group(1))
-
-
-def write_graph(prompt: str, tasks: list[dict]) -> None:
-    planner_graph_path(prompt).write_text(yaml.safe_dump({"tasks": tasks}), encoding="utf-8")
-
-
-def unit_tasks(workspace: Path) -> list[dict]:
-    """One assemble/feature task per unit, in order, claiming that unit's checks."""
-    contract = yaml.safe_load((workspace / contract_mod.CONTRACT_FILENAME).read_text())
-    units: dict[str, list[str]] = {}
-    for check in contract["checks"]:
-        units.setdefault(check["unit"], []).append(
-            f"{check['unit']}:{check['gate']}@{check['member']}"
-        )
-    tasks, previous = [], None
-    for unit, checks in units.items():
-        tasks.append(
-            {
-                "id": unit,
-                "kind": "assemble" if unit == "core" else "feature",
-                "goal": f"build {unit}",
-                "ref": unit,
-                "depends_on": [previous] if previous else [],
-                # The target's own code: no cross-model regression is owed for it.
-                "touches": [f"{TARGET_REL}/{unit}.py"],
-                "satisfies": checks,
-            }
-        )
-        previous = unit
-    return tasks
-
-
-def plan_every_unit(turn: int, prompt: str) -> dict:
-    """The default planner: one task per unit on its first turn, DONE after."""
-    if turn == 1:
-        workspace = planner_graph_path(prompt).parent
-        write_graph(prompt, unit_tasks(workspace))
-        return {"decision": "GRAPH_UPDATED", "summary": "one task per unit"}
-    return {"decision": "DONE", "summary": "the contract should hold"}
 
 
 def _git(repo: Path, *args: str) -> str:

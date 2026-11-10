@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
 import threading
 import time
 import tomllib
@@ -19,22 +18,20 @@ from typing import Any
 
 import anyio
 import pytest
-import yaml
 from jinja2 import StrictUndefined, UndefinedError
 
 from agent_flow.backends import claude_code
 from agent_flow.logger import get_logger
 from agent_flow.types import AgentTextEvent, SessionInitEvent, ThinkingEvent, ToolCallEvent
-from agent_flow.workflows.trtllm_modeling_v2.agents import prompts, roles, slots
-from agent_flow.workflows.trtllm_modeling_v2.agents.decisions import names
-from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import _common, _render, kernel, survey
-from agent_flow.workflows.trtllm_modeling_v2.agents.prompts.tags import (
-    TAG_PROMPTS,
-    TAG_SUMMARIES,
-    task_tags,
+from agent_flow.workflows.trtllm_modeling_v2.agents import prompts, roles
+from agent_flow.workflows.trtllm_modeling_v2.agents.decisions import (
+    decision_path,
+    names,
+    read_decision,
 )
+from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import _common, _render, kernel, survey
+from agent_flow.workflows.trtllm_modeling_v2.agents.prompts.tags import TAG_PROMPTS, task_tags
 from agent_flow.workflows.trtllm_modeling_v2.agents.prompts.worker import WORKER_BASE
-from agent_flow.workflows.trtllm_modeling_v2.agents.slots import AgentGate, Priority
 from agent_flow.workflows.trtllm_modeling_v2.agents.turns import (
     InProcessTurnExecutor,
     TurnOutcome,
@@ -43,15 +40,8 @@ from agent_flow.workflows.trtllm_modeling_v2.agents.turns import (
 )
 from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
-from agent_flow.workflows.trtllm_modeling_v2.run.execution.handoff import (
-    current_decision,
-    decision_path,
-    mark_decision_dispatch,
-    read_decision,
-)
-from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
-from agent_flow.workflows.trtllm_modeling_v2.run.graph import WORKER_TAGS, Graph, Task
-from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe, bootstrap, primers
+from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import ROLE_BY_KIND, TAGS_BY_KIND
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe, bootstrap
 from agent_flow.workflows.trtllm_modeling_v2.run.startup.agent_probe import (
     AGENT_PROBE_RECORD,
     AGENT_PROBE_SKIP_ENV,
@@ -115,59 +105,6 @@ def test_a_role_whose_model_the_spec_does_not_state_is_refused():
     agents = roles.resolve_role_agents(spec)
     assert (agents["planner"].backend, agents["planner"].model) == ("codex", "codex-m")
     assert (agents["assembler"].backend, agents["assembler"].model) == ("claude-code", "m")
-
-
-@pytest.fixture
-def _quick_polls(monkeypatch):
-    """Background and side turns look again every 0.1s here, not every 5s."""
-    monkeypatch.setattr(slots, "_BACKGROUND_POLL_S", 0.1)
-
-
-class _Turns:
-    """Turns that hold their slot until released, started one thread each."""
-
-    def __init__(self, gate: AgentGate) -> None:
-        self.gate = gate
-        self.release = threading.Event()
-        self.admitted: list[str] = []
-        self._lock = threading.Lock()
-
-    def start(self, name: str, priority: Priority) -> None:
-        def hold():
-            with self.gate.slot(priority):
-                with self._lock:
-                    self.admitted.append(name)
-                self.release.wait()
-
-        threading.Thread(target=hold, daemon=True).start()
-
-    def settle(self) -> None:
-        time.sleep(0.2)
-
-
-@pytest.mark.usefixtures("_quick_polls")
-def test_the_planner_owns_the_reserved_slot_and_takes_no_other():
-    turns = _Turns(AgentGate(8))
-    for i in range(8):
-        turns.start(f"task{i}", Priority.REQUIRED)
-    turns.settle()
-    assert len(turns.admitted) == 7  # the eighth task turn waits: the last slot is the planner's
-    turns.start("critic", Priority.SIDE)
-    turns.settle()
-    assert "critic" not in turns.admitted
-    turns.start("planner", Priority.PLANNER)
-    turns.settle()
-    assert "planner" in turns.admitted and len(turns.admitted) == 8
-    turns.release.set()
-    # Arriving first, the planner still leaves every task slot to the tasks.
-    first = _Turns(AgentGate(4))
-    first.start("planner", Priority.PLANNER)
-    first.settle()
-    for i in range(3):
-        first.start(f"task{i}", Priority.REQUIRED)
-    first.settle()
-    assert len(first.admitted) == 4
-    first.release.set()
 
 
 @pytest.fixture
@@ -267,10 +204,7 @@ def _request(role: str = "kernel_writer", what: str = "k12", prompt: str = "go")
     )
 
 
-def test_a_turn_past_its_bound_is_stopped_and_retried_as_an_infrastructure_failure(tmp_path):
-    # Imported here: importing the orchestrator first walks into the stages' import cycle.
-    from agent_flow.workflows.trtllm_modeling_v2.run.orchestrator import _not_the_task
-
+def test_a_turn_past_its_bound_is_stopped_and_says_so(tmp_path):
     layer = StreamingLayer(hold=threading.Event())
     executor = InProcessTurnExecutor(lambda r: layer, timeout_s=0.2, records=tmp_path)
     started = time.monotonic()
@@ -283,64 +217,8 @@ def test_a_turn_past_its_bound_is_stopped_and_retried_as_an_infrastructure_failu
     assert layer.cancelled
     done = json.loads((tmp_path / "001-kernel_writer.done").read_text())
     assert done["outcome"] == "timed out" and "001-kernel_writer.activity.log" in done["error"]
-    # What an unanswered turn raises: the orchestrator retries it as the run's failure.
-    assert _not_the_task(f"raised {type(raised.value).__name__}: {raised.value}")
-
-
-def _completed(workspace, *, task="core-tp", attempt=2):
-    decision = mark_decision_dispatch(
-        workspace,
-        "assembler",
-        5,
-        unit="core",
-        identity={"task_id": task, "task_attempt": attempt},
-    )
-
-    class Answer:
-        async def aforward(self, prompt):
-            decision.write_text("decision: UNIT_READY\nsummary: measured on the worker tree\n")
-            return "UNIT_READY"
-
-    records = workspace / "turns"
-    original = InProcessTurnExecutor(lambda request: Answer(), records=records)
-    original.run(
-        TurnRequest(
-            role="assembler", what=task, work=task, prompt="assemble", decision_file=str(decision)
-        )
-    )
-    return original, decision
-
-
-def _resumed(workspace):
-    def unexpected(request):
-        raise AssertionError("a completed worker turn must not start an agent")
-
-    return InProcessTurnExecutor(unexpected, records=workspace / "turns")
-
-
-def _relaunched(tmp_path, *, attempt):
-    """A workflow relaunched on a running task's second attempt, after a turn of ``attempt``."""
-    workspace = tmp_path / "ws"
-    _, answer = _completed(workspace, attempt=attempt)
-    Graph(tasks=[Task(id="core-tp", kind="feature", goal="g", status="running", attempts=2)]).save(
-        workspace / "graph.yaml"
-    )
-    workflow = _workflow(tmp_path)
-    workflow._turns = _resumed(workspace)
-    return workflow, answer
-
-
-def test_a_relaunch_adopts_without_another_agent_call_or_decision_copy(tmp_path):
-    workflow, answer = _relaunched(tmp_path, attempt=2)
-    workspace = workflow.workspace
-    result = ExecutionStage(workflow)._dispatch_task("assembler", "core", "core-tp", "assemble")
-    assert result.decision == "UNIT_READY"
-    assert result.result_file.is_file()
-    assert len(list((workspace / "turns").glob("*.request.json"))) == 1
-    # Read where the earlier dispatch reserved it: no path is reserved again.
-    assert [p.name for p in (workspace / "decisions").glob("*.yaml")] == [answer.name]
-    assert result.data["decision"] == "UNIT_READY"
-    assert "decision adopted on resume" in workflow.journal_path.read_text()
+    # What the pipeline records of it: the turn's own failure, with where its activity is.
+    assert "the turn was stopped" in str(raised.value)
 
 
 class _Executor:
@@ -386,77 +264,6 @@ def _primed(tmp_path, monkeypatch, primer):
     return workflow, executor, made
 
 
-def test_a_codex_role_keeps_its_primer_thread_for_later_forks(tmp_path, monkeypatch):
-    executor = _Executor()
-    workflow = _workflow(tmp_path, primers=True)
-    workflow._turns = executor
-    workflow.task_data = {"agents": {"defaults": {"backend": "codex", "model": "codex-test-model"}}}
-
-    def make_agent(name, system_prompt, *, requires_decision=True, session_mode="stateless",
-                   fork_from=None):  # fmt: skip
-        layer = _Layer(fork_from)
-        layer.session_id = "thread-1"
-        return layer
-
-    monkeypatch.setattr(workflow, "_make_agent", make_agent)
-    ready = threading.Event()
-    workflow._primer_ready["kernel_writer"] = ready
-    workflow._build_primer("kernel_writer", "v", ready)
-    assert ready.is_set()
-    assert "your session is copied to start every later kernel_writer turn" in executor.prompts[-1]
-    assert workflow._primers["kernel_writer"].session_id == "thread-1"
-    start = workflow._turn_start("kernel_writer", "implement")
-    assert start.forked and start.layer.fork_from == "thread-1"
-    assert primers.load(workflow.workspace)["kernel_writer"].session_id == "thread-1"
-
-
-def test_a_failed_fork_keeps_the_summary_fallback_across_restart(tmp_path, monkeypatch):
-    summary = tmp_path / "briefing.md"
-    summary.write_text("saved source reading")
-    primer = primers.Primer("kernel_writer", "old-thread", "a" * 40, "v", str(summary))
-    workflow, executor, _ = _primed(tmp_path, monkeypatch, primer)
-    original = executor.run
-
-    def run(request):
-        if request.prompt.startswith("**You are now working your own turn"):
-            raise RuntimeError("thread/fork failed before the turn started")
-        return original(request)
-
-    monkeypatch.setattr(executor, "run", run)
-    assert workflow._run_turn("kernel_writer", "verify", "do the entry") == "ok"
-    assert str(summary) in executor.prompts[-1]
-    kept = primers.load(workflow.workspace)["kernel_writer"]
-    assert kept.session_id == "" and kept.summary == str(summary)
-
-
-def _write(workspace: Path, agent: str, iteration: int, payload: dict) -> Path:
-    path = decision_path(workspace, agent, iteration)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
-    return path
-
-
-def test_a_decision_older_than_the_marker_is_refused(tmp_path):
-    stale = _write(tmp_path, "assembler", 1, {"summary": "s", "decision": "BLOCKED"})
-    os.utime(stale, (1_000_000, 1_000_000))  # written long before this dispatch
-    stale.with_name(f".{stale.stem}.dispatched").write_text("", encoding="utf-8")
-    assert read_decision(stale, "assembler") is None
-
-
-def test_a_previous_turns_decision_is_never_read_as_this_ones(tmp_path):
-    """A new dispatch is reserved a new path: the earlier verdict is neither read nor overwritten."""
-    old = _write(tmp_path, "assembler", 1, {"summary": "s", "decision": "BLOCKED"})
-    before = old.read_text()
-    target = mark_decision_dispatch(tmp_path, "assembler", 1)
-
-    assert target != old
-    assert current_decision(tmp_path, "assembler", 1) == target
-    assert read_decision(target, "assembler") is None
-    target.write_text("summary: s\ndecision: UNIT_READY\n", encoding="utf-8")
-    assert read_decision(target, "assembler")["decision"] == "UNIT_READY"
-    assert old.read_text() == before
-
-
 def test_missing_context_raises() -> None:
     assert _render._ENVIRONMENT.undefined is StrictUndefined
     with pytest.raises(UndefinedError):
@@ -475,7 +282,7 @@ def test_markdown_and_user_notes_are_neither_escaped_nor_rendered_again() -> Non
 def test_decision_file_extra_keys_scope_and_role_endings() -> None:
     plain = _common.decision_file_block("surveyor")
     extra = _common.decision_file_block("assembler", ("blocked_reason", "uncertified"))
-    assert "<unit>-surveyor-<turn>.yaml" in plain
+    assert "<task>-<attempt>.yaml" in plain
     assert "This role also carries" not in plain
     assert "  blocked_reason: ...\n  uncertified: ...\n```" in extra
     assert _common.scope_block("full") == ""
@@ -484,14 +291,31 @@ def test_decision_file_extra_keys_scope_and_role_endings() -> None:
         for decision in names(role):
             assert decision in prompt
         assert "SPDX-License-Identifier" not in prompt
-    assert task_tags("feature", ("investigate", "assemble")) == (
-        "assemble",
-        "feature",
-        "investigate",
-    )
-    assert tuple(TAG_PROMPTS) == WORKER_TAGS == tuple(TAG_SUMMARIES)
+    assert task_tags("feature", ("fix", "assemble")) == ("assemble", "feature", "fix")
+    # Every kind of task the pipeline runs has a role, and a section for each of its tags.
+    assert set(TAGS_BY_KIND) | {"kernel"} == set(ROLE_BY_KIND)
+    assert {tag for tags in TAGS_BY_KIND.values() for tag in tags} | {"kernel"} == set(TAG_PROMPTS)
     for tag, text in TAG_PROMPTS.items():
         assert text.startswith(f"## Tag `{tag}`")
+
+
+def test_each_attempt_of_a_task_has_its_own_decision_file_and_only_a_valid_one_is_read(tmp_path):
+    first = decision_path(tmp_path, "core", 1)
+    assert first == tmp_path / "decisions" / "core-1.yaml" and first.parent.is_dir()
+    assert decision_path(tmp_path, "core", 2) != first
+    assert decision_path(tmp_path, "core", 1, turn=2).name == "core-1.2.yaml"
+    assert decision_path(tmp_path, "k1/rms norm", 1).name == "k1_rms_norm-1.yaml"
+    assert read_decision(first, "assembler") is None  # no file is no decision
+    first.write_text("summary: s\ndecision: LANDED\n")
+    assert read_decision(first, "assembler") is None  # another role's decision is none
+    first.write_text("decision: [not, a, mapping")
+    assert read_decision(first, "assembler") is None
+    first.write_text("summary: s\ndecision: ' UNIT_READY '\nchecks: [boot]\n")
+    assert read_decision(first, "assembler") == {
+        "summary": "s",
+        "decision": "UNIT_READY",
+        "checks": ["boot"],
+    }
 
 
 def test_workers_wait_for_results_and_write_decisions_before_ending() -> None:
@@ -521,7 +345,7 @@ def kernel_context() -> kernel.KernelContext:
         goal="certify norm",
         task_id="k4-rmsnorm",
         task_kind="kernel",
-        tags=("investigate",),
+        tags=("fix",),
         tier=4,
         landing="ops/norm/rmsnorm__r4",
         paths=("entry.py", "test.py"),
@@ -539,7 +363,7 @@ def test_kernel_device_assignment_respects_scheduler_and_device_zero(
     text = kernel.kernel_prompt(ctx)
     assert ("CUDA_VISIBLE_DEVICES=0" in text) is (environment == "local" and devices > 1)
     assert text.index(ctx.note) < text.index("## Your task")
-    assert text.index("## Tag `kernel`") < text.index("## Tag `investigate`")
+    assert text.index("## Tag `kernel`") < text.index("## Tag `fix`")
     assert "from .ops.norm.rmsnorm__r4 import rmsnorm" in text
     assert text.index("`entry.py`") < text.index("`test.py`")
     assert "The surface to certify: bf16" in text

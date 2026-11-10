@@ -2,55 +2,33 @@
 # SPDX-License-Identifier: Apache-2.0
 """One worktree per task, integrated into the checkout when the task finishes.
 
-Tasks that change the tree (``kernel``, ``assemble``, ``feature``,
-``integrate``) each work on their own branch in their own worktree, cut from
-the integration checkout's head when the task starts. When the worker
-finishes, the branch's commits are audited against the run's commit rules
-(``infra/git.py``), and one that breaks them goes back to the worker.
-The branch is then rebased onto the head as it is then and fast-forwarded in,
-under one lock: the integration branch only ever moves by
-whole tasks, never by a half-written file, and it carries no merge commits. A
-rebase that conflicts is aborted and reported with the conflicting files and
-the head it was onto; the worker is then asked, in its worktree, to rebase onto
-that head and resolve (:func:`rebase_block`), and the task fails only when that
-does not work.
+A task that changes the tree (a kernel entry, a unit, a variant, a fix) works
+on its own branch in its own worktree, cut from the checkout's head when the
+task starts. When its worker finishes, the branch's commits are audited
+against the run's commit rules (``infra/git.py``): who made them, how they are
+signed, and that they change only the run's own paths. A branch that breaks
+them goes back to its worker. The branch is then rebased onto the head as it
+is then and fast-forwarded in, under one lock: the checkout only ever moves by
+whole tasks and carries no merge commits. Tasks run one at a time but for
+kernel entries, so a rebase rarely conflicts; one that does is aborted and
+goes back to its worker once (:func:`rebase_block`).
 
-A task's next attempt keeps its worktree and branch; its worker is told how
-far the branch is behind the checkout, and rebases when it needs what landed
-(:func:`worktree_block`).
-
-A worktree is a sparse checkout (:func:`cone`): the Python package, the tests
-and examples a worker runs, and the directories its task ``touches``. A task
-that touches native code, or runs ``exclusive``, gets the whole tree, and a
-worker widens its own with ``git sparse-checkout add``. The files left out are
-still in the branch: commits, the rebase and the fast-forward carry them as
-they are.
-
-No config file says a worktree is sparse. Its cone is the cone file in its
-own git directory and the skip-worktree entries of its index, and each git
-command run here on it carries :data:`SPARSE_ON`, which turns sparse checkout
-on for that command alone: ``git sparse-checkout set --cone`` in a linked
-worktree would first turn on per-worktree config in the config every worktree
-of the repository shares, and fails where that file is read-only or locked.
-
-An ``investigate`` task gets a scratch worktree that is never integrated.
+A task's next attempt keeps its worktree and branch.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import posixpath
-import re
 import shutil
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
-from typing import Callable, Iterable, Mapping
+from pathlib import Path
+from typing import Callable
 
-from ...infra.git import (
+from ..infra.git import (
     CommitPolicy,
     audit_commits,
     git_checked,
@@ -59,32 +37,7 @@ from ...infra.git import (
     repo_lock,
 )
 
-#: Kinds whose work is integrated, and the kind that gets a throwaway tree.
-INTEGRATED_KINDS = frozenset({"kernel", "assemble", "feature", "integrate"})
-SCRATCH_KINDS = frozenset({"investigate"})
 WORKTREES_DIRNAME = "worktrees"
-#: What every sparse worktree checks out: the package, the tests a worker runs
-#: and what they import, and the examples a gate runs and reads (the
-#: quickstart, a prompt's images) from the tree it measures. Cone mode adds
-#: the files directly in each one's parent directories and at the top level.
-SPARSE_CONE: tuple[str, ...] = (
-    "examples",
-    "tensorrt_llm",
-    "tests/integration",
-    "tests/test_common",
-    "tests/unittest/_torch",
-    "tests/unittest/llmapi/apps",
-    "tests/unittest/utils",
-    "triton_kernels",
-)
-#: A task that touches these changes native code, whose build needs the whole tree.
-FULL_TREE_ROOTS = frozenset({"cpp", "3rdparty"})
-#: Turns sparse checkout on for one git command in a worktree, without a config
-#: file: git then reads and writes the cone file in the worktree's own git
-#: directory and the skip-worktree bits of its index.
-SPARSE_ON = ("-c", "core.sparseCheckout=true", "-c", "core.sparseCheckoutCone=true")
-#: The same for a pattern rather than a cone: ``/*`` brings every file back.
-_PATTERNS_ON = ("-c", "core.sparseCheckout=true", "-c", "core.sparseCheckoutCone=false")
 #: Files one checkout writes at once (``checkout.workers``, git 2.32 or later).
 CHECKOUT_WORKERS = 16
 _CHECKOUT = ("-c", f"checkout.workers={CHECKOUT_WORKERS}")
@@ -95,9 +48,9 @@ ADD_RETRY_S = 5.0
 INTEGRATED_FILENAME = "integrated.json"
 #: A fast-forward that meets another git process's index lock is tried again.
 LOCK_RETRIES, LOCK_RETRY_S = 5, 3.0
-#: A finished task whose rebase conflicts goes back to its worker to resolve
-#: it this many times before the task fails.
-REBASE_RETRIES = 2
+#: A finished task whose branch does not integrate as it stands goes back to
+#: its worker this many times before the task fails.
+REPAIR_TURNS = 1
 
 
 class TaskNotStarted(RuntimeError):
@@ -156,23 +109,20 @@ class Integration:
             env={**os.environ, **self.env},
         )
 
-    def open(self, task_id: str, touches: Iterable[str] = (), full: bool = False) -> Path:
-        """The task's worktree, created from the integration head the first time.
+    def open(self, task_id: str) -> Path:
+        """The task's worktree, created from the checkout's head the first time.
 
-        It checks out :func:`cone` of ``touches``, or the whole tree when
-        ``full`` or a touched path asks for it. Only registering the worktree
-        holds the repository lock. A worktree opened again is widened to what
-        ``touches`` asks now; one whose checkout was cut short is made again,
-        on the branch an earlier attempt left when there is one. A branch that holds
-        nothing the integration head lacks starts again at that head
-        (:meth:`_caught_up`), so a retry sees what other tasks landed since.
+        Only registering the worktree holds the repository lock. One whose
+        checkout was cut short is made again, on the branch an earlier attempt
+        left when there is one. A branch that holds nothing the checkout's
+        head lacks starts again at that head (:meth:`_caught_up`), so a retry
+        sees what other tasks landed since.
         """
-        tree, dirs = self.tree(task_id), cone(touches, full)
+        tree = self.tree(task_id)
         if _checked_out(tree):
-            self._widen(tree, dirs)
             self._catch_up(task_id, tree)
         else:
-            self._create(task_id, tree, dirs)
+            self._create(task_id, tree)
         link_native(self.repo, tree)
         return tree
 
@@ -192,11 +142,10 @@ class Integration:
         head = self._caught_up(task_id)
         if head is None or (git_output(tree, "rev-parse", "HEAD") or "").strip() == head:
             return
-        flags = _sparse_flags(tree)
-        edits = git_output(tree, *flags, "status", "--porcelain", "--untracked-files=no")
+        edits = git_output(tree, "status", "--porcelain", "--untracked-files=no")
         if (edits or "").strip():
             return  # edits an earlier attempt left uncommitted stay where they are
-        moved = self._git(tree, *_CHECKOUT, *flags, "reset", "--hard", "-q", head)
+        moved = self._git(tree, *_CHECKOUT, "reset", "--hard", "-q", head)
         if moved.returncode == 0:
             self.log(f"{tree.name}: moved to the integration head {head[:10]}")
 
@@ -205,56 +154,10 @@ class Integration:
         listed = git_output(self.repo, "diff", "--name-only", f"HEAD...{self.branch(task_id)}")
         return tuple(sorted({line.strip() for line in (listed or "").splitlines() if line.strip()}))
 
-    def _widen(self, tree: Path, dirs: tuple[str, ...] | None) -> None:
-        """Check out in ``tree`` what ``dirs`` has beyond its cone; the whole tree for None.
+    def _create(self, task_id: str, tree: Path) -> None:
+        """Register ``tree`` on the task's branch, then check it out whole.
 
-        A tree whose own config makes it sparse (``git sparse-checkout set
-        --cone`` where the shared config can be written) is widened through
-        that config.
-        """
-        flags, current = _sparse(tree)
-        if not current:
-            return
-        why = "its task now asks for the whole tree"
-        if dirs is not None:
-            missing = [d for d in dirs if not any(_under(d, c) for c in current)]
-            if not missing:
-                return
-            added = self._git(
-                tree, *_CHECKOUT, *flags, "sparse-checkout", "add", "--skip-checks", *missing
-            )
-            if added.returncode == 0:
-                self.log(f"{tree.name}: worktree widened to {', '.join(missing)} {_way(flags)}")
-                return
-            why = f"git could not widen it: {_last_line(added.stderr)}"
-        # The whole tree, also where git could not widen the cone.
-        self.log(f"{tree.name}: {self._whole(tree, flags)} ({why})")
-
-    def _whole(self, tree: Path, flags: tuple[str, ...]) -> str:
-        """Check out the rest of the sparse ``tree``, leaving it whole; say what happened.
-
-        A file the tree has on disk outside its cone is left as it is.
-        """
-        if not flags:
-            done = self._git(tree, *_CHECKOUT, "sparse-checkout", "disable")
-        else:
-            # A pattern for every file checks the rest out; the cone file then
-            # goes, so that git reads the tree as whole.
-            done = self._git(
-                tree, *_CHECKOUT, *_PATTERNS_ON, "sparse-checkout", "set", "--skip-checks", "/*"
-            )
-            if done.returncode == 0:
-                _drop_cone(tree)
-        if done.returncode != 0:
-            error = _last_line(done.stderr)
-            return f"worktree left sparse, git could not check out the rest: {error}"
-        return f"worktree made whole {_way(flags)}"
-
-    def _create(self, task_id: str, tree: Path, dirs: tuple[str, ...] | None) -> None:
-        """Register ``tree`` on the task's branch, write its cone, then check it out.
-
-        The tree is whole when ``dirs`` is None, and where git cannot make it
-        sparse. The branch is an earlier attempt's when one is there.
+        The branch is an earlier attempt's when one is there.
         """
         if tree.exists():
             self._discard(tree)
@@ -278,20 +181,8 @@ class Integration:
                         f"git worktree add {' '.join(where)}: {added.stderr.strip()}"
                     )
                 time.sleep(ADD_RETRY_S)
-        sparse, how = (), "worktree made whole, as its task asks"
-        if dirs is not None:
-            # Writes the cone file in the worktree's own git directory only, so
-            # it runs beside other tasks doing the same.
-            made = self._git(tree, *SPARSE_ON, "sparse-checkout", "set", "--skip-checks", *dirs)
-            if made.returncode == 0:
-                sparse = SPARSE_ON
-                how = f"worktree made sparse {_way(sparse)}: {', '.join(dirs)}"
-            else:
-                _drop_cone(tree)
-                error = _last_line(made.stderr)
-                how = f"worktree made whole: git could not make it sparse ({error})"
-        git_checked(tree, *_CHECKOUT, *sparse, "reset", "--hard", "-q")
-        self.log(f"{task_id}: {how}")
+        git_checked(tree, *_CHECKOUT, "reset", "--hard", "-q")
+        self.log(f"{task_id}: worktree {tree} on {branch}")
 
     def _discard(self, tree: Path) -> None:
         """Remove what a cut-short creation of ``tree`` left: its registration and its files."""
@@ -333,11 +224,7 @@ class Integration:
         return self._git(self.repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode == 0
 
     def integrate(self, task_id: str) -> Outcome:
-        """Rebase the task's branch onto the integration head and fast-forward it in.
-
-        The rebase keeps a sparse worktree sparse: what the head changed
-        outside its cone stays off disk.
-        """
+        """Rebase the task's branch onto the checkout's head and fast-forward it in."""
         tree, branch = self.tree(task_id), self.branch(task_id)
         if self._already_in(task_id):
             return Outcome(True, f"{branch} was integrated before the restart", 0)
@@ -347,7 +234,7 @@ class Integration:
             # A rebase cut short, by a process that stopped mid-integration or
             # by a worker, leaves HEAD detached at the base; going back to the
             # branch is what makes its commits count again.
-            self._git(tree, *_sparse_flags(tree), "rebase", "--abort")
+            self._git(tree, "rebase", "--abort")
         on = git_checked(tree, "symbolic-ref", "--quiet", "HEAD", check=False).strip()
         if on != f"refs/heads/{branch}":
             return Outcome(
@@ -374,13 +261,12 @@ class Integration:
             broken = self._audit(tree, head, branch)
             if broken:
                 return Outcome(False, broken, repairable=True)
-            flags = _sparse_flags(tree)
-            rebased = self._git(tree, *flags, "rebase", head)
+            rebased = self._git(tree, "rebase", head)
             if rebased.returncode != 0:
                 conflicts = git_checked(
                     tree, "diff", "--name-only", "--diff-filter=U", check=False
                 ).split()
-                self._git(tree, *flags, "rebase", "--abort")
+                self._git(tree, "rebase", "--abort")
                 return Outcome(
                     False,
                     f"branch {branch} conflicts with the integration head {head[:10]} in: "
@@ -424,49 +310,6 @@ class Integration:
             git_checked(self.repo, "worktree", "remove", "--force", str(tree), check=False)
 
 
-def _under(path: str, root: str) -> bool:
-    return path == root or path.startswith(root + "/")
-
-
-def _touched_dir(path: str) -> str:
-    """The directory a ``touches`` entry needs on disk, repo-relative; "" for the top level.
-
-    A file (a last part with a suffix, as the graph reads ``touches``) needs
-    the directory holding it, and a glob the directory it starts in. A path
-    that leaves the repository needs nothing.
-    """
-    path = path.strip()
-    glob = re.search(r"[*?\[]", path)
-    if glob:
-        path = path[: glob.start()].rpartition("/")[0] + "/"
-    clean = posixpath.normpath(path) if path.strip("/") else "."
-    if clean == "." or clean.startswith(("/", "..")):
-        return ""
-    if not path.endswith("/") and PurePosixPath(clean).suffix:
-        clean = posixpath.dirname(clean)
-    return clean
-
-
-def cone(touches: Iterable[str] = (), full: bool = False) -> tuple[str, ...] | None:
-    """The directories a task's worktree checks out, or None for the whole tree.
-
-    :data:`SPARSE_CONE` and the directories ``touches`` names. ``full``, or a
-    touched path under :data:`FULL_TREE_ROOTS`, asks for the whole tree.
-    """
-    dirs = {_touched_dir(path) for path in touches} - {""}
-    if full or any(d.split("/")[0] in FULL_TREE_ROOTS for d in dirs):
-        return None
-    dirs |= set(SPARSE_CONE)
-    return tuple(sorted(d for d in dirs if not any(o != d and _under(d, o) for o in dirs)))
-
-
-def _sparse(tree: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """What turns sparse checkout on in ``tree`` (:func:`_sparse_flags`), and its cone."""
-    flags = _sparse_flags(tree)
-    listed = git_output(tree, *flags, "sparse-checkout", "list") or ""
-    return flags, tuple(line.strip() for line in listed.splitlines() if line.strip())
-
-
 def _rebase_in_progress(tree: Path) -> bool:
     """Whether ``tree`` holds a rebase that stopped before it finished."""
     for state in ("rebase-merge", "rebase-apply"):
@@ -474,34 +317,6 @@ def _rebase_in_progress(tree: Path) -> bool:
         if where and (tree / where).exists():
             return True
     return False
-
-
-def _sparse_flags(tree: Path) -> tuple[str, ...]:
-    """The flags that turn sparse checkout on for one git command in ``tree``.
-
-    No flags for a tree whose own config says whether it is sparse, as one
-    made sparse through ``git sparse-checkout set --cone`` does, and
-    :data:`SPARSE_ON` for any other. Without a cone file, as in a whole tree,
-    they change nothing.
-    """
-    said = git_output(tree, "config", "--show-scope", "--get", "core.sparseCheckout") or ""
-    return () if said.startswith("worktree") else SPARSE_ON
-
-
-def _drop_cone(tree: Path) -> None:
-    """Remove ``tree``'s cone file, which git keeps in the worktree's own git directory."""
-    path = git_checked(tree, "rev-parse", "--git-path", "info/sparse-checkout", check=False)
-    if path:
-        Path(tree, path).unlink(missing_ok=True)
-
-
-def _way(flags: tuple[str, ...]) -> str:
-    return "without a config" if flags else "through its config"
-
-
-def _last_line(text: str) -> str:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return lines[-1] if lines else "no message"
 
 
 def _checked_out(tree: Path) -> bool:
@@ -516,31 +331,7 @@ def _checked_out(tree: Path) -> bool:
     return bool(gitdir) and Path(gitdir, "index").exists()
 
 
-def _sparse_note(tree: Path) -> str:
-    """How a worker reaches what its sparse worktree leaves out; "" for a whole tree."""
-    flags, dirs = _sparse(tree)
-    if not dirs:
-        return ""
-    listed = ", ".join(f"`{d}/`" for d in dirs)
-    widen = " ".join(("git", "-C", str(tree), *flags, "sparse-checkout", "add", "<dir>"))
-    note = (
-        f"\n\nOnly part of the checkout is on disk in your worktree: {listed}, and the files "
-        "at the top level and directly in those directories' parents. Everything else is in "
-        "your branch, unchanged by what you commit: read a file of it with "
-        f"`git -C {tree} show HEAD:<path>`, search it with "
-        f"`git -C {tree} grep <pattern> HEAD -- <dir>`, and before you edit or build in a "
-        "directory that is not on disk, check it out with\n\n"
-        f"    {widen}"
-    )
-    if flags:
-        note += (
-            "\n\nKeep the `-c` options: no config file marks your worktree sparse, and without "
-            "them git answers `no sparse-checkout to add to`."
-        )
-    return note
-
-
-def _behind_note(tree: Path, repo: Path, scratch: bool) -> str:
+def _behind_note(tree: Path, repo: Path) -> str:
     """What a worker whose branch lacks the checkout's head is told; "" when it holds it."""
     head = (git_output(repo, "rev-parse", "HEAD") or "").strip()
     if not head or git_output(tree, "merge-base", "--is-ancestor", head, "HEAD") is not None:
@@ -548,82 +339,30 @@ def _behind_note(tree: Path, repo: Path, scratch: bool) -> str:
     behind = (git_output(tree, "rev-list", "--count", f"HEAD..{head}") or "").strip()
     if not behind.isdigit() or behind == "0":
         return ""
-    landed = (
-        f"{behind} commit(s) landed on the checkout after your branch was cut or last rebased; "
-        f"its head is `{head}`."
-    )
-    if not scratch:
-        landed += " They reach your work when it is integrated, after your tests have run."
     return (
-        f"\n\n## Your branch is behind the checkout\n\n{landed} If your task needs them (a fix "
-        "it depends on, say), rebase onto that head before anything else, for this turn only "
-        "despite the rule against it:\n\n"
+        f"\n\n## Your branch is behind the checkout\n\n{behind} commit(s) landed on the checkout "
+        f"after your branch was cut; its head is `{head}`. Rebase onto that head before anything "
+        "else, for this turn only despite the rule against it:\n\n"
         f"    git -C {tree} rebase {head}\n\n"
         "Resolve each conflict so that both your change and the landed one stand, then "
         f"`git -C {tree} add` the resolved files and `GIT_EDITOR=true git -C {tree} rebase "
         f"--continue` until the rebase is done. If the two cannot both stand, `git -C {tree} "
-        "rebase --abort` and say why in your report."
+        "rebase --abort` and say why in your decision file."
     )
 
 
-def worktree_block(tree: Path, repo: Path, scratch: bool) -> str:
+def worktree_block(tree: Path, repo: Path) -> str:
     """What a worker in its own worktree is told, appended to its turn prompt."""
-    if scratch:
-        return (
-            "## Your worktree\n\n"
-            f"Experiment in `{tree}`, a scratch copy of `{repo}`. Nothing in it is integrated: "
-            "write what you find to your report and decision file, and leave the checkout alone."
-            + _sparse_note(tree)
-            + _behind_note(tree, repo, scratch=True)
-        )
     return (
         "## Your worktree\n\n"
         f"You work in `{tree}`, your own branch of the checkout `{repo}`. Edit, build, test and "
         f"commit there and nowhere else; do not touch `{repo}`. Read paths relative to your "
         "worktree where the prompt names the checkout. Commit with\n\n"
         f"    git -C {tree} add <path> [path...] && git -C {tree} commit -s -m <message>\n\n"
-        f"Run a gate on your work with `--tree {tree}`. When you finish, the orchestrator "
-        "checks your commits, rebases them onto the checkout and runs your task's checks "
-        "there; uncommitted changes are not integrated and fail the task."
-        + _sparse_note(tree)
-        + _behind_note(tree, repo, scratch=False)
-    )
-
-
-def soft_dependency_block(states: Mapping[str, str], receipts: Path, repo: str) -> str:
-    """What a task that starts beside its soft dependencies is told; "" with none.
-
-    ``states`` is each one's status as the task starts; ``receipts`` the
-    directory their receipts land in; ``repo`` the checkout.
-    """
-    if not states:
-        return ""
-    lines = []
-    for dep, status in states.items():
-        receipt = receipts / f"{dep}.receipt.yaml"
-        if status == "done":
-            lines.append(f"- `{dep}` has landed; its receipt is `{receipt}`.")
-        elif status in ("failed", "abandoned", "split"):
-            lines.append(
-                f"- `{dep}` ended {status}: its change will not land. Go on without it, and say "
-                "in your report what of your work needed it."
-            )
-        else:
-            lines.append(
-                f"- `{dep}` is {status}: its change lands while you work, and its receipt "
-                f"`{receipt}` appears when it has."
-            )
-    head = f"$(git -C {repo} rev-parse HEAD)" if repo else "<the checkout's head>"
-    return (
-        "## Soft dependencies\n\n"
-        "Your task starts beside these, and needs their change only where its checks run:\n\n"
-        + "\n".join(lines)
-        + "\n\nWrite your change against the code as it is now. When you finish, your "
-        "integration waits for each of them to land or end; your branch is then rebased onto "
-        "the checkout's head, which holds what landed, and your task's checks run there. If "
-        "your own tests need a change that has landed meanwhile, rebase onto the checkout's "
-        f"head first, for this turn only despite the rule against it: `git -C <your worktree> "
-        f"rebase {head}`."
+        f"Run a check on your work with `--tree {tree}`. When you finish, the orchestrator "
+        "audits your commits and rebases them onto the checkout; uncommitted changes are not "
+        "integrated and fail the task."
+        + _behind_note(tree, repo)
     )
 
 
@@ -660,18 +399,11 @@ def rebase_block(outcome: Outcome, tree: Path) -> str:
 
 __all__ = [
     "CHECKOUT_WORKERS",
-    "FULL_TREE_ROOTS",
-    "INTEGRATED_KINDS",
     "Integration",
     "Outcome",
-    "REBASE_RETRIES",
-    "SCRATCH_KINDS",
-    "SPARSE_CONE",
-    "SPARSE_ON",
+    "REPAIR_TURNS",
     "TaskNotStarted",
-    "cone",
     "rebase_block",
     "repair_block",
-    "soft_dependency_block",
     "worktree_block",
 ]

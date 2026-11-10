@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
 from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
@@ -24,7 +25,7 @@ from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
     format_surface,
     parse_inventory,
 )
-from agent_flow.workflows.trtllm_modeling_v2.run.startup import datasets, preflight
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
 from agent_flow.workflows.trtllm_modeling_v2.run.startup.preflight import PreflightError
 
 

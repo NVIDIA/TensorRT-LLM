@@ -35,13 +35,13 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
 import anyio
 
 from agent_flow.backends.claude_code import cli_stderr_to
 
-from ..infra.files import read_json, write_json_atomic, write_text_atomic
+from ..infra.files import write_json_atomic, write_text_atomic
 
 
 class TurnExecutionError(RuntimeError):
@@ -65,9 +65,6 @@ DEFAULT_ROLE_TURN_TIMEOUTS: dict[str, float] = {
 
 #: Where in-process turns leave their files, under the workspace.
 TURNS_DIRNAME = "turns"
-#: The marker beside an answered turn's files once the run is done with it: no
-#: later process adopts that answer.
-CONSUMED_SUFFIX = ".consumed"
 
 #: One activity entry's text is cut at this many characters.
 ACTIVITY_ENTRY_LIMIT = 4000
@@ -90,11 +87,6 @@ class TurnRequest:
     backend: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
-    #: The work the turn is for (a graph task's id), when ``what`` alone does
-    #: not name it: two tasks verifying one entry are both asked ``verify
-    #: <entry>``. A restarted run adopts a turn a previous process left only
-    #: for the same work. Empty: ``what`` names it.
-    work: str = ""
 
 
 @dataclass(frozen=True)
@@ -105,18 +97,6 @@ class TurnOutcome:
     text: str
     #: The id of the turn's records (``turns/<id>.*``), where it has them.
     request_id: str = ""
-
-
-@dataclass(frozen=True)
-class AnsweredTurn:
-    """An earlier process's answered turn, adopted instead of asked again."""
-
-    request_id: str
-    #: The answering session's result text.
-    text: str
-    #: Where the turn wrote its decision; the adopting caller reads it there.
-    decision_file: Path
-    result_file: Path
 
 
 #: Given a request, the :class:`agent_flow.AgentLayer` that runs it: its
@@ -182,7 +162,6 @@ class TurnRecord:
                     "id": self.request_id,
                     "role": request.role,
                     "what": request.what,
-                    "work": request.work,
                     "decision_file": request.decision_file,
                     "agent": {
                         "backend": request.backend,
@@ -253,8 +232,6 @@ class _TurnLog:
         self.root: Path | None = None
         self._lock = threading.Lock()
         self._counter: Any = None
-        self.created = time.time()
-        self.read: set[str] = set()
 
     def keep_in(self, root: Path | str) -> None:
         # Absolute, so the paths a record names hold from any working directory.
@@ -339,8 +316,7 @@ class InProcessTurnExecutor:
     every role has that one bound. A turn past its bound is cancelled -- the
     CLI it started is stopped -- and :class:`TurnTimeout` is raised. Once
     :meth:`keep_records` names a directory, each turn leaves its files there
-    (the module docstring), and an answered turn can be adopted after a
-    restart until its task has an outcome and consumes it.
+    (the module docstring).
     """
 
     def __init__(
@@ -378,95 +354,6 @@ class InProcessTurnExecutor:
         view = copy.copy(self)
         view._provider = lambda request: session
         return view
-
-    def _requests(self, role: str | None = None) -> list[tuple[str, dict]]:
-        root = self.records
-        if root is None:
-            return []
-        rows = []
-        pattern = f"*-{role}.request.json" if role else "*.request.json"
-        for path in root.glob(pattern):
-            data = read_json(path)
-            if data is not None:
-                rows.append((path.name.removesuffix(".request.json"), data))
-        return sorted(rows, key=lambda row: _seq(row[0]))
-
-    def _answered(self, request_id: str) -> bool:
-        root = self.records
-        if root is None:
-            return False
-        done = read_json(root / f"{request_id}.done")
-        return bool(done and done.get("outcome") == "answered" and not done.get("error"))
-
-    def adopt_answered(
-        self, role: str, what: str, accept: Callable[[Path], bool]
-    ) -> AnsweredTurn | None:
-        """Recover the latest completed turn, without rerunning its agent or its tools.
-
-        A newer incomplete or failed turn supersedes older answers. Consumed
-        answers and turns started or already read by this executor are never
-        adopted; a later process may still adopt an unconsumed answer again.
-        """
-        if self.records is None:
-            return None
-        with self._log._lock:
-            rows = [
-                (name, data)
-                for name, data in self._requests(role)
-                if (data.get("work") or data.get("what")) == what
-            ]
-            if not rows:
-                return None
-            name, data = rows[-1]
-            try:
-                started = float(data.get("started_at") or 0)
-            except (TypeError, ValueError):
-                return None
-            if (
-                name in self._log.read
-                or started <= 0
-                or started >= self._log.created
-                or (self.records / f"{name}{CONSUMED_SUFFIX}").exists()
-                or not self._answered(name)
-            ):
-                return None
-            decision = data.get("decision_file")
-            if (
-                not isinstance(decision, str)
-                or not decision
-                or not Path(decision).is_absolute()
-                or not accept(Path(decision))
-            ):
-                return None
-            try:
-                text = (self.records / f"{name}.result.md").read_text(encoding="utf-8")
-            except OSError:
-                return None
-            self._log.read.add(name)
-            return AnsweredTurn(name, text, Path(decision), self.records / f"{name}.result.md")
-
-    def consume(self, work: Iterable[str]) -> list[str]:
-        """Keep a finished or retried task's prior answers from being adopted again."""
-        if self.records is None:
-            return []
-        wanted = set(work)
-        if not wanted:
-            return []
-        consumed = []
-        with self._log._lock:
-            for name, data in self._requests():
-                marker = self.records / f"{name}{CONSUMED_SUFFIX}"
-                identity = data.get("work") or data.get("what")
-                if not isinstance(identity, str) or identity not in wanted or marker.exists():
-                    continue
-                if not self._answered(name):
-                    continue
-                try:
-                    write_json_atomic(marker, {**_process(), "at": time.time()})
-                except OSError:
-                    continue
-                consumed.append(name)
-        return consumed
 
     def run(self, request: TurnRequest) -> TurnOutcome:
         layer = self._provider(request)
@@ -529,8 +416,6 @@ def _stderr_sink(record: TurnRecord | None) -> Callable[[str], None]:
 
 __all__ = [
     "ACTIVITY_ENTRY_LIMIT",
-    "CONSUMED_SUFFIX",
-    "AnsweredTurn",
     "DEFAULT_ROLE_TURN_TIMEOUTS",
     "DEFAULT_TURN_TIMEOUT_S",
     "TURNS_DIRNAME",

@@ -192,10 +192,14 @@ class CommitPolicy:
         *,
         workspace: str | Path | None = None,
         identity: CommitIdentity | None = None,
+        own_paths: Sequence[str] = (),
     ) -> "CommitPolicy":
         """The policy a run's ``task.yaml`` asks for, as the repository's user unless ``identity``.
 
         A workspace inside the repository is denied: the run's records are never delivered.
+        ``own_paths`` are the run's own paths (``operators.coverage.own_paths``): where the
+        spec states no ``commit_policy.allowed_paths``, the run's commits are held to them,
+        so a run never changes code another model runs.
         """
         repo = str(task_data.get("trtllm_repo_path") or "")
         block = task_data.get(COMMIT_POLICY_FIELD) or {}
@@ -213,7 +217,7 @@ class CommitPolicy:
         return cls(
             identity=identity,
             allowed_paths=(
-                DEFAULT_ALLOWED_PATHS
+                (tuple(own_paths) or DEFAULT_ALLOWED_PATHS)
                 if allowed is None
                 else tuple(_as_prefix(str(p)) for p in allowed)
             ),

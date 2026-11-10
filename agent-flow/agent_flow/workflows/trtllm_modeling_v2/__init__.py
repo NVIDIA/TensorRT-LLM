@@ -7,7 +7,7 @@ Brings one deployment target — a ``(checkpoint, GPU arch, parallel
 config)`` triple — from a HuggingFace checkpoint to a gated
 ``tensorrt_llm/_torch/_experimental/modeling_v2`` target::
 
-    preflight -> execution stage (planner + workers) -> delivery
+    preflight -> the tasks in a fixed order -> certification of the final commit
 
 See ``README.md`` for usage and architecture, and ``task.example.yaml`` for configuration.
 """
@@ -15,7 +15,7 @@ See ``README.md`` for usage and architecture, and ``task.example.yaml`` for conf
 from typing import Any
 
 from .agents.prompts import DEFAULT_PROMPTS, PromptBundle, build_trtllm_modeling_v2_prompts
-from .run.records.state import STAGE_EXECUTION, STAGE_PREFLIGHT
+from .run.state import STAGE_EXECUTION, STAGE_PREFLIGHT
 
 __all__ = [
     "DEFAULT_PROMPTS",

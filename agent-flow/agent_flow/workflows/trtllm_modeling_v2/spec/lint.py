@@ -585,7 +585,7 @@ def coverage_rules(ctx: LintContext) -> Iterator[Finding]:
     if ctx.contract is None:
         return
     try:
-        from ..run.validation import requirements as requirements_mod
+        from ..run import requirements as requirements_mod
 
         matrix = requirements_mod.requirements_matrix(ctx.task, ctx.contract, ctx.world)
     except Exception:  # the schema check owns malformed specs
@@ -884,7 +884,7 @@ RULES: tuple[Rule, ...] = (
 
 def _compile(task: Mapping[str, Any], world: int) -> tuple[Any, str]:
     try:
-        from ..run.validation.contract import compile_contract
+        from ..run.contract import compile_contract
 
         return compile_contract(task, world), ""
     except Exception as exc:  # the schema check owns malformed specs

@@ -208,23 +208,50 @@ def wait(
 
 
 def status(cfg: MonitorConfig, now: float | None = None) -> dict:
-    """The orchestrator, where correctness stands and the sessions, as data."""
+    """The orchestrator, where the run stands and the sessions, as data."""
     now = time.time() if now is None else now
     state, detail = orchestrator_state(cfg, now)
     return {
         "workspace": str(cfg.workspace),
         "orchestrator": {"state": state, "detail": detail},
-        "correctness": _correctness(cfg.workspace),
+        "run": _run(cfg.workspace),
         "sessions": sessions_mod.session_status(cfg.task, now) if cfg.sessions else [],
     }
 
 
-def _correctness(workspace: Path) -> str | None:
-    """Where the run last delivered correctness, or ``None`` before it has."""
-    from ...run.validation import contract as contract_mod
+def _run(workspace: Path) -> str | None:
+    """Where the run stands: its stage or verdict, its tasks by status, its last certification."""
+    import yaml
 
-    milestone = contract_mod.latest_milestone(workspace)
-    return milestone.describe() if milestone else None
+    from ..files import read_json
+
+    state = read_json(Path(workspace) / ".trtllm_modeling_v2_state.json")
+    if not state:
+        return None
+    said = [f"verdict {state['verdict']}" if state.get("done") else f"stage {state.get('stage')}"]
+    try:
+        tasks = (yaml.safe_load((Path(workspace) / "tasks.yaml").read_text()) or {}).get("tasks")
+    except (OSError, yaml.YAMLError):
+        tasks = None
+    if tasks:
+        counts: dict[str, int] = {}
+        for task in tasks:
+            counts[str(task.get("status"))] = counts.get(str(task.get("status")), 0) + 1
+        said.append("tasks " + ", ".join(f"{n} {status}" for status, n in sorted(counts.items())))
+        running = [str(t.get("id")) for t in tasks if t.get("status") == "running"]
+        if running:
+            said.append("running " + ", ".join(running))
+    try:
+        certification = yaml.safe_load((Path(workspace) / "certification.yaml").read_text())
+    except (OSError, yaml.YAMLError):
+        certification = None
+    if certification:
+        said.append(
+            f"certification round {certification.get('round')}: "
+            + ("certified" if certification.get("certified") else "not certified")
+            + f" {str(certification.get('commit') or '')[:12]}"
+        )
+    return "; ".join(said)
 
 
 def format_status(data: Mapping[str, Any]) -> str:
@@ -232,8 +259,8 @@ def format_status(data: Mapping[str, Any]) -> str:
     lines = [
         f"orchestrator: {data['orchestrator']['state']} ({data['orchestrator']['detail']})",
     ]
-    if data.get("correctness"):
-        lines.append(f"correctness: {data['correctness']}")
+    if data.get("run"):
+        lines.append(f"run: {data['run']}")
     for session in data["sessions"]:
         beat = (
             "never" if session["heartbeat_age_s"] is None else f"{session['heartbeat_age_s']:.0f}s"

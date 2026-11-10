@@ -31,8 +31,7 @@ Routing selects a supported target once at model load and explains unsupported
 configurations with `NoTarget`. Per-step differences stay inside the target.
 Preserve CUDA-graph safety: avoid host synchronization and data-dependent host
 branches in captured paths. Derive bounds on rows, tokens, batches and slots
-from engine arguments, and check them against `runtime_facts.yaml` rather
-than the workloads the gates happened to serve.
+from engine arguments, not from the workloads the checks happen to serve.
 
 Validate and benchmark the target with `modeling_v2="require"`, so a fallback
 cannot masquerade as target evidence. Run the applicable current-checkout

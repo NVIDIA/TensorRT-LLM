@@ -67,10 +67,8 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.monitor.heartbeat import (
 )
 from agent_flow.workflows.trtllm_modeling_v2.infra.monitor.status import load_config
 from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import Inventory
-from agent_flow.workflows.trtllm_modeling_v2.run.records.state import STAGE_PREFLIGHT
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap as preflight_stage
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
-from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
+from agent_flow.workflows.trtllm_modeling_v2.run.state import STAGE_PREFLIGHT
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
 
 from ._helpers import Script, _install, _state, healthy_smi
@@ -501,7 +499,7 @@ def test_monitor_cli_tells_a_busy_orchestrator_from_one_that_has_exited(
     assert data == {
         "workspace": str(tmp_path.resolve()),
         "orchestrator": {"state": "unknown", "detail": "no orchestrator heartbeat"},
-        "correctness": None,
+        "run": None,
         "sessions": [],
     }
     dispatch = tmp_path / "dispatch"
@@ -752,8 +750,6 @@ def test_a_spool_run_puts_its_commands_in_the_spool(tmp_path, task_file, monkeyp
 
 
 def test_cpu_introspection_does_not_reserve_a_gpu(tmp_path):
-    from types import SimpleNamespace
-
     from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
     from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
 
@@ -959,32 +955,3 @@ def test_a_fresh_inode_leaves_a_mapped_library_untouched(tmp_path):
     finally:
         held.close()
     assert not list(lib.parent.glob(".*.tmp"))
-
-
-class _Stage(CheckRunner):
-    def __init__(self):
-        self.task_data = {"features": ["mtp"], "parallel": "tp1"}
-        self.seen = []
-
-    def _run_contract_check(self, check, log):
-        self.seen.append((check.key, priority.current_job_priority()))
-        return SimpleNamespace(passed=True)
-
-
-def test_the_first_units_inner_checks_go_ahead_of_every_other():
-    stage = _Stage()
-    for check in (
-        c.Check("core", "boot", "tp1", c.TIER_INNER),
-        c.Check("core", "serve", "tp1", c.TIER_DELIVERY),
-        c.Check("mtp", "boot", "tp1", c.TIER_INNER),
-        c.Check("mtp", "acceptance", "tp1", c.TIER_PROOF),
-    ):
-        stage._prioritized_check(check, None)
-    assert stage.seen == [
-        ("core:boot@tp1", priority.ACCURACY),
-        ("core:serve@tp1", priority.FEATURE),
-        ("mtp:boot@tp1", priority.FEATURE),
-        ("mtp:acceptance@tp1", priority.FEATURE),
-    ]
-    # Outside a check: the scheduler's default, a worker's own jobs.
-    assert priority.current_job_priority() == 0

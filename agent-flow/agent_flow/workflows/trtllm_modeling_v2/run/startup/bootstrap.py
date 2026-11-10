@@ -3,9 +3,10 @@
 
 """Preflight: the checks, the environment, the agent probe, host facts and the surface survey.
 
-The substrate gate, the one check that boots a GPU, runs beside the run's
-first turns, unless a recent pass in this environment stands for it: its
-failure stops the run, which stays open for the same command to resume.
+The substrate gate, the one check that boots a GPU, runs last, unless a recent
+pass in this environment stands for it or the run is a dry run. Any failure
+here stops the run before its first turn; it stays open for the same command
+to resume.
 """
 
 from __future__ import annotations
@@ -13,10 +14,9 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 import yaml
 from rich.markup import escape as escape_markup
@@ -28,6 +28,7 @@ from ...agents.prompts import PROMPTS_DIRNAME, build_trtllm_modeling_v2_prompts
 from ...agents.roles import packaged_skills
 from ...agents.turns import TURNS_DIRNAME
 from ...checks import check_config, gate_cli
+from ...checks import datasets as datasets_mod
 from ...infra.compute.environment import (
     MAX_TMPDIR_LEN,
     RunEnvironment,
@@ -35,7 +36,6 @@ from ...infra.compute.environment import (
 )
 from ...infra.compute.executor import select_command_executor, shell_runner_for
 from ...infra.files import read_json, write_json_atomic
-from ...infra.git import CommitPolicy
 from ...operators import prior_art, tree_anchors
 from ...operators.inventory import (
     format_surface,
@@ -44,9 +44,9 @@ from ...operators.inventory import (
     write_surface_file,
 )
 from ...spec.task_schema import assembly_units
-from ..records.state import WorkflowState
-from ..validation import contract as contract_mod
-from ..validation import requirements as requirements_mod
+from .. import contract as contract_mod
+from .. import requirements as requirements_mod
+from ..state import WorkflowState
 from . import agent_probe
 from .preflight import (
     PreflightError,
@@ -166,15 +166,8 @@ def substrate_reuse(
     return True, f"passed {age / 3600:.1f} h ago in this environment"
 
 
-def _run_preflight(
-    workflow, state: WorkflowState, log, *, stop: Callable[[str], None] | None = None
-) -> bool:
-    """Resolve and prove what the run needs before its first turn; False stops the run.
-
-    With ``stop`` the substrate gate runs beside what follows
-    (:func:`_prove_substrate_beside`) and its failure calls it; without, it
-    runs here and its failure returns False.
-    """
+def _run_preflight(workflow, state: WorkflowState, log) -> bool:
+    """Resolve and prove what the run needs before its first turn; False stops the run."""
     print_rule("[bold magenta]preflight[/bold magenta]", log)
     kwargs: dict[str, Any] = {}
     if workflow._command_runner is not None:
@@ -210,8 +203,6 @@ def _run_preflight(
     )
     workflow.journal.section("preflight", f"```\n{format_preflight_report(result)}\n```")
     # The benchmarks' datasets, staged beside the first turns: never a blocker.
-    from . import datasets as datasets_mod
-
     datasets_mod.start(
         workflow.task_data,
         workflow.workspace,
@@ -248,9 +239,7 @@ def _run_preflight(
 
     # Skipped on a dry run, which only asks whether the spec resolves.
     if not workflow.dry_run and not workflow.skip_substrate_gate:
-        if stop is not None:
-            _prove_substrate_beside(workflow, result, log, stop)
-        elif not _prove_substrate(workflow, result, log):
+        if not _prove_substrate(workflow, result, log):
             return False
 
     _take_survey(workflow, result, log)
@@ -264,7 +253,7 @@ def _run_preflight(
         workflow.prompts = build_trtllm_modeling_v2_prompts(
             environment=result.environment,
             scope=str(workflow.task_data.get("scope") or "full"),
-            commit_policy=CommitPolicy.from_task(workflow.task_data, workspace=workflow.workspace),
+            commit_policy=workflow._commit_policy(),
             notes=str(workflow.task_data.get("notes") or ""),
         )
     # What every role is told, verbatim and per launch.
@@ -352,35 +341,6 @@ def _prove_substrate(workflow, result, log) -> bool:
     )
     workflow.journal.event("substrate gate passed", f"run because {why}; `{record_path}`")
     return True
-
-
-def _prove_substrate_beside(workflow, result, log, stop: Callable[[str], None]) -> None:
-    """Run the substrate gate on a thread of its own, while the run's first turns start.
-
-    A pass rewrites the host facts with what it measured; a failure, or an
-    error that kept it from a verdict, calls ``stop`` with why.
-    """
-
-    def prove() -> None:
-        try:
-            passed = _prove_substrate(workflow, result, log)
-        except Exception as exc:  # the run waits on this thread's answer, whatever it hit
-            workflow.journal.section("substrate gate failed", f"{type(exc).__name__}: {exc}")
-            passed = False
-        if passed:
-            _write_host_facts(workflow, result)
-            return
-        stop("the substrate gate failed; the journal has its output")
-
-    workflow._substrate_thread = threading.Thread(target=prove, name="mv2-substrate", daemon=True)
-    workflow._substrate_thread.start()
-
-
-def _await_substrate(workflow) -> None:
-    """Wait for a substrate gate that runs beside the run, if one does."""
-    thread = getattr(workflow, "_substrate_thread", None)
-    if thread is not None:
-        thread.join()
 
 
 def _prove_agents(workflow, log) -> bool:

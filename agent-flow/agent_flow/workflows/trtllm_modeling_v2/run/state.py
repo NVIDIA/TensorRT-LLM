@@ -8,8 +8,8 @@ interrupted by Ctrl-C, a crash or a reboot continues when the same command is
 run again against the same workspace (``--clean`` starts over).
 
 The checkpoint records only **where the orchestrator was**. The run's
-progress lives in files the run keeps anyway: the task graph
-(``graph.yaml``), the contract's verdicts (``contract_status.jsonl``) and the
+progress lives in files the run keeps anyway: the task list
+(``tasks.yaml``), the contract's verdicts (``contract_status.jsonl``) and the
 decision files.
 """
 
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 STATE_FILENAME = ".trtllm_modeling_v2_state.json"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 STAGE_PREFLIGHT = "preflight"
 STAGE_EXECUTION = "execution"
@@ -32,18 +32,12 @@ _VALID_STAGES = (STAGE_PREFLIGHT, STAGE_EXECUTION)
 
 #: Verdicts a re-run should re-enter rather than refuse: each names a repair the
 #: operator makes outside the run (the repository, ``task.yaml``, the cluster).
-#: Prefix match, because ``delivery-failed`` carries what it was about.
-REMEDIABLE_VERDICTS: tuple[str, ...] = (
-    "delivery-failed",
-    "escalated",
-    "planner-stalled",
-    "planner-failed",
-)
+REMEDIABLE_VERDICTS: tuple[str, ...] = ("certification-failed", "escalated")
 
 
 def is_remediable(verdict: str) -> bool:
     """Whether a closed run's verdict describes a repair made outside the run."""
-    return any(verdict == known or verdict.startswith(known + ":") for known in REMEDIABLE_VERDICTS)
+    return verdict in REMEDIABLE_VERDICTS
 
 
 @dataclass
@@ -61,6 +55,11 @@ class WorkflowState:
     slug: str = ""
     branch: str = ""
     devices: list[int] = field(default_factory=list)
+    # The certification: how many rounds started, whether the last one is still running
+    # (a restart goes on with it), and the checks that failed it (the next round's first).
+    round: int = 0
+    round_open: bool = False
+    failed_checks: list[str] = field(default_factory=list)
 
 
 def load_state(path: Path) -> WorkflowState:
@@ -85,6 +84,9 @@ def load_state(path: Path) -> WorkflowState:
         slug=str(data.get("slug", "")),
         branch=str(data.get("branch", "")),
         devices=[int(d) for d in data.get("devices", [])],
+        round=int(data.get("round", 0)),
+        round_open=bool(data.get("round_open", False)),
+        failed_checks=[str(k) for k in data.get("failed_checks", [])],
     )
 
 

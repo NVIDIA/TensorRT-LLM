@@ -33,9 +33,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping, Sequence
 
-from ...checks import disagg, feature_evidence
-from ...spec import variants as variants_mod
-from ...spec.task_schema import (
+from ..checks import disagg, feature_evidence
+from ..spec import variants as variants_mod
+from ..spec.task_schema import (
     COVERAGE_FIELD,
     DISAGG_FEATURE,
     PROFILE_BRINGUP,

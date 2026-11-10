@@ -51,8 +51,8 @@ configuration explicitly, and supply `reference`, `is_valid`, `CELLS` and
   quirks, measurements and hard limits in `note`.
 - If Python must compose several calls, first look for a better replacement:
   one fused kernel in the tree (`torch.ops.trtllm.*`, the catalog, another
-  model's ops), FlashInfer, or another engine's kernel. If one exists, report
-  `MACRO` and the constituents/tiers to source it instead of writing an entry.
+  model's ops), FlashInfer, or another engine's kernel. If one exists, end
+  `BLOCKED` and name the entries and tiers to source it instead of writing an entry.
   If nothing better than the native PyTorch implementation exists, write the
   entry as that composition (a **macro entry**): `__call__` composes the native
   calls, `note` says so and lists what you searched, and the decision is
@@ -72,7 +72,7 @@ README's CODEOWNERS paths for new code. Rebuild and install before testing:
 the default installed library is a hard link, and relinking the build output
 does not update it. Follow the guide's reinstall or symlink procedure and
 verify which library the interpreter loads. An out-of-scope build or shared
-file is reported to the planner for ownership; it is not silently omitted.
+file is named in your decision file; it is not silently omitted.
 
 ## Test and certify
 
@@ -102,7 +102,7 @@ file is reported to the planner for ownership; it is not silently omitted.
   missing marker registration rather than editing `tests/unittest/pytest.ini`.
 - For index arguments, compute 2^31-element, 2^31/row-width and fp32 2^24+1
   boundaries. Probe those the runtime envelope reaches; record all limits,
-  guarding measured silent failures. Size from measured `runtime_facts.yaml`.
+  guarding measured silent failures. Size from measured values.
 - Iterate with `pytest -k`; certify once after the last edit to entry **and**
   test: run the whole test file and `test_modeling_v2_no_stale_claims.py` under
   `tests/unittest/_torch/modeling_v2`.

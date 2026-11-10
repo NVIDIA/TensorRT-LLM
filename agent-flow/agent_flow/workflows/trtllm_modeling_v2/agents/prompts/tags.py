@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Worker tag sections in briefing order, and the summaries the planner chooses them by."""
+"""Worker tag sections in briefing order: what each kind of task asks of its worker."""
 
 from __future__ import annotations
 
@@ -9,17 +9,6 @@ from typing import Iterable
 from ...operators.coverage import MAX_ROW_CELLS, TIER_DESCRIPTION
 from ._render import render_template
 from .survey import CAPTURE_LISTS_HEADING
-
-#: What the planner chooses a task's kind and tags by: one line per tag.
-TAG_SUMMARIES: dict[str, str] = {
-    "survey": "map the checkpoint's computation steps onto the catalog: `plan.md` and "
-    "`vocabulary.yaml`",
-    "kernel": "one catalog entry: onboard a missing one, or verify an existing one at new values",
-    "assemble": "the target itself: modeling, weights, routing",
-    "feature": "one feature, or one configuration variant, on a target whose core is built",
-    "integrate": "land work that did not integrate on its own, resolving its conflicts",
-    "investigate": "find the root cause of a failing check; writes a diagnosis, never the target",
-}
 
 #: Tags another tag brings with it: a feature is work on the target.
 IMPLIED: dict[str, tuple[str, ...]] = {"feature": ("assemble",)}
@@ -35,8 +24,7 @@ _SURVEY = render_template(
 _KERNEL = render_template("tags/kernel.md.j2")
 _ASSEMBLE = render_template("tags/assemble.md.j2")
 _FEATURE = render_template("tags/feature.md.j2")
-_INTEGRATE = render_template("tags/integrate.md.j2")
-_INVESTIGATE = render_template("tags/investigate.md.j2")
+_FIX = render_template("tags/fix.md.j2")
 
 #: Each tag's section of the dispatch.
 TAG_PROMPTS: dict[str, str] = {
@@ -44,8 +32,7 @@ TAG_PROMPTS: dict[str, str] = {
     "kernel": _KERNEL,
     "assemble": _ASSEMBLE,
     "feature": _FEATURE,
-    "integrate": _INTEGRATE,
-    "investigate": _INVESTIGATE,
+    "fix": _FIX,
 }
 
 
@@ -72,7 +59,6 @@ def tag_section(tags: Iterable[str]) -> str:
 __all__ = [
     "IMPLIED",
     "TAG_PROMPTS",
-    "TAG_SUMMARIES",
     "tag_section",
     "task_tags",
 ]

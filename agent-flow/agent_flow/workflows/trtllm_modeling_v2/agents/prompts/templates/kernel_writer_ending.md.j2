@@ -1,20 +1,15 @@
 {# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0 -#}
-Your report gives the entry's path, the wrapped op, `ARCHS` and `CELLS` as
+Your summary gives the entry's path, the wrapped op, `ARCHS` and `CELLS` as
 committed, the test command you watched pass and **what remains uncertified
 on this entry**; list that also under `uncertified` in your decision file,
-one line each (the values, the call site, why they are not certified here):
-the planner plans the certification from it.
-
-A `FAILED_RECEIPT`'s own files are the entry or its local variant, its test
-and a new `ops/<category>/__init__.py`: the refusal, the guard test and the
-measurement reach the target whether or not the task runs again.
+one line each (the values, the call site, why they are not certified here).
 
 When the defect is in shared code outside the entry (an upstream kernel, a
 library the entry wraps, the engine) and the checkpoint's own call fails on
 it, end the turn with `FAILED_RECEIPT` as soon as you have measured that:
-commit the guard and the failing test, and name the defect in your decision
-file by what triggers it, not by this model:
+commit the guard and the failing test on your branch, and name the defect in
+your decision file by what triggers it, not by this model:
 
 ```yaml
 engine_defect:
@@ -24,14 +19,11 @@ engine_defect:
   proposal: the fix, in a sentence or two
 ```
 
-The planner gets the report, plans the task that fixes it, and retries this
-task once the fix lands. Leave the remaining cells to the re-certification that follows the
-fix.
+The planner reads it and decides what happens next.
 
-A `MACRO` lists its constituents, the better replacement it names (a fused
-kernel to source); a row without `target` and `tier` is dropped. When nothing
-better than the native PyTorch implementation exists, the composition is the
-entry: write it, and land it with what you searched:
+When the callable is more than one kernel-launching call and nothing better
+than the native PyTorch composition exists, the composition is the entry:
+write it, and land it with what you searched:
 
 ```yaml
 decision: LANDED
@@ -40,19 +32,6 @@ macro:
   searched: in-tree torch.ops.trtllm, the catalog, FlashInfer, vLLM, SGLang   # where you looked
 ```
 
-Otherwise, a `MACRO`:
-
-```yaml
-decision: MACRO
-summary: |
-  why this step is more than one kernel-launching call, measured.
-constituents:
-  - target: quantization/dequantize_e4m3_per_tensor   # REQUIRED: proposed entry path (ops/... for this target only)
-    tier: 1                                            # REQUIRED: sourcing rung
-    note: registered as tensorrt_llm::dequantize_...   # optional
-    surface: fp8 e4m3 -> bf16, per-tensor scale        # optional
-    unit: core                                         # optional, default core
-    depends_on: []                                     # optional
-```
-
-Omit a constituent an existing entry already serves, and say so.
+When a better replacement exists but must be sourced first (a fused kernel),
+end `BLOCKED` and name in `summary` each entry to source, as
+`onboard:<category>/<name>` with its sourcing tier.

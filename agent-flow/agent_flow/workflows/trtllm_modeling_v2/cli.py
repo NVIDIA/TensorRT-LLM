@@ -22,21 +22,17 @@ from .infra.git import (
     trial_commit,
 )
 from .infra.monitor.heartbeat import ORCHESTRATOR_HEARTBEAT_S, start_orchestrator_heartbeat
-from .run.records.state import STATE_FILENAME
-from .run.workflow import DEFAULT_EVENT_WINDOW_S, DEFAULT_MAX_ATTEMPTS, DEFAULT_REVISION_CAP
+from .run.pipeline import DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_PARALLEL_TASKS, DEFAULT_MAX_ROUNDS
+from .run.state import STATE_FILENAME
 from .spec.task_schema import TaskSchemaError, load_and_validate_task_yaml
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    # Here, not with the imports above: the orchestrator imported before run.workflow
-    # walks into the contract -> stages -> orchestrator import cycle.
-    from .run.orchestrator import DEFAULT_MAX_PARALLEL_TASKS
-
     parser = argparse.ArgumentParser(
         prog="trtllm-modeling-v2",
         description=(
-            "Bring one checkpoint to a gated modeling_v2 target: "
-            "preflight -> execution stage -> deliver."
+            "Bring one checkpoint to a certified modeling_v2 target: preflight, the tasks in "
+            "a fixed order, then the certification of the final commit."
         ),
     )
     source = parser.add_mutually_exclusive_group(required=True)
@@ -82,51 +78,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-parallel-tasks",
         type=int,
         default=DEFAULT_MAX_PARALLEL_TASKS,
-        help="How many agents work at once, task turns and the planner's "
-        "alike; task turns leave one of them for the planner. A task keeps "
-        "its place until its checks are in; checks take no agent. "
-        f"Default {DEFAULT_MAX_PARALLEL_TASKS}.",
-    )
-    parser.add_argument(
-        "--revision-cap",
-        type=int,
-        default=DEFAULT_REVISION_CAP,
-        help="How many graph revisions the planner may make without progress (a task "
-        "done, a change landed on the target or a contract check turning green) before "
-        f"the run closes planner-stalled. Default {DEFAULT_REVISION_CAP}.",
+        help="How many kernel tasks of one unit run beside each other. Every other task "
+        f"runs alone, in the pipeline's order. Default {DEFAULT_MAX_PARALLEL_TASKS}.",
     )
     parser.add_argument(
         "--max-attempts",
         type=int,
         default=DEFAULT_MAX_ATTEMPTS,
-        help="How many worker runs one task gets, its first and the planner's retries: a "
-        "revision that retries a task past them is refused, and the planner reshapes the work "
-        f"instead. Default {DEFAULT_MAX_ATTEMPTS}.",
+        help="How many worker runs one task gets, its first included. A task that spent "
+        f"them is the planner's to repair around or escalate. Default {DEFAULT_MAX_ATTEMPTS}.",
     )
     parser.add_argument(
-        "--event-window",
-        dest="event_window_s",
-        type=float,
-        default=DEFAULT_EVENT_WINDOW_S,
-        metavar="SECONDS",
-        help="While work is in flight, batch ordinary reports, green finishes and nonblocking "
-        "task failures for this many seconds. Failures blocking pending hard dependencies, "
-        "operator messages, failed re-checks, or an idle graph wake the planner at once. "
-        f"Default {DEFAULT_EVENT_WINDOW_S:g}.",
-    )
-    parser.add_argument(
-        "--no-primers",
-        dest="primers",
-        action="store_false",
-        help="Start every planner, kernel writer and assembler turn afresh instead of as a fork "
-        "of one briefing session per role, which read what all of them read first "
-        "(run/startup/primers.py; a turn that cannot fork reads the session's summary).",
+        "--max-rounds",
+        type=int,
+        default=DEFAULT_MAX_ROUNDS,
+        help="How many certification rounds the run gets, the first included; each later "
+        "one follows a repair. A run that spent them closes certification-failed. "
+        f"Default {DEFAULT_MAX_ROUNDS}.",
     )
     parser.add_argument(
         "--clean",
         action="store_true",
         help="Wipe the workspace checkpoint and managed files "
-        f"({STATE_FILENAME}, plan.md, vocabulary.yaml,"
+        f"({STATE_FILENAME}, plan.md, vocabulary.yaml, tasks.yaml, the verdicts, "
         "journal.md) and start fresh. Without this flag the workflow "
         "resumes from the checkpoint when one is present, and starts fresh "
         "otherwise.",
@@ -280,32 +254,13 @@ def _lazy_main(module: str) -> Callable[[list[str]], int]:
     return run
 
 
-def _metrics(argv: list[str]) -> int:
-    import json
-
-    from .run.records import metrics
-    from .run.records.journal import Journal
-
-    parser = argparse.ArgumentParser(
-        prog="trtllm-modeling-v2 metrics",
-        description="What a run cost and proved so far: milestones, cells, checks by gate with "
-        "their device-hours, turns by role, refused graphs, operator messages.",
-    )
-    parser.add_argument("--workspace", type=Path, required=True, help="The run's workspace.")
-    args = parser.parse_args(argv)
-    opened = Journal(path=args.workspace / "journal.md").opened_at()
-    path = metrics.write(args.workspace, opened=opened)
-    print(json.dumps(json.loads(path.read_text(encoding="utf-8")), indent=1))
-    return 0
-
-
 def _feedback(argv: list[str]) -> int:
     from .run import inbox
 
     parser = argparse.ArgumentParser(
         prog="trtllm-modeling-v2 feedback",
         description="Leave a message for the planner of the run in a workspace. The run "
-        "puts it first in the planner's next turn. A message steers the work in a few "
+        "asks the planner about it between two tasks. A message steers the work in a few "
         f"sentences, evidence in a file it names; past {inbox.MESSAGE_MAX_CHARS} characters "
         "the planner reads its head and the path of the whole. It does not change the "
         "contract's checks, which task.yaml defines, and is no place for status reports.",
@@ -314,18 +269,13 @@ def _feedback(argv: list[str]) -> int:
     text = parser.add_mutually_exclusive_group(required=True)
     text.add_argument("message", nargs="?", help="The message.")
     text.add_argument("--file", type=Path, help="Read the message from this file.")
-    parser.add_argument(
-        "--now",
-        action="store_true",
-        help="Wake the planner for it at once; otherwise it rides with the planner's next turn.",
-    )
     args = parser.parse_args(argv)
     message = args.file.read_text(encoding="utf-8") if args.file else args.message
     try:
-        path = inbox.post(args.workspace, message, now=args.now)
+        path = inbox.post(args.workspace, message)
     except ValueError as exc:
         parser.error(str(exc))
-    print(f"left for the planner's {'turn, now' if args.now else 'next turn'}: {path}")
+    print(f"left for the planner, which is asked between two tasks: {path}")
     if len(message.strip()) > inbox.MESSAGE_MAX_CHARS:
         print(
             f"note: the message is {len(message.strip())} characters; the planner reads its "
@@ -349,8 +299,6 @@ SUBCOMMANDS = {
     "monitor": _lazy_main(".infra.monitor.status"),
     # A message for the planner of a running run: `feedback --workspace W "..."`.
     "feedback": _feedback,
-    # What a run cost and proved so far: `metrics --workspace W` (writes metrics.json).
-    "metrics": _metrics,
 }
 
 
@@ -431,14 +379,12 @@ def main(argv: list[str] | None = None) -> None:
     with TrtllmModelingV2Workflow(
         workspace=args.workspace,
         max_parallel_tasks=args.max_parallel_tasks,
-        revision_cap=args.revision_cap,
         max_attempts=args.max_attempts,
+        max_rounds=args.max_rounds,
         clean=args.clean,
         dry_run=args.dry_run,
         skip_substrate_gate=args.skip_substrate_gate,
         agent_turn_timeout=args.agent_turn_timeout,
-        event_window_s=args.event_window_s,
-        primers=args.primers,
     ) as workflow:
         try:
             workflow.run(args.task)

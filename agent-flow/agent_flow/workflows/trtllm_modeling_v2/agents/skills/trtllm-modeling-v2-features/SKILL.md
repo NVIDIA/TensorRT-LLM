@@ -123,14 +123,14 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
   `TestDeepSeekV4Flash` puts TP2/EP2 and TP2/EP2+ADP on four GPUs; with `nodes`,
   one engine per node, its role from `MV2FLOW_JOB_NODE_RANK`. Never hand-roll a
   launcher, a server or a transport. What the test keeps for after it (HTTP
-  records, continuations, transfer logs) goes under `$MV2FLOW_GATE_ARTIFACTS`:
-  the snapshot the gate runs in is pruned once it ends.
+  records, continuations, transfer logs) goes under `$MV2FLOW_GATE_ARTIFACTS`.
 - A change outside the target is allowed where the target truly needs it (a
   runtime, executor or serving file of the tree): follow the ModelingV2 design,
   keep model-specific logic at the narrowest target or family scope that uses
   it, and make a shared runtime change the smallest general one, never a
-  branch on this model. Name each such file and
-  why in your report; the regression check follows it.
+  branch on this model. A run commits only its own paths unless
+  `commit_policy.allowed_paths` allows more: name each such file and why in
+  your decision file, and end `BLOCKED` when the path is not allowed.
 - A stock-path control (`--mode off`, `modeling_v2: off`) splits a target bug
   from an engine bug. A new architecture has none; say so instead of guessing.
 - Report each feature as *verified* (its proof passed), *configured* (on, not

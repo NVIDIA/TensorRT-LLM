@@ -4,8 +4,8 @@ SPDX-License-Identifier: Apache-2.0 -#}
 
 Your task answers one question in two files: **can this checkpoint be
 assembled from the catalog as it stands, and if not, what has to be added
-first?** A re-draft addresses what the planner sent back; it does not
-re-derive everything. Do not gold-plate, but never guess at what a file on
+first?** A second attempt addresses what the first was refused for; it does
+not re-derive everything. Do not gold-plate, but never guess at what a file on
 disk would tell you.
 
 Read the checkpoint as data: its quantization method decides which entries
@@ -75,7 +75,7 @@ and lifecycle delegation, following the README's naming conventions, the
 derived facts, the assembly units with `core` first, the gaps, the anchor,
 the envelope, and `## Open risks`.
 
-**`vocabulary.yaml`**, which the orchestrator validates and walks:
+**`vocabulary.yaml`**, which the pipeline validates and turns into kernel tasks:
 
 ```yaml
 verdict: assemblable | assemblable_after_additions | ceiling
@@ -116,7 +116,7 @@ The validator reports every structural error at once. What it cannot check:
   `note` for it. Untagged rows block `core`; when unsure, leave it untagged.
 - `depends_on` is for real ordering only: a spurious one serializes work.
 - A `verify` row states its `cells`: one mapping per cell, the entry's spec
-  keys with values from the runtime facts. The kernel writer certifies each
+  keys with values from the spec's runtime block. The kernel writer certifies each
   cell, so cover each axis of the envelope, not their product: every dtype
   each variant runs, each call site's rows per request at the smallest and
   the largest captured batch (and where the entry's code switches path),

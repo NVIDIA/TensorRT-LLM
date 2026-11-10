@@ -14,9 +14,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Collection, Iterable, Sequence
-
-import yaml
+from typing import Callable, Collection, Iterable, Sequence
 
 from ..infra.git import git_output
 from .harness.test_driver import RECORD_VERSION, SESSIONS_DIRNAME
@@ -134,83 +132,6 @@ def list_test_files(repo: str | Path, commit: str, paths: Iterable[str]) -> list
     return sorted(f for f in listing.split("\0") if f and TEST_FILE.search(f))
 
 
-@dataclass(frozen=True)
-class Comparison:
-    """A test that fails at the head, and how it ended at the base."""
-
-    head: Result
-    base: Result | None
-    #: The base does not hold the test at all.
-    new: bool = False
-
-
-@dataclass
-class CompareReport:
-    """The tests of a declared list at the head, against the base."""
-
-    regressions: list[Comparison] = field(default_factory=list)
-    pre_existing: list[Comparison] = field(default_factory=list)
-    base_unknown: list[Comparison] = field(default_factory=list)
-    #: Test ids with no result at the head; a file no session collected, whole.
-    not_run: list[str] = field(default_factory=list)
-    #: Test ids with no result at the head that fail at the base: no change can regress them.
-    failing_at_base: list[str] = field(default_factory=list)
-    passed: int = 0
-
-    @property
-    def verdict(self) -> str:
-        """``REGRESSED``; ``INCOMPLETE``: a test unrun at the head, or of unknown standing; ``CLEAN``."""
-        if self.regressions:
-            return "REGRESSED"
-        if self.base_unknown or self.not_run:
-            return "INCOMPLETE"
-        return "CLEAN"
-
-
-def compare(
-    head: Results, base: Results, files: Sequence[str], base_files: Iterable[str]
-) -> CompareReport:
-    """``head``'s results for the tests of ``files`` against ``base``'s.
-
-    A test that fails at the head is a regression when it passed at the base or
-    the base does not hold it (its file is not among ``base_files``, or the
-    base's collection of that file has no such test); pre-existing when it
-    failed there too; and of unknown standing when the base has no result for it.
-    A test with no result at the head is not run there, unless it fails at the
-    base: a test that already fails cannot regress.
-    """
-    at_base = set(base_files)
-    report = CompareReport()
-    for file in files:
-        ids = head.test_ids(file)
-        if ids is None:
-            report.not_run.append(file)
-            continue
-        held = base.test_ids(file) if file in at_base else []
-        for nodeid in ids:
-            now = head.result(nodeid)
-            if now is None:
-                then = base.result(nodeid)
-                if then is not None and then.outcome in FAILING:
-                    report.failing_at_base.append(nodeid)
-                else:
-                    report.not_run.append(nodeid)
-                continue
-            if now.outcome not in FAILING:
-                report.passed += 1
-                continue
-            then = base.result(nodeid)
-            new = then is None and held is not None and nodeid not in held
-            entry = Comparison(now, then, new)
-            if new or (then is not None and then.outcome not in FAILING):
-                report.regressions.append(entry)
-            elif then is None:
-                report.base_unknown.append(entry)
-            else:
-                report.pre_existing.append(entry)
-    return report
-
-
 @dataclass
 class HeadResults:
     """What the recorded results say of some tests at one commit, on their own."""
@@ -270,47 +191,6 @@ def head_results(results: Results, files: Iterable[str]) -> HeadResults:
     return found
 
 
-def default_base(workspace: str | Path, repo: str | Path, head: str) -> str | None:
-    """The commit a regression check last cleared, else the run's starting commit.
-
-    The first is the newest ``cleared`` among the receipts in
-    ``<workspace>/tasks/`` that is an ancestor of ``head``; the second, the
-    parent of the oldest commit any receipt says its task integrated.
-    """
-
-    def resolve(rev: str) -> str | None:
-        found = git_output(repo, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
-        return (found or "").strip() or None
-
-    def ancestor(older: str, newer: str) -> bool:
-        return git_output(repo, "merge-base", "--is-ancestor", older, newer) is not None
-
-    receipts = []
-    for path in sorted((Path(workspace) / "tasks").glob("*.receipt.yaml")):
-        try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
-            continue
-        if isinstance(data, dict):
-            receipts.append(data)
-    cleared = []
-    for receipt in receipts:
-        commit = resolve(str(receipt["cleared"])) if receipt.get("cleared") else None
-        if commit and ancestor(commit, head):
-            cleared.append((str(receipt.get("written_at") or ""), commit))
-    if cleared:
-        return max(cleared)[1]
-    integrated = []
-    for receipt in receipts:
-        for line in receipt.get("commits") or ():
-            words = str(line).split()
-            commit = resolve(words[0]) if words else None
-            if commit and ancestor(commit, head):
-                integrated.append(commit)
-    oldest = [c for c in integrated if all(ancestor(c, o) for o in integrated)]
-    return resolve(f"{oldest[0]}^") if oldest else None
-
-
 def write_selection(path: Path, lines: Sequence[str]) -> Path:
     """``lines``, one per line, at ``path``: what one driver job runs."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -339,21 +219,69 @@ def driver_command(
     )
 
 
+#: How long one test job may run at most.
+JOB_TIMEOUT_S = 2 * 3600
+#: How long the test jobs at one commit may run in all. A job out of time keeps the files
+#: it finished, and the next runs the rest.
+TEST_BUDGET_S = 3 * JOB_TIMEOUT_S
+#: The environment probe's wall limit: it prints one line.
+PROBE_TIMEOUT_S = 600
+#: Runs one command line in a tree on the run's devices: ``(command, tree, timeout_s)``
+#: to its exit code and output tail.
+RunJob = Callable[[str, Path, int], "tuple[int, str]"]
+
+
+def run_at(
+    commit: str,
+    files: Sequence[str],
+    *,
+    cache_dir: Path,
+    out: Path,
+    tree: Path,
+    run_job: RunJob,
+    python: str,
+) -> tuple[Results, int, int, str]:
+    """Probe the environment, then run the ``files`` with no result at ``commit`` in it.
+
+    The probe is one short job. Then a job at a time, each resuming from what the last
+    recorded, while one makes progress and :data:`TEST_BUDGET_S` is not spent. Returns the
+    results, the test jobs run, and the last job's exit code and output tail. A failed
+    probe returns empty results, never historical ones.
+    """
+    command = f"{python} {shlex.quote(str(DRIVER))} --environment"
+    code, tail = run_job(command, tree, PROBE_TIMEOUT_S)
+    match = re.search(r"^MV2FLOW_TEST_ENV ([0-9a-f]{16})$", tail, re.MULTILINE)
+    if code or match is None:
+        return Results(commit), 0, code, f"environment probe failed: {tail}"
+    env_digest = match.group(1)
+    results = recorded(cache_dir, commit, env_digest)
+    unrun = results.unrun(files)
+    jobs, allowed = 0, max(1, TEST_BUDGET_S // JOB_TIMEOUT_S)
+    while unrun and jobs < allowed:
+        listed = write_selection(out / f"{commit[:12]}.txt", unrun)
+        code, tail = run_job(driver_command(python, cache_dir, tree, listed), tree, JOB_TIMEOUT_S)
+        jobs += 1
+        results = recorded(cache_dir, commit, env_digest)
+        left = results.unrun(files)
+        if len(left) >= len(unrun):
+            break
+        unrun = left
+    return results, jobs, code, tail
+
+
 __all__ = [
     "CACHE_DIRNAME",
     "DRIVER",
-    "CompareReport",
-    "Comparison",
+    "JOB_TIMEOUT_S",
     "HeadResults",
     "Result",
     "Results",
     "Session",
-    "compare",
-    "default_base",
     "driver_command",
     "head_results",
     "list_test_files",
     "load_sessions",
     "recorded",
+    "run_at",
     "write_selection",
 ]

@@ -21,6 +21,7 @@ ladder (``TIER_*``). Only when **every** rung is exhausted is the verdict a
 from __future__ import annotations
 
 import ast
+import posixpath
 import re
 import zlib
 from dataclasses import dataclass
@@ -199,7 +200,7 @@ class QueueItem:
     tier: int = TIER_TRTLLM_OP
     #: The first assembly unit that needs this entry. It decides what a
     #: failed dispatch blocks, not when the dispatch runs
-    #: (`run/orchestrator._add_kernel_tasks`).
+    #: (`run/pipeline.py`).
     unit: str = UNIT_CORE
     #: The call site a shared entry's local variant is named for; ``r<n>``
     #: when the row names none (:attr:`variant`).
@@ -634,6 +635,36 @@ def imported_catalog_entries(modeling_py: Path) -> list[tuple[str, str]]:
     return sorted(set(found))
 
 
+#: Where a target's CI accuracy test, its test list entry and its reference row live.
+INTEGRATION_TESTS_DIR = "tests/integration"
+
+
+def own_paths(target_rel: str) -> tuple[str, ...]:
+    """The run's own paths, repo-relative prefixes: the only ones its commits may change.
+
+    The target's family directory (its targets and the ``ops/`` they share)
+    and the tests that mirror it, the two registries a new family adds a line
+    to (``models/__init__.py``, ``_router_index.py``), and the integration
+    tests (the accuracy test, its test list entry and its reference). Every
+    other path is code other models run: a shared catalog entry is served by
+    a local variant in the target's own ``ops/`` instead of being changed.
+    None without a target.
+    """
+    target = target_rel.strip().strip("/")
+    if not target:
+        return ()
+    family = posixpath.dirname(target)
+    models = posixpath.dirname(family)
+    package = posixpath.dirname(models)
+    return (
+        f"{family}/",
+        f"{model_ops_tests_dir(family)}/",
+        f"{models}/__init__.py",
+        f"{package}/_router_index.py",
+        f"{INTEGRATION_TESTS_DIR}/",
+    )
+
+
 def model_ops_tests_dir(target_rel: str) -> str:
     """``.../modeling_v2/models/<family>/<target>`` -> its tests' directory."""
     tail = target_rel.rstrip("/").split(f"{MODELING_V2_PACKAGE}/", 1)[-1]
@@ -683,7 +714,9 @@ __all__ = [
     "is_entry_file",
     "entry_module",
     "imported_catalog_entries",
+    "INTEGRATION_TESTS_DIR",
     "model_ops_tests_dir",
+    "own_paths",
     "MODEL_OPS_DIRNAME",
     "MODELING_V2_PACKAGE",
     "CATALOG_TESTS_DIR",

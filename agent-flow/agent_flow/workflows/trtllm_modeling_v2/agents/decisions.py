@@ -1,18 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Every decision a role can end its turn with: when to choose it, and what the run does next.
+"""Every decision a role can end its turn with, and the file it is written to.
 
-One table for the three places that must agree on it: the role's prompt,
-whose "Ending your turn" section is rendered from it (:func:`ending_section`);
-the decision-file validation, whose enum per role is its names
-(``run/execution/handoff.py``); and the orchestrator, for which a decision that
-``finishes`` a task ends it done and any other ends it failed, back to the
-planner (``run/orchestrator.FINISHED``).
+One table for the places that must agree on it: the role's prompt, whose
+"Ending your turn" section is rendered from it (:func:`ending_section`); the
+decision-file validation, whose enum per role is its names
+(:func:`read_decision`); and the pipeline, for which a decision that
+``finishes`` a task ends it done and any other ends it failed
+(``run/pipeline.py``).
+
+A turn reports by writing one YAML file at the one path its dispatch names
+(:func:`decision_path`: the task and its attempt). The pipeline reads it there
+and nowhere else: a turn that wrote no valid decision has none.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+DECISIONS_DIRNAME = "decisions"
 
 
 @dataclass(frozen=True)
@@ -24,12 +35,15 @@ class Decision:
     when: str
     #: What the run does next.
     then: str
-    #: The task the turn worked on ends done (``True``) or failed, to the planner
-    #: (``False``); ``None`` for a role whose turn is not a task's.
+    #: The task the turn worked on ends done (``True``) or failed (``False``);
+    #: ``None`` for the planner, whose turn is not a task's.
     finishes: bool | None = None
 
 
-_TO_PLANNER = "the task fails to the planner"
+_FAILS = "the task fails, and the planner decides what happens next"
+
+#: The planner's decisions, which the pipeline branches on.
+CONTINUE, REPAIR, SKIP, ESCALATE = "CONTINUE", "REPAIR", "SKIP", "ESCALATE"
 
 DECISIONS: dict[str, tuple[Decision, ...]] = {
     "kernel_writer": (
@@ -38,7 +52,7 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "the entry is committed, its cells driven and passing on this architecture, "
             "`ARCHS` naming it; name `entry` (its path) and `tier` (the sourcing rung its "
             "committed `__call__` wraps, 1 to 5)",
-            "the task is done: its commits are integrated and the checks it claims run",
+            "the task is done: its commits are audited and integrated",
             True,
         ),
         Decision(
@@ -46,35 +60,26 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "the op demonstrably fails at a value the call site needs, or the defect is in "
             "shared code outside the entry, handed back as soon as it is measured with the "
             "`engine_defect` block",
-            f"{_TO_PLANNER}. Commits that change only the entry's own files are integrated "
-            "as they stand, the rest stay on the task's branch for its next attempt; an "
-            "`engine_defect` goes to the planner, which plans its fix and retries this task once "
-            "the fix lands",
-            False,
-        ),
-        Decision(
-            "MACRO",
-            "the callable is more than one kernel-launching call and a better replacement "
-            "than the native PyTorch composition exists (a fused kernel to source); list "
-            "`constituents`. With nothing better, the composition is the entry: land it with "
-            "`macro`",
-            f"{_TO_PLANNER} with the constituents, and it adds a kernel task per row",
+            f"{_FAILS}. Nothing is integrated; your commits stay on the task's branch for its "
+            "next attempt",
             False,
         ),
         Decision(
             "BLOCKED",
-            "nothing in this turn can move the entry: the environment (a refused job or no "
-            "session, never a job still queued), or a prerequisite outside it; say which",
-            f"{_TO_PLANNER} with your summary",
+            "nothing in this turn can move the entry: the environment, a prerequisite outside "
+            "it, or a better fused replacement that must be sourced first (name its entries "
+            "in `summary`); say which",
+            f"{_FAILS} from your summary",
             False,
         ),
     ),
     "assembler": (
         Decision(
             "UNIT_READY",
-            "the work the task asks is written and committed, and you expect its checks to pass",
-            "the task is done: its branch is integrated and the checks it claims run; a "
-            "check that fails comes back to the planner",
+            "the work the task asks is written and committed, and every check of the unit you "
+            "ran yourself passed; list what you ran under `checks`",
+            "the task is done: its branch is audited and integrated. Nothing re-checks it "
+            "until the final certification, which runs every check on the final commit",
             True,
         ),
         Decision(
@@ -82,11 +87,8 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "the work cannot go on in this turn: a callable no catalog entry covers "
             "(`blocked_reason: vocabulary_gap`, the callable in `missing_entry`), or what "
             "you lack (`knowledge_gap`), an accuracy you cannot close (`accuracy_shortfall`) "
-            "or the site (`environment`: a refused job or no session, never a job still "
-            "queued). Block as soon as you know",
-            f"{_TO_PLANNER} at once with `blocked_reason`, `missing_entry` and your "
-            "summary: it adds the missing entry's kernel task and retries yours, or "
-            "re-plans",
+            "or the host (`environment`). Block as soon as you know",
+            f"{_FAILS} from `blocked_reason`, `missing_entry` and your summary",
             False,
         ),
     ),
@@ -95,39 +97,43 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "DRAFT_READY",
             "both files are written and coherent; `summary` names what you wrote and the "
             "counts by state",
-            "the survey is done: the orchestrator adds a kernel task per queue row, and the "
-            "planner wires them",
+            "the survey is done: the pipeline adds one kernel task per queue row, then the "
+            "units in order",
             True,
         ),
         Decision(
             "CEILING",
             "a computation step has no server anywhere: the step, what you searched and why "
             "go in `vocabulary.yaml`'s `ceiling` block",
-            f"{_TO_PLANNER}, which escalates the step or re-plans around it",
+            f"{_FAILS}",
             False,
         ),
     ),
     "planner": (
         Decision(
-            "GRAPH_UPDATED",
-            "the graph is written; `summary` gives the reason for the change in one paragraph",
-            "the orchestrator validates the revision and adopts it, or sends it back with why",
+            CONTINUE,
+            "the pipeline should go on as it is: after a failed task this runs the task "
+            "again, with your `note` for its worker; after a failed certification it "
+            "certifies again; after an operator message it changes nothing",
+            "the pipeline goes on",
         ),
         Decision(
-            "DONE",
-            "you believe every required check holds",
-            "the orchestrator verifies, and delivers once full support holds",
+            REPAIR,
+            "other work must land first: list it under `tasks`, at most three, each a "
+            "`kernel` task (one catalog entry) or a `fix` task (a change to the target)",
+            "the pipeline runs your tasks in order, then goes on as for CONTINUE",
         ),
         Decision(
-            "ESCALATE",
-            "a requirement cannot be met as confirmed; name it and the evidence",
-            "the operator is asked; the work that does not wait on the answer goes on, and the "
-            "run ends escalated once nothing else can move",
+            SKIP,
+            "a failed `kernel` task is not needed: the unit that would call the entry can be "
+            "written without it; say why",
+            "the pipeline leaves the task out and goes on",
         ),
         Decision(
-            "CEILING",
-            "a computation step has no implementation anywhere, with the evidence",
-            "the run ends at the ceiling",
+            ESCALATE,
+            "the run cannot meet a requirement as the spec states it; name the requirement "
+            "and the evidence",
+            "the run stops `escalated`, and the operator reads your summary",
         ),
     ),
 }
@@ -154,52 +160,102 @@ def ending_section(role: str, extra: str = "", *, heading: str = "Ending your tu
     return f"{body}\n\n{extra.strip()}" if extra.strip() else body
 
 
-#: The roles whose decisions are filed under the plan rather than under a unit.
-PLAN_ROLES: tuple[str, ...] = ("surveyor", "planner")
-
 #: The one-line reminder at the end of a dispatch; the system prompt carries the protocol.
 DECISION_REMINDER = "Before ending your turn, write your decision file to the path below."
 
-#: The closed enum each role's decision file is validated against: its row of the
-#: decision table (``agents/decisions.py``).
-DECISIONS_BY_AGENT: dict[str, tuple[str, ...]] = {
-    role: names(role) for role in (*PLAN_ROLES, "kernel_writer", "assembler")
+#: The closed enum each role's decision file is validated against.
+DECISIONS_BY_AGENT: dict[str, tuple[str, ...]] = {role: names(role) for role in DECISIONS}
+
+#: The keys besides ``summary`` and ``decision`` a role's decision file carries.
+EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
+    # `engine_defect` is a failed receipt's defect outside the entry; `uncertified` is what a
+    # landed entry still does not certify of what the target serves; `macro` is a landed
+    # entry that composes native PyTorch calls, nothing better existing.
+    "kernel_writer": ("entry", "receipt", "engine_defect", "uncertified", "macro"),
+    # `checks` are the unit's checks the worker ran itself, each with its result;
+    # `uncertified` names the calls a unit makes, correct, outside their entries' CELLS.
+    "assembler": ("checks", "blocked_reason", "missing_entry", "uncertified"),
+    # `note` is what a retried task's worker is told; `tasks` is a REPAIR's work.
+    "planner": ("note", "tasks"),
 }
 
-#: The keys besides ``summary`` and ``decision`` a role's decision file carries for the
-#: orchestrator to read.
-EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
-    # `constituents` is a MACRO's decomposition, the work that comes next.
-    # `engine_defect` is a failed receipt's defect outside the entry
-    # (`ENGINE_DEFECT_KEYS`): the planner hears it with the task's end and
-    # plans the fix.
-    # `uncertified` is what a landed entry still does not certify of what the
-    # target serves: the planner hears it with the task's end.
-    # `macro` is a landed entry that composes native PyTorch calls, nothing better existing:
-    # what it composes and where its writer looked.
-    "kernel_writer": (
-        "entry",
-        "receipt",
-        "constituents",
-        "engine_defect",
-        "uncertified",
-        "macro",
-    ),
-    # `uncertified` names the calls a unit makes, correct, outside their entries'
-    # CELLS: the planner hears them with the task's end and adds the certification.
-    "assembler": ("blocked_reason", "missing_entry", "uncertified"),
-}
+
+# -------------------------------------------------------------------------- the file
+
+
+def decision_path(workspace: Path, task_id: str, attempt: int, turn: int = 1) -> Path:
+    """``decisions/<task>-<attempt>[.<turn>].yaml``: where one turn writes its decision.
+
+    A task's attempt has one path, so a restarted run finds the answer an
+    earlier process's turn left, and no attempt reads another's. ``turn``
+    numbers the short turns after the first within one attempt (a worktree to
+    put right before it integrates).
+    """
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", task_id)
+    token = f"{attempt}.{turn}" if turn > 1 else str(attempt)
+    directory = Path(workspace) / DECISIONS_DIRNAME
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{name}-{token}.yaml"
+
+
+def decision_file_instruction(path: Path) -> str:
+    """The block a dispatch prompt ends with: the one exact path this turn writes."""
+    return (
+        "---\n\n"
+        "**Write your decision file to exactly this path when you finish:**\n\n"
+        f"`{path}`\n\n"
+        "Nothing downstream reads your prose. This file is how this turn "
+        "reaches the orchestrator.\n"
+    )
+
+
+def read_decision(path: Path, role: str) -> dict[str, Any] | None:
+    """What ``role`` wrote at ``path`` when it holds a decision ``role`` may give; else ``None``."""
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    decision = str(raw.get("decision", "")).strip()
+    if decision not in DECISIONS_BY_AGENT[role]:
+        return None
+    return {**raw, "decision": decision}
+
+
+def clip(text: str, limit: int) -> str:
+    """``text`` up to ``limit`` characters, an ellipsis marking what was cut."""
+    text = str(text).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def first_paragraph(text: Any, limit: int = 400) -> str:
+    """The first paragraph of ``text`` as one line, clipped to ``limit``."""
+    for paragraph in re.split(r"\n\s*\n", str(text or "").strip()):
+        line = " ".join(paragraph.split())
+        if line:
+            return clip(line, limit)
+    return ""
 
 
 __all__ = [
-    "DECISION_REMINDER",
-    "PLAN_ROLES",
-    "EXTRA_KEYS_BY_AGENT",
-    "DECISIONS_BY_AGENT",
+    "CONTINUE",
     "DECISIONS",
+    "DECISIONS_BY_AGENT",
+    "DECISIONS_DIRNAME",
+    "DECISION_REMINDER",
+    "ESCALATE",
+    "EXTRA_KEYS_BY_AGENT",
     "Decision",
+    "REPAIR",
+    "SKIP",
+    "clip",
+    "decision_file_instruction",
     "decision_list",
+    "decision_path",
     "ending_section",
     "finishing",
+    "first_paragraph",
     "names",
+    "read_decision",
 ]

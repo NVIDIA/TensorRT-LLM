@@ -56,7 +56,7 @@ from ...spec.task_schema import (
 )
 from ...spec.variants import ANCHOR_RELATIVE, anchor_state, base_unit, variant_gates
 from ...spec.variants import variants as variants_of
-from ..validation import contract as contract_mod
+from .. import contract as contract_mod
 
 # A device is claimable when it is this close to empty. Not 100%: a healthy
 # idle card still shows a little in use (ECC tables, the driver's own context).
@@ -489,7 +489,9 @@ def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list
         if anchor_state(task_data, name) == ANCHOR_RELATIVE:
             contract = contract or contract_mod.compile_contract(task_data, world_size)
             own = [c for c in contract.checks if c.unit == name and c.gate.startswith("accuracy[")]
-            alone = [c.member for c in own if not c.after]
+            owed = {c.key for c in contract.checks}
+            base = base_unit(task_data, name)
+            alone = [c.member for c in own if f"{base}:{c.gate}@{c.member}" not in owed]
             if alone:
                 raise PreflightError(
                     f"configuration variant `{name}` is judged against its unit's own score "

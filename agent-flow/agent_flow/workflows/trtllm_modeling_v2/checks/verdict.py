@@ -5,10 +5,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping
 
 from ..infra.compute.commands import CommandResult
 from ..infra.git import git_output
@@ -33,11 +33,7 @@ def describe_tree_state(repo_root: str | Path) -> str:
 
 
 def inspect_tree(task_data: Mapping[str, Any]) -> str:
-    """The tree a gate is about to measure: :func:`describe_tree_state` of ``trtllm_repo_path``.
-
-    A contract check measures a read-only snapshot of one commit
-    (``run/workspace/snapshots.py``), which stamps its own description over this one.
-    """
+    """The tree a gate is about to measure: :func:`describe_tree_state` of ``trtllm_repo_path``."""
     repo_root = task_data.get("trtllm_repo_path")
     return describe_tree_state(repo_root) if repo_root else UNKNOWN_TREE_STATE
 
@@ -62,22 +58,6 @@ class GateResult:
     #: ``git describe --always`` under ``trtllm_repo_path``, or
     #: :data:`UNKNOWN_TREE_STATE` where git could not answer.
     tree_state: str = UNKNOWN_TREE_STATE
-    #: The target's marker for the commit this verdict measured, when the check
-    #: ran on a snapshot of one (``run/workspace/snapshots.py``): the contract records the
-    #: verdict under it, whatever the checkout became while the check ran.
-    marker: str = ""
-    #: What each command of the gate imported the package under test from, in
-    #: order, as its processes reported it: the commit of the snapshot it ran
-    #: in, or the path of a checkout no commit pins. Empty where no command
-    #: said, and for a gate that ran on no snapshot.
-    imported: tuple[str, ...] = ()
-    #: Why this verdict says nothing about one tree, when it does not: its
-    #: commands imported more than one tree, or a tree no commit pins, or no
-    #: snapshot could be made. A void verdict never passes.
-    void: str = ""
-    #: The tree's Python files the gate's processes imported, relative to it;
-    #: empty where a command did not say (``run/workspace/snapshots.py:CheckTree.read``).
-    reads: tuple[str, ...] = ()
     #: The per-prompt numbers behind ``measured``, where a gate has them.
     breakdown: str = ""
     #: The accuracy floor the measurement was held to, and the binomial
@@ -106,7 +86,7 @@ class GateResult:
 
     def summary(self) -> str:
         """One line for the journal, carrying the numbers verbatim."""
-        verdict = "VOID" if self.void else "PASS" if self.passed else "FAIL"
+        verdict = "PASS" if self.passed else "FAIL"
         label = f"{self.name}@{self.member}" if self.member else self.name
         tree = f" [tree {self.tree_state}]"
         breakdown = f" [{self.breakdown}]" if self.breakdown else ""
@@ -145,34 +125,6 @@ def lost_session(result: CommandResult) -> dict[str, Any]:
     }
 
 
-def measured_on(
-    result: GateResult,
-    *,
-    tree_state: str,
-    marker: str = "",
-    imported: Sequence[str] = (),
-    void: str = "",
-    warnings: Sequence[str] = (),
-    reads: Sequence[str] = (),
-) -> GateResult:
-    """``result`` as measured on one pinned tree: what it is, its marker, and what was imported.
-
-    A void result (``void`` says why) does not pass, whatever it measured, and
-    its detail leads with why.
-    """
-    fields: dict[str, Any] = {
-        "tree_state": tree_state,
-        "marker": marker,
-        "imported": tuple(imported),
-        "warnings": (*result.warnings, *warnings),
-        "reads": tuple(reads),
-    }
-    if void:
-        detail = f"{void}; what it measured: {result.detail}" if result.detail else void
-        fields.update(passed=False, void=void, explained=True, detail=detail)
-    return replace(result, **fields)
-
-
 def tree_commit(repo_root: str | Path | None) -> str | None:
     """The full commit ``HEAD`` names in ``repo_root``, or ``None`` if git cannot say."""
     if not repo_root:
@@ -202,7 +154,6 @@ __all__ = [
     "describe_tree_state",
     "inspect_tree",
     "lost_session",
-    "measured_on",
     "tree_commit",
     "verdict_factory",
 ]

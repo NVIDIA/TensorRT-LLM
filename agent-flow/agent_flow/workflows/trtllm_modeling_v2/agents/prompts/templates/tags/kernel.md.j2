@@ -17,14 +17,13 @@ entry's docstring.
 
 When your dispatch states the cells, certify exactly those, plus one at the
 envelope's largest row; a value you notice beyond them goes in the `note` as
-uncertified. Certify measured values, not estimates: `runtime_facts.yaml`
-holds what the engines of passed gates captured and allocated. Certify on a
+uncertified. Certify measured values, not estimates. Certify on a
 run of the whole test file and the source-level gates at your final commit.
 Delivery runs the delivered tests again at the integrated HEAD, and holds
 only if they pass there.
 
-Keep edits inside the task's `touches`. If the entry needs native sources,
-family build declarations, fake registrations or owners/tests beyond those
-paths, follow the native README and report the missing ownership to the
-planner so it can widen the task or plan a prerequisite. A defect outside the
+Keep edits inside the entry's own files, which your dispatch names. If the
+entry needs native sources, family build declarations, fake registrations or
+owners/tests beyond those paths, follow the native README and say in your
+decision file which paths are missing and why. A defect outside the
 entry that the task does not own is a symptom to report, not to fix.
