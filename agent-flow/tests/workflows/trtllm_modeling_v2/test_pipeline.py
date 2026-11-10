@@ -176,6 +176,25 @@ def test_the_tasks_run_in_the_fixed_order_and_every_check_runs_once_at_the_end(
     assert "`core` (assemble): done UNIT_READY" in mtp_prompt
 
 
+def test_a_kernel_row_runs_after_the_rows_it_depends_on_in_the_first_unit_that_needs_it():
+    from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
+    from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import _rows_by_unit
+
+    queue = (
+        QueueItem(1, "onboard", "ops/a/one", depends_on=(3,)),  # on a later row
+        QueueItem(2, "onboard", "ops/a/two", unit="mtp"),
+        QueueItem(3, "onboard", "ops/a/three"),
+        QueueItem(4, "onboard", "ops/a/four", unit="mtp", depends_on=(2,)),
+        QueueItem(5, "onboard", "ops/a/five", depends_on=(6,)),  # on a row of a later unit
+        QueueItem(6, "onboard", "ops/a/six", unit="mtp"),
+        QueueItem(7, "onboard", "ops/a/seven", unit="mtp", depends_on=(8,)),  # a circle
+        QueueItem(8, "onboard", "ops/a/eight", unit="mtp", depends_on=(7,)),
+    )
+    grouped = _rows_by_unit(queue, ["core", "mtp"])
+    assert [q.n for q in grouped["core"]] == [3, 1, 6, 5]
+    assert [q.n for q in grouped["mtp"]] == [2, 4, 7, 8]
+
+
 def test_kernel_tasks_of_one_unit_run_beside_each_other_and_a_dependent_row_waits(
     tmp_path, task_file, monkeypatch
 ):
@@ -617,6 +636,35 @@ def test_an_interrupted_run_goes_on_from_its_tasks_and_from_the_verdicts_of_its_
     assert {v["round"] for v in verdicts} == {1}
     assert [v["gate"] for v in verdicts].count("boot") == 2  # core's, then mtp's: once each
     assert sum(1 for v in verdicts if (v["unit"], v["gate"]) == ("core", "boot")) == 1
+
+
+def test_a_spec_edited_between_two_runs_adds_and_drops_tasks(
+    tmp_path, task_file, repo, monkeypatch
+):
+    """A run re-entered after the operator changed the spec follows the spec as it is now."""
+    plain = task_file.read_text()
+    with_variant = yaml.safe_load(plain)
+    with_variant["variants"] = {"switched": {"env": {"MY_SWITCH": "1"}, "gates": ["accuracy"]}}
+    task_file.write_text(yaml.safe_dump(with_variant))
+
+    def blocked_variant(turn, prompt):
+        if _task_id(prompt) == "variant-switched":
+            return {"decision": "BLOCKED", "summary": "the switch is not wired"}
+        return {"decision": "UNIT_READY", "summary": "done"}
+
+    _run(tmp_path, task_file, monkeypatch, Script(assembler=blocked_variant))
+    assert _state(tmp_path).verdict == "escalated"
+    # The operator drops the variant and asks for a feature instead.
+    _mtp_task(tmp_path, task_file, repo, variants={})
+    calls = _run(tmp_path, task_file, monkeypatch, Script())
+    assert [_task_id(p) for role, p in calls] == ["mtp"]
+    assert _state(tmp_path).verdict == "delivered"
+    assert [(t["id"], t["status"]) for t in _tasks(tmp_path)] == [
+        ("survey", "done"),
+        ("core", "done"),
+        ("variant-switched", "skipped"),
+        ("mtp", "done"),
+    ]
 
 
 def test_a_decision_left_by_a_stopped_process_is_taken_not_asked_for_again(

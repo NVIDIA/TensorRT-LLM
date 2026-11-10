@@ -255,24 +255,19 @@ class Pipeline:
         taken.add(f"{stem}-{n}")
         return f"{stem}-{n}"
 
-    def _expand(self) -> None:
-        """Once the survey is done: the units' tasks, in the fixed order of the module docstring."""
-        survey = self.by_id(SURVEY_ID)
-        if self.expanded or survey is None or survey.status != DONE:
-            return
+    def _planned(self) -> list[Task]:
+        """The tasks the spec and the vocabulary ask for, in the fixed order of the module docstring."""
         try:
             queue = load_vocabulary(self.w.vocabulary_path, units=self.units)
         except VocabularyError:
             queue = ()  # no vocabulary: a run told to start without a survey
         first = self.units[0] if self.units else ""
-        rows: dict[str, list[QueueItem]] = {unit: [] for unit in self.units}
-        for item in sorted(queue, key=lambda q: q.n):
-            rows[item.unit if item.unit in rows else first].append(item)
+        rows = _rows_by_unit(queue, self.units)
         row_task = {item.n: f"k{item.n}-{_entry_name(item.target)}" for item in queue}
-        added: list[Task] = []
+        planned: list[Task] = []
         for unit in self.units:
             for item in rows[unit]:
-                added.append(
+                planned.append(
                     Task(
                         row_task[item.n],
                         "kernel",
@@ -283,11 +278,11 @@ class Pipeline:
                     )
                 )
             kind = "assemble" if unit == first else "feature"
-            added.append(Task(unit, kind, unit=unit, goal=_unit_goal(kind, unit)))
+            planned.append(Task(unit, kind, unit=unit, goal=_unit_goal(kind, unit)))
         owed = {c.unit for c in self.w._contract.checks} if self.w._contract else set()
         for name in variants_mod.variants(self.w.task_data):
             if name in owed:
-                added.append(
+                planned.append(
                     Task(
                         f"variant-{name}",
                         "variant",
@@ -295,14 +290,43 @@ class Pipeline:
                         goal=f"make the target serve the configuration variant `{name}` as well",
                     )
                 )
+        return planned
+
+    def _expand(self) -> None:
+        """Once the survey is done: add the planned tasks the list lacks, and drop what the spec dropped.
+
+        The first time, that is every unit's tasks. On a resume it is what an
+        edited spec added (a feature, a variant); a unit or variant the spec no
+        longer has, and whose task has not run, is skipped.
+        """
+        survey = self.by_id(SURVEY_ID)
+        if survey is None or survey.status != DONE:
+            return
+        planned = self._planned()
+        have = {t.id for t in self.tasks}
+        added = [t for t in planned if t.id not in have]
+        wanted = {t.id for t in planned}
+        dropped = [
+            t
+            for t in self.tasks
+            if t.open and t.kind in ("assemble", "feature", "variant") and t.id not in wanted
+        ]
+        if not added and not dropped and self.expanded:
+            return
         with self._lock:
             self.tasks += added
+            for task in dropped:
+                task.status, task.note = SKIPPED, "the spec no longer asks for it"
             self.expanded = True
             self._save()
-        self.w.journal.event(
-            "pipeline",
-            f"{len(added)} task(s) after the survey: " + ", ".join(t.id for t in added),
-        )
+        if added:
+            self.w.journal.event(
+                "pipeline", f"{len(added)} task(s) added: " + ", ".join(t.id for t in added)
+            )
+        if dropped:
+            self.w.journal.event(
+                "pipeline", "no longer in the spec, skipped: " + ", ".join(t.id for t in dropped)
+            )
 
     def _next_batch(self) -> list[Task]:
         """The task that runs next; a unit's kernel tasks that can run beside it, with it."""
@@ -348,8 +372,14 @@ class Pipeline:
         if len(batch) == 1:
             self._run_task(batch[0])
         else:
-            with ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix="mv2-task") as pool:
+            pool = ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix="mv2-task")
+            try:
                 list(pool.map(self._run_task, batch))
+            except BaseException:
+                # An interrupt does not wait for the turns in flight: the next start resumes them.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            pool.shutdown()
         for task in batch:
             if task.status == FAILED:
                 verdict = self._after_failure(task)
@@ -889,6 +919,37 @@ class Pipeline:
             log=lambda message: self.w.journal.event("integration", message),
             policy=policy,
         )
+
+
+def _rows_by_unit(queue, units: list[str]) -> dict[str, list[QueueItem]]:
+    """The queue rows each unit's kernel tasks come from, each after the rows it depends on.
+
+    A row belongs to the first unit that needs it: its own, or an earlier unit's when a
+    row of that unit depends on it. Within a unit, rows keep their numbers' order but for
+    a row that depends on a later one, which follows it; rows that depend on each other
+    in a circle keep their numbers' order.
+    """
+    index = {unit: i for i, unit in enumerate(units)}
+    by_n = {item.n: item for item in queue}
+    place = {n: index.get(item.unit, 0) for n, item in by_n.items()}
+    changed = True
+    while changed:
+        changed = False
+        for n, item in by_n.items():
+            for dep in item.depends_on:
+                if dep in place and place[dep] > place[n]:
+                    place[dep], changed = place[n], True
+    grouped: dict[str, list[QueueItem]] = {unit: [] for unit in units}
+    for i, unit in enumerate(units):
+        left = sorted(n for n in by_n if place[n] == i)
+        placed: list[int] = []
+        while left:
+            ready = [n for n in left if not (set(by_n[n].depends_on) & set(left) - {n})]
+            take = ready[0] if ready else left[0]
+            placed.append(take)
+            left.remove(take)
+        grouped[unit] = [by_n[n] for n in placed]
+    return grouped
 
 
 def _entry_name(target: str) -> str:
