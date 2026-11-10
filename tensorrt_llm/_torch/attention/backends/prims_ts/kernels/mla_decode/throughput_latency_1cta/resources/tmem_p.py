@@ -83,6 +83,7 @@ class TmemPResource(MlaResource):
         ("p_stage_idx", Int32, Int32(0), "Current TMEM P pipeline stage."),
     )
     inst_id: cutlass.Constexpr[int] = 0
+    store_softmax_stats: cutlass.Constexpr[bool] = False
     scale_softmax_log2: Float32 = None
     tmem_alias_ref: Optional[MlaResource] = None
     p_stage_idx: cutlass.Constexpr[TaskLocalVariable] = (
@@ -169,6 +170,23 @@ class TmemPResource(MlaResource):
         for i in cutlass.range_constexpr(4):
             sums[i] = Float32(0)
         packed_p_reg_count = num_packed_p_regs(cfg)
+        if cutlass.const_expr(self.store_softmax_stats):
+            # Center before scaling so equal scores retain an exact zero origin.
+            for idx in cutlass.range_constexpr(num_scale_groups):
+                neg_scaled_max[idx] = Float32(0.0)
+            for score_idx in cutlass.range_constexpr(
+                packed_p_reg_count * (4 if cfg.is_fp8_qkv() else 2)
+            ):
+                scale_idx = 0
+                if cutlass.const_expr(cfg.kernel_variant != "keeps_mma_ab"):
+                    pair_idx = score_idx // 2
+                    scale_idx = (
+                        (pair_idx % (2 * max(cfg.tile_size_q // 8, 1))) // 2
+                    ) * 2 + score_idx % 2
+                safe_max = new_max_arr[scale_idx]
+                if safe_max == neg_max_f32():
+                    safe_max = Float32(0)
+                s_arr[score_idx] = s_arr[score_idx] - safe_max
         regs_p = cutlass.Array(
             Int32, packed_p_reg_count, space=cutlass.AddressSpace.rmem
         )

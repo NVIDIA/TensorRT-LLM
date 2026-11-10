@@ -1603,6 +1603,9 @@ class FmhaDecodeConfig:
     # `attention_sinks` tensor argument at launch.
     use_attention_sinks: bool = False
     lse_mode: str = "none"
+    # Export merge-compatible (natural-log maximum, unscaled denominator).
+    # Only separate reducers require an additional per-split maximum scalar.
+    store_softmax_stats: bool = False
     # Optional profile and reduction knobs selected by launcher policy or tests.
     use_keeps_mma_ab: bool = False
     # Sage attention: a nonzero ``sage_k_block_size`` enables per-block Q/K
@@ -2113,6 +2116,8 @@ class FmhaDecodeConfig:
         Sage attention takes 8-bit Q/K of one dtype, E4M3 V and a 16-bit
         output; Int8 Q/K exists only in that recipe.
         """
+        if self.store_softmax_stats and self.use_sage_attention:
+            raise ValueError("store_softmax_stats does not support Sage attention")
         for name, dtype, supported in (
             ("q_dtype", self.q_dtype, SUPPORTED_QK_DTYPES),
             ("k_dtype", self.k_dtype, SUPPORTED_KV_DTYPES | SUPPORTED_QK_DTYPES),
@@ -2839,7 +2844,11 @@ class FmhaDecodeConfig:
         every Keeps profile takes the trade. A zero headroom anchors on the
         exact row maximum.
         """
-        return self.use_keeps_mma_ab and self.softmax_anchor_headroom_log2 > 0
+        return (
+            not self.store_softmax_stats
+            and self.use_keeps_mma_ab
+            and self.softmax_anchor_headroom_log2 > 0
+        )
 
     @property
     def softmax_anchor_headroom_log2(self) -> float:

@@ -41,7 +41,6 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ...task_compat import consumer_work_stage
 from ...._block_sparse.prepared import (
     _PREPARED_ROUTE_IS_FULL_FLAG,
     _PREPARED_ROUTE_IS_PROXY_FLAG,
@@ -835,7 +834,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     def _consumer_stage_base(self) -> Int32:
         """Return the consumer stage selected by the latest wait."""
 
-        return consumer_work_stage(self) * Int32(self.staging_layout.stage_stride_words)
+        return self.consumer_work_stage * Int32(self.staging_layout.stage_stride_words)
 
     @cute.jit
     def _store_route_swaps(
