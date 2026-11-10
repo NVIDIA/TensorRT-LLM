@@ -447,10 +447,10 @@ def cute_dsl_dspark_rmsnorm_rope(
         )
 
     original_shape = x.shape
-    # Fused QKV projections supply regular strided views; this specialization
-    # uses compact rows in its compiled signature.
-    x_flat = x.view(-1, x.shape[-1]).contiguous()
-    output = torch.empty_like(x_flat)
+    # Fused QKV projections supply regular strided views; the kernel reads
+    # them in place through a runtime row stride. The output rows are compact.
+    x_flat = x.view(-1, x.shape[-1])
+    output = torch.empty(x_flat.shape, dtype=x_flat.dtype, device=x_flat.device)
     compiled = _compile_fused_dspark_rmsnorm_rope(
         x.shape[-1],
         rope_dim,
@@ -481,7 +481,8 @@ def _(
     inverse_rope: bool,
     norm_dim: int | None = None,
 ) -> torch.Tensor:
-    return torch.empty_like(x)
+    # Compact like the real output, also when x is a row-strided view.
+    return x.new_empty(x.shape)
 
 
 @torch.library.custom_op(
