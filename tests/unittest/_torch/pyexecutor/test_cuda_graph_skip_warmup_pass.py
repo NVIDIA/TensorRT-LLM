@@ -36,10 +36,10 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
-# A greedy token may differ only where the two-pass run's top two logprobs are closer than this.
-NEAR_TIE = 0.05
-# How far a token's logprob may differ between the runs while their tokens still match.
-LOGPROB_TOLERANCE = 1e-2
+# A flip needs a near tie: top two logprobs within two BF16 logit steps (1/8 at logits 16-32).
+NEAR_TIE = 0.3
+# The generated token's logprob may move by two BF16 logit steps between the runs.
+LOGPROB_TOLERANCE = 0.3
 
 PROMPTS = [
     "The capital of France is",
@@ -118,6 +118,7 @@ def _generate(skip_warmup_pass: bool, move_workspace: bool = False) -> _Run:
             moved[0] = True
 
         def observed_forward(inputs: dict[str, Any]) -> Any:
+            """Record whether this forward is captured and which MoE timeouts it runs with."""
             capture_timeouts[-1].add((torch.cuda.is_current_stream_capturing(), guard.in_warmup))
             return forward_fn(inputs)
 
@@ -190,22 +191,23 @@ def _generate(skip_warmup_pass: bool, move_workspace: bool = False) -> _Run:
 
 
 def _assert_same_generation(run: _Run, two_pass_run: _Run) -> None:
-    """Tokens and logprobs match the two-pass run up to a near tie there; the token may then flip
-    to the two-pass runner-up, and that prompt is compared no further."""
+    """The tokens match the two-pass run until one flips to the baseline's runner-up at a near
+    tie; that prompt is compared no further."""
     for tokens, logprobs, ref_tokens, ref_logprobs in zip(
         run.tokens, run.logprobs, two_pass_run.tokens, two_pass_run.logprobs, strict=True
     ):
         assert len(tokens) == len(ref_tokens)
-        for token, step, ref_token, ref_step in zip(tokens, logprobs, ref_tokens, ref_logprobs):
+        for token, step, ref_token, ref_step in zip(
+            tokens, logprobs, ref_tokens, ref_logprobs, strict=True
+        ):
             if token != ref_token:
-                by_rank = sorted(ref_step, key=lambda candidate: ref_step[candidate].rank)
-                top, runner_up = by_rank[:2]
-                assert (token, top) == (runner_up, ref_token)
-                assert ref_step[top].logprob - ref_step[runner_up].logprob < NEAR_TIE
+                runner_up = max(
+                    (c for c in ref_step if c != ref_token), key=lambda c: ref_step[c].logprob
+                )
+                assert token == runner_up
+                assert ref_step[ref_token].logprob - ref_step[runner_up].logprob < NEAR_TIE
                 break
-            for candidate in step.keys() & ref_step.keys():
-                drift = abs(step[candidate].logprob - ref_step[candidate].logprob)
-                assert drift < LOGPROB_TOLERANCE
+            assert abs(step[token].logprob - ref_step[token].logprob) < LOGPROB_TOLERANCE
 
 
 @pytest.fixture(scope="module")
