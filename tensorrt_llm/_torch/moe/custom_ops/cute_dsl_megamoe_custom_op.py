@@ -169,6 +169,9 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 _TACTIC_LEN = 11
 _TACTIC_LEN_V4 = 10
 _LEGACY_TACTIC_LEN = 8
+# SMs whose load-balanced (helper-bearing) tactic candidates also come with atomic-counter work
+# ids; measured on SM103, and SM100 runs the same kernel.
+_ATOMIC_COUNTER_HELPER_SMS = (100, 103)
 _DEFAULT_TOKEN_BACK_READY_GRANULARITY = "expert"  # nosec B105 -- scheduler mode name, not a credential
 _TOKEN_BACK_READY_GRANULARITIES = ("expert", "token_tile")
 
@@ -1293,6 +1296,31 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
             )
 
 
+def _with_atomic_counter_work_ids(candidates: List[Tuple], sm_version: int) -> List[Tuple]:
+    """The candidates of a helper-bearing (load-balanced) launch and, on
+    _ATOMIC_COUNTER_HELPER_SMS, each one's twin with atomic-counter work ids.
+
+    The autotuner then chooses the work-id mode per shape.
+
+    Per-layer dynamic EPLB launches MegaMoE on the full grid while the HALO-Q
+    + TMA copy kernel can still hold its auxiliary SMs, so with grid-stride work
+    ids the CTAs that start late keep a static share of the tiles. A twin differs
+    from its candidate only in the work-id field and is validated again. Other
+    SMs keep their candidates.
+    """
+    if sm_version not in _ATOMIC_COUNTER_HELPER_SMS:
+        return list(candidates)
+    tactics = list(candidates)
+    canonical = [tuple(_unpack_tactic(tactic)) for tactic in candidates]
+    for fields in list(canonical):
+        twin = fields[:4] + ("atomic_counter",) + fields[5:]  # the fifth field is the work-id mode
+        if twin not in canonical:
+            validate_megamoe_tactic(twin, sm_version=sm_version)
+            tactics.append(twin)
+            canonical.append(twin)
+    return tactics
+
+
 def _expand_megamoe_ready_tactics(
     candidates: list[Tuple], sm_version: int, *, load_balance: bool
 ) -> list[Tuple]:
@@ -1507,6 +1535,8 @@ def enumerate_megamoe_candidate_tactics(
         )
         validate_megamoe_tactic(tactic, sm_version=sm_version)
         candidates.append(tactic)
+    if load_balance:
+        candidates = _with_atomic_counter_work_ids(candidates, sm_version)
     return _expand_megamoe_ready_tactics(candidates, sm_version, load_balance=load_balance)
 
 
@@ -2455,8 +2485,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
             )
-            if default_tactic not in candidates:
-                candidates.append(default_tactic)
+            defaults = [default_tactic]
+            if self.helper_expert_count > 0:
+                defaults = _with_atomic_counter_work_ids(defaults, self.sm_version)
+            candidates.extend(tactic for tactic in defaults if tactic not in candidates)
             for table in (_SM107_DSV4_PRO_DEFAULT_TACTICS, _SM107_KIMI_K3_GENPHASE_TACTICS):
                 default_tactic = table.get(self.unique_id())
                 if default_tactic is not None:
