@@ -3,7 +3,7 @@
 
 """Blackwell DSpark attention specialization and persistent scheduler."""
 
-from typing import Optional, Tuple, Type
+from typing import Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -244,7 +244,6 @@ class DSparkAttention(DSparkAttentionKernel):
         seq_len_q: int = block_size,
         mma_qk_tiler_k: int = qk_tiler_k,
         inverse_rope_dim: int = 0,
-        output_groups: int | None = None,
         history_page_size: int = 32,
         num_heads: int = num_heads,
     ):
@@ -274,12 +273,6 @@ class DSparkAttention(DSparkAttentionKernel):
             )
         if inverse_rope_dim not in (0, 64):
             raise ValueError(f"DSpark inverse_rope_dim must be 0 or 64, got {inverse_rope_dim}")
-        if output_groups is not None and (
-            output_groups <= 0 or self.num_heads % output_groups != 0
-        ):
-            raise ValueError(
-                f"DSpark output groups must divide {self.num_heads}, got {output_groups}"
-            )
 
         super().__init__(
             acc_dtype,
@@ -299,7 +292,6 @@ class DSparkAttention(DSparkAttentionKernel):
         self.tma_page_size_draft = self.qk_tiler_mn[1]
         self.fixed_cache_seq_len = self.window_size + seq_len_q
         self.inverse_rope_dim = inverse_rope_dim
-        self.output_groups = output_groups
         self.history_page_size = history_page_size
         # Subdivide the 64-row loads at physical-page and cyclic-window boundaries.
         self.history_tile_sizes = tuple(sorted({1, 4, 16, min(history_page_size, 64)}))
@@ -322,7 +314,6 @@ class DSparkAttention(DSparkAttentionKernel):
         attn_sink_ptr: cute.Pointer,
         inverse_rope_freqs_ptr: cute.Pointer,
         o_tensor: cute.Tensor,
-        o_scale_tensor: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
@@ -364,10 +355,7 @@ class DSparkAttention(DSparkAttentionKernel):
             page_table_ptr,
             layout=cute.make_layout((table_width, batch_size), stride=(1, table_stride)),
         )
-        if cutlass.const_expr(self.output_groups is None):
-            output = cute.make_tensor(o_tensor.iterator, layout=q_layout)
-        else:
-            output = o_tensor
+        output = cute.make_tensor(o_tensor.iterator, layout=q_layout)
         cache_seqs = cute.make_tensor(
             cache_seqs_ptr,
             layout=cute.make_layout((batch_size,), stride=(1,)),
@@ -397,7 +385,6 @@ class DSparkAttention(DSparkAttentionKernel):
             draft,
             page_table,
             output,
-            o_scale_tensor,
             cache_seqs,
             valid_len,
             capacities,

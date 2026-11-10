@@ -53,9 +53,7 @@ _DSV4_DSPARK_ROPE_DIM = 64
 _DSV4_DSPARK_PAGE_SIZES = (16, 32, 64, 128, 256)
 
 
-_dspark_attention_kernel_cache: dict[
-    tuple[int, int, int, str, int | None], Callable[..., None]
-] = {}
+_dspark_attention_kernel_cache: dict[tuple[int, int, int, str], Callable[..., None]] = {}
 
 
 def _make_compile_gmem_pointer(dtype: Type[Numeric], assumed_align: int) -> Pointer:
@@ -72,7 +70,6 @@ def _compile_dspark_attention(
     block_size: int,
     arch_str: str,
     page_size: int,
-    output_groups: int | None,
     num_heads: int,
 ) -> Callable[..., None]:
     """Compile the pointer host wrapper without runtime tensor specimens."""
@@ -84,22 +81,6 @@ def _compile_dspark_attention(
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    output_scale_fake = None
-    if output_groups is not None:
-        group_dim = num_heads * head_dim // output_groups
-        rows = batch * block_size
-        output_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float8E4M3FN,
-            (output_groups, rows, group_dim),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
-        output_scale_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (output_groups, group_dim // 128, cute.sym_int(divisibility=4)),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Real tensor specimens used to make PyTorch's primary CUDA context current
@@ -121,7 +102,6 @@ def _compile_dspark_attention(
         inverse_rope_dim=_DSV4_DSPARK_ROPE_DIM,
         arch_str=arch_str,
         history_page_size=page_size,
-        output_groups=output_groups,
         num_heads=num_heads,
     )
     # Scalars and typed, aligned compile-only pointers define the runtime ABI.
@@ -144,7 +124,6 @@ def _compile_dspark_attention(
         _make_compile_gmem_pointer(cutlass.Float32, 4),
         _make_compile_gmem_pointer(cutlass.Float32, 4),
         output_fake,
-        output_scale_fake,
         cutlass.Float32(1.0),
         stream_fake,
         options="--opt-level 2 --enable-tvm-ffi",
@@ -167,14 +146,11 @@ def _run_paged_dspark_attention(
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
     softmax_scale: float,
-    output_groups: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> torch.Tensor:
     """Attend to a 128-token context window and fuse the inverse-RoPE epilogue."""
     arch_str = _get_dspark_arch_str()
     if arch_str is None:
         raise RuntimeError("Embedded DSpark attention requires SM100, SM103, or SM107")
-    if output_groups is not None and arch_str != "sm_107":
-        raise RuntimeError("DSpark fused FP8 output requires SM107")
     batch, block, heads, dim = q.shape
     page_size = kv_pages.shape[1]
     if block not in _DSV4_DSPARK_BLOCK_SIZES:
@@ -260,26 +236,14 @@ def _run_paged_dspark_attention(
         )
     ):
         raise ValueError("All DSpark attention inputs must be on the same CUDA device")
-    cache_key = (block, heads, page_size, arch_str, output_groups)
+    cache_key = (block, heads, page_size, arch_str)
     compiled = _dspark_attention_kernel_cache.get(cache_key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("DSpark paged attention must run eagerly before graph capture")
-        compiled = _compile_dspark_attention(block, arch_str, page_size, output_groups, heads)
+        compiled = _compile_dspark_attention(block, arch_str, page_size, heads)
         _dspark_attention_kernel_cache[cache_key] = compiled
     output = torch.empty_like(q)
-    output_scale = None
-    if output_groups is not None:
-        rows = batch * block
-        group_dim = heads * dim // output_groups
-        output = torch.empty(
-            (output_groups, rows, group_dim), dtype=torch.float8_e4m3fn, device=q.device
-        )
-        output_scale = torch.empty(
-            (output_groups, group_dim // 128, (rows + 3) // 4 * 4),
-            dtype=torch.float32,
-            device=q.device,
-        )
     compiled(
         batch,
         kv_pages.shape[0],
@@ -296,10 +260,9 @@ def _run_paged_dspark_attention(
         attn_sink.data_ptr(),
         inverse_rope_freqs.data_ptr(),
         output,
-        output_scale,
         softmax_scale,
     )
-    return output, output_scale
+    return output
 
 
 @torch.library.custom_op(
@@ -328,7 +291,7 @@ def fused_dsv4_dspark_attention(
         attn_sink,
         inverse_rope_freqs,
         softmax_scale,
-    )[0]
+    )
 
 
 @torch.library.register_fake("trtllm::fused_dsv4_dspark_attention")
@@ -345,65 +308,6 @@ def _(
     softmax_scale: float,
 ) -> torch.Tensor:
     return torch.empty_like(q)
-
-
-@torch.library.custom_op(
-    "trtllm::fused_dsv4_dspark_attention_fp8", mutates_args=(), device_types="cuda"
-)
-def fused_dsv4_dspark_attention_fp8(
-    q: torch.Tensor,
-    draft_block: torch.Tensor,
-    kv_pages: torch.Tensor,
-    block_tables: torch.Tensor,
-    positions: torch.Tensor,
-    valid_lengths: torch.Tensor,
-    capacities: torch.Tensor,
-    attn_sink: torch.Tensor,
-    inverse_rope_freqs: torch.Tensor,
-    softmax_scale: float,
-    output_groups: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    output, scales = _run_paged_dspark_attention(
-        q,
-        draft_block,
-        kv_pages,
-        block_tables,
-        positions,
-        valid_lengths,
-        capacities,
-        attn_sink,
-        inverse_rope_freqs,
-        softmax_scale,
-        output_groups,
-    )
-    assert scales is not None
-    return output, scales
-
-
-@torch.library.register_fake("trtllm::fused_dsv4_dspark_attention_fp8")
-def _(
-    q: torch.Tensor,
-    draft_block: torch.Tensor,
-    kv_pages: torch.Tensor,
-    block_tables: torch.Tensor,
-    positions: torch.Tensor,
-    valid_lengths: torch.Tensor,
-    capacities: torch.Tensor,
-    attn_sink: torch.Tensor,
-    inverse_rope_freqs: torch.Tensor,
-    softmax_scale: float,
-    output_groups: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rows = q.shape[0] * q.shape[1]
-    group_dim = q.shape[2] * q.shape[3] // output_groups
-    return (
-        torch.empty((output_groups, rows, group_dim), dtype=torch.float8_e4m3fn, device=q.device),
-        torch.empty(
-            (output_groups, group_dim // 128, (rows + 3) // 4 * 4),
-            dtype=torch.float32,
-            device=q.device,
-        ),
-    )
 
 
 if IS_CUTLASS_DSL_RUBIN_AVAILABLE:

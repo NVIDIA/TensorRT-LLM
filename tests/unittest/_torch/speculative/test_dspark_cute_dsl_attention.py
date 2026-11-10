@@ -231,7 +231,7 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
         pytest.fail("invalid inputs reached compilation or a kernel launch")
 
     monkeypatch.setattr(attention_op, "_get_dspark_arch_str", lambda: "sm_100")
-    key = (6, 128, 32, attention_op._get_dspark_arch_str(), None)
+    key = (6, 128, 32, attention_op._get_dspark_arch_str())
     monkeypatch.setattr(attention_op, "_dspark_attention_kernel_cache", {key: unexpected_launch})
     monkeypatch.setattr(attention_op, "_compile_dspark_attention", unexpected_launch)
     with pytest.raises(ValueError, match=reason):
@@ -363,11 +363,11 @@ def test_compile_without_real_specimens_and_cached_wrapper_avoids_views(monkeypa
         patch.setattr(torch, "empty", unexpected_compile_op)
         patch.setattr(torch, "empty_like", unexpected_compile_op)
         patch.setattr(attention_op.cute.runtime, "from_dlpack", unexpected_compile_op)
-        compiled = attention_op._compile_dspark_attention(5, arch_str, 32, None, 128)
+        compiled = attention_op._compile_dspark_attention(5, arch_str, 32, 128)
     monkeypatch.setattr(
         attention_op,
         "_dspark_attention_kernel_cache",
-        {(5, 128, 32, arch_str, None): compiled},
+        {(5, 128, 32, arch_str): compiled},
     )
     inputs = _make_inputs(41, block=5, positions=[257, 9])
 
@@ -531,68 +531,6 @@ def test_batched_attention_respects_partial_window_valid_len():
         probs = torch.softmax(scores, dim=-1)[..., :-1]
         expected = torch.einsum("mhn,nd->mhd", probs, kv.float()).to(q.dtype)
         torch.testing.assert_close(actual[row], expected, rtol=5e-2, atol=3e-2)
-
-
-@pytest.mark.skipif(
-    get_sm_version() != 107,
-    reason="The fused DSpark FP8 output projection is a Rubin specialization",
-)
-def test_fused_dsv4_dspark_attention_fp8_matches_separate_quant_and_replays_graph():
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        fused_dsv4_dspark_attention,
-        fused_dsv4_dspark_attention_fp8,
-    )
-
-    groups = 16
-    inputs = _make_inputs(47, page_size=256, positions=[257, 390], valid_lengths=[3, 5])
-    q = inputs["q"]
-    block = q.shape[1]
-
-    def separate_quantize():
-        bf16 = fused_dsv4_dspark_attention(**inputs)
-        rows = q.shape[0] * block
-        grouped = bf16.reshape(rows, groups, -1).permute(1, 0, 2).contiguous()
-        quant_blocks = grouped.view(groups, rows, -1, 128)
-        amax = quant_blocks.abs().amax(dim=-1).float().clamp_min(1e-10)
-        quant_scale = 448.0 / amax
-        quantized = (quant_blocks.float() * quant_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-        scale_rows = (rows + 3) // 4 * 4
-        scales = torch.zeros(
-            groups,
-            quant_blocks.shape[2],
-            scale_rows,
-            device=q.device,
-            dtype=torch.float32,
-        )
-        scales[..., :rows] = (1.0 / quant_scale).transpose(1, 2)
-        return quantized.view_as(grouped), scales
-
-    def assert_quantized_close(actual_fp8, actual_scale, expected_fp8, expected_scale):
-        rows = q.shape[0] * block
-        torch.testing.assert_close(
-            actual_scale[..., :rows], expected_scale[..., :rows], rtol=1e-6, atol=0
-        )
-        actual = actual_fp8.float()
-        expected = expected_fp8.float()
-        mismatch_rate = torch.count_nonzero(actual != expected) / actual.numel()
-        assert mismatch_rate <= 1e-3
-        # CuTe and Torch can choose neighboring E4M3 values at a rounding tie.
-        torch.testing.assert_close(actual, expected, rtol=0.125, atol=0.015625)
-
-    actual_fp8, actual_scale = fused_dsv4_dspark_attention_fp8(**inputs, output_groups=groups)
-    expected_fp8, expected_scale = separate_quantize()
-    assert_quantized_close(actual_fp8, actual_scale, expected_fp8, expected_scale)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_fp8, captured_scale = fused_dsv4_dspark_attention_fp8(
-            **inputs, output_groups=groups
-        )
-    q.copy_(torch.randn_like(q))
-    inputs["valid_lengths"].copy_(torch.tensor([7, 2], device=q.device))
-    graph.replay()
-    expected_fp8, expected_scale = separate_quantize()
-    assert_quantized_close(captured_fp8, captured_scale, expected_fp8, expected_scale)
 
 
 @pytest.mark.skipif(
