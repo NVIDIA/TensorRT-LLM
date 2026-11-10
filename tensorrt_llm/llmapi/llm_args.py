@@ -8487,6 +8487,24 @@ class TorchLlmArgs(BaseLlmArgs):
             self.enable_early_first_token_response = False
         return self
 
+    @model_validator(mode="after")
+    def validate_copy_based_rebalancing_disagg(self) -> 'TorchLlmArgs':
+        """Copy-based rebalancing is not supported with disaggregated serving yet.
+
+        Its GPU arena puts every KV pool at the arena base, so the KV cache
+        transceiver's per-pool NIXL registrations would overlap and peers could
+        not load this instance's memory descriptors.
+        """
+        is_disagg = (self.cache_transceiver_config is not None
+                     and self.cache_transceiver_config.backend is not None)
+        if (is_disagg and self.kv_cache_config.kv_pool_rebalance_config.
+                copy_based_rebalancing):
+            raise ValueError(
+                "kv_cache_config.kv_pool_rebalance_config.copy_based_rebalancing "
+                "is not supported with disaggregated serving "
+                "(cache_transceiver_config) yet.")
+        return self
+
     @field_validator("checkpoint_format", mode="before")
     @classmethod
     def convert_checkpoint_format(
