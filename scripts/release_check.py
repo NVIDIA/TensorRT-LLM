@@ -205,7 +205,7 @@ def main():
         print("=== No arguments specified, running pre-commit on ALL files ===")
 
     # Install relevant packages from requirements-dev.txt
-    deps = ["pre-commit", "bandit", "mypy"]
+    deps = ["pre-commit", "bandit", "pyrefly"]
     with open("requirements-dev.txt") as f:
         reqs = f.readlines()
     reqs_to_install = [
