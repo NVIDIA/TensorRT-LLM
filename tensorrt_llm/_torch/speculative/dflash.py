@@ -1698,15 +1698,14 @@ class DFlashWorker(SpecWorkerBase):
     ) -> None:
         """Report, once, how this drafter's context is served on KV-cache prefix hits.
 
-        Unless the draft pool is paired with the target's block reuse, the
-        target must recompute the prompt tail the drafter attends to
-        (``context_recompute_tail``), or a cache hit drafts from only the
-        uncached tail of the prompt. ``joint_fallback``: the caller already
-        warned that a paired pool fell back to a private arena.
+        Without a recomputed prompt tail (``context_recompute_tail``), a cache
+        hit drafts from only the uncached tail of the prompt on an unpaired
+        pool; a pool paired with the target's block reuse hands the reused
+        prefix's drafter K/V back, but acceptance can still drop on hits, so
+        both warn. ``joint_fallback``: the caller already warned that a paired
+        pool fell back to a private arena.
         """
-        if self._ctx_reuse_addressable or not getattr(
-            target_cache_manager, "enable_block_reuse", False
-        ):
+        if not getattr(target_cache_manager, "enable_block_reuse", False):
             return
         name = type(self).__name__
         tail = getattr(target_cache_manager, "spec_recompute_tail", 0)
@@ -1734,11 +1733,20 @@ class DFlashWorker(SpecWorkerBase):
                 "context_recompute_tail is 0 (set it to the drafter's attention "
                 "window -- null resolves it -- or -1 to recompute on hits)"
             )
+        if self._ctx_reuse_addressable:
+            loss = (
+                "the paired draft pool hands the reused prefix's drafter K/V back, "
+                "but acceptance can still drop on prefix-cache hits; a recomputed "
+                "tail trades TTFT for acceptance."
+            )
+        else:
+            loss = (
+                "the drafter's context K/V are not kept where a prefix-cache hit can "
+                "hand them back, so a cache-hit request drafts from only the uncached "
+                "tail of its prompt and acceptance drops on every hit."
+            )
         logger.warning_once(
-            f"{name}: KV-cache block reuse is on, but the drafter's context K/V are "
-            f"not kept where a prefix-cache hit can hand them back, and {why}: a "
-            "cache-hit request drafts from only the uncached tail of its prompt, so "
-            "acceptance drops on every hit.",
+            f"{name}: KV-cache block reuse is on and {why}: {loss}",
             key="dflash_prefix_reuse_report",
         )
 

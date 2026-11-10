@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -37,7 +38,7 @@ from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import SpecMetadata, SpecWorkerBase
-from .vocab_parallel import tp_pair_exchange
+from .vocab_parallel import markov_sampled_chain, tp_pair_exchange
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
@@ -1350,7 +1351,7 @@ class DSparkWorker(DFlashWorker):
         num_contexts: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, int]:
-        """With ``ancestral_draft_sampling``, draw sampled drafts ancestrally through the Markov head.
+        """Draw sampled drafts ancestrally through the Markov head.
 
         Position k is drawn by the seeded draft sampler from
         ``base_k + bias(d_{k-1})`` under the request's draft sampling
@@ -1358,7 +1359,10 @@ class DSparkWorker(DFlashWorker):
         token drawn before it (the anchor for k = 0), and that distribution is
         stored as the position's proposal in ``draft_probs``. ``gen_logits`` are the
         raw ``[num_gens, K, vocab]`` block logits. Returns the ``[num_gens, K]``
-        int32 draft tokens and the stored vocab width. With the option off,
+        int32 draft tokens and the stored vocab width. Unfiltered drafts
+        (``draft_temperature_only`` or no top-k/top-p in the batch) take the
+        fused :func:`markov_sampled_chain`; filtered drafts take a per-position
+        sampler loop and only with ``ancestral_draft_sampling``. Otherwise,
         without a Markov head, for argmax drafts, or for a drafter that also
         carries a DFlash 2 candidate scorer (LiLiCorr or the selector), the DFlash path
         (greedy-chained :meth:`_refine_block_logits`, then the scorer and the
@@ -1367,8 +1371,14 @@ class DSparkWorker(DFlashWorker):
         has_candidate_scorer = getattr(draft_model, "lilicorr", None) is not None or getattr(
             draft_model, "has_candidate_selector", False
         )
+        # Unfiltered drafts take the fused chain, which costs no more than the
+        # block sampler, so they are drawn ancestrally without the option.
+        fused_chain = gen_logits.is_cuda and (
+            spec_metadata.draft_temperature_only
+            or spec_metadata.advanced_sampling_mode is AdvancedSamplingMode.NO_TOPK_NO_TOPP
+        )
         if not (
-            self.spec_config.ancestral_draft_sampling
+            (self.spec_config.ancestral_draft_sampling or fused_chain)
             and getattr(draft_model, "has_markov_head", False)
             and spec_metadata.wants_advanced_draft_sampling
             and not has_candidate_scorer
@@ -1417,6 +1427,28 @@ class DSparkWorker(DFlashWorker):
             slot=spec_metadata.rng_draft_slot(0),
         )[1]
         offsets = offsets.view(num_gens, num_drafts).t().contiguous()
+        if fused_chain:
+            # No filter applies: the fused Gumbel-max chain draws every
+            # position and stores its softmax in a few launches per position.
+            probs_out = (
+                gen_logits.new_empty((num_gens, num_drafts, vocab), dtype=torch.float32)
+                if draft_probs is None
+                else draft_probs
+            )
+            tokens = markov_sampled_chain(
+                gen_logits,
+                inputs["first_prev_tokens"],
+                markov_w1,
+                markov_w2,
+                sampling_params[0],
+                seed,
+                offsets,
+                probs_out,
+                slots,
+            )
+            if draft_probs is not None:
+                spec_metadata.draft_probs_last_dim = vocab
+            return tokens, vocab
         # Only the anchor can be out of vocab (-1 for a row with no accepted
         # token); every token drawn below is a valid row of the table.
         emb = markov_prev_embeddings(inputs["first_prev_tokens"], markov_w1)

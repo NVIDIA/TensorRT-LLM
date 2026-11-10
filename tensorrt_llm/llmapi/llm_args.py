@@ -3979,9 +3979,9 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         description=
         "Prompt-tail tokens to recompute through the target forward when a "
         "request takes a KV-cache prefix hit, so a standalone DSpark drafter "
-        "gets context K/V for reused tokens. A draft KV pool paired with the "
-        "target's block reuse hands back the drafter K/V of the reused "
-        "prefix, so the tail matters most for an unpaired drafter. 0 "
+        "gets context K/V for reused tokens. Acceptance drops on hits with "
+        "or without a draft KV pool paired with the target's block reuse, so "
+        "the tail trades TTFT for acceptance in either layout. 0 "
         "(default) disables it; -1 forces a full re-prefill on a hit; None "
         "resolves from the draft model config to the drafter's attention "
         "window when every layer's context attention is windowed, else -1 (0 "
@@ -3997,13 +3997,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         default=False,
         status="prototype",
         description=
-        "If true, sampled drafts of a drafter with a Markov head are drawn "
-        "ancestrally: each position is sampled given the token drawn before "
-        "it, so the stored proposals are the drafter's joint distribution, "
-        "which raises acceptance. Costs one sampler call per draft position. "
-        "False (default) chains the Markov bias through the greedy argmax and "
-        "samples every position at once. Requires use_rejection_sampling=True; "
-        "standalone drafters only, not supported with confidence scheduling.")
+        "Sampled drafts of a standalone drafter with a Markov head are drawn "
+        "ancestrally when they carry no top-k/top-p filter (draft_temperature_only "
+        "or unfiltered requests): each position is sampled given the token drawn "
+        "before it by one fused kernel, so the stored proposals are the "
+        "drafter's joint distribution, which raises acceptance. If true, "
+        "filtered drafts are drawn ancestrally too, at one sampler call per "
+        "draft position. False (default) chains the Markov bias of filtered "
+        "drafts through the greedy argmax and samples every position at once. "
+        "Requires use_rejection_sampling=True; standalone drafters only, not "
+        "supported with confidence scheduling.")
 
     enable_confidence_scheduling: bool = Field(
         default=False,

@@ -374,7 +374,14 @@ def _worker(*, addressable: bool = False, requested_tail: Optional[int] = 4096) 
 @pytest.mark.parametrize(
     "worker, target, joint_fallback, info, warning",
     [
-        (_worker(addressable=True), _target(tail=0), False, None, None),
+        (
+            _worker(addressable=True, requested_tail=0),
+            _target(tail=0),
+            False,
+            None,
+            "can still drop",
+        ),
+        (_worker(addressable=True), _target(tail=4096), False, "a 4096-token prompt tail", None),
         (_worker(requested_tail=0), _target(enable_block_reuse=False, tail=0), False, None, None),
         (_worker(requested_tail=0), None, False, None, None),
         (_worker(), _target(tail=4096), False, "a 4096-token prompt tail", None),
@@ -386,7 +393,8 @@ def _worker(*, addressable: bool = False, requested_tail: Optional[int] = 4096) 
         (_worker(requested_tail=0), _target(tail=0), True, None, None),
     ],
     ids=[
-        "paired-pool-hands-the-prefix-back",
+        "paired-pool-without-a-tail",
+        "paired-pool-with-a-tail",
         "no-block-reuse",
         "no-target-manager",
         "recomputed-tail",

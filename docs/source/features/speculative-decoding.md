@@ -206,17 +206,21 @@ startup.
 DFlash and standalone DSpark drafters attend to K/V projected from target hidden states, and
 the target only produces hidden states for tokens it runs a forward on. With KV-cache block
 reuse on, a request that hits a cached prefix skips those tokens, so the drafter sees only the
-uncached tail of its prompt and the acceptance length drops on every hit. A draft KV pool that
-shares the target's KV cache manager (above) hands the reused prefix's draft K/V back with the
-target's pages; a drafter on a separate or private pool loses it.
+uncached tail of its prompt and the acceptance length drops on every hit. A draft KV pool paired
+with the target's block reuse, separate or sharing the target's KV cache manager (above), hands
+the reused prefix's draft K/V back with the target's pages, but acceptance still drops on hits:
+on MiniMax-M3.1-Flash with 8000-token prompts, cold AL 4.56 fell to 4.10 on repeats at tail `0`
+and to 4.35 at the drafter's window, the same for both pool layouts. The tail trades TTFT for
+acceptance in either layout.
 
 `context_recompute_tail` (on `DFlashDecodingConfig` and `DSparkDecodingConfig`) caps the reuse
 claim so the target recomputes the last tokens of the prompt:
 
 * `0` (default): no recompute; the full cached prefix is reused.
 * a positive `N`: the last `N` prompt tokens are recomputed, rounded so the reused prefix ends on
-  a block boundary. A tail of the drafter's attention window reproduces the drafter's inputs
-  without reuse exactly.
+  a block boundary. A tail of the drafter's attention window gives the drafter the inputs it
+  would see without reuse; the recomputed target K/V can still differ numerically from a cold
+  prefill, so the output need not match it token for token.
 * `-1`: a prefix hit re-prefills the whole prompt.
 * `null`: resolved from the drafter config to its attention window, or `-1` when the drafter
   attends to its whole context (`0` for the embedded DeepSeek-V4 drafter).

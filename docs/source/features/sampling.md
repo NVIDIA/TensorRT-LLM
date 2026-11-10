@@ -288,11 +288,14 @@ thinking-phase acceptance (`use_relaxed_acceptance_for_thinking=True`, which acc
 without the rejection rule) or with DSpark confidence scheduling (which admits only greedy
 requests under rejection sampling); those combinations are rejected when the config is built.
 
-With a DSpark drafter that has a Markov head, `DSparkDecodingConfig.ancestral_draft_sampling=True`
-(prototype, off by default) draws sampled drafts ancestrally: each position is sampled from the
-drafter's distribution given the token drawn before it, so the stored proposals are the
-drafter's own joint distribution. This raises the acceptance length but costs one sampler call
-per draft position, which outweighs the gain at low concurrency.
+With a standalone DSpark drafter that has a Markov head, sampled drafts without a top-k/top-p
+filter (`draft_temperature_only=True`, or requests that set neither) are drawn ancestrally: each
+position is sampled from the drafter's distribution given the token drawn before it, so the
+stored proposals are the drafter's own joint distribution. One fused kernel draws the whole
+block, so this raises the acceptance length at no extra per-step cost.
+`DSparkDecodingConfig.ancestral_draft_sampling=True` (prototype, off by default) extends this to
+filtered drafts, which cost one sampler call per draft position; at low concurrency that
+outweighs the acceptance gain.
 
 ```python
 from tensorrt_llm.llmapi import MTPDecodingConfig

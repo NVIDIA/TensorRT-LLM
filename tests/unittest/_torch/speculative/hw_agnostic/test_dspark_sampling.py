@@ -20,6 +20,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 from _torch.speculative.hw_agnostic.test_block_verification import chi_square
 
 from tensorrt_llm._torch.models.modeling_dspark import _DSparkHeadMixin
@@ -32,6 +34,7 @@ from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN, SpecWorkerBase
 from tensorrt_llm._torch.speculative.utils import get_spec_metadata
+from tensorrt_llm._torch.speculative.vocab_parallel import _gumbel_fine, markov_sampled_chain
 from tensorrt_llm.llmapi.llm_args import (
     AdvancedSamplingMode,
     DSparkDecodingConfig,
@@ -557,6 +560,129 @@ def test_sampled_block_captures_in_a_cuda_graph(
     meta.request_offsets += 1 << 20
     graph.replay()
     assert not torch.equal(first, tokens)
+
+
+@_needs_cuda
+@pytest.mark.parametrize(
+    "temperature_only, mode",
+    [(True, AdvancedSamplingMode.FULL), (False, AdvancedSamplingMode.NO_TOPK_NO_TOPP)],
+    ids=["temperature_only", "no_topk_no_topp"],
+)
+def test_unfiltered_chain_draws_follow_the_stored_proposals(
+    temperature_only: bool, mode: AdvancedSamplingMode
+) -> None:
+    """Without filters the fused chain draws ancestrally, also with ancestral_draft_sampling
+    off: the joint of two positions is p(d0) p(d1 | d0) under the stored rows, and a greedy
+    row takes the argmax chain."""
+    generator = torch.Generator().manual_seed(51)
+    vocab, num_gens, draft_len, temperature = 8, 40000, 2, 0.9
+    worker = _worker(ancestral=False)
+    drafter = _drafter(generator, vocab=vocab, device="cuda")
+    one = torch.randn(1, draft_len, vocab, generator=generator).cuda()
+    anchor = torch.randint(vocab, (1,), generator=generator).cuda()
+    base, anchors = one.expand(num_gens, -1, -1).contiguous(), anchor.expand(num_gens).contiguous()
+    meta = _metadata(
+        num_gens,
+        vocab=vocab,
+        draft_len=draft_len,
+        temperature=temperature,
+        temperature_only=temperature_only,
+        mode=mode,
+        device="cuda",
+    )
+    meta.request_temperatures[-1] = 0.0  # one greedy request
+    calls = []
+    tokens, _ = _sample_with(_cpu_sampler(generator, calls), worker, drafter, base, anchors, meta)
+    assert not calls  # the fused chain, not the per-position sampler
+
+    stored = meta.draft_probs[meta.batch_slot_ids]
+    sampled = tokens[:-1].long()
+    expected = _expected_rows(drafter, base[:-1], anchors[:-1], tokens[:-1], temperature)
+    torch.testing.assert_close(stored[:-1], expected, atol=1e-6, rtol=1e-5)
+    assert (stored[:-1].gather(-1, sampled.unsqueeze(-1)) > 0).all()
+
+    # Row d0 of `rows`: position 0's distribution and position 1's given d0.
+    rows = _expected_rows(
+        drafter,
+        one.expand(vocab, -1, -1),
+        anchor.expand(vocab),
+        torch.arange(vocab, device="cuda").view(-1, 1).expand(-1, draft_len),
+        temperature,
+    ).double()
+    joint = rows[0, 0].view(-1, 1) * rows[:, 1]
+    histogram = torch.bincount(
+        (sampled[:, 0] * vocab + sampled[:, 1]).cpu(), minlength=vocab * vocab
+    )
+    stat, critical = chi_square(histogram.double(), joint.flatten().cpu())
+    assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"
+
+    greedy, _ = dspark_markov_chain(
+        one,
+        anchor,
+        lambda prev, hidden: dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2),
+        cast_bias_to_logits=True,
+    )
+    assert torch.equal(tokens[-1:].long(), greedy)
+    assert torch.equal(
+        stored[-1], torch.nn.functional.one_hot(tokens[-1].long(), vocab).to(stored.dtype)
+    )
+
+
+@triton.jit
+def _gumbel_fine_kernel(a_ptr, b_ptr, out_ptr, N: tl.constexpr):
+    offs = tl.arange(0, N)
+    a = tl.load(a_ptr + offs).to(tl.uint32)
+    b = tl.load(b_ptr + offs).to(tl.uint32)
+    tl.store(out_ptr + offs, _gumbel_fine(a, b))
+
+
+@_needs_cuda
+def test_chain_noise_reaches_far_tail_tokens() -> None:
+    """The chain's Gumbel noise spans about [-2.8, 32.6] and stays finite at the extreme
+    words, so a token 35 below its row's maximum logit can still win the draw."""
+    words = torch.tensor(
+        [[0, 0], [0, 0xFFFFFFFF], [0xFFFFFFFF, 0], [0xFFFFFFFF, 0xFFFFFFFF]], dtype=torch.int64
+    )
+    a, b = (words[:, i].to(torch.int32).cuda() for i in (0, 1))  # bit pattern of the uint32
+    out = torch.empty(4, device="cuda")
+    _gumbel_fine_kernel[(1,)](a, b, out, N=4)
+    w = (words[:, 0] >> 9).double() + ((words[:, 1] >> 9).double() + 0.5) / 2**23
+    w = (w / 2**23).clamp(max=float(torch.tensor(0.99999994, dtype=torch.float32)))
+    expected = -torch.log(-torch.log1p(-w))
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.double().cpu(), expected, atol=1e-4, rtol=1e-5)
+    assert out.max() > 32.5 and out.min() > -2.9
+
+
+@_needs_cuda
+@pytest.mark.parametrize(
+    "logit, temperature", [(2.0**30, 1.0), (128.0, 1 / 4096)], ids=["huge_logit", "tiny_temp"]
+)
+def test_chain_draws_tied_tokens_evenly_at_large_scaled_logits(
+    logit: float, temperature: float
+) -> None:
+    """Two tied top tokens in different splits are each drawn half the time, as stored, even
+    when logit / T is so large that noise added to it unscaled would round away."""
+    vocab, num_reqs, rank = 1 << 17, 4096, 8
+    base = torch.full((1, 1, vocab), logit - 64 * logit / 2**20, device="cuda")
+    base[..., 0] = base[..., vocab - 1] = logit
+    base = base.expand(num_reqs, -1, -1).contiguous()
+    zeros = torch.zeros(vocab, rank, device="cuda")
+    probs = torch.empty(num_reqs, 1, vocab, device="cuda")
+    tokens = markov_sampled_chain(
+        base,
+        torch.zeros(num_reqs, dtype=torch.int64, device="cuda"),
+        zeros,
+        zeros,
+        torch.full((num_reqs,), temperature, device="cuda"),
+        torch.arange(num_reqs, dtype=torch.int64, device="cuda") + 5,
+        torch.zeros(1, num_reqs, dtype=torch.int64, device="cuda"),
+        probs,
+    )
+    torch.testing.assert_close(probs[:, 0, [0, vocab - 1]].cpu(), torch.full((num_reqs, 2), 0.5))
+    assert set(tokens.flatten().tolist()) <= {0, vocab - 1}
+    share = (tokens == 0).double().mean().item()
+    assert abs(share - 0.5) < 4 * 0.5 / num_reqs**0.5, share
 
 
 @_needs_cuda
