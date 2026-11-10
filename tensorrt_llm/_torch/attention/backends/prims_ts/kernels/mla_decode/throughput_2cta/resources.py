@@ -3695,12 +3695,15 @@ class TmemCorrResource(HighThroughputMlaResource):
         tmem_raw_addr = (tmem_warp_row_id << 16) | col_offset
         tmem_ptr_arr = prims.make_tmem_ptr(tmem_raw_addr, Float32)
 
-        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
         loaded = prims.tcgen05_ld(
             TCGEN05_32B_SHAPE,
             tmem_ptr_arr,
             num=4,
         )
+        # The runtime releases this stage to the softmax warps as soon as the
+        # task body returns, and the loaded words are consumed later (rescale_o,
+        # epilogue), so the load must be complete before the release.
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
 
         self.final_row_stats[0] = loaded[0]
         self.final_row_stats[1] = loaded[1]
