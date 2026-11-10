@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for CoverageSelector: changed core-Python files -> per-stage impacted/skippable sets."""
+"""Tests for CoverageSelector: changed Python files -> per-stage impacted/skippable sets."""
 
 from __future__ import annotations
 
@@ -22,14 +22,21 @@ import json
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from ._dataclass_helpers import ADDED_DATACLASS, added_dataclass_change
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
 from cbts.blocks import Block, Stage, YAMLIndex
-from cbts.command.main import Selector, _load_pr_inputs
+from cbts.command.main import (
+    COVERAGE_NEEDS_DIFF_FOR,
+    Selector,
+    _coverage_decline_category,
+    _load_pr_inputs,
+    main,
+)
 from cbts.coverage.selection.selector import CoverageSelector
-from cbts.coverage.tier import apply_coverage_tier
+from cbts.coverage.tier import apply_coverage_tier, coverage_preflight
 from cbts.rules.base import PRInputs
 from cbts.rules.docs import CPU_TEST_YAML_STEM, DOCS_STAGE, DocsRule
 
@@ -62,6 +69,165 @@ class _FakeDB:
 
     def untrusted_tests(self, *_args) -> set[str]:
         return set()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "conftest.py",
+        "tests/integration/defs/conftest.py",
+        "tests/test_common/llm_data.py",
+        "tests/unittest/conftest.py",
+        "examples/helper.py",
+        "scripts/helper.py",
+        "examples/tensorrt_llm/helper.py",
+    ],
+)
+def test_coverage_tier_uses_attributed_python_coverage_in_any_directory(
+    tmp_path: Path, path: str
+) -> None:
+    """A covered helper keeps its callers and allows unrelated test entries to be pruned."""
+    source = tmp_path / path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("def caller():\n    return 2\n")
+    pr = PRInputs(
+        changed_files=[path],
+        diffs={path: "@@ -1,2 +1,2 @@\n def caller():\n-    return 1\n+    return 2\n"},
+    )
+
+    class PathDB(_FakeDB):
+        def file_has_touch_rows(self, file: str) -> bool:
+            return file == path
+
+        def tests_touching_func(self, file: str, qualname: str) -> set[str]:
+            assert file == path
+            return super().tests_touching_func(file, qualname)
+
+    index = YAMLIndex()
+    index.blocks = [Block("l0_a10", 0, {}, ["test_caller", "test_unrelated"])]
+    stages = {
+        "A10-PyTorch-1": Stage(
+            name="A10-PyTorch-1",
+            yaml_stem="l0_a10",
+            cpu_arch="x86_64",
+            split_id=1,
+            total_splits=1,
+        )
+    }
+
+    assert coverage_preflight(pr, [], set()) == ([path], "")
+    result, note = apply_coverage_tier(pr, [], set(), stages, index, tmp_path, PathDB())
+
+    assert result is not None, note
+    assert result.removed == {("l0_a10", 0): {"test_unrelated"}}
+    assert not result.dropped
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "conftest.py",
+        "tests/integration/defs/conftest.py",
+        "tests/unittest/conftest.py",
+        "tests/test_common/session_reuse.py",
+        "tests/plugins/shared.py",
+    ],
+)
+def test_shared_session_fixture_declines_even_with_first_consumer_rows(
+    tmp_path: Path, path: str
+) -> None:
+    """The second consumer of a cached session fixture must not be pruned."""
+    source = tmp_path / path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        'import pytest\n@pytest.fixture(scope="session")\ndef shared():\n    return 2\n'
+    )
+    diff = (
+        '@@ -1,4 +1,4 @@\n import pytest\n @pytest.fixture(scope="session")\n'
+        " def shared():\n-    return 1\n+    return 2\n"
+    )
+
+    class SharedFixtureDB(_FakeDB):
+        def __init__(self) -> None:
+            self.rows = {"shared": {"A10-PyTorch-1/test_first"}}
+
+        def known_by_family(self) -> dict[str, set[str]]:
+            return {"A10-PyTorch": {"test_first", "test_second"}}
+
+    pr = PRInputs(changed_files=[path], diffs={path: diff})
+    residual, note = coverage_preflight(pr, [], set())
+    result = CoverageSelector(SharedFixtureDB(), tmp_path).decide(residual, pr.diffs)
+
+    assert not note
+    assert not result.ok
+    assert "shared test infrastructure" in result.reason
+    assert not result.skippable
+    assert _coverage_decline_category(result.reason) == "shared_test_infrastructure"
+    tier, tier_note = apply_coverage_tier(
+        pr, [], set(), {}, YAMLIndex(), tmp_path, SharedFixtureDB()
+    )
+    assert tier is None
+    assert "shared test infrastructure" in tier_note
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'import pytest\n@pytest.fixture(scope="session")\ndef shared():\n    return 2\n',
+        'from pytest import fixture\n@fixture(scope="module")\ndef shared():\n    return 2\n',
+        "def pytest_collection_modifyitems(items):\n    return 2\n",
+    ],
+)
+def test_selector_declines_pytest_modules_outside_tests(tmp_path: Path, source: str) -> None:
+    """Plugin eligibility depends on its pytest role as well as its path."""
+    path = "scripts/shared.py"
+    selector = CoverageSelector(_FakeDB(), tmp_path, read_source=lambda _path: source)
+
+    before = source.replace("return 2", "return 1")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert "shared test infrastructure" in result.reason
+    assert not result.skippable
+
+
+def test_selector_does_not_borrow_core_coverage_for_nested_package_path(tmp_path: Path) -> None:
+    """A same-named module in examples has its own DB identity."""
+    path = "examples/tensorrt_llm/helper.py"
+
+    class CoreOnlyDB(_FakeDB):
+        def file_has_touch_rows(self, file: str) -> bool:
+            return file == "tensorrt_llm/helper.py"
+
+    result = CoverageSelector(CoreOnlyDB(), tmp_path).decide([path], {})
+
+    assert not result.ok
+    assert result.reason == f"zero-touch residual file (new/uninstrumented): {path}"
+    assert not result.skippable
+
+
+@pytest.mark.parametrize("path", ["tests/helper.cu", "examples/config.json", "setup.cfg"])
+def test_coverage_tier_declines_non_python_even_with_db_rows(tmp_path: Path, path: str) -> None:
+    """DB presence cannot make the Python AST selector analyze another language."""
+    pr = PRInputs(changed_files=[path], diffs={})
+
+    residual, note = coverage_preflight(pr, [], set())
+    result = CoverageSelector(_FakeDB(), tmp_path).decide(residual, {})
+
+    assert path in note
+    assert not result.ok
+    assert result.reason == f"non-Python residual file: {path}"
+    assert _coverage_decline_category(note) == "non_python"
+
+
+def test_coverage_cli_requests_diffs_for_python_in_every_directory() -> None:
+    """Jenkins must fetch the diff before a newly eligible path reaches Tier 2."""
+    result = CliRunner().invoke(main, ["--list-needed-diffs"])
+
+    assert result.exit_code == 0, result.output
+    assert COVERAGE_NEEDS_DIFF_FOR == ("**/*.py",)
+    assert set(COVERAGE_NEEDS_DIFF_FOR) <= set(result.output.splitlines())
 
 
 @pytest.mark.parametrize(
@@ -953,3 +1119,377 @@ def test_class_docstring_and_code_changes_preserve_coverage_decision(
     else:
         assert tier is None
         assert "class/signature import change" in note
+
+
+@pytest.mark.parametrize(
+    ("path", "module"),
+    [
+        ("jenkins/scripts/cbts/cbts/owner.py", "cbts.owner"),
+        ("tests/unittest/utils/owner.py", "utils.owner"),
+        ("tests/unittest/_torch/owner.py", "_torch.owner"),
+    ],
+)
+def test_selector_keeps_binding_consumer_without_touch_rows(
+    tmp_path: Path, path: str, module: str
+) -> None:
+    """A constant imported by a test affects that test without executing owner frames."""
+    owner = tmp_path / path
+    owner.parent.mkdir(parents=True)
+    owner.write_text("VALUE = 2\n")
+    consumer = tmp_path / "tests/unittest/pkg/test_consumer.py"
+    consumer.parent.mkdir(parents=True)
+    consumer.write_text(f"from {module} import VALUE\n")
+    selector = CoverageSelector(_ExternalTestReferenceDB(), tmp_path)
+
+    result = selector.decide([path], {path: "@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n"})
+
+    assert result.ok, result.reason
+    assert (
+        "test_unittests.py::test_unittests_v2[unittest/pkg]" in result.impacted["CPU-Generic-x86"]
+    )
+    assert (
+        "test_unittests.py::test_unittests_v2[unittest/pkg]"
+        not in result.skippable["CPU-Generic-x86"]
+    )
+
+
+@pytest.mark.parametrize("scope", ["function", "module", "session", "class", "package", "dynamic"])
+def test_conftest_fixture_body_selection_depends_on_scope(tmp_path: Path, scope: str) -> None:
+    """Function fixtures have per-test rows; wider or unresolved scopes do not."""
+    scope_value = "choose_scope" if scope == "dynamic" else repr(scope)
+    source = f"import pytest\n@pytest.fixture(scope={scope_value})\ndef caller():\n    return 2\n"
+    before = source.replace("return 2", "return 1")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    result = CoverageSelector(_FakeDB(), tmp_path, read_source=lambda _path: source).decide(
+        ["conftest.py"], {"conftest.py": diff}
+    )
+
+    assert result.ok is (scope == "function"), result.reason
+    if result.ok:
+        assert result.impacted == {"A10-PyTorch": {"test_caller"}}
+        assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+    else:
+        assert not result.skippable
+
+
+@pytest.mark.parametrize("dependency", ["caller()", "bridge()"])
+def test_conftest_shared_fixture_helper_change_declines(tmp_path: Path, dependency: str) -> None:
+    """Follow direct and transitive dependencies from shared fixtures to helpers."""
+    source = (
+        "import pytest\ndef caller():\n    return 2\n"
+        "def bridge():\n    return caller()\n"
+        f'@pytest.fixture(scope="session")\ndef shared():\n    return {dependency}\n'
+    )
+    before = source.replace("return 2", "return 1")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    result = CoverageSelector(_FakeDB(), tmp_path, read_source=lambda _path: source).decide(
+        ["conftest.py"], {"conftest.py": diff}
+    )
+
+    assert not result.ok
+    assert "shared fixture" in result.reason
+    assert not result.skippable
+
+
+def test_unrelated_shared_fixture_does_not_block_conftest_helper(tmp_path: Path) -> None:
+    """A shared fixture elsewhere in the file is not a blanket exclusion."""
+    source = (
+        "import pytest\ndef caller():\n    return 2\n"
+        '@pytest.fixture(scope="session")\ndef shared():\n    return 10\n'
+    )
+    before = source.replace("return 2", "return 1")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    result = CoverageSelector(_FakeDB(), tmp_path, read_source=lambda _path: source).decide(
+        ["conftest.py"], {"conftest.py": diff}
+    )
+
+    assert result.ok, result.reason
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+
+
+@pytest.mark.parametrize(
+    "import_line, expression",
+    [
+        ("from test_common.helper import caller", "caller()"),
+        ("from test_common.helper import caller as make", "make()"),
+        ("import test_common.helper as helpers", "helpers.caller()"),
+    ],
+)
+def test_shared_fixture_imported_helper_change_declines(
+    tmp_path: Path, import_line: str, expression: str
+) -> None:
+    """Shared fixture dependency checks cross the harness's test_common import root."""
+    path = "tests/test_common/helper.py"
+    helper = tmp_path / path
+    helper.parent.mkdir(parents=True)
+    helper.write_text("def caller():\n    return 2\n")
+    consumer = tmp_path / "tests/conftest.py"
+    consumer.write_text(
+        f'import pytest\n{import_line}\n@pytest.fixture(scope="session")\n'
+        f"def shared():\n    return {expression}\n"
+    )
+    result = CoverageSelector(_FakeDB(), tmp_path).decide(
+        [path], {path: "@@ -1,2 +1,2 @@\n def caller():\n-    return 1\n+    return 2\n"}
+    )
+
+    assert not result.ok
+    assert "shared fixture" in result.reason
+    assert "tests/conftest.py::shared" in result.reason
+    assert not result.skippable
+
+
+@pytest.mark.parametrize("decorator", ["cache", "lru_cache(maxsize=1)"])
+def test_changed_cached_test_helper_declines(tmp_path: Path, decorator: str) -> None:
+    source = f"from functools import cache, lru_cache\n@{decorator}\ndef caller():\n    return 2\n"
+    before = source.replace("return 2", "return 1")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    path = "tests/test_common/helper.py"
+    result = CoverageSelector(_FakeDB(), tmp_path, read_source=lambda _path: source).decide(
+        [path], {path: diff}
+    )
+
+    assert not result.ok
+    assert "cached helper" in result.reason
+    assert not result.skippable
+
+
+@pytest.mark.parametrize("decorator", ["pytest.fixture", "fx", 'pytest.fixture(scope="function")'])
+def test_default_function_fixtures_remain_eligible(tmp_path: Path, decorator: str) -> None:
+    source = f"import pytest\nfrom pytest import fixture as fx\n@{decorator}\ndef caller():\n    return 2\n"
+    before = source.replace("return 2", "return 1")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    result = CoverageSelector(_FakeDB(), tmp_path, read_source=lambda _path: source).decide(
+        ["conftest.py"], {"conftest.py": diff}
+    )
+    assert result.ok, result.reason
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+
+
+def test_per_test_hook_body_remains_eligible(tmp_path: Path) -> None:
+    source = "def pytest_runtest_setup(item):\n    return 2\n"
+    before = source.replace("return 2", "return 1")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    db = _FakeDB()
+    db.rows["pytest_runtest_setup"] = {"A10-PyTorch-1/test_caller"}
+    result = CoverageSelector(db, tmp_path, read_source=lambda _path: source).decide(
+        ["conftest.py"], {"conftest.py": diff}
+    )
+    assert result.ok, result.reason
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+
+
+def test_deleting_shared_fixture_decorator_uses_preimage(tmp_path: Path) -> None:
+    source = "import pytest\ndef caller():\n    return 2\n"
+    before = 'import pytest\n@pytest.fixture(scope="session")\ndef caller():\n    return 2\n'
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    result = CoverageSelector(_FakeDB(), tmp_path, read_source=lambda _path: source).decide(
+        ["conftest.py"], {"conftest.py": diff}
+    )
+    assert not result.ok
+    assert not result.skippable
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "global cached\n    cached = 2\n    return cached",
+        "CACHE['value'] = 2\n    return CACHE['value']",
+        "CACHE.update(value=2)\n    return CACHE['value']",
+    ],
+)
+def test_persistent_test_helper_state_declines(tmp_path: Path, body: str) -> None:
+    source = f"CACHE = {{}}\ndef caller():\n    {body}\n"
+    before = source.replace("2", "1")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    result = CoverageSelector(_FakeDB(), tmp_path, read_source=lambda _path: source).decide(
+        ["tests/test_common/helper.py"], {"tests/test_common/helper.py": diff}
+    )
+    assert not result.ok
+    assert "stateful helper" in result.reason
+    assert not result.skippable
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        'fx = pytest.fixture\n@fx(scope="session")',
+        "@custom_fixture",
+    ],
+)
+def test_unresolved_or_aliased_fixture_decorator_declines(tmp_path: Path, declaration: str) -> None:
+    source = f"import pytest\n{declaration}\ndef caller():\n    return 2\n"
+    before = source.replace("return 2", "return 1")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    result = CoverageSelector(_FakeDB(), tmp_path, read_source=lambda _path: source).decide(
+        ["conftest.py"], {"conftest.py": diff}
+    )
+    assert not result.ok
+    assert "shared test infrastructure" in result.reason
+    assert not result.skippable
+
+
+@pytest.mark.parametrize(
+    "receiver, declaration",
+    [
+        ("cls", "@classmethod\n    "),
+        ("self", ""),
+        ("FixtureMixin", "@staticmethod\n    "),
+        ("alias", "@classmethod\n    "),
+    ],
+)
+def test_shared_class_fixture_method_dependency_keeps_both_consumers(
+    tmp_path: Path, receiver: str, declaration: str
+) -> None:
+    """A shared fixture's later consumer has no execution row for its method."""
+    parameter = "self" if receiver == "self" else "cls"
+    build_parameter = "" if "staticmethod" in declaration else parameter
+    source = (
+        "import pytest\nclass FixtureMixin:\n"
+        f"    {declaration}def build({build_parameter}):\n        return 2\n"
+        '    @pytest.fixture(scope="class")\n'
+        f"    def shared({parameter}):\n        alias = {parameter}\n"
+        f"        return {receiver}.build()\n"
+    )
+    _assert_shared_dependency_declines(tmp_path, source, "FixtureMixin.build", "shared fixture")
+
+
+def _assert_shared_dependency_declines(
+    tmp_path: Path, source: str, changed: str, reason: str
+) -> None:
+    path = "tests/test_common/helper.py"
+    helper = tmp_path / path
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    helper.write_text(source)
+    before = source.replace("return 2", "return 1")
+    assert before != source
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+
+    class FirstConsumerDB(_FakeDB):
+        def __init__(self) -> None:
+            self.rows = {changed: {"A10-PyTorch-1/test_first"}}
+
+        def tests_touching_file(self, _path: str) -> set[str]:
+            return {"A10-PyTorch-1/test_first"}
+
+        def known_by_family(self) -> dict[str, set[str]]:
+            return {"A10-PyTorch": {"test_first", "test_second"}}
+
+    result = CoverageSelector(FirstConsumerDB(), tmp_path).decide([path], {path: diff})
+
+    assert not result.ok
+    assert reason in result.reason
+    assert not result.skippable
+    pr = PRInputs(changed_files=[path], diffs={path: diff})
+    tier, note = apply_coverage_tier(pr, [], set(), {}, YAMLIndex(), tmp_path, FirstConsumerDB())
+    assert tier is None
+    assert reason in note
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "VALUE = caller()",
+        "VALUE: int = caller()",
+        "VALUE = OTHER = caller()",
+        "VALUE, OTHER = (caller(), 0)",
+        "if True:\n    VALUE = caller()",
+        "class Values:\n    VALUE = caller()",
+        "VALUE = [caller() for _ in range(2)]",
+        "VALUE = caller()\nALIAS = VALUE",
+    ],
+)
+def test_initialized_helper_result_keeps_both_consumers(tmp_path: Path, assignment: str) -> None:
+    """Module/class initialization is reused even when imports occur inside tests."""
+    source = f"def caller():\n    return 2\n{assignment}\n"
+    reason = (
+        "class initialization result"
+        if assignment.startswith("class")
+        else "module initialization result"
+    )
+    _assert_shared_dependency_declines(tmp_path, source, "caller", reason)
+
+
+def test_imported_helper_initialization_keeps_both_consumers(tmp_path: Path) -> None:
+    path = "tests/test_common/helper.py"
+    helper = tmp_path / path
+    helper.parent.mkdir(parents=True)
+    helper.write_text("def caller():\n    return 2\n")
+    consumer = helper.with_name("values.py")
+    consumer.write_text("from test_common.helper import caller as make\nVALUE = make()\n")
+    source = helper.read_text()
+    # The changed function has rows only for the first test importing values.
+    _assert_shared_dependency_declines(tmp_path, source, "caller", "module initialization result")
+
+
+@pytest.mark.parametrize(
+    "source, changed",
+    [
+        (
+            "def caller():\n    return 2\ndef use():\n    value = caller()\n    return value\n",
+            "caller",
+        ),
+        (
+            "def caller():\n    return 2\ndef other():\n    return 10\nVALUE = other()\n",
+            "caller",
+        ),
+        (
+            "import pytest\nclass Helpers:\n"
+            "    def caller(self):\n        return 2\n"
+            '    @pytest.fixture(scope="function")\n'
+            "    def per_test(self):\n        return self.caller()\n"
+            '    @pytest.fixture(scope="class")\n'
+            "    def shared(self):\n        return 10\n",
+            "Helpers.caller",
+        ),
+    ],
+)
+def test_unrelated_initialization_and_per_test_method_calls_remain_eligible(
+    tmp_path: Path, source: str, changed: str
+) -> None:
+    before = source.replace("return 2", "return 1")
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    db = _FakeDB()
+    db.rows[changed] = {"A10-PyTorch-1/test_caller"}
+    result = CoverageSelector(db, tmp_path, read_source=lambda _path: source).decide(
+        ["tests/test_common/helper.py"], {"tests/test_common/helper.py": diff}
+    )
+    assert result.ok, result.reason
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+
+
+@pytest.mark.parametrize("receiver", ["self", "type(self)", "super()"])
+def test_inherited_shared_fixture_method_keeps_both_consumers(
+    tmp_path: Path, receiver: str
+) -> None:
+    source = (
+        "import pytest\nclass Base:\n"
+        "    @classmethod\n    def build(cls):\n        return 2\n"
+        "class FixtureMixin(Base):\n"
+        '    @pytest.fixture(scope="class")\n'
+        f"    def shared(self):\n        return {receiver}.build()\n"
+    )
+    _assert_shared_dependency_declines(tmp_path, source, "Base.build", "shared fixture")
+
+
+def test_shared_base_fixture_dispatches_to_changed_override(tmp_path: Path) -> None:
+    source = (
+        "import pytest\nclass Base:\n"
+        "    def build(self):\n        return 0\n"
+        '    @pytest.fixture(scope="class")\n'
+        "    def shared(self):\n        return self.build()\n"
+        "class Derived(Base):\n    def build(self):\n        return 2\n"
+    )
+    _assert_shared_dependency_declines(tmp_path, source, "Derived.build", "shared fixture")
+
+
+def test_shared_fixture_using_imported_base_keeps_both_consumers(tmp_path: Path) -> None:
+    consumer = tmp_path / "tests/conftest.py"
+    consumer.parent.mkdir(parents=True)
+    consumer.write_text(
+        "import pytest\nfrom test_common.helper import Base as Parent\n"
+        "class FixtureMixin(Parent):\n"
+        '    @pytest.fixture(scope="class")\n'
+        "    def shared(self):\n        return self.build()\n"
+    )
+    source = "class Base:\n    def build(self):\n        return 2\n"
+    _assert_shared_dependency_declines(tmp_path, source, "Base.build", "shared fixture")

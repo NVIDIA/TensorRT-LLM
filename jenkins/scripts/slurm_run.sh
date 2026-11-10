@@ -159,8 +159,6 @@ slurm_wait_all_ranks
 set +e
 
 pytest_exit_code=0
-perf_check_exit_code=0
-perf_report_exit_code=0
 
 eval $pytestCommand
 pytest_exit_code=$?
@@ -170,64 +168,13 @@ if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
         --drain-spool "$jobWorkspace" || true
 fi
 
-# DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
-# Remove this after the issue is resolved
-if [ $pytest_exit_code -eq 4 ]; then
-    echo "DEBUG: Pytest failed with usage error (exit code 4)"
-    echo "DEBUG: Directory state at $(pwd):"
-    ls -l
-    echo "DEBUG: Directory state at $llmSrcNode/tests/integration/defs:"
-    ls -l $llmSrcNode/tests/integration/defs
-
-    echo "DEBUG: conftest.py content:"
-    md5sum $llmSrcNode/tests/integration/defs/conftest.py
-
-    echo "DEBUG: pytest.ini content:"
-    md5sum $llmSrcNode/tests/integration/defs/pytest.ini
-
-    echo "DEBUG: Check importability of conftest.py"
-    python3 -c "import sys; sys.path.insert(0, '.'); import conftest; print('DEBUG: conftest imported successfully')"
-fi
-
-if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
-    # Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
-    basePerfFilename="base_perf_pytorch.csv"
-    basePerfPath="$llmSrcNode/tests/integration/defs/perf/$basePerfFilename"
-    echo "Check Perf Result"
-    python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \
-        $stageName/perf_script_test_results.csv \
-        $basePerfPath
-    perf_check_exit_code=$?
-
-    echo "Create Perf Report"
-    python3 $llmSrcNode/tests/integration/defs/perf/create_perf_comparison_report.py \
-        --output_path $stageName/report.pdf \
-        --files $stageName/perf_script_test_results.csv \
-        $basePerfPath
-    perf_report_exit_code=$?
-    echo "Rank${SLURM_PROCID} Perf report finished execution with exit code $perf_report_exit_code"
-
-    if [ "$perf_check_exit_code" -eq 0 ] && [ "$perf_report_exit_code" -ne 0 ]; then
-        perf_check_exit_code=$perf_report_exit_code
-    fi
-    echo "Rank${SLURM_PROCID} Perf check finished execution with exit code $perf_check_exit_code"
-fi
-
-# The TOT waive refresh in L0_Test.groovy may waive this job's failures only when pytest's
-# own test failures decide it (not the perf check) and a single task ran, so rank 0's results
-# cover every test. The file holds the GPU compute capability for "full:smNN/" waives.
+# Only single-task pytest failures are eligible for a TOT waive check. The refresh
+# also verifies report completeness; this file carries the compute-node GPU SM.
 if [ "${SLURM_PROCID:-0}" -eq 0 ] && [ "$pytest_exit_code" -eq 1 ] && \
-        [ "$perf_check_exit_code" -eq 0 ] && [ "${SLURM_NTASKS:-1}" -eq 1 ]; then
+        [ "${SLURM_NTASKS:-1}" -eq 1 ]; then
     timeout 10s nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 \
         > "$jobWorkspace/tot_waive_eligible.txt" || true
 fi
 
-if [ "$pytest_exit_code" -ne 0 ]; then
-    final_exit_code=$pytest_exit_code
-elif [ "$perf_check_exit_code" -ne 0 ]; then
-    final_exit_code=$perf_check_exit_code
-else
-    final_exit_code=0
-fi
-echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $final_exit_code"
-exit $final_exit_code
+echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $pytest_exit_code"
+exit $pytest_exit_code

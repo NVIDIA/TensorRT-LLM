@@ -766,8 +766,11 @@ def _test_moe_worker_impl(
             with torch.inference_mode():
                 ref_output = ref_fused_moe.forward(x, router_logits)
 
-            # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
-            use_flashinfer = getattr(fused_moe, "use_flashinfer", False)
+            # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels.
+            # The flag lives on the leaf, which ConfigurableMoE holds as ``backend``.
+            use_flashinfer = getattr(
+                getattr(fused_moe, "backend", fused_moe), "use_flashinfer", False
+            )
 
             # Run tests
             if enable_autotune:
