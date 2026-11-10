@@ -48,12 +48,17 @@ def _build(spec, seed):
 
     `mat_b` is built as [N, K] and transposed, because that is the one thing a
     spec cannot say: the op reads it column-major, and a stored weight's `.t()`
-    already is that, which is why no transpose kernel runs in a target.
+    already is that, which is why no transpose kernel runs in a target. With
+    `rows`, the weight is `[rows, K]` and `mat_b` the first N columns of its
+    `.t()` (column stride still K); rows from `live` on are zero.
     """
     g = torch.Generator(device="cuda").manual_seed(seed)
     m, k, n, dt = spec["m"], spec["k"], spec["n"], spec["dtype"]
     mat_a = torch.randn(m, k, generator=g, device="cuda").to(dt)
-    mat_b = torch.randn(n, k, generator=g, device="cuda").to(dt).t()
+    w = torch.randn(spec.get("rows", n), k, generator=g, device="cuda").to(dt)
+    if "live" in spec:
+        w[spec["live"] :] = 0
+    mat_b = w.t()[:, :n]
     out_dtype = spec["out_dtype"]
     bias = None
     if spec["bias"]:
@@ -112,6 +117,45 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
         Cell(
             why="gpt-oss qkv with fused bias: hidden 2880 -> (64 + 8 + 8) * 64",
             spec=dict(m=16, k=2880, n=5120, dtype=torch.bfloat16, bias=True, out_dtype=None),
+        ),
+    ),
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+        Cell(
+            why="qwen fp8 attn in-proj tp2 7424 wide, the largest captured decode batch 128",
+            spec=dict(m=128, k=2560, n=7424, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="qwen fp8 o_proj / GDN out_proj tp1, K 6144 -> hidden 2560, 128 rows",
+            spec=dict(m=128, k=6144, n=2560, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="qwen fp8 GDN in_proj tp4 4120 wide, MTP-7 verify of 128 requests: 1024 rows",
+            spec=dict(m=1024, k=2560, n=4120, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="qwen fp8 attn in-proj tp2 7424 wide, a max_num_tokens prefill chunk: 8192 rows",
+            spec=dict(m=8192, k=2560, n=7424, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="qwen fp8 draft fc_h over 4 streams of an 8192-row chunk: 32768 rows",
+            spec=dict(m=32768, k=2560, n=2560, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="qwen fp8 HC first fp32 logits: 352 columns of a padded [384, 10240] weight",
+            spec=dict(
+                m=128,
+                k=10240,
+                n=352,
+                dtype=torch.bfloat16,
+                bias=False,
+                out_dtype=torch.float32,
+                rows=384,
+                live=324,
+            ),
+        ),
+        Cell(
+            why="qwen fp8 vision qkv 1152 -> 3456 with bias, 5580 patches",
+            spec=dict(m=5580, k=1152, n=3456, dtype=torch.bfloat16, bias=True, out_dtype=None),
         ),
     ),
 }
