@@ -136,7 +136,9 @@ def test_a_placeholder_anchor_is_named_with_the_floor_it_implies(tmp_path):
     reference.write_text(yaml.safe_dump({"toy": [{"accuracy": 50.0}]}))
     task = copy.deepcopy(_GOOD)
     task["accuracy"].update(reference_yaml=str(reference), model_key="toy")
-    assert _finding("accuracy-placeholder-anchor", task)
+    low = _finding("accuracy-placeholder-anchor", task)
+    # No score the run measures replaces the row: a placeholder certifies no accuracy.
+    assert low.severity == lint.WARN and "certifies no accuracy" in low.message
     reference.write_text(yaml.safe_dump({"toy": [{"accuracy": 93.1}]}))
     assert _finding("accuracy-placeholder-anchor", task) is None
     reference.write_text("# placeholder\n" + yaml.safe_dump({"toy": [{"accuracy": 95.0}]}))
@@ -216,23 +218,6 @@ def test_a_kv_dtype_the_engine_refuses_is_a_block(tmp_path):
     assert "kv-cache-dtype" not in _rules(lint.lint_task(task, repo=repo))
     # A tree that does not say what it accepts is not guessed at.
     assert prior_art.engine_kv_dtypes(tmp_path / "elsewhere") is None
-
-
-def test_a_feature_is_not_proven_again_under_another_axis():
-    task = copy.deepcopy(_GOOD)
-    task["features"] = ["disagg", "mtp"]
-    task["members"]["mtp"] = ["dep4"]
-    task["variants"]["mtp_kv_fp8"] = {
-        "unit": "mtp",
-        "llm_api_options": {"kv_cache_config": {"dtype": "fp8"}},
-    }
-    finding = _finding("feature-combination", task)
-    assert "mtp_kv_fp8 (mtp x kv dtype: " in finding.message
-    assert "core proves the axis in kv_fp8" in finding.message
-    # A variant on a feature unit that changes none of the storage or scheduling axes is the
-    # feature's own configuration, not a combination.
-    task["variants"]["mtp_kv_fp8"] = {"unit": "mtp", "env": {"TRTLLM_MTP_EAGER": "1"}}
-    assert "feature-combination" not in _rules(lint.lint_task(task))
 
 
 def test_every_member_holds_one_engine_of_the_checkpoint(tmp_path):

@@ -39,7 +39,6 @@ import yaml
 from ..checks import accuracy_policy, check_config
 from ..checks import disagg as disagg_checks
 from ..operators import prior_art, tree_anchors
-from . import variants as variants_mod
 from .task_schema import (
     assembly_units,
     gpus_per_node,
@@ -53,12 +52,11 @@ BLOCK = "block"
 WARN = "warn"
 INFO = "info"
 
-#: Blocks a request may still keep on purpose, accepted in notes like a warn: a combination
-#: of non-core features the request names, which the contract otherwise refuses to multiply,
-#: and an accuracy check run eager on purpose (a short subset, a capture still being built).
-ACCEPTABLE_BLOCKS: frozenset[str] = frozenset({"variants-cross-product", "accuracy-eager"})
+#: Blocks a request may still keep on purpose, accepted in notes like a warn: an accuracy
+#: check run eager on purpose (a short subset, a capture still being built).
+ACCEPTABLE_BLOCKS: frozenset[str] = frozenset({"accuracy-eager"})
 #: A contract past this many required checks is worth a second look before it is paid for:
-#: every check loads the model, and every change to the target runs the stale ones again.
+#: every check loads the model, and each certification round runs every one of them.
 CONTRACT_REVIEW_SIZE = 30
 #: Per benchmark: an anchor below this cannot tell a working target from a broken one.
 PLAUSIBLE_ANCHOR: dict[str, float] = {"gsm8k": 60.0}
@@ -70,8 +68,6 @@ CHAT_TEMPLATE_MIN_OUTPUT = 1024
 ENGINE_WEIGHT_FRACTION = 0.75
 #: Notes past this many characters stop being a brief: every role reads them in every turn.
 NOTES_BRIEF_CHARS = 6000
-#: The prior-art leads of each kind the notes are expected to name (or set aside).
-PRIOR_ART_NAMED_PER_KIND = 3
 
 _ACCEPT = re.compile(r"intake-accept:\s*([a-z0-9-]+(?:\s*,\s*[a-z0-9-]+)*)", re.I)
 # Words about the intake itself. At launch every role reads them as standing orders.
@@ -209,33 +205,6 @@ def _benchmark_args(accuracy: Mapping[str, Any]) -> list[str]:
     return [str(a) for a in args]
 
 
-def _variant_axes(entry: Mapping[str, Any]) -> set[str]:
-    axes = set()
-    runtime = entry.get("runtime") or {}
-    options = entry.get("llm_api_options") or {}
-    flags = _flags(runtime)
-    if (options.get("kv_cache_config") or {}).get("dtype") or (
-        flags.get("kv_cache_config") or {}
-    ).get("dtype"):
-        axes.add("kv dtype")
-    if (
-        "chunked_prefill" in runtime
-        or "enable_chunked_prefill" in options
-        or "max_num_tokens" in flags
-        or "max_num_tokens" in options
-    ):
-        axes.add("chunked prefill")
-    if "kv_cache_reuse" in runtime or "enable_block_reuse" in (
-        options.get("kv_cache_config") or {}
-    ):
-        axes.add("block reuse")
-    if options.get("speculative_config") or flags.get("speculative_config"):
-        axes.add("speculative decoding")
-    if "mamba_ssm_cache_dtype" in flags or "mamba_ssm_cache_dtype" in options:
-        axes.add("ssm dtype")
-    return axes
-
-
 def checkpoint_weight_bytes(checkpoint: str | Path | None) -> int | None:
     """The checkpoint's weights in bytes: its safetensors index's total, else its files' sizes."""
     if not checkpoint:
@@ -331,21 +300,6 @@ def cuda_graph_rules(ctx: LintContext) -> Iterator[Finding]:
         )
 
 
-def runtime_rules(ctx: LintContext) -> Iterator[Finding]:
-    task = ctx.task
-    runtime = check_config.resolve_runtime(task, None)
-    on = [name for name in ("chunked_prefill", "kv_cache_reuse") if runtime.get(name)]
-    if on:
-        yield Finding(
-            "runtime-non-core-in-core",
-            WARN,
-            f"the core configuration turns on {' and '.join(on)}: a non-core feature in core is "
-            "in every check, so a failure no longer says which feature it belongs to",
-            "keep core to CUDA graphs and the overlap scheduler; turn it off in `runtime` and "
-            "prove it with its own variant on core (`chunked`, `reuse`)",
-        )
-
-
 def kv_cache_rules(ctx: LintContext) -> Iterator[Finding]:
     """Every ``kv_cache_config.dtype`` a launch asks for is one the engine loads a model with."""
     accepted = prior_art.engine_kv_dtypes(ctx.repo)
@@ -436,32 +390,6 @@ def _width(member: str) -> int:
         return 1
 
 
-def scope_rules(ctx: LintContext) -> Iterator[Finding]:
-    task = ctx.task
-    crossed = sorted(
-        name
-        for name, entry in (task.get("variants") or {}).items()
-        if len(_variant_axes(entry or {})) >= 2
-    )
-    if crossed:
-        yield Finding(
-            "variants-cross-product",
-            BLOCK,
-            f"{len(crossed)} variant{'s combine' if len(crossed) > 1 else ' combines'} two or more axes "
-            f"({', '.join(crossed[:6])}{', ...' if len(crossed) > 6 else ''}): each pays its own "
-            "checks and proves no axis a one-axis variant does not",
-            "one variant per non-core feature (a KV dtype, `chunked`, `reuse`) proves each; a "
-            "combination the request names goes in notes with `intake-accept: "
-            "variants-cross-product -- <why>`",
-        )
-    if profile_of(task) == "certified":
-        yield Finding(
-            "profile-certified",
-            INFO,
-            "the certified profile turns on boot boundaries and the serve gate",
-        )
-
-
 def contract_rules(ctx: LintContext) -> Iterator[Finding]:
     if ctx.contract is None:
         return
@@ -471,88 +399,11 @@ def contract_rules(ctx: LintContext) -> Iterator[Finding]:
             "contract-size",
             WARN,
             f"the contract owes {len(required)} checks: each loads the model, each accuracy "
-            "check is a full benchmark run, and every change to the target runs the stale "
-            "ones again",
+            "check is a full benchmark run, and the certification runs all of them once, and "
+            "again after each repair",
             "prove each requested feature once, at the member the request validates fully; "
             "members the request scopes to text-only take core alone; accept the rest "
             "explicitly (the report's per-unit lines show where the checks go)",
-        )
-    # A storage or scheduling variant that boots boots at every member of its unit.
-    boots: dict[str, int] = {}
-    for name in variants_mod.variants(ctx.task):
-        gates = variants_mod.variant_gates(ctx.task, name)
-        if "boot" not in gates or "accuracy" not in gates or "acceptance" in gates:
-            continue
-        if profile_of(ctx.task, name) in ("smoke", "bringup"):
-            continue
-        count = sum(1 for c in required if c.unit == name and c.gate == "boot")
-        if count:
-            boots[name] = count
-    if boots:
-        yield Finding(
-            "variant-boot-everywhere",
-            WARN,
-            f"{', '.join(f'{n} ({k})' for n, k in boots.items())} boot at every member of their "
-            f"unit: {sum(boots.values())} boot checks, each a model load, beside accuracy "
-            "checks that load the same engine and fail unless each rank reports the variant's "
-            "setting (its KV dtype, its chunking)",
-            "give each such variant `gates: [accuracy]` and `members:` the member(s) the request "
-            "validates it at, and accept its other cells in coverage.accept",
-        )
-
-
-def feature_rules(ctx: LintContext) -> Iterator[Finding]:
-    """Each requested feature is proven once: at one member, and not again under another axis."""
-    if ctx.contract is None:
-        return
-    task = ctx.task
-    required = ctx.contract.required()
-    units = assembly_units(task)
-    spread = []
-    for unit in units[1:]:
-        if profile_of(task, unit) == "certified":
-            continue
-        at = list(dict.fromkeys(c.member for c in required if c.unit == unit))
-        if len(at) > 1:
-            count = sum(1 for c in required if c.unit == unit)
-            spread.append(f"{unit} at {', '.join(at)} ({count} checks)")
-    if spread:
-        yield Finding(
-            "feature-members",
-            WARN,
-            f"{'; '.join(spread)}: one member proves a feature, and each other member proves it "
-            "again with a model load per check",
-            "narrow the feature's `members` to the member the request validates fully and list "
-            "its other cells in coverage.accept; keep more only when the request names them",
-        )
-    # Axes a variant on core proves, so a variant on a feature unit that changes one is a combination.
-    on_core: dict[str, list[str]] = {}
-    declared = variants_mod.variants(task)
-    for name, entry in declared.items():
-        if variants_mod.base_unit(task, name) == units[0]:
-            for axis in _variant_axes(entry):
-                on_core.setdefault(axis, []).append(name)
-    combined = []
-    for name, entry in declared.items():
-        base = variants_mod.base_unit(task, name)
-        axes = sorted(_variant_axes(entry))
-        count = sum(1 for c in required if c.unit == name)
-        if base == units[0] or not axes or not count or profile_of(task, name) == "certified":
-            continue
-        proven = sorted({v for axis in axes for v in on_core.get(axis, ())})
-        combined.append(
-            f"{name} ({base} x {', '.join(axes)}: {count} check{'s' if count > 1 else ''}"
-            + (f"; core proves the axis in {', '.join(proven)}" if proven else "")
-            + ")"
-        )
-    if combined:
-        yield Finding(
-            "feature-combination",
-            WARN,
-            f"{'; '.join(combined)}: a variant on a feature unit proves a combination; its "
-            "feature is proven by its own unit's checks and the axis by a variant on core",
-            "put the variant on `unit: core` (or drop it when core already proves the axis); keep "
-            "a combination only when the request names it",
         )
 
 
@@ -627,18 +478,18 @@ def accuracy_rules(ctx: LintContext) -> Iterator[Finding]:
     low = [v for v in values if plausible is not None and v < plausible]
     marked = any(word in text.lower() for word in _PLACEHOLDER_WORDS)
     replace = (
-        "replace the row, committed, when a measured anchor is known (the user's, the "
-        "reference implementation's on this hardware, or one the onboarding measures): every "
-        "accuracy check then runs again"
+        "write the measured anchor into the row, committed, before launch (the user's, or the "
+        "reference implementation's on this hardware): the certification holds the benchmark "
+        "to the row as written"
     )
     if low:
         yield Finding(
             "accuracy-placeholder-anchor",
-            INFO,
+            WARN,
             f"the {benchmark} anchor {', '.join(f'{v:g}' for v in low)} is a low placeholder: "
             f"its floor catches an engine that answers nothing and passes one that answers "
-            f"({_floors(accuracy, values)}); a configuration variant is judged against its "
-            "unit's own score, not this row",
+            f"({_floors(accuracy, values)}), so a run delivered on it certifies no accuracy; a "
+            "configuration variant is judged against its unit's own score, not this row",
             replace,
         )
     elif marked:
@@ -782,29 +633,6 @@ def engine_rules(ctx: LintContext) -> Iterator[Finding]:
         )
 
 
-def prior_art_rules(ctx: LintContext) -> Iterator[Finding]:
-    """The best leads of each kind are named in notes: used, or set aside with a reason."""
-    if ctx.prior_art is None:
-        return
-    lowered = ctx.notes.lower()
-    unnamed = []
-    for kind in dict.fromkeys(c.kind for c in ctx.prior_art.candidates):
-        for candidate in ctx.prior_art.by_kind(kind)[:PRIOR_ART_NAMED_PER_KIND]:
-            tail = "/".join(Path(candidate.path).parts[-2:]).lower()
-            if tail not in lowered and not any(n.lower() in lowered for n in candidate.names):
-                unnamed.append(candidate.path)
-    if unnamed:
-        yield Finding(
-            "notes-prior-art-unnamed",
-            WARN,
-            f"notes do not name {len(unnamed)} of the top prior-art leads (the first "
-            f"{PRIOR_ART_NAMED_PER_KIND} of each kind): " + ", ".join(f"`{p}`" for p in unnamed),
-            "read each and give it one line under 'Prior art in this tree worth surveying', "
-            "named by its last two path parts (`<dir>/<file>.py`) or a function it defines: "
-            "what it offers, or why it does not fit",
-        )
-
-
 def tree_rules(ctx: LintContext) -> Iterator[Finding]:
     """What the lint reads off the tree and this checkout has nowhere: the check it then skips."""
     if not ctx.repo:
@@ -825,12 +653,9 @@ def tree_rules(ctx: LintContext) -> Iterator[Finding]:
 #: Every rule, in report order. A new feature, scope or launch check adds its function here.
 RULES: tuple[Rule, ...] = (
     cuda_graph_rules,
-    runtime_rules,
     kv_cache_rules,
     placement_rules,
-    scope_rules,
     contract_rules,
-    feature_rules,
     coverage_rules,
     accuracy_rules,
     boot_rules,
@@ -839,7 +664,6 @@ RULES: tuple[Rule, ...] = (
     agents_rules,
     notes_rules,
     engine_rules,
-    prior_art_rules,
     tree_rules,
 )
 
