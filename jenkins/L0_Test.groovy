@@ -819,6 +819,8 @@ def isValidSlurmJobId(def slurmJobID) {
 // Computed only here; the builder and prepare_container.sh receive it as FAT_SQSH_PATH.
 def computeFatSqshPath(String fatSqshDir, String llmTarArtifactPath, String fatBuildScriptLocalPath) {
     def shortHash = { String text -> sh(returnStdout: true, script: "printf '%s' '${text}' | sha256sum | cut -c1-8").trim() }
+    // The commit the package was built from: L0_MergeRequest passes gitlabCommit with the artifactPath
+    // it built, and artifactCommit overrides it when testing another commit's artifacts (as linuxPkgName).
     def commit = env.artifactCommit ?: env.gitlabCommit
     // Without a commit, fall back to the artifact path, which is unique per pipeline.
     def commitTag = commit ? commit.take(8) : shortHash(llmTarArtifactPath)
