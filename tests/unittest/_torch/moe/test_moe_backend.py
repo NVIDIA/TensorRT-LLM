@@ -86,6 +86,7 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmCutlassUnquantizedImpl,
     TrtllmCutlassW4a16Mxfp4Impl,
     TrtllmCutlassW4a16Nvfp4Impl,
+    TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl,
     TrtllmTritonFp8BlockScalesImpl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
@@ -6616,6 +6617,7 @@ def _cutlass_leaf_on_cpu(leaf_cls):
     leaf.act_beta = None
     leaf.act_clamp = None
     leaf.act_clamp_after_silu = False
+    leaf.activation = DEFAULT_MOE_ACTIVATION
     leaf.tp_size, leaf.tp_rank, leaf.ep_size, leaf.ep_rank = 1, 0, 1, 0
     leaf.cluster_size, leaf.cluster_rank = 1, 0
     leaf.use_fused_finalize = True
@@ -6980,6 +6982,114 @@ def test_triton_fp8_block_scales_leaf_localizes_global_slot_ids(enable_alltoall,
     # The kernel returns its own tensor, so the scheduler must not hand it the
     # alltoall workspace to fill.
     assert not leaf.supports_moe_output_in_alltoall_workspace()
+
+
+def _sm90_triton_fp8_act_leaf_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl, dict, list]:
+    """The SM90 Triton FP8-activation leaf, opted into its Triton path, with
+    both callees replaced by recorders: what the Triton runner saw, and the
+    fused-op calls."""
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import fp8_block_scales_hopper_triton
+
+    seen = {}
+
+    def run_triton(x, ids, scales, *args, **kwargs):
+        seen.update(ids=ids, scales=scales, args=args, **kwargs)
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(
+        fp8_block_scales_hopper_triton, "run_triton_fp8_block_scale_moe_fp8_act", run_triton
+    )
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+    leaf.quant_scales = SimpleNamespace(
+        fc_weight_scales="fc31-scale", proj_weight_scales="fc2-scale"
+    )
+    leaf._triton_swiglu = (7.0, True)
+    return leaf, seen, calls
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "change, takes_triton",
+    [
+        pytest.param({}, True, id="at-threshold"),
+        pytest.param({"num_tokens": 33}, False, id="above-threshold"),
+        pytest.param({"x_sf": torch.ones(1)}, False, id="scale-factors"),
+        pytest.param({"x_dtype": torch.float16}, False, id="fp16-input"),
+        pytest.param({"moe_output": torch.zeros(32, 8)}, False, id="moe-output"),
+        pytest.param({"triton_swiglu": None}, False, id="non-uniform-clamp"),
+    ],
+)
+def test_sm90_triton_fp8_act_leaf_dispatch(change, takes_triton, monkeypatch):
+    """Up to ``TRITON_FP8_ACT_MAX_TOKENS`` rows of plain BF16 input without an
+    output buffer run Triton; everything else runs the inherited fused op."""
+    leaf, seen, calls = _sm90_triton_fp8_act_leaf_on_cpu(monkeypatch)
+    assert leaf.TRITON_FP8_ACT_MAX_TOKENS == 32
+    if "triton_swiglu" in change:
+        leaf._triton_swiglu = change["triton_swiglu"]
+    num_tokens = change.get("num_tokens", 32)
+    ctx = _cpu_run_context(num_tokens=num_tokens)
+    ctx = dataclasses.replace(
+        ctx,
+        x=ctx.x.to(change.get("x_dtype", torch.bfloat16)),
+        x_sf=change.get("x_sf"),
+        comm_plan=dataclasses.replace(ctx.comm_plan, moe_output=change.get("moe_output")),
+    )
+
+    leaf.run_moe(ctx)
+
+    assert bool(seen) is takes_triton
+    assert len(calls) == (0 if takes_triton else 1)
+    if takes_triton:
+        assert seen["args"] == (leaf.w3_w1_weight, "fc31-scale", leaf.w2_weight, "fc2-scale")
+        assert seen["swiglu_limit"] == 7.0
+        assert seen["swiglu_clamp_after_silu"] is True
+        assert seen["output_dtype"] is torch.bfloat16
+
+
+@pytest.mark.cpu_only
+def test_sm90_triton_fp8_act_leaf_localizes_slots_and_defaults_the_scales(monkeypatch):
+    """Under EP the Triton kernel indexes this rank's experts, so every slot
+    outside them weighs 0; folded router weights arrive as None and weigh 1."""
+    leaf, seen, _ = _sm90_triton_fp8_act_leaf_on_cpu(monkeypatch)
+    leaf.ep_size = 2
+    leaf.expert_size_per_partition = 4
+    leaf.slot_start = 4  # this rank owns slots 4..7
+    ctx = dataclasses.replace(
+        _cpu_run_context(num_tokens=2),
+        # 1 is below this rank's slots, -1 padding, 8 (num_slots) above them.
+        token_selected_experts=torch.tensor([[5, 1], [-1, 8]], dtype=torch.int32),
+        token_final_scales=None,
+    )
+
+    leaf.run_moe(ctx)
+
+    assert seen["ids"].tolist() == [[1, 0], [0, 3]]
+    assert seen["scales"].tolist() == [[1.0, 0.0], [0.0, 0.0]]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "slots, expected",
+    [
+        pytest.param({}, (None, False), id="no-clamp"),
+        pytest.param({"act_clamp": 5.0, "act_clamp_after_silu": True}, (5.0, True), id="scalar"),
+        pytest.param({"act_clamp": torch.full((4,), 5.0)}, (5.0, False), id="uniform-tensor"),
+        pytest.param({"act_clamp": torch.tensor([5.0, 5.0, 6.0, 5.0])}, None, id="per-expert"),
+        pytest.param({"w2_bias": torch.zeros(1)}, None, id="expert-bias"),
+        pytest.param({"act_alpha": 1.702}, None, id="alpha"),
+    ],
+)
+def test_sm90_triton_fp8_act_leaf_reads_the_clamp_off_its_slots(slots, expected):
+    """The Triton SwiGLU takes the clamp by value, so it serves only a layer
+    whose installed clamp is one value for every expert."""
+    leaf = _cutlass_leaf_on_cpu(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+    for name, value in slots.items():
+        setattr(leaf, name, value)
+
+    assert leaf._uniform_swiglu_clamp() == expected
 
 
 @pytest.mark.cpu_only

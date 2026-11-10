@@ -332,13 +332,14 @@ parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
 | `base.py` | `CutlassFusedMoEBase` — construction, the layer-format check in `create_weights`, and the defaults: a pass-through `quantize_input` and a `run_moe` that calls the op with the leaf's `FUSED_MOE_OP_FLAGS` (the weight lifecycle itself is `MoEWeightOwnerMixin`'s). Also the one `torch.ops.trtllm.fused_moe` call (`_run_fused_moe_op`, which a leaf's `run_moe` calls with the operands the `run_moe` contract does not carry), `FusedMoeOpFlags`, and the `quantize_input` implementations several formats bind (`quantize_input_static_e4m3`, `quantize_input_mxfp8`) |
 | `eligibility.py` | The checks each leaf's `can_implement` composes |
 | `lora.py` | `CutlassMoELoraMixin` — routed-expert LoRA, mixed in only by the two leaves the op can fuse it for |
-| `<format>.py` | One registered leaf each, named after its format: `unquantized.py` for `none`, `fp8_block_scales_hopper.py` / `fp8_block_scales_triton.py` for the two `fp8_block_scales` leaves, the `quant` segment otherwise |
+| `<format>.py` | One registered leaf each, named after its format: `unquantized.py` for `none`, `fp8_block_scales_hopper.py` / `fp8_block_scales_hopper_triton.py` / `fp8_block_scales_triton.py` for the three `fp8_block_scales` leaves, the `quant` segment otherwise |
 
 | `quant` segment | Leaf | Id | What differs from the base |
 |---|---|---|---|
 | `none` | `TrtllmCutlassUnquantizedImpl` | `trtllm.cutlass.grouped_gemm.none` | Fuses routed-expert LoRA |
 | `fp8` | `TrtllmCutlassFp8Impl` | `trtllm.cutlass.grouped_gemm.fp8` | Static per-tensor e4m3 input; fuses routed-expert LoRA |
-| `fp8_block_scales` | `DeepgemmCudaHopperFp8BlockScalesImpl` | `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales` | SM90; `CutlassMoeFCRunner` hands FC1/FC2 to the vendored DeepGEMM. Decode-sized batches (at most 32 tokens per rank) with a plain SwiGLU, no expert bias and no LoRA run Triton FP8-activation GEMMs (`run_triton_fp8_block_scale_moe_fp8_act`) instead |
+| `fp8_block_scales` | `DeepgemmCudaHopperFp8BlockScalesImpl` | `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales` | SM90; `CutlassMoeFCRunner` hands FC1/FC2 to the vendored DeepGEMM |
+| `fp8_block_scales` | `TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl` | `trtllm.triton.fp8_act_grouped_gemm.fp8_block_scales` | SM90, opt-in (`TLLM_MOE_ENABLE_SM90_TRITON_FP8_DECODE=1`, else it declines with `PATH_NOT_ENABLED`); subclasses the DeepGEMM leaf. SwiGLU only, no expert bias. `run_moe` runs Triton FP8-activation GEMMs (`run_triton_fp8_block_scale_moe_fp8_act`) when it receives at most `TRITON_FP8_ACT_MAX_TOKENS` rows after dispatch, no `moe_output` buffer (so never under NVLinkOneSided), BF16 input and a clamp uniform across experts (`_takes_triton_path`); otherwise the parent's fused op |
 | `fp8_block_scales` | `TrtllmTritonFp8BlockScalesImpl` | `trtllm.triton.grouped_gemm.fp8_block_scales` | SM120/121, BF16 activations; a Triton grouped GEMM that never enters C++ (`issues_fused_moe_op = False`, so no build gate); runs SwiGLU/GeGLU only, takes no expert bias and no activation constant but a uniform pre-SiLU SwiGLU clamp |
 | `nvfp4` | `TrtllmCutlassNvfp4Impl` | `trtllm.cutlass.grouped_gemm.nvfp4` | Quantizes activations to NVFP4 itself |
 | `w4a16_nvfp4` | `TrtllmCutlassW4a16Nvfp4Impl` | `trtllm.cutlass.grouped_gemm.w4a16_nvfp4` | Dequantizes the weights every forward, then runs unquantized |
@@ -355,12 +356,14 @@ parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
   copies `scheduler_kind`, `capabilities` and `input_requirement` off the
   descriptor, so the contract has one source, and nothing in the base branches
   on `quant_config`.
-- **FP8 block scales splits by SM.** Its two leaves carry the providers and
+- **FP8 block scales splits by SM.** Its three leaves carry the providers and
   techniques of the kernels they run (DeepGEMM, Triton), yet stay in the family
   because the `CUTLASS` literal serves FP8 block scales on SM90 and SM120/121.
+  The two SM90 leaves overlap: the opt-in Triton FP8-activation leaf ranks
+  first and declines unless its `opt_in_flag` is set.
   `find_cutlass_leaf(quant_algo, *, sm=None)` (and `cutlass_leaf`, which
   raises instead of returning `None`) is a lookup, not an eligibility check, and
-  reads the SM only to choose between those two.
+  reads the SM, and a leaf's `opt_in_flag`, only to choose among those leaves.
 
 ### TRTLLM-Gen leaves (`fused_moe/trtllm_gen/`)
 
@@ -1104,7 +1107,8 @@ as `<Provider><Technique><Quant>Impl`. The kernel segment enters when two ids
 differ in that segment alone: the class that would otherwise collide spells it
 out between technique and quant, in id order
 (`DeepgemmCudaHopperFp8BlockScalesImpl` next to
-`DeepgemmCudaFp8BlockScalesImpl`). The `trtllm.cutedsl.*.nvfp4` ids
+`DeepgemmCudaFp8BlockScalesImpl`, `TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl`
+next to `TrtllmTritonFp8BlockScalesImpl`). The `trtllm.cutedsl.*.nvfp4` ids
 (`mega_moe`, `fused_fc12`, `dense_gemm`, `grouped_gemm`) differ in
 `kernel_name` alone, so their classes spell the kernel out;
 `TrtllmCutedslGroupedGemmBf16Impl` keeps it to match its NVFP4 sibling. Quant

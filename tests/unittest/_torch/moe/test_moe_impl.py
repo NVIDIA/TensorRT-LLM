@@ -62,8 +62,10 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmCutlassW4a16Mxfp4Impl,
     TrtllmCutlassW4a16Nvfp4Impl,
     TrtllmCutlassW8a16Impl,
+    TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl,
     TrtllmTritonFp8BlockScalesImpl,
     cutlass_leaf,
+    find_cutlass_leaf,
 )
 from tensorrt_llm._torch.moe.fused_moe.cutlass.base import (
     CutlassFusedMoEBase,
@@ -96,7 +98,11 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     identity_quant_of,
     normalize_quant,
 )
-from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep, override_moe_environment
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
+    MoEDep,
+    MoEEnvFlag,
+    override_moe_environment,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_identity import (
     MOE_IMPL_REGISTRY,
     MoEImplDescriptor,
@@ -1077,6 +1083,15 @@ _HP_FP32 = _HP | {torch.float32}
 _FROM_AMPERE = frozenset(range(80, 125))
 _PROBED_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float8_e4m3fn)
 
+#: The environment flags that admit the SM90 Triton FP8-activation leaf.
+_SM90_TRITON_FP8_DECODE_ON = ((MoEEnvFlag.SM90_TRITON_FP8_DECODE.value, "1"),)
+
+
+def _opt_in_flags(leaf: type) -> tuple[tuple[str, str], ...]:
+    """The env flags a leaf needs set before it admits anything."""
+    return () if leaf.opt_in_flag is None else ((leaf.opt_in_flag.value, "1"),)
+
+
 # Every CUTLASS leaf's declarations, written out by hand rather than read off
 # the leaves, so one that drifts fails here: the SMs it admits (probed over
 # SM75-124), its activation dtypes, whether its loader takes a gpt-oss / 1-D
@@ -1112,6 +1127,16 @@ _CUTLASS_DECLARATIONS = (
         FusedMoeOpFlags(use_deepseek_fp8_block_scale=True),
         False,
         id="fp8_block_scales-sm90",
+    ),
+    pytest.param(
+        TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl,
+        {90},
+        {torch.bfloat16},
+        (False, False),
+        (False, False),
+        FusedMoeOpFlags(use_deepseek_fp8_block_scale=True),
+        False,
+        id="fp8_block_scales-sm90-triton-fp8-act",
     ),
     pytest.param(
         TrtllmTritonFp8BlockScalesImpl,
@@ -1235,8 +1260,9 @@ def test_cutlass_leaf_declarations(leaf, sms, dtypes, gptoss, oss_build, flags, 
         **problem_fields: object,
     ) -> bool:
         problem = MoEProblem(quant=quant, dtype_act=dtype, **problem_fields)
+        environment = MoEEnvironment(sm=sm, oss_cutlass_moe=oss, env_flags=_opt_in_flags(leaf))
         deployment = dataclasses.replace(
-            _single_rank_deployment(MoEEnvironment(sm=sm, oss_cutlass_moe=oss)),
+            _single_rank_deployment(environment),
             force_dynamic_quantization=dynamic,
             moe_lora_enabled=lora,
         )
@@ -1302,6 +1328,73 @@ def test_cutlass_literal_picks_the_fp8_block_scales_leaf_by_sm(sm, impl_id):
         )
     assert impl_class_for(report).descriptor.identity.canonical() == impl_id
     assert not report.degraded
+
+
+@pytest.mark.parametrize(
+    "env_flags, winner",
+    [
+        pytest.param((), DeepgemmCudaHopperFp8BlockScalesImpl, id="default"),
+        pytest.param(
+            _SM90_TRITON_FP8_DECODE_ON,
+            TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl,
+            id="opted-in",
+        ),
+    ],
+)
+def test_sm90_triton_fp8_act_leaf_is_opt_in(env_flags, winner):
+    """Ranked ahead of the DeepGEMM leaf, the Triton FP8-activation leaf wins
+    only when the deployment opts in; otherwise it declines without blaming the
+    layer, and resolution and the leaf lookup both land on the DeepGEMM leaf."""
+    with override_moe_environment(MoEEnvironment(sm=90, env_flags=env_flags)):
+        report = resolve_moe_impl(
+            _cutlass_model_config(QuantAlgo.FP8_BLOCK_SCALES), dtype=torch.bfloat16
+        )
+        assert find_cutlass_leaf(QuantAlgo.FP8_BLOCK_SCALES) is winner
+    assert impl_class_for(report) is winner
+    assert not report.degraded
+    if not env_flags:
+        (rejection,) = [r for r in report.rejected if "TritonFp8ActGroupedGemm" in r.legacy_backend]
+        assert rejection.reason is MoERejectReason.PATH_NOT_ENABLED
+        assert MoEEnvFlag.SM90_TRITON_FP8_DECODE.value in rejection.detail
+
+
+def test_sm90_triton_fp8_act_pin_needs_the_opt_in():
+    """A pinned identity measures the kernel it names or nothing at all."""
+    impl_id = TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl.descriptor.identity.canonical()
+    assert impl_id == "trtllm.triton.fp8_act_grouped_gemm.fp8_block_scales"
+    with override_moe_environment(MoEEnvironment(sm=90)):
+        report = resolve_moe_impl(
+            _cutlass_model_config(QuantAlgo.FP8_BLOCK_SCALES),
+            impl_id=impl_id,
+            dtype=torch.bfloat16,
+        )
+    assert report.winner is None
+    assert report.rejected[-1].reason is MoERejectReason.PATH_NOT_ENABLED
+
+
+@pytest.mark.parametrize(
+    "problem_fields, detail",
+    [
+        pytest.param({"bias": True}, "takes no expert bias", id="expert-bias"),
+        pytest.param({"activation": "Geglu"}, "does not execute Geglu", id="geglu"),
+    ],
+)
+def test_sm90_triton_fp8_act_leaf_declines_what_its_kernel_lacks(problem_fields, detail):
+    """Even opted in, the leaf stands aside for what the Triton path never runs,
+    so the DeepGEMM leaf serves those layers under its own name."""
+    problem = MoEProblem(
+        quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
+        dtype_act=torch.bfloat16,
+        **problem_fields,
+    )
+    deployment = _single_rank_deployment(
+        MoEEnvironment(sm=90, env_flags=_SM90_TRITON_FP8_DECODE_ON)
+    )
+    verdict = TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl.can_implement(problem, deployment)
+
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+    assert detail in verdict.detail
+    assert DeepgemmCudaHopperFp8BlockScalesImpl.can_implement(problem, deployment).eligible
 
 
 def test_cutlass_leaf_names_the_registered_formats_when_none_serves():
