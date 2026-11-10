@@ -363,6 +363,7 @@ static auto makeStrideKv(FmhaOptions const& options, bool isK, int32_t vTokenStr
       if (vTokenStrideElements > 0) {
         strideKeysVals = vTokenStrideElements;
       } else if (options.mHeadDimQk != options.mHeadDimV && options.mDtypeKv != tg::Dtype::E4m3) {
+        // Callers without an explicit stride can use the packed MLA layout.
         strideKeysVals = options.mNumHeadsKv * (options.mHeadDimQk - 64 + options.mHeadDimV);
       }
     }
