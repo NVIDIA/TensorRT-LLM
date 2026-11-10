@@ -38,6 +38,7 @@ Full documentation: https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html
 | [`apps/`](apps/) | Application examples (chat, FastAPI server) |
 | [`configs/`](configs/) | Pre-tuned serving configurations — [curated](configs/curated/) quick-starts and a [comprehensive database](configs/database/) |
 | [`serve/`](serve/) | `trtllm-serve` deployment guides and examples |
+| [`perf_reproductions/`](perf_reproductions/) | How to reproduce published benchmark results, with the exact code, container and serving configuration |
 | [`quantization/`](quantization/) | Quantization workflows with NVIDIA Model Optimizer |
 
 ## Pre-Tuned Model Configurations
