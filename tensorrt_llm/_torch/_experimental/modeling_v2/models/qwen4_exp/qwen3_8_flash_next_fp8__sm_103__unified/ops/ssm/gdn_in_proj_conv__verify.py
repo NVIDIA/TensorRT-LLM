@@ -731,6 +731,9 @@ class GdnInProjConv(OpWrapper):
         assert tuple(x.shape) == (rows, K_IN) and tuple(in_proj.shape) == (K_IN, N_OUT)
         assert in_proj.stride() == (1, K_IN), "in_proj is the column-major [2560, 4128] operand"
         assert rows % rows_per_request == 0 and 1 <= rows <= tactic.token_tile, (rows, tactic)
+        assert conv_weight.dtype == conv_state.dtype == window.dtype == torch.bfloat16, (
+            "the epilogue reads and writes the conv taps, pool and window as bf16"
+        )
         assert tuple(conv_weight.shape) == (CONV_DIM, CONV_WIDTH) and conv_weight.is_contiguous()
         assert conv_state.dim() == 3 and tuple(conv_state.shape[1:]) == (CONV_DIM, CONV_WIDTH - 1)
         assert window.dim() == 4 and tuple(window.shape[2:]) == (CONV_DIM, CONV_WIDTH - 1)

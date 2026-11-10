@@ -972,9 +972,14 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
         return hc_up_gate_mean(low, up, normed, hc_count, _BLOCK_H, wide)
 
     def reference(
-        self, low: torch.Tensor, up: torch.Tensor, normed: torch.Tensor, hc_count: int
+        self,
+        low: torch.Tensor,
+        up: torch.Tensor,
+        normed: torch.Tensor,
+        hc_count: int,
+        wide: bool = False,
     ) -> torch.Tensor:
-        """float64, one rounding."""
+        """float64, one rounding. `wide` does not change the result."""
         hidden = normed.shape[1] // hc_count
         gate = torch.sigmoid(F.linear(low.double(), up.double().t())).unflatten(
             -1, (hc_count, hidden)
