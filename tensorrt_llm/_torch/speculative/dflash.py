@@ -92,12 +92,13 @@ def compute_dflash_ctx_buffer_bytes(
     page_size: int = 32,
     kv_factor: int = 2,
     paged: Optional[bool] = None,
+    extra_request_slots: int = 0,
 ) -> int:
     """Per-GPU bytes ``_lazy_init_ctx_buffers`` will allocate for the DFlash
     pooled-context K/V buffers.
 
-    Mirrors the allocation exactly: ``max_batch_size + 1`` slots (one scratch
-    slot for padding/warmup dummies), capacity ``max_ctx_len + block_size``
+    Mirrors the allocation exactly: ``max_batch_size + extra_request_slots + 1``
+    slots (one scratch slot for padding/warmup dummies), capacity ``max_ctx_len + block_size``
     per slot, ``kv_factor`` halves for every drafter attention layer (K and V,
     so 2; the MLA drafter keeps one latent and no V, so 1). The dense layout
     holds ``kv_factor`` contiguous ``[slots, L, capacity, Hkv, D]`` tensors;
@@ -110,7 +111,7 @@ def compute_dflash_ctx_buffer_bytes(
     no drafter to ask -- it falls back to whether ``attention_backend`` is a
     paged backend.
     """
-    num_slots = max_batch_size + 1
+    num_slots = max_batch_size + extra_request_slots + 1
     capacity = max_ctx_len + block_size
     if paged is None:
         paged = attention_backend in _PAGED_ATTENTION_BACKENDS
@@ -246,6 +247,7 @@ def validate_dflash_ctx_buffer_budget(
     tp_size: int = 1,
     memory_budget_bytes: Optional[int] = None,
     arena_before_pool: bool = True,
+    gen_preemption_enabled: bool = False,
 ) -> None:
     """Config-time checks for failure modes DFlash otherwise hits late.
 
@@ -285,6 +287,7 @@ def validate_dflash_ctx_buffer_budget(
         arena_before_pool: Which headroom ``memory_budget_bytes`` describes
             (see ``derive_dflash_ctx_memory_budget_bytes``); only affects
             the wording and remedy of the refusal.
+        gen_preemption_enabled: Reserve private-arena rows for paused requests.
 
     Raises:
         ValueError: On a token-budget violation or when the pooled-context
@@ -368,6 +371,10 @@ def validate_dflash_ctx_buffer_budget(
     dtype_bytes = 4 if draft_config.get("torch_dtype") in ("float32", "float") else 2
     block_size = K + 1
 
+    from ..pyexecutor.scheduler.gen_preemption import paused_cap
+
+    extra_slots = paused_cap(max_batch_size) if gen_preemption_enabled else 0
+    num_slots = max_batch_size + extra_slots + 1
     required = compute_dflash_ctx_buffer_bytes(
         max_batch_size,
         max_ctx,
@@ -377,11 +384,21 @@ def validate_dflash_ctx_buffer_budget(
         head_dim,
         dtype_bytes=dtype_bytes,
         attention_backend=attention_backend,
+        extra_request_slots=extra_slots,
     )
     if required <= memory_budget_bytes:
         return
-    per_slot = required // (max_batch_size + 1)
-    fitting = int(memory_budget_bytes // per_slot) - 1  # one slot is scratch
+    per_slot = required // num_slots
+    fitting = max(0, int(memory_budget_bytes // per_slot) - 1)  # one scratch slot
+    if gen_preemption_enabled:
+        lo, hi = 0, fitting
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if mid + paused_cap(mid) + 1 <= memory_budget_bytes // per_slot:
+                lo = mid
+            else:
+                hi = mid - 1
+        fitting = lo
     gib = 1024**3
     if arena_before_pool:
         budget_desc = (
@@ -412,13 +429,18 @@ def validate_dflash_ctx_buffer_budget(
         if fitting >= 1
         else "no max_batch_size fits; lower max_seq_len or the drafter context"
     )
+    slot_formula = (
+        "max_batch_size + resident_headroom + 1 slots"
+        if gen_preemption_enabled
+        else "max_batch_size + 1 slots"
+    )
     message = (
         f"DFlash: the pooled-context K/V buffers for max_batch_size="
         f"{max_batch_size} need {required / gib:.2f} GiB per GPU, exceeding "
         f"{budget_desc} Size formula: "
-        "2 (K and V) x (max_batch_size + 1 slots) x num_layers x "
+        f"2 (K and V) x ({slot_formula}) x num_layers x "
         "(max_ctx + block_size) x kv_heads_per_rank x head_dim x dtype_bytes "
-        f"= 2 x {max_batch_size + 1} x {num_layers} x ({max_ctx} + "
+        f"= 2 x {num_slots} x {num_layers} x ({max_ctx} + "
         f"{block_size}) x {num_kv_heads_per_rank} x {head_dim} x "
         f"{dtype_bytes}. With the current settings, {remedy}."
     )
@@ -651,7 +673,8 @@ class DFlashSpecMetadata(SpecMetadata):
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
         if worker is not None and worker._ctx_buf_inited:
-            current = set(self.request_ids)
+            # Requests paused in place (GEN slot preemption) keep their slot.
+            current = set(self.request_ids) | getattr(self, "paused_in_place_ids", frozenset())
             # Slot lengths (and bases) written in one batch: evicted slots are
             # emptied, newly assigned ones seeded below.
             updates, bases = {}, {}
@@ -1495,11 +1518,13 @@ class DFlashWorker(SpecWorkerBase):
 
         dtype = dflash_context_dtype(draft_model)
 
-        # Reserve slot index max_batch as a scratch slot for padding/unknown
-        # dummies; real requests only draw slots 0..max_batch-1, so dummy
-        # writes land here and can't corrupt a real request's context.
-        self._dummy_slot = max_batch
-        num_slots = max_batch + 1
+        # Real requests draw slots 0..num_req_slots-1 (max_batch plus requests
+        # paused in place by GEN slot preemption); the next slot is a scratch
+        # slot for padding/unknown dummies, so dummy writes can't corrupt a
+        # real request's context.
+        num_req_slots = max_batch + getattr(cache_manager, "gen_preemption_headroom", 0)
+        self._dummy_slot = num_req_slots
+        num_slots = num_req_slots + 1
         # CUDA-graph padding uses ids counting down from
         # CUDA_GRAPH_DUMMY_REQUEST_ID; a floor of one draft block separates them
         # from real ids. Imported lazily to avoid an import cycle.
@@ -1516,7 +1541,7 @@ class DFlashWorker(SpecWorkerBase):
             pin_memory=prefer_pinned(),
         )
 
-        self._free_slots = deque(range(max_batch))
+        self._free_slots = deque(range(num_req_slots))
         self._req_to_slot = {}
         self._req_ctx_pos = {}
 
