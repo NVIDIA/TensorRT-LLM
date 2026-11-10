@@ -919,10 +919,10 @@ def test_fa4_shared_prefix_attention_matches_dense_and_writes_kv(
     """FlashAttention-4 for the shared pages (whole, or split into runs, some empty: 4 shared pages
     split 8 ways) and the private pages + their merge against the float64 reference (also with
     massive activations), and the step's K/V written at cached + j."""
-    from tensorrt_llm._torch.attention.backends.fmha import flash_attn4_generation as fa4_gen
+    from tensorrt_llm._torch.attention.backends.fmha import flash_attn4_kernels as fa4_kernels
 
     # One page (32 tokens) per run/chunk at least: the 4 shared pages really split.
-    monkeypatch.setattr(fa4_gen, "MIN_SPLIT_TOKENS", min_split_tokens)
+    monkeypatch.setattr(fa4_kernels, "MIN_SPLIT_TOKENS", min_split_tokens)
     for seed in range(2):
         case = _spec_case(num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows,
                           seed, overshoot, massive=massive)  # fmt: skip

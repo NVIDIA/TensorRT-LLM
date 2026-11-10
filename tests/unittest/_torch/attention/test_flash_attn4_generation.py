@@ -18,8 +18,8 @@ import math
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
-    _fa4_forward,
+from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_kernels import (
+    fa4_forward,
     fa4_paged_generation,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -27,7 +27,7 @@ from tensorrt_llm._utils import get_sm_version
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
     pytest.mark.skipif(
-        not torch.cuda.is_available() or get_sm_version() != 90 or _fa4_forward() is None,
+        not torch.cuda.is_available() or get_sm_version() != 90 or fa4_forward() is None,
         reason="FlashAttention-4 generation path is SM90-only",
     ),
 ]
@@ -203,7 +203,7 @@ def test_rope_write_kv_paged_matches_rope_then_write(
     """The fused launch leaves the pool as NeoX RoPE + ``write_kv_paged`` do and the Q heads
     rotated in place the same way (partial rotary, rows whose first tokens fall before
     position 0 write nothing for them)."""
-    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_kernels import (
         rope_write_kv_paged,
         write_kv_paged,
     )
@@ -264,14 +264,15 @@ def test_fa4_paged_generation_split_matches_dense(
     float64 reference, including rows whose cache is shorter than the split count (empty chunks) and rows
     with nothing cached before the page of their first step token; chunks of at least one page or of at
     least the default minimum length."""
-    from tensorrt_llm._torch.attention.backends.fmha import flash_attn4_generation as fa4_gen
-    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+    from tensorrt_llm._torch.attention.backends.fmha import flash_attn4_kernels as fa4_kernels
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_kernels import (
+        allocate_split_workspace,
         fa4_paged_generation_split,
         split_tables,
         write_kv_paged,
     )
 
-    monkeypatch.setattr(fa4_gen, "MIN_SPLIT_TOKENS", min_split_tokens)
+    monkeypatch.setattr(fa4_kernels, "MIN_SPLIT_TOKENS", min_split_tokens)
     for seed in range(2):
         case = _case(num_heads, num_kv_heads, head_dim, q_len, rows=5, seed=seed, massive=massive)
         ref = _reference(case, num_heads, num_kv_heads, head_dim, q_len)
@@ -280,9 +281,13 @@ def test_fa4_paged_generation_split_matches_dense(
         )
         tables = split_tables(case["page_table"], case["kv_lens"], q_len, splits, case["tpb"])
         out = torch.empty_like(case["q"])
-        fa4_paged_generation_split(
-            case["pool"], case["q"], out, tables, q_len, splits, 1.0 / math.sqrt(head_dim)
+        workspace = allocate_split_workspace(
+            5, splits, q_len, num_heads, head_dim, out.dtype, out.device
         )
+        fa4_paged_generation_split(
+            case["pool"], case["q"], out, tables, q_len, splits, 1.0 / math.sqrt(head_dim),
+            workspace,
+        )  # fmt: skip
         torch.cuda.synchronize()
         head_max = ref.abs().amax(-1)
         err = (out.double() - ref).abs().amax(-1)
@@ -291,7 +296,7 @@ def test_fa4_paged_generation_split_matches_dense(
 
 
 def test_generation_splits_follow_the_grid(monkeypatch):
-    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_kernels import (
         SPLITS_ENV,
         generation_splits,
     )
@@ -310,7 +315,7 @@ def test_generation_splits_follow_the_grid(monkeypatch):
 def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions(q_len):
     """A page table covering only the end of each row (``page_lens`` < ``kv_lens``, as for the n-sample
     library's private pages): RoPE at the absolute positions, K/V at slot ``page_len - q_len + j``."""
-    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_kernels import (
         rope_write_kv_paged,
         write_kv_paged,
     )
@@ -403,3 +408,16 @@ def test_per_layer_page_tables_are_declined(per_layer_tables):
         fmha, q, None, None, metadata, forward_args, phase=FmhaPhase.GENERATION
     )
     assert supported is not per_layer_tables
+
+
+def test_split_workspaces_are_owned_per_kv_cache_manager():
+    """A split call writes its workspace, so concurrent executors in one process (each with its own
+    KV cache manager) never share one; the layers of one executor do."""
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import _split_workspace
+
+    q = torch.empty((8, 4, 64), dtype=torch.bfloat16, device="cuda")
+    first, second = object.__new__(type("Manager", (), {})), object.__new__(type("Manager", (), {}))
+    workspace = _split_workspace(first, 2, 4, 4, 4, 64, q)
+    assert _split_workspace(first, 2, 4, 4, 4, 64, q) is workspace
+    other = _split_workspace(second, 2, 4, 4, 4, 64, q)
+    assert all(a.data_ptr() != b.data_ptr() for a, b in zip(workspace, other))
