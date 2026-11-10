@@ -58,9 +58,47 @@ def _load_test_unittests_module() -> types.ModuleType:
 
 
 _TEST_UNITTESTS = _load_test_unittests_module()
+_junit_all_skipped_reason = _TEST_UNITTESTS._junit_all_skipped_reason
 _junit_culprits = _TEST_UNITTESTS._junit_culprits
 _fail_unittests = _TEST_UNITTESTS._fail_unittests
 _parallel_config_key = _TEST_UNITTESTS._parallel_config_key
+
+
+def test_junit_all_skipped_reason_matches_only_an_all_skip_report(tmp_path: Path) -> None:
+    report = tmp_path / "results.xml"
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest" errors="0" failures="0" skipped="2" tests="2">
+    <testcase classname="pkg.test_awq" name="test_a"><skipped message="SM100" /></testcase>
+    <testcase classname="pkg.test_awq" name="test_b"><skipped message="SM100" /></testcase>
+  </testsuite>
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_skipped_reason(str(report)) == "all 2 unittest(s) skipped"
+
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest" errors="0" failures="0" skipped="1" tests="2">
+    <testcase classname="pkg.test_awq" name="test_a"><skipped message="SM100" /></testcase>
+    <testcase classname="pkg.test_awq" name="test_b" />
+  </testsuite>
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_skipped_reason(str(report)) is None
+
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" />
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_skipped_reason(str(report)) is None
+    assert _junit_all_skipped_reason(str(tmp_path / "missing.xml")) is None
 
 
 def test_junit_culprits_reports_failures_and_errors(tmp_path: Path) -> None:

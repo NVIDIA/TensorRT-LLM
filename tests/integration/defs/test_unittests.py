@@ -67,6 +67,45 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
 
 
+def _junit_all_skipped_reason(xml_path: str) -> Optional[str]:
+    """Reason when every testcase in a JUnit report was skipped.
+
+    The inner pytest exits 0 in that case, so ``test_unittests_v2`` would
+    otherwise be recorded as PASSED. A missing, empty, or mixed report
+    returns None.
+    """
+    import xml.etree.ElementTree as ElementTree
+    try:
+        root = ElementTree.parse(xml_path).getroot()
+    except (OSError, ElementTree.ParseError):
+        return None
+    suites = list(root.iter("testsuite"))
+    if root.tag == "testsuite":
+        suites = [root]
+    tests = skipped = failures = errors = 0
+    counted_suite = False
+    for suite in suites:
+        if "tests" not in suite.attrib:
+            continue
+        counted_suite = True
+        try:
+            tests += int(suite.attrib.get("tests", "0"))
+            skipped += int(suite.attrib.get("skipped", "0"))
+            failures += int(suite.attrib.get("failures", "0"))
+            errors += int(suite.attrib.get("errors", "0"))
+        except ValueError:
+            return None
+    if not counted_suite:
+        cases = [case for case in root.iter("testcase") if case.get("name")]
+        tests = len(cases)
+        skipped = sum(1 for case in cases if case.find("skipped") is not None)
+        failures = sum(1 for case in cases if case.find("failure") is not None)
+        errors = sum(1 for case in cases if case.find("error") is not None)
+    if tests > 0 and failures == 0 and errors == 0 and skipped == tests:
+        return f"all {tests} unittest(s) skipped"
+    return None
+
+
 def _junit_culprits(xml_path: str) -> list[str]:
     """Names of failed/errored tests in a JUnit report.
 
@@ -465,6 +504,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if not passed:
         _fail_unittests("failure reported in unittests", output_xml, output_dir,
                         case, unfinished_test_path)
+    skip_reason = _junit_all_skipped_reason(output_xml)
+    if skip_reason:
+        import pytest
+        pytest.skip(f"{case}: {skip_reason}")
 
 
 def test_csa2_tensor_parallel(llm_root, llm_venv, output_dir):
