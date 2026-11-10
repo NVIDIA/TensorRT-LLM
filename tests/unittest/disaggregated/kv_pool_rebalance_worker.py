@@ -77,9 +77,11 @@ MAX_SEQ_LEN = 1024
 WINDOWS = [256, 256, 256, 256, MAX_SEQ_LEN]
 REQ_LEN = 200
 MODE = os.environ.get("MODE", "refresh")
-# The ctx completion check waits for the request's transfer deadline even after a
-# send has failed, so the negative control, whose first send fails, uses a short one.
-TRANSFER_TIMEOUT_MS = 10_000 if MODE == "skiptail" else 60_000
+# One deadline for every mode. It also covers the three warm-up transfers, and the
+# first of those includes NIXL/UCX connection setup, which can take over 10 s on a
+# busy or slow node. The negative control's ctx completion check waits out this
+# deadline after its send fails, which only makes that case slower.
+TRANSFER_TIMEOUT_MS = 60_000
 
 
 def build_mgr(mapping):
