@@ -149,3 +149,22 @@ def test_beam_shared_prefix_is_opt_in_and_precedes_fallback(
     enabled = _enabled_names()
     assert beam in enabled
     assert enabled.index(beam) < enabled.index("fallback")
+
+
+def test_only_enabled_libraries_that_plan_steps_are_planned_and_report_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare() runs ``plan_step`` of, and the executor reports ``step_stats`` of, the enabled
+    libraries that define them; with the default libraries there are none, so steady decode steps
+    stay available."""
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    assert registry.step_planning_fmha_lib_classes() == ()
+    assert registry.step_stats_fmha_lib_classes() == ()
+
+    shared_prefix = registry.FMHA_LIBS[SAMPLING_SHARED_PREFIX]
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{SAMPLING_SHARED_PREFIX},+flash_attn4_generation")
+    assert registry.step_planning_fmha_lib_classes() == (shared_prefix,)
+    assert registry.step_stats_fmha_lib_classes() == (shared_prefix,)
+    assert {name for name, cls in registry.FMHA_LIBS.items() if cls.plans_steps()} == {
+        SAMPLING_SHARED_PREFIX
+    }

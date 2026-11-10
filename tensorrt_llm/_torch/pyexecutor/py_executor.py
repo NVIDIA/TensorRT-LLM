@@ -1466,11 +1466,12 @@ class PyExecutor:
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
             self.kv_cache_manager.snapshot_warmup_baseline()
-        # Likewise drop the warmup steps from the shared-prefix attention counters.
-        sampling_shared_prefix = self._shared_prefix_attn_library()
-        if (sampling_shared_prefix is not None
-                and self.kv_cache_manager is not None):
-            sampling_shared_prefix.reset_step_stats(self.kv_cache_manager)
+        # Likewise drop the warmup steps from the FMHA libraries' step counters.
+        if self.kv_cache_manager is not None:
+            from tensorrt_llm._torch.attention.backends.fmha.registry import \
+                step_stats_fmha_lib_classes
+            for fmha_cls in step_stats_fmha_lib_classes():
+                fmha_cls.reset_step_stats(self.kv_cache_manager)
 
         self.is_shutdown = False
         # Set at the executor loops' normal-exit `break` sites, and ONLY
@@ -3994,7 +3995,7 @@ class PyExecutor:
             gpu_forward_time_ms=gpu_forward_time_ms,
             mm_encoder_stats=mm_encoder_stats,
             executor_loop=loop_metrics,
-            shared_prefix_attn_stats=self._shared_prefix_attn_stats())
+            fmha_step_stats=self._fmha_step_stats())
 
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
@@ -4076,34 +4077,30 @@ class PyExecutor:
                     self.stats.pop(0)
                 self.stats.append(row)
 
-    @staticmethod
-    def _shared_prefix_attn_library():
-        """The shared-prefix attention module when that FMHA library is enabled, else None."""
-        from tensorrt_llm._torch.attention.backends.fmha.registry import \
-            is_fmha_lib_enabled
-        if not is_fmha_lib_enabled("sampling_shared_prefix"):
-            return None
-        from tensorrt_llm._torch.attention.backends.fmha import \
-            sampling_shared_prefix
-        return sampling_shared_prefix
-
-    def _shared_prefix_attn_stats(
-            self,
-            attention_dp_rank: Optional[int] = None) -> Optional[Dict[str, int]]:
-        """Cumulative shared-prefix attention counters of this executor's KV cache.
+    def _fmha_step_stats(
+        self,
+        attention_dp_rank: Optional[int] = None
+    ) -> Optional[Dict[str, Dict[str, int]]]:
+        """Cumulative per-step counters of the enabled FMHA libraries that keep them
+        (``Fmha.step_stats``) for this executor's KV cache, by iteration-stats record field.
 
         Cumulative, so a consumer that misses records (a bounded stats buffer)
-        still reads exact totals. None unless that FMHA library is enabled, and
+        still reads exact totals. None when no such library is enabled, and
         for records this rank appends on behalf of another attention-DP rank
         (the counters are local to each rank; TLLM_METRICS_ALL_RANKS=1 reports
         every rank's own).
         """
-        if attention_dp_rank not in (None, self.dist.tp_rank):
+        if (attention_dp_rank not in (None, self.dist.tp_rank)
+                or self.kv_cache_manager is None):
             return None
-        sampling_shared_prefix = self._shared_prefix_attn_library()
-        if sampling_shared_prefix is None or self.kv_cache_manager is None:
-            return None
-        return sampling_shared_prefix.step_stats(self.kv_cache_manager).as_dict()
+        from tensorrt_llm._torch.attention.backends.fmha.registry import \
+            step_stats_fmha_lib_classes
+        stats = {
+            fmha_cls.step_stats_field:
+            fmha_cls.step_stats(self.kv_cache_manager)
+            for fmha_cls in step_stats_fmha_lib_classes()
+        }
+        return stats or None
 
     def _process_iter_stats(
         self,

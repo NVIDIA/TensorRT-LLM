@@ -51,15 +51,6 @@ def _open_size_gate(monkeypatch):
     monkeypatch.setenv(lib.MIN_GROUP_ENV, "2")
 
 
-@pytest.fixture(autouse=True)
-def _model_shape(request, monkeypatch):
-    """The library remembers the attention shape of the model it serves; the host and planner tests
-    use the MHA shape of the n-sample target (20 heads of 128). The end-to-end tests start without
-    one, so the model they load sets its own."""
-    shape = None if request.node.name.endswith("_e2e") else (20, 20, 128)
-    monkeypatch.setattr(lib, "_model_shape", shape)
-
-
 def _build(pages, kv_lens, tpb, *, q_len=1, max_sharing_groups=None, padded_groups=None, **kw):
     pages = np.asarray(pages, dtype=np.int64)
     return lib._build_grouping(
@@ -235,23 +226,31 @@ def test_step_stats_count_request_steps_per_kv_manager():
 
 
 def test_executor_reports_only_its_own_rank_counters(monkeypatch):
-    """Records appended on behalf of another attention-DP rank carry no counters (they are local)."""
+    """The executor reports the counters of the enabled libraries that keep them, under their record
+    field; records appended on behalf of another attention-DP rank carry none (they are local)."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = object.__new__(PyExecutor)
     executor.dist = SimpleNamespace(rank=0, tp_rank=0)
     executor.kv_cache_manager = _Manager()
-    monkeypatch.setattr(PyExecutor, "_shared_prefix_attn_library", staticmethod(lambda: lib))
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "+sampling_shared_prefix")
     lib.reset_step_stats()
     lib._record_step(_stats_meta(executor.kv_cache_manager, [5, 6]), None)
-    expected = {"requestSteps": 2, "shareableRequestSteps": 0, "sharedRequestSteps": 0}
-    assert executor._shared_prefix_attn_stats() == expected
-    assert executor._shared_prefix_attn_stats(attention_dp_rank=0) == expected
-    assert executor._shared_prefix_attn_stats(attention_dp_rank=1) is None
+    expected = {
+        "sharedPrefixAttnStats": {
+            "requestSteps": 2,
+            "shareableRequestSteps": 0,
+            "sharedRequestSteps": 0,
+        }
+    }
+    assert executor._fmha_step_stats() == expected
+    assert executor._fmha_step_stats(attention_dp_rank=0) == expected
+    assert executor._fmha_step_stats(attention_dp_rank=1) is None
     executor.kv_cache_manager = None
-    assert executor._shared_prefix_attn_stats() is None
-    monkeypatch.setattr(PyExecutor, "_shared_prefix_attn_library", staticmethod(lambda: None))
-    assert PyExecutor._shared_prefix_attn_stats(executor) is None
+    assert executor._fmha_step_stats() is None
+    executor.kv_cache_manager = _Manager()
+    monkeypatch.delenv("TLLM_FMHA_LIBS")
+    assert executor._fmha_step_stats() is None
     lib.reset_step_stats()
 
 
@@ -326,22 +325,22 @@ def test_size_gate_follows_saved_bytes(monkeypatch):
     assert lib.group_saved_bytes(rows, tokens, mha).tolist() == [
         (r - 1) * t * 10240 for r, t in zip(rows.tolist(), tokens.tolist())
     ]
-    monkeypatch.setattr(lib, "_model_shape", mha)
-    assert lib._group_filter(9)(rows, tokens).tolist() == [False, True, False, True, True, True]
-    monkeypatch.setattr(lib, "_model_shape", gqa)
-    assert lib._group_filter(9)(rows, tokens).all()
+    assert lib._group_filter(9, mha)(rows, tokens).tolist() == [
+        False, True, False, True, True, True
+    ]  # fmt: skip
+    assert lib._group_filter(9, gqa)(rows, tokens).all()
     # The Curiosity-4B cells (20-80 rows per group, 600-6,500 shared tokens) always share.
-    monkeypatch.setattr(lib, "_model_shape", mha)
     cells = np.array([[20, 600], [40, 600], [80, 600], [20, 6500]])
-    assert lib._group_filter(9)(cells[:, 0], cells[:, 1]).all()
+    assert lib._group_filter(9, mha)(cells[:, 0], cells[:, 1]).all()
 
 
 def test_group_filter_follows_the_env_threshold(monkeypatch):
     rows, tokens = np.array([2, 40, 40, 1]), np.array([4000, 32, 4000, 4000])
+    mha = (20, 20, 128)
     monkeypatch.setenv(lib.MIN_SHARED_ENV, "1000")
-    assert lib._group_filter(9)(rows, tokens).tolist() == [True, False, True, False]
+    assert lib._group_filter(9, mha)(rows, tokens).tolist() == [True, False, True, False]
     monkeypatch.setenv(lib.MIN_GROUP_ENV, "3")
-    assert lib._group_filter(9)(rows, tokens).tolist() == [False, False, True, False]
+    assert lib._group_filter(9, mha)(rows, tokens).tolist() == [False, False, True, False]
 
 
 # --------------------------------------------------------------------------- #
@@ -413,7 +412,9 @@ class _Manager(SimpleNamespace):  # weak-referenceable, like the real managers
 
 
 def _planner_meta(host, request_ids, slot_of, kv_lens, tpb, *, q_len, caches, index_scale=2,
-                  kv_factor=2, is_cuda_graph=False):  # fmt: skip
+                  kv_factor=2, is_cuda_graph=False, kv_heads=20, head_dim=128,
+                  heads_per_kv=1):  # fmt: skip
+    """Metadata of an executor whose KV pool view is [512 pages, 2, kv_heads, tpb, head_dim]."""
     rows = len(request_ids)
     manager = _Manager(
         layer_offsets={0: 0},
@@ -422,7 +423,9 @@ def _planner_meta(host, request_ids, slot_of, kv_lens, tpb, *, q_len, caches, in
         index_mapper=SimpleNamespace(get_index=lambda rid: slot_of[rid]),
         layer_to_pool_mapping_dict={0: 0},
         get_layer_page_index_scale=lambda layer_idx: index_scale,
-        get_buffers=lambda layer, kv_layout: torch.empty(512, 1),
+        get_buffers=lambda layer, kv_layout: torch.empty(
+            (512, 2, kv_heads, tpb, head_dim), dtype=torch.bfloat16, device="meta"
+        ),
     )
     return SimpleNamespace(
         fmha_plan_caches=caches,
@@ -437,7 +440,77 @@ def _planner_meta(host, request_ids, slot_of, kv_lens, tpb, *, q_len, caches, in
         num_tokens=rows * q_len,
         seq_lens=torch.full((rows,), q_len, dtype=torch.int32),
         is_cuda_graph=is_cuda_graph,
+        max_num_heads_per_kv=heads_per_kv,
     )
+
+
+@needs_fa4
+def test_plan_takes_the_attention_shape_of_its_executor():
+    """Two models of different attention shapes in one process (one after the other, or side by
+    side) each plan with the shape of their own KV cache and query heads per KV head: step buffers
+    and size gate never carry another model's shape."""
+    tpb, q_len = 4, 4
+    host = torch.zeros(1, 2, 2, 4, dtype=torch.int32)
+    host[0, :, 0, :] = torch.tensor([[5, 6, 10, 11], [5, 6, 7, 12]])
+    plans = {}
+    for name, kv_heads, head_dim, heads_per_kv in (("mha", 20, 128, 1), ("gqa", 4, 64, 7)):
+        caches = {}
+        meta = _planner_meta(host, [1, 2], {1: 0, 2: 1}, [12, 14], tpb, q_len=q_len, caches=caches,
+                             kv_heads=kv_heads, head_dim=head_dim,
+                             heads_per_kv=heads_per_kv)  # fmt: skip
+        lib._plan_sampling_step(meta)
+        plans[name] = caches[lib.SAMPLING_KEY]
+    assert plans["mha"].shape == (20, 20, 128)
+    assert plans["gqa"].shape == (28, 4, 64)
+    for state in plans.values():
+        num_heads, _, head_dim = state.shape
+        assert state.buffers.tail.out.shape[1:] == (num_heads, head_dim)
+        assert state.buffers.prefix.q.shape[1:] == (num_heads, head_dim)
+
+
+@needs_fa4
+def test_a_layer_of_another_shape_than_the_plan_takes_the_regular_kernel():
+    """A layer whose (heads, KV heads, head size) differ from the plan's declines the batch, so the
+    step buffers are never used with another shape; layers of the plan's shape take it."""
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
+    )
+    from tensorrt_llm.functional import PositionEmbeddingType
+
+    tpb, q_len, rows = 4, 4, 2
+    host = torch.zeros(1, 2, 2, 4, dtype=torch.int32)
+    host[0, :, 0, :] = torch.tensor([[5, 6, 10, 11], [5, 6, 7, 12]])
+    caches = {}
+    meta = _planner_meta(host, [1, 2], {1: 0, 2: 1}, [12, 14], tpb, q_len=q_len,
+                         caches=caches)  # fmt: skip
+    lib._plan_sampling_step(meta)
+    assert caches[lib.SAMPLING_KEY].shape == (20, 20, 128)
+    # Batch fields of an eligible n-sample decode step (``sampling_metadata_eligible``).
+    manager = meta.kv_cache_manager
+    manager.host_kv_cache_block_offsets = host
+    manager.tokens_per_block = tpb
+    for key, value in dict(beam_width=1, is_cross=False, enable_helix=False,
+                           is_spec_dec_tree=False, is_spec_dec_dynamic_tree=False,
+                           kv_cache_params=SimpleNamespace(use_cache=True),
+                           max_seq_len=64).items():  # fmt: skip
+        setattr(meta, key, value)
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        is_fused_qkv=True,
+        update_kv_cache=True,
+    )
+    q = torch.empty((rows * q_len, 1), dtype=torch.bfloat16)
+
+    def supported(num_heads, num_kv_heads, head_dim):
+        attn = _Attn(num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+                     layer_idx=0, is_mla_enable=False,
+                     position_embedding_type=int(PositionEmbeddingType.learned_absolute))  # fmt: skip
+        return lib.SamplingSharedPrefixFmha(attn)._is_supported(q, None, None, meta, forward_args)
+
+    assert supported(20, 20, 128)
+    assert not supported(28, 4, 128)
+    assert not supported(20, 20, 64)
 
 
 @needs_fa4
@@ -674,6 +747,7 @@ def test_library_cuda_graph_replay_matches_eager_across_steps(monkeypatch):
             num_tokens=rows * q_len,
             seq_lens=torch.full((rows,), q_len, dtype=torch.int32),
             is_cuda_graph=True,
+            max_num_heads_per_kv=1,
         )
         lib._plan_sampling_step(meta)
         state = caches[lib.SAMPLING_KEY]
