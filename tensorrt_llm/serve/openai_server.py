@@ -38,6 +38,7 @@ from transformers import AutoProcessor
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
@@ -977,7 +978,8 @@ class OpenAIServer(_VideoRoutesMixin):
         trust_remote_code = self.generator.args.trust_remote_code
         checkpoint_format = getattr(self.generator.args, "checkpoint_format",
                                     None)
-        if checkpoint_format in ("mistral", "mistral_large_3"):
+        if checkpoint_format in (CheckpointFormat.MISTRAL,
+                                 CheckpointFormat.MISTRAL_LARGE_3):
             # Do not load HF processor for mistral native checkpoints
             # even if it is available
             self.processor = None
@@ -2500,6 +2502,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
+            if raw_request is not None:
+                # The executor client id, which the perf metrics, the
+                # post-processor hook records and the disconnect log carry. A
+                # caller that names its reply after the request (the Anthropic
+                # route) reads it here; a non-streamed chat completion's own id
+                # is random.
+                raw_request.state.executor_client_id = promise.request_id
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -2560,10 +2569,14 @@ class OpenAIServer(_VideoRoutesMixin):
             return anthropic_error_response("Internal server error",
                                             "api_error", 500)
 
+        # The reply is named after the request (see anthropic_message_id).
+        executor_client_id = getattr(raw_request.state, "executor_client_id",
+                                     None)
         if isinstance(response, StreamingResponse):
             return StreamingResponse(
                 content=reframe_openai_stream(response.body_iterator,
-                                              model=self.model),
+                                              model=self.model,
+                                              request_id=executor_client_id),
                 media_type="text/event-stream",
             )
 
@@ -2580,7 +2593,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            anthropic_response = convert_chat_response(
+                chat_response, request_id=executor_client_id)
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error("Invalid response from OpenAI chat pipeline:\n"
                          f"{traceback.format_exc()}")
@@ -2730,7 +2744,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            anthropic_response = convert_chat_response(
+                chat_response,
+                request_id=getattr(raw_request.state, "executor_client_id",
+                                   None))
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error(
                 "Invalid response from OpenAI chat pipeline in batch:\n"

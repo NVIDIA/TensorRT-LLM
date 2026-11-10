@@ -8,16 +8,24 @@ import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
 
+from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.moe.routed_experts import (  # noqa: E501
-    ACT_TYPE_SWIGLU,
-    FUSED_ROUTER_WORKSPACE_WORDS,
-    ROUTING_METHOD_DEEPSEEK_V3,
-    make_fused_router_workspace,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.moe.routed_experts import (  # noqa: E501
-    routed_experts as op,
-)
+
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency import (
+        native_ops,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.moe.routed_experts import (  # noqa: E501
+        ACT_TYPE_SWIGLU,
+        FUSED_ROUTER_WORKSPACE_WORDS,
+        ROUTING_METHOD_DEEPSEEK_V3,
+        make_fused_router_workspace,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.moe.routed_experts import (  # noqa: E501
+        routed_experts as op,
+    )
+except NoTarget as exc:
+    pytest.skip(str(exc), allow_module_level=True)
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../.."]
@@ -432,13 +440,13 @@ def test_custom_op_mutation_schema_and_fake(
     with monkeypatch.context() as patch:
         patch.setattr(torch, "allclose", allclose_with_float8)
         torch.library.opcheck(
-            torch.ops.trtllm.glm_routed_experts.default,
+            native_ops.glm_routed_experts.default,
             (),
             args,
             test_utils=("test_schema",),
         )
     torch.library.opcheck(
-        torch.ops.trtllm.glm_routed_experts.default,
+        native_ops.glm_routed_experts.default,
         (),
         args,
         test_utils=("test_faketensor",),

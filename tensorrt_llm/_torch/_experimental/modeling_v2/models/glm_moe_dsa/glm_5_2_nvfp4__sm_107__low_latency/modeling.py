@@ -27,12 +27,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     AttentionMetadata,
 )
-from tensorrt_llm._torch.attention.backends.sparse.dsa.module import forward_generation_sparse_attn
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSABackendForwardArgs
 from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_speculative import _slice_spec_position_ids
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.swiglu import swiglu
@@ -44,13 +42,16 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.kernel_inputs import (
 from tensorrt_llm._torch.speculative import MTPEagleWorker, SpecMetadata, get_num_extra_kv_tokens
 from tensorrt_llm._torch.utils import EventType
 
+from . import native_ops
 from . import weights as _weights
+from ._dsa import forward_generation_sparse_attn
 from ._full_context import FullContextIndexer
+from ._megakernel import GlmMegakernel
 from ._model import Glm52Model
 from ._model import setup_aliases as _setup_aliases
 from ._mtp_worker import MTPDraftWorker
 from ._small_batch_draft import DRAFT_SHAPES, build_small_batch_draft
-from ._speculative import Glm52SpecDecOneEngineForCausalLM
+from ._speculative import Glm52SpecDecOneEngineForCausalLM, _slice_spec_position_ids
 from .ops.attention.mla_kv_half_append import mla_kv_half_append
 from .ops.attention.sparse_mla_flash_decode import (
     sparse_mla_flash_decode,
@@ -321,6 +322,7 @@ class DecodeTarget:
             self._full_context = FullContextIndexer(self, core._decode_context_capacity, device)
         if self.mapping.tp_size == 8:
             self._prepare_tp8_rows(device)
+        self._megakernel = GlmMegakernel.create(self)
 
     def _prepare_tp8_rows(self, device: torch.device) -> None:
         """Check the complete TP8 projection/collective route before profiling writes KV."""
@@ -588,7 +590,7 @@ class DecodeTarget:
                 1 <= rows <= 8
                 and rows <= FUSED_ROUTER_MAX_TOKENS
                 and bool(
-                    torch.ops.trtllm.glm_dense_mlp_small_m_supported(
+                    native_ops.glm_dense_mlp_small_m_supported(
                         rows, self.hidden_size, INTER_PER_RANK
                     )
                 )
@@ -639,7 +641,17 @@ class DecodeTarget:
             return hidden_states
         sharded = self._shard_indexer_keys(attn_metadata)
         self._keys_sharded = sharded
+        megakernel = self._megakernel
+        if megakernel is not None and (
+            not sharded or not megakernel.begin(hidden_states, attn_metadata, spec_metadata)
+        ):
+            megakernel = None
         for layer in layers:
+            if megakernel is not None and layer.layer_idx in megakernel.layers:
+                hidden_states, residual = megakernel.layers[layer.layer_idx].forward(
+                    hidden_states, residual, attn_metadata, self._hist_buffers["topk"][:8]
+                )
+                continue
             attn_out = self._attention(layer, position_ids, hidden_states, attn_metadata, sharded)
             quantized = None
             if self._ipc is not None and not isinstance(layer.mlp, GatedMLP):

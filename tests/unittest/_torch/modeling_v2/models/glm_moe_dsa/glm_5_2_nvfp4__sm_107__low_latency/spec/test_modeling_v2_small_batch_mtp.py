@@ -7,21 +7,26 @@ these tests exercise the real bridge around it, not GPU kernel numerics.
 """
 
 import contextlib
+import importlib
 import inspect
-from types import SimpleNamespace
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency import (
-    _mtp_worker as worker_module,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency import (
-    _small_batch_draft as small,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency._mtp_worker import (  # noqa: E501
-    MTPDraftWorker,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.models import glm_moe_dsa
+
+# Load the Python bridge under a private package so CPU reference tests do not
+# initialize the CUDA-only target or alter its production import state.
+_PACKAGE = ModuleType("_glm_small_batch_cpu")
+_PACKAGE.__path__ = [str(Path(glm_moe_dsa.__file__).parent / "glm_5_2_nvfp4__sm_107__low_latency")]
+_PACKAGE.native_ops = SimpleNamespace()
+sys.modules[_PACKAGE.__name__] = _PACKAGE
+small = importlib.import_module(f"{_PACKAGE.__name__}._small_batch_draft")
+worker_module = importlib.import_module(f"{_PACKAGE.__name__}._mtp_worker")
+MTPDraftWorker = worker_module.MTPDraftWorker
 
 pytestmark = pytest.mark.cpu_only
 

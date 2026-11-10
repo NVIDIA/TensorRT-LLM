@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from ... import native_ops
 
 #: GLM-5.2's vocabulary and hidden size: the table every rank holds whole.
 VOCAB = 154880
@@ -80,7 +81,7 @@ class GlmFusedEmbedding(OpWrapper):
     """
 
     def __call__(self, input_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        return torch.ops.trtllm.glm_fused_embedding(input_ids, weight)
+        return native_ops.glm_fused_embedding(input_ids, weight)
 
     def reference(self, input_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         """The table rows of the in-range ids, zero rows elsewhere: a gather,

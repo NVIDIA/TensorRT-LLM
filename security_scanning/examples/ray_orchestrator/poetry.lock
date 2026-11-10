@@ -575,14 +575,14 @@ files = [
 
 [[package]]
 name = "click"
-version = "8.5.0"
+version = "8.5.1"
 description = "Composable command line interface toolkit"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "click-8.5.0-py3-none-any.whl", hash = "sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360"},
-    {file = "click-8.5.0.tar.gz", hash = "sha256:ba0d2089de75ea0310e2dde03160e6ca10009947fb95a182f9b54021bb272e34"},
+    {file = "click-8.5.1-py3-none-any.whl", hash = "sha256:8bb5376d2006950386f8c6427613334a2acadc5f559cb80e638d00b4df957e37"},
+    {file = "click-8.5.1.tar.gz", hash = "sha256:9bbfada76703fd1d784b83eea012e3e8c6a001a876543ef104fa56aaaeb072b4"},
 ]
 
 [[package]]
@@ -716,15 +716,15 @@ files = [
 
 [[package]]
 name = "filelock"
-version = "4.2.9"
+version = "4.2.10"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 markers = "python_version == \"3.12\""
 files = [
-    {file = "filelock-4.2.9-py3-none-any.whl", hash = "sha256:a379c50a729e5b68c8519a4d26489f755d9769960a236ecd838190e2a78db2e9"},
-    {file = "filelock-4.2.9.tar.gz", hash = "sha256:96530b7c538d4ea08493ab067247aab7948c54d8cd622cce711c97cccc5d9896"},
+    {file = "filelock-4.2.10-py3-none-any.whl", hash = "sha256:9479aaeb4db20b5a53e3da28493edd24720b66b8a0b84030aa56ccdf243d6857"},
+    {file = "filelock-4.2.10.tar.gz", hash = "sha256:fcc3c0cb8bfe7f4b3bb0e231c04b15dbad068cb3c2515f343d8fde4dce93bd5d"},
 ]
 
 [[package]]
@@ -2119,14 +2119,14 @@ typing-extensions = ">=4.16.0"
 
 [[package]]
 name = "python-discovery"
-version = "1.9.4"
+version = "1.9.5"
 description = "Python interpreter discovery"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "python_discovery-1.9.4-py3-none-any.whl", hash = "sha256:b468f365040b40f4cb39918b0766d3e5a2f340968e07df752fbc96f1bb4641ab"},
-    {file = "python_discovery-1.9.4.tar.gz", hash = "sha256:c01b45fe515c1d268b57c57d554bb0e1d320b8e9eb5490bb2f4f577be26e4380"},
+    {file = "python_discovery-1.9.5-py3-none-any.whl", hash = "sha256:a1fae8fca11e4bc61e38491c2aafff29e430b3c5e272d51ae52fb895bc4c0fac"},
+    {file = "python_discovery-1.9.5.tar.gz", hash = "sha256:86279f5d2728bc067de28b7ddc571be2eacc2ae0e7048f8629d2481a0f8848a2"},
 ]
 
 [package.dependencies]
@@ -2608,14 +2608,14 @@ files = [
 
 [[package]]
 name = "smart-open"
-version = "9.0.2"
+version = "9.0.3"
 description = "Utils for streaming large files (S3, HDFS, GCS, SFTP, Azure Blob Storage, gzip, bz2, zst...)"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "smart_open-9.0.2-py3-none-any.whl", hash = "sha256:945216f3360166fdb42fdee0e19b37f032caaf9429d5797bc06b01d2c75a71a4"},
-    {file = "smart_open-9.0.2.tar.gz", hash = "sha256:adfe6413bfb39c2895cf9d066c8bea326aeb8b3b717306e6a10c9efa931ae796"},
+    {file = "smart_open-9.0.3-py3-none-any.whl", hash = "sha256:8de5f18719bb79b5621571291463d9ab3935bf007b310eb7e604b1b59f2a96b4"},
+    {file = "smart_open-9.0.3.tar.gz", hash = "sha256:9911fe8cdc60834bd51a28c5d2ec16cdc8b702a24b10e1b747c9dbbbeb423746"},
 ]
 
 [package.dependencies]
@@ -2680,14 +2680,14 @@ zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 
 [[package]]
 name = "virtualenv"
-version = "21.15.5"
+version = "21.15.6"
 description = "Virtual Python Environment builder"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "virtualenv-21.15.5-py3-none-any.whl", hash = "sha256:bcf98c32139cf3df7f0cc2c8c48ca150645c20e66f8c4fe6c1e5e40bcae73947"},
-    {file = "virtualenv-21.15.5.tar.gz", hash = "sha256:fb869ea32930530ccc87549877b53268c2a4d4a7d7f2c384042eca05170350e6"},
+    {file = "virtualenv-21.15.6-py3-none-any.whl", hash = "sha256:4b99ab9b95ff11043939bb4cad2fa0449175fa5a478372864f62160cb6c1a7ed"},
+    {file = "virtualenv-21.15.6.tar.gz", hash = "sha256:c8b65c7d206ca6ef18de9352c160b3f04f66fff9f6b0ec8fd31f14688eba52c4"},
 ]
 
 [package.dependencies]

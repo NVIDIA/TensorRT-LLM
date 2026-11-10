@@ -8,9 +8,9 @@ from typing import Sequence
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ... import native_ops
 from ._mnnvl_workspace import NUM_LAMPORT_BUFFERS
 
 
@@ -53,7 +53,7 @@ class GlmMnnvlAllgather(OpWrapper):
         buffer_flags: torch.Tensor,
         group_size: int,
     ) -> torch.Tensor:
-        return torch.ops.trtllm.glm_mnnvl_allgather(input, comm_buffer, buffer_flags, group_size)
+        return native_ops.glm_mnnvl_allgather(input, comm_buffer, buffer_flags, group_size)
 
     def reference(
         self,

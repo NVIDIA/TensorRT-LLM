@@ -25,6 +25,7 @@
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/utils/cudaContextScope.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -418,6 +419,9 @@ void Batch::setCudaStream(CUstream stream)
 
 Batch::~Batch()
 {
+    // _drain() waits on the upload stream, and the device and pinned buffers are freed with
+    // cuMemFree and cuMemFreeHost: all of it needs the manager's context current.
+    CudaContextScope const context(mManager->cudaContext());
     // Both buffers are about to go, and transfers on the upload stream still name them.
     _drain();
     KVCM2_POISON_ON_EXCEPT(
@@ -431,6 +435,17 @@ Batch::~Batch()
                 }
             }
         });
+    // Released here, inside the scope, rather than by the member destructors that run after it.
+    // mScratch only points into mDeviceArena, so it needs no release of its own.
+    mSparseArenas.clear();
+    mDeviceArena.reset();
+    mHitMiss.reset();
+    mCopyDesc.reset();
+    mDeviceStaging.reset();
+    mMirror.reset();
+    mIndexTableDescs.reset();
+    mIndexTableMemory.reset();
+    mStaging = StaticHostMem{};
 }
 
 size_t Batch::_rowElements() const noexcept

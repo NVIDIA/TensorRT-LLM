@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -86,7 +87,7 @@ def _replacement_mtp_model_config(model_config: ModelConfig) -> ModelConfig:
             quant_path, checkpoint_dir, model_config.moe_backend)
 
     mapper = AutoCheckpointMapper.get(
-        "HF", model_config.pretrained_config.architectures[0])
+        CheckpointFormat.HF, model_config.pretrained_config.architectures[0])
     start_layer_idx = model_config.pretrained_config.num_hidden_layers
     if layer_configs is not None:
         normalized = {}
@@ -1598,6 +1599,7 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
+        use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
         # The user's value, NOT the engine's: py_executor_creator raises it past
         # this and never writes back, so drafters read _runtime_position_ceiling.
         # None sizes position tables from max_position_embeddings: 1M for K3.

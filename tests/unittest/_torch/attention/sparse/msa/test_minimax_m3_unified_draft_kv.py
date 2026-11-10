@@ -34,7 +34,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative.dflash_attention import DFLASH_CONTEXT_LOWERING
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MiniMaxM3SparseAttentionConfig
@@ -733,7 +732,12 @@ def _dspark_creator(*, is_disagg: bool, context_kernel: bool = False) -> KvCache
     target, draft = model_config(QuantAlgo.NVFP4), model_config()
     # DSpark's checkpoint declares its sliding window.
     draft.pretrained_config.sliding_window = 4096
-    lowering = DFLASH_CONTEXT_LOWERING if context_kernel else "causal decode + future-block merge"
+    # A drafter that cannot report its lowerings is assumed to need the context kernel.
+    drafter = SimpleNamespace(dflash_attention_backend="TRTLLM")
+    if not context_kernel:
+        drafter.validate_block_attention_windows = (
+            lambda: ["causal decode + future-block merge"] * 2
+        )
     creator = object.__new__(KvCacheCreator)
     creator._speculative_config = SimpleNamespace(
         spec_dec_mode=SimpleNamespace(is_dflash=lambda: False, is_dspark=lambda: True),
@@ -751,10 +755,7 @@ def _dspark_creator(*, is_disagg: bool, context_kernel: bool = False) -> KvCache
         model=SimpleNamespace(
             model_config=target,
             config=target.pretrained_config,
-            draft_model=SimpleNamespace(
-                dflash_attention_backend="TRTLLM",
-                validate_block_attention_windows=lambda: [lowering] * 2,
-            ),
+            draft_model=drafter,
         ),
     )
     creator._kv_cache_manager_cls = MiniMaxM3KVCacheManagerV2

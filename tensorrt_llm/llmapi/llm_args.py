@@ -38,6 +38,8 @@ from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+
 try:
     from ray.util.placement_group import PlacementGroup
 except ImportError:
@@ -47,6 +49,7 @@ from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 
+from .._errors import ConfigInputError
 from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
 
@@ -4547,6 +4550,41 @@ class DynamicBatchConfig(StrictBaseModel, PybindMirror):
             dynamic_batch_moving_average_window)
 
 
+class GenPreemptionConfig(StrictBaseModel):
+    """GEN slot preemption on a disaggregated generation worker.
+
+    When every slot is taken and the next waiting request is at risk of missing
+    its TTFT target, a decode request is paused in place for it. Set at most
+    one field to bound the TPOT cost (neither: off). Needs the auto GEN
+    admission policy and the KV cache manager V2 scheduler.
+    """
+    tpot_budget: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        lt=1.0,
+        description="Allowed mean-TPOT increase from pauses, as a fraction "
+        "(0.10 = +10%).",
+        status="prototype")
+    target_output_tps: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Per-request output tokens/s floor kept by about 80% of "
+        "requests.",
+        status="prototype")
+
+    @model_validator(mode="after")
+    def validate_one_bound(self) -> "GenPreemptionConfig":
+        if self.tpot_budget is not None and self.target_output_tps is not None:
+            raise ValueError(
+                "gen_preemption: set tpot_budget or target_output_tps, not both"
+            )
+        return self
+
+    @property
+    def enabled(self) -> bool:
+        return self.tpot_budget is not None or self.target_output_tps is not None
+
+
 @PybindMirror.mirror_pybind_fields(_SchedulerConfig)
 class SchedulerConfig(StrictBaseModel, PybindMirror):
     capacity_scheduler_policy: CapacitySchedulerPolicy = Field(
@@ -4578,6 +4616,11 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
                      "duplicate-request deferral, and token-budget decisions. "
                      "This is orthogonal to "
                      "kv_cache_config.enable_block_reuse."))
+
+    gen_preemption: GenPreemptionConfig = Field(
+        default_factory=GenPreemptionConfig,
+        description="GEN slot preemption on disaggregated generation workers.",
+        status="prototype")
 
     context_scheduling_policy: ContextSchedulingPolicy = Field(
         default=ContextSchedulingPolicy.FCFS,
@@ -6615,7 +6658,7 @@ class BaseLlmArgs(StrictBaseModel):
         if config_dict is None:
             config_dict = {}
         elif not isinstance(config_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
         return cls(**config_dict)
 
     @field_validator("gpus_per_node", mode='before')
@@ -7443,10 +7486,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    checkpoint_format: Optional[str] = Field(
+    checkpoint_format: Union[CheckpointFormat, str, None] = Field(
         default=None,
+        telemetry=False,
         description=
-        "The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P "
+        "The checkpoint loader format to use. Built-in formats use CheckpointFormat; custom registered formats accept strings. "
+        "`MX` selects ModelExpress as an opportunistic P2P "
         "loading path and falls back to loading the provided Hugging Face checkpoint; it does not require "
         "converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing "
         "`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\n"
@@ -7631,7 +7676,7 @@ class TorchLlmArgs(BaseLlmArgs):
         self._quant_config = value
 
     modeling_v2: Literal["off", "auto", "require"] = Field(
-        default="off",
+        default="auto",
         status="prototype",
         description=
         "Whether to build the model from a modeling_v2 target (experimental) "
@@ -7683,6 +7728,19 @@ class TorchLlmArgs(BaseLlmArgs):
     @extra_resource_managers.setter
     def extra_resource_managers(self, value: Dict[str, object]) -> None:
         self._extra_resource_managers = value
+
+    @model_validator(mode="after")
+    def validate_gen_preemption(self) -> 'TorchLlmArgs':
+        # PP has multiple in-flight microbatches, so removing a request needs
+        # stage-coordinated draining. Attention DP routes independent request
+        # sets across ranks, so a rank-0 clock alone cannot synchronize victims
+        # and admission capacity. The controller supports one shared batch.
+        if self.scheduler_config.gen_preemption.enabled and (
+                self.pipeline_parallel_size > 1 or self.enable_attention_dp):
+            raise ValueError(
+                "GEN slot preemption (scheduler_config.gen_preemption) does "
+                "not support pipeline parallelism or attention DP.")
+        return self
 
     @model_validator(mode="after")
     def validate_encoder_modes(self) -> 'TorchLlmArgs':
@@ -7992,6 +8050,8 @@ class TorchLlmArgs(BaseLlmArgs):
         fraction implies) and when a CUDA device is visible.
         ``memory_budget_bytes`` overrides the derivation (tests).
         """
+        from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import \
+            unsupported_headroom_reason
         from tensorrt_llm._torch.speculative.dflash import (
             derive_dflash_ctx_memory_budget_bytes,
             estimate_checkpoint_weight_bytes, validate_dflash_ctx_buffer_budget)
@@ -8068,6 +8128,10 @@ class TorchLlmArgs(BaseLlmArgs):
             tp_size=self.tensor_parallel_size,
             memory_budget_bytes=memory_budget_bytes,
             arena_before_pool=arena_before_pool,
+            gen_preemption_enabled=(self.scheduler_config.gen_preemption.enabled
+                                    and unsupported_headroom_reason(
+                                        self.scheduler_config.gen_preemption,
+                                        self) is None),
         )
 
     @model_validator(mode="after")
@@ -8434,6 +8498,19 @@ class TorchLlmArgs(BaseLlmArgs):
             self.enable_early_first_token_response = False
         return self
 
+    @field_validator("checkpoint_format", mode="before")
+    @classmethod
+    def convert_checkpoint_format(
+            cls, value: CheckpointFormat | str | None
+    ) -> CheckpointFormat | str | None:
+        if isinstance(value, str):
+            try:
+                return CheckpointFormat(value)
+            except ValueError:
+                # Custom loader registrations can define additional formats.
+                return value
+        return value
+
     @model_validator(mode="after")
     def validate_checkpoint_format(self):
         if self.checkpoint_format is not None and self.checkpoint_loader is not None:
@@ -8446,7 +8523,7 @@ class TorchLlmArgs(BaseLlmArgs):
             logger.info(
                 "neither checkpoint_format nor checkpoint_loader were provided, "
                 "checkpoint_format will be set to HF.")
-            self.checkpoint_format = "HF"
+            self.checkpoint_format = CheckpointFormat.HF
 
         return self
 
@@ -8457,7 +8534,7 @@ class TorchLlmArgs(BaseLlmArgs):
         # env var that the upstream ``modelexpress`` library reads. This
         # lets orchestrators configure MX via the environment while keeping
         # the resolved value visible on ``llm_args.mx_config.server_url``.
-        if self.checkpoint_format == "MX" and self.mx_config.server_url is None:
+        if self.checkpoint_format == CheckpointFormat.MX and self.mx_config.server_url is None:
             env_url = os.environ.get("MODEL_EXPRESS_URL")
             if env_url:
                 logger.info(
@@ -8465,7 +8542,7 @@ class TorchLlmArgs(BaseLlmArgs):
                     "from environment.", env_url)
                 self.mx_config.server_url = env_url
 
-        if self.mx_config.server_url is not None and self.checkpoint_format != "MX":
+        if self.mx_config.server_url is not None and self.checkpoint_format != CheckpointFormat.MX:
             logger.warning(
                 "mx_config.server_url is set but checkpoint_format is '%s', not "
                 "'MX'. The MX config will be ignored. Set "
@@ -8852,7 +8929,7 @@ def update_llm_args_with_extra_options(
         if llm_args_dict is None:
             llm_args_dict = {}
         elif not isinstance(llm_args_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
         llm_args = update_llm_args_with_extra_dict(
             llm_args,
             llm_args_dict,
