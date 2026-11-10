@@ -298,6 +298,44 @@ def test_fused_dspark_rmsnorm_rope_norm_dim(split_norm):
     torch.testing.assert_close(got.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
 
+# One row gives a slice whose only row keeps the wide row stride.
+@pytest.mark.parametrize("rows", [1, 16])
+def test_fused_dspark_rmsnorm_rope_reads_mla_layer_slice_in_place(rows):
+    """The MLA drafter passes each layer's slice of one fused GEMM output.
+
+    ``latent[:, layer]`` has row stride ``layers * 576``. The fused path must
+    read it with the row-strided kernel and match a compact copy bitwise.
+    """
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        _compile_fused_dspark_rmsnorm_rope,
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+    from tensorrt_llm._torch.models.modeling_dspark import _rmsnorm_rope_batched
+
+    torch.manual_seed(rows)
+    layers, hidden, rope_dim = 3, 576, 64
+    norm_dim = hidden - rope_dim
+    eps = 1e-5
+    latent = torch.randn(rows, layers, hidden, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(norm_dim, dtype=torch.bfloat16, device="cuda").abs() + 0.5
+    ang = torch.rand(1, rows, rope_dim // 2, device="cuda", dtype=torch.float32) * 6.28
+    freqs = torch.complex(ang.cos(), ang.sin())
+    x = latent[:, 1].unsqueeze(0)
+    compact = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    compact.copy_(x)
+
+    assert x.stride(1) == layers * hidden
+    freqs_real = torch.view_as_real(freqs).reshape(-1, freqs.shape[-1], 2)
+    assert is_fused_dspark_rmsnorm_rope_supported(x, w, freqs_real, 1, rope_dim, norm_dim)
+    _compile_fused_dspark_rmsnorm_rope.cache_clear()
+    got = _rmsnorm_rope_batched(x, w, eps, rope_dim, freqs, norm_dim=norm_dim)
+    expected = _rmsnorm_rope_batched(compact, w, eps, rope_dim, freqs, norm_dim=norm_dim)
+
+    # The slice and the compact copy each compile their own row layout.
+    assert _compile_fused_dspark_rmsnorm_rope.cache_info().misses == 2
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
 def test_fused_dspark_rmsnorm_rope_accepts_no_weight() -> None:
     """A gain-less call may pass None, and must match passing an ignored weight.
 
