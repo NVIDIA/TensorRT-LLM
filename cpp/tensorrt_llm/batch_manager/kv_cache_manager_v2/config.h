@@ -108,7 +108,7 @@ struct DiskCacheTierConfig
     bool keepCopyAfterRestore = false;
 
     // Also copy pages evicted GPU -> host to disk in the background, into free disk slots only and behind restores
-    // and required writes. Requires keepCopyAfterRestore and numIoThreads > 0.
+    // and required writes. Requires numIoThreads > 0.
     bool writeThrough = false;
 
     [[nodiscard]] CacheTier tier() const noexcept

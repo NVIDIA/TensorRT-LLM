@@ -581,7 +581,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         if (auto const* disk = std::get_if<DiskCacheTierConfig>(&tierConfig))
         {
             mKeepDiskCopy = mKeepDiskCopy || disk->keepCopyAfterRestore;
-            mDiskWriteThrough = mDiskWriteThrough || (disk->keepCopyAfterRestore && disk->writeThrough);
+            mDiskWriteThrough = mDiskWriteThrough || disk->writeThrough;
             configureAsyncDiskIo(static_cast<size_t>(std::max(disk->numIoThreads, 0)));
         }
     }
@@ -592,10 +592,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         TLLM_LOG_WARNING("[kvCacheManagerV2] disk write_through needs async disk I/O (num_io_threads > 0); disabled");
         mDiskWriteThrough = false;
     }
-    if (mKeepDiskCopy)
+    if (mKeepDiskCopy || mDiskWriteThrough)
     {
-        TLLM_LOG_INFO("[kvCacheManagerV2] disk tier: keep_copy_after_restore=1 write_through=%d",
-            static_cast<int>(mDiskWriteThrough));
+        TLLM_LOG_INFO("[kvCacheManagerV2] disk tier: keep_copy_after_restore=%d write_through=%d",
+            static_cast<int>(mKeepDiskCopy), static_cast<int>(mDiskWriteThrough));
     }
 }
 

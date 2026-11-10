@@ -2052,13 +2052,13 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
     assert config.disk_keep_copy_after_restore is True
     assert config.disk_write_through is True
 
-    with pytest.raises(ValidationError) as exc_info:
-        KvCacheConfig(disk_write_through=True)
-    assert "disk_keep_copy_after_restore" in str(exc_info.value)
+    # Write-through does not need keep-copy, only the I/O pool.
+    config = KvCacheConfig(disk_io_threads=4, disk_write_through=True)
+    assert config.disk_write_through is True
+    assert config.disk_keep_copy_after_restore is False
 
     with pytest.raises(ValidationError) as exc_info:
-        KvCacheConfig(disk_keep_copy_after_restore=True,
-                      disk_write_through=True)
+        KvCacheConfig(disk_write_through=True)
     assert "disk_io_threads" in str(exc_info.value)
 
     with pytest.raises(ValidationError):
@@ -2080,13 +2080,12 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
     tier.validate()
     assert tier.num_io_threads == 16
 
-    with pytest.raises(ValueError):
-        DiskCacheTierConfig(2048, str(tmp_path), write_through=True).validate()
+    DiskCacheTierConfig(2048,
+                        str(tmp_path),
+                        num_io_threads=4,
+                        write_through=True).validate()
     with pytest.raises(ValueError, match="numIoThreads"):
-        DiskCacheTierConfig(2048,
-                            str(tmp_path),
-                            keep_copy_after_restore=True,
-                            write_through=True).validate()
+        DiskCacheTierConfig(2048, str(tmp_path), write_through=True).validate()
     with pytest.raises(ValueError):
         DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=-1).validate()
 

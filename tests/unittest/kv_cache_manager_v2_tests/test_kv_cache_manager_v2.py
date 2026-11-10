@@ -11549,6 +11549,28 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         self._run_and_close(again)
         self.manager.clear_reusable_blocks()
 
+    def test_write_through_without_keep_copy(self) -> None:
+        # Write-through alone: pages evicted GPU -> host are copied to disk early and their host -> disk eviction
+        # reuses the copy, while a restore from disk still frees the disk slot (no keep-copy).
+        self.disk_tier_options = {"num_io_threads": 4, "write_through": True}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        filled = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(filled["write_through_pages"], 0)
+        self.assertGreater(filled["reused"], 0)
+
+        # Restore the first request's prefix from disk; refcheck verifies the restored KV.
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        self.manager.clear_reusable_blocks()
+
     def test_full_disk_evicts_lru_pages_before_retained_copies(self) -> None:
         # The disk holds only a few requests, so it fills with pages whose only copy is on disk. Further
         # evictions must drop the least recently used of those before reclaiming any retained copy.
