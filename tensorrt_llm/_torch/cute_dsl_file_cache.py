@@ -220,17 +220,39 @@ def install_cute_dsl_file_cache() -> None:
         )
         return
     try:
-        # _load and _store import these too; a missing one leaves the DSL as it is.
+        # What the hooks below import or call per compile; a missing one leaves the DSL as it is.
         from cutlass._mlir import ir  # noqa: F401
         from cutlass.base_dsl import compile_backend, compiler
         from cutlass.base_dsl.cache_helpers import (  # noqa: F401
             read_bytecode_and_check_crc32,
             write_bytecode_with_crc32,
         )
+        from cutlass.base_dsl.compiler import (  # noqa: F401
+            DeviceTarget,
+            FlattenLocsOutputJsonPath,
+            KeepCUBIN,
+            KeepPTX,
+            KeepSASS,
+            LinkLibraries,
+            RemarkOutput,
+        )
+        from cutlass.base_dsl.dsl import BaseDSL
+        from cutlass.base_dsl.env_manager import EnvironmentVarManager
 
         compile_callable = compiler.CompileCallable._compile
         backend_compile = compile_backend.CompilerBackend.compile
         compile_cache_state = compile_backend.CompileCacheState
+        for owner, name in (
+            (EnvironmentVarManager, "cache_key_str"),
+            (BaseDSL, "get_version"),
+            (BaseDSL, "preprocess_pipeline"),
+            (BaseDSL, "_get_pipeline"),
+            (compile_backend.CompilerBackend, "_resolve_compile_gpu_arch"),
+            (compile_backend.CompilerBackend, "_validate_compile"),
+            (compile_backend.CompilerBackend, "_validate_execution_target"),
+            (compile_backend.CompilerBackend, "_build_compiled_function"),
+        ):
+            getattr(owner, name)
     except (ImportError, AttributeError) as e:
         logger.warning(f"[cute_dsl_file_cache] not enabled, unexpected CuTe DSL layout: {e}")
         return
