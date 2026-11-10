@@ -543,6 +543,8 @@ def epilogue(
             #
             tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
             cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+            # Wait for the TMEM load to complete before the stage can be released to the MMA warp
+            cute.arch.fence_view_async_tmem_load()
             # Async arrive accumulator buffer empty
             # Release early for perf
             if subtile_idx == subtile_cnt - 1:
