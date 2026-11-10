@@ -529,13 +529,37 @@ def _tep8_decode(what: str) -> RuleFn:
     return rule
 
 
-def _ported_on(kind: Kind, what: str, params: Tuple[Param, ...] = ()) -> Rule:
+def _served_untwinned() -> Gate:
+    """The sm103 tep8 decode class, declared served for a lossless-numeric lever.
+
+    What backs it: the lever boots, installs and runs in its row band on two GB300 nodes, and
+    its kernels reproduce the path they replace on every shape checked standalone.
+
+    What does NOT back it: no SPEED-Bench acceptance twin has been run for the levers that
+    carry this gate, and both are known to move the sampled token stream at tep8 (one shifts a
+    step between generation counts, the other takes a batch-4 run from 287 decode steps to
+    641). The gate is declared on the operator's instruction to serve them by default, not on
+    an acceptance measurement. Replace this scope text with the twin's result once there is one.
+    """
+
+    def holds(d: "Deployment") -> bool:
+        return d.sm == 103 and d.tp == 8 and d.decodes()
+
+    return Gate(holds, "sm103 tep8 decode: served by operator decision, no acceptance twin yet")
+
+
+def _ported_on(
+    kind: Kind,
+    what: str,
+    params: Tuple[Param, ...] = (),
+    gates: Tuple[Gate, ...] = (),
+) -> Rule:
     """A ported switch this target now serves by default on a tep8 decode server.
 
     ``baseline`` still turns it off (the origin is not ``upstream``), so a deployment can ask
     for the pre-port paths with one knob.
     """
-    return Rule("LL", kind, _tep8_decode(what), params=params)
+    return Rule("LL", kind, _tep8_decode(what), params=params, gates=gates)
 
 
 def _hot_replicas(requires_decode: bool) -> RuleFn:
@@ -768,14 +792,23 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         # (``wide_projection_gathers``) is TEP4-only on sm103. At TEP8 the served call is
         # cuBLAS, so the summation order changes and the decoded text moves with it, which a
         # batch-4 run makes plain. Lossless-numeric, and it needs a gate before it is on.
-        "tep8_attn_block_splitk": _ported(Kind.NUMERIC),
+        "tep8_attn_block_splitk": _ported_on(
+            Kind.NUMERIC,
+            "9..32-row attention-block projections on a tep8 decode server",
+            gates=(_served_untwinned(),),
+        ),
         "swa_block_single_early_loads": _ported_on(
             Kind.BITWISE, "the one-request sliding-window block on a tep8 decode server"
         ),
         # The qkv / gate_up / coefficient cells keep their row's split_k and are bitwise the
         # table's row; the o_proj and down_proj cells reproduced cuBLAS's bits on every checked
-        # shape, which cannot be proven against a closed library.
-        "drafter_multi_request_cells": _ported(Kind.FLAGGED),
+        # shape, which cannot be proven against a closed library. Running the model showed a
+        # step moving between generation counts, so it is lossless-numeric rather than flagged.
+        "drafter_multi_request_cells": _ported_on(
+            Kind.NUMERIC,
+            "16, 24 and 32-row drafter blocks on a tep8 decode server",
+            gates=(_served_untwinned(),),
+        ),
         **{name: _tep4_path_rule() for name in TEP4_PATHS},
     }
 )
