@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import collections
 import copy
 import gc
 import inspect
@@ -24,6 +25,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import trace
 import traceback
 import weakref
@@ -411,12 +413,176 @@ def get_free_ports(num=1) -> List[int]:
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
+# TLLM_BCAST_VERIFY=1 (diagnostic; set it on every rank of a worker, since it
+# changes safe_broadcast's wire format): safe_broadcast checks each payload
+# against the root's CRC32 and sequence numbers, and the worker communicator
+# counts and records its collectives, so a corrupted payload or a collective
+# that only some ranks issue shows in the log.
+# safe_allgather and mpi_allgather check every rank's payload the same way, and
+# safe_gather the payloads the root receives; mpi_broadcast and pp_broadcast
+# go through safe_broadcast.
+# TLLM_BCAST_RETRY=1 enables the checks without the collective trace (which
+# stays with TLLM_BCAST_VERIFY=1) and re-sends a payload whose CRC32
+# mismatches on any rank, instead of returning or failing on the bad copy.
+BCAST_RETRY = os.environ.get("TLLM_BCAST_RETRY", "0") == "1"
+COLLECTIVE_TRACE = os.environ.get("TLLM_BCAST_VERIFY", "0") == "1"
+BCAST_VERIFY = BCAST_RETRY or COLLECTIVE_TRACE
+
+# Collectives over every rank of a communicator; each one advances its sequence
+# number. Create_group is collective over the new group only, so it is
+# recorded but does not advance the number.
+_TRACED_COLLECTIVES = ("Barrier", "barrier", "Ibarrier", "Bcast", "bcast",
+                       "Ibcast", "Gather", "gather", "Gatherv", "Scatter",
+                       "scatter", "Scatterv", "Allgather", "allgather",
+                       "Allgatherv", "Iallgather", "Alltoall", "alltoall",
+                       "Alltoallv", "Reduce", "reduce", "Allreduce",
+                       "allreduce", "Iallreduce", "Reduce_scatter",
+                       "Reduce_scatter_block", "Scan", "scan", "Exscan",
+                       "exscan", "Dup", "Split", "Split_type")
+_GROUP_COLLECTIVES = ("Create_group", )
+_collective_depth = threading.local()
+
+
+def _call_site(frame, depth=3):
+    site = []
+    while frame is not None and len(site) < depth:
+        site.append(
+            (frame.f_code.co_filename, frame.f_lineno, frame.f_code.co_name))
+        frame = frame.f_back
+    return tuple(site)
+
+
+def _format_site(site):
+    return " < ".join(f"{os.path.basename(path)}:{line} {name}"
+                      for path, line, name in site)
+
+
+def _payload_nbytes(args):
+    buf = args[0] if args else None
+    if isinstance(buf, (list, tuple)) and buf:
+        buf = buf[0]
+    try:
+        return memoryview(buf).nbytes
+    except Exception:
+        return -1
+
+
+class CollectiveTrace:
+    """The collectives issued on one communicator: a sequence number, the most
+    recent calls, and each distinct call site, logged the first time it is
+    seen. A second thread entering a collective on the same communicator while
+    one is in flight is logged as an error."""
+
+    def __init__(self, name):
+        self.name = name
+        self.seq = 0
+        self.recent = collections.deque(maxlen=64)
+        self.sites = set()
+        self.inflight = {}
+        self.concurrent_logged = 0
+        self.lock = threading.Lock()
+
+    def enter(self, op, counted, site, nbytes):
+        tid = threading.get_ident()
+        thread_name = threading.current_thread().name
+        with self.lock:
+            seq = self.seq
+            self.seq += counted
+            other = next(
+                (v for t, v in self.inflight.items() if t != tid), None)
+            self.inflight[tid] = (seq, op, site, thread_name)
+            self.recent.append(
+                (seq, op, nbytes, site, thread_name, time.monotonic()))
+            new_site = (op, site) not in self.sites
+            self.sites.add((op, site))
+            report = other is not None and self.concurrent_logged < 20
+            self.concurrent_logged += report
+        if new_site:
+            logger.warning(f"{self.prefix()}: new collective site: seq {seq} "
+                           f"{op} nbytes {nbytes} thread {thread_name} "
+                           f"at {_format_site(site)}")
+        if report:
+            o_seq, o_op, o_site, o_thread = other
+            logger.error(
+                f"{self.prefix()}: concurrent collectives on one communicator: "
+                f"seq {seq} {op} in thread {thread_name} at "
+                f"{_format_site(site)} while seq {o_seq} {o_op} in thread "
+                f"{o_thread} at {_format_site(o_site)} is in flight")
+
+    def prefix(self):
+        return f"[bcast-verify] rank {global_mpi_rank()} {self.name}"
+
+    def exit(self):
+        with self.lock:
+            self.inflight.pop(threading.get_ident(), None)
+
+    def dump(self, n=32):
+        now = time.monotonic()
+        with self.lock:
+            recent = list(self.recent)[-n:]
+        return [
+            f"seq {seq} {op} nbytes {nbytes} thread {thread_name} "
+            f"{(now - t) * 1e3:.1f} ms ago at {_format_site(site)}"
+            for seq, op, nbytes, site, thread_name, t in recent
+        ]
+
+
+@lru_cache(maxsize=None)
+def _collective_trace_type(base):
+    """A subclass of the communicator type *base* whose collectives go through
+    the instance's CollectiveTrace."""
+
+    def traced(name, counted):
+        base_method = getattr(base, name)
+
+        @wraps(base_method)
+        def method(self, *args, **kwargs):
+            # pkl5's object methods issue raw collectives on self; count the
+            # outer call only.
+            if getattr(_collective_depth, "value", 0):
+                return base_method(self, *args, **kwargs)
+            ct = getattr(self, "_collective_trace", None)
+            if ct is None:  # made by mpi4py through type(self), e.g. by Dup
+                ct = self._collective_trace = CollectiveTrace(
+                    f"comm {self.py2f()}")
+            ct.enter(name, int(counted), _call_site(sys._getframe(1)),
+                     _payload_nbytes(args))
+            _collective_depth.value = 1
+            try:
+                return base_method(self, *args, **kwargs)
+            finally:
+                _collective_depth.value = 0
+                ct.exit()
+
+        return method
+
+    namespace = {"_collective_traced": True}
+    for names, counted in ((_TRACED_COLLECTIVES, True), (_GROUP_COLLECTIVES,
+                                                         False)):
+        namespace.update((name, traced(name, counted)) for name in names
+                         if hasattr(base, name))
+    return type(f"Traced{base.__name__}", (base, ), namespace)
+
+
+def trace_collectives(c, name=None):
+    """*c* with its collectives counted and recorded (TLLM_BCAST_VERIFY). The
+    result shares c's MPI handle; c is kept alive with it."""
+    if c is None or getattr(type(c), "_collective_traced", False):
+        return c
+    traced = _collective_trace_type(type(c))(c)
+    traced._collective_trace_base = c
+    traced._collective_trace = CollectiveTrace(name or f"comm {c.py2f()}")
+    return traced
+
+
 comm = pkl5.Intracomm(MPI.COMM_WORLD)
+if COLLECTIVE_TRACE:
+    comm = trace_collectives(comm, "world")
 
 
 def set_mpi_comm(new_comm):
     global comm
-    comm = new_comm
+    comm = trace_collectives(new_comm) if COLLECTIVE_TRACE else new_comm
 
 
 thread_local_comm = threading.local()
@@ -536,10 +702,16 @@ def local_mpi_barrier():
 
 
 def mpi_broadcast(obj, root=0):
+    if global_mpi_size() > 1 and BCAST_VERIFY:  # CRC-checked
+        from tensorrt_llm._torch.distributed.communicator import safe_broadcast
+        return safe_broadcast(mpi_comm(), obj, root=root)
     return mpi_comm().bcast(obj, root) if global_mpi_size() > 1 else obj
 
 
 def mpi_allgather(obj):
+    if ENABLE_MULTI_DEVICE and BCAST_VERIFY:  # CRC-checked, see safe_allgather
+        from tensorrt_llm._torch.distributed.communicator import safe_allgather
+        return safe_allgather(mpi_comm(), obj)
     return mpi_comm().allgather(obj) if ENABLE_MULTI_DEVICE else obj
 
 

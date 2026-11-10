@@ -1,5 +1,12 @@
+import atexit
 import math
+import os
 import pickle  # nosec B403
+import signal
+import socket
+import threading
+import time
+import zlib
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from functools import lru_cache, wraps
@@ -18,10 +25,11 @@ except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
 from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
-from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
-                                 mpi_comm, mpi_disabled, mpi_isend,
-                                 mpi_isend_object, mpi_recv, mpi_recv_object,
-                                 mpi_send, mpi_send_object, mpi_world_size,
+from tensorrt_llm._utils import (BCAST_RETRY, BCAST_VERIFY, local_mpi_size,
+                                 mpi_allgather, mpi_barrier, mpi_comm,
+                                 mpi_disabled, mpi_isend, mpi_isend_object,
+                                 mpi_recv, mpi_recv_object, mpi_send,
+                                 mpi_send_object, mpi_world_size,
                                  torch_pybind11_abi)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
@@ -309,18 +317,23 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
     rank = comm.Get_rank()
 
     # ---- Serialization phase (root only) ----
-    # Header layout: [ok_flag, total_size, num_chunks] as int64
-    header = np.zeros(3, dtype=np.int64)
+    # Header layout: [ok_flag, total_size, num_chunks] as int64; with
+    # TLLM_BCAST_VERIFY also [crc32, broadcast seq, collective seq].
+    header = np.zeros(6 if BCAST_VERIFY else 3, dtype=np.int64)
+    if BCAST_VERIFY:
+        local_seq = _bcast_verify_next_seq(comm)
     if rank == root:
         try:
             serialized = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
             total_size = len(serialized)
             num_chunks = math.ceil(total_size /
                                    chunk_size) if total_size > 0 else 0
-            header[:] = (1, total_size, num_chunks)
+            header[:3] = (1, total_size, num_chunks)
+            if BCAST_VERIFY:
+                header[3:] = (zlib.crc32(serialized), *local_seq)
         except Exception as e:
             # Signal failure to all ranks, then raise
-            header[:] = (0, 0, 0)
+            header[:] = 0
             comm.Bcast([header, MPI.INT64_T], root=root)
             raise RuntimeError(f"Serialization failed: {str(e)}") from e
     else:
@@ -328,6 +341,8 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
 
     # ---- Metadata broadcast (Bcast the fixed-size header) ----
     comm.Bcast([header, MPI.INT64_T], root=root)
+    if BCAST_VERIFY and rank != root and header.any():  # zeros: root failed
+        _bcast_verify_check_header(comm, rank, header, local_seq)
     ok_flag, total_size, num_chunks = int(header[0]), int(header[1]), int(
         header[2])
     if not ok_flag:
@@ -364,6 +379,11 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
 
         offset += cur
 
+    if BCAST_VERIFY:
+        return _finish_verified_broadcast(
+            comm, rank, root, obj, header, local_seq,
+            serialized if rank == root else dst_buf, chunk_size)
+
     # ---- Reconstruction and deserialization ----
     if rank == root:
         # Root already holds `obj`; rebuilding it from its own serialized bytes
@@ -379,6 +399,403 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
             return pickle.loads(dst_buf)  # nosec B301
         except Exception as e:
             raise RuntimeError(f"Deserialization failed: {str(e)}") from e
+
+
+# ---- TLLM_BCAST_VERIFY (diagnostic) ----
+_BCAST_VERIFY_BLOCK = 256  # bytes per block CRC: the first bad offset's granularity
+_BCAST_VERIFY_LOG_EVERY = 1000  # broadcasts per payload-size histogram line
+_BCAST_VERIFY_TALLY_EVERY = 10000  # allgathers or gathers per histogram line
+# Seconds between summary lines: atexit does not run when a worker is SIGKILLed.
+_BCAST_VERIFY_SUMMARY_EVERY_S = 60
+_BCAST_VERIFY_MAX_REPORTS = 10  # flagged broadcasts logged per process; later ones are counted
+_BCAST_RETRY_MAX = 3  # TLLM_BCAST_RETRY: re-broadcasts of one payload before raising
+_bcast_verify_seqs = {}  # communicator handle -> safe_broadcast calls on it
+# checked: broadcast payload copies this rank received and CRC-checked
+# (retries included); mismatches: those whose CRC32 differed from the root's;
+# retries: re-broadcasts this rank took part in; allgather_*, gather_*: the
+# same for safe_allgather and safe_gather, per contribution a receiving rank
+# checked (the root, for a gather); unchecked: payloads returned without a
+# matching CRC (only without TLLM_BCAST_RETRY, which never returns one) and
+# calls of the object collectives that have no CRC (_bcast_note_unchecked),
+# by kind in unchecked_kinds.
+_bcast_verify_stats = {
+    "total": 0,
+    "flagged": 0,
+    "checked": 0,
+    "mismatches": 0,
+    "retries": 0,
+    "allgather_checked": 0,
+    "allgather_mismatches": 0,
+    "allgather_retries": 0,
+    "gather_checked": 0,
+    "gather_mismatches": 0,
+    "gather_retries": 0,
+    "unchecked": 0,
+    "unchecked_kinds": {},
+    "sizes": {},
+    "window": {},
+    "summary_at": 0.0,
+    "prefix": None
+}
+
+
+def _bcast_verify_prefix() -> str:
+    """The log prefix. The first call logs the MPI stack, once per process."""
+    stats = _bcast_verify_stats
+    if stats["prefix"] is None:
+        from mpi4py import __version__ as mpi4py_version
+        stats["prefix"] = (f"[bcast-verify] rank {MPI.COMM_WORLD.Get_rank()} "
+                           f"({socket.gethostname()})")
+        levels = {
+            MPI.THREAD_SINGLE: "single",
+            MPI.THREAD_FUNNELED: "funneled",
+            MPI.THREAD_SERIALIZED: "serialized",
+            MPI.THREAD_MULTIPLE: "multiple"
+        }
+        env = " ".join(f"{k}={v}" for k, v in sorted(os.environ.items())
+                       if k.startswith(("UCX_", "OMPI_MCA_", "HCOLL_", "UCC_")))
+        retry = (f"on, up to {_BCAST_RETRY_MAX} per broadcast"
+                 if BCAST_RETRY else "off")
+        logger.warning(
+            f"{stats['prefix']}: enabled; "
+            f"{MPI.Get_library_version().splitlines()[0]}; MPI thread level "
+            f"{levels.get(MPI.Query_thread())}; mpi4py {mpi4py_version}; "
+            f"retry {retry}; CRC-checked: broadcast, allgather, gather; "
+            f"unchecked by design: allreduce votes and int64 count buffers; "
+            f"{env}")
+        stats["summary_at"] = time.monotonic()
+        atexit.register(_bcast_verify_summary)
+    return stats["prefix"]
+
+
+def _bcast_verify_counts() -> str:
+    stats = _bcast_verify_stats
+    # list(): a signal handler may run this as the executor adds a kind
+    kinds = ",".join(f"{kind}:{calls}" for kind, calls in sorted(
+        list(stats["unchecked_kinds"].items()))) or "none"
+    return (f"checked={stats['checked']} mismatches={stats['mismatches']} "
+            f"retries={stats['retries']} unchecked={stats['unchecked']} "
+            f"allgather_checked={stats['allgather_checked']} "
+            f"allgather_mismatches={stats['allgather_mismatches']} "
+            f"allgather_retries={stats['allgather_retries']} "
+            f"gather_checked={stats['gather_checked']} "
+            f"gather_mismatches={stats['gather_mismatches']} "
+            f"gather_retries={stats['gather_retries']} "
+            f"unchecked_kinds={kinds}")
+
+
+def _bcast_note_unchecked(kind: str) -> None:
+    """Count a call of an object collective that has no CRC (the pipeline-
+    parallel point-to-point objects): not a mismatch, but a payload nobody
+    checked, so `unchecked` and `unchecked_kinds` name it."""
+    if BCAST_VERIFY:
+        _bcast_verify_prefix()
+        stats = _bcast_verify_stats
+        stats["unchecked"] += 1
+        stats["unchecked_kinds"][kind] = stats["unchecked_kinds"].get(
+            kind, 0) + 1
+        _bcast_verify_tick()
+
+
+def _bcast_verify_tally(kind: str, comm, rank: int, nbytes: int) -> None:
+    """Histogram the payload sizes (summed over ranks) of safe_allgather and
+    safe_gather by communicator; rank 0 of the communicator logs it every
+    _BCAST_VERIFY_TALLY_EVERY calls."""
+    entry = _bcast_verify_stats["sizes"].setdefault((kind, comm.py2f()),
+                                                    [0, {}])
+    entry[0] += 1
+    bucket = 1 << max(nbytes - 1, 0).bit_length()
+    entry[1][bucket] = entry[1].get(bucket, 0) + 1
+    if rank == 0 and entry[0] % _BCAST_VERIFY_TALLY_EVERY == 0:
+        histogram = ", ".join(f"<={k}: {v}"
+                              for k, v in sorted(entry[1].items()))
+        entry[1] = {}
+        logger.warning(
+            f"{_bcast_verify_prefix()}: {entry[0]} {kind}s on comm "
+            f"{comm.py2f()}, {_bcast_verify_counts()}; payload bytes over the "
+            f"last {_BCAST_VERIFY_TALLY_EVERY}: {histogram}")
+
+
+def _bcast_verify_summary(when: str = "exit") -> None:
+    """This process's totals, logged every _BCAST_VERIFY_SUMMARY_EVERY_S
+    seconds of collective traffic (when=periodic), at the give-up of a retry,
+    on SIGUSR1 or SIGTERM, and at exit (not run when a worker is SIGKILLed)."""
+    logger.warning(f"{_bcast_verify_prefix()}: TLLM_BCAST_RETRY summary "
+                   f"{_bcast_verify_counts()} "
+                   f"broadcasts={_bcast_verify_stats['total']} "
+                   f"retry={'on' if BCAST_RETRY else 'off'} when={when}")
+
+
+def _bcast_verify_tick() -> None:
+    """Log the summary if _BCAST_VERIFY_SUMMARY_EVERY_S seconds have passed
+    since the last one. Called after each checked collective, so a process that
+    is later SIGKILLed has its totals in the log to within that interval."""
+    stats = _bcast_verify_stats
+    now = time.monotonic()
+    if now - stats["summary_at"] >= _BCAST_VERIFY_SUMMARY_EVERY_S:
+        stats["summary_at"] = now
+        _bcast_verify_summary("periodic")
+
+
+def _bcast_verify_install_signal_handlers() -> None:
+    """Log the summary on SIGUSR1 (a dump on request; the process goes on) and
+    on SIGTERM (then the default action, at once). A SIGKILL, which ends the
+    workers of a run, cannot be caught: that is what the periodic summary is
+    for. Only where it cannot disturb: from the main thread, for a signal that
+    still has its default action. A python handler runs only when the main
+    thread is back in the interpreter, so a process blocked in an MPI call sees
+    SIGTERM when that call returns."""
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def handler(signum, frame):
+        try:
+            if _bcast_verify_stats["prefix"] is not None:  # a collective ran
+                _bcast_verify_summary(signal.Signals(signum).name)
+        finally:
+            if signum == signal.SIGTERM:  # the default action, as without this
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGUSR1):
+        if signal.getsignal(sig) == signal.SIG_DFL:
+            signal.signal(sig, handler)
+
+
+if BCAST_VERIFY:
+    _bcast_verify_install_signal_handlers()
+
+
+def _bcast_verify_report(comm, text: str, dump: bool) -> None:
+    """Log a finding, with the communicator's last collectives if *dump*, for
+    the first _BCAST_VERIFY_MAX_REPORTS flagged broadcasts of this process."""
+    if _bcast_verify_stats["flagged"] >= _BCAST_VERIFY_MAX_REPORTS:
+        return
+    if dump:
+        ct = getattr(comm, "_collective_trace", None)
+        recent = ct.dump() if ct is not None else ["comm not traced"]
+        text += (f"; last collectives on comm {comm.py2f()}, oldest first:\n  "
+                 + "\n  ".join(recent))
+    logger.error(f"{_bcast_verify_prefix()}: {text}")
+
+
+def _bcast_verify_flag() -> None:
+    stats = _bcast_verify_stats
+    stats["flagged"] += 1
+    if stats["flagged"] == _BCAST_VERIFY_MAX_REPORTS:
+        logger.error(f"{_bcast_verify_prefix()}: {_BCAST_VERIFY_MAX_REPORTS} "
+                     f"flagged collectives logged; later ones are only counted")
+
+
+def _verified_loads(payload, expected_crc: int, source: str):
+    """CRC32-check *payload* against *expected_crc*, unpickle it, and check it
+    again after unpickling. Returns (object, error, findings, mismatch); a
+    mismatched payload is not unpickled under TLLM_BCAST_RETRY."""
+    result, error, findings = None, None, []
+    crc = zlib.crc32(payload)
+    mismatch = crc != expected_crc
+    if mismatch:
+        findings.append(f"payload CRC32 mismatch: {source} "
+                        f"{expected_crc:#010x}, this rank {crc:#010x}")
+    if not (mismatch and BCAST_RETRY):  # a bad copy is re-sent instead
+        try:
+            result = pickle.loads(payload)  # nosec B301
+        except Exception as e:
+            error = e
+            findings.append(f"unpickling failed: {e!r}")
+        if not mismatch and zlib.crc32(payload) != crc:
+            findings.append("payload changed after its CRC check")
+            mismatch = True
+    return result, error, findings, mismatch
+
+
+def _bcast_verify_next_seq(comm) -> Tuple[int, int]:
+    """(broadcast seq, collective seq) of this safe_broadcast on *comm*: its
+    safe_broadcast count, and its collective count if the communicator is
+    traced (-1 if not)."""
+    _bcast_verify_prefix()
+    key = comm.py2f()
+    seq = _bcast_verify_seqs.get(key, 0)
+    _bcast_verify_seqs[key] = seq + 1
+    ct = getattr(comm, "_collective_trace", None)
+    return seq, (ct.seq if ct is not None else -1)
+
+
+def _bcast_verify_check_header(comm, rank, header, local_seq) -> None:
+    """Log a sequence mismatch as soon as the header arrives: on a desynced
+    communicator the next collective may hang or fail."""
+    root_seq = (int(header[4]), int(header[5]))
+    if root_seq != local_seq:
+        _bcast_verify_report(
+            comm, f"sequence mismatch at the header on comm {comm.py2f()}, "
+            f"rank {rank}: header {header.tolist()}, root (broadcast, "
+            f"collective) {root_seq}, this rank {local_seq}",
+            dump=True)
+
+
+def _bcast_block_crcs(payload) -> np.ndarray:
+    view = memoryview(payload)
+    return np.array([
+        zlib.crc32(view[i:i + _BCAST_VERIFY_BLOCK])
+        for i in range(0, len(view), _BCAST_VERIFY_BLOCK)
+    ],
+                    dtype=np.uint32)
+
+
+def _bcast_mapping_of(address: int) -> str:
+    """The /proc/self/maps line holding *address*."""
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                lo, hi = line.split(None, 1)[0].split("-")
+                if int(lo, 16) <= address < int(hi, 16):
+                    return line.strip()
+    except OSError as e:
+        return f"unreadable: {e}"
+    return "none"
+
+
+def _describe_bcast_corruption(payload, root_blocks: np.ndarray) -> str:
+    total = len(payload)
+    bad = np.flatnonzero(_bcast_block_crcs(payload) != root_blocks)
+    address = np.frombuffer(payload, dtype=np.uint8).ctypes.data
+    text = (f"buffer at {address:#x}, mapping "
+            f"[{_bcast_mapping_of(address)}]")
+    if bad.size == 0:
+        return text + "; every block matches the root's block CRCs"
+    first = int(bad[0]) * _BCAST_VERIFY_BLOCK
+    end = min(total, (int(bad[-1]) + 1) * _BCAST_VERIFY_BLOCK)
+    span = "one contiguous span" if int(bad[-1]) - int(
+        bad[0]) + 1 == bad.size else "scattered"
+    return (f"{text}; {bad.size} of {len(root_blocks)} "
+            f"{_BCAST_VERIFY_BLOCK}-byte blocks differ ({span}), first bad "
+            f"offset {first} (page offset {(address + first) % 4096}), bad "
+            f"blocks end at {end}; received bytes at {first}: "
+            f"{bytes(memoryview(payload)[first:first + 64]).hex()}")
+
+
+def _bcast_retry_resend(comm, rank, root, header, payload, chunk_size):
+    """Re-broadcast the header (its CRC32 field may be the corrupted part) and
+    the payload in safe_broadcast's chunks; a non-root rank receives into a
+    fresh buffer of the first attempt's size."""
+    comm.Bcast([header, MPI.INT64_T], root=root)
+    if rank != root:
+        payload = bytearray(len(payload))
+    view = memoryview(payload)
+    for offset in range(0, len(view), chunk_size):
+        comm.Bcast([view[offset:offset + chunk_size], MPI.BYTE], root=root)
+    return payload
+
+
+def _finish_verified_broadcast(comm, rank, root, obj, header, local_seq,
+                               payload, chunk_size):
+    """TLLM_BCAST_VERIFY: check the payload against the root's CRC32 and
+    sequence numbers, log this rank's findings before any further collective,
+    vote so every rank logs its last collectives, then return or raise as
+    safe_broadcast does without verification.
+
+    TLLM_BCAST_RETRY: a CRC32 mismatch on any rank re-broadcasts the header and
+    payload, up to _BCAST_RETRY_MAX times, then raises on every rank; a
+    mismatched copy is never unpickled or returned. Each rank's setting rides
+    on the vote and one rank's suffices, so every rank takes the same path."""
+    stats = _bcast_verify_stats
+    total_size = int(header[1])
+    for attempt in range(_BCAST_RETRY_MAX + 1):
+        if attempt:
+            payload = _bcast_retry_resend(comm, rank, root, header, payload,
+                                          chunk_size)
+        problems, result, error, crc_bad = [], obj, None, False
+        if rank != root:
+            root_seq = (int(header[4]), int(header[5]))
+            if root_seq != local_seq:  # logged at the header
+                problems.append(f"sequence mismatch: root (broadcast, "
+                                f"collective) {root_seq}, this rank "
+                                f"{local_seq}")
+            result, error, findings, crc_bad = _verified_loads(
+                payload, int(header[3]), "root")
+            problems += findings
+            stats["checked"] += 1
+            stats["mismatches"] += crc_bad
+            if crc_bad:  # before the vote, which a desynced rank may not reach
+                logger.warning(
+                    f"{_bcast_verify_prefix()}: payload CRC32 mismatch "
+                    f"detected on comm {comm.py2f()}, broadcast seq "
+                    f"{local_seq[0]}, {total_size} bytes, attempt "
+                    f"{attempt + 1}; {_bcast_verify_counts()}")
+            if problems:
+                _bcast_verify_report(
+                    comm, f"rank {rank} on comm {comm.py2f()}: "
+                    f"{'; '.join(problems)}",
+                    dump=False)
+
+        # MAX over ranks of [flagged, CRC mismatch, retry enabled]
+        vote = np.array([bool(problems), crc_bad, BCAST_RETRY],
+                        dtype=np.int64)
+        comm.Allreduce(MPI.IN_PLACE, [vote, MPI.INT64_T], op=MPI.MAX)
+        if vote[1]:  # locate the corruption with the root's block CRCs
+            root_blocks = np.empty(-(-total_size // _BCAST_VERIFY_BLOCK),
+                                   dtype=np.uint32)
+            if rank == root:
+                root_blocks[:] = _bcast_block_crcs(payload)
+            comm.Bcast([root_blocks, MPI.UINT32_T], root=root)
+            if crc_bad:
+                try:  # every rank must reach the next collective
+                    problems.append(
+                        _describe_bcast_corruption(payload, root_blocks))
+                except Exception as e:
+                    problems.append(f"{e!r} while locating the corruption")
+        if vote[0]:
+            _bcast_verify_report(
+                comm, f"broadcast flagged on comm {comm.py2f()}, rank {rank} "
+                f"of {comm.Get_size()}, root {root}, attempt {attempt + 1}; "
+                f"header {header.tolist()}; (broadcast, collective) seq here "
+                f"{local_seq}; payload {total_size} bytes; "
+                f"{'; '.join(problems) or 'payload verified on this rank'}",
+                dump=True)
+            _bcast_verify_flag()
+        if not (vote[1] and vote[2]):
+            break
+        last = attempt == _BCAST_RETRY_MAX
+        stats["retries"] += not last
+        this_rank = ("sender" if rank == root else
+                     "mismatch" if crc_bad else "verified")
+        action = (f"giving up after {_BCAST_RETRY_MAX} retries" if last else
+                  f"retry {attempt + 1} of {_BCAST_RETRY_MAX}")
+        (logger.error if last else logger.warning)(
+            f"{_bcast_verify_prefix()}: payload CRC32 mismatch on comm "
+            f"{comm.py2f()}, broadcast seq {local_seq[0]}, {total_size} "
+            f"bytes, attempt {attempt + 1}: this rank {this_rank}; {action}; "
+            f"{_bcast_verify_counts()}")
+    else:
+        _bcast_verify_summary("give-up")
+        raise RuntimeError(
+            f"Deserialization failed: payload CRC32 mismatch on comm "
+            f"{comm.py2f()} persisted after {_BCAST_RETRY_MAX} retries" +
+            (f": {'; '.join(problems)}" if problems else ""))
+
+    stats["total"] += 1
+    if crc_bad and error is None:  # returned as received, without retry
+        stats["unchecked"] += 1
+    window = stats["window"].setdefault(comm.py2f(), {})
+    bucket = 1 << max(total_size - 1, 0).bit_length()
+    window[bucket] = window.get(bucket, 0) + 1
+    if stats["total"] % _BCAST_VERIFY_LOG_EVERY == 0:
+        histogram = "; ".join(
+            f"comm {handle}: " + ", ".join(f"<={k}: {v}"
+                                          for k, v in sorted(w.items()))
+            for handle, w in sorted(stats["window"].items()))
+        stats["window"] = {}
+        logger.warning(
+            f"{_bcast_verify_prefix()}: {stats['total']} broadcasts, "
+            f"{stats['flagged']} flagged, {_bcast_verify_counts()}; "
+            f"(broadcast, collective) seq {local_seq} on comm {comm.py2f()}; "
+            f"payload bytes over the last {_BCAST_VERIFY_LOG_EVERY}, by comm: "
+            f"{histogram}")
+    _bcast_verify_tick()
+
+    if error is not None:
+        raise RuntimeError(f"Deserialization failed: {str(error)}") from error
+    return result
 
 
 def _serialize_and_exchange_lengths(
@@ -572,6 +989,9 @@ def safe_gather(
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
 
+    if BCAST_VERIFY:
+        return _verified_exchange(comm, obj, chunk_size, root)
+
     # Step 1: serialize once and exchange lengths (1 MPI collective).
     rank, size, lengths, displs, sendbuf = \
         _serialize_and_exchange_lengths(comm, obj)
@@ -655,6 +1075,9 @@ def safe_allgather(
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
 
+    if BCAST_VERIFY:
+        return _verified_exchange(comm, obj, chunk_size)
+
     # Step 1: serialize once and exchange lengths (1 MPI collective).
     rank, size, lengths, displs, sendbuf = \
         _serialize_and_exchange_lengths(comm, obj)
@@ -690,6 +1113,115 @@ def safe_allgather(
                            num_rounds, chunk_size, recvbuf, _allgatherv)
 
     return _deserialize_recvbuf(recvbuf, lengths, displs, size)
+
+
+def _verified_exchange(comm: Any,
+                       obj: Any,
+                       chunk_size: int,
+                       root: Optional[int] = None) -> Optional[List[Any]]:
+    """safe_allgather (*root* None) and safe_gather under TLLM_BCAST_VERIFY:
+    each rank's payload travels with its CRC32 in the length exchange, and
+    every payload a rank receives (every rank's, or the root's for a gather) is
+    checked before and after unpickling. Under TLLM_BCAST_RETRY a mismatch on
+    any rank re-runs the exchange on every rank, up to _BCAST_RETRY_MAX times,
+    then raises on every rank, as _finish_verified_broadcast does. A gather
+    returns None on a rank that is not the root."""
+    stats = _bcast_verify_stats
+    kind = "allgather" if root is None else "gather"
+    _bcast_verify_prefix()
+    rank, size = comm.Get_rank(), comm.Get_size()
+    receives = root is None or rank == root
+    ser_error = None
+    try:
+        payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        meta = np.array([len(payload), zlib.crc32(payload)], dtype=np.int64)
+    except Exception as exc:
+        payload, meta, ser_error = b"", np.array([-1, 0], dtype=np.int64), exc
+    sendbuf = np.frombuffer(payload, dtype=np.uint8)
+    chunk_size = min(chunk_size, np.iinfo(np.int32).max // size)
+
+    def _exchange(send_part, round_recvbuf, counts, round_displs):
+        recv = ([round_recvbuf, counts, round_displs, MPI.BYTE]
+                if receives else None)  # as safe_gather off the root
+        if root is None:
+            comm.Allgatherv([send_part, MPI.BYTE], recv)
+        else:
+            comm.Gatherv([send_part, MPI.BYTE], recv, root=root)
+
+    for attempt in range(_BCAST_RETRY_MAX + 1):
+        metas = np.empty((size, 2), dtype=np.int64)  # [length, crc32] per rank
+        comm.Allgather([meta, MPI.INT64_T], [metas, MPI.INT64_T])
+        lengths = metas[:, 0]
+        if (lengths < 0).any():
+            raise RuntimeError(
+                f"Rank {rank}: serialization failed on at least one rank "
+                f"(lengths={lengths})") from ser_error
+        displs = np.zeros(size, dtype=np.int64)
+        displs[1:] = np.cumsum(lengths[:-1])
+        total_size = int(lengths.sum())
+        recvbuf = np.empty(total_size, dtype=np.uint8) if receives else None
+        _chunked_transfer_loop(comm, rank, size, lengths, displs, sendbuf,
+                               -(-int(lengths.max()) // chunk_size),
+                               chunk_size, recvbuf, _exchange)
+
+        results, error, problems, bad = [], None, [], []
+        if receives:
+            for i in range(size):
+                if lengths[i] == 0:  # as _deserialize_recvbuf
+                    results.append(None)
+                    continue
+                result, err, findings, mismatch = _verified_loads(
+                    recvbuf[displs[i]:displs[i] + lengths[i]],
+                    int(metas[i, 1]), f"rank {i}")
+                results.append(result)
+                error = error or err
+                if findings:
+                    problems.append(f"from rank {i}: {'; '.join(findings)}")
+                if mismatch:
+                    bad.append(i)
+            stats[f"{kind}_checked"] += size
+            stats[f"{kind}_mismatches"] += len(bad)
+        if bad:  # before the vote, which a desynced rank may not reach
+            logger.warning(
+                f"{_bcast_verify_prefix()}: {kind} CRC32 mismatch detected on "
+                f"comm {comm.py2f()}, from ranks {bad}, {total_size} bytes, "
+                f"attempt {attempt + 1}; {_bcast_verify_counts()}")
+        if problems:
+            _bcast_verify_report(
+                comm, f"{kind} on comm {comm.py2f()}, rank {rank} of "
+                f"{size}, attempt {attempt + 1}, {total_size} bytes: "
+                f"{'; '.join(problems)}",
+                dump=False)
+            _bcast_verify_flag()
+
+        # MAX over ranks of [CRC mismatch, retry enabled]
+        vote = np.array([bool(bad), BCAST_RETRY], dtype=np.int64)
+        comm.Allreduce(MPI.IN_PLACE, [vote, MPI.INT64_T], op=MPI.MAX)
+        if not (vote[0] and vote[1]):
+            break
+        last = attempt == _BCAST_RETRY_MAX
+        stats[f"{kind}_retries"] += not last
+        this_rank = (f"mismatch from ranks {bad}" if bad else
+                     "verified" if receives else "sender")
+        action = (f"giving up after {_BCAST_RETRY_MAX} retries" if last else
+                  f"retry {attempt + 1} of {_BCAST_RETRY_MAX}")
+        (logger.error if last else logger.warning)(
+            f"{_bcast_verify_prefix()}: {kind} CRC32 mismatch on comm "
+            f"{comm.py2f()}, {total_size} bytes, attempt {attempt + 1}: this "
+            f"rank {this_rank}; {action}; {_bcast_verify_counts()}")
+    else:
+        _bcast_verify_summary("give-up")
+        raise RuntimeError(
+            f"Deserialization failed: {kind} CRC32 mismatch on comm "
+            f"{comm.py2f()} persisted after {_BCAST_RETRY_MAX} retries" +
+            (f": {'; '.join(problems)}" if problems else ""))
+
+    _bcast_verify_tally(kind, comm, rank, total_size)
+    stats["unchecked"] += len(bad)  # returned as received, without retry
+    _bcast_verify_tick()
+    if error is not None:
+        raise error
+    return results if receives else None
 
 
 class MPIDist(Distributed):
@@ -743,13 +1275,18 @@ class MPIDist(Distributed):
         # in-place recv numpy buffer
         return mpi_recv(buf, src, tag)
 
+    # The point-to-point object sends carry the pipeline-parallel schedule and
+    # sampled tokens; they have no CRC, so TLLM_BCAST_VERIFY counts their calls.
     def send_object(self, obj, dest, tag=0):
+        _bcast_note_unchecked("send_object")
         mpi_send_object(obj, dest, tag)
 
     def isend_object(self, obj, dest, tag=0):
+        _bcast_note_unchecked("isend_object")
         return mpi_isend_object(obj, dest, tag)
 
     def recv_object(self, src, tag=0):
+        _bcast_note_unchecked("recv_object")
         return mpi_recv_object(src, tag)
 
     @property
@@ -784,7 +1321,7 @@ class MPIDist(Distributed):
                      *,
                      small_payload: bool = False):
         comm = self.cp_comm
-        if small_payload:
+        if small_payload and not BCAST_VERIFY:
             # mpi4py's native object allgather is cheaper for tiny payloads;
             # callers must guarantee the payload stays small on every rank.
             return comm.allgather(obj)
@@ -804,7 +1341,7 @@ class MPIDist(Distributed):
                      *,
                      small_payload: bool = False):
         comm = self.tp_comm
-        if small_payload:
+        if small_payload and not BCAST_VERIFY:
             return comm.allgather(obj)
         return safe_allgather(comm, obj, chunk_size=chunk_size)
 
@@ -829,6 +1366,8 @@ class MPIDist(Distributed):
         return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
 
     def pp_broadcast(self, obj, root=0):
+        if BCAST_VERIFY:  # CRC-checked, see safe_broadcast
+            return safe_broadcast(self.pp_comm, obj, root=root)
         return self.pp_comm.bcast(obj, root)
 
     def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
