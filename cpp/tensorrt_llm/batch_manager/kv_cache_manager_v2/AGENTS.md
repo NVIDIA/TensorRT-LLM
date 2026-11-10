@@ -276,6 +276,19 @@ Eviction controller
   `Block::~Block()` reclaims those pages when the last block owner releases them.
   Every `KvCache` must be closed before manager shutdown so this deferred cleanup
   runs while `StorageManager` is still alive.
+- Teardown may run on a thread with no CUDA context: destructors run on
+  whatever thread drops the last reference (Python's cyclic garbage collector),
+  and every driver call needs a context. `~KvCacheManager`, `~KvCache`, `~Batch`
+  and `~PlannedDropHandle` therefore make the manager's context current
+  (`CudaContextScope`) for their body. For a manager and a `KvCache` the
+  destructor is a fallback for an owner that skipped `shutdown()` / `close()`;
+  destroying a `Batch` or a `PlannedDropHandle` is their normal teardown. The
+  scope ends before the members are destroyed, so everything that needs the
+  context is released inside the body: a manager's through `shutdown()`, a
+  `Batch`'s by resetting its device and pinned buffers at the end of `~Batch`.
+  When no context can be made current at all, `~KvCacheManager` leaks its storage
+  and tree instead of poisoning; the other destructors let the failing driver
+  call poison KVCM2.
 
 ### Beam-search pages
 

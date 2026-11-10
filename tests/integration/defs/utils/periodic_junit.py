@@ -21,14 +21,18 @@ pytest's built-in junitxml plugin for simplified test result handling.
 
 import copy
 import faulthandler
+import json
 import os
 import platform
 import signal
 import threading
 import time
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Optional, TextIO
+
+import pytest
 
 try:
     from _pytest.config import Config
@@ -41,6 +45,108 @@ except ImportError:
     TestReport = None  # type: ignore
     LogXML = None  # type: ignore
     Item = None  # type: ignore
+
+_TIMEOUT_EVIDENCE_MARKER = "TRTLLM_PYTEST_TIMEOUT "
+_TIMEOUT_ATTEMPT_MARKER = "TRTLLM_PYTEST_ATTEMPT "
+_TIMEOUT_EVIDENCE_PLUGIN_NAME = "trtllm_pytest_timeout_evidence"
+
+
+def _emit_timeout_record(marker, payload, config) -> None:
+    """Emit a record with both global and fixture output capture disabled."""
+    try:
+        record = json.dumps(payload, separators=(",", ":"))
+        capman = config.pluginmanager.getplugin("capturemanager")
+        capture_disabled = (capman.global_and_fixture_disabled()
+                            if capman else nullcontext())
+        with capture_disabled:
+            os.write(2, f"\n{marker}{record}\n".encode("utf-8"))
+    except (OSError, TypeError, UnicodeError, ValueError):
+        # Timeout handling must proceed even if diagnostic output is unavailable.
+        pass
+
+
+def _emit_timeout_event(marker, item, attempt, timeout=None) -> None:
+    """Emit one timeout or attempt event for an exact pytest nodeid."""
+    payload = {"nodeid": item.nodeid, "attempt": attempt}
+    if timeout is not None:
+        payload["timeout"] = float(timeout)
+    _emit_timeout_record(marker, payload, item.config)
+
+
+class _PytestTimeoutEvidencePlugin:
+    """Preserve pytest-timeout behavior while adding exact nodeid evidence."""
+
+    def __init__(self):
+        self._attempts = {}
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_runtest_setup(self, item: "Item") -> None:
+        """Count each setup phase, including every in-process rerun."""
+        attempt = self._attempts.get(item.nodeid, 0) + 1
+        self._attempts[item.nodeid] = attempt
+        if attempt > 1:
+            _emit_timeout_event(_TIMEOUT_ATTEMPT_MARKER, item, attempt)
+
+    @pytest.hookimpl(optionalhook=True, tryfirst=True)
+    def pytest_timeout_set_timer(self, item, settings):
+        import pytest_timeout
+
+        timeout_method = settings.method
+        if (timeout_method == "signal"
+                and threading.current_thread() is not threading.main_thread()):
+            timeout_method = "thread"
+
+        def timeout_is_suppressed():
+            return (not settings.disable_debugger_detection
+                    and pytest_timeout.is_debugging())
+
+        if timeout_method == "signal":
+
+            def handler(signum, frame):
+                __tracebackhide__ = True
+                if timeout_is_suppressed():
+                    return
+                _emit_timeout_event(_TIMEOUT_EVIDENCE_MARKER, item,
+                                    self._attempts.get(item.nodeid, 1),
+                                    settings.timeout)
+                pytest_timeout.timeout_sigalrm(item, settings)
+
+            def cancel():
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, signal.SIG_DFL)
+
+            item.cancel_timeout = cancel
+            signal.signal(signal.SIGALRM, handler)
+            signal.setitimer(signal.ITIMER_REAL, settings.timeout)
+        elif timeout_method == "thread":
+
+            def expire():
+                if timeout_is_suppressed():
+                    return
+                _emit_timeout_event(_TIMEOUT_EVIDENCE_MARKER, item,
+                                    self._attempts.get(item.nodeid, 1),
+                                    settings.timeout)
+                pytest_timeout.timeout_timer(item, settings)
+
+            timer = threading.Timer(settings.timeout, expire)
+            timer.name = f"{pytest_timeout.__name__} {item.nodeid}"
+
+            def cancel():
+                timer.cancel()
+                timer.join()
+
+            item.cancel_timeout = cancel
+            timer.start()
+        return True
+
+
+def register_pytest_timeout_evidence(config) -> None:
+    """Register timeout evidence in controllers and xdist workers once."""
+    if not config.pluginmanager.hasplugin(_TIMEOUT_EVIDENCE_PLUGIN_NAME):
+        config.pluginmanager.register(
+            _PytestTimeoutEvidencePlugin(),
+            _TIMEOUT_EVIDENCE_PLUGIN_NAME,
+        )
 
 
 class PeriodicJUnitXML:
@@ -138,6 +244,7 @@ class PeriodicJUnitXML:
         self._hang_lock = threading.RLock()
 
         self.completed_tests = 0
+        self._completed_unfinished_tests: set[str] = set()
         self.last_save_time = time.time()
         self.suite_start_time = time.time()
 
@@ -206,6 +313,25 @@ class PeriodicJUnitXML:
         self.logxml.node_reporters_ordered = []  # type: ignore
         self.logxml.global_properties = []
 
+    def pytest_runtest_logstart(self, nodeid: str, location) -> None:
+        """Record the test before fixtures run, including setup-time hangs."""
+        if not self.save_unfinished_test:
+            return
+        # A new attempt of the same nodeid must remain tracked until it finishes.
+        self._completed_unfinished_tests.discard(nodeid)
+        unfinished_test_path = self.unfinished_test_path or os.path.join(
+            os.path.dirname(self.xmlpath), "unfinished_test.txt")
+        try:
+            os.makedirs(os.path.dirname(unfinished_test_path), exist_ok=True)
+            # Close the file before setup: thread-mode timeouts use os._exit(),
+            # which cannot flush Python buffers or run reporting hooks.
+            with open(unfinished_test_path, "a", encoding="utf-8") as f:
+                f.write(nodeid + "\n")
+        except OSError as e:
+            self._log_warning(
+                f"Error writing unfinished test {nodeid} to {unfinished_test_path}: {e}"
+            )
+
     def pytest_runtest_logreport(self, report: TestReport):
         """Handle test reports and trigger periodic saving."""
         # The teardown report lands after every fixture finalizer, so the item is
@@ -217,44 +343,13 @@ class PeriodicJUnitXML:
         # Collect the report for later batch processing (fast)
         self.pending_reports.append(report)
 
-        output_dir = os.path.dirname(self.xmlpath)
-        unfinished_test_path = self.unfinished_test_path or os.path.join(
-            output_dir, "unfinished_test.txt")
-
-        # save unfinished test nodeid to output-dir/unfinished_test.txt
-        if self.save_unfinished_test and report.when == "setup":
-            try:
-                # Create the directory actually being written to, not output_dir --
-                # they differ when self.unfinished_test_path redirects elsewhere.
-                os.makedirs(os.path.dirname(unfinished_test_path),
-                            exist_ok=True)
-                with open(unfinished_test_path, "a", encoding="utf-8") as f:
-                    f.write(report.nodeid + "\n")
-            except Exception as e:
-                self._log_warning(
-                    f"Error writing unfinished test {report.nodeid} to {unfinished_test_path}: {e}"
-                )
-
         # Only increment counter and check for save on teardown phase
         if report.when == "teardown":
             self.completed_tests += 1
             current_time = time.time()
 
             if self.save_unfinished_test:
-                if os.path.exists(unfinished_test_path):
-                    try:
-                        with open(unfinished_test_path, "r+",
-                                  encoding="utf-8") as f:
-                            lines = f.readlines()
-                            f.seek(0)
-                            f.truncate()
-                            for line in lines:
-                                if line.strip() != report.nodeid:
-                                    f.write(line)
-                    except Exception as e:
-                        self._log_warning(
-                            f"Error clearing nodeid {report.nodeid} from {unfinished_test_path}: {e}"
-                        )
+                self._completed_unfinished_tests.add(report.nodeid)
 
             # Flush if batch threshold reached OR time interval elapsed
             should_flush_by_time = (current_time -
@@ -389,6 +484,35 @@ class PeriodicJUnitXML:
                 except OSError:
                     pass
             raise
+
+        self._clear_saved_unfinished_tests()
+
+    def _clear_saved_unfinished_tests(self) -> None:
+        """Clear completed records only after their XML has been published."""
+        if not self.save_unfinished_test or not self._completed_unfinished_tests:
+            return
+        unfinished_test_path = self.unfinished_test_path or os.path.join(
+            os.path.dirname(self.xmlpath), "unfinished_test.txt")
+        temp_path = unfinished_test_path + ".tmp"
+        try:
+            with open(unfinished_test_path, encoding="utf-8") as f:
+                lines = f.readlines()
+            # Preserve active tests if interrupted during setup/call/teardown.
+            # Atomic replacement avoids losing them if cleanup is interrupted.
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.writelines(
+                    line for line in lines
+                    if line.strip() not in self._completed_unfinished_tests)
+            os.replace(temp_path, unfinished_test_path)
+            self._completed_unfinished_tests.clear()
+        except (OSError, UnicodeDecodeError) as e:
+            self._log_warning(
+                f"Error clearing saved tests from {unfinished_test_path}: {e}")
+            # Keep completed nodeids so the next successful save retries cleanup.
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
     def _hang_traceback_path(self) -> str:
         """Path of the sidecar file that captures thread stacks on a hang."""
