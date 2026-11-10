@@ -481,11 +481,13 @@ def accuracy_rules(ctx: LintContext) -> Iterator[Finding]:
         yield Finding(
             "accuracy-placeholder-anchor",
             WARN,
-            f"the {benchmark} anchor {', '.join(f'{v:g}' for v in low)} is a low placeholder: "
-            f"its floor catches an engine that answers nothing and passes one that answers "
+            f"the {benchmark} anchor {', '.join(f'{v:g}' for v in low)} is under "
+            f"{plausible:g}, where most served models score: if it is a placeholder, its floor "
+            f"catches an engine that answers nothing and passes one that answers "
             f"({_floors(accuracy, values)}), so a run delivered on it certifies no accuracy; a "
             "configuration variant is judged against its unit's own score, not this row",
-            replace,
+            f"{replace}; a measured score of a small model is right as it is: keep it with "
+            "`intake-accept: accuracy-placeholder-anchor -- <how it was measured>` in notes",
         )
     elif marked:
         yield Finding(
