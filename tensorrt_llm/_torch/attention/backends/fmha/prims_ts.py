@@ -38,6 +38,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .prims_ts_mla_warmup import _MlaContextPlan, _MlaDecodePlan, _scale_profile
 from .utils import get_kv_page_offset, get_multi_processor_count_for_device
 
 if TYPE_CHECKING:
@@ -247,6 +248,8 @@ class PrimsTSFmha(PhasedFmha):
         self._mla_context_wrappers: dict[
             tuple[int, int, int, str, bool], "BatchPrefillTSWrapper"
         ] = {}
+        self._mla_context_plan_profiles: set[_MlaContextPlan] = set()
+        self._mla_decode_plan_profiles: set[_MlaDecodePlan] = set()
         # Dense MLA's quantization scales are fixed for this layer/model. PrimTS
         # takes host scalars, so read them once during eager warmup, not capture.
         self._mla_fp8_scales: tuple[float, float] | None = None
@@ -996,14 +999,14 @@ class PrimsTSFmha(PhasedFmha):
         )
 
         wrapper = BatchMLADecodePagedTSWrapper()
-        wrapper.plan(
-            workspace_buffer.device,
-            batch_size,
-            num_heads,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            page_size,
-            max_kv_len,
+        plan_kwargs = dict(
+            device=workspace_buffer.device,
+            batch_size=batch_size,
+            num_qo_heads=num_heads,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            page_size=page_size,
+            max_kv_len=max_kv_len,
             max_q_len=max_q_len,
             packed_query=False,
             q_dtype=q_dtype,
@@ -1012,8 +1015,9 @@ class PrimsTSFmha(PhasedFmha):
             mask_type=mask_type,
             store_softmax_stats=store_softmax_stats,
             use_kv_bounds=use_kv_bounds,
-            workspace_buffer=workspace_buffer,
         )
+        wrapper.plan(**plan_kwargs, workspace_buffer=workspace_buffer)
+        self._mla_decode_plan_profiles.add(_MlaDecodePlan(**plan_kwargs))
         self._mla_decode_wrappers[key] = wrapper
         return wrapper
 
@@ -1242,6 +1246,7 @@ class PrimsTSFmha(PhasedFmha):
             if self._mla_decode_workspace_capacity != max_seq_len:
                 if self._mla_decode_workspace_capacity is not None:
                     self._mla_decode_wrappers.clear()
+                    self._mla_decode_plan_profiles.clear()
                 self._mla_decode_workspace_capacity = max_seq_len
                 self._mla_decode_workspace_sizes.clear()
             size_key = (batch_size, seq_len_q)
@@ -1460,7 +1465,7 @@ class PrimsTSFmha(PhasedFmha):
             )
 
             wrapper = BatchPrefillTSWrapper()
-            wrapper.plan(
+            plan_kwargs = dict(
                 device=q.device,
                 batch_size=params.batch_size,
                 max_q_len=q_capacity,
@@ -1475,9 +1480,15 @@ class PrimsTSFmha(PhasedFmha):
                 out_dtype=params.output.dtype,
                 packed_query=True,
                 mask_type=mask,
-                softmax_scale=softmax_scale,
-                output_scale=output_scale,
                 store_softmax_stats=stats is not None,
+            )
+            wrapper.plan(**plan_kwargs, softmax_scale=softmax_scale, output_scale=output_scale)
+            self._mla_context_plan_profiles.add(
+                _MlaContextPlan(
+                    **plan_kwargs,
+                    softmax_scale=_scale_profile(softmax_scale),
+                    output_scale=_scale_profile(output_scale),
+                )
             )
             self._mla_context_wrappers[key] = wrapper
         wrapper.run(

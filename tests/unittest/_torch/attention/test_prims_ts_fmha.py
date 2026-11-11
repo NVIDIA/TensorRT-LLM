@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import math
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, create_autospec
 
@@ -32,6 +32,7 @@ from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts_mla_warmup import _ScaleKind
 from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_classes
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
@@ -1368,6 +1369,14 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     qo_indptr.copy_(torch.tensor([0, 3, 5], dtype=torch.int32))
     fmha.run_mla_context(params)
     assert factory.call_count == wrapper.plan.call_count == 1
+    assert len(fmha._mla_context_plan_profiles) == 1
+    profile = next(iter(fmha._mla_context_plan_profiles))
+    recorded = asdict(profile)
+    recorded.pop("window_left")
+    expected = dict(wrapper.plan.call_args.kwargs)
+    if fp8:
+        expected.update(softmax_scale=_ScaleKind.DEVICE, output_scale=_ScaleKind.DEVICE)
+    assert recorded == expected
     assert native_preprocess.call_count == wrapper.run.call_count == 2
     torch.testing.assert_close(first_kv_offsets, torch.tensor([0, 4, 9], dtype=torch.int32))
     torch.testing.assert_close(
@@ -2152,21 +2161,18 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
 
     wrapper_factory.assert_called_once_with()
     wrapper.plan.assert_called_once()
-    plan_args = wrapper.plan.call_args.args
     plan_kwargs = wrapper.plan.call_args.kwargs
-    assert plan_args == (
-        params.workspace.device,
-        2,
-        attn.num_heads,
-        512,
-        64,
-        page_size,
-        3 * page_size,
-    )
     workspace_buffer = plan_kwargs["workspace_buffer"]
     assert workspace_buffer.data_ptr() == params.workspace.data_ptr()
     assert workspace_buffer.numel() == 64
     assert {key: value for key, value in plan_kwargs.items() if key != "workspace_buffer"} == {
+        "device": params.workspace.device,
+        "batch_size": 2,
+        "num_qo_heads": attn.num_heads,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "page_size": page_size,
+        "max_kv_len": 3 * page_size,
         "max_q_len": query_width,
         "packed_query": False,
         "q_dtype": kernel_dtype,
@@ -2232,6 +2238,10 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
     if helix:
         torch.testing.assert_close(wrapper.run.call_args.kwargs["kv_bounds"], expected_bounds)
     assert fmha._mla_decode_wrappers[(2, query_width)] is wrapper
+    assert len(fmha._mla_decode_plan_profiles) == 1
+    assert asdict(next(iter(fmha._mla_decode_plan_profiles))) == {
+        key: value for key, value in plan_kwargs.items() if key != "workspace_buffer"
+    }
 
 
 @pytest.mark.parametrize("buffer_dtype", [torch.uint8, torch.float8_e4m3fn])
@@ -2360,6 +2370,11 @@ def test_mla_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
         assert wrapper.plan.call_args.kwargs["workspace_buffer"] is workspace
     assert fmha._mla_decode_wrappers[(2, 1)] is wrappers[0]
     assert fmha._mla_decode_wrappers[(1, 1)] is wrappers[1]
+    profiles = fmha._mla_decode_plan_profiles.copy()
+    assert {profile.batch_size for profile in profiles} == {1, 2}
+    fmha._update_workspace_allocation(workspace)
+    assert not fmha._mla_decode_wrappers
+    assert fmha._mla_decode_plan_profiles == profiles
 
 
 def test_mla_wrapper_capture_uses_cached_plan_and_rejects_plan_miss(
@@ -2526,17 +2541,14 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
 
     wrapper_factory.assert_called_once_with()
     wrapper.plan.assert_called_once()
-    plan_args = wrapper.plan.call_args.args
     plan_kwargs = wrapper.plan.call_args.kwargs
-    assert plan_args == (
-        params.workspace.device,
-        2,
-        attn.num_heads,
-        512,
-        64,
-        32,
-        96,
-    )
+    assert plan_kwargs["device"] == params.workspace.device
+    assert plan_kwargs["batch_size"] == 2
+    assert plan_kwargs["num_qo_heads"] == attn.num_heads
+    assert plan_kwargs["kv_lora_rank"] == 512
+    assert plan_kwargs["qk_rope_head_dim"] == 64
+    assert plan_kwargs["page_size"] == 32
+    assert plan_kwargs["max_kv_len"] == 96
     assert plan_kwargs["packed_query"] is False
     assert plan_kwargs["workspace_buffer"].data_ptr() == params.workspace.data_ptr()
     assert plan_kwargs["workspace_buffer"].numel() == 96
@@ -2777,12 +2789,14 @@ def test_mla_workspace_size_cache_tracks_request_geometry(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     previous_pointer = workspace.data_ptr()
     fmha._mla_decode_wrappers[(2, 1)] = Mock()
+    fmha._mla_decode_plan_profiles.add(object())
     metadata.kv_cache_block_offsets = torch.empty((4, 2, 6), dtype=torch.int32)
     fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
     assert workspace_size.call_count == 4
     assert workspace_size.call_args.args[5] == 192
     assert set(fmha._mla_decode_workspace_sizes) == {(2, 1)}
     assert fmha._mla_decode_wrappers == {}
+    assert fmha._mla_decode_plan_profiles == set()
     assert workspace.data_ptr() == previous_pointer
 
     metadata.kv_cache_block_offsets = torch.empty((4, 2, 64), dtype=torch.int32)
