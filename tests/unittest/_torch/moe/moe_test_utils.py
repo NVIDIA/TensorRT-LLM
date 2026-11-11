@@ -286,10 +286,7 @@ def should_skip_trtllm(
     model_config: "MoeModelConfig",
     routing_method_cls=None,
     swiglu_gptoss_style: bool = False,
-    comm_method: Optional[str] = None,
-    seq_len: Optional[int] = None,
     moe_tp_size: int = 1,
-    parallel_mode: Optional[str] = None,
 ) -> Optional[str]:
     """
     Check TRTLLM Gen backend specific constraints.
@@ -304,13 +301,7 @@ def should_skip_trtllm(
         routing_method_cls: Optional routing method class for compatibility checks
             (used by test_moe_module.py)
         swiglu_gptoss_style: Whether using swiglu gptoss style
-        comm_method: Optional communication method (e.g. "DEEPEP", "DEEPEPLOWLATENCY")
-            for multi-GPU EP mode checks
-        seq_len: Optional sequence length for seq_len-sensitive skip checks
         moe_tp_size: MoE TP parallelism size (default: 1, no TP sharding)
-        parallel_mode: Optional multi-GPU parallel mode label (e.g. "DEP",
-            "DTP", "TTP", "TEP"); used by parallel-mode-specific kernel-bug
-            skips that ``moe_tp_size`` alone cannot disambiguate.
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
@@ -1195,7 +1186,6 @@ def get_quick_skip_reason(
                 model_config,
                 routing_method_cls,
                 swiglu_gptoss_style,
-                seq_len=seq_len,
             ),
             lambda: should_skip_cutlass(
                 backend_type,
