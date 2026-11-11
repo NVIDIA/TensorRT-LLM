@@ -927,10 +927,8 @@ def test_selfsampling_hopper_clusters_are_coresident() -> None:
         assert plan["cluster"] == 4, (n, plan)
 
 
-def test_selfsampling_bf16_partitioned_rows_cluster_on_blackwell_only(monkeypatch) -> None:
-    """BF16 rows split over CTAs launch each row's parts as one cluster on Blackwell; Hopper
-    launches them as plain CTAs (the cluster only co-schedules the parts, and 32 rows of 4-CTA
-    clusters would take two waves there)."""
+def _record_compile_requests(monkeypatch) -> list:
+    """Route the launchers' compile requests to a recorder that returns no-op kernels."""
     real = ss_host._device()
     requests = []
 
@@ -940,29 +938,34 @@ def test_selfsampling_bf16_partitioned_rows_cluster_on_blackwell_only(monkeypatc
                 return getattr(real, name)
 
             def compile_request(*args: object, **kwargs: object):
-                requests.append(kwargs)
+                requests.append((name, kwargs))
                 return lambda *launch_args: None
 
             return compile_request
 
     monkeypatch.setattr(ss_host, "_device", RecordingDevice)
+    for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
+        monkeypatch.setattr(ss_host, cache, {})
+    return requests
+
+
+def _varlen_plan(rows, n, k, num_sms, sm_version, dtype=torch.float32):
+    npad = (n + 63) // 64 * 64
+    return ss_host._varlen_launcher(
+        rows, npad, k, n, 1, 4, num_sms, sm_version, dtype=dtype, device_index=0
+    )
+
+
+def test_selfsampling_bf16_partitioned_rows_cluster_on_blackwell_only(monkeypatch) -> None:
+    """BF16 rows split over CTAs launch each row's parts as one cluster on Blackwell; Hopper
+    launches them as plain CTAs (the cluster only co-schedules the parts, and 32 rows of 4-CTA
+    clusters would take two waves there)."""
+    requests = _record_compile_requests(monkeypatch)
     for rows in (8, 32):
         for (num_sms, sm_version), clustered in (((148, 100), True), ((132, 90), False)):
-            monkeypatch.setattr(ss_host, "_VARLEN_CACHE_BF16", {})
             requests.clear()
-            ss_host._varlen_launcher(
-                rows,
-                8256,
-                1024,
-                8195,
-                1,
-                4,
-                num_sms,
-                sm_version,
-                dtype=torch.bfloat16,
-                device_index=0,
-            )
-            partitioned = [r for r in requests if r.get("pcw")]
+            _varlen_plan(rows, 8195, 1024, num_sms, sm_version, torch.bfloat16)
+            partitioned = [kwargs for _, kwargs in requests if kwargs.get("pcw")]
             assert partitioned and partitioned[-1]["parts"] > 1, (rows, sm_version, requests)
             assert partitioned[-1]["pcw_cluster"] is clustered, (rows, sm_version, partitioned[-1])
 
@@ -972,23 +975,10 @@ def test_selfsampling_hopper_long_rows_sample_with_staging_headroom(monkeypatch)
     the kernel clamps to SCAP / 2): FP32 rows of 64K or more scores at K <= 1024 and 16-bit rows
     of 128K or more at K = 1024, or of 64K or more for BF16 batches that read their survivors
     from registers, which keep the 256-thread slab below 128K. Blackwell keeps its plans."""
-    real = ss_host._device()
-
-    class RecordingDevice:
-        def __getattr__(self, name: str):
-            if not name.startswith("get_compiled"):
-                return getattr(real, name)
-            return lambda *args, **kwargs: (lambda *launch_args: None)
-
-    monkeypatch.setattr(ss_host, "_device", RecordingDevice)
-    for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
-        monkeypatch.setattr(ss_host, cache, {})
+    _record_compile_requests(monkeypatch)
 
     def aim(rows, n, k, num_sms, sm_version, dtype):
-        npad = (n + 63) // 64 * 64
-        launcher = ss_host._varlen_launcher(
-            rows, npad, k, n, 1, 4, num_sms, sm_version, dtype=dtype, device_index=0
-        )
+        launcher = _varlen_plan(rows, n, k, num_sms, sm_version, dtype)
         assert launcher[0] == "main", (rows, n, k, dtype, launcher)
         return launcher[3][0]
 
@@ -1018,38 +1008,39 @@ def test_selfsampling_hopper_long_rows_sample_with_staging_headroom(monkeypatch)
     assert slab(1024, 65539, torch.bfloat16, 148, 100) == slab(1024, 65539, torch.float16, 148, 100)
 
 
-def test_selfsampling_hopper_tall_register_batches_read_row_stride_at_run_time(monkeypatch) -> None:
-    """FP32 K=1024 register kernels compile the row stride in, except on Hopper for batches beyond
-    two waves of rows above 4K scores."""
-    real = ss_host._device()
-    requests = []
+def test_selfsampling_hopper_reads_shape_constants_at_run_time(monkeypatch) -> None:
+    """Kernels that compile a shape constant in keep it at run time on Hopper where that is
+    faster: the row stride of FP32 K=1024 register kernels in batches beyond two waves of rows
+    above 4K scores, and K in BF16 K=512 main slabs. Blackwell compiles both in."""
+    requests = _record_compile_requests(monkeypatch)
 
-    class RecordingDevice:
-        def __getattr__(self, name: str):
-            if not name.startswith("get_compiled"):
-                return getattr(real, name)
-
-            def compile_request(*args: object, **kwargs: object):
-                requests.append((name, kwargs))
-                return lambda *launch_args: None
-
-            return compile_request
-
-    monkeypatch.setattr(ss_host, "_device", RecordingDevice)
+    def request(kernel, rows, n, k, num_sms, sm_version, dtype):
+        for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16"):
+            monkeypatch.setattr(ss_host, cache, {})
+        requests.clear()
+        _varlen_plan(rows, n, k, num_sms, sm_version, dtype)
+        matching = [kwargs for name, kwargs in requests if name == kernel]
+        assert matching, (kernel, rows, n, k, sm_version, requests)
+        return matching[-1]
 
     def static_npad(rows, n, num_sms, sm_version):
-        monkeypatch.setattr(ss_host, "_VARLEN_CACHE", {})
-        requests.clear()
-        ss_host._varlen_launcher(rows, (n + 63) // 64 * 64, 1024, n, 1, 4, num_sms, sm_version)
-        reg = [kwargs for name, kwargs in requests if name == "get_compiled__reg"]
-        assert reg, (rows, n, sm_version, requests)
-        return reg[-1]["static_npad"]
+        kwargs = request("get_compiled__reg", rows, n, 1024, num_sms, sm_version, torch.float32)
+        return kwargs["static_npad"]
 
     for rows, n in ((512, 4099), (1024, 4099), (512, 8195), (1024, 8195)):
         assert static_npad(rows, n, 132, 90) is None, (rows, n)
         assert static_npad(rows, n, 148, 100) == (n + 63) // 64 * 64, (rows, n)
     for rows, n in ((256, 4099), (1024, 2051)):
         assert static_npad(rows, n, 132, 90) == (n + 63) // 64 * 64, (rows, n)
+
+    def staged_k(rows, n, k, num_sms, sm_version):
+        kwargs = request("get_compiled", rows, n, k, num_sms, sm_version, torch.bfloat16)
+        return kwargs.get("staged_k", 0)
+
+    for rows, n in ((512, 16387), (1024, 16387), (1024, 32771)):
+        assert staged_k(rows, n, 512, 132, 90) == 0, (rows, n)
+        assert staged_k(rows, n, 512, 148, 100) == 512, (rows, n)
+        assert staged_k(rows, n, 1024, 132, 90) == 1024, (rows, n)
 
 
 @pytest.mark.skipif(

@@ -3192,7 +3192,12 @@ def _varlen_launcher(
                     main_options["envf"] = True
                 if dtype is torch.bfloat16 and sm_version in _TUNED_SM_VERSIONS:
                     main_options["warp_rank"] = True
-                    if r_const == 1 and (k == 2048 or main_options["v16"]):
+                    # a compile-time K pays off on Hopper from K = 1024
+                    if (
+                        r_const == 1
+                        and (k == 2048 or main_options["v16"])
+                        and (k >= 1024 or sm_version in _BLACKWELL_SM_VERSIONS)
+                    ):
                         main_options["staged_k"] = k
                 if dtype is torch.float16 and not tpl[5]:
                     main_options["p2"] = (
