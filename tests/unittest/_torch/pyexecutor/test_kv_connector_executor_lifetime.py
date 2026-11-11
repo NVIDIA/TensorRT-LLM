@@ -793,6 +793,7 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     executor.hang_detector.detected.return_value = False
     executor.worker_thread = Mock()
     executor._worker_phase_done = Mock()
+    executor._worker_phase_done.wait.side_effect = lambda: order.append("phase")
     executor._worker_phases = Mock()
     executor.dist = SimpleNamespace(rank=0, pp_size=1)
     executor._shutdown_sleep_wakeup_listeners = Mock()
@@ -807,6 +808,6 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
 
     executor.shutdown()
 
-    # The worker thread first: it is the one still handing the connector work.
+    # The execution phase must stop handing the connector work before it drains.
     executor.worker_thread.join.assert_called_once_with()
-    assert order == ["connector", "kv pools"]
+    assert order == ["phase", "connector", "kv pools"]
