@@ -249,6 +249,7 @@ def _gen_admission_setup(
     """Use real admission paths with fake external KV and receive operations."""
     manager = SimpleNamespace(
         prepare_disagg_gen_init=Mock(return_value=True),
+        wait_disagg_receive_ready=Mock(),
         kv_cache_map={request.py_request_id: SimpleNamespace(capacity=65, history_length=64)},
         mapping=SimpleNamespace(rank=4),
         tokens_per_block=32,
@@ -542,6 +543,8 @@ def test_gen_decode_ready_requires_successful_handoff_and_uses_full_cp_prompt_le
     executor.dist = SimpleNamespace(tp_rank=1, pp_rank=0, cp_rank=3)
     executor._disagg_coordinator = _coordinator()
     executor._disagg_coordinator._transceiver = executor.kv_cache_transceiver
+    # The state receive_gen_init leaves for a receive it started.
+    executor._disagg_coordinator._started_gen_receives[request.py_request_id] = request
 
     emit_event = Mock()
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
@@ -969,6 +972,7 @@ def test_fallback_identity_matches_session_without_changing_local_table_keys(
     request.set_kv_cache_transfer_start = Mock()
     manager = SimpleNamespace(
         prepare_disagg_gen_init=Mock(return_value=True),
+        wait_disagg_receive_ready=Mock(),
         kv_cache_map={41: SimpleNamespace(capacity=65, history_length=64)},
         mapping=SimpleNamespace(rank=4),
         tokens_per_block=32,
