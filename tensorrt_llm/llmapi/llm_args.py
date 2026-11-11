@@ -281,8 +281,9 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
             "MTP-Eagle one-model decode samples vocabulary-sharded logits (the "
             "spec-decode fast paths; today Qwen3.5 checkpoints on SM 10.0/10.3 GPUs) "
             "with tensor parallelism, without attention DP, relaxed acceptance, "
-            "rejection sampling or penalties; on other models the first capture "
-            "rejects it. By default every variant the engine supports is captured. "
+            "rejection sampling, penalties or watermark_config; on other "
+            "models the first capture rejects it. By default every variant the "
+            "engine supports is captured. "
             "Without 'temperature_only', temperature-only batches use "
             "'advanced'. Without 'greedy', greedy batches use the sampled graphs "
             "('temperature_only' if listed, else 'advanced') and still decode "
@@ -8644,8 +8645,10 @@ class TorchLlmArgs(BaseLlmArgs):
         from tensorrt_llm._torch.speculative.interface import \
             supports_sharded_target_sampling
 
-        # Batches never select temperature_only with rejection sampling or penalties.
+        # Batches never select temperature_only with rejection sampling,
+        # penalties or a watermark.
         if (spec_config.use_rejection_sampling or spec_config.enable_penalty
+                or self.watermark_config is not None
                 or not supports_sharded_target_sampling(
                     spec_config,
                     types.SimpleNamespace(
@@ -8654,8 +8657,8 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "cuda_graph_config.sampling_variants lists 'temperature_only', which "
                 "needs MTP-Eagle one-model decoding with tensor parallelism and without "
-                "attention DP, relaxed acceptance, rejection sampling or penalties"
-            )
+                "attention DP, relaxed acceptance, rejection sampling, penalties or "
+                "watermark_config")
         return self
 
     @model_validator(mode="after")

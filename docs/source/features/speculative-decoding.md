@@ -360,7 +360,7 @@ temperature, top-k, top-p or min-p does not resolve to greedy decoding; a seed o
 and `temperature_only` for sampled batches whose sampled requests set only a temperature. `temperature_only`
 needs a model whose MTP-Eagle one-model decode samples vocabulary-sharded logits (the spec-decode fast paths;
 today Qwen3.5 checkpoints on SM 10.0/10.3 GPUs), tensor parallelism, and no attention DP, relaxed acceptance,
-rejection sampling or penalties; on other models the first CUDA graph capture rejects it.
+rejection sampling, penalties or `watermark_config`; on other models the first CUDA graph capture rejects it.
 `cuda_graph_config.sampling_variants` (prototype) captures only the listed variants, which shortens startup
 and saves graph memory:
 
