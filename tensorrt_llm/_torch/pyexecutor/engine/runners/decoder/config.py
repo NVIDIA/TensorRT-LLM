@@ -4,6 +4,7 @@
 """Resolved settings for scheduled decoder execution."""
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -14,6 +15,9 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 
 from ..interface import RunnerConfig
+
+if TYPE_CHECKING:
+    from tensorrt_llm.watermark.config import WatermarkConfig
 
 
 @dataclass(frozen=True)
@@ -52,3 +56,4 @@ class DecoderRunnerConfig(RunnerConfig):
     # (SpecDecOneEngineForCausalLM.spec_decode_fast_paths); False for a config
     # built without it. Keyword-only, so subclasses may still add required fields.
     spec_decode_fast_paths: bool = field(default=False, kw_only=True)
+    watermark_config: "WatermarkConfig | None" = field(default=None, kw_only=True)

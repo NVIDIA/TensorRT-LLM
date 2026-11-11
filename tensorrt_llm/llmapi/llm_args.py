@@ -76,6 +76,7 @@ from ..tokenizer import TOKENIZER_ALIASES  # noqa: F401
 from ..tokenizer import load_custom_tokenizer
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
+from ..watermark.config import WatermarkConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
@@ -928,6 +929,46 @@ class GuidedDecodingConfig(StrictBaseModel):
         description="The stop token ids for guided decoding config.")
 
 
+class SparseKvCacheOffloadConfig(StrictBaseModel):
+    """Memory sizing for sparse attention KV cache offload.
+
+    With offload, the KV history a sparse attention layer selects from lives in
+    host memory, and each request keeps a GPU cache of the units its selections
+    name.
+    """
+    gpu_cache_factor: float = Field(
+        default=2.0,
+        ge=1.0,
+        status="prototype",
+        description=
+        "Size of each request's GPU cache for offloaded attention history, in "
+        "selections: the cache holds this many times the units one decode step "
+        "selects, plus the unit being written, rounded up to whole pages. A "
+        "larger cache keeps more history on the GPU between decode steps, so "
+        "fewer units are fetched from host memory, at the cost of GPU memory per "
+        "request.")
+    host_history_size: Optional[NonNegativeInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Pinned host memory in bytes, per rank, for offloaded attention history "
+        "and the staging buffers that publish it to the GPU. The KV cache "
+        "manager holds the history pools within it, beside the GPU KV cache "
+        "quota, which it does not lower; a size too small for the batches the "
+        "manager must always hold, such as one max_seq_len request, is "
+        "rejected. It is separate from kv_cache_config.host_cache_size, the "
+        "host tier that evicted KV cache pages move to, and the two together "
+        "must fit this rank's share of available host memory and the "
+        "pinned-memory limit. When unset, the history pools come first: they "
+        "may take the host memory automatic sizing may pin, beside the staging "
+        "buffers and, unless kv_cache_config.host_cache_size or a disk tier is "
+        "set, room in the host tier for one max_seq_len request. Either way it "
+        "is an upper bound: the history pools share their slot count with the "
+        "GPU KV cache pools, so they pin only what the GPU quota's slots pair "
+        "with. When unset, the automatic host tier takes the host memory they "
+        "leave, up to the GPU KV cache quota.")
+
+
 class BaseSparseAttentionConfig(StrictBaseModel):
     """Configuration for sparse attention."""
     algorithm: str
@@ -937,6 +978,14 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         a subset of the possible backends.
         """
         return True
+
+    def get_kv_cache_offload_config(
+            self) -> Optional[SparseKvCacheOffloadConfig]:
+        """Return the KV cache offload sizing, or None without offload.
+
+        Override in algorithms that can offload attention history to host memory.
+        """
+        return None
 
     def to_sparse_params(self, **kwargs):
         """Lower user-facing config into SparseParams."""
@@ -1417,6 +1466,42 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         description=
         "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
         "it each step. Defaults to the model's HF config value.")
+    enable_kv_cache_offload: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Offload the KV history sparse attention selects from to host memory "
+        "with KV cache manager v2: the MLA latent cache, or for DeepSeek-V4 "
+        "the ratio-4 compressed cache. Each decode step fetches the units the "
+        "indexer selects into a per-request GPU cache; the indexer and "
+        "sliding-window caches remain on GPU. Only a decode-only worker, such "
+        "as the generation worker of a disaggregated deployment, can offload.")
+    kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
+        default_factory=SparseKvCacheOffloadConfig,
+        status="prototype",
+        description="Memory sizing for KV cache offload. Applies only with "
+        "enable_kv_cache_offload.")
+
+    @model_validator(mode="after")
+    def _validate_kv_cache_offload(self):
+        """Reject offload sizing without offload and a non-positive top-k.
+
+        ``index_topk`` may still be None here; the checkpoint fills it later.
+        """
+        if self.enable_kv_cache_offload:
+            if self.index_topk is not None and self.index_topk <= 0:
+                raise ValueError(
+                    "KV cache offload requires a positive index_topk.")
+        elif self.kv_cache_offload_config != SparseKvCacheOffloadConfig():
+            raise ValueError("kv_cache_offload_config requires "
+                             "enable_kv_cache_offload=True.")
+        return self
+
+    def get_kv_cache_offload_config(
+            self) -> Optional[SparseKvCacheOffloadConfig]:
+        if not self.enable_kv_cache_offload:
+            return None
+        return self.kv_cache_offload_config
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -1550,6 +1635,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 pretrained_config, kwargs.get("layer_idx")),
             mtp_index_share=bool(_value("index_share_for_mtp_iteration",
                                         False)),
+            enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1586,6 +1672,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             has_shared_indexer_layers=has_shared_indexer_layers,
             mtp_index_share=bool(_value("index_share_for_mtp_iteration",
                                         False)),
+            enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
 
 
@@ -1618,14 +1705,6 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         description="The sliding window size in tokens for SWA layers.")
     index_topk: Optional[int] = Field(default=512,
                                       description="The top-k for the indexer.")
-    enable_kv_cache_offload: bool = Field(
-        default=False,
-        status="prototype",
-        description=
-        "Offload ratio-4 compressed attention KV history to host memory with "
-        "KV cache manager v2. The indexer and sliding-window caches remain on "
-        "GPU. This feature is under development and currently cannot be "
-        "enabled for inference.")
 
     @field_validator("index_head_dim")
     @classmethod
@@ -1645,7 +1724,8 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         return [1 if ratio == 0 else ratio for ratio in compress_ratios]
 
     @model_validator(mode="after")
-    def validate_kv_cache_offload(self) -> "DeepSeekV4SparseAttentionConfig":
+    def _validate_deepseek_v4_kv_cache_offload(
+            self) -> "DeepSeekV4SparseAttentionConfig":
         if self.enable_kv_cache_offload:
             if 4 not in self.compress_ratios:
                 raise ValueError(
@@ -7142,6 +7222,16 @@ class TorchLlmArgs(BaseLlmArgs):
         "Separated-routing MoE backends only.",
         status="beta")
 
+    watermark_config: Optional[WatermarkConfig] = Field(
+        default=None,
+        description=
+        "Enables statistical text watermarking of generated tokens (Gumbel-max). "
+        "Requests may opt out with SamplingParams.watermarking=False unless "
+        "allow_request_opt_out is False. Greedy and beam-search requests cannot "
+        "carry a watermark and are generated normally. The key is a secret and "
+        "must match at detection time (see tensorrt_llm.watermark).",
+        status="prototype")
+
     lm_head_output_dtype: Literal["auto", "float32"] = Field(
         default="auto",
         description=
@@ -7230,6 +7320,18 @@ class TorchLlmArgs(BaseLlmArgs):
         # tensor derives both from the model, and only the engine knows which
         # kind of encoder the model has. It still raises for the token encoders
         # that require them.
+        return self
+
+    @model_validator(mode="after")
+    def validate_watermark_config(self) -> 'TorchLlmArgs':
+        spec = self.speculative_config
+        if (self.watermark_config is not None and spec is not None
+                and spec.spec_dec_mode.is_dspark()):
+            raise ValueError(
+                "watermark_config is not supported with DSpark speculative "
+                "decoding: its ragged verification windows cannot be "
+                "watermarked. Use another speculation mode or drop "
+                "watermark_config.")
         return self
 
     attn_backend: str = Field(

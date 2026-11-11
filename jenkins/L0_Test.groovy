@@ -1931,7 +1931,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             }
         }
 
-        slurmRunner = null
+        def slurmRunner = null
         echo "${stageName} Slurm partition timeout: ${partition.time}"
         def partitionTimeout = partition?.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
         if (cluster.containerRuntime.toString() == "DOCKER") {

@@ -582,6 +582,7 @@ class BaseWorker(GenerationExecutor):
                     conversation_params=request.conversation_params,
                     kv_hints=request.kv_hints,
                     arrival_time=request.arrival_time,
+                    watermarking=request.sampling_params.watermarking,
                 ),
             )
 

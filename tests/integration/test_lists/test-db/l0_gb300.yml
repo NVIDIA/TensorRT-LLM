@@ -66,6 +66,7 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm_ple_offload
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_megamoe_cutedsl_ple_offload
   - accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]
+  - unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::TestSparseResolve::test_colliding_selections_preserve_slots_and_eviction
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   # Kimi K3 KDA unit tests (single GPU, random weights, no checkpoint).
@@ -139,6 +140,12 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp4] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] TIMEOUT (60)
+  # Exact LongBench v2 offload parity: TP2/EP2 context and generation workers. Pre-merge
+  # keeps GLM with an NVFP4 latent and V4 with block reuse; the FP8 variants run post-merge
+  # (l0_gb300_multi_gpus).
+  - unittest/_torch/attention/sparse/dsa/test_dsa_indexer.py::test_indexer_projection_is_batch_invariant
+  - accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_kv_cache_offload[kv_dtype=nvfp4] TIMEOUT (30)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_kv_cache_offload_block_reuse TIMEOUT (30)
   # qwen4_exp target, pre-merge: tep4 with three drafts and IndexShare, gsm8k and then
   # 3k-6k-token pass keys with their acceptance-length floor. The other layouts and KV dtypes
   # run post-merge (l0_gb300_multi_gpus).
