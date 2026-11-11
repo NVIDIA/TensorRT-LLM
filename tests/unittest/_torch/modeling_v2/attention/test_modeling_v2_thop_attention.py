@@ -7493,6 +7493,9 @@ _ULTRA_256 = dict(max_num_requests=256, num_blocks=6400)
 #: dep4 (attention data parallel) a rank runs the unsharded 64 over 2.
 _ULTRA_NVFP4_TEP4_16_1_128 = dict(_ULTRA_BF16_FP8KV_8_1_128, num_heads=16)
 _ULTRA_NVFP4_DEP4_64_2_128 = dict(_ULTRA_BF16_FP8KV_8_1_128, num_heads=64, num_kv_heads=2)
+#: Nemotron-3 Ultra BF16 at dep16 (attention data parallel over 16 ranks): a rank runs the
+#: unsharded 64 q over 2 kv heads over the bf16 pool.
+_ULTRA_BF16_DEP16_64_2_128 = dict(_ULTRA_BF16_8_1_128, num_heads=64, num_kv_heads=2)
 
 
 def _ultra_cells(
@@ -8066,6 +8069,9 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
     ),
     "nemotron_h/nemotron3_ultra_nvfp4__sm_107__dep4": _ultra_cells(
         _ULTRA_NVFP4_DEP4_64_2_128, "NVFP4 dep4", mixed_packed=False, decode_256=False
+    ),
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__dep16": _ultra_cells(
+        _ULTRA_BF16_DEP16_64_2_128, "BF16 dep16", mixed_packed=True, decode_256=False
     ),
 }
 
