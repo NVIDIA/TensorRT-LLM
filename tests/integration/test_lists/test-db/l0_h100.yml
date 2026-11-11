@@ -163,7 +163,6 @@ l0_h100:
   - unittest/llmapi/test_return_routed_experts.py
   - unittest/llmapi/test_lm_head_dtype.py
   - unittest/scaffolding
-  - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
   - accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[no_overlap]
   - accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[overlap]

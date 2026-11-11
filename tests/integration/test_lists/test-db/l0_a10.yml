@@ -93,10 +93,8 @@ l0_a10:
   # Files whose tests are all cpu_only are covered by l0_cpu.yml, which lists
   # unittest/tools as a directory.
   - unittest/tools/test_host_profiler.py
-  - unittest/tools/test_infra_dry_run_pipeline.py
   - unittest/tools/test_infra_dry_run_pytest.py
   - unittest/tools/test_unittest_culprits.py
-  - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph
