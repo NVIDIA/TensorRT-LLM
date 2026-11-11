@@ -128,7 +128,6 @@ def start(workflow, state, log) -> bool:
     body = "\n".join(lines + [f"- differs from the tree now: {line}" for line in moved])
     workflow.journal.section(f"deployments: {len(found)}", body)
     print_message(f"deployments ({len(found)}):\n{escape_markup(body)}")
-    state.libraries = state.libraries or contract_mod.library_digest(task["trtllm_repo_path"])
     workflow._checkpoint(state)
     return True
 

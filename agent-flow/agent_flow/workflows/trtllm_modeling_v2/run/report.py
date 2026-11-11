@@ -270,10 +270,16 @@ def record_onboarded(workflow, tree: Path, commit: str) -> str:
         status.last(c.key, passed=True) for c in _onboard_checks(workflow) if c.gate != "boot"
     ]
     judged = any(v is not None and not v.unjudged for v in scores)
-    libraries = contract_mod.library_digest(tree)
     ref = onboard_ref(state.slug)
     commit = _pinned(workflow, repo, ref) or commit
     written = _pin(workflow, repo, ref, commit)
+    # The build the passing boot measured, from its verdict on record: not the tree's as it
+    # is now (a later start that finds the ref without the state), nor what an evaluation
+    # nothing judges left there after the boot.
+    boot = next((c.key for c in _onboard_checks(workflow) if c.gate == "boot"), "")
+    measured = status.at(boot, commit, passed=True)
+    libraries = contract_mod.libraries_of(measured.tree if measured else "")
+    libraries = libraries or contract_mod.library_digest(tree)
     state.onboarded = dict(
         commit=commit,
         ref=ref if written else f"{ref} (git did not write it)",
@@ -290,20 +296,23 @@ def record_onboarded(workflow, tree: Path, commit: str) -> str:
         return why
     workflow.journal.event("onboarded", f"{commit} ({ref}); accuracy {state.onboarded['accuracy']}")
     print_message(f"[bold green]✔ onboarded at {commit[:12]}[/bold green]")
-    if state.libraries and libraries != state.libraries:
-        _keep_libraries(workflow, Path(tree), libraries)
+    _keep_libraries(workflow, Path(tree), libraries)
     return ""
 
 
 def _keep_libraries(workflow, tree: Path, digest: str) -> None:
     """Copy the native libraries the onboard check accepted, then say what was copied.
 
-    This run rebuilt them, in a worktree or through its links in the checkout itself: a
-    later task may build over them. The manifest is written last, so a copy that was
-    cut or failed has none. Nothing here takes the record back.
+    Always: a worktree links the checkout's build, so a later rebuild writes over the only
+    copy of what was measured. Only the bytes of ``digest`` are kept: where the tree holds
+    another build by now, nothing is copied and the report says incomplete. The manifest
+    is written last, so a copy that was cut or failed has none. Nothing here takes the
+    record back.
     """
     kept = workflow.workspace / LIBRARIES_DIRNAME
     try:
+        if contract_mod.library_digest(tree) != digest:
+            raise OSError(f"{tree} no longer holds the build the boot measured ({digest})")
         files = {}
         for library in contract_mod.native_libraries(tree):
             target = kept / library.relative_to(tree)
@@ -317,11 +326,8 @@ def _keep_libraries(workflow, tree: Path, digest: str) -> None:
 
 
 def kept_libraries(workflow) -> str:
-    """What the report says of the accepted libraries: not needed, kept and verified, or incomplete."""
-    state, kept = workflow._state, workflow.workspace / LIBRARIES_DIRNAME
-    record = state.onboarded
-    if not state.libraries or record["libraries"] == state.libraries:
-        return "unchanged since the run's start, so none were kept"
+    """What the report says of the accepted libraries: kept and verified, or incomplete."""
+    record, kept = workflow._state.onboarded, workflow.workspace / LIBRARIES_DIRNAME
     try:
         manifest = json.loads((kept / LIBRARIES_MANIFEST).read_text(encoding="utf-8"))
         wrong = [
@@ -641,13 +647,14 @@ def _done_rows(workflow, pipeline) -> list[str]:
             v = workflow._selected.get(check.key)
             if v is None and check in first:
                 v = status.at(check.key, onboarded)
-            if v is not None and v.passed and not v.unjudged and v.commit:
+            if v is not None and v.commit:
                 earlier.setdefault(v.commit[:12], []).append(check.key)
             held = frozen.get(f"{name}:{check.gate[9:-1]}") if "[" in check.gate else None
             anchor = "-"
             if held is not None:
                 value = "" if held.value is None else f" {held.value:g}"
-                anchor = f"{held.kind}{value} ({held.source})".replace("|", "/")
+                floor = "" if v is None or v.floor is None else f", floor {v.floor:.2f}"
+                anchor = f"{held.kind}{value}{floor} ({held.source})".replace("|", "/")
             score = "-" if v is None or v.measured is None else f"{v.measured:g}"
             cells = (score, anchor, v.said if v else "not run", (v.path if v else "") or "-")
             commit = (v.commit if v else "")[:12] or "-"
@@ -658,24 +665,25 @@ def _done_rows(workflow, pipeline) -> list[str]:
     return [head, "|---" * 8 + "|", *rows, *_earlier(workflow, earlier)] if rows else []
 
 
-def _earlier(workflow, passed: dict[str, list[str]]) -> list[str]:
-    """One line under the table when checks passed on another commit than the head.
+def _earlier(workflow, measured: dict[str, list[str]]) -> list[str]:
+    """One line under the table when rows were measured on another commit than the head.
 
-    Each row names its commit, and a reader still takes the table for the head.
+    Each row names its commit, and a reader still takes the table for the head. Every
+    such row is named, a score with no verdict too.
     """
     head = (workflow._head() or "")[:12]
     there = [
         f"{', '.join(f'`{key}`' for key in keys)} (on `{commit}`)"
-        for commit, keys in passed.items()
+        for commit, keys in measured.items()
         if head and commit != head
     ]
     if not there:
         return []
     return [
         "",
-        f"Not measured on the head `{head}`: {'; '.join(there)}. Each passed on its commit; "
-        "what passed is measured again only after a `fix` task, and then only for the first "
-        "deployment and for a deployment that had a failure.",
+        f"Not measured on the head `{head}`: {'; '.join(there)}. Each row is of its own "
+        "commit; a check is measured again only after a `fix` task, and then only for the "
+        "first deployment and for a deployment that had a failure.",
     ]
 
 

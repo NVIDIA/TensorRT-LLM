@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 Build a TensorRT-LLM Modeling V2 target from a HuggingFace checkpoint. Agents write the code; Python fixes the order of the tasks, lands their commits and runs every check.
 
-**`onboarded`** means: the first deployment of the spec (`core`) boots with `modeling_v2=require` on the commit that landed, and each of its benchmarks meets its frozen floor (`anchor - 2 x SE`, anchors in `<ws>/anchors.yaml`). With no anchor it holds on the boot alone, and the report says `accuracy unjudged (boot only)`. Once met, the flow writes `refs/mv2/<slug>/onboarded` (created once, never moved) and keeps native libraries the run rebuilt in `<ws>/onboarded_libraries/`, with a manifest; nothing later takes it back, and a later start that stops early still exits 0 and says in the report why it stopped.
+**`onboarded`** means: the first deployment of the spec (`core`) boots with `modeling_v2=require` on the commit that landed, and each of its benchmarks meets its frozen floor (`anchor - 2 x SE`, anchors in `<ws>/anchors.yaml`). With no anchor it holds on the boot alone, and the report says `accuracy unjudged (boot only)`. Once met, the flow writes `refs/mv2/<slug>/onboarded` (created once, never moved) and keeps the native libraries its boot measured in `<ws>/onboarded_libraries/`, with a manifest; nothing later takes it back, and a later start that stops early still exits 0 and says in the report why it stopped.
 
 **Exit status:** 0 onboarded (or a `--dry-run` whose preflight passed), 1 not onboarded, 2 a spec, state or usage error, 3 the workspace is held by another process.
 
@@ -38,12 +38,12 @@ A check is `trtllm-modeling-v2 gate <boot|accuracy|tests> --task <ws>/task.yaml 
 # onboarded: commit `c46647fa...`, ref `refs/mv2/<slug>/onboarded`, 2026-11-11T16:00:53+00:00
 ## Done
 | deployment | check | score | anchor | verdict | judged | commit | engine attested |
-| `tp1` | `accuracy[gsm8k]` | 41.7 | reference 41.77 (...) | PASS | trtllm-eval | `fa0d912fafd2` | [engine match: 1 rank(s) x 15 option(s); target ...] |
+| `tp1` | `accuracy[gsm8k]` | 41.7 | reference 41.77, floor 39.05 (...) | PASS | trtllm-eval | `fa0d912fafd2` | [engine match: 1 rank(s) x 15 option(s); target ...] |
 ## Not done / Not attempted / Changed outside the target / Skipped kernel rows
 ## Convention findings left / Final pass / What the run did not check / What the workers left / Models per role / Tasks
 ```
 
-A run that is not onboarded says in its first lines where it stopped, the result line, the `gate` command that reproduces it and the last commit where that check passed. A score nothing judges is `no verdict`, never a pass or a failure. `engine attested` is every option of the deployment against what each rank's engine resolved; a rank that reported nothing is `unknown`, which fails the check. Each row names the commit it was measured on, and a line under the table says which checks were not measured on the head. "What the workers left" is each task's own `not_done`, a sentence several tasks wrote printed once.
+A run that is not onboarded says in its first lines where it stopped, the result line, the `gate` command that reproduces it and the last commit where that check passed. A score nothing judges is `no verdict`, never a pass or a failure. `engine attested` is every option of the deployment against what each rank's engine resolved; a rank that reported nothing is `unknown`, which fails the check. Each row names the commit it was measured on and the floor its score was held to, and a line under the table names every row that was not measured on the head. "What the workers left" is each task's own `not_done`, a sentence several tasks wrote printed once.
 
 ## A multi-node site, and disaggregation
 

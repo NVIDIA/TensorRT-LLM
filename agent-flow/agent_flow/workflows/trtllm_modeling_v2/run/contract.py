@@ -195,6 +195,12 @@ def tree_id(
     return "+".join(parts)
 
 
+def libraries_of(identity: str) -> str:
+    """The native libraries' digest in a verdict's identity (:func:`tree_id`); ``""`` without one."""
+    parts = identity.split("+")
+    return parts[1] if len(parts) > 1 else ""
+
+
 # ------------------------------------------------------------------------------ the ledger
 
 
@@ -211,6 +217,8 @@ class Verdict:
     #: The score a benchmark measured, pass or fail, and the reference it was held to.
     measured: float | None = None
     reference: float | None = None
+    #: The floor the score was held to, where something judged it.
+    floor: float | None = None
     #: The gate's one-line summary, with its numbers.
     summary: str = ""
     #: A score nothing judged: reported, neither a pass nor a failure.
@@ -277,6 +285,7 @@ class ContractStatus:
             duration_s=round(_number(getattr(result, "duration_s", 0.0)) or 0.0, 3),
             measured=_number(getattr(result, "measured", None)),
             reference=_number(getattr(result, "reference", None)),
+            floor=_number(getattr(result, "floor", None)),
             summary=str(result.summary())[:1000] if hasattr(result, "summary") else "",
             unjudged=bool(getattr(result, "unjudged", False)) and not infrastructure,
             path=str(getattr(result, "path", "") or ""),
@@ -304,9 +313,13 @@ class ContractStatus:
         """
         return {v.key: v for v in self.verdicts if tree and v.tree == tree}
 
-    def at(self, key: str, commit: str) -> Verdict | None:
-        """The latest verdict of ``key`` that was measured at ``commit``."""
-        found = [v for v in self.verdicts if v.key == key and commit and v.commit == commit]
+    def at(self, key: str, commit: str, *, passed: bool | None = None) -> Verdict | None:
+        """The latest verdict of ``key`` measured at ``commit``; with ``passed``, the latest that was."""
+        found = [
+            v
+            for v in self.verdicts
+            if v.key == key and commit and v.commit == commit and passed in (None, v.passed)
+        ]
         return found[-1] if found else None
 
     def last(self, key: str, *, passed: bool | None = None) -> Verdict | None:

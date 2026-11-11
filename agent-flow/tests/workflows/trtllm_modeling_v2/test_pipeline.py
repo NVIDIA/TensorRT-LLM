@@ -21,6 +21,7 @@ from agent_flow.workflows.trtllm_modeling_v2 import cli
 from agent_flow.workflows.trtllm_modeling_v2.agents import prompts
 from agent_flow.workflows.trtllm_modeling_v2.agents.turns import TurnTimeout
 from agent_flow.workflows.trtllm_modeling_v2.checks import gate_cli
+from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.git import (
     CommitIdentity,
@@ -223,7 +224,7 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     report = _report(tmp_path)
     first = report.splitlines()[0]
     assert first.startswith(f"# onboarded: commit `c0ffee1`, ref `refs/mv2/{SLUG}/onboarded`, 20")
-    assert "| `tp1` | `accuracy[gsm8k]` | 90 | reference 85.6 (" in report
+    assert "| `tp1` | `accuracy[gsm8k]` | 90 | reference 85.6, floor 83.67 (" in report
     assert "| PASS | trtllm-eval | `c0ffee1` |" in report
     assert "| `tep2` | `boot` | - | - | PASS | through the endpoint | `c0ffee1` |" in report
     assert "| `kv_fp8` |" not in report.split("## Done")[1].split("##")[0]
@@ -452,6 +453,34 @@ def test_only_a_benchmark_with_an_anchor_can_refuse_onboarded(
     assert "| FAIL | trtllm-eval |" in report
 
 
+def test_a_score_with_no_verdict_on_an_earlier_commit_is_named_under_the_table(
+    tmp_path, task_file, repo, monkeypatch
+):
+    """Every row measured on another commit than the head is named, not the passes alone."""
+    refs = repo / "tests/integration/defs/accuracy/references/gsm8k.yaml"
+    refs.write_text(yaml.safe_dump({"another/model": [{"accuracy": 85.6}]}))
+    head, shell = _Head(), _checks(fail={"kv_fp8:boot"})
+    plain = {"name": "kv_fp8", "options": {"kv_cache_config": {"dtype": "fp8"}}}
+
+    def fix(attempt, prompt):
+        shell.fail.clear()
+        head.at = "f1xed00"
+        return READY
+
+    kwargs = dict(shell_runner=shell, git_runner=head, command_runner=healthy_smi(2))
+    script = Script(assembler=_by_task({"fix-1": fix}))
+    _run(tmp_path, _spec(task_file, TEP2, plain), monkeypatch, script, **kwargs)
+    report = _report(tmp_path)
+    row = next(line for line in report.splitlines() if line.startswith("| `tep2` | `accuracy"))
+    assert "| no verdict |" in row and "| `c0ffee1` |" in row
+    under = report.split("## Done")[1].split("##")[0].strip().splitlines()[-1]
+    assert under.startswith(
+        "Not measured on the head `f1xed00`: `tep2:boot`, `tep2:accuracy[gsm8k]` (on "
+        "`c0ffee1`). Each row is of its own commit; a check is measured again only after"
+    )
+    assert "kv_fp8" not in under and "tp1" not in under
+
+
 def test_core_spent_ends_the_run_not_onboarded_and_the_report_says_where(
     tmp_path, task_file, monkeypatch
 ):
@@ -605,7 +634,10 @@ def test_what_preflight_left_out_gets_no_task_and_a_score_nothing_judges_gives_n
     _run(tmp_path, task, monkeypatch, Script(), shell_runner=shell)
     assert shell.ran == ["mid:boot", "mid:accuracy"]
     report = _report(tmp_path)
-    assert "| `kv_fp8` | `accuracy[gsm8k]` | 90 | relative (the score of `mid`) | PASS |" in report
+    assert (
+        "| `kv_fp8` | `accuracy[gsm8k]` | 90 | relative, floor 88.77 (the score of `mid`) | PASS |"
+        in report
+    )
     judged = [v for v in _verdicts(tmp_path) if v["gate"].startswith("accuracy")][-1]
     assert (judged["deployment"], judged["passed"], judged["unjudged"]) == ("kv_fp8", True, False)
     assert judged["reference"] == 91.0 and "its score on record, judged now" in judged["detail"]
@@ -760,7 +792,7 @@ def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_findi
     under = report.split("## Done")[1].split("##")[0].strip().splitlines()[-1]
     assert under == (
         "Not measured on the head `f1xed00`: `tep2:boot`, `tep2:accuracy[gsm8k]` (on "
-        "`c0ffee1`). Each passed on its commit; what passed is measured again only after a "
+        "`c0ffee1`). Each row is of its own commit; a check is measured again only after a "
         "`fix` task, and then only for the first deployment and for a deployment that had a "
         "failure."
     )
@@ -857,7 +889,10 @@ def test_a_fix_that_breaks_core_is_reported_and_takes_nothing_back(
     assert report.startswith("# onboarded: commit `c0ffee1`")
     assert _state(tmp_path).onboarded["commit"] == "c0ffee1"
     assert "| `tp1` | `boot` | - | - | FAIL | through the endpoint | `f1xed00` |" in report
-    assert "| `kv_fp8` | `accuracy[gsm8k]` | 90 | relative (the score of `tp1`) | PASS |" in report
+    assert (
+        "| `kv_fp8` | `accuracy[gsm8k]` | 90 | relative, floor 87.66 (the score of `tp1`) | PASS |"
+        in report
+    )
     # Core's benchmark ran on the new commit as what `kv_fp8` is held to, then its boot.
     assert shell.ran[-3:] == ["tp1:accuracy", "kv_fp8:accuracy", "tp1:boot"]
 
@@ -1962,8 +1997,7 @@ def _recording(tmp_path, refs: dict, events: list | None = None) -> SimpleNamesp
     return SimpleNamespace(
         task_data={"trtllm_repo_path": str(repo), "deployments": [{"name": "tp1", "options": {}}]},
         workspace=tmp_path / "ws",
-        # The run began on a checkout with no library of its own: the tree's were rebuilt.
-        _state=WorkflowState(task_path="t", slug="s", libraries=contract_mod.library_digest(repo)),
+        _state=WorkflowState(task_path="t", slug="s"),
         _contract=contract_mod.Contract((contract_mod.Check("tp1", "boot"),)),
         _contract_status=lambda: contract_mod.ContractStatus.load(tmp_path / "ws"),
         _git=lambda repo, *args: scripted_refs(refs, "abc123", args),
@@ -2087,7 +2121,8 @@ def test_the_accepted_libraries_are_kept_with_a_manifest_and_the_report_says_whi
     workflow, tree = _recording(tmp_path, {}, events), tmp_path / "tree"
     kept = tmp_path / "ws" / "onboarded_libraries"
     assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
-    # Rebuilt since the run's start: copied, and the manifest, written last, says what.
+    # Always copied, whoever built them and when: a worktree links the checkout's build, so
+    # a later rebuild writes over the only copy. The manifest, written last, says what.
     assert (kept / "tensorrt_llm" / "libtensorrt_llm.so").read_bytes() == b"rebuilt"
     manifest = json.loads((kept / "MANIFEST.json").read_text())
     assert manifest["digest"] == workflow._state.onboarded["libraries"]
@@ -2109,23 +2144,42 @@ def test_the_accepted_libraries_are_kept_with_a_manifest_and_the_report_says_whi
     assert workflow._state.onboarded["commit"] == "abc123"
     assert events[-1][0] == "onboarded" and "were not kept" in events[-1][1]
     assert report_mod.kept_libraries(workflow).startswith(f"incomplete in `{kept}`")
-    # A worktree links the checkout's build: rebuilt there, the checkout holds the same
-    # bytes, and a later task may build over them. They are kept all the same.
     monkeypatch.undo()
     shutil.rmtree(kept)
-    repo_lib = tmp_path / "repo" / "tensorrt_llm" / "libtensorrt_llm.so"
-    repo_lib.write_bytes(b"rebuilt")
-    workflow._state.onboarded = {}
-    assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
-    assert report_mod.kept_libraries(workflow).startswith("kept and verified in ")
-    repo_lib.unlink()
-    # Libraries that are the ones the run started with need no copy, linked or not.
-    workflow._state.onboarded = {}
-    workflow._state.libraries = contract_mod.library_digest(tree)
-    assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
-    assert report_mod.kept_libraries(workflow) == (
-        "unchanged since the run's start, so none were kept"
+    # The record's libraries are the build the passing boot measured, from its verdict on
+    # record: an evaluation nothing judges that rebuilt them afterwards does not replace
+    # it, and bytes that are no longer there read incomplete, never another build's.
+    accepted = contract_mod.library_digest(tree)
+    boot = GateResult("boot", True, "started and answered", deployment="tp1")
+    workflow._contract_status().record(
+        contract_mod.Check("tp1", "boot"),
+        boot,
+        tree=f"tree0+{accepted}+in+flow+env",
+        commit="abc123",
     )
+    (tree / "tensorrt_llm" / "libtensorrt_llm.so").write_bytes(b"built after the boot")
+    workflow._state.onboarded = {}
+    assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
+    assert workflow._state.onboarded["libraries"] == accepted != contract_mod.library_digest(tree)
+    assert not kept.exists() and "no longer holds the build the boot measured" in events[-1][1]
+    assert "no manifest of a finished copy" in report_mod.kept_libraries(workflow)
+    # The same for a later start that finds the ref and no record: the digest comes from
+    # that commit's verdict, not from the checkout as it is by then; while the bytes are
+    # still the accepted ones, they are kept.
+    (tree / "tensorrt_llm" / "libtensorrt_llm.so").write_bytes(b"rebuilt")
+    workflow._state.onboarded = {}
+    assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
+    assert workflow._state.onboarded["libraries"] == accepted
+    assert report_mod.kept_libraries(workflow) == f"kept and verified in `{kept}` (1 file(s))"
+    # A boot that failed at the commit afterwards is no measure of its build.
+    failed = GateResult("boot", False, "did not start", deployment="tp1")
+    workflow._contract_status().record(
+        contract_mod.Check("tp1", "boot"), failed, tree="tree0+other+in+flow+env", commit="abc123"
+    )
+    workflow._state.onboarded = {}
+    assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
+    assert workflow._state.onboarded["libraries"] == accepted
+    assert contract_mod.libraries_of("") == "" and contract_mod.libraries_of("t+l+i") == "l"
 
 
 def test_a_pass_counts_only_for_the_content_it_measured(tmp_path):
