@@ -36,7 +36,6 @@ from ..agents.prompts import PromptBundle, build_trtllm_modeling_v2_prompts
 from ..agents.roles import resolve_role_agents
 from ..agents.turns import InProcessTurnExecutor, TurnRequest
 from ..checks import check_runtime, conventions
-from ..checks import verdict as check_result
 from ..infra.compute.commands import CommandExecutor
 from ..infra.compute.environment import RunEnvironment
 from ..infra.git import CommitPolicy, git_output
@@ -120,7 +119,6 @@ class TrtllmModelingV2Workflow:
             for name in RUN_DIRS:
                 shutil.rmtree(self.workspace / name, ignore_errors=True)
         self.journal = Journal(path=self.workspace / "journal.md")
-        self.gate_log = check_result.GateLog()
         self.task_data: dict[str, Any] = {}
         self.environment: RunEnvironment | None = None
         self.prompts: PromptBundle = prompts or build_trtllm_modeling_v2_prompts()
@@ -242,8 +240,7 @@ class TrtllmModelingV2Workflow:
             self.journal.event("run interrupted")
             raise
         said = report.read_text(encoding="utf-8").splitlines()[0].lstrip("# ")
-        checks = self.gate_log.render() or "(none run)"
-        self.journal.section("run closed", f"- {said}\n- report: `{report}`\n\n```\n{checks}\n```")
+        self.journal.section("run closed", f"- {said}\n- report: `{report}`")
         colour = "green" if state.onboarded else "red"
         print_message(f"[bold {colour}]{said}[/bold {colour}]\nreport: {report}", log)
         return bool(state.onboarded)

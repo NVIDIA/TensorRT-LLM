@@ -132,7 +132,6 @@ def measure(
             break
         workflow.journal.event("check without a verdict", f"{check.key}: {result.infrastructure}")
     verdict = status.record(check, result, tree=identity, commit=commit)
-    workflow.gate_log.record(result)
     workflow.journal.event("check", f"at {commit[:12]}: {result.summary()}")
     colour = "green" if verdict.passed else "yellow"
     print_message(f"[bold {colour}]{escape_markup(result.summary())}[/bold {colour}]")
@@ -168,12 +167,6 @@ def record_onboarded(workflow, tree: Path, commit: str) -> None:
     libraries = contract_mod.library_digest(tree)
     ref = onboard_ref(state.slug)
     workflow._git(str(repo), "update-ref", ref, commit)
-    if Path(tree) != repo and libraries != contract_mod.library_digest(repo):
-        # This run rebuilt them: the checkout does not hold what was accepted.
-        for library in contract_mod.native_libraries(Path(tree)):
-            kept = workflow.workspace / LIBRARIES_DIRNAME / library.relative_to(tree)
-            kept.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(library, kept)
     state.onboarded = dict(
         commit=commit,
         ref=ref,
@@ -184,6 +177,17 @@ def record_onboarded(workflow, tree: Path, commit: str) -> None:
     workflow._checkpoint(state)
     workflow.journal.event("onboarded", f"{commit} ({ref}); accuracy {state.onboarded['accuracy']}")
     print_message(f"[bold green]✔ onboarded at {commit[:12]}[/bold green]")
+    if Path(tree) == repo or libraries == contract_mod.library_digest(repo):
+        return
+    # This run rebuilt them: the checkout does not hold what was accepted. A copy that
+    # fails (a full disk) is said and takes nothing back.
+    try:
+        for library in contract_mod.native_libraries(Path(tree)):
+            kept = workflow.workspace / LIBRARIES_DIRNAME / library.relative_to(tree)
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(library, kept)
+    except OSError as exc:
+        workflow.journal.event("onboarded", f"the accepted libraries were not kept: {exc}")
 
 
 # ------------------------------------------------------------------------ the final pass

@@ -128,17 +128,3 @@ def lost_session(result: CommandResult) -> dict[str, Any]:
         "detail": f"did not run to a verdict: {result.infrastructure}",
         "infrastructure": result.infrastructure,
     }
-
-
-@dataclass
-class GateLog:
-    """Every gate a run has fired, in order. The journal's raw material."""
-
-    results: list[GateResult] = field(default_factory=list)
-
-    def record(self, result: GateResult) -> GateResult:
-        self.results.append(result)
-        return result
-
-    def render(self) -> str:
-        return "\n".join(result.summary() for result in self.results)

@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -949,6 +951,10 @@ def test_on_a_real_checkout_core_lands_only_the_commit_the_onboard_check_passed(
         tree = re.match(r"cd (\S+) &&", command)
         if tree and re.search(r"/(boot|eval)\.", command):
             checked.append((tree.group(1), _git(Path(tree.group(1)), "rev-parse", "HEAD")))
+            # A check takes as long as a benchmark: the repository's lock is free meanwhile,
+            # so another run on this checkout is not kept from opening its worktrees.
+            with open(repo / ".git" / "mv2flow-worktree.lock", "w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return shell(command, env, timeout)
 
     def tree_of(prompt: str) -> Path:
@@ -1077,6 +1083,36 @@ def test_a_worker_that_commits_nothing_is_still_held_to_the_onboard_check(
     assert "core (attempt 1 of 3): pending UNIT_READY: [FAIL] tp1:boot: " in journal
     assert _state(tmp_path).onboarded["commit"] == base == _git(repo, "rev-parse", "HEAD")
     assert _tasks(tmp_path)[1]["attempts"] == 2
+
+
+def test_the_onboard_record_stands_when_the_accepted_libraries_cannot_be_kept(
+    tmp_path, monkeypatch
+):
+    repo, tree = tmp_path / "repo", tmp_path / "tree"
+    for root in (repo, tree):
+        (root / "tensorrt_llm").mkdir(parents=True)
+    (tree / "tensorrt_llm" / "libtensorrt_llm.so").write_bytes(b"rebuilt")
+    events: list[tuple[str, str]] = []
+    workflow = SimpleNamespace(
+        task_data={"trtllm_repo_path": str(repo), "deployments": [{"name": "tp1", "options": {}}]},
+        workspace=tmp_path / "ws",
+        _state=WorkflowState(task_path="t", slug="s"),
+        _contract=contract_mod.Contract((contract_mod.Check("tp1", "boot"),)),
+        _contract_status=lambda: contract_mod.ContractStatus.load(tmp_path / "ws"),
+        _git=lambda *args: "",
+        _checkpoint=lambda state: None,
+        journal=SimpleNamespace(event=lambda what, detail="": events.append((what, detail))),
+    )
+
+    def full(source, target):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(report_mod.shutil, "copy2", full)
+    report_mod.record_onboarded(workflow, tree, "abc123")
+    record = workflow._state.onboarded
+    assert record["commit"] == "abc123" and record["accuracy"] == "unjudged (boot only)"
+    assert record["libraries"] == contract_mod.library_digest(tree)
+    assert events[-1][0] == "onboarded" and "were not kept" in events[-1][1]
 
 
 def test_a_pass_counts_only_for_the_content_it_measured(tmp_path):

@@ -266,13 +266,11 @@ class Pipeline:
     def _next(self) -> Task | None:
         """The first open task; none once a gating task is not done, where the run stops."""
         self._plan()
-        for task in self.tasks:
-            if task.status == NOT_DONE and task.kind in GATING:
-                self.stopped = task
-                return None
-            if task.status in (PENDING, RUNNING):
-                return task
-        return None
+        gate = (t for t in self.tasks if t.status == NOT_DONE and t.kind in GATING)
+        self.stopped = next(gate, None)
+        if self.stopped is not None:
+            return None
+        return next((t for t in self.tasks if t.status in (PENDING, RUNNING)), None)
 
     # ----------------------------------------------------------------------- the loop
     def run(self) -> None:

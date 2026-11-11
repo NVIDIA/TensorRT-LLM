@@ -286,16 +286,13 @@ class Integration:
             )
         with repo_lock(self.repo):
             head = git_checked(self.repo, "rev-parse", "HEAD")
-            ahead = git_checked(
-                tree, "rev-list", "--count", f"{head}..{branch}", check=False
-            ).strip()
-            if ahead in ("", "0"):
-                # The worker changed nothing: what its check judges is the head itself.
-                failed = check(tree, head) if check else ""
-                return Outcome(not failed, failed or "nothing to integrate", head, bool(failed))
-            broken = self._audit(tree, head, branch)
+            count = ("rev-list", "--count", f"{head}..{branch}")
+            ahead = git_checked(tree, *count, check=False).strip() or "0"
+            broken = self._audit(tree, head, branch) if ahead != "0" else ""
             if broken:
                 return Outcome(False, broken, repairable=True)
+            # With nothing of its own, the branch is brought to the head: what its check
+            # judges is then the head itself.
             rebased = self._git(tree, "rebase", head)
             if rebased.returncode != 0:
                 conflicts = git_checked(
@@ -310,9 +307,11 @@ class Integration:
                     conflicts=tuple(conflicts),
                 )
             tip = git_checked(tree, "rev-parse", "HEAD")
-            failed = check(tree, tip) if check else ""
-            if failed:
-                return Outcome(False, failed, checked=True)
+        # Not under the repository's lock: a check takes as long as a benchmark does.
+        failed = check(tree, tip) if check else ""
+        if failed:
+            return Outcome(False, failed, checked=True)
+        with repo_lock(self.repo):
             merged = self._git(self.repo, "merge", "--ff-only", "--quiet", branch)
             for _ in range(LOCK_RETRIES):
                 # Another git process held the checkout's index lock for a moment.
@@ -321,10 +320,14 @@ class Integration:
                 time.sleep(LOCK_RETRY_S)
                 merged = self._git(self.repo, "merge", "--ff-only", "--quiet", branch)
             if merged.returncode != 0:
+                # The checkout moved while the check ran, or git refused: nothing landed.
                 return Outcome(False, f"fast-forward of {branch} failed: {merged.stderr.strip()}")
             self._record(task_id, tip)
             self._label(task_id, head, branch)
-            return Outcome(True, f"integrated {branch} ({ahead} commit(s))", tip)
+        said = (
+            f"integrated {branch} ({ahead} commit(s))" if ahead != "0" else "nothing to integrate"
+        )
+        return Outcome(True, said, tip)
 
     def _label(self, task_id: str, head: str, branch: str) -> None:
         """Record each commit the task landed as the target's own, shared code, or both."""
