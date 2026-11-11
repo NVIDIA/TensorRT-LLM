@@ -70,8 +70,8 @@ Transforms:
   checkpoint row order. Under trtllm-gen a second copy of the window in the CuteDSL
   layout (`fc*_cd`) is declared when the core keeps it (`moe_prefill_copy`);
 * n-gram table: 128 row chunks concatenated into one `[rows, 160]` buffer (the hash
-  emits global row indices). It is replicated, and host-resident by default
-  (`_host_resident_empty`): one copy per rank.
+  emits global row indices). It is host-resident by default, one copy per rank, per server
+  or per node (`qwen4_exp/ple_host_table.py`).
 
 The n-gram table is not in the table: its height is a checkpoint fact, so `load`
 registers it with `torch.empty` (`_declare_ngram_table`) and adds its rows to the
@@ -103,6 +103,7 @@ from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.llmapi.utils import get_numa_aware_cpu_affinity
 from tensorrt_llm.logger import logger
 
+from .. import ple_host_table as _ple_host
 from .pool import attention_tp_size
 
 #: `layers=ALL_LAYERS`, the default: the weight is on every layer.
@@ -1591,6 +1592,9 @@ class Qwen4ExpDefaultWeights:
             set(manifest.keys()) ^ set(core.w.keys()),
         )
         for param_key, sources in manifest.items():
+            if param_key == "ple_table" and core._ple_table_host is not None:
+                consumed |= _fill_ngram_table(core, d, weights, rows_per_shard)
+                continue
             for ckpt_key, index, cut, transform in sources:
                 fill(core.w[param_key], ckpt_key, index, cut, transform)
             if param_key.endswith(_RELEASE_AFTER):
@@ -1845,15 +1849,53 @@ def _declare_ngram_table(core, d: SimpleNamespace, weights) -> int:
     device = core.w["embed"].device
     rows = d.ple_shards * rows_per_shard
     if core.ple_host_offload:
-        table, core._ple_table_host = _host_resident_empty(rows, head_dim, dtype, device)
+        mode = getattr(core, "ple_host_mode", _ple_host.RANK)
+        identity = None
+        if mode == _ple_host.NODE:
+            identity = _ple_host.checkpoint_identity(
+                getattr(core, "checkpoint_dir", None), rows, head_dim, dtype, *keys
+            )
+        mapping = getattr(core, "mapping", None)
+        core._ple_table_host = _ple_host.PleHostTable(
+            mode,
+            rows,
+            head_dim,
+            dtype,
+            device,
+            rank=mapping.tp_rank if mapping is not None else 0,
+            world=mapping.tp_size if mapping is not None else 1,
+            dp=getattr(core, "dp_size", 1),
+            private=_host_resident_empty,
+            identity=identity,
+        )
+        _bind_ngram_table(core)
     else:
         table = torch.empty(rows, head_dim, dtype=dtype, device=device)
         core._ple_table_host = None
+        core.w["ple_table"] = nn.Parameter(table, requires_grad=False)
+    core.ple_rows_per_shard = rows_per_shard
+    return rows_per_shard
+
+
+def _bind_ngram_table(core) -> None:
+    """`core.w["ple_table"]` as the host table's current view (a placeholder until a `node`
+    table is mapped). `nn.Parameter` (`_make_subclass`) shares storage rather than copying;
+    host offload depends on that, so it is asserted."""
+    host = core._ple_table_host
+    table = host.table
+    if table is None:
+        table = torch.empty(0, host.cols, dtype=host.dtype, device="meta")
     core.w["ple_table"] = nn.Parameter(table, requires_grad=False)
-    # `nn.Parameter` (`_make_subclass`) shares storage rather than copying; host offload
-    # depends on that, so it is asserted.
     assert core.w["ple_table"].data_ptr() == table.data_ptr(), (
         "wrapping the n-gram table in nn.Parameter moved its storage"
     )
-    core.ple_rows_per_shard = rows_per_shard
-    return rows_per_shard
+
+
+def _fill_ngram_table(core, d: SimpleNamespace, weights, rows_per_shard: int) -> set:
+    """Fill this rank's rows of the host-resident n-gram table (`ple_host_table`); return the
+    shard keys."""
+    keys = ngram_shard_keys(d)
+    copy, read = _ple_host.shard_rows(weights, keys, rows_per_shard, _read)
+    core._ple_table_host.fill(copy, read)
+    _bind_ngram_table(core)
+    return set(keys)

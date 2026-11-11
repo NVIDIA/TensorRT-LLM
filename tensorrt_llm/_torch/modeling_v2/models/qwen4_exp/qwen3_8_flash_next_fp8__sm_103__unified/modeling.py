@@ -49,8 +49,8 @@ every step: the asserts, the cache-manager bind, the target choice and the prefi
 bookkeeping live there. The graph breaks (the vision splice, the PLE block, each layer's
 attention core and GDN recurrence) each write rows `[:n]` of a fixed output and zero rows `[n:]`.
 
-**Host offload.** The PLE n-gram table lives in device-addressable host memory, one copy per
-rank.
+**Host offload.** The PLE n-gram table lives in device-addressable host memory: one copy per
+rank, per server or per node (`qwen4_exp/ple_host_table.py`).
 
 **One-model MTP-Eagle.** With a `speculative_config` the core also holds the MTP module
 (`MTPLayer`), replayed `max_draft_len` times by the spec worker; the trunk runs every generation
@@ -261,11 +261,13 @@ from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate
 from tensorrt_llm._torch.utils import is_gdn_flashinfer_replay_enabled, is_gdn_replay_enabled
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
+from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
+from .. import ple_host_table as _ple_host
 from . import pool as _pool
 from . import vision as _vision
 from . import weights as _weights
@@ -1012,7 +1014,9 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         eos = cfg.eos_token_id
         self.eos_token_id = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
         self.ple_table_dtype = _weights.PLE_TABLE_DTYPE
-        # Host memory behind the offloaded table; `ple_table` is a non-owning device view.
+        # How the table is stored (`ple_host_table`); the storage is `_ple_table_host` after load.
+        self.ple_host_mode = _ple_host.host_table_mode()
+        self.checkpoint_dir = getattr(composite_config, "_name_or_path", None)
         self._ple_table_host = None
 
         vcfg = getattr(composite_config, "vision_config", None)
@@ -1214,7 +1218,9 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         for i in self.gdn_layers:
             w[f"l{i}_in_proj_w"][sum(self.in_proj_split) :].zero_()
         # An index past the table's end is a device-side assert that poisons the process.
-        table_rows = w["ple_table"].shape[0]
+        # Rows of the whole table: under `server` storage `ple_table` holds only this rank's.
+        host = self._ple_table_host
+        table_rows = host.rows if host is not None else w["ple_table"].shape[0]
         used_rows = int(w["ple_offs"][-1]) + int(w["ple_vocab"][-1])
         assert used_rows <= table_rows, (
             f"the n-gram table has {table_rows} rows but its per-head offsets and vocabulary "
@@ -1396,12 +1402,12 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
 
     def _check_ple_residency(self) -> None:
         """Assert via the driver that the n-gram table is host-resident; outputs cannot show it."""
-        table = self.w["ple_table"]
-        kind = _weights.memory_kind(table.data_ptr())
-        assert kind == _weights.CUDA_MEMORY_TYPE_HOST, (
-            f"the n-gram table was declared in host memory, but the driver reports "
-            f"cudaMemoryType {kind} for the pointer the forward gathers from"
+        host = self._ple_table_host
+        assert host.resident_on_host(), (
+            f"the n-gram table ({host.describe()}) was declared in host memory, but the driver "
+            "reports device memory for the pointer the forward gathers from"
         )
+        logger.info(f"ple n-gram table: {host.describe()}")
 
     # ---------------------------------------------------------------- bind ---
 
@@ -4873,7 +4879,10 @@ class PrefillTarget:
             S.ple_offs,
             core.eos_token_id,
             num_tokens,
+            row_window=core._ple_table_host.window,
         )
+        if core._ple_table_host.needs_sum:
+            ngram = core.tp_sum(ngram)
         ple_gate_conv_inject_norm(
             hc[:num_tokens],
             cublas_mm(ngram, S.ple_key),
@@ -5827,7 +5836,10 @@ class DecodeTarget:
             S.ple_offs,
             core.eos_token_id,
             rows,
+            row_window=core._ple_table_host.window,
         )
+        if core._ple_table_host.needs_sum:
+            ngram = core.tp_sum(ngram)
         return cublas_mm(ngram, S.ple_key), cublas_mm(ngram, S.ple_val)
 
     def _ple_block(
@@ -5976,10 +5988,11 @@ class DecodeTarget:
 
         hc_count = core.hc_count
         layers, S = self._layers, self._stack
-        # The PLE front reads no residual, so it runs on the PLE stream beside the first layers.
+        # The PLE front reads no residual, so it runs on the PLE stream beside the first layers;
+        # a row-sharded table's sum is a TP collective, which stays on the main stream.
         ple_stream = getattr(core, "_ple_stream", None)
         ple_front = None
-        if ple_stream is not None and core.ple_layer > 0:
+        if ple_stream is not None and core.ple_layer > 0 and not core._ple_table_host.needs_sum:
             caller = torch.cuda.current_stream()
             ple_stream.wait_stream(caller)
             with torch.cuda.stream(ple_stream):

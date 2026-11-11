@@ -66,7 +66,9 @@ _ROWS_BLOCK_T = 32
 _MIN_LOG_S = 8
 
 
-@triton.jit
+# `row_lo`, `row_hi`, `row_base`: the gather reads table rows `[row_lo, row_hi)` from the view whose
+# first row is `row_base` and writes zeros for the others (a rank's share of a row-sharded table).
+@triton.jit(do_not_specialize=["row_lo", "row_hi", "row_base"])
 def _ple_ngram_embed_kernel(
     ids_ptr,
     pool_ptr,
@@ -83,6 +85,9 @@ def _ple_ngram_embed_kernel(
     stride_table,
     stride_out,
     eos,
+    row_lo,
+    row_hi,
+    row_base,
     NGRAM: tl.constexpr,
     HEADS_PER: tl.constexpr,
     HEADS: tl.constexpr,
@@ -135,7 +140,12 @@ def _ple_ngram_embed_kernel(
 
     d = tl.arange(0, BLOCK_D)
     m3 = tmask[:, None, None] & hmask[None, :, None] & (d < HEAD_DIM)[None, None, :]
-    q = tl.load(table_ptr + rows[:, :, None] * stride_table + d[None, None, :], mask=m3, other=0.0)
+    own = ((rows >= row_lo) & (rows < row_hi))[:, :, None]
+    q = tl.load(
+        table_ptr + (rows - row_base)[:, :, None] * stride_table + d[None, None, :],
+        mask=m3 & own,
+        other=0.0,
+    )
     val = q.to(tl.float32) * tl.load(scale_ptr).to(tl.float32)
     cols = heads[None, :, None] * HEAD_DIM + d[None, None, :]
     tl.store(
@@ -173,7 +183,7 @@ def _seq_of_rows(qsl_ptr, t, num_seqs, LOG_S: tl.constexpr):
     return s
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["row_lo", "row_hi", "row_base"])
 def _ple_ngram_embed_rows_kernel(
     ids_ptr,
     pool_ptr,
@@ -192,6 +202,9 @@ def _ple_ngram_embed_rows_kernel(
     stride_table,
     stride_out,
     eos,
+    row_lo,
+    row_hi,
+    row_base,
     NGRAM: tl.constexpr,
     HEADS_PER: tl.constexpr,
     HEADS: tl.constexpr,
@@ -249,7 +262,12 @@ def _ple_ngram_embed_rows_kernel(
     scale = tl.load(scale_ptr).to(tl.float32)
     for h in tl.static_range(HEADS):
         row_h = tl.sum(tl.where((heads == h)[None, :], rows, 0), axis=1)
-        q = tl.load(table_ptr + row_h[:, None] * stride_table + d[None, :], mask=m2, other=0.0)
+        own = ((row_h >= row_lo) & (row_h < row_hi))[:, None]
+        q = tl.load(
+            table_ptr + (row_h - row_base)[:, None] * stride_table + d[None, :],
+            mask=m2 & own,
+            other=0.0,
+        )
         val = q.to(tl.float32) * scale
         tl.store(
             out_ptr + t[:, None] * stride_out + (h * HEAD_DIM + d)[None, :],
@@ -310,7 +328,10 @@ class PleNgramEmbed(OpWrapper):
 
         out[t, h * D : (h + 1) * D] = to(scale.dtype)(float(table[row[t, h]]) * float(scale))
 
-    with `D = table.shape[1]` -- one rounding of the scaled fp8 value.
+    with `D = table.shape[1]` -- one rounding of the scaled fp8 value. With
+    `row_window = (lo, hi, base)` the view `table` holds global rows from `base`
+    on: rows in `[lo, hi)` are read from `table[row - base]` and the others
+    give zeros, so a row-sharded table's shares sum to the whole table's output.
     Then, **in place**, `context_pool[slot]` becomes the last `ngram_size - 1`
     ids of the stream (a zero-row sequence republishes its carry). Unnamed slots
     are untouched.
@@ -461,8 +482,10 @@ class PleNgramEmbed(OpWrapper):
         head_offsets: torch.Tensor,
         eos_token_id: int,
         max_rows: int,
+        row_window: Optional[tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         num_tokens = input_ids.shape[0]
+        row_lo, row_hi, row_base = row_window or (0, table.shape[0], 0)
         num_seqs = state_indices.shape[0]
         ngram_size = layer_multipliers.numel()
         heads = head_vocab_sizes.numel()
@@ -491,6 +514,9 @@ class PleNgramEmbed(OpWrapper):
                     table.stride(0),
                     out.stride(0),
                     eos_token_id,
+                    row_lo,
+                    row_hi,
+                    row_base,
                     NGRAM=ngram_size,
                     HEADS_PER=heads // (ngram_size - 1),
                     HEADS=heads,
@@ -532,6 +558,9 @@ class PleNgramEmbed(OpWrapper):
                 table.stride(0),
                 out.stride(0),
                 eos_token_id,
+                row_lo,
+                row_hi,
+                row_base,
             )
             embed_constexprs = dict(
                 NGRAM=ngram_size,
@@ -575,6 +604,7 @@ class PleNgramEmbed(OpWrapper):
         head_offsets: torch.Tensor,
         eos_token_id: int,
         max_rows: int,
+        row_window: Optional[tuple[int, int, int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`(out, context_pool)` as the call leaves them, from the scalar
         references of the two entries it fuses -- `ngram_token_history`
@@ -598,7 +628,14 @@ class PleNgramEmbed(OpWrapper):
         rows = ngram_hash.reference(
             window, layer_multipliers, head_vocab_sizes, head_offsets, eos_token_id, 1
         ).reshape(window.shape[0], -1)
-        gathered = table[rows.reshape(-1)].double().reshape(rows.shape[0], -1)
+        flat = rows.reshape(-1)
+        lo, hi, base = row_window or (0, table.shape[0], 0)
+        own = (flat >= lo) & (flat < hi)
+        picked = torch.zeros(
+            (flat.numel(), table.shape[1]), dtype=torch.float64, device=table.device
+        )
+        picked[own] = table[flat[own] - base].double()
+        gathered = picked.reshape(rows.shape[0], -1)
         out = (gathered * scale.double().reshape(())).to(scale.dtype)
         return out, pool
 
@@ -616,6 +653,7 @@ class PleNgramEmbed(OpWrapper):
         head_offsets: torch.Tensor,
         eos_token_id: int,
         max_rows: int,
+        row_window: Optional[tuple[int, int, int]] = None,
     ) -> None:
         num_seqs = state_indices.shape[0]
         ngram_size = layer_multipliers.numel()
@@ -643,6 +681,12 @@ class PleNgramEmbed(OpWrapper):
         assert table.dim() == 2 and table.stride(1) == 1, "table [rows, D], unit column stride"
         assert scale.numel() == 1, "one per-tensor scale"
         assert max_rows >= 1, "max_rows >= 1"
+        if row_window is not None:
+            lo, hi, base = row_window
+            assert 0 <= base <= lo <= hi and hi - base <= table.shape[0], (
+                f"row_window {row_window}: rows [lo, hi) must lie in the view of "
+                f"{table.shape[0]} rows starting at row `base`"
+            )
 
 
 ple_ngram_embed = PleNgramEmbed()

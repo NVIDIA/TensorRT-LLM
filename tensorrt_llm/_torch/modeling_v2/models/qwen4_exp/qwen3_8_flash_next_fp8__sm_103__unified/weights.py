@@ -58,6 +58,8 @@ from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
 from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.logger import logger
 
+from .. import ple_host_table as _ple_host
+
 ALL_LAYERS = object()
 
 Cut = tuple[slice, ...]
@@ -1271,6 +1273,9 @@ class Qwen4ExpFp8Weights:
             set(manifest.keys()) ^ set(core.w.keys()),
         )
         for param_key, sources in manifest.items():
+            if param_key == "ple_table":
+                consumed |= _fill_ngram_table(core, d, weights, rows_per_shard)
+                continue
             consumed |= self.fill(core.w[param_key], sources, weights, d)
             if param_key.endswith(_RELEASE_AFTER):
                 torch.cuda.empty_cache()
@@ -1515,7 +1520,8 @@ def _declare_ngram_table(core, d: SimpleNamespace, weights) -> int:
 
     The shards are contiguous row chunks (global row `r` is shard `r // rows_per_shard`), so
     the flat buffer takes the hash's global rows. On CUDA it is host memory the device
-    addresses; otherwise an ordinary allocation on the weights' device.
+    addresses, stored as `core.ple_host_mode` says (`ple_host_table`); otherwise an ordinary
+    allocation on the weights' device.
     """
     keys = ngram_shard_keys(d)
     for key in keys:
@@ -1538,14 +1544,47 @@ def _declare_ngram_table(core, d: SimpleNamespace, weights) -> int:
     )
     device = core.w["embed"].device
     rows = d.ple_shards * rows_per_shard
-    if device.type != "cuda":
-        table = torch.empty(rows, head_dim, dtype=dtype, device=device)
-        core._ple_table_host = None
-    else:
-        table, core._ple_table_host = _host_resident_empty(rows, head_dim, dtype, device)
+    mode = getattr(core, "ple_host_mode", _ple_host.RANK)
+    identity = None
+    if mode == _ple_host.NODE:
+        identity = _ple_host.checkpoint_identity(
+            getattr(core, "checkpoint_dir", None), rows, head_dim, dtype, *keys
+        )
+    mapping = getattr(core, "mapping", None)
+    core._ple_table_host = _ple_host.PleHostTable(
+        mode,
+        rows,
+        head_dim,
+        dtype,
+        device,
+        rank=mapping.tp_rank if mapping is not None else 0,
+        world=mapping.tp_size if mapping is not None else 1,
+        dp=getattr(core, "dp_size", 1),
+        private=_host_resident_empty,
+        identity=identity,
+    )
+    _bind_ngram_table(core)
+    return rows_per_shard
+
+
+def _bind_ngram_table(core) -> None:
+    """`core.w["ple_table"]` as the host table's current view (a placeholder until a `node`
+    table is mapped)."""
+    host = core._ple_table_host
+    table = host.table
+    if table is None:
+        table = torch.empty(0, host.cols, dtype=host.dtype, device="meta")
     core.w["ple_table"] = nn.Parameter(table, requires_grad=False)
     # Host offload relies on `nn.Parameter` sharing storage rather than copying.
     assert core.w["ple_table"].data_ptr() == table.data_ptr(), (
         "wrapping the n-gram table in nn.Parameter moved its storage"
     )
-    return rows_per_shard
+
+
+def _fill_ngram_table(core, d: SimpleNamespace, weights, rows_per_shard: int) -> set:
+    """Fill this rank's rows of the n-gram table (`ple_host_table`); return the shard keys."""
+    keys = ngram_shard_keys(d)
+    copy, read = _ple_host.shard_rows(weights, keys, rows_per_shard, _read)
+    core._ple_table_host.fill(copy, read)
+    _bind_ngram_table(core)
+    return set(keys)
