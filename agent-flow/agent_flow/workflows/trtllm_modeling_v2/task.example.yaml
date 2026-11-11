@@ -1,250 +1,111 @@
-# trtllm-modeling-v2 task specification: every key the spec accepts, with its default. Fill it in
-# by following spec/INTAKE.md and check it
-# with `trtllm-modeling-v2 --task task.yaml --workspace W --dry-run`. `trtllm-modeling-v2 intake
-# derive --checkpoint <dir> (--site site.yaml | --repo <checkout>) --out D` writes the smallest
-# spec the checkpoint and the site support, D/task.derived.yaml: its first deployment and that
-# deployment's options. Add what else the run should bring up to its `deployments`.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# Every block is CLOSED: an unknown key is an error naming the nearest real key, never a silent
-# default. Commented-out keys are optional, with their default beside them.
-# README.md summarizes the workflow's design and code ownership.
-
-# ---------------------------------------------------------------- identity
-
-# REQUIRED: the HuggingFace checkpoint directory.
-checkpoint_path: /path/to/Qwen3-30B-A3B
-
-# REQUIRED and never inferred: catalog receipts are per architecture. sm_100 = B200, sm_103 = GB300.
-arch: sm_103
-
-# WHAT THE RUN BRINGS UP: its deployments, the first being core's (it defines `onboarded`).
-# State them natively:
+# trtllm-modeling-v2 task specification. Unknown keys are refused, with the nearest known one.
+# Validate without a GPU: trtllm-modeling-v2 --task task.yaml --workspace <ws> --dry-run
+#
+# 1) The smallest form: one host, one deployment (what `intake derive` writes).
+#
+# checkpoint_path: <checkpoint-dir>
+# trtllm_repo_path: <trtllm-repo-dir>
+# arch: sm_103                              # sm_100 is B200, sm_103 is GB300
+# accuracy: {model_key: <org/model>}        # leave out to onboard on the boot alone
+# environment:
+#   python: <venv-dir>/bin/python
+#   env: {TMPDIR: /var/tmp/mv2}             # writable, 61 characters at most
+# agents:
+#   defaults: {backend: claude-code, model: <agent-model-id>}
 # deployments:
-#   - name: dep16                     # the first is core's
-#     options: engines/dep16.yaml     # a native LLM-API options file (`trtllm-serve --config`),
-#                                     # beside this file, or the options as a mapping
-#     launch: "<site prefix>"         # empty: this host. With one, its boot starts a server
-#                                     # behind the prefix and asks it; its benchmarks run
-#                                     # `trtllm-eval` behind the same prefix
-#     stop: "<site command>"          # optional: ends what `launch` started
-#     timeout: 5400
-#     inputs: [text, image]           # default [text]
-#     benchmarks:                     # each a `trtllm-eval` subcommand; default: `accuracy.benchmark`
-#       - name: gsm8k                 # judged against the reference row of accuracy.model_key
-#       - {name: aa_lcr, anchor: 0.62, source: "<where it was measured>", env: {NS_JUDGE_MODEL: m}}
-#     tests: []                       # native pytest node ids that also judge it
-#   - name: pd                        # disaggregated: a context and a generation server
-#     env: {UCX_TLS: "tcp,self,sm,cuda_copy,cuda_ipc"}
-#     ctx: {options: engines/ctx.yaml, launch: "<nodes 1 to 4>"}
-#     gen: {options: engines/gen.yaml, launch: "<nodes 5 to 8>"}
-#     relative_to: dep16              # judged against dep16's own score where no row fits
-# Each deployment owes its boot, one accuracy check for each benchmark, and its `tests`. Every
-# check holds every rank's engine to the options stated here, key by key.
+#   - {name: tp1, options: engines/tp1.yaml}
 #
-# Or use the SHORTHAND below, a small table that expands to deployments (the run prints the
-# expansion, one line each, at `--dry-run` and in its journal):
-# - each member listed is one deployment, named by the member; the first is core's;
-# - each feature and each variant is one more deployment on the FIRST member, named by itself,
-#   judged against the first's own score where no reference row carries its tags;
-# - `disagg` is one disaggregated deployment whose two servers take core's options at the
-#   member `members: {disagg: [<m>]}` names, else the first.
-# What the table cannot say is refused in one line (`state deployments: <why>`).
+# 2) The full form: a multi-node site, two benchmarks, a KV dtype judged against the
+#    first deployment, and a disaggregated deployment.
 
-# One member: tp<N> | tep<N> | dep<N>. Also the name segment of the target's directory.
-parallel: tp1
-
-# Several members, the first is core's:
-# members: [tp1, tep4, dep4]
-# members: {default: [tp1, dep4], disagg: [dep4]}
-
-# mtp, eagle3, dflash, dspark, multimodal, host_offload, disagg, kv_quant, decoder_replay,
-# encoder_replay. A drafter's acceptance is judged by a native test of the tree, named in
-# `accuracy.disagg.tests` for disagg or in a stated deployment's `tests`, not by the flow.
-features: []
-
-# One more configuration of core or of a feature, as an overlay on its options:
-# variants:
-#   kv_fp8:
-#     unit: core                    # default core
-#     runtime: {extra_flags: [--kv_cache_dtype=fp8]}      # over the spec's; flags appended
-#     llm_api_options: {kv_cache_config: {dtype: fp8}}    # merged into the unit's options
-#     env: {}                       # added to its checks' environment
-#     # Where they differ: benchmark, reference_yaml, model_key, benchmark_args, samples,
-#     # discriminators (layered over the unit's).
-#     note: KV cache stored as FP8
-
-# Keys of earlier versions are IGNORED with one notice each, never an error: `profile`,
-# `coverage`, `accuracy.floor`, `accuracy.tolerance`, `accuracy.benchmark_members`,
-# `accuracy.acceptance`, `accuracy.envelope`, `accuracy.reference_logits`, a variant's `gates`
-# and `members`, `accuracy.disagg.devices` and `nodes`.
-
-# REQUIRED: the checkout the target is built in.
-trtllm_repo_path: /path/to/TensorRT-LLM
-
-# Overrides of the derived Python package names: the family (from `architectures[0]`) and the
-# checkpoint segment (from the directory name).
-# target: {family: qwen3_5, checkpoint_segment: qwen3_5_27b}
-
-# `full` (default) | `text_only`: a multimodal checkpoint built and gated as a language model.
-# scope: text_only
-
-# Free text passed verbatim to every role. It never relaxes a gate or the scope.
-# notes: |
-#   Reuse the NVFP4 MoE kernels in tensorrt_llm/_torch/modules/fused_moe.
-
-# ----------------------------------------------------------------- runtime
-# Shorthand only: switches and flags written into every expanded deployment's options.
-#
-# runtime:
-#   cuda_graph: true           # default true: eager checks make every accuracy run 10-50x
-#                              # slower and score a path the target does not serve
-#   chunked_prefill: false     # default false
-#   overlap_scheduler: true    # default true
-#   kv_cache_reuse: false      # default false; on, a boot repeats a prompt and expects
-#                              # cached tokens
-#   # --max_seq_len, --max_batch_size (a global total: an attention-DP rank gets its share),
-#   # --max_num_tokens, --kv_cache_fraction, --kv_cache_dtype, --tokens_per_block,
-#   # --mamba_ssm_cache_dtype, --attention_backend, --moe_backend, --trust_remote_code.
-#   # Anything else goes in an options file; a check samples greedily, by its own protocol.
-#   # A setting stated here and in `llm_api_options` with two values is refused.
-#   extra_flags: [--max_seq_len=9216, --max_batch_size=64, --kv_cache_fraction=0.7]
-
-# ------------------------------------------------------------- environment
-# REQUIRED: how GPU work is launched, resolved once into the command prefix every prompt carries.
-
-environment:
-  # `local`, the one kind and the default: every command runs on the orchestrator's own host, on
-  # the devices preflight claims. On a cluster, start the orchestrator inside the allocation.
-  kind: local
-
-  # The site's prefix for a one-GPU command; a deployment carries its own `launch`. Validated
-  # here; the run's commands do not go through it yet.
-  # launch: "<site prefix>"
-
-  # REQUIRED: the interpreter every Python command runs under, the editable install to measure.
-  # It must exist at launch.
-  python: /path/to/TensorRT-LLM/.venv-3.12/bin/python
-
-  # Exported to every command. Preflight requires TMPDIR and CLAUDE_CODE_TMPDIR outside /tmp, and
-  # TMPDIR at most 61 characters (the LLM API binds a unix socket under it).
-  env:
-    TMPDIR: /path/to/scratch/tmp
-    CLAUDE_CODE_TMPDIR: /path/to/scratch/tmp
-
-  # gpus_per_node: 4                        # the devices this host holds
-  # gpu_memory_gib: 288                     # per device: derive sizes engines and disagg by it
-  # The image the GPU jobs run in, if any, and how host paths appear inside it. How the image is
-  # started is yours.
-  # container_image: /path/to/image
-  # mounts: [/data:/data]
-
-# ---------------------------------------------------------------- accuracy
-# Optional with stated `deployments` (a deployment with no benchmark is judged by its boot
-# alone); the defaults every benchmark takes. The release criterion: measured >= anchor - 2 x SE,
-# the SE binomial over the benchmark's sample count (0.75 points for GSM8K's 1319 questions at
-# 92 %). An anchor is, in this order: a benchmark's declared `anchor` with its `source`; the
-# reference row of `model_key` whose tags are exactly the deployment's; the score of the
-# deployment `relative_to` names, with the error of both (sqrt(2) x SE); else none, and the
-# score is reported with no verdict. Anchors are frozen in the workspace at the first start.
+checkpoint_path: <checkpoint-dir>
+trtllm_repo_path: <trtllm-repo-dir>
+arch: sm_103
+# target: {family: <family_name>, checkpoint_segment: <target_name>}   # derived when unsaid
 
 accuracy:
-  # The default benchmark (gsm8k unsaid) and its reference file (the tree's own for the
-  # benchmark, unsaid). In shorthand each also takes the per-unit form {default: ..., <unit>: ...}.
-  benchmark: gsm8k
-  reference_yaml: tests/integration/defs/accuracy/references/gsm8k.yaml
+  model_key: <org/model>                    # the reference row's key; defaults for every benchmark
 
-  # Seconds one complete benchmark command may take (default 14400, four hours).
-  # timeout: 14400
+environment:
+  python: <venv-dir>/bin/python
+  launch: "<one-gpu-prefix>"                # the site's prefix of one-GPU commands
+  # gpu_memory_gib: 288                     # lets a dry run warn of a first deployment too narrow
+  env:
+    TMPDIR: /var/tmp/mv2
+    CLAUDE_CODE_TMPDIR: /var/tmp/mv2
 
-  # The sample count for the SE where the run's output and `--num_samples` do not say it and the
-  # benchmark's is not known (gsm8k, mmlu, mmmu, gpqa_*). Without a count a score has no verdict.
-  # samples: 1319
+agents:
+  defaults:
+    backend: claude-code                    # claude-code or codex
+    model: <agent-model-id>
+    reasoning_effort: high
+  # roles:
+  #   assembler: {model: <stronger-model-id>}
 
-  # Commit the rows: a declared or measured anchor is what the run is held to, and a low
-  # placeholder passes any engine that answers.
+notes: |
+  The architecture in a few lines, and prior art in the tree.
 
-  # The reference_yaml row's model, stated (`org/model`); default: the checkpoint path's last two
-  # components, which name no model when config.json states no `_name_or_path`.
-  # model_key: openai/gpt-oss-120b
+deployments:
+  # The first deployment is core: its boot and benchmarks define `onboarded`. It stays first.
+  # `options` is a YAML path beside the spec (`options: engines/dep8.yaml`) or a mapping.
+  - name: dep8
+    options:
+      tensor_parallel_size: 8
+      moe_expert_parallel_size: 8
+      enable_attention_dp: true
+      max_seq_len: 8192
+      max_batch_size: 8
+    launch: "<two-node-8-rank-prefix>"      # allocation and container only
+    stop: "<site-step-cleanup>"             # ends what launch started; gets $MV2FLOW_SERVER=dep8
+    inputs: [text, image]
+    timeout: 5400
+    benchmarks:
+      - name: gsm8k                         # anchor: the reference row of <org/model>
+      - name: aa_lcr                        # no reference row: declare the anchor
+        anchor: 0.62
+        unit: fraction                      # percent (the default) or fraction
+        source: "<where and how 0.62 was measured>"
+        samples: 100
+        args: ["--max_seq_len", "131072"]
+        env:
+          NS_JUDGE_MODEL: <judge-model-id>
 
-  # The row's tags, matched EXACTLY (`quant_algo`, `kv_cache_quant_algo`, `spec_dec_algo`). What a
-  # deployment's options imply (a quantized KV cache, a drafter) is added to them; state the
-  # checkpoint's own here. Flat, or per unit in shorthand:
-  # discriminators: {quant_algo: NVFP4}
+  # A KV dtype no reference row fits: judged against dep8's own score.
+  - name: dep8_kv_nvfp4
+    options:
+      tensor_parallel_size: 8
+      moe_expert_parallel_size: 8
+      enable_attention_dp: true
+      kv_cache_config: {dtype: nvfp4}
+    launch: "<two-node-8-rank-prefix>"
+    stop: "<site-step-cleanup>"
+    relative_to: dep8
+    tests:
+      - tests/unittest/_torch/modeling_v2/<test_file.py>::<test_name>
 
-  # Shorthand's `disagg` feature: what the disaggregated deployment runs with. It boots and is
-  # scored through its proxy like any deployment; `test`/`tests` name the tree's own
-  # disaggregated-serving tests that also judge it, each run as one pytest job from its pytest
-  # root, passing only when every test the node id selects passed (a skip fails it).
-  # disagg:
-  #   test: tests/integration/defs/accuracy/test_disaggregated_serving.py::TestMyModel::test_auto_dtype
-  #   env: {LLM_MODELS_ROOT: /path/to/models}   # what the test and the servers read
-  #   tests: []                    # more node ids, each run as a job of its own
-  #   timeout: 7200                # default, seconds
-
-  # The BOOT workload, run-wide or per deployment by its name (`core` for the first); keywords
-  # match generated text only. A deployment that takes images and sends none gets the tree's
-  # tests/integration/test_input_files/merlion.png.
-  # boot:
-  #   prompts:
-  #     - "The capital of France is"
-  #     - prompt: "Natalia sold 48 clips in April and half as many in May. How many in all?"
-  #       keywords: ["72"]
-  #   # prompts_file: boot_prompts.yaml   # or a YAML/JSON list of plain prompts
-  #   keywords: [Paris]             # each must appear in some generated text
-  #   max_tokens: 32                # default
-  #   multimodal:
-  #     prompts:
-  #       - prompt: "<|User|><image>What vegetable is this? One word.<|Assistant|>"
-  #         images: [examples/images/carrots.jpeg]   # beside this file, or in the tree
-  #         render: raw                              # pre-rendered; or `loader`
-  #         keywords_any: [carrot]
-
-  # The SERVE gate: `trtllm-serve` starts core with its options and answers one completion (and
-  # an image chat when its boot sends one). Off unless enabled.
-  # serve:
-  #   enabled: true
-  #   prompt: "The capital of France is"   # default
-  #   max_tokens: 32               # default
-  #   timeout: 1800                # default, seconds for /health
-
-  # Shorthand only: the limits every expanded deployment runs under. Without `max_seq_len` an
-  # engine sizes its KV cache for the checkpoint's `max_position_embeddings`.
-  # max_seq_len: 8192
-  # max_batch_size: 32
-
-  # Accuracy runs offline. GSM8K is found under $LLM_MODELS_ROOT/datasets/openai/gsm8k or in the
-  # HuggingFace cache; any other benchmark's dataset, or another place, is stated:
-  # dataset_path: /path/to/datasets/mmlu
-
-  # Shorthand only: the options file each unit's deployments start from, per unit, relative to
-  # THIS FILE. A drafter's carries its `speculative_config` (`max_draft_len`, the draft model).
-  # llm_api_options: {core: scripts/core_llm_api.yaml, mtp: scripts/mtp_llm_api.yaml}
-
-  # Shorthand only (a stated benchmark has `args`): the benchmark subcommand's own options, the
-  # PROTOCOL, which must match the anchor's. Flat, or per unit.
-  # benchmark_args: [--apply_chat_template]
-
-# ------------------------------------------------------- agent backends
-# REQUIRED: the model every role runs on. The launching agent writes its own backend, model and
-# reasoning_effort into defaults (spec/INTAKE.md section 7); nothing is inherited from the launching
-# session or the environment, and a role with no stated model stops the run before any worker starts.
-# `roles.<name>` overrides `defaults` per field: backend (claude-code | codex, default claude-code),
-# model, reasoning_effort, extra_mcp_servers. A role on another backend than defaults states its own
-# model. Models are pinned once for the probe and every turn; an unset effort is the backend's.
-# agents:
-#   defaults: {backend: claude-code, model: <your-model-id>, reasoning_effort: <your-effort>}
-#   roles:
-#     surveyor: {backend: codex, model: <your-codex-model-id>, reasoning_effort: high}
-#   # defaults: {extra_mcp_servers: {knowledge-base: {type: http, url: https://example.test/mcp}}}
-
-# ----------------------------------------------------------- commit policy
-# A task's commits are audited before each integration. No path is refused but the workspace, an
-# added symlink, a sandbox placeholder and the judge's paths (tensorrt_llm/evaluate/,
-# tensorrt_llm/commands/eval.py, the accuracy references the anchors come from). Every landed
-# commit is labelled: `target` when all of its paths are the target's own (its family directory,
-# the tests that mirror it, the two family registries, tests/integration/), `shared` when none
-# is, `mixed` otherwise. Every commit is authored and signed off as the repository's user (or
-# MV2FLOW_GIT_NAME / MV2FLOW_GIT_EMAIL).
-# commit_policy:
-#   allow_co_authors: false    # the default
+  # Disaggregated: each side states how the cache moves; env states the site's UCX transports.
+  - name: pd
+    env:
+      UCX_TLS: "^ib"                        # what worked on GB300; a container's tcp did not
+    ctx:
+      options:
+        tensor_parallel_size: 8
+        moe_expert_parallel_size: 8
+        enable_attention_dp: true
+        disable_overlap_scheduler: true
+        cache_transceiver_config: {backend: DEFAULT}
+      launch: "<ctx-nodes-8-rank-prefix>"   # gets $MV2FLOW_SERVER=pd.ctx
+      stop: "<ctx-step-cleanup>"
+    gen:
+      options:
+        tensor_parallel_size: 8
+        moe_expert_parallel_size: 8
+        disable_overlap_scheduler: true
+        cache_transceiver_config: {backend: DEFAULT}
+      launch: "<gen-nodes-8-rank-prefix>"   # gets $MV2FLOW_SERVER=pd.gen
+      stop: "<gen-step-cleanup>"
+    relative_to: dep8
+    timeout: 7200

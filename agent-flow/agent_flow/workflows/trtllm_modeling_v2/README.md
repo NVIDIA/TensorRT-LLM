@@ -5,171 +5,72 @@ SPDX-License-Identifier: Apache-2.0
 
 # trtllm-modeling-v2
 
-Onboard a HuggingFace checkpoint as a TensorRT-LLM ModelingV2 target: reuse or certify catalog
-operators, assemble the model, bring up its first deployment and then each further one the spec
-states. Agents write code; Python owns the order of the work, the landing of each task, the checks
-and the report. Performance tuning is another tool's work, on the onboarded target.
+Build a TensorRT-LLM Modeling V2 target from a HuggingFace checkpoint. Agents write the code; Python fixes the order of the tasks, lands their commits and runs every check.
 
-## Terms
+**`onboarded`** means: the first deployment of the spec (`core`) boots with `modeling_v2=require` on the commit that landed, and each of its benchmarks meets its frozen floor (`anchor - 2 x SE`, anchors in `<ws>/anchors.yaml`). With no anchor it holds on the boot alone, and the report says `accuracy unjudged (boot only)`. Once met, the flow writes `refs/mv2/<slug>/onboarded` and keeps rebuilt native libraries in `<ws>/onboarded_libraries/`; nothing later takes it back.
 
-| Term | Meaning |
-|---|---|
-| Target | Model implementation for a checkpoint family and the deployments it supports |
-| Deployment | One way the target is served: its engine options, its launch, its benchmarks. The first is `core` |
-| Check | One gate (boot, accuracy, serve, tests) of one deployment |
-| Task | One piece of work for one agent turn: the survey, a kernel entry, a deployment, a fix |
-| Entry | A kernel wrapper with executable input, architecture and correctness contracts |
-| Onboarded | The first deployment's boot and benchmarks passed, by code, on the commit that landed |
+**Exit status:** 0 onboarded (or a `--dry-run` whose preflight passed), 1 not onboarded, 2 a spec, state or usage error, 3 the workspace is held by another process.
+
+## Start
+
+```bash
+trtllm-modeling-v2 intake derive --checkpoint <ckpt> --repo <trtllm> --out <spec-dir>   # a first spec
+trtllm-modeling-v2 --task <spec-dir>/task.derived.yaml --workspace <ws> --dry-run        # no GPU
+trtllm-modeling-v2 --task <spec-dir>/task.derived.yaml --workspace <ws>
+```
+
+On one host with a simple environment, fill `checkpoint_path`, `trtllm_repo_path`, `arch`, `environment.python`, `agents.defaults` (`backend`, `model`) and one deployment with its options file. [spec/INTAKE.md](spec/INTAKE.md) says how to add deployments and benchmarks; `task.example.yaml` shows every key.
 
 ## How a run goes
 
-```text
-preflight -> tasks in a fixed order, the onboard check after core -> the final pass -> the report
-```
+1. **Preflight** probes where `core` runs and stops only on a hard blocker: an unreadable `config.json`, a tree that does not import, an unwritable `TMPDIR` (61 characters at most), too few free devices for `core`, a missing dataset of `core`, an agent CLI that does not answer. A config the tree cannot load adds a `config` task first. A later deployment that does not fit, and a benchmark with no dataset or whose base is not attempted, are recorded `not attempted`.
+2. **Survey** writes `plan.md` and `vocabulary.yaml` (the operators the checkpoint needs, and the kernel rows to add).
+3. **Core**, after the kernel rows it needs: each task is one agent turn in its own worktree, 3 attempts, a spent kernel row skipped. When the worker says `ready`, code runs `core`'s boot and benchmarks on its commit; only a pass lands it. A `config`, `survey` or `core` task that spends its attempts ends the run `not onboarded`.
+4. **Each further deployment**, in the spec's order. One that spends its attempts is `not done`: nothing of it lands and the run goes on.
+5. **Final pass**, once: every check the done deployments owe, the target's tests, and the convention scan (an entry without `CELLS` or `ARCHS`, a Modeling V1 import; reported, never a gate). What fails goes to one `fix` task, then the failed checks and `core`'s run again.
+6. **Report**: `<ws>/delivery_report.md`.
 
-1. **Preflight** (Python, plus one probe turn per agent configuration). It stops the run before
-   a worker starts only on a hard blocker: the checkpoint cannot be read, the tree does not import,
-   the first deployment's devices are missing, busy or too small for its weights, its temporary
-   directory is not writable, a benchmark it is scored on has no dataset, an agent does not answer.
-   The tree, the devices and the temporary directory are probed where the first deployment runs
-   (behind its launch prefix). Everything else it sees is a note; a later deployment that cannot be
-   attempted, and a checkpoint config the tree cannot load yet, are recorded in `preflight.json`.
-   It freezes the accuracy anchors (`anchors.yaml`). The same command starts again once a blocker
-   is fixed.
-2. **Tasks**, in this order, which no agent chooses:
-   - a config task, only when the tree cannot load the checkpoint's config;
-   - the survey: `plan.md` and `vocabulary.yaml`, the checkpoint mapped onto the catalog;
-   - `core`, the first deployment, after one kernel task per vocabulary queue row it needs;
-   - each further deployment in the spec's order, after the kernel rows it needs.
+A check is `trtllm-modeling-v2 gate <boot|accuracy|tests> --task <ws>/task.yaml --deployment <name> --tree <tree>`, the same command for the run and for a worker. Its verdict line names the directory of its files.
 
-   Tasks run one at a time, each starting from the commits of the tasks before it. Each task
-   is one agent turn in its own git worktree. When the worker says it is ready, its commits are
-   audited (who made them, the sign-off, and that none touches the workspace or a judge path),
-   rebased, fast-forwarded into the checkout and labelled `target`, `shared` or `mixed` by whether
-   their paths are the target's own. Each landing is read by the conventions scan (an entry's
-   `CELLS`, `ARCHS` and test, Modeling V1 imports, the landing name): its findings are kept for
-   the report and never hold a task.
-3. **The onboard check**, by code: when `core` says it is ready, the run boots and scores the first
-   deployment under `modeling_v2=require` on the worker's clean, committed worktree, against the
-   frozen anchors. A pass lands that commit, records `onboarded` (the commit, the content hash of
-   its native libraries, the time) and points `refs/mv2/<slug>/onboarded` at it; nothing later
-   takes that back. A failure is the attempt's result line and the next attempt's note. A
-   benchmark nothing anchors is a score with no verdict, and with none judged the record says
-   `accuracy unjudged (boot only)`.
-4. **The final pass**, once, after the last task: the remaining checks of every done deployment,
-   the target's own tests and whether the delivered trees are committed, each a report line
-   naming the commit it was measured on, the path that judged it and what it attested of the
-   engine. A pass on record for
-   the same content is reused, and a deployment whose boot failed is not scored. When something
-   failed or the conventions scan has findings, one `fix` task names them all; then each
-   deployment that had a failure and core's own checks run once more.
-5. **The report**, `delivery_report.md`: its first line says `onboarded` (commit, ref, time) or
-   `not onboarded` (where it stopped, the gate command that shows it again, the last commit where
-   that check passed); then what is done, not done, not attempted, changed outside the target, the
-   skipped kernel rows, the findings left, what the run did not check and each role's model.
-
-**The bounds are numbers.** A task gets three attempts (`--max-attempts`); a failed attempt runs
-again with its result line as its note. An attempt whose turn a stopped process cut restarts free
-twice. A task that spent its attempts is not done: nothing of it lands and the run goes on, except
-for the config task, the survey and `core`, where the run ends not onboarded. Each new start
-reopens a task not done with fresh attempts, four times for those three and twice for any other.
-
-Exit status: 0 onboarded, whatever else is not done (or a dry run whose preflight passed), 1 any
-other outcome, 2 a spec or usage error, 3 the workspace is held by another process.
-
-## Use through your agent
-
-Open Claude Code or Codex in the TensorRT-LLM checkout. Choose the model, reasoning effort and
-execution permissions appropriate for your environment, then describe the task. Provide checkpoint,
-checkout and workspace paths, the feature and parallelism scope and the accuracy reference.
-The agent prepares the spec and launches the workflow; missing inputs must be resolved, not guessed.
-
-**The agent writes the spec by following [spec/INTAKE.md](spec/INTAKE.md)**: `trtllm-modeling-v2 intake
-derive` writes a starting spec and prints three warnings where they apply: a first deployment
-too narrow for the checkpoint's weights, a first deployment with no accuracy anchor, and a
-deployment scored without CUDA graphs. Launch after a `--dry-run`, which validates the spec,
-journals the same warnings and the deployments the spec comes to, and touches no GPU.
-
-**Example prompt** — replace placeholders and omit requirements you do not need.
+## The report
 
 ```text
-Use the trtllm_modeling_v2 agent flow to onboard <model> from <checkpoint path>.
-
-Requirements:
-- Platform: <GPU type and count>; parallelism: <TP / TEP / attention-DP modes and sizes>.
-- Workload: <input/output tokens>; weight precision: <dtype>; KV cache: <formats to support>.
-- Features: <e.g. core, chunked prefill, block reuse, disagg, multimodality>.
-- Exclude: <e.g. speculative decoding>.
-
-Validation:
-- Fully validate <features/configurations>; limit <others> to <aggregated text-only / smoke>.
-- Accuracy reference: <benchmark and reference/config>. Report unsupported or unverified cases.
+# onboarded: commit `c46647fa...`, ref `refs/mv2/<slug>/onboarded`, 2026-11-11T16:00:53+00:00
+## Done
+| deployment | check | score | anchor | verdict | judged | commit | engine attested |
+| `tp1` | `accuracy[gsm8k]` | 41.7 | reference 41.77 (...) | PASS | trtllm-eval | `fa0d912fafd2` | [engine match: 1 rank(s) x 15 option(s); target ...] |
+## Not done / Not attempted / Changed outside the target / Skipped kernel rows
+## Convention findings left / Final pass / What the run did not check / Models per role / Tasks
 ```
 
-Roles run on the backend, model and reasoning effort the spec states in `agents.defaults` (the
-launching agent writes its own: [spec/INTAKE.md](spec/INTAKE.md), section 7), with per-role
-overrides under `agents.roles`; the keys are in [task.example.yaml](task.example.yaml). Nothing
-is inherited from the launching session or the environment, and a role whose model the spec does
-not state stops the run before any worker starts. Roles load the run's own skills only:
-preflight's agent probe reads the skills a session would load and turns off the user's, and Codex
-roles run without the user's plugins and apps. Both backends use their native CLI's login,
-configuration and state directories from the launching environment. Set up those CLIs before
-launching the flow; preflight checks whether they can perform the required work. The workflow
-never copies credentials, parses native state configuration or chooses storage locations. It also
-leaves sandbox/approval policy to the native CLI, never silently upgrades the runtime on PATH,
-and surfaces startup errors to the run's journal. Configure permissions before launching; an
-unattended capability probe must complete without interactive approval.
+A run that is not onboarded says in its first lines where it stopped, the result line, the `gate` command that reproduces it and the last commit where that check passed. A score nothing judges is `no verdict`, never a pass or a failure. `engine attested` is every option of the deployment against what each rank's engine resolved; a rank that reported nothing is `unknown`, which fails the check.
 
-**Compute.** `environment.kind: local`, the one kind: every command, a worker's and the
-run's own checks, runs on the orchestrator's own host, on the devices preflight claims. On a
-cluster, start the orchestrator inside the allocation that holds the GPUs, on a host that sees the
-checkout, the checkpoint and the workspace. The workflow has no launcher, queue or scheduler of its
-own; `infra/compute/executor.py` is the one function to wrap for a package that wants commands to
-land elsewhere.
+## A multi-node site, and disaggregation
 
-**While it runs**, leave the work to the run. `trtllm-modeling-v2 monitor status --workspace <ws>`
-says whether the orchestrator is alive (from any node that sees the workspace), whether the run is
-onboarded and where its tasks stand. To tell the workers something, run
-`trtllm-modeling-v2 feedback --workspace <ws> "<what, and why>"`: the text is appended, with its
-time, to `operator_notes.md`, which every later turn is told to read first and again before it
-decides. No agent interprets it and it adds no task; to reach the turn in progress, stop the run
-and start it again. A note never changes an anchor or a check: the spec defines those, and it is
-read again on every start, so a new deployment is an edit of the spec.
+Nothing here names a scheduler. A site adds three fields:
 
-`core` is the first deployment of the spec: a start whose first deployment is another one than
-`core` was built for is refused. Add deployments after it; to onboard another first, use another
-workspace.
+- `launch`, on a deployment or on each of `ctx` and `gen`: the prefix that places the server's ranks (allocation and container only; the flow adds the ranks' launcher). It stays in the foreground, sees the same workspace, checkout and checkpoint paths, and gives rank 0 a hostname this host reaches. `environment.launch` is the prefix of one-GPU commands.
+- `stop`, beside `launch`: the site's command that ends what `launch` started. Both receive `MV2FLOW_SERVER=<deployment>[.<role>]`.
+- `env`, on a deployment: what its servers need of the site.
 
-**If it stops**, run the same command again. It goes on from `tasks.yaml`: a done task is not
-asked again, a task whose worker had already answered keeps that answer, a cut turn restarts, a
-task not done gets fresh attempts within its grants, and a check that passed on the same content
-is not run again. `--clean` starts over; the frozen anchors and your notes stay.
+A disaggregated deployment (`ctx` and `gen`) states `cache_transceiver_config` with a `backend` in both sides' options (`{backend: DEFAULT}` lets the engine choose; a spec without it is refused at load), and its `env` states the site's UCX transports: a container's `UCX_TLS=tcp` stops the NIXL backend from starting, and `UCX_TLS: "^ib"` worked on GB300.
 
-## What is where in the workspace
+## Resume, notes, spec edits
 
-| File | What it is |
-|---|---|
-| `task.yaml` | the resolved spec every agent reads |
-| `tasks.yaml` | the tasks in order, and where each stands: pending, running, done, not done, skipped |
-| `decisions/<task>-<attempt>.yaml` | what each turn decided, written by the agent |
-| `contract_status.jsonl` | every verdict, with the commit and the content it measured |
-| `delivery_report.md` | whether the run is onboarded, and every deployment where it stands |
-| `operator_notes.md` | what `feedback` appended, for the workers |
-| `anchors.yaml`, `preflight.json` | the frozen anchors; what preflight left out and why |
-| `conventions.json`, `commit_labels.json` | the scan's findings by first task; each landed commit's label |
-| `journal.md`, `turns/` | what happened; each turn's prompt, activity and answer |
+- **Resume:** the same command against the same workspace goes on from where the last start stopped. A cut turn restarts, free twice. Each new start gives tasks not done fresh attempts: 4 times for `config`, `survey` and `core`, 2 for any other. `--clean` starts over; `trtllm-modeling-v2 monitor --workspace <ws> status` (or `wait`) follows a run.
+- **A note:** `trtllm-modeling-v2 feedback --workspace <ws> "<note>"` (or `--file <path>`) appends to `<ws>/operator_notes.md`. Every later turn reads it first and again before its receipt. To reach the turn in progress, stop the run and start it again. A note never permits changing an anchor, a tolerance or a check.
+- **The spec:** add deployments to `task.yaml` and start again. The first deployment stays first.
 
-## Code map
+## What the flow does not check
 
-| Location | Responsibility |
-|---|---|
-| `cli.py`, `spec/` | Entry point; task schema, deployments, derivation and configuration variants |
-| `agents/` | Role and model routing, turns, the decision table, prompts and skills |
-| `operators/` | The vocabulary (`vocabulary.yaml`) and the inventory of the tree's operators |
-| `run/workflow.py` | One start of a run: the spec, the state, the agents, the report |
-| `run/pipeline.py` | The fixed order of tasks, attempts, cut turns, grants, landing |
-| `run/integration.py` | One worktree per task, the commit audit, rebase, the landing check, fast-forward |
-| `run/contract.py`, `run/report.py` | The checks each deployment owes and their verdicts; the onboard check, the final pass, the report |
-| `run/startup/`, `run/start.py` | Preflight's hard blockers and the agent probe; what a run starts from |
-| `checks/`, `checks/harness/` | The gates and their evidence; `gate_cli.run_check` runs one for a worker and for the run alike |
-| `infra/` | Command execution on this host, Git operations, the heartbeat and `monitor` |
+- Performance: there is no tuning stage, no sweep and no throughput claim.
+- Whether the target's tests are registered with the repository's CI.
+- Whether a disaggregated generation server reused what its context server computed: the proxy does not show it.
+- Commits on the branch that no task of this run landed.
+- Conventions are findings in the report, not gates.
+
+Run on GPUs so far: every check once, standalone, on one node (aggregated and disaggregated, GSM8K). Not yet: a prefix that leaves the host, several ranks per server, `stop`, a restart after a killed process, image prompts, a benchmark other than GSM8K through a proxy.
+
+## An agent that operates a run
+
+An outside agent may drive a run without a person: change the environment, the spec, shared code or the target, send notes, and start again within the bounds above. Two rules: every change is a commit or a spec edit, so the report lists it; and it never alters an anchor, a tolerance or a check. A commit that touches `tensorrt_llm/evaluate/`, `tensorrt_llm/commands/eval.py` or the accuracy references is refused.

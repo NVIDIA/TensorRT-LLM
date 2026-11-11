@@ -318,3 +318,47 @@ def test_each_deployment_owes_its_boot_its_benchmarks_and_its_tests_and_core_the
     bare = compile_contract({"deployments": [{"name": "only", "options": {}}]})
     assert [c.key for c in bare.checks] == ["only:boot"]
     assert bare.notes == ("only: it names no benchmark, so its boot alone judges it",)
+
+
+def test_the_example_spec_loads_whole_and_so_do_its_smallest_and_its_disaggregated_form(tmp_path):
+    package = Path(task_schema.__file__).resolve().parents[1]
+    text = (package / "task.example.yaml").read_text(encoding="utf-8")
+    for name in ("ckpt", "repo", "engines"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "engines" / "tp1.yaml").write_text("max_batch_size: 8\n")
+
+    def load(spec: dict) -> dict:
+        places = {
+            "checkpoint_path": str(tmp_path / "ckpt"),
+            "trtllm_repo_path": str(tmp_path / "repo"),
+        }
+        return load_and_validate_task_yaml(_write(tmp_path, {**spec, **places}))
+
+    full = yaml.safe_load(text)
+    found = deployments.resolve(load(full))
+    assert [d.name for d in found] == ["dep8", "dep8_kv_nvfp4", "pd"]
+    assert [b.name for b in found[0].benchmarks] == ["gsm8k", "aa_lcr"]
+    assert found[2].kind == deployments.DISAGGREGATED and found[2].env == {"UCX_TLS": "^ib"}
+    # The smallest form is the one in the file's first comment: what `intake derive` writes.
+    block = text.split("# 1) The smallest form")[1].split("# 2) The full form")[0]
+    lines = [line[2:] for line in block.splitlines()[1:] if line[2:]]
+    smallest = yaml.safe_load("\n".join(lines))
+    assert set(smallest) == {
+        "checkpoint_path",
+        "trtllm_repo_path",
+        "arch",
+        "accuracy",
+        "environment",
+        "agents",
+        "deployments",
+    }
+    [tp1] = deployments.resolve(load(smallest))
+    assert tp1.core and tp1.server.options == {"max_batch_size": 8}
+    # A disaggregated deployment may be the first one, and so define `onboarded`.
+    alone = {k: v for k, v in full["deployments"][2].items() if k != "relative_to"}
+    [pd] = deployments.resolve(load({**full, "deployments": [alone]}))
+    assert pd.core and list(pd.servers) == ["ctx", "gen"]
+    assert [c.key for c in compile_contract(load({**full, "deployments": [alone]})).checks] == [
+        "pd:boot",
+        "pd:accuracy[gsm8k]",
+    ]
