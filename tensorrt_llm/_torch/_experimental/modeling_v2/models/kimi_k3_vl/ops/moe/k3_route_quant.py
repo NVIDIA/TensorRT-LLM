@@ -76,7 +76,7 @@ class K3RouteQuant(OpWrapper):
     kimi_k3_noaux_tc_mxfp8_quant, with and without early trigger,
     including tied/saturated routing and zero/large/denormal latent
     rows. Reruns and each M's rows agree bitwise with the M=64 call.
-    The kernel test also compares noaux_tc_op plus mxfp8_quantize.
+    The tests also match noaux_tc_op plus mxfp8_quantize bit for bit.
     Router and latent-down GEMMs, expert execution and combine remain
     outside the fusion. k3_moe consumes the outputs; k3_moe_front fuses
     the GEMMs, head all-gather and this op's device code.

@@ -185,10 +185,10 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Distinct reuse policies need separate GPU pools and eviction queues. Keying on
-    // per-pool sparsity too keeps a shared pool uniformly host-backed or device-backed.
-    // A region with a fixed slot count gets a pool group of its own: KvCache::resume()
-    // gates on each pool group's utilization, so a count that leaves resume headroom for the
+    // Distinct reuse policies need separate GPU pools and eviction queues, except that SINK_REQUIRED_ONLY shares the
+    // REQUIRED ones (effectivePoolReusePolicy explains why). Keying on per-pool sparsity too keeps a shared pool
+    // uniformly host-backed or device-backed. A region with a fixed slot count gets a pool group of its own:
+    // KvCache::resume() gates on each pool group's utilization, so a count that leaves resume headroom for the
     // region's owners holds only while no other lifecycle shares its slots.
     struct PoolGroupKey
     {
@@ -209,7 +209,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     {
         auto const& lifeCycle = registry.getLifeCycle(sg.lifeCycleId);
         auto const sizes = sg.slotSizeList();
-        auto const policy = reusePolicy(lifeCycle);
+        auto const policy = effectivePoolReusePolicy(lifeCycle);
         TypedVec<PoolIndex, bool> sparsity;
         sparsity.reserve(sizes.size());
         for (PoolIndex pool{0}; pool < sizes.size(); ++pool)

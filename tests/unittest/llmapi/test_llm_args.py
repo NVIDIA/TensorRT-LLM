@@ -2188,8 +2188,12 @@ class TestMultimodalConfig:
             setattr(llm, method, lambda *args, **kwargs: None)
         module = "mm_encoder" if encoder_only else "llm"
         with patch.object(BaseLLM, "_build_model"), patch(
-                f"tensorrt_llm.llmapi.{module}.create_input_processor",
-                side_effect=ValueError("input processor boundary")) as factory:
+                "tensorrt_llm.llmapi.llm.check_quantization_compute_capability"
+        ), patch(
+                "tensorrt_llm.llmapi.llm.check_architecture_registered"), patch(
+                    f"tensorrt_llm.llmapi.{module}.create_input_processor",
+                    side_effect=ValueError(
+                        "input processor boundary")) as factory:
             with pytest.raises(ValueError, match="input processor boundary"):
                 llm._build_model()
         kwargs = factory.call_args.kwargs
@@ -5727,6 +5731,32 @@ class TestTransceiverRuntimeAutoResolution:
             "/tmp/dummy_model", args, fake_loader)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
         assert args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    def test_model_loader_applies_defaults_from_architecture_override(
+            self, monkeypatch):
+        """Early config loading must include model_kwargs for class defaults."""
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        class _PreferFlashinferModel:
+
+            @classmethod
+            def get_model_defaults(cls, llm_args):
+                return {"attn_backend": "FLASHINFER"}
+
+        monkeypatch.setattr(model_loader_mod.AutoModelForCausalLM,
+                            "_resolve_class",
+                            staticmethod(lambda config: _PreferFlashinferModel))
+        fake_loader = self._fake_checkpoint_loader(["PplxDeciderForDecision"])
+        model_kwargs = {"architectures": ["PplxDeciderForDecision"]}
+        args = TorchLlmArgs(model="/tmp/dummy_model", model_kwargs=model_kwargs)
+
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+
+        assert fake_loader.load_config.call_args.kwargs[
+            "model_kwargs"] == model_kwargs
+        assert args.attn_backend == "FLASHINFER"
 
     @pytest.mark.parametrize("arch,expected", [
         ("ModelAForCausalLM", "CPP"),

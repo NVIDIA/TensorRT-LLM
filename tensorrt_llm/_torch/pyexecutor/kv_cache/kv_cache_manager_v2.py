@@ -6420,11 +6420,8 @@ class KVCacheManagerV2(BaseResourceManager):
         IndexMapper contains the correct request IDs. With block reuse, the
         scheduler pre-creates context caches to coordinate the reusable prefix.
         """
-        # Joint V2 reuse deliberately shares the target request progress. A
-        # separate draft engine still uses the legacy draft request view; a
-        # one-engine external drafter never advances that view, so its mirror
-        # reads the target's position and chunk (see _mirror_uses_draft_view).
-        use_draft_view = self._mirror_uses_draft_view and not self.enable_joint_kv_cache_reuse
+        # Draft mirrors follow target progress when sizing the cache.
+        use_draft_view = False
         with request_context(use_draft_view, scheduled_batch):
             for req in scheduled_batch.context_requests:
                 kv_cache = self._mirror_draft_kv_cache(req)

@@ -34,6 +34,7 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/spec/test_modeling_v2_mtp_step.py
   - unittest/_torch/models/test_qwen3_5_int4_loading.py
   - unittest/_torch/modules/test_linear_uneven_tp.py::TestW4A16AWQMLP::test_optional_pre_quant_scale
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_v2_decode_beyond_encoder_length[False]
@@ -45,6 +46,10 @@ l0_b200:
   - unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_explicit_caches_match_manager
+  - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_plan_reuses_and_invalidates
+  - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_plan_caches_unsupported_layout
+  - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_checks_slot_capacity_after_plan_hit
+  - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_plan_cache_is_bounded
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
   # MiniMax-M3 VL checkpoint-backed processor parity (the CPU stage's -m cpu_only leaves these out)
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_input_ids_match_trt_build_helper
@@ -88,7 +93,8 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu_suspend_resume
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency] # Cover nvbugs 5461712 and 5505402
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16[bf16-kv]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16[fp8-kv]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark[TRTLLM] # SM100+ only; l0_h100 runs [VANILLA]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-TRTLLM]
@@ -367,11 +373,18 @@ l0_b200:
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e4b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_multimodal_26b_dummy
-  # Muse Spark Open: the decoder's GPU module tests and the tower load; the
-  # remaining Muse files are cpu_only and run in l0_cpu.
+  # Muse Spark Open: the decoder's GPU module tests, the tower load and the
+  # decoder's Triton fast paths, which need only CUDA. The GB300 kernels' tests
+  # run in l0_gb300 and l0_gb300_multi_gpus, the cpu_only files in l0_cpu.
   - unittest/_torch/modeling/test_modeling_musespark_open.py
   - unittest/_torch/modeling/test_musespark_open_moe_tp.py
   - unittest/_torch/modeling/test_musespark_open_tower_load.py
+  - unittest/_torch/modeling/test_musespark_open_router_projection.py
+  - unittest/_torch/modeling/test_musespark_open_full_routing.py
+  - unittest/_torch/modeling/test_musespark_open_norm_gate.py
+  - unittest/_torch/modeling/test_musespark_open_moe_finalize.py
+  - unittest/_torch/modeling/test_musespark_open_boundary_fusion.py
+  - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
