@@ -1,15 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The one-launch KDA replay acceptance record matches the torch ops it replaces."""
+"""The one-launch KDA replay acceptance record matches its torch reference."""
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.modules.kimi_kda import _kda_kernels
-from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
-    can_record_kda_replay_acceptance,
-    record_kda_replay_acceptance,
-)
+from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import record_kda_replay_acceptance
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KDAReplayState
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import MambaAcceptanceBatch
 
@@ -20,7 +17,7 @@ POOL_COLUMNS = 4
 
 
 def _reference(prev, state_indices, num_accepted, is_dummy_request, num_bonus_tokens):
-    """The torch ops KDAReplayState used before the fused kernel."""
+    """The acceptance record in torch ops: read the dummy rows' counts back, write every row."""
     slots = state_indices.to(torch.long)
     accepted = (num_accepted - num_bonus_tokens).to(torch.int32).clamp(min=0)
     if is_dummy_request is not None:
@@ -73,7 +70,6 @@ def test_matches_torch_on_strided_column(
     expected = pool.clone()
     prev = pool[:, 0]
     assert prev.stride(0) == POOL_COLUMNS
-    assert can_record_kda_replay_acceptance(prev, state_indices, num_accepted, is_dummy)
 
     record_kda_replay_acceptance(prev, state_indices, num_accepted, is_dummy, num_bonus_tokens)
     _reference(expected[:, 0], state_indices, num_accepted, is_dummy, num_bonus_tokens)
@@ -91,30 +87,61 @@ def test_contiguous_count_vector():
     torch.testing.assert_close(prev, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize(
-    "case",
-    ["cpu", "int64_counts", "strided_indices", "strided_accepted", "uint8_dummy", "short_dummy"],
-)
-def test_unsupported_layouts_are_rejected(case):
+def _unsupported_layout(case):
+    """Inputs with one tensor in a layout the kernel does not take, and the pool behind the counts."""
     state_indices, num_accepted, is_dummy = _inputs(8, torch.int32, torch.int32, True)
-    prev = _pool()[:, 0]
+    pool = _pool()
+    prev = pool[:, 0]
     if case == "cpu":
-        prev, state_indices, num_accepted, is_dummy = (
-            t.cpu() for t in (prev, state_indices, num_accepted, is_dummy)
+        pool, state_indices, num_accepted, is_dummy = (
+            t.cpu() for t in (pool, state_indices, num_accepted, is_dummy)
         )
+        prev = pool[:, 0]
     elif case == "int64_counts":
-        prev = prev.to(torch.int64)
+        pool = pool.to(torch.int64)
+        prev = pool[:, 0]
+    elif case == "2d_counts":
+        prev = pool
     elif case == "strided_indices":
         state_indices = torch.stack([state_indices, state_indices], dim=1)[:, 0]
     elif case == "strided_accepted":
         num_accepted = torch.stack([num_accepted, num_accepted], dim=1)[:, 0]
+    elif case == "float_indices":
+        state_indices = state_indices.to(torch.float32)
+    elif case == "2d_indices":
+        state_indices = state_indices.view(-1, 1)
+    elif case == "length_mismatch":
+        num_accepted = num_accepted[:-1]
     elif case == "uint8_dummy":
         is_dummy = is_dummy.to(torch.uint8)
     elif case == "short_dummy":
         is_dummy = is_dummy[:-1]
-    assert not can_record_kda_replay_acceptance(prev, state_indices, num_accepted, is_dummy)
-    with pytest.raises(ValueError):
+    else:
+        raise AssertionError(case)
+    return pool, prev, state_indices, num_accepted, is_dummy
+
+
+_UNSUPPORTED_LAYOUTS = [
+    "cpu",
+    "int64_counts",
+    "2d_counts",
+    "strided_indices",
+    "strided_accepted",
+    "float_indices",
+    "2d_indices",
+    "length_mismatch",
+    "uint8_dummy",
+    "short_dummy",
+]
+
+
+@pytest.mark.parametrize("case", _UNSUPPORTED_LAYOUTS)
+def test_unsupported_layouts_raise(case):
+    pool, prev, state_indices, num_accepted, is_dummy = _unsupported_layout(case)
+    before = pool.clone()
+    with pytest.raises(ValueError, match="unsupported tensor layout"):
         record_kda_replay_acceptance(prev, state_indices, num_accepted, is_dummy, 1)
+    torch.testing.assert_close(pool, before, rtol=0, atol=0)
 
 
 def _bound_state(prev):
@@ -137,8 +164,7 @@ def _batch(state_indices, num_accepted, is_dummy):
     )
 
 
-@pytest.mark.parametrize("strided_indices", [False, True])
-def test_state_update_and_record_acceptance(monkeypatch, strided_indices):
+def test_state_update_and_record_acceptance(monkeypatch):
     launches = []
     monkeypatch.setattr(
         _kda_kernels,
@@ -146,9 +172,6 @@ def test_state_update_and_record_acceptance(monkeypatch, strided_indices):
         lambda *args: launches.append(args) or record_kda_replay_acceptance(*args),
     )
     state_indices, num_accepted, is_dummy = _inputs(48, torch.int32, torch.int32, True)
-    if strided_indices:
-        # Takes the torch path, with the same result.
-        state_indices = torch.stack([state_indices, state_indices], dim=1)[:, 0]
 
     pool = _pool()
     expected = pool.clone()
@@ -160,7 +183,19 @@ def test_state_update_and_record_acceptance(monkeypatch, strided_indices):
     _reference(expected[:, 0], state_indices, num_accepted - 1, is_dummy, 0)
     torch.testing.assert_close(pool, expected, rtol=0, atol=0)
 
-    assert len(launches) == (0 if strided_indices else 2)
+    assert len(launches) == 2
+
+
+@pytest.mark.parametrize("case", ["cpu", "strided_indices", "float_indices"])
+def test_state_entry_points_raise_on_unsupported_layouts(case):
+    pool, prev, state_indices, num_accepted, is_dummy = _unsupported_layout(case)
+    before = pool.clone()
+    state = _bound_state(prev)
+    with pytest.raises(ValueError, match="unsupported tensor layout"):
+        state.update(_batch(state_indices, num_accepted, is_dummy))
+    with pytest.raises(ValueError, match="unsupported tensor layout"):
+        state.record_acceptance(state_indices, num_accepted - 1, is_dummy)
+    torch.testing.assert_close(pool, before, rtol=0, atol=0)
 
 
 def test_cuda_graph_replay():

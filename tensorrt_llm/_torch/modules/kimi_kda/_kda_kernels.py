@@ -249,19 +249,12 @@ def _is_dense_vector(tensor: torch.Tensor, device: torch.device, dtypes: tuple) 
     )
 
 
-def can_record_kda_replay_acceptance(
+def _is_supported_acceptance_layout(
     prev_num_accepted_tokens: torch.Tensor,
     state_indices: torch.Tensor,
     num_accepted: torch.Tensor,
     is_dummy_request: Optional[torch.Tensor],
 ) -> bool:
-    """Whether ``record_kda_replay_acceptance`` handles these tensors' layout.
-
-    It needs CUDA tensors on one device: an int32 ``prev_num_accepted_tokens``
-    vector of any stride, contiguous int32/int64 ``state_indices`` and
-    ``num_accepted`` vectors of equal length, and an optional contiguous bool
-    ``is_dummy_request`` vector of that length.
-    """
     device = prev_num_accepted_tokens.device
     return (
         device.type == "cuda"
@@ -295,6 +288,12 @@ def record_kda_replay_acceptance(
     keeps its value. The launch shape depends only on the host-side length, so
     the call is CUDA-graph capturable.
 
+    Dummy rows are not written at all. This relies on the V2 manager's slot
+    assignment (``_setup_state_indices``): dummy and CUDA-graph padding
+    requests own the reserved dummy slots (``_num_reserved_dummy_slots``),
+    which several dummy rows may share but which never alias a real
+    request's slot, so no real request's count is written by a dummy row.
+
     Args:
         prev_num_accepted_tokens: ``[num_slots]`` int32, may be strided (a
             column of a per-slot state pool).
@@ -304,11 +303,26 @@ def record_kda_replay_acceptance(
         num_bonus_tokens: subtracted from ``num_accepted`` to get the
             accepted drafts (1 for accepted-token counts that include the
             target's own token, 0 for draft counts).
+
+    Raises:
+        ValueError: if a tensor is not on ``prev_num_accepted_tokens``'s CUDA
+            device or does not have the dtype, rank, contiguity or length
+            listed above.
     """
-    if not can_record_kda_replay_acceptance(
+    if not _is_supported_acceptance_layout(
         prev_num_accepted_tokens, state_indices, num_accepted, is_dummy_request
     ):
-        raise ValueError("record_kda_replay_acceptance: unsupported tensor layout")
+        described = ", ".join(
+            f"{name}={tuple(t.shape)}:{t.dtype}:stride{tuple(t.stride())}@{t.device}"
+            for name, t in (
+                ("prev_num_accepted_tokens", prev_num_accepted_tokens),
+                ("state_indices", state_indices),
+                ("num_accepted", num_accepted),
+                ("is_dummy_request", is_dummy_request),
+            )
+            if t is not None
+        )
+        raise ValueError(f"record_kda_replay_acceptance: unsupported tensor layout ({described})")
     num_requests = state_indices.numel()
     if num_requests == 0:
         return
