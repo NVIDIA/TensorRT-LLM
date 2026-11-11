@@ -17,7 +17,8 @@
 ``tensorrt_llm/serve/responses_utils.py`` is the Responses API implementation; it
 pulls in the tool parsers, ``web_search`` and the harmony adapter. The
 disaggregated client, service, coordinator and router need only the service
-types in ``tensorrt_llm/serve/_base/``, so importing them must not load it. The
+types and the shared Responses stream module in ``tensorrt_llm/serve/_base/``,
+so importing them must not load it. The
 layering contract in ``test_layering.py`` checks direct imports; this test
 checks what a fresh interpreter actually loads.
 """
@@ -35,23 +36,10 @@ pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
 RESPONSES_IMPLEMENTATION = "tensorrt_llm.serve.responses_utils"
 
-# Only the import-isolation assertion is expected to fail; an import crash of the
-# module raises CalledProcessError and still fails the test.
-_RESPONSES_STREAM_HELPERS_PENDING = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "openai_disagg_service imports the Responses stream helpers from responses_utils "
-        "until they move to serve/_base/responses_stream.py"
-    ),
-)
-
 DISAGGREGATED_MODULES = (
     "tensorrt_llm.serve.openai_client",
     "tensorrt_llm.serve.openai_service",
-    pytest.param(
-        "tensorrt_llm.serve.openai_disagg_service", marks=_RESPONSES_STREAM_HELPERS_PENDING
-    ),
+    "tensorrt_llm.serve.openai_disagg_service",
     "tensorrt_llm.serve.disagg_coordinator",
     "tensorrt_llm.serve.router",
 )

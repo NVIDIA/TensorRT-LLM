@@ -113,24 +113,49 @@ CONTRACTS = (
             "tensorrt_llm.serve.router",
         ),
         forbidden=("tensorrt_llm.serve.responses_utils",),
-        # The Responses stream helper the disaggregated service still takes from the
-        # Responses implementation; the allowance goes when the shared stream code
-        # moves to tensorrt_llm/serve/_base/responses_stream.py. It only shrinks.
-        allowed=frozenset(
-            {
-                (
-                    "tensorrt_llm.serve.openai_disagg_service",
-                    "tensorrt_llm.serve.responses_utils",
-                    "responses_done_generator",
-                )
-            }
-        ),
         fix=(
             "Import ResponseHooks, done_generator and UCompletionResponseOrGenerator from "
             "tensorrt_llm.serve._base.service_types, PeriodicLatencyLogger from "
             "tensorrt_llm.serve._base.latency_logger and get_steady_clock_now_in_seconds from "
             "tensorrt_llm._utils. Responses stream code shared with the disaggregated frontend "
             "belongs in tensorrt_llm/serve/_base/responses_stream.py."
+        ),
+    ),
+    Contract(
+        name="the shared Responses stream module is a leaf below both servers",
+        importers=("tensorrt_llm.serve._base.responses_stream",),
+        forbidden=(
+            "tensorrt_llm.serve.openai_server",
+            "tensorrt_llm.serve.app",
+            "tensorrt_llm.serve.responses_utils",
+            "tensorrt_llm.serve.openai_disagg_server",
+            "tensorrt_llm.serve.openai_disagg_service",
+            "tensorrt_llm.serve.openai_client",
+            "tensorrt_llm.serve.openai_service",
+            "tensorrt_llm.executor",
+        ),
+        # The executor's error contract is the one import from tensorrt_llm.executor the
+        # module takes: the exception types a stream can end with and the over-length
+        # rejection it answers in-stream, from tensorrt_llm.executor.utils, which the
+        # disaggregated server already imports. Nothing else of the executor.
+        allowed=frozenset(
+            {
+                ("tensorrt_llm.serve._base.responses_stream", "tensorrt_llm.executor.utils", name)
+                for name in (
+                    "CONTEXT_LENGTH_EXCEEDED_CODE",
+                    "EngineDeadError",
+                    "RequestError",
+                    "is_context_length_exceeded_message",
+                )
+            }
+        ),
+        fix=(
+            "tensorrt_llm/serve/_base/responses_stream.py holds the Responses stream lifecycle "
+            "both servers use (terminal events, termination codes, guard, keepalive, renumbering, "
+            "relay). It imports the protocol models, other serve/_base/ modules and, from the "
+            "executor, only its error contract in tensorrt_llm.executor.utils. Code that needs the "
+            "Responses implementation or more of the executor stays in responses_utils.py; pass a "
+            "callable in instead of importing it here."
         ),
     ),
 )

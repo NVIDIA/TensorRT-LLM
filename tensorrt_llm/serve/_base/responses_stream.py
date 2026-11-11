@@ -1,6 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""The lifecycle of a Responses SSE stream, shared by both servers.
+
+The terminal events a stream ends with and the ``response.failed`` frame,
+the codes a stream that stops early reports and the classification of the
+exception behind them, the markers that tell a terminal frame apart, the
+guard that ends a failing stream with the events saying so, the keepalive
+that repeats ``response.in_progress`` while a stream is silent and renumbers
+the events after it, the relay of a worker's stream to a client that already
+holds its opening, and the SSE run of an already-complete response. Besides
+the protocol models, only the executor's error contract is imported here
+(``tensorrt_llm.executor.utils``): the exception types a stream can end with
+and the over-length rejection that is answered in-stream.
+"""
 
 import asyncio
 import json
@@ -16,8 +29,8 @@ from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseIncompleteEvent,
                                     ResponseInProgressEvent)
 
-from tensorrt_llm.executor import EngineDeadError, RequestError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         EngineDeadError, RequestError,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import (OpenAIBaseModel,

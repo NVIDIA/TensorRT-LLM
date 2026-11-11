@@ -3161,11 +3161,6 @@ async def rejected_responses_stream(processor: ResponsesStreamingProcessor,
         yield frame
 
 
-# --------------------------------------------------------------------------
-# Keepalive while a stream is silent
-# --------------------------------------------------------------------------
-
-
 class ServerArrivalTimeMiddleware:
     """
     Custom ASGI middleware to track server arrival time.

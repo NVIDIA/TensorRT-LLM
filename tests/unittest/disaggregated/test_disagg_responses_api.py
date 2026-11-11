@@ -40,7 +40,8 @@ from pydantic import ValidationError
 
 from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
-from tensorrt_llm.serve import openai_disagg_server, responses_utils
+from tensorrt_llm.serve import openai_disagg_server
+from tensorrt_llm.serve._base import responses_stream
 from tensorrt_llm.serve._base.responses_stream import responses_done_generator
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_client import _encode_request_body
@@ -793,7 +794,7 @@ class _WorkersSilentAfterTheFirstOutput(_Workers):
                 yield frame
 
         self.frames = []
-        async for frame in responses_utils.keep_responses_stream_alive(produced()):
+        async for frame in responses_stream.keep_responses_stream_alive(produced()):
             self.frames.append(frame)
             yield frame.encode()
 
@@ -933,7 +934,7 @@ def _without_number(data: dict) -> dict:
 
 def _short_waits(monkeypatch):
     monkeypatch.setattr(openai_disagg_server, "_RESPONSES_STREAM_START_WAIT_S", 0.05)
-    monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(responses_stream, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.05)
 
 
 def _waits_for(event: asyncio.Event):
@@ -1452,7 +1453,7 @@ async def test_the_relay_drops_the_worker_opening_and_keepalives_and_numbers_the
         ]
     )
 
-    relayed = responses_utils.relay_after_opening(_transport(worker, piece), 2)
+    relayed = responses_stream.relay_after_opening(_transport(worker, piece), 2)
 
     assert [frame async for frame in relayed] == [
         _frame("response.output_text.delta", 2, delta="hi"),
@@ -1464,7 +1465,7 @@ async def test_the_relay_drops_the_worker_opening_and_keepalives_and_numbers_the
 async def test_the_relay_numbers_a_failure_the_worker_reported_before_its_opening():
     worker = _frame("error", 0, code="upstream_error", message="ClientResponseError")
 
-    relayed = responses_utils.relay_after_opening(_transport(worker, 4096), 3)
+    relayed = responses_stream.relay_after_opening(_transport(worker, 4096), 3)
 
     assert [frame async for frame in relayed] == [
         _frame("error", 3, code="upstream_error", message="ClientResponseError")
@@ -1476,7 +1477,7 @@ async def test_the_relay_passes_on_an_event_its_stream_stopped_inside():
     cut = 'event: response.output_text.delta\ndata: {"type":"response.out'
     worker = _frame("response.output_text.delta", 2, delta="hi") + cut
 
-    relayed = responses_utils.relay_after_opening(_transport(worker, 7), 2)
+    relayed = responses_stream.relay_after_opening(_transport(worker, 7), 2)
 
     assert [frame async for frame in relayed] == [
         _frame("response.output_text.delta", 2, delta="hi"),
@@ -1495,7 +1496,7 @@ async def test_the_relay_closes_its_stream_when_it_stops_early():
         finally:
             closed.set()
 
-    relayed = responses_utils.relay_after_opening(worker(), 2)
+    relayed = responses_stream.relay_after_opening(worker(), 2)
     await relayed.__anext__()
     await relayed.aclose()
 

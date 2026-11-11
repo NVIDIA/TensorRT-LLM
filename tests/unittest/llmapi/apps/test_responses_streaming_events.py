@@ -35,7 +35,7 @@ from openai.types.responses import ResponseFailedEvent
 from openai.types.responses.tool import FunctionTool
 from starlette.requests import ClientDisconnect
 
-import tensorrt_llm.serve.responses_utils as responses_utils
+import tensorrt_llm.serve._base.responses_stream as responses_stream
 from tensorrt_llm.executor import EngineDeadError, RequestError
 from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.serve._base.responses_stream import (
@@ -712,7 +712,7 @@ async def _collect(stream, sent=None, limit=500):
 
 
 async def _send(monkeypatch, frames, interval):
-    monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", interval)
+    monkeypatch.setattr(responses_stream, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", interval)
     return await _collect(keep_responses_stream_alive(frames))
 
 
@@ -840,7 +840,7 @@ async def test_a_failure_after_keepalives_still_ends_with_error_and_response_fai
         _server_frames([(0, "Hello"), (0.3, "")], processor, fail=RuntimeError("engine failed")),
         processor.get_stream_failed_events,
     )
-    monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(responses_stream, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.05)
 
     sent = []
     with pytest.raises(RuntimeError, match="engine failed"):
@@ -854,7 +854,7 @@ async def test_a_failure_after_keepalives_still_ends_with_error_and_response_fai
 @pytest.mark.asyncio
 async def test_stopping_the_stream_cancels_its_pending_read(monkeypatch):
     """A client that goes away during a silence stops the source's read at once."""
-    monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(responses_stream, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.05)
     cancelled = []
 
     async def frames():
@@ -995,7 +995,7 @@ async def test_a_slow_client_holds_back_the_source():
 @pytest.mark.asyncio
 async def test_a_source_cancelled_on_its_own_ends_the_stream(monkeypatch):
     """A cancellation raised inside the source ends the stream instead of leaving it to keepalives."""
-    monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.02)
+    monkeypatch.setattr(responses_stream, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.02)
 
     async def frames():
         for frame in _processor().get_initial_responses():
@@ -1104,7 +1104,7 @@ def _server_streaming(monkeypatch, steps):
 @pytest.mark.asyncio
 async def test_the_responses_route_keeps_a_silent_stream_alive(monkeypatch):
     """The streaming route sends in_progress again before the first token and while a call is held."""
-    monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(responses_stream, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.05)
     steps = [(0.3, "Let me run it.")] + [(0.02, "")] * 15 + [(0, " Done.")]
     server = _server_streaming(monkeypatch, steps)
     request = ResponsesRequest(model="test-model", input="hi", stream=True)
