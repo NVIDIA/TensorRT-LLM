@@ -1329,9 +1329,37 @@ def get_tp_group_exchange(
 _EXCHANGES: Dict[tuple, Optional[TPKeyExchange]] = {}
 
 
+def _agree_on_key_exchange(mapping, ex: Optional[TPKeyExchange]) -> Optional[TPKeyExchange]:
+    """``ex`` where every rank of the TP group built its exchange, else None on every rank (collective).
+
+    A caller picks the exchange or the NCCL path per rank from whether it has one, so the ranks must agree:
+    the peer allocation is agreed inside ``_PeerBuffers.create``, but the rest of the setup can still fail
+    on one rank only. Setups that return None on every rank before any collective step (an unsupported
+    group, MPI disabled) skip the agreement."""
+    from tensorrt_llm._utils import mpi_disabled
+
+    if (
+        mapping.tp_size not in (2, 4, 8, 16)
+        or mapping.enable_attention_dp
+        or mapping.has_pp()
+        or mapping.cp_size > 1
+        or mpi_disabled()
+    ):
+        return ex
+    from .mnnvl_memory import TpMnnvlMemory
+
+    if all(TpMnnvlMemory.get_comm(mapping).allgather(ex is not None)):
+        return ex
+    if ex is not None:
+        logger.warning("[TPKeyExchange] setup failed on another rank of the TP group, keeping NCCL")
+        ex.close()
+    return None
+
+
 def create_tp_key_exchange(mapping, max_rows: int) -> Optional[TPKeyExchange]:
     """Build the TP group's exchange for launches of up to ``max_rows`` keys (collective: every rank of the group
-    calls it in step, outside CUDA-graph capture); None where unsupported. A second call returns the first one's."""
+    calls it in step, outside CUDA-graph capture); None where unsupported, then on every rank of the group. A
+    second call returns the first one's."""
     key = (tuple(mapping.tp_group), mapping.tp_rank, torch.cuda.current_device())
     if key not in _EXCHANGES:
         try:
@@ -1339,6 +1367,7 @@ def create_tp_key_exchange(mapping, max_rows: int) -> Optional[TPKeyExchange]:
         except (RuntimeError, ValueError) as e:  # callers keep the NCCL all-gather
             logger.warning(f"[TPKeyExchange] setup failed, keeping NCCL all-gather: {e}")
             ex = None
+        ex = _agree_on_key_exchange(mapping, ex)
         _EXCHANGES[key] = ex
         logger.info(
             f"[TPKeyExchange] tp_size={mapping.tp_size} rank={mapping.tp_rank}: "

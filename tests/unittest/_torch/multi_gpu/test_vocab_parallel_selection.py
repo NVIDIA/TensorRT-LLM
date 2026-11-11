@@ -348,7 +348,8 @@ def _worker_argmax_check(rank, tp, mnnvl):
                 lm_head, key_exchange if use_key_exchange else None
             )
             assert (worker.key_exchange is not None) == use_key_exchange
-            assert worker.mapping is mapping
+            assert worker._target_head_mapping is mapping
+            worker.mapping = mapping  # the draft head's TP rank
             for rows in (1, 7, 64, 300):
                 gen = torch.Generator(device="cuda").manual_seed(rows)
                 full = torch.randint(-4, 4, (rows, vocab), device="cuda", generator=gen).to(

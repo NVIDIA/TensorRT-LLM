@@ -508,6 +508,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self._samples_sharded_temperature = (
             key_exchange is not None
             and supports_sharded_target_sampling(spec_config, mapping))
+        if self._samples_sharded_temperature:
+            # The target LM head is sharded over this mapping's TP group.
+            self._target_head_mapping = mapping
 
     def set_draft_model(self, draft_model) -> None:
         super().set_draft_model(draft_model)
@@ -996,6 +999,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # (streaming GEMV + fused shard argmax + key exchange); no
                 # draft logits are materialized.
                 draft_head = None
+                # Set where this step projects only this rank's vocab shard
+                # of the draft head, for the greedy sampler.
+                draft_logits_are_shard = None
                 if (self.is_mtp_eagle and not lm_head_tp_in_adp_configured
                         and not advanced_draft_sampling
                         and self.guided_decoder is None and self._d2t is None
@@ -1063,6 +1069,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     # then applies d2t.
                     logits = draft_model.lm_head(hidden_states[gather_ids],
                                                  gather_output=False)
+                    draft_logits_are_shard = True
                 else:
                     logits = draft_model.logits_processor(
                         hidden_states[gather_ids], draft_model.lm_head,
@@ -1098,7 +1105,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         spec_metadata,
                         batch_size,
                         draft_step=i,
-                        mapping_lm_head_tp=mapping_lm_head_tp)
+                        mapping_lm_head_tp=mapping_lm_head_tp,
+                        vocab_sharded=draft_logits_are_shard)
                     if use_lm_head_tp_in_adp:
                         new_draft_token = new_draft_token[:token_count]
                     if token_buffer is not None:
