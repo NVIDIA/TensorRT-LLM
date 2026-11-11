@@ -3,10 +3,13 @@
 """Startup planning contracts without importing the TensorRT-LLM extension."""
 
 import ast
+import gc
 import importlib
 import importlib.util
 import sys
+import weakref
 from collections.abc import Callable, Iterator
+from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -17,10 +20,12 @@ import torch
 
 _ROOT = Path(__file__).resolve().parents[4]
 _FMHA = _ROOT / "tensorrt_llm/_torch/attention/backends/fmha"
-_MODULE_NAME = "tensorrt_llm._torch.attention.backends.fmha.prims_ts_mla_warmup"
+_MODULE_NAME = "tensorrt_llm._torch.attention.backends.fmha._isolated_mla_warmup"
 _SPEC = importlib.util.spec_from_file_location(_MODULE_NAME, _FMHA / "prims_ts_mla_warmup.py")
 _warmup = importlib.util.module_from_spec(_SPEC)
+sys.modules[_MODULE_NAME] = _warmup
 _SPEC.loader.exec_module(_warmup)
+del sys.modules[_MODULE_NAME]
 
 
 def _capacity_function() -> Callable[..., tuple[int, int]]:
@@ -35,32 +40,37 @@ def _capacity_function() -> Callable[..., tuple[int, int]]:
     return namespace[function.name]
 
 
-def _geometry(**overrides: object) -> SimpleNamespace:
+def _geometry(**overrides: object) -> _warmup._MlaContextPlan:
     fields = dict(
         device=torch.device("cuda:0"),
         batch_size=4,
         max_q_len=2048,
-        max_seq_len_k=2048,
+        max_kv_len=2048,
         num_qo_heads=96,
         num_kv_heads=96,
         head_dim=192,
         head_dim_vo=128,
-        qk_dtype=torch.float8_e4m3fn,
-        pv_dtype=torch.float8_e4m3fn,
+        q_dtype=torch.float8_e4m3fn,
+        k_dtype=torch.float8_e4m3fn,
+        v_dtype=torch.float8_e4m3fn,
         out_dtype=torch.bfloat16,
         packed_query=True,
-        uniform_packed_lengths=False,
         mask_type="causal",
         window_left=-1,
         store_softmax_stats=False,
+        softmax_scale=1.0,
+        output_scale=1.0,
     )
-    return SimpleNamespace(**(fields | overrides))
+    return _warmup._MlaContextPlan(**(fields | overrides))
 
 
 def _capacities() -> Callable[[int, int], tuple[int, int]]:
     geometry = vars(_geometry())
     geometry["output_dtype"] = geometry.pop("out_dtype")
     geometry["packed"] = geometry.pop("packed_query")
+    geometry["qk_dtype"] = geometry.pop("q_dtype")
+    geometry["pv_dtype"] = geometry.pop("v_dtype")
+    geometry["uniform_packed_lengths"] = False
     fields = (
         "head_dim",
         "head_dim_vo",
@@ -162,37 +172,34 @@ def planners(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
     package.__path__ = [str(_FMHA.parent / "prims_ts")]
     context_api = importlib.import_module(f"{package.__name__}.context")
     decode_api = importlib.import_module(f"{package.__name__}.mla_decode")
-    context_api._context_compile_spec.cache_clear()
-    monkeypatch.setattr(
-        context_api,
-        "_resolve_cuda_device",
-        lambda device: (torch.device(device), torch.device(device).index),
-    )
-    monkeypatch.setattr(
-        context_api, "_resolve_context_scheduler", lambda geometry: "clc_dynamic_persistent"
-    )
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 7))
-    context = SimpleNamespace()
-    context._resolve_context_plan_geometry = context_api._resolve_context_plan_geometry
-    context._context_compile_spec = context_api._context_compile_spec
-    context.plan = create_autospec(context_api.BatchPrefillTSWrapper, instance=True).plan
+    context = ModuleType(context_api.__name__)
+    context.plan = create_autospec(context_api.BatchPrefillTSWrapper().plan)
     context.BatchPrefillTSWrapper = Mock(side_effect=lambda: SimpleNamespace(plan=context.plan))
-    decode = SimpleNamespace()
-    decode._dtype_key = str
-    decode._resolve_mla_decode_launch_spec = create_autospec(
-        decode_api._resolve_mla_decode_launch_spec,
-        side_effect=lambda *args, **kwargs: (args[1] % 3, args[0], tuple(sorted(kwargs.items()))),
-    )
-    decode._make_mla_decode_compile_spec = create_autospec(
-        decode_api._make_mla_decode_compile_spec,
-        side_effect=lambda launch, **kwargs: ("decode", launch, tuple(sorted(kwargs.items()))),
-    )
-    decode.plan = create_autospec(decode_api.BatchMLADecodePagedTSWrapper, instance=True).plan
-    decode.MLAAttentionTuning = decode_api.MLAAttentionTuning
+    decode = ModuleType(decode_api.__name__)
+    decode.plan = create_autospec(decode_api.BatchMLADecodePagedTSWrapper().plan)
     decode.BatchMLADecodePagedTSWrapper = Mock(
         side_effect=lambda: SimpleNamespace(plan=decode.plan)
     )
+    # Only public symbols exist on these substitutes: private accesses fail.
+    monkeypatch.setitem(sys.modules, context.__name__, context)
+    monkeypatch.setitem(sys.modules, decode.__name__, decode)
     package.context, package.mla_decode = context, decode
+    workspace_size = create_autospec(
+        decode_api.get_prims_ts_batch_mla_decode_workspace_size,
+        side_effect=lambda **kwargs: (128 - kwargs["batch_size"]) * kwargs["max_q_len"]
+        + 1024 * kwargs["store_softmax_stats"],
+    )
+    package.get_prims_ts_batch_mla_decode_workspace_size = workspace_size
+    allocations = []
+    empty, ones = torch.empty, torch.ones
+
+    def allocate(size: int, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        buffer = empty(size, dtype=dtype, device="cpu")
+        allocations.append((device, size, weakref.ref(buffer)))
+        return buffer
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    monkeypatch.setattr(torch, "ones", lambda *args, **kwargs: ones(*args, dtype=kwargs["dtype"]))
 
     class MLA:
         sparse_attn_hooks = None
@@ -226,15 +233,16 @@ def planners(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
     yield SimpleNamespace(
         context=context,
         decode=decode,
+        workspace_size=workspace_size,
+        allocations=allocations,
         MLA=MLA,
         backend=TrtllmAttention,
         metadata=Metadata(),
         provider=PrimsTSFmha,
     )
-    context_api._context_compile_spec.cache_clear()
 
 
-def _decode_state(**overrides: object) -> SimpleNamespace:
+def _decode_profile(**overrides: object) -> _warmup._MlaDecodePlan:
     fields = dict(
         device=torch.device("cuda:0"),
         batch_size=1,
@@ -251,112 +259,23 @@ def _decode_state(**overrides: object) -> SimpleNamespace:
         mask_type="causal",
         store_softmax_stats=False,
         use_kv_bounds=False,
-        workspace_buffer=object(),
-        softmax_scale=1.0,
-        output_scale=1.0,
-        softmax_rescale_threshold_log2=0.0,
-        lse_mode="none",
     )
-    return SimpleNamespace(**(fields | overrides))
-
-
-def test_context_normal_planning_and_full_spec_dedup(planners: SimpleNamespace) -> None:
-    warmer = _warmup.PrimsTSDenseMlaWarmup()
-    args = dict(max_num_tokens=2048, max_seq_len=4608)
-    assert warmer._prewarm_context(_geometry(), planners.metadata, **args) == 3
-    assert warmer._prewarm_context(_geometry(batch_size=16), planners.metadata, **args) == 0
-    assert planners.context.plan.call_count == 3
-    for call in planners.context.plan.call_args_list:
-        assert call.kwargs["batch_size"] == 1
-        assert call.kwargs["q_dtype"] == torch.float8_e4m3fn
-    assert (
-        warmer._prewarm_context(_geometry(device=torch.device("cuda:1")), planners.metadata, **args)
-        == 3
-    )
-    assert warmer._prewarm_context(_geometry(packed_query=False), planners.metadata, **args) == 0
-    scale = torch.tensor([0.25])
-    assert (
-        warmer._prewarm_context(
-            _geometry(), planners.metadata, softmax_scale=scale, output_scale=scale, **args
-        )
-        == 3
-    )
-    assert planners.context.plan.call_args.kwargs["softmax_scale"] is scale
-    assert planners.context.plan.call_args.kwargs["output_scale"] is scale
-    assert (
-        warmer._prewarm_context(
-            _geometry(),
-            planners.metadata,
-            softmax_scale=scale.clone(),
-            output_scale=scale.clone(),
-            **args,
-        )
-        == 0
-    )
-
-
-def test_failed_plan_is_retried(planners: SimpleNamespace) -> None:
-    warmer = _warmup.PrimsTSDenseMlaWarmup()
-    planners.context.plan.side_effect = RuntimeError("compile failure")
-    args = dict(max_num_tokens=1, max_seq_len=1)
-    with pytest.raises(RuntimeError, match="compile failure"):
-        warmer._prewarm_context(_geometry(), planners.metadata, **args)
-    assert not warmer._completed
-    planners.context.plan.side_effect = None
-    assert warmer._prewarm_context(_geometry(), planners.metadata, **args) == 1
-
-
-def test_decode_scans_batches_not_unobserved_widths(planners: SimpleNamespace) -> None:
-    warmer = _warmup.PrimsTSDenseMlaWarmup()
-    state = _decode_state()
-    original_workspace = state.workspace_buffer
-    assert warmer._prewarm_decode(state, max_batch_size=16, max_num_tokens=2048) == 3
-    resolve_calls = planners.decode._resolve_mla_decode_launch_spec.call_args_list
-    assert [call.args[1] for call in resolve_calls] == list(range(1, 17))
-    assert {call.args[11] for call in resolve_calls} == {6}
-    assert {call.args[6] for call in resolve_calls} == {4608}
-    assert {call.args[1] for call in planners.decode.plan.call_args_list} == {14, 15, 16}
-    assert all(
-        "workspace_buffer" not in call.kwargs for call in planners.decode.plan.call_args_list
-    )
-    assert state.workspace_buffer is original_workspace
-    assert warmer._prewarm_decode(state, max_batch_size=16, max_num_tokens=2048) == 0
-    assert (
-        warmer._prewarm_decode(
-            _decode_state(store_softmax_stats=True, use_kv_bounds=True),
-            max_batch_size=16,
-            max_num_tokens=2048,
-        )
-        == 3
-    )
-    assert (
-        warmer._prewarm_decode(
-            _decode_state(device=torch.device("cuda:1")), max_batch_size=16, max_num_tokens=2048
-        )
-        == 3
-    )
-
-
-def test_decode_respects_token_budget_and_failure_retry(planners: SimpleNamespace) -> None:
-    warmer = _warmup.PrimsTSDenseMlaWarmup()
-    planners.decode.plan.side_effect = RuntimeError("compile failure")
-    with pytest.raises(RuntimeError, match="compile failure"):
-        warmer._prewarm_decode(_decode_state(), max_batch_size=16, max_num_tokens=13)
-    assert not warmer._completed
-    assert [
-        call.args[1] for call in planners.decode._resolve_mla_decode_launch_spec.call_args_list
-    ] == [1, 2]
-    planners.decode.plan.side_effect = None
-    assert warmer._prewarm_decode(_decode_state(), max_batch_size=16, max_num_tokens=13) == 2
+    return _warmup._MlaDecodePlan(**(fields | overrides))
 
 
 def _model(
-    planners: SimpleNamespace, *, selected: bool = True, device: str = "cuda:0"
-) -> tuple[SimpleNamespace, object, SimpleNamespace]:
+    planners: SimpleNamespace,
+    *,
+    contexts: tuple[_warmup._MlaContextPlan, ...] = (),
+    decodes: tuple[_warmup._MlaDecodePlan, ...] = (),
+) -> tuple[SimpleNamespace, object, object]:
     library = planners.provider()
-    wrapper = SimpleNamespace(_plan_state=_decode_state(device=torch.device(device)))
-    library._mla_context_wrappers = {}
-    library._mla_decode_wrappers = {(1, 6): wrapper} if selected else {}
+    # Production wrappers intentionally expose no library implementation state.
+    wrapper = object()
+    library._mla_context_wrappers = {0: wrapper}
+    library._mla_decode_wrappers = {(1, 6): wrapper}
+    library._mla_context_plan_profiles = set(contexts)
+    library._mla_decode_plan_profiles = set(decodes)
     backend = planners.backend()
     backend._fmha_manager = SimpleNamespace(fmha_libs=[library])
     module = planners.MLA()
@@ -364,28 +283,152 @@ def _model(
     return SimpleNamespace(modules=lambda: [module]), library, wrapper
 
 
+def _run(
+    warmer: object, planners: SimpleNamespace, model: object, **overrides: int
+) -> tuple[int, int]:
+    capacities = dict(max_batch_size=16, max_num_tokens=2048, max_seq_len=4608)
+    return warmer.run(model, planners.metadata, **(capacities | overrides))
+
+
+def test_context_public_planning_and_model_profile_dedup(planners: SimpleNamespace) -> None:
+    warmer = _warmup.PrimsTSDenseMlaWarmup()
+    observed = _geometry()
+    model, library, _ = _model(planners, contexts=(observed, replace(observed, batch_size=16)))
+    assert _run(warmer, planners, model) == (38, 0)
+    assert planners.context.plan.call_count == 38
+    assert {
+        (
+            c.kwargs["max_q_len"],
+            c.kwargs["max_kv_len"],
+            c.kwargs["mask_type"],
+            c.kwargs["store_softmax_stats"],
+        )
+        for c in planners.context.plan.call_args_list
+    } == set(_profiles())
+    assert all(c.kwargs["batch_size"] == 1 for c in planners.context.plan.call_args_list)
+    assert _run(warmer, planners, model) == (0, 0)
+    library._mla_context_plan_profiles.add(replace(observed, device=torch.device("cuda:1")))
+    assert _run(warmer, planners, model) == (38, 0)
+    library._mla_context_plan_profiles.add(replace(observed, packed_query=False))
+    assert _run(warmer, planners, model) == (0, 0)
+    assert not planners.allocations
+
+
+def test_context_scale_kinds_do_not_retain_or_read_device_operands(
+    planners: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scale = torch.tensor([0.25])
+    ref = weakref.ref(scale)
+    monkeypatch.setattr(torch.Tensor, "item", Mock(side_effect=AssertionError("device read")))
+    monkeypatch.setattr(torch.Tensor, "cpu", Mock(side_effect=AssertionError("device read")))
+    profile = _geometry(softmax_scale=_warmup._scale_profile(scale), output_scale=0.5)
+    assert profile == _geometry(
+        softmax_scale=_warmup._scale_profile(scale.clone()), output_scale=0.5
+    )
+    del scale
+    assert ref() is None
+    model, library, _ = _model(planners, contexts=(profile,))
+    warmer = _warmup.PrimsTSDenseMlaWarmup()
+    assert _run(warmer, planners, model, max_num_tokens=1, max_seq_len=1) == (1, 0)
+    kwargs = planners.context.plan.call_args.kwargs
+    assert isinstance(kwargs["softmax_scale"], torch.Tensor)
+    assert kwargs["output_scale"] == 0.5
+    assert "workspace_buffer" not in kwargs
+    library._mla_context_plan_profiles.add(replace(profile, softmax_scale=1.0))
+    assert _run(warmer, planners, model, max_num_tokens=1, max_seq_len=1) == (1, 0)
+    assert all(
+        not isinstance(value, torch.Tensor)
+        for p in warmer._completed
+        for value in asdict(p).values()
+    )
+
+
+def test_decode_all_batches_modes_and_devices_share_maximum_workspace(
+    planners: SimpleNamespace,
+) -> None:
+    warmer = _warmup.PrimsTSDenseMlaWarmup()
+    base = _decode_profile()
+    modes = (
+        base,
+        replace(base, store_softmax_stats=True, use_kv_bounds=True),
+        replace(base, max_q_len=8),
+        replace(base, device=torch.device("cuda:1")),
+    )
+    model, library, wrapper = _model(planners, decodes=modes + (replace(base, batch_size=3),))
+    assert _run(warmer, planners, model, max_batch_size=4, max_num_tokens=19) == (0, 11)
+    calls = planners.decode.plan.call_args_list
+    assert {(c.kwargs["max_q_len"], c.kwargs["batch_size"]) for c in calls} == {
+        (6, 1),
+        (6, 2),
+        (6, 3),
+        (8, 1),
+        (8, 2),
+    }
+    assert planners.workspace_size.call_count == 11
+    assert len(planners.allocations) == 2
+    expected_sizes = {torch.device("cuda:0"): 127 * 6 + 1024, torch.device("cuda:1"): 127 * 6}
+    workspaces = {}
+    for call in calls:
+        device, workspace = call.kwargs["device"], call.kwargs["workspace_buffer"]
+        assert workspace.numel() == expected_sizes[device]
+        assert workspaces.setdefault(device, workspace) is workspace
+        assert call.kwargs["max_kv_len"] == 4608
+    assert library._mla_decode_wrappers == {(1, 6): wrapper}
+    assert _run(warmer, planners, model, max_batch_size=4, max_num_tokens=19) == (0, 0)
+    assert len(planners.allocations) == 2
+    del calls, call, workspace, workspaces
+    planners.decode.plan.reset_mock()
+    gc.collect()
+    assert all(ref() is None for _, _, ref in planners.allocations)
+
+
+@pytest.mark.parametrize("phase", ["context", "decode"])
+def test_failed_public_plan_retries_and_releases_temporary_workspace(
+    planners: SimpleNamespace,
+    phase: str,
+) -> None:
+    warmer = _warmup.PrimsTSDenseMlaWarmup()
+    model, _, _ = _model(
+        planners,
+        contexts=(_geometry(),) if phase == "context" else (),
+        decodes=(_decode_profile(),),
+    )
+    plan = planners.context.plan if phase == "context" else planners.decode.plan
+    plan.side_effect = RuntimeError("compile failure")
+    with pytest.raises(RuntimeError, match="compile failure"):
+        _run(warmer, planners, model, max_num_tokens=13, max_seq_len=1)
+    assert not warmer._completed
+    plan.side_effect = None
+    plan.reset_mock()
+    gc.collect()
+    assert all(ref() is None for _, _, ref in planners.allocations)
+    assert _run(warmer, planners, model, max_num_tokens=13, max_seq_len=1) == (
+        1 if phase == "context" else 0,
+        2,
+    )
+
+
 def test_selected_provider_and_capture_gates(
     planners: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     warmer = _warmup.PrimsTSDenseMlaWarmup()
-    args = dict(max_batch_size=16, max_num_tokens=2048, max_seq_len=4608)
-    model, library, wrapper = _model(planners, selected=False)
-    assert warmer.run(model, planners.metadata, **args) == (0, 0)
+    model, _, _ = _model(planners)
+    assert _run(warmer, planners, model) == (0, 0)
     assert not planners.decode.plan.called
-    model, library, wrapper = _model(planners)
-    assert warmer.run(model, None, **args) == (0, 0)
+    model, _, _ = _model(planners, decodes=(_decode_profile(),))
+    assert warmer.run(model, None, max_batch_size=16, max_num_tokens=2048, max_seq_len=4608) == (
+        0,
+        0,
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="during capture"):
-        warmer.run(model, planners.metadata, **args)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    assert warmer.run(model, planners.metadata, **args) == (0, 3)
-    assert library._mla_decode_wrappers == {(1, 6): wrapper}
-    assert warmer.run(model, planners.metadata, **args) == (0, 0)
-    cpu_model, _, _ = _model(planners, device="cpu")
+        _run(warmer, planners, model)
+    cpu_model, _, _ = _model(planners, decodes=(_decode_profile(device=torch.device("cpu")),))
     monkeypatch.setattr(
         torch.cuda, "is_current_stream_capturing", Mock(side_effect=AssertionError("CUDA touched"))
     )
-    assert warmer.run(cpu_model, planners.metadata, **args) == (0, 0)
+    assert _run(warmer, planners, cpu_model) == (0, 0)
 
 
 def test_startup_hook_is_after_graphs_and_not_gated_on_graph_enablement() -> None:
