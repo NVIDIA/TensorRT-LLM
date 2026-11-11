@@ -2704,9 +2704,10 @@ def test_a_windowed_joint_draft_pool_resumes_only_where_its_context_resize_holds
         ) as draft,
     ):
         pools = (target, draft)
-        for mgr in pools:
-            assert JOINT_WINDOW in kit.windows(mgr), "a pool has no window: nothing checked"
-            beg, end = kit.stale_blocks(mgr, kit.windows(mgr).index(JOINT_WINDOW), PAIRED_END)
+        # A DFlash draft pool retains one page below its window (_draft_slot_trail_tokens).
+        for mgr, window in ((target, JOINT_WINDOW), (draft, JOINT_WINDOW + TPB)):
+            assert window in kit.windows(mgr), "a pool has no window: nothing checked"
+            beg, end = kit.stale_blocks(mgr, kit.windows(mgr).index(window), PAIRED_END)
             assert end <= beg, "a window released blocks at the fetch's end: nothing checked"
         scheduler = KVCacheV2Scheduler(
             max_batch_size=4,

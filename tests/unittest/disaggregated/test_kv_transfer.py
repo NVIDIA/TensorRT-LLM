@@ -2309,6 +2309,7 @@ def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, pro
         block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
         dst_start_token=None,
         slice_id=0,
+        kv_result_report_token=b"",
     )
     meta = transfer_mod.Sender._build_kv_write_meta(
         SimpleNamespace(_registrar=registrar), task, req_info
@@ -2406,6 +2407,7 @@ def _helix_ring_write_meta(
         block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
         dst_start_token=None,
         slice_id=0,
+        kv_result_report_token=b"",
     )
     return transfer_mod.Sender._build_kv_write_meta(
         SimpleNamespace(_registrar=registrar), task, req_info
@@ -2509,7 +2511,13 @@ def test_failed_write_build_reports_failure_to_the_receiver():
         slice_id=0,
     )
     task._unique_rid = 42
-    info = SimpleNamespace(instance_name="gen", instance_rank=5, unique_rid=42, slice_id=0)
+    info = SimpleNamespace(
+        instance_name="gen",
+        instance_rank=5,
+        unique_rid=42,
+        slice_id=0,
+        kv_result_report_token=b"",
+    )
 
     with pytest.raises(ValueError, match="size mismatch"):
         sender._dispatch_task_to_peer(task, info)

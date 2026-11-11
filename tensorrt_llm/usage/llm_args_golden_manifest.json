@@ -182,7 +182,7 @@
         "native",
         "rank_striped_read_ahead"
       ],
-      "capture_policy": "literal",
+      "capture_policy": "enum[CheckpointIOPolicy]",
       "kind": "categorical",
       "path": "checkpoint_io_policy"
     },
@@ -296,9 +296,38 @@
       "path": "dwdp_config.contention_opt"
     },
     {
+      "allowed_values": [
+        "per_slice",
+        "batched",
+        "gather"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "dwdp_config.copy_mode"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.dwdp_size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_dense"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_experts"
+    },
+    {
+      "allowed_values": [
+        "register",
+        "tma"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "dwdp_config.gather_kernel"
     },
     {
       "capture_policy": "int",
@@ -1155,6 +1184,11 @@
       "path": "multimodal_config.video_pruning_rate"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "multimodal_config.vision_gpu_normalize"
+    },
+    {
       "allowed_values": [
         "per_module"
       ],
@@ -1456,6 +1490,16 @@
       "path": "scheduler_config.enable_prefix_aware_scheduling"
     },
     {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "scheduler_config.gen_preemption.target_output_tps"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "scheduler_config.gen_preemption.tpot_budget"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "scheduler_config.use_python_scheduler"
@@ -1473,6 +1517,11 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "serve_frontend_affinity_port_stride"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "serve_graceful_shutdown_timeout_s"
     },
     {
       "capture_policy": "bool",
@@ -1771,6 +1820,11 @@
       "path": "speculative_config.block_size"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "speculative_config.confidence_min_predicted_gain"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.context_recompute_tail"
@@ -1830,6 +1884,16 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "speculative_config.eagle3_model_arch"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.enable_confidence_scheduling"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.enable_fused_confidence_scheduler"
     },
     {
       "capture_policy": "bool",

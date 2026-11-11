@@ -25,12 +25,16 @@ l0_dgx_b200:
   - unittest/_torch/multi_gpu/test_minimax_m3_piecewise.py::test_minimax_m3_piecewise_empty_adp_rank_preserves_caches
   # One process: the MNNVL workspace's capture guard raises before any MNNVL call.
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_creation_refuses_graph_capture
+  # Lamport all-reduces of mixed dtypes and odd sizes sharing one workspace.
+  - unittest/_torch/multi_gpu/test_allreduce.py::test_allreduce_lamport_mixed_dtype
+  - unittest/_torch/multi_gpu/test_allreduce.py::test_minimax_allreduce_rms_odd_tokens
   # TP2 DSpark MLA drafter (split context projection, fused all-reduce + norm)
   # vs the single-GPU drafter.
   - unittest/_torch/multi_gpu/test_dspark_drafter_tp_fusion.py
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
   - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam2-reuse]
   - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam4-no-reuse]
+  - accuracy/test_disaggregated_serving.py::TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv
   # ------------- KV Cache V2 Scheduler IT (multi-GPU) ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_draft_tokens
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_chunked_draft_tokens
@@ -41,12 +45,16 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[TRTLLM-2-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FLASHINFER-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_ulysses_and_parallel_vae
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_tp2_example_lpips TIMEOUT (30)
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_text_encoder_tp.py::test_minimax_h3_text_encoder_tp[tp2_world2]
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_text_encoder_tp_lpips[2] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-VANILLA] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FA4] TIMEOUT (30)
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-TRTLLM] TIMEOUT (30)
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FLASHINFER] TIMEOUT (30)
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxCombinedOptimizations::test_all_optimizations_combined
 - condition:
@@ -67,15 +75,20 @@ l0_dgx_b200:
   - unittest/disaggregated/test_transfer_lifecycle_gpu.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-4-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-4-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[TRTLLM-4-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FLASHINFER-4-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-2]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-2]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[TRTLLM-2-2]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FLASHINFER-2-2]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_partial_vae_groups
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_text_encoder_tp.py::test_minimax_h3_text_encoder_tp[tp2_world4]
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_text_encoder_tp_lpips[4] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[4-3-VANILLA] TIMEOUT (30)
   # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
-  # Vocab-parallel token selection over TP2/TP4 vocab shards (default all-reduce).
+  # Vocab-parallel token selection over TP2/TP4 vocab shards (default all-reduce),
+  # and the pair exchange next to large bf16 one-shot all-reduces.
   - unittest/_torch/multi_gpu/test_vocab_parallel_selection.py
   - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpu_mtp_ar TIMEOUT (60)
@@ -103,6 +116,10 @@ l0_dgx_b200:
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_tep_mtp_separate_draft_kv_cache TIMEOUT (60)
+  # GLM-5.3-Flash modeling_v2 targets (SM100 only): the split target with vanilla MTP and the
+  # MTP-fused target with MTP-Eagle.
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100Default::test_gsm8k_mtp_vanilla
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused::test_gsm8k_mtp
   # Exercise VisualGen worker-failure containment with live CUDA allocations
   # spread across four local processes.
   - unittest/_torch/visual_gen/test_executor_lifecycle_multi_gpu.py::test_sigkill_one_worker_contains_real_multi_gpu_group
@@ -297,6 +314,8 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
+  # GLM-5.3-Flash modeling_v2 split target without speculation (SM100 only).
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100Default::test_gsm8k
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=fp8]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=nvfp4]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=False-eval_mode=inferencex-kv_dtype=fp8]

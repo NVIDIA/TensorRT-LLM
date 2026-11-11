@@ -413,6 +413,7 @@ class ReusePolicy(enum.IntEnum):
     REQUIRED = 0
     PRIVATE = 1
     OPTIONAL = 2
+    SINK_REQUIRED_ONLY = 3
 
 @dataclass(slots=True)
 class AttentionLayerConfig:

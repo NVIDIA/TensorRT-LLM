@@ -131,6 +131,8 @@ def BOLT_PROFILE_REF = "bolt_profile_ref"
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 @Field
 def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
+@Field
+def TRTLLM_RELEASE_REPO = "TRTLLM_RELEASE_REPO"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -147,6 +149,8 @@ def globalVars = [
     // Pre-declared so updateMapWithJson() populates it from the parent (see
     // LLM_ARTIFACTS_PRIMARY_FROM_PARENT).
     (LLM_ARTIFACTS_PRIMARY_KEY): "",
+    // Release scripts repository as [url: ..., commit: ...], resolved by L0_MergeRequest.
+    (TRTLLM_RELEASE_REPO): null,
 ]
 
 @Field
@@ -545,17 +549,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
         trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
     }
     if (versionOverride) {
-        def resolvedVersionOverride = versionOverride
-        if (versionOverride.startsWith(".")) {
-            def versionFile = readFile("${LLM_ROOT}/tensorrt_llm/version.py")
-            def versionMatcher = versionFile =~ /(?m)^__version__ = "([^"]+)"$/
-            if (!versionMatcher.find()) {
-                error "Unable to read __version__ from ${LLM_ROOT}/tensorrt_llm/version.py"
-            }
-            resolvedVersionOverride =
-                "${versionMatcher.group(1)}${versionOverride}"
-        }
-        env.TRTLLM_VERSION_OVERRIDE = resolvedVersionOverride
+        env.TRTLLM_VERSION_OVERRIDE = versionOverride
         args += ' TRT_LLM_VERSION="${TRTLLM_VERSION_OVERRIDE}"'
     }
 
@@ -1187,7 +1181,7 @@ pipeline {
         stage("Register NGC Image For Security Check") {
             when {
                 expression {
-                    return params.nspect_id && params.action == "push"
+                    return params.nspect_id && params.action == "push" && params.register_images
                 }
             }
             steps {
@@ -1196,15 +1190,11 @@ pipeline {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install 'requests>=2.32.4,<3'")
-                            def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
-                            def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
-                            if (override_commit) {
-                                echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
-                            nspect_commit = override_commit
+                            def releaseRepo = globalVars[TRTLLM_RELEASE_REPO]
+                            if (!releaseRepo?.url || !releaseRepo?.commit) {
+                                error "TRTLLM_RELEASE_REPO is missing from globalVars; it is resolved by L0_MergeRequest"
                             }
-                            withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
-                                trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
-                            }
+                            trtllm_utils.checkoutSource(releaseRepo.url, releaseRepo.commit, "nspect")
                             def nspect_env = params.nspect_env ? params.nspect_env : "prod"
                             def nspectReleaseVersion = params.program_version_name ?: "PostMerge"
                             def cmd = """./nspect/nspect.py \
@@ -1212,29 +1202,30 @@ pipeline {
                                 --nspect_id ${params.nspect_id} \
                                 --program_version_name '${nspectReleaseVersion}' \
                                 """
-                            if (params.register_images) {
-                                cmd += "--add_version "
-                                if (params.release_type_id) {
-                                    cmd += "--release_type_id ${params.release_type_id} "
-                                }
-                            }
-                            if (params.osrb_ticket) {
-                                cmd += "--osrb_ticket ${params.osrb_ticket} "
-                            }
+                            def imageArgs = "--image " + imageKeyToTag.values().join(" ")
+                            def registrationCmd = cmd + "--add_version " +
+                                "--release_type_id ${params.release_type_id ?: 1} "
                             if (params.export_compliance_bug) {
-                                cmd += "--export_compliance_bug '${params.export_compliance_bug}' "
+                                registrationCmd += "--export_compliance_bug '${params.export_compliance_bug}' "
                             }
-                            if (params.wait_success_seconds) {
-                                cmd += "--check_launch_api "
-                                cmd += "--wait_success ${params.wait_success_seconds} "
-                            }
-                            cmd += "--image "
-                            cmd += imageKeyToTag.values().join(" ")
+                            registrationCmd += "--check_launch_api --criteria container-registration --wait_success 180 " + imageArgs
                             withCredentials([
                                 usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET'),
                                 usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'ARTIFACTORY_USERNAME', passwordVariable: 'ARTIFACTORY_PASSWORD')
                             ]) {
-                                trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
+                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
+                                    retry(3) {
+                                        sh(label: 'Register images to nSpect', script: registrationCmd)
+                                        if (params.osrb_ticket) {
+                                            sh(label: 'Associate images with OSRB in nSpect',
+                                                script: cmd + "--osrb_ticket ${params.osrb_ticket} " + imageArgs)
+                                        }
+                                    }
+                                }
+                                if (params.wait_success_seconds) {
+                                    def launchCheckCmd = cmd + "--check_launch_api --wait_success ${params.wait_success_seconds} " + imageArgs
+                                    trtllm_utils.llmExecStepWithRetry(this, script: launchCheckCmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
+                                }
                             }
                         }
                     }

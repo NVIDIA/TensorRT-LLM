@@ -49,7 +49,12 @@ namespace kernels::kimiK3AttnRes
 //! shared-memory copy rather than a reload. Every in-tree caller passes a
 //! freshly allocated tensor, and attnResPersistentFusedSupported rejects the
 //! aliased form so a caller that stops doing so fails loudly.
-void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_t stream);
+//!
+//! smReserve SMs are left out of the grid: a kernel resident for the whole
+//! step (the DWDP weight gather) holds them, and CTAs that landed there would
+//! run as a second, mostly idle wave. attn_res_add_rmsnorm_persistent_fwd
+//! rejects values outside [0, SM count); this launcher clamps to that range.
+void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, int smReserve, cudaStream_t stream);
 
 //! True when B, H, N, T >= 1, the required tensors and the aliasing rule above
 //! all hold, so callers can route without duplicating those checks.

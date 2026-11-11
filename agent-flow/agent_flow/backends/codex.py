@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import asyncio
@@ -6,6 +9,7 @@ import os
 import shutil
 import subprocess
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -13,10 +17,9 @@ from typing import Any, AsyncIterator
 
 from openai_codex.client import CodexConfig
 from openai_codex.generated.v2_all import (
-    AskForApproval,
-    AskForApprovalValue,
     FunctionDynamicToolSpec,
     SandboxMode,
+    ThreadForkParams,
     ThreadStartParams,
 )
 
@@ -29,6 +32,7 @@ from .codex_transport import CodexTransport
 
 
 def _resolve_codex_bin() -> str:
+    """Use an explicit ``CODEX_BIN``, otherwise the pinned runtime or a PATH fallback."""
     override = os.environ.get("CODEX_BIN")
     if override:
         if not Path(override).is_file():
@@ -89,6 +93,23 @@ async def _session_init(transport: CodexTransport, cwd: Path) -> SessionInitEven
 _CLI_VERSION_TIMEOUT_S = 5.0
 _VERSION_CACHE: str | None = None
 
+#: ``thread/start``'s sandbox policy types, named as a configuration names its modes.
+_SANDBOX_NAMES = {
+    "dangerFullAccess": SandboxMode.danger_full_access.value,
+    "workspaceWrite": SandboxMode.workspace_write.value,
+    "readOnly": SandboxMode.read_only.value,
+    "externalSandbox": "external-sandbox",
+}
+
+
+def _sandbox_name(policy: Any) -> str | None:
+    kind = policy.get("type") if isinstance(policy, dict) else None
+    return _SANDBOX_NAMES.get(kind, kind)
+
+
+def _approval_name(policy: Any) -> str | None:
+    return policy if policy is None or isinstance(policy, str) else "granular"
+
 
 def _codex_sdk_version() -> str:
     """Version of the Python ``openai-codex`` SDK package, or ``""``."""
@@ -139,9 +160,6 @@ def _codex_backend_version() -> str:
     return _VERSION_CACHE
 
 
-_REASONING_EFFORT = "max"
-
-
 def _disabled_skills_override(names: tuple[str, ...]) -> tuple[str, ...]:
     if not names:
         return ()
@@ -149,31 +167,45 @@ def _disabled_skills_override(names: tuple[str, ...]) -> tuple[str, ...]:
     return (f"skills.config=[{entries}]",)
 
 
+#: The feature switches that keep a session's user-installed plugins and apps out of it.
+_NO_PLUGINS_OVERRIDES: tuple[str, ...] = ("features.plugins=false", "features.apps=false")
+
+
+def _config_overrides(disabled_skills: tuple[str, ...], plugins: bool) -> tuple[str, ...]:
+    """The app server's ``-c`` overrides: skills turned off, and plugins unless kept."""
+    return _disabled_skills_override(disabled_skills) + (() if plugins else _NO_PLUGINS_OVERRIDES)
+
+
 class CodexBackend(Backend):
     def __init__(
         self,
         reasoning_effort: str | None = None,
         disabled_skills: tuple[str, ...] = (),
+        writable_roots: tuple[str, ...] = (),
+        plugins: bool = True,
     ) -> None:
         self._transport: CodexTransport | None = None
-        self._reasoning_effort = reasoning_effort or _REASONING_EFFORT
+        self._reasoning_effort = reasoning_effort
         self._disabled_skills = disabled_skills
+        self._writable_roots = writable_roots
+        self._plugins = plugins
 
     def version(self) -> str:
         return _codex_backend_version()
 
     def reasoning_effort(self) -> str:
-        return self._reasoning_effort
+        return self._reasoning_effort or ""
 
     async def __aenter__(self) -> "CodexBackend":
-        self._transport = CodexTransport(
+        transport = CodexTransport(
             CodexConfig(
                 codex_bin=_resolve_codex_bin(),
                 experimental_api=True,
-                config_overrides=_disabled_skills_override(self._disabled_skills),
+                config_overrides=_config_overrides(self._disabled_skills, self._plugins),
             )
         )
-        await self._transport.start()
+        await transport.start()
+        self._transport = transport
         return self
 
     async def __aexit__(self, *args: object) -> None:
@@ -191,6 +223,7 @@ class CodexBackend(Backend):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
+        fork_from: str | None = None,
     ) -> AsyncIterator[BackendClient]:
         if self._transport is None:
             raise RuntimeError("CodexBackend must be entered before creating clients.")
@@ -202,8 +235,12 @@ class CodexBackend(Backend):
             tools=tools,
             cwd=session_cwd,
         )
-        mcp_overrides = config.get("mcp_servers", {})
-        if any("disabled_tools" in server for server in mcp_overrides.values()):
+        mcp_overrides = config.setdefault("mcp_servers", {})
+        if (
+            self._writable_roots
+            or not self._plugins
+            or any("disabled_tools" in server for server in mcp_overrides.values())
+        ):
             # Codex replaces arrays when merging thread overrides. Preserve
             # exclusions inherited from the native config for this session's cwd.
             # A failed read must prevent starting a thread with weakened bans.
@@ -214,13 +251,18 @@ class CodexBackend(Backend):
                 timeout=5,
             )
             inherited_configs = [native_config["config"]]
-            # Starting an unrestricted session can trust a project and activate
-            # its config. Conservatively retain those exclusions as well.
+            # Native project trust can activate a previously disabled layer.
+            # Retain its tool exclusions when building session overrides.
             inherited_configs.extend(
                 layer["config"]
                 for layer in native_config.get("layers") or []
                 if layer["name"]["type"] == "project" and layer.get("disabledReason") is not None
             )
+            if not self._plugins:
+                for inherited_config in inherited_configs:
+                    for name in inherited_config.get("mcp_servers") or {}:
+                        if name not in mcp_overrides:
+                            mcp_overrides[name] = {"enabled": False}
             for name, server in mcp_overrides.items():
                 if "disabled_tools" not in server:
                     continue
@@ -240,27 +282,61 @@ class CodexBackend(Backend):
                 server["disabled_tools"] = list(
                     dict.fromkeys([*inherited, *server["disabled_tools"]])
                 )
-        config.update(
-            model_reasoning_effort=self._reasoning_effort,
-            model_context_window=1000000,
-        )
-        params = ThreadStartParams(
-            model=model,
+            if self._writable_roots:
+                native = native_config["config"].get("sandbox_workspace_write") or {}
+                roots = native.get("writable_roots") or []
+                if not isinstance(roots, list) or not all(isinstance(p, str) for p in roots):
+                    raise ValueError("Native workspace writable_roots must be a list of strings")
+                config["sandbox_workspace_write"] = {
+                    "writable_roots": list(
+                        dict.fromkeys(
+                            [*roots, *(str(Path(p).resolve()) for p in self._writable_roots)]
+                        )
+                    )
+                }
+        if self._reasoning_effort is not None:
+            config["model_reasoning_effort"] = self._reasoning_effort
+        options = dict(
+            # An empty model leaves the choice to Codex's own configuration.
+            model=model or None,
             developer_instructions=system_prompt or None,
             config=config,
             cwd=str(session_cwd),
-            sandbox=SandboxMode.danger_full_access,
-            approval_policy=AskForApproval(root=AskForApprovalValue.never),
         )
+        if fork_from is not None:
+            if definitions:
+                raise ValueError(
+                    "thread/fork cannot introduce dynamic tools; use native MCP tools "
+                    "or start a fresh session with these tools"
+                )
+            params = ThreadForkParams(thread_id=fork_from, exclude_turns=True, **options)
+        else:
+            params = ThreadStartParams(**options)
         payload = params.model_dump(by_alias=True, mode="json", exclude_none=True)
         if definitions:
             payload["dynamicTools"] = [_dynamic_tool_spec(tool) for tool in definitions]
         session_init = await _session_init(self._transport, session_cwd)
-        started = await self._transport.request("thread/start", payload)
+        started = await self._transport.request(
+            "thread/fork" if fork_from is not None else "thread/start", payload
+        )
         thread_id = started["thread"]["id"]
+        session_init = replace(
+            session_init or SessionInitEvent(),
+            backend="codex",
+            model=started.get("model"),
+            reasoning_effort=started.get("reasoningEffort"),
+            session_id=thread_id,
+            sandbox=_sandbox_name(started.get("sandbox")),
+            approval_policy=_approval_name(started.get("approvalPolicy")),
+        )
         self._transport.register_tools(thread_id, definitions)
         try:
-            yield CodexClient(self._transport, thread_id, session_init=session_init)
+            yield CodexClient(
+                self._transport,
+                thread_id,
+                session_init=session_init,
+                inherited_history=fork_from is not None,
+            )
         finally:
             self._transport.unregister_tools(thread_id)
             # Unload the thread, while retaining the saved session just as the

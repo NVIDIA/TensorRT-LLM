@@ -1885,6 +1885,101 @@ class TestKVCacheFailuresCtxChunked:
 
 
 # ===========================================================================
+# GEN slot preemption: pause in place (see gen_preemption.py)
+# ===========================================================================
+
+
+class TestGenSlotPreemption:
+    def test_paused_requests_stay_resident_and_unscheduled(self):
+        mgr = make_kv_cache_manager(can_evict=True)
+        draft = make_kv_cache_manager(can_evict=True)
+        sched = make_scheduler(mgr, max_batch_size=2, draft_kv_cache_manager=draft)
+        reqs = [make_gen_request(i) for i in range(3)]
+        reqs[1].py_batch_idx = 5
+        sched.set_gen_paused_ids(frozenset({1}))
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 2] and out.paused_requests == []
+        allocated = [c.args[0].py_request_id for c in mgr.try_allocate_generation.call_args_list]
+        assert allocated == [0, 2]
+        for m in (mgr, draft):  # nothing is suspended or freed
+            m.suspend_request.assert_not_called()
+            m.free_resources.assert_not_called()
+        assert reqs[1].py_batch_idx is None  # resumes from the host token
+        sched.set_gen_paused_ids(frozenset())
+        assert ids(sched.schedule_request(reqs, set()).generation_requests) == [0, 1]
+
+    @pytest.mark.parametrize("first_token_first", [False, True])
+    def test_forced_resume_precedes_first_token(self, first_token_first, monkeypatch):
+        from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import (
+            GenPreemption,
+            GenPreemptionConfig,
+        )
+
+        monkeypatch.setenv("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", str(int(first_token_first)))
+        sched = make_scheduler(make_kv_cache_manager(), max_batch_size=1)
+        resident, waiter = [make_gen_request(i) for i in range(2)]
+        for req, decoding_iter in [(resident, 100), (waiter, 0)]:
+            req.py_decoding_iter = decoding_iter
+            req.is_generation_only_request = True
+            req.state = LlmRequestState.GENERATION_IN_PROGRESS
+            req.prompt_len = 10
+            req.get_num_tokens.return_value = 110
+        waiter.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        waiter.state_value = waiter.state.value
+        waiter.is_generation_in_progress_state = False
+        p = GenPreemption(GenPreemptionConfig(tpot_budget=0.1), 1)
+        p.observe([resident], 0.0)
+        p._pause(resident)
+        assert p.step([waiter, resident], 11.0, 1, 2, None) == 2
+        assert p.resumed_ids == {0} and p.stats["forced"] == 1
+        sched.set_gen_paused_ids(p.paused_ids, p.resumed_ids)
+        assert ids(sched.schedule_request([waiter, resident], set()).generation_requests) == [0]
+        assert p._reqs[0].paused_t is None and p._reqs[0].paused_total == 11.0
+
+        # On the next pass the ordinary first-token preference applies again.
+        resident.py_decoding_iter += 1
+        p.step([resident, waiter], 11.1, 1, 2, None)
+        assert not p.resumed_ids
+        sched.set_gen_paused_ids(p.paused_ids, p.resumed_ids)
+        expected = [1] if first_token_first else [0]
+        assert (
+            ids(sched.schedule_request([resident, waiter], set()).generation_requests) == expected
+        )
+
+    @pytest.mark.parametrize("paused_ids", [frozenset({0}), frozenset()])
+    def test_paused_and_displaced_requests_keep_peft_claims(self, paused_ids):
+        peft = make_peft_cache_manager(max_device_pages=1)
+        sched = make_scheduler(make_kv_cache_manager(), max_batch_size=1, peft_cache_manager=peft)
+        sched.set_gen_paused_ids(paused_ids)
+        resident = make_gen_request(0, lora_task_id=10)
+        waiter = make_disagg_request(1, lora_task_id=20)
+        # Transfer admission precedes decode and bypasses the batch-slot budget.
+        # The resident adapter must be claimed even when decode is not reached.
+        out = sched.schedule_request([waiter, resident], set())
+        assert out.fitting_disagg_gen_init_requests == []
+        assert out.generation_requests == []
+        resumed = sched.schedule_request([resident], set())
+        assert ids(resumed.generation_requests) == ([] if paused_ids else [0])
+
+    def test_paused_peft_claim_survives_remote_tail_retry(self):
+        peft = make_peft_cache_manager(max_device_pages=1)
+        mgr = make_kv_cache_manager(
+            prepare_context_fn=lambda req, reuse_limit=None: req.py_request_id != 1
+        )
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+        sched.set_gen_paused_ids(frozenset({0}))
+        paused = make_gen_request(0, lora_task_id=10)
+        replay = make_ctx_request(1, context_remaining_length=64)
+        replay.py_csa2_remote_tail_mode = "destination"
+        other = make_ctx_request(2, context_remaining_length=64, lora_task_id=20)
+        # The replay cannot allocate KV, so admission retries without it. The
+        # retry must still count the paused decode's resident adapter.
+        out = sched.schedule_request([paused, replay, other], set())
+        assert out.context_requests == []
+        assert out.generation_requests == []
+
+
+# ===========================================================================
 # Eviction (MAX_UTILIZATION)
 # ===========================================================================
 
@@ -2671,6 +2766,47 @@ class TestDeadlockDetection:
         with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
             sched.schedule_request([blocked], set())
 
+    @pytest.mark.parametrize("pages_available_after_retirement", [False, True])
+    def test_cancelled_receive_holds_pages_only_until_retirement(
+        self, pages_available_after_retirement: bool
+    ) -> None:
+        """Off-list receive retirement defers deadlock detection, not future stalls."""
+        retiring = [False]
+        retirement_finished = [False]
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: (
+                retirement_finished[0] and pages_available_after_retirement
+            ),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        sched.set_retiring_gen_receives_probe(lambda: retiring[0])
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+        for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
+            sched.schedule_request([blocked], set())
+        assert sched._stalled_schedules == sched._DEADLOCK_STALL_ITERS - 1
+
+        retiring[0] = True
+        for _ in range(sched._DEADLOCK_STALL_ITERS + 2):
+            out = sched.schedule_request([blocked], set())
+            assert not out.context_requests
+            assert sched._stalled_schedules == 0
+        retiring[0] = False
+        retirement_finished[0] = True
+        if pages_available_after_retirement:
+            assert ids(sched.schedule_request([blocked], set()).context_requests) == [0]
+        else:
+            for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
+                sched.schedule_request([blocked], set())
+            with patch(
+                "tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger.warning"
+            ) as warning:
+                with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+                    sched.schedule_request([blocked], set())
+            warning.assert_called_once()
+            assert "local_retiring_gen_receives=False" in warning.call_args.args[0]
+
 
 # ===========================================================================
 # PEFT / LoRA
@@ -2678,6 +2814,59 @@ class TestDeadlockDetection:
 
 
 class TestPEFT:
+    @pytest.mark.parametrize("retained_adapter", [None, 0, 1])
+    @pytest.mark.parametrize("pending_termination", [False, True])
+    def test_executor_defers_lora_while_cancelled_request_retains_adapter(
+        self, retained_adapter, pending_termination
+    ):
+        """Do not reuse hidden adapter capacity before normal cancellation cleanup."""
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+        mgr = make_kv_cache_manager()
+        peft = make_peft_cache_manager(max_device_pages=1, pages_per_task=1)
+        engine = object.__new__(PyExecutor)
+        engine.scheduler = make_scheduler(mgr, peft_cache_manager=peft)
+        engine.kv_cache_manager = mgr
+        engine._maybe_record_hang_diagnostic_phase = Mock()
+        engine._get_ctx_mla_kv_len_cap = lambda: None
+        engine.is_encoder_decoder = False
+        engine.enable_attention_dp = False
+        engine.enable_batch_waiting = False
+        engine.inflight_req_ids = set()
+        held = make_ctx_request(0, 100, is_first_context_chunk=False, lora_task_id=retained_adapter)
+        other_adapter = make_ctx_request(1, 100, lora_task_id=1)
+        no_adapter = make_ctx_request(2, 100)
+        active = (
+            [other_adapter, no_adapter]
+            if pending_termination
+            else [held, other_adapter, no_adapter]
+        )
+        engine.active_requests = active.copy()
+        engine._pending_response_terminations = [held] if pending_termination else []
+        engine.previous_batch = SimpleNamespace(
+            scheduled_requests=SimpleNamespace(context_requests=[held])
+        )
+        engine._cancelled_disagg_model_request_ids = lambda: set() if pending_termination else {0}
+
+        # Repeated passes cannot make the retained adapter evictable. Exercise
+        # the real scheduler and PEFT budget, not only its input list.
+        for _ in range(2):
+            batch, _, _ = engine._schedule()
+            expected = [2, 1] if retained_adapter is None else [2]
+            assert ids(batch.context_requests) == expected
+            assert engine.active_requests == active
+            assert engine._pending_response_terminations == ([held] if pending_termination else [])
+            mgr.free_resources.assert_not_called()
+
+        # The ordinary post-batch cleanup removes the cancelled owner. LoRA
+        # admission resumes even while its old cancellation ID is still known.
+        if pending_termination:
+            engine._pending_response_terminations.clear()
+        else:
+            engine.active_requests.remove(held)
+        batch, _, _ = engine._schedule()
+        assert ids(batch.context_requests) == [2, 1]
+
     def test_no_peft_manager(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, peft_cache_manager=None)

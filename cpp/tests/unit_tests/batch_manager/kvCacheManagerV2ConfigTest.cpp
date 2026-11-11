@@ -146,6 +146,33 @@ TEST(KvCacheManagerV2ConfigTest, MatchingSlotShapesSharePoolsAcrossWindows)
     EXPECT_NE(poolOf(0), poolOf(2));
 }
 
+TEST(KvCacheManagerV2ConfigTest, SinkRequiredOnlyWindowsShareRequiredPools)
+{
+    auto config = makeTieredConfig();
+    auto sinkOnly = makeAttentionLayer(1, false);
+    sinkOnly.slidingWindowSize = 128;
+    sinkOnly.numSinkTokens = 4;
+    sinkOnly.reusePolicy = ReusePolicy::SINK_REQUIRED_ONLY;
+    auto optional = sinkOnly;
+    optional.layerId = 2;
+    optional.reusePolicy = ReusePolicy::OPTIONAL;
+    config.layers = {makeAttentionLayer(0, false), sinkOnly, optional};
+    ASSERT_NO_THROW(config.validate());
+
+    auto const storage = createStorageConfig(config);
+    auto const attributes = storage.bufferAttributes();
+    auto const grouping = storage.lifeCycleGrouping();
+    auto const& full = attributes.at(BufferId{0, "key"});
+    auto const& window = attributes.at(BufferId{1, "key"});
+    auto const& optionalWindow = attributes.at(BufferId{2, "key"});
+    // Three life cycles of one page shape: the SINK_REQUIRED_ONLY window shares the REQUIRED
+    // layer's pool group, and OPTIONAL keeps its own.
+    EXPECT_EQ(storage.numLifeCycles(), LifeCycleId{3});
+    EXPECT_EQ(storage.slotDescList.size(), PoolGroupIndex{2});
+    EXPECT_EQ(grouping[full.lifeCycleId], grouping[window.lifeCycleId]);
+    EXPECT_NE(grouping[full.lifeCycleId], grouping[optionalWindow.lifeCycleId]);
+}
+
 TEST(KvCacheManagerV2ConfigTest, SparseBuffersCoalesceBySize)
 {
     // A sparse buffer's `size` is its whole page, as for any other buffer, so two of equal
