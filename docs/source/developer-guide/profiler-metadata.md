@@ -49,14 +49,24 @@ probes.
 Custom Python scopes require a `torch.profiler.profile` session active on the
 thread emitting the event. An `ExecutionTraceObserver` alone does not enable
 them. To retain the metadata string input, attach an execution-trace observer
-to the profiler and enable shape recording. The `TRTLLM1` fields are inputs in
+to the profiler. Shape recording is optional. The `TRTLLM1` fields are inputs in
 the execution trace; `export_chrome_trace` does not export those fields. Chrome
 traces still show scope names and CPU durations.
 
 Profiler state is thread-local: a session on the executor thread does not enable
 scopes on background send/receive threads. Use a profiler on each emitting thread
-when that coverage is needed. CUDA graph replay does not re-enter Python or native
-host scopes recorded at capture time.
+when that coverage is needed.
+
+`ExecutionTraceObserver` registration is process-wide: only the first observer
+installs a capture callback, and another registered observer can stop or
+unregister that shared capture. Have one coordinator register and start an
+observer before worker activity. Run each thread's profiler without an attached
+observer; stop and unregister the coordinated observer only after all worker
+profiling finishes. Sharing an observer between independently ending profiler
+contexts also lets the first context to exit stop and unregister shared capture.
+
+CUDA graph replay does not re-enter Python or native host scopes recorded at
+capture time.
 
 ## TRTLLM1 envelope
 
