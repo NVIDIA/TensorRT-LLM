@@ -7922,6 +7922,12 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 f"{feature} supports the dsa and deepseek_v4 sparse "
                 f"attention algorithms; got {sparse.algorithm!r}.")
+        if cold and sparse is not None and sparse.enable_kv_cache_offload:
+            # Sparse KV cache offload reads the selected rows from its own
+            # arena, which the redirect to the high layer does not cover.
+            raise ValueError(
+                f"{feature} is not supported together with sparse KV cache "
+                "offload (enable_kv_cache_offload).")
         if hot and self.kv_cache_compression_config is not None:
             raise ValueError(
                 "Mixed-precision KV (kv_cache_config.dtype=mixed_*) cannot be "

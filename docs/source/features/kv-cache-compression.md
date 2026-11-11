@@ -296,8 +296,9 @@ step's new tokens are copied into the history pages as well.
 The option is a prototype and has the limits of the mixed-precision KV cache:
 the TRTLLM attention backend, the standard KV cache manager, the hybrid Mamba
 manager and the DSA and DeepSeek-V4 sparse backends, single-beam decoding,
-speculative decoding except dynamic-tree drafting, no KV connector, and not the
-`fp8_ds_mla` cache layout. Drafter layers appended to the target cache (MTP,
+speculative decoding except dynamic-tree drafting, no KV connector, not the
+`fp8_ds_mla` cache layout, and not sparse KV cache offload
+(`enable_kv_cache_offload`). Drafter layers appended to the target cache (MTP,
 Eagle3) keep their first/last tokens like the target layers; a separate drafter
 with its own architecture keeps a plain cache.
 

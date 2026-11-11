@@ -4907,6 +4907,9 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         ("fp8_ds_mla",
          dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
                                             dtype="fp8_ds_mla"))),
+        ("sparse KV cache offload",
+         dict(sparse_attention_config=DeepSeekSparseAttentionConfig(
+             index_head_dim=128, enable_kv_cache_offload=True))),
         ("dynamic-tree",
          dict(
              speculative_config={
