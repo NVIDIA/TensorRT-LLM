@@ -430,6 +430,27 @@ def test_deferred_receives_publish_independently_and_in_admission_order() -> Non
     assert [req.state for req in (first, second, unfenced)] == [_RECEIVING] * 3
 
 
+def test_deferred_receives_are_reported_from_admission_until_published() -> None:
+    """The transceiver learns the waiting count at admission, before any
+    receive starts, and again after each publication pass: its idle-poll skip
+    counts a waiting receive as a session on every rank."""
+    late = _ScriptedEvent(False, False, True)
+    h = _deferring_harness({1: _ScriptedEvent(True), 2: late})
+    first, second = _gen_init(h, 1), _gen_init(h, 2)
+
+    h.coordinator.receive_gen_init([first, second])
+
+    # admission (both waiting), then the publication pass that started 1
+    assert h.transceiver.deferred_receive_reports == [2, 1]
+    assert h.transceiver.call_log[0] == "request_and_receive_async:1"
+
+    h.coordinator.poll_gen_transfers()
+    assert h.transceiver.deferred_receive_reports == [2, 1, 1]
+    h.coordinator.poll_gen_transfers()
+    assert h.transceiver.deferred_receive_reports == [2, 1, 1, 0]
+    assert h.transceiver.call_log.count("request_and_receive_async:2") == 1
+
+
 def test_forgotten_deferred_receive_is_never_published() -> None:
     """A request freed while its receive waits is dropped from the queue, so
     a later ready fence does not start a receive into freed blocks."""

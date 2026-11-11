@@ -17,13 +17,14 @@
 #pragma once
 
 #include "tensorrt_llm/kernels/communicationKernels/mnnvlAllreduceKernels.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3MnnvlOneShot
 {
 
-struct AllReduceFusionParams : mnnvl::AllReduceFusionParams
+struct AllReduceFusionParams : ::tensorrt_llm::kernels::mnnvl::AllReduceFusionParams
 {
     bool earlyTrigger = false;
 };
@@ -32,4 +33,4 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params);
 
 }
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

@@ -194,6 +194,9 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // MXFP8 Quantization
 
+// Kill switch for the SM107 quantize_mxfp8_rows path of invokeMxFP8Quantization.
+constexpr bool kMxfp8QuantSm107Rows = true;
+
 template <typename T, int SF_VEC_SIZE, int SF_OUTPUT_VEC_SIZE>
 void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output, int32_t* SFOuput,
     QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream)
@@ -205,6 +208,33 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
     if (b == 0 || m == 0 || n == 0)
     {
         return;
+    }
+
+    // SM107: one unpadded matrix with swizzled K32 scales runs quantize_mxfp8_rows (same math, one column chunk per
+    // thread, 8 rows in flight); bitwise the same output.
+    if constexpr (SF_VEC_SIZE == 32 && SF_OUTPUT_VEC_SIZE == 32)
+    {
+        int const colThreads = n / CVT_ELTS_PER_THREAD;
+        if (kMxfp8QuantSm107Rows && tensorrt_llm::common::getSMVersion() == 107 && b == 1 && n == padded_n
+            && layout == QuantizationSFLayout::SWIZZLED && n % 128 == 0 && colThreads <= 1024 && colThreads % 32 == 0)
+        {
+            constexpr int kRows = 8;
+            int const ctasPerSm = colThreads > 512 ? 1 : 2;
+            dim3 grid(std::min(int(PadUpFn(m, 128) + kRows - 1) / kRows, multiProcessorCount * ctasPerSm));
+            cudaLaunchConfig_t config;
+            config.gridDim = grid;
+            config.blockDim = dim3(colThreads);
+            config.dynamicSmemBytes = 0;
+            config.stream = stream;
+            cudaLaunchAttribute attrs[1];
+            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+            config.numAttrs = 1;
+            config.attrs = attrs;
+            TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, quantize_mxfp8_rows<T, kRows>, m, n, input,
+                reinterpret_cast<uint64_t*>(output), reinterpret_cast<uint32_t*>(SFOuput)));
+            return;
+        }
     }
 
     // Grid, Block size.

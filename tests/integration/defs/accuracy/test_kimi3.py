@@ -223,6 +223,23 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         TP=8 / EP=8 with attention DP, TRTLLM-Gen MoE (fused NVFP4 SiTu
         cubins), CUDA graphs and chunked prefill.
         """
+        self._run_gsm8k_nvfp4_dep8(monkeypatch, kv_cache_dtype="auto")
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device_memory(250000)
+    def test_gsm8k_nvfp4_kv_dep8(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The DEP8 NVFP4 recipe on an NVFP4 KV cache, which selects FP4 MLA.
+
+        The checkpoint declares no KV-cache quantization, so the recipe above
+        never reaches the FP4 MLA path: the hybrid KV cache manager with the
+        FP4 MLA layout, the FP8 fallback layers, and FP4 MLA chunked prefill.
+        """
+        self._run_gsm8k_nvfp4_dep8(monkeypatch, kv_cache_dtype="nvfp4")
+
+    def _run_gsm8k_nvfp4_dep8(
+        self, monkeypatch: pytest.MonkeyPatch, *, kv_cache_dtype: str
+    ) -> None:
         # Attention DP also replicates the shared-expert and latent MoE MLPs.
         # Kept in BF16 (the default) they cost about 15.7 GiB more per rank
         # and leave DEP8 no KV-cache room, so read them as FP8 block-scale
@@ -252,17 +269,21 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 use_low_precision_moe_combine=True,
             ),
             kv_cache_config=KvCacheConfig(
+                dtype=kv_cache_dtype,
                 enable_block_reuse=False,
                 # Attention DP replicates KV per rank. A smaller fraction lets
                 # clamp_max_seq_len_for_mem drop max_seq_len below a GSM8K
                 # prompt, which then overruns max_blocks_per_seq mid-run.
                 free_gpu_memory_fraction=0.4,
+                # FP4 MLA raises this to its 128-token page size.
                 tokens_per_block=64,
             ),
         ) as llm:
             # The requant ships hf_quant_config.json, so the matcher sees
             # MIXED_PRECISION -- only the experts are 4-bit.
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            if kv_cache_dtype == "nvfp4":
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 

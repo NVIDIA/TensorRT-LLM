@@ -28,7 +28,6 @@ import pytest
 import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
-from tensorrt_llm._torch.disaggregation.native.bounce.impl import NoBounceTransport
 from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.transfer import AgentResult, KVRecvTask, RxSession
@@ -45,6 +44,15 @@ pytestmark = pytest.mark.cpu_only
 _OLD_REQUEST = 41
 _NEW_REQUEST = 42
 _SENTINEL = b"new-data"
+
+
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
 
 
 class _PrematureReuse(AssertionError):
@@ -134,7 +142,6 @@ class _ReceiveCase:
         self.cleanup_count = 0
         self.receiver = SimpleNamespace(
             _enforce_physical_ownership=ownership,
-            _bounce=NoBounceTransport(),
             _registrar=SimpleNamespace(
                 self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
             ),
@@ -164,6 +171,7 @@ class _ReceiveCase:
         self.transceiver.kv_transfer_timeout_ms = 1000
         self.transceiver._ever_had_recv_session = True
         self.transceiver._gen_need_sync = False
+        self.transceiver._init_gen_idle_poll(False)
         self.transceiver._gen_allgather = Mock(side_effect=AssertionError("unexpected collective"))
         self.transceiver._mapping = mapping
         self.transceiver._wait_reqs = {}
@@ -258,7 +266,10 @@ class _ReceiveCase:
     def complete(self, resource: Literal["kv", "aux"]) -> None:
         if resource == "kv":
             self.kv.data[:] = b"old-data"
-            self.session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+            _publish_report_tokens(self.session)
+            self.session.process_kv_agent_result(
+                0, 0, True, AgentResult.SUCCESS, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+            )
         else:
             self.aux.slot.data[:] = b"old-data"
             self.session.process_aux_agent_result(0, AgentResult.SUCCESS)
@@ -287,7 +298,10 @@ def test_cancelled_receive_retains_destinations_until_all_accessors_settle(
     assert case.kv.allocate(_NEW_REQUEST)
     assert case.aux.slot.allocate(_NEW_REQUEST)
     # Duplicate control-plane completion reports carry no new memory access.
-    case.session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+    _publish_report_tokens(case.session)
+    case.session.process_kv_agent_result(
+        0, 0, True, AgentResult.SUCCESS, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+    )
     case.session.process_aux_agent_result(0, AgentResult.SUCCESS)
     for _ in range(2):
         case.poll_and_cleanup()

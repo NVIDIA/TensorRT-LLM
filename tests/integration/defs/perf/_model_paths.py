@@ -16,6 +16,7 @@
 
 # Model PATH of local dir synced from internal LLM models repo
 MODEL_PATH_DICT = {
+    "muse_spark_open_nvfp4": "Muse-Spark-Open-816B-A42B-NVFP4",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
     "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
     "llama_v3.1_8b_instruct_fp4": "modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4",
@@ -85,6 +86,8 @@ MODEL_PATH_DICT = {
     # DSpark draft stages are embedded in this checkpoint, so it is also the
     # `speculative_model` of the DSpark perf-sanity cases.
     "deepseek_v41_flash": "DeepSeek-V4.1-Flash",
+    # GLM-5.3 FP8 (MoE)
+    "glm_5.3_fp8": "GLM-5.3",
     "deepseek_v41_flash_nvfp4": "DeepSeek-V4.1-Flash-NVFP4",
     "deepseek_v41_flash_nvfp4_dspark": "DeepSeek-V4.1-Flash-NVFP4",
     # GLM-5 FP8 (MoE)
@@ -92,6 +95,7 @@ MODEL_PATH_DICT = {
     # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)
     "glm_5.2_fp4": "GLM-5.2-NVFP4",
     "glm_5.3_flash_fp8": "GLM-5.3-Flash",
+    "glm_5.3_flash_fp8_mtp": "GLM-5.3-Flash",
     "glm_5.3_flash_nvfp4": "GLM-5.3-Flash-NVFP4",
     # MiniMax-M3 NVFP4: MXFP8 base layers with NVFP4 routed experts
     # (the MXFP8 checkpoint is registered as "minimax_m3_mxfp8" above).
@@ -100,6 +104,9 @@ MODEL_PATH_DICT = {
     "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
     # Kimi K3 (KDA linear attention + MLA MoE, MXFP4 routed experts)
     "kimi_k3": "Kimi-K3",
+    # The same checkpoint under its own key, so that the MXFP4 modeling_v2 perf-sanity
+    # cases are recorded under their own s_model_name in the perf database.
+    "kimi_k3_mxfp4": "Kimi-K3",
     # Kimi K3 NVFP4 requant (MIXED_PRECISION routed experts). Its DSpark drafter
     # is the separate Inferact-Kimi-K3-DSpark checkpoint, given per config as
     # `speculative_model`.

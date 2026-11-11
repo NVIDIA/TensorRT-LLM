@@ -25,7 +25,7 @@ l0_dgx_b300:
   # this 4-GPU stage runs only multi_gpu/, whose cases need >= 2 GPUs;
   # test_helix_zero_kv.py runs in this list's pre_merge block instead.
   - unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/multi_gpu/test_helix_zero_kv.py
-  - unittest/_torch/executor
+  - unittest/_torch/pyexecutor
   - unittest/_torch/disaggregation
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
@@ -72,7 +72,7 @@ l0_dgx_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=TRTLLM-mtp_nextn=0-tp4-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-low_precision_combine=True-torch_compile=False]
   # modeling_v2 GLM-5.2-NVFP4 sm_103 tep4 target: identity and MTP1 GSM8K paired in one test,
   # with the MTP1 acceptance gate on the second leg.
-  - accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm103Tep4::test_gsm8k_identity_vs_mtp1_and_acceptance TIMEOUT (45)
+  - accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm103Tep4::test_gsm8k_identity_vs_mtp1_and_acceptance TIMEOUT (45)
 - condition:
     ranges:
       system_gpu_count:

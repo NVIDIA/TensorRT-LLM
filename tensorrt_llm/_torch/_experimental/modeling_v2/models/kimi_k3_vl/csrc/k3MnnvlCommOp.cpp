@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 
-#include "mnnvlAllGatherKernels.h"
-#include "mnnvlAllreduceAttnRes.h"
+#include "kimi_k3_vl/csrc/mnnvlAllGatherKernels.h"
+#include "kimi_k3_vl/csrc/mnnvlAllreduceAttnRes.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/mnnvlAllreduceKernels.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
+#include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -27,7 +29,7 @@
 #include <cstdint>
 #include <vector>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -91,7 +93,7 @@ std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
     params.output = normOut.mutable_data_ptr();
     params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-    tensorrt_llm::kernels::kimiK3Mnnvl::AttnResEpilogueParams epilogue{};
+    TRTLLM_MV2_NS::kernels::kimiK3Mnnvl::AttnResEpilogueParams epilogue{};
     epilogue.blockResidual = block_residual.const_data_ptr();
     epilogue.resWeight = res_weight.const_data_ptr();
     epilogue.rmsWeight = rms_weight.const_data_ptr();
@@ -100,18 +102,18 @@ std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
     epilogue.outputRmsEps = static_cast<float>(output_rms_eps);
     epilogue.numCandidates = static_cast<int>(block_residual.size(0)) + 1;
 
-    tensorrt_llm::kernels::kimiK3Mnnvl::oneshotAllreduceAttnResOp(params, epilogue);
+    TRTLLM_MV2_NS::kernels::kimiK3Mnnvl::oneshotAllreduceAttnResOp(params, epilogue);
     return {normOut, prefixOut};
 }
 
 namespace
 {
 
-tensorrt_llm::kernels::kimiK3Mnnvl::AllGatherSplitParams makeAllGatherSplitParams(torch::Tensor const& input,
+TRTLLM_MV2_NS::kernels::kimiK3Mnnvl::AllGatherSplitParams makeAllGatherSplitParams(torch::Tensor const& input,
     int64_t bf16_columns, int64_t world_size, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags,
     torch::Tensor& bf16Out, torch::Tensor& fp32Out)
 {
-    namespace k3Mnnvl = tensorrt_llm::kernels::kimiK3Mnnvl;
+    namespace k3Mnnvl = TRTLLM_MV2_NS::kernels::kimiK3Mnnvl;
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
         mcast_mem != nullptr, "[mnnvlAllGatherSplit] comm_buffer must be obtained from a mcastBuffer instance.");
@@ -159,15 +161,15 @@ std::vector<torch::Tensor> mnnvlAllGatherSplit(torch::Tensor const& input, int64
     torch::Tensor fp32Out;
     auto const params
         = makeAllGatherSplitParams(input, bf16_columns, world_size, comm_buffer, buffer_flags, bf16Out, fp32Out);
-    tensorrt_llm::kernels::kimiK3Mnnvl::mnnvlAllGatherSplitOp(params);
+    TRTLLM_MV2_NS::kernels::kimiK3Mnnvl::mnnvlAllGatherSplitOp(params);
     return {bf16Out, fp32Out};
 }
 
 }
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END
 
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
+TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "mnnvl_allreduce_attn_res(Tensor input, Tensor? prefix_sum, Tensor block_residual, Tensor res_weight, "
@@ -178,8 +180,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(b!) buffer_flags) -> Tensor[]");
 }
 
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
 {
-    m.impl("mnnvl_allreduce_attn_res", &tensorrt_llm::torch_ext::mnnvlAllReduceAttnRes);
-    m.impl("mnnvl_allgather_split", &tensorrt_llm::torch_ext::mnnvlAllGatherSplit);
+    m.impl("mnnvl_allreduce_attn_res", &TRTLLM_MV2_NS::torch_ext::mnnvlAllReduceAttnRes);
+    m.impl("mnnvl_allgather_split", &TRTLLM_MV2_NS::torch_ext::mnnvlAllGatherSplit);
 }

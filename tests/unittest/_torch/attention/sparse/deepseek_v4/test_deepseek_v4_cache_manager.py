@@ -62,6 +62,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     BatchDesc,
     BufferConfig,
+    CacheTier,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheDesc,
@@ -524,7 +525,8 @@ def test_build_cache_config_long_decode_constraint(
         assert config.constraints == []
 
 
-def test_cache_size_estimation_uses_model_attention_layer_count():
+@pytest.mark.parametrize("preemption", [False, True])
+def test_cache_size_estimation_uses_model_attention_layer_count(preemption):
     class FakeModelConfig:
         sparse_attention_config = SimpleNamespace(
             index_head_dim=128,
@@ -551,9 +553,33 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
     cost = CacheCost.from_raw(size_per_token)
     assert cost.slope > 0
     assert cost.intercept == 0
+    config = FakeModelConfig()
+    cost = CacheCost.from_raw(
+        DeepseekV4CacheManager.get_cache_size_per_token(
+            config,
+            Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            tokens_per_block=128,
+            max_batch_size=4,
+            gen_preemption_headroom=2 if preemption else 0,
+        )
+    )
+    _, per_request = deepseek_v4_cache._estimate_swa_cache_size(
+        576,
+        128,
+        config.sparse_attention_config.compress_ratios,
+        False,
+        128,
+        128,
+        context=False,
+        scratch=False,
+        indexer_k_dtype="fp8",
+        use_fp8_ds_mla=False,
+    )
+    assert cost.intercept == (6 if preemption else 4) * per_request
 
 
-def test_quota_from_max_tokens_models_context_swa_scratch():
+@pytest.mark.parametrize("preemption", [False, True])
+def test_quota_from_max_tokens_models_context_swa_scratch(preemption):
     manager = object.__new__(DeepseekV4CacheManager)
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [4, 4]
@@ -587,6 +613,24 @@ def test_quota_from_max_tokens_models_context_swa_scratch():
     assert no_scratch_small_quota < no_scratch_large_quota
     assert no_scratch_delta > scratch_delta
     assert manager._get_max_tokens_from_quota(no_scratch_large_quota) == 4096
+    manager.gen_preemption_headroom = 1 if preemption else 0
+    _, per_request = deepseek_v4_cache._estimate_swa_cache_size(
+        576,
+        128,
+        [4, 4],
+        False,
+        128,
+        128,
+        context=False,
+        scratch=False,
+        indexer_k_dtype="fp8",
+        use_fp8_ds_mla=False,
+    )
+    assert manager._get_generation_request_capacity() == (3 if preemption else 2)
+    for tokens, baseline in [(1, no_scratch_small_quota), (4096, no_scratch_large_quota)]:
+        quota = manager._get_quota_from_max_tokens(tokens)
+        assert quota == baseline + (per_request if preemption else 0)
+        assert manager._get_max_tokens_from_quota(quota) == tokens
 
 
 def test_needed_resource_uses_context_swa_scratch_slope():
@@ -989,6 +1033,15 @@ class TestDeepseekV4CacheManager:
 
                 first_cache = cache_manager.kv_cache_map[first.py_request_id]
                 cache_manager.suspend_request(first)
+
+                # The pressure request displaces the suspended one only when the GPU tier holds
+                # no slack beyond its slot floors, which depends on how the allocator packed the
+                # pools. Shrink the tier to the least the floors allow; resize refuses anything
+                # smaller.
+                gpu_quota = cache_manager.impl.get_quota(0)
+                grain = _introspection.tier_allocation_granularity(CacheTier.GPU_MEM, gpu_quota)
+                while cache_manager.impl.resize(0, gpu_quota - grain):
+                    gpu_quota -= grain
 
                 pressure = self._create_request(request_id=1, prompt_len=pressure_len)
                 requests.append(pressure)

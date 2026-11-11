@@ -304,6 +304,7 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch: pytest.Monke
         py_request_id=7,
         is_child=False,
         is_context_only_request=True,
+        is_generation_only_request=False,
         py_kv_transfer_timed_out=True,
         py_decoding_iter=3,
         finish_by_reason=Mock(),

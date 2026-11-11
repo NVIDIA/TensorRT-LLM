@@ -29,6 +29,7 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSACacheManagerV2, DSAtrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention.backends.trtllm import \
@@ -471,6 +472,71 @@ def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
         draft_inputs["input_ids"],
         torch.tensor([11, 12, 13, 21, 88], dtype=torch.int32, device="cuda"),
     )
+
+
+@skip_num_gpus_less_than(1)
+def test_eagle3_prepare_skipped_uploads_keep_slot_ids_current() -> None:
+    slots = {5: 2, 6: 0, 7: 3}
+    md = object.__new__(Eagle3OneModelSpecMetadata)
+    md.use_rejection_sampling = False
+    md.use_dynamic_tree = False
+    md.num_tokens = 0
+    md.num_generations = 0
+    md.batch_indices_cuda = torch.full((8, ),
+                                       -1,
+                                       dtype=torch.int,
+                                       device="cuda")
+    md.slot_ids = torch.full((8, ), -1, dtype=torch.long, device="cuda")
+    md._batch_indices_upload = DeviceCopyBuffer(md.batch_indices_cuda)
+    md._slot_ids_upload = DeviceCopyBuffer(md.slot_ids)
+    md.spec_resource_manager = SimpleNamespace(slot_manager=SimpleNamespace(
+        get_slot=lambda rid: slots[rid]))
+    md.spec_dec_mode = SimpleNamespace(is_mtp_eagle_one_model=lambda: True)
+
+    # Repeated and prefix batches may skip the upload; a reassigned slot may not.
+    for request_ids, reassign in [([5, 6], None), ([5, 6], None), ([5], None),
+                                  ([5, 6, 7], None), ([5, 6, 7], (6, 4))]:
+        if reassign is not None:
+            slots[reassign[0]] = reassign[1]
+        md.request_ids = request_ids
+        md.prepare()
+        torch.cuda.synchronize()
+        n = len(request_ids)
+        assert md.batch_indices_cuda[:n].tolist() == list(range(n))
+        assert md.slot_ids[:n].tolist() == [slots[r] for r in request_ids]
+
+
+def test_external_shared_target_kv_step_prepares_next_new_tokens() -> None:
+    accepted = torch.tensor([[11, 12, 13]], dtype=torch.int32)
+    num_accepted = torch.tensor([2], dtype=torch.int32)
+    drafts = torch.tensor([[21, 22]], dtype=torch.int32)
+    worker = SimpleNamespace(
+        _execute_guided_decoder_if_present=lambda logits: None,
+        sample_and_accept_draft_tokens=lambda *args: (accepted, num_accepted),
+        _is_mamba_hybrid_cache=False,
+        sa_enhancer=None,
+        _uses_external_shared_target_kv=True,
+        _forward_external_shared_target_kv_draft_loop=lambda **kwargs: drafts,
+        _prepare_next_new_tokens=lambda *args: "next new tokens",
+        _auxiliary_state_handlers=[],
+    )
+    spec_metadata = SimpleNamespace(runtime_draft_len=2,
+                                    spec_resource_manager=None,
+                                    batch_indices_cuda=torch.tensor([0]),
+                                    sharded_target_logits=False)
+    attn_metadata = SimpleNamespace(num_seqs=1, num_contexts=0)
+
+    out = MTPEagleWorker._forward_impl(worker,
+                                       torch.tensor([1, 2, 3]),
+                                       torch.arange(3),
+                                       torch.zeros(3, 8),
+                                       torch.zeros(3, 16),
+                                       attn_metadata,
+                                       spec_metadata,
+                                       draft_model=None)
+
+    assert out["next_draft_tokens"] is drafts
+    assert out["next_new_tokens"] == "next new tokens"
 
 
 @pytest.fixture(scope="function")

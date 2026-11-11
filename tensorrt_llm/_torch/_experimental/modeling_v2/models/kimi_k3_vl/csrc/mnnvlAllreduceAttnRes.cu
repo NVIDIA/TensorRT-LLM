@@ -13,8 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "mnnvlAllreduceAttnRes.h"
+#include "kimi_k3_vl/csrc/mnnvlAllreduceAttnRes.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 #include <cfloat>
 #include <cooperative_groups.h>
 #include <cstddef>
@@ -37,10 +38,11 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3Mnnvl
 {
+using namespace ::tensorrt_llm::kernels;
 
 using mnnvl::AllReduceFusionParams;
 using tensorrt_llm::common::isNegZero;
@@ -683,4 +685,4 @@ void oneshotAllreduceAttnResOp(AllReduceFusionParams const& params, AttnResEpilo
 }
 }
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

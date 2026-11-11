@@ -997,10 +997,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
         context_tokens = min(max_tokens, max_context_tokens)
         generation_tokens = max_tokens - context_tokens
+        # Paused decode requests keep their SWA pools; the quota must cover
+        # every resident request, not just the active ones.
         generation_quota = (
             max_tokens * non_sliding_attn_size_per_token
             + generation_tokens * generation_swa_size_per_token
-            + self.max_batch_size * generation_swa_size_per_request
+            + self._get_generation_request_capacity() * generation_swa_size_per_request
         )
         context_extra_quota = context_tokens * context_swa_size_per_token
         padding = self._get_extra_quota_padding()
@@ -1047,7 +1049,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
         padding = self._get_extra_quota_padding()
-        size_per_batch = self.max_batch_size * generation_swa_size_per_request + padding
+        size_per_batch = (
+            self._get_generation_request_capacity() * generation_swa_size_per_request + padding
+        )
         if quota < size_per_batch:
             return 0
         context_size_per_token = non_sliding_attn_size_per_token + context_swa_size_per_token
@@ -1062,6 +1066,19 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if generation_size_per_token <= 0:
             return float("inf")
         return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
+
+    # One mixed-precision high layer per compressed layer.
+    _supports_mixed_precision_kv = True
+    _own_pool_is_mixed_precision_low = True
+
+    def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
+        return super()._is_mixed_precision_layer(local_layer_idx) and compress_ratio_has_attention(
+            self._compress_ratios[self.pp_layers[local_layer_idx]], DeepseekV4AttentionType.COMPRESS
+        )
+
+    def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
+        # A compressed page holds tokens_per_block // ratio rows.
+        return self.compressed_block_sizes[self.pp_layers[local_layer_idx]]
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
@@ -2058,9 +2075,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=use_fp8_ds_mla,
         )
         max_batch_size = int(kwargs.get("max_batch_size") or 0)
+        # Paused decode requests keep their SWA caches; the static cost
+        # covers every resident request, not just the active ones.
+        resident_capacity = max_batch_size + int(kwargs.get("gen_preemption_headroom", 0))
         return (
             non_sliding_attn_size_per_token + swa_size_per_token,
-            swa_size_per_request * max_batch_size,
+            swa_size_per_request * resident_capacity,
         )
 
     def _iter_guard_candidate_buffers(

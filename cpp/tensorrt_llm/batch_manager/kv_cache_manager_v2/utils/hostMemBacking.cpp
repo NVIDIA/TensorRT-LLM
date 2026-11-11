@@ -52,6 +52,29 @@ size_t commitAlignment()
     return static_cast<size_t>(::sysconf(_SC_PAGESIZE));
 }
 
+} // namespace
+
+size_t hostMemSizeGranularity() noexcept
+{
+    // A page is the only hard bound; 2 MiB is the floor because that is the huge page the
+    // backing asks for, and a size quantized below it would straddle one for no gain.
+    static size_t const unit = std::max(size_t{2} << 20, commitAlignment());
+    return unit;
+}
+
+namespace
+{
+
+//! Bytes one step populates. Large enough that the call overhead disappears against the
+//! faulting, small enough that a caller publishing progress between steps releases an
+//! early waiter early.
+constexpr size_t kCommitChunkSize = 32ULL << 20;
+
+//! Bytes one registration covers, before the register unit rounds it down. Near the commit
+//! chunk so the two advance together, and small enough that the tail a shrink has to split
+//! is cheap to put back.
+constexpr size_t kRegisterChunkTarget = 32ULL << 20;
+
 //! The pages [addr, addr + size) touches, widened to whole pages.
 //!
 //! For calls that must cover at least the range: populating or opening a few
@@ -160,45 +183,41 @@ void bindRangeToGpuNumaNode(MemAddress addr, size_t size, bool allowRemoteFallba
 
 } // namespace
 
-HostMemBacking::HostMemBacking(HostMemBackingOptions const& options)
-    : mUnit(std::max(options.commitUnit, commitAlignment()))
+HostMemBacking::HostMemBacking(size_t vmSize, HostMemBackingOptions const& options)
+    : mUnit(hostMemSizeGranularity())
+    , mRegUnit(std::max<size_t>(options.registerUnit, 1))
+    // Whole register units, so no bound falls inside one.
+    , mRegChunk(std::max(kRegisterChunkTarget / mRegUnit * mRegUnit, mRegUnit))
     , mAllowRemoteNumaFallback(options.allowRemoteNumaFallback)
 {
-}
+    if (vmSize == 0)
+    {
+        return;
+    }
+    // The caller rounds: a reservation silently made larger is one the caller does not
+    // know it can resize into.
+    TLLM_CHECK_WITH_INFO(
+        vmSize % mUnit == 0, "HostMemBacking reservation %zu is not a multiple of the granularity %zu", vmSize, mUnit);
 
-HostMemBacking::~HostMemBacking()
-{
-    HostMemBacking::destroy();
-}
-
-MemAddress HostMemBacking::reserve(size_t size)
-{
-    TLLM_CHECK_WITH_INFO(mAddr == 0, "HostMem backing reserved twice");
-    TLLM_CHECK_DEBUG(size % mUnit == 0);
-
-    // Captured here rather than in commit(): this runs on the thread that owns
-    // the context, while the fill worker only sets the device.
     cuCheck(cuCtxGetCurrent(reinterpret_cast<CUcontext*>(&mContext)));
-    TLLM_CHECK_WITH_INFO(mContext != nullptr, "HostMemBacking::reserve needs a current CUDA context");
+    TLLM_CHECK_WITH_INFO(mContext != nullptr, "HostMemBacking needs a current CUDA context");
 
-    // No alignment is asked of the mapping. Unit boundaries line up with slot
-    // boundaries because slot 0 sits at the base and a unit is a whole number of
-    // slots, wherever the base happens to land; registration needs no alignment,
-    // and the madvise and mprotect calls round to pages themselves. The mapped
-    // length is page-rounded so the guard below covers whole pages.
-    mMapped = roundUp(size, commitAlignment());
+    // No alignment is asked of the mapping: registration needs none, and the
+    // madvise and mprotect calls round to pages themselves. The mapped length is
+    // page-rounded so the guard below covers whole pages.
+    mMapped = roundUp(vmSize, commitAlignment());
     mAddr = hostMmap(mMapped);
-    mSize = size;
+    mSize = vmSize;
 
     //! Applied once over the whole mapping. Per-chunk page-mode advice would
     //! change VMA flags and split the mapping into one VMA per chunk.
     hostMadvisePageMode(mAddr, mSize, hostUseThp());
     bindRangeToGpuNumaNode(mAddr, mSize, mAllowRemoteNumaFallback);
 
-    // Nothing is reachable until commit() opens it, so a read that runs ahead
-    // of the fill faults rather than returning zeros from an untouched page.
-    // Costs one VMA and is independent of the size: with no resident pages
-    // there are no page tables to rewrite.
+    // Nothing is reachable until a step opens it, so a read that runs ahead of
+    // the fill faults rather than returning zeros from an untouched page. Costs
+    // one VMA and is independent of the size: with no resident pages there are
+    // no page tables to rewrite.
     auto const [guardAddr, guardSize] = pagesCovering(mAddr, mSize);
     if (::mprotect(reinterpret_cast<void*>(guardAddr), guardSize, PROT_NONE) != 0)
     {
@@ -208,49 +227,87 @@ MemAddress HostMemBacking::reserve(size_t size)
         mMapped = 0;
         throw HostOOMError(std::string("mprotect(PROT_NONE) failed: ") + std::strerror(errno));
     }
-    return mAddr;
 }
 
-void HostMemBacking::commit(size_t offset, size_t size, bool populated)
+HostMemBacking::~HostMemBacking()
 {
-    TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
-    TLLM_CHECK_DEBUG(offset % mUnit == 0 && size % mUnit == 0);
+    HostMemBacking::destroy();
+}
 
+void HostMemBacking::setTargetSize(size_t size)
+{
+    TLLM_CHECK_WITH_INFO(mAddr != 0, "HostMemBacking::setTargetSize on a backing that reserved nothing");
+    TLLM_CHECK_WITH_INFO(size <= mSize, "HostMemBacking target %zu exceeds the reservation of %zu", size, mSize);
+    TLLM_CHECK_WITH_INFO(
+        size % mUnit == 0, "HostMemBacking target %zu is not a multiple of the granularity %zu", size, mUnit);
+    TLLM_CHECK_WITH_INFO(mCommitted == mTarget, "HostMemBacking: a new target with %zu of %zu bytes still to commit",
+        mTarget - mCommitted, mTarget);
+    mTarget = size;
+}
+
+size_t HostMemBacking::resizeStep(bool populated)
+{
+    if (mCommitted == mTarget)
+    {
+        return mRegisteredEnd;
+    }
     // cuMemHostRegister needs a current context; the fill worker has only set
     // the device, which does not give it one.
     cuCheck(cuCtxSetCurrent(static_cast<CUcontext>(mContext)));
 
+    if (mCommitted < mTarget)
+    {
+        // Rounding up from one past the end lands on the next chunk boundary
+        // whether or not the previous step ended on one, so a step that resumed
+        // a partial chunk completes it rather than carrying the offset forward.
+        commitUpTo(std::min(roundUp(mCommitted + 1, kCommitChunkSize), mTarget), populated);
+    }
+    else
+    {
+        decommitFrom(std::max(mTarget, (mCommitted - 1) / kCommitChunkSize * kCommitChunkSize));
+    }
+    return mRegisteredEnd;
+}
+
+size_t HostMemBacking::commitChunkSize() noexcept
+{
+    return kCommitChunkSize;
+}
+
+size_t HostMemBacking::nextStepEnd() const noexcept
+{
+    return mCommitted < mTarget ? std::min(roundUp(mCommitted + 1, kCommitChunkSize), mTarget) : mCommitted;
+}
+
+void HostMemBacking::resizeTo(size_t size)
+{
+    setTargetSize(size);
+    while (mCommitted != mTarget)
+    {
+        resizeStep();
+    }
+}
+
+void HostMemBacking::commitUpTo(size_t end, bool populated)
+{
+    // With `populated` the caller has already opened and populated this range;
+    // the step only has to register it.
     if (!populated)
     {
-        open(offset, size);
-        populate(offset, size);
+        open(mCommitted, end - mCommitted);
+        populate(mCommitted, end - mCommitted);
     }
 
-    size_t committed = 0;
+    size_t const begin = mCommitted;
+    mCommitted = end;
     try
     {
-        for (; committed < size; committed += mUnit)
-        {
-            MemAddress const unitAddr = mAddr + offset + committed;
-            CUresult const registered = cuMemHostRegister(
-                reinterpret_cast<void*>(unitAddr), mUnit, CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
-            if (registered == CUDA_ERROR_OUT_OF_MEMORY)
-            {
-                throw HostOOMError("cuMemHostRegister failed: out of memory");
-            }
-            cuCheck(registered);
-            mRegistered.emplace(offset + committed, mUnit);
-        }
+        registerUpTo(end, /*allowPartialChunk=*/end == mTarget);
     }
     catch (...)
     {
-        // The caller treats a failed commit as having taken nothing.
-        decommit(offset, committed);
-        auto const [closeAddr, closeSize] = pagesWithin(mAddr + offset + committed, size - committed);
-        if (closeSize != 0 && ::mprotect(reinterpret_cast<void*>(closeAddr), closeSize, PROT_NONE) != 0)
-        {
-            TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed while unwinding a commit, errno %d", errno);
-        }
+        // A failed step must take nothing, so what it populated goes back.
+        decommitFrom(begin);
         throw;
     }
 }
@@ -284,37 +341,118 @@ void HostMemBacking::populate(size_t offset, size_t size) const
     }
 }
 
-void HostMemBacking::unregisterRange(size_t offset, size_t size) noexcept
+void HostMemBacking::registerUpTo(size_t end, bool allowPartialChunk)
 {
-    auto unit = mRegistered.lower_bound(offset);
-    while (unit != mRegistered.end() && unit->first < offset + size)
+    size_t const target = end / mRegUnit * mRegUnit;
+    while (mRegisteredEnd < target)
     {
-        CUresult const result = cuMemHostUnregister(reinterpret_cast<void*>(mAddr + unit->first));
+        // Rounding up from one past the start stops at the next chunk boundary, so
+        // no registration ever spans one.
+        size_t const chunkEnd = std::min(roundUp(mRegisteredEnd + 1, mRegChunk), target);
+        if (!allowPartialChunk && chunkEnd % mRegChunk != 0)
+        {
+            return;
+        }
+        CUresult const registered = cuMemHostRegister(reinterpret_cast<void*>(mAddr + mRegisteredEnd),
+            chunkEnd - mRegisteredEnd, CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
+        if (registered == CUDA_ERROR_OUT_OF_MEMORY)
+        {
+            throw HostOOMError("cuMemHostRegister failed: out of memory");
+        }
+        cuCheck(registered);
+        recordRegistrationStart(mRegisteredEnd);
+        mRegisteredEnd = chunkEnd;
+    }
+}
+
+void HostMemBacking::recordRegistrationStart(size_t start)
+{
+    // A start on a chunk boundary is the one innermostRegistrationStart() derives,
+    // so remembering it would only duplicate the arithmetic.
+    if (start % mRegChunk != 0)
+    {
+        mUnalignedRegStarts.push(start);
+    }
+}
+
+size_t HostMemBacking::innermostRegistrationStart() const noexcept
+{
+    TLLM_CHECK_DEBUG(mRegisteredEnd > 0);
+    // A registration never reaches past the chunk boundary above where it began,
+    // so the boundary below its last byte is where it began -- unless it began
+    // off a boundary, which is the case the stack exists to record.
+    size_t const onChunkBoundary = (mRegisteredEnd - 1) / mRegChunk * mRegChunk;
+    return mUnalignedRegStarts.empty() ? onChunkBoundary : std::max(mUnalignedRegStarts.top(), onChunkBoundary);
+}
+
+size_t HostMemBacking::dropInnermostRegistration() noexcept
+{
+    size_t const start = innermostRegistrationStart();
+    unregisterAt(start);
+    if (!mUnalignedRegStarts.empty() && mUnalignedRegStarts.top() == start)
+    {
+        mUnalignedRegStarts.pop();
+    }
+    // Registrations are contiguous, so the one below ends where this began.
+    mRegisteredEnd = start;
+    return start;
+}
+
+void HostMemBacking::unregisterAt(size_t offset) noexcept
+{
+    CUresult const result = cuMemHostUnregister(reinterpret_cast<void*>(mAddr + offset));
+    if (result != CUDA_SUCCESS)
+    {
+        char const* name = nullptr;
+        cuGetErrorName(result, &name);
+        // The driver and this object disagree about what is registered, which the
+        // pages are about to be freed on the assumption of.
+        Poison::set("HostMemBacking::unregisterAt", name != nullptr ? name : "cuMemHostUnregister failed");
+    }
+}
+
+void HostMemBacking::unregisterFrom(size_t end) noexcept
+{
+    size_t const target = end / mRegUnit * mRegUnit;
+    while (mRegisteredEnd > target)
+    {
+        size_t const start = dropInnermostRegistration();
+        if (start >= target)
+        {
+            continue;
+        }
+        // That one straddled `target`. A registration cannot be shortened, so it
+        // had to go whole and its surviving prefix is registered again. Leaving
+        // it would pin pages madvise is about to discard.
+        CUresult const result = cuMemHostRegister(reinterpret_cast<void*>(mAddr + start), target - start,
+            CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
         if (result != CUDA_SUCCESS)
         {
             char const* name = nullptr;
             cuGetErrorName(result, &name);
-            // The driver and this object disagree about what is registered,
-            // which the pages below are about to be freed on the assumption of.
-            Poison::set("HostMemBacking::unregisterRange", name != nullptr ? name : "cuMemHostUnregister failed");
+            // The prefix stays committed but unregistered, so a copy over it would
+            // fail rather than read the wrong pages. Nothing can repair that here.
+            Poison::set("HostMemBacking::unregisterFrom", name != nullptr ? name : "cuMemHostRegister failed");
+            return;
         }
-        unit = mRegistered.erase(unit);
+        recordRegistrationStart(start);
+        mRegisteredEnd = target;
+        return;
     }
 }
 
-void HostMemBacking::decommit(size_t offset, size_t size) noexcept
+void HostMemBacking::decommitFrom(size_t end) noexcept
 {
-    if (mAddr == 0 || size == 0)
+    if (mAddr == 0 || end >= mCommitted)
     {
         return;
     }
-    TLLM_CHECK_DEBUG(offset % mUnit == 0 && size % mUnit == 0);
-
     // Order matters and nothing enforces it: registration does not hold the
     // pages, so discarding them first destroys memory the GPU still has
     // registered, with every call reporting success.
-    unregisterRange(offset, size);
-    auto const [dropAddr, dropSize] = pagesWithin(mAddr + offset, size);
+    unregisterFrom(end);
+    auto const [dropAddr, dropSize] = pagesWithin(mAddr + end, mCommitted - end);
+    mCommitted = end;
     if (dropSize == 0)
     {
         return;
@@ -327,6 +465,31 @@ void HostMemBacking::decommit(size_t offset, size_t size) noexcept
     }
     // Back to unreachable, so a reader that outlives the shrink faults instead
     // of silently re-faulting a zero page.
+    if (::mprotect(reinterpret_cast<void*>(dropAddr), dropSize, PROT_NONE) != 0)
+    {
+        TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed with errno %d", errno);
+    }
+}
+
+void HostMemBacking::discardUncommitted(size_t offset, size_t size) noexcept
+{
+    if (mAddr == 0 || size == 0)
+    {
+        return;
+    }
+    // Never registered -- registration happens in the commit -- so unlike
+    // decommitFrom() this only has pages to drop.
+    TLLM_CHECK_DEBUG(offset >= mCommitted);
+    auto const [dropAddr, dropSize] = pagesWithin(mAddr + offset, size);
+    if (dropSize == 0)
+    {
+        return;
+    }
+    if (::madvise(reinterpret_cast<void*>(dropAddr), dropSize, MADV_DONTNEED) != 0)
+    {
+        TLLM_LOG_WARNING("KVCM2 host tier: madvise(MADV_DONTNEED) failed with errno %d", errno);
+    }
+    // Back to unreachable, undoing the open() that let it be populated.
     if (::mprotect(reinterpret_cast<void*>(dropAddr), dropSize, PROT_NONE) != 0)
     {
         TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed with errno %d", errno);
@@ -346,13 +509,16 @@ void HostMemBacking::destroy() noexcept
     KVCM2_POISON_ON_EXCEPT(
         [&]
         {
-            unregisterRange(0, mSize);
+            unregisterFrom(0);
             hostMunmap(mAddr, mMapped);
         });
-    mRegistered.clear();
+    mUnalignedRegStarts = {};
+    mRegisteredEnd = 0;
     mAddr = 0;
     mSize = 0;
     mMapped = 0;
+    mTarget = 0;
+    mCommitted = 0;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

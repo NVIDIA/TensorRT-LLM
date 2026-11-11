@@ -341,7 +341,7 @@ def k3_sandwich_oproj(
     src_slab: Optional[torch.Tensor] = None,
     src_buf: int = 0,
 ) -> List[torch.Tensor]:
-    """``(normed, updated)`` of ``o_proj`` followed by ``trtllm::mnnvl_allreduce_attn_res``.
+    """``(normed, updated)`` of ``o_proj`` followed by ``mv2_kimi_k3_vl::mnnvl_allreduce_attn_res``.
 
     ``core`` bf16 [M, 768] is this rank's attention output, ``o_weight`` [7168, 768] its o_proj slice;
     ``prefix`` [M, 7168] (or None), ``block_residual`` [S, M, 7168] the S valid snapshots, the weights [7168];

@@ -20,7 +20,7 @@ class K3MoeM1(OpWrapper):
     """This rank's routed partial ``[M, 3584]`` bf16 of ``layer``'s experts for the M tokens of its state. Advances
     the state's workspace by one call: the calls on one state run in one stream order."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="TP16 x EP1 single-token weight stream with 192 real columns padded to 256",
@@ -82,7 +82,7 @@ class K3MoeM1(OpWrapper):
     Tests retain eight payloads per cell, bitwise repeats, twelve steps of
     three layers, four rewritten-input graph replays with eager calls,
     two-state interleaving, epoch wrap and eager-construction refusals.
-    Kernel tests additionally cover TP4 x EP4 at M=1 and compare k3_moe.
+    Each payload is also within one bf16 ulp of the row max of k3_moe.
     """
 
     def __call__(

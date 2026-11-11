@@ -17,7 +17,7 @@ class SituAndMul(OpWrapper):
     A new `[M, d]` tensor in `x.dtype`.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(

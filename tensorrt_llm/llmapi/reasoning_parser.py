@@ -358,31 +358,41 @@ class GlmReasoningParser(BaseReasoningParser):
     """Reasoning parser for the GLM family.
 
     GLM-4.7 and GLM-5 templates prefill `<think>` (`reasoning_at_start`), or
-    `</think>` when `enable_thinking` is false. GLM-4.5/4.6 (`glm45`) do not
-    prefill `<think>`; the model opens the block at the start of its output.
+    close the block when `enable_thinking` is false; GLM-5.3 prefills `<think>`
+    either way. GLM-4.5/4.6 (`glm45`) do not prefill `<think>`; the model
+    opens the block at the start of its output. A rendered prompt that ends in
+    `<think>` or `</think>` sets the mode, whatever `enable_thinking` says.
 
     The block ends at the first `</think>`, or at a `<tool_call>` opened
     before it; a later `<think>` is text. A `</think>` before any content, or
     directly before the first `<tool_call>`, closes the block again and is
-    dropped. Text from the first `<tool_call>` on is kept verbatim.
+    dropped. Text from the first `<tool_call>` on is kept verbatim, except
+    for the `</think>` still owed by a block that a call ended: the first one
+    outside a call (a call runs from `<tool_call>` to its `</tool_call>`) is
+    dropped.
     """
 
+    resolves_thinking_from_prompt = True
     reasoning_start = "<think>"
     reasoning_end = "</think>"
     _tool_call_start = "<tool_call>"
+    _tool_call_end = "</tool_call>"
 
     def __init__(self,
                  *,
                  reasoning_at_start: bool = False,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
         super().__init__(chat_template_kwargs=chat_template_kwargs)
-        # The templates close the block in the prompt when `enable_thinking`
-        # is passed and false.
+        # `enable_thinking` is the mode read off the rendered prompt when the
+        # server could read it, else the request's; false means the prompt
+        # closed the block.
         if not (chat_template_kwargs or {}).get("enable_thinking", True):
             reasoning_at_start = False
         self.reasoning_at_start = reasoning_at_start
         # "start": the block may still open after leading whitespace;
-        # "closed": the block ended and no content followed yet.
+        # "closed": the block ended and no content followed yet;
+        # "call" and "owed": a call ended the block, which still owes its
+        # `</think>`, and the text is inside a call or between calls.
         self._state = "reasoning" if reasoning_at_start else "start"
         self._buffer = ""
 
@@ -402,6 +412,19 @@ class GlmReasoningParser(BaseReasoningParser):
             if state == "tool_calls":
                 content.append(data)
                 break
+            if state == "call":
+                close = data.find(self._tool_call_end)
+                if close == -1:
+                    cut = len(data) - _trailing_partial_marker(
+                        data, self._tool_call_end)
+                    content.append(data[:cut])
+                    self._buffer = data[cut:]
+                    break
+                close += len(self._tool_call_end)
+                content.append(data[:close])
+                data = data[close:]
+                self._state = "owed"
+                continue
             if state == "start":
                 stripped = data.lstrip()
                 if stripped.startswith(self.reasoning_start):
@@ -417,8 +440,15 @@ class GlmReasoningParser(BaseReasoningParser):
             end = data.find(self.reasoning_end)
             call = data.find(self._tool_call_start)
             if call != -1 and (end == -1 or call < end):
-                # A tool call ends the block; everything after it is content.
                 out.append(data[:call])
+                if state in ("reasoning", "owed"):
+                    # The call ends the block, which still owes `</think>`.
+                    opened = call + len(self._tool_call_start)
+                    content.append(data[call:opened])
+                    data = data[opened:]
+                    self._state = "call"
+                    continue
+                # Everything from the first tool call on is content.
                 content.append(data[call:])
                 self._state = "tool_calls"
                 break
@@ -432,6 +462,11 @@ class GlmReasoningParser(BaseReasoningParser):
                 break
             out.append(data[:end])
             rest = data[end + len(self.reasoning_end):]
+            if state == "owed":
+                # The `</think>` the block owed: drop it.
+                self._state = "tool_calls"
+                data = rest
+                continue
             if state == "reasoning":
                 self._state = "closed"
             elif end:

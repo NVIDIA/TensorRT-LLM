@@ -33,6 +33,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
 
 from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
+from ..mixed_precision_high_rows import overlay_mixed_precision_high_rows
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -205,7 +206,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         self,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
-    ) -> None:
+    ) -> AttentionForwardArgs:
         attention_input_type = forward_args.attention_input_type
         if attention_input_type == AttentionInputType.context_only:
             start_idx = 0
@@ -217,7 +218,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             start_idx = 0
             end_idx = metadata.num_tokens
 
-        sparse_args = forward_args.sparse_runtime_params
+        sparse_args = replace(forward_args.sparse_runtime_params)
         sparse_args.sparse_attn_kv_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
             start_idx:end_idx
         ]
@@ -230,6 +231,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             self.sparse_attention_config.window_size
             + metadata.max_compressed_indices[self.compress_ratio]
         )
+        return replace(forward_args, sparse_runtime_params=sparse_args)
 
     def forward(
         self,
@@ -246,7 +248,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             if forward_args.attention_sinks is None:
                 forward_args = replace(forward_args, attention_sinks=attn_sink.data)
 
-        self._prepare_sparse_forward_args(metadata, forward_args)
+        forward_args = self._prepare_sparse_forward_args(metadata, forward_args)
         return super().forward(q, k, v, metadata, forward_args=forward_args)
 
     def _unit_scale(self, like: torch.Tensor) -> torch.Tensor:
@@ -478,6 +480,16 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         max_compressed_kv_tokens,
                         num_pool_tokens,
                     )
+            if metadata.has_mixed_precision_high_rows:
+                overlay_mixed_precision_high_rows(
+                    self,
+                    metadata,
+                    compressed_local_indices,
+                    req_id,
+                    compressed_indices,
+                    scratch,
+                    shared_rows=attention_input_type != AttentionInputType.generation_only,
+                )
             metadata.nvfp4_compress_fp8_scratch = scratch
             global_indices[:, -num_compressed_indices:] = compressed_indices
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()

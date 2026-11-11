@@ -8,8 +8,9 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Callable, ClassVar, Dict, Generic, Iterator, List,
-                    Literal, Optional, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Generic,
+                    Iterator, List, Literal, Optional, Tuple, Type, TypeVar,
+                    Union)
 
 import torch
 from torch import nn
@@ -17,8 +18,11 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm._errors import (ConfigInputError, ModelLoadError,
+                                  UnsupportedError)
 from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import local_mpi_rank
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
@@ -33,8 +37,15 @@ from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..speculative import SpecMetadata
+from ..utils import split
 from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
                           is_builtin_zoo_module)
+
+if TYPE_CHECKING:
+    # The checkpoints package imports this module, so import its loader base
+    # classes for type checking only.
+    from .checkpoints.base_config_loader import BaseConfigLoader
+    from .checkpoints.base_weight_loader import BaseWeightLoader
 
 
 @contextlib.contextmanager
@@ -106,6 +117,44 @@ class MetaInitMode(TorchDispatchMode):
             raise MetaInitException(
                 f"Meta tensor used in unsupported function: {func}")
         return func(*args, **kwargs)
+
+
+def concatenate_weights_by_tp_rank(components: list[torch.Tensor],
+                                   tp_size: int) -> torch.Tensor:
+    """Concatenate projection components in rank-major row order.
+
+    Args:
+        components: Tensors shaped ``[rows_i, ...]`` with matching trailing
+            dimensions. Each physical row count must be divisible by
+            ``tp_size``. Packed weights remain packed; callers must ensure
+            logical channel boundaries align with physical row boundaries.
+        tp_size: Number of tensor-parallel ranks.
+
+    Returns:
+        A tensor ordered as ``[c0_r0 | c1_r0 | ... | c0_r1 | c1_r1 | ...]``.
+        A contiguous row split gives each rank its slice of every component.
+        With one rank, this is a plain concatenation along dimension zero.
+    """
+    if not components:
+        raise ValueError("rank blocking requires at least one projection")
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    trailing_shape = components[0].shape[1:]
+    for component in components:
+        if component.ndim == 0 or component.shape[1:] != trailing_shape:
+            raise ValueError(
+                "rank-blocked projections must have matching trailing dimensions"
+            )
+        if component.shape[0] % tp_size:
+            raise ValueError(
+                f"projection rows {component.shape[0]} are not divisible by tp_size={tp_size}"
+            )
+    if tp_size == 1:
+        return torch.cat(components, dim=0)
+    rows: list[torch.Tensor] = []
+    for rank in range(tp_size):
+        rows.extend(split(c, tp_size, rank) for c in components)
+    return torch.cat(rows, dim=0)
 
 
 def duplicate_kv_weight(weight: torch.Tensor, num_kv_heads: int,
@@ -542,6 +591,9 @@ class DecoderModelForCausalLM(nn.Module,
 
     # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
     use_fx_for_pcg_fallback: ClassVar[bool] = True
+    # The model-specific TorchLlmArgs fields this model implements; the loader
+    # rejects a set one that is not listed.
+    model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(
@@ -1154,6 +1206,21 @@ def register_external_model_modules(arch_to_module: Dict[str, str]) -> None:
     _rebuild_arch_registries(declared)
 
 
+def _model_arch_provider(model_arch: str) -> Optional[str]:
+    """The module to import for ``model_arch``, or ``None`` if no source lists it.
+
+    External declarations take precedence over the static index of built-in
+    architectures. Imports nothing; ``_ensure_model_registered`` and
+    ``is_model_arch_known`` both resolve providers through this function.
+    """
+    full_name = _EXTERNAL_ARCH_TO_MODULE.get(model_arch)
+    if full_name is None:
+        module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
+        if module_name is not None:
+            full_name = f"tensorrt_llm._torch.models.{module_name}"
+    return full_name
+
+
 def _ensure_model_registered(model_arch: str) -> None:
     """Import the module that provides ``model_arch``, if it isn't loaded yet.
 
@@ -1174,12 +1241,9 @@ def _ensure_model_registered(model_arch: str) -> None:
     registration decorator; the import itself is idempotent via
     ``sys.modules``.
     """
-    full_name = _EXTERNAL_ARCH_TO_MODULE.get(model_arch)
+    full_name = _model_arch_provider(model_arch)
     if full_name is None:
-        module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
-        if module_name is None:
-            return
-        full_name = f"tensorrt_llm._torch.models.{module_name}"
+        return
     try:
         importlib.import_module(full_name)
     except ModuleNotFoundError as e:
@@ -1204,6 +1268,18 @@ def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
     if model_arch not in MODEL_CLASS_MAPPING:
         _ensure_model_registered(model_arch)
     return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def is_model_arch_known(model_arch: str) -> bool:
+    """Whether ``get_registered_model_class`` has a source for ``model_arch``.
+
+    Checks the registry and then ``_model_arch_provider``, the same steps as
+    the lookup, but imports nothing, so it is cheap enough for checks that run
+    before the model is built. A provider whose module later fails to import
+    still counts as known; that error surfaces where the model is built.
+    """
+    return (model_arch in MODEL_CLASS_MAPPING
+            or _model_arch_provider(model_arch) is not None)
 
 
 def _is_builtin_draft_model_builder(builder) -> bool:
@@ -1380,7 +1456,7 @@ def register_vision_encoder(
     return wrapper
 
 
-def register_mapper(format: str, name: Optional[str] = None):
+def register_mapper(format: CheckpointFormat | str, name: Optional[str] = None):
 
     def decorator(cls):
         if name is not None:
@@ -1394,7 +1470,7 @@ def register_mapper(format: str, name: Optional[str] = None):
     return decorator
 
 
-def register_checkpoint_weight_loader(name: str):
+def register_checkpoint_weight_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name] = cls
@@ -1403,7 +1479,7 @@ def register_checkpoint_weight_loader(name: str):
     return decorator
 
 
-def register_checkpoint_loader(name: str):
+def register_checkpoint_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING[name] = cls
@@ -1412,7 +1488,7 @@ def register_checkpoint_loader(name: str):
     return decorator
 
 
-def register_config_loader(name: str):
+def register_config_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name] = cls
@@ -1421,13 +1497,14 @@ def register_config_loader(name: str):
     return decorator
 
 
-def get_checkpoint_weight_loader(name: str) -> Type["BaseWeightLoader"]:
+def get_checkpoint_weight_loader(
+        name: CheckpointFormat | str) -> Type["BaseWeightLoader"]:
     if name not in MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default checkpoint weight loader {name} not found.")
     return MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name]
 
 
-def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
+def get_config_loader(name: CheckpointFormat | str) -> Type["BaseConfigLoader"]:
     if name not in MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default config loader {name} not found.")
     return MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name]
@@ -1447,16 +1524,17 @@ def get_model_architecture(
             model_config.architectures) > 0:
         cls = get_registered_model_class(model_config.architectures[0])
     else:
-        raise RuntimeError("Model architecture is not provided.")
+        raise ModelLoadError("Model architecture is not provided.")
 
     if cls is None:
         arch = model_config.architectures[0]
         if arch in _GEMMA4_ARCHITECTURES:
-            raise RuntimeError(
+            raise ConfigInputError(
                 f"Gemma4 model support requires transformers>=5.5.0, "
                 f"please upgrade: pip install 'transformers>=5.5.0' "
-                f"(architecture: {arch}).")
-        raise RuntimeError(f"Unknown model architecture: {arch}")
+                f"(architecture: {arch}).",
+                reason="import")
+        raise UnsupportedError(f"Unknown model architecture: {arch}")
     return cls, model_config.architectures[0]
 
 
