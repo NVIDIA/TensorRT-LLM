@@ -185,10 +185,17 @@ TEST(ProfilerStartupDeathTest, ProbesBeforeStartupNeverParseInvalidConfiguration
         {
             setenv("TLLM_PROFILE_CUSTOM_REGIONS", "unknown", 1);
             CallbackGuard callback;
+            int nameCalls = 0;
+            int metadataCalls = 0;
             tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kWorkflow};
-            scope.startWithLazyName([]() -> std::string { throw std::logic_error("name evaluated"); },
-                [](tc::ProfilerMetadata&) { throw std::logic_error("metadata evaluated"); });
-            std::exit(observation().starts == 0 ? 0 : 1);
+            scope.startWithLazyName(
+                [&]() -> std::string
+                {
+                    ++nameCalls;
+                    return "uninitialized";
+                },
+                [&](tc::ProfilerMetadata&) { ++metadataCalls; });
+            std::exit(nameCalls == 0 && metadataCalls == 0 && observation().starts == 0 ? 0 : 1);
         },
         ::testing::ExitedWithCode(0), "");
 }
@@ -201,10 +208,17 @@ TEST(ProfilerStartupDeathTest, NoneSelectionNeverEvaluatesFactoriesOrEmitsScopes
             setenv("TLLM_PROFILE_CUSTOM_REGIONS", "none", 1);
             ASSERT_FALSE(tc::initializeProfilerRegions().has_value());
             CallbackGuard callback;
+            int nameCalls = 0;
+            int metadataCalls = 0;
             tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kWorkflow};
-            scope.startWithLazyName([]() -> std::string { throw std::logic_error("name evaluated"); },
-                [](tc::ProfilerMetadata&) { throw std::logic_error("metadata evaluated"); });
-            std::exit(observation().starts == 0 ? 0 : 1);
+            scope.startWithLazyName(
+                [&]() -> std::string
+                {
+                    ++nameCalls;
+                    return "unselected";
+                },
+                [&](tc::ProfilerMetadata&) { ++metadataCalls; });
+            std::exit(nameCalls == 0 && metadataCalls == 0 && observation().starts == 0 ? 0 : 1);
         },
         ::testing::ExitedWithCode(0), "");
 }
