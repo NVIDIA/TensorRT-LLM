@@ -106,22 +106,28 @@ def test_tasks_run_one_at_a_time(tmp_path, task_file, monkeypatch):
             {"n": 3, "mode": "onboard", "target": "ops/norm/last", "depends_on": [1]},
         ],
     )
-    lock = threading.Lock()
-    running: list[str] = []
-    seen: list[tuple[str, int]] = []
+    # Two turns inside at once meet at the barrier; a turn alone waits it out. A run that
+    # started independent rows together would always meet here, whatever the scheduler does.
+    together = threading.Barrier(2)
+    met: list[str] = []
+    earlier: dict[str, str] = {}
 
     def kernel_writer(turn, prompt):
         task = _task_id(prompt)
-        with lock:
-            running.append(task)
-            seen.append((task, len(running)))
-        with lock:
-            running.remove(task)
+        earlier[task] = prompt
+        try:
+            together.wait(timeout=0.3)
+            met.append(task)
+        except threading.BrokenBarrierError:
+            together.reset()
         return {"decision": "LANDED", "summary": task}
 
     _run(tmp_path, task_file, monkeypatch, Script(kernel_writer=kernel_writer))
     assert _state(tmp_path).verdict == "delivered"
-    assert seen == [("k1-rms", 1), ("k2-scale", 1), ("k3-last", 1)]
+    assert met == [] and list(earlier) == ["k1-rms", "k2-scale", "k3-last"]
+    # Each dispatch says the tasks before it are done: it starts from their commits.
+    assert "`k1-rms` (kernel): done LANDED" in earlier["k2-scale"]
+    assert "`k2-scale` (kernel): done LANDED" in earlier["k3-last"]
 
 
 # ------------------------------------------------------------------------------ the checks
@@ -165,7 +171,16 @@ def test_a_measured_small_anchor_is_not_called_a_placeholder(task_file, repo):
 
 def test_delivered_tests_run_with_the_tree_first_on_pythonpath(tmp_path):
     """Defect 15: rank processes a test starts inherit the tree, as the gates' commands do."""
-    line = certify.test_job_line("python -m pytest t.py", tmp_path)
+    ran: list[str] = []
+
+    def shell(line, env, timeout):
+        ran.append(line)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    workflow = SimpleNamespace(_shell_runner_override=shell, _shell_runner=shell)
+    # What the executor is handed, not a helper beside it.
+    certify._test_job(workflow, "python -m pytest t.py", tmp_path, 60)
+    [line] = ran
     assert line.startswith(f"cd {tmp_path.resolve()} && export PYTHONPATH={tmp_path.resolve()}")
     assert line.endswith("&& python -m pytest t.py")
 
@@ -219,6 +234,17 @@ def test_the_memory_limit_is_read_from_the_process_own_cgroup(tmp_path):
     v1 = "12:cpuset:/slurm/uid_1/job_7\n9:memory:/slurm/uid_1/job_7\n"
     assert preflight.cgroup_memory_limit(v1, root) == 64 << 30
     assert preflight.cgroup_memory_limit("0::/\n", tmp_path / "none") is None
+
+
+def test_the_host_memory_note_is_held_to_the_process_own_cgroup_limit(tmp_path, monkeypatch):
+    """Defect 9 at the note itself: the limit preflight warns by is the process's cgroup's."""
+    # The mount's root states no limit; the step this process runs in does.
+    monkeypatch.setattr(preflight, "CGROUP_ROOT", tmp_path / "no-limit-at-the-root")
+    monkeypatch.setattr(preflight, "cgroup_memory_limit", lambda *a, **k: 1 << 30)
+    spec = {"deployments": [{"name": "tp1", "options": {}}]}
+    [note] = preflight.check_kv_cache_configs(spec, {})
+    assert note.startswith("host memory: tp1: set no `kv_cache_config.host_cache_size`")
+    assert "this process may use 1 GiB (its cgroup's limit)" in note
 
 
 # ------------------------------------------------------------------------ the decision file
@@ -281,6 +307,54 @@ def _landing() -> SimpleNamespace:
             task_data={"arch": "sm_103", "trtllm_repo_path": ""},
         ),
     )
+
+
+def _land(tmp_path, *decisions: dict) -> tuple[object, list[str]]:
+    """One kernel task's turn through the pipeline's own landing path; its result and dispatches.
+
+    The worktree is ``tmp_path``; each dispatch writes the next of ``decisions``.
+    """
+    answers, prompts = list(decisions), []
+
+    def dispatch(task, role, prompt, path):
+        prompts.append(prompt)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(yaml.safe_dump(answers.pop(0)), encoding="utf-8")
+
+    pipeline = _landing()
+    pipeline.integration = SimpleNamespace(open=lambda task_id: tmp_path, repo=tmp_path)
+    pipeline.workspace = tmp_path / "ws"
+    pipeline.w.journal = SimpleNamespace(event=lambda *said: None)
+    pipeline._dispatch = dispatch
+    pipeline._prompt = lambda task, block: block
+    pipeline._integrate = lambda task, role, tree, block: ""
+    pipeline._static_problems = lambda *a: Pipeline._static_problems(pipeline, *a)
+    pipeline._entry_problems = lambda *a: Pipeline._entry_problems(pipeline, *a)
+    task = Task(id="k1-rms", kind="kernel", unit="core", ref="1", attempts=1)
+    return Pipeline._work(pipeline, task, False), prompts
+
+
+def test_a_landing_reads_the_entry_and_gives_one_turn_to_put_it_right(tmp_path):
+    """Defects 11 and 14 where they act: the turn that says LANDED is held to its entry."""
+    named = f"{_TARGET}/ops/norm/rms__r1.py"
+    landed = {"decision": "LANDED", "summary": "landed", "entry": named}
+    entry = tmp_path / named
+    entry.parent.mkdir(parents=True)
+    # An entry with no CELLS: one short turn names the problem, and the task does not land.
+    entry.write_text(_ENTRY_HEAD + _ENTRY_ARCHS)
+    result, prompts = _land(tmp_path, landed, landed)
+    assert len(prompts) == 2 and "- Rms declares no CELLS: nothing is certified" in prompts[1]
+    assert result.error == "its landed work is not deliverable: Rms declares no CELLS: " + (
+        "nothing is certified"
+    )
+    # The module the decision names is the one read, whatever its name: it lands in one turn.
+    entry.write_text(_ENTRY_HEAD + _ENTRY_CELLS + _ENTRY_ARCHS)
+    result, prompts = _land(tmp_path, landed)
+    assert (result.decision, result.error, len(prompts)) == ("LANDED", "", 1)
+    # A decision that names no entry is held to where the queue row places it.
+    result, prompts = _land(tmp_path, {"decision": "LANDED", "summary": "x"}, landed)
+    assert f"`{_TARGET}/ops/norm/rms.py` is not in your worktree" in prompts[1]
+    assert (result.decision, result.error) == ("LANDED", "")
 
 
 def test_an_entry_without_cells_or_this_arch_is_refused_when_its_task_lands(tmp_path):
@@ -364,24 +438,26 @@ def test_the_report_lists_what_the_workers_left_uncertified(tmp_path):
         "decision: UNIT_READY\nuncertified: |\n  lm_head at M=8192\n"
     )
     (decisions / "planner-3.yaml").write_text("decision: CONTINUE\nuncertified: [not a task]\n")
-    assert certify.uncertified_lines(tmp_path) == [
+    listed = [
         "- `core`: lm_head at M=8192",
         "- `k1-rms`: cached-prefix context (31+33 tokens) fails in shared code",
     ]
+    assert certify.uncertified_lines(tmp_path) == listed
+    # In the report a reader opens, not only in the helper that collects them.
+    workflow = SimpleNamespace(task_data={}, _preflight=None, workspace=tmp_path)
+    report = certify.write_report(workflow, "escalated", None, "").read_text()
+    assert "## What the workers left uncertified\n\n" + "\n".join(listed) in report
 
 
 # ----------------------------------------------------------------------------- the backend
 
 
-def test_the_claude_backend_reads_stream_messages_past_the_sdk_default():
+async def test_the_claude_backend_reads_stream_messages_past_the_sdk_default(monkeypatch):
     """Defect 12: a tool result is one stream-json message, and the SDK's default is 1 MiB.
 
-    That the size reaches the SDK's options is pinned beside the backend's other option
-    cases; this holds the size and that case's presence.
+    Held where it acts: the options the backend hands the SDK when it creates a client.
     """
     from tests import test_backends
 
-    assert claude_code.CLI_MESSAGE_BUFFER_BYTES >= 64 << 20
-    assert callable(
-        test_backends.TestClaudeBackendCreateClient.test_create_client_reads_large_cli_messages
-    )
+    options = await test_backends.TestClaudeBackendCreateClient()._capture_options(monkeypatch)
+    assert options.max_buffer_size == claude_code.CLI_MESSAGE_BUFFER_BYTES >= 64 << 20
