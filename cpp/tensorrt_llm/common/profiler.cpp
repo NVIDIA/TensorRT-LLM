@@ -30,7 +30,15 @@ namespace
 {
 
 constexpr std::string_view kRegionNames[]{"workflow", "mpi", "nccl", "nanobind", "kv", "moe"};
-constexpr std::uint8_t kDefaultRegions{0x0FU};
+static_assert(std::size(kRegionNames) == static_cast<std::uint8_t>(ProfilerRegion::kCount));
+
+constexpr std::uint8_t regionMask(ProfilerRegion region)
+{
+    return static_cast<std::uint8_t>(1U << static_cast<std::uint8_t>(region));
+}
+
+constexpr std::uint8_t kDefaultRegions = regionMask(ProfilerRegion::kWorkflow) | regionMask(ProfilerRegion::kMpi)
+    | regionMask(ProfilerRegion::kNccl) | regionMask(ProfilerRegion::kNanobind);
 
 std::atomic<int>& initializedRegions() noexcept
 {
@@ -99,7 +107,7 @@ struct Selection
 } // namespace
 
 //! Cache startup selection once, retaining a diagnostic and default regions after malformed input.
-std::optional<std::string> initializeProfiler()
+std::optional<std::string> initializeProfilerRegions()
 {
     static Selection const selection = []
     {
@@ -138,91 +146,29 @@ void reportProfilerFailure(char const* diagnostic) noexcept
 }
 
 ProfilerMetadata::ProfilerMetadata(std::string_view region)
-    : mEncoded{"TRTLLM1"}
+    : mPrefix{"TRTLLM1:" + std::to_string(region.size()) + ':' + std::string{region}}
 {
-    mEncoded += std::to_string(region.size());
-    mEncoded += ':';
-    mEncoded += region;
-    mEncoded += '{';
 }
 
 void ProfilerMetadata::add(std::string_view name, std::string_view value)
 {
-    appendName(name);
-    appendQuoted(value);
+    mFields[std::string{name}] = std::string{value};
 }
 
 void ProfilerMetadata::add(std::string_view name, std::int64_t value)
 {
-    appendName(name);
-    mEncoded += std::to_string(value);
+    mFields[std::string{name}] = value;
 }
 
 //! Append a signed integer list, preserving order and allowing an empty vector.
 void ProfilerMetadata::add(std::string_view name, std::vector<std::int64_t> const& value)
 {
-    appendName(name);
-    mEncoded += '[';
-    bool first = true;
-    for (auto const item : value)
-    {
-        if (!first)
-        {
-            mEncoded += ',';
-        }
-        first = false;
-        mEncoded += std::to_string(item);
-    }
-    mEncoded += ']';
+    mFields[std::string{name}] = value;
 }
 
 std::string ProfilerMetadata::take() &&
 {
-    mEncoded += '}';
-    return std::move(mEncoded);
-}
-
-//! Insert a field separator when needed, followed by the quoted key and colon.
-void ProfilerMetadata::appendName(std::string_view name)
-{
-    if (!mFirst)
-    {
-        mEncoded += ',';
-    }
-    mFirst = false;
-    appendQuoted(name);
-    mEncoded += ':';
-}
-
-//! Escape quotes, backslashes, and control bytes in a UTF-8 Python string literal.
-void ProfilerMetadata::appendQuoted(std::string_view value)
-{
-    constexpr char kHexDigits[] = "0123456789abcdef";
-    mEncoded += '\'';
-    for (unsigned char const character : value)
-    {
-        switch (character)
-        {
-        case '\\': mEncoded += "\\\\"; break;
-        case '\'': mEncoded += "\\\'"; break;
-        case '\n': mEncoded += "\\n"; break;
-        case '\r': mEncoded += "\\r"; break;
-        case '\t': mEncoded += "\\t"; break;
-        default:
-            if (character < 0x20U)
-            {
-                mEncoded += "\\x";
-                mEncoded += kHexDigits[character >> 4U];
-                mEncoded += kHexDigits[character & 0x0FU];
-            }
-            else
-            {
-                mEncoded += static_cast<char>(character);
-            }
-            break;
-        }
-    }
-    mEncoded += '\'';
+    return std::move(mPrefix) + mFields.dump();
 }
 
 //! Prepare a same-thread user scope only when the selected region has an active callback.

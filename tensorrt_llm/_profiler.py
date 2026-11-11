@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared, observational PyTorch profiler scopes and literal metadata."""
+"""Shared, observational PyTorch profiler scopes and JSON metadata."""
 
+import json
 import logging
 import math
 import os
@@ -24,8 +25,6 @@ from typing import Literal, TypeAlias, cast
 import torch
 
 ProfilerRegion: TypeAlias = Literal["workflow", "mpi", "nccl", "nanobind", "kv", "moe"]
-
-
 MetadataValue: TypeAlias = (
     str
     | int
@@ -37,32 +36,27 @@ MetadataValue: TypeAlias = (
     | dict[str, "MetadataValue"]
 )
 
-
 __all__ = [
     "MetadataValue",
     "ProfilerRegion",
     "custom_region_active",
     "custom_region_enabled",
+    "encode_metadata",
     "record_function_metadata_scope",
     "warn_profiler_failure",
 ]
+
 _CUSTOM_REGIONS_ENV = "TLLM_PROFILE_CUSTOM_REGIONS"
-
-
 _CUSTOM_REGION_NAMES: frozenset[ProfilerRegion] = frozenset(
     {"workflow", "mpi", "nccl", "nanobind", "kv", "moe"}
 )
-
-
 _CUSTOM_REGION_DEFAULTS = _CUSTOM_REGION_NAMES - {"kv", "moe"}
-
-
-_METADATA_PREFIX = "TRTLLM1"
+_METADATA_PREFIX = "TRTLLM1:"
 
 
 def _parse_custom_regions(value: str | None) -> frozenset[ProfilerRegion]:
     """Parse the startup selector, rejecting unknown or repeated region names."""
-    if value is None or not value.strip():
+    if value is None or not value.strip(" \t\r\n"):
         return _CUSTOM_REGION_DEFAULTS
     regions = [region.strip(" \t\r\n") for region in value.split(",")]
     if regions == ["none"]:
@@ -74,7 +68,7 @@ def _parse_custom_regions(value: str | None) -> frozenset[ProfilerRegion]:
     ):
         raise ValueError(
             f"Invalid {_CUSTOM_REGIONS_ENV}: {value!r}; expected a comma-separated subset of "
-            "workflow,mpi,nccl,nanobind,kv,moe or none"
+            f"{','.join(sorted(_CUSTOM_REGION_NAMES))} or none"
         )
     return frozenset(cast(ProfilerRegion, region) for region in regions)
 
@@ -89,8 +83,8 @@ def _load_custom_regions() -> frozenset[ProfilerRegion]:
 
 
 _CUSTOM_REGIONS = _load_custom_regions()
-
-
+# Metadata access, literal validation, tensor conversion, and profiler operations
+# can fail independently of the observed workload.
 _OBSERVATION_ERRORS = (AttributeError, LookupError, TypeError, ValueError, RuntimeError, OSError)
 
 
@@ -128,47 +122,63 @@ def warn_profiler_failure(name: str, region: ProfilerRegion, phase: str, error: 
         pass
 
 
-def _validate_metadata_value(value: MetadataValue) -> None:
-    """Reject values that cannot be encoded as supported finite literals."""
-    if type(value) not in (type(None), str, bool, int, float, list, tuple, dict):
-        raise TypeError(f"Unsupported profiler metadata value: {type(value).__name__}")
-    if value is None or isinstance(value, (str, bool, int)):
+def _validate_metadata_value(value: MetadataValue, ancestors: set[int] | None = None) -> None:
+    """Reject nonfinite values, nonstring keys, unsupported types, and cycles."""
+    value_type = type(value)
+    # Scalar fields dominate workflow/MPI payloads. Exact types retain the
+    # strict built-in contract without repeatedly building a type tuple.
+    if value_type is str or value_type is int or value_type is bool or value is None:
         return
-    if isinstance(value, float):
+    if value_type is float:
         if not math.isfinite(value):
             raise ValueError("Profiler metadata floats must be finite")
         return
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            _validate_metadata_value(item)
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if type(key) is not str:
-                raise TypeError("Profiler metadata keys must be strings")
-            _validate_metadata_value(item)
-        return
+    if value_type not in (list, tuple, dict):
+        raise TypeError(f"Unsupported profiler metadata value: {value_type.__name__}")
+    if ancestors is None:
+        ancestors = set()
+    identity = id(value)
+    if identity in ancestors:
+        raise ValueError("Profiler metadata cannot contain cycles")
+    ancestors.add(identity)
+    try:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise TypeError("Profiler metadata keys must be strings")
+                _validate_metadata_value(item, ancestors)
+        else:
+            for item in value:
+                _validate_metadata_value(item, ancestors)
+    finally:
+        ancestors.remove(identity)
 
 
-def _encode_metadata(region: ProfilerRegion, metadata: Mapping[str, MetadataValue]) -> str:
-    """Encode a UTF-8 byte-prefixed region and a supported Python literal dictionary."""
+def encode_metadata(region: str, metadata: Mapping[str, MetadataValue]) -> str:
+    """Encode ``TRTLLM1:<UTF-8 region bytes>:<region><finite JSON object>``.
+
+    Dictionary keys must be strings at every depth. Tuples become JSON arrays;
+    unsupported objects, nonfinite numbers, and cycles raise TypeError/ValueError.
+    """
     fields = dict(metadata)
     _validate_metadata_value(fields)
-    return _METADATA_PREFIX + f"{len(region.encode('utf-8'))}:{region}" + repr(fields)
+    encoded = json.dumps(fields, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    return _METADATA_PREFIX + f"{len(region.encode('utf-8'))}:{region}" + encoded
 
 
 @contextmanager
 def record_function_metadata_scope(
     name: str,
     region: ProfilerRegion,
-    metadata_factory: Callable[[], str | Mapping[str, MetadataValue]],
+    metadata_factory: Callable[[], str | Mapping[str, MetadataValue]] | None = None,
 ) -> Generator[None, None, None]:
     """Record a selected active scope without changing the body's outcome.
 
     Args:
         name: The PyTorch user-scope name.
         region: The category controlled by process-start selection.
-        metadata_factory: A lazy producer of a complete envelope or typed fields.
+        metadata_factory: Optional lazy envelope or typed fields; omit it for a
+            metadata-free observational scope.
 
     Yields:
         None while the wrapped operation executes. ``contextmanager`` converts
@@ -185,18 +195,18 @@ def record_function_metadata_scope(
 
     scope: torch.profiler.record_function | None = None
     try:
-        metadata = metadata_factory()
-        if not isinstance(metadata, str):
-            metadata = _encode_metadata(region, metadata)
+        metadata = metadata_factory() if metadata_factory is not None else None
+        if metadata is not None and not isinstance(metadata, str):
+            metadata = encode_metadata(region, metadata)
     except _OBSERVATION_ERRORS as error:
         warn_profiler_failure(name, region, "metadata", error)
-    else:
-        try:
-            scope = torch.profiler.record_function(name, args=metadata)
-            scope.__enter__()
-        except _OBSERVATION_ERRORS as error:
-            warn_profiler_failure(name, region, "entry", error)
-            scope = None
+        metadata = None
+    try:
+        scope = torch.profiler.record_function(name, args=metadata)
+        scope.__enter__()
+    except _OBSERVATION_ERRORS as error:
+        warn_profiler_failure(name, region, "entry", error)
+        scope = None
     try:
         yield
     finally:

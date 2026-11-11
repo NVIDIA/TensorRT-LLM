@@ -18,7 +18,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdlib>
+#include <fstream>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,6 +35,7 @@ struct Observation
 {
     std::string name;
     std::string metadata;
+    bool inputsEmpty{true};
     int starts{0};
     int ends{0};
 };
@@ -48,18 +52,11 @@ std::unique_ptr<at::ObserverContext> observeStart(at::RecordFunction const& reco
     auto& value = observation();
     value.name = record.name();
     ++value.starts;
-    if (!record.inputs().empty())
+    value.inputsEmpty = record.inputs().empty();
+    if (!value.inputsEmpty)
     {
         value.metadata = record.inputs().front().toStringRef();
     }
-    return nullptr;
-}
-
-std::unique_ptr<at::ObserverContext> observeName(at::RecordFunction const& record)
-{
-    auto& value = observation();
-    value.name = record.name();
-    ++value.starts;
     return nullptr;
 }
 
@@ -73,7 +70,7 @@ class CallbackGuard
 public:
     //! Install a thread-local user-scope callback and clear observations from earlier tests.
     explicit CallbackGuard(bool inputs = true)
-        : mHandle{at::addThreadLocalCallback(at::RecordFunctionCallback(inputs ? observeStart : observeName, observeEnd)
+        : mHandle{at::addThreadLocalCallback(at::RecordFunctionCallback(observeStart, observeEnd)
                                                  .needsInputs(inputs)
                                                  .scopes({at::RecordScope::USER_SCOPE}))}
     {
@@ -94,78 +91,55 @@ private:
 
 #if !defined(_WIN32)
 //! Check selection in a child process and verify that later environment changes are ignored.
-void checkSelection(char const* selection, std::vector<tc::ProfilerRegion> const& expected)
+void checkSelection(nlohmann::json const& selection)
 {
-    if (selection == nullptr)
+    if (selection["value"].is_null())
     {
         unsetenv("TLLM_PROFILE_CUSTOM_REGIONS");
     }
     else
     {
-        setenv("TLLM_PROFILE_CUSTOM_REGIONS", selection, 1);
+        auto const value = selection["value"].get<std::string>();
+        setenv("TLLM_PROFILE_CUSTOM_REGIONS", value.c_str(), 1);
     }
-    ASSERT_FALSE(tc::initializeProfiler().has_value());
-    for (auto region : {tc::ProfilerRegion::kWorkflow, tc::ProfilerRegion::kMpi, tc::ProfilerRegion::kNccl,
-             tc::ProfilerRegion::kNanobind, tc::ProfilerRegion::kKv, tc::ProfilerRegion::kMoe})
+    auto const error = tc::initializeProfilerRegions();
+    if (error.has_value() == selection["valid"].get<bool>()
+        || (error && error->find("TLLM_PROFILE_CUSTOM_REGIONS") == std::string::npos))
     {
-        bool selected = false;
-        for (auto candidate : expected)
-        {
-            selected = selected || candidate == region;
-        }
+        std::exit(1);
+    }
+    std::pair<tc::ProfilerRegion, char const*> const regions[]{{tc::ProfilerRegion::kWorkflow, "workflow"},
+        {tc::ProfilerRegion::kMpi, "mpi"}, {tc::ProfilerRegion::kNccl, "nccl"},
+        {tc::ProfilerRegion::kNanobind, "nanobind"}, {tc::ProfilerRegion::kKv, "kv"},
+        {tc::ProfilerRegion::kMoe, "moe"}};
+    auto const expected = selection["expected"].get<std::vector<std::string>>();
+    for (auto const& [region, name] : regions)
+    {
+        bool const selected = std::find(expected.begin(), expected.end(), name) != expected.end();
         if (tc::customRegionEnabled(region) != selected)
         {
             std::exit(1);
         }
     }
     setenv("TLLM_PROFILE_CUSTOM_REGIONS", "unknown", 1);
-    ASSERT_FALSE(tc::initializeProfiler().has_value());
-    std::exit(0);
+    std::exit(tc::initializeProfilerRegions() == error ? 0 : 1);
 }
 #endif
 
 } // namespace
 
 #if !defined(_WIN32)
-//! Check default, explicit, trimmed, empty, and none selections in independent child processes.
-TEST(ProfilerStartupDeathTest, DefaultsAndOptInAreCached)
+//! Check both language implementations against the same startup selector cases, including cached diagnostics.
+TEST(ProfilerStartupDeathTest, SharedSelectorCasesAreCached)
 {
-    EXPECT_EXIT(checkSelection(nullptr,
-                    {tc::ProfilerRegion::kWorkflow, tc::ProfilerRegion::kMpi, tc::ProfilerRegion::kNccl,
-                        tc::ProfilerRegion::kNanobind}),
-        ::testing::ExitedWithCode(0), "");
-    EXPECT_EXIT(checkSelection("workflow,moe", {tc::ProfilerRegion::kWorkflow, tc::ProfilerRegion::kMoe}),
-        ::testing::ExitedWithCode(0), "");
-    EXPECT_EXIT(checkSelection(" workflow , kv ", {tc::ProfilerRegion::kWorkflow, tc::ProfilerRegion::kKv}),
-        ::testing::ExitedWithCode(0), "");
-    EXPECT_EXIT(checkSelection("",
-                    {tc::ProfilerRegion::kWorkflow, tc::ProfilerRegion::kMpi, tc::ProfilerRegion::kNccl,
-                        tc::ProfilerRegion::kNanobind}),
-        ::testing::ExitedWithCode(0), "");
-    EXPECT_EXIT(checkSelection("  ",
-                    {tc::ProfilerRegion::kWorkflow, tc::ProfilerRegion::kMpi, tc::ProfilerRegion::kNccl,
-                        tc::ProfilerRegion::kNanobind}),
-        ::testing::ExitedWithCode(0), "");
-    EXPECT_EXIT(checkSelection("none", {}), ::testing::ExitedWithCode(0), "");
-}
-
-//! Verify malformed selections retain their first diagnostic and select the default regions.
-TEST(ProfilerStartupDeathTest, InvalidSelectionReturnsCachedDiagnosticAndDefaults)
-{
-    for (auto const* selection : {"workflow,", ",workflow", "workflow,,mpi", "unknown", "mpi,mpi", "none,kv"})
+    std::ifstream fixture{TRTLLM_PROFILER_SELECTOR_CASES};
+    ASSERT_TRUE(fixture.is_open());
+    auto const cases = nlohmann::json::parse(fixture);
+    ASSERT_FALSE(cases.empty());
+    for (auto const& selection : cases)
     {
-        EXPECT_EXIT(
-            {
-                setenv("TLLM_PROFILE_CUSTOM_REGIONS", selection, 1);
-                auto const error = tc::initializeProfiler();
-                bool const diagnosed = error && error->find("TLLM_PROFILE_CUSTOM_REGIONS") != std::string::npos;
-                bool const defaults = tc::customRegionEnabled(tc::ProfilerRegion::kWorkflow)
-                    && !tc::customRegionEnabled(tc::ProfilerRegion::kKv);
-                setenv("TLLM_PROFILE_CUSTOM_REGIONS", "none", 1);
-                auto const repeatedError = tc::initializeProfiler();
-                std::exit(diagnosed && defaults && repeatedError == error ? 0 : 1);
-            },
-            ::testing::ExitedWithCode(0), "");
+        SCOPED_TRACE(selection.dump());
+        EXPECT_EXIT(checkSelection(selection), ::testing::ExitedWithCode(0), "");
     }
 }
 
@@ -175,7 +149,7 @@ TEST(ProfilerStartupDeathTest, ObservationFailureWarnsOnceAndPreservesOperationE
     EXPECT_EXIT(
         {
             unsetenv("TLLM_PROFILE_CUSTOM_REGIONS");
-            if (tc::initializeProfiler())
+            if (tc::initializeProfilerRegions())
             {
                 std::exit(1);
             }
@@ -186,7 +160,8 @@ TEST(ProfilerStartupDeathTest, ObservationFailureWarnsOnceAndPreservesOperationE
                 try
                 {
                     tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kWorkflow};
-                    scope.start("failed", [](tc::ProfilerMetadata&) { throw std::runtime_error("factory failed"); });
+                    scope.startWithLazyName([]() -> std::string { return "failed"; },
+                        [](tc::ProfilerMetadata&) { throw std::runtime_error("factory failed"); });
                     bodyRan = true;
                     throw std::logic_error("body failed");
                 }
@@ -224,7 +199,7 @@ TEST(ProfilerStartupDeathTest, NoneSelectionNeverEvaluatesFactoriesOrEmitsScopes
     EXPECT_EXIT(
         {
             setenv("TLLM_PROFILE_CUSTOM_REGIONS", "none", 1);
-            ASSERT_FALSE(tc::initializeProfiler().has_value());
+            ASSERT_FALSE(tc::initializeProfilerRegions().has_value());
             CallbackGuard callback;
             tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kWorkflow};
             scope.startWithLazyName([]() -> std::string { throw std::logic_error("name evaluated"); },
@@ -243,16 +218,17 @@ TEST(ProfilerMetadataTest, NativeGoldenIncludesUnicodeEscapingSignedIntegersAndE
     metadata.add("rank", std::int64_t{-7});
     metadata.add("ids", std::vector<std::int64_t>{});
     EXPECT_EQ(
-        std::move(metadata).take(), "TRTLLM18:workflow{'quoted\\'key':'slash\\\\line\\n\\t\\'雪','rank':-7,'ids':[]}");
+        std::move(metadata).take(), R"(TRTLLM1:8:workflow{"quoted'key":"slash\\line\n\t'雪","rank":-7,"ids":[]})");
 }
 
 //! Check UTF-8 region byte lengths, control-byte escapes, and signed integer boundary literals.
-TEST(ProfilerMetadataTest, ByteLengthsAndControlCharactersAreLiteralCompatible)
+TEST(ProfilerMetadataTest, ByteLengthsAndControlCharactersAreJsonCompatible)
 {
     tc::ProfilerMetadata metadata{"区域"};
     metadata.add("control", std::string_view{"\0\x01\r", 3});
     metadata.add("ids", std::vector<std::int64_t>{-7, 0, 9223372036854775807LL});
-    EXPECT_EQ(std::move(metadata).take(), "TRTLLM16:区域{'control':'\\x00\\x01\\r','ids':[-7,0,9223372036854775807]}");
+    EXPECT_EQ(
+        std::move(metadata).take(), R"(TRTLLM1:6:区域{"control":"\u0000\u0001\r","ids":[-7,0,9223372036854775807]})");
 }
 
 class ProfilerScopeTest : public ::testing::Test
@@ -266,7 +242,7 @@ protected:
 #else
         ASSERT_EQ(unsetenv("TLLM_PROFILE_CUSTOM_REGIONS"), 0);
 #endif
-        ASSERT_FALSE(tc::initializeProfiler().has_value());
+        ASSERT_FALSE(tc::initializeProfilerRegions().has_value());
     }
 };
 
@@ -289,9 +265,10 @@ TEST_F(ProfilerScopeTest, ActiveCallbackReceivesOwnedMetadataAndEndsOnce)
                 ++fields;
                 metadata.add("rank", std::int64_t{-7});
             });
-        scope.start("duplicate", [](tc::ProfilerMetadata&) { FAIL() << "scope started twice"; });
+        scope.startWithLazyName([]() -> std::string { return "duplicate"; },
+            [](tc::ProfilerMetadata&) { FAIL() << "scope started twice"; });
         EXPECT_EQ(observation().name, "foundation");
-        EXPECT_EQ(observation().metadata, "TRTLLM18:workflow{'rank':-7}");
+        EXPECT_EQ(observation().metadata, R"(TRTLLM1:8:workflow{"rank":-7})");
     }
     EXPECT_EQ(names, 1);
     EXPECT_EQ(fields, 1);
@@ -305,12 +282,13 @@ TEST_F(ProfilerScopeTest, CallbackWithoutInputsDoesNotInspectMetadata)
     CallbackGuard callback{false};
     {
         tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kWorkflow};
-        scope.start("name-only", [](tc::ProfilerMetadata&) { FAIL() << "unneeded metadata evaluated"; });
+        scope.startWithLazyName([]() -> std::string { return "name-only"; },
+            [](tc::ProfilerMetadata&) { FAIL() << "unneeded metadata evaluated"; });
     }
     EXPECT_EQ(observation().name, "name-only");
     EXPECT_EQ(observation().starts, 1);
     EXPECT_EQ(observation().ends, 1);
-    EXPECT_TRUE(observation().metadata.empty());
+    EXPECT_TRUE(observation().inputsEmpty);
 }
 
 //! Verify missing callbacks and excluded regions both bypass name and metadata factories.
@@ -342,7 +320,8 @@ TEST_F(ProfilerScopeTest, MetadataFailureDoesNotPreventBodyOrMaskItsException)
     try
     {
         tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kWorkflow};
-        scope.start("failed-metadata", [](tc::ProfilerMetadata&) { throw std::runtime_error("metadata failed"); });
+        scope.startWithLazyName([]() -> std::string { return "failed-metadata"; },
+            [](tc::ProfilerMetadata&) { throw std::runtime_error("metadata failed"); });
         bodyRan = true;
         throw std::logic_error("original body failure");
     }
