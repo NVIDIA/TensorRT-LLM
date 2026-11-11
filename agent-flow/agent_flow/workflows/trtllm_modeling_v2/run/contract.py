@@ -11,22 +11,26 @@ is trusted. The contract is run once, whole, on the final commit
 passed on that one commit.
 
 Verdicts are appended to ``contract_status.jsonl``, each with the tree it
-measured (:func:`tree_id`: the commit and the native libraries built into the
+measured (:func:`tree_id`: the git tree and the contents of the native libraries built into the
 checkout). A verdict about any other tree does not count (:func:`evaluate`).
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import yaml
 
 from ..checks import disagg, serve
+from ..infra.git import git_output
+from ..operators.coverage import MODELING_V2_PACKAGE
+from ..spec import deployments as deployments_mod
 from ..spec import shorthand
 from ..spec import variants as variants_mod
 from ..spec.shorthand import order_members_by_cost
@@ -47,6 +51,8 @@ CONTRACT_FILENAME = "contract.yaml"
 STATUS_FILENAME = "contract_status.jsonl"
 #: Where the native libraries an engine loads are built: inside the checkout, ignored by git.
 NATIVE_LIBRARY_DIRS: tuple[str, ...] = ("tensorrt_llm", "tensorrt_llm/libs")
+#: Where a family builds libraries of its own: anywhere under the Modeling V2 package.
+FAMILY_LIBRARY_DIR = MODELING_V2_PACKAGE
 NATIVE_LIBRARY_PATTERNS: tuple[str, ...] = ("*.so", "*.so.*")
 
 
@@ -236,33 +242,96 @@ def write_contract(workspace: Path, contract: Contract) -> Path:
 # ------------------------------------------------------------------ the tree a verdict is about
 
 
-def native_libraries(repo: Path) -> list[str]:
-    """Each native library built into the checkout: ``<path> <size> <mtime_ns>``, sorted."""
-    found: set[str] = set()
+def native_libraries(repo: Path) -> list[Path]:
+    """Each native library built into the checkout, sorted: the engine's and a family's own."""
+    found: set[Path] = set()
     for directory in NATIVE_LIBRARY_DIRS:
         for pattern in NATIVE_LIBRARY_PATTERNS:
-            for path in (repo / directory).glob(pattern):
-                try:
-                    stat = path.stat()
-                except OSError:
-                    continue
-                found.add(f"{path.relative_to(repo).as_posix()} {stat.st_size} {stat.st_mtime_ns}")
+            found.update(p for p in (repo / directory).glob(pattern) if p.is_file())
+    for pattern in NATIVE_LIBRARY_PATTERNS:
+        found.update(p for p in (repo / FAMILY_LIBRARY_DIR).rglob(pattern) if p.is_file())
     return sorted(found)
 
 
-def tree_id(repo: str | Path, commit: str) -> str:
-    """What a verdict is about: ``commit``, and the native libraries built into ``repo``.
+def _content_hash(path: Path) -> str:
+    """The SHA-256 of a file's bytes, read every time: size and time do not say content."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
-    The libraries are outside git, so a rebuild changes what a check measures
-    without a commit; their sizes and modification times are part of the id.
+
+def library_digest(repo: str | Path) -> str:
+    """One hash of the contents of the native libraries built into ``repo``.
+
+    Content, not size and time: the same build copied to another node is the same
+    libraries, and a rebuild that changes a byte is not.
+    """
+    digest = hashlib.sha256()
+    root = Path(repo)
+    for library in native_libraries(root):
+        try:
+            digest.update(
+                f"{library.relative_to(root).as_posix()} {_content_hash(library)}\n".encode()
+            )
+        except OSError:
+            continue
+    return digest.hexdigest()[:12]
+
+
+@functools.lru_cache(maxsize=1)
+def flow_version() -> str:
+    """A hash of this workflow's own sources: a verdict belongs to the checks that gave it."""
+    root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for source in sorted(root.rglob("*.py")):
+        digest.update(source.relative_to(root).as_posix().encode())
+        digest.update(source.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def inputs_digest(task_data: Mapping[str, Any]) -> str:
+    """A hash of what the checks read of the spec: all of it but ``notes`` and ``agents``.
+
+    With the options each deployment resolves to, so an options file edited in place
+    counts as the spec edit it is.
+    """
+    spec = {k: v for k, v in task_data.items() if k not in ("notes", "agents")}
+    try:
+        resolved = [
+            {role: dict(server.options) for role, server in deployment.servers.items()}
+            for deployment in deployments_mod.resolve(task_data)
+        ]
+    except (ValueError, OSError, KeyError):
+        resolved = []
+    text = json.dumps([spec, resolved], sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def tree_id(
+    repo: str | Path,
+    commit: str,
+    task_data: Mapping[str, Any] | None = None,
+    environment: str = "",
+    git: Callable[..., Any] = git_output,
+) -> str:
+    """What a verdict is about, by content.
+
+    The git tree of ``commit`` (not the commit: the same files under another commit are
+    the same thing measured) and the contents of the native libraries built into
+    ``repo``, which are outside git. With ``task_data``, also what the checks read of
+    the spec, this workflow's own version and ``environment`` (a digest of where the
+    checks run): a verdict counts only where all five are what they were.
     ``""`` without a commit: nothing is established, and no verdict counts.
     """
     if not commit:
         return ""
-    digest = hashlib.sha1()
-    for library in native_libraries(Path(repo)):
-        digest.update(os.fsencode(f"{library}\n"))
-    return f"{commit}+{digest.hexdigest()[:12]}"
+    words = (git(str(repo), "rev-parse", f"{commit}^{{tree}}") or "").split()
+    parts = [words[0] if words else commit, library_digest(repo)]
+    if task_data is not None:
+        parts += [inputs_digest(task_data), flow_version(), environment or "unknown-environment"]
+    return "+".join(parts)
 
 
 # ------------------------------------------------------------------------------ verdicts
@@ -350,12 +419,18 @@ class ContractStatus:
         )
         self.verdicts.append(verdict)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Synced: a verdict that cost a load must survive the node that measured it.
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(asdict(verdict)) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         return verdict
 
     def on(self, tree: str, round: int | None = None) -> dict[str, Verdict]:
-        """The last verdict per check key measured on ``tree`` (in ``round``, when given)."""
+        """The latest verdict per check key measured on ``tree`` (in ``round``, when given).
+
+        The latest outcome counts: a failure recorded after a pass replaces it.
+        """
         last: dict[str, Verdict] = {}
         for v in self.verdicts:
             if tree and v.tree == tree and (round is None or v.round == round):
@@ -417,6 +492,9 @@ __all__ = [
     "benchmark_members",
     "compile_contract",
     "evaluate",
+    "flow_version",
+    "inputs_digest",
+    "library_digest",
     "native_libraries",
     "tree_id",
     "write_contract",

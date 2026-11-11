@@ -18,6 +18,7 @@ once the operator has repaired what it names.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import threading
 from pathlib import Path
@@ -361,6 +362,20 @@ class TrtllmModelingV2Workflow:
         repo = str(self.task_data.get("trtllm_repo_path") or "")
         words = (self._git(repo, "rev-parse", "HEAD") or "").split() if repo else []
         return words[0] if words else ""
+
+    def _identity(self, commit: str | None = None) -> str:
+        """What a verdict measured on ``commit`` (the checkout's, unsaid) is about, by content.
+
+        The tree and its native libraries, what the checks read of the spec, this
+        workflow's version, and the environment the checks run in as the run resolved
+        it: the interpreter, the exported variables, the devices and the launch prefix.
+        """
+        repo = str(self.task_data.get("trtllm_repo_path") or "")
+        described = self.environment.describe() if self.environment is not None else ""
+        environment = hashlib.sha256(described.encode("utf-8")).hexdigest()[:12]
+        return contract_mod.tree_id(
+            repo, self._head() if commit is None else commit, self.task_data, environment, self._git
+        )
 
     def _commit_policy(self) -> CommitPolicy:
         """The run's commit rules: who commits, and that a run changes only its own paths."""

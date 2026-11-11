@@ -11,7 +11,7 @@ delivered only when all of it passed on that one commit, with the checkout
 clean and unmoved while it ran.
 
 One rule decides what counts: a verdict counts for the tree it measured
-(``contract.tree_id``: the commit and the native libraries built into the
+(``contract.tree_id``: the git tree and the contents of the native libraries built into the
 checkout) and for no other. A round whose tree changed under it certifies
 nothing. Nothing is shared between checks and
 nothing is carried from an earlier commit. A round interrupted by a restart
@@ -233,7 +233,7 @@ def certify(workflow, round: int, first: Sequence[str] = (), log=None) -> Certif
     contract = workflow._contract
     repo = str(workflow.task_data.get("trtllm_repo_path") or "")
     commit = workflow._head()
-    tree = contract_mod.tree_id(repo, commit)
+    tree = workflow._identity(commit)
     status = workflow._contract_status()
 
     def result(delivery=None, problems: Sequence[str] = ()) -> Certification:
@@ -270,7 +270,7 @@ def certify(workflow, round: int, first: Sequence[str] = (), log=None) -> Certif
             f"[bold {colour}]{check.unit}: {escape_markup(outcome.summary())}[/bold {colour}]",
             log,
         )
-        if contract_mod.tree_id(repo, workflow._head()) != tree:
+        if workflow._identity() != tree:
             return result(
                 problems=["its commit or its native libraries changed while the checks ran"]
             )
@@ -293,7 +293,7 @@ def certify(workflow, round: int, first: Sequence[str] = (), log=None) -> Certif
                 DeliveryCheck("delivery", False, f"could not be run: {type(exc).__name__}: {exc}"),
             )
         )
-    if contract_mod.tree_id(repo, workflow._head()) != tree or _dirty(workflow, repo):
+    if workflow._identity() != tree or _dirty(workflow, repo):
         problems.append("it changed while the delivery checks ran")
     return result(delivery, problems)
 

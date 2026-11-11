@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -577,16 +578,19 @@ def test_a_passing_verdict_counts_only_for_the_tree_it_measured(tmp_path):
     class Result:
         name, member, detail, passed, infrastructure = "boot", "tp1", "ok", True, ""
 
-    before = contract_mod.tree_id(repo, "aaaa")
+    before = contract_mod.tree_id(repo, "aaaa", git=lambda *args: "")
     status.record(contract.checks[0], Result(), tree=before, round=1)
     assert contract_mod.evaluate(contract, status.on(before, 1)).missing == (contract.checks[1],)
     assert contract_mod.evaluate(contract, status.on(before, 1)).passed == (contract.checks[0],)
-    # Another commit, another round, or a rebuilt native library: the verdict is not about it.
-    assert not contract_mod.evaluate(contract, status.on(contract_mod.tree_id(repo, "bbbb"))).passed
+    # Another tree, another round, or a rebuilt native library: the verdict is not about it.
+    other = contract_mod.tree_id(repo, "bbbb", git=lambda *args: "")
+    assert not contract_mod.evaluate(contract, status.on(other)).passed
     assert not contract_mod.evaluate(contract, status.on(before, 2)).passed
-    (repo / "tensorrt_llm" / "libtensorrt_llm.so").write_bytes(b"elf")
-    assert contract_mod.tree_id(repo, "aaaa") != before
-    assert contract_mod.tree_id(repo, "") == ""
+    library = repo / "tensorrt_llm" / "libtensorrt_llm.so"
+    library.write_bytes(b"elf")
+    rebuilt = contract_mod.tree_id(repo, "aaaa", git=lambda *args: "")
+    assert rebuilt != before
+    assert contract_mod.tree_id(repo, "", git=lambda *args: "") == ""
     # A result the infrastructure ended is never a pass.
     Result.infrastructure = "the session was lost"
     assert not status.record(contract.checks[1], Result(), tree=before, round=1).passed
@@ -885,5 +889,58 @@ def test_a_task_whose_branch_conflicts_goes_back_to_its_worker_once_and_then_lan
     head = _git(repo, "rev-parse", "HEAD")
     certification = yaml.safe_load((tmp_path / "ws" / "certification.yaml").read_text())
     assert certification["commit"] == head
-    assert {v["tree"].split("+")[0] for v in _verdicts(tmp_path)} == {head}
+    # A verdict names the files it measured: the commit's tree, not the commit.
+    tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    assert {v["tree"].split("+")[0] for v in _verdicts(tmp_path)} == {tree}
     assert not (tmp_path / "ws" / "worktrees" / "core").exists()  # integrated, so closed
+
+
+def test_a_verdict_is_identified_by_content(tmp_path):
+    repo = tmp_path / "repo"
+    family = repo / contract_mod.FAMILY_LIBRARY_DIR / "models" / "fam" / "native"
+    family.mkdir(parents=True)
+    (repo / "tensorrt_llm" / "libs").mkdir(parents=True, exist_ok=True)
+    engine = repo / "tensorrt_llm" / "libs" / "libtensorrt_llm.so"
+    engine.write_bytes(b"engine")
+    kernels = family / "libfam_kernels.so.1"
+    kernels.write_bytes(b"kernels")
+
+    def git(repo, *args, stdin=None):
+        # Two commits with the same files have one tree.
+        return {"aaaa^{tree}": "7ree", "bbbb^{tree}": "7ree", "cccc^{tree}": "0ther"}[args[-1]]
+
+    spec = {"checkpoint_path": "/ckpt", "parallel": "tp1", "notes": "n", "agents": {"a": 1}}
+    spec["deployments"] = [{"name": "tp1", "options": {"max_seq_len": 5120}}]
+
+    def identity(commit="aaaa", task=spec, environment="env1"):
+        return contract_mod.tree_id(repo, commit, task, environment, git)
+
+    base = identity()
+    assert base.split("+")[0] == "7ree" and len(base.split("+")) == 5
+    assert identity("bbbb") == base and identity("cccc") != base
+    # The same build on another node: other times, the same bytes.
+    os.utime(engine, ns=(1, 1))
+    assert identity() == base
+    # A rebuilt engine library, or a family's own, is another thing measured.
+    kernels.write_bytes(b"rebuilt")
+    assert identity() != base
+    kernels.write_bytes(b"kernels")
+    assert identity() == base
+    # What the checks read of the spec, and where they run; not the notes or the agents.
+    assert identity(task={**spec, "notes": "other", "agents": {}}) == base
+    edited = {**spec, "deployments": [{"name": "tp1", "options": {"max_seq_len": 4096}}]}
+    assert identity(task=edited) != base
+    assert identity(environment="env2") != base
+    assert contract_mod.flow_version() in base
+
+    # The latest outcome counts, and every append reaches the disk.
+    status = contract_mod.ContractStatus.load(tmp_path)
+    check = contract_mod.Check("core", "boot", "tp1")
+
+    class Result:
+        name, member, detail, passed, infrastructure = "boot", "tp1", "ok", True, ""
+
+    status.record(check, Result(), tree=base)
+    Result.passed = False
+    status.record(check, Result(), tree=base)
+    assert not contract_mod.ContractStatus.load(tmp_path).on(base)["core:boot@tp1"].passed
