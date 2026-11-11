@@ -27,6 +27,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.fmha import gqa_decode
 from tensorrt_llm._torch.attention.backends.fmha import gqa_kv_replica_fused as F
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
+    FlashInferTrtllmGenFmha,
     _get_generation_workspace_layout,
 )
 from tensorrt_llm._torch.attention.backends.fmha.gqa_decode import (
@@ -37,9 +38,7 @@ from tensorrt_llm._torch.attention.backends.fmha.gqa_decode import (
     GqaSplitKvFmha,
 )
 from tensorrt_llm._torch.attention.backends.fmha.gqa_kv_replica import kv_replica_partial_merge_free
-from tensorrt_llm._torch.attention.backends.fmha.gqa_segmented_decode import (
-    segment_attention_softmax_bytes,
-)
+from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -406,26 +405,15 @@ KV_REPLICAS, LOCAL_HEADS = 2, 8
 def test_kv_replica_segment_attention_takes_softmax_stats(
     max_batch: int, tokens_per_gen_step: int, softmax_bytes: int
 ) -> None:
-    """The largest segment attention call of the KV-replica decode overflows the trtllm-gen decode's FMHA workspace
-    by FlashInfer's softmax stats, and runs on that workspace extended by segment_attention_softmax_bytes."""
+    """The segment kernel needs its softmax statistics in addition to the ordinary FMHA workspace."""
     page = 32
     max_kv_len = 1 << 18  # the 256K-token window of the failing configuration
     group_heads = KV_REPLICAS * LOCAL_HEADS
-    layer = SimpleNamespace(
-        num_heads=LOCAL_HEADS,
-        gqa_decode=GqaDecodeSetup(kv_replicas=KV_REPLICAS, tokens_per_gen_step=tokens_per_gen_step),
-    )
-    assert GqaKvReplicaFmha._largest_segment_stats_bytes(layer, max_batch) == softmax_bytes
-    for b in range(1, max_batch + 1):
-        for q_len in range(1, tokens_per_gen_step + 1):
-            call = GqaKvReplicaFmha._segment_call(b, q_len, group_heads)
-            assert segment_attention_softmax_bytes(*call) <= softmax_bytes
-
     # The largest call: max_batch requests of tokens_per_gen_step tokens.
     b, q_len = max_batch, tokens_per_gen_step
     segments = GqaKvReplicaFmha._num_segments(b, q_len)
-    call = GqaKvReplicaFmha._segment_call(b, q_len, group_heads)
-    assert segment_attention_softmax_bytes(*call) == softmax_bytes
+    num_segment_requests = b * segments
+    num_folded_heads = q_len * group_heads
     dev = torch.device("cuda", 0)
     g = torch.Generator(device=dev).manual_seed(b + q_len)
     lens = torch.randint(q_len + 1, q_len + 300, (b,), device=dev, generator=g).to(torch.int32)
@@ -441,7 +429,9 @@ def test_kv_replica_segment_attention_takes_softmax_stats(
         .to(torch.float8_e4m3fn)
         .permute(1, 0, 2, 3)
     )
-    counter = torch.zeros(call[0] * call[1] + 1024, dtype=torch.int32, device=dev)
+    counter = torch.zeros(
+        num_segment_requests * num_folded_heads + 1024, dtype=torch.int32, device=dev
+    )
 
     def run(workspace: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return kv_replica_partial_merge_free(
@@ -486,6 +476,68 @@ def test_kv_replica_segment_attention_takes_softmax_stats(
     ref_o, ref_lse = _kv_replica_partial_ref(q_all, kv, tables, lens, q_len, 0, page, False)
     _assert_partial_matches(merged_o, ref_o)
     assert (merged_lse - ref_lse).abs().amax().item() < LSE_ABS_ERR
+
+
+def test_kv_replica_admission_respects_counter_capacity() -> None:
+    """A real library admits eight-token calls at capacity, but not ten-token calls; ordinary decode admits both."""
+    max_batch = 512
+    setup = GqaDecodeSetup(
+        kv_replicas=KV_REPLICAS,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        tokens_per_gen_step=10,
+    )
+    layer = _gqa_layer(LOCAL_HEADS, setup)
+    library = next(lib for lib in layer._fmha_manager.fmha_libs if type(lib) is GqaKvReplicaFmha)
+    ordinary = next(lib for lib in layer._fmha_manager.fmha_libs if type(lib) is GqaDecodeFmha)
+    manager = KVCacheManagerV2(
+        KvCacheConfig(max_tokens=max_batch * PAGE),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=HEAD_DIM,
+        tokens_per_block=PAGE,
+        max_seq_len=PAGE,
+        max_batch_size=max_batch,
+        mapping=setup.mapping,
+        dtype=tensorrt_llm.bindings.DataType.FP8,
+    )
+    request_ids = list(range(max_batch))
+    try:
+        manager.add_dummy_requests(request_ids, [11] * max_batch)
+        for q_len, admitted in ((8, True), (10, False)):
+            metadata = TrtllmAttentionMetadata(
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True, num_cached_tokens_per_seq=[1] * max_batch
+                ),
+                seq_lens=torch.full((max_batch,), q_len, dtype=torch.int32),
+                max_num_requests=max_batch,
+                max_num_tokens=max_batch * setup.tokens_per_gen_step,
+                kv_cache_manager=manager,
+                request_ids=request_ids,
+                prompt_lens=[q_len + 1] * max_batch,
+            )
+            metadata.prepare()
+            qkv = torch.empty(
+                max_batch * q_len,
+                (LOCAL_HEADS + 2) * HEAD_DIM,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            forward_args = AttentionForwardArgs(
+                output=torch.empty(
+                    max_batch * q_len,
+                    LOCAL_HEADS * HEAD_DIM,
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                ),
+                attention_input_type=AttentionInputType.generation_only,
+                is_fused_qkv=True,
+            )
+            assert ordinary.is_supported(qkv, None, None, metadata, forward_args)
+            assert library.is_supported(qkv, None, None, metadata, forward_args) is admitted
+    finally:
+        manager.shutdown()
 
 
 def test_segment_stats_bytes_follow_the_admitted_calls() -> None:
@@ -554,7 +606,7 @@ def _generation_call(
         metadata=metadata,
         fwd=fwd,
         workspace=workspace,
-        params=SimpleNamespace(
+        params=FmhaParams(
             attn=layer,
             workspace=workspace,
             input_seq_length=q_len,
@@ -587,9 +639,12 @@ def _fmha_slice(
     return workspace.view(torch.uint8).narrow(0, int(offset), int(size))
 
 
-@pytest.mark.parametrize("tokens_per_gen_step,stats_bytes", [(1, 34603008), (4, 68157440)])
+@pytest.mark.parametrize(
+    "tokens_per_gen_step,q_len,stats_bytes",
+    [(1, 1, 34603008), (4, 4, 68157440), (10, 8, 135266304)],
+)
 def test_kv_replica_library_runs_on_the_extended_fmha_workspace(
-    monkeypatch: pytest.MonkeyPatch, tokens_per_gen_step: int, stats_bytes: int
+    monkeypatch: pytest.MonkeyPatch, tokens_per_gen_step: int, q_len: int, stats_bytes: int
 ) -> None:
     """The layer's first generation call sizes the attention workspace for its largest segment attention call, and
     GqaKvReplicaFmha passes the FMHA slice extended by the call's softmax stats; a workspace that ends at the
@@ -614,14 +669,12 @@ def test_kv_replica_library_runs_on_the_extended_fmha_workspace(
     library = GqaKvReplicaFmha(layer)
 
     # The attention JIT warmup: one request, taken by the segmented library, sizes for the KV-replica calls too.
-    warmup = _generation_call(layer, max_batch, 1, tokens_per_gen_step)
+    warmup = _generation_call(layer, max_batch, 1, q_len)
     workspace = warmup.workspace
-    assert segmented._segment_stats_bytes(max_batch) == stats_bytes
-    assert library._segment_stats_bytes(max_batch) == stats_bytes
     segmented.prepare_workspace(warmup.qkv, None, None, warmup.metadata, warmup.fwd, workspace)
     sized = (workspace.data_ptr(), workspace.numel())
 
-    call = _generation_call(layer, max_batch, max_batch, tokens_per_gen_step)
+    call = _generation_call(layer, max_batch, max_batch, q_len)
     call.params.workspace = workspace
     library.prepare_workspace(call.qkv, None, None, call.metadata, call.fwd, workspace)
     # nothing left to grow at the first full batch
@@ -664,3 +717,19 @@ def test_segmented_library_takes_any_supported_q_len(monkeypatch: pytest.MonkeyP
     assert taken.data_ptr() == fmha_workspace.data_ptr()
     # 16 segments of q_len x HEADS folded heads
     assert taken.numel() == fmha_workspace.numel() + 2048 * 16 * q_len * HEADS + MIB
+
+
+def test_disabled_segment_libraries_do_not_extend_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabling both LSE-using libraries leaves the ordinary decode workspace unchanged."""
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "gqa_decode,fallback")
+    layer = _gqa_layer(LOCAL_HEADS, GqaDecodeSetup(kv_replicas=KV_REPLICAS, tokens_per_gen_step=1))
+    library = next(lib for lib in layer._fmha_manager.fmha_libs if type(lib) is GqaDecodeFmha)
+    call = _generation_call(layer, 512, 1, 1)
+    reference = torch.empty_like(call.workspace)
+    FlashInferTrtllmGenFmha(layer).prepare_workspace(
+        call.qkv, None, None, call.metadata, call.fwd, reference
+    )
+    library.prepare_workspace(call.qkv, None, None, call.metadata, call.fwd, call.workspace)
+    assert call.workspace.numel() == reference.numel()

@@ -329,15 +329,17 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
             self._counter_buffer = torch.zeros(slots, dtype=torch.int32, device=device)
 
     def _segment_stats_bytes(self, max_num_requests: int) -> int:
-        """Softmax-stats bytes of the largest segment attention call (gqa_segmented_decode.py) of the layer's
-        libraries; the same on every GQA decode library of the layer."""
+        """Softmax-stats bytes of the largest segment attention call admitted by an enabled library of the layer;
+        the same on every GQA decode library of the layer."""
         nbytes = self._segment_stats_bytes_cache.get(max_num_requests)
         if nbytes is None:
+            manager = self.attn._fmha_manager
+            assert manager is not None
             nbytes = max(
                 (
                     lib._largest_segment_stats_bytes(self.attn, max_num_requests)
-                    for lib in (GqaKvReplicaFmha, GqaSegmentedFmha)
-                    if lib.is_available(self.attn)
+                    for lib in manager.fmha_libs
+                    if isinstance(lib, (GqaKvReplicaFmha, GqaSegmentedFmha))
                 ),
                 default=0,
             )
