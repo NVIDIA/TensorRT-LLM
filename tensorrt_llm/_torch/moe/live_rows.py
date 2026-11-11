@@ -130,10 +130,14 @@ class LiveRowWord:
         The first call must run outside CUDA graph capture: it allocates the word holding the
         last value written, synchronizes the current stream so kernels on any stream read it,
         and allocates ``all_rows_word`` of the device too. Later calls return the same tensor
-        and require the same device.
+        and require the same device (a device without an index means the word's).
         """
         if self._tensor is not None:
-            if self._tensor.device != torch.device(device):
+            requested = torch.device(device)
+            if requested.type != self._tensor.device.type or requested.index not in (
+                None,
+                self._tensor.device.index,
+            ):
                 raise ValueError(
                     f"the live-row word lives on {self._tensor.device}, not on {device}"
                 )
@@ -186,7 +190,9 @@ def forward_rows_split_across_cp_ranks(mapping: Mapping) -> bool:
     """Whether each CP rank's token-indexed modules (MoE) run on a slice of the forward's rows.
 
     The condition under which the attention output projection reduce-scatters across the
-    CP group (``_helix_cp_output_projection`` in ``attention/attention.py``).
+    CP group (``_helix_cp_output_projection`` in ``attention/attention.py``). Other CP types
+    keep the forward's rows on every CP rank: Ulysses folds CP into attention TP, and the
+    MoE token counts of attention DP are then not divided by the CP size.
     """
     return mapping.has_cp_helix() and mapping.enable_attention_dp
 
