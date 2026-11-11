@@ -4663,7 +4663,7 @@ def test_megamoe_cutedsl_nvfp4_awq_matches_cutlass() -> None:
 
 
 @pytest.fixture(scope="module")
-def _run_megamoe_prologue_helper() -> Callable[[int, bool], torch.Tensor]:
+def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("The scheduler helper regression requires an SM107 CUDA GPU")
 
@@ -4793,7 +4793,8 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool], torch.Tensor]:
     compiled = cute.compile(probe, *tensors, stream)
     counter_index = probe.device.offset(probe.scheduler._work_id_worker.work_id_counter_region) // 4
 
-    def run(counter: int, input_exhausted: bool) -> torch.Tensor:
+    def run(counter: int, input_exhausted: bool, token_count: int) -> torch.Tensor:
+        counts.fill_(token_count)
         workspace.zero_()
         workspace.view(torch.int32)[counter_index] = counter
         workspace.view(torch.int32)[counter_index + 1] = 1
@@ -4812,7 +4813,7 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool], torch.Tensor]:
     ids=["slow-peek", "fast-peek", "already-exhausted"],
 )
 def test_fc1_prologue_wait_preserves_exhaustion(
-    _run_megamoe_prologue_helper: Callable[[int, bool], torch.Tensor],
+    _run_megamoe_prologue_helper: Callable[[int, bool, int], torch.Tensor],
     counter: int,
     input_exhausted: bool,
 ) -> None:
@@ -4821,8 +4822,19 @@ def test_fc1_prologue_wait_preserves_exhaustion(
     # claims. Already-exhausted controls include an invalid local claim. The
     # stream ends before the prologue target, so every CTA of a cluster must
     # report FC1 exhausted no matter what its counter peek saw.
-    actual = _run_megamoe_prologue_helper(counter, input_exhausted)
+    actual = _run_megamoe_prologue_helper(counter, input_exhausted, 1)
     expected = torch.tensor([1, counter, 1, 1, 1, 1], dtype=torch.int32).expand_as(actual)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_fc1_prologue_wait_keeps_a_longer_stream_open(
+    _run_megamoe_prologue_helper: Callable[[int, bool, int], torch.Tensor],
+) -> None:
+    # 512 tokens give four FC1 tiles, more than the three-claim prologue target.
+    # Once the target is claimed, FC1 still has work, so the wait must not mark
+    # it exhausted; marking it unconditionally would drop the fourth tile.
+    actual = _run_megamoe_prologue_helper(3, False, 512)
+    expected = torch.tensor([0, 3, 3, 0, 1, 1], dtype=torch.int32).expand_as(actual)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
