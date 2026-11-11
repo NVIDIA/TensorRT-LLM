@@ -16,6 +16,7 @@ import pytest
 from agent_flow.workflows.trtllm_modeling_v2.checks import pytest_runner
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
+from agent_flow.workflows.trtllm_modeling_v2.infra.git import uncommitted
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import model_ops_tests_dir
 from agent_flow.workflows.trtllm_modeling_v2.run import contract, report
 
@@ -120,6 +121,12 @@ def test_the_delivered_tests_run_once_at_the_commit_and_hold_on_their_passing(
     placed = stage.check()
     assert placed.passed, placed.detail
     assert "; env SITE_PREFIX=1 " in stage.ran[-1] and "CUDA_VISIBLE_DEVICES" not in stage.ran[-1]
+    # Four jobs ran in the checkout, and it is still its commit: the report and what a test
+    # keeps go under the workspace, and pytest leaves no cache of its own in the tree. A
+    # check that left an untracked source there would void every later verdict.
+    assert uncommitted(stage.repo) == []
+    left = _git(stage.repo, "status", "--porcelain", "--untracked-files=all", "--ignored")
+    assert [line for line in left.splitlines() if "__pycache__/" not in line] == []
 
 
 @pytest.mark.parametrize(
