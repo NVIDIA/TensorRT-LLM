@@ -362,11 +362,11 @@ Tokens may execute only on an expert's owner or a rank holding its replica. Each
 - **Free:** each exported expert may use any subset of receiver ranks.
 - **Hierarchical:** each exported expert uses one aligned group of size $2,4,\ldots,P$. Every group member consumes one helper slot, including an owner inside the group or a member assigned zero tokens.
 
-Every Hierarchical plan is also feasible under Free placement after removing unused replicas, so $R_{\mathrm{free}}^*\le R_{\mathrm{hier}}^*$. Figure 12 illustrates the slot constraints on a constructed instance; the small average gap above is specific to the tested workloads.
+Every Hierarchical plan is also feasible under Free placement after removing unused replicas, so $R_{\mathrm{free}}^*\le R_{\mathrm{hier}}^*$. Figure 12 illustrates the placement rules; the small average gap above is specific to the tested workloads.
 
-![Slot-occupancy matrices and final rank loads for Free and Hierarchical; hatched zero-token replicas still consume a slot.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_slot_usage.svg)
+![Free selects receiver slots independently; Hierarchical places the same expert on both members of each selected aligned pair.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_slot_usage.svg)
 
-*Figure 12. Placement constraints with eight ranks and one helper slot per rank. Filled cells serve one token; hatched cells hold a replica but serve none. Columns are receiver slots. The lower bars show optimal plans for this constructed example; the dashed line marks the mean-load lower bound of two.*
+*Figure 12. Example helper-slot placement with one slot per receiver rank. Free selects receivers independently; Hierarchical places the same expert on both members of each selected aligned pair. Letters identify experts; owners are omitted.*
 
 **Solving the bound.** Mixed-integer linear programming gives lower bounds on $R_m^*$, and validated integral plans give feasible upper bounds. Equal bounds certify the optimum; unresolved cases retain an interval. Figure 13 uses 1,536 experts, top-16 routing, 131,072 tokens per step, random contiguous ownership, and Zipf popularity calibrated to a coefficient of variation of two.
 

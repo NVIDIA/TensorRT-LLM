@@ -1,194 +1,45 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="704" viewBox="0 0 1160 704" role="img" aria-labelledby="slot-title slot-desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="235" viewBox="0 0 960 235" role="img" aria-labelledby="slot-title slot-desc">
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0 -->
-<title id="slot-title">Helper-slot occupancy and load balance</title>
-<desc id="slot-desc">A constructed eight-rank example with one home expert and one helper slot per rank. Initial loads are 3,3,3,3,1,1,1,1. Matrices show candidate experts e0 to e3 and receiver ranks 4 to 7. Free placement occupies one receiver slot for each expert and routes one token to each replica. Hierarchical placement occupies both slots of each aligned pair; the zero-token cells are still occupied. One optimal hierarchical plan offloads e0 to rank 4 and e1 to rank 6, reserving unused replicas on ranks 5 and 7. Final loads are all two for Free and 2,2,3,3,2,1,2,1 for Hierarchical. Their optimal imbalance ratios are one and 1.5. The common load lower bound is two.</desc>
-<defs><pattern id="idle-slot" width="7" height="7" patternUnits="userSpaceOnUse"><rect width="7" height="7" fill="#fbf3e6"/><path d="M-2,2L2,-2 M0,7L7,0 M5,9L9,5" stroke="#ddbd88" stroke-width="1"/></pattern></defs>
-<rect width="1160" height="704" fill="white"/>
-<g font-family="Arial, Helvetica, sans-serif">
-<text x="24" y="31" font-size="23" fill="#243447" font-weight="bold" text-anchor="start">Helper-slot occupancy and load balance</text>
-<text x="24" y="57" font-size="15" fill="#657587" font-weight="normal" text-anchor="start">Constructed example: P = 8, H = 1, S = 1; no load relay.</text>
-<text x="24" y="111" font-size="16" fill="#243447" font-weight="bold" text-anchor="start">Initial rank load</text>
-<rect x="216" y="80" width="72" height="47" rx="5" fill="#fff2e2" stroke="none" />
-<text x="252" y="97" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r0</text>
-<text x="252" y="120" font-size="21" fill="#c17b30" font-weight="bold" text-anchor="middle">3</text>
-<rect x="308" y="80" width="72" height="47" rx="5" fill="#fff2e2" stroke="none" />
-<text x="344" y="97" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r1</text>
-<text x="344" y="120" font-size="21" fill="#c17b30" font-weight="bold" text-anchor="middle">3</text>
-<rect x="400" y="80" width="72" height="47" rx="5" fill="#fff2e2" stroke="none" />
-<text x="436" y="97" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r2</text>
-<text x="436" y="120" font-size="21" fill="#c17b30" font-weight="bold" text-anchor="middle">3</text>
-<rect x="492" y="80" width="72" height="47" rx="5" fill="#fff2e2" stroke="none" />
-<text x="528" y="97" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r3</text>
-<text x="528" y="120" font-size="21" fill="#c17b30" font-weight="bold" text-anchor="middle">3</text>
-<rect x="584" y="80" width="72" height="47" rx="5" fill="#edf5fa" stroke="none" />
-<text x="620" y="97" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r4</text>
-<text x="620" y="120" font-size="21" fill="#2275a5" font-weight="bold" text-anchor="middle">1</text>
-<rect x="676" y="80" width="72" height="47" rx="5" fill="#edf5fa" stroke="none" />
-<text x="712" y="97" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r5</text>
-<text x="712" y="120" font-size="21" fill="#2275a5" font-weight="bold" text-anchor="middle">1</text>
-<rect x="768" y="80" width="72" height="47" rx="5" fill="#edf5fa" stroke="none" />
-<text x="804" y="97" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r6</text>
-<text x="804" y="120" font-size="21" fill="#2275a5" font-weight="bold" text-anchor="middle">1</text>
-<rect x="860" y="80" width="72" height="47" rx="5" fill="#edf5fa" stroke="none" />
-<text x="896" y="97" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r7</text>
-<text x="896" y="120" font-size="21" fill="#2275a5" font-weight="bold" text-anchor="middle">1</text>
-<text x="999" y="98" font-size="12" fill="#657587" font-weight="normal" text-anchor="start">Mean / lower bound</text>
-<text x="999" y="121" font-size="22" fill="#2275a5" font-weight="bold" text-anchor="start">2</text>
-<rect x="24" y="154" width="540" height="500" rx="7" fill="white" stroke="#d4dee7" />
-<text x="44" y="184" font-size="21" fill="#243447" font-weight="bold" text-anchor="start">(a) Free</text>
-<text x="44" y="208" font-size="14" fill="#657587" font-weight="normal" text-anchor="start">One optimal free plan</text>
-<text x="230" y="263" font-size="15" fill="#657587" font-weight="normal" text-anchor="middle">r4</text>
-<text x="306" y="263" font-size="15" fill="#657587" font-weight="normal" text-anchor="middle">r5</text>
-<text x="382" y="263" font-size="15" fill="#657587" font-weight="normal" text-anchor="middle">r6</text>
-<text x="458" y="263" font-size="15" fill="#657587" font-weight="normal" text-anchor="middle">r7</text>
-<text x="180" y="300" font-size="14" fill="#657587" font-weight="normal" text-anchor="end">e0 (owner r0)</text>
-<rect x="200" y="278" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="276" y="278" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="352" y="278" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="428" y="278" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<text x="180" y="344" font-size="14" fill="#657587" font-weight="normal" text-anchor="end">e1 (owner r1)</text>
-<rect x="200" y="322" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="276" y="322" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="352" y="322" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="428" y="322" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<text x="180" y="388" font-size="14" fill="#657587" font-weight="normal" text-anchor="end">e2 (owner r2)</text>
-<rect x="200" y="366" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="276" y="366" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="352" y="366" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="428" y="366" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<text x="180" y="432" font-size="14" fill="#657587" font-weight="normal" text-anchor="end">e3 (owner r3)</text>
-<rect x="200" y="410" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="276" y="410" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="352" y="410" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="428" y="410" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="200" y="278" width="60" height="32" rx="4" fill="#2275a5" stroke="#2275a5" />
-<text x="230" y="301" font-size="19" fill="white" font-weight="bold" text-anchor="middle">1</text>
-<rect x="276" y="322" width="60" height="32" rx="4" fill="#2275a5" stroke="#2275a5" />
-<text x="306" y="345" font-size="19" fill="white" font-weight="bold" text-anchor="middle">1</text>
-<rect x="352" y="366" width="60" height="32" rx="4" fill="#2275a5" stroke="#2275a5" />
-<text x="382" y="389" font-size="19" fill="white" font-weight="bold" text-anchor="middle">1</text>
-<rect x="428" y="410" width="60" height="32" rx="4" fill="#2275a5" stroke="#2275a5" />
-<text x="458" y="433" font-size="19" fill="white" font-weight="bold" text-anchor="middle">1</text>
-<text x="180" y="467" font-size="13" fill="#657587" font-weight="normal" text-anchor="end">Slots used</text>
-<text x="230" y="467" font-size="13" fill="#657587" font-weight="normal" text-anchor="middle">1 / 1</text>
-<text x="306" y="467" font-size="13" fill="#657587" font-weight="normal" text-anchor="middle">1 / 1</text>
-<text x="382" y="467" font-size="13" fill="#657587" font-weight="normal" text-anchor="middle">1 / 1</text>
-<text x="458" y="467" font-size="13" fill="#657587" font-weight="normal" text-anchor="middle">1 / 1</text>
-<text x="44" y="491" font-size="14" fill="#243447" font-weight="normal" text-anchor="start">4 slots used; 4 hot experts offloaded.</text>
-<text x="44" y="523" font-size="14" fill="#243447" font-weight="bold" text-anchor="start">Final rank loads</text>
-<line x1="190" y1="572" x2="480" y2="572" stroke="#8d9ba9" stroke-dasharray="4 4"/>
-<text x="180" y="576" font-size="12" fill="#657587" font-weight="normal" text-anchor="end">2</text>
-<rect x="200" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="212" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="212" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r0</text>
-<rect x="234" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="246" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="246" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r1</text>
-<rect x="268" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="280" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="280" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r2</text>
-<rect x="302" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="314" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="314" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r3</text>
-<rect x="336" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="348" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="348" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r4</text>
-<rect x="370" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="382" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="382" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r5</text>
-<rect x="404" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="416" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="416" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r6</text>
-<rect x="438" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="450" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="450" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r7</text>
-<text x="44" y="573" font-size="22" fill="#2275a5" font-weight="bold" text-anchor="start">R* = 1.00</text>
-<text x="44" y="594" font-size="12" fill="#657587" font-weight="normal" text-anchor="start">optimal imbalance</text>
-<rect x="596" y="154" width="540" height="500" rx="7" fill="white" stroke="#d4dee7" />
-<text x="616" y="184" font-size="21" fill="#243447" font-weight="bold" text-anchor="start">(b) Hierarchical</text>
-<text x="616" y="208" font-size="14" fill="#657587" font-weight="normal" text-anchor="start">One optimal hierarchical plan</text>
-<path d="M772,242 v-7 H908 v7" fill="none" stroke="#93a3b1" stroke-width="1.3"/>
-<text x="840.0" y="228" font-size="13" fill="#657587" font-weight="normal" text-anchor="middle">pair {r4, r5}</text>
-<path d="M924,242 v-7 H1060 v7" fill="none" stroke="#93a3b1" stroke-width="1.3"/>
-<text x="992.0" y="228" font-size="13" fill="#657587" font-weight="normal" text-anchor="middle">pair {r6, r7}</text>
-<text x="802" y="263" font-size="15" fill="#657587" font-weight="normal" text-anchor="middle">r4</text>
-<text x="878" y="263" font-size="15" fill="#657587" font-weight="normal" text-anchor="middle">r5</text>
-<text x="954" y="263" font-size="15" fill="#657587" font-weight="normal" text-anchor="middle">r6</text>
-<text x="1030" y="263" font-size="15" fill="#657587" font-weight="normal" text-anchor="middle">r7</text>
-<text x="752" y="300" font-size="14" fill="#657587" font-weight="normal" text-anchor="end">e0 (owner r0)</text>
-<rect x="772" y="278" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="848" y="278" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="924" y="278" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="1000" y="278" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<text x="752" y="344" font-size="14" fill="#657587" font-weight="normal" text-anchor="end">e1 (owner r1)</text>
-<rect x="772" y="322" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="848" y="322" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="924" y="322" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="1000" y="322" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<text x="752" y="388" font-size="14" fill="#657587" font-weight="normal" text-anchor="end">e2 (owner r2)</text>
-<rect x="772" y="366" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="848" y="366" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="924" y="366" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="1000" y="366" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<text x="752" y="432" font-size="14" fill="#657587" font-weight="normal" text-anchor="end">e3 (owner r3)</text>
-<rect x="772" y="410" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="848" y="410" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="924" y="410" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="1000" y="410" width="60" height="32" rx="4" fill="white" stroke="#e3e9ef" />
-<rect x="772" y="278" width="60" height="32" rx="4" fill="#2275a5" stroke="#2275a5" />
-<text x="802" y="301" font-size="19" fill="white" font-weight="bold" text-anchor="middle">1</text>
-<rect x="848" y="278" width="60" height="32" rx="4" fill="url(#idle-slot)" stroke="#c8a36a" />
-<text x="878" y="301" font-size="19" fill="#895d22" font-weight="bold" text-anchor="middle">0</text>
-<rect x="924" y="322" width="60" height="32" rx="4" fill="#2275a5" stroke="#2275a5" />
-<text x="954" y="345" font-size="19" fill="white" font-weight="bold" text-anchor="middle">1</text>
-<rect x="1000" y="322" width="60" height="32" rx="4" fill="url(#idle-slot)" stroke="#c8a36a" />
-<text x="1030" y="345" font-size="19" fill="#895d22" font-weight="bold" text-anchor="middle">0</text>
-<text x="752" y="467" font-size="13" fill="#657587" font-weight="normal" text-anchor="end">Slots used</text>
-<text x="802" y="467" font-size="13" fill="#657587" font-weight="normal" text-anchor="middle">1 / 1</text>
-<text x="878" y="467" font-size="13" fill="#657587" font-weight="normal" text-anchor="middle">1 / 1</text>
-<text x="954" y="467" font-size="13" fill="#657587" font-weight="normal" text-anchor="middle">1 / 1</text>
-<text x="1030" y="467" font-size="13" fill="#657587" font-weight="normal" text-anchor="middle">1 / 1</text>
-<text x="616" y="491" font-size="14" fill="#243447" font-weight="normal" text-anchor="start">4 slots used; 2 hot experts offloaded.</text>
-<text x="616" y="523" font-size="14" fill="#243447" font-weight="bold" text-anchor="start">Final rank loads</text>
-<line x1="762" y1="572" x2="1052" y2="572" stroke="#8d9ba9" stroke-dasharray="4 4"/>
-<text x="752" y="576" font-size="12" fill="#657587" font-weight="normal" text-anchor="end">2</text>
-<rect x="772" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="784" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="784" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r0</text>
-<rect x="806" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="818" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="818" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r1</text>
-<rect x="840" y="555" width="24" height="51" rx="2" fill="#c17b30" stroke="none" />
-<text x="852" y="549" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">3</text>
-<text x="852" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r2</text>
-<rect x="874" y="555" width="24" height="51" rx="2" fill="#c17b30" stroke="none" />
-<text x="886" y="549" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">3</text>
-<text x="886" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r3</text>
-<rect x="908" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="920" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="920" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r4</text>
-<rect x="942" y="589" width="24" height="17" rx="2" fill="#78a9c6" stroke="none" />
-<text x="954" y="583" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">1</text>
-<text x="954" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r5</text>
-<rect x="976" y="572" width="24" height="34" rx="2" fill="#78a9c6" stroke="none" />
-<text x="988" y="566" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">2</text>
-<text x="988" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r6</text>
-<rect x="1010" y="589" width="24" height="17" rx="2" fill="#78a9c6" stroke="none" />
-<text x="1022" y="583" font-size="13" fill="#243447" font-weight="normal" text-anchor="middle">1</text>
-<text x="1022" y="624" font-size="12" fill="#657587" font-weight="normal" text-anchor="middle">r7</text>
-<text x="616" y="573" font-size="22" fill="#2275a5" font-weight="bold" text-anchor="start">R* = 1.50</text>
-<text x="616" y="594" font-size="12" fill="#657587" font-weight="normal" text-anchor="start">optimal imbalance</text>
-<rect x="24" y="670" width="24" height="20" rx="3" fill="#2275a5" stroke="#2275a5" />
-<text x="36" y="685" font-size="14" fill="white" font-weight="bold" text-anchor="middle">1</text>
-<text x="57" y="685" font-size="13" fill="#657587" font-weight="normal" text-anchor="start">replica + 1 token</text>
-<rect x="258" y="670" width="24" height="20" rx="3" fill="url(#idle-slot)" stroke="#c8a36a" />
-<text x="270" y="685" font-size="14" fill="#895d22" font-weight="bold" text-anchor="middle">0</text>
-<text x="291" y="685" font-size="13" fill="#657587" font-weight="normal" text-anchor="start">replica + 0 tokens; slot occupied</text>
-<rect x="624" y="670" width="24" height="20" rx="3" fill="white" stroke="#d4dee7" />
-<text x="657" y="685" font-size="13" fill="#657587" font-weight="normal" text-anchor="start">no replica</text>
-<line x1="831" y1="679" x2="865" y2="679" stroke="#8d9ba9" stroke-dasharray="4 4"/>
-<text x="874" y="685" font-size="13" fill="#657587" font-weight="normal" text-anchor="start">lower bound B = 2</text>
+<title id="slot-title">Free and hierarchical helper-slot placement</title>
+<desc id="slot-desc">Four receiver ranks, 4 through 7, each have one helper slot. Free placement is illustrated with independently selected experts A, B, C and D. Hierarchical placement uses aligned pairs 4 and 5, and 6 and 7: the slots contain A, A, B and B. The same expert is copied to every member of a selected group. Expert owners are omitted.</desc>
+<rect width="960" height="235" fill="white"/>
+<g font-family="Liberation Serif, Times New Roman, serif">
+<text x="24" y="30" font-size="23" fill="#222222" font-weight="bold" text-anchor="start">(a) Free</text>
+<text x="24" y="56" font-size="17" fill="#626262" font-weight="normal" text-anchor="start">Independent receiver slots</text>
+<text x="44" y="144" font-size="18" fill="#626262" font-weight="normal" text-anchor="start">h₀</text>
+<rect x="76" y="117" width="68" height="40" fill="#E69F00" stroke="#555555" stroke-width="1"/>
+<text x="110" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">A</text>
+<text x="110" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 4</text>
+<rect x="165" y="117" width="68" height="40" fill="#CC79A7" stroke="#555555" stroke-width="1"/>
+<text x="199" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">B</text>
+<text x="199" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 5</text>
+<rect x="254" y="117" width="68" height="40" fill="#56B4E9" stroke="#555555" stroke-width="1"/>
+<text x="288" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">C</text>
+<text x="288" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 6</text>
+<rect x="343" y="117" width="68" height="40" fill="#009E73" stroke="#555555" stroke-width="1"/>
+<text x="377" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">D</text>
+<text x="377" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 7</text>
+<text x="514" y="30" font-size="23" fill="#222222" font-weight="bold" text-anchor="start">(b) Hierarchical</text>
+<text x="514" y="56" font-size="17" fill="#626262" font-weight="normal" text-anchor="start">One expert per aligned pair</text>
+<text x="534" y="144" font-size="18" fill="#626262" font-weight="normal" text-anchor="start">h₀</text>
+<rect x="566" y="117" width="68" height="40" fill="#E69F00" stroke="#555555" stroke-width="1"/>
+<text x="600" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">A</text>
+<text x="600" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 4</text>
+<rect x="655" y="117" width="68" height="40" fill="#E69F00" stroke="#555555" stroke-width="1"/>
+<text x="689" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">A</text>
+<text x="689" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 5</text>
+<rect x="744" y="117" width="68" height="40" fill="#CC79A7" stroke="#555555" stroke-width="1"/>
+<text x="778" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">B</text>
+<text x="778" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 6</text>
+<rect x="833" y="117" width="68" height="40" fill="#CC79A7" stroke="#555555" stroke-width="1"/>
+<text x="867" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">B</text>
+<text x="867" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 7</text>
+<path d="M566,108 V92 H723 V108" fill="none" stroke="#666666" stroke-width="1.2"/>
+<text x="644.5" y="85" font-size="16" fill="#626262" font-weight="normal" text-anchor="middle">{4, 5}</text>
+<path d="M744,108 V92 H901 V108" fill="none" stroke="#666666" stroke-width="1.2"/>
+<text x="822.5" y="85" font-size="16" fill="#626262" font-weight="normal" text-anchor="middle">{6, 7}</text>
+<text x="480" y="222" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">One helper slot per receiver rank; repeated letters denote replicas of the same expert.</text>
 </g>
 </svg>
