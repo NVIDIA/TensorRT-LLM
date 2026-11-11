@@ -629,7 +629,8 @@
     },
     {
       "allowed_values": [
-        "nvfp4"
+        "nvfp4",
+        "turboquant"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
@@ -639,6 +640,20 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_compression_config.skip_rope_quantization"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_compression_config.turboquant_bits"
+    },
+    {
+      "allowed_values": [
+        "mse",
+        "prod"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.turboquant_mode"
     },
     {
       "capture_policy": "int",

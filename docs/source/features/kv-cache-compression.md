@@ -11,6 +11,7 @@ SPDX-License-Identifier: Apache-2.0
   - [Storage-Bound Methods](#storage-bound-methods)
 - [Compression Methods](#compression-methods)
   - [Cold-Page Quantization](#cold-page-quantization)
+    - [TurboQuant Cold Pages](#turboquant-cold-pages)
   - [TriAttention](#triattention)
 - [Support](#support)
 - [Further Reading](#further-reading)
@@ -145,7 +146,7 @@ each LLM instance.
 
 | Method | When it runs | What it changes | Primary benefit |
 | --- | --- | --- | --- |
-| Cold-page quantization (NVFP4) | When Pages move between the GPU and a Host or Disk cache tier | The stored representation of cold Attention KV | More KV Pages per cold-tier byte and fewer bytes transferred |
+| Cold-page quantization (NVFP4 or TurboQuant) | When Pages move between the GPU and a Host or Disk cache tier | The stored representation of cold Attention KV | More KV Pages per cold-tier byte and fewer bytes transferred |
 | TriAttention | Periodically during generation | The set of KV tokens retained in the cache | Lower KV-cache memory usage and Attention work for long generation |
 
 ### Cold-Page Quantization
@@ -161,7 +162,9 @@ validate.
 
 NVFP4 is the first supported cold-page quantization format. It stores eligible
 Attention KV in NVFP4 in the cold tiers, while the GPU cache continues to use
-the model's normal runtime KV type, such as FP16, BF16, or FP8.
+the model's normal runtime KV type, such as FP16, BF16, or FP8. TurboQuant is a
+second, prototype format that stores 2 to 4 bits per value; see
+[TurboQuant Cold Pages](#turboquant-cold-pages).
 
 ```text
 GPU hot Page (runtime KV type)
@@ -240,6 +243,9 @@ kv_cache_compression_config:
   skip_rope_quantization: true
 ```
 
+TurboQuant cold pages apply `skip_rope_quantization` with the same semantics and
+model support; only their DeepSeek-V4 rows differ, as described below.
+
 #### Keeping the First and Last Tokens Unquantized
 
 Cold-page quantization stores every page that leaves the GPU in the compact
@@ -302,6 +308,143 @@ speculative decoding except dynamic-tree drafting, no KV connector, not the
 Eagle3) keep their first/last tokens like the target layers; a separate drafter
 with its own architecture keeps a plain cache.
 
+#### TurboQuant Cold Pages
+
+[TurboQuant](https://arxiv.org/abs/2504.19874) is a data-oblivious vector
+quantizer with near-optimal distortion. TensorRT-LLM provides it as a prototype
+cold-page format, selected with `quant: turboquant`, that stores 2 to 4 bits per
+value plus small per-vector scales, compared with NVFP4's 4.5 bits. Like NVFP4
+cold pages, it changes only the Host and Disk representation: the GPU cache
+keeps the runtime KV type, and Attention never reads TurboQuant data. Unlike
+NVFP4, TurboQuant is not an active-KV format in TensorRT-LLM; it is used only
+for cold pages.
+
+TurboQuant encodes each quantized K or V vector, one per token and KV head, on
+its own:
+
+1. Rotate the vector with a random orthogonal matrix. After the rotation, every
+   coordinate of a unit vector follows the same known distribution whatever the
+   input was, which spreads outlier channels over all coordinates and removes
+   the need for calibration.
+2. Replace each rotated coordinate with the index of the nearest value of a
+   Lloyd-Max codebook for that distribution, and store one BF16 scale for the
+   vector.
+3. To decode, look up the codebook values, apply the scale, and rotate back.
+
+`turboquant_mode: mse` is the paper's Algorithm 1 and minimizes the
+reconstruction error. `turboquant_mode: prod` is Algorithm 2: it runs the steps
+above with one bit fewer and spends the last bit on the sign of a random
+Gaussian projection (Quantized Johnson-Lindenstrauss, QJL) of the residual,
+stored together with the residual norm. The inner product of any query with a
+decoded `prod` vector is then an unbiased estimate of the exact inner product
+(in expectation over the random projection), at the cost of a larger
+reconstruction error than `mse` at the same bit width.
+
+Fractional widths (2.5 and 3.5 bits, `mse` only) treat outlier channels
+separately, as the paper does. For each group of vectors that share a page,
+layer, buffer, and KV head, the codec ranks the channels by their energy in that
+page, computed while encoding without any calibration. The half of the channels
+with the most energy uses `turboquant_bits + 0.5` bits and the other half
+`turboquant_bits - 0.5` bits, each half with its own rotation, codebook, and
+scales; a channel mask per group records the split.
+
+The rotations and projections depend only on `turboquant_seed` and the vector
+width and are generated the same way in every process, so equal configurations
+produce equal cold pages.
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  host_cache_size: 8589934592  # 8 GiB
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: turboquant
+  turboquant_bits: 3     # 2, 2.5, 3, 3.5, or 4
+  turboquant_mode: mse   # mse or prod
+```
+
+| Field | Values | Default | Meaning |
+| --- | --- | --- | --- |
+| `quant` | `nvfp4`, `turboquant` | `nvfp4` | Cold-page format |
+| `turboquant_bits` | `2`, `2.5`, `3`, `3.5`, `4` | `4` | Average bits per quantized value: codebook indices plus QJL sign bits, not counting per-vector scales and norms |
+| `turboquant_mode` | `mse`, `prod` | `mse` | `mse` minimizes the reconstruction error; `prod` gives unbiased inner-product estimates and supports only 2, 3, and 4 bits |
+| `turboquant_seed` | Integer `>= 0` | `5` | Seed of the random rotations and QJL projections |
+| `skip_rope_quantization` | `true`, `false` | `false` | Same as for NVFP4; see [Skipping RoPE Quantization](#skipping-rope-quantization) |
+
+A configuration fails when it is constructed if it sets `turboquant_*` fields
+with `quant: nvfp4`, sets `nvfp4_residual_dim` or `scale_checkpoint_path` with
+`quant: turboquant`, or combines `prod` with 2.5 or 3.5 bits. When the
+executor builds the KV cache, TensorRT-LLM also rejects TurboQuant on a GPU with
+compute capability below 8.0 and when the active KV cache is NVFP4; TurboQuant
+decodes into an FP16, BF16, or FP8 active KV cache.
+
+| `turboquant_mode` | `turboquant_bits` | Stored for each vector of `n` quantized values | Bits per value, `n` = 128 |
+| --- | --- | --- | --- |
+| `mse` | `2`, `3`, `4` | `n * b` codebook bits and one BF16 scale | 2.125, 3.125, 4.125 |
+| `mse` | `2.5`, `3.5` | `n/2 * (b + 0.5)` plus `n/2 * (b - 0.5)` codebook bits and two BF16 scales, plus one `n`-bit channel mask per group | 2.78, 3.78[^turboquant-mask] |
+| `prod` | `2`, `3`, `4` | `n * (b - 1)` codebook bits, `n` QJL sign bits, a BF16 scale, and a BF16 residual norm | 2.25, 3.25, 4.25 |
+| NVFP4, for comparison | | `n` FP4 values and one E4M3 scale per 16 values | 4.5 |
+
+[^turboquant-mask]: With `tokens_per_block` of 32, the default; the channel
+    mask is shared by the tokens of a page, so it costs less with larger pages.
+
+A BF16 hot page shrinks by a factor of 16 divided by these numbers and an FP8 hot
+page by 8 divided by them. Each lifecycle's cold page is the sum of its
+buffers, with every region rounded up to 16 bytes:
+
+```text
+quantized buffer:  H * T * (n * b / 8 + 2 * s)    codebook and QJL bits, per-vector BF16 values
+                 + H * n / 8                       channel masks (fractional bits only)
+                 + H * T * (r - n) * e             values kept at the hot-cache precision
+lossless buffer:   its hot size
+
+H: KV heads of the buffer (1 for an MLA latent)    T: tokens_per_block
+n: quantized values per vector                     r: values per vector in the hot cache
+b: turboquant_bits                                 e: bytes per hot value (2 for FP16/BF16, 1 for FP8)
+s: 1 for mse with 2, 3, or 4 bits; 2 for prod and for fractional bits; per instance for n > 512
+```
+
+Vectors with more than 512 quantized values, such as the 576-value MLA latent,
+are stored as several independent TurboQuant instances, each with its own
+rotation, codebook and scale, because decoding accumulates all output values of
+an instance on chip: with `mse`, instances of 256 values plus the rest (576 =
+256 + 256 + 64, three BF16 scales); with `prod`, the first 512 values and the
+rest (four BF16 values). The per-vector side information stays within 64 bits.
+
+For example, Llama-3.1-8B (32 layers, 8 KV heads, head dimension 128) with
+32-token Pages and a BF16 cache has 4 MiB hot Pages. TurboQuant stores them in
+1,081,344 bytes at 4 bits (`mse`) and 819,200 bytes at 3 bits, compared with
+1,179,648 bytes for NVFP4.
+
+TurboQuant supports the same cache layouts as NVFP4 cold-page quantization: K
+and V of MHA, MQA, and GQA; the key-only MLA latent, including widths that are
+not a power of two such as DeepSeek's 576 values; and DeepSeek-V4 compressed
+(CSA) rows, whose 448 NoPE values are quantized while the 64 RoPE values and
+the indexer cache are stored losslessly whatever `skip_rope_quantization` says.
+Auxiliary Attention buffers, such as DSA index keys, are stored losslessly in
+the same cold page, and DeepSeek-V4 SWA, HCA, and compressor state and GDN, SSM,
+and Conv state are preserved losslessly. See [Support](#support).
+
+- Hot KV can be FP16, BF16, or FP8, and Host and Disk tiers share one TurboQuant
+  representation.
+- Block reuse remains supported because Page and token identity are unchanged.
+- One-model MTP-EAGLE and EAGLE3 are supported. Target and draft KVCMs encode
+  their cold Pages independently, and draft cold Pages always quantize whole
+  vectors, ignoring `skip_rope_quantization`.
+- TurboQuant kernels are written in Triton and need compute capability 8.0 or
+  newer; NVFP4 cold pages need an SM100-family GPU.
+
+Integer-bit `mse` reaches the paper's distortion (normalized MSE 0.117, 0.034, and
+0.0094 at 2, 3, and 4 bits for head dimension 128) on every input structure tested, and
+re-encoding a decoded Page reproduces its codes, so Pages that migrate repeatedly do not
+accumulate error. `prod` stays unbiased but adds fresh QJL noise on every re-encoding; prefer
+`mse` when Pages migrate repeatedly. Encode and decode are bound by the host link for
+conventional K/V Pages, so they take about the NVFP4 time scaled by the cold-page size.
+
+For measured quality, encode and decode times, end-to-end accuracy, a complete configuration,
+and how to confirm that Pages pass through the cold tier, see the
+[TurboQuant cold-page compression example](source:examples/kv_cache_compression/turboquant_cold_page.md).
+
 ### TriAttention
 
 [TriAttention](https://arxiv.org/abs/2604.04921) (ICML 2026) periodically scores
@@ -341,32 +484,36 @@ For calibration, configuration parameters, and current requirements, see the
 
 ## Support
 
-The two methods share the compression framework but support different cache
-structures. Both share the same general platform requirements.[^general-requirements]
+The methods share the compression framework but support different cache
+structures and GPUs.[^general-requirements]
 
-| Cache structure | NVFP4 cold-page quantization[^cold-page-requirements] | TriAttention[^triattention-requirements] |
-| --- | --- | --- |
-| MHA Attention KV | Supported | Supported |
-| MQA Attention KV | Supported | Supported |
-| GQA Attention KV | Supported | Supported |
-| MLA Attention KV | Supported | Not supported |
-| GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
-| DSA and other Attention side buffers | Preserved losslessly | Not supported |
-| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; NoPE uses NVFP4 and RoPE defaults to 2FP4, or keeps its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly | Not supported |
-| DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Not supported |
+| Cache structure | NVFP4 cold-page quantization[^cold-page-requirements] | TurboQuant cold-page quantization[^cold-page-requirements] | TriAttention[^triattention-requirements] |
+| --- | --- | --- | --- |
+| MHA Attention KV | Supported | Supported | Supported |
+| MQA Attention KV | Supported | Supported | Supported |
+| GQA Attention KV | Supported | Supported | Supported |
+| MLA Attention KV | Supported | Supported | Not supported |
+| GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Skipped by quantization and preserved losslessly | Not supported |
+| DSA and other Attention side buffers | Preserved losslessly | Preserved losslessly | Not supported |
+| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; NoPE uses NVFP4 and RoPE defaults to 2FP4, or keeps its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly | Supported[^deepseek-v4]; NoPE uses TurboQuant, and RoPE and the indexer cache are preserved losslessly | Not supported |
+| DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Preserved losslessly | Not supported |
 
-[^general-requirements]: Both methods currently require the PyTorch backend,
-    KVCM V2, and an NVIDIA GPU with compute capability SM100, SM103, or SM107.
+[^general-requirements]: All methods currently require the PyTorch backend and
+    KVCM V2. NVFP4 cold-page quantization and TriAttention require an NVIDIA GPU
+    with compute capability SM100, SM103, or SM107; TurboQuant cold-page
+    quantization requires compute capability 8.0 or newer.
 [^deepseek-v4]: DeepSeek-V4 requires `tokens_per_block` of 128 or 256 (the
     DeepSeek-V4 cache manager's constraint) and cold-page compression does not
     cover the FP8 `fp8_ds_mla` footer-scale KV layout; use the ordinary FP8 or
     BF16 runtime KV layout. If `scale_checkpoint_path` supplies ModelOpt KV
-    scales, only the per-layer K scale is applied to the CSA cache; the V scale
-    is not used.
-[^cold-page-requirements]: NVFP4 cold-page quantization additionally requires
-    the native C++ KVCM V2 backend and a nonzero Host or Disk cache. See the
-    [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md)
-    for its remaining requirements and validated modes.
+    scales to NVFP4 cold pages, only the per-layer K scale is applied to the CSA
+    cache; the V scale is not used.
+[^cold-page-requirements]: Cold-page quantization additionally requires the
+    native C++ KVCM V2 backend and a nonzero Host or Disk cache. See the
+    [NVFP4](source:examples/kv_cache_compression/nvfp4_cold_page.md) and
+    [TurboQuant](source:examples/kv_cache_compression/turboquant_cold_page.md)
+    cold-page compression examples for their remaining requirements and
+    validated modes.
 [^triattention-requirements]: TriAttention requires a model-specific offline
     calibration file. See the
     [detailed TriAttention example](source:examples/kv_cache_compression/triattention.md)
@@ -382,6 +529,14 @@ NVFP4 cold-page quantization has been tested with the following model families:
 - DeepSeek-R1 family
 - DeepSeek-V4 family
 
+TurboQuant cold-page quantization has been tested with the following model
+families:
+
+- Qwen3.8 family, including Qwen3.8-Flash-Next (GQA with partial RoPE, QSA and GDN layers)
+- GLM family, including GLM-5.3 (MLA latent with DSA) and GLM-5.3-Flash (sparse MLA latent,
+  KDA layers)
+- DeepSeek-V4 CSA and HCA cache layouts, covered by KVCacheManagerV2 integration tests
+
 TriAttention has been tested with the following model families:
 
 - Qwen3 family
@@ -395,6 +550,8 @@ examples for method-specific requirements.
 ## Further Reading
 
 - [NVFP4 Cold-Page KV-Cache Compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md)
+- [TurboQuant Cold-Page KV-Cache Compression example](source:examples/kv_cache_compression/turboquant_cold_page.md)
+- [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874)
 - [TriAttention KV-Cache Compression example](source:examples/kv_cache_compression/triattention.md)
 - [KV Cache Compression Development Guide](../developer-guide/kv-cache-compression-development.md)
 - [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md)

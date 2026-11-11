@@ -50,6 +50,16 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
     return result
 
 
+def _turboquant_cold_pages(**options: object) -> dict:
+    return {
+        "kv_cache_compression_config": {
+            "algorithm": "quantization_for_cold_page",
+            "quant": "turboquant",
+            **options,
+        }
+    }
+
+
 @pytest.mark.parametrize(
     ("filename", "config", "valid"),
     [
@@ -195,6 +205,16 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         ),
         (generator.SERVE_SCHEMA, {"dwdp_config": {"num_experts_per_worker": -1}}, False),
         (generator.SERVE_SCHEMA, {"dwdp_config": {"num_prefetch_experts": -1}}, False),
+        (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits=2.5), True),
+        (
+            generator.DISAGG_SCHEMA,
+            _turboquant_cold_pages(turboquant_bits=3, turboquant_mode="prod", turboquant_seed=7),
+            True,
+        ),
+        (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits=5), False),
+        (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits="4"), False),
+        (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_mode="lloyd"), False),
+        (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_seed=-1), False),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),
         (generator.DISAGG_SCHEMA, {"backend": "_autodeploy"}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"urls": ["ctx:8001"]}}, True),

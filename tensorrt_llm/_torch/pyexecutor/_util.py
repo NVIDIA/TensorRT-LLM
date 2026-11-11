@@ -4319,6 +4319,11 @@ def validate_kv_cache_compression_compatibility(
             raise UnsupportedError(
                 "NVFP4 cold-page quantization requires an SM100-family device "
                 "(SM100, SM103 or SM107).")
+        if config.quant == "turboquant" and get_sm_version() < 80:
+            raise UnsupportedError(
+                "TurboQuant cold-page quantization requires a device with "
+                "compute capability 8.0 or newer: its Triton kernels use "
+                "tensor-core tl.dot.")
     elif config.algorithm == "triattention" and not is_sm_100f():
         raise UnsupportedError(
             "TriAttention requires an SM100-family device (SM100 or SM103).")
@@ -4365,12 +4370,29 @@ def create_kv_cache_compression_manager(
             "KV-cache compression does not support HELIX context parallelism.")
 
     if config.algorithm == "quantization_for_cold_page":
-        if config.quant != "nvfp4":
+        if config.quant not in ("nvfp4", "turboquant"):
             raise NotImplementedError(
                 f"Unsupported cold-page quantization format {config.quant!r}")
         quant_config = model_engine.model.model_config.quant_config
-        if (quant_config is not None and getattr(
-                quant_config, "kv_cache_quant_algo", None) == QuantAlgo.NVFP4):
+        active_kv_is_nvfp4 = (quant_config is not None and getattr(
+            quant_config, "kv_cache_quant_algo", None) == QuantAlgo.NVFP4)
+        if config.quant == "turboquant":
+            if active_kv_is_nvfp4:
+                raise ValueError(
+                    "TurboQuant cold pages decode to an FP16, BF16, or FP8 "
+                    "active KV cache, but the active KV cache uses NVFP4. Use "
+                    "an FP16, BF16, or FP8 KV cache, or remove "
+                    "kv_cache_compression_config.")
+            validate_kv_cache_compression_compatibility(
+                config, kv_cache_config, model_engine.spec_config)
+            # The TurboQuant codec imports Triton; keep executor startup lazy.
+            from ..kv_cache_compression.quantization_for_cold_page.turboquant_quantization import \
+                TurboQuantColdPageQuantizationCompression
+
+            model_config = model_engine.model.model_config
+            return TurboQuantColdPageQuantizationCompression(
+                config, pretrained_config=model_config.pretrained_config)
+        if active_kv_is_nvfp4:
             logger.info(
                 "Skipping cold-page NVFP4 quantization because the active KV "
                 "cache already uses NVFP4; KVCM will migrate it losslessly.")
