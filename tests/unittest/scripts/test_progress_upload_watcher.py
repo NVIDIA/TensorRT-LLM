@@ -1007,8 +1007,8 @@ def _step_ending(step: str) -> str:
     """Return what ``step`` does with the watcher once its tests have ended."""
     if step == "batch":
         return "\n".join(_batch_step_lines())
-    rerun, first_run = _step_lines('touch "\\$PROGRESS_DONE_FILE"', "exit \\$rc", count=2)
-    return {"rerun": rerun, "first run": first_run}[step]
+    (runner,) = _step_lines('touch "\\$PROGRESS_DONE_FILE"', "exit \\$rc", count=1)
+    return runner
 
 
 def _run_beside_the_watcher(watcher: Watcher, lines: str, **env: str) -> tuple[int, str]:
@@ -1069,7 +1069,7 @@ def _run_beside_the_watcher(watcher: Watcher, lines: str, **env: str) -> tuple[i
     return proc.returncode, output
 
 
-@pytest.mark.parametrize("step", ["batch", "rerun", "first run"])
+@pytest.mark.parametrize("step", ["batch", "runner"])
 def test_a_step_that_cannot_create_the_done_file_still_returns(watcher: Watcher, step: str) -> None:
     """Each step returns the tests' exit code although its done file cannot be created.
 
@@ -1100,7 +1100,7 @@ def test_a_step_that_cannot_create_the_done_file_still_returns(watcher: Watcher,
     ]
 
 
-@pytest.mark.parametrize("step", ["batch", "rerun", "first run"])
+@pytest.mark.parametrize("step", ["batch", "runner"])
 def test_a_step_that_can_create_the_done_file_sends_no_signal(watcher: Watcher, step: str) -> None:
     """Each step that can create its done file ends the watcher with that file alone.
 
