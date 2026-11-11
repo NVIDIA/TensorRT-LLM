@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ..infra.compute.commands import ended_early
-from ..infra.compute.environment import RunEnvironment, env_assignments, single_task_scrub
+from ..infra.compute.environment import RunEnvironment, behind_launch
 from ..infra.git import git_output
 from ..spec.deployments import Deployment
 from . import servers
@@ -84,10 +84,18 @@ def pytest_command(
     nodes: Sequence[str],
     report: str | Path,
     extra: Sequence[str] = (),
+    site: RunEnvironment | None = None,
 ) -> str:
-    """One pytest process over ``nodes`` under ``python``, from the selection's root."""
+    """One pytest process over ``nodes`` under ``python``, from the selection's root.
+
+    Behind ``site``'s launch prefix when it states one: one-GPU work runs where the site
+    says, not on the orchestrator's host.
+    """
     root, argv = pytest_argv(repo, nodes, report, extra)
-    return f"cd {shlex.quote(str(root))} && {shlex.quote(python)} {shlex.join(argv)}"
+    program = f"{shlex.quote(python)} {shlex.join(argv)}"
+    if site is not None and site.launch:
+        program = behind_launch(site.launch, site.launch_env, program)
+    return f"cd {shlex.quote(str(root))} && {program}"
 
 
 @dataclass(frozen=True)
@@ -211,9 +219,7 @@ def run_tests(
             # prefix places the test (rank 0 runs it where the options ask for several),
             # and nothing of this host's devices goes with it.
             words = [*servers.launcher(deployment.server), shlex.quote(env.python)]
-            program = f"{launch} {' '.join(words)} {shlex.join(argv)}"
-            inner = f"{single_task_scrub(list(env.env), rank=False)}; {program}"
-            run = f"{' '.join(env_assignments(env.env))} bash -c {shlex.quote(inner)}"
+            run = behind_launch(launch, env.env, f"{' '.join(words)} {shlex.join(argv)}")
         else:
             run = env.python_command(argv, single_process=True)
         command = f"cd {shlex.quote(str(root))} && {run}"

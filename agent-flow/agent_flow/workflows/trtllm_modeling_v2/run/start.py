@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 from rich.markup import escape as escape_markup
 
@@ -28,6 +29,7 @@ from ..infra.files import write_text_atomic
 from ..operators.inventory import run_inventory_probe
 from ..spec import deployments as deployments_mod
 from . import contract as contract_mod
+from . import report as report_mod
 from .startup import agent_probe
 from .startup.preflight import PREFLIGHT_FILENAME, PreflightError, PreflightResult, run_preflight
 
@@ -78,6 +80,16 @@ def start(workflow, state, log) -> bool:
     write_text_atomic(workflow.workspace / PREFLIGHT_FILENAME, json.dumps(kept, indent=1))
     workflow.journal.section("preflight", f"```\n{result.report()}\n```")
     print_message(f"[bold green]✔ preflight[/bold green]\n{result.report()}", log)
+    # Said at the start, not found at the end: the final pass measures the checkout, and a
+    # tree that is not its commit gives no verdict, whoever left the files there.
+    stray = report_mod.unmeasurable(workflow, Path(str(task["trtllm_repo_path"])), "")
+    if stray:
+        said = (
+            f"the checkout is not its commit: {stray}. A check that runs in it gives no "
+            f"verdict until they are committed, removed or git-ignored"
+        )
+        workflow.journal.event("checkout", said)
+        print_message(f"[bold yellow]! {escape_markup(said)}[/bold yellow]", log)
     # Where this run's commands land, from the resolved environment; an injected runner wins.
     workflow._command_executor = select_command_executor(result.environment)
     if workflow._shell_runner_override is None:

@@ -61,6 +61,7 @@ from ._helpers import (
     passing_shell,
     scripted_refs,
 )
+from .conftest import SCRATCH
 
 FAMILY = str(Path(TARGET_REL).parent)
 SLUG = "gpt-oss-120b-sm_103-tp1"
@@ -281,6 +282,29 @@ def test_a_kernel_row_that_is_not_done_is_skipped_and_the_run_goes_on(
     skipped = report.split("## Skipped kernel rows")[1].split("##")[0]
     assert "- `k1-rms` (queue row 1): it ended blocked: no kernel exports it on sm_103" in skipped
     assert "k1-rms" not in report.split("## Not done")[1].split("##")[0]
+
+
+def test_a_workers_one_gpu_commands_run_behind_the_sites_prefix(
+    tmp_path, task_file, repo, monkeypatch
+):
+    """`environment.launch` is where an entry's test runs, not the orchestrator's host."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    _write_vocabulary(workspace, [{"n": 1, "mode": "onboard", "target": "ops/norm/rms"}])
+    spec = yaml.safe_load(_spec(task_file).read_text())
+    launch = spec["environment"]["launch"] = "srun -N1 --gpus=1 --container-image=img"
+    task_file.write_text(yaml.safe_dump(spec))
+    calls = _run(tmp_path, task_file, monkeypatch, Script())
+    [kernel] = _prompts(calls, "k1-rms")
+    [command] = [line.strip() for line in kernel.splitlines() if " -m pytest " in line]
+    assert command.startswith(f"cd {repo} && PYTHONPATH={repo} ")
+    assert f" TMPDIR={SCRATCH} " in command and " TLLM_WORKER_USE_SINGLE_PROCESS=1 " in command
+    assert f" {launch} /opt/venv/bin/python -m pytest " in command
+    # The prefix a worker is given for any other command is the same: the spec's variables
+    # and the site's prefix, with no device of this host.
+    said = re.search(r"the site's, which brings its own device:\n\n    ([^\n]+)\n", kernel)
+    assert said and said.group(1).endswith(f" {launch}") and f"TMPDIR={SCRATCH} " in said.group(1)
+    assert "CUDA_VISIBLE_DEVICES" not in kernel
 
 
 def test_a_task_that_changed_the_libraries_without_landing_is_named_in_the_report(
@@ -1048,6 +1072,10 @@ def test_a_tree_that_is_not_its_commit_gives_no_verdict_on_record_or_not(
     said = "[NO VERDICT] tp1:boot: 1 file(s) in the tree are in no commit: tensorrt_llm/extra.py"
     assert said in _tasks(tmp_path)[1]["note"]
     assert shell.ran == [] and _verdicts(tmp_path) == [] and not _state(tmp_path).onboarded
+    # Said when the run starts, not found at its end: the checkout itself is not its commit.
+    told = "**checkout**: the checkout is not its commit: 1 file(s) in the tree are in no commit: "
+    told += "tensorrt_llm/extra.py. A check that runs in it gives no verdict until"
+    assert told in (tmp_path / "ws" / "journal.md").read_text()
     # What a sandbox drops into a directory is no source, nor what an engine leaves behind.
     git.dirt = "?? .mcp.json\n?? tensorrt_llm/.claude/x.py\n?? core.4242\n?? lm_cache/a.db\n"
     _run(tmp_path, task, monkeypatch, Script(), **run)
@@ -1074,7 +1102,7 @@ def test_the_runs_own_workspace_inside_the_tree_is_no_uncommitted_source(tmp_pat
         _git=lambda repo, *args: "c0ffee1\n" if args[0] == "rev-parse" else listed,
         _commit_policy=lambda: CommitPolicy(denied_paths=("ws/",)),
     )
-    said = report_mod._unmeasurable(workflow, tmp_path, "c0ffee1")
+    said = report_mod.unmeasurable(workflow, tmp_path, "c0ffee1")
     assert said == "1 file(s) in the tree are in no commit: other/probe.py"
 
 

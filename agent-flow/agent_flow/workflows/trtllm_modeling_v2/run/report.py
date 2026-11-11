@@ -82,7 +82,7 @@ def onboard_ref(slug: str) -> str:
     return f"refs/mv2/{slug or 'run'}/onboarded"
 
 
-def _unmeasurable(workflow, tree: Path, commit: str) -> str:
+def unmeasurable(workflow, tree: Path, commit: str) -> str:
     """Why a check on ``tree`` would not be a check of ``commit``; ``""`` when it would.
 
     Another head, or files the commit does not hold (an untracked source too): what the
@@ -124,7 +124,7 @@ def measure(
     deployment has one. A check that cannot be run at all is a failed check with why.
     """
     identity = workflow._identity(commit, tree)
-    why = _unmeasurable(workflow, tree, commit) or (
+    why = unmeasurable(workflow, tree, commit) or (
         "" if identity else "the tree's content cannot be identified: git names no commit"
     )
     if why:
@@ -183,7 +183,7 @@ def measure(
             break
         workflow.journal.event("check without a verdict", f"{check.key}: {result.infrastructure}")
     # What was measured is the commit only when the tree is still it, as it was.
-    moved = _unmeasurable(workflow, tree, commit)
+    moved = unmeasurable(workflow, tree, commit)
     if not moved and workflow._identity(commit, tree) != identity:
         moved = "its native libraries are not the ones the check started on"
     if moved:
@@ -482,7 +482,9 @@ def delivered_tests(workflow, commit: str) -> Line | None:
     report = workflow.workspace / CHECKS_DIRNAME / commit[:12] / "delivered-tests.xml"
     report.parent.mkdir(parents=True, exist_ok=True)
     report.unlink(missing_ok=True)
-    command = pytest_runner.pytest_command(python, repo, files, report, ("--timeout=180",))
+    command = pytest_runner.pytest_command(
+        python, repo, files, report, ("--timeout=180",), workflow.environment
+    )
     line = test_job_line(command, repo)
     if workflow._shell_runner_override is not None:
         done = workflow._shell_runner(line, None, pytest_runner.TIMEOUT_S)

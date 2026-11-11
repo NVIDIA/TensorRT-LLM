@@ -291,6 +291,20 @@ def test_ranks_left_after_a_stop_are_no_verdict_and_stay_owned_until_the_devices
     servers.stop(running)
 
 
+def test_a_look_reads_its_markers_wherever_the_prefix_puts_them(site):
+    """`srun --label` prints `0: ` before each line, and a prefix may print lines of its own."""
+    label = site / "bin" / "label"
+    label.write_text('#!/bin/bash\necho "site banner: node-1 777"\n"$@" | sed "s/^/0: /"\n')
+    label.chmod(0o755)
+    (site / "holders").write_text("4242\n111\n")
+    holders, processes = servers._look("label", dict(os.environ), 30)
+    # The banner is no holder, the labelled lines are read, and the one process is counted.
+    assert (holders, processes) == ([f"{HOST} 111", f"{HOST} 4242"], 1)
+    assert servers._look("", dict(os.environ), 30) == (holders, 1)
+    # A look that fails is unknown, never "no holder".
+    assert servers._look("false", dict(os.environ), 30) == (None, 0)
+
+
 def test_every_server_is_ended_before_the_devices_are_looked_at(tmp_path, monkeypatch):
     """A deployment's other servers, still up while one stops, are not ranks left behind."""
     roles = (("ctx", 1001), ("gen", 1002), ("proxy", 1003))

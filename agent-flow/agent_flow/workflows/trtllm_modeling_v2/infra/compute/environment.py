@@ -135,6 +135,8 @@ class RunEnvironment:
     world_size: int = 1
     # The image the GPU jobs run in, if any: an interpreter path above is a path inside it.
     container_image: str | None = None
+    #: ``environment.launch``: the site's prefix of one-GPU commands; empty: this host.
+    launch: str = ""
 
     @property
     def ntasks(self) -> int:
@@ -166,6 +168,17 @@ class RunEnvironment:
             parts.append("CUDA_VISIBLE_DEVICES=" + ",".join(str(d) for d in self.devices))
         parts.extend(env_assignments(self.launch_env))
         return " ".join(parts)
+
+    @property
+    def one_gpu_prefix(self) -> str:
+        """What a worker puts before a one-GPU command (an entry's test).
+
+        On this host, :attr:`prefix`. Where the spec states ``environment.launch``: the
+        exported variables, then that prefix, which brings its own device and container.
+        """
+        if not self.launch:
+            return self.prefix
+        return " ".join([*env_assignments(self.launch_env), self.launch])
 
     def _scrub_and_exec(self, argv: str) -> str:
         """``argv`` behind a scrub of the MPI environment, in this process."""
@@ -216,6 +229,16 @@ class RunEnvironment:
         return self.command(f"{shlex.quote(self.python)} {argv}", single_process=single_process)
 
 
+def behind_launch(launch: str, env: Mapping[str, str], program: str) -> str:
+    """``program`` behind a site's ``launch`` prefix, started by the flow, with ``env`` exported.
+
+    The prefix is the site's own words and brings its allocation: nothing of the
+    orchestrator's MPI or scheduler identity goes behind it.
+    """
+    inner = f"{single_task_scrub(list(env), rank=False)}; {launch} {program}"
+    return f"{' '.join(env_assignments(env))} bash -c {shlex.quote(inner)}".strip()
+
+
 def resolve_environment(
     task_data: Mapping[str, Any],
     *,
@@ -233,6 +256,7 @@ def resolve_environment(
         devices=tuple(int(d) for d in devices),
         world_size=max(1, int(world_size)),
         container_image=block.get("container_image"),
+        launch=str(block.get("launch") or "").strip(),
     )
 
 

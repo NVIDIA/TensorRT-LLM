@@ -4,10 +4,11 @@
 """The receipt: the one file a turn reports with, and the two things it can say.
 
 A turn writes one YAML file at the one path its message names (:func:`decision_path`:
-the task and its attempt). Its first line is ``decision: ready`` (the work is committed
-and the task's checks passed: the branch may land) or ``decision: blocked`` (the attempt
-ends, and what the worker wrote is the next attempt's note). The pipeline reads it there
-and nowhere else: a turn that wrote no valid receipt has none.
+the task and its attempt). Its key ``decision`` says ``ready`` (the work is committed
+and the task's checks passed: the branch may land) or ``blocked`` (the attempt ends, and
+what the worker wrote is the next attempt's note). The pipeline reads it there and
+nowhere else: a turn that wrote no valid receipt has none. The other keys are typed
+(:func:`shape_problem`); a wrong type costs one short turn and never the decision.
 """
 
 from __future__ import annotations
@@ -53,6 +54,37 @@ def decision_problem(path: Path) -> str:
         return f"`{path}` has no `decision` key; it must be {allowed}"
     if str(raw["decision"]).strip() not in DECISIONS:
         return f"`decision` is {str(raw['decision']).strip()!r} in `{path}`; it must be {allowed}"
+    return ""
+
+
+def shape_problem(path: Path) -> str:
+    """Why a key of the receipt at ``path`` is not of its type, in a sentence; ``""`` when each is.
+
+    ``summary`` is text; ``not_done`` and ``checks`` are lists with a line of text per
+    item (``- what: why`` too: YAML reads that item as a mapping). The decision of such
+    a receipt stands: its worker gets one turn to write it again, and whatever is found
+    there afterwards is printed as text.
+    """
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return ""
+    for key in ("summary", "not_done", "checks") if isinstance(raw, dict) else ():
+        value = raw.get(key)
+        if value is None or (key == "summary" and isinstance(value, str)):
+            continue
+        if key == "summary":
+            return f"`summary` in `{path}` must be text; it is {clip(repr(value), 80)}"
+        flat = isinstance(value, list) and not any(
+            isinstance(item, list)
+            or (isinstance(item, dict) and any(isinstance(v, (list, dict)) for v in item.values()))
+            for item in value
+        )
+        if not flat:
+            return (
+                f"`{key}` in `{path}` must be a list with one line of text per item (`[]` "
+                f"when nothing); it is {clip(repr(value), 80)}"
+            )
     return ""
 
 

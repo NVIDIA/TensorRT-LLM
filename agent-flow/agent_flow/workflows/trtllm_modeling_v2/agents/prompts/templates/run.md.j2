@@ -35,7 +35,7 @@ The ones the onboard check accepted: {{ kept }}.
 {% endif %}
 {% endif %}{% if python %}## GPU commands
 
-The gate launches what it measures itself. Any other GPU command (an entry's test) runs under `{{ python }}` with this prefix, on the device(s) the run claimed ({{ devices }}):
+The gate launches what it measures itself. Any other GPU command (an entry's test) runs under `{{ python }}` with this prefix, {% if launch %}the site's, which brings its own device{% else %}on the device(s) the run claimed ({{ devices }}){% endif %}:
 
     {{ prefix }}
 

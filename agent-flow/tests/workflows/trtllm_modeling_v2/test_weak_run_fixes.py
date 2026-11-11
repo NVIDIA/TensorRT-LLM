@@ -54,6 +54,11 @@ import yaml
 
 from agent_flow.backends import claude_code
 from agent_flow.workflows.trtllm_modeling_v2.agents import prompts as prompt_texts
+from agent_flow.workflows.trtllm_modeling_v2.agents.decisions import (
+    decision_problem,
+    read_decision,
+    shape_problem,
+)
 from agent_flow.workflows.trtllm_modeling_v2.checks import anchors, conventions, servers
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
 from agent_flow.workflows.trtllm_modeling_v2.run import report as report_mod
@@ -241,14 +246,61 @@ def test_a_decision_file_without_its_decision_gets_one_turn_to_write_it(
     assert (core["status"], core["attempts"]) == ("done", 1)
 
 
+def test_a_receipt_key_of_the_wrong_type_gets_one_turn_and_never_costs_the_decision(
+    tmp_path, task_file, monkeypatch
+):
+    """The work was accepted; a number where a list belongs must not end the run at its report."""
+    prompts: list[str] = []
+
+    def assembler(turn, prompt):
+        prompts.append(prompt)
+        return {"decision": "ready", "summary": ["boot", "passed"], "not_done": 7, "checks": "all"}
+
+    _run(tmp_path, task_file, monkeypatch, Script(assembler=assembler))
+    # One short turn to write it again, told which key and what it is; then the decision stands.
+    assert len(prompts) == 2 and "## Your receipt is not valid" in prompts[1]
+    assert (
+        "`summary` in `" in prompts[1] and "must be text; it is ['boot', 'passed']." in prompts[1]
+    )
+    [core] = [t for t in _tasks(tmp_path) if t["id"] == "core"]
+    assert (core["status"], core["attempts"]) == ("done", 1) and _state(tmp_path).onboarded
+    # The report prints whatever it finds as text.
+    report = (tmp_path / "ws" / "delivery_report.md").read_text()
+    assert "- `core` left not done: 7" in report and "| ready | ['boot', 'passed'] |" in report
+    path = tmp_path / "receipt.yaml"
+    listed = "must be a list with one line of text per item (`[]` when nothing); it is"
+    forms = {
+        'summary: s\nnot_done: []\nchecks:\n  - "gate @ 1a2b: [PASS]"': "",
+        "not_done:\n  - what: why\n  - plain\n  - 3": "",
+        "summary:\nnot_done:\nchecks:": "",
+        "": "",
+        "not_done: 7": f"`not_done` in `{path}` {listed} 7",
+        "not_done: |\n  one\n  two": f"`not_done` in `{path}` {listed} 'one\\ntwo\\n'",
+        "checks: not-a-list": f"`checks` in `{path}` {listed} 'not-a-list'",
+        "checks: {boot: pass}": f"`checks` in `{path}` {listed} {{'boot': 'pass'}}",
+        "not_done:\n  - [a, b]": f"`not_done` in `{path}` {listed} [['a', 'b']]",
+        "not_done:\n  - what: [a, b]": f"`not_done` in `{path}` {listed} [{{'what': ['a', 'b']}}]",
+        "summary: 7": f"`summary` in `{path}` must be text; it is 7",
+        "summary: {a: b}": f"`summary` in `{path}` must be text; it is {{'a': 'b'}}",
+    }
+    for form, said in forms.items():
+        path.write_text(f"decision: ready\n{form}\n")
+        assert shape_problem(path) == said, form
+        assert decision_problem(path) == "" and read_decision(path)["decision"] == "ready"
+    # What is no receipt at all is the other question's.
+    path.write_text("summary: [a]\n")
+    assert shape_problem(path) and "has no `decision` key" in decision_problem(path)
+
+
 def test_the_decision_is_the_first_line_of_the_decision_file():
     """Defect 7: the example starts with ``decision:``, every other key top-level after it."""
     for kind in ("survey", "kernel", "core", "deployment", "fix", "config"):
         said = prompt_texts.dispatch(kind, facts())
+        # What the text says is what the parser holds: the key, wherever a worker put it.
         assert (
-            "Line 1 is `decision: ready` or `decision: blocked`. Nothing comes before it." in said
+            "Begin with `decision: ready` or `decision: blocked`: without that key the file "
+            "is no receipt. Every key starts at column 0." in said
         )
-        assert "Every key starts at column 0." in said
         assert "```yaml\ndecision: ready\nsummary: |" in said and "\nnot_done:\n" in said
 
 

@@ -15,6 +15,7 @@ import pytest
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import pytest_runner
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
+from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import model_ops_tests_dir
 from agent_flow.workflows.trtllm_modeling_v2.run import contract, report
 
@@ -57,6 +58,7 @@ class _Delivery:
         }
         self.workspace = tmp_path / "ws"
         self._preflight = SimpleNamespace(target_rel=TARGET)
+        self.environment = None
         self._status = contract.ContractStatus.load(self.workspace)
         self.ran: list[str] = []
 
@@ -78,7 +80,9 @@ class _Delivery:
         return report.delivered_tests(self, self.head)
 
 
-def test_the_delivered_tests_run_once_at_the_commit_and_hold_on_their_passing(tmp_path):
+def test_the_delivered_tests_run_once_at_the_commit_and_hold_on_their_passing(
+    tmp_path, monkeypatch
+):
     tests = model_ops_tests_dir(TARGET)
     stage = _Delivery(
         tmp_path,
@@ -102,6 +106,20 @@ def test_the_delivered_tests_run_once_at_the_commit_and_hold_on_their_passing(tm
     _git(stage.repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "y")
     stage.head = _git(stage.repo, "rev-parse", "HEAD")
     assert stage.check().passed and len(stage.ran) == 2
+    # One-GPU work runs where the site says: behind `environment.launch`, with the spec's
+    # variables, and with nothing of the orchestrator's scheduler identity.
+    behind = "import os\n\ndef test_site():\n    assert os.environ['SITE_PREFIX'] == '1'\n"
+    behind += "    assert os.environ['A'] == 'b' and 'SLURM_JOB_ID' not in os.environ\n"
+    (stage.repo / tests / "test_forward.py").write_text(behind)
+    _git(stage.repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "z")
+    stage.head = _git(stage.repo, "rev-parse", "HEAD")
+    assert not stage.check().passed
+    site = {"python": sys.executable, "launch": "env SITE_PREFIX=1", "env": {"A": "b"}}
+    stage.environment = resolve_environment({"environment": site}, devices=(3,))
+    monkeypatch.setenv("SLURM_JOB_ID", "7")
+    placed = stage.check()
+    assert placed.passed, placed.detail
+    assert "; env SITE_PREFIX=1 " in stage.ran[-1] and "CUDA_VISIBLE_DEVICES" not in stage.ran[-1]
 
 
 @pytest.mark.parametrize(

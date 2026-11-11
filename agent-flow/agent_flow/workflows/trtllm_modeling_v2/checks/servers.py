@@ -87,12 +87,15 @@ COMPLETED: tuple[str, ...] = ("stop", "length")
 #: Printed once by each process a launch prefix starts: how many it starts is how many
 #: ranks it can place.
 _PROCESS = "MV2FLOW_PROCESS"
+#: Before each ``<host> <pid>`` the look prints: a line without a marker is the prefix's
+#: own (a banner, a scheduler's label before each line), and is not read.
+_HOLDER = "MV2FLOW_HOLDER"
 # Each process holding a device, with the host it is on: one prefix may land on several.
 # A host whose devices cannot be listed fails the look; it is not a host with no holder.
 _HOLDERS = (
     f"bash -o pipefail -c 'h=$(hostname); echo {_PROCESS}; "
     "nvidia-smi --query-compute-apps=pid --format=csv,noheader "
-    '| while read -r p; do echo "$h $p"; done\''
+    f'| while read -r p; do echo "{_HOLDER} $h $p"; done\''
 )
 
 
@@ -301,8 +304,10 @@ def _look(launch: str, env: Mapping[str, str], timeout: float) -> tuple[list[str
         return None, 0
     if done.returncode:
         return None, 0
-    lines = [" ".join(line.split()) for line in done.stdout.splitlines() if line.strip()]
-    return sorted({line for line in lines if line != _PROCESS}), lines.count(_PROCESS)
+    # A marker is found wherever the prefix put it in a line (`srun --label` prints `0: ...`).
+    lines = done.stdout.splitlines()
+    holders = {" ".join(line.split(_HOLDER, 1)[1].split()) for line in lines if _HOLDER in line}
+    return sorted(holders), sum(_PROCESS in line for line in lines)
 
 
 def _released(owned: Owned, release_s: float) -> str:

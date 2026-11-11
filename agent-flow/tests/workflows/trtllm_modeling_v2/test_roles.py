@@ -331,7 +331,7 @@ def test_every_kind_of_task_has_a_role_its_section_and_the_one_receipt() -> None
         # The priorities come first, then the task, last the receipt: ready or blocked.
         assert said.startswith("## Priorities, in this order\n\n1. Onboard: ")
         assert said.index(heading) < said.index("## The receipt")
-        assert "Line 1 is `decision: ready` or `decision: blocked`." in said
+        assert "Begin with `decision: ready` or `decision: blocked`: " in said
         assert "```yaml\ndecision: ready\nsummary: |" in said
         assert "to exactly this path. The run reads nothing else.\n\n`/ws/decisions/" in said
         assert "list" not in said.split("## Priorities")[0] and "SPDX" not in said
@@ -339,6 +339,7 @@ def test_every_kind_of_task_has_a_role_its_section_and_the_one_receipt() -> None
         # The prefix of any other GPU command, as the run resolved it.
         assert "## GPU commands" in said and "under `/opt/venv/bin/python`" in said
         assert "\n    CUDA_VISIBLE_DEVICES=0 TMPDIR=/scratch/tmp\n" in said
+        assert "with this prefix, on the device(s) the run claimed (" in said
         assert "{{" not in said and "{%" not in said
     kernel = prompts.dispatch("kernel", facts())
     assert "- `entry`: the entry's path as committed" in kernel and "- `tier`: " in kernel
@@ -418,15 +419,15 @@ def test_one_turn_loads_about_twelve_hundred_words_and_the_texts_stay_small() ->
     sizes["survey"] = words("survey", worktree="", gate="")  # it has no worktree and no check
     sizes.update({card: words("deployment", cards=[card]) for card in _CARDS})
     # Counted with the fixture's paths and commands in it, which are not standing text.
-    assert max(sizes.values()) <= 1260, sizes
+    assert max(sizes.values()) <= 1270, sizes
     assert all(size <= 1200 for kind, size in sizes.items() if kind != "kernel"), sizes
     # What is maintained: the base, the receipt, the six sections and the six cards; and
     # with them what a message says of the run (its facts, a repair, the host's file).
     root = Path(prompts.__file__).parent / "templates"
     texts = {p.name: len(p.read_text().split()) - 13 for p in root.rglob("*.md.j2")}
     run_facts = sum(texts.pop(name) for name in ("run.md.j2", "repair.md.j2", "host_facts.md.j2"))
-    assert len(texts) == 14 and sum(texts.values()) <= 4300, texts
-    assert run_facts <= 1200, run_facts
+    assert len(texts) == 14 and sum(texts.values()) <= 4320, texts
+    assert run_facts <= 1210, run_facts
 
 
 def test_the_texts_name_only_paths_the_tree_has() -> None:

@@ -72,6 +72,7 @@ _UNSAID: dict[str, Any] = dict(
     kept="",
     python="",
     prefix="",
+    launch=False,
     devices="",
     text_only=False,
     spec_notes="",

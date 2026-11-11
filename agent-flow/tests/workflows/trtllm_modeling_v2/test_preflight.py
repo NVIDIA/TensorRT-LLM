@@ -110,6 +110,17 @@ def test_the_probe_runs_where_the_first_deployments_engine_will(tmp_path):
     assert "`dep16` needs 16 free sm_103 device(s) behind `srun -N4 -n16`; 0 of 16 are free" in (
         str(short.value)
     )
+    # A prefix that labels its output (`srun --label` prints `3: ` before each line) or prints
+    # lines of its own is read all the same: the answer is found wherever it is in a line.
+    plain = healthy_smi(16)
+
+    def labelled(command, env=None, timeout=0):
+        lines = plain(command, env, timeout).stdout.splitlines()
+        said = "\n".join(f"{rank}: {line}" for rank, line in enumerate(lines))
+        return CommandResult(returncode=0, stdout=f"srun: job 7 queued\n{said}\n")
+
+    result = preflight.run_preflight(alone, runner=labelled)
+    assert result.not_attempted == [] and "(none claimed here)" in result.report()
     # Each server of a disaggregated first deployment is probed behind its own prefix
     # and owes its own ranks there: the generation side too, and here when it has none.
     halves = {

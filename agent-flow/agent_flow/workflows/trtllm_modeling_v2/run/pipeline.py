@@ -45,6 +45,7 @@ from ..agents.decisions import (
     decision_problem,
     first_paragraph,
     read_decision,
+    shape_problem,
 )
 from ..checks import anchors as anchors_mod
 from ..checks import conventions, gate_cli
@@ -373,9 +374,10 @@ class Pipeline:
             facts = self._facts(task, tree)
             self._dispatch(task, role, facts, path)
             data = read_decision(path)
-            problem = decision_problem(path) if data is None else ""
+            problem = decision_problem(path) or shape_problem(path)
             if problem:
                 # The work may be done though the file is wrong: one short turn to say so.
+                # A key of the wrong type costs that turn and no more: the decision stands.
                 self.w.journal.event("task", f"{task.id}: receipt not valid: {problem}")
                 self._dispatch(
                     task, role, {**facts, "repair": prompts.repair(problem=problem)}, path
@@ -567,7 +569,8 @@ class Pipeline:
             # What the report says of them: kept and verified, incomplete, or not needed.
             kept=report_mod.kept_libraries(w) if self.state.onboarded else "",
             python=w.environment.python if w.environment is not None else "",
-            prefix=w.environment.prefix if w.environment is not None else "",
+            prefix=w.environment.one_gpu_prefix if w.environment is not None else "",
+            launch=bool(w.environment is not None and w.environment.launch),
             devices=", ".join(map(str, self.state.devices)) or "none",
             text_only=w.task_data.get("scope") == "text_only",
             spec_notes=str(w.task_data.get("notes") or "").strip(),
@@ -643,7 +646,7 @@ class Pipeline:
         landing = str(item.variant) if local else item.target
         paths = entry_paths(item, target, repo or None) or ()
         env = w.environment
-        python = f"{env.prefix} {env.python}".strip() if env is not None else "python"
+        python = f"{env.one_gpu_prefix} {env.python}".strip() if env is not None else "python"
         return dict(
             n=item.n,
             mode=item.mode,

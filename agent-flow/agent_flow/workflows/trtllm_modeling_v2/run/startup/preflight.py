@@ -30,12 +30,7 @@ from ...checks import anchors as anchors_mod
 from ...checks import datasets
 from ...checks.check_runtime import MODE_REQUIRE, with_mode
 from ...checks.servers import rank_problem
-from ...infra.compute.environment import (
-    RunEnvironment,
-    env_assignments,
-    resolve_environment,
-    single_task_scrub,
-)
+from ...infra.compute.environment import RunEnvironment, behind_launch, resolve_environment
 from ...operators.coverage import MODELING_V2_PACKAGE
 from ...spec import deployments as deployments_mod
 from ...spec.advice import checkpoint_notes, spec_warnings, unfit
@@ -179,16 +174,17 @@ def probe(
     command = environment.python_command(argv, single_process=True)
     if launch:
         words = " ".join(shlex.quote(word) for word in (environment.python, *argv))
-        inner = f"{single_task_scrub(list(env), rank=False)}; {launch} {words}"
-        command = f"{' '.join(env_assignments(environment.env))} bash -c {shlex.quote(inner)}"
+        command = behind_launch(launch, environment.env, words)
     repo = shlex.quote(str(task_data["trtllm_repo_path"]))
     result = runner(f"cd {repo} && {command}", None, PROBE_TIMEOUT_S)
     output = f"{result.stdout}\n{result.stderr}"
     records = []
     for line in output.splitlines():
-        if line.startswith(PROBE_MARKER):
+        # Wherever the prefix put it in the line: `srun --label` prints `0: ` before each.
+        _, marked, answer = line.partition(PROBE_MARKER)
+        if marked:
             try:
-                records.append(json.loads(line[len(PROBE_MARKER) :]))
+                records.append(json.loads(answer))
             except ValueError:
                 continue  # a line a rank tore: no answer of its own
     found: dict[str, Any] = {"devices": [], "processes": len(records)}
