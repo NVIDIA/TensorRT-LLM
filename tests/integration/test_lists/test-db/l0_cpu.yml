@@ -350,6 +350,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_responses_custom_tools.py
   - unittest/llmapi/apps/test_responses_deepseek_v41_namespaces.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py
+  - unittest/llmapi/apps/test_responses_serving_extensions.py
   - unittest/llmapi/apps/test_responses_store_replay.py
   - unittest/llmapi/apps/test_responses_stream_final_consistency.py
   - unittest/llmapi/apps/test_responses_streaming_events.py
@@ -415,6 +416,11 @@ l0_cpu:
   - unittest/quantization/test_nvfp4_plus_format.py
   - unittest/scaffolding
   - unittest/scripts
+  - unittest/serve
+  # VisualGen serve tests are also collected by the entry above. This entry keeps
+  # them for VisualGen-only PRs, where CBTS keeps only entries containing visual_gen/
+  # (with the trailing slash).
+  - unittest/serve/api/visual_gen/
   - unittest/tools
   - unittest/usage
   - unittest/utils/test_logger.py

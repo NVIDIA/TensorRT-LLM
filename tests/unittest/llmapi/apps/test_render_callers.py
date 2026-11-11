@@ -806,7 +806,7 @@ class TestResponsesInputTokens:
     ) -> None:
         import tensorrt_llm.serve.responses_utils as responses_utils
 
-        async def fake_input_messages(request, prev_msgs):
+        async def fake_input_messages(request, prev_msgs, extension=None):
             return [{"role": "user", "content": "hello world"}]
 
         monkeypatch.setattr(responses_utils, "_create_input_messages", fake_input_messages)

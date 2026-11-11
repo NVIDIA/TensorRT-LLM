@@ -424,14 +424,39 @@ def render_chat(
     return result
 
 
-class _LengthExtension(ServingExtension):
-    """No extension hooks, but the model's tool serialization (kimi_k3 drops null defaults)."""
+class _ModelToolsExtension(ServingExtension):
+    """No request hooks, but the model's tool serialization (kimi_k3 drops null defaults)."""
 
     def __init__(self, model_extension: ServingExtension):
         self._model_extension = model_extension
 
     def serialize_tool(self, tool: Any) -> Dict[str, Any]:
         return self._model_extension.serialize_tool(tool)
+
+
+def render_prepared_chat(
+    request: "ChatCompletionRequest",
+    res: RenderResources,
+    *,
+    tokenize: bool = True,
+    encode_rendered: Optional[Callable[[str, Any], List[int]]] = None,
+) -> RenderedPrompt:
+    """Render a chat request whose request-level preprocessing already happened.
+
+    The Responses route derives the chat-template kwargs and the tool list from the
+    Responses request through the model's Responses hooks, then renders the converted
+    chat messages with the model's tool serialization and without
+    ``apply_chat_extensions``. A caller that rebuilt that chat request to render the
+    same prompt (the KV-aware router) renders it the same way here. Like
+    :func:`render_chat_for_length`, the result serves routing and is never forwarded
+    to a worker.
+    """
+    return render_chat(
+        request,
+        dataclasses.replace(res, extension=_ModelToolsExtension(res.extension)),
+        tokenize=tokenize,
+        encode_rendered=encode_rendered,
+    )
 
 
 def render_chat_for_length(
@@ -477,7 +502,7 @@ def render_chat_for_length(
         model_type="" if _is_passthrough_model(res) else res.model_type,
         hf_config=None,
         input_processor=None,
-        extension=_LengthExtension(res.extension),
+        extension=_ModelToolsExtension(res.extension),
         use_harmony=False,
     )
     return render_chat(text_only, plain, encode_rendered=encode_rendered)
