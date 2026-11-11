@@ -1847,8 +1847,9 @@ class GenphaseTokenComm(KernelComponent):
                 any_destination = any_destination | destination_masks[token_round, word]
 
             if any_destination != cutlass.Uint32(0):
-                # The caller's row stride is the padded one `launch` checks, a
-                # multiple of sixteen bytes, so every word read is aligned.
+                # The caller's row stride is the padded one, a multiple of sixteen
+                # bytes, so every word read is aligned: `launch` checks a static
+                # stride, the kernel entry a dynamic one.
                 source_row_address = activation_sf[token, None].iterator.toint()
                 for pair_round in cutlass.range_constexpr(self.sf_ll_pairs_per_lane):
                     pair_idx = Int32(pair_round * 32) + lane_idx
