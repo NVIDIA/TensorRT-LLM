@@ -1145,9 +1145,17 @@ def responses_api_streaming_post_processor(
     if args.streaming_processor is None:
         raise ValueError(
             "streaming_processor is required for streaming post-processing")
-    outputs = args.streaming_processor.process_single_output(rsp)
+    try:
+        outputs = args.streaming_processor.process_single_output(rsp)
+        if rsp._done:
+            outputs.append(
+                args.streaming_processor.get_final_response_non_store(
+                    rsp,
+                    args.usage_num_prompt_tokens(),
+                    tokenizer=args.tokenizer))
+    except Exception:
+        args.streaming_processor.cleanup_stream_state()
+        raise
     if rsp._done:
-        outputs.append(
-            args.streaming_processor.get_final_response_non_store(
-                rsp, args.usage_num_prompt_tokens(), tokenizer=args.tokenizer))
+        args.streaming_processor.cleanup_stream_state()
     return outputs
