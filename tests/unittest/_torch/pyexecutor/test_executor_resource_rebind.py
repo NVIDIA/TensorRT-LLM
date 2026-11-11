@@ -458,8 +458,9 @@ def test_final_shutdown_after_release_does_not_release_resources_twice(executor)
 
 
 @pytest.mark.parametrize("failure_stage", ["graphs", "synchronize"])
+@pytest.mark.parametrize("release_first", [False, True])
 def test_terminal_release_error_stops_worker_and_allows_shutdown_retry(
-    executor, monkeypatch, failure_stage
+    executor, monkeypatch, failure_stage, release_first
 ):
     ex, events = executor
     _enable_real_worker(ex, monkeypatch)
@@ -474,11 +475,12 @@ def test_terminal_release_error_stops_worker_and_allows_shutdown_retry(
     ex.executor_request_queue.enqueue_shutdown_request.side_effect = stop_requested.set
     try:
         ex.start_worker()
-        _run_bounded(ex.release_resources)
+        if release_first:
+            _run_bounded(ex.release_resources)
         worker = ex.worker_thread
         engine = ex.model_engine
         assert worker.is_alive()
-        assert ex._worker_phase_done.is_set()
+        assert ex._worker_phase_done.is_set() == release_first
         with monkeypatch.context() as patch:
             owner, name = (
                 (engine, "release_executor_resources")
@@ -497,6 +499,51 @@ def test_terminal_release_error_stops_worker_and_allows_shutdown_retry(
         _run_bounded(ex.shutdown)
         assert ex._closed
         assert not hasattr(ex, "model_engine")
+        assert events.count("cache") == 1
+        assert events.count("unregister") == 1
+    finally:
+        stop_requested.set()
+        _run_bounded(ex._stop_worker_thread)
+
+
+def test_terminal_pool_retry_stops_worker_after_profiling_release_error(executor, monkeypatch):
+    ex, events = executor
+    _enable_real_worker(ex, monkeypatch)
+    stop_requested = threading.Event()
+    cleanup_error = RuntimeError("pool teardown failed")
+    pool = Mock()
+    pool.__exit__ = Mock(side_effect=cleanup_error)
+    ex.dwdp_manager = pool
+
+    def event_loop():
+        assert stop_requested.wait(5)
+        ex.shutdown_event.set()
+
+    ex._event_loop_wrapper = event_loop
+    ex.executor_request_queue.enqueue_shutdown_request.side_effect = stop_requested.set
+    try:
+        ex.start_worker()
+        worker = ex.worker_thread
+        with pytest.raises(RuntimeError) as error:
+            _run_bounded(ex.release_resources)
+        assert error.value is cleanup_error
+        assert ex._shutdown_runtime_complete
+        assert worker.is_alive()
+        assert ex._worker_phase_done.is_set()
+
+        with pytest.raises(RuntimeError) as error:
+            _run_bounded(ex.shutdown)
+        assert error.value is cleanup_error
+        assert not worker.is_alive()
+        assert not ex._closed
+        assert ex.dwdp_manager is pool
+
+        pool.__exit__.side_effect = None
+        _run_bounded(ex.shutdown)
+        assert ex._closed
+        assert ex.dwdp_manager is None
+        assert events.count("graphs") == 1
+        assert events.count("synchronize") == 1
         assert events.count("cache") == 1
         assert events.count("unregister") == 1
     finally:

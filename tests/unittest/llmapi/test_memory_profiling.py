@@ -91,7 +91,10 @@ def test_profile_kvcache():
     assert vlm_activation_bytes_with_mm_reqs > vlm_activation_bytes_no_mm_reqs, f"Activation bytes should be higher with mm reqs, but got {vlm_activation_bytes_with_mm_reqs} for mm reqs and {vlm_activation_bytes_no_mm_reqs} without mm reqs"
 
 
-def test_pyexecutor_and_kvcache_share_execution_stream(monkeypatch):
+@pytest.mark.parametrize("release_before_shutdown", [False, True],
+                         ids=["bound", "released"])
+def test_pyexecutor_and_kvcache_share_execution_stream(monkeypatch,
+                                                       release_before_shutdown):
     """Test that PyExecutor and KVCacheManager share the same execution_stream.
 
     The execution_stream is created once in create_py_executor and passed to:
@@ -176,12 +179,13 @@ def test_pyexecutor_and_kvcache_share_execution_stream(monkeypatch):
         assert py_executor.worker_thread is profiling_thread
         assert profiling_thread.is_alive(), \
             "The shared worker must remain alive until serving shuts down"
-        py_executor.release_resources()
-        assert py_executor.worker_thread is profiling_thread
-        assert profiling_thread.is_alive(), \
-            "Resource release must park the shared worker until terminal shutdown"
+        if release_before_shutdown:
+            py_executor.release_resources()
+            assert py_executor.worker_thread is profiling_thread
+            assert profiling_thread.is_alive(), \
+                "Resource release must park the shared worker until terminal shutdown"
     finally:
         py_executor.shutdown()
         torch.cuda.empty_cache()
     assert not profiling_thread.is_alive(), \
-        "Terminal shutdown must stop the parked worker"
+        "Terminal shutdown must stop the shared worker"

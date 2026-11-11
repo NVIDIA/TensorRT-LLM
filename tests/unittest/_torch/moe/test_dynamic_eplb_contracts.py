@@ -961,15 +961,17 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
         "worker_phase_done",
         "listener_shutdown",
         ("sampler_stop", 1),
+        "worker_join",
         "release_graphs",
         "resource_shutdown",
         ("pool_delete", 1),
         ("terminal_cleanup", False),
+        "worker_join",
         ("pool_delete", 2),
         ("dwdp_exit", 1),
         ("terminal_cleanup", False),
-        ("dwdp_exit", 2),
         "worker_join",
+        ("dwdp_exit", 2),
         ("terminal_cleanup", True),
     ]
     assert executor.virtual_memory_pools == {}

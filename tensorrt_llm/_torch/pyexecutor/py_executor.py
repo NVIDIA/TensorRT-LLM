@@ -2580,7 +2580,6 @@ class PyExecutor:
             if not self._release_execution_resources(
                     release_model_owned_graphs=True):
                 return
-            self._stop_worker_thread()
         else:
             try:
                 for engine in self._terminal_model_engines:
@@ -2605,6 +2604,8 @@ class PyExecutor:
                                      ) -> bool:
         """Stop execution and release GPU resources; retain model ownership."""
         if getattr(self, "_shutdown_runtime_complete", False):
+            if release_model_owned_graphs:
+                self._stop_worker_thread()
             return self._release_execution_pools()
         node_server = getattr(self, "_openengine_node_server", None)
         if node_server is not None:
@@ -2679,6 +2680,10 @@ class PyExecutor:
             # synchronization and allocator teardown can touch DMA-owned memory
             # or hang on a failed device, so retain the whole execution state.
             return False
+        if release_model_owned_graphs:
+            # Terminal shutdown cannot leave this idle worker holding model
+            # owners if later teardown fails. Profiling retains its TLS state.
+            self._stop_worker_thread()
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
         # that is referenced by raw pointers inside captured CUDA graphs.  If
