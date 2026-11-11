@@ -269,6 +269,25 @@ _PREPARE_ARGS = (
 )  # fmt: skip
 
 
+@pytest.mark.parametrize("all_sparse_indices_valid", [False, True], ids=["masked", "all_valid"])
+def test_full_topk_validity_specializations(all_sparse_indices_valid, certifying) -> None:
+    certifying(op)
+    args, rows = _build(dict(new=[2, 3], cached=[TOP_K - 1, TOP_K + 33]), seed=17)
+    assert bool((rows >= 0).all())
+    total_q = args["quant_q_buffer"].shape[0]
+    valid_counts = args["cu_seqlen_ke"][:total_q] - args["cu_seqlen_ks"][:total_q]
+    assert int(valid_counts[0]) == TOP_K
+    assert bool((valid_counts[1:] > TOP_K).all())
+    handle = entry.compile(
+        device_index=torch.cuda.current_device(),
+        all_sparse_indices_valid=all_sparse_indices_valid,
+    )
+    out = op(**args, compiled=handle)
+    torch.cuda.synchronize()
+    ref = op.reference(**args, compiled=handle)
+    _compare(out, ref, _band(args["quant_q_buffer"], args["kv_pool_view"], rows, BMM1[0]))
+
+
 def test_dense_causal_equals_the_index_mode(compiled, compiled_dc) -> None:
     """The kernel's own claim, which the target's switch between the two modes
     rests on: on the dense causal index image with `ks = 0`, the two modes write

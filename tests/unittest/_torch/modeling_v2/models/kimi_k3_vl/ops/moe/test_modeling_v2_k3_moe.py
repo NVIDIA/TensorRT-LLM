@@ -579,6 +579,37 @@ def test_k3_moe_wide_single_call(cell, m):
     assert det and rearmed
 
 
+@pytest.mark.parametrize("rows", [9, 33, 64])
+def test_k3_moe_wide_shared_experts(rows):
+    """Shared experts span partial groups, both token masks, and all eight groups per expert."""
+    state, layers = _wide()
+    layer = layers[0]
+    proc, raw, bias = _experts()
+    generator = torch.Generator(device=DEV).manual_seed(20261031 + rows)
+    chosen = list(range(OFFSET + E_LOCAL - TOP_K, OFFSET + E_LOCAL))
+    logits = _chosen_logits([chosen] * rows, generator)
+    latent = torch.randn(rows, H, generator=generator, device=DEV).bfloat16()
+    stock, ids, weights, x_fp8, x_sf = _stock(proc, bias, latent, logits)
+    expected_ids = torch.tensor(chosen, dtype=ids.dtype, device=ids.device)
+    assert torch.equal(ids.sort(dim=1).values, expected_ids.expand(rows, -1))
+    assert bool((weights > 0).all())
+    assert _groups_wide(ids) == TOP_K * ((rows + DECODE_MAX - 1) // DECODE_MAX)
+
+    output = k3_moe(x_fp8, x_sf, ids, weights, OFFSET, layer)
+    torch.cuda.synchronize()
+    assert output.shape == (rows, H) and output.dtype == torch.bfloat16
+    assert output.device == latent.device and output.is_contiguous()
+    reference = k3_moe.reference(raw, x_fp8, x_sf, ids, weights, OFFSET)
+    assert _compare(output, reference)["ok"]
+    assert _compare(output, stock)["ok"]
+    assert _armed(state, layers)
+
+    repeated = k3_moe(x_fp8, x_sf, ids, weights, OFFSET, layer)
+    torch.cuda.synchronize()
+    assert _same(repeated, output)
+    assert _armed(state, layers)
+
+
 def test_routing_from_a_parameter_that_requires_grad():
     """A model's first k3_moe calls (a load-time warm-up) can run outside inference mode, routed with a bias that is an
     ``nn.Parameter``: the routing weights then require grad. The op hands the kernel tensors DLPack exports (it refuses
