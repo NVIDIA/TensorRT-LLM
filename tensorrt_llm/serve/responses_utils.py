@@ -3240,14 +3240,37 @@ def stream_error_event(cause: str, detail: str,
     ]
 
 
+async def note_stream_termination(
+    stream: AsyncGenerator[Any, None],
+    on_termination: Callable[[str, str], None],
+) -> AsyncGenerator[Any, None]:
+    """Pass a stream through and report why it failed, if it does.
+
+    ``on_termination(cause, detail)`` is called once with the classified cause
+    (``classify_stream_termination``) when the producer raises; the exception
+    is re-raised unchanged and nothing is added to the stream. A client hangup
+    (CancelledError or GeneratorExit) is not a producer failure and is not
+    reported.
+    """
+    try:
+        async for chunk in stream:
+            yield chunk
+    except Exception as exc:
+        cause = classify_stream_termination(exc)
+        on_termination(cause, describe_stream_termination(exc, cause))
+        raise
+
+
 async def guard_responses_stream(
     stream: AsyncGenerator[Any, None],
     terminal_events: Callable[[str, str, int], List[Any]],
+    on_termination: Optional[Callable[[str, str], None]] = None,
 ) -> AsyncGenerator[Any, None]:
     """End a stream that fails before its terminal event with events saying so.
 
     The exception is re-raised and frames pass through untouched. A client hangup (CancelledError or
-    GeneratorExit) is not caught: there is nobody left to tell.
+    GeneratorExit) is not caught: there is nobody left to tell. ``on_termination(cause, detail)``,
+    when given, is told the classified cause of a producer failure before the terminal events go out.
     """
     events_sent = 0
     tail = None
@@ -3277,9 +3300,11 @@ async def guard_responses_stream(
                 tail = text[-_SSE_TAIL_LENGTH:]
             yield chunk
     except Exception as exc:
+        cause = classify_stream_termination(exc)
+        if on_termination is not None:
+            on_termination(cause, describe_stream_termination(exc, cause))
         if completed:
             raise
-        cause = classify_stream_termination(exc)
         logger.error("Responses stream terminated before completion "
                      f"({cause}): {type(exc).__name__}: {exc}")
         try:

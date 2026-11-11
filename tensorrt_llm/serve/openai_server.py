@@ -132,11 +132,14 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        render_conversation)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
                                                 ConversationHistoryStore,
-                                                ResponsesStreamingProcessor)
+                                                ResponsesStreamingProcessor,
+                                                classify_stream_termination)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
-from tensorrt_llm.serve.responses_utils import (guard_responses_stream,
-                                                keep_responses_stream_alive)
+from tensorrt_llm.serve.responses_utils import (describe_stream_termination,
+                                                guard_responses_stream,
+                                                keep_responses_stream_alive,
+                                                note_stream_termination)
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
@@ -207,6 +210,33 @@ class _MsgspecRoute(KvHintsRoute):
 
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+
+def _trace_facts(raw_request: Optional[Request]):
+    """The request-trace facts the middleware seeded for this request, or None.
+
+    None whenever the trace is off or the request is not recorded; a handler
+    then does nothing more, so the untraced path pays one attribute lookup.
+    """
+    if raw_request is None:
+        return None
+    return getattr(raw_request.state, "request_trace", None)
+
+
+def _note_engine_request(facts, promise, served_model: str) -> None:
+    """Record the engine request behind a reply and the prompt it was given.
+
+    The promise's prompt token ids are held by reference and digested on the
+    trace writer's thread. A failure here costs the facts, never the reply.
+    """
+    try:
+        facts.served_model = served_model
+        facts.add_engine_request(promise.request_id,
+                                 getattr(promise, "prompt_token_ids", None))
+    except Exception as error:  # noqa: BLE001 - a trace must not break serving
+        logger.warning(
+            f"Request trace: cannot record the engine request: {error}")
+
 
 _warned_unresolvable_thinking = False
 
@@ -2508,10 +2538,16 @@ class OpenAIServer(_VideoRoutesMixin):
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
+            trace_facts = _trace_facts(raw_request)
+            if trace_facts is not None:
+                _note_engine_request(trace_facts, promise, self.model)
 
             if request.stream:
                 response_generator = chat_stream_generator(
                     promise, postproc_params)
+                if trace_facts is not None:
+                    response_generator = note_stream_termination(
+                        response_generator, trace_facts.note_termination)
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
@@ -2955,6 +2991,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
+        trace_facts = _trace_facts(raw_request)
 
         async def completion_response(
                 promise: RequestOutput,
@@ -3018,6 +3055,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self._extract_metrics(output, raw_request)
             except Exception as e:
                 logger.error(traceback.format_exc())
+                # The failure ends here, as an SSE error event: this is
+                # where the request trace learns why the stream stopped.
+                if trace_facts is not None:
+                    cause = classify_stream_termination(e)
+                    trace_facts.note_termination(
+                        cause, describe_stream_termination(e, cause))
                 # StreamingResponse commits HTTP 200 before the first
                 # chunk, so we cannot change the status code.  Yield
                 # an SSE error event so the stream terminates cleanly
@@ -3147,6 +3190,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     postproc_args.tokenizer = self.tokenizer
                     postproc_args.num_prompt_tokens = len(
                         promise.prompt_token_ids)
+                if trace_facts is not None:
+                    _note_engine_request(trace_facts, promise, self.model)
                 promises.append(promise)
                 postproc_params_collection.append(
                     None if self.postproc_worker_enabled else postproc_params)
@@ -3318,11 +3363,17 @@ class OpenAIServer(_VideoRoutesMixin):
 
             # Disconnect cancellation
             asyncio.create_task(self.await_disconnected(raw_request, promise))
+            trace_facts = _trace_facts(raw_request)
+            if trace_facts is not None:
+                _note_engine_request(trace_facts, promise, self.model)
 
             # Handle streaming
             if request.stream:
-                return StreamingResponse(content=create_streaming_generator(
-                    promise, postproc_params),
+                stream = create_streaming_generator(promise, postproc_params)
+                if trace_facts is not None:
+                    stream = note_stream_termination(
+                        stream, trace_facts.note_termination)
+                return StreamingResponse(content=stream,
                                          media_type="text/event-stream")
             else:
                 response = await self._create_chat_response(
@@ -3569,6 +3620,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     "Postproc workers are enabled, request will not be stored!")
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))
+            trace_facts = _trace_facts(raw_request)
+            if trace_facts is not None:
+                _note_engine_request(trace_facts, promise, self.model)
 
             if request.stream:
                 return ClosingStreamingResponse(
@@ -3577,6 +3631,8 @@ class OpenAIServer(_VideoRoutesMixin):
                             create_streaming_generator(promise,
                                                        postproc_params),
                             streaming_processor.get_stream_failed_events,
+                            on_termination=None if trace_facts is None else
+                            trace_facts.note_termination,
                         )),
                     media_type="text/event-stream")
             else:

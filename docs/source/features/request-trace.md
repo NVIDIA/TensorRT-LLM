@@ -106,6 +106,27 @@ Written when the reply has ended, however it ended.
 | `not_started` | The handler ended without sending anything and without an error, as a streaming response does when the client disconnects before the reply begins. |
 | `cancelled` | The request's task was cancelled (server shutdown) without a client disconnect. |
 
+### What only the handler knows
+
+The middleware sees requests and replies; four facts live only in the handler that served
+the request. The middleware seeds `request.state.request_trace` with a `RequestTraceFacts`
+object for every request it records, the handlers fill it in as they learn things, and the
+set fields are added to the response line:
+
+| Field | Meaning |
+|-------|---------|
+| `engine_requests` | One entry per engine request the handler submitted for the reply: `{"request_id": <engine request id>, "prompt_tokens": {"count", "sha256", "encoding": "int32le"}}`. The digest is over the token ids the engine was given, as a little-endian int32 buffer (`hashlib.sha256(numpy.asarray(ids, dtype="<i4").tobytes())`), so a reader can check that its own rendering of the recorded body is the prompt the model saw. Only the digest is stored, never the ids. Recorded by the aggregated server for chat completions, completions (one entry per prompt), Responses and Messages. |
+| `served_model` | The model name the aggregated server served the request under. |
+| `disaggregated` | What the disaggregated server knows: `disagg_request_id`, `ctx_request_id`, `ctx_server`, `gen_server` (which workers served the request) and `prompt_tokens`, the digest of the prompt the context worker tokenized (taken from its reply, which the server relays and never hands to the client; a prefill run again on another worker replaces it). |
+| `termination` | Why a stream's generation failed, as the producer saw it: `{"cause": "engine_error" \| "upstream_error" \| "internal_error", "detail": "<exception type, and its message for engine errors>"}`. Recorded whether the failure cut the stream (`status` is then `error`) or was answered inside it (a completions stream ends with an SSE `error` event and `[DONE]`, so its `status` is `completed`). Absent for a generation that ran to its end and for a stream the client cut. |
+
+A handler that never touches the object -- a route this server does not instrument, or
+a deployment that overrides a handler -- leaves the response line exactly as above. On
+the untraced path the handlers do one attribute lookup and nothing else; with the trace
+on, a handler does a few attribute writes and keeps a reference to the prompt token ids
+it already holds, which the writer's thread digests when it writes the line, so the
+event loop's cost does not grow with the prompt.
+
 The trace never changes a reply: every step it takes runs under a guard, and a failure
 inside the trace (a body the decoder cannot follow is not one -- it is recorded as text
 with `body_parse_error`) costs the line it was building, is counted, and is logged once

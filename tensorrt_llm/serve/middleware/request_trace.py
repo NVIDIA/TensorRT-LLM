@@ -38,15 +38,19 @@ step of the trace is guarded: a failure in its own code costs a line, never the 
 worker thread.
 """
 
+import array
 import asyncio
+import base64
 import functools
 import hashlib
 import importlib
 import json
 import os
 import re
+import sys
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
 
@@ -59,14 +63,17 @@ from tensorrt_llm.serve._base.sharded_jsonl_writer import ShardedJsonlRecordWrit
 from tensorrt_llm.serve.conversation_id import extract_conversation_id_from_headers
 
 __all__ = [
+    "PROMPT_TOKEN_DIGEST_ENCODING",
     "REQUEST_TRACE_DIR_ENV",
     "REQUEST_TRACE_IDENTITY_ENV",
     "IdentityPlugin",
     "RequestTrace",
+    "RequestTraceFacts",
     "RequestTraceMiddleware",
     "RequestTraceWriter",
     "classify_ending",
     "load_identity_plugin",
+    "prompt_token_digest",
 ]
 
 #: Directory the trace is written to. Unset or empty: no trace, no middleware.
@@ -141,11 +148,159 @@ _WRITER_QUEUE_SIZE = 1024
 _WRITER_BATCH_SIZE = 32
 _WRITER_SHUTDOWN_TIMEOUT_SECONDS = 5
 
+#: The byte layout the prompt-token digest is computed over: int32, little endian, no
+#: header -- the buffer a context worker relays as ``prompt_token_ids_b64``, so the digest
+#: of a relayed buffer is the digest of its bytes. A reader reproduces it with
+#: ``hashlib.sha256(numpy.asarray(ids, dtype="<i4").tobytes())``.
+PROMPT_TOKEN_DIGEST_ENCODING = "int32le"
+
 _msgpack_decoder = msgspec.msgpack.Decoder()
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# -- facts only a handler knows -------------------------------------------------------
+
+
+def _int32le_bytes(ids: Iterable[int]) -> bytes:
+    buffer = array.array("i", ids)
+    if buffer.itemsize != 4:  # pragma: no cover - no supported platform
+        buffer = array.array("l", ids)
+    if sys.byteorder != "little":  # pragma: no cover - no supported platform
+        buffer.byteswap()
+    return buffer.tobytes()
+
+
+def prompt_token_digest(
+    ids: Optional[Iterable[int]] = None, *, b64: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """``{"count", "sha256", "encoding"}`` of a prompt's token ids, or None.
+
+    Takes the ids, or the base64 int32 buffer a context worker returns in their place;
+    the buffer is hashed as it is, because its bytes are the encoding the digest is
+    defined over. A digest, never the ids: it lets a reader verify that a rendering of
+    the recorded body is the prompt the engine saw without storing tokenizer output.
+    None when nothing was given, the input cannot be read, or it holds no id.
+    """
+    if ids is not None:
+        try:
+            data = _int32le_bytes(ids)
+        except (TypeError, OverflowError, ValueError) as error:
+            logger.warning(f"Request trace: cannot digest the prompt token ids: {error}")
+            return None
+    elif b64:
+        try:
+            data = base64.b64decode(b64, validate=True)
+        except (TypeError, ValueError) as error:
+            logger.warning(f"Request trace: cannot decode prompt_token_ids_b64: {error}")
+            return None
+        data = data[: len(data) - len(data) % 4]
+    else:
+        return None
+    if not data:
+        return None
+    return {
+        "count": len(data) // 4,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "encoding": PROMPT_TOKEN_DIGEST_ENCODING,
+    }
+
+
+def _engine_request_field(request_id: Any, prompt_token_ids: Any) -> dict[str, Any]:
+    """One ``engine_requests`` entry of the response line: the id and the prompt digest."""
+    entry: dict[str, Any] = {"request_id": request_id}
+    digest = prompt_token_digest(prompt_token_ids)
+    if digest is not None:
+        entry["prompt_tokens"] = digest
+    return entry
+
+
+@dataclass
+class RequestTraceFacts:
+    """What only a handler knows about a traced request, read for the response line.
+
+    The middleware puts one of these in ``request.state.request_trace`` for every request
+    it records (and nowhere else: a handler finds None when the trace is off or the request
+    is not recorded, and then does nothing). The handlers fill in what they learn as they
+    learn it, with plain attribute writes; :meth:`as_fields` turns the object into the
+    response line's fields on the writer's thread, and that is where the prompt token ids
+    are digested, so the event loop's cost does not grow with the prompt. Until then the
+    object holds the ids as the handler gave them: a reference to the list the engine
+    request holds, which is never mutated in place, or the base64 buffer a context worker
+    returned. The line carries a digest, never the ids.
+    """
+
+    #: One entry per engine request the handler submitted for this reply, as recorded:
+    #: ``{"request_id", "prompt_token_ids"}``. On the line: ``request_id`` and the
+    #: ``prompt_tokens`` digest.
+    engine_requests: list[dict[str, Any]] = field(default_factory=list)
+    #: The model name the server served the request under.
+    served_model: Optional[str] = None
+    #: What the disaggregated server knows: ``disagg_request_id``, ``ctx_request_id``,
+    #: ``ctx_server`` and ``gen_server``. On the line, the ``prompt_tokens`` digest joins them.
+    disaggregated: Optional[dict[str, Any]] = None
+    #: The prompt the context worker tokenized, every report as given (ids, base64 buffer);
+    #: the latest readable one is digested for the line.
+    context_prompts: list[tuple[Optional[Iterable[int]], Optional[str]]] = field(
+        default_factory=list
+    )
+    #: Why a stream stopped, as the producer understood it: ``{"cause", "detail"}``.
+    termination: Optional[dict[str, str]] = None
+
+    def add_engine_request(
+        self, request_id: Any, prompt_token_ids: Optional[Iterable[int]] = None
+    ) -> None:
+        """Record an engine request and the prompt ids it was given, to be digested."""
+        self.engine_requests.append(
+            {"request_id": request_id, "prompt_token_ids": prompt_token_ids}
+        )
+
+    def note_disaggregated(self, **facts: Any) -> None:
+        """Merge the given disaggregated facts; None values are ignored."""
+        known = {key: value for key, value in facts.items() if value is not None}
+        if known:
+            self.disaggregated = {**(self.disaggregated or {}), **known}
+
+    def set_context_prompt_tokens(
+        self, ids: Optional[Iterable[int]] = None, *, b64: Optional[str] = None
+    ) -> None:
+        """Record the prompt the context worker tokenized; a later report replaces it.
+
+        A disaggregated server may run the prefill again on another context worker
+        when a generation reservation falls through; the recorded stream was produced
+        from the later prefill. Nothing is decoded or hashed here.
+        """
+        if ids is not None or b64:
+            self.context_prompts.append((ids, b64))
+
+    def note_termination(self, cause: str, detail: str = "") -> None:
+        """Record why a stream stopped; the first report wins."""
+        if self.termination is None:
+            self.termination = {"cause": cause, "detail": detail}
+
+    def as_fields(self) -> dict[str, Any]:
+        """The set facts as response-line fields; the digests are computed here."""
+        fields: dict[str, Any] = {}
+        if self.engine_requests:
+            fields["engine_requests"] = [
+                _engine_request_field(entry["request_id"], entry.get("prompt_token_ids"))
+                for entry in self.engine_requests
+            ]
+        if self.served_model is not None:
+            fields["served_model"] = self.served_model
+        disaggregated = dict(self.disaggregated or {})
+        for ids, b64 in reversed(self.context_prompts):
+            digest = prompt_token_digest(ids, b64=b64)
+            if digest is not None:
+                disaggregated["prompt_tokens"] = digest
+                break
+        if disaggregated:
+            fields["disaggregated"] = disaggregated
+        if self.termination is not None:
+            fields["termination"] = dict(self.termination)
+        return fields
 
 
 # -- request side -------------------------------------------------------------------
@@ -598,6 +753,31 @@ def _reply_fields(
     return fields
 
 
+def _response_fields(
+    trace_id: str,
+    route: str,
+    headers: Optional[list[tuple[bytes, bytes]]],
+    chunks: Sequence[bytes],
+    facts: Optional[RequestTraceFacts],
+) -> dict[str, Any]:
+    """The response line's deferred fields, on the writer thread: the reply and the facts.
+
+    The reply fields need a reply that started (``headers``); the handler's facts need
+    the handler to have recorded any. A failure in the facts costs them, never the line.
+    """
+    fields: dict[str, Any] = {}
+    if headers is not None:
+        fields.update(_reply_fields(trace_id, route, headers, chunks))
+    if facts is not None:
+        try:
+            fields.update(facts.as_fields())
+        except Exception as error:
+            logger.warning(
+                "Request trace %s: cannot record the handler's facts: %s", trace_id, error
+            )
+    return fields
+
+
 class RequestTraceWriter(ShardedJsonlRecordWriter):
     """The trace's writer: one directory per UTC hour, one file per record kind.
 
@@ -799,12 +979,14 @@ class RequestTrace:
         chunks: Sequence[bytes],
         error: Optional[BaseException],
         disconnected: bool,
+        facts: Optional[RequestTraceFacts] = None,
     ) -> None:
         """Queue the response line: how the request ended and the reply as sent.
 
         The reply's chunks are not touched here; the writer's thread joins, decodes and
         summarizes them (:func:`_reply_fields`), so the event loop does no work that grows
-        with the reply.
+        with the reply. ``facts`` are what the handler recorded (:class:`RequestTraceFacts`);
+        the same thread digests their prompt token ids (:func:`_response_fields`).
         """
         record: dict[str, Any] = {
             "event": "response",
@@ -818,9 +1000,9 @@ class RequestTrace:
             record["disconnected"] = True
         if error is not None:
             record["error"] = f"{type(error).__name__}: {error}"
-        if headers is not None:
+        if headers is not None or facts is not None:
             record[_DEFERRED_FIELDS] = functools.partial(
-                _reply_fields, trace_id, route, headers, chunks
+                _response_fields, trace_id, route, headers, chunks, facts
             )
         self._writer.submit(record)
 
@@ -858,6 +1040,7 @@ class _TracedRequest:
         self._chunks: list[bytes] = []
         self._send_error: Optional[BaseException] = None
         self._app_error: Optional[BaseException] = None
+        self._facts: Optional[RequestTraceFacts] = None
         self._finished = False
 
     def on_received(self, message: Message) -> None:
@@ -932,6 +1115,11 @@ class _TracedRequest:
             return
         self._request_recorded = True
         self._body = bytearray()  # the queued line holds the body now
+        # The handler runs after this (the body is read before the app): give it the
+        # object it fills with what only it knows. Absent for a request that is not
+        # recorded, so a handler that finds None does no work at all.
+        self._facts = RequestTraceFacts()
+        self._scope.setdefault("state", {})["request_trace"] = self._facts
 
     def finish(self) -> None:
         if self._finished:
@@ -962,6 +1150,7 @@ class _TracedRequest:
                 chunks=tuple(self._chunks),  # the writer thread owns this copy
                 error=error,
                 disconnected=self._disconnected,
+                facts=self._facts,
             )
         except Exception as error:
             self._trace.note_failure("response line", error)

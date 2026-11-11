@@ -73,6 +73,7 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              combine_disagg_metrics)
 from tensorrt_llm.serve.responses_utils import (get_steady_clock_now_in_seconds,
                                                 guard_responses_stream,
+                                                note_stream_termination,
                                                 stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
@@ -126,6 +127,9 @@ class RawRequestResponseHooks(ResponseHooks):
         self.ctx_dispatch_time = 0
         self.ctx_metrics = None
         self.gen_metrics = None
+        # What the request trace wants to know from this side (None: trace off
+        # or request not recorded); see serve/middleware/request_trace.py.
+        self.trace_facts = getattr(raw_req.state, "request_trace", None)
 
     def on_req_begin(self, request: UCompletionRequest):
         params = request.disaggregated_params
@@ -133,12 +137,19 @@ class RawRequestResponseHooks(ResponseHooks):
             self.disagg_request_id = params.disagg_request_id
             request_id = params.disagg_request_id or params.ctx_request_id
             self.request_id = str(request_id or "")
+            if self.trace_facts is not None:
+                self.trace_facts.note_disaggregated(
+                    disagg_request_id=params.disagg_request_id,
+                    ctx_request_id=params.ctx_request_id)
         self.queue_latency_metric.observe(
             get_steady_clock_now_in_seconds() - self.request_arrival_time)
 
     def on_disagg_request_id(self, disagg_request_id: int):
         self.disagg_request_id = disagg_request_id
         self.request_id = str(disagg_request_id)
+        if self.trace_facts is not None:
+            self.trace_facts.note_disaggregated(
+                disagg_request_id=disagg_request_id)
 
     def on_ctx_dispatch(self, request: UCompletionRequest):
         self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
@@ -153,17 +164,35 @@ class RawRequestResponseHooks(ResponseHooks):
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
+        if self.trace_facts is None:
+            return
+        # The context worker's reply is the one place this server sees the
+        # tokenized prompt: it relays the ids to the generation worker and
+        # never hands them to the client. The trace digests them on its
+        # writer's thread; only the digest reaches the line.
+        try:
+            self.trace_facts.note_disaggregated(ctx_server=ctx_server)
+            self.trace_facts.set_context_prompt_tokens(
+                getattr(response, "prompt_token_ids", None),
+                b64=getattr(response, "prompt_token_ids_b64", None))
+        except Exception as error:  # noqa: BLE001 - a trace must not break serving
+            logger.warning("Request trace: cannot record the context "
+                           f"worker's prompt digest: {error}")
 
     def on_first_token(
             self, gen_server: str, request: UCompletionRequest,
             response: UCompletionResponse = None):
         self.gen_server = gen_server
         self.server_first_token_time = get_steady_clock_now_in_seconds()
+        if self.trace_facts is not None:
+            self.trace_facts.note_disaggregated(gen_server=gen_server or None)
 
     def on_resp_done(
             self, gen_server: str, request: UCompletionRequest,
             response: UCompletionResponse = None):
         self.gen_server = gen_server
+        if self.trace_facts is not None:
+            self.trace_facts.note_disaggregated(gen_server=gen_server or None)
         if not self.collect_perf_metrics:
             return
         disagg_phase = {
@@ -453,11 +482,18 @@ class OpenAIDisaggServer:
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
                     stream = response_or_generator
+                    trace_facts = hooks.trace_facts
                     if isinstance(req, ResponsesRequest):
                         # A relayed Responses stream that fails early ends with
                         # an `error` event; other protocols end on a sentinel.
-                        stream = guard_responses_stream(stream,
-                                                        stream_error_event)
+                        stream = guard_responses_stream(
+                            stream,
+                            stream_error_event,
+                            on_termination=None if trace_facts is None else
+                            trace_facts.note_termination)
+                    elif trace_facts is not None:
+                        stream = note_stream_termination(
+                            stream, trace_facts.note_termination)
                     return StreamingResponse(
                         content=stream,
                         media_type="text/event-stream")
