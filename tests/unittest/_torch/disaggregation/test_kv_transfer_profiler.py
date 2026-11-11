@@ -18,9 +18,9 @@ import weakref
 from collections.abc import Iterator, ValuesView
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
-from threading import Event, current_thread
+from threading import Event, Lock, current_thread
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, PropertyMock
 
 import pytest
 import torch
@@ -36,8 +36,11 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     GenTransferStatus,
     KvCacheTransceiver,
 )
+from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
+from tensorrt_llm._torch.disaggregation.native.transfer import TxSession
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -378,7 +381,9 @@ def test_v2_failed_receive_safe_cancellation_preserves_failure(
     assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert not wrapper.has_inflight_transfer(req)
     assert wrapper.cancel_request(req) is True
-    session.cancel.assert_called_once_with()
+    session.cancel_local.assert_called_once_with()
+    session.notify_cancel.assert_called_once_with()
+    session.cancel.assert_not_called()
     session.close.assert_called_once_with()
     assert [name for name, _ in events] == [
         "trtllm::kv_transfer_submit",
@@ -386,6 +391,174 @@ def test_v2_failed_receive_safe_cancellation_preserves_failure(
     ]
     assert events[0][1] == events[1][1]
     assert not wrapper._records
+
+
+@pytest.mark.parametrize("failed", [False, True], ids=["cancelled", "failed"])
+@pytest.mark.parametrize("retirement_path", ["cancel", "poll"])
+def test_v2_send_cancellation_preserves_retirement_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list,
+    failed: bool,
+    retirement_path: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Keep the first logical outcome while real retirement owns a writer claim."""
+    owner = _v2_owner()
+    owner._wait_reqs = {}
+    owner._send_sessions = {}
+    owner._send_reqs = {}
+    owner._recv_sessions = {}
+    owner._recv_reqs = {}
+    owner._ever_had_send_session = False
+    owner._ctx_need_tp_sync = False
+    owner._ctx_need_pp_sync = False
+    monkeypatch.setattr(
+        owner,
+        "respond_and_send_async",
+        lambda request: setattr(request, "state", LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS),
+    )
+    wrapper = _wrap(owner, monkeypatch)
+    req = _request()
+    wrapper.respond_and_send_async(req)
+    fatal = Mock()
+    watchdog = RetirementWatchdog(fatal, clock=Mock(return_value=10.0))
+    request.addfinalizer(watchdog.stop)
+    sender = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        _sessions_lock=Lock(),
+        _pre_cancelled_rids={},
+        _get_req_info=Mock(return_value=None),
+        setup_session=Mock(),
+        clear_session=Mock(),
+        send_cancel_to_receivers=Mock(),
+    )
+    session = TxSession(
+        req.request_id,
+        DisaggregatedParams(disagg_request_id=17, schedule_style=DisaggScheduleStyle.CONTEXT_FIRST),
+        sender,
+        overall_timeout_s=5.0,
+        retirement_watchdog=watchdog,
+    )
+    request.addfinalizer(session.close)
+    retirement = session._retirement
+    assert retirement is not None
+    claim = object()
+    request.addfinalizer(lambda: retirement.settle(claim))
+    assert retirement.expose(claim)
+    owner._send_sessions[17] = session
+    owner._send_reqs[17] = req
+    if failed:
+        session.set_exception("original send failure")
+    original_outcome = session._logical_outcomes.terminal
+
+    assert wrapper.cancel_request(req) is False
+    assert session._terminal_status is SessionStatus.CANCELLED
+    expected_status = SessionStatus.ERROR if failed else SessionStatus.CANCELLED
+    assert session.status is expected_status
+    if failed:
+        assert session._logical_outcomes.terminal is original_outcome
+    assert owner._send_sessions == {17: session}
+    assert owner._send_reqs == {17: req}
+    assert not req.py_kv_send_session_retired
+    assert owner.get_send_terminal_outcome(req) is None
+    assert [name for name, _ in events] == ["trtllm::kv_transfer_submit"]
+    sender.clear_session.assert_not_called()
+
+    assert retirement.settle(claim)
+    if retirement_path == "cancel":
+        assert wrapper.cancel_request(req) is True
+    else:
+        # Pipeline teardown can retire before the wrapper's next status poll.
+        owner._retire_send_session(17, req, outcome="cancelled")
+        assert owner.get_send_terminal_outcome(req) == ("failed" if failed else "cancelled")
+        result = wrapper.check_context_transfer_status(0)
+        assert result.completed_request_ids == []
+        assert result.error_request_ids == []
+    assert wrapper.cancel_request(req) is True
+    assert session.status is expected_status
+    assert req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    assert req.py_kv_send_session_retired
+    assert owner._send_sessions == {}
+    assert owner._send_reqs == {}
+    assert owner.get_send_terminal_outcome(req) is None
+    assert not owner._profile_send_observers
+    assert not wrapper._records
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_failed" if failed else "trtllm::kv_transfer_cancelled",
+    ]
+    assert events[0][1] == events[1][1]
+    sender.setup_session.assert_called_once_with(session)
+    sender.clear_session.assert_called_once_with(17)
+    sender.send_cancel_to_receivers.assert_called_once_with(17)
+    fatal.assert_not_called()
+
+
+@pytest.mark.parametrize("observed", [False, True])
+def test_v2_send_retirement_status_read_is_opt_in_and_observational(
+    monkeypatch: pytest.MonkeyPatch, observed: bool
+) -> None:
+    """A failing status accessor cannot alter retirement or the unobserved path."""
+    owner = _v2_owner()
+    req = _request()
+    session = Mock(_enforce_physical_ownership=False)
+    status = PropertyMock(side_effect=RuntimeError("status evidence unavailable"))
+    monkeypatch.setattr(type(session), "status", status, raising=False)
+    owner._send_sessions = {17: session}
+    owner._send_reqs = {17: req}
+    warning = Mock()
+    monkeypatch.setattr(_profiler, "warn_profiler_failure", warning)
+    if observed:
+        owner.start_send_terminal_outcome_observation(req)
+
+    owner._retire_send_session(17, req, outcome="cancelled")
+
+    session.close.assert_called_once_with()
+    assert req.py_kv_send_session_retired
+    assert owner._send_sessions == {}
+    assert owner._send_reqs == {}
+    if observed:
+        status.assert_called_once_with()
+        assert owner.get_send_terminal_outcome(req) == "cancelled"
+        warning.assert_called_once()
+        assert warning.call_args.args[:3] == (
+            "trtllm::kv_transfer",
+            "kv",
+            "send retirement outcome",
+        )
+    else:
+        status.assert_not_called()
+        warning.assert_not_called()
+        assert owner.get_send_terminal_outcome(req) is None
+
+
+def test_send_cancellation_outcome_read_failure_preserves_delegate_result(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    """Failed evidence extraction must not turn a successful cancel into an error."""
+    backend = _ScriptedTransceiver()
+    backend.cancels = iter([True])
+    wrapper = _wrap(backend, monkeypatch)
+    req = _request()
+    wrapper.respond_and_send_async(req)
+    monkeypatch.setattr(
+        backend,
+        "get_send_terminal_outcome",
+        Mock(side_effect=RuntimeError("outcome evidence unavailable")),
+    )
+    warning = Mock()
+    monkeypatch.setattr(_profiler, "warn_profiler_failure", warning)
+
+    assert wrapper.cancel_request(req) is True
+
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_cancelled",
+    ]
+    assert not wrapper._records
+    assert not backend.observed
+    warning.assert_called_once()
+    assert warning.call_args.args[:3] == ("trtllm::kv_transfer", "kv", "send cancellation outcome")
 
 
 def test_v2_poll_failure_settles_only_already_retired_receive(

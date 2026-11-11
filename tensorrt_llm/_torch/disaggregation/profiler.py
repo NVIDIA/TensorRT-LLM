@@ -457,12 +457,17 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
             for direction in directions:
                 record = self._records.get((id(req), direction))
                 if record is not None:
-                    self._finish(
-                        record,
-                        "failed"
-                        if direction == "recv" and req.state == LlmRequestState.DISAGG_TRANS_ERROR
-                        else "cancelled",
-                    )
+                    outcome: SendTerminalOutcome = "cancelled"
+                    if direction == "send":
+                        try:
+                            outcome = self._transceiver.get_send_terminal_outcome(req) or outcome
+                        except _OBSERVATION_ERRORS as error:
+                            _profiler.warn_profiler_failure(
+                                "trtllm::kv_transfer", "kv", "send cancellation outcome", error
+                            )
+                    elif req.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                        outcome = "failed"
+                    self._finish(record, outcome)
         return cancelled
 
     def prepare_context_requests(self, requests: list[LlmRequest]) -> None:
