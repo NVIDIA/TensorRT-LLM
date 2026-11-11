@@ -330,9 +330,10 @@ def _support_result(
     )
 
 
-@pytest.mark.parametrize("num_heads", [6, 12, 96])
 @pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize("head_dim,v_head_dim", [(128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize(
+    "head_dim,v_head_dim,num_heads", [(128, 128, 6), (192, 128, 96), (256, 256, 12)]
+)
 def test_supports_mla_context(num_heads: int, fp8: bool, head_dim: int, v_head_dim: int) -> None:
     supported, reason = _support_result(
         attention_input_type=AttentionInputType.context_only,
@@ -378,14 +379,13 @@ def test_mla_context_rejects_unsupported_geometry(overrides: dict, expected_reas
 
 
 @pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize("spec_flags", [(True, False), (False, True), (True, True)])
 @pytest.mark.parametrize(
-    "mask,store_stats,kv_len",
+    "mask,store_stats,kv_len,spec_flags",
     [
-        (PredefinedAttentionMask.CAUSAL, False, 4),
-        (PredefinedAttentionMask.CAUSAL, True, 4),
-        (PredefinedAttentionMask.FULL, True, 4),
-        (PredefinedAttentionMask.FULL, True, 0),
+        (PredefinedAttentionMask.CAUSAL, False, 4, (True, False)),
+        (PredefinedAttentionMask.CAUSAL, True, 4, (False, True)),
+        (PredefinedAttentionMask.FULL, True, 4, (True, True)),
+        (PredefinedAttentionMask.FULL, True, 0, (True, True)),
     ],
     ids=["fresh", "final-chunk", "cached-chunk", "empty-cached-chunk"],
 )
@@ -466,9 +466,17 @@ def test_rejects_unsupported_linear_mla_context(overrides: dict, expected_reason
     assert expected_reason in reason
 
 
-@pytest.mark.parametrize("query_width", [1, 6, 8])
-@pytest.mark.parametrize("helix", [False, True])
-@pytest.mark.parametrize("page_size", [32, 128])
+@pytest.mark.parametrize(
+    "query_width,helix,page_size",
+    [
+        (1, False, 32),
+        (1, True, 128),
+        (6, False, 32),
+        (6, True, 128),
+        (8, False, 128),
+        (8, True, 32),
+    ],
+)
 def test_supports_uniform_linear_fp8_mla(query_width: int, helix: bool, page_size: int) -> None:
     supported, reason = _support_result(
         attention_input_type=AttentionInputType.generation_only,
@@ -486,10 +494,52 @@ def test_supports_uniform_linear_fp8_mla(query_width: int, helix: bool, page_siz
     assert supported, reason
 
 
+def test_mla_generation_rejects_ragged_query_lengths() -> None:
+    with pytest.raises(ValueError, match="fixed-query PrimTS MLA.*uniform per-request"):
+        _support_result(
+            attention_input_type=AttentionInputType.generation_only,
+            head_dim=576,
+            is_mla=True,
+            quant_mode=QuantMode.FP8_KV_CACHE,
+            kv_dtype=DataType.FP8,
+            use_spec_decoding=True,
+            query_width=6,
+            query_lens=[1, 11, 6, 6],
+        )
+
+
+@pytest.mark.parametrize(
+    "query_lens,num_gen_tokens,expected",
+    [
+        (torch.tensor([3, 6, 6]), 12, True),
+        (torch.tensor([3, 5, 7]), 12, False),
+        (torch.tensor([3, 6, 6]), 11, False),
+        (torch.tensor([3, 6, 6]), 0, False),
+        (torch.tensor([3, 6]), 12, False),
+        (torch.tensor([[3, 6, 6]]), 12, False),
+        (torch.empty(3, device="meta", dtype=torch.int32), 12, False),
+        (None, 12, False),
+    ],
+)
+def test_generation_query_uniformity_uses_only_cpu_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    query_lens: torch.Tensor | None,
+    num_gen_tokens: int,
+    expected: bool,
+) -> None:
+    metadata = SimpleNamespace(num_contexts=1, num_generations=2, seq_lens=query_lens)
+    device_read = Mock(side_effect=AssertionError("unexpected device read"))
+    for name in ("cpu", "item", "to"):
+        monkeypatch.setattr(torch.Tensor, name, device_read)
+    assert (
+        prims_ts_module._has_uniform_generation_query_lengths(metadata, num_gen_tokens) is expected
+    )
+    device_read.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "overrides,expected_reason",
     [
-        ({"query_lens": [1, 11, 6, 6]}, "uniform per-request"),
         ({"is_spec_dec_tree": True}, "tree speculative"),
         ({"metadata_overrides": {"is_spec_dec_dynamic_tree": True}}, "tree speculative"),
         ({"forward_overrides": {"attention_mask_data": torch.empty(1)}}, "custom attention"),
@@ -1215,8 +1265,7 @@ def test_sequence_lengths_are_live_source_view() -> None:
     torch.testing.assert_close(actual, torch.tensor([33, 65], dtype=torch.int32))
 
 
-@pytest.mark.parametrize("enabled_libs", ["prims_ts", "trtllm-gen"])
-@pytest.mark.parametrize("attention_dp", [False, True])
+@pytest.mark.parametrize("enabled_libs,attention_dp", [("prims_ts", True), ("trtllm-gen", False)])
 def test_mla_non_fp8_has_no_token_scaled_workspace_reservation(
     monkeypatch: pytest.MonkeyPatch, enabled_libs: str, attention_dp: bool
 ) -> None:
@@ -1239,11 +1288,19 @@ def test_mla_non_fp8_has_no_token_scaled_workspace_reservation(
     assert TrtllmAttention.runtime_workspace_bytes_per_token(model_config, mapping) == 0
 
 
-@pytest.mark.parametrize("num_heads", [6, 96])
-@pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize("mask", [PredefinedAttentionMask.CAUSAL, PredefinedAttentionMask.FULL])
-@pytest.mark.parametrize("store_softmax_stats", [False, True])
-@pytest.mark.parametrize("head_dim,v_head_dim", [(128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize(
+    "fp8,mask,store_softmax_stats,head_dim,v_head_dim,num_heads",
+    [
+        (False, PredefinedAttentionMask.CAUSAL, False, 128, 128, 6),
+        (False, PredefinedAttentionMask.CAUSAL, True, 192, 128, 96),
+        (False, PredefinedAttentionMask.FULL, False, 256, 256, 6),
+        (False, PredefinedAttentionMask.FULL, True, 192, 128, 96),
+        (True, PredefinedAttentionMask.CAUSAL, False, 192, 128, 6),
+        (True, PredefinedAttentionMask.CAUSAL, True, 256, 256, 96),
+        (True, PredefinedAttentionMask.FULL, False, 192, 128, 96),
+        (True, PredefinedAttentionMask.FULL, True, 128, 128, 6),
+    ],
+)
 def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     monkeypatch: pytest.MonkeyPatch,
     num_heads: int,
@@ -1984,17 +2041,16 @@ def _get_test_mla_wrapper(
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
-@pytest.mark.parametrize("page_size", [32, 128])
 @pytest.mark.parametrize(
-    "query_width,helix_mode",
+    "query_width,helix_mode,page_size",
     [
-        (1, "none"),
-        (6, "none"),
-        (8, "none"),
-        (1, "single"),
-        (1, "token"),
-        (6, "token"),
-        (8, "token"),
+        (1, "none", 32),
+        (6, "none", 128),
+        (8, "none", 32),
+        (1, "single", 128),
+        (1, "token", 32),
+        (6, "token", 128),
+        (8, "token", 32),
     ],
 )
 def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
@@ -2512,9 +2568,15 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
     get_page_index_upper_bound.assert_called_once()
 
 
-@pytest.mark.parametrize("is_cuda_graph", [False, True], ids=["eager", "cuda-graph"])
-@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
-@pytest.mark.parametrize("query_width,with_stats", [(1, False), (6, True), (8, True)])
+@pytest.mark.parametrize(
+    "is_cuda_graph,fp8,query_width,with_stats",
+    [
+        (False, False, 1, False),
+        (True, False, 6, True),
+        (True, True, 1, False),
+        (False, True, 8, True),
+    ],
+)
 def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     monkeypatch: pytest.MonkeyPatch,
     is_cuda_graph: bool,

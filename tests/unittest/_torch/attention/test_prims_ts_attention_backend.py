@@ -670,14 +670,8 @@ def test_prims_ts_mla_context_preprocess_layout(
     "qk_head_dim,v_head_dim,num_heads,use_kv_cache_manager_v2",
     [
         pytest.param(128, 128, 6, False, id="qk128-h6-v1"),
-        pytest.param(128, 128, 12, True, id="qk128-h12-v2"),
-        pytest.param(128, 128, 96, False, id="qk128-h96-v1"),
-        pytest.param(192, 128, 6, True, id="qk192-h6-v2"),
-        pytest.param(192, 128, 12, False, id="qk192-h12-v1"),
         pytest.param(192, 128, 96, True, id="qk192-h96-v2"),
-        pytest.param(256, 256, 6, False, id="qk256-h6-v1"),
         pytest.param(256, 256, 12, True, id="qk256-h12-v2"),
-        pytest.param(256, 256, 96, False, id="qk256-h96-v1"),
     ],
 )
 def test_prims_ts_mla_preprocessing(

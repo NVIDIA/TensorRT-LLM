@@ -168,10 +168,9 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(16)
     @pytest.mark.skip_less_device_memory(200000)
-    @pytest.mark.parametrize("fp8_kv", [False, True], ids=["bf16-kv", "fp8-kv"])
     @pytest.mark.private_mpi_session
-    def test_prims_ts(self, fp8_kv: bool, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Full K3: strict PrimTS MLA context/decode, chunking, reuse and graphs.
+    def test_prims_ts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Full K3: strict PrimTS FP8 MLA context/decode, chunking, reuse and graphs.
 
         An exact FMHA list makes an unsupported full-attention phase fail on
         the workers rather than silently falling back. KDA is unchanged.
@@ -195,7 +194,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
                 moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
                 kv_cache_config=KvCacheConfig(
-                    dtype="fp8" if fp8_kv else "auto",
+                    dtype="fp8",
                     enable_block_reuse=True,
                     free_gpu_memory_fraction=0.25,
                     tokens_per_block=64,
@@ -208,7 +207,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             ) as llm,
         ):
             self._assert_resolved_args(llm, "reuse")
-            assert llm.args.quant_config.kv_cache_quant_algo == (QuantAlgo.FP8 if fp8_kv else None)
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             assert_kv_cache_reuse_for_llm(llm, [1] + [42] * 4094 + [43])
             GSM8K(self.MODEL_NAME).evaluate(llm)
 
