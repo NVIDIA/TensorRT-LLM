@@ -581,7 +581,11 @@ class FusedMoEMethodBase(ABC):
             module.w3_w1_bias.data if module.bias else None,
             module.w2_bias.data if module.bias else None, **additional_kargs)
 
-        self.load_quant_scales(module, weights)
+        quant_scale_kargs = {}
+        if "allow_partial_loading" in inspect.getfullargspec(
+                self.load_quant_scales).args:
+            quant_scale_kargs["allow_partial_loading"] = allow_partial_loading
+        self.load_quant_scales(module, weights, **quant_scale_kargs)
         if weights:
             module._weights_transformed = False
 
@@ -2817,31 +2821,40 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 f"the layer's quantization from the checkpoint block it is "
                 f"read from.")
 
-    def check_checkpoint_expert(self, module: torch.nn.Module, weights: Dict,
-                                expert_id: int) -> None:
+    def check_checkpoint_expert(self,
+                                module: torch.nn.Module,
+                                weights: Dict,
+                                expert_id: int,
+                                require_complete: bool = True) -> None:
         """Refuse a checkpoint expert that this method would load wrongly.
 
         The loaders read every scale with ``weights.get`` and skip what is
         missing, so an expert stored in another format loads without an
-        error. Each projection of an expert whose weight ``weights`` carries
-        needs a block scale that covers it (``check_block_scale``) and, when
-        the checkpoint carries global scales, its ``weight_scale_2``, which
-        every alpha is computed from whether the activations are quantized
-        with the checkpoint's ``input_scale`` or dynamically. An expert whose
-        weight is not in ``weights``, as in a partial reload, is not judged.
+        error. Every block scale ``weights`` carries must cover its projection
+        (``check_block_scale``). With ``require_complete``, as on a full load,
+        each projection whose weight ``weights`` carries also needs its block
+        scale and, when the checkpoint carries global scales, its
+        ``weight_scale_2``, which every alpha is computed from whether the
+        activations are quantized with the checkpoint's ``input_scale`` or
+        dynamically. A partial reload may send a weight and its scales in
+        different buckets, so it only has the widths of its scales checked.
         """
-        if (module.weight_loading_mode != MoEWeightLoadingMode.VANILLA
-                or f"{expert_id}.w1.weight" not in weights):
+        if module.weight_loading_mode != MoEWeightLoadingMode.VANILLA:
             return
         projections = [("w1", module.hidden_size),
                        ("w2", module.intermediate_size)]
         if module.is_gated_activation:
             projections.append(("w3", module.hidden_size))
         for proj, in_features in projections:
+            required = (require_complete
+                        and f"{expert_id}.{proj}.weight" in weights)
             key = f"{expert_id}.{proj}.weight_scale"
-            self.check_block_scale(module, key, weights.get(key), in_features)
+            scale = weights.get(key)
+            if scale is not None or required:
+                self.check_block_scale(module, key, scale, in_features)
             key = f"{expert_id}.{proj}.weight_scale_2"
-            if self.checkpoint_has_global_scales and key not in weights:
+            if (required and self.checkpoint_has_global_scales
+                    and key not in weights):
                 raise ValueError(
                     f"MoE layer {module.layer_idx}: the checkpoint has no "
                     f"{key}; an NVFP4 expert needs its global weight scale.")
@@ -2854,7 +2867,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             dst_w3_w1_weight_scale: Optional[torch.Tensor],
             dst_w2_weight_scale: Optional[torch.Tensor],
             tmp_weight_scale_2: Dict,
-            ignore_weight_scale=False):
+            ignore_weight_scale=False,
+            require_complete: bool = True):
         """Load weight block scales and store raw weight_scale_2 per expert.
 
         Block scales are loaded directly into destination tensors.
@@ -2870,7 +2884,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         for local_slot_id, expert_id in enumerate(load_expert_ids):
             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
                 if not ignore_weight_scale:
-                    self.check_checkpoint_expert(module, weights, expert_id)
+                    self.check_checkpoint_expert(module, weights, expert_id,
+                                                 require_complete)
                     w1_weight_scale = weights.get(
                         f"{expert_id}.w1.weight_scale")
                     w3_weight_scale = weights.get(
@@ -2969,7 +2984,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                       requires_grad=False)
         module.register_parameter("fc31_act_scale", fc31_act_scale)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self,
+                          module: torch.nn.Module,
+                          weights: Dict,
+                          allow_partial_loading: bool = False):
         # Check if pre_quant_scale exists in the checkpoint (for NVFP4_AWQ)
         has_pre_quant_scale = False
         if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
@@ -3042,11 +3060,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # Alphas are computed in process_weights_after_loading() using global input_scale.
         if not hasattr(module, 'tmp_weight_scale_2'):
             module.tmp_weight_scale_2 = {}
-        self.load_fp4_weight_block_scales(module, weights,
-                                          module.initial_local_expert_ids,
-                                          module.w3_w1_weight_scale.data,
-                                          module.w2_weight_scale.data,
-                                          module.tmp_weight_scale_2)
+        self.load_fp4_weight_block_scales(
+            module,
+            weights,
+            module.initial_local_expert_ids,
+            module.w3_w1_weight_scale.data,
+            module.w2_weight_scale.data,
+            module.tmp_weight_scale_2,
+            require_complete=not allow_partial_loading)
 
         # Step 3: if needed, load into shared
         if self.need_load_shared_weights(module):
@@ -3074,11 +3095,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 module.local_shared_w2_scale_tensors = local_shared_w2_scale_tensors
             if not hasattr(module, 'tmp_shared_weight_scale_2'):
                 module.tmp_shared_weight_scale_2 = {}
-            self.load_fp4_weight_block_scales(module, weights,
-                                              local_shared_load_expert_ids,
-                                              local_shared_w3_w1_scale_tensors,
-                                              local_shared_w2_scale_tensors,
-                                              module.tmp_shared_weight_scale_2)
+            self.load_fp4_weight_block_scales(
+                module,
+                weights,
+                local_shared_load_expert_ids,
+                local_shared_w3_w1_scale_tensors,
+                local_shared_w2_scale_tensors,
+                module.tmp_shared_weight_scale_2,
+                require_complete=not allow_partial_loading)
 
     # Whether the checkpoint carries the NVFP4 global scales (weight_scale_2
     # and input_scale).
@@ -4026,7 +4050,10 @@ class NVFP4PlusCuteDslFusedMoEMethod(NVFP4CuteDslFusedMoEMethod):
     unsupported_scale_suffixes = ("input_scale", "weight_scale_2",
                                   "pre_quant_scale")
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
+    def load_quant_scales(self,
+                          module: torch.nn.Module,
+                          weights: Dict,
+                          allow_partial_loading: bool = False) -> None:
         unsupported = sorted(key for key in weights
                              if key.endswith(self.unsupported_scale_suffixes))
         if unsupported:
@@ -4035,7 +4062,9 @@ class NVFP4PlusCuteDslFusedMoEMethod(NVFP4CuteDslFusedMoEMethod):
                 "input_scale, weight_scale_2 or pre_quant_scale, but this "
                 f"checkpoint has {', '.join(unsupported[:3])}"
                 f"{' ...' if len(unsupported) > 3 else ''}")
-        super().load_quant_scales(module, weights)
+        super().load_quant_scales(module,
+                                  weights,
+                                  allow_partial_loading=allow_partial_loading)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
             self,
@@ -5839,8 +5868,13 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         if not dst_on_gpu:
             dst_w2_weight_scale.copy_(dst_w2_weight_scale_gpu)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
-        super().load_quant_scales(module, weights)
+    def load_quant_scales(self,
+                          module: torch.nn.Module,
+                          weights: Dict,
+                          allow_partial_loading: bool = False):
+        super().load_quant_scales(module,
+                                  weights,
+                                  allow_partial_loading=allow_partial_loading)
 
         # Store raw shared weight_scale_2 for deferred alpha + fc31_scale_c computation
         if self.need_load_shared_weights(module):

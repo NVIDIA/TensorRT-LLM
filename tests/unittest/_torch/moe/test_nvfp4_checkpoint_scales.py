@@ -22,13 +22,18 @@ tests build such experts on the CPU and check that both loading paths refuse
 them while an NVFP4 expert still loads.
 """
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
-from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4CutlassFusedMoEMethod
+from tensorrt_llm._torch.moe.fused_moe.quantization import (
+    NVFP4CutlassFusedMoEMethod,
+    NVFP4PlusCuteDslFusedMoEMethod,
+    NVFP4TRTLLMGenFusedMoEMethod,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -89,7 +94,7 @@ def _expert(expert_id=0, block=16, global_scales=True, drop=()):
     return weights
 
 
-def _load_block_scales(method, module, weights):
+def _load_block_scales(method, module, weights, require_complete=True):
     tmp_weight_scale_2 = {}
     method.load_fp4_weight_block_scales(
         module,
@@ -98,6 +103,7 @@ def _load_block_scales(method, module, weights):
         torch.empty(1, 2 * INTERMEDIATE, HIDDEN // 16, dtype=torch.uint8),
         torch.empty(1, HIDDEN, INTERMEDIATE // 16, dtype=torch.uint8),
         tmp_weight_scale_2,
+        require_complete=require_complete,
     )
     return tmp_weight_scale_2
 
@@ -160,6 +166,57 @@ def test_expert_absent_from_a_partial_reload_is_not_judged():
     weights = {k: v for k, v in _expert().items() if not k.endswith(".weight")}
     weights.pop("0.w2.weight_scale")
     _load_block_scales(method, _module(), weights)
+
+
+def _bucket(weights, *suffixes):
+    return {k: v for k, v in weights.items() if k.split(".", 1)[1] in suffixes}
+
+
+_PROJECTION_KEYS = {
+    proj: tuple(f"{proj}.{kind}" for kind in ("weight", "weight_scale", "weight_scale_2"))
+    for proj in ("w1", "w2", "w3")
+}
+
+
+@pytest.mark.parametrize(
+    "buckets",
+    [
+        # By projection, as the bucketed refit tests of the other MoE methods send them.
+        (_PROJECTION_KEYS["w1"] + _PROJECTION_KEYS["w3"], _PROJECTION_KEYS["w2"]),
+        (_PROJECTION_KEYS["w1"], _PROJECTION_KEYS["w3"], _PROJECTION_KEYS["w2"]),
+        # One tensor kind per bucket, as a partial update_weights may send them: every
+        # weight arrives without its scales.
+        tuple((f"{proj}.{kind}",) for kind in ("weight", "weight_scale", "weight_scale_2")
+              for proj in ("w1", "w3", "w2")),
+    ],
+    ids=["w3w1_then_w2", "per_projection", "per_tensor_kind"],
+)
+def test_partial_reload_buckets_load(buckets):
+    method = _RecordingMethod()
+    expert = _expert()
+    for suffixes in buckets:
+        _load_block_scales(method, _module(), _bucket(expert, *suffixes), require_complete=False)
+    assert {entry[0] for entry in method.loaded} == {"w3_w1", "w2"}
+
+
+def test_narrow_block_scale_in_a_partial_reload_is_refused():
+    method = _RecordingMethod()
+    expert = _expert(block=32, global_scales=False)
+    with pytest.raises(ValueError, match=r"0\.w2\.weight_scale .* need 2 columns"):
+        _load_block_scales(
+            method, _module(), _bucket(expert, "w2.weight_scale"), require_complete=False
+        )
+    assert method.loaded == []
+
+
+@pytest.mark.parametrize(
+    "method_cls",
+    [NVFP4CutlassFusedMoEMethod, NVFP4PlusCuteDslFusedMoEMethod, NVFP4TRTLLMGenFusedMoEMethod],
+)
+def test_load_weights_hands_the_partial_flag_to_the_scale_checks(method_cls):
+    # FusedMoEMethodBase.load_weights passes allow_partial_loading only to a load_quant_scales
+    # that names it; an override that drops it would demand complete experts from every bucket.
+    assert "allow_partial_loading" in inspect.getfullargspec(method_cls.load_quant_scales).args
 
 
 def test_streamed_expert_with_narrow_block_scale_is_refused():
