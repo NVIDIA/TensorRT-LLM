@@ -1177,6 +1177,29 @@ def test_selfsampling_hopper_fp16_skips_survivor_rereads(monkeypatch) -> None:
     assert p2(512, 65551, 2048, 132, 90)  # 512-thread slab, n x rows <= 48M scores
 
 
+def test_selfsampling_hopper_fp16_ranks_survivors_per_warp(monkeypatch) -> None:
+    """FP16 main slabs of 132-SM Hopper parts rank survivors per warp with a compile-time K and
+    an smem-staged output row, as BF16 does, except in batches beyond two waves that keep the p2
+    pass; one-wave batches of 16M scores or more on 512-thread slabs skip p2. The H20 and
+    Blackwell keep their options."""
+    requests = _record_compile_requests(monkeypatch)
+
+    def options(rows, n, k, num_sms, sm_version):
+        monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
+        requests.clear()
+        _varlen_plan(rows, n, k, num_sms, sm_version, torch.float16)
+        (kwargs,) = [kwargs for name, kwargs in requests if name == "get_compiled"]
+        return kwargs.get("warp_rank", False), kwargs.get("staged_k", 0), kwargs.get("p2", False)
+
+    assert options(512, 32783, 2048, 132, 90) == (True, 2048, False)
+    assert options(128, 65551, 2048, 132, 90) == (True, 2048, True)  # below 16M scores
+    assert options(256, 131075, 1024, 132, 90) == (True, 1024, False)
+    for k, n in ((1024, 65539), (2048, 65551)):
+        assert options(512, n, k, 132, 90) == (False, 0, True), (k, n)
+    for num_sms, sm_version in ((78, 90), (148, 100)):
+        assert options(256, 131075, 1024, num_sms, sm_version) == (False, 0, True), num_sms
+
+
 @pytest.mark.skipif(
     getSMVersion() != 90
     or torch.cuda.get_device_properties(0).multi_processor_count

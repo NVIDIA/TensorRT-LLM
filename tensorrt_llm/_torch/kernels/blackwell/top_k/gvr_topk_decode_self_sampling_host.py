@@ -3266,8 +3266,23 @@ def _varlen_launcher(
                         or num_sms in _HOPPER_BLACKWELL_BANDWIDTH_SMS
                     )
                     main_options["p2"] = (int(tpl[0]) < 512 and rereads_cheap) or (
-                        int(tpl[0]) >= 512 and n_kernel * num_rows <= 48 * 1024 * 1024
+                        int(tpl[0]) >= 512
+                        and n_kernel * num_rows <= 48 * 1024 * 1024
+                        and (
+                            rereads_cheap
+                            or num_rows > 2 * wave
+                            or n_kernel * num_rows < 16 * 1024 * 1024
+                        )
                     )
+                    if not rereads_cheap and not (main_options["p2"] and num_rows > 2 * wave):
+                        # ... and rank survivors per warp with a compile-time K, staging the output
+                        # row in smem (16-B copy-out instead of scattered 4-B index stores), as BF16;
+                        # batches beyond two waves that keep p2 lose with either option
+                        main_options["warp_rank"] = True
+                        if r_const == 1 and (
+                            k == 2048 or main_options["v16"] or (k == 1024 and int(tpl[0]) == 512)
+                        ):
+                            main_options["staged_k"] = k
         else:
             if k == 512 and num_rows > 2 * num_sms and sm_version in _TUNED_SM_VERSIONS:
                 n4 = n_route >> 2
