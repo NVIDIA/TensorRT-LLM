@@ -669,6 +669,7 @@ includes full requested and observed dispatch/expert matrices.
 | `minimax_m3_1_flash` | 128 | 4 | 6144 | 3072 | pass `--quant` | `MINIMAX_M3` |
 | `glm_5_3` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `muse_spark_open` | 256 | 8 | 4096 | 4096 | `NVFP4` | `MUSE_SPARK_OPEN` |
+| `mistral_large_4` | 128 | 4 | 6144 | 6144 | pass `--quant` | `RENORMALIZE` |
 | `glm_5` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
@@ -714,6 +715,10 @@ Supported layouts are pure EP and pure MoE TP without attention DP; the pooler,
 unpooler, and dense router projection are outside the routed-expert benchmark.
 The fixed release's MXFP4/MXFP8 implementations do not return unfinalized
 expert outputs required by this norm; do not substitute a norm of their sum.
+
+`mistral_large_4` uses FP32 softmax routing, normalized top-4 weights and
+plain SwiGLU. Its routed intermediate size is 6144; the dense MLP width
+24576 and the separate shared expert are outside this routed-expert preset.
 
 Custom shapes can be used instead of `--model`:
 

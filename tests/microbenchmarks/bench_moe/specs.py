@@ -559,4 +559,16 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         routing_renorm_eps=1e-15,
         post_expert_norm_eps=1e-8,
     ),
+    "mistral_large_4": ModelSpec(
+        name="mistral_large_4",
+        num_experts=128,
+        top_k=4,
+        hidden_size=6144,
+        intermediate_size=6144,
+        quant_algo=None,
+        routing_method="RENORMALIZE",
+        router_fp32=True,
+        n_group=1,
+        topk_group=1,
+    ),
 }
