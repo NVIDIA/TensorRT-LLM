@@ -108,6 +108,7 @@ def test_full_context_plan_runs_primts_runtime_contract_on_cpu(
         """Stand in for the compiled attention kernel."""
         assert query.is_contiguous()
         assert query.shape == (qlen, plan.GEOMETRY.heads, plan.GEOMETRY.head_dim)
+        torch.testing.assert_close(query.float(), expected_query, rtol=0, atol=0)
         output.fill_(1.0)
 
     def compiled_reducer(output: torch.Tensor, *runtime_args: object) -> None:
@@ -118,12 +119,21 @@ def test_full_context_plan_runs_primts_runtime_contract_on_cpu(
     def owned_reducer(
         partial_o: torch.Tensor,
         partial_stats: torch.Tensor,
-        sequence_lengths: torch.Tensor,
+        reducer_sequence_lengths: torch.Tensor,
         output: torch.Tensor,
         *reducer_args: object,
     ) -> None:
         """Require the plan's split-buffer storage and layout at the native merge."""
         assert own_reducer
+        torch.testing.assert_close(reducer_sequence_lengths, sequence_lengths, rtol=0, atol=0)
+        assert reducer_args == (
+            plan.qlen,
+            plan.q_tokens_per_cta,
+            plan.tile_kv,
+            plan.insts_kv,
+            plan.causal,
+            plan.pdl,
+        )
         for actual_buffer, workspace_buffer in (
             (partial_o, plan.workspace.partial_o),
             (partial_stats, plan.workspace.partial_stats),
@@ -155,7 +165,10 @@ def test_full_context_plan_runs_primts_runtime_contract_on_cpu(
         pdl=False,
     )
     geometry = plan.GEOMETRY
-    query = torch.ones(qlen, 2 * geometry.heads, geometry.head_dim).to(torch.float8_e4m3fn)[:, ::2]
+    assert plan.tile_kv != plan.insts_kv
+    head_values = torch.arange(2 * geometry.heads, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    query = head_values.view(1, -1, 1).expand(qlen, -1, geometry.head_dim).contiguous()[:, ::2]
+    expected_query = query.float().clone()
     key_pages = torch.zeros(1, geometry.kv_heads, geometry.page, geometry.head_dim).to(
         torch.float8_e4m3fn
     )
