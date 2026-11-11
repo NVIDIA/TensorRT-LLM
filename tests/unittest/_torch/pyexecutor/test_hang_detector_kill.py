@@ -1039,10 +1039,10 @@ def test_delivery_is_checked_after_the_grace_not_before(monkeypatch: pytest.Monk
 
     delivered = threading.Event()
 
+    delivered_before_wait = []
+
     def deliver_during_grace(remaining: float, cancelled: threading.Event | None) -> bool:
-        assert remaining == grace
-        assert cancelled is None
-        assert not delivered.is_set()
+        delivered_before_wait.append(delivered.is_set())
         delivered.set()
         return True
 
@@ -1051,6 +1051,8 @@ def test_delivery_is_checked_after_the_grace_not_before(monkeypatch: pytest.Monk
     fired = hard_kill_on_rank_crash(4, error_delivered=delivered)
 
     wait.assert_called_once_with(grace, None)
+    assert delivered_before_wait == [False]
+    assert delivered.is_set()
     assert fired is False, "the flag was set during the grace window; the kill must observe it"
     assert calls == []
 
@@ -1067,7 +1069,13 @@ def test_watchdog_threads_the_delivery_event_through(monkeypatch):
     delivered.set()
     wd = start_rank_crash_kill_watchdog(4, error_delivered=delivered)
     assert wd is not None
-    wd.run()
+    with patch.object(
+        hang_detector_module, "hard_kill_on_rank_crash", wraps=hard_kill_on_rank_crash
+    ) as kill:
+        wd.run()
+    kill.assert_called_once_with(
+        4, deadline=wd.deadline, cancelled=wd._cancelled, error_delivered=delivered
+    )
 
     assert calls == [], "watchdog killed despite a delivered error"
 
