@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import time
 
@@ -55,6 +56,36 @@ class BindingsNixlTransferStatus(TransferStatus):
                 f"NIXL (cpp binding) wait returned non-SUCCESS state={result} "
                 f"after {time.time() - start_time:.3f}s (agent={self._agent_name})."
             )
+        return result == TransferState.SUCCESS
+
+    @nvtx_range("BindingsNixlTransferStatus.wait_until")
+    def wait_until(self, deadline_monotonic_s: float) -> bool:
+        """Wait within an accepted operation's fixed local deadline.
+
+        Backend queueing remains part of this wait. Neither expiry nor a
+        backend failure proves that the operation's memory access has ended.
+
+        Args:
+            deadline_monotonic_s: Absolute deadline on ``time.monotonic()``'s
+                clock, anchored by the caller at accepted submission.
+
+        Returns:
+            True on backend success, False on a backend failure.
+
+        Raises:
+            TimeoutError: The deadline has already expired or the backend
+                reports that its bounded wait ended while still in progress.
+        """
+        remaining_s = deadline_monotonic_s - time.monotonic()
+        if remaining_s <= 0:
+            raise TimeoutError("NIXL submitted-operation deadline expired before waiting")
+        # The binding accepts integer milliseconds. Do not truncate a positive
+        # sub-millisecond remainder to a zero-duration poll.
+        # Clamp rounding at the binding's signed 64-bit millisecond limit.
+        timeout_ms = min(math.ceil(remaining_s * 1000), 2**63 - 1)
+        result = self._cpp_status.wait(timeout_ms)
+        if result == TransferState.IN_PROGRESS:
+            raise TimeoutError("NIXL submitted-operation deadline expired during backend wait")
         return result == TransferState.SUCCESS
 
     def last_status_str(self) -> str:

@@ -5480,6 +5480,80 @@ class TestMambaSnapshotConfigResolution:
 
 
 @pytest.mark.cpu_only
+class TestTransferOperationTimeout:
+    """Validate the opt-in operation budget without changing legacy budgets."""
+
+    @pytest.mark.parametrize("timeout_ms", [None, 1, 10000, 2**63 - 1])
+    def test_optional_positive_budget(self, timeout_ms: int | None) -> None:
+        """A finite operation budget is independent of the existing wait limit."""
+        config = CacheTransceiverConfig(
+            backend="NIXL", kv_transfer_operation_timeout_ms=timeout_ms)
+        assert config.kv_transfer_operation_timeout_ms == timeout_ms
+        assert config.kv_transfer_timeout_ms == 60000
+        assert config.kv_transfer_sender_future_timeout_ms == 1000
+
+    def test_disabled_by_default(self) -> None:
+        """Omitting the operation budget preserves existing configurations."""
+        config = CacheTransceiverConfig(backend="NIXL")
+        assert config.kv_transfer_operation_timeout_ms is None
+        assert not hasattr(config._to_pybind(),
+                           "kv_transfer_operation_timeout_ms")
+
+    @pytest.mark.parametrize("timeout_ms", [
+        0, -1, 1.5, "invalid", 2**63,
+        pytest.param(10**1000, id="integer-overflow")
+    ])
+    def test_invalid_budget(self, timeout_ms: int | float | str) -> None:
+        """Reject budgets outside the positive signed-int64 millisecond range."""
+        with pytest.raises(ValueError,
+                           match="kv_transfer_operation_timeout_ms"):
+            CacheTransceiverConfig(backend="NIXL",
+                                   kv_transfer_operation_timeout_ms=timeout_ms)
+
+    @pytest.mark.parametrize("runtime", ["CPP", "auto", None])
+    def test_requires_python_runtime(self, runtime: str | None) -> None:
+        """Do not permit an operation budget to disappear in a C++ fallback."""
+        with pytest.raises(ValueError, match="transceiver_runtime='PYTHON'"):
+            CacheTransceiverConfig(backend="NIXL",
+                                   transceiver_runtime=runtime,
+                                   kv_transfer_operation_timeout_ms=1000)
+
+    @pytest.mark.parametrize("backend", [None, "UCX", "MPI", "MOONCAKE"])
+    def test_requires_nixl_backend(self, backend: str | None) -> None:
+        """Only the native NIXL path implements this budget."""
+        with pytest.raises(ValueError, match="NIXL backend"):
+            CacheTransceiverConfig(backend=backend,
+                                   kv_transfer_operation_timeout_ms=1000)
+
+    def test_default_backend_uses_effective_selection(
+            self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve DEFAULT before accepting the NIXL-only operation budget."""
+        for name, _ in llm_args_mod._CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+        config = CacheTransceiverConfig(backend="DEFAULT",
+                                        kv_transfer_operation_timeout_ms=1000)
+        assert config.kv_transfer_operation_timeout_ms == 1000
+        monkeypatch.setenv("TRTLLM_USE_UCX_KVCACHE", "1")
+        with pytest.raises(ValueError, match="NIXL backend"):
+            CacheTransceiverConfig(backend="DEFAULT",
+                                   kv_transfer_operation_timeout_ms=1000)
+
+    def test_preserves_required_transfer_budget(self) -> None:
+        """An operation limit cannot replace the finite transfer-wait budget."""
+        with pytest.raises(ValueError, match="finite kv_transfer_timeout_ms"):
+            CacheTransceiverConfig(backend="NIXL",
+                                   kv_transfer_timeout_ms=None,
+                                   kv_transfer_operation_timeout_ms=1000)
+
+    def test_cpp_conversion_rejects_enabled_budget(self) -> None:
+        """The C++ conversion must not silently drop the enabled option."""
+        config = CacheTransceiverConfig(backend="NIXL",
+                                        kv_transfer_operation_timeout_ms=1000)
+        with pytest.raises(ValueError, match="not supported by the C\\+\\+"):
+            config._to_pybind()
+
+
+@pytest.mark.cpu_only
 class TestTransceiverRuntimeAutoResolution:
     """Tests for the transceiver_runtime 'auto' selection mechanism."""
 

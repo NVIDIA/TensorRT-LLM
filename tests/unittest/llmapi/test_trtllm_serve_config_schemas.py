@@ -448,6 +448,92 @@ def test_connector_timeout_constraints(
 
 
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        (None, True),
+        (1, True),
+        (10000, True),
+        (2**63 - 1, True),
+        (2**63, False),
+        (0, False),
+        (-1, False),
+        (1.5, False),
+        ("invalid", False),
+    ],
+)
+def test_transfer_operation_timeout_constraints(
+    schemas: dict[str, dict], filename: str, value: int | float | str | None, valid: bool
+) -> None:
+    """The optional operation timeout is a positive integer in worker YAML."""
+    config = {
+        "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "kv_transfer_operation_timeout_ms": value,
+        }
+    }
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("overrides", "valid"),
+    [
+        ({"transceiver_runtime": "CPP"}, False),
+        ({"transceiver_runtime": "auto"}, False),
+        ({"transceiver_runtime": None}, False),
+        ({"backend": "UCX"}, False),
+        ({"backend": "MPI"}, False),
+        ({"backend": "MOONCAKE"}, False),
+        ({"backend": None}, False),
+        ({"backend": "DEFAULT"}, True),
+        ({"kv_transfer_timeout_ms": None}, False),
+        ({"transceiver_runtime": "CPP", "kv_transfer_operation_timeout_ms": None}, True),
+    ],
+)
+def test_transfer_operation_timeout_runtime_constraints(
+    schemas: dict[str, dict], filename: str, overrides: dict, valid: bool
+) -> None:
+    """Reject explicit YAML conflicts while leaving DEFAULT resolution to runtime."""
+    config = {
+        "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "kv_transfer_operation_timeout_ms": 1000,
+            **overrides,
+        }
+    }
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("transfer_config", "valid"),
+    [
+        ({"kv_transfer_operation_timeout_ms": 1000}, False),
+        ({"backend": "NIXL", "kv_transfer_operation_timeout_ms": 1000}, True),
+        ({"kv_transfer_operation_timeout_ms": None}, True),
+    ],
+)
+def test_transfer_operation_timeout_defaults(
+    schemas: dict[str, dict], filename: str, transfer_config: dict, valid: bool
+) -> None:
+    """An enabled budget needs a backend; the runtime still defaults to Python."""
+    config = {"cache_transceiver_config": transfer_config}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
 @pytest.mark.parametrize("section", ["block_reuse_config", "mamba_state_config"])
 @pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
 def test_branch_snapshot_field_types(

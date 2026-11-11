@@ -306,18 +306,26 @@ def _select_lifecycle_ownership(
                     )
         if fp4 or context_first:
             communicator = _retirement_executor_comm(mapping, warn=False)
+        if config.kv_transfer_operation_timeout_ms is not None and not fp4:
+            raise ValueError(
+                "kv_transfer_operation_timeout_ms requires the generation-first FP4 MLA "
+                "lifecycle-ownership profile"
+            )
     except Exception as error:
         # Exchange all rank-local failures before raising so peers reach agreement.
         failure = f"{type(error).__name__}: {error}"
 
-    selections = dist.allgather((fp4, context_first, failure))
+    operation_timeout_ms = config.kv_transfer_operation_timeout_ms
+    selections = dist.allgather((fp4, context_first, failure, operation_timeout_ms))
     failures = [f"rank {rank}: {item[2]}" for rank, item in enumerate(selections) if item[2]]
     if failures:
         raise ValueError("KV lifecycle initialization rejected: " + "; ".join(failures))
     if len(selections) != mapping.world_size or any(
-        item[:2] != (fp4, context_first) for item in selections
+        item[:2] != (fp4, context_first) or item[3] != operation_timeout_ms for item in selections
     ):
-        raise ValueError("KV lifecycle ownership must agree on every executor rank")
+        raise ValueError(
+            "KV lifecycle ownership and operation timeout must agree on every executor rank"
+        )
     if fp4 or context_first:
         _warn_retirement_termination_scope(mapping)
     return fp4, context_first, communicator
@@ -439,6 +447,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
                 tx_timeout_s=sender_wait_slice_s,
                 tx_overall_timeout_s=transfer_timeout_s,
+                operation_timeout_ms=cache_transceiver_config.kv_transfer_operation_timeout_ms,
                 rx_timeout_s=transfer_timeout_s,
                 enforce_physical_ownership=enforce_physical_ownership,
                 context_first_ownership=self._context_first_ownership,

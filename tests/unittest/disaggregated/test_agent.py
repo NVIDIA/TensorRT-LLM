@@ -252,6 +252,7 @@ def test_transfer_between_agents(
     transfer_agent_dst.invalidate_remote_agent("src_agent")
 
 
+@pytest.mark.cpu_only
 @pytest.mark.skipif(not _HAS_CPP_NIXL_BINDING, reason="nixl C++ transfer-agent binding unavailable")
 class TestBindingsNixlTransferStatus(TestCase):
     """Cover BindingsNixlTransferStatus (#14137) with a mocked cpp_status.
@@ -284,6 +285,71 @@ class TestBindingsNixlTransferStatus(TestCase):
         msg = mlog.error.call_args.args[0]
         self.assertIn("non-SUCCESS", msg)
         self.assertIn("testAgent", msg)
+
+    def test_wait_until_uses_remaining_monotonic_budget(self) -> None:
+        """Caller-side delay is charged and positive fractional milliseconds round up."""
+        for now, deadline, expected_ms in [(10.75, 11.0, 250), (10.9995, 11.0, 1)]:
+            with self.subTest(now=now):
+                cpp = Mock()
+                cpp.wait.return_value = TransferState.SUCCESS
+                status = BindingsNixlTransferStatus(cpp)
+                with (
+                    patch(f"{_AGENT_CPP_MODULE}.time.monotonic", return_value=now),
+                    patch(
+                        f"{_AGENT_CPP_MODULE}.time.time",
+                        side_effect=AssertionError("deadline must not use wall time"),
+                    ),
+                ):
+                    self.assertTrue(status.wait_until(deadline))
+                cpp.wait.assert_called_once_with(expected_ms)
+
+    def test_wait_until_expired_does_not_wait(self) -> None:
+        """An exhausted deadline never grants another backend wait budget."""
+        for now in (10.0, 11.0):
+            with self.subTest(now=now):
+                cpp = Mock()
+                status = BindingsNixlTransferStatus(cpp)
+                with patch(f"{_AGENT_CPP_MODULE}.time.monotonic", return_value=now):
+                    with self.assertRaisesRegex(TimeoutError, "before waiting"):
+                        status.wait_until(10.0)
+                cpp.wait.assert_not_called()
+
+    def test_wait_until_clamps_rounding_to_binding_range(self) -> None:
+        """The maximum configured duration remains representable by the binding."""
+        max_timeout_ms = 2**63 - 1
+        cpp = Mock()
+        cpp.wait.return_value = TransferState.SUCCESS
+        status = BindingsNixlTransferStatus(cpp)
+        with patch(f"{_AGENT_CPP_MODULE}.time.monotonic", return_value=0.0):
+            self.assertTrue(status.wait_until(max_timeout_ms / 1000.0))
+        cpp.wait.assert_called_once_with(max_timeout_ms)
+
+    def test_wait_until_distinguishes_failure_from_timeout(self) -> None:
+        """The compiled wait result, not elapsed-time inference, identifies expiry."""
+        for result in (TransferState.SUCCESS, TransferState.FAILURE, TransferState.IN_PROGRESS):
+            with self.subTest(result=result):
+                cpp = Mock()
+                cpp.wait.return_value = result
+                status = BindingsNixlTransferStatus(cpp)
+                with patch(f"{_AGENT_CPP_MODULE}.time.monotonic", return_value=10.0):
+                    if result == TransferState.IN_PROGRESS:
+                        with self.assertRaisesRegex(TimeoutError, "during backend wait"):
+                            status.wait_until(11.0)
+                    else:
+                        self.assertEqual(status.wait_until(11.0), result == TransferState.SUCCESS)
+                cpp.wait.assert_called_once_with(1000)
+
+    def test_wait_until_does_not_reset_after_timeout(self) -> None:
+        """Reusing a deadline after expiry does not restart the operation budget."""
+        cpp = Mock()
+        cpp.wait.return_value = TransferState.IN_PROGRESS
+        status = BindingsNixlTransferStatus(cpp)
+        with patch(f"{_AGENT_CPP_MODULE}.time.monotonic", side_effect=[10.0, 11.0]):
+            with self.assertRaises(TimeoutError):
+                status.wait_until(11.0)
+            with self.assertRaises(TimeoutError):
+                status.wait_until(11.0)
+        cpp.wait.assert_called_once_with(1000)
 
     def test_is_completed_passthrough(self):
         cpp = Mock()

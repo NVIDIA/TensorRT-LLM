@@ -197,6 +197,16 @@ The same flag can select the existing no-retry FP4 MLA generation-first bridge w
 
 The sender and receiver retain resources until access is proven safe. An unresolved failure, cancellation or timeout starts the existing non-resettable quiescence grace (also `kv_transfer_timeout_ms`); expiry retains those resources and fail-stops the executor, potentially the entire shared MPI launcher job. This does not provide automatic replacement or generalized in-flight cancellation delivery.
 
+#### Optional submitted-operation timeout
+
+`cache_transceiver_config.kv_transfer_operation_timeout_ms` adds a separate positive millisecond limit for each submitted KV or auxiliary operation. It is disabled by default (`null`). It requires `transceiver_runtime: PYTHON` (the default), the NIXL backend, a finite `kv_transfer_timeout_ms`, and the supported no-retry FP4 MLA **generation-first** ownership profile above. Enable `TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT=1` and `TRTLLM_DISAGG_NO_RETRY=1` on all participants; unsupported profiles are rejected, not silently downgraded.
+
+The operation clock starts when the backend returns an accepted handle. Receiver-readiness waiting, the local sender queue, and time inside the submission call are excluded; any queueing after acceptance remains included. Backend service start is not observable, so this is **not** a measurement or limit of pure on-wire transfer time.
+
+This option does not reset, replace or extend the existing queue-inclusive KV wait, request, first-exposure safety or quiescence-grace deadlines. An operation timeout does not prove that remote access has stopped: the existing failure path retains the handle and KV as unresolved (`IN_DOUBT`) until safe retirement or containment. Cleanup may outlive logical request failure, and unresolved access can still fail-stop the executor.
+
+The existing `IN_DOUBT` path also stops **all further submissions** through that sender; late completion does not re-enable it. Do not use an aggressive operation budget as ordinary back-pressure: it can quarantine an otherwise healthy sender and require an executor restart.
+
 #### Basic serving example
 
 The following example illustrates general serving setup, not the ownership-enabled profile above. You could launch two context servers and one generation server as follows:

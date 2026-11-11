@@ -5792,6 +5792,19 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "available to other runtimes. It is distinct from the sender future "
         "wait slice.")
 
+    kv_transfer_operation_timeout_ms: Optional[PositiveInt] = Field(
+        default=None,
+        le=2**63 - 1,
+        description=
+        "Optional deadline in milliseconds for each submitted KV or auxiliary "
+        "operation, starting when the backend returns an accepted handle. "
+        "None (default) disables it. Includes backend queueing, but excludes "
+        "receiver-readiness waiting, the local sender queue and the submission "
+        "call; it is not an on-wire transfer duration. Requires the Python "
+        "NIXL transceiver and the supported no-retry generation-first physical "
+        "ownership profile. Existing KV, request and safety/grace deadlines "
+        "remain unchanged; expiry does not authorize freeing retained KV.")
+
     kv_transfer_sender_future_timeout_ms: Optional[PositiveInt] = Field(
         default=1000,
         description=
@@ -5904,6 +5917,29 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
                     f"are {sorted(AGENT_BOUNCE_PARAM_KEYS)}.")
         return self
 
+    @model_validator(mode='after')
+    def validate_operation_timeout(self) -> 'CacheTransceiverConfig':
+        """Reject an operation budget that the selected runtime cannot enforce.
+
+        Returns:
+            The validated configuration.
+
+        Raises:
+            ValueError: The budget is enabled outside Python NIXL or without
+                the existing finite transfer timeout.
+        """
+        if self.kv_transfer_operation_timeout_ms is not None:
+            backend, _ = self._resolve_default_backend()
+            if self.transceiver_runtime != "PYTHON" or backend != "NIXL":
+                raise ValueError(
+                    "kv_transfer_operation_timeout_ms requires "
+                    "transceiver_runtime='PYTHON' and the NIXL backend")
+            if self.kv_transfer_timeout_ms is None:
+                raise ValueError(
+                    "kv_transfer_operation_timeout_ms requires a finite "
+                    "kv_transfer_timeout_ms")
+        return self
+
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
 
@@ -5919,7 +5955,10 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         return "NIXL", None
 
     def _to_pybind(self):
-        # Python-transceiver-only option.
+        if self.kv_transfer_operation_timeout_ms is not None:
+            raise ValueError(
+                "kv_transfer_operation_timeout_ms is not supported by the "
+                "C++ transceiver")
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,

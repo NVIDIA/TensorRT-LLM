@@ -205,6 +205,24 @@ def generate_serve_schema() -> dict:
 
     # Annotated fields are derived; config changes still require snapshot regeneration and CPU tests.
     schema = _schema_for(TorchLlmArgs)
+    # Mirror explicit operation-budget incompatibilities. DEFAULT is resolved
+    # against environment variables at runtime, not by static YAML validation.
+    schema["$defs"]["CacheTransceiverConfig"].setdefault("allOf", []).append(
+        {
+            "if": {
+                "properties": {"kv_transfer_operation_timeout_ms": {"type": "integer"}},
+                "required": ["kv_transfer_operation_timeout_ms"],
+            },
+            "then": {
+                "properties": {
+                    "transceiver_runtime": {"const": "PYTHON"},
+                    "backend": {"enum": ["NIXL", "DEFAULT"]},
+                    "kv_transfer_timeout_ms": {"type": "integer"},
+                },
+                "required": ["backend"],
+            },
+        }
+    )
     # MODEL is supplied on the command line; nested required fields still apply.
     schema["required"] = [name for name in schema.get("required", []) if name != "model"]
     properties = schema["properties"]

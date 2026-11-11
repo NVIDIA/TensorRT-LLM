@@ -101,7 +101,7 @@ def test_lifecycle_activation_preserves_explicit_policy(
     fp4, context_first, communicator = _select(activation)
 
     assert (fp4, context_first) == expected
-    activation.dist.allgather.assert_called_once_with((*expected, None))
+    activation.dist.allgather.assert_called_once_with((*expected, None, None))
     if any(expected):
         assert communicator is activation.communicator
         activation.qualify.assert_called_once_with(activation.mapping, warn=False)
@@ -126,9 +126,10 @@ def test_invalid_lifecycle_policy_participates_in_rank_agreement(
         _select(activation)
 
     activation.dist.allgather.assert_called_once()
-    fp4, context_first, failure = activation.dist.allgather.call_args.args[0]
+    fp4, context_first, failure, operation_timeout = activation.dist.allgather.call_args.args[0]
     assert (fp4, context_first) == (False, False)
     assert failure
+    assert operation_timeout is None
     activation.qualify.assert_not_called()
     activation.warning.assert_not_called()
 
@@ -179,8 +180,8 @@ def test_local_selection_exception_rejects_every_rank_before_worker_creation(
     """
     monkeypatch.setenv(transceiver._KV_LIFECYCLE_ENFORCEMENT_ENV, "1")
     failure = f"{type(error).__name__}: {error}"
-    selections = [(False, True, None), (False, True, None)]
-    selections[failing_rank] = (*selected, failure)
+    selections = [(False, True, None, None), (False, True, None, None)]
+    selections[failing_rank] = (*selected, failure, None)
     worker = Mock()
     monkeypatch.setattr(transceiver, "TransferWorker", worker)
     monkeypatch.setattr(transceiver.KvCacheTransceiverV2, "_check_compatible", lambda _: None)
@@ -216,14 +217,18 @@ def test_activation_collective_failure_propagates_without_retry(
         _select(activation)
 
     assert caught.value is error
-    activation.dist.allgather.assert_called_once_with((False, True, None))
+    activation.dist.allgather.assert_called_once_with((False, True, None, None))
     activation.warning.assert_not_called()
 
 
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize(
     "remote_selection",
-    [(False, False, None), (True, False, None), (False, False, "bad peer config")],
+    [
+        (False, False, None, None),
+        (True, False, None, None),
+        (False, False, "bad peer config", None),
+    ],
 )
 def test_all_ranks_reject_inconsistent_activation_before_publication(
     monkeypatch: pytest.MonkeyPatch,
@@ -246,20 +251,82 @@ def test_all_ranks_reject_inconsistent_activation_before_publication(
             activation.mapping, activation.dist, activation.manager, activation.config
         )
 
-    activation.dist.allgather.assert_called_once_with((False, True, None))
+    activation.dist.allgather.assert_called_once_with((False, True, None, None))
     worker.assert_not_called()
     activation.warning.assert_not_called()
 
 
 def test_inactive_rank_still_joins_activation_agreement(activation: SimpleNamespace) -> None:
-    activation.dist.allgather.side_effect = lambda local: [local, (False, True, None)]
+    activation.dist.allgather.side_effect = lambda local: [local, (False, True, None, None)]
 
     with pytest.raises(ValueError, match="must agree on every executor rank"):
         _select(activation)
 
-    activation.dist.allgather.assert_called_once_with((False, False, None))
+    activation.dist.allgather.assert_called_once_with((False, False, None, None))
     activation.qualify.assert_not_called()
     activation.warning.assert_not_called()
+
+
+@pytest.mark.parametrize("setting", [None, "0", "1"])
+def test_operation_timeout_rejects_unqualified_profile_collectively(
+    monkeypatch: pytest.MonkeyPatch, activation: SimpleNamespace, setting: str | None
+) -> None:
+    """A budget cannot activate an unprotected or context-first-only profile."""
+    activation.config.kv_transfer_operation_timeout_ms = 100
+    if setting is not None:
+        monkeypatch.setenv(transceiver._KV_LIFECYCLE_ENFORCEMENT_ENV, setting)
+
+    with pytest.raises(ValueError, match="generation-first FP4 MLA"):
+        _select(activation)
+
+    activation.dist.allgather.assert_called_once()
+    selection = activation.dist.allgather.call_args.args[0]
+    assert selection[2]
+    assert selection[3] == 100
+    activation.warning.assert_not_called()
+
+
+@pytest.mark.parametrize("remote_budget", [100, None, 200])
+def test_operation_timeout_requires_executor_wide_profile_and_budget_agreement(
+    monkeypatch: pytest.MonkeyPatch,
+    activation: SimpleNamespace,
+    remote_budget: int | None,
+) -> None:
+    """Only the qualified FP4 profile with one agreed budget may initialize."""
+    monkeypatch.setenv(transceiver._KV_LIFECYCLE_ENFORCEMENT_ENV, "1")
+    activation.mapping = Mapping(world_size=2, rank=0, tp_size=2, enable_attention_dp=True)
+    activation.manager.dtype = DataType.NVFP4
+    activation.manager.kv_cache_type = CacheTypeCpp.SELFKONLY
+    activation.config.kv_transfer_operation_timeout_ms = 100
+    activation.dist.allgather.side_effect = lambda local: [
+        local,
+        (True, False, None, remote_budget),
+    ]
+
+    if remote_budget == 100:
+        assert _select(activation) == (True, False, activation.communicator)
+    else:
+        with pytest.raises(ValueError, match="agree on every executor rank"):
+            _select(activation)
+        activation.warning.assert_not_called()
+    activation.dist.allgather.assert_called_once_with((True, False, None, 100))
+
+
+@pytest.mark.parametrize("owned,has_containment", [(False, False), (False, True), (True, False)])
+def test_operation_timeout_requires_retirement_before_worker_setup(
+    owned: bool, has_containment: bool
+) -> None:
+    """Direct worker construction cannot bypass ownership and containment."""
+    config = transceiver.TransferWorkerConfig(
+        kv_cache_manager=Mock(),
+        device_id=0,
+        instance_name="test",
+        operation_timeout_ms=100,
+        enforce_physical_ownership=owned,
+        quiescence_fatal_callback=Mock() if has_containment else None,
+    )
+    with pytest.raises(ValueError, match="generation-first retirement"):
+        transceiver.TransferWorker(config)
 
 
 @pytest.mark.parametrize("rank", [0, 1])

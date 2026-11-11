@@ -26,7 +26,7 @@ import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union, cast
 
 import msgpack
 import numpy as np
@@ -47,6 +47,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     RegMemoryDescs,
     TransferOp,
     TransferRequest,
+    use_pure_python_transfer_agent,
 )
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     ReceiverBase,
@@ -102,6 +103,7 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggSchedul
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.base.agent import TransferStatus
+    from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import BindingsNixlTransferStatus
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
@@ -597,6 +599,7 @@ class _SessionQuiescence:
 
 
 class Sender(SenderBase):
+    _operation_timeout_ms: int | None = None
     # Time-to-live for orphaned RecvReqInfo entries (seconds).
     # In gen-first ADP broadcast, non-assigned DP ranks accumulate
     # RecvReqInfo that never gets consumed.  Entries older than this
@@ -610,13 +613,23 @@ class Sender(SenderBase):
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
         context_first_ownership: bool = False,
+        operation_timeout_ms: int | None = None,
     ) -> None:
+        if operation_timeout_ms is not None and (
+            operation_timeout_ms <= 0
+            or not enforce_physical_ownership
+            or retirement_watchdog is None
+        ):
+            raise ValueError(
+                "operation timeout requires positive budget and generation-first retirement"
+            )
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._enforce_physical_ownership = enforce_physical_ownership
         self._context_first_ownership = context_first_ownership
         self._retirement_watchdog = retirement_watchdog
+        self._operation_timeout_ms = operation_timeout_ms
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -939,6 +952,9 @@ class Sender(SenderBase):
         on_submitted: Optional[Callable[[], None]] = None,
     ) -> tuple[bool, Optional[str]]:
         owned = self._owns_task(task)
+        operation_timeout_ms = self._operation_timeout_ms
+        if operation_timeout_ms is not None and not owned:
+            raise _TransferNotSubmittedError("operation timeout requires physical ownership")
         try:
             # This query cannot submit a transfer. Reject before acquiring backend ownership.
             if request.op == TransferOp.WRITE and not self._agent.check_remote_descs(
@@ -967,10 +983,13 @@ class Sender(SenderBase):
                     "NIXL sender rejected transfer before backend submission"
                 ) from error
             task.begin_backend_submission(peer_rank, request)
+        accepted_at: float | None = None
         try:
             # SUBMITTING already retains the request. Neither backend admission
             # nor completion may hold the lock needed by deadline containment.
             status = self._agent.submit_transfer_requests(request)
+            if operation_timeout_ms is not None:
+                accepted_at = time.monotonic()
             task.record_backend_submission(peer_rank, status)
         except Exception as error:
             with self._ownership_poison_lock:
@@ -981,7 +1000,17 @@ class Sender(SenderBase):
             with disagg_diagnostics.suppress_diagnostic_errors():
                 on_submitted()
         try:
-            if not status.wait():
+            if accepted_at is None:
+                completed = status.wait()
+            else:
+                assert operation_timeout_ms is not None
+                # The qualified profile uses the C++ NIXL agent. Its finite wait
+                # distinguishes expiry from backend failure without inferring
+                # physical quiescence from either result.
+                completed = cast("BindingsNixlTransferStatus", status).wait_until(
+                    accepted_at + operation_timeout_ms / 1000.0
+                )
+            if not completed:
                 # A non-success query is a logical transfer failure, but the
                 # current binding does not expose a backend-defined proof that
                 # the request handle has released every memory accessor. Treat
@@ -993,6 +1022,13 @@ class Sender(SenderBase):
                     task.mark_physical_operation_in_doubt(peer_rank)
                 return False, detail
         except Exception as error:
+            if accepted_at is not None and isinstance(error, TimeoutError):
+                error = TimeoutError(
+                    "KV submitted-operation timeout: deadline_owner=native_operation "
+                    f"timer_start=backend_accepted elapsed_ms={(time.monotonic() - accepted_at) * 1000:.3f} "
+                    f"limit_ms={operation_timeout_ms} peer_rank={peer_rank} "
+                    "progress_at_observation=accepted_operation service_start=unknown"
+                )
             with self._ownership_poison_lock:
                 self._ownership_poisoned = error
                 task.mark_physical_operation_in_doubt(peer_rank)
@@ -4525,6 +4561,7 @@ class TransferWorkerConfig:
     tx_timeout_s: Optional[float] = None
     rx_timeout_s: Optional[float] = None
     tx_overall_timeout_s: Optional[float] = None
+    operation_timeout_ms: int | None = None
     enforce_physical_ownership: bool = False
     context_first_ownership: bool = False
     # Internal activation gate: only the qualified containment policy supplies it.
@@ -4542,6 +4579,17 @@ class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
         self._config = config
         self._retirement_watchdog = None
+        if config.operation_timeout_ms is not None and (
+            config.operation_timeout_ms <= 0
+            or not config.enforce_physical_ownership
+            or config.quiescence_fatal_callback is None
+            or use_pure_python_transfer_agent()
+            or config.agent_buffer_size_mb != 0
+        ):
+            raise ValueError(
+                "operation timeout requires positive budget, generation-first retirement "
+                "and the direct C++ NIXL agent"
+            )
         if config.quiescence_fatal_callback is not None:
             if not (config.enforce_physical_ownership or config.context_first_ownership):
                 raise ValueError("deadline retirement requires physical ownership")
@@ -4690,6 +4738,7 @@ class TransferWorker:
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
                 context_first_ownership=self._config.context_first_ownership,
+                operation_timeout_ms=self._config.operation_timeout_ms,
             )
             self._receiver = Receiver(
                 self._peer_registrar,
