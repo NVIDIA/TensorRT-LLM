@@ -49,7 +49,7 @@ bookkeeping live there. The graph breaks (the vision splice, the PLE block, each
 attention core and GDN recurrence) each write rows `[:n]` of a fixed output and zero rows `[n:]`.
 
 **Host offload.** The PLE n-gram table lives in device-addressable host memory, one copy per
-rank, or one per host with `weights.PLE_SHARED_HOST_ENV` (`host_share.py`).
+rank.
 
 **One-model MTP-Eagle.** With a `speculative_config` the core also holds the MTP module
 (`MTPLayer`), replayed `max_draft_len` times by the spec worker; the trunk runs every generation
@@ -1004,8 +1004,6 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         eos = cfg.eos_token_id
         self.eos_token_id = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
         self.ple_table_dtype = _weights.PLE_TABLE_DTYPE
-        # One host copy per host, not per rank (`host_share.py`).
-        self.ple_shared_host = _weights.ple_shared_host_scope()
         # Host memory behind the offloaded table; `ple_table` is a non-owning device view.
         self._ple_table_host = None
 
@@ -1389,18 +1387,11 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
     def _check_ple_residency(self) -> None:
         """Assert via the driver that the n-gram table is host-resident; outputs cannot show it."""
         table = self.w["ple_table"]
-        segment = self._ple_table_host
-        if hasattr(segment, "backing"):
-            # A VMM mapping: the allocation's own properties say where its pages are.
-            assert segment.backing.resident_on_host(segment.pointer), (
-                f"the shared n-gram table ({segment.describe()}) is not host NUMA memory"
-            )
-        else:
-            kind = _weights.memory_kind(table.data_ptr())
-            assert kind == _weights.CUDA_MEMORY_TYPE_HOST, (
-                f"the n-gram table was declared in host memory, but the driver reports "
-                f"cudaMemoryType {kind} for the pointer the forward gathers from"
-            )
+        kind = _weights.memory_kind(table.data_ptr())
+        assert kind == _weights.CUDA_MEMORY_TYPE_HOST, (
+            f"the n-gram table was declared in host memory, but the driver reports "
+            f"cudaMemoryType {kind} for the pointer the forward gathers from"
+        )
 
     # ---------------------------------------------------------------- bind ---
 
