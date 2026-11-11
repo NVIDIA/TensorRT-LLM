@@ -56,6 +56,8 @@ _REQUESTS, _ROWS_PER_REQUEST = 8, 4
 # Real requests per rank: a full batch, graph padding behind five and behind three real
 # requests, and an attention-DP placeholder rank.
 _REAL_REQUESTS = (8, 5, 0, 3)
+# The top-k reduce has one store path per combine wire format; each must zero the dropped rows.
+_COMBINE_FORMATS = ("bf16", "32e4m3xe8m0", "16e2m1xbf16")
 
 
 @requires_blackwell
@@ -169,15 +171,15 @@ def _published_counts(fused_moe, rank, rows):
     return matrix.view(torch.int32).view(_WORLD, width)[rank, : router.expert_count].cpu().clone()
 
 
-def _drop_worker(real_requests_by_rank):
+def _drop_worker(real_requests_by_rank, combine_format):
     try:
-        _drop_worker_impl(real_requests_by_rank)
+        _drop_worker_impl(real_requests_by_rank, combine_format)
     except Exception:
         traceback.print_exc()
         raise
 
 
-def _drop_worker_impl(real_requests_by_rank):
+def _drop_worker_impl(real_requests_by_rank, combine_format):
     from _torch.moe.moe_test_utils import MoeBackendType
     from _torch.moe.quantize_utils import get_test_quant_params
     from _torch.moe.test_moe_module import (
@@ -197,6 +199,7 @@ def _drop_worker_impl(real_requests_by_rank):
     from tensorrt_llm.models.modeling_utils import QuantAlgo
 
     os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
+    os.environ["MEGAMOE_COMBINE_FORMAT"] = combine_format
     rank = mpi_rank()
     mapping = _create_mapping_for_parallel_mode(_WORLD, "DEP")
     mapping.rank = rank
@@ -302,9 +305,12 @@ def _drop_worker_impl(real_requests_by_rank):
 @requires_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < _WORLD, reason=f"needs {_WORLD} GPUs")
 @pytest.mark.threadleak(enabled=False)  # the pool's manager thread persists by design
-def test_megamoe_cutedsl_drops_padding_rows():
+@pytest.mark.parametrize("combine_format", _COMBINE_FORMATS)
+def test_megamoe_cutedsl_drops_padding_rows(combine_format):
     with MPIPoolExecutor(
         initializer=_init_worker, initargs=(sys.path,), max_workers=_WORLD
     ) as executor:
-        results = list(executor.map(_drop_worker, [_REAL_REQUESTS] * _WORLD))
+        results = list(
+            executor.map(_drop_worker, [_REAL_REQUESTS] * _WORLD, [combine_format] * _WORLD)
+        )
     assert results == [None] * _WORLD
