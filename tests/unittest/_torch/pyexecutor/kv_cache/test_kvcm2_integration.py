@@ -4983,7 +4983,7 @@ def _native_config_with_sparse_arena(
         ]
     )
     fake_impl = Mock()
-    fake_impl.layer_grouping = [[0]]
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
@@ -6097,7 +6097,7 @@ def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
 
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     fake_impl = Mock()
-    fake_impl.layer_grouping = [[0]]
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
