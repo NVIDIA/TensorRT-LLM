@@ -1077,6 +1077,14 @@ class AttentionForwardArgs:
     quant_q_buffer: Optional[torch.Tensor] = None
     cross_kv: Optional[torch.Tensor] = None
     relative_attention_bias: Optional[torch.Tensor] = None
+    # Caller-quantized FP8 Q for the MLA FP8 context / fused generation paths;
+    # only meaningful together with `quant_q_buffer`. The fused paths that
+    # quantize into `quant_q_buffer` (DSv4 generation / context RoPE) read the
+    # value as the quant scale. The non-sparse FP8 context path reads only the
+    # presence: its FMHA dequantizes Q / K / V with the kv cache scale, so
+    # caller-quantized FP8 `k` / `v` and `quant_q_buffer` must have been
+    # quantized with `kv_scale_orig_quant`, and this tensor must carry that
+    # scale.
     quant_scale_qkv: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_field(
         dtype=torch.float32)

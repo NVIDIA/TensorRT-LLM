@@ -2911,6 +2911,14 @@ void MLA::prepareInputs(FmhaParams& p, bool isGen)
                     TORCH_CHECK(quantQ.scalar_type() == torch::kFloat8_e4m3fn && quantQ.is_contiguous()
                             && quantQ.numel() >= p.getQueryInput().numel(),
                         "The FP8 MLA context quant_q_buffer must be a contiguous FP8 copy of q.");
+                    // The value is not read as a scale here; the FMHA dequantizes
+                    // Q / K / V with the kv cache scale, so it must equal
+                    // kv_scale_orig_quant. The mixed path (BF16 Q, FP8 k / v)
+                    // also quantizes Q with it.
+                    auto const& quantScaleQkv = p.fwd.quant_scale_qkv.value();
+                    TORCH_CHECK(quantScaleQkv.is_cuda() && quantScaleQkv.is_contiguous()
+                            && quantScaleQkv.scalar_type() == at::ScalarType::Float && quantScaleQkv.numel() >= 1,
+                        "The FP8 MLA context quant_scale_qkv must be a contiguous CUDA float scalar.");
                 }
             }
             else
@@ -3329,6 +3337,10 @@ int MLA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
         mla.k_buf = p.getK<T>();
         mla.v_buf = p.getV<T>();
         mla.fp8_kv_input = p.key_input.has_value() && p.key_input->scalar_type() == torch::kFloat8_e4m3fn;
+        // `quant_scale_qkv` is a presence flag for caller-quantized FP8 Q; its value
+        // is not read on this branch. The FP8 context FMHA dequantizes Q with the
+        // kv cache dequant scale (see the context scale comment below), so the
+        // caller must have quantized `quant_q_buffer` with kv_scale_orig_quant.
         mla.fp8_q_input = mla.fp8_kv_input && p.fwd.quant_q_buffer.has_value() && p.fwd.quant_scale_qkv.has_value();
         mla.helix_position_offsets = p.getHelixPositionOffsets();
         mla.helix_is_inactive_rank = p.getHelixIsInactiveRank();
@@ -3447,6 +3459,20 @@ int MLA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
     mla.quant_scale_kv = p.getKvScaleOrigQuant();
     mla.dequant_scale_q = p.getKvScaleQuantOrig();
     mla.dequant_scale_kv = cache_type == KvCacheDataType::NVFP4 ? nullptr : p.getKvScaleQuantOrig();
+    // The FP8 context FMHA dequantizes Q / K / V with the kv cache dequant
+    // scale: quantizeCopyInputToFp8Kernel folds dequant_scale_q / dequant_scale_kv
+    // into bmm1_scale / bmm2_scale, and the FMHA reads those. Everything that
+    // reaches it must have been quantized with the cache quant scale -- the
+    // copies the op makes of BF16 Q / K / V, and any caller-quantized FP8 k / v
+    // or `quant_q_buffer`. On the non-sparse branch `quant_scale_qkv` only flags
+    // caller-quantized FP8 Q (its value is not read), so the copies take
+    // `quant_scale_kv` here. NVFP4 keeps a unit scale: its fp8 context buffers are
+    // an uncalibrated scratch quantization (nullptr dequant above). Sparse keeps
+    // the caller's scale set above, which its fused RoPE kernel quantizes Q with.
+    if (!use_sparse_attention && cache_type == KvCacheDataType::FP8)
+    {
+        mla.quant_scale_qkv = mla.quant_scale_kv;
+    }
     mla.host_bmm1_scale = 1 / (q_scaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
     // The sparse MLA is in the absorption mode for the context phase.
     mla.absorption_mode = useSparseMLA();
