@@ -970,7 +970,8 @@ def test_selfsampling_bf16_partitioned_rows_cluster_on_blackwell_only(monkeypatc
 def test_selfsampling_hopper_long_rows_sample_with_staging_headroom(monkeypatch) -> None:
     """Hopper samples the long rows of tall batches with the full staging headroom (aim 4K, which
     the kernel clamps to SCAP / 2): FP32 rows of 64K or more scores at K <= 1024 and 16-bit rows
-    of 128K or more at K = 1024. Blackwell keeps its sampling targets."""
+    of 128K or more at K = 1024, or of 64K or more for BF16 batches that read their survivors
+    from registers, which keep the 256-thread slab below 128K. Blackwell keeps its plans."""
     real = ss_host._device()
 
     class RecordingDevice:
@@ -997,13 +998,24 @@ def test_selfsampling_hopper_long_rows_sample_with_staging_headroom(monkeypatch)
                 assert aim(rows, n, 1024, 132, 90, dtype) == 4096, (rows, n, dtype)
         assert aim(rows, 65539, 1024, 132, 90, torch.float32) == 4096
         assert aim(rows, 131075, 512, 132, 90, torch.float32) == 2048
+        regsel = rows > 4 * 132
+        assert aim(rows, 65539, 1024, 132, 90, torch.bfloat16) == (4096 if regsel else 1408)
+        assert aim(rows, 65539, 1024, 132, 90, torch.float16) == 1408
         for dtype in (torch.bfloat16, torch.float16):
-            assert aim(rows, 65539, 1024, 132, 90, dtype) == 1408, (rows, dtype)
             assert aim(rows, 131075, 512, 132, 90, dtype) == 768, (rows, dtype)
+
+    def slab(rows, n, dtype, num_sms=132, sm_version=90):
+        plan = ss_host._route_streaming_16bit(rows, n, n, 1024, True, dtype, num_sms, sm_version)
+        return plan["tpl"][0]
+
+    assert slab(1024, 65539, torch.bfloat16) == 256
+    assert slab(1024, 65539, torch.float16) == slab(512, 65539, torch.bfloat16) == 512
+    assert slab(1024, 131075, torch.bfloat16) == 512
     # Blackwell: only BF16 batches beyond two waves (256-thread slabs) raise the K=1024 target
     for dtype, expected in ((torch.float32, 1408), (torch.bfloat16, 2048), (torch.float16, 1408)):
         assert aim(512, 131075, 1024, 148, 100, dtype) == expected, dtype
     assert aim(256, 131075, 1024, 148, 100, torch.bfloat16) == 1408
+    assert slab(1024, 65539, torch.bfloat16, 148, 100) == slab(1024, 65539, torch.float16, 148, 100)
 
 
 @pytest.mark.skipif(

@@ -167,13 +167,28 @@ def cluster_fits(cluster_size: int, rows: int, num_sms: int, sm_version: int) ->
     return rows <= _HOPPER_CLUSTER_ROWS[cluster_size] * num_sms // _HOPPER_CLUSTER_SMS
 
 
-def _wide_slab(b: int, n: int, k: int, wave: int, sm_version: int) -> bool:
+def _regsel_rows(dtype: torch.dtype, num_rows: int, num_sms: int) -> bool:
+    """Whether a BF16 batch reads its survivors back from the tile registers (``regsel``).
+
+    Only the 256-thread slab holds the tile that long; the 512-thread slab spends those registers
+    on its load prefetch.
+    """
+    return dtype is torch.bfloat16 and num_rows > 4 * num_sms
+
+
+def _wide_slab(b: int, n: int, k: int, wave: int, sm_version: int, regsel: bool = False) -> bool:
     """Whether a main slab that is not ``big`` runs 512-thread CTAs (two per SM) rather than 256.
 
-    Batches of up to two waves do on every target; Hopper also streams long K <= 1024 rows of
-    taller batches with them, whose register prefetch pays off from 64K scores per row.
+    Batches of up to two waves do on every target. Hopper also streams long K <= 1024 rows of
+    taller batches with them, whose register prefetch pays off from 64K scores per row; at
+    K = 1024 rows below 128K scores whose survivors are read from registers (``regsel``) stay
+    on 256 threads.
     """
-    return b <= 2 * wave or (sm_version not in _BLACKWELL_SM_VERSIONS and k <= 1024 and n >= 65536)
+    if b <= 2 * wave:
+        return True
+    if sm_version in _BLACKWELL_SM_VERSIONS or k > 1024 or n < 65536:
+        return False
+    return not (regsel and k == 1024 and n < 131072)
 
 
 def route(
@@ -736,6 +751,7 @@ def route_streaming(
     force_main: bool = False,
     num_sms: int = 148,
     sm_version: int = 100,
+    regsel: bool = False,
 ) -> dict[str, object]:
     """route() restricted to its STREAMING half (main / clus) — the varlen
     capture policy: per-row kernels must be picked from the families that are
@@ -743,7 +759,8 @@ def route_streaming(
     skipped even when the envelope n would normally land on them.  Where
     route() itself lands on main/clus this is IDENTICAL to route().
     force_main additionally skips the clus rounding, so the raw
-    min(r1, r2) R matches the CUDA else-branch exactly."""
+    min(r1, r2) R matches the CUDA else-branch exactly. regsel: the rows read
+    their survivors back from registers (BF16, see ``_regsel_rows``)."""
     if b < 1:
         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
     wave = wave_sms(num_sms, sm_version)
@@ -830,7 +847,7 @@ def route_streaming(
             "smem": smc,
             "ws": False,
         }
-    wide_slab = _wide_slab(b, n, k, wave, sm_version)
+    wide_slab = _wide_slab(b, n, k, wave, sm_version, regsel)
     smem_main = (scap + 4) * (8 if (R > 1 or wide_slab) else 4) + (cmp_ + 1) * 8
 
     def _main(blk_, minb_, u_, split_):
@@ -1715,14 +1732,16 @@ def _route_streaming_16bit(
 ) -> dict[str, object]:
     """16-bit form of ``route_streaming``.
 
-    ``dtype`` is accepted for call-site parity and no rule reads it. Adjusts the FP32 streaming
-    plan's block size, split count, vector width and U for 16-bit vectors. A 16-byte tile spans
-    BLK*8 elements and cannot shrink below U == 1, so for K != 2048 a split main plan at U == 1
-    (n >= 16384, b*R < wave) whose chunk fills less than 3/4 of that tile takes the 8-byte-vector
-    engine (``vec4``: FP32 tile geometry, all threads active).
+    Adjusts the FP32 streaming plan's block size, split count, vector width and U for 16-bit
+    vectors; ``dtype`` only marks the BF16 batches that read their survivors from registers
+    (``_regsel_rows``), which picks their slab. A 16-byte tile spans BLK*8 elements and cannot
+    shrink below U == 1, so for K != 2048 a split main plan at U == 1 (n >= 16384, b*R < wave)
+    whose chunk fills less than 3/4 of that tile takes the 8-byte-vector engine (``vec4``: FP32
+    tile geometry, all threads active).
     """
     wave = wave_sms(num_sms, sm_version)
-    plan = route_streaming(b, n, npad, k, force_main, num_sms, sm_version)
+    regsel = _regsel_rows(dtype, b, num_sms)
+    plan = route_streaming(b, n, npad, k, force_main, num_sms, sm_version, regsel)
     if plan["kernel"] in ("main", "clus"):
         tpl = plan["tpl"]
         if (
@@ -3158,7 +3177,7 @@ def _varlen_launcher(
                     )
                 ):
                     main_options["dense"] = False
-                if dtype is torch.bfloat16 and num_rows > 4 * num_sms:
+                if _regsel_rows(dtype, num_rows, num_sms):
                     main_options["regsel"] = True
                 if dtype is torch.bfloat16:
                     main_options["envf"] = True
@@ -3211,14 +3230,15 @@ def _varlen_launcher(
             if k >= 1024
             else 3 * k // 2
         )
-        if (
-            not big
-            and sm_version not in _BLACKWELL_SM_VERSIONS
-            and (k == 1024 and n_kernel >= 131072 if low else k <= 1024 and n_kernel >= 65536)
-        ):
+        if low:
+            # 16-bit rows at K = 1024 from 128K scores, or from 64K when their survivors are read
+            # back from registers (regsel), where the extra staged survivors cost little
+            long_row = k == 1024 and n_kernel >= (65536 if main_options.get("regsel") else 131072)
+        else:
+            long_row = k <= 1024 and n_kernel >= 65536
+        if long_row and not big and sm_version not in _BLACKWELL_SM_VERSIONS:
             # A retried attempt re-reads the row from DRAM; Hopper's lower bandwidth makes long
-            # rows sample with the full staging headroom (the kernel clamps aim to SCAP / 2):
-            # FP32 rows of 64K or more scores at K <= 1024, 16-bit rows of 128K or more at K = 1024.
+            # rows sample with the full staging headroom (the kernel clamps aim to SCAP / 2).
             aim_base = 4 * k
         if (
             dtype is torch.bfloat16
