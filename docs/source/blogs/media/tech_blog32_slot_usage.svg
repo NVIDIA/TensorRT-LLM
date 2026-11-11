@@ -3,7 +3,7 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0 -->
 <title id="slot-title">Free and hierarchical helper-slot placement</title>
-<desc id="slot-desc">Four receiver ranks, 4 through 7, each have one helper slot. Free placement is illustrated with independently selected experts A, B, C and D. Hierarchical placement uses aligned pairs 4 and 5, and 6 and 7: the slots contain A, A, B and B. The same expert is copied to every member of a selected group. Expert owners are omitted.</desc>
+<desc id="slot-desc">Four receiver ranks, 0 through 3, each have one helper slot. Free placement is illustrated with independently selected experts A, B, C and D. Hierarchical placement uses aligned pairs 0 and 1, and 2 and 3: the slots contain A, A, B and B. The same expert is copied to every member of a selected group. Expert owners are omitted.</desc>
 <rect width="960" height="235" fill="white"/>
 <g font-family="Liberation Serif, Times New Roman, serif">
 <text x="24" y="30" font-size="23" fill="#222222" font-weight="bold" text-anchor="start">(a) Free</text>
@@ -11,35 +11,35 @@ SPDX-License-Identifier: Apache-2.0 -->
 <text x="44" y="144" font-size="18" fill="#626262" font-weight="normal" text-anchor="start">h₀</text>
 <rect x="76" y="117" width="68" height="40" fill="#E69F00" stroke="#555555" stroke-width="1"/>
 <text x="110" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">A</text>
-<text x="110" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 4</text>
+<text x="110" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 0</text>
 <rect x="165" y="117" width="68" height="40" fill="#CC79A7" stroke="#555555" stroke-width="1"/>
 <text x="199" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">B</text>
-<text x="199" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 5</text>
+<text x="199" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 1</text>
 <rect x="254" y="117" width="68" height="40" fill="#56B4E9" stroke="#555555" stroke-width="1"/>
 <text x="288" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">C</text>
-<text x="288" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 6</text>
+<text x="288" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 2</text>
 <rect x="343" y="117" width="68" height="40" fill="#009E73" stroke="#555555" stroke-width="1"/>
 <text x="377" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">D</text>
-<text x="377" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 7</text>
+<text x="377" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 3</text>
 <text x="514" y="30" font-size="23" fill="#222222" font-weight="bold" text-anchor="start">(b) Hierarchical</text>
 <text x="514" y="56" font-size="17" fill="#626262" font-weight="normal" text-anchor="start">One expert per aligned pair</text>
 <text x="534" y="144" font-size="18" fill="#626262" font-weight="normal" text-anchor="start">h₀</text>
 <rect x="566" y="117" width="68" height="40" fill="#E69F00" stroke="#555555" stroke-width="1"/>
 <text x="600" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">A</text>
-<text x="600" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 4</text>
+<text x="600" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 0</text>
 <rect x="655" y="117" width="68" height="40" fill="#E69F00" stroke="#555555" stroke-width="1"/>
 <text x="689" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">A</text>
-<text x="689" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 5</text>
+<text x="689" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 1</text>
 <rect x="744" y="117" width="68" height="40" fill="#CC79A7" stroke="#555555" stroke-width="1"/>
 <text x="778" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">B</text>
-<text x="778" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 6</text>
+<text x="778" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 2</text>
 <rect x="833" y="117" width="68" height="40" fill="#CC79A7" stroke="#555555" stroke-width="1"/>
 <text x="867" y="145" font-size="25" fill="#222222" font-weight="bold" text-anchor="middle">B</text>
-<text x="867" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 7</text>
+<text x="867" y="185" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">rank 3</text>
 <path d="M566,108 V92 H723 V108" fill="none" stroke="#666666" stroke-width="1.2"/>
-<text x="644.5" y="85" font-size="16" fill="#626262" font-weight="normal" text-anchor="middle">{4, 5}</text>
+<text x="644.5" y="85" font-size="16" fill="#626262" font-weight="normal" text-anchor="middle">{0, 1}</text>
 <path d="M744,108 V92 H901 V108" fill="none" stroke="#666666" stroke-width="1.2"/>
-<text x="822.5" y="85" font-size="16" fill="#626262" font-weight="normal" text-anchor="middle">{6, 7}</text>
+<text x="822.5" y="85" font-size="16" fill="#626262" font-weight="normal" text-anchor="middle">{2, 3}</text>
 <text x="480" y="222" font-size="17" fill="#626262" font-weight="normal" text-anchor="middle">One helper slot per receiver rank; repeated letters denote replicas of the same expert.</text>
 </g>
 </svg>
