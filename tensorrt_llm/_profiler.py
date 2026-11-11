@@ -21,6 +21,7 @@ import os
 from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from functools import wraps
+from threading import Lock
 from types import TracebackType
 from typing import Literal, ParamSpec, TypeAlias, TypeVar, cast
 
@@ -46,6 +47,8 @@ __all__ = [
     "encode_metadata",
     "record_function_metadata_scope",
     "record_function_with_metadata",
+    "record_workflow_scope",
+    "tensor_metadata",
     "warn_profiler_failure",
 ]
 
@@ -55,11 +58,7 @@ _CUSTOM_REGION_NAMES: frozenset[ProfilerRegion] = frozenset(
 )
 _CUSTOM_REGION_DEFAULTS = _CUSTOM_REGION_NAMES - {"kv", "moe"}
 _METADATA_PREFIX = "TRTLLM1:"
-
-
 _P = ParamSpec("_P")
-
-
 _R = TypeVar("_R")
 
 
@@ -226,13 +225,13 @@ def record_function_metadata_scope(
                 warn_profiler_failure(name, region, "cleanup", error)
 
 
-def _tensor_metadata(tensor: torch.Tensor) -> dict[str, MetadataValue]:
-    """Describe tensor shape, dtype, stride, and device without reading values."""
+def tensor_metadata(tensor: torch.Tensor, prefix: str = "") -> dict[str, MetadataValue]:
+    """Describe tensor layout without reading values; prepend ``prefix`` to each key."""
     return {
-        "shape": list(tensor.shape),
-        "dtype": str(tensor.dtype),
-        "stride": list(tensor.stride()),
-        "device": str(tensor.device),
+        f"{prefix}shape": list(tensor.shape),
+        f"{prefix}dtype": str(tensor.dtype),
+        f"{prefix}stride": list(tensor.stride()),
+        f"{prefix}device": str(tensor.device),
     }
 
 
@@ -249,6 +248,8 @@ class _RecordFunctionWithMetadata:
         self._values = values
         self._metadata_factory = metadata_factory
         self._scope: AbstractContextManager[None] | None = None
+        self._enter_lock = Lock()
+        self._entered = False
 
     def _metadata(self) -> dict[str, MetadataValue]:
         """Collect direct tensor descriptors and merge explicit workflow fields."""
@@ -257,9 +258,7 @@ class _RecordFunctionWithMetadata:
         for value in self._values:
             if isinstance(value, torch.Tensor):
                 prefix = f"workflow.tensor.{tensor_index}"
-                metadata.update(
-                    {f"{prefix}.{key}": item for key, item in _tensor_metadata(value).items()}
-                )
+                metadata.update(tensor_metadata(value, f"{prefix}."))
                 tensor_index += 1
         metadata["workflow.tensor_count"] = tensor_index
         if self._metadata_factory is not None:
@@ -267,6 +266,10 @@ class _RecordFunctionWithMetadata:
         return metadata
 
     def __enter__(self) -> "_RecordFunctionWithMetadata":
+        with self._enter_lock:
+            if self._entered:
+                raise RuntimeError("Workflow profiler contexts are single-use")
+            self._entered = True
         self._scope = record_function_metadata_scope(self._name, "workflow", self._metadata)
         self._scope.__enter__()
         return self
@@ -309,7 +312,7 @@ class _RecordFunctionWithMetadata:
         return wrapper
 
 
-def record_function_with_metadata(
+def record_workflow_scope(
     name: str,
     *values: object,
     metadata_factory: Callable[..., Mapping[str, MetadataValue]] | None = None,
@@ -333,5 +336,11 @@ def record_function_with_metadata(
         does not re-execute Python decorators inside the captured model.
         When used as a decorator, startup-excluded workflow returns the original
         callable; context managers retain their per-scope selection checks.
+        Each context is single-use: nested, sequential, or concurrent re-entry
+        raises RuntimeError. Decorated calls each create a fresh context.
     """
     return _RecordFunctionWithMetadata(name, *values, metadata_factory=metadata_factory)
+
+
+# Compatibility for callers using the original workflow helper name.
+record_function_with_metadata = record_workflow_scope

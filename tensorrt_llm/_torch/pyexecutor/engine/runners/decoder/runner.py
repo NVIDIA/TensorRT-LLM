@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from tensorrt_llm._profiler import MetadataValue, record_function_with_metadata
+from tensorrt_llm._profiler import MetadataValue, record_workflow_scope
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
     AttentionRuntimeFeatures,
@@ -899,7 +899,7 @@ class DecoderRunner(ScheduledModelRunner):
         """Run auxiliary warmups and ordinary CUDA graph capture eagerly."""
         return self._maybe_bypass_torch_compile(bypass=True)
 
-    @record_function_with_metadata(
+    @record_workflow_scope(
         "trtllm::model_forward", metadata_factory=_model_forward_workflow_metadata
     )
     def _model_forward(self, *, is_dummy: bool, **kwargs: Any) -> Any:

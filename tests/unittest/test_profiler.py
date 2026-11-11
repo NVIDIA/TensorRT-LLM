@@ -21,8 +21,10 @@ import logging
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
+from threading import Barrier
 from types import TracebackType
 from typing import cast
 
@@ -78,6 +80,49 @@ def test_failed_metadata_keeps_named_scope(monkeypatch: pytest.MonkeyPatch) -> N
             result = 42
     assert result == 42
     assert sum(event.name == "named_without_metadata" for event in trace.events()) == 1
+
+
+@pytest.mark.parametrize("reuse", ["nested", "sequential", "threads"])
+def test_workflow_context_is_single_use(monkeypatch: pytest.MonkeyPatch, reuse: str) -> None:
+    """Only one caller may own a context; decorators create their own per call."""
+    select_regions(monkeypatch)
+    scope = profiler.record_function_with_metadata("single_use")
+    if reuse == "threads":
+        ready = Barrier(2)
+
+        def enter() -> bool:
+            ready.wait()
+            try:
+                with scope:
+                    return True
+            except RuntimeError:
+                return False
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert sorted(pool.map(lambda _: enter(), range(2))) == [False, True]
+    elif reuse == "nested":
+        with scope:
+            with pytest.raises(RuntimeError, match="single.use"):
+                with scope:
+                    pytest.fail("context entered twice")
+    else:
+        with scope:
+            pass
+        with pytest.raises(RuntimeError, match="single.use"):
+            with scope:
+                pytest.fail("context entered twice")
+
+
+def test_workflow_scope_alias_and_shared_tensor_descriptor() -> None:
+    """The workflow-specific API remains compatible and exposes one tensor schema."""
+    assert profiler.record_function_with_metadata is profiler.record_workflow_scope
+    value = torch.arange(6, dtype=torch.int64).reshape(2, 3).t()
+    assert profiler.tensor_metadata(value, "mpi.payload.") == {
+        "mpi.payload.shape": [3, 2],
+        "mpi.payload.dtype": "torch.int64",
+        "mpi.payload.stride": [1, 3],
+        "mpi.payload.device": "cpu",
+    }
 
 
 @pytest.mark.parametrize(
@@ -332,9 +377,7 @@ def test_inactive_workflow_decorator_bypasses_scope_construction(
     monkeypatch: pytest.MonkeyPatch, active: bool, selected: bool
 ) -> None:
     """Disabled calls must bypass per-call profiler object and closure setup."""
-    monkeypatch.setattr(
-        profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if selected else frozenset()
-    )
+    select_regions(monkeypatch, *(("workflow",) if selected else ()))
     result = object()
     original = ValueError("workload failed")
 
@@ -366,7 +409,7 @@ def test_startup_disabled_workflow_decorator_returns_original_function(
     monkeypatch: pytest.MonkeyPatch, selection: frozenset[str]
 ) -> None:
     """Excluded startup regions must leave no decorator on each function call."""
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", selection)
+    select_regions(monkeypatch, *selection)
     calls: list[str] = []
     result = object()
     original = ValueError("workload failed")
@@ -401,7 +444,7 @@ def test_workflow_decorator_tracks_live_selection_and_profiler_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A startup-selected callable must follow both runtime gates across calls."""
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    select_regions(monkeypatch, "workflow")
     metadata_labels: list[str] = []
     result = object()
     original = ValueError("workload failed")
@@ -425,18 +468,18 @@ def test_workflow_decorator_tracks_live_selection_and_profiler_state(
     assert wrapped(result) is result
 
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
-        monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset())
+        select_regions(monkeypatch)
         assert wrapped(result, label="unselected") is result
-        monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+        select_regions(monkeypatch, "workflow")
         assert wrapped(result) is result
         assert wrapped(result, label="selected") is result
         with pytest.raises(ValueError) as caught:
             wrapped(result, label="failure")
         assert caught.value is original
-        monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset())
+        select_regions(monkeypatch)
         assert wrapped(result, label="deselected") is result
 
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    select_regions(monkeypatch, "workflow")
     assert wrapped(result, label="profiler_stopped") is result
     assert metadata_labels == ["positional", "selected", "failure"]
     assert sum(event.name == "live_workflow" for event in trace.events()) == 3

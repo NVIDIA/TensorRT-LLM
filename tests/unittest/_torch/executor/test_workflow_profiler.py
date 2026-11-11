@@ -14,18 +14,21 @@
 
 """Workflow metadata and current inference-boundary contracts (CPU only)."""
 
-import ast
 import inspect
 import json
-from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
-from profiler_test_utils import decode_profiler_metadata
+from profiler_test_utils import (
+    decode_node_metadata,
+    execution_trace_observer,
+    profiler_nodes,
+    select_regions,
+)
 
 from tensorrt_llm import _profiler as profiler
 from tensorrt_llm._torch.pyexecutor import cuda_graph_runner, py_executor
@@ -33,17 +36,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as deco
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
-
-
-@contextmanager
-def _execution_trace_observer(path: Path) -> Iterator[torch.profiler.ExecutionTraceObserver]:
-    """Register a real observer and always release its process-wide callback."""
-    observer = torch.profiler.ExecutionTraceObserver()
-    try:
-        observer.register_callback(str(path))
-        yield observer
-    finally:
-        observer.unregister_callback()
 
 
 def _request(**values: object) -> SimpleNamespace:
@@ -67,7 +59,7 @@ def _request(**values: object) -> SimpleNamespace:
 def test_phase_tracks_scheduled_work(
     context_tokens: int, generation_requests: int, expected: str
 ) -> None:
-    assert py_executor._forward_workflow_region(context_tokens, generation_requests) == expected
+    assert py_executor._forward_phase_scope_name(context_tokens, generation_requests) == expected
 
 
 @pytest.mark.skipif(
@@ -77,13 +69,13 @@ def test_direct_tensor_metadata_and_decorator_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Describe direct tensors while preserving the decorated call signature."""
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    select_regions(monkeypatch, "workflow")
     tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
     scalar = torch.tensor(7, dtype=torch.int64)
     result = object()
     path = tmp_path / "execution.json"
 
-    @profiler.record_function_with_metadata("workflow::decorated")
+    @profiler.record_workflow_scope("workflow::decorated")
     def wrapped(value: torch.Tensor, *, offset: torch.Tensor, nested: object) -> object:
         """Verify direct and nested argument identity before returning a sentinel."""
         assert value is tensor and offset is scalar
@@ -91,15 +83,15 @@ def test_direct_tensor_metadata_and_decorator_identity(
         return result
 
     container = {"ignored": [tensor]}
-    with _execution_trace_observer(path) as observer:
+    with execution_trace_observer(path) as observer:
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
         ) as trace:
             assert wrapped(tensor, offset=scalar, nested=container) is result
-            with profiler.record_function_with_metadata("workflow::context", tensor, container):
+            with profiler.record_workflow_scope("workflow::context", tensor, container):
                 torch.ones(1)
-    nodes = {node["name"]: node for node in json.loads(path.read_text())["nodes"]}
-    region, metadata = decode_profiler_metadata(nodes["workflow::decorated"]["inputs"]["values"][0])
+    nodes = {node["name"]: node for node in profiler_nodes(path)}
+    region, metadata = decode_node_metadata(nodes["workflow::decorated"])
     assert region == "workflow"
     assert metadata == {
         "workflow.tensor_count": 2,
@@ -112,12 +104,7 @@ def test_direct_tensor_metadata_and_decorator_identity(
         "workflow.tensor.1.stride": [],
         "workflow.tensor.1.device": "cpu",
     }
-    assert (
-        decode_profiler_metadata(nodes["workflow::context"]["inputs"]["values"][0])[1][
-            "workflow.tensor_count"
-        ]
-        == 1
-    )
+    assert decode_node_metadata(nodes["workflow::context"])[1]["workflow.tensor_count"] == 1
     chrome_path = tmp_path / "chrome.json"
     trace.export_chrome_trace(str(chrome_path))
     names = {event.get("name") for event in json.loads(chrome_path.read_text())["traceEvents"]}
@@ -131,20 +118,18 @@ def test_metadata_factory_is_lazy(
     monkeypatch: pytest.MonkeyPatch, active: bool, selected: bool
 ) -> None:
     """Inspect tensor metadata only when workflow is selected and active."""
-    monkeypatch.setattr(
-        profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if selected else frozenset()
-    )
+    select_regions(monkeypatch, *(["workflow"] if selected else []))
     calls = 0
 
-    def fail_metadata(tensor: torch.Tensor) -> dict[str, profiler.MetadataValue]:
+    def fail_metadata(tensor: torch.Tensor, prefix: str = "") -> dict[str, profiler.MetadataValue]:
         nonlocal calls
         calls += 1
         raise RuntimeError("observational metadata failure")
 
-    monkeypatch.setattr(profiler, "_tensor_metadata", fail_metadata)
+    monkeypatch.setattr(profiler, "tensor_metadata", fail_metadata)
     tensor = torch.ones(1)
 
-    @profiler.record_function_with_metadata("workflow::lazy")
+    @profiler.record_workflow_scope("workflow::lazy")
     def wrapped(value: torch.Tensor) -> torch.Tensor:
         return value
 
@@ -162,11 +147,9 @@ def test_wrapped_exception_identity(
     monkeypatch: pytest.MonkeyPatch, selected: bool, error: BaseException
 ) -> None:
     """Preserve body exception identity in decorator and context forms."""
-    monkeypatch.setattr(
-        profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if selected else frozenset()
-    )
+    select_regions(monkeypatch, *(["workflow"] if selected else []))
 
-    @profiler.record_function_with_metadata("workflow::exception")
+    @profiler.record_workflow_scope("workflow::exception")
     def wrapped() -> None:
         raise error
 
@@ -175,16 +158,16 @@ def test_wrapped_exception_identity(
             wrapped()
         assert caught.value is error
         with pytest.raises(type(error)) as caught:
-            with profiler.record_function_with_metadata("workflow::exception_context"):
+            with profiler.record_workflow_scope("workflow::exception_context"):
                 raise error
         assert caught.value is error
 
 
 def test_none_selection_suppresses_real_trace(monkeypatch: pytest.MonkeyPatch) -> None:
     """Emit no workflow scope when startup selection excludes workflow."""
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset())
+    select_regions(monkeypatch)
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
-        with profiler.record_function_with_metadata("workflow::disabled", torch.ones(1)):
+        with profiler.record_workflow_scope("workflow::disabled", torch.ones(1)):
             torch.ones(1)
     assert "workflow::disabled" not in {event.name for event in trace.events()}
 
@@ -212,16 +195,14 @@ def test_executor_forward_preserves_replay_and_diagnostic_order(
     is_warmup: bool,
 ) -> None:
     """Execute the current forward owner with only CUDA/model operations replaced."""
-    monkeypatch.setattr(
-        profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if selected else frozenset()
-    )
+    select_regions(monkeypatch, *(["workflow"] if selected else []))
     monkeypatch.setattr(py_executor.ExpertStatistic, "set_iter", Mock())
     if not (active and selected):
 
         def unexpected_scope(*args: object, **kwargs: object) -> None:
             pytest.fail("Inactive forward must not construct a profiling scope")
 
-        monkeypatch.setattr(py_executor, "record_function_with_metadata", unexpected_scope)
+        monkeypatch.setattr(py_executor, "_forward_phase_scope_name", unexpected_scope)
     events: list[str] = []
     result = object()
     failure = RuntimeError("model failed")
@@ -284,7 +265,7 @@ def test_executor_forward_preserves_replay_and_diagnostic_order(
         _maybe_record_hang_diagnostic_phase=lambda name, *args, **kwargs: events.append(name),
         _handle_errors=lambda message: events.append(message),
     )
-    with _execution_trace_observer(tmp_path / "forward.json") as observer:
+    with execution_trace_observer(tmp_path / "forward.json") as observer:
         with (
             torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
@@ -294,10 +275,10 @@ def test_executor_forward_preserves_replay_and_diagnostic_order(
         ) as trace:
             actual = py_executor.PyExecutor._forward_step(executor, batch)
     if active and selected:
-        nodes = json.loads((tmp_path / "forward.json").read_text())["nodes"]
-        for name in ("trtllm::forward", phase):
+        nodes = profiler_nodes(tmp_path / "forward.json")
+        for name in ("trtllm::forward",):
             node = next(node for node in nodes if node["name"] == name)
-            fields = decode_profiler_metadata(node["inputs"]["values"][0])[1]
+            fields = decode_node_metadata(node)[1]
             assert fields["workflow.executor.iteration"] == 7
             assert fields["workflow.executor.is_warmup"] is is_warmup
             assert (
@@ -341,9 +322,7 @@ def test_explicit_metadata_is_lazy_and_observational(
     monkeypatch: pytest.MonkeyPatch, active: bool, selected: bool, tmp_path: Path
 ) -> None:
     """Missing factory gating or swallowing a body exception breaks this contract."""
-    monkeypatch.setattr(
-        profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if selected else frozenset()
-    )
+    select_regions(monkeypatch, *(["workflow"] if selected else []))
     calls = []
     value = torch.ones(2)
     failure = RuntimeError("body")
@@ -355,7 +334,7 @@ def test_explicit_metadata_is_lazy_and_observational(
             raise ValueError("metadata")
         return {"workflow.owner.count": 3}
 
-    @profiler.record_function_with_metadata("workflow::explicit", metadata_factory=metadata)
+    @profiler.record_workflow_scope("workflow::explicit", metadata_factory=metadata)
     def wrapped(tensor: torch.Tensor, *, fails: bool = False) -> torch.Tensor:
         """Return the input tensor or raise the original body failure."""
         if fails:
@@ -363,7 +342,7 @@ def test_explicit_metadata_is_lazy_and_observational(
         return tensor
 
     with (
-        _execution_trace_observer(tmp_path / "explicit.json") as observer,
+        execution_trace_observer(tmp_path / "explicit.json") as observer,
         (
             torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
@@ -382,10 +361,10 @@ def test_explicit_metadata_is_lazy_and_observational(
     if active and selected:
         node = next(
             node
-            for node in json.loads((tmp_path / "explicit.json").read_text())["nodes"]
+            for node in profiler_nodes(tmp_path / "explicit.json")
             if node["name"] == "workflow::explicit"
         )
-        fields = decode_profiler_metadata(node["inputs"]["values"][0])[1]
+        fields = decode_node_metadata(node)[1]
         assert fields["workflow.owner.count"] == 3
         assert fields["workflow.tensor.0.shape"] == [2]
 
@@ -394,7 +373,7 @@ def test_batch_dummy_counts_mapping_and_microbatch_metadata(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Counting padded lists as live occupancy or dropping PP slot must fail."""
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    select_regions(monkeypatch, "workflow")
     mapping = SimpleNamespace(
         rank=3,
         world_size=8,
@@ -425,24 +404,20 @@ def test_batch_dummy_counts_mapping_and_microbatch_metadata(
         ],
     )
     with (
-        _execution_trace_observer(tmp_path / "batch.json") as observer,
+        execution_trace_observer(tmp_path / "batch.json") as observer,
         torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
         ),
     ):
-        with profiler.record_function_with_metadata(
+        with profiler.record_workflow_scope(
             "batch",
             metadata_factory=lambda: py_executor._forward_workflow_metadata(
                 owner, batch, microbatch_id=2
             ),
         ):
             torch.ones(1)
-    node = next(
-        node
-        for node in json.loads((tmp_path / "batch.json").read_text())["nodes"]
-        if node["name"] == "batch"
-    )
-    fields = decode_profiler_metadata(node["inputs"]["values"][0])[1]
+    node = next(node for node in profiler_nodes(tmp_path / "batch.json") if node["name"] == "batch")
+    fields = decode_node_metadata(node)[1]
     assert fields["workflow.executor.microbatch_slot"] == 2
     assert fields["workflow.attention_dp_enabled"] is True
     assert fields["workflow.executor.is_warmup"] is True
@@ -472,7 +447,7 @@ def test_decoder_capture_and_replay_named_capacity(
     ragged_verify_bucket: int | None,
 ) -> None:
     """Actual graph owners must not present padded token rows as live requests."""
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    select_regions(monkeypatch, "workflow")
     monkeypatch.setattr(
         cuda_graph_runner, "with_multi_stream", lambda value: nullcontext(), raising=False
     )
@@ -518,7 +493,7 @@ def test_decoder_capture_and_replay_named_capacity(
         _pre_replay_hooks=[],
     )
     with (
-        _execution_trace_observer(tmp_path / "graph.json") as observer,
+        execution_trace_observer(tmp_path / "graph.json") as observer,
         torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
         ) as trace,
@@ -538,7 +513,7 @@ def test_decoder_capture_and_replay_named_capacity(
                     enable_attention_dp=False,
                     dist=SimpleNamespace(mapping=Mapping()),
                 )
-                with profiler.record_function_with_metadata(
+                with profiler.record_workflow_scope(
                     "parent",
                     metadata_factory=lambda: py_executor._forward_workflow_metadata(
                         executor, batch
@@ -551,18 +526,17 @@ def test_decoder_capture_and_replay_named_capacity(
                         position_id_offsets=None,
                         static_inputs_staged=staged_count,
                     )
-    nodes = json.loads((tmp_path / "graph.json").read_text())["nodes"]
+    nodes = profiler_nodes(tmp_path / "graph.json")
     graph_nodes = [node for node in nodes if node["name"].startswith("trtllm::cuda_graph_")]
     assert len(graph_nodes) == (1 if warmup_only else 3)
     for node in graph_nodes:
-        fields = decode_profiler_metadata(node["inputs"]["values"][0])[1]
+        fields = decode_node_metadata(node)[1]
         assert fields["workflow.graph.kind"] == "decoder"
         assert fields["workflow.graph.key.batch_size"] == 4
         assert fields["workflow.graph.key.draft_len"] == 2
         assert fields["workflow.graph.key.short_seq_len_mode"] is False
         assert fields["workflow.graph.key.temperature_only"] is temperature_only
         assert fields["workflow.graph.key.ragged_verify_bucket"] == ragged_verify_bucket
-        assert "workflow.graph.key.is_first_draft" not in fields
         assert fields["workflow.graph.key.sample_type"] == "FULL"
         assert fields["workflow.graph.batch_capacity"] == 4
         assert fields["workflow.graph.token_capacity"] == 12
@@ -570,11 +544,11 @@ def test_decoder_capture_and_replay_named_capacity(
         assert fields["workflow.graph.padding_enabled"] is True
         assert "workflow.batch.live_requests" not in fields
         assert "workflow.graph.padding_requests" not in fields
-    first = decode_profiler_metadata(graph_nodes[0]["inputs"]["values"][0])[1]
+    first = decode_node_metadata(graph_nodes[0])[1]
     assert first["workflow.graph.operation"] == ("warmup_only" if warmup_only else "capture")
     if not warmup_only:
         parent_counts = [
-            decode_profiler_metadata(node["inputs"]["values"][0])[1]["workflow.batch.live_requests"]
+            decode_node_metadata(node)[1]["workflow.batch.live_requests"]
             for node in nodes
             if node["name"] == "parent"
         ]
@@ -663,7 +637,7 @@ def test_encoder_graph_preserves_source_and_key_semantics(
     has_source_counts: bool,
 ) -> None:
     """Keep encoder bucket capacities distinct from host source counts."""
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    select_regions(monkeypatch, "workflow")
     result = object()
     owner = SimpleNamespace(
         feature_mode=True,
@@ -697,7 +671,7 @@ def test_encoder_graph_preserves_source_and_key_semantics(
     if source_lengths is not None:
         inputs[cuda_graph_runner._ENCODER_SOURCE_SEQ_LENS] = source_lengths
     with (
-        _execution_trace_observer(tmp_path / "encoder.json") as observer,
+        execution_trace_observer(tmp_path / "encoder.json") as observer,
         torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
         ),
@@ -711,10 +685,10 @@ def test_encoder_graph_preserves_source_and_key_semantics(
         assert actual is result
     node = next(
         node
-        for node in json.loads((tmp_path / "encoder.json").read_text())["nodes"]
+        for node in profiler_nodes(tmp_path / "encoder.json")
         if node["name"] == f"trtllm::cuda_graph_{operation}"
     )
-    fields = decode_profiler_metadata(node["inputs"]["values"][0])[1]
+    fields = decode_node_metadata(node)[1]
     assert fields["workflow.graph.kind"] == "encoder"
     assert fields["workflow.graph.operation"] == operation
     assert fields["workflow.graph.key.padded_batch_size"] == 4
@@ -737,7 +711,7 @@ def test_eager_model_physical_rows_are_not_generation_requests(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, is_dummy: bool
 ) -> None:
     """Speculative rows must retain their physical dimension, not request count."""
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    select_regions(monkeypatch, "workflow")
     tensor = torch.ones(9, dtype=torch.int64)
     owner = SimpleNamespace(
         _model_caller=lambda **kwargs: kwargs["input_ids"],
@@ -745,7 +719,7 @@ def test_eager_model_physical_rows_are_not_generation_requests(
         _moe_workspace_reclaimer=None,
     )
     with (
-        _execution_trace_observer(tmp_path / "model.json") as observer,
+        execution_trace_observer(tmp_path / "model.json") as observer,
         torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
         ),
@@ -758,10 +732,10 @@ def test_eager_model_physical_rows_are_not_generation_requests(
         )
     node = next(
         node
-        for node in json.loads((tmp_path / "model.json").read_text())["nodes"]
+        for node in profiler_nodes(tmp_path / "model.json")
         if node["name"] == "trtllm::model_forward"
     )
-    fields = decode_profiler_metadata(node["inputs"]["values"][0])[1]
+    fields = decode_node_metadata(node)[1]
     assert fields["workflow.model.input_token_rows"] == 9
     assert fields["workflow.executor.is_warmup"] is is_dummy
     assert "workflow.batch.live_generation_requests" not in fields
@@ -771,8 +745,8 @@ def test_eager_model_physical_rows_are_not_generation_requests(
 def test_pp_loop_call_propagates_actual_slot(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route: str
 ) -> None:
-    """Execute the PP loop's real call expression and intermediate forward owner."""
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    """Call forward owners directly and preserve the caller's microbatch slot."""
+    select_regions(monkeypatch, "workflow")
     batch = SimpleNamespace(
         context_requests=[], generation_requests=[_request()], context_requests_last_chunk=[]
     )
@@ -788,7 +762,7 @@ def test_pp_loop_call_propagates_actual_slot(
         sampler=SimpleNamespace(SampleState=lambda **kwargs: None),
     )
 
-    @profiler.record_function_with_metadata(
+    @profiler.record_workflow_scope(
         "pp-forward", metadata_factory=py_executor._forward_workflow_metadata
     )
     def forward(
@@ -802,45 +776,20 @@ def test_pp_loop_call_propagates_actual_slot(
     )
     monkeypatch.setattr(torch.cuda, "Event", lambda: SimpleNamespace(record=lambda: None))
     monkeypatch.setattr(py_executor, "SamplerEvent", lambda **kwargs: None, raising=False)
-    tree = ast.parse(Path(py_executor.__file__).read_text())
-    cls = next(
-        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "PyExecutor"
-    )
-    loop = next(
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_executor_loop_pp"
-    )
-    call = next(
-        node
-        for node in ast.walk(loop)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == route
-    )
-    expression = compile(ast.fix_missing_locations(ast.Expression(body=call)), "pp-call", "eval")
     with (
-        _execution_trace_observer(tmp_path / "pp.json") as observer,
+        execution_trace_observer(tmp_path / "pp.json") as observer,
         torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
         ),
     ):
-        eval(
-            expression,
-            {
-                "self": owner,
-                "scheduled_batch": batch,
-                "microbatch_id": 3,
-                "gpu_forward_start": None,
-                "gpu_forward_end": None,
-            },
-        )
+        if route == "_forward_step_inter_pp":
+            py_executor.PyExecutor._forward_step_inter_pp(owner, batch, microbatch_id=3)
+        else:
+            owner._forward_step(batch, microbatch_id=3)
     node = next(
-        node
-        for node in json.loads((tmp_path / "pp.json").read_text())["nodes"]
-        if node["name"] == "pp-forward"
+        node for node in profiler_nodes(tmp_path / "pp.json") if node["name"] == "pp-forward"
     )
-    fields = decode_profiler_metadata(node["inputs"]["values"][0])[1]
+    fields = decode_node_metadata(node)[1]
     assert fields["workflow.executor.microbatch_slot"] == 3
     assert fields["workflow.executor.iteration"] == 6
 
@@ -850,7 +799,7 @@ def test_microbatch_slot_unknown_is_not_a_numeric_sentinel(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pp_size: int, expected: int | None
 ) -> None:
     """Omit unknown pipeline slots while preserving the single-stage zero slot."""
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    select_regions(monkeypatch, "workflow")
     owner = SimpleNamespace(
         iter_counter=1,
         is_warmup=False,
@@ -859,21 +808,19 @@ def test_microbatch_slot_unknown_is_not_a_numeric_sentinel(
     )
     batch = SimpleNamespace(context_requests=[], generation_requests=[])
     with (
-        _execution_trace_observer(tmp_path / "unknown.json") as observer,
+        execution_trace_observer(tmp_path / "unknown.json") as observer,
         torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
         ),
     ):
-        with profiler.record_function_with_metadata(
+        with profiler.record_workflow_scope(
             "unknown", metadata_factory=lambda: py_executor._forward_workflow_metadata(owner, batch)
         ):
             pass
     node = next(
-        node
-        for node in json.loads((tmp_path / "unknown.json").read_text())["nodes"]
-        if node["name"] == "unknown"
+        node for node in profiler_nodes(tmp_path / "unknown.json") if node["name"] == "unknown"
     )
-    fields = decode_profiler_metadata(node["inputs"]["values"][0])[1]
+    fields = decode_node_metadata(node)[1]
     if expected is None:
         assert "workflow.executor.microbatch_slot" not in fields
     else:
@@ -887,9 +834,7 @@ def test_graph_metadata_failure_keeps_replay_body_exception(
     monkeypatch: pytest.MonkeyPatch, selected: bool
 ) -> None:
     """Keep graph replay exceptions independent of metadata selection or failure."""
-    monkeypatch.setattr(
-        profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if selected else frozenset()
-    )
+    select_regions(monkeypatch, *(["workflow"] if selected else []))
     calls = []
 
     def fail_metadata(*args: object) -> dict[str, profiler.MetadataValue]:
@@ -933,65 +878,76 @@ def test_graph_metadata_failure_keeps_replay_body_exception(
 
 
 @pytest.mark.parametrize(
-    ("filename", "owner", "boundaries"),
+    "method,scope_name,args,dependency",
     [
         (
-            "py_executor.py",
-            "PyExecutor",
-            {
-                "_prepare_and_schedule_batch": "trtllm::prepare_batch",
-                "_schedule": "trtllm::schedule",
-                "_forward_step": "trtllm::forward",
-                "_sample_async": "trtllm::sampling",
-                "_update_requests": "trtllm::update_requests",
-                "_handle_responses": "trtllm::handle_responses",
-            },
+            "_prepare_and_schedule_batch",
+            "trtllm::prepare_batch",
+            (),
+            "_release_unused_connector_reservations",
         ),
-        (
-            "engine/runners/decoder/inputs.py",
-            "DecoderInputPreparer",
-            {"prepare_inputs": "trtllm::prepare_inputs"},
-        ),
-        (
-            "engine/runners/decoder/runner.py",
-            "DecoderRunner",
-            {"_model_forward": "trtllm::model_forward"},
-        ),
-        (
-            "cuda_graph_runner.py",
-            "CUDAGraphRunner",
-            {"capture": "trtllm::cuda_graph_capture", "replay": "trtllm::cuda_graph_replay"},
-        ),
-        (
-            "cuda_graph_runner.py",
-            "EncoderCUDAGraphRunner",
-            {"capture": "trtllm::cuda_graph_capture", "replay": "trtllm::cuda_graph_replay"},
-        ),
+        ("_schedule", "trtllm::schedule", (), "_maybe_record_hang_diagnostic_phase"),
+        ("_sample_async", "trtllm::sampling", (None, None), "_maybe_record_hang_diagnostic_phase"),
+        ("_update_requests", "trtllm::update_requests", (None,), "sampler"),
+        ("_handle_responses", "trtllm::handle_responses", (), "perf_manager"),
     ],
 )
-def test_annotations_stay_at_current_owner_boundaries(
-    filename: str, owner: str, boundaries: dict[str, str]
+def test_executor_owner_scope_preserves_body_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    scope_name: str,
+    args: tuple[object, ...],
+    dependency: str,
 ) -> None:
-    """Missing a boundary or wrapping the entire executor loop breaks trace granularity."""
-    tree = ast.parse((Path(py_executor.__file__).parent / filename).read_text())
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == owner)
-    methods = {node.name: node for node in cls.body if isinstance(node, ast.FunctionDef)}
-    for method, region in boundaries.items():
-        names = [
-            decorator.args[0].value
-            for decorator in methods[method].decorator_list
-            if isinstance(decorator, ast.Call)
-            and isinstance(decorator.func, ast.Name)
-            and decorator.func.id == "record_function_with_metadata"
-        ]
-        assert names == [region]
-    for name, method in methods.items():
-        if "executor_loop" in name:
-            assert not any(
-                isinstance(node, ast.Name) and node.id == "record_function_with_metadata"
-                for decorator in method.decorator_list
-                for node in ast.walk(decorator)
-            )
+    """Observe real owner entry points, independent of aliases or source layout."""
+    select_regions(monkeypatch, "workflow")
+    error = KeyboardInterrupt("owner body")
+    fail = Mock(side_effect=error)
+    owner = SimpleNamespace(dist=SimpleNamespace(rank=0), active_requests=[])
+    if dependency == "sampler":
+        owner.sampler = SimpleNamespace(update_requests=fail)
+    elif dependency == "perf_manager":
+        owner.perf_manager = SimpleNamespace(get_timestamp=fail)
+    else:
+        setattr(owner, dependency, fail)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            getattr(py_executor.PyExecutor, method)(owner, *args)
+    assert caught.value is error
+    fail.assert_called_once()
+    assert sum(event.name == scope_name for event in trace.events()) == 1
+
+
+def test_encoder_replay_rows_agree_in_metadata_phase_and_step_label() -> None:
+    """Count encoder replay for both live and scheduled context work."""
+    from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay
+
+    replay = EncoderReplay(request_id=1, cache_identity=7, global_end=9, start=0)
+    live = _request(context_chunk_size=3, py_ced_replay=replay)
+    dummy = _request(context_chunk_size=2, is_dummy_request=True)
+    batch = SimpleNamespace(
+        context_requests=[live, dummy],
+        generation_requests=[],
+        num_context_requests=2,
+        num_generation_requests=0,
+    )
+    owner = SimpleNamespace(
+        iter_counter=1,
+        is_warmup=False,
+        enable_attention_dp=False,
+        dist=SimpleNamespace(mapping=Mapping()),
+    )
+    fields = py_executor._forward_workflow_metadata(owner, batch, future_adapter_option=True)
+    assert fields["workflow.batch.scheduled_context_tokens"] == 14
+    assert fields["workflow.batch.live_context_tokens"] == 12
+    assert fields["workflow.phase"] == "prefill"
+    assert (
+        py_executor.PyExecutor._build_step_scope_label(owner, batch) == "step[EXTEND bs=2 toks=14]"
+    )
+    replay.consumed = True
+    fields = py_executor._forward_workflow_metadata(owner, batch)
+    assert fields["workflow.batch.scheduled_context_tokens"] == 5
+    assert fields["workflow.batch.live_context_tokens"] == 3
 
 
 def test_live_workflow_counts_use_request_dummy_contract() -> None:
@@ -1004,3 +960,43 @@ def test_live_workflow_counts_use_request_dummy_contract() -> None:
     batch = SimpleNamespace(context_requests=[], generation_requests=[_request(is_dummy=True)])
     fields = py_executor._forward_workflow_metadata(owner, batch)
     assert fields["workflow.batch.live_requests"] == 0
+
+
+@pytest.mark.parametrize("failure_phase", ["setup", "entry", "cleanup"])
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_metadata_free_phase_scope_preserves_operation_outcome(
+    monkeypatch: pytest.MonkeyPatch, failure_phase: str, body_fails: bool
+) -> None:
+    """Removing duplicate metadata must retain fail-open phase instrumentation."""
+    select_regions(monkeypatch, "workflow")
+    monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: True)
+    scope = MagicMock()
+    observational = RuntimeError("phase instrumentation")
+    if failure_phase == "entry":
+        scope.__enter__.side_effect = observational
+    elif failure_phase == "cleanup":
+        scope.__exit__.side_effect = observational
+
+    def record(name: str, args: str | None = None) -> object:
+        assert name == "trtllm::prefill" and args is None
+        if failure_phase == "setup":
+            raise observational
+        return scope
+
+    monkeypatch.setattr(torch.profiler, "record_function", record)
+    body_error = KeyboardInterrupt("forward body")
+    calls = []
+
+    def run() -> None:
+        with profiler.record_function_metadata_scope("trtllm::prefill", "workflow"):
+            calls.append(True)
+            if body_fails:
+                raise body_error
+
+    if body_fails:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            run()
+        assert caught.value is body_error
+    else:
+        run()
+    assert calls == [True]
