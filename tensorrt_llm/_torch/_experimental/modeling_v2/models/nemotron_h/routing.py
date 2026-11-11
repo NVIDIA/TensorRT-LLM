@@ -59,9 +59,24 @@ _BF16_KV_ALGOS = {
     _BF16_TP8EP2: (None, QuantAlgo.FP8),
 }
 
-# The MoE backends the targets stand for: they run their own expert path, so a
-# request for another backend does not route here.
-_BF16_MOE_BACKENDS = frozenset({"AUTO", "CUTLASS"})
+# The MoE backends each BF16 layout stands for. AUTO and CUTLASS run the target's own
+# expert path (fused_moe). tep8 also runs its routed experts in the engine's MoE layer when
+# MEGAMOE_CUTEDSL (CuTe DSL MegaMoE, BF16 Relu2 leaf) or TRTLLM (FlashInfer's TRTLLM-Gen BF16
+# MoE) is asked for by name; a request either leaf declines fails at construction.
+_BF16_MOE_BACKENDS = {
+    _BF16_TEP8: frozenset({"AUTO", "CUTLASS", "MEGAMOE_CUTEDSL", "TRTLLM"}),
+    _BF16_TP8EP2: frozenset({"AUTO", "CUTLASS"}),
+}
+# Why a layout refuses a backend another BF16 layout takes, by backend.
+_BF16_MOE_REFUSALS = {
+    _BF16_TP8EP2: {
+        "MEGAMOE_CUTEDSL": (
+            "MegaMoE is expert-parallel only (moe_tp 1) and tp8ep2 splits each expert over "
+            "moe_tp 4; tep8 (moe_ep 8, moe_tp 1) runs it"
+        ),
+        "TRTLLM": "tp8ep2 runs its experts on fused_moe only; tep8 (moe_ep 8) runs TRTLLM",
+    },
+}
 
 # The NVFP4 release: MIXED_PRECISION weights and an 8-bit (FP8) KV cache, gated on
 # sm_107 (Rubin) with 4 ranks. tep4: attention and mamba heads tensor-parallel over
@@ -239,12 +254,15 @@ def route(
             "and register no layer with the balancer"
         )
     requested = str(model_config.moe_backend_requested).upper()
-    backends = _NVFP4_MOE_BACKENDS if nvfp4 else _BF16_MOE_BACKENDS
+    backends = _NVFP4_MOE_BACKENDS if nvfp4 else _BF16_MOE_BACKENDS[layout]
     if requested not in backends:
+        reason = None if nvfp4 else _BF16_MOE_REFUSALS.get(layout, {}).get(requested)
+        if reason is not None:
+            raise NoTarget(f"moe_config.backend={model_config.moe_backend_requested!r}: {reason}")
+        served = "TRTLLM" if nvfp4 else ", ".join(sorted(backends - {"AUTO"}))
         raise NoTarget(
-            f"moe_config.backend={model_config.moe_backend_requested!r}; the "
-            f"{'NVFP4' if nvfp4 else 'BF16'} targets run their routed experts on "
-            f"{'TRTLLM' if nvfp4 else 'CUTLASS'}"
+            f"moe_config.backend={model_config.moe_backend_requested!r} at parallel layout "
+            f"{split}; the target runs its routed experts on {served}"
         )
     if str(llm_args.prefill_cuda_graph_backend.value) == "piecewise":
         raise NoTarget(

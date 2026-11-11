@@ -86,7 +86,7 @@ _CHECKPOINT = [
 ]
 
 
-def _core(rank: int) -> SimpleNamespace:
+def _core(rank: int, moe_backend: str = "AUTO") -> SimpleNamespace:
     """The few fields `dims` reads, at Ultra's numbers, for one rank of an 8-rank tep8 group."""
     cfg = SimpleNamespace(
         layers_block_type=list(KINDS),
@@ -109,7 +109,10 @@ def _core(rank: int) -> SimpleNamespace:
     )
     mapping = SimpleNamespace(tp_size=TP, tp_rank=rank, moe_ep_size=TP, moe_ep_rank=rank)
     model_config = SimpleNamespace(
-        pretrained_config=cfg, mapping=mapping, torch_dtype=torch.bfloat16
+        pretrained_config=cfg,
+        mapping=mapping,
+        torch_dtype=torch.bfloat16,
+        moe_backend_requested=moe_backend,
     )
     return SimpleNamespace(model_config=model_config)
 

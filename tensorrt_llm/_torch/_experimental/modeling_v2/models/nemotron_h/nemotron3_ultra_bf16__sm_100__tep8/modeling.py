@@ -20,6 +20,15 @@ tep8: every block's output is a per-rank partial sum (mamba and attention by
 head, the shared expert by its intermediate split, the routed experts by EP
 window) completed by one all-reduce over the 8 ranks.
 
+The routed experts run on this target's fused_moe (CUTLASS) by default. Asking
+for `moe_config.backend` MEGAMOE_CUTEDSL or TRTLLM by name runs them instead in
+the engine's MoE layer, built with Modeling V1's `create_moe` on its unquantized
+Relu2 leaf: CuTe DSL MegaMoE (fused dispatch, experts and combine) or FlashInfer's
+TRTLLM-Gen BF16 MoE. Those layers route the fp32 logits themselves (the same
+noaux_tc selection) and return this rank's partial, so the block's all-reduce is
+unchanged. A request either leaf turns down fails at construction; it is never
+served by another kernel. `UNCERTIFIED_GENERIC_CALLS` names that stock code.
+
 Each target is self-contained: it holds the per-layer weight views it reads,
 passes every argument to every op at the call site, and shares no code with the
 other targets.
@@ -91,6 +100,30 @@ from . import weights as _weights
 
 # The certification is per GPU architecture: this code was gated on sm_100 only.
 _SM = (10, 0)
+
+#: Stock code this target runs outside the catalog, declared so it is not consumed silently: every
+#: tensorrt_llm import of this module that computes. The `create_moe` route runs only when
+#: moe_config.backend names MEGAMOE_CUTEDSL or TRTLLM; an entry leaves the list when a catalog
+#: entry or a family op replaces it.
+UNCERTIFIED_GENERIC_CALLS = (
+    # The engine hooks this target inherits.
+    "tensorrt_llm._torch.models.modeling_utils.DecoderModel",
+    "tensorrt_llm._torch.models.modeling_utils.DecoderModelForCausalLM",
+    # The MNNVL eligibility probe of the all-reduce group.
+    "tensorrt_llm._torch.distributed.ops.MNNVLAllReduce",
+    # The opt-in routed experts: the engine's MoE layer and the routing it applies.
+    "tensorrt_llm._torch.moe.fused_moe.create_moe",
+    "tensorrt_llm._torch.moe.fused_moe.ConfigurableMoE",
+    "tensorrt_llm._torch.moe.fused_moe.DeepSeekV3MoeRoutingMethod",
+)
+
+# The engine MoE leaf each opt-in backend must resolve to. create_moe runs with backend
+# degradation off, so a backend that declines the layer raises with its rejection trail; this
+# also pins the leaf within the backend, so the request cannot be served by another kernel.
+_ENGINE_MOE_LEAVES = {
+    "MEGAMOE_CUTEDSL": "trtllm.cutedsl.mega_moe.none",
+    "TRTLLM": "flashinfer.trtllm_gen.fused_moe.none",
+}
 
 # An empty slot in the recurrent-state pools (padding rows of a captured batch).
 _PAD_SLOT_ID = -1
@@ -217,8 +250,11 @@ class _Moe(NamedTuple):
     fc2_lat: torch.Tensor
     sh_up: torch.Tensor
     sh_down: torch.Tensor
-    fc1_w: torch.Tensor
-    fc2_w: torch.Tensor
+    # fused_moe's expert operands, or None when `experts` runs them.
+    fc1_w: "torch.Tensor | None"
+    fc2_w: "torch.Tensor | None"
+    # The engine's MoE layer (MEGAMOE_CUTEDSL / TRTLLM), or None for fused_moe.
+    experts: "nn.Module | None"
 
 
 class _Bound(NamedTuple):
@@ -267,6 +303,7 @@ def _layer_views(core) -> list:
             L = _Attention(qkv=w[f"l{i}_qkv_w"].t(), o=w[f"l{i}_o_w"].t())
         else:
             assert kind == "moe", kind
+            engine = core.routed_experts is not None
             L = _Moe(
                 gate=w[f"l{i}_gate_w"].t(),
                 gate_bias=w[f"l{i}_gate_b"],
@@ -274,12 +311,91 @@ def _layer_views(core) -> list:
                 fc2_lat=w[f"l{i}_fc2_lat_w"].t(),
                 sh_up=w[f"l{i}_sh_up_w"].t(),
                 sh_down=w[f"l{i}_sh_down_w"].t(),
-                fc1_w=w[f"l{i}_ex_fc1_w"],
-                fc2_w=w[f"l{i}_ex_fc2_w"],
+                fc1_w=None if engine else w[f"l{i}_ex_fc1_w"],
+                fc2_w=None if engine else w[f"l{i}_ex_fc2_w"],
+                experts=core.routed_experts[str(i)] if engine else None,
             )
         nxt = w[f"l{i + 1}_norm"] if i + 1 < d.num_layers else w["final_norm"]
         views.append((L, nxt))
     return views
+
+
+def _routed_moe_kwargs(model_config: ModelConfig, d, w: nn.ParameterDict, layer_idx: int) -> dict:
+    """`create_moe`'s arguments for MoE block `layer_idx`: the checkpoint's routed experts in
+    the latent space (512 x [5120, 2048], non-gated Relu2, no bias) behind its router (sigmoid
+    + correction bias selection, one group, top-22, renormalized and scaled), expert-parallel
+    by the engine's mapping (moe_tp 1, moe_ep 8: the same 64-expert windows as fused_moe)."""
+    from tensorrt_llm._torch.moe.fused_moe import (
+        DeepSeekV3MoeRoutingMethod,
+        MoEWeightLoadingMode,
+        SimpleActivation,
+    )
+    from tensorrt_llm._torch.utils import ActivationType
+
+    bias_key = f"l{layer_idx}_gate_b"
+    return dict(
+        routing_method=DeepSeekV3MoeRoutingMethod(
+            top_k=d.top_k,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=d.routed_scale,
+            # Looked up on every call: the loader replaces the meta parameter with the
+            # loaded one. fp32, as the checkpoint stores it and fused_moe's router reads it.
+            callable_e_score_correction_bias=lambda w=w, k=bias_key: w[k],
+            is_fused=True,
+        ),
+        num_experts=d.num_experts,
+        hidden_size=d.latent,
+        intermediate_size=d.moe_inter,
+        dtype=torch.bfloat16,
+        # The block's own all-reduce sums the routed and shared partials together.
+        reduce_results=False,
+        model_config=model_config,
+        weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        bias=False,
+        layer_idx=layer_idx,
+        activation=SimpleActivation(kind=ActivationType.Relu2),
+        # A request the leaf declines raises with the rejection trail instead of running on
+        # another backend and being reported as the one asked for.
+        allow_backend_degradation=False,
+    )
+
+
+def _routed_experts(model_config: ModelConfig, d, w: nn.ParameterDict) -> nn.ModuleDict:
+    """The engine's MoE layer per MoE block, for an explicit MEGAMOE_CUTEDSL / TRTLLM request.
+
+    Fails loudly on anything but the requested leaf over this rank's contiguous 64-expert
+    window, which is what the weight table feeds it.
+    """
+    from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, create_moe
+
+    backend = d.engine_moe
+    assert model_config.moe_backend == backend, (
+        f"moe_config.backend={backend!r} resolved to {model_config.moe_backend!r}"
+    )
+    leaf = _ENGINE_MOE_LEAVES[backend]
+    window = list(range(d.expert_offset, d.expert_offset + d.local_experts))
+    layers = nn.ModuleDict()
+    for i in d.moe_layers:
+        moe = create_moe(**_routed_moe_kwargs(model_config, d, w, i))
+        if not isinstance(moe, ConfigurableMoE):
+            raise RuntimeError(
+                f"moe_config.backend={backend!r} built {type(moe).__name__}, not ConfigurableMoE; "
+                "ENABLE_CONFIGURABLE_MOE must not be disabled for this target"
+            )
+        got = str(type(moe.backend).descriptor.identity)
+        if got != leaf:
+            raise RuntimeError(
+                f"moe_config.backend={backend!r} resolved layer {i} to {got}; this target runs "
+                f"that request only on {leaf}"
+            )
+        if list(moe.backend.initial_local_expert_ids) != window:
+            raise RuntimeError(
+                f"layer {i}: the MoE layer holds experts {moe.backend.initial_local_expert_ids}, "
+                f"not this rank's window [{window[0]}, {window[-1] + 1})"
+            )
+        layers[str(i)] = moe
+    return layers
 
 
 class NemotronUltraBf16Tep8ModelingV2(DecoderModel):
@@ -287,6 +403,11 @@ class NemotronUltraBf16Tep8ModelingV2(DecoderModel):
         super().__init__(model_config)
         self.dims = _weights.MODEL_WEIGHTS.dims(self)
         self.w = _weights.MODEL_WEIGHTS.declare(self.dims)
+        # moe_config.backend MEGAMOE_CUTEDSL / TRTLLM: the engine's MoE layers, which own the
+        # routed experts' weights. None runs them on fused_moe (the default).
+        self.routed_experts: "nn.ModuleDict | None" = (
+            _routed_experts(model_config, self.dims, self.w) if self.dims.engine_moe else None
+        )
         mapping = model_config.mapping
         self.tp_group = list(mapping.tp_group)
         self._bound: "_Bound | None" = None
@@ -336,6 +457,12 @@ class NemotronUltraBf16Tep8ModelingV2(DecoderModel):
                 logger.warning(f"MNNVL all-reduce workspace setup failed, using NCCL: {exc}")
                 self.mnnvl = False
                 self.mnnvl_args = None
+        if mapping.rank == 0 and self.routed_experts is not None:
+            logger.info(
+                f"nemotron3_ultra_bf16__sm_100__tep8: routed experts on "
+                f"{_ENGINE_MOE_LEAVES[self.dims.engine_moe]} (moe_config.backend="
+                f"{self.dims.engine_moe})"
+            )
         if mapping.rank == 0:
             logger.info(
                 f"nemotron3_ultra_bf16__sm_100__tep8: all-reduce over {mapping.tp_size} ranks via "
@@ -462,6 +589,8 @@ class PrefillTarget:
             for name in ("state_indices", "has_initial_states", "query_start_loc", "seq_idx"):
                 getattr(mm, name)
             mm.use_initial_states, mm.chunk_size  # noqa: B018 — read for the AttributeError
+            if self.core.routed_experts is not None:
+                md.all_rank_num_tokens  # noqa: B018 — the engine MoE layers read it
         except AttributeError as exc:
             raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
         self._contract_pending = False
@@ -672,25 +801,39 @@ class PrefillTarget:
                 # Router: fp32 logits over the full hidden state, selection on sigmoid +
                 # correction bias, weights from the unbiased sigmoid, renormalized and scaled.
                 logits = cublas_mm(x, L.gate, out_dtype=torch.float32)
-                topk_w, topk_ids = noaux_tc_op(logits, L.gate_bias, 1, 1, d.top_k, d.routed_scale)
+                if L.experts is None:
+                    topk_w, topk_ids = noaux_tc_op(
+                        logits, L.gate_bias, 1, 1, d.top_k, d.routed_scale
+                    )
                 # Routed experts in the latent space: every rank routes the same tokens over
                 # all 512 experts, answers for its own EP window and contributes zero for the
                 # ids outside it.
                 xl = cublas_mm(x, L.fc1_lat)
-                routed = fused_moe(
-                    xl,
-                    topk_ids,
-                    topk_w,
-                    L.fc1_w,
-                    None,
-                    L.fc2_w,
-                    None,
-                    torch.bfloat16,
-                    [],
-                    ep_size=d.ep_size,
-                    ep_rank=d.ep_rank,
-                    activation_type=ACTIVATION_RELU2,
-                )[0]
+                if L.experts is None:
+                    routed = fused_moe(
+                        xl,
+                        topk_ids,
+                        topk_w,
+                        L.fc1_w,
+                        None,
+                        L.fc2_w,
+                        None,
+                        torch.bfloat16,
+                        [],
+                        ep_size=d.ep_size,
+                        ep_rank=d.ep_rank,
+                        activation_type=ACTIVATION_RELU2,
+                    )[0]
+                else:
+                    # The engine's MoE layer routes the logits itself and returns this
+                    # rank's partial (MegaMoE: the combined output on TP rank 0, zeros on
+                    # the others), consumed by fc2_lat before the next MoE launch.
+                    routed = L.experts(
+                        xl,
+                        logits,
+                        all_rank_num_tokens=md.all_rank_num_tokens,
+                        use_dp_padding=False,
+                    )
                 out = cublas_mm(routed, L.fc2_lat)
                 main.wait_stream(side)
                 out = out + shared
@@ -734,6 +877,8 @@ class DecodeTarget:
         try:
             self.step_args(md)
             md.mamba_metadata.state_indices  # noqa: B018 — read for the AttributeError
+            if self.core.routed_experts is not None:
+                md.all_rank_num_tokens  # noqa: B018 — the engine MoE layers read it
         except AttributeError as exc:
             raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
         self._contract_pending = False
@@ -900,25 +1045,36 @@ class DecodeTarget:
                     a = torch.square(torch.relu(u))
                     shared = cublas_mm(a, L.sh_down)
                 logits = cublas_mm(x, L.gate, out_dtype=torch.float32)
-                topk_w, topk_ids = noaux_tc_op(logits, L.gate_bias, 1, 1, d.top_k, d.routed_scale)
+                if L.experts is None:
+                    topk_w, topk_ids = noaux_tc_op(
+                        logits, L.gate_bias, 1, 1, d.top_k, d.routed_scale
+                    )
                 if num_tokens <= _LOWM_MAX_ROWS:
                     xl = flashinfer_direct_bf16_gemm(x, L.fc1_lat, core.pdl)
                 else:
                     xl = cublas_mm(x, L.fc1_lat)
-                routed = fused_moe(
-                    xl,
-                    topk_ids,
-                    topk_w,
-                    L.fc1_w,
-                    None,
-                    L.fc2_w,
-                    None,
-                    torch.bfloat16,
-                    [],
-                    ep_size=d.ep_size,
-                    ep_rank=d.ep_rank,
-                    activation_type=ACTIVATION_RELU2,
-                )[0]
+                if L.experts is None:
+                    routed = fused_moe(
+                        xl,
+                        topk_ids,
+                        topk_w,
+                        L.fc1_w,
+                        None,
+                        L.fc2_w,
+                        None,
+                        torch.bfloat16,
+                        [],
+                        ep_size=d.ep_size,
+                        ep_rank=d.ep_rank,
+                        activation_type=ACTIVATION_RELU2,
+                    )[0]
+                else:
+                    routed = L.experts(
+                        xl,
+                        logits,
+                        all_rank_num_tokens=md.all_rank_num_tokens,
+                        use_dp_padding=False,
+                    )
                 out = cublas_mm(routed, L.fc2_lat)
                 main.wait_stream(side)
                 out = out + shared

@@ -27,6 +27,11 @@ The checkpoint has no quantization scales of any kind.
 
 The checkpoint's MTP module (`mtp.*`) is not loaded: this target implements no
 draft path, and routing refuses speculative decoding.
+
+With `moe_config.backend` MEGAMOE_CUTEDSL or TRTLLM the routed experts run in the
+engine's MoE layer instead of this target's fused_moe. That layer owns its expert
+weights, so the table declares none for them, and `load` hands each layer this rank's
+window of the checkpoint in the engine's per-expert key format.
 """
 
 from dataclasses import dataclass
@@ -39,6 +44,21 @@ import torch.nn as nn
 # A source row: (checkpoint key, index into the checkpoint tensor | None,
 # index into the destination parameter | None).
 Source = tuple[str, Any, Any]
+
+# The moe_config.backend values that run the routed experts in the engine's MoE layer
+# (create_moe) rather than in this target's fused_moe. Any other request routing admits
+# (AUTO, CUTLASS) keeps fused_moe, the default.
+ENGINE_MOE_BACKENDS = ("MEGAMOE_CUTEDSL", "TRTLLM")
+
+
+def engine_moe_backend(model_config) -> str | None:
+    """The engine MoE backend the user asked for by name, or None for fused_moe.
+
+    Read off the request, not the resolved backend: only an explicit opt-in leaves the
+    default path, whatever AUTO may resolve to.
+    """
+    requested = str(model_config.moe_backend_requested).upper()
+    return requested if requested in ENGINE_MOE_BACKENDS else None
 
 
 @dataclass(frozen=True)
@@ -196,6 +216,12 @@ def _moe(d):
     return d.moe_layers
 
 
+def _moe_own_experts(d):
+    """The MoE layers whose routed experts this table declares: none when the engine's MoE
+    layer owns them."""
+    return [] if d.engine_moe else d.moe_layers
+
+
 _L = "backbone.layers.{i}"
 _M = "backbone.layers.{i}.mixer"
 
@@ -334,13 +360,13 @@ class NemotronUltraBf16Tep8Weights:
             "ex_fc1_w",
             lambda d: (d.local_experts, d.moe_inter, d.latent),
             _expert_window("up_proj.weight"),
-            _moe,
+            _moe_own_experts,
         ),
         W(
             "ex_fc2_w",
             lambda d: (d.local_experts, d.latent, d.moe_inter),
             _expert_window("down_proj.weight"),
-            _moe,
+            _moe_own_experts,
         ),
     )
 
@@ -403,6 +429,8 @@ class NemotronUltraBf16Tep8Weights:
             latent=cfg.moe_latent_size,
             shared_r=cfg.moe_shared_expert_intermediate_size // tp,
             dtype=core.model_config.torch_dtype,
+            # MEGAMOE_CUTEDSL / TRTLLM: the engine's MoE layer owns the routed experts.
+            engine_moe=engine_moe_backend(core.model_config),
         )
 
     def _targets(self, entry: W, d: SimpleNamespace) -> list[tuple[str, int | None]]:
@@ -431,6 +459,20 @@ class NemotronUltraBf16Tep8Weights:
             for key, i in self._targets(entry, d):
                 rows[key] = [(s, entry.transform) for s in entry.src(d, i)]
         return rows
+
+    @staticmethod
+    def engine_expert_feed(d: SimpleNamespace, i: int) -> list[tuple[str, str, str]]:
+        """Layer `i`'s routed experts for the engine's MoE layer: `(checkpoint up key,
+        checkpoint down key, engine expert prefix)` per expert of this rank's window.
+
+        The engine's loader takes `{e}.w1.weight` (FC1), `{e}.w3.weight` (the gate half,
+        empty for the non-gated Relu2) and `{e}.w2.weight` (FC2), by global expert id.
+        """
+        p = f"backbone.layers.{i}.mixer.experts"
+        return [
+            (f"{p}.{e}.up_proj.weight", f"{p}.{e}.down_proj.weight", str(e))
+            for e in range(d.expert_offset, d.expert_offset + d.local_experts)
+        ]
 
     @staticmethod
     def _take(entry, index) -> torch.Tensor:
@@ -468,6 +510,22 @@ class NemotronUltraBf16Tep8Weights:
             if param_key.endswith(self.RELEASE_AFTER):
                 torch.cuda.empty_cache()
 
+        if d.engine_moe:
+            # One layer at a time, the scratch released after each, as for fused_moe's experts.
+            for i in d.moe_layers:
+                fed = {}
+                for up_key, down_key, e in self.engine_expert_feed(d, i):
+                    assert up_key in weights and down_key in weights, (
+                        f"checkpoint key missing: {up_key} / {down_key}"
+                    )
+                    up = self._take(weights[up_key], None)
+                    fed[f"{e}.w1.weight"] = up
+                    fed[f"{e}.w3.weight"] = up[:0]
+                    fed[f"{e}.w2.weight"] = self._take(weights[down_key], None)
+                    consumed.update((up_key, down_key))
+                core.routed_experts[str(i)].load_weights([fed])
+                torch.cuda.empty_cache()
+
         # Shell-registered exception: the base class owns lm_head (untied), and under
         # tensor parallelism without attention DP it builds a vocab-parallel shard.
         vocab_r = d.vocab // d.tp
@@ -480,7 +538,12 @@ class NemotronUltraBf16Tep8Weights:
             ("lm_head.weight", (slice(d.tp_rank * vocab_r, (d.tp_rank + 1) * vocab_r),), None),
             None,
         )
-        shell = {n for n, _ in model.named_parameters() if not n.startswith("model.w.")}
+        # The engine MoE layers' parameters were fed above, layer by layer.
+        shell = {
+            n
+            for n, _ in model.named_parameters()
+            if not n.startswith(("model.w.", "model.routed_experts."))
+        }
         assert shell == {"lm_head.weight"}, f"unfed shell parameters: {sorted(shell)}"
 
         torch.cuda.synchronize()
