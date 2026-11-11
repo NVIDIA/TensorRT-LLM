@@ -6992,3 +6992,57 @@ def test_configurable_moe_exposes_the_backend_lora_state():
     assert getattr(moe, "_moe_lora_enabled", False) is True
     moe.backend = SimpleNamespace()
     assert getattr(moe, "_moe_lora_enabled", False) is False
+
+
+def test_trtllm_mxfp4_fp8_activation_scales_on_reload():
+    from tensorrt_llm._torch.moe.fused_moe.activation import (
+        ActivationParamShape,
+        MoEActivationSupport,
+        SwigluBiasActivation,
+        install_activation_params,
+    )
+    from tensorrt_llm._torch.moe.fused_moe.quantization import W4A8MXFP4FP8TRTLLMGenFusedMoEMethod
+
+    class TestModule(torch.nn.Module):
+        activation_support = MoEActivationSupport(
+            kinds=frozenset({ActivationType.SwigluBias}),
+            alpha_beta=ActivationParamShape.PER_EXPERT_TENSOR,
+            limit=ActivationParamShape.PER_EXPERT_TENSOR,
+        )
+
+    module = TestModule()
+    module.expert_size_per_partition = 2
+    module.activation = SwigluBiasActivation(
+        gate_sigmoid_scale=1.702,
+        linear_offset=torch.tensor([1.0, 2.0]),
+        clamp=torch.tensor([7.0, 8.0]),
+    )
+    install_activation_params(module)
+    act_beta = module.act_beta
+    act_clamp = module.act_clamp
+    module.w3_w1_bias = torch.tensor([[2.0, 4.0], [3.0, 6.0]])
+    module.w2_bias = torch.tensor([[4.0, 8.0], [6.0, 12.0]])
+    module.fc31_input_gate_dequant = torch.tensor([0.5, 0.25])
+    module.fc2_input_dequant = torch.tensor([2.0, 3.0])
+    method = W4A8MXFP4FP8TRTLLMGenFusedMoEMethod()
+
+    method.process_weights_after_loading(module)
+    torch.testing.assert_close(module.w3_w1_bias, torch.tensor([[4.0, 8.0], [12.0, 24.0]]))
+    torch.testing.assert_close(module.w2_bias, torch.tensor([[2.0, 4.0], [2.0, 4.0]]))
+    torch.testing.assert_close(module.act_beta, torch.tensor([2.0, 8.0]))
+    torch.testing.assert_close(module.act_clamp, torch.tensor([14.0, 32.0]))
+
+    # Weight reload replaces the bias tensors and may change the input scale;
+    # the original activation parameters must not be divided a second time.
+    module.w3_w1_bias = torch.tensor([[2.0, 4.0], [3.0, 6.0]])
+    module.w2_bias = torch.tensor([[4.0, 8.0], [6.0, 12.0]])
+    module.fc31_input_gate_dequant = torch.tensor([1.0, 0.5])
+    method.process_weights_after_loading(module)
+    torch.testing.assert_close(module.w3_w1_bias, torch.tensor([[2.0, 4.0], [6.0, 12.0]]))
+    torch.testing.assert_close(module.w2_bias, torch.tensor([[2.0, 4.0], [2.0, 4.0]]))
+    torch.testing.assert_close(module.activation.linear_offset, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(module.activation.clamp, torch.tensor([7.0, 8.0]))
+    assert module.act_beta is act_beta
+    assert module.act_clamp is act_clamp
+    torch.testing.assert_close(module.act_beta, torch.tensor([1.0, 4.0]))
+    torch.testing.assert_close(module.act_clamp, torch.tensor([7.0, 16.0]))

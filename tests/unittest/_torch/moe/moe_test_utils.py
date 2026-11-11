@@ -509,48 +509,6 @@ def should_skip_trtllm(
                 f"(mismatch ~20-22%). CUTLASS backend with the same config passes."
             )
 
-    # W4A8_MXFP4_FP8 used to share the GatedMLP+W4A8MXFP4FP8LinearMethod
-    # reference path with W4A8_MXFP4_MXFP8 and hit a ~50-70x ref-vs-fused gap
-    # caused by the ref module's dynamic FP8 quantization being miswired to
-    # ``trtllm::w4a8_mxfp4_fp8_gemm`` (FP4GemmType.W4A8_MXFP4_MXFP8, which
-    # expects per-block activation scales with alpha=1). The reference now
-    # dequantizes the MXFP4 weights at load time AND emulates the kernel's
-    # static per-tensor FP8 round-trip on FC1 and FC2 inputs (see
-    # ``MXFP4FP8RefGatedMLPFusedMoE.forward``), so the generic / default
-    # SwiGLU configs (any top_k, any model shape) see the same FP8 noise as
-    # the fused kernel and pass.
-    #
-    # The remaining failure surface is
-    # W4A8_MXFP4_FP8 + TRTLLM-Gen + ``swiglu_gptoss_style=True`` (any top_k,
-    # any model shape, single- or multi-GPU). The element-wise reproducer at
-    # ``tests/unittest/_torch/moe/test_w4a8_mxfp4_fp8_divergence_repro.py``
-    # holds the model config / weights / input identical and only toggles
-    # the SwiGLU shape; on ``e60_k4_h2048_i1408 seq=1`` it shows:
-    #   * default SwiGLU (alpha=1, beta=0, limit=inf):
-    #       kernel ~ ref (1.00x magnitude, 0% mismatch_frac, PASS)
-    #   * gpt-oss SwiGLU (alpha=1.702, beta=1.0, limit=7.0):
-    #       kernel ~ 600-800x SMALLER than ref (94% mismatch_frac, FAIL)
-    # Eight ref variants that toggle gate clamp single/double-sided, drop
-    # the ``+beta`` term, drop the limit clamp, or skip the FC1/FC2 FP8
-    # round-trip all stay at ~94% mismatch, so the ref activation algebra
-    # is not the source. The CUTLASS backend with the same gpt-oss SwiGLU
-    # passes (Phase B verification, 16 passed / 0 failed). The bug is
-    # therefore in the TRTLLM-Gen kernel's gpt-oss SwiGLU code path itself
-    # (likely a wrong scale wired into the gpt-oss epilogue path - see
-    # ``GemmGatedActOptions.h`` ``scaleC`` / ``dequantScaleAb`` plumbing).
-    #
-    # Skip removal must be tied to the kernel bug fix tracked in
-    # https://nvbugspro.nvidia.com/bug/6178914.
-    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8 and swiglu_gptoss_style:
-        return (
-            "[Kernel Bug NVBUG-6178914] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with "
-            "swiglu_gptoss_style: the kernel produces output ~600-800x smaller "
-            "than the bf16 reference across all top_k / model shapes / "
-            "parallel modes, while the same kernel matches ref under default "
-            "SwiGLU and CUTLASS matches ref under gpt-oss SwiGLU. Bug is "
-            "isolated to the TRTLLM-Gen gpt-oss SwiGLU epilogue scale path."
-        )
-
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
     # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_MXFP8) auto-pad to 128 alignment,
     # but other quants (FP8_BLOCK_SCALES, NVFP4, W4A8_NVFP4_FP8) crash:
