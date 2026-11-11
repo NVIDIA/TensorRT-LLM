@@ -3738,19 +3738,17 @@ def _sparse_gqa_rowtile(
     """The row-tile pass over a context launch, or None where it does not serve it.
 
     An fp8 pool's reached pages are widened exactly into a bf16 scratch pool; `fp8_pages` is
-    their host count (read from the device when None)."""
+    their host count, without which the pass does not serve an fp8 pool (`_rowtile_takes`)."""
     k_cache, v_cache, table = kv.k, kv.v, block_table
     if kv.k.dtype == torch.float8_e4m3fn:
+        if fp8_pages is None or fp8_pages * kv.k[0].numel() * 4 > _FP8_ROWTILE_MAX_SCRATCH:
+            return None
         # Each slot's highest position, -1 if absent: a compare-and-max over `[slots, rows]`
         # (a scatter max would serialize a request's rows on one address).
         slots = torch.arange(block_table.shape[0], dtype=request_indices.dtype, device=q.device)
         held = request_indices[None, :] == slots[:, None]
         last = torch.where(held, query_positions[None, :].long(), -1).amax(1)
         counts = torch.div(last + tpb, tpb, rounding_mode="floor")
-        if fp8_pages is None:
-            fp8_pages = int(counts.sum())
-        if fp8_pages * kv.k[0].numel() * 4 > _FP8_ROWTILE_MAX_SCRATCH:
-            return None
         k_cache = torch.empty([fp8_pages, *kv.k.shape[1:]], dtype=q.dtype, device=q.device)
         v_cache = torch.empty_like(k_cache)
         table = torch.full_like(block_table, -1)
@@ -5595,6 +5593,7 @@ class PrefillTarget:
                 self._capture_selection(md, topk_indices, visible_blocks)
             attn = torch.empty([rows, core.q_width], dtype=qkv.dtype, device=qkv.device)
             for lo, hi, context_rows in parts:
+                # The context rows reach the trunk step's pages: its host count serves here.
                 out = _sparse_gqa(
                     core,
                     kv,
@@ -5604,6 +5603,7 @@ class PrefillTarget:
                     req_idx[lo:hi],
                     tokens_per_block,
                     logical[lo:hi] if context_rows else None,
+                    self._step.fp8_pages if context_rows else None,
                 )
                 attn[lo:hi].copy_(torch.reshape(out, [hi - lo, core.q_width]))
         else:
