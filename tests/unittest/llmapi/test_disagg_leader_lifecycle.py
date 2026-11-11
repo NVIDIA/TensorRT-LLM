@@ -282,7 +282,7 @@ def test_disaggregated_leader_cleanup_timeout_retains_guard(
     monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
     """A delayed guard remains alive to finish cleanup without masking the server error."""
-    from tensorrt_llm.commands import serve
+    from tensorrt_llm.commands.serve_cli import disaggregated as serve
     from tensorrt_llm.llmapi import mgmn_leader_node
 
     child = mock.MagicMock(pid=12345)
@@ -337,6 +337,6 @@ if __name__ == "__main__":
     elif mode == "proxy":
         sys.exit(_run_proxy(directory, scenario))
     elif mode == "leader":
-        from tensorrt_llm.commands import serve
+        from tensorrt_llm.commands.serve_cli import disaggregated as serve
 
         sys.exit(_run_leader(serve, directory, scenario))

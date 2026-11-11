@@ -31,7 +31,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm.commands import serve
+from tensorrt_llm.commands.serve_cli import _disagg_fleet as fleet
 from tensorrt_llm.serve import disagg_coordinator
 
 pytestmark = pytest.mark.cpu_only
@@ -107,10 +107,10 @@ class _CoordinatorRun:
         self._done = threading.Event()
         monkeypatch.setenv("TRTLLM_NO_USAGE_STATS", "1")
         monkeypatch.setenv(
-            serve.DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT, str(self.coord_port)
+            fleet.DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT, str(self.coord_port)
         )
         monkeypatch.setattr(disagg_coordinator, "DisaggCoordinatorService", _StubCoordinatorService)
-        monkeypatch.setattr(serve, "_launch_disagg_fleet", self._launch_fleet)
+        monkeypatch.setattr(fleet, "_launch_disagg_fleet", self._launch_fleet)
         disagg_cfg = SimpleNamespace(
             hostname="127.0.0.1",
             port=self.public_port,
@@ -127,7 +127,7 @@ class _CoordinatorRun:
 
     def _serve(self, disagg_cfg):
         try:
-            serve._serve_coordinator_and_fleet(disagg_cfg, "disagg.yaml", None, None, 180, 180, 2)
+            fleet._serve_coordinator_and_fleet(disagg_cfg, "disagg.yaml", None, None, 180, 180, 2)
         except BaseException as e:  # noqa: BLE001 - reported by the test thread
             self.errors.append(e)
 
@@ -172,7 +172,7 @@ def short_temp_root(monkeypatch):
 def test_coordinator_unix_socket_is_in_new_owner_only_directory(
     monkeypatch, short_temp_root, umask
 ):
-    monkeypatch.delenv(serve.DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS, raising=False)
+    monkeypatch.delenv(fleet.DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS, raising=False)
     run = _CoordinatorRun(monkeypatch)
     old_umask = os.umask(umask)
     try:
@@ -199,7 +199,7 @@ def test_coordinator_unix_socket_is_in_new_owner_only_directory(
 
 
 def test_coordinator_tcp_transport_creates_no_socket_directory(monkeypatch):
-    monkeypatch.setenv(serve.DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS, "0")
+    monkeypatch.setenv(fleet.DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS, "0")
     run = _CoordinatorRun(monkeypatch)
     name_prefix = f"trtllm_disagg_coord_{run.public_port}"
 
@@ -226,9 +226,9 @@ def test_coordinator_socket_directory_fits_unix_socket_address(monkeypatch, tmp_
     long_tmpdir.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(long_tmpdir))
 
-    uds_dir = serve._make_coordinator_uds_dir(8000)
+    uds_dir = fleet._make_coordinator_uds_dir(8000)
     try:
-        uds_path = os.path.join(uds_dir.name, serve._COORDINATOR_UDS_NAME)
+        uds_path = os.path.join(uds_dir.name, fleet._COORDINATOR_UDS_NAME)
         assert os.path.dirname(uds_dir.name) == "/tmp"
         assert stat.S_IMODE(os.stat(uds_dir.name).st_mode) == 0o700
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:

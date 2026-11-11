@@ -32,7 +32,9 @@ import pytest
 import yaml
 
 import tensorrt_llm.commands.serve as serve_module
+import tensorrt_llm.commands.serve_cli._disagg_fleet as fleet_module
 import tensorrt_llm.commands.serve_cli._net as net_module
+import tensorrt_llm.commands.serve_cli.disaggregated as disagg_module
 from tensorrt_llm.commands.serve_cli._disagg_fleet import DisaggLauncherEnvs, DisaggWorkerEnvs
 from tensorrt_llm.commands.serve_cli._net import _bind_listener, _listener_address_family
 from tensorrt_llm.logger import Logger
@@ -415,21 +417,21 @@ _SITES = [
     ),
     _Site(
         "disaggregated with one worker",
-        lambda: serve_module.disaggregated.callback,
+        lambda: disagg_module.disaggregated.callback,
         _run_disaggregated,
         ("disaggregated server", _HOST, _PORT, "ipv4"),
         ("disaggregated server", _HOST, _PORT, socket.AF_INET, False),
     ),
     _Site(
         "coordinator of a worker fleet",
-        lambda: serve_module._serve_coordinator_and_fleet,
+        lambda: fleet_module._serve_coordinator_and_fleet,
         _run_coordinator_and_fleet,
         ("coordinator", _HOST, _PORT - 1, "ipv4"),
         ("coordinator", _HOST, _PORT - 1, socket.AF_INET, False),
     ),
     _Site(
         "fleet worker",
-        lambda: serve_module._run_fleet_worker_impl,
+        lambda: fleet_module._run_fleet_worker_impl,
         _run_fleet_worker,
         ("fleet worker", _HOST, _PORT, "ipv4"),
         None,
@@ -469,7 +471,7 @@ def restored_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     # Patched on the class, so undoing it leaves no attribute on the logger instance.
     monkeypatch.setattr(Logger, "set_level", lambda self, min_severity: None)
     monkeypatch.setattr(
-        inspect.getmodule(serve_module.disaggregated.callback),
+        inspect.getmodule(disagg_module.disaggregated.callback),
         "set_usage_context",
         lambda usage_context: None,
     )
@@ -556,7 +558,7 @@ def test_launch_server_publishes_the_kernel_assigned_port(
 def test_disaggregated_publishes_the_kernel_assigned_port(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restored_environment
 ) -> None:
-    module = inspect.getmodule(serve_module.disaggregated.callback)
+    module = inspect.getmodule(disagg_module.disaggregated.callback)
     calls = []
     _bind_to_kernel_port(monkeypatch, module, calls)
     monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))

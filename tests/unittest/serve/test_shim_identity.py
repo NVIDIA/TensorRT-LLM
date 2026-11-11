@@ -34,7 +34,22 @@ pytestmark = pytest.mark.cpu_only
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Rows are added only by the pull requests that create the kept shims.
-SHIM_ROWS: tuple = ()
+SHIM_ROWS: tuple = (
+    # tensorrt_llm/commands/serve.py stays the trtllm-serve entry point and re-exports the public
+    # names that moved into commands/serve_cli/ lazily: each warns on its first read, never at import.
+    ShimRow(
+        "tensorrt_llm.commands.serve",
+        "DisaggWorkerEnvs",
+        "tensorrt_llm.commands.serve_cli._disagg_fleet",
+        retire_in="a future release",
+    ),
+    ShimRow(
+        "tensorrt_llm.commands.serve",
+        "set_cuda_device",
+        "tensorrt_llm.commands.serve_cli.disaggregated",
+        retire_in="a future release",
+    ),
+)
 
 
 def test_shim_identity():
