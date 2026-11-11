@@ -309,7 +309,7 @@ class Integration:
         """What in the task's own commits breaks the run's commit rules, said for its worker; "" if nothing."""
         if self.policy is None:
             return ""
-        findings = audit_commits(tree, f"{head}..{branch}", self.policy, own=True)
+        findings = audit_commits(tree, f"{head}..{branch}", self.policy)
         if not findings:
             return ""
         fork = git_checked(tree, "merge-base", head, branch, check=False).strip() or head

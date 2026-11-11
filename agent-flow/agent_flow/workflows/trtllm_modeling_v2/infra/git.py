@@ -80,7 +80,7 @@ def git_checked(repo: str | Path, *args: str, check: bool = True) -> str:
 
 #: The optional task.yaml block that configures the policy; every key has a default.
 COMMIT_POLICY_FIELD = "commit_policy"
-COMMIT_POLICY_KEYS: tuple[str, ...] = ("allow_co_authors", "base_ref")
+COMMIT_POLICY_KEYS: tuple[str, ...] = ("allow_co_authors",)
 
 #: What scores the run, as repo-relative prefixes: the evaluator and the reference rows the
 #: anchors come from. A commit of the run's that touches one is refused.
@@ -147,7 +147,6 @@ class CommitPolicy:
     denied_paths: tuple[str, ...] = ()
     judge_paths: tuple[str, ...] = JUDGE_PATHS
     allow_co_authors: bool = False
-    base_ref: str = ""
 
     @classmethod
     def from_task(
@@ -192,7 +191,6 @@ class CommitPolicy:
             denied_paths=tuple(denied),
             judge_paths=(*JUDGE_PATHS, *sorted(stated - {""})),
             allow_co_authors=bool(block.get("allow_co_authors", False)),
-            base_ref=str(block.get("base_ref") or ""),
         )
 
     def path_problem(self, path: str) -> str:
@@ -228,8 +226,6 @@ def validate_commit_policy_block(block: Any, errors: list[str]) -> None:
         )
     if "allow_co_authors" in block and not isinstance(block["allow_co_authors"], bool):
         errors.append(f"'{COMMIT_POLICY_FIELD}.allow_co_authors' must be true or false")
-    if "base_ref" in block and not isinstance(block["base_ref"], str):
-        errors.append(f"'{COMMIT_POLICY_FIELD}.base_ref' must be a string (a git revision)")
 
 
 def _relative_inside(path: Path, root: Path) -> str:
@@ -288,7 +284,7 @@ def trial_commit(identity: CommitIdentity, *, allow_co_authors: bool = False) ->
             if done.returncode != 0:
                 return [f"git {args[0]} failed (rc {done.returncode}): {done.stderr.strip()}"]
         policy = CommitPolicy(identity=identity, allow_co_authors=allow_co_authors)
-        return [f.problem for f in audit_commits(tmp, "HEAD", policy, own=True)]
+        return [f.problem for f in audit_commits(tmp, "HEAD", policy)]
 
 
 @dataclass(frozen=True)
@@ -314,14 +310,11 @@ def audit_commits(
     repo: str | Path,
     rev_range: str,
     policy: CommitPolicy | None = None,
-    *,
-    paths: Sequence[str] = (),
-    own: bool = False,
 ) -> list[CommitFinding]:
     """Check every non-merge commit in ``rev_range`` (``git log`` syntax) against the commit rules.
 
-    Only ``own`` commits (a task's branch) are held to the author and path rules. ``paths``
-    limits the audit to commits touching those repo-relative prefixes.
+    The range is a task's branch: its commits are held to the sign-off, the run's identity
+    when the policy has one, and the paths the policy refuses.
     """
     policy = policy or CommitPolicy()
     fmt = (
@@ -330,8 +323,6 @@ def audit_commits(
         "%x1f%(trailers:key=Co-authored-by,valueonly,separator=%x1d)%x1f"
     )
     args = ["log", "--no-merges", "--raw", "--no-renames", f"--format={fmt}", rev_range]
-    if paths:
-        args += ["--", *(p.rstrip("/") for p in paths)]
     out = _git(repo, *args, timeout=None)
     if out is None or out.returncode != 0:
         why = "git could not be run" if out is None else out.stderr.strip()
@@ -356,7 +347,7 @@ def audit_commits(
             found(f"no sign-off carries the author email <{author_email}> (found {shown})")
         if not policy.allow_co_authors and any(c.strip() for c in coauthors.split("\x1d")):
             found("carries Co-authored-by")
-        if own and policy.identity is not None and author != policy.identity.render():
+        if policy.identity is not None and author != policy.identity.render():
             found(f"authored as {author!r}, not the run's {policy.identity.render()!r}")
         for line in raw.splitlines():
             if not line.startswith(":") or "\t" not in line:
@@ -367,7 +358,7 @@ def audit_commits(
                 found(f"adds a symlink: {path}")
             if is_sandbox_placeholder(path) and not (len(modes) >= 2 and modes[1] == "000000"):
                 found(f"adds a sandbox placeholder: {path}")
-            if own and policy.path_problem(path):
+            if policy.path_problem(path):
                 found(policy.path_problem(path))
     return findings
 
@@ -378,21 +369,6 @@ def is_sandbox_placeholder(path: str) -> bool:
     return parts[-1] in SANDBOX_PLACEHOLDER_NAMES or any(
         part in SANDBOX_PLACEHOLDER_DIRS for part in parts[:-1]
     )
-
-
-def resolve_base(repo: str | Path, candidates: Sequence[str]) -> str:
-    """The merge base of ``HEAD`` with the first candidate ref that resolves, or ``""``."""
-    for ref in candidates:
-        if not ref:
-            continue
-        out = _git(repo, "merge-base", "HEAD", ref, timeout=None)
-        if out is not None and out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip()
-    return ""
-
-
-#: Where a branch's commits are counted from when the policy names no base.
-DEFAULT_BASE_REFS: tuple[str, ...] = ("origin/main", "upstream/main", "main")
 
 
 NATIVE_ROOT = "tensorrt_llm"

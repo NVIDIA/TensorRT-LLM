@@ -12,8 +12,8 @@ Nothing later takes the record back. A benchmark with no anchor is a score with 
 verdict; with none judged the record says ``accuracy unjudged (boot only)``.
 
 **The final pass** (:func:`final_pass`) runs once, after the last task: every other check
-of every done deployment, the target's delivered tests and the commit audit, on the
-checkout's head. Each is a report line naming the commit it was measured on. A deployment
+of every done deployment, the target's delivered tests and whether the delivered trees
+are committed, on the checkout's head. Each is a report line naming the commit it was measured on. A deployment
 whose boot failed there is not scored. When a check failed or the conventions scan has
 findings, one `fix` task names them all; then the deployments that had a failure and core's
 own checks run once more. A pass on record for the same content is
@@ -43,14 +43,7 @@ from ..checks import anchors, conventions, gate_cli, pytest_runner
 from ..checks import verdict as check_result
 from ..infra.compute.commands import CommandSpec
 from ..infra.files import write_text_atomic
-from ..infra.git import (
-    DEFAULT_BASE_REFS,
-    CommitPolicy,
-    CommitPolicyError,
-    audit_commits,
-    git_output,
-    resolve_base,
-)
+from ..infra.git import git_output
 from ..operators.coverage import CATALOG_TESTS_DIR, MODELING_V2_PACKAGE, model_ops_tests_dir
 from ..spec import deployments as deployments_mod
 from . import contract as contract_mod
@@ -76,6 +69,7 @@ NOT_CHECKED: tuple[str, ...] = (
     "whether a disaggregated deployment's generation server reused what its context server "
     "computed: the proxy does not show it (unknown)",
     "performance: the flow has no tuning stage",
+    "commits on the branch that no task of this run landed: a task's are audited as it lands",
 )
 
 
@@ -240,14 +234,11 @@ def _measure_owed(pipeline, commit: str, only: Collection[str] | None = None) ->
     return failed
 
 
-def git_lines(
-    repo: Path, policy: CommitPolicy, trees: Sequence[str], commit: str = ""
-) -> list[Line]:
-    """The delivered ``trees`` are in git, and the run's commits meet the commit rules.
+def git_lines(repo: Path, trees: Sequence[str], commit: str = "") -> list[Line]:
+    """Whether the delivered ``trees`` are committed: what is not, no check measured.
 
     Nothing outside a git work tree: a fixture in a temporary directory is no delivery. The
-    audit runs over every commit since the merge base that touches the target's own paths,
-    by the rules each task's commits were held to when they landed.
+    commits themselves were audited as each task landed (``run/integration.py``).
     """
     if not (repo / ".git").exists():
         return []
@@ -258,21 +249,7 @@ def git_lines(
         said = "git status could not be run"
     elif dirty:
         said = "uncommitted, so a clone would not have them:\n  " + "\n  ".join(dirty[:12])
-    lines = [Line("git:target-committed", dirt is not None and not dirty, said, commit)]
-    base = resolve_base(repo, [policy.base_ref] if policy.base_ref else DEFAULT_BASE_REFS)
-    if not base:
-        return lines
-    try:
-        found = audit_commits(repo, f"{base}..HEAD", policy, paths=policy.own_paths)
-        said = "\n  ".join(f.render() for f in found[:12])
-    except CommitPolicyError as exc:
-        found, said = [exc], str(exc)
-    said = (
-        f"{len(found)} finding(s) since {base[:10]}:\n  {said}"
-        if found
-        else (f"every commit since {base[:10]} is signed off by its author, with no co-author")
-    )
-    return [*lines, Line("git:commit-rules", not found, said, commit)]
+    return [Line("git:target-committed", dirt is not None and not dirty, said, commit)]
 
 
 def test_modules(repo_root: str | Path, target_rel: str, commit: str = "") -> Line | None:
@@ -341,7 +318,7 @@ def delivery_lines(workflow, commit: str) -> list[Line]:
     repo = Path(str(workflow.task_data["trtllm_repo_path"]))
     target_rel = workflow._preflight.target_rel
     trees = (target_rel, MODELING_V2_PACKAGE, CATALOG_TESTS_DIR)
-    lines: list[Line | None] = [*git_lines(repo, workflow._commit_policy(), trees, commit)]
+    lines: list[Line | None] = [*git_lines(repo, trees, commit)]
     try:
         lines += [test_modules(repo, target_rel, commit), delivered_tests(workflow, commit)]
     except Exception as exc:  # a failed line, never an error of the run

@@ -75,5 +75,3 @@ def test_audit_commits_finds_every_kind_of_violation(repo):
     assert by_sha[link] == ["adds a symlink: link"]
     assert by_sha[placeholder] == ["adds a sandbox placeholder: pkg/.mcp.json"]
     assert audit_commits(repo, f"{base}..HEAD", CommitPolicy(allow_co_authors=True)) != findings
-    scoped = audit_commits(repo, f"{base}..HEAD", paths=("pkg/",))
-    assert {f.sha for f in scoped} == {placeholder}

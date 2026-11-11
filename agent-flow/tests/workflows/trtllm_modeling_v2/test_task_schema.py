@@ -255,12 +255,14 @@ def test_a_key_this_version_no_longer_reads_is_dropped_with_one_notice_each(tmp_
     # A spec written for the planner still loads: its role is dropped, with why.
     assert notices.pop().startswith("'agents.roles.planner' is ignored: there is no planner")
     assert resolved["agents"]["roles"] == {}
-    assert len(notices) == 3
+    assert len(notices) == 4
     assert notices[0].startswith("'accuracy.envelope' is ignored: a boot runs its workload only")
     assert notices[1].startswith("'accuracy.reference_logits' is ignored: ")
-    # No path is refused by the spec any more: the key is accepted, said, and read no further.
-    assert notices[2].startswith("'commit_policy.allowed_paths' is ignored: no path is refused")
-    assert resolved["commit_policy"] == {"base_ref": "main"}
+    # No path is refused by the spec any more, and no branch is audited whole: the keys are
+    # accepted, said, and read no further.
+    assert notices[2].startswith("'commit_policy.base_ref' is ignored: each task's commits")
+    assert notices[3].startswith("'commit_policy.allowed_paths' is ignored: no path is refused")
+    assert resolved["commit_policy"] == {}
     # Without a list to fill, the spec loads the same, silently.
     assert load_and_validate_task_yaml(_write(tmp_path, spec)) == resolved
 

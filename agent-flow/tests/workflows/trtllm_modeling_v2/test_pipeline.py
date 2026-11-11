@@ -1368,7 +1368,6 @@ def test_on_a_real_checkout_core_lands_only_the_commit_the_onboard_check_passed(
     assert report.startswith(f"# onboarded: commit `{onboarded}`")
     final = report.split("## Final pass")[1].split("##")[0]
     assert "[ok] git:target-committed at `" in final
-    assert "[ok] git:commit-rules at `" in final and "signed off by its author" in final
     # Nothing later takes the record back, or writes it again.
     report_mod.record_onboarded(workflow, repo, base)
     assert _state(tmp_path).onboarded == record

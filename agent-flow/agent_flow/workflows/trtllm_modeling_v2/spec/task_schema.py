@@ -105,6 +105,8 @@ IGNORED_KEYS: dict[str, str] = {
     "another deployment's score (`relative_to`)",
     "accuracy.disagg.devices": "a disaggregated deployment takes its two servers' ranks",
     "accuracy.disagg.nodes": "where a server runs is its launch prefix's to say",
+    "commit_policy.base_ref": "each task's commits are audited as they land; the branch is "
+    "not audited as a whole",
     "commit_policy.allowed_paths": "no path is refused but the workspace and the judge's "
     "(the evaluator, the accuracy references); a landed commit is labelled target, shared "
     "or mixed",

@@ -248,5 +248,3 @@ accuracy:
 # MV2FLOW_GIT_NAME / MV2FLOW_GIT_EMAIL).
 # commit_policy:
 #   allow_co_authors: false    # the default
-#   base_ref: origin/main      # delivery audits merge-base(HEAD, base_ref)..HEAD; default
-#                              # origin/main, else upstream/main, else main

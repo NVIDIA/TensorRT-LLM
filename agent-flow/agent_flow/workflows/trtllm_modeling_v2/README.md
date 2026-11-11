@@ -57,8 +57,9 @@ preflight -> tasks in a fixed order, the onboard check after core -> the final p
    benchmark nothing anchors is a score with no verdict, and with none judged the record says
    `accuracy unjudged (boot only)`.
 4. **The final pass**, once, after the last task: the remaining checks of every done deployment,
-   the target's own tests and the commit audit, each a report line naming the commit it was
-   measured on, the path that judged it and what it attested of the engine. A pass on record for
+   the target's own tests and whether the delivered trees are committed, each a report line
+   naming the commit it was measured on, the path that judged it and what it attested of the
+   engine. A pass on record for
    the same content is reused, and a deployment whose boot failed is not scored. When something
    failed or the conventions scan has findings, one `fix` task names them all; then each
    deployment that had a failure and core's own checks run once more.
