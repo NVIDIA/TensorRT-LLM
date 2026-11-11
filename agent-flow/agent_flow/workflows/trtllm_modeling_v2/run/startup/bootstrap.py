@@ -11,10 +11,8 @@ same without touching a GPU.
 
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from rich.markup import escape as escape_markup
 
@@ -28,13 +26,7 @@ from ...checks import anchors as anchors_mod
 from ...checks import gate_cli
 from ...infra.compute.environment import MAX_TMPDIR_LEN
 from ...infra.compute.executor import select_command_executor, shell_runner_for
-from ...operators import prior_art, tree_anchors
-from ...operators.inventory import (
-    format_surface,
-    run_inventory_probe,
-    surface_names,
-    write_surface_file,
-)
+from ...operators.inventory import run_inventory_probe
 from ...spec import deployments as deployments_mod
 from .. import contract as contract_mod
 from ..state import WorkflowState
@@ -347,75 +339,6 @@ def _write_host_facts(workflow, result) -> None:
     workflow.host_facts_path.write_text(head + appended, encoding="utf-8")
 
 
-#: What the tree already implements for this checkpoint and what the engine refuses, per run.
-PRIOR_ART_FILENAME = "prior_art.md"
-#: Where the checkout under test keeps what the workflow reads and the roles are sent to.
-TREE_MAP_FILENAME = "tree_map.md"
-
-
-def _checkpoint_config(task_data: Mapping[str, Any]) -> dict[str, Any]:
-    """The checkpoint's ``config.json``, or ``{}`` when it cannot be read here."""
-    try:
-        path = Path(str(task_data.get("checkpoint_path") or "")) / "config.json"
-        config = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return config if isinstance(config, dict) else {}
-
-
-def _take_prior_art(workflow, config: Mapping[str, Any]) -> None:
-    """Read the tree's prior art and the engine's limits for this checkpoint, for the survey.
-
-    Into ``prior_art.md`` in the workspace, for every role, and the section the
-    survey dispatch carries; the leads and the limits the survey review holds
-    the vocabulary to. **Never fatal**: an unreadable config or tree leaves none.
-    """
-    repo = workflow.task_data.get("trtllm_repo_path")
-    workflow._prior_art, workflow._engine_limits = None, []
-    if config and repo:
-        try:
-            workflow._prior_art = prior_art.find_prior_art(repo, config)
-            workflow._engine_limits = prior_art.engine_limits(config, repo)
-        except OSError:
-            pass
-    workflow._prior_art_block = prior_art.survey_block(workflow._prior_art, workflow._engine_limits)
-    path = workflow.workspace / PRIOR_ART_FILENAME
-    if not workflow._prior_art_block:
-        path.unlink(missing_ok=True)
-        return
-    path.write_text(
-        prior_art.survey_block(workflow._prior_art, workflow._engine_limits, limit=12),
-        encoding="utf-8",
-    )
-
-
-def _take_tree_map(workflow) -> str:
-    """Write ``tree_map.md``: every anchor's place in the checkout under test (:mod:`.tree_anchors`).
-
-    Returns a line for the journal when an anchor moved or is missing, else
-    ``""``. **Never fatal**: a checkout it cannot read leaves no map.
-    """
-    repo = workflow.task_data.get("trtllm_repo_path")
-    path = workflow.workspace / TREE_MAP_FILENAME
-    if not repo:
-        path.unlink(missing_ok=True)
-        return ""
-    try:
-        found = [tree_anchors.resolve(repo, key) for key in tree_anchors.ANCHORS]
-        path.write_text(tree_anchors.render_map(repo, found), encoding="utf-8")
-    except OSError:
-        path.unlink(missing_ok=True)
-        return ""
-    parts = []
-    moved = [r.anchor.concept for r in found if r.via == "search"]
-    if moved:
-        parts.append(f"moved: {', '.join(moved)}")
-    gone = [r.anchor.concept for r in found if not r.found]
-    if gone:
-        parts.append(f"missing: {', '.join(gone)}")
-    return f"tree map ({'; '.join(parts)}): `{TREE_MAP_FILENAME}`" if parts else ""
-
-
 def _take_survey(workflow, result, log) -> None:
     """Measure what the build supplies, for the surveyor and in ``surface.md``.
 
@@ -428,24 +351,8 @@ def _take_survey(workflow, result, log) -> None:
         result.environment,
         shell_runner=_cpu_probe_runner(workflow, result),
     )
-    config = _checkpoint_config(workflow.task_data)
-    # Every list is ordered by what this checkpoint is likely to reuse before it is cut.
-    rank = prior_art.ranker(config, surface_names(inventory)) if config else None
-    workflow._surface_block = format_surface(inventory, rank=rank)
-    write_surface_file(workflow.workspace / "surface.md", inventory, rank=rank)
-    _take_prior_art(workflow, config)
-    tree_note = _take_tree_map(workflow)
-
-    headline = (
-        f"{len(inventory.spendable)}/{len(inventory.catalog)} entries certified on "
-        f"{inventory.arch}, {len(inventory.unwrapped_ops)} unwrapped op(s)"
-        if inventory.ok
-        else f"inventory probe failed: {inventory.error.splitlines()[0]}"
-    )
-    workflow.journal.section(
-        "surface survey",
-        headline + "\n\nFull survey: `surface.md`" + (f"\n\n{tree_note}" if tree_note else ""),
-    )
-    # A probe that never ran must not read as an empty catalog.
-    mark, colour = ("✔", "green") if inventory.ok else ("⚠", "yellow")
-    print_message(f"[bold {colour}]{mark} survey[/bold {colour}] {headline}", log)
+    workflow._surface_block = inventory.block
+    (workflow.workspace / "surface.md").write_text(inventory.surface, encoding="utf-8")
+    workflow.journal.section("surface survey", inventory.headline + "\n\nFull survey: `surface.md`")
+    mark, colour = ("⚠", "yellow") if "failed" in inventory.headline else ("✔", "green")
+    print_message(f"[bold {colour}]{mark} survey[/bold {colour}] {inventory.headline}", log)

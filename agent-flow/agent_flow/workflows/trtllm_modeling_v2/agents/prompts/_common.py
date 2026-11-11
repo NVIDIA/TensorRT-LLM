@@ -8,7 +8,15 @@ from __future__ import annotations
 import re
 from typing import Sequence
 
-from ...operators.coverage import CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
+from ...operators.coverage import (
+    CATALOG_TESTS_DIR,
+    MODELING_V2_PACKAGE,
+    TIER_INTREE_CALLABLE,
+    TIER_KERNEL_LIBRARY,
+    TIER_NATIVE_TORCH,
+    TIER_TRITON,
+    TIER_TRTLLM_OP,
+)
 from ._render import render_template
 
 
@@ -58,3 +66,29 @@ __all__ = [
     "scope_block",
     "tidy",
 ]
+
+
+#: What each rung means to the agent that has to build it.
+TIER_DESCRIPTION: dict[int, str] = {
+    TIER_TRTLLM_OP: "an op the engine already exports as torch.ops.trtllm.*",
+    TIER_INTREE_CALLABLE: (
+        "a callable already in this repository: the engine's modules, its attention backends "
+        "(sparse ones included), custom ops and kernels, or another modeling_v2 target's "
+        "`ops/` (reused by copying it into this target's own `ops/`); the kernel plane is "
+        "reused, not rewritten"
+    ),
+    TIER_KERNEL_LIBRARY: (
+        "a kernel from a library the engine already pins (FlashInfer), called through its "
+        "public Python API because no trtllm op wraps it; the kernel is reused, not "
+        "rewritten. Read its API in the run's interpreter"
+    ),
+    TIER_NATIVE_TORCH: (
+        "no engine implementation exists, so compose one from torch ops. Correct first and "
+        "slow is acceptable for a functionality onboarding; the tuning phase replaces it"
+    ),
+    TIER_TRITON: (
+        "native torch cannot express it, or does so at a cost that breaks the gate's budget, "
+        "so write a Triton kernel, adapted from an existing one (FlashInfer, vLLM, SGLang) "
+        "where there is one"
+    ),
+}

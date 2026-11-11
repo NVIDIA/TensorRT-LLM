@@ -16,10 +16,13 @@ import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.git import CommitIdentity, CommitPolicy
-from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import own_paths
 from agent_flow.workflows.trtllm_modeling_v2.run import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run import inbox
-from agent_flow.workflows.trtllm_modeling_v2.run.integration import Integration
+from agent_flow.workflows.trtllm_modeling_v2.run.integration import (
+    Integration,
+    load_labels,
+    own_paths,
+)
 from agent_flow.workflows.trtllm_modeling_v2.run.state import (
     STAGE_EXECUTION,
     WorkflowState,
@@ -824,28 +827,48 @@ def test_uncommitted_work_or_a_commit_that_breaks_the_rules_does_not_land(tmp_pa
     assert _git(repo, "rev-list", "--merges", "--count", "HEAD") == "0"
 
 
-def test_a_run_changes_only_its_own_paths(tmp_path):
-    """Code other models run is refused at integration unless the spec allows the path."""
+def test_a_commit_lands_labelled_by_its_paths_and_only_a_judge_path_is_refused(tmp_path):
     repo = _checkout(tmp_path)
     integration = _integration(repo, tmp_path)
-    assert f"{FAMILY}/" in integration.policy.allowed_paths
+    assert f"{FAMILY}/" in integration.policy.own_paths
     tree = integration.open("core")
     (tree / "shared.py").write_text("S = 2\n")
     _git(tree, "commit", "-q", "-am", f"change shared code{_SIGNED}")
-    outcome = integration.integrate("core")
+    (tree / FAMILY / "a.py").write_text("A = 2\n")
+    _git(tree, "commit", "-q", "-am", f"the target{_SIGNED}")
+    (tree / FAMILY / "a.py").write_text("A = 3\n")
+    (tree / "shared.py").write_text("S = 3\n")
+    _git(tree, "commit", "-q", "-am", f"both{_SIGNED}")
+    # Code other models run is not refused: it lands, and the report can list it.
+    assert integration.integrate("core").merged
+    assert (repo / "shared.py").read_text() == "S = 3\n"
+    rows = load_labels(tmp_path / "ws")
+    assert {(r["subject"], r["label"], tuple(r["outside"])) for r in rows} == {
+        ("change shared code", "shared", ("shared.py",)),
+        ("the target", "target", ()),
+        ("both", "mixed", ("shared.py",)),
+    }
+    assert all(r["task"] == "core" and len(r["sha"]) == 40 for r in rows)
+    # What scores the run is not the run's to change: one line naming the path, and nothing lands.
+    tree = integration.open("fix")
+    judge = tree / "tensorrt_llm/evaluate/lm_eval.py"
+    judge.parent.mkdir(parents=True)
+    judge.write_text("EASIER = True\n")
+    _git(tree, "add", "tensorrt_llm/evaluate/lm_eval.py")
+    _git(tree, "commit", "-q", "-m", f"an easier judge{_SIGNED}")
+    outcome = integration.integrate("fix")
     assert not outcome.merged and outcome.repairable
-    assert "shared.py is outside the paths this run may commit" in outcome.detail
-    assert (repo / "shared.py").read_text() == "S = 1\n"
-    # The spec may say otherwise, path by path.
-    allowed = CommitPolicy.from_task(
-        {"trtllm_repo_path": str(repo), "commit_policy": {"allowed_paths": ["shared.py"]}},
-        identity=CommitIdentity("T", "t@example.com"),
-        own_paths=own_paths(TARGET_REL),
-    )
-    assert allowed.allowed_paths == ("shared.py",)
     assert (
-        Integration(repo, tmp_path / "ws", "mv2/run", _ENV, policy=allowed).integrate("core").merged
+        "tensorrt_llm/evaluate/lm_eval.py is a judge path (tensorrt_llm/evaluate/)"
+        in outcome.detail
     )
+    assert not (repo / "tensorrt_llm/evaluate").exists() and len(load_labels(tmp_path / "ws")) == 3
+    # A reference file the spec names is the judge's too; `allowed_paths` is read no more.
+    spec = {"trtllm_repo_path": str(repo), "accuracy": {"reference_yaml": "refs/gsm8k.yaml"}}
+    named = CommitPolicy.from_task(spec, identity=CommitIdentity("T", "t@example.com"))
+    assert "refs/gsm8k.yaml is a judge path" in named.path_problem("refs/gsm8k.yaml")
+    assert named.path_problem("tests/integration/defs/accuracy/references/gsm8k.yaml")
+    assert not named.path_problem("tests/integration/defs/accuracy/test_llm_api_pytorch.py")
 
 
 def test_a_task_whose_branch_conflicts_goes_back_to_its_worker_once_and_then_lands(

@@ -226,12 +226,16 @@ def test_a_key_this_version_no_longer_reads_is_dropped_with_one_notice_each(tmp_
     assert quiet == []
     spec["accuracy"]["envelope"] = {"enabled": True, "probes": ["1, 2, 3,"]}
     spec["accuracy"]["reference_logits"] = {"path": "reference.json"}
+    spec["commit_policy"] = {"allowed_paths": ["tensorrt_llm/"], "base_ref": "main"}
     notices: list[str] = []
     resolved = load_and_validate_task_yaml(_write(tmp_path, spec), notices)
     assert "envelope" not in resolved["accuracy"] and "reference_logits" not in resolved["accuracy"]
-    assert len(notices) == 2
+    assert len(notices) == 3
     assert notices[0].startswith("'accuracy.envelope' is ignored: a boot runs its workload only")
     assert notices[1].startswith("'accuracy.reference_logits' is ignored: ")
+    # No path is refused by the spec any more: the key is accepted, said, and read no further.
+    assert notices[2].startswith("'commit_policy.allowed_paths' is ignored: no path is refused")
+    assert resolved["commit_policy"] == {"base_ref": "main"}
     # Without a list to fill, the spec loads the same, silently.
     assert load_and_validate_task_yaml(_write(tmp_path, spec)) == resolved
 

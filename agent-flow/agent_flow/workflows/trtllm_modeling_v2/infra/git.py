@@ -83,10 +83,17 @@ def git_checked(repo: str | Path, *args: str, check: bool = True) -> str:
 
 #: The optional task.yaml block that configures the policy; every key has a default.
 COMMIT_POLICY_FIELD = "commit_policy"
-COMMIT_POLICY_KEYS: tuple[str, ...] = ("allowed_paths", "allow_co_authors", "base_ref")
+COMMIT_POLICY_KEYS: tuple[str, ...] = ("allow_co_authors", "base_ref")
 
-#: Where an onboarding writes, as repo-relative prefixes.
-DEFAULT_ALLOWED_PATHS: tuple[str, ...] = ("tensorrt_llm/", "tests/", "cpp/", "examples/")
+#: What scores the run, as repo-relative prefixes: the evaluator and the reference rows the
+#: anchors come from. A commit of the run's that touches one is refused.
+JUDGE_PATHS: tuple[str, ...] = (
+    "tensorrt_llm/evaluate/",
+    "tensorrt_llm/commands/eval.py",
+    "tests/integration/defs/accuracy/references/",
+)
+#: What a landed commit is labelled: all of its paths are the target's own, none, or some.
+LABEL_TARGET, LABEL_SHARED, LABEL_MIXED = "target", "shared", "mixed"
 
 #: File names the operator's sandbox drops into every directory its shell
 #: enters, and directory names it creates there.
@@ -129,15 +136,19 @@ class CommitIdentity:
 
 @dataclass(frozen=True)
 class CommitPolicy:
-    """What the run's commits may touch, and as whom they are made.
+    """As whom the run's commits are made, what they may never touch, and what labels them.
 
-    With no ``identity`` (none could be resolved) the audit does not ask who authored a commit;
-    an empty ``allowed_paths`` allows the whole repository.
+    No path is refused but the run's own workspace and the judge's (:data:`JUDGE_PATHS`,
+    and the reference files the spec names): what scores the run is not the run's to
+    change. Every other commit lands and is labelled by ``own_paths``, the target's own
+    path prefixes (:meth:`label`). With no ``identity`` the audit does not ask who
+    authored a commit.
     """
 
     identity: CommitIdentity | None = None
-    allowed_paths: tuple[str, ...] = ()
+    own_paths: tuple[str, ...] = ()
     denied_paths: tuple[str, ...] = ()
+    judge_paths: tuple[str, ...] = JUDGE_PATHS
     allow_co_authors: bool = False
     base_ref: str = ""
 
@@ -150,12 +161,10 @@ class CommitPolicy:
         identity: CommitIdentity | None = None,
         own_paths: Sequence[str] = (),
     ) -> "CommitPolicy":
-        """The policy a run's ``task.yaml`` asks for, as the repository's user unless ``identity``.
+        """The policy of a run of ``task.yaml``, as the repository's user unless ``identity``.
 
         A workspace inside the repository is denied: the run's records are never delivered.
-        ``own_paths`` are the run's own paths (``operators.coverage.own_paths``): where the
-        spec states no ``commit_policy.allowed_paths``, the run's commits are held to them,
-        so a run never changes code another model runs.
+        A reference file a benchmark names inside the repository is a judge path.
         """
         repo = str(task_data.get("trtllm_repo_path") or "")
         block = task_data.get(COMMIT_POLICY_FIELD) or {}
@@ -164,34 +173,47 @@ class CommitPolicy:
                 identity = resolve_commit_identity(repo)
             except CommitPolicyError:
                 identity = None
-        allowed = block.get("allowed_paths")
         denied: list[str] = []
         if workspace is not None and repo:
             rel = _relative_inside(Path(workspace), Path(repo))
             if rel:
                 denied.append(rel.rstrip("/") + "/")
+        named = [(task_data.get("accuracy") or {}).get("reference_yaml")]
+        for entry in task_data.get("deployments") or ():
+            benchmarks = entry.get("benchmarks") if isinstance(entry, Mapping) else None
+            named += [b.get("reference_yaml") for b in benchmarks or () if isinstance(b, Mapping)]
+        stated = {
+            str(path)
+            if not Path(str(path)).is_absolute()
+            else _relative_inside(Path(path), Path(repo))
+            for path in named
+            if path and repo
+        }
         return cls(
             identity=identity,
-            allowed_paths=(
-                (tuple(own_paths) or DEFAULT_ALLOWED_PATHS)
-                if allowed is None
-                else tuple(_as_prefix(str(p)) for p in allowed)
-            ),
+            own_paths=tuple(own_paths),
             denied_paths=tuple(denied),
+            judge_paths=(*JUDGE_PATHS, *sorted(stated - {""})),
             allow_co_authors=bool(block.get("allow_co_authors", False)),
             base_ref=str(block.get("base_ref") or ""),
         )
 
     def path_problem(self, path: str) -> str:
-        """Why ``path`` (repo-relative) may not be committed under this policy, or ``""``."""
+        """Why ``path`` (repo-relative) may not be committed by this run, or ``""``."""
         for prefix in self.denied_paths:
             if path.startswith(prefix):
                 return f"{path} is under {prefix}, which this run never commits (its own workspace)"
-        if self.allowed_paths and not any(path.startswith(p) for p in self.allowed_paths):
-            return (
-                f"{path} is outside the paths this run may commit: {', '.join(self.allowed_paths)}"
-            )
+        for prefix in self.judge_paths:
+            if path.startswith(prefix):
+                return (
+                    f"{path} is a judge path ({prefix}): what scores the run is not its to change"
+                )
         return ""
+
+    def label(self, paths: Sequence[str]) -> str:
+        """``target``, ``shared`` or ``mixed``: whether a commit's ``paths`` are the target's own."""
+        own = [any(path.startswith(prefix) for prefix in self.own_paths) for path in paths]
+        return LABEL_TARGET if all(own) else LABEL_MIXED if any(own) else LABEL_SHARED
 
 
 def validate_commit_policy_block(block: Any, errors: list[str]) -> None:
@@ -207,37 +229,10 @@ def validate_commit_policy_block(block: Any, errors: list[str]) -> None:
             f"'{COMMIT_POLICY_FIELD}' has unknown key(s) {unknown}; known keys are "
             f"{list(COMMIT_POLICY_KEYS)}"
         )
-    allowed = block.get("allowed_paths")
-    if allowed is not None:
-        if not isinstance(allowed, list) or not all(isinstance(p, str) for p in allowed):
-            errors.append(f"'{COMMIT_POLICY_FIELD}.allowed_paths' must be a list of strings")
-        else:
-            for entry in allowed:
-                problem = _path_problem(entry)
-                if problem:
-                    errors.append(
-                        f"'{COMMIT_POLICY_FIELD}.allowed_paths' entry {entry!r}: {problem}"
-                    )
     if "allow_co_authors" in block and not isinstance(block["allow_co_authors"], bool):
         errors.append(f"'{COMMIT_POLICY_FIELD}.allow_co_authors' must be true or false")
     if "base_ref" in block and not isinstance(block["base_ref"], str):
         errors.append(f"'{COMMIT_POLICY_FIELD}.base_ref' must be a string (a git revision)")
-
-
-def _path_problem(entry: str) -> str:
-    if not entry.strip():
-        return "is empty"
-    if entry.startswith("/"):
-        return "must be repo-relative"
-    if any(part in ("..", ".") for part in entry.strip("/").split("/")):
-        return "must not contain '.' or '..' components"
-    return ""
-
-
-def _as_prefix(entry: str) -> str:
-    """A repo-relative prefix: a bare file name stays one; a directory gets its slash."""
-    entry = entry.strip()
-    return entry if entry.endswith("/") or "." in entry.rsplit("/", 1)[-1] else entry + "/"
 
 
 def _relative_inside(path: Path, root: Path) -> str:
@@ -405,7 +400,8 @@ DEFAULT_BASE_REFS: tuple[str, ...] = ("origin/main", "upstream/main", "main")
 
 def commit_instruction(policy: CommitPolicy) -> str:
     """The block every committing role's prompt carries."""
-    where = ", ".join(f"`{p}`" for p in policy.allowed_paths) or "anywhere in the repository"
+    own = ", ".join(f"`{p}`" for p in policy.own_paths) or "the target's family and its tests"
+    judge = ", ".join(f"`{p}`" for p in policy.judge_paths)
     return (
         "## Committing\n"
         "\n"
@@ -418,8 +414,13 @@ def commit_instruction(policy: CommitPolicy) -> str:
         "```\n"
         "\n"
         "Name every file explicitly: no directories, no globs that could match a file you did "
-        f"not write, never `git add -A`. Commit only under {where}; never a symlink git does "
-        "not track (a worktree's link to the native build), never a sandbox placeholder "
+        f"not write, never `git add -A`. The target's own paths are {own}: a commit that "
+        "touches any other path is code other models run, lands all the same and is listed in "
+        "the run's report as `shared` or `mixed`, so keep such a change in a commit of its "
+        f"own and say why in your decision. Never commit a judge path ({judge}): what scores "
+        "the run is not the run's to change, and a commit that touches one is refused. Never "
+        "a symlink git does not track (a worktree's link to the native build), never a "
+        "sandbox placeholder "
         "(`.mcp.json`, anything under `.claude/`). The run sets the author and the committer: "
         "leave them, sign off with `-s`, and write no `Co-authored-by` line and no AI "
         "attribution.\n"
@@ -487,7 +488,10 @@ __all__ = [
     "CommitIdentity",
     "CommitPolicy",
     "CommitPolicyError",
-    "DEFAULT_ALLOWED_PATHS",
+    "JUDGE_PATHS",
+    "LABEL_MIXED",
+    "LABEL_SHARED",
+    "LABEL_TARGET",
     "DEFAULT_BASE_REFS",
     "ENV_EMAIL",
     "ENV_NAME",

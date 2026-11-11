@@ -41,11 +41,11 @@ write.
   truly cannot work without it. Follow the ModelingV2 design: the model's own
   logic stays at the narrowest target or family scope that uses it. A change
   to the shared runtime is the smallest general one, never a branch on this
-  model. **A run commits only its own paths** (the target's family, its
-  tests, the family registries, the integration tests): a commit outside
-  them is refused unless `task.yaml`'s `commit_policy.allowed_paths` allows
-  it. When the target needs such a change, end `BLOCKED` naming the path and
-  why.
+  model. A commit outside the target's own paths (its family, its tests, the
+  family registries, the integration tests) lands labelled `shared` or
+  `mixed` in the run's report: keep it in a commit of its own and name the
+  path and why in your decision. A commit that touches a judge path (the
+  evaluator, the accuracy references) is refused.
 - **Finish the repair in this task.** Ordinary build, import and launch
   failures inside your goal are yours to fix before you return.
 - A command longer than a few minutes is launched and polled, never blocked
@@ -62,8 +62,7 @@ write.
   configuration reaches, how serving is measured. When something fails, and
   before you write a launcher, server, transport, harness or benchmark of your
   own, find the test that already does it and start from its configuration.
-  `tree_map.md` in the workspace says where each kind is in this checkout,
-  and what finds it if the tree has moved:
+  Where each kind is in this checkout (`git grep` finds one that has moved):
   - unit tests, by area (attention, executor, modeling_v2, multimodal,
     speculative, disaggregation, the LLM API): one op, cache behaviour,
     transfer or API path;

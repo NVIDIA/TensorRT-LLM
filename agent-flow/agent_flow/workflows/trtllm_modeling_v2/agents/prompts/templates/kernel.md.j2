@@ -49,7 +49,7 @@ The entry's `__call__` calls the FlashInfer callable directly — no trtllm op w
 ## Where a kernel comes from
 
 An op in `torch.ops.trtllm` is registered from Python (a `torch.library.custom_op("trtllm::...")`
-under the custom ops `tree_map.md` lists: the file name is its source) or from C++ (a
+under `tensorrt_llm/_torch/custom_ops/`: the file name is its source) or from C++ (a
 `TORCH_LIBRARY_FRAGMENT(trtllm, ...)` / `TORCH_LIBRARY_IMPL(trtllm, ...)` block), and
 `git grep` for the op's name finds it. A FlashInfer callable no op wraps is tier 3: the entry's `__call__` calls
 `flashinfer.<module>.<name>` itself. What the entry certifies follows the source: a JIT-compiled

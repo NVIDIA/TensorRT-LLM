@@ -45,11 +45,11 @@ from ..checks import verdict as check_result
 from ..infra.compute.commands import CommandExecutor
 from ..infra.compute.environment import RunEnvironment
 from ..infra.git import CommitPolicy, git_output
-from ..operators.coverage import own_paths
 from ..spec.task_schema import load_and_validate_task_yaml
 from . import certify as certify_mod
 from . import contract as contract_mod
 from . import pipeline as pipeline_mod
+from .integration import own_paths
 from .journal import Journal
 from .pipeline import DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ROUNDS, Pipeline
 from .startup import bootstrap
@@ -79,8 +79,6 @@ RUN_FILES: tuple[str, ...] = (
     certify_mod.CERTIFICATION_FILENAME,
     certify_mod.REPORT_FILENAME,
     "surface.md",
-    "prior_art.md",
-    "tree_map.md",
 )
 RUN_DIRS: tuple[str, ...] = ("reports", "decisions", certify_mod.CERTIFY_DIRNAME)
 
@@ -179,8 +177,6 @@ class TrtllmModelingV2Workflow:
             "## Surface survey\n\nNot taken for this run — plan on the assumption that "
             "you do not know what exists, and say so in the plan's open items.\n"
         )
-        # The tree's prior art and the engine's limits for this checkpoint (preflight).
-        self._prior_art_block: str = ""
         # Backend kind -> the skills its sessions load besides the run's own (the user's),
         # which the agent probe reads and every role then runs without.
         self._foreign_skills: dict[str, tuple[str, ...]] = {}
@@ -377,7 +373,7 @@ class TrtllmModelingV2Workflow:
         )
 
     def _commit_policy(self) -> CommitPolicy:
-        """The run's commit rules: who commits, and that a run changes only its own paths."""
+        """The run's commit rules: who commits, the judge's paths, and what labels a commit."""
         target_rel = str(getattr(self._preflight, "target_rel", "") or "")
         return CommitPolicy.from_task(
             self.task_data, workspace=self.workspace, own_paths=own_paths(target_rel)

@@ -40,8 +40,9 @@ preflight -> tasks, in a fixed order -> certification of the final commit -> ver
 
    Tasks run one at a time, each starting from the commits of the tasks before it. Each task
    is one agent turn in its own git worktree. When the worker
-   says it finished, its commits are audited (who made them, the sign-off, and that they change
-   only the run's own paths) and fast-forwarded into the checkout. **A worker checks its own task**
+   says it finished, its commits are audited (who made them, the sign-off, and that none touches
+   the workspace or a judge path), fast-forwarded into the checkout and labelled `target`,
+   `shared` or `mixed` by whether their paths are the target's own. **A worker checks its own task**
    with `trtllm-modeling-v2 gate` and its decision is trusted: no check runs between tasks.
 3. **Certification**: every check of the contract runs once, on the commit the checkout is at, then
    the delivery checks (the files on disk, the commit audit, the delivered tests, the CI test
@@ -147,7 +148,7 @@ round goes on from the verdicts it recorded for the same commit. `--clean` start
 |---|---|
 | `cli.py`, `spec/` | Entry point; task schema, deployments, derivation and configuration variants |
 | `agents/` | Role and model routing, turns, the decision table, prompts and skills |
-| `operators/` | Inventory, prior art and the vocabulary (`vocabulary.yaml`) |
+| `operators/` | The vocabulary (`vocabulary.yaml`) and the inventory of the tree's operators |
 | `run/workflow.py` | Lifecycle: init, resume, turn dispatch, close |
 | `run/pipeline.py` | The fixed order of tasks, the planner's four decisions |
 | `run/integration.py` | One worktree per task, the commit audit, rebase and fast-forward |

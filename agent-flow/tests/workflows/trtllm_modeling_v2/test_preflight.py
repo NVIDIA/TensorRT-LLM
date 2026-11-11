@@ -5,22 +5,18 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
+import re
 import subprocess
 import sys
-import warnings
 from pathlib import Path
 
 import pytest
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
-from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
 from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
     PROBE_SOURCE,
-    RECEIPT_PASSED,
-    format_surface,
     parse_inventory,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
@@ -225,78 +221,44 @@ def _fake_repo(tmp_path, entries, model_ops=()):
     return tmp_path
 
 
-def _run_probe(repo, arch="sm_103", prelude=""):
+def test_the_inventory_lists_what_the_tree_holds_as_the_surveyor_reads_it(tmp_path):
+    repo = _fake_repo(
+        tmp_path,
+        [
+            ("norm/x.py", "torch.ops.trtllm.x", ("SM_103",)),
+            ("norm/y.py", "torch.ops.trtllm.y", ("SM_100",)),
+        ],
+        model_ops=[
+            ("fam/ckpt__sm_103__tp1", "moe/router.py", "torch.ops.trtllm.router", ("SM_103",)),
+            ("fam", "norm/shared.py", "torch.ops.trtllm.shared", ("SM_103",)),
+        ],
+    )
     proc = subprocess.run(
-        [sys.executable, "-c", prelude + PROBE_SOURCE, str(repo), arch],
+        [sys.executable, "-c", PROBE_SOURCE, str(repo), "sm_103", "1"],
         capture_output=True,
         text=True,
         timeout=120,
     )
-    return parse_inventory(proc.stdout + proc.stderr, arch=arch)
-
-
-_INLINE_PASS = ("SM_103",)
-
-
-def test_another_targets_ops_are_listed_not_spendable(tmp_path):
-    repo = _fake_repo(
-        tmp_path,
-        [("norm/x.py", "torch.ops.trtllm.x", _INLINE_PASS)],
-        model_ops=[
-            ("fam/ckpt__sm_103__tp1", "moe/router.py", "torch.ops.trtllm.router", _INLINE_PASS)
-        ],
+    inventory = parse_inventory(proc.stdout + proc.stderr)
+    lists = {
+        title.split(":")[0]: names.split()
+        for title, names in re.findall(
+            r"\*\*(.+?)\*\* \(\d+\):\n\n((?:- .*\n)+)", inventory.surface
+        )
+    }
+    # Certified here and on another arch only; another target's and a family's own ops.
+    assert lists["Spendable"] == ["-", "`norm/x`"]
+    assert lists["Present but un-run on this arch"] == ["-", "`norm/y`"]
+    assert lists["Family and target ops"] == [
+        "-", "`fam/ckpt__sm_103__tp1/ops/moe/router`", "-", "`fam/ops/norm/shared`",
+    ]  # fmt: skip
+    # The dispatch carries the head of each list and says where the rest is.
+    assert "- ... 1 more, see `surface.md`" in inventory.block
+    assert "`fam/ops/norm/shared`" not in inventory.block and "## Versions" in inventory.surface
+    assert "1/4 entries certified on sm_103" in inventory.headline or (
+        inventory.headline.startswith("inventory probe failed: ")
     )
-    inventory = _run_probe(repo)
-    (op,) = inventory.other_targets
-    assert (op.scope, op.path, op.impl) == (
-        "fam/ckpt__sm_103__tp1",
-        "moe/router.py",
-        "torch.ops.trtllm.router",
-    )
-    assert op.receipt == RECEIPT_PASSED
-    assert op not in inventory.spendable and op not in inventory.uncertified
-    assert "router" not in inventory.unwrapped_ops
-    assert "`fam/ckpt__sm_103__tp1/ops/moe/router`" in format_surface(inventory)
-
-
-def test_family_shared_ops_are_discovered_alongside_target_ops(tmp_path):
-    repo = _fake_repo(
-        tmp_path,
-        [],
-        model_ops=[
-            ("fam", "norm/shared.py", "torch.ops.trtllm.shared", _INLINE_PASS),
-        ],
-    )
-    inventory = _run_probe(repo)
-    assert any(
-        entry.scope == "fam" and entry.path == "norm/shared.py" for entry in inventory.other_targets
-    )
-
-
-ANCHORS = tree_anchors.ANCHORS
-
-
-def test_every_anchor_is_found_by_what_identifies_it_in_this_checkout():
-    """Inside a TensorRT-LLM checkout, a search that ignores each hint finds what the hint points at.
-
-    The search is what a run relies on once the tree moves, so it is what this
-    holds. A hint this tree lacks (an older or newer layout) only warns.
-    """
-    root = Path(__file__).resolve().parents[4]
-    if not (root / "tensorrt_llm").is_dir():
-        pytest.skip("not inside a TensorRT-LLM checkout")
-    unfindable = []
-    for key, anchor in ANCHORS.items():
-        here = tree_anchors.resolve(root, anchor)
-        if here.via != "hint":
-            where = f"found at {list(here.paths[:3])}" if here.found else "missing"
-            warnings.warn(f"anchor {key}: no {anchor.hint} in this tree, {where}", stacklevel=1)
-            continue
-        moved = dataclasses.replace(anchor, hint=f"{anchor.hint}.moved")
-        found = tree_anchors.resolve(root, moved).paths
-        hint = anchor.hint
-        if not any(
-            p == hint or p.startswith(hint + "/") or hint.startswith(p + "/") for p in found
-        ):
-            unfindable.append(f"{key}: a search found {list(found[:3])}")
-    assert not unfindable, f"anchors a search cannot find by what identifies them: {unfindable}"
+    # A probe that printed nothing is said to the surveyor, never read as an empty catalog.
+    silent = parse_inventory("Traceback\nImportError: no torch\n")
+    assert "printed no payload" in silent.block and "ImportError: no torch" in silent.block
+    assert silent.headline == "inventory probe failed: it printed no payload"

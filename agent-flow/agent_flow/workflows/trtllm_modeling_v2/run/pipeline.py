@@ -872,7 +872,6 @@ class Pipeline:
             f"Read `{w.task_path}` for the run's spec: the checkpoint, the "
             f"architecture, the deployments it brings up and the accuracy anchor.\n\n"
             f"{w._surface_block}\n"
-            f"{w._prior_art_block}\n"
             f"{capture_lists_block(w.task_data)}\n"
             f"Write `{w.plan_path}` and `{w.vocabulary_path}` as the `survey` "
             f"section specifies. The orchestrator parses `vocabulary.yaml` and refuses "
@@ -898,8 +897,7 @@ class Pipeline:
             )
         target_rel = str(getattr(w._preflight, "target_rel", "") or "")
         repo = w.task_data.get("trtllm_repo_path") or None
-        # A shared entry lands as its local variant in the target's own ops/: the run
-        # changes only its own paths.
+        # A shared entry lands as its local variant in the target's own ops/.
         landing = str(item.variant) if item.variant is not None and target_rel else item.target
         try:
             rows = (yaml.safe_load(w.vocabulary_path.read_text(encoding="utf-8")) or {}).get(

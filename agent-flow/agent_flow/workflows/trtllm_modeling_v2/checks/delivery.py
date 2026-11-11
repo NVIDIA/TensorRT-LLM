@@ -625,7 +625,7 @@ def check_commit_hygiene(repo_root: Path, policy: CommitPolicy) -> list[Check]:
     """The run's commits meet the commit rules each task's were audited against.
 
     The audit runs over every commit since the merge base that touches the
-    paths the run may commit (``commit_policy.allowed_paths``). Returns no
+    target's own paths. Returns no
     check outside a git work tree, or when no base resolves.
     """
     if not (repo_root / ".git").exists():
@@ -634,7 +634,7 @@ def check_commit_hygiene(repo_root: Path, policy: CommitPolicy) -> list[Check]:
     if not base:
         return []
     try:
-        findings = audit_commits(repo_root, f"{base}..HEAD", policy, paths=policy.allowed_paths)
+        findings = audit_commits(repo_root, f"{base}..HEAD", policy, paths=policy.own_paths)
     except CommitPolicyError as exc:
         return [Check(name="git:commit-hygiene", passed=False, detail=str(exc))]
     return [
@@ -642,7 +642,7 @@ def check_commit_hygiene(repo_root: Path, policy: CommitPolicy) -> list[Check]:
             name="git:commit-hygiene",
             passed=not findings,
             detail=(
-                f"every commit since {base[:10]} under {', '.join(policy.allowed_paths) or 'the repo'} "
+                f"every commit since {base[:10]} under {', '.join(policy.own_paths) or 'the repo'} "
                 f"is signed off by its author, with no co-author, symlink or placeholder"
                 if not findings
                 else f"{len(findings)} finding(s):\n  "

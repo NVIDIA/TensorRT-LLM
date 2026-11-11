@@ -15,8 +15,7 @@ how others did it, and say in your report what you used:
 - **Kernel libraries**: the engine's own ops, FlashInfer, CUTLASS: the kernels
   the sourcing ladder reuses before anything is written.
 
-`tree_map.md` in the workspace says where each part of this tree is in the
-checkout under test. A path you were given that is not there has moved: find
+A path you were given that is not in the checkout under test has moved: find
 what it defined by name (`git grep`), and trust the tree over any prompt.
 - **Other inference engines** (vLLM, SGLang, ...), from a checkout, an
   installed package or the web where you have one: often the first to serve

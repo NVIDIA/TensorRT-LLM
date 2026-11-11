@@ -6,8 +6,10 @@ A task that changes the tree (a kernel entry, a deployment, a fix) works
 on its own branch in its own worktree, cut from the checkout's head when the
 task starts. When its worker finishes, the branch's commits are audited
 against the run's commit rules (``infra/git.py``): who made them, how they are
-signed, and that they change only the run's own paths. A branch that breaks
-them goes back to its worker. The branch is then rebased onto the head as it
+signed, and that none touches the workspace or a judge path. A branch that breaks
+them goes back to its worker. Every commit that lands is labelled ``target``,
+``shared`` or ``mixed`` by whether its paths are the target's own
+(``commit_labels.json`` in the workspace, for the report). The branch is then rebased onto the head as it
 is then and fast-forwarded in, under one lock: the checkout only ever moves by
 whole tasks and carries no merge commits. Tasks run one at a time but for
 kernel entries, so a rebase rarely conflicts; one that does is aborted and
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import shutil
 import subprocess
 import threading
@@ -28,7 +31,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from ..infra.git import CommitPolicy, audit_commits, git_checked, git_output, link_native, repo_lock
+from ..infra.files import write_text_atomic
+from ..infra.git import (
+    LABEL_TARGET,
+    CommitPolicy,
+    audit_commits,
+    git_checked,
+    git_output,
+    link_native,
+    repo_lock,
+)
+from ..operators.coverage import INTEGRATION_TESTS_DIR, model_ops_tests_dir
 
 WORKTREES_DIRNAME = "worktrees"
 #: Files one checkout writes at once (``checkout.workers``, git 2.32 or later).
@@ -39,6 +52,8 @@ ADD_RETRY_S = 5.0
 #: Each integrated task's branch tip, so a task whose integration a restart
 #: interrupted is not integrated a second time.
 INTEGRATED_FILENAME = "integrated.json"
+#: In the workspace: the label of every commit the run landed, for the report.
+COMMIT_LABELS_FILENAME = "commit_labels.json"
 #: A fast-forward that meets another git process's index lock is tried again.
 LOCK_RETRIES, LOCK_RETRY_S = 5, 3.0
 #: A finished task whose branch does not integrate as it stands goes back to
@@ -62,6 +77,37 @@ class Outcome:
     #: The worktree is not in a state to integrate (uncommitted changes, not on
     #: its branch): its worker can put it right in a short turn.
     repairable: bool = False
+
+
+def own_paths(target_rel: str) -> tuple[str, ...]:
+    """The target's own paths, as repo-relative prefixes; none without a target.
+
+    Its family directory (its targets and the ``ops/`` they share) and the tests that
+    mirror it, the two registries a new family adds a line to (``models/__init__.py``,
+    ``_router_index.py``) and the integration tests (the accuracy test, its list entry).
+    A commit inside them is the target's; any other path is code other models run.
+    """
+    target = target_rel.strip().strip("/")
+    if not target:
+        return ()
+    family = posixpath.dirname(target)
+    models = posixpath.dirname(family)
+    return (
+        f"{family}/",
+        f"{model_ops_tests_dir(family)}/",
+        f"{models}/__init__.py",
+        f"{posixpath.dirname(models)}/_router_index.py",
+        f"{INTEGRATION_TESTS_DIR}/",
+    )
+
+
+def load_labels(workspace: str | Path) -> list[dict]:
+    """The label of every commit the run landed: ``task``, ``sha``, ``subject``, ``label``, ``outside``."""
+    try:
+        rows = json.loads((Path(workspace) / COMMIT_LABELS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
 class Integration:
@@ -272,7 +318,32 @@ class Integration:
             if merged.returncode != 0:
                 return Outcome(False, f"fast-forward of {branch} failed: {merged.stderr.strip()}")
             self._record(task_id, git_checked(self.repo, "rev-parse", branch))
+            self._label(task_id, head, branch)
             return Outcome(True, f"integrated {branch} ({ahead} commit(s))", int(ahead))
+
+    def _label(self, task_id: str, head: str, branch: str) -> None:
+        """Record each commit the task landed as the target's own, shared code, or both."""
+        if self.policy is None:
+            return
+        out = git_checked(
+            self.repo, "log", "--no-merges", "--name-only", "--format=%x1e%H%x1f%s%x1f",
+            f"{head}..{branch}", check=False,
+        )  # fmt: skip
+        rows = load_labels(self.root.parent)
+        for record in filter(str.strip, out.split("\x1e")):
+            sha, subject, names = record.split("\x1f", 2)
+            paths = names.split()
+            outside = [p for p in paths if self.policy.label([p]) != LABEL_TARGET]
+            rows.append(
+                dict(
+                    task=task_id,
+                    sha=sha,
+                    subject=subject,
+                    label=self.policy.label(paths),
+                    outside=outside,
+                )
+            )
+        write_text_atomic(self.root.parent / COMMIT_LABELS_FILENAME, json.dumps(rows, indent=1))
 
     def _audit(self, tree: Path, head: str, branch: str) -> str:
         """What in the task's own commits breaks the run's commit rules, said for its worker; "" if nothing."""

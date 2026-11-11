@@ -6,7 +6,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from ...operators.coverage import MAX_ROW_CELLS, TIER_DESCRIPTION
+from ...operators.coverage import MAX_ROW_CELLS
+from ._common import TIER_DESCRIPTION
 from ._render import render_template
 from .survey import CAPTURE_LISTS_HEADING
 

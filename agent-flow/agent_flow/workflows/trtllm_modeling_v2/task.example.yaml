@@ -239,14 +239,14 @@ accuracy:
 #   # defaults: {extra_mcp_servers: {knowledge-base: {type: http, url: https://example.test/mcp}}}
 
 # ----------------------------------------------------------- commit policy
-# What a task's commits may touch, audited before each integration and over the branch at delivery.
-# By default a run commits only its own paths: the target's family directory, the tests that mirror
-# it, the two family registries and tests/integration/. Code other models run is refused; a shared
-# catalog entry is served by a local variant in the target's own ops/.
-# Every commit is authored and signed off as the repository's user (or MV2FLOW_GIT_NAME /
-# MV2FLOW_GIT_EMAIL); an added symlink, a sandbox placeholder and the workspace are always refused.
+# A task's commits are audited before each integration. No path is refused but the workspace, an
+# added symlink, a sandbox placeholder and the judge's paths (tensorrt_llm/evaluate/,
+# tensorrt_llm/commands/eval.py, the accuracy references the anchors come from). Every landed
+# commit is labelled: `target` when all of its paths are the target's own (its family directory,
+# the tests that mirror it, the two family registries, tests/integration/), `shared` when none
+# is, `mixed` otherwise. Every commit is authored and signed off as the repository's user (or
+# MV2FLOW_GIT_NAME / MV2FLOW_GIT_EMAIL).
 # commit_policy:
-#   allowed_paths: [tensorrt_llm/, tests/]   # instead of the run's own paths: say why in notes
 #   allow_co_authors: false    # the default
 #   base_ref: origin/main      # delivery audits merge-base(HEAD, base_ref)..HEAD; default
 #                              # origin/main, else upstream/main, else main

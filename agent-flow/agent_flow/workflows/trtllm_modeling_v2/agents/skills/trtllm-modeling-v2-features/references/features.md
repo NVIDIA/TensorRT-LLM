@@ -5,9 +5,7 @@ were when this was written; `_torch/` means `tensorrt_llm/_torch/`. The code
 moves, and what it defines moves with it: each section's **Grep** line lists
 the symbols that find it. When a path below is missing, `git grep -n` its
 symbol, or a test's function name (`git grep -n "def test_<name>"`), and use
-where it is now. `tree_map.md` in the run's workspace says where the backends,
-the accuracy and perf tests, their reference scores and the CI test lists are
-in the checkout under test. Flow paths (`checks/`, `spec/INTAKE.md`,
+where it is now. Flow paths (`checks/`, `spec/INTAKE.md`,
 `task.example.yaml`) are relative to
 `agent-flow/agent_flow/workflows/trtllm_modeling_v2/` and move with the flow.
 Integration node ids are relative to the integration tests' `defs/` directory

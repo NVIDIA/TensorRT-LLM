@@ -35,13 +35,13 @@ def _doc(**overrides):
 def test_every_problem_is_batched():
     doc = {
         "verdict": "maybe",
-        "steps": [{"step": "", "state": "NOPE"}],
-        "queue": [{"n": 1, "mode": "guess", "target": ""}],
+        "queue": [{"n": 1, "mode": "guess", "target": ""}, {"n": "x"}],
     }
     with pytest.raises(vocab.VocabularyError) as excinfo:
         vocab.parse_vocabulary(doc)
     message = str(excinfo.value)
-    assert "verdict" in message and "state" in message and "mode" in message
+    assert "`verdict` is 'maybe'" in message and "queue[0].mode is 'guess'" in message
+    assert "queue[0].target must name" in message and "queue[1] must be a mapping whose" in message
 
 
 def test_a_row_covers_each_axis_not_their_product():

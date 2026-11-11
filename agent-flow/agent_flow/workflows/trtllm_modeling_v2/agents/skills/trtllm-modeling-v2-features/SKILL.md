@@ -24,9 +24,7 @@ hard-linked library is not updated by relinking the build output alone.
 Paths here are where things were when this was written; the code moves, and
 what it defines moves with it. Every path sits next to a symbol (a class,
 function, flag or test name): when the path is missing, `git grep -n` the
-symbol and use where it is now. `tree_map.md` in the run's workspace says where
-the backends, accuracy and perf tests and CI test lists are in the checkout
-under test. Where the tree disagrees with this skill, the tree wins.
+symbol and use where it is now. Where the tree disagrees with this skill, the tree wins.
 
 ## Where a target sits
 
@@ -129,9 +127,9 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
   runtime, executor or serving file of the tree): follow the ModelingV2 design,
   keep model-specific logic at the narrowest target or family scope that uses
   it, and make a shared runtime change the smallest general one, never a
-  branch on this model. A run commits only its own paths unless
-  `commit_policy.allowed_paths` allows more: name each such file and why in
-  your decision file, and end `BLOCKED` when the path is not allowed.
+  branch on this model. Such a commit lands labelled `shared` or `mixed` in the
+  run's report: name each such file and why in your decision file. A judge
+  path (the evaluator, the accuracy references) is never the run's to change.
 - A stock-path control (`--mode off`, `modeling_v2: off`) splits a target bug
   from an engine bug. A new architecture has none; say so instead of guessing.
 - Report each feature as *verified* (its proof passed), *configured* (on, not

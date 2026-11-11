@@ -7,14 +7,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ...operators.coverage import (
-    HIGHEST_REUSING_TIER,
-    MODE_ONBOARD,
-    TIER_DESCRIPTION,
-    TIER_KERNEL_LIBRARY,
-    QueueItem,
-)
+from ...operators.coverage import HIGHEST_REUSING_TIER, MODE_ONBOARD, TIER_KERNEL_LIBRARY, QueueItem
 from ..decisions import DECISION_REMINDER
+from ._common import TIER_DESCRIPTION
 from ._render import render_template
 from .tags import tag_section, task_tags
 
