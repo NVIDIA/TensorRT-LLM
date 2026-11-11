@@ -444,10 +444,15 @@ index b86948ba6a37455033daed88d7520c87270f1cc6..397da9b69057ce1854eb7da335cccbfe
  
      prims.barrier_cta_sync(
 diff --git a/mla_decode.py b/mla_decode.py
-index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147b96580bb 100644
+index 981392acd6391be952315bb060b1371aaeb22615..9d90315d8af0edf39a41082850ee1147b96580bb 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
-@@ -41,12 +41,8 @@ from .kernels.mla_decode.helpers.nvfp4_kv import (
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -40,12 +41,8 @@ from .kernels.mla_decode.helpers.nvfp4_kv import (
      validate_nvfp4_kv_formats,
  )
  
@@ -461,7 +466,7 @@ index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147
  
  
  from .decode import (
-@@ -1309,8 +1305,34 @@ def _make_mla_decode_compile_spec(
+@@ -1308,8 +1305,34 @@ def _make_mla_decode_compile_spec(
  _cached_mla_decode_compile_spec = functools.cache(_make_mla_decode_compile_spec)
  
  
@@ -498,7 +503,7 @@ index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147
      compile_spec: _MLADecodeCompileSpec,
  ):
      """Compile and cache one batch-dynamic TS MLA topology."""
-@@ -2078,7 +2100,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -2077,7 +2100,7 @@ class BatchMLADecodePagedTSWrapper:
              use_kv_bounds=use_kv_bounds,
          )
  
@@ -507,7 +512,7 @@ index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147
      def run(
          self,
          query: torch.Tensor,
-@@ -2220,7 +2242,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -2219,7 +2242,7 @@ class BatchMLADecodePagedTSWrapper:
          return (result, lse) if return_lse else result
  
  
@@ -516,7 +521,7 @@ index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2599,6 +2621,7 @@ def _prepare_sparse_output_quant(
+@@ -2598,6 +2621,7 @@ def _prepare_sparse_output_quant(
      )
  
  
@@ -524,7 +529,7 @@ index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147
  def _resolve_sparse_mla_plan(
      device,
      batch_size,
-@@ -2631,17 +2654,17 @@ def _resolve_sparse_mla_plan(
+@@ -2630,17 +2654,17 @@ def _resolve_sparse_mla_plan(
      affect geometry or workspace sizing.
      """
      import cutlass
@@ -546,7 +551,7 @@ index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147
          MlaDecodeTs,
      )
  
-@@ -3029,6 +3052,9 @@ def resolve_sparse_d576_reload_plan(
+@@ -3028,6 +3052,9 @@ def resolve_sparse_d576_reload_plan(
      return device, profile, spec, sections, byte_end, capacity, None
  
  
@@ -556,7 +561,7 @@ index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147
  class BatchSparseMLADecodePagedTSWrapper:
      """Plan native BF16/E4M3 attention, then bind one or two source index lists.
  
-@@ -3079,6 +3105,7 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -3078,6 +3105,7 @@ class BatchSparseMLADecodePagedTSWrapper:
      def __init__(self, workspace_buffer=None):
          self._workspace_buffer = workspace_buffer
          self._state = None
@@ -564,7 +569,7 @@ index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147
          self.workspace_size_bytes = 0
  
      def plan(
-@@ -3261,6 +3288,7 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -3260,6 +3288,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                  kernel_signature=_mla_kernel_compile_signature(kernel),
              )
          compiled = _get_compiled_mla_decode(spec)
@@ -572,7 +577,7 @@ index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147
          self._state = dict(
              reload_d576=reload_d576,
              device=device,
-@@ -3496,6 +3524,49 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -3495,6 +3524,49 @@ class BatchSparseMLADecodePagedTSWrapper:
          state = self._state
          if state is None:
              raise RuntimeError("plan() must be called before run()")
@@ -622,7 +627,7 @@ index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147
          _validate_query(
              query,
              packed_query=state["packed_query"],
-@@ -3564,15 +3635,6 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -3563,15 +3635,6 @@ class BatchSparseMLADecodePagedTSWrapper:
              raise ValueError("attention_sinks must be contiguous CUDA FP32[H]")
          if validate and torch.isnan(attention_sinks).any().item():
              raise ValueError("attention_sinks must not contain NaN")
@@ -638,7 +643,7 @@ index 1c4bac70c3dc3b076ed9729a2b157cc6081e62b8..9d90315d8af0edf39a41082850ee1147
          if state["kv_cache_format"] != "fp8" and (
              isinstance(kv_cache_scale, torch.Tensor) or kv_cache_scale != 1.0
          ):
-@@ -3699,10 +3761,129 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -3698,10 +3761,129 @@ class BatchSparseMLADecodePagedTSWrapper:
                  compiled=state["compiled"],
                  max_q_len=1,
              )
