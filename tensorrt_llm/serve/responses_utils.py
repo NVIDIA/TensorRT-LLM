@@ -3552,6 +3552,47 @@ async def keep_responses_stream_alive(
         await items.aclose()
 
 
+_OPENING_FRAME_STARTS = ("event: response.created\n", _IN_PROGRESS_FRAME_START)
+
+
+async def relay_after_opening(stream: AsyncGenerator[Union[str, bytes], None],
+                              events_sent: int) -> AsyncGenerator[str, None]:
+    """Relay a worker's Responses stream to a client that already has its opening.
+
+    The client holds ``events_sent`` events, ``response.created`` and
+    ``response.in_progress`` among them, and is kept alive with that
+    ``response.in_progress`` by the stream this relay feeds
+    (``keep_responses_stream_alive``). So every ``response.created`` and
+    ``response.in_progress`` of the worker's is dropped, wherever it comes:
+    the worker's opening and its keepalives, which repeat that opening, carry
+    the worker's response object, not the one the client holds, and a second
+    source of keepalives would only add to the relaying stream's own. Every
+    other event is numbered to follow on, and is yielded whole, one per item
+    as ``keep_responses_stream_alive`` takes them, wherever ``stream`` splits
+    it. ``stream`` is closed when the relay ends.
+    """
+    delimiter = _SSE_EVENT_DELIMITER.encode()
+    pending = b""
+    try:
+        async for chunk in stream:
+            if isinstance(chunk, str):
+                chunk = chunk.encode()
+            *events, pending = (pending + chunk).split(delimiter)
+            for event in events:
+                frame = event.decode(errors="replace") + _SSE_EVENT_DELIMITER
+                if not event or frame.startswith(_OPENING_FRAME_STARTS):
+                    continue
+                yield _stamp_sequence_number(frame, events_sent)
+                events_sent += 1
+        if pending:
+            # The stream stopped inside an event.
+            yield pending.decode(errors="replace")
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
 class ServerArrivalTimeMiddleware:
     """
     Custom ASGI middleware to track server arrival time.

@@ -22,9 +22,10 @@ import socket
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from typing import AsyncIterator, Callable, Optional
 
 import aiohttp
+import anyio
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -71,9 +72,11 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
 from tensorrt_llm.serve.responses_utils import (
-    STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED, ResponsesStreamingProcessor,
-    ServerArrivalTimeMiddleware, guard_responses_stream,
-    rejected_responses_stream, stream_error_event)
+    STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED,
+    STREAM_TERMINATION_UPSTREAM_ERROR, ClosingStreamingResponse,
+    ResponsesStreamingProcessor, ServerArrivalTimeMiddleware,
+    guard_responses_stream, keep_responses_stream_alive,
+    rejected_responses_stream, relay_after_opening, stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
@@ -83,6 +86,17 @@ _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
 }
+
+# Seconds a streamed /v1/responses request waits for its pipeline before the
+# response starts. The pipeline has a stream to return only once its context
+# phase is done, and until the response starts the client receives nothing,
+# not even the status line, which clients and proxies take for a dead
+# connection after a while. A pipeline that answers within the wait is relayed
+# or, if it failed, answered with its error status. For one still running, the
+# stream starts at once with response.created and response.in_progress, and
+# response.in_progress is sent again whenever the stream is silent, as an
+# aggregated server does.
+_RESPONSES_STREAM_START_WAIT_S = 1.0
 
 # Most round trips to spend estimating one ctx/gen server's steady-clock
 # offset. Only the least-delayed sample is kept; see `_sync_server_clock`.
@@ -185,6 +199,62 @@ class RawRequestResponseHooks(ResponseHooks):
                 self.gen_metrics,
                 disagg_request_id=self.disagg_request_id,
             ))
+
+
+class _ResponsesStreamingResponse(ClosingStreamingResponse):
+    """Release the pipeline however the response ends, body iterated or not.
+
+    A pipeline still running is cancelled, and the stream of one that has
+    answered is closed: the body may stop, or never start, before it has read
+    that stream to its end.
+    """
+
+    def __init__(self, pipeline: asyncio.Future,
+                 content: AsyncIterator[str]) -> None:
+        super().__init__(content=content, media_type="text/event-stream")
+        self._pipeline = pipeline
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            pipeline = self._pipeline
+            pipeline.cancel()
+            if (pipeline.done() and not pipeline.cancelled()
+                    and pipeline.exception() is None
+                    and isinstance(pipeline.result(), StreamingResponse)):
+                with anyio.CancelScope(shield=True):
+                    await pipeline.result().body_iterator.aclose()
+
+
+def _guard_relayed_responses_stream(answer: Response) -> Response:
+    """``answer``, with a stream that fails early ending in an ``error`` event.
+
+    The stream is the generation worker's own, response.created included, so
+    there is no response of this server's to report as failed.
+    """
+    if not isinstance(answer, StreamingResponse):
+        return answer
+    return StreamingResponse(
+        content=guard_responses_stream(answer.body_iterator,
+                                       stream_error_event),
+        media_type="text/event-stream")
+
+
+def _error_response_failure(response: Response) -> tuple[str, str]:
+    """The cause and message a stream reports an error response with.
+
+    An over-length rejection keeps its code, context_length_exceeded, which
+    clients act on; any other error response is an upstream error.
+    """
+    try:
+        payload = json.loads(response.body)
+        message = str(payload.get("message") or payload.get("detail") or payload)
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return STREAM_TERMINATION_UPSTREAM_ERROR, "Internal server error"
+    if payload.get("code") == CONTEXT_LENGTH_EXCEEDED_CODE:
+        return STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED, message
+    return STREAM_TERMINATION_UPSTREAM_ERROR, message
 
 
 def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
@@ -390,7 +460,7 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
         self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
         self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
-        self.app.add_api_route("/v1/responses", self._wrap_entry_point(self._service.openai_responses, ResponsesRequest), methods=["POST"])
+        self.app.add_api_route("/v1/responses", self.openai_responses, methods=["POST"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
@@ -484,14 +554,10 @@ class OpenAIDisaggServer:
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
-                    stream = response_or_generator
-                    if isinstance(req, ResponsesRequest):
-                        # A relayed Responses stream that fails early ends with
-                        # an `error` event; other protocols end on a sentinel.
-                        stream = guard_responses_stream(stream,
-                                                        stream_error_event)
+                    # openai_responses ends a Responses stream that fails early
+                    # with error events; other protocols end on a sentinel.
                     return StreamingResponse(
-                        content=stream,
+                        content=response_or_generator,
                         media_type="text/event-stream")
                 # by_alias: e.g. text.format.schema goes out under its wire name.
                 return JSONResponse(
@@ -510,6 +576,100 @@ class OpenAIDisaggServer:
                         return _context_length_exceeded_stream(req, message)
                 return error_response
         return wrapper
+
+    async def openai_responses(self, request: ResponsesRequest,
+                               raw_request: Request) -> Response:
+        """Serve Responses through the disaggregated pipeline.
+
+        A streamed request whose pipeline is still running after
+        _RESPONSES_STREAM_START_WAIT_S is answered from here at once; see
+        _responses_stream_when_done.
+        """
+        responses = self._wrap_entry_point(self._service.openai_responses)
+        if not request.stream:
+            return await responses(request, raw_request)
+        pipeline = asyncio.ensure_future(responses(request, raw_request))
+        try:
+            await asyncio.wait((pipeline, ),
+                               timeout=_RESPONSES_STREAM_START_WAIT_S)
+        except asyncio.CancelledError:
+            # Cancelling the request cancels its pipeline.
+            pipeline.cancel()
+            raise
+        if pipeline.done():
+            return _guard_relayed_responses_stream(pipeline.result())
+        try:
+            # The opening names request.request_id, the id every worker is sent
+            # (_encode_request_body) and answers under.
+            processor = ResponsesStreamingProcessor(
+                request=request,
+                sampling_params=request.to_sampling_params(),
+                model_name=request.model)
+            opening = processor.get_initial_responses()
+        except ValueError:
+            # The opening is built from the request alone; a request it cannot
+            # be built from is answered when its pipeline answers.
+            return _guard_relayed_responses_stream(await pipeline)
+        # keep_responses_stream_alive repeats the opening's response.in_progress
+        # whenever the stream is silent, as it is while the pipeline runs.
+        return _ResponsesStreamingResponse(
+            pipeline=pipeline,
+            content=keep_responses_stream_alive(
+                self._responses_stream_when_done(processor, opening,
+                                                 pipeline)))
+
+    async def _responses_stream_when_done(
+            self, processor: ResponsesStreamingProcessor, opening: list[str],
+            pipeline: asyncio.Future) -> AsyncIterator[str]:
+        """The stream of a Responses request whose pipeline outlasted the start wait.
+
+        ``opening`` is the request's response.created and response.in_progress,
+        and the pipeline's stream follows it without the worker's own
+        response.created and response.in_progress events (relay_after_opening),
+        so that every keepalive the client gets repeats ``opening``'s
+        response.in_progress. The status line is already out, so a pipeline
+        that fails ends the stream with error and response.failed, which carry
+        the message of its error response, and for an over-length rejection
+        its code, context_length_exceeded (_error_response_failure); so does a
+        pipeline's stream that fails before its terminal event. A stream
+        abandoned before the pipeline answers, as when the client disconnects,
+        cancels the pipeline.
+        """
+        try:
+            for frame in opening:
+                yield frame
+            try:
+                answer = await pipeline
+            except HTTPException as e:
+                failure = (STREAM_TERMINATION_UPSTREAM_ERROR, str(e.detail))
+            else:
+                failure = (None if isinstance(answer, StreamingResponse) else
+                           _error_response_failure(answer))
+        finally:
+            pipeline.cancel()
+        if failure is not None:
+            cause, detail = failure
+            for frame in processor.get_stream_failed_events(
+                    cause, detail, len(opening)):
+                yield frame
+            return
+        # The guard reads the worker's stream as it comes, so it knows whether
+        # the terminal event went out; its events are numbered on with the
+        # worker's by relay_after_opening.
+        frames = relay_after_opening(
+            guard_responses_stream(answer.body_iterator,
+                                   processor.get_stream_failed_events),
+            len(opening))
+        try:
+            async for frame in frames:
+                yield frame
+        except Exception:  # noqa: BLE001 - the guard has reported it
+            # The guard has logged the failure and sent error and
+            # response.failed, unless the terminal event had gone out: either
+            # way the response is over, and so is the stream.
+            return
+        finally:
+            await frames.aclose()
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
