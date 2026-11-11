@@ -510,4 +510,16 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         swiglu_limit=7.0,
         expert_bias=False,
     ),
+    "glm_5_3": ModelSpec(
+        name="glm_5_3",
+        num_experts=256,
+        top_k=8,
+        hidden_size=6144,
+        intermediate_size=2048,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=2.5,
+    ),
 }
