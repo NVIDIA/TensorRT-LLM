@@ -19,6 +19,8 @@ report has to show *their* numbers and *their* advice, not a second opinion
 that could drift from them.
 """
 
+import types
+
 import pytest
 import torch
 from memory_monitor_test_utils import GIB, capability
@@ -233,32 +235,48 @@ def test_residual_breakdown(monkeypatch):
     parts = dict(startup.residual_breakdown(9 * GIB))
     assert parts["released since startup"] == -GIB, "freed parts are a negative remainder"
 
-    # A region of the temporary sizing executor leaves the breakdown once it
-    # is released; the step that released it no longer shows the release,
-    # and the parts still sum exactly.
+    # The creator's sequence with KV sizing: a temporary executor is built,
+    # profiled, released and replaced. Its transfer buffers exist only
+    # during sizing; the communicators it creates outlive it.
+    from tensorrt_llm._torch.memory.monitor.names import (
+        REGION_KV_TRANSFER_BUFFERS,
+        REGION_TORCH_DISTRIBUTED_NCCL,
+    )
+
     startup.clear()
-    startup._first = startup.Reading(process=10 * GIB, torch=3 * GIB, known=2 * GIB)
-    startup._regions.append(startup.RegionSample("KV cache transfer buffers", "init", GIB))
-    startup._stages.append(startup.StageSample("init", "Sizing", 0, 0, residual_taken=GIB))
-    startup._active_stage = "extra"
-    startup.release_regions(("init",))
-    startup._stages.append(startup.StageSample("extra", "Extra", 0, 0, residual_taken=-GIB))
-    startup._regions.append(startup.RegionSample("KV cache transfer buffers", "kv", GIB))
-    startup._stages.append(startup.StageSample("kv", "KV cache", 0, 0, residual_taken=GIB))
-    parts = dict(startup.residual_breakdown(6 * GIB))
-    assert sum(parts.values()) == 6 * GIB, "parts sum to the residual"
-    assert parts["KV cache transfer buffers"] == GIB, "listed once, for the final executor"
-    assert parts["Sizing"] == 0 and parts["Extra"] == 0, "the temporary pair cancels out"
-    # Released outside every step: the remainder absorbs it, still exact.
-    startup.clear()
-    startup._first = startup.Reading(process=10 * GIB, torch=3 * GIB, known=2 * GIB)
-    startup._regions.append(startup.RegionSample("LoRA device cache", "init", GIB))
-    startup._stages.append(startup.StageSample("init", "Sizing", 0, 0, residual_taken=GIB))
-    startup.release_regions(("init",))
-    parts = dict(startup.residual_breakdown(5 * GIB))
-    assert sum(parts.values()) == 5 * GIB
-    assert "LoRA device cache" not in parts and parts["Sizing"] == 0
-    assert parts["since startup"] == 0, "released between steps cancels in the remainder"
+    state = types.SimpleNamespace(process=10 * GIB)
+    monkeypatch.setattr(startup, "_reading", lambda: startup.Reading(state.process, 0, 0))
+
+    def step(name, body):
+        before = startup.begin_stage(name)
+        body()
+        startup.record_stage(name, 0, 0, before)
+
+    def allocate(nbytes):
+        state.process += nbytes
+
+    def init_extra_resources():
+        with startup.region(REGION_KV_TRANSFER_BUFFERS, per_executor=True):
+            allocate(GIB)
+        with startup.region(REGION_TORCH_DISTRIBUTED_NCCL):
+            allocate(GIB // 2)
+
+    def extra_resources():
+        with startup.region(REGION_KV_TRANSFER_BUFFERS, per_executor=True):
+            allocate(GIB)
+
+    startup.set_sizing_pass(True)
+    step("init_extra", init_extra_resources)
+    step("model_extra", lambda: allocate(-GIB))  # release_resources() frees the sizing copy
+    startup.set_sizing_pass(False)  # after teardown_managers, between steps
+    step("extra", extra_resources)
+    parts = dict(startup.residual_breakdown(state.process))
+    assert sum(parts.values()) == state.process, "parts sum to the residual"
+    assert parts[REGION_KV_TRANSFER_BUFFERS] == GIB, "named once, for the final executor"
+    assert parts[REGION_TORCH_DISTRIBUTED_NCCL] == GIB // 2, "communicators outlive sizing"
+    assert parts["init_extra (other)"] == GIB, "the sizing copy shows where it was allocated"
+    assert parts["model_extra"] == -GIB, "and is given back where it was freed"
+    assert parts["since startup"] == 0, "nothing appears as growth after startup"
 
     startup.clear()
     monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)

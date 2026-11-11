@@ -209,6 +209,16 @@ def test_nested_windows_resolve_to_the_innermost():
     assert [lookup(t) for t in (10, 50, 70, 150)] == ["outer", "inner", "outer", None]
 
 
+class _Pkl5Request:
+    """Shaped like ``mpi4py.util.pkl5.Request``: ``test()`` but no ``Test()``."""
+
+    def __init__(self, done):
+        self._done = done
+
+    def test(self):
+        return self._done, None
+
+
 class _FakeComm:
     """Point-to-point messages between in-process ranks, mpi4py-shaped."""
 
@@ -229,7 +239,7 @@ class _FakeComm:
 
     def isend(self, obj, dest, tag):
         self.send(obj, dest, tag)
-        return SimpleNamespace(Test=lambda: True)
+        return _Pkl5Request(done=True)
 
 
 def _ranks(monkeypatch, world, listening):
@@ -286,7 +296,9 @@ def test_a_reply_nobody_collects_does_not_hold_up_shutdown(monkeypatch):
     listener = reporters[1]
     # A report above MPI's eager limit completes only when rank 0 receives it.
     sent = threading.Event()
-    listener._comm.isend = lambda obj, dest, tag: sent.set() or SimpleNamespace(Test=lambda: False)
+    pending = _Pkl5Request(done=False)
+    listener._comm.isend = lambda obj, dest, tag: sent.set() or pending
+    monkeypatch.setattr(ranks, "_abandoned_sends", [])
     with lock:
         box.setdefault((0, 1, ranks._REQUEST_TAG), []).append(1)
     assert sent.wait(5), "the listener answered"
@@ -295,6 +307,8 @@ def test_a_reply_nobody_collects_does_not_hold_up_shutdown(monkeypatch):
     assert time.monotonic() - started < 1.0, "stop() returned while the reply was pending"
     assert not listener._thread.is_alive()
     assert any("before rank 0 collected" in w for w in warnings)
+    assert not any("listener failed" in w for w in warnings), "the request was polled as pkl5's"
+    assert ranks._abandoned_sends == [pending], "MPI may still read its buffer: keep it"
 
     # Rank 0 drains replies that arrive after their gather gave up.
     with lock:

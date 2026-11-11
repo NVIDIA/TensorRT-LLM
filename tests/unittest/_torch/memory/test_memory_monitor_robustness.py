@@ -22,7 +22,7 @@ import weakref
 
 import pytest
 import torch
-from memory_monitor_test_utils import MB, capture_graph, needs_gpu
+from memory_monitor_test_utils import GIB, MB, capture_graph, needs_gpu
 
 import tensorrt_llm._torch.memory.monitor as mon
 from tensorrt_llm._torch.memory.monitor import pools, startup, tagging
@@ -185,9 +185,20 @@ def test_startup_state_does_not_leak(monkeypatch):
     with tagging.startup_window() as recording:
         assert recording is True, "the only executor records its startup"
         startup._stages.append(startup.StageSample("model", "Model", 0, 0, 1, 1))
+    startup.record_memory_plan(non_kv_peak=GIB, activation=None)
+    plan = startup.memory_plan()
     second = providers.begin_executor()
     with tagging.startup_window() as recording:
         assert recording is False, "a second live executor's startup is not recorded"
+        # Its creation still runs every writer; none may touch the record.
+        before = startup.begin_stage("model")
+        with startup.region("NCCL communicators (torch.distributed)"):
+            pass
+        startup.record_stage("model", 0, 0, before)
+        startup.record_memory_plan(non_kv_peak=5 * GIB, activation=None)
+    assert len(startup.stages()) == 1, "the second executor's steps are not added"
+    assert startup._regions == [], "nor its regions"
+    assert startup.memory_plan() == plan, "nor does its KV sizing plan replace the first one's"
     assert startup.stages(), "the running executor's steps survive the second startup"
     providers.end_executor(second)
     tagging.forget_startup_of(second)

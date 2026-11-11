@@ -52,6 +52,10 @@ _SEND_POLL_S = 0.05
 _GATHER_POLL_S = 0.05
 _DEFAULT_TIMEOUT_S = 30.0
 
+#: Replies whose send was abandoned when a listener stopped. MPI may still
+#: read their buffers, so they stay referenced for the life of the process.
+_abandoned_sends: list[Any] = []
+
 
 class RankReporter:
     """Rank 0 gathers; every other rank answers from a listener thread."""
@@ -94,9 +98,17 @@ class RankReporter:
                 self._stop.wait(_POLL_S)
 
     def _deliver(self, request: Any) -> bool:
-        """Wait for a reply to be received; ``False`` if stopped first."""
-        while not request.Test():
+        """Wait for a reply to be received; ``False`` if stopped first.
+
+        ``request`` is what the communicator's ``isend`` returns: an
+        ``MPI.Request`` or, for the pickle-5 communicator the executor
+        uses, a ``pkl5.Request``; both offer ``test()``, returning
+        ``(done, payload)``. A request abandoned on stop is kept referenced
+        until the process exits, because its send buffer may still be read.
+        """
+        while not request.test()[0]:
             if self._stop.wait(_SEND_POLL_S):
+                _abandoned_sends.append(request)
                 logger.warning(
                     f"memory monitor: rank {self._rank} stopped before rank 0 collected its report"
                 )

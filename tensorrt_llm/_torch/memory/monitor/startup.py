@@ -34,10 +34,16 @@ available. The KV sizing plan is device-wide too, so it is compared only
 with device-wide usage.
 
 A startup that sizes the KV cache builds a temporary executor first and
-releases it before building the final one. Regions entered while building
-the temporary one are marked released when it goes (:func:`release_regions`)
-and leave the breakdown, so memory that existed only during sizing is not
-listed next to the final executor's.
+releases it before building the final one. Regions for resources each
+executor owns (KV transfer buffers, the LoRA device cache) are recorded for
+the final executor only (:func:`sizing_pass`); what the temporary one
+allocates and frees shows in the steps that allocate and free it. Regions
+for resources that outlive it, such as communicators, are recorded either
+way.
+
+Only the executor that owns the record writes to it: while another executor
+is built alongside a running one, every writer is a no-op
+(:func:`suspended`).
 
 The module holds one startup's record. ``startup_window`` clears it when an
 executor's startup begins; :func:`clear` is the reset.
@@ -46,7 +52,6 @@ executor's startup begins; :func:`clear` is the reset.
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -64,7 +69,7 @@ __all__ = [
     "Reading",
     "RegionSample",
     "region",
-    "release_regions",
+    "set_sizing_pass",
     "residual_breakdown",
     "begin_stage",
     "StageSample",
@@ -80,6 +85,7 @@ __all__ = [
     "record_stage",
     "set_stage_advice",
     "stages",
+    "suspended",
     "step_name",
 ]
 
@@ -133,10 +139,6 @@ class RegionSample:
     residual_taken: int
     #: Recorded before the first step's reading, which therefore includes it.
     before_first: bool = False
-    #: Its memory was released with the temporary sizing executor.
-    released: bool = False
-    #: The step that was running when it was released, if any.
-    released_in: str | None = None
 
 
 _stages: list[StageSample] = []
@@ -157,8 +159,31 @@ _plan: MemoryPlan | None = None
 _baseline: dict[Group, int | None] | None = None
 
 
+#: Nesting depth of :func:`suspended`; writers are no-ops while positive.
+_suspended: int = 0
+#: Whether the temporary executor that sizes the KV cache is being built.
+_sizing: bool = False
+
+
 def _on() -> bool:
-    return full_mode()
+    return full_mode() and _suspended == 0
+
+
+@contextlib.contextmanager
+def suspended() -> Iterator[None]:
+    """Make every writer a no-op, for an executor that does not own the record."""
+    global _suspended
+    _suspended += 1
+    try:
+        yield
+    finally:
+        _suspended -= 1
+
+
+def set_sizing_pass(active: bool) -> None:
+    """Mark whether the temporary KV-sizing executor is being built."""
+    global _sizing
+    _sizing = active
 
 
 def _process_used() -> int | None:
@@ -208,14 +233,16 @@ def begin_stage(stage: str | None = None) -> Reading | None:
 
 
 @contextlib.contextmanager
-def region(name: str) -> Iterator[None]:
+def region(name: str, *, per_executor: bool = False) -> Iterator[None]:
     """Attribute unexplained memory that appears inside this block to ``name``.
 
     For code that allocates outside PyTorch and keeps no account of its own,
     such as a library creating its communicators. A no-op when the monitor
-    is off.
+    is off. ``per_executor`` marks a resource each executor creates and
+    frees with itself; it is not recorded for the temporary KV-sizing
+    executor, whose copy is gone before startup ends.
     """
-    if not _on():
+    if not _on() or (per_executor and _sizing):
         yield
         return
     before = _reading()
@@ -232,21 +259,6 @@ def region(name: str) -> Iterator[None]:
             )
             if _open_regions:
                 _open_regions[-1] += taken
-
-
-def release_regions(stages: tuple[str, ...]) -> None:
-    """Mark the regions recorded during ``stages`` as released.
-
-    For the temporary executor KV cache sizing builds: its regions measured
-    resources it gave back, so they leave the breakdown. The breakdown still
-    sums exactly: the release is credited to the step running now, or, when
-    no step is, cancels out in the remainder after startup.
-    """
-    for position, sample in enumerate(_regions):
-        if sample.stage in stages and not sample.released:
-            _regions[position] = dataclasses.replace(
-                sample, released=True, released_in=_active_stage
-            )
 
 
 def set_stage_advice(names: dict[str, str], advice: dict[str, str]) -> None:
@@ -338,7 +350,7 @@ def advice_for_stage(stage: str) -> str | None:
 
 def clear() -> None:
     """Forget everything recorded, the baseline included; called as each executor's startup begins."""
-    global _failed, _plan, _first, _active_stage, _baseline
+    global _sizing, _failed, _plan, _first, _active_stage, _baseline
     _stages.clear()
     _regions.clear()
     _open_regions.clear()
@@ -349,6 +361,7 @@ def clear() -> None:
     _names.clear()
     _advice.clear()
     _baseline = None
+    _sizing = False
 
 
 def render_stage_lines() -> list[str]:
@@ -435,28 +448,20 @@ def residual_breakdown(current_residual: int) -> list[tuple[str, int]]:
     early = sum(r.residual_taken for r in _regions if r.before_first)
     parts = [("before the first startup step", _first.residual - early)]
     for region_sample in _regions:
-        if not region_sample.released:
-            parts.append((region_sample.name, region_sample.residual_taken))
+        parts.append((region_sample.name, region_sample.residual_taken))
     for sample in _stages:
         if sample.residual_taken is None:
             continue
-        # Every region inside the step comes out of it, released or not; a
-        # released region's memory is credited back to the step that freed it.
-        inside = sum(r.residual_taken for r in _regions if r.stage == sample.stage)
-        listed = sum(
-            r.residual_taken for r in _regions if r.stage == sample.stage and not r.released
-        )
-        given_back = sum(
-            r.residual_taken for r in _regions if r.released and r.released_in == sample.stage
-        )
+        # Every region inside the step comes out of it.
+        inside = [r.residual_taken for r in _regions if r.stage == sample.stage]
         parts.append(
             (
-                f"{sample.name} (other)" if listed else sample.name,
-                sample.residual_taken - inside + given_back,
+                f"{sample.name} (other)" if inside else sample.name,
+                sample.residual_taken - sum(inside),
             )
         )
     # The remainder is what the parts leave over, so the parts always sum to
-    # the residual; a release outside every step cancels out inside it.
+    # the residual.
     remainder = current_residual - sum(size for _, size in parts)
     parts.append(("since startup" if remainder >= 0 else "released since startup", remainder))
     # A region entered more than once -- one workspace per mapping, say --

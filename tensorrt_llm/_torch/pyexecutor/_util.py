@@ -31,7 +31,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, ContextSchedulingPolicy,
-    ExecutorMemoryType, KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig,
+    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig,
     MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
     SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
@@ -3721,11 +3721,6 @@ class KvCacheCreator:
             cross_kv_cache_manager.shutdown()
         if ResourceManagerType.CROSS_KV_CACHE_MANAGER in resources:
             del resources[ResourceManagerType.CROSS_KV_CACHE_MANAGER]
-        # The sizing executor's resources are gone; what the memory monitor
-        # measured while creating them no longer exists.
-        _monitor_startup.release_regions(
-            (ExecutorMemoryType.INIT_KV_CACHE.value,
-             ExecutorMemoryType.INIT_EXTRA_RESOURCES.value))
 
 
 def _build_per_layer_num_kv_heads(
@@ -4978,7 +4973,7 @@ def create_py_executor_resources(
 
     # Disaggregated serving's KV transfer buffers are allocated in C++ with
     # no size exposed to Python; the memory monitor names them by measuring.
-    with _monitor_startup.region(REGION_KV_TRANSFER_BUFFERS):
+    with _monitor_startup.region(REGION_KV_TRANSFER_BUFFERS, per_executor=True):
         kv_cache_transceiver = create_kv_cache_transceiver(
             mapping, dist, kv_cache_manager, attention_type,
             cache_transceiver_config, mamba_cache_manager)

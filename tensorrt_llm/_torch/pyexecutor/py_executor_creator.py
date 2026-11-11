@@ -1377,6 +1377,8 @@ def _create_py_executor(
             log_memory_usage("after loading weights")
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+        # Resources each executor owns are named for the final executor only.
+        gpu_memory_startup.set_sizing_pass(estimating_kv_cache)
 
         # Without the estimation, build_managers sizes the final KV cache from
         # the device memory free now, so DWDP is set up first: the KV cache
@@ -1489,6 +1491,7 @@ def _create_py_executor(
                 kv_cache_creator.teardown_managers(resources)
                 gc.collect()
                 torch.cuda.empty_cache()
+            gpu_memory_startup.set_sizing_pass(False)
 
             with allocation_scope(ExecutorMemoryType.KV_CACHE):
                 # Before estimating KV cache size, a minimal KV cache has been allocated using
@@ -1603,6 +1606,7 @@ def create_py_executor(
     except BaseException:
         gpu_memory_providers.end_executor(monitor_token)
         gpu_memory_tagging.forget_startup_of(monitor_token)
+        gpu_memory_startup.set_sizing_pass(False)
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None
                 and current_dwdp_manager is not previous_dwdp_manager):

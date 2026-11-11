@@ -161,16 +161,21 @@ def test_ipc_buffers_are_counted_by_purpose_on_this_device(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_ipc_memory_records_the_size_it_allocated():
     from tensorrt_llm._ipc_utils import IpcMemory
+    from tensorrt_llm._torch.memory.monitor.capability import nvml_process_usage
     from tensorrt_llm.mapping import Mapping
 
     device = torch.cuda.current_device()
     before = IpcMemory.live_allocations(device).get("unit", (0, 0))
-    free_before = torch.cuda.mem_get_info()[0]
+    # This process's usage, which other processes on the GPU cannot change.
+    used_before = nvml_process_usage(device)[0]
     ipc = IpcMemory(Mapping(world_size=1, rank=0, tp_size=1), 3 * MB, True, "unit")
     assert ipc.open_ipc
     count, nbytes = IpcMemory.live_allocations(device)["unit"]
-    # Rounded up to the 2 MiB IPC alignment, and as much as the device lost.
+    # Rounded up to the 2 MiB IPC alignment ...
     assert (count, nbytes) == (before[0] + 1, before[1] + 4 * MB)
-    assert free_before - torch.cuda.mem_get_info()[0] >= 4 * MB
+    used_after = nvml_process_usage(device)[0]
+    if used_before is not None and used_after is not None:
+        # ... and at least as much as this process now holds more.
+        assert used_after - used_before >= 4 * MB
     del ipc
     assert IpcMemory.live_allocations(device).get("unit", (0, 0)) == before

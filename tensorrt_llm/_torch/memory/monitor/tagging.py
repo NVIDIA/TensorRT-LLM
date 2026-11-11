@@ -486,7 +486,10 @@ def startup_window(rank: int | None = None) -> Iterator[bool]:
             "executor's startup is not recorded, and reports keep describing the "
             "running executor's startup"
         )
-        yield False
+        # Steps, regions and the KV sizing plan of this startup must not be
+        # written into the running executor's record either.
+        with startup.suspended():
+            yield False
         return
 
     # A process can build more than one executor in turn; what the previous
