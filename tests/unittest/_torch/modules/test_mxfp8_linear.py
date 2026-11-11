@@ -922,3 +922,34 @@ def test_mxfp8_fused_scales_follow_weight_rows_per_tp_rank(weight_mode, shard_ro
         # Dynamic MXFP8 activations cost about 1% relative error; a scale row
         # on the wrong weight row is off by at least a factor of two.
         assert rel < 0.05, (rank, float(rel))
+
+
+@pytest.mark.cpu_only
+def test_flashinfer_autotuner_module_is_queued_for_a_model_that_tunes_through_flashinfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tensorrt_llm._torch.flashinfer_utils as flashinfer_utils
+
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    queued = []
+    monkeypatch.setattr(
+        flashinfer_utils,
+        "queue_flashinfer_module_build",
+        lambda name, gen_spec: queued.append(name) or True,
+    )
+
+    def model(flashinfer_decode_graphs: bool) -> torch.nn.Module:
+        layer = torch.nn.Module()
+        layer.quant_method = MXFP8LinearMethod()
+        root = torch.nn.Module()
+        root.layer = layer
+        if flashinfer_decode_graphs:
+            root._use_flashinfer_mxfp8_decode_graph_default = True
+        return root
+
+    # The native backend never tunes through FlashInfer.
+    assert not linear_module.queue_flashinfer_autotune_build(None, model(False))
+    assert queued == []
+    # A model the warmup may switch to FlashInfer tunes through its autotuner.
+    assert not linear_module.queue_flashinfer_autotune_build(None, model(True))
+    assert queued == ["trtllm_utils"]

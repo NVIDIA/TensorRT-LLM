@@ -31,7 +31,11 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, Union, cast
 
 import torch
 
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from tensorrt_llm._torch.flashinfer_utils import (
+    IS_FLASHINFER_AVAILABLE,
+    get_env_enable_pdl,
+    queue_flashinfer_module_build,
+)
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -400,6 +404,18 @@ def warmup_sampling_module() -> None:
             "flashinfer sampling module prewarm failed; it will be built "
             f"lazily on first use. {type(e).__name__}: {e}"
         )
+
+
+def queue_sampling_module_build(model_config: Any, model: Any) -> bool:
+    """KernelBuilder op family: the sampling module ``warmup_sampling_module`` loads at every
+    model's warmup, built on a worker thread from when the model is created. It needs no
+    forward: False."""
+    del model_config, model
+    if IS_FLASHINFER_AVAILABLE:
+        from flashinfer.jit.sampling import gen_sampling_module
+
+        queue_flashinfer_module_build("sampling", gen_sampling_module)
+    return False
 
 
 _topk_module_ready: Optional[bool] = None

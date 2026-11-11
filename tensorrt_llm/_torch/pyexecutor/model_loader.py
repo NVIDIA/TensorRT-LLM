@@ -1398,6 +1398,9 @@ class ModelLoader:
 
             validate_lm_head_output_dtype(model,
                                           self.llm_args.lm_head_output_dtype)
+            # Queues the kernel builds the configuration alone determines; they
+            # run on KernelBuilder's worker threads while the weights load.
+            wants_rehearsal = KernelBuilder.get().wants_rehearsal(config, model)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)
@@ -1541,7 +1544,7 @@ class ModelLoader:
                     and not requires_standard_hf_loading
                     and moe_load_balancer is None and getattr(
                         model.model_config, "modeling_v2_target", None) is None
-                    and KernelBuilder.get().wants_rehearsal(config, model)):
+                    and wants_rehearsal):
                 self._deferred = self._load_rehearsal_weights(
                     model,
                     config,

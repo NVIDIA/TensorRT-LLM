@@ -212,9 +212,15 @@ states: the autotuner warmup tunes it, a build state builds the kernels of every
 runner and tactic its tuning will time on the same worker threads without timing them, and
 serving runs the tuned tactic.
 
-For a model with such an op, the engine first loads dummy weights and runs the autotuner
-warmup's two forwards on them (a context batch at the maximum token count and one
-generation request) in the build state, then loads the checkpoint while the kernels build.
+Kernels the configuration alone determines start building on worker threads when the model
+is created, for every model, and build while the weights load: FlashInfer's sampling,
+trtllm-gen FMHA and autotuner modules, and MiniMax-M3's MSA modules with its k2q CSR
+extension. The calls that need them find them built, or wait for their builds.
+
+For a model with an op that lists its kernels as it runs, the engine first loads dummy
+weights and runs the autotuner warmup's two forwards on them (a context batch at the
+maximum token count and one generation request) in the build state, then loads the
+checkpoint while the kernels build.
 The startup log shows these as the `rehearsal`, `checkpoint` and `gpu_builds` phases,
 which `model_engine_creation_seconds` then does not include; `gpu_builds` waits for the
 builds that run kernels on the GPU. Supported ops: MiniMax-M3's MSA attention
@@ -224,7 +230,7 @@ FlashInfer's MXFP8 GEMM.
 | Environment variable | Default | Effect |
 |----------------------|---------|--------|
 | `TLLM_KERNEL_BUILDER` | `1` | `0` compiles each kernel on its first use instead. |
-| `TLLM_KERNEL_BUILDER_REHEARSAL` | `1` | `0` loads the checkpoint first; the kernels then build from the warmup on. |
+| `TLLM_KERNEL_BUILDER_REHEARSAL` | `1` | `0` loads the checkpoint first; the kernels a forward lists then build from the warmup on. |
 | `TLLM_KERNEL_BUILDER_AUTOTUNER` | `1` | `0` leaves the autotuned ops' kernels to the autotuner warmup. |
 | `TLLM_KERNEL_BUILDER_THREADS` | this rank's share of the CPUs, up to 32 | Worker threads per process. |
 

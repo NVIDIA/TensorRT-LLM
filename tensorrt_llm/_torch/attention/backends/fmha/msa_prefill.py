@@ -344,6 +344,13 @@ def run_msa_prefill_gqa(
             )
         if row_first != 0:
             raise ValueError("NVFP4 sparse prefill must cover the context prefix")
+        from tensorrt_llm._torch.kernel_builder import KernelBuilder
+
+        if KernelBuilder.get().rehearsing():
+            # A rehearsal runs none of it: the k2q CSR extension it loads builds on a
+            # KernelBuilder worker (msa_kernel_builds). The output holds zeros.
+            out_view.zero_()
+            return
         k_scale, v_scale = _aligned_nvfp4_dequant_scales(attn, kv_scale_quant_orig)
         run_msa_nvfp4_sparse_gqa(
             q_view,

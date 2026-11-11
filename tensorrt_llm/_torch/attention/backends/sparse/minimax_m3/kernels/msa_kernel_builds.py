@@ -13,8 +13,10 @@ dimensions sweep from that call's and no earlier run of its call signature swept
 the package's variant lookup recording the variant it is asked for instead of compiling
 it. Each variant found is submitted to ``KernelBuilder``, whose workers compile it in the
 directory and under the file lock the package's own lookup uses. The plan, split-KV
-reduction and sparse top-k modules need nothing from a call: ``reaches`` submits them, or
-else the first run in a build pass.
+reduction and sparse top-k modules, and the k2q CSR extension the sparse prefill loads,
+need nothing from a call: ``reaches`` submits them, or else the first run in a build pass.
+``reaches`` also queues FlashInfer's trtllm-gen FMHA module, on which M3's dense layers
+decode.
 
 In a rehearsal every run is such a replay: it compiles and launches nothing, and its
 outputs hold zeros and an empty maximum score.
@@ -64,6 +66,8 @@ _MODULES = (
     ("reduction", "fmha_sm100_reduction.so", "_do_compile_reduction"),
     ("sparse_topk", "sparse_topk_select.so", "_do_compile_sparse_topk"),
 )
+# The package module that compiles the sparse prefill's k2q CSR extension on import.
+_K2Q_CSR_MODULE = "src.sm100.build_k2q_csr"
 
 _replay = threading.local()  # .found: the variants a replay on this thread asked for
 _package: Optional["_Package"] = None  # set by install
@@ -128,6 +132,7 @@ class _Package:
             builder.submit(
                 _OP, name, functools.partial(self.build_module, name, library, compile_fn)
             )
+        builder.submit(_OP, _K2Q_CSR_MODULE, _import_k2q_csr)
 
     def run(self, q, k, v, plan_info, *args, **kwargs):
         builder = KernelBuilder.get()
@@ -291,9 +296,23 @@ class _Package:
         return self.reduction_fn()
 
 
+def _import_k2q_csr() -> bool:
+    """The k2q CSR extension compiles when its module is first imported; an import the
+    sparse prefill makes meanwhile waits on the module's import lock and then reuses it."""
+    import importlib
+
+    t0 = time.perf_counter()
+    importlib.import_module(_K2Q_CSR_MODULE)
+    # Loading a built extension takes milliseconds.
+    return time.perf_counter() - t0 >= 1.0
+
+
 def reaches(model_config: Any, model: Any = None) -> bool:
     """True when the model runs MiniMax-M3's MSA attention on fmha_sm100, whose modules
-    are then submitted."""
+    are then submitted, with the trtllm-gen FMHA module its dense layers decode on."""
+    from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
+        queue_trtllm_gen_fmha_module_build,
+    )
     from tensorrt_llm._utils import is_sm_100f
     from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
@@ -308,6 +327,7 @@ def reaches(model_config: Any, model: Any = None) -> bool:
     if _package is None:
         return False
     _package.submit_modules()
+    queue_trtllm_gen_fmha_module_build()
     return True
 
 

@@ -186,6 +186,56 @@ def test_the_rehearsal_runs_for_a_model_an_op_family_reaches(monkeypatch):
     assert not KernelBuilder(threads=1, enabled=False).wants_rehearsal("msa")
 
 
+def test_the_builds_a_configuration_determines_start_without_a_rehearsal(monkeypatch):
+    family = types.ModuleType("family")
+    builder = KernelBuilder(threads=1, enabled=True, rehearse=False)
+    built = []
+
+    def queue_builds(model_config, model):
+        builder.submit("module", model_config, _recorder(built, model_config))
+        return False
+
+    family.queue_builds = queue_builds
+    monkeypatch.setitem(sys.modules, "family", family)
+    monkeypatch.setattr(kernel_builder, "_FAMILIES", {"module": "family:queue_builds"})
+    assert not builder.wants_rehearsal("config", "model")
+    builder.join(timeout=30)
+    assert built == ["config"]
+    assert builder.state("module", "config") == "done"
+
+
+def test_a_flashinfer_module_builds_once_only_where_nothing_is_built(monkeypatch):
+    from tensorrt_llm._torch import flashinfer_utils
+
+    builder = KernelBuilder(threads=1, enabled=True)
+    monkeypatch.setattr(KernelBuilder, "_instance", builder)
+    monkeypatch.setattr(flashinfer_utils, "IS_FLASHINFER_AVAILABLE", True)
+    built = []
+
+    class Spec:
+        def __init__(self, name, is_aot=False, is_compiled=False):
+            self.name, self.is_aot, self.is_compiled = name, is_aot, is_compiled
+
+        def build(self, need_lock=False):
+            built.append((self.name, need_lock))
+
+    specs = {"cold": {}, "aot": {"is_aot": True}, "warm": {"is_compiled": True}}
+    for name, flags in specs.items():
+        assert flashinfer_utils.queue_flashinfer_module_build(
+            name, lambda name=name, flags=flags: Spec(name, **flags)
+        )
+    assert not flashinfer_utils.queue_flashinfer_module_build("cold", lambda: Spec("cold"))
+    builder.join(timeout=30)
+    # Under the lock FlashInfer's own build_and_load takes.
+    assert built == [("cold", True)]
+    stats = builder.stats("flashinfer")
+    assert (stats.built, stats.present) == (1, 2)
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    flashinfer_utils.queue_flashinfer_module_build("disabled", lambda: Spec("disabled"))
+    builder.join(timeout=30)
+    assert built == [("cold", True)]
+
+
 def test_join_can_wait_only_for_the_builds_that_use_the_gpu():
     builder = KernelBuilder(threads=2, enabled=True)
     release = threading.Event()

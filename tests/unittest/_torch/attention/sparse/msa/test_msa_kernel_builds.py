@@ -118,8 +118,32 @@ def test_a_rehearsal_run_lists_and_launches_nothing(fmha_sm100, no_compile, monk
         fmha_sm100.fmha_sm100(q, k, k, plan, kv_indices=kv_indices, out=out, output_maxscore=False)
     # The run listed its variants, compiled none, and left zeros where its output goes.
     modules = {name for name, _, _ in msa_kernel_builds._MODULES}
+    modules.add(msa_kernel_builds._K2Q_CSR_MODULE)
     assert len([key for key in submitted if key not in modules]) >= 2
     assert torch.equal(out, torch.zeros_like(out))
+
+
+def test_an_msa_model_queues_the_modules_its_calls_load(fmha_sm100, monkeypatch):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+    from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+
+    builder = kernel_builder.KernelBuilder.get()
+    submitted = []
+    monkeypatch.setattr(
+        builder, "submit", lambda op, key, build, uses_gpu=False: submitted.append(key) or True
+    )
+    monkeypatch.setattr(msa_kernel_builds._package, "modules_submitted", False)
+    config = SimpleNamespace(
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(implementation="msa")
+    )
+    assert msa_kernel_builds.reaches(config)
+    expected = {name for name, _, _ in msa_kernel_builds._MODULES}
+    expected.add(msa_kernel_builds._K2Q_CSR_MODULE)
+    if IS_FLASHINFER_AVAILABLE:
+        expected.add("trtllm_gen_fmha")
+    assert set(submitted) == expected
 
 
 def test_kernels_are_built_once_where_the_package_loads_them(fmha_sm100, monkeypatch, tmp_path):
