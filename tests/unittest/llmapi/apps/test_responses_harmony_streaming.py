@@ -45,6 +45,12 @@ _OUTPUTS = {
         "<|start|>assistant<|channel|>commentary to=functions.get_order <|constrain|>json"
         '<|message|>{"order_id": "#W2378156"}<|call|>'
     ),
+    # A preamble is not an output item of the response.
+    "preamble_then_answer": (
+        f"<|channel|>analysis<|message|>{_REASONING}<|end|>"
+        "<|start|>assistant<|channel|>commentary<|message|>Checking the order.<|end|>"
+        f"<|start|>assistant<|channel|>final<|message|>{_ANSWER}<|return|>"
+    ),
     # Cut off by max_tokens: the last item is never closed.
     "truncated_answer": (
         f"<|channel|>analysis<|message|>{_REASONING}<|end|>"
@@ -53,10 +59,11 @@ _OUTPUTS = {
 }
 
 
-def _stream(text, tokens_per_response, empty_responses=False):
+def _stream(text, tokens_per_response, empty_responses=False, finish_reason=None):
     """Stream one Harmony output; returns the event payloads of each response.
 
     With empty_responses, a response without new tokens follows every response.
+    With finish_reason, the terminal event follows as the last response.
     """
     adapter = get_harmony_adapter()
     tokens = adapter.encoding.encode(text, allowed_special="all")
@@ -82,6 +89,10 @@ def _stream(text, tokens_per_response, empty_responses=False):
             result._done = i == len(chunks) - 1
             frames = processor.process_single_output(result)
             responses.append([json.loads(frame.split("data: ", 1)[1]) for frame in frames])
+        if finish_reason is not None:
+            output.finish_reason = finish_reason
+            frame = processor.get_final_response_non_store(result)
+            responses.append([json.loads(frame.split("data: ", 1)[1])])
     finally:
         adapter.cleanup_stream_state(processor.stream_request_id)
     return responses
@@ -137,15 +148,32 @@ def test_a_response_sends_one_delta_per_content_part(harmony_vocab):
 @pytest.mark.parametrize("tokens_per_response", [1, 20])
 @pytest.mark.parametrize("output", sorted(_OUTPUTS))
 def test_item_events_carry_the_item_output_index(harmony_vocab, output, tokens_per_response):
-    """Every event of an item, from output_item.added to output_item.done, has the item's index."""
-    added = []
-    for events in _stream(_OUTPUTS[output], tokens_per_response):
+    """Every event of an item, from output_item.added to output_item.done, has the item's index.
+
+    That index is the item's position in the final response, and only an answer cut off by
+    the token limit stays open.
+    """
+    truncated = output == "truncated_answer"
+    responses = _stream(
+        _OUTPUTS[output], tokens_per_response, finish_reason="length" if truncated else "stop"
+    )
+    final_items = [item["type"] for item in responses.pop()[0]["response"]["output"]]
+    added, done = [], []
+    for events in responses:
         for event in events:
             if event["type"] == "response.output_item.added":
-                added.append(event["output_index"])
+                added.append((event["output_index"], event["item"]["type"]))
             elif "output_index" in event:
-                assert event["output_index"] == added[-1], event["type"]
-    assert added == sorted(set(added))
+                assert event["output_index"] == added[-1][0], event["type"]
+                if event["type"] == "response.output_item.done":
+                    done.append((event["output_index"], event["item"]["type"]))
+    # Tool calls are not streamed on this path.
+    assert added == [
+        (index, item_type)
+        for index, item_type in enumerate(final_items)
+        if item_type in ("reasoning", "message")
+    ]
+    assert done == (added[:-1] if truncated else added)
 
 
 @pytest.mark.parametrize("output", sorted(_OUTPUTS))

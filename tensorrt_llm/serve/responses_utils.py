@@ -3165,8 +3165,11 @@ def _generate_harmony_token_events(
                 yield streaming_events_helper.get_output_item_done_event(
                     text_item)
 
-        # The done events above carry the index of the item they close.
-        streaming_events_helper.output_index_increment()
+        # The done events above carry the index of the item they close. A
+        # preamble (commentary without a recipient) is not an output item.
+        if not (messages and messages[-1].channel == "commentary"
+                and messages[-1].recipient is None):
+            streaming_events_helper.output_index_increment()
         streaming_events_helper.is_output_item_added_sent = False
 
     if parser.last_content_delta:
