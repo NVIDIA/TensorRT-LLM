@@ -7125,7 +7125,8 @@ DS_QSF_BYTES = 10 * 512
 DS_KSF_BYTES = 10 * 2 * 512
 # V ring: tile t of a pair occupies V / VSF bank t % DS_V_BANKS.  With four banks the loader issues the TMA load of
 # tile t when PV(t - 4) has completed, a full round before PV(t) needs it: V is never what a PV waits for and needs no
-# L2 prefetch (with two banks the load could start only one PV earlier, and its latency sat on the round).
+# per-tile L2 prefetch (with two banks the load could start only one PV earlier, and its latency sat on the round).
+# Only the kernel-start warm of tiles 0 and 1 (issued while Q is in flight) remains.
 DS_V_BANKS = 4
 DS_V_BANK_BYTES = 2 * 128 * 128 // 2
 DS_VSF_BANK_BYTES = 2 * 4 * 512
@@ -7140,43 +7141,56 @@ DS_PAYLOAD_BYTES = DS_P_BYTES + DS_PSF_BYTES + DS_META_BYTES
 PB_OWN = 1
 PB_LAND = 0
 
-# Shared-memory layout of one CTA: the arrays in the order fp4_mla_4x_full_ctm declares them.  Every offset is a
-# multiple of 1024 (the s128b swizzle of the operand arrays is taken on the address).
+# Shared-memory layout of one CTA: the arrays in the order ordered_v30_six_yield_kernel declares them (the control
+# words by hand, the data arrays from this table through _ds_smem_arrays).  Every offset is a multiple of 1024 (the
+# s128b swizzle of the operand arrays is taken on the address).
 #
 # GR100 serves shared memory from two sub-banks split at DS_SMEM_SUBBANK_BYTES.  A tensor-core operand fetch takes
 # the read port of a whole sub-bank and wins over the copy engine's source read and over warp loads; an arriving
 # copy or TMA load wins the write port over warp stores.  The arrays are therefore placed by who touches them:
 #   below the border  the scale factors, V and the landing P bank (the peer PV's operands; where the P copy lands)
-#   above the border  the own P bank (softmax stores, P copy source, own PV operand), then K and Q
+#   above the border  the own P bank (softmax stores, P copy source, own PV operand), the alternate [PSF | META]
+#                     image (softmax stores, [PSF | META] copy source), then K and Q
 # with the border exactly between the two P banks.  The control words (tmem handle, release cookie, mbarriers,
 # address relay) come first, padded to DS_SMEM_CONTROL_BYTES.  The total is above what a block gets by default: the
 # device must offer the oversized shared-memory mode (fp4_mla_cutedsl_4x_host.device_unsupported_reason).
 DS_SMEM_SUBBANK_BYTES = 128 * 1024
 DS_SMEM_CONTROL_BYTES = 4096
-DS_SMEM_LAYOUT = (
-    ("control", DS_SMEM_CONTROL_BYTES),
-    ("sQSF", DS_QSF_BYTES),
-    ("sV", DS_V_BYTES),
-    ("sVSF", DS_VSF_BYTES),
-    ("sKSFBanks", 2 * DS_KSF_BYTES),
-    ("sPayloadBanks", 2 * DS_PAYLOAD_BYTES),
-    ("sPsfMetaAlt", DS_PSF_BYTES + DS_META_BYTES),
-    ("sKBanks", 2 * DS_K_BYTES),
-    ("sQ", DS_Q_BYTES),
+DS_SMEM_LAYOUT = (  # (array, element type, bytes)
+    ("control", None, DS_SMEM_CONTROL_BYTES),
+    ("sQSF", ctm.Uint8, DS_QSF_BYTES),
+    ("sV", ctm.Int32, DS_V_BYTES),
+    ("sVSF", ctm.Uint8, DS_VSF_BYTES),
+    ("sKSFBanks", ctm.Uint8, 2 * DS_KSF_BYTES),
+    ("sPayloadBanks", ctm.Int32, 2 * DS_PAYLOAD_BYTES),
+    # cp_dual_alt: second [PSF|META] source image; own tiles alternate between the in-bank region of the own P bank
+    # (even own index) and this buffer (odd), so the ALU stores of own tile i+1 can never race warp 9's [PSF|META]
+    # copy of own tile i, which may still be pending then (see _r93_pack).
+    ("sPsfMetaAlt", ctm.Int32, DS_PSF_BYTES + DS_META_BYTES),
+    ("sKBanks", ctm.Int32, 2 * DS_K_BYTES),
+    ("sQ", ctm.Int32, DS_Q_BYTES),
 )
-DS_SMEM_BYTES = sum(size for _, size in DS_SMEM_LAYOUT)
+DS_SMEM_BYTES = sum(size for _, _, size in DS_SMEM_LAYOUT)
 
 
 def _ds_smem_offset(name):
     offset = 0
-    for array, size in DS_SMEM_LAYOUT:
+    for array, _, size in DS_SMEM_LAYOUT:
         if array == name:
             return offset
         offset += size
     raise KeyError(name)
 
 
-assert all(size % 1024 == 0 for _, size in DS_SMEM_LAYOUT)
+def _ds_smem_arrays():
+    """Declare the data arrays of DS_SMEM_LAYOUT in table order; call once, right behind the control block."""
+    return {
+        name: ctm.Array(dtype, size // dtype.bytes, space=ctm.AddressSpace.smem, alignment=128)
+        for name, dtype, size in DS_SMEM_LAYOUT[1:]
+    }
+
+
+assert all(size % 1024 == 0 for _, _, size in DS_SMEM_LAYOUT)
 assert (PB_LAND, PB_OWN) == (0, 1)
 assert _ds_smem_offset("sPayloadBanks") + DS_PAYLOAD_BYTES == DS_SMEM_SUBBANK_BYTES
 
@@ -7190,6 +7204,9 @@ DS_BAR_META_FREE = 26  # the [PSF | META] landing bank may be overwritten
 DS_BAR_V_LANDED = 17  # + V bank: the bank's TMA loads have landed
 DS_BAR_V_FREE = 31  # + V bank: the PV packet that read the bank has completed
 # (comments write bars[META_LANDED] / bars[META_FREE] for the two metadata barriers)
+assert DS_V_BANKS & (DS_V_BANKS - 1) == 0  # V bank of a tile = tile & (DS_V_BANKS - 1)
+assert DS_BAR_V_LANDED + DS_V_BANKS <= 21  # bars[21 + bank] is the next literal index in use
+assert DS_BAR_V_FREE + DS_V_BANKS == DS_NUM_BARS  # the V-free barriers are the last of bars
 DS_Q_TMEM = 256
 DS_QSF_TMEM = 528
 DS_KSF_TMEM = 544
@@ -7212,14 +7229,22 @@ assert DS_PSF_TMEM + 8 <= NUM_TMEM_ALLOC_COLS
 # registers through the issuer's QK/PV packet blocks. They are computed once per CTA
 # at kernel start (_ur_relay_init) into the 32-byte sUrRelay table and re-read
 # with one LDS at each use. Word 7 is padding.
-UR_RELAY_P_DST = 0  # mapa(sPayloadBanks[pair_id], rank ^ 2): P bulk-copy destination
+UR_RELAY_P_DST = (
+    0  # mapa(sPayloadBanks[PB_LAND], rank ^ 2): P bulk-copy destination (the peer's landing bank)
+)
 UR_RELAY_P_BAR = 1  # mapa(&bars[8], rank ^ 2): its complete_tx mbarrier
-UR_RELAY_META_DST = 2  # mapa(sMeta[pair_id], rank ^ 2): [PSF|META] bulk-copy destination
+UR_RELAY_META_DST = (
+    2  # mapa([PSF|META] of sPayloadBanks[PB_LAND], rank ^ 2): [PSF|META] bulk-copy destination
+)
 UR_RELAY_META_BAR = 3  # mapa(&bars[DS_BAR_META_LANDED], rank ^ 2): its complete_tx mbarrier
 UR_RELAY_PAIR_BAR = 4  # mapa(&bars[1], rank ^ 1): issuer pair rendezvous
 UR_RELAY_P_CREDIT_BAR = 5  # mapa(&bars[6], rank ^ 2): issuer peer-P credit release
 UR_RELAY_LANDED_BAR = 6  # mapa(&bars[7], rank ^ 2): landing-bank release (warp 8 start, warp 9)
 UR_RELAY_WORDS = 8
+# Control block of DS_SMEM_LAYOUT: tmem + sReleaseCookie (4 B each), bars (8 B each) and sUrRelay (aligned 16, so up
+# to 8 B of padding in front) must end inside the first 1024 B; sControlPad (alignment 1024) then ends the block at
+# DS_SMEM_CONTROL_BYTES.
+assert 8 + 8 * DS_NUM_BARS + 8 + 4 * UR_RELAY_WORDS <= 1024 < DS_SMEM_CONTROL_BYTES
 # The base's cp.async.bulk (prims.cp_async_bulk_shared_cluster_shared_cta) for the two
 # copy sizes; the size is a register operand, as in the base PTX.
 _UR_BULK_COPY_PTX = {
@@ -7250,7 +7275,8 @@ def _ur_mapa_u32(view, target_rank: ctm.Int32) -> ctm.Int32:
 def _ur_relay_init(relay, bars, sPayloadBanks, rank: ctm.Int32):
     # ur_relief: once per CTA, at kernel start (warp 8, elected lane). rank,
     # pair_id = rank >> 1 and the SMEM layout are CTA constants, so every word equals
-    # the base's hoisted mapa result. Same views as the use sites.
+    # the base's hoisted mapa result. Same mbarrier views as the use sites; the two copy destinations are the
+    # peer's landing bank (below), not the own-bank views the use sites copy from.
     peer = rank ^ ctm.Int32(2)
     # The copy lands in the receiver's landing bank.
     sPayload = sPayloadBanks.subview(ctm.Int32(PB_LAND) * ctm.Int32(DS_PAYLOAD_BYTES // 4))
@@ -7591,8 +7617,9 @@ def _s34_q_rows_to_tmem(sQ, sQSF, base: ctm.Int32, wq: ctm.Int32, lane: ctm.Int3
     # epoch_s34: the per-warp body of _ds_q_to_tmem for TMEM row block wq (0..3):
     # ten QSF STTM columns [DS_QSF_TMEM, +10) and the Q tail permutation of rows
     # wq*32 .. wq*32+31. Called with wq = warp by warps 0-3 at kernel start (FULL-only:
-    # the drain-time call by warps 8-11 is gone). Same words, same TMEM addresses, same
-    # SMEM bytes. sQSF may be any SMEM view holding the 5,120 B raw QSF image.
+    # the drain-time call by warps 8-11 is gone). The eight core QSF columns are the raw
+    # image; the two tail QSF columns and the Q tail rows are written in the tail_k128
+    # order [Qr | Qm] (below). sQSF may be any SMEM view holding the 5,120 B raw QSF image.
     row = wq * ctm.Int32(32) + lane
     # Raw TRT QSF encodes four groups of 32 rows per 512B atom.
     for ck in ctm.range_constexpr(8):
@@ -7624,7 +7651,7 @@ def _s34_q_rows_to_tmem(sQ, sQSF, base: ctm.Int32, wq: ctm.Int32, lane: ctm.Int3
             _ds_tmem_ptr(base, wq * ctm.Int32(32), ctm.Int32(DS_QSF_TMEM + 8 + ck)),
             word,
         )
-    # The same raw tail permutation as the frozen baseline, now 128 rows.
+    # Q tail rows of this warp, permuted in place in SMEM.
     tail = sQ.subview(128 * 512 // 2 // 4)
     swizzle = ctm.Swizzle.from_name("s64b")
     ptr = tail.data_ptr() + row * ctm.Int32(16)
@@ -7668,7 +7695,7 @@ def _ds_q_to_tmem(
     prims.barrier(barrier_id=0, number_of_threads=cta_threads)
     _fence_async_shared_cta()
     _ds_pair_sync(pairbar, rank, ctm.Int32(0), warp, relay, issue_warp, cta_threads)
-    # C92: retain Q in SMEM after the unchanged tail permutation.
+    # C92: Q stays in SMEM after the tail permutation (tail_k128 order [Qr | Qm]).
     # QSF STTM completion plus the pair rendezvous above publishes Q/QSF.
 
 
@@ -8099,11 +8126,16 @@ def _r93_prep_pv(
     if cutlass.const_expr(not is_local):
         _ds_wait(bars.subview(DS_BAR_META_LANDED), phase)
         _fence_async_shared_cta()
-        # The landed bank's re-arm (bars[META_LANDED] expect_tx) and release (remote bars[META_FREE]
-        # arrive) now follow the issuer's copy: warp 9 performs both when
-        # PV(tile) completes (_r95_complete_pv). The TMEM PSF bank is written
-        # by the issuer after its own V-landed wait, which transitively implies
-        # PV(tile-2) done, so the former bar11(tile-2) wait is not needed here.
+        # The landed [PSF|META] bank is re-armed (bars[META_LANDED] expect_tx) and released to its producer (remote
+        # bars[META_FREE]) by the issuer in _r93_issue_pv: the re-arm after its own bars[META_LANDED] wait, the
+        # release by a tcgen05.commit queued behind its PSF tcgen05.cp (_r95_complete_pv is empty).  The TMEM PSF
+        # bank of a peer tile is written by that issuer tcgen05.cp, not by the ALU warps, so no wait for the bank's
+        # last reader PV(local_tile-2) (bars[11+bank], previous phase) is needed here.  The copy is ordered behind
+        # PV(local_tile-2) twice: the issuer first waits bars[8], and P(local_tile) lands only after the producer
+        # got the bar7 credit that PV(local_tile-2) commits behind its MMAs; and the copy is submitted by the
+        # thread that submitted those MMAs (one thread's tcgen05 operations execute in order).  The issuer's
+        # V-landed wait is NOT such a guarantee: with DS_V_BANKS V banks it implies only
+        # PV(local_tile - DS_V_BANKS) done.
     if tile > ctm.Int32(0):
         if cute.arch.vote_any_sync(oldscale != ctm.Float32(1.0)):
             if local_tile > ctm.Int32(0):
@@ -8274,7 +8306,6 @@ def _r93_issue_pv(
     rank: ctm.Int32,
     pair_phase: ctm.Int32,
     is_local: ctm.Constexpr,
-    sPsfMetaAlt,
     relay,
 ):
     bank = pair_id if cutlass.const_expr(is_local) else (pair_id ^ ctm.Int32(1))
@@ -8302,7 +8333,7 @@ def _r93_issue_pv(
     if cutlass.const_expr(not is_local):
         credit_remote = relay[UR_RELAY_P_CREDIT_BAR]
         # Note: this credit protects only P. The landed metadata bank has its
-        # own credit (warp 9 releases it at PV done, _r95_complete_pv).
+        # own credit (the issuer releases it by the commit behind its PSF copy, below).
         _ds_wait(bars.subview(8), phase)
         if prims.elect_sync():
             _ur_arrive_remote(credit_remote)
@@ -8338,31 +8369,24 @@ def _r93_issue_pv(
     _ds_wait(bars.subview(1), pair_phase)
     prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
     if (rank & ctm.Int32(1)) == ctm.Int32(0):
-        # One selected thread submits the PSF copy, both PV K terms, adjacent
+        # One selected thread submits the peer tile's PSF copy, both PV K terms, adjacent
         # rowsums, and commit.
         if prims.elect_sync():
-            # cp_dual: one tcgen05.cp.cta_group::2.128x128b moves this tile's
-            # 128-row x 16 B PSF image (row-major; word c = E4M3x4 scales of
-            # K64 chunk c, exactly as _r93_pack stores it and as the DSMEM copy
-            # lands it) from each CTA's own payload bank into the TMEM SFA bank
-            # [DS_PSF_TMEM + bank*4, +4): lane = row, column = chunk. This is
-            # byte-for-byte the image the eight ALU warps used to tcgen05.st.
-            # LBO 16 / SBO 128 / no swizzle is the descriptor of every SF copy
-            # in this kernel. Issued first in the packet: the VSF copies queue
-            # behind it (one UTCCP at a time) and the kb=0 MMA's SFA operand
-            # exact-matches its destination. Its completion is covered by this
-            # packet's commit (bar11 + bank), like the VSF copies.
-            psf_shape, psf_multicast = prims.S2TCopyMode.S2T_128x128b
-            psf_tmem = _ds_tmem_ptr(
-                base, ctm.Int32(0), ctm.Int32(DS_PSF_TMEM) + bank * ctm.Int32(4)
-            )
-            if cutlass.const_expr(is_local):
-                # C_issuer_streamlining v7: own tile: no PSF tcgen05.cp; the ALU warps
-                # tcgen05.st'd the identical image before arriving on bars[9+bank]
-                # (_r93_prep_pv), so the VSF copies and the kb=0 MMA start right away.
-                pass
-            else:
-                # Peer tile: the landed image in this CTA's landing bank.
+            if cutlass.const_expr(not is_local):
+                # cp_dual: peer tile: one tcgen05.cp.cta_group::2.128x128b moves the landed 128-row x 16 B PSF
+                # image (row-major; word c = E4M3x4 scales of K64 chunk c, exactly as the producer's _r93_pack
+                # stored it and the DSMEM copy landed it) from each CTA's landing bank into the TMEM SFA bank
+                # [DS_PSF_TMEM + bank*4, +4): lane = row, column = chunk.  LBO 16 / SBO 128 / no swizzle is the
+                # descriptor of every SF copy in this kernel.  Issued first in the packet: the VSF copies queue
+                # behind it (one UTCCP at a time) and the kb=0 MMA's SFA operand exact-matches its destination.
+                # Its completion is covered by this packet's commit (bar11 + bank), like the VSF copies.
+                # C_issuer_streamlining v7: an own tile has no PSF tcgen05.cp: the ALU warps tcgen05.st'd the
+                # same image before arriving on bars[9+bank] (_r93_prep_pv), so its VSF copies and kb=0 MMA
+                # start right away.
+                psf_shape, psf_multicast = prims.S2TCopyMode.S2T_128x128b
+                psf_tmem = _ds_tmem_ptr(
+                    base, ctm.Int32(0), ctm.Int32(DS_PSF_TMEM) + bank * ctm.Int32(4)
+                )
                 prims.tcgen05_cp(
                     psf_shape,
                     psf_tmem,
@@ -8435,7 +8459,9 @@ def _r93_issue_pv(
                 multicast_mask=ctm.Int16(3) << ctm.Int16(pair_id * ctm.Int32(2)),
                 group=prims.CTAGroup.CTA_2,
             )
-            # The V bank this packet read is free for tile local_tile + DS_V_BANKS (waited in _vh2_issue).
+            # The V bank this packet read is free for tile local_tile + DS_V_BANKS (waited in _vh2_issue).  The last
+            # DS_V_BANKS tiles of a task have no such waiter; the commit is not guarded, to keep a compare and a
+            # branch out of the packet (see the kernel-end note on unwaited releases).
             prims.tcgen05_commit(
                 bars.subview(ctm.Int32(DS_BAR_V_FREE) + vbank),
                 multicast_mask=ctm.Int16(3) << ctm.Int16(pair_id * ctm.Int32(2)),
@@ -8605,18 +8631,13 @@ def _r93_pack(
     sf_bias = _ds_sf_bias_fma_rn(newanchor, scale)
     # Note: previous remote metadata readers imply source-copy completion
     # and destination SMEM release. Local preparation uses the RF values.
-    # cp_dual_v4: no landing-free wait here. The source image is double-buffered
-    # (below); the buffer written now was last read by warp 0's copy of
-    # generation own_index-2 (complete before the peer released bars[META_FREE] for it,
-    # which warp 0 waited before its generation own_index-1 copy, i.e. before
-    # releasing S(own_index-1) and hence before QK(own_index) could be issued)
-    # and by the issuer's local PSF copy of own_index-2 (complete before
-    # QK(own_index) completes, same in-order tcgen05 pipeline).
-    # cp_dual_alt: this own tile's [PSF|META] source image alternates by own-index
-    # parity between the in-bank region and sPsfMetaAlt. The issuer's copy of own
-    # tile own_index-1 (other parity) completes before QK(own_index+1) completes
-    # (same issuing thread, in-order tcgen05 pipeline), i.e. before the next
-    # store into that buffer.
+    # cp_dual_v4: no landing-free wait here.  cp_dual_alt: this own tile's [PSF|META] source image alternates by
+    # own-index parity between the in-bank region and sPsfMetaAlt.  Its only reader is warp 9's [PSF|META] copy to
+    # the other pair (the issuer no longer copies an own tile's PSF: the ALU warps store it into TMEM themselves,
+    # _r93_prep_pv).  The copy of own_index-1 may still be pending when these stores run, hence the other buffer.
+    # The copy of own_index-2, the last reader of the buffer written now, has landed: the peer's ALU warps waited
+    # bars[META_LANDED] for it (_r93_prep_pv, peer tile) in the round before the one whose blockmax
+    # _r93_replay_peer consumed above.
     psf_base = ctm.Int64(sPayload.data_ptr().toint()) + ctm.Int64(DS_P_BYTES)
     if (own_index & ctm.Int32(1)) != ctm.Int32(0):
         psf_base = ctm.Int64(sPsfMetaAlt.data_ptr().toint())
@@ -8976,9 +8997,6 @@ def ordered_v30_six_yield_kernel(
     lane = tid & ctm.Int32(31)
     pair_rank = rank & ctm.Int32(1)
     # Shared memory, in the order of DS_SMEM_LAYOUT (the placement rules are documented there).
-    # cp_dual_alt: second [PSF|META] source image; own tiles alternate between the
-    # in-bank region (even own index) and this buffer (odd), so the issuer's async
-    # PSF copy of own tile i can never race the stores of own tile i+1.
     tmem = ctm.Array(ctm.Int32, 1, space=ctm.AddressSpace.smem)
     sReleaseCookie = ctm.Array(ctm.Int32, 1, space=ctm.AddressSpace.smem)
     bars = ctm.Array(ctm.Int64, DS_NUM_BARS, space=ctm.AddressSpace.smem, alignment=8)
@@ -8986,22 +9004,15 @@ def ordered_v30_six_yield_kernel(
     # at kernel start by warp 8's elected lane, read-only afterwards; no TMA, bulk copy, st.async or
     # alias view covers it.
     sUrRelay = ctm.Array(ctm.Int32, UR_RELAY_WORDS, space=ctm.AddressSpace.smem, alignment=16)
-    # The control words above end inside the first 1024 B; the pad completes DS_SMEM_CONTROL_BYTES.
+    # The control words above end inside the first 1024 B (asserted beside UR_RELAY_WORDS); the pad completes
+    # DS_SMEM_CONTROL_BYTES.
     sControlPad = ctm.Array(  # noqa: F841
         ctm.Uint8, DS_SMEM_CONTROL_BYTES - 1024, space=ctm.AddressSpace.smem, alignment=1024
     )
-    sQSF = ctm.Array(ctm.Uint8, DS_QSF_BYTES, space=ctm.AddressSpace.smem, alignment=128)
-    sV = ctm.Array(ctm.Int32, DS_V_BYTES // 4, space=ctm.AddressSpace.smem, alignment=128)
-    sVSF = ctm.Array(ctm.Uint8, DS_VSF_BYTES, space=ctm.AddressSpace.smem, alignment=128)
-    sKSFBanks = ctm.Array(ctm.Uint8, 2 * DS_KSF_BYTES, space=ctm.AddressSpace.smem, alignment=128)
-    sPayloadBanks = ctm.Array(
-        ctm.Int32, 2 * DS_PAYLOAD_BYTES // 4, space=ctm.AddressSpace.smem, alignment=128
-    )
-    sPsfMetaAlt = ctm.Array(
-        ctm.Int32, (DS_PSF_BYTES + DS_META_BYTES) // 4, space=ctm.AddressSpace.smem, alignment=128
-    )
-    sKBanks = ctm.Array(ctm.Int32, 2 * DS_K_BYTES // 4, space=ctm.AddressSpace.smem, alignment=128)
-    sQ = ctm.Array(ctm.Int32, DS_Q_BYTES // 4, space=ctm.AddressSpace.smem, alignment=128)
+    smem = _ds_smem_arrays()
+    sQSF, sV, sVSF, sKSFBanks = smem["sQSF"], smem["sV"], smem["sVSF"], smem["sKSFBanks"]
+    sPayloadBanks, sPsfMetaAlt = smem["sPayloadBanks"], smem["sPsfMetaAlt"]
+    sKBanks, sQ = smem["sKBanks"], smem["sQ"]
     # FULL-only: one task per cluster; identity bound once at kernel start (its valid_k / page-indptr
     # loads issue first, ahead of the barrier init).
     (
@@ -9390,8 +9401,10 @@ def ordered_v30_six_yield_kernel(
                                 )
     if warp == ctm.Int32(11):
         # Tiles are walked in pairs over a rolling window of resolved pages (vhoist2), so no page-table load
-        # sits between a V bank's release and its TMA issue.  There is no L2 prefetch: the four-bank ring
-        # issues the load itself a round ahead.
+        # sits between a V bank's release and its TMA issue.  There is no per-tile L2 prefetch: the four-bank ring
+        # issues the load itself a round ahead (only the kernel-start warm of tiles 0 and 1 above remains).
+        # Window: a/b = this tile pair, c/d = the next one (resolved before the loop for tiles 2/3, which issue
+        # without a wait right after tiles 0/1), e/f = the pair after that, looked up in this iteration.
         vh_a0 = _lookup_physical_page(
             mPageTable_pl, begin_tile * ctm.Int32(2), sequence, page_begin, page_count
         )
@@ -9503,8 +9516,9 @@ def ordered_v30_six_yield_kernel(
                 sPayload = sPayloadBanks.subview(
                     ctm.Int32(PB_OWN) * ctm.Int32(DS_PAYLOAD_BYTES // 4)
                 )
-                # ur_relief: relayed [PSF|META] copy destination / mbarrier
-                # (mapa rank ^ 2 of sMeta and &bars[DS_BAR_META_LANDED]), read before the waits.
+                # ur_relief: relayed [PSF|META] copy destination / mbarrier (mapa rank ^ 2 of the [PSF|META]
+                # region of the landing bank sPayloadBanks[PB_LAND] and of &bars[DS_BAR_META_LANDED]), read
+                # before the waits.
                 meta_dst = sUrRelay[UR_RELAY_META_DST]
                 meta_bar = sUrRelay[UR_RELAY_META_BAR]
                 # cp_dual_v5: [PSF|META] copy (was ALU warp 0): all eight writers
@@ -9527,8 +9541,8 @@ def ordered_v30_six_yield_kernel(
                         _ur_bulk_copy_to_peer(
                             meta_dst, sPsfMetaAlt, meta_bar, DS_PSF_BYTES + DS_META_BYTES
                         )
-                # ur_relief: relayed P copy destination / mbarrier (mapa rank ^ 2
-                # of sPayload and &bars[8]), read before the waits.
+                # ur_relief: relayed P copy destination / mbarrier (mapa rank ^ 2 of the landing bank
+                # sPayloadBanks[PB_LAND] and of &bars[8]), read before the waits.
                 p_dst = sUrRelay[UR_RELAY_P_DST]
                 p_bar = sUrRelay[UR_RELAY_P_BAR]
                 _ds_wait(bars.subview(5), own_index & ctm.Int32(1))
@@ -9545,8 +9559,8 @@ def ordered_v30_six_yield_kernel(
                 bars.subview(ctm.Int32(11) + pair_id), (own_count - ctm.Int32(1)) & ctm.Int32(1)
             )  # x9
             _ds_wait(bars.subview(6), (own_count - ctm.Int32(1)) & ctm.Int32(1))
-            # Drain the final landed-bank release (partner warp 9 at
-            # PV done, cp_dual) before epoch invalidation.
+            # Drain the final landed-bank release (the peer issuer's commit behind its
+            # PSF copy, cp_dual) before epoch invalidation.
             _ds_wait(bars.subview(DS_BAR_META_FREE), (own_count - ctm.Int32(1)) & ctm.Int32(1))
     if warp == ctm.Int32(8):
         pair_phase = ctm.Int32(1)
@@ -9685,7 +9699,6 @@ def ordered_v30_six_yield_kernel(
                         rank,
                         pair_phase,
                         False,
-                        sPsfMetaAlt,
                         sUrRelay,
                     )
                 if previous_owned < chunk_tiles:
@@ -9703,7 +9716,6 @@ def ordered_v30_six_yield_kernel(
                         rank,
                         pair_phase,
                         True,
-                        sPsfMetaAlt,
                         sUrRelay,
                     )
         if pair_rank == ctm.Int32(0) and own_count > ctm.Int32(0):
@@ -9943,10 +9955,14 @@ def ordered_v30_six_yield_kernel(
     # fence_a: no all-thread fence.acq_rel.gpu at the boundary: a FULL task publishes nothing to
     # another CTA or kernel before the kernel boundary; intra-CTA handoffs are ordered by the bar.sync.
     prims.barrier_cta_sync(0, thread_count=384)
-    # fence_b: barrier.cluster.arrive.relaxed. Nothing written before this arrive is read by a peer
-    # after its wait: every remote arrive or complete_tx on this CTA's mbarriers was consumed by one
-    # of its own waits before the bar.sync above, every DSMEM payload (sDenom st.async included) was
-    # consumed in-loop, and TMEM hazards are bracketed by tcgen05.fence::before/after_thread_sync.
+    # fence_b: barrier.cluster.arrive.relaxed. Nothing written before this arrive is read by a peer after its wait:
+    # every remote arrive or complete_tx on this CTA's mbarriers was consumed by one of its own waits before the
+    # bar.sync above, or is a tcgen05.commit release that has no waiter at the end of a task: the K-stage releases
+    # (bars[27..30]) of the last two own tiles and the V-free releases (bars[DS_BAR_V_FREE + vbank]) of the last
+    # DS_V_BANKS tiles.  Those are issued by the pair leader's issuer ahead of (K stage) or right behind (V free) a
+    # commit of the same packet that this CTA does wait (bars[15 + bank] / bars[11 + bank]), so they land with it,
+    # the whole epilogue before the bar.sync.  Every DSMEM payload (sDenom st.async included) was consumed in-loop,
+    # and TMEM hazards are bracketed by tcgen05.fence::before/after_thread_sync.
     # The barrier keeps every CTA resident until its peers' DSMEM traffic into it has completed;
     # barrier.cluster.wait keeps .acquire.
     cute.arch.cluster_arrive_relaxed()
