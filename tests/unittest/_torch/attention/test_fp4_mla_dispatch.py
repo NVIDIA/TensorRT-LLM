@@ -1,14 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Host-side tests of the FP4 MLA decode path selection (no GPU, no torch)."""
+"""Host-side tests of the FP4 MLA decode path selection (no GPU)."""
+
+import sys
+import types
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch as dp
 
 SM = 212
 ROWS_Q4, ROWS_Q2 = 512, 256
+CUDA0 = torch.device("cuda", 0)  # constructing it needs no GPU
+OPT_IN_SMEM = 232448  # the 227 KiB a block may opt into without the oversized mode
 
 
 def _choose(num_requests, query_len, kv_capacity, *, live=None, unavailable=None, **kw):
@@ -46,11 +53,9 @@ def _clean_env(monkeypatch):
 def test_unavailable_4x_is_2x(monkeypatch):
     s = _choose(128, 4, 30080, unavailable="no 4x kernel on this device")
     assert s.path == dp.PATH_2X and s.reason == "no 4x kernel on this device"
-    # a forced path cannot bring the kernel back, and the shape keeps the single regime of its capacity
+    # a forced path cannot bring the kernel back
     monkeypatch.setenv(dp.DECODE_PATH_ENV, "4x")
     assert _choose(128, 4, 30080, unavailable="no 4x kernel on this device").path == dp.PATH_2X
-    monkeypatch.delenv(dp.DECODE_PATH_ENV)
-    assert _regimes(128, 4, 30080, unavailable="no 4x kernel on this device") == (30080,)
 
 
 def test_device_unsupported_reason(monkeypatch):
@@ -58,13 +63,93 @@ def test_device_unsupported_reason(monkeypatch):
     monkeypatch.setattr(
         host_4x, "max_shared_memory_per_block", lambda device: host_4x.SMEM_BYTES_PER_CTA
     )
-    assert host_4x.device_unsupported_reason(None) is None
+    assert host_4x.device_unsupported_reason(CUDA0) is None
+    host_4x._require_device(CUDA0)
     monkeypatch.setattr(
         host_4x, "max_shared_memory_per_block", lambda device: host_4x.SMEM_BYTES_PER_CTA - 1
     )
-    reason = host_4x.device_unsupported_reason(None)
+    reason = host_4x.device_unsupported_reason(CUDA0)
     assert reason is not None and str(host_4x.SMEM_BYTES_PER_CTA) in reason
     assert _choose(128, 4, 30080, unavailable=reason).reason == reason
+    # the host's own entry points refuse that device with the same reason, and whatever is not a CUDA device
+    with pytest.raises(host_4x.EnvelopeError, match=str(host_4x.SMEM_BYTES_PER_CTA)):
+        host_4x._require_device(CUDA0)
+    assert "CUDA" in host_4x.device_unsupported_reason(torch.device("cpu"))
+    with pytest.raises(host_4x.EnvelopeError, match="CUDA"):
+        host_4x._require_device(torch.device("cpu"))
+
+
+def _fake_cuda_driver(monkeypatch, *, known=True, get_err=0, attr_err=0, value=0):
+    """Install a stand-in ``cuda.bindings.driver`` whose device reports ``value`` as its oversized limit."""
+    driver = types.ModuleType("cuda.bindings.driver")
+    driver.CUresult = SimpleNamespace(CUDA_SUCCESS=0)
+    driver.CUdevice_attribute = SimpleNamespace(
+        **({host_4x._OVERSIZED_SMEM_ATTRIBUTE: 150} if known else {})
+    )
+    driver.cuDeviceGet = lambda index: (get_err, index)
+    driver.cuDeviceGetAttribute = lambda attribute, device: (attr_err, value)
+    bindings = types.ModuleType("cuda.bindings")
+    bindings.driver = driver
+    package = types.ModuleType("cuda")
+    package.bindings = bindings
+    for name, module in (
+        ("cuda", package),
+        ("cuda.bindings", bindings),
+        ("cuda.bindings.driver", driver),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+@pytest.mark.parametrize(
+    "driver, limit",
+    [
+        ({"value": 334848}, 334848),  # the oversized limit wins over the opt-in limit
+        ({"value": 0}, OPT_IN_SMEM),  # a driver without the mode reports 0
+        ({"known": False}, OPT_IN_SMEM),  # bindings that do not know the attribute
+        ({"get_err": 1}, OPT_IN_SMEM),  # the device handle cannot be taken
+        ({"attr_err": 1}, OPT_IN_SMEM),  # the driver refuses the attribute
+    ],
+)
+def test_max_shared_memory_per_block(monkeypatch, driver, limit):
+    _fake_cuda_driver(monkeypatch, **driver)
+    queried = []
+
+    def properties(index):
+        queried.append(index)
+        return SimpleNamespace(shared_memory_per_block_optin=OPT_IN_SMEM)
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    monkeypatch.setattr(host_4x, "_SMEM_PER_BLOCK_CACHE", {})
+    device = torch.device("cuda", 3)  # an explicit index: the current device is never asked
+    assert host_4x.max_shared_memory_per_block(device) == limit
+    assert host_4x.max_shared_memory_per_block(device) == limit
+    assert queried == [3]  # one device query per index, then the cache
+    unsupported = host_4x.device_unsupported_reason(device) is not None
+    assert unsupported == (limit < host_4x.SMEM_BYTES_PER_CTA)
+    with pytest.raises(ValueError, match="CUDA"):
+        host_4x.max_shared_memory_per_block(torch.device("cpu"))
+
+
+def test_max_shared_memory_per_block_of_an_unindexed_device(monkeypatch):
+    # torch.device("cuda") names no index: the limit is the current device's, cached under that index
+    _fake_cuda_driver(monkeypatch, value=334848)
+    queried = []
+
+    def properties(index):
+        queried.append(index)
+        return SimpleNamespace(shared_memory_per_block_optin=OPT_IN_SMEM)
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(host_4x, "_SMEM_PER_BLOCK_CACHE", {})
+    assert host_4x.max_shared_memory_per_block(torch.device("cuda")) == 334848
+    assert host_4x.device_unsupported_reason(torch.device("cuda")) is None
+    assert queried == [2] and host_4x._SMEM_PER_BLOCK_CACHE == {2: 334848}
+    # the same device named by its index is served from that entry; another index is asked on its own
+    assert host_4x.max_shared_memory_per_block(torch.device("cuda", 2)) == 334848
+    assert queried == [2]
+    assert host_4x.max_shared_memory_per_block(torch.device("cuda", 0)) == 334848
+    assert queried == [2, 0]
 
 
 def test_b128_q4_long_kv_is_two_stream():
@@ -205,7 +290,7 @@ def test_main_tree_2x_calibration_keeps_plain_4x_at_b128(monkeypatch):
     assert _choose(48, 4, 30080).path == dp.PATH_TWO_STREAM
 
 
-def _regimes(num_requests, query_len, capacity, num_heads=128, unavailable=None):
+def _regimes(num_requests, query_len, capacity, num_heads=128):
     rows = num_heads * query_len
     return dp.kv_regimes_for_batch(
         num_requests=num_requests,
@@ -215,7 +300,6 @@ def _regimes(num_requests, query_len, capacity, num_heads=128, unavailable=None)
         kv_capacity=capacity,
         sm_count=SM,
         envelope_reason=host_4x.envelope_reason_static,
-        four_x_unavailable=unavailable,
     )
 
 

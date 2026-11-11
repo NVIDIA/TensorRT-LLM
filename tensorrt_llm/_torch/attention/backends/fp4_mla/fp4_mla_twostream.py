@@ -18,7 +18,7 @@ variables read at call time:
 
 ``TRTLLM_FP4_MLA_TWOSTREAM``          1 (default): automatic; 0: never split the call.
 ``TRTLLM_FP4_MLA_TWOSTREAM_R2``       force the number of 2x requests (0 = force the plain 4x path).
-``TRTLLM_FP4_MLA_TWOSTREAM_MIN_GAIN`` minimum modelled gain over the plain 4x path (default 0.08 = 8 %).
+``TRTLLM_FP4_MLA_TWOSTREAM_MIN_GAIN`` minimum modelled gain over the plain 4x path (default 0.03 = 3 %).
 ``TRTLLM_FP4_MLA_TWOSTREAM_MAX_R2``   cap on r2 (default 36 = the largest share that still leaves the 4x arm
                                       the longer one at q4).
 ``TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE`` relative cost of this tree's 2x packed kernel (see ``DEFAULT_T2_SCALE``).
@@ -40,6 +40,14 @@ KV_TILE = 256
 # Cost model (us) fitted to the in-kernel item timelines of 2026-11-02 (B128/q4 at 2K/4K/16K/30K, q2 at 16K):
 # a 4x item = one 4-CTA cluster over 256 packed rows and the request's KV; a 2x item = one 2-CTA pair over a
 # 128-row m-tile and the request's KV.  Fixed costs are prologue/epilogue, slopes are per 256-key tile.
+# Not re-fitted for the 4x kernel of 2026-11-10 (shared memory by sub-bank, four-bank V ring, K128 QK tail): its 4x
+# and two-stream cells run 2-14 % faster in the dispatcher matrices while the 2x kernel is unchanged, so T4 now
+# overstates the 4x item.  The bias is towards a split: the 4x arm is modelled longer than it is, so the
+# critical-path rule of ``_plan_two_stream`` can pass a split whose 2x arm is the longer one on the part (the gain
+# gate moves less: T4 is on both sides of it).  Such a split cannot be slower than it was, only slower than plain 4x
+# has become; the splits of the matrix shapes (q4: B48 r2 = 2, B64 r2 = 1, B96 r2 = 4, B256 r2 = 3) measured ahead
+# of 2x in the 2026-11-10 matrix of ``fp4_mla_dispatch``.  A re-fit needs the 4x item timelines of the new kernel
+# at the fitted shapes and a plain 4x arm next to the two-stream cells.
 T4_FIXED_US, T4_TILE_US = 13.0, 0.64
 T2_FIXED_US, T2_TILE_US = 10.0, 0.62
 # Relative speed of the 2x packed kernel this tree ships against the kernel the model was fitted on (the internal

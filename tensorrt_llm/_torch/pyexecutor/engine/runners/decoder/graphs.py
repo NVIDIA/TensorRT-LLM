@@ -805,7 +805,9 @@ class DecoderCudaGraphs:
         regime ceiling, the step's longest live KV rounded up, instead of the
         page-table capacity. Resolved at capture, once the KV cache exists; the
         regimes of a shape are those its 2x | 4x | two-stream decision can tell
-        apart (``kv_regimes_for_batch``), one for most shapes. The graph runner
+        apart (``kv_regimes_for_batch``), one for most shapes. None as well
+        where every step decodes on the 2x kernel whatever its KV: with Helix,
+        and on a device that cannot host the 4x kernel. The graph runner
         resolves every decode step, so each shape is computed once: replay keeps
         the ceilings its graphs were captured for.
         """
@@ -835,13 +837,16 @@ class DecoderCudaGraphs:
         num_heads = self._fp4_mla_decode_heads()
         if num_heads is None:
             return None
+        # A device that cannot host the 4x kernel decodes every step on 2x, as
+        # Helix does: no regimes (the host logs the reason once per device).
+        if self._fp4_mla_4x_unavailable() is not None:
+            return None
         from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_4x_host import (
             envelope_reason_static,
         )
 
         capacity = int(kv_cache_manager.max_blocks_per_seq) * FP4_MLA_TOKENS_PER_BLOCK
         sm_count = self._decode_sm_count()
-        four_x_unavailable = self._fp4_mla_4x_unavailable()
 
         @functools.cache
         def resolver(batch_size: int, draft_len: int) -> tuple[int, ...]:
@@ -854,7 +859,6 @@ class DecoderCudaGraphs:
                 kv_capacity=capacity,
                 sm_count=sm_count,
                 envelope_reason=envelope_reason_static,
-                four_x_unavailable=four_x_unavailable,
             )
 
         return resolver

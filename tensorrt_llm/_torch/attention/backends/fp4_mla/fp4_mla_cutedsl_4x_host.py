@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Torch host entry for the four-CTA-cluster (4x) FP4 MLA decode kernel (``fp4_mla_cutedsl_4x.py``).
 
-Scope: validate the envelope, build the 30 wrapper arguments of
+Scope: validate the envelope, build the 36 positional wrapper arguments (20 pointers + 16 values) of
 ``fp4_mla_4x_full_ctm`` from the mufu16 input contract, compile + cache per (query_len_per_seq, output dtype,
 use_ksf_gather4), launch MAIN only.  There is no reset kernel, no workspace contract and no generation gate
 in the FULL-only variant, so a call is a pure function of its inputs.
@@ -87,10 +87,14 @@ V_PACK_BLOCK = (
 KSF_PAYLOAD_BYTES = PAGE_SIZE * K_SF_GROUPS  # 5120 (X79:10345)
 VSF_PAYLOAD_BYTES = OUT_COLS * (PAGE_SIZE // 16)  # 4096 (X79:10356)
 CUDA_GRID_Z_MAX = 65535  # X79:37
-MIN_SM_COUNT = 4 * FULL_ONLY_MAX_PAIRS  # 184: one wave of 46 four-CTA clusters must be co-resident
+# 184: one wave of 46 four-CTA clusters must be co-resident.  An envelope rule, checked with the shapes
+# (``envelope_reason_static``); what the device must offer for the kernel to launch at all is
+# ``device_unsupported_reason``.
+MIN_SM_COUNT = 4 * FULL_ONLY_MAX_PAIRS
 # Shared memory one CTA of the kernel declares (bytes; the kernel's DS_SMEM_BYTES, checked at load).  It is above the
-# 227 KiB a block may opt into by default, so the device must offer the oversized shared-memory mode; one that does
-# not keeps every call on the 2x kernel (``device_unsupported_reason``).
+# 227 KiB a block may opt into by default, so the device must offer the oversized shared-memory mode.  On a device
+# without it the dispatcher keeps every call on the 2x kernel (``device_unsupported_reason``) and the host's own
+# entry points (``validate_envelope``, ``compile_variant``) refuse a direct call.
 SMEM_BYTES_PER_CTA = 276480
 # --- split mode (Milestone 2): plan-driven KV split tasks + FP32 partials merged by fp4_mla_packed_reduce ----------
 SPLIT_ENV = "TRTLLM_FP4_MLA_4X_SPLIT"  # default on; 0 keeps the one-wave FULL-only kernel (and its envelope) only
@@ -383,8 +387,9 @@ def validate_envelope(
 ) -> EnvelopeGeometry:
     """Raise EnvelopeError (a ValueError) / TypeError unless the call is inside the fair envelope and satisfies
     the mufu16 input contract.  Pure metadata unless ``check_device_contents`` (which reads the small int32
-    tensors; never do that under CUDA-graph capture).  ``max_pairs`` overrides FULL_ONLY_MAX_PAIRS and exists
-    ONLY for the two-wave control experiment (TEST MATRIX "B26/Q4 CONTROL (b)")."""
+    tensors; never do that under CUDA-graph capture).  ``require_cuda`` also requires a device that can host the
+    kernel (``device_unsupported_reason``, cached per device).  ``max_pairs`` overrides FULL_ONLY_MAX_PAIRS and
+    exists ONLY for the two-wave control experiment (TEST MATRIX "B26/Q4 CONTROL (b)")."""
     check_kernel_argv()
     # --- scalars -------------------------------------------------------------------------------------------------
     if type(query_len_per_seq) is not int or query_len_per_seq not in SUPPORTED_QUERY_LENS:
@@ -683,8 +688,8 @@ def validate_envelope(
     )
     if any(t.device != device for t in tensors):
         raise EnvelopeError("all decode tensors must share one device (X79:10379-10394)")
-    if require_cuda and device.type != "cuda":
-        raise EnvelopeError(f"all decode tensors must be CUDA tensors (X79:10393), got {device}")
+    if require_cuda:
+        _require_device(device)
     # --- device contents (optional; small int32 tensors only) ------------------------------------------------------
     if check_device_contents:
         check_table_contents(
@@ -816,7 +821,8 @@ def _header_scratch(device: torch.device) -> torch.Tensor:
 
 
 def _make_wrapper_ptrs(addresses: list[int], output_dtype: torch.dtype) -> tuple:
-    """The 16 cute.Pointer args in wrapper order (X79:1160-1175), typed exactly as X79:9795-9846 _make_fused_ptrs."""
+    """Wrapper args 1-20, the cute.Pointer args in order: the 16 of X79:1160-1175, typed exactly as X79:9795-9846
+    _make_fused_ptrs, then the four split-mode pointers (plan, partial, rowmax, rowsum)."""
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
@@ -887,6 +893,8 @@ def envelope_reason_static(
         return "no requests"
     if max_kv_len <= 0 or max_kv_len > PHYSICAL_K:
         return f"max_kv_len {max_kv_len} outside (0, {PHYSICAL_K}]"
+    # A device number, kept with the shapes because the two-stream planner takes the same sm_count; what the device
+    # must offer for the kernel to launch at all is device_unsupported_reason.
     if sm_count < MIN_SM_COUNT:
         return f"sm_count {sm_count} < {MIN_SM_COUNT}"
     if helix:
@@ -923,11 +931,18 @@ def envelope_reason_static(
 
 
 _SMEM_PER_BLOCK_CACHE: dict[int, int] = {}
+_OVERSIZED_SMEM_ATTRIBUTE = "CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK"
 
 
 def max_shared_memory_per_block(device: torch.device) -> int:
-    """Most shared memory one block may use on ``device`` (bytes), cached per device index: the oversized limit
-    where the CUDA driver reports one (Rubin: 327 KiB per block, taken from the L1 cache), else the opt-in limit."""
+    """Most shared memory one block may use on the CUDA ``device`` (bytes), cached per device index: the oversized
+    limit where the CUDA driver reports one (Rubin: 327 KiB per block, taken from the L1 cache), else the opt-in limit.
+
+    A limit below ``SMEM_BYTES_PER_CTA`` takes the 4x kernel away for the whole process, so it is logged, once per
+    device, together with why the oversized limit was not read when that is the cause.
+    """
+    if device.type != "cuda":
+        raise ValueError(f"max_shared_memory_per_block needs a CUDA device, got {device}")
     index = device.index if device.index is not None else torch.cuda.current_device()
     limit = _SMEM_PER_BLOCK_CACHE.get(index)
     if limit is None:
@@ -935,18 +950,28 @@ def max_shared_memory_per_block(device: torch.device) -> int:
         import cuda.bindings.driver as cuda
 
         # Bindings older than CUDA 13 do not know the attribute; a driver without the mode reports 0.
-        oversized = getattr(
-            cuda.CUdevice_attribute,
-            "CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK",
-            None,
-        )
-        if oversized is not None:
+        oversized = getattr(cuda.CUdevice_attribute, _OVERSIZED_SMEM_ATTRIBUTE, None)
+        unread = None
+        if oversized is None:
+            unread = f"cuda.bindings has no {_OVERSIZED_SMEM_ATTRIBUTE}"
+        else:
             err, cu_device = cuda.cuDeviceGet(index)
             if err == cuda.CUresult.CUDA_SUCCESS:
                 err, value = cuda.cuDeviceGetAttribute(oversized, cu_device)
-                if err == cuda.CUresult.CUDA_SUCCESS:
-                    limit = max(limit, int(value))
+            if err == cuda.CUresult.CUDA_SUCCESS:
+                limit = max(limit, int(value))
+            else:
+                unread = f"the oversized limit could not be read ({err!r})"
         _SMEM_PER_BLOCK_CACHE[index] = limit
+        if limit < SMEM_BYTES_PER_CTA:
+            from tensorrt_llm.logger import logger
+
+            logger.warning(
+                f"FP4 MLA 4x kernel unavailable on cuda:{index}: one block needs {SMEM_BYTES_PER_CTA} B of shared "
+                f"memory, {limit} B are available"
+                + (f" (opt-in limit; {unread})" if unread else "")
+                + "; decode stays on the 2x kernel."
+            )
     return limit
 
 
@@ -956,17 +981,27 @@ def device_unsupported_reason(device: torch.device) -> str | None:
     Device properties only, nothing about the call.  The SM count is not checked here: the envelope takes it with
     the shapes (``envelope_reason_static``), because the two-stream planner sizes its lanes from the same number.
     """
+    if device.type != "cuda":
+        return f"the 4x kernel needs a CUDA device, got {device}"
     limit = max_shared_memory_per_block(device)
     if limit < SMEM_BYTES_PER_CTA:
         return (
             f"the 4x kernel declares {SMEM_BYTES_PER_CTA} B of shared memory per block, "
-            f"the device allows {limit}"
+            f"{limit} B are available on {device}"
         )
     return None
 
 
+def _require_device(device: torch.device) -> None:
+    """Raise EnvelopeError when ``device`` cannot host the kernel: the gate of the host's own entry points."""
+    reason = device_unsupported_reason(device)
+    if reason is not None:
+        raise EnvelopeError(reason)
+
+
 def _scalar_args(geom: EnvelopeGeometry, stream, *, exemplar: bool = False) -> tuple:
-    """Wrapper args 17-29 in order (X79:1176-1189 without the retired prefetch switch).  With ``exemplar`` the page
+    """Wrapper args 21-36 in order: the 16 values after the 20 pointers, ``problem_size`` to ``stream`` (the x79
+    scalars plus the split mode's ``task_capacity`` and ``used_tasks``).  With ``exemplar`` the page
     counts/strides are the type-only stand-ins the template uses at compile time
     (compile_balanced_template.py:136-138); otherwise the real values (X79:10513-10528 + requested_cut, dead in
     FULL-only -> 0)."""
@@ -1072,8 +1107,7 @@ def compile_variant(
     dev = torch.device(
         f"cuda:{device}" if isinstance(device, int) else (device or torch.cuda.current_device())
     )
-    if dev.type != "cuda":
-        raise EnvelopeError("compile_variant needs a CUDA device")
+    _require_device(dev)
     with torch.cuda.device(dev):
         exemplar = torch.zeros(1024, dtype=torch.uint8, device=dev)
         scratch = _header_scratch(dev)

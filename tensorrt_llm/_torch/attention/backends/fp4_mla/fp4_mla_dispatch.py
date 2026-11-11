@@ -22,8 +22,9 @@ B128/q4, KV 4K                          101         102          102            
 Graph-replay medians throughout (the 2x kernel's first replays at 8K are faster, 158 us cold, which is the only
 sense in which 2x "wins" there); on the main tree's slower 2x packed kernel (#20576) the 8K row read 190 / 191 /
 192 and 4K 106 / 107 / 107 on 2026-11-02 (hecate0358) and 182 / 178 / 178 and 110 / 116 / 116 on 2026-11-03
-(hecate0341, the matrix below): B128 at 8K is a tie within the node-to-node spread either way, which is why the
-many-wave floor sits there.
+(hecate0341, the first matrix below): with the 4x kernel of that date B128 at 8K was a tie within the node-to-node
+spread either way, which is where the many-wave floor was put.  The 4x and two-stream columns of the table above
+are that kernel's; the kernel of 2026-11-10 is faster and the many-wave tie sits at 4K (second matrix below).
 
 Below the batch's KV floor (``four_x_floor_kv``) the 2x packed kernel keeps the call: the 4x kernel pays ~13 us of
 fixed cost per 256-row item (task identity, barrier init, exposed Q load, pipeline fill and drain) and every wave
@@ -42,6 +43,30 @@ B128 (5.6)                 0.86x   0.88x   0.95x   1.02x   1.14x   1.15x   8K
 B256 (11.1)                        0.88x   0.95x   1.09x           1.19x   8K
 =========================  ======  ======  ======  ======  ======  ======  ==========
 
+Re-validated on 2026-11-10 (hecate0087) for the 4x kernel of that date: shared memory laid out by sub-bank, the
+four-bank V ring and the K128 QK tail make the 4x and two-stream cells 2-14 % faster, the 2x kernel is unchanged.
+Same shapes, graph-replay medians; ratio = 2x / the 4x paths with the floor forced to 0
+(``TRTLLM_FP4_MLA_4X_MIN_KV=0``); ``*`` marks a cell under its floor, where the dispatcher keeps 2x:
+
+===========================  ======  ======  ======  ======  ======  ======  ==========
+batch (4x waves)             1K      2K      4K      8K      12K     16K     floor
+===========================  ======  ======  ======  ======  ======  ======  ==========
+B16 (0.7, one wave)          1.33x   2.66x   2.35x   2.09x                   0
+B32 (1.4)                    0.97x*  1.07x   1.15x   1.31x   1.40x           2K
+B48 (2.1, two-stream r2=2)   0.92x*  0.99x*  1.04x   1.18x   1.27x   1.30x   4K
+B64 (2.8)                    0.91x*  0.98x*  1.08x   1.23x   1.30x   1.33x   4K
+B96 (4.2)                    0.90x*  0.94x*  1.02x*  1.17x   1.25x           8K
+B128 (5.6)                   0.90x*  0.95x*  0.99x*  1.12x   1.20x   1.24x   8K
+B256 (11.1)                          0.98x*  1.02x*  1.16x           1.25x   8K
+===========================  ======  ======  ======  ======  ======  ======  ==========
+
+Above the floors the 4x path was two-stream at B48 (r2 = 2), B64 at 4K (r2 = 1), B96 at 8K and 12K (r2 = 4) and
+B256 at 8K (r2 = 3), plain 4x in the other cells.  No floor moves (a floor moves on a gain clearly outside the
+run-to-run noise of about 2 %): the best cell under a floor is 1.02x (B96 and B256 at 4K), every cell at a floor is
+ahead (1.04x to 1.17x).  What changed is the margin of the many-wave floor: B128 at 8K was the tie (1.02x) and is
+1.12x now, and these shapes tie at 4K instead (0.99x-1.02x).  The two-stream planner's item cost model was not
+re-fitted to this kernel: see the note at ``T4_FIXED_US`` in ``fp4_mla_twostream``.
+
 Above the floor the static 4x envelope (``fp4_mla_cutedsl_4x_host.envelope_reason_static``:
 small-batch rules, Helix / softmax-stats / packed-V requirements, split-mode bounds) decides whether the 4x kernel
 may run, and the two-stream planner (``fp4_mla_twostream``) decides whether handing the last requests to the 2x
@@ -49,7 +74,8 @@ kernel on a concurrent stream drops a whole 4x wave.
 
 Whether the 4x kernel can run here at all is not this module's knowledge either: the caller passes the reason it
 cannot as ``four_x_unavailable`` (``fp4_mla_cutedsl_4x_host.device_unsupported_reason``: what the kernel needs from
-the device, today the shared memory a block may use), and every call then stays on ``2x`` with that reason.
+the device, today the shared memory a block may use), and every call then stays on ``2x`` with that reason.  A graph
+runner on such a device keys its decode graphs by no KV regime, as it does for Helix.
 
 KV length used for the decision: ``live_max_kv``, the ceiling of the KV regime a CUDA graph runner keys its decode
 graphs by (``set_decode_kv_regime`` on the graph's attention metadata stores it in ``Fp4MlaState.kv_regime_max_kv``),
@@ -57,10 +83,13 @@ an upper bound of the step's longest live KV; without one, eager steps included,
 kernels themselves are always compiled and planned for the capacity.
 
 Environment:
-``TRTLLM_FP4_MLA_CUTEDSL_4X``       master switch (default off): 0 -> always ``2x``.
+``TRTLLM_FP4_MLA_CUTEDSL_4X``       master switch (default off), honoured by the callers (``decode.py`` and the
+                                    decode graphs): when it is off this module is not consulted and every call
+                                    stays on ``2x``.
 ``TRTLLM_FP4_MLA_DECODE_PATH``      ``auto`` (default) | ``2x`` | ``4x`` | ``twostream``: force a path (a forced 4x or
-                                    two-stream path still needs the static envelope; ``twostream`` falls back to ``4x``
-                                    when the planner finds no useful split).
+                                    two-stream path still needs the static envelope and a device that can host the
+                                    4x kernel, ``four_x_unavailable``; ``twostream`` falls back to ``4x`` when the
+                                    planner finds no useful split).
 ``TRTLLM_FP4_MLA_4X_MIN_KV``        one flat KV length (tokens) below which every call stays on ``2x``, replacing
                                     the per-batch floor of ``four_x_floor_kv`` (0 / 2048 / 4096 / 8192 by 4x waves).
 ``TRTLLM_FP4_MLA_KV_REGIME_GRID``   extra KV regime ceilings (tokens, comma-separated) a graph runner keys its
@@ -79,7 +108,8 @@ from .fp4_mla_twostream import LANES_4X, ROWS_PER_4X_ITEM, TwoStreamPlan, plan_t
 DECODE_PATH_ENV = "TRTLLM_FP4_MLA_DECODE_PATH"
 MIN_KV_4X_ENV = "TRTLLM_FP4_MLA_4X_MIN_KV"
 # KV floor (tokens) of the 4x paths by the batch's 4x wave count (``four_x_waves``): (waves at most, floor) in
-# ascending order, ``FLOOR_KV_4X_MANY_WAVES`` beyond the last bound.  From the matrix in the module docstring.
+# ascending order, ``FLOOR_KV_4X_MANY_WAVES`` beyond the last bound.  From the 2026-11-03 matrix of the module
+# docstring; its 2026-11-10 matrix (the 4x kernel with the sub-bank shared-memory layout) moves none of them.
 FLOOR_KV_4X_BY_WAVES = ((1.0, 0), (1.5, 2048), (3.0, 4096))
 FLOOR_KV_4X_MANY_WAVES = 8192
 
@@ -179,23 +209,22 @@ def kv_regimes_for_batch(
     kv_capacity: int,
     sm_count: int,
     envelope_reason: Callable[..., Optional[str]],
-    four_x_unavailable: Optional[str] = None,
 ) -> tuple[int, ...]:
     """Ceilings of the KV regimes a graph runner captures one decode graph of this batch shape for.
 
     Ascending, the page-table capacity last.  Only regimes whose graphs would decide differently earn one: a shape
-    the 4x paths can never take (``four_x_unavailable``, a forced ``2x`` / ``4x`` path, a shape outside the static
-    envelope on the capacity,
+    the 4x paths can never take (a forced ``2x`` / ``4x`` path, a shape outside the static envelope on the capacity,
     among them every ``query_len`` whose rows are no multiple of 256 and every batch over the split-mode pair bound)
     or always may (floor 0) has the single regime of the capacity; otherwise the 2x regime ends right under the
     shape's KV floor, the 4x-eligible span above it is split wherever the two-stream plan changes (the plan is taken
     on the regime ceiling, and ``plan_two_stream`` drops the split at long KV where its gain fades below the gate:
     B48/q4 keeps r2 = 2 up to ~50K and runs plain 4x beyond, so a 160K page table gets a two-stream regime for the
-    short steps), ``kv_regime_grid`` adds its points, and the capacity closes the list.  ``envelope_reason`` and
-    ``four_x_unavailable`` as in ``choose_decode_strategy``.
+    short steps), ``kv_regime_grid`` adds its points, and the capacity closes the list.  ``envelope_reason`` as in
+    ``choose_decode_strategy``.  A runner that knows no step can leave ``2x`` at all (Helix, a device where the 4x
+    kernel is unavailable) keys its graphs by no regime and does not ask.
     """
     capacity = int(kv_capacity)
-    if four_x_unavailable is not None or _env_path() in (PATH_2X, PATH_4X):
+    if _env_path() in (PATH_2X, PATH_4X):
         return (capacity,)
     reason = envelope_reason(
         num_heads=num_heads,
@@ -231,6 +260,9 @@ _PLAN_PROBE_KVS = tuple(
 # A plan flip earns a regime boundary only when the plan it protects is worth it: the modelled two-stream gain of
 # the lower regime's plan at one of its probes must reach this much (the planner's own gate is 3 %; B48/q4 is
 # ~20 % at 4K, B64/q4's r2 = 1 and B96/q4's r2 = 4 are 4-6 %, which the matrix measured as a wash).
+# The gains are the model's (``fp4_mla_twostream``, constants of 2026-11-02) and the wash is the 2026-11-03 matrix:
+# neither was re-taken for the 4x kernel of 2026-11-10, whose matrices have no plain 4x arm on the split cells.  A
+# lower T4 moves the modelled gain of the small splits up towards this gate, so re-read it with any re-fit of T4.
 PLAN_FLIP_MIN_GAIN = 0.08
 
 
@@ -292,11 +324,11 @@ def choose_decode_strategy(
     kv_capacity: int,
     sm_count: int,
     envelope_reason: Callable[..., Optional[str]],
+    four_x_unavailable: Optional[str],
     live_max_kv: Optional[int] = None,
     helix: bool = False,
     softmax_stats: bool = False,
     v_packed: bool = True,
-    four_x_unavailable: Optional[str] = None,
 ) -> DecodeStrategy:
     """Pick the decode path for one packed-Q decode call.
 
@@ -305,7 +337,8 @@ def choose_decode_strategy(
     kernels are compiled for.  ``live_max_kv`` is an upper bound of the call's longest KV (the KV regime ceiling of
     a regime-keyed CUDA graph) that the floor and the two-stream plan are taken on instead of the capacity; None
     keeps the capacity.  ``four_x_unavailable`` is why the 4x kernel cannot run at all where the call executes
-    (None when it can): it wins over a forced path, and becomes the strategy's reason.
+    (None when it can; required, so that no caller assumes it can by omission): it wins over a forced path, and
+    becomes the strategy's reason.
     """
     forced = _env_path()
     kv_source = "capacity"
