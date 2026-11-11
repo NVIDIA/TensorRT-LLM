@@ -234,6 +234,14 @@ class MiniMaxM2ToolParser(BaseToolParser):
             # Drop the returned prefix so later increments do not re-emit it.
             self._buffer = current_text[tc_start:]
             inner_text = current_text[tc_start + len(self.bot_token) :]
+            # Read only the block opened at tc_start. What follows its closing
+            # tag stays in the buffer for the next pass, which counts the
+            # invocations of the next block from zero.
+            block_end = inner_text.find(self.eot_token)
+            after_block = None
+            if block_end != -1:
+                after_block = inner_text[block_end + len(self.eot_token) :]
+                inner_text = inner_text[:block_end]
 
             # Find all complete invoke blocks
             complete_invocations = list(self.invoke_regex.finditer(inner_text))
@@ -327,11 +335,10 @@ class MiniMaxM2ToolParser(BaseToolParser):
                             self._json_buffers[self.current_tool_id] = new_args_json
 
             # Check if tool call block is complete
-            eot_idx = current_text.find(self.eot_token, tc_start + len(self.bot_token))
-            if eot_idx >= 0:
+            if after_block is not None:
                 if self.current_tool_name_sent:
                     calls.append(self._close_streamed_call())
-                self._buffer = current_text[eot_idx + len(self.eot_token) :]
+                self._buffer = after_block
                 self.current_tool_name_sent = False
                 self._current_invoke_count = 0
                 self._json_buffers.clear()

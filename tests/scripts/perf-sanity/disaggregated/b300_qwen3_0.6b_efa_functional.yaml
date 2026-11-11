@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+metadata:
+  model_name: qwen3_0.6b
+  model_dir_name: Qwen3/Qwen3-0.6B
+  precision: bf16
+  supported_gpus:
+  - B300
+slurm:
+  timeout: 600
+  numa_bind: false
+hardware:
+  gpus_per_node: 1
+  num_ctx_servers: 1
+  num_gen_servers: 1
+benchmark:
+  mode: e2e
+  concurrency_list: '4'
+environment:
+  worker_env_var: >-
+    TLLM_LOG_LEVEL=INFO
+    TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC
+    FI_PROVIDER=efa
+    FI_LOG_LEVEL=info
+    FI_LOG_PROV=efa
+    TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1
+    TRTLLM_KVCACHE_TIME_OUTPUT_PATH=
+    TLLM_KV_TRANSFER_PERF_LOG_FILE=
+worker_config:
+  ctx: &worker
+    dtype: bfloat16
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    # Match batch shapes between ordinary and disaggregated greedy inference.
+    max_batch_size: 1
+    max_num_tokens: 4096
+    max_seq_len: 4096
+    cuda_graph_config: null
+    disable_overlap_scheduler: false
+    kv_cache_config:
+      dtype: auto
+      free_gpu_memory_fraction: 0.1
+      enable_block_reuse: false
+      use_kv_cache_manager_v2: true
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      kv_cache_bounce_size_mb: 0
+  gen: *worker
