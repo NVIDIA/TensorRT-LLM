@@ -424,6 +424,12 @@ SMEM_P4_ATOMIC_RUNNING_ROWMAX_SMEM_ROWS = SMEM_P4_BMM1_M
 SMEM_P4_TMEM_SCORE_PIPELINE_STAGES = SMEM_P4_QK_PIPELINE_SLOTS
 SMEM_P4_MBAR_PARITY_PHASES = 2
 SMEM_P4_PAIR_CORR_MBAR_OFFSET = 0
+# The P4_READY and HALF1_ROWSUM_READY barriers are intentionally never initialized, and
+# nothing arrives on them or waits on them. Their slots stay counted in
+# SMEM_P4_PAIR_OVERLAP_MBAR_COUNT because the live offsets chain through these
+# definitions (SCORE_CONSUMED via ROWSUM_DONE, FINAL_PV_ISSUED, ROWMAX_READ_DONE). A
+# barrier taken into use again must first restore its mbarrier_init in
+# _run_mla_decode_body.
 SMEM_P4_PAIR_P4_READY_MBAR_OFFSET = (
     SMEM_P4_PAIR_CORR_MBAR_OFFSET + SMEM_P4_N_OUT_TILES * SMEM_P4_QK_PIPELINE_SLOTS
 )
@@ -436,6 +442,7 @@ SMEM_P4_PAIR_P_SOURCE_READY_MBAR_OFFSET = (
 SMEM_P4_PAIR_P_HALF_READY_MBAR_OFFSET = (
     SMEM_P4_PAIR_P_SOURCE_READY_MBAR_OFFSET + SMEM_P4_P_HALF_COUNT * SMEM_P4_QK_PIPELINE_SLOTS
 )
+# Intentionally never initialized either; see the comment at the P4_READY offset above.
 SMEM_P4_PAIR_HALF1_ROWSUM_READY_MBAR_OFFSET = SMEM_P4_PAIR_P_HALF_READY_MBAR_OFFSET
 SMEM_P4_PAIR_FINAL_PV_ISSUED_MBAR_OFFSET = (
     SMEM_P4_PAIR_HALF1_ROWSUM_READY_MBAR_OFFSET + SMEM_P4_QK_PIPELINE_SLOTS
@@ -5104,6 +5111,14 @@ def _finalize_pipelined_tile(
     ``_runtime_t336_producer_tile_v23`` (row anchor, P and PSF stores, lazy O rescale and the
     P_SOURCE_READY arrive), except that it reads the parity-indexed ``sPipelinedRowMax``, never
     masks K, and does not wait on ``pair_rowmax_read_done``.
+
+    The skipped wait is safe because ``sPipelinedRowMax`` is double-buffered per tile parity:
+    this tile reads the half ``stream_li_idx & 1``, the tile pipelined one step ahead
+    publishes into the other half, and the next writer of this half runs two tiles later.
+    ``_runtime_t336_prepare_p_source`` needs the wait (and the second dual-half barrier
+    before its arrive) only because both score halves read one shared
+    ``sAtomicRunningRowMax``. Do not remove the parity double buffer without restoring
+    the wait.
     """
     bank_idx = stream_li_idx % ctm.Int32(SMEM_P4_TMEM_BANKS)
     p_stage_base = bank_idx * ctm.Int32(SMEM_P4_SCORE_SLOTS_PER_KV_TILE)
