@@ -540,7 +540,8 @@ def test_one_model_draft_kv_cache_dtype(is_mtp):
     creator = SimpleNamespace(
         _speculative_config=SimpleNamespace(
             spec_dec_mode=SimpleNamespace(is_mtp_one_model=lambda: is_mtp)
-        )
+        ),
+        _get_draft_max_attention_window=lambda max_seq_len, kv_cache_config: None,
     )
     draft = KvCacheCreator._get_one_model_draft_kv_cache_config(
         creator, target, max_seq_len=1024, estimating_kv_cache=True
