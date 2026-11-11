@@ -83,7 +83,7 @@ tensor values are not serialized.
 
 ## Scheduled logical work and executor coordinates
 
-`trtllm::forward` and its `prefill`/`decode`/`mixed` child emit the following
+`trtllm::forward` emits the following
 fields from the owning executor's host state. Counts describe the boundary before
 the model engine adds any further graph-padding requests, not graph occupancy.
 
