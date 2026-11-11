@@ -56,9 +56,16 @@ chunk's tokens, not the full prompt length. An empty forward follows the decode
 fallback. Router Replay preparation, finish/abort, and hang diagnostics retain
 their existing ordering and ownership.
 
+The outer `trtllm::forward` scope owns batch metadata, including `workflow.phase`.
+The nested phase scope carries only its name, avoiding duplicate batch walks
+and encoding within the measured forward interval.
+
 ## Tensor metadata and graph limitations
 
-`record_function_with_metadata` supports contexts and decorators. Selected active
+`record_workflow_scope` supports contexts and decorators. The earlier
+`record_function_with_metadata` name remains a compatible alias. Context objects
+are single-use; create a fresh one for each entry. Decorators create a fresh
+context for each active call. Selected active
 scopes lazily inspect only directly supplied tensors, including a decorated call's
 positional and keyword arguments. Each tensor contributes `workflow.tensor.N.shape`,
 `.dtype`, `.stride`, and `.device`; `workflow.tensor_count` reports the number of
@@ -92,7 +99,7 @@ the model engine adds any further graph-padding requests, not graph occupancy.
 | `workflow.batch.scheduled_context_requests`, `workflow.batch.scheduled_generation_requests` | Current context/generation list lengths, including any dummies already present |
 | `workflow.batch.live_context_requests`, `workflow.batch.live_generation_requests`, `workflow.batch.live_requests` | Current request-list entries excluding the union of `is_attention_dp_dummy`, `is_cuda_graph_dummy` and `is_dummy_request`, matching `LlmRequest.is_dummy`; total is the sum of the two live counts |
 | `workflow.batch.attention_dp_dummy_requests`, `workflow.batch.cuda_graph_dummy_requests`, `workflow.batch.generic_dummy_requests` | Entries carrying each explicit flag (`generic_dummy_requests` is the `is_dummy_request` flag used by synthetic warmup requests); categories can overlap, so their counts must not be summed as a unique dummy total |
-| `workflow.batch.scheduled_context_tokens`, `workflow.batch.live_context_tokens` | Sum of current `context_chunk_size` across all context entries or only live context entries; not full prompt lengths |
+| `workflow.batch.scheduled_context_tokens`, `workflow.batch.live_context_tokens` | Sum of current `context_chunk_size` plus encoder replay rows across all context entries or only live entries; not full prompt lengths |
 
 Unavailable coordinates/state are omitted, never replaced with numeric sentinels.
 There is no concrete aggregate worker-role state at these owners, so no worker
