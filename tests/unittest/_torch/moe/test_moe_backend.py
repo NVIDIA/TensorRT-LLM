@@ -6994,16 +6994,21 @@ def test_configurable_moe_exposes_the_backend_lora_state():
     assert getattr(moe, "_moe_lora_enabled", False) is False
 
 
-def test_trtllm_mxfp4_fp8_activation_scales_on_reload():
+@pytest.mark.cpu_only
+def test_trtllm_mxfp4_fp8_activation_scales_on_reload(monkeypatch):
     from tensorrt_llm._torch.moe.fused_moe.activation import (
         ActivationParamShape,
         MoEActivationSupport,
         SwigluBiasActivation,
         install_activation_params,
     )
-    from tensorrt_llm._torch.moe.fused_moe.quantization import W4A8MXFP4FP8TRTLLMGenFusedMoEMethod
+    from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEWeightOwnerMixin
+    from tensorrt_llm._torch.moe.fused_moe.quantization import (
+        MXFP4WeightTRTLLMGenFusedMoEMethod,
+        W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
+    )
 
-    class TestModule(torch.nn.Module):
+    class TestModule(MoEWeightOwnerMixin, torch.nn.Module):
         activation_support = MoEActivationSupport(
             kinds=frozenset({ActivationType.SwigluBias}),
             alpha_beta=ActivationParamShape.PER_EXPERT_TENSOR,
@@ -7024,9 +7029,24 @@ def test_trtllm_mxfp4_fp8_activation_scales_on_reload():
     module.w2_bias = torch.tensor([[4.0, 8.0], [6.0, 12.0]])
     module.fc31_input_gate_dequant = torch.tensor([0.5, 0.25])
     module.fc2_input_dequant = torch.tensor([2.0, 3.0])
-    method = W4A8MXFP4FP8TRTLLMGenFusedMoEMethod()
+    monkeypatch.setattr(MXFP4WeightTRTLLMGenFusedMoEMethod, "transform_weights", lambda *_: None)
+    monkeypatch.setattr(MXFP4WeightTRTLLMGenFusedMoEMethod, "cache_derived_state", lambda *_: None)
+    module.quant_method = W4A8MXFP4FP8TRTLLMGenFusedMoEMethod()
+    module._weights_transformed = False
 
-    method.process_weights_after_loading(module)
+    module.process_weights_after_loading()
+    module.post_load_weights()
+    torch.testing.assert_close(module.w3_w1_bias, torch.tensor([[4.0, 8.0], [12.0, 24.0]]))
+    torch.testing.assert_close(module.w2_bias, torch.tensor([[2.0, 4.0], [2.0, 4.0]]))
+    torch.testing.assert_close(module.act_beta, torch.tensor([2.0, 8.0]))
+    torch.testing.assert_close(module.act_clamp, torch.tensor([14.0, 32.0]))
+
+    # Repeated finalization and a staged cache refresh must leave biases intact.
+    module.process_weights_after_loading()
+    module.post_load_weights()
+    module.act_beta.zero_()
+    module.act_clamp.zero_()
+    module.cache_derived_state()
     torch.testing.assert_close(module.w3_w1_bias, torch.tensor([[4.0, 8.0], [12.0, 24.0]]))
     torch.testing.assert_close(module.w2_bias, torch.tensor([[2.0, 4.0], [2.0, 4.0]]))
     torch.testing.assert_close(module.act_beta, torch.tensor([2.0, 8.0]))
@@ -7037,7 +7057,9 @@ def test_trtllm_mxfp4_fp8_activation_scales_on_reload():
     module.w3_w1_bias = torch.tensor([[2.0, 4.0], [3.0, 6.0]])
     module.w2_bias = torch.tensor([[4.0, 8.0], [6.0, 12.0]])
     module.fc31_input_gate_dequant = torch.tensor([1.0, 0.5])
-    method.process_weights_after_loading(module)
+    module._weights_transformed = False
+    module.process_weights_after_loading()
+    module.post_load_weights()
     torch.testing.assert_close(module.w3_w1_bias, torch.tensor([[2.0, 4.0], [6.0, 12.0]]))
     torch.testing.assert_close(module.w2_bias, torch.tensor([[2.0, 4.0], [2.0, 4.0]]))
     torch.testing.assert_close(module.activation.linear_offset, torch.tensor([1.0, 2.0]))

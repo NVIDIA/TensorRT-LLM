@@ -7596,20 +7596,8 @@ class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
-    def process_weights_after_loading(self, module: torch.nn.Module):
-        super().process_weights_after_loading(module)
-
-        # The batched GEMM epilogue consumes bias, beta, and clamp limits in
-        # the accumulator domain, before applying the activation dequant scale.
-        if module.w3_w1_bias is not None:
-            module.w3_w1_bias.data.div_(
-                module.fc31_input_gate_dequant.view(-1, 1))
-        if module.w2_bias is not None:
-            module.w2_bias.data.div_(module.fc2_input_dequant.view(-1, 1))
-        self._refresh_gated_activation_inputs(module)
-        module._mxfp4_fp8_inputs_processed = True
-
-    def _refresh_gated_activation_inputs(self, module: torch.nn.Module):
+    def cache_derived_state(self, module: torch.nn.Module):
+        super().cache_derived_state(module)
         # Recreate the unscaled constants before each refresh so a reload does
         # not divide an already-normalized value by the new input scale.
         params = materialize_activation_params(
@@ -7625,18 +7613,14 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
                 getattr(module,
                         name).copy_(value / module.fc31_input_gate_dequant)
 
-    def cache_derived_state(self, module: torch.nn.Module):
-        super().cache_derived_state(module)
-        # Staged receivers can skip the weight transform; rebuild the
-        # nonpersistent activation buffers from their received scales.
-        self._refresh_gated_activation_inputs(module)
-
     def transform_weights(self, module: torch.nn.Module):
         super().transform_weights(module)
-        # Dummy-loaded models do not call load_weights, but still need the
-        # derived epilogue inputs before their first forward.
-        if not module._mxfp4_fp8_inputs_processed:
-            self.process_weights_after_loading(module)
+        # The batched GEMM epilogue consumes bias in the accumulator domain.
+        if module.w3_w1_bias is not None:
+            module.w3_w1_bias.data.div_(
+                module.fc31_input_gate_dequant.view(-1, 1))
+        if module.w2_bias is not None:
+            module.w2_bias.data.div_(module.fc2_input_dequant.view(-1, 1))
 
     def create_weights(self, module: torch.nn.Module):
         fc31_input_dequant = nn.Parameter(torch.empty(
@@ -7655,8 +7639,6 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
         module.register_parameter("fc2_input_dequant", fc2_input_dequant)
 
         super().create_weights(module)
-
-        module._mxfp4_fp8_inputs_processed = False
 
         self._online_eplb_not_supported(module)
 
