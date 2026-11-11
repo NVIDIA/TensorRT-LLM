@@ -1601,7 +1601,6 @@ class FusedCommMoEScheduler(MoEScheduler):
             route_capture = get_active_route_capture()
             if route_capture is not None:  # R3: in-graph device-buffer capture
                 route_capture.capture(moe.layer_idx, token_selected_experts, row_offset)
-            record_moe_routing(moe.layer_idx, moe.num_experts, token_selected_experts)
             if token_final_scales.dtype != torch.float32:
                 token_final_scales = token_final_scales.to(torch.float32)
         else:
@@ -1616,7 +1615,8 @@ class FusedCommMoEScheduler(MoEScheduler):
                 dtype=torch.float32,
                 device=device,
             )
-            record_moe_routing(moe.layer_idx, moe.num_experts, token_selected_experts)
+
+        record_moe_routing(moe.layer_idx, moe.num_experts, token_selected_experts)
 
         # ----- EPLB: update stats + remap expert ids -> slot ids -----
         # Per-layer dynamic EPLB plans from the routes that the layer-wise

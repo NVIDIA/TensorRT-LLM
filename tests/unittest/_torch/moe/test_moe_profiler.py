@@ -23,7 +23,12 @@ from typing import TYPE_CHECKING, TypeAlias, cast
 
 import pytest
 import torch
-from profiler_test_utils import decode_profiler_metadata
+from profiler_test_utils import (
+    decode_node_metadata,
+    execution_trace_observer,
+    profiler_nodes,
+    select_regions,
+)
 
 from tensorrt_llm import _profiler as profiler
 from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
@@ -45,7 +50,7 @@ TraceRouting: TypeAlias = Callable[[Callable[[], object]], TraceRecords]
 
 @pytest.fixture(autouse=True)
 def select_moe(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"moe"}))
+    select_regions(monkeypatch, "moe")
 
 
 @pytest.fixture
@@ -61,22 +66,15 @@ def trace_routing(tmp_path: Path) -> Iterator[TraceRouting]:
         index += 1
         execution = tmp_path / f"execution-{index}.json"
         chrome = tmp_path / f"chrome-{index}.json"
-        observer = torch.profiler.ExecutionTraceObserver().register_callback(str(execution))
-        try:
+        with execution_trace_observer(execution) as observer:
             with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU],
                 record_shapes=True,
                 execution_trace_observer=observer,
             ) as active:
                 operation()
-        finally:
-            observer.unregister_callback()
         active.export_chrome_trace(str(chrome))
-        nodes = [
-            node
-            for node in json.loads(execution.read_text())["nodes"]
-            if node["name"] in {"trtllm::moe_routing", "trtllm::moe_routing_ids"}
-        ]
+        nodes = profiler_nodes(execution, "trtllm::moe_routing", "trtllm::moe_routing_ids")
         events = json.loads(chrome.read_text())["traceEvents"]
         assert sum(
             event.get("name") in {"trtllm::moe_routing", "trtllm::moe_routing_ids"}
@@ -84,7 +82,10 @@ def trace_routing(tmp_path: Path) -> Iterator[TraceRouting]:
         ) == len(nodes)
         records = []
         for node in nodes:
-            region, fields = decode_profiler_metadata(node["inputs"]["values"][0])
+            if not node["inputs"]["values"]:
+                records.append({})
+                continue
+            region, fields = decode_node_metadata(node)
             assert region == "moe"
             if node["name"] == "trtllm::moe_routing":
                 assert set(fields) == {
@@ -280,7 +281,7 @@ class TestMoeProfilerCPU:
         CUDA.
         """
         ids = torch.tensor([[1, 0]], dtype=torch.int32)
-        monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"moe"} if selected else {}))
+        select_regions(monkeypatch, *(("moe",) if selected else ()))
         monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: active)
         inspected: list[str] = []
 
@@ -292,7 +293,7 @@ class TestMoeProfilerCPU:
         monkeypatch.setattr(torch.Tensor, "cpu", forbidden)
         monkeypatch.setattr(torch.Tensor, "tolist", forbidden)
         monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", forbidden)
-        monkeypatch.setattr(profiler, "_encode_metadata", forbidden)
+        monkeypatch.setattr(profiler, "encode_metadata", forbidden)
         profiler.record_moe_routing(0, 2, ids)
         assert inspected == []
 
@@ -342,7 +343,7 @@ class TestMoeProfilerCPU:
         torch.testing.assert_close(context.token_final_scales, weights.to(expected_dtype))
         assert torch.equal(outputs[0], x)
         enabled_ledger = moe.ledger.copy()
-        monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset())
+        select_regions(monkeypatch)
         moe_disabled = _Moe(eplb=True)
         assert torch.equal(run(moe_disabled, x, logits), outputs[0])
         assert moe_disabled.ledger == enabled_ledger
@@ -415,9 +416,7 @@ class TestMoeProfilerCPU:
         moe = _Moe()
         monkeypatch.setattr(moe.backend, "_supports_load_balancer", lambda: False)
         monkeypatch.setattr(moe_scheduler, "FORCE_SEPARATED_ROUTING", force_separated)
-        monkeypatch.setattr(
-            profiler, "_CUSTOM_REGIONS", frozenset({"moe"}) if selected else frozenset()
-        )
+        select_regions(monkeypatch, *(("moe",) if selected else ()))
         x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
         prerouted = PreroutedRouting(
             tables=torch.empty(0, dtype=torch.int32),
@@ -557,14 +556,14 @@ class TestMoeProfilerCPU:
         def fail_encode(region: str, metadata: object) -> str:
             raise ValueError("observational metadata failure")
 
-        monkeypatch.setattr(profiler, "_encode_metadata", fail_encode)
+        monkeypatch.setattr(profiler, "encode_metadata", fail_encode)
 
         def run() -> None:
             with pytest.raises(RuntimeError) as caught:
                 _external(moe, torch.ones((1, 4)), torch.zeros((1, 4)))
             assert caught.value is original
 
-        assert trace_routing(run) == []
+        assert trace_routing(run) == [{}]
 
     @pytest.mark.parametrize("fused", [False, True])
     def test_shape_observation_preserves_scheduler_weight_contract(
@@ -635,14 +634,52 @@ def test_completed_cpu_ids_preserve_all_rows_and_values(
 
 
 @pytest.mark.cpu_only
+def test_completed_integer_ids_avoid_recursive_python_validation(
+    monkeypatch: pytest.MonkeyPatch, trace_routing: TraceRouting
+) -> None:
+    """CPU integer tensors guarantee ID types without another walk over every ID."""
+    host_rows = torch.arange(8192, dtype=torch.int32).reshape(128, 1, 64)
+    validate = profiler._validate_metadata_value
+    visited = 0
+
+    def counted(value: profiler.MetadataValue, *args: object) -> None:
+        nonlocal visited
+        visited += 1
+        validate(value, *args)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("completed CPU IDs must not add copies, finite reductions, or waits")
+
+    monkeypatch.setattr(profiler, "_validate_metadata_value", counted)
+    for method in ("cpu", "cuda", "to", "copy_", "item"):
+        monkeypatch.setattr(torch.Tensor, method, forbidden)
+    monkeypatch.setattr(torch, "isfinite", forbidden)
+    monkeypatch.setattr(torch.cuda, "synchronize", forbidden)
+    records = trace_routing(
+        lambda: profiler.record_moe_routing_ids(host_rows, step=3, rank=1, layer_pos=((7, 0),))
+    )
+    assert records[0]["moe.selected_expert_ids"] == host_rows[:, 0].tolist()
+    assert visited < 32
+
+
+@pytest.mark.cpu_only
+def test_completed_routing_ids_reject_floating_rows(
+    trace_routing: TraceRouting,
+) -> None:
+    """Only completed CPU integer rows qualify for trusted ID serialization."""
+    rows = torch.tensor([[[1.5, float("nan")]]])
+    assert trace_routing(
+        lambda: profiler.record_moe_routing_ids(rows, step=1, rank=0, layer_pos=((7, 0),))
+    ) == [{}]
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("selected,active", [(False, True), (True, False), (False, False)])
 def test_completed_ids_inactive_never_inspect_rows(
     selected: bool, active: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Keep completed-copy observation lazy when its region or profiler is inactive."""
-    monkeypatch.setattr(
-        profiler, "_CUSTOM_REGIONS", frozenset({"moe"}) if selected else frozenset()
-    )
+    select_regions(monkeypatch, *(("moe",) if selected else ()))
     monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: active)
     profiler.record_moe_routing_ids(
         cast(torch.Tensor, object()), step=1, rank=0, layer_pos=((7, 0),)
@@ -659,13 +696,10 @@ def test_completed_ids_metadata_failure_does_not_mutate_host_rows(
     def fail(region: str, metadata: object) -> str:
         raise ValueError("failed completed-ID annotation")
 
-    monkeypatch.setattr(profiler, "_encode_metadata", fail)
-    assert (
-        trace_routing(
-            lambda: profiler.record_moe_routing_ids(host_rows, step=1, rank=0, layer_pos=((7, 0),))
-        )
-        == []
-    )
+    monkeypatch.setattr(profiler, "encode_metadata", fail)
+    assert trace_routing(
+        lambda: profiler.record_moe_routing_ids(host_rows, step=1, rank=0, layer_pos=((7, 0),))
+    ) == [{}]
     assert host_rows.tolist() == [[[3, 1]]]
 
 
@@ -786,7 +820,8 @@ def test_cuda_shape_only_scope_and_cpu_ids_device_guard(
             "moe.num_tokens": 1,
             "moe.num_experts": 4,
             "moe.experts_per_token": 2,
-        }
+        },
+        {},
     ]
 
 
@@ -811,9 +846,7 @@ def test_unsupported_moe_paths_warn_once(monkeypatch: pytest.MonkeyPatch, select
     """Verify unsupported routing paths emit one warning per selected path."""
     from tensorrt_llm.logger import logger
 
-    monkeypatch.setattr(
-        profiler, "_CUSTOM_REGIONS", frozenset({"moe"}) if selected else frozenset()
-    )
+    select_regions(monkeypatch, *(("moe",) if selected else ()))
     monkeypatch.setattr(logger, "_appeared_keys", set())
     messages: list[str] = []
     monkeypatch.setattr(logger, "log", lambda level, *parts: messages.append(" ".join(parts)))
