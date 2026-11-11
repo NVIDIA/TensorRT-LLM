@@ -35,7 +35,7 @@ default selection. Set `none` explicitly to disable custom regions.
 
 Python and native code cache selection at startup; later environment changes do
 not reconfigure either language. Native applications call
-`tensorrt_llm::common::initializeProfiler()` once and handle its optional diagnostic
+`tensorrt_llm::common::initializeProfilerRegions()` once and handle its optional diagnostic
 at their startup boundary. Native initialization is thread safe; probes remain
 inactive until initialization. Do not initialize from a collective, profiler
 callback, ABI entry point or shared-library static initializer.
@@ -63,47 +63,47 @@ host scopes recorded at capture time.
 The encoding is exactly:
 
 ```text
-TRTLLM1<decimal UTF-8 byte length>:<region><Python literal dictionary>
+TRTLLM1:<decimal UTF-8 byte length>:<region><JSON object>
 ```
 
 For example:
 
 ```text
-TRTLLM18:workflow{'rank':-7,'ids':[]}
+TRTLLM1:8:workflow{"rank":-7,"ids":[]}
 ```
 
 The region length counts bytes, not Unicode code points. It applies only to
 the region, and no separator follows the region. UTF-8 is used for the complete
 string. Whitespace and quote choices inside the dictionary may differ between
-producers; consumers compare decoded values. Preserve the prefix and length
-framing when extending payloads. Use a literal decoder such as `ast.literal_eval`,
-never `eval`.
+producers; consumers compare decoded values. Preserve the version and length
+framing when extending payloads. Decode the payload with a JSON parser. The test
+utilities also accept the earlier Python-literal envelope for existing traces;
+new producers emit only the separated JSON format.
 
 Python supports string keys and recursively nested values of the following
 built-in types: strings, integers, finite floats, booleans, `None`, lists,
 tuples and dictionaries with string keys. Sets, tensors, non-finite floats,
 custom objects and cyclic containers are not supported. Python integers have
-arbitrary precision. The encoder uses a Python literal dictionary, not JSON.
+arbitrary precision. Tuples encode as JSON arrays and `None` encodes as `null`. JSON floats must be finite.
 
 Native `ProfilerMetadata` supports a smaller subset: UTF-8 strings, signed
-int64 values and vectors of int64 values, which decode as lists. String keys
-and values escape backslashes, quotes, newlines, carriage returns, tabs and
-ASCII control characters. Empty vectors decode as `[]`. Native consumers must
+int64 values and vectors of int64 values, which decode as lists. The native encoder uses the existing nlohmann/json library for escaping. Empty vectors decode as `[]`. Native consumers must
 use unique field names and valid UTF-8. Both languages' tests decode the same
 Unicode, escaping, signed-integer and empty-list golden payloads.
 
 ## Scope and ownership behavior
 
 Python `record_function_metadata_scope` accepts a name, typed `ProfilerRegion`,
-and a lazy factory returning either typed fields or an already encoded string.
+and an optional lazy factory returning typed fields or an already encoded string.
+Omitting the factory records a metadata-free scope with the same observational
+error handling.
 It yields `None` and is decorated with `contextmanager`, so it can be used as
 both a context manager and a function decorator. An already encoded string
 must obey this envelope contract. Disabled or inactive scopes never evaluate
 the factory. An active Python scope constructs metadata once.
 
-Native `RecordFunctionWithMetadata::start` accepts an owned string name and
-a metadata factory taking `ProfilerMetadata&`. `startWithLazyName` also makes
-the name lazy. Disabled and inactive probes evaluate neither factory. An
+Native `RecordFunctionWithMetadata::startWithLazyName` accepts lazy name and
+metadata factories; the metadata factory takes `ProfilerMetadata&`. Disabled and inactive probes evaluate neither factory. An
 active probe evaluates metadata only when its `RecordFunction` callbacks need
 inputs, and starts at most once. `ProfilerMetadata::take() &&` transfers the
 completed encoded string and consumes the builder once.
@@ -116,7 +116,8 @@ an exception from it. Native scope construction, start and destruction are
 non-throwing; selector diagnostics are handled at explicit startup. Python
 isolates expected metadata/profiler failures (`AttributeError`, `LookupError`,
 `TypeError`, `ValueError`, `RuntimeError`, and `OSError`) and emits a once-only
-warning identifying the scope and failed phase. Custom factories must use these
+warning identifying the scope and failed phase. A Python metadata failure retains
+the named scope without metadata, so trace boundaries remain visible. Custom factories must use these
 error types for observational failures; other exceptions propagate. Process-control
 `BaseException` subclasses also propagate.
 
