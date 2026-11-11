@@ -667,6 +667,11 @@ def _register_fake():
           is_sf_swizzled_layout: bool = False) -> None:
         return None
 
+    @torch.library.register_fake("trtllm::megamoe_stage_routes")
+    def _(ids: torch.Tensor, weights: torch.Tensor, ids_out: torch.Tensor,
+          weights_out: torch.Tensor) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
     def _(
         X: torch.Tensor,

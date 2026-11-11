@@ -1790,15 +1790,24 @@ def test_executors_of_one_engine_share_the_execution_stream():
 
 def test_route_wait_occurs_after_independent_staging():
     source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
+    trace = []
+
+    def stage_routes(ids, weights, ids_out, weights_out):
+        trace.append(f"stage_routes:{ids_out.name},{weights_out.name}")
+
     impl = _extract_class(
         source,
         "TrtllmCutedslMegaMoeNvfp4Impl",
         {"_stage_inputs"},
-        {"torch": SimpleNamespace(uint8="uint8")},
+        {
+            "torch": SimpleNamespace(
+                uint8="uint8",
+                ops=SimpleNamespace(trtllm=SimpleNamespace(megamoe_stage_routes=stage_routes)),
+            )
+        },
     )
 
     def run():
-        trace = []
         owner = impl()
         owner._wait_rebalance_routes = lambda replica_plan=None: trace.append("wait")
         bufs = SimpleNamespace(
@@ -1817,13 +1826,16 @@ def test_route_wait_occurs_after_independent_staging():
             top_k=6,
             stage_activation=True,
         )
-        return trace
 
-    trace = run()
-    assert trace.index("fill:topk_idx_local") < trace.index("wait")
-    assert trace.index("copy:activation") < trace.index("wait")
-    assert trace.index("copy:topk_weights") < trace.index("wait")
-    assert trace.index("wait") < trace.index("copy:topk_idx_local")
+    run()
+    # The activation stages before the wait; one op after it writes the slot ids and
+    # gate weights of the whole bucket.
+    assert trace == [
+        "copy:activation",
+        "copy:activation_sf",
+        "wait",
+        "stage_routes:topk_idx_local,topk_weights",
+    ]
 
 
 @pytest.mark.parametrize("has_sm_budget", [True, False])

@@ -1371,8 +1371,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if topk_weights_f32.dtype != torch.float32 or not topk_weights_f32.is_contiguous():
             topk_weights_f32 = topk_weights_f32.to(torch.float32).contiguous()
 
-        # Routes stay as produced: the staging copy into the kernel's index
-        # buffer widens int32 to its dtype, and it is the first route reader.
+        # Routes stay as produced: the route staging widens int32 to the
+        # kernel's index dtype, and it is the first route reader.
         return self._run_moe(
             x=x,
             x_sf=x_sf,
@@ -1589,43 +1589,30 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         replica_plan=None,
     ) -> None:
         """Copy live rows of the user-domain inputs into the kernel's
-        pre-allocated buffers and refresh the padded tail.
+        pre-allocated buffers and reset the padded tail.
 
         Same code for single-rank (writes land in local CUDA) and
         multi-rank (writes land in symmetric heap regions visible to
         peers). The buffer source is selected upstream by
         :meth:`_acquire_buffers`.
 
-        Tail policy:
-
-          * ``topk_idx_local``: always ``-1`` outside live rows. The
-            kernel routes every row of the bucket whose expert id is
-            valid, so the whole tail ``[num_tokens, max_T)`` is reset
-            on every call. The reset is a device op decided by
-            ``num_tokens`` alone: a captured CUDA graph replays it, so
-            rows an eager call wrote into the same bucket after the
-            capture are never routed by a replay.
-          * ``topk_weights``: always ``0.0`` outside live rows. The
-            combine kernel writes one cell per
-            ``(token, k in [0, top_k))`` regardless of the
-            ``topk_idx == -1`` mask, so a stale non-zero weight in
-            the tail could corrupt the combine reduction (especially
-            on peer ranks via NVLink). One cheap zero kernel covers
-            it.
+        One op stages the routes of the whole bucket: rows ``[0,
+        num_tokens)`` of ``topk_idx_local`` and ``topk_weights`` get the
+        slot ids (widened to the kernel's index dtype) and gate weights,
+        rows ``[num_tokens, max_T)`` get ``-1`` and ``0.0``. The kernel
+        routes every row whose slot id is valid, and the combine writes
+        one cell per ``(token, k in [0, top_k))`` whatever the id, so
+        both tails are rewritten on every launch. The op depends on
+        ``num_tokens`` alone, so a CUDA graph replay resets rows that an
+        eager launch into the same bucket wrote after the capture.
         """
-        max_T = bufs.topk_idx_local.shape[0]
-        if num_tokens < max_T:
-            bufs.topk_idx_local[num_tokens:max_T].fill_(-1)
-        if num_tokens > 0:
-            if stage_activation:
-                bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
-                bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
-            bufs.topk_weights[:num_tokens, :top_k].copy_(topk_weights, non_blocking=True)
-        if num_tokens < max_T:
-            bufs.topk_weights[num_tokens:max_T, :top_k].zero_()
-        if num_tokens > 0:
-            self._wait_rebalance_routes(replica_plan)
-            bufs.topk_idx_local[:num_tokens].copy_(topk_idx, non_blocking=True)
+        if stage_activation and num_tokens > 0:
+            bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
+            bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
+        self._wait_rebalance_routes(replica_plan)
+        torch.ops.trtllm.megamoe_stage_routes(
+            topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights[:, :top_k]
+        )
 
     def _launch_megamoe_kernel(
         self,
@@ -1874,12 +1861,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 output_dtype=output_dtype,
                 launch_max_T=max_T,
             )
+            # A launch without rows: its routes are the bucket's own zero leading rows.
             self._stage_inputs(
                 bufs=bufs,
                 x=None,
                 x_sf=None,
-                topk_idx=None,
-                topk_weights=None,
+                topk_idx=bufs.topk_idx_local[:0],
+                topk_weights=bufs.topk_weights[:0, :top_k],
                 num_tokens=0,
                 top_k=top_k,
                 stage_activation=False,
