@@ -172,6 +172,13 @@ class KVCacheV2Scheduler(RequestScheduler):
     assignment into one unified loop.
     """
 
+    _ctx_decoder_held = False
+    # Holds since take_decision_counters (see RequestScheduler.take_decision_counters).
+    _num_gen_init_cap_holds = 0
+    _num_gen_init_transfer_budget_holds = 0
+    _num_ctx_decoder_hold_passes = 0
+    _num_ctx_decoder_held_requests = 0
+
     def __init__(
         self,
         max_batch_size: int,
@@ -408,6 +415,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     def set_ctx_decoder_hold(self, window: int) -> None:
         """Hold every holdable final window of this pass (``window`` > 0), or nothing (0)."""
+        self._num_ctx_decoder_hold_passes += self._ctx_decoder_held
         self._ctx_decoder_hold_window = int(window)
         self._ctx_decoder_held = False
 
@@ -421,6 +429,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             return chunk_size
         req.py_ctx_decoder_held = True
         self._ctx_decoder_held = True
+        self._num_ctx_decoder_held_requests += 1
         return ctx_decoder_batch.hold_chunk(
             pos, chunk_size, req.prompt_len, window, self.chunk_unit_size
         )
@@ -504,6 +513,19 @@ class KVCacheV2Scheduler(RequestScheduler):
         see those pages and reports a false deadlock.
         """
         self._async_transfer_manager = mgr
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        counters = (
+            self._num_gen_init_cap_holds,
+            self._num_gen_init_transfer_budget_holds,
+            self._num_ctx_decoder_hold_passes,
+            self._num_ctx_decoder_held_requests,
+        )
+        self._num_gen_init_cap_holds = 0
+        self._num_gen_init_transfer_budget_holds = 0
+        self._num_ctx_decoder_hold_passes = 0
+        self._num_ctx_decoder_held_requests = 0
+        return counters
 
     def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
         """Expose current rank-local receive ownership to the deadlock detector.
@@ -746,6 +768,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     and len(disagg_candidates) >= self.max_gen_init_admissions_per_pass
                 ):
                     # Admitted in a later pass, in order.
+                    self._num_gen_init_cap_holds += 1
                     req_it += 1
                     continue
                 peft_pages = budget.peft_pages_needed(req)
@@ -758,6 +781,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     # so do not allocate it. PEFT is charged as for such a deferred candidate, so the
                     # rest of the pass sees the same budget as without the gate.
                     disagg_gate.num_skipped += 1
+                    self._num_gen_init_transfer_budget_holds += 1
                     if peft_pages > 0:
                         budget.commit_peft(req, peft_pages)
                     req_it += 1

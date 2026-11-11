@@ -397,6 +397,11 @@ class RequestScheduler(ABC):
             probe: Whether cancelled receives still retain local resources.
         """
 
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
+        decoder-tail hold passes, and requests whose final window was held."""
+        return (0, 0, 0, 0)
+
 
 @dataclass
 class SerializableSchedulerOutput:
@@ -758,6 +763,9 @@ class MultimodalScheduler(RequestScheduler):
             probe: Whether cancelled receives still retain local resources.
         """
         self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        return self.scheduler.take_decision_counters()
 
     def _new_encoder_step(self) -> _MultimodalEncoderStep:
         return _MultimodalEncoderStep(

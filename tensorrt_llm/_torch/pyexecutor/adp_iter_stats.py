@@ -19,7 +19,7 @@ from tensorrt_llm.logger import logger
 
 from .iteration_stats_json import iteration_stats_row
 from .scheduler.adp_router import RankIterStatsPayload, RankState
-from .scheduler.rank_state import RankKvCacheStats, RankSpecDecodingStats
+from .scheduler.rank_state import RankKvCacheStats, RankSchedulingCounters, RankSpecDecodingStats
 
 _ITERATION_STATS_SCALAR_FIELDS = (
     "timestamp",
@@ -50,14 +50,32 @@ _PAYLOAD_IFB_KEYS = {
     "num_paused_requests": "numPausedRequests",
     "num_paused_kv_tokens": "numPausedKvTokens",
 }
+# The /metrics JSON key of each scheduling counter a rank's payload carries.
+_SCHEDULING_COUNTER_KEYS = {
+    "num_skipped_forward_ctx_chunks": "numSkippedForwardCtxChunks",
+    "num_dropped_ctx_chunks": "numDroppedCtxChunks",
+    "num_reverted_ctx_tokens": "numRevertedCtxTokens",
+    "num_deferred_gen_receives": "numDeferredGenReceives",
+    "gen_receive_ready_wait_ms": "genReceiveReadyWaitMs",
+    "num_gen_init_cap_holds": "numGenInitCapHolds",
+    "num_gen_init_transfer_budget_holds": "numGenInitTransferBudgetHolds",
+    "num_ctx_decoder_hold_passes": "numCtxDecoderHoldPasses",
+    "num_ctx_decoder_held_requests": "numCtxDecoderHeldRequests",
+}
+_NO_SCHEDULING_COUNTERS = RankSchedulingCounters()
 # The /metrics JSON key of each KvCacheStats field, in the native serializer's (sorted) key order.
 _KV_CACHE_STATS_KEYS = {
     "alloc_new_blocks": "allocNewBlocks",
     "alloc_total_blocks": "allocTotalBlocks",
     "cache_hit_rate": "cacheHitRate",
     "free_num_blocks": "freeNumBlocks",
+    "host_slab_bytes": "hostSlabBytes",
     "max_num_blocks": "maxNumBlocks",
     "missed_blocks": "missedBlocks",
+    "num_page_table_full_builds": "numPageTableFullBuilds",
+    "num_page_table_reuses": "numPageTableReuses",
+    "num_page_table_row_updates": "numPageTableRowUpdates",
+    "page_table_full_build_ms": "pageTableFullBuildMs",
     "reused_blocks": "reusedBlocks",
     "tokens_per_block": "tokensPerBlock",
     "used_num_blocks": "usedNumBlocks",
@@ -109,17 +127,7 @@ def _snapshot_kv_cache_stats(stats: KvCacheStats | None) -> RankKvCacheStats | N
     """
     if stats is None:
         return None
-    return RankKvCacheStats(
-        max_num_blocks=stats.max_num_blocks,
-        free_num_blocks=stats.free_num_blocks,
-        used_num_blocks=stats.used_num_blocks,
-        tokens_per_block=stats.tokens_per_block,
-        alloc_total_blocks=stats.alloc_total_blocks,
-        alloc_new_blocks=stats.alloc_new_blocks,
-        reused_blocks=stats.reused_blocks,
-        missed_blocks=stats.missed_blocks,
-        cache_hit_rate=stats.cache_hit_rate,
-    )
+    return RankKvCacheStats(*(getattr(stats, name) for name in RankKvCacheStats._fields))
 
 
 def _restore_kv_cache_stats(snapshot: RankKvCacheStats) -> KvCacheStats:
@@ -245,6 +253,9 @@ class ADPIterStatsBuffer:
             kv_cache_stats=_snapshot_kv_cache_stats(stats.kv_cache_stats),
             cross_kv_cache_stats=_snapshot_kv_cache_stats(stats.cross_kv_cache_stats),
             specdec_stats=_snapshot_specdec_stats(stats.specdec_stats),
+            scheduling_counters=RankSchedulingCounters(
+                *(getattr(ifb, name) for name in RankSchedulingCounters._fields)
+            ),
         )
 
     def queue(
@@ -384,6 +395,9 @@ class ADPIterStatsBuffer:
         ifb.num_paused_requests = payload.num_paused_requests
         ifb.num_paused_kv_tokens = payload.num_paused_kv_tokens
         ifb.num_scheduled_requests = ifb.num_context_requests + ifb.num_gen_requests
+        counters = payload.scheduling_counters or _NO_SCHEDULING_COUNTERS
+        for name, value in zip(RankSchedulingCounters._fields, counters):
+            setattr(ifb, name, value)
 
         if source_ifb is not None:
             ifb.micro_batch_id = source_ifb.micro_batch_id
@@ -506,6 +520,9 @@ class ADPIterStatsBuffer:
             payload = state.iter_stats
             for name, key in _PAYLOAD_IFB_KEYS.items():
                 ifb[key] = getattr(payload, name)
+            counters = payload.scheduling_counters or _NO_SCHEDULING_COUNTERS
+            for name, key in _SCHEDULING_COUNTER_KEYS.items():
+                ifb[key] = getattr(counters, name)
             ifb["numScheduledRequests"] = payload.num_context_requests + payload.num_gen_requests
             fills = {
                 _IFB_TEXT: json.dumps(ifb),

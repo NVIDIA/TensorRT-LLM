@@ -7877,7 +7877,11 @@ class TestVetoedContextChunk:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         executor = SimpleNamespace(
-            _is_kv_manager_v2=True, kv_cache_manager=manager, enable_joint_kv_cache_reuse=False
+            _is_kv_manager_v2=True,
+            kv_cache_manager=manager,
+            enable_joint_kv_cache_reuse=False,
+            _num_skipped_forward_ctx_chunks=0,
+            _num_reverted_ctx_tokens=0,
         )
         batch = ScheduledRequests()
         for request in output.context_requests:

@@ -112,7 +112,12 @@ void initBindings(nb::module_& m)
         .def_rw("alloc_new_blocks", &tle::KvCacheStats::allocNewBlocks)
         .def_rw("reused_blocks", &tle::KvCacheStats::reusedBlocks)
         .def_rw("missed_blocks", &tle::KvCacheStats::missedBlocks)
-        .def_rw("cache_hit_rate", &tle::KvCacheStats::cacheHitRate);
+        .def_rw("cache_hit_rate", &tle::KvCacheStats::cacheHitRate)
+        .def_rw("host_slab_bytes", &tle::KvCacheStats::hostSlabBytes)
+        .def_rw("num_page_table_reuses", &tle::KvCacheStats::numPageTableReuses)
+        .def_rw("num_page_table_row_updates", &tle::KvCacheStats::numPageTableRowUpdates)
+        .def_rw("num_page_table_full_builds", &tle::KvCacheStats::numPageTableFullBuilds)
+        .def_rw("page_table_full_build_ms", &tle::KvCacheStats::pageTableFullBuildMs);
 
     nb::class_<tle::StaticBatchingStats>(m, "StaticBatchingStats")
         .def(nb::init<>())
@@ -137,7 +142,16 @@ void initBindings(nb::module_& m)
         .def_rw("num_queued_ctx_tokens", &tle::InflightBatchingStats::numQueuedCtxTokens)
         .def_rw("num_queued_gen_requests", &tle::InflightBatchingStats::numQueuedGenRequests)
         .def_rw("num_queued_gen_kv_tokens", &tle::InflightBatchingStats::numQueuedGenKvTokens)
-        .def_rw("num_paused_kv_tokens", &tle::InflightBatchingStats::numPausedKvTokens);
+        .def_rw("num_paused_kv_tokens", &tle::InflightBatchingStats::numPausedKvTokens)
+        .def_rw("num_skipped_forward_ctx_chunks", &tle::InflightBatchingStats::numSkippedForwardCtxChunks)
+        .def_rw("num_dropped_ctx_chunks", &tle::InflightBatchingStats::numDroppedCtxChunks)
+        .def_rw("num_reverted_ctx_tokens", &tle::InflightBatchingStats::numRevertedCtxTokens)
+        .def_rw("num_deferred_gen_receives", &tle::InflightBatchingStats::numDeferredGenReceives)
+        .def_rw("gen_receive_ready_wait_ms", &tle::InflightBatchingStats::genReceiveReadyWaitMs)
+        .def_rw("num_gen_init_cap_holds", &tle::InflightBatchingStats::numGenInitCapHolds)
+        .def_rw("num_gen_init_transfer_budget_holds", &tle::InflightBatchingStats::numGenInitTransferBudgetHolds)
+        .def_rw("num_ctx_decoder_hold_passes", &tle::InflightBatchingStats::numCtxDecoderHoldPasses)
+        .def_rw("num_ctx_decoder_held_requests", &tle::InflightBatchingStats::numCtxDecoderHeldRequests);
 
     nb::class_<tle::SpecDecodingStats>(m, "SpecDecodingStats")
         .def(nb::init<>())

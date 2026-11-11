@@ -517,6 +517,9 @@ class PoolRebalanceConfig:
     ratio_tolerance: float = 0.25
     moving_average_decay: float = 0.9999
 
+# Host bytes held by live page slabs in this process.
+def live_slab_bytes() -> int: ...
+
 # How the manager backs the host cache tier's memory; the tier does not read it.
 @dataclass(slots=True)
 class HostMemBackingConfig:

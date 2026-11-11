@@ -41,6 +41,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <new>
@@ -132,12 +133,18 @@ struct InplaceControlBlock final : ControlBlockBase
 struct SlabHeader
 {
     int liveBlocks = 1;
+    size_t bytes = 0;
 };
+
+//! Bytes of the slabs allocated and not yet freed in this process. Defined in page.cpp, so every
+//! shared library that includes this header uses the one counter.
+extern std::atomic<size_t> gLiveSlabBytes;
 
 inline void releaseSlab(SlabHeader* slab) noexcept
 {
     if (--slab->liveBlocks == 0)
     {
+        gLiveSlabBytes.fetch_sub(slab->bytes, std::memory_order_relaxed);
         slab->~SlabHeader();
         ::operator delete(static_cast<void*>(slab));
     }
@@ -189,6 +196,9 @@ template <typename T>
 inline constexpr bool hasEnable = !std::is_void_v<EnableBase<T>>;
 
 } // namespace detail
+
+//! Host bytes held by live SlabArena allocations (page slabs) in this process.
+size_t liveSlabBytes() noexcept;
 
 // =========================================================================
 // SharedPtr<T>
@@ -638,6 +648,8 @@ public:
         ((bytes = placeArray<Ts>(bytes)), ...);
         mBase = static_cast<unsigned char*>(::operator new(bytes));
         mHeader = new (mBase) detail::SlabHeader();
+        mHeader->bytes = bytes;
+        detail::gLiveSlabBytes.fetch_add(bytes, std::memory_order_relaxed);
     }
 
     ~SlabArena()

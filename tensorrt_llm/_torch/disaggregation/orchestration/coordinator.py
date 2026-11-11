@@ -100,6 +100,9 @@ class DisaggTransferCoordinator:
     # Class-level default, so a coordinator assembled without ``__init__``
     # keeps the blocking receive fence.
     _defer_unready_gen_receives = False
+    # Since take_gen_receive_counters: most deferred receives pending at once, and the wait (s).
+    _max_deferred_gen_receives = 0
+    _gen_receive_ready_wait_s = 0.0
 
     def __init__(
         self,
@@ -565,6 +568,9 @@ class DisaggTransferCoordinator:
             self._effects.prepare_gen_resources(admitted)
             self._emit_admission_diagnostics(admitted)
             self._deferred_gen_receives.extend(admitted)
+            self._max_deferred_gen_receives = max(
+                self._max_deferred_gen_receives, len(self._deferred_gen_receives)
+            )
             return
         defer_unready = self._defer_unready_gen_receives and uses_async_gen_transfer()
         # Take the admission readiness events first, so preparing resources
@@ -652,7 +658,16 @@ class DisaggTransferCoordinator:
     def _wait_gen_receive_ready(self, requests: List[LlmRequest]) -> None:
         # A remote write does not follow stream order, so it waits for the pages' admission work.
         if self._is_kv_manager_v2:
+            start = time.perf_counter()
             self._kv_cache_manager.wait_disagg_receive_ready(requests)
+            self._gen_receive_ready_wait_s += time.perf_counter() - start
+
+    def take_gen_receive_counters(self) -> Tuple[int, float]:
+        """Return and reset the most deferred receives pending at once and the wait in ms."""
+        counters = (self._max_deferred_gen_receives, self._gen_receive_ready_wait_s * 1e3)
+        self._max_deferred_gen_receives = len(getattr(self, "_deferred_gen_receives", ()))
+        self._gen_receive_ready_wait_s = 0.0
+        return counters
 
     def _start_gen_receives(self, admitted: List[LlmRequest]) -> None:
         for req in admitted:

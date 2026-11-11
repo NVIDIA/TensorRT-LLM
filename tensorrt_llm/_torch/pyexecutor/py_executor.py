@@ -715,6 +715,10 @@ class PyExecutor:
     _executor_events: Optional[ExecutorEvents] = None
     # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
     _is_kv_manager_v2 = False
+    # Context chunks given back since the last stats record, by cause, and their tokens.
+    _num_skipped_forward_ctx_chunks = 0
+    _num_dropped_ctx_chunks = 0
+    _num_reverted_ctx_tokens = 0
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
     # Defaults for executors built without __init__ (test stubs); __init__ sets
@@ -3442,6 +3446,7 @@ class PyExecutor:
             kv_stats_to_save.reused_blocks = kv_stats.reused_blocks
             kv_stats_to_save.missed_blocks = kv_stats.missed_blocks
             kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
+            self._fill_kv_host_stats(kv_stats_to_save, kv_cache_manager)
             stats.kv_cache_stats = kv_stats_to_save
 
             # Collect per-iteration stats (with deltas) at configured interval.
@@ -3673,8 +3678,37 @@ class PyExecutor:
         stats.inflight_batching_stats.num_queued_gen_requests = num_queued_gen_requests
         stats.inflight_batching_stats.num_queued_gen_kv_tokens = num_queued_gen_kv_tokens
         stats.inflight_batching_stats.num_paused_kv_tokens = num_paused_kv_tokens
+        self._take_scheduling_counters(stats.inflight_batching_stats)
 
         return stats
+
+    def _fill_kv_host_stats(self, kv_stats: KvCacheStats,
+                            kv_cache_manager) -> None:
+        """Fill the host slab bytes and page-table counters of a V2 KV cache manager."""
+        if not self._is_kv_manager_v2:
+            return
+        kv_stats.host_slab_bytes = kv_cache_manager.host_slab_bytes()
+        (kv_stats.num_page_table_reuses, kv_stats.num_page_table_row_updates,
+         kv_stats.num_page_table_full_builds, kv_stats.page_table_full_build_ms
+         ) = kv_cache_manager.take_page_table_stats()
+
+    def _take_scheduling_counters(self, ifb: InflightBatchingStats) -> None:
+        """Move the scheduling decision counters gathered since the last record into ``ifb``."""
+        ifb.num_skipped_forward_ctx_chunks = self._num_skipped_forward_ctx_chunks
+        ifb.num_dropped_ctx_chunks = self._num_dropped_ctx_chunks
+        ifb.num_reverted_ctx_tokens = self._num_reverted_ctx_tokens
+        self._num_skipped_forward_ctx_chunks = 0
+        self._num_dropped_ctx_chunks = 0
+        self._num_reverted_ctx_tokens = 0
+        take_holds = getattr(self.scheduler, "take_decision_counters", None)
+        if take_holds is not None:
+            (ifb.num_gen_init_cap_holds, ifb.num_gen_init_transfer_budget_holds,
+             ifb.num_ctx_decoder_hold_passes,
+             ifb.num_ctx_decoder_held_requests) = take_holds()
+        disagg = getattr(self, "_disagg_coordinator", None)
+        if disagg is not None:
+            (ifb.num_deferred_gen_receives, ifb.gen_receive_ready_wait_ms
+             ) = disagg.take_gen_receive_counters()
 
     def _update_batch_acceptance_rate(
             self,
@@ -5408,6 +5442,13 @@ class PyExecutor:
         for req in scheduled_batch.context_requests:
             for manager in managers:
                 manager.revert_unexecuted_context_chunk(req)
+        reverted = [
+            req for req in scheduled_batch.context_requests
+            if not PyExecutor._is_stats_dummy_request(req)
+        ]
+        self._num_skipped_forward_ctx_chunks += len(reverted)
+        self._num_reverted_ctx_tokens += sum(req.context_chunk_size
+                                             for req in reverted)
 
     def _revert_context_chunks(self, context_requests) -> None:
         """Give back the KV growth the V2 scheduler made for context chunks that will not run."""
@@ -5419,6 +5460,9 @@ class PyExecutor:
         for req in context_requests:
             for manager in managers:
                 manager.revert_unexecuted_context_chunk(req)
+            if not PyExecutor._is_stats_dummy_request(req):
+                self._num_dropped_ctx_chunks += 1
+                self._num_reverted_ctx_tokens += req.context_chunk_size
 
     def _update_v2_context_resources(self, scheduled_batch) -> None:
         """Update self, draft, and cross caches after a context forward."""

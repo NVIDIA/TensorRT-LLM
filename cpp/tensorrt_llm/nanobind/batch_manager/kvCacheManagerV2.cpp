@@ -1753,6 +1753,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
         .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 
+    m.def("live_slab_bytes", &kv::liveSlabBytes, "Host bytes held by live page slabs in this process.");
+
     nb::class_<kv::HostMemBackingConfig>(m, "HostMemBackingConfig")
         .def(nb::init<std::optional<int>, bool>(), nb::arg("numa_node") = nb::none(),
             nb::arg("allow_remote_numa_fallback") = true)

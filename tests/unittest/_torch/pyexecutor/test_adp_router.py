@@ -363,6 +363,11 @@ class TestRankState:
             "reused_blocks",
             "missed_blocks",
             "cache_hit_rate",
+            "host_slab_bytes",
+            "num_page_table_reuses",
+            "num_page_table_row_updates",
+            "num_page_table_full_builds",
+            "page_table_full_build_ms",
         )
         state = RankState(
             rank=1,
@@ -397,11 +402,12 @@ class TestRankState:
             321,
             2,
             0,  # Rank state prefix.
-            -2,
+            -3,
             1,
             1,
             1,
-            1,  # Version and load/primary/cross/speculative-decoding presence flags.
+            1,
+            0,  # Version and load/primary/cross/speculative-decoding/counters presence flags.
             1,
             9,
             2,
@@ -422,7 +428,12 @@ class TestRankState:
             30,
             7,
             5,
-            0.375,  # Primary KV snapshot.
+            0.375,
+            0,
+            0,
+            0,
+            0,
+            0.0,  # Primary KV snapshot.
             60,
             45,
             15,
@@ -431,7 +442,12 @@ class TestRankState:
             18,
             4,
             3,
-            0.25,  # Cross KV snapshot.
+            0.25,
+            0,
+            0,
+            0,
+            0,
+            0.0,  # Cross KV snapshot.
             15,
             9,
             5,  # Speculative-decoding snapshot.

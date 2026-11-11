@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 import weakref
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -29,7 +30,13 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _get_generation_kv_capacity,
     get_scratch_entry,
 )
-from tensorrt_llm._utils import CUASSERT, TensorWrapper, convert_to_torch_tensor, prefer_pinned
+from tensorrt_llm._utils import (
+    CUASSERT,
+    TensorWrapper,
+    convert_to_torch_tensor,
+    nvtx_range,
+    prefer_pinned,
+)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.logger import logger
@@ -277,6 +284,12 @@ class CSA2CacheManager(KVCacheManagerV2):
     Logical buffer identities include model layer, compression ratio and role.
     SWA belongs to the uncompressed family regardless of the layer's GLOBAL ratio.
     """
+
+    # Page-table conversions since take_page_table_stats, and the full builds' host time (s).
+    _num_page_table_reuses = 0
+    _num_page_table_row_updates = 0
+    _num_page_table_full_builds = 0
+    _page_table_full_build_s = 0.0
 
     # A list while a deferring context prepare runs: block-offset copies are recorded for it.
     _deferred_block_offsets: list | None = None
@@ -1013,6 +1026,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             if _same_conversion_inputs(inputs, self._batch_conversion_inputs):
                 # The previous conversion recorded this event.
                 torch.cuda.current_stream().wait_event(self._base_rows_read[self._base_rows_slot])
+                self._num_page_table_reuses += 1
                 return None
         changed = _changed_rows(inputs, self._batch_conversion_inputs)
         self._batch_conversion_inputs = None
@@ -1031,8 +1045,13 @@ class CSA2CacheManager(KVCacheManagerV2):
             # The other rows hold this conversion already (every row is BAD_PAGE_INDEX past its
             # live columns), so only the changed rows are converted, over the full width.
             self._convert_changed_rows(changed, width, swa_out, written)
+            self._num_page_table_row_updates += 1
         else:
-            self._convert_all_rows(count, width, scratch, swa_out, written)
+            start = time.perf_counter()
+            with nvtx_range("csa2_convert_all_rows"):
+                self._convert_all_rows(count, width, scratch, swa_out, written)
+            self._page_table_full_build_s += time.perf_counter() - start
+            self._num_page_table_full_builds += 1
         self._table_live[:count] = live
         if swa_out is None:
             self._swa_table_live[:count] = live
@@ -1040,6 +1059,19 @@ class CSA2CacheManager(KVCacheManagerV2):
             swa_out[:, : swa_live[0], written : swa_live[1]].fill_(BAD_PAGE_INDEX)
         self._batch_conversion_inputs = inputs
         return written
+
+    def take_page_table_stats(self) -> tuple[int, int, int, float]:
+        stats = (
+            self._num_page_table_reuses,
+            self._num_page_table_row_updates,
+            self._num_page_table_full_builds,
+            self._page_table_full_build_s * 1e3,
+        )
+        self._num_page_table_reuses = 0
+        self._num_page_table_row_updates = 0
+        self._num_page_table_full_builds = 0
+        self._page_table_full_build_s = 0.0
+        return stats
 
     def _convert_changed_rows(self, changed, width, swa_out, written) -> None:
         """Convert the batch rows ``changed`` from a pinned snapshot of their base rows."""

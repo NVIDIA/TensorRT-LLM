@@ -104,6 +104,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
+    live_slab_bytes,
     typed_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DiskOOMError as KVCacheDiskOOMError
@@ -8004,6 +8005,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 iter_unaligned_snapshot_hits=snapshot_delta.iter_unaligned_snapshot_hits,
             ),
         )
+
+    def host_slab_bytes(self) -> int:
+        """Host bytes held by live page slabs in this process."""
+        return live_slab_bytes()
+
+    def take_page_table_stats(self) -> tuple[int, int, int, float]:
+        """Return and reset the page-table conversions: reused, row updates, full builds, full ms."""
+        return (0, 0, 0, 0.0)
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()

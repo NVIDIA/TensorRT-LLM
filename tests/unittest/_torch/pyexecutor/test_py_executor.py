@@ -3143,6 +3143,8 @@ def _make_adp_request(
 
 class _StubADPExecutor:
     _dspark_adp_shape_cache_enabled = PyExecutor._dspark_adp_shape_cache_enabled
+    _num_skipped_forward_ctx_chunks = 0
+    _num_reverted_ctx_tokens = 0
 
     def __init__(
         self,

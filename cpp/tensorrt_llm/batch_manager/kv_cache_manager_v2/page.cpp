@@ -28,6 +28,16 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
+namespace detail
+{
+std::atomic<size_t> gLiveSlabBytes{0};
+} // namespace detail
+
+size_t liveSlabBytes() noexcept
+{
+    return detail::gLiveSlabBytes.load(std::memory_order_relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------

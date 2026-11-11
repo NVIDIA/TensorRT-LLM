@@ -67,6 +67,8 @@ def _executor(**kwargs: object) -> SimpleNamespace:
         _is_kv_manager_v2=True,
         enable_joint_kv_cache_reuse=False,
         active_requests=[],
+        _num_skipped_forward_ctx_chunks=0,
+        _num_reverted_ctx_tokens=0,
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)

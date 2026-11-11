@@ -92,6 +92,7 @@ ExpandedBuffer = _cpp.ExpandedBuffer
 HalfOpenRange = _cpp.HalfOpenRange
 HostCacheTierConfig = _cpp.HostCacheTierConfig
 HostMemBackingConfig = _cpp.HostMemBackingConfig
+live_slab_bytes = _cpp.live_slab_bytes
 HostOOMError = _cpp.HostOOMError
 KVCacheDesc = _cpp.KVCacheDesc
 KVCacheCreatedData = _cpp.KVCacheCreatedData
@@ -250,6 +251,7 @@ __all__ = [
     "HalfOpenRange",
     "HostCacheTierConfig",
     "HostMemBackingConfig",
+    "live_slab_bytes",
     "IKvCacheColdPageCodec",
     "KVCacheDesc",
     "KVCacheCreatedData",
