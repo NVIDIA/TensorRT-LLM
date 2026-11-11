@@ -3253,7 +3253,8 @@ def _varlen_launcher(
         if long_row and not big and sm_version not in _BLACKWELL_SM_VERSIONS:
             # A retried attempt re-reads the row from DRAM; Hopper's lower bandwidth makes long
             # rows sample with the full staging headroom (the kernel clamps aim to SCAP / 2).
-            aim_base = 4 * k
+            # Below 128K scores, rows at K < 1024 sample with 2k, the aim of their big batches.
+            aim_base = 4 * k if k >= 1024 or n_kernel >= 131072 else 2 * k
         if (
             dtype is torch.bfloat16
             and k == 1024
