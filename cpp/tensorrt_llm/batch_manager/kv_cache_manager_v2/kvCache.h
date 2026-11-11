@@ -140,6 +140,16 @@ public:
         return mSlots.end();
     }
 
+    //! In-place relocation (copy-based rebalancing): the locks themselves, so that a rebalance can
+    //! hand a slot outside its pool group's new window a new one. Call republish() afterwards.
+    [[nodiscard]] std::vector<ScratchSlotLock>& locksForRelocation() noexcept
+    {
+        return mSlots;
+    }
+
+    //! Rewrite every live entry of the mirror from its lock's slot, after slots were relocated.
+    void republish();
+
 private:
     void _mirrorBack();
     //! Fill [from, to) of the mirror with the sentinel; unset `to` means its end.
@@ -623,6 +633,13 @@ public:
 
     // True if any lifecycle has scratch slots allocated.
     bool hasScratchSlots() const;
+
+    // In-place relocation (copy-based rebalancing): the scratch slots this cache holds, per
+    // lifecycle, so that a rebalance can move those outside their pool group's new window.
+    TypedVec<LifeCycleId, ScratchSlots>& scratchSlotLocks() noexcept
+    {
+        return mScratchSlots;
+    }
 
     // Whether SWA scratch reuse is enabled for this KvCache.
     bool isSwaScratchReuseEnabled() const noexcept;

@@ -168,6 +168,19 @@ public:
     static void setNumSampledKvCaches(KvCacheManager& manager, int value);
     static void setLastAdjustmentTime(KvCacheManager& manager, double value);
     static void setTargetRatioListGpu(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value);
+    //! Target ratio list shared by every cold level (cold pool-group order).
+    static void setTargetRatioListCold(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value);
+
+    //! Current slot window [begin, end) of each pool group at `level` (arena-relative in an arena).
+    static std::vector<std::pair<SlotCount, SlotCount>> slotWindows(KvCacheManager& manager, CacheLevel level);
+
+    //! Current GPU slot window [begin, end) of each pool group. Arena-relative under copy-based
+    //! rebalancing; [0, numSlots) otherwise.
+    static std::vector<std::pair<SlotCount, SlotCount>> gpuSlotWindows(KvCacheManager& manager);
+
+    //! GPU window [begin, end) of every pool of every pool group, in the pool's own ids (bound pools
+    //! of a copy-based rebalancing arena have their own; every other pool's is its group's).
+    static std::vector<std::vector<std::pair<SlotCount, SlotCount>>> gpuPoolWindows(KvCacheManager& manager);
 
     //! Allocates `size` bytes of host-tier memory the way the host tier would
     //! and reports where its pages landed.

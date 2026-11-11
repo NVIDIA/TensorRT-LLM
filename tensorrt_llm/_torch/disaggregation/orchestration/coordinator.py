@@ -549,6 +549,16 @@ class DisaggTransferCoordinator:
         for req in failed_on_a_peer_only:
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
 
+    def has_unpublished_gen_receives(self) -> bool:
+        """Whether an admitted request still waits for its receive to start.
+
+        Its destination pages are allocated, and the readiness event recorded
+        at admission covers only work enqueued before it: a pool rebalance
+        that moved those pages afterwards could still be copying when the
+        peer's write lands. A rebalance drain treats these as in flight.
+        """
+        return bool(self._unpublished_gen_receives)
+
     def _take_receive_fences(
         self, requests: List[LlmRequest]
     ) -> Dict[int, Optional["torch.cuda.Event"]]:
@@ -1224,6 +1234,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
 
     def poll_gen_transfers(self) -> None:
         return None
+
+    def has_unpublished_gen_receives(self) -> bool:
+        return False
 
     def poll_progress_when_idle(self) -> None:
         return None

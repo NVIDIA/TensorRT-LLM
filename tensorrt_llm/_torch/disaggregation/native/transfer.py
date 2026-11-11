@@ -92,8 +92,11 @@ from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, per
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo, validate_protocol_version
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    KVRegionExtractorV1,
+    build_page_table_from_manager,
+)
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -156,10 +159,19 @@ class RecvReqInfo:
     # Single-use token the receiver minted for this writer; echoed in every
     # KV result. Carried as a separate REQUEST_DATA frame, not in to_bytes().
     kv_result_report_token: bytes = field(default=b"", repr=False, compare=False)
+    # Copy-based rebalancing with several pools in a pool group: for each of the
+    # receiver's bound pools, keyed "layer_group:pool_view", its own slots,
+    # positionally aligned with block_ids_per_layer_groups[layer_group] (the
+    # receiver's bindings at the time of the request; it does not rebalance
+    # while the receive is in flight). Pools not listed use the group's slots.
+    bound_pool_block_ids: Optional[dict[str, np.ndarray]] = None
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
             {
+                "bound_pool_block_ids": None
+                if self.bound_pool_block_ids is None
+                else {k: v.tobytes() for k, v in self.bound_pool_block_ids.items()},
                 "sender_req_id": self.sender_req_id,
                 "instance_name": self.instance_name,
                 "instance_rank": self.instance_rank,
@@ -180,6 +192,11 @@ class RecvReqInfo:
         d["block_ids_per_layer_groups"] = [
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
+        if d.get("bound_pool_block_ids") is not None:
+            d["bound_pool_block_ids"] = {
+                k: np.frombuffer(b, dtype=np.int64).copy()
+                for k, b in d["bound_pool_block_ids"].items()
+            }
         from_older_release = _OLDER_RELEASE_REQUEST_KEY in d
         d.pop(_OLDER_RELEASE_REQUEST_KEY, None)
         # The report token comes only from its own checked REQUEST_DATA frame.
@@ -188,6 +205,86 @@ class RecvReqInfo:
         if from_older_release:
             raise OlderReleaseRequestError(info)
         return info
+
+
+class ArenaPoolBindings:
+    """Slot translation for bound pools of a copy-based rebalancing arena.
+
+    Under CoReba a pool group with several pools gives each pool after the
+    first its own window and slot ids: pool p's slot for the group's slot id
+    ``i`` is ``bindings_p[i]``, at ``arena_base + bindings_p[i] * slot_bytes_p``.
+    The page table addresses every pool with the group's ids, so the transfer
+    path translates ids of bound pools through this before extracting regions.
+    Tables change when a rebalance moves a pool; they are refetched when the
+    manager's binding version changes.
+    """
+
+    def __init__(self, impl):
+        self._impl = impl
+        descs = list(impl.pool_group_descs)
+        # Page table pool group list index -> storage pool group index.
+        self._storage_pg = [int(d.pool_group_index) for d in descs]
+        self._num_pools = [len(d.pools) for d in descs]
+        self._version = None
+        self._tables: dict[tuple[int, int], Optional[np.ndarray]] = {}
+
+    def table(self, pg_list_idx: int, pool_idx: int) -> Optional[np.ndarray]:
+        """Binding table of a bound pool, or None for a pool using the group's ids."""
+        if pool_idx == 0 or pool_idx >= self._num_pools[pg_list_idx]:
+            return None
+        version = self._impl.get_page_index_binding_version()
+        if version != self._version:
+            self._tables.clear()
+            self._version = version
+        key = (pg_list_idx, pool_idx)
+        if key not in self._tables:
+            t = self._impl.get_pool_bindings(self._storage_pg[pg_list_idx], pool_idx)
+            self._tables[key] = None if t is None else np.asarray(t, dtype=np.int64)
+        return self._tables[key]
+
+    def translate(self, page_table, lg_idx: int, pv_idx: int, ids) -> Optional[np.ndarray]:
+        """The pool view's own slots for the group's slots ``ids`` (-1 kept), or
+        None when the pool uses the group's slots."""
+        lg = page_table.layer_groups[lg_idx]
+        pv = lg.pool_views[pv_idx]
+        t = self.table(lg.pool_group_idx, pv.pool_idx)
+        if t is None:
+            return None
+        ids = np.asarray(ids, dtype=np.int64)
+        out = np.full_like(ids, -1)
+        held = ids >= 0
+        if np.any(ids[held] >= t.size):
+            raise RuntimeError(
+                f"slot id beyond the binding table of pool {pv.pool_idx} of layer group {lg_idx}"
+            )
+        out[held] = t[ids[held]]
+        if np.any(out[held] < 0):
+            raise RuntimeError(
+                f"held slot without a binding in pool {pv.pool_idx} of layer group {lg_idx}"
+            )
+        return out
+
+    def translate_all(self, page_table, block_ids_per_layer_groups) -> dict[str, np.ndarray]:
+        """Translated slots of every bound pool view, keyed "layer_group:pool_view"."""
+        out = {}
+        for lg_idx, lg in enumerate(page_table.layer_groups):
+            if lg.kind == CacheKind.STATE or lg_idx >= len(block_ids_per_layer_groups):
+                continue
+            for pv_idx in range(len(lg.pool_views)):
+                ids = self.translate(page_table, lg_idx, pv_idx, block_ids_per_layer_groups[lg_idx])
+                if ids is not None:
+                    out[f"{lg_idx}:{pv_idx}"] = ids
+        return out
+
+
+def _self_pool_bindings(registrar) -> Optional[ArenaPoolBindings]:
+    """The registrar's bound-pool bindings, or None when its pools use the group's slot ids.
+
+    Only an ``ArenaPoolBindings`` counts: a registrar without the attribute (or a
+    stand-in for one) never translates.
+    """
+    bindings = getattr(registrar, "self_pool_bindings", None)
+    return bindings if isinstance(bindings, ArenaPoolBindings) else None
 
 
 @dataclass
@@ -1609,6 +1706,19 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
+                # Bound pools (copy-based rebalancing, several pools per group)
+                # have their own slot ids: ours from our bindings, the
+                # receiver's from its request.
+                self_bindings = _self_pool_bindings(self._registrar)
+                if self_bindings is not None:
+                    own = self_bindings.translate(
+                        extractor.page_table, self_lg, self_pi, src_block_ids
+                    )
+                    if own is not None:
+                        src_block_ids = own
+                peer_bound = getattr(req_info, "bound_pool_block_ids", None)
+                if peer_bound:
+                    dst_block_ids = peer_bound.get(f"{peer_lg}:{peer_pi}", dst_block_ids)
                 helix_stride = peer_ri.cp_size > 1 and self_ri.cp_size == 1
                 if helix_stride:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
@@ -2286,6 +2396,9 @@ class TxSession(TxSessionBase):
                 self._retirement.close()
             raise
         self.receiver_ready: bool = False
+        # When the context side opened the send, so that the rebalance drain
+        # can tell how long a send has been waiting for receiver_ready.
+        self.created_monotonic = time.monotonic()
         self.kv_tasks = []
         self.aux_task = None
         self._reported_aux_peer_ranks: set[int] = set()
@@ -3130,6 +3243,14 @@ class Receiver(ReceiverBase):
                 "both ctx_request_id and disagg_request_id are None for task "
                 f"unique_rid={task._unique_rid}"
             )
+        bindings = _self_pool_bindings(self._registrar)
+        bound = (
+            bindings.translate_all(
+                self._registrar.self_extractor.page_table, task._chunk.block_ids_per_layer_groups
+            )
+            if bindings is not None
+            else None
+        )
         # Receiver's cached prefix is implicit in block_ids size; sender derives dst_start.
         return RecvReqInfo(
             sender_req_id=sender_req_id,
@@ -3141,6 +3262,7 @@ class Receiver(ReceiverBase):
             aux_slot=task._aux_slot,
             slice_id=task.slice_id,
             context_first=task._params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST,
+            bound_pool_block_ids=bound or None,
         )
 
     def dispatch_task(self, task: KVRecvTask) -> None:
@@ -3344,6 +3466,16 @@ class Receiver(ReceiverBase):
     def _should_register_peer(self, params: DisaggregatedParams) -> bool:
         endpoint = self._extract_info_endpoint(params)
         return endpoint not in self._sender_ep_instance_map
+
+    @property
+    def has_registered_with_peers(self) -> bool:
+        """Whether any context peer holds this rank's page table and agent desc.
+
+        ``REGISTER_RANK_INFO`` is the only way a peer learns them, and it is
+        sent from ``_get_sender_info`` alone, which records the peer here.
+        Entries are never removed, so once True this stays True.
+        """
+        return bool(self._sender_ep_instance_map)
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:
@@ -4477,6 +4609,32 @@ class RankInfoServer:
         self.shutdown()
 
 
+# Incremental KV pool registration (see TransferWorker._register_kv_tails): the
+# registration unit, and a switch back to registering every pool as a whole.
+_KV_REG_SEGMENT_BYTES = 64 << 20
+
+
+def _incremental_kv_registration_enabled() -> bool:
+    return os.environ.get("TLLM_KV_INCREMENTAL_REGISTRATION", "1") != "0"
+
+
+def _paged_kv_pools(page_table: KVCachePageTable) -> Optional[Dict[int, tuple]]:
+    """Every KV pool as base -> (slot stride, pool group, num slots).
+
+    None when a layer group is not paged attention (recurrent state shares
+    allocations between roles), where incremental registration does not apply.
+    """
+    if any(lg.kind == CacheKind.STATE for lg in page_table.layer_groups):
+        return None
+    pools = {}
+    for pg_idx, pg in enumerate(page_table.pool_groups):
+        for pool in pg.pools:
+            pools.setdefault(
+                int(pool.base_address), (int(pool.slot_stride_bytes), pg_idx, int(pool.num_slots))
+            )
+    return pools
+
+
 def _create_nixl_agent(
     name: str,
     rank: int,
@@ -4680,6 +4838,11 @@ class TransferWorker:
                 "per-descriptor NIXL transfers are in use."
             )
         self._registered_mem: list = []
+        # The KV pools' entry in _registered_mem; swapped on a pool resize.
+        self._kv_registered_mem: Optional[RegMemoryDescs] = None
+        # Incremental registration: per pool base, (start, end, descs) segments
+        # in address order covering [0, end of the last one). None: legacy.
+        self._kv_segments: Optional[Dict[int, list]] = None
         try:
             self._register_kv_cache()
             if self._aux_buffer is not None:
@@ -4708,16 +4871,205 @@ class TransferWorker:
                 logger.warning(f"TransferWorker init-failure cleanup: {e}")
             raise
 
+    def _gpu_arena_extent(self) -> Optional[tuple]:
+        """(base, bytes, has_bound_pools) of the KV manager's GPU arena, or None.
+
+        Copy-based rebalancing (CoReba) keeps every GPU pool in one arena that
+        is mapped once and never moves or changes size; a rebalance only moves
+        the pools' slot windows inside it.
+        """
+        impl = getattr(self._config.kv_cache_manager, "impl", None)
+        get_extent = getattr(impl, "get_gpu_arena_extent", None)
+        return get_extent() if get_extent is not None else None
+
+    @property
+    def kv_pool_layout_fixed(self) -> bool:
+        """Whether a pool rebalance leaves every address and registration as is.
+
+        True under copy-based rebalancing: slot ``id`` of a pool is always at
+        ``arena_base + id * slot_bytes`` and the whole arena is registered once,
+        so a peer's cached page table and registration keys stay valid.
+        """
+        return self._gpu_arena_extent() is not None
+
     def _register_kv_cache(self):
         assert self._rank_info.page_table is not None
+        if self._kv_segments is not None:
+            self._register_kv_tails()
+            return
+        # An arena (copy-based rebalancing) is registered as one region below: its pools all start at the arena base
+        # and never resize, so per-pool segments would overlap and buy nothing.
+        if self._gpu_arena_extent() is None and _incremental_kv_registration_enabled():
+            pools = _paged_kv_pools(self._rank_info.page_table)
+            if pools is not None:
+                self._kv_segments = {base: [] for base in pools}
+                self._register_kv_tails()
+                return
         memory_descs = get_unique_pool_memory_descs(
             self._rank_info.page_table, self._rank_info.device_id
         )
+        arena = self._gpu_arena_extent()
+        if arena is not None:
+            arena_base, arena_bytes, has_bound_pools = arena
+            # Bound pools are addressed with their own slot ids, translated in
+            # the transfer path (ArenaPoolBindings); the whole arena, bound
+            # pools' windows included, is registered here.
+            self._peer_registrar.self_pool_bindings = (
+                ArenaPoolBindings(self._config.kv_cache_manager.impl) if has_bound_pools else None
+            )
+            # Every pool's base is the arena base and its page table entry
+            # counts only its current window, so the per-pool regions would
+            # overlap and miss windows that start further into the arena.
+            # Register the arena once instead; pools outside it, if any, as
+            # before.
+            memory_descs = [
+                (arena_base, arena_bytes, self._rank_info.device_id, "kv_cache_arena")
+            ] + [d for d in memory_descs if not arena_base <= d[0] < arena_base + arena_bytes]
         if memory_descs:
             reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
             self._agent.register_memory(reg_memory_desc)
             logger.debug(f"Registered KV cache memory with transfer agent: {memory_descs}")
             self._registered_mem.append(reg_memory_desc)
+            self._kv_registered_mem = reg_memory_desc
+
+    # -- Incremental KV pool registration ---------------------------------------
+    #
+    # NIXL registration costs ~280 us per physical chunk of a pool, and the
+    # ranks of a node serialize on it, so re-registering every pool made a
+    # rebalance cost 250-600 ms. Instead each pool is registered as segments of
+    # _KV_REG_SEGMENT_BYTES; a resize drops only the segments that reach past
+    # the pool's planned length (before adjust() unmaps them) and then registers
+    # [end of the last kept segment, new length). Pools never move, so kept
+    # segments stay valid; NIXL keys regions by base address and splits
+    # transfers at region boundaries.
+
+    def _register_kv_tails(self) -> None:
+        """Register every pool from the end of its last segment to its length."""
+        for base, (stride, _, num_slots) in _paged_kv_pools(self._rank_info.page_table).items():
+            segs = self._kv_segments.setdefault(base, [])
+            length = num_slots * stride
+            covered = segs[-1][1] if segs else 0
+            if length < covered:
+                # adjust() shrank the pool below the planned length, so the
+                # tail past `length` was unmapped while still registered.
+                # planCacheLevel and adjustCacheLevel share one computation,
+                # so this should not happen.
+                logger.error(
+                    f"KV pool {base:#x}: {length} bytes after resize, below the "
+                    f"{covered} bytes still registered; deregistering the excess."
+                )
+                while segs and segs[-1][1] > length:
+                    self._deregister_kv_segment(segs.pop()[2])
+                covered = segs[-1][1] if segs else 0
+            if covered < length and covered % _KV_REG_SEGMENT_BYTES:
+                # The last segment ends mid-chunk (the old pool length). A
+                # multi-chunk VMM descriptor must start at a chunk boundary
+                # (VmmDescSplitter::splitVmmDescs), so redo that segment from
+                # its aligned start instead of appending at `covered`.
+                covered = segs[-1][0]
+                self._deregister_kv_segment(segs.pop()[2])
+            for start in range(covered, length, _KV_REG_SEGMENT_BYTES):
+                end = min(start + _KV_REG_SEGMENT_BYTES, length)
+                descs = RegMemoryDescs(
+                    "VRAM",
+                    [
+                        (
+                            base + start,
+                            end - start,
+                            self._rank_info.device_id,
+                            f"kv_pool_{base:x}_{start:x}",
+                        )
+                    ],
+                )
+                self._agent.register_memory(descs)
+                self._registered_mem.append(descs)
+                segs.append((start, end, descs))
+
+    def _deregister_kv_segment(self, descs: RegMemoryDescs) -> None:
+        self._registered_mem.remove(descs)
+        self._agent.deregister_memory(descs)
+
+    def _planned_kv_lengths(self) -> Optional[Dict[int, int]]:
+        """Each pool's length in bytes after the next adjust(), or None if unknown."""
+        impl = getattr(self._config.kv_cache_manager, "impl", None)
+        planned = getattr(impl, "planned_slot_counts", None)
+        if planned is None:
+            return None
+        page_table = self._rank_info.page_table
+        current = [int(d.num_slots) for d in impl.pool_group_descs]
+        pools = _paged_kv_pools(page_table)
+        if pools is None or len(planned) != len(current):
+            return None
+        if any(current[pg] != num_slots for _, pg, num_slots in pools.values()):
+            # The page table's pool groups are not the manager's, in order.
+            return None
+        return {base: planned[pg] * stride for base, (stride, pg, _) in pools.items()}
+
+    def begin_kv_pool_resize(self) -> None:
+        """Deregister the KV pools ahead of ``KvCacheManager::adjust()``.
+
+        It has to come before ``adjust()``: a shrinking pool has the tail of
+        its registered region unmapped (``cuMemUnmap``) by the resize. Which
+        pools change is only known afterwards, so every KV pool is dropped.
+        The NIXL wrapper's ``registerMemory`` merges region info without
+        overwriting, so a pool cannot be re-registered at a new size without
+        this either.
+
+        The caller guarantees that no send or receive is in flight and that
+        no peer holds this rank's page table (see
+        ``Receiver.has_registered_with_peers``).
+
+        With incremental registration only the segments reaching past a pool's
+        planned length are dropped; without a plan, every segment is.
+        """
+        if self.kv_pool_layout_fixed:
+            # Copy-based rebalancing: the registered arena is neither unmapped nor resized.
+            return
+        if self._kv_segments is not None:
+            planned = self._planned_kv_lengths()
+            for base, segs in self._kv_segments.items():
+                new_len = planned.get(base, 0) if planned is not None else 0
+                while segs and segs[-1][1] > new_len:
+                    self._deregister_kv_segment(segs.pop()[2])
+            return
+        reg = getattr(self, "_kv_registered_mem", None)
+        if reg is None:
+            return
+        self._kv_registered_mem = None
+        self._registered_mem.remove(reg)
+        self._agent.deregister_memory(reg)
+
+    def end_kv_pool_resize(self) -> None:
+        """Rebuild the local page table and re-register the KV pools.
+
+        Must run after every ``begin_kv_pool_resize``, whether or not
+        ``adjust()`` succeeded. Base addresses survive a resize and only
+        ``num_slots`` changes, so the slot layouts, the bounce sizing and the
+        per-peer caches stay valid; what is refreshed is every copy of the page
+        table, the registration, and the agent desc that ``REGISTER_RANK_INFO``
+        hands to peers.
+        """
+        page_table = build_page_table_from_manager(self._config.kv_cache_manager)
+        # Single attribute assignments: RankInfoServer serializes _rank_info
+        # from its listener thread, and generation peers read only geometry
+        # from it, never num_slots or the agent desc.
+        self._rank_info.page_table = page_table
+        self._kv_extractor = KVRegionExtractorV1(page_table)
+        self._peer_registrar.replace_self_extractor(self._kv_extractor)
+        if self.kv_pool_layout_fixed:
+            # Copy-based rebalancing: only num_slots changed in the page
+            # table; the registration and the agent desc stay valid.
+            return
+        self._register_kv_cache()
+        self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
+
+    @property
+    def has_registered_with_peers(self) -> bool:
+        return self._receiver.has_registered_with_peers
+
+    @property
+    def has_cross_node_peer(self) -> bool:
+        return self._peer_registrar.has_cross_node_peer
 
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None

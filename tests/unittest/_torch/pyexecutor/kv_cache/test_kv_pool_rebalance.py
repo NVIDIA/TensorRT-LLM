@@ -57,6 +57,7 @@ pytestmark = pytest.mark.cpu_only
 def _make_executor(
     *,
     enable_kv_pool_rebalance: bool = True,
+    in_place_relocation: bool = False,
     pp_size: int = 1,
     tp_size: int = 1,
     cp_size: int = 1,
@@ -128,12 +129,23 @@ def _make_executor(
     # the PP drain delegate to.
     exe._rebalance_kv_pools_now = lambda: PyExecutor._rebalance_kv_pools_now(exe)
     exe._pp_ring_is_quiescent = lambda: PyExecutor._pp_ring_is_quiescent(exe)
+    # Disaggregated-serving drain and back-off (no-ops without a transceiver).
+    exe._disagg_rebalance_disabled = False
+    exe._disagg_rebalance_skips = 0
+    exe._disagg_rebalance_retry_at = 0.0
+    exe._kv_pool_rebalance_allow_cross_node = False
+    exe._in_disagg_rebalance_backoff = lambda: PyExecutor._in_disagg_rebalance_backoff(exe)
+    exe._drain_disagg_transfers_for_rebalance = (
+        lambda: PyExecutor._drain_disagg_transfers_for_rebalance(exe)
+    )
 
     # KV cache manager (resource-manager wrapper).
     exe.kv_cache_manager = MagicMock()
     exe.kv_cache_manager.max_beam_width = max_beam_width
     exe.kv_cache_manager.impl = MagicMock()
     exe.kv_cache_manager.impl.need_adjustment = need_adjustment
+    # A bare MagicMock attribute would be truthy and select the in-place path.
+    exe.kv_cache_manager.impl.init_config.pool_rebalance.in_place_relocation = in_place_relocation
 
     # CUDA-graph runner holding the pre-allocated padding dummies.  A bare
     # MagicMock would be truthy and non-iterable in the suspend helper.
@@ -242,8 +254,19 @@ class TestCanPauseForRebalance:
         exe = _make_executor(pp_size=2)
         assert PyExecutor._can_pause_for_rebalance(exe) is True
 
-    def test_transceiver_present_returns_false(self):
-        exe = _make_executor(kv_cache_transceiver=MagicMock())
+    def test_unsupported_transceiver_returns_false(self):
+        transceiver = MagicMock()
+        transceiver.kv_pool_rebalance_unsupported_reason.return_value = "unsupported"
+        exe = _make_executor(kv_cache_transceiver=transceiver)
+        assert PyExecutor._can_pause_for_rebalance(exe) is False
+
+    def test_supported_transceiver_returns_true(self):
+        """Context-side disaggregated rebalance: the per-rank checks run later, in the drain."""
+        transceiver = MagicMock()
+        transceiver.kv_pool_rebalance_unsupported_reason.return_value = None
+        exe = _make_executor(kv_cache_transceiver=transceiver)
+        assert PyExecutor._can_pause_for_rebalance(exe) is True
+        exe._disagg_rebalance_disabled = True
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
     def test_connector_present_returns_false(self):
@@ -303,6 +326,19 @@ class TestMaybeRebalanceKvPools:
         exe.kv_cache_manager.impl.adjust.assert_called_once()
         assert exe.kv_cache_manager.suspend_request.call_count == 2
         assert exe.kv_cache_manager.resume_request.call_count == 2
+
+    def test_in_place_relocation_adjusts_without_suspending(self, monkeypatch):
+        reqs = [_make_request(1), _make_request(2)]
+        exe = _make_executor(active_requests=reqs, in_place_relocation=True)
+        exe._consume_previous_batch_for_rebalance = MagicMock()
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
+        exe._consume_previous_batch_for_rebalance.assert_called_once()
+        exe.kv_cache_manager.impl.adjust.assert_called_once()
+        exe.kv_cache_manager.suspend_request.assert_not_called()
+        exe.kv_cache_manager.resume_request.assert_not_called()
 
     def test_skips_already_suspended_requests(self, monkeypatch):
         active = _make_request(1)
@@ -1188,6 +1224,7 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     # The suspend/adjust/resume core is covered by its own tests; here we only
     # care that the loop reaches it, and on which iteration.
     exe._rebalance_kv_pools_now = MagicMock()
+    exe._drain_disagg_transfers_for_rebalance = MagicMock(return_value=True)
 
     # Per-iteration no-ops.
     exe._handle_control_request = MagicMock()

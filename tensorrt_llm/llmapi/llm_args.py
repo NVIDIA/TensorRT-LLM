@@ -5159,6 +5159,54 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "Number of PyExecutor iterations between checks of whether a pool rebalance "
         "should be attempted.")
 
+    copy_based_rebalancing: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Copy-based rebalancing (CoReba). The GPU KV cache becomes one arena mapped once at "
+        "startup; every pool group addresses it from the same base pointer with block indices "
+        "relative to the arena. A rebalance moves the pool boundaries in proportion to the new "
+        "ratios and copies blocks out of the parts that change owner, instead of remapping memory. "
+        "With a host cache tier, the host quota is one arena as well, registered once. A pool group "
+        "with several pools gives each pool its own window and block ids, which the model's cache "
+        "manager must translate (DeepSeek-V4 does; other models with such pool groups are "
+        "rejected). The GPU and host quotas are fixed after startup.")
+
+    drop_unreferenced_on_rebalance: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "With copy_based_rebalancing: drop, rather than copy, blocks that must move during a "
+        "rebalance and that no request references (cached reusable blocks).")
+
+    in_place_relocation: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "With copy_based_rebalancing: rebalance without suspending running requests. Their "
+        "blocks are copied on the GPU between iterations and their block indices rewritten in "
+        "place, SWA scratch slots included.")
+
+    allow_cross_node_disagg: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Disaggregated context servers: keep rebalancing after a KV transfer peer is "
+        "found on another node. Rebalancing there is validated for intra-node "
+        "transfers only, so by default it is switched off on every rank once a peer "
+        "on another host registers.")
+
+    @model_validator(mode='after')
+    def _validate_drop_requires_copy_based(self) -> 'KvPoolRebalanceConfig':
+        if self.drop_unreferenced_on_rebalance and not self.copy_based_rebalancing:
+            raise ValueError(
+                "drop_unreferenced_on_rebalance requires copy_based_rebalancing"
+            )
+        if self.in_place_relocation and not self.copy_based_rebalancing:
+            raise ValueError(
+                "in_place_relocation requires copy_based_rebalancing")
+        return self
+
 
 # Mixed-precision KV dtype: "mixed_<low dtype>_<high dtype>". The
 # first/last tokens and the attention inputs use the second dtype;
@@ -5410,8 +5458,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "(2000 samples / 120s by default). When False (default) the rebalance "
         "hook is skipped entirely and pool ratios remain at their "
         "warmup-derived values. Beta: enable at your own risk. Only used when "
-        "using KV cache manager v2 (experimental). This option is incompatible "
-        "with dtype='fp8_ds_mla'.")
+        "using KV cache manager v2 (experimental). With dtype='fp8_ds_mla' it "
+        "requires kv_pool_rebalance_config.copy_based_rebalancing.")
 
     kv_pool_rebalance_config: KvPoolRebalanceConfig = Field(
         default_factory=KvPoolRebalanceConfig,
@@ -5560,12 +5608,22 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
-        """Reject resizing while packed sparse-MLA pool views are fixed."""
-        if self.dtype == "fp8_ds_mla" and self.enable_kv_pool_rebalance:
+        """Reject VMM resizing while packed sparse-MLA pool views are fixed.
+
+        The packed sparse-MLA views (pool base pointers, per-layer buffer pointers and the
+        footer-scale pool extents) are captured once at construction. VMM resizing changes them;
+        copy-based rebalancing (CoReba) keeps every pool in one arena whose base address and
+        page-index upper bound never change, so those views stay valid and only the page
+        indices (block tables) move.
+        """
+        if (self.dtype == "fp8_ds_mla" and self.enable_kv_pool_rebalance
+                and not self.kv_pool_rebalance_config.copy_based_rebalancing):
             raise ValueError(
-                "kv_cache_config.dtype='fp8_ds_mla' is incompatible with "
-                "kv_cache_config.enable_kv_pool_rebalance=True because packed "
-                "sparse-MLA pool views are fixed at cache-manager construction time."
+                "kv_cache_config.dtype='fp8_ds_mla' with "
+                "kv_cache_config.enable_kv_pool_rebalance=True requires "
+                "kv_pool_rebalance_config.copy_based_rebalancing=True: packed "
+                "sparse-MLA pool views are fixed at cache-manager construction time, "
+                "and only copy-based rebalancing keeps the pool addresses fixed."
             )
         return self
 

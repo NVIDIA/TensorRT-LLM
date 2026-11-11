@@ -1907,7 +1907,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "__init__",
             [](kv::PoolRebalanceConfig* cfg, int minSampledKvCaches, double cooldownSecs, int targetRatioUpdateInterval,
-                float ratioTolerance, double movingAverageDecay)
+                float ratioTolerance, double movingAverageDecay, bool copyBasedRebalancing,
+                bool dropUnreferencedOnRebalance, bool inPlaceRelocation)
             {
                 new (cfg) kv::PoolRebalanceConfig();
                 cfg->minSampledKvCaches = minSampledKvCaches;
@@ -1915,16 +1916,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->targetRatioUpdateInterval = targetRatioUpdateInterval;
                 cfg->ratioTolerance = ratioTolerance;
                 cfg->movingAverageDecay = movingAverageDecay;
+                cfg->copyBasedRebalancing = copyBasedRebalancing;
+                cfg->dropUnreferencedOnRebalance = dropUnreferencedOnRebalance;
+                cfg->inPlaceRelocation = inPlaceRelocation;
                 cfg->validate();
             },
             nb::arg("min_sampled_kv_caches") = 2000, nb::arg("cooldown_secs") = 120.0,
             nb::arg("target_ratio_update_interval") = 100, nb::arg("ratio_tolerance") = 0.25f,
-            nb::arg("moving_average_decay") = 0.9999)
+            nb::arg("moving_average_decay") = 0.9999, nb::arg("copy_based_rebalancing") = false,
+            nb::arg("drop_unreferenced_on_rebalance") = false, nb::arg("in_place_relocation") = false)
         .def_rw("min_sampled_kv_caches", &kv::PoolRebalanceConfig::minSampledKvCaches)
         .def_rw("cooldown_secs", &kv::PoolRebalanceConfig::cooldownSecs)
         .def_rw("target_ratio_update_interval", &kv::PoolRebalanceConfig::targetRatioUpdateInterval)
         .def_rw("ratio_tolerance", &kv::PoolRebalanceConfig::ratioTolerance)
         .def_rw("moving_average_decay", &kv::PoolRebalanceConfig::movingAverageDecay)
+        .def_rw("copy_based_rebalancing", &kv::PoolRebalanceConfig::copyBasedRebalancing)
+        .def_rw("drop_unreferenced_on_rebalance", &kv::PoolRebalanceConfig::dropUnreferencedOnRebalance)
+        .def_rw("in_place_relocation", &kv::PoolRebalanceConfig::inPlaceRelocation)
         .def("validate", &kv::PoolRebalanceConfig::validate) DEF_COPY(kv::PoolRebalanceConfig);
 
     nb::class_<kv::KVCacheManagerConfig>(m, "KVCacheManagerConfig")
@@ -2673,6 +2681,27 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 manager, kv::TypedVec<kv::PoolGroupIndex, float>{std::move(ratios)});
         },
         nb::arg("manager"), nb::arg("ratios"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "set_target_ratio_list_cold",
+        [](kv::KvCacheManager& manager, std::vector<float> ratios)
+        {
+            kv::KvCacheIntrospection::setTargetRatioListCold(
+                manager, kv::TypedVec<kv::PoolGroupIndex, float>{std::move(ratios)});
+        },
+        nb::arg("manager"), nb::arg("ratios"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "gpu_slot_windows",
+        [](kv::KvCacheManager& manager) { return kv::KvCacheIntrospection::gpuSlotWindows(manager); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "slot_windows",
+        [](kv::KvCacheManager& manager, int level)
+        { return kv::KvCacheIntrospection::slotWindows(manager, kv::CacheLevel{level}); },
+        nb::arg("manager"), nb::arg("level"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "gpu_pool_windows",
+        [](kv::KvCacheManager& manager) { return kv::KvCacheIntrospection::gpuPoolWindows(manager); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
     // White-box reuse-tree introspection: mirror the Python manager's _life_cycles
     // and _radix_tree attributes so shared tests can inspect reuse state.
     mIntrospection.def(
@@ -3531,6 +3560,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "because a fetch with no converted indices would read the wrong pages rather than fail. Their "
             "shape is not a choice, so this saves a caller re-deriving the pool layout to restate it.")
         .def("get_page_index_scale", &kv::KvCacheManager::getPageIndexScale, nb::arg("layer_id"), nb::arg("data_role"))
+        .def("get_page_index_bindings", &kv::KvCacheManager::getPageIndexBindings, nb::arg("layer_id"),
+            nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_page_index_binding_version", &kv::KvCacheManager::getPageIndexBindingVersion,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_gpu_arena_extent", &kv::KvCacheManager::getGpuArenaExtent, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_pool_bindings",
+            [](kv::KvCacheManager const& self, int poolGroupIndex, int poolIndex)
+            { return self.getPoolBindings(kv::PoolGroupIndex{poolGroupIndex}, kv::PoolIndex{poolIndex}); },
+            nb::arg("pool_group_index"), nb::arg("pool_index"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_page_index_range", &kv::KvCacheManager::getPageIndexRange, nb::arg("layer_id"), nb::arg("data_role"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
             nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
         .def("is_sparse", &kv::KvCacheManager::isSparse, nb::arg("layer_id"), nb::arg("data_role"),
@@ -3791,6 +3832,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("buffers"))
         .def("adjust", &kv::KvCacheManager::adjust, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "raise_hot_min_slots",
+            [](kv::KvCacheManager& self, kv::BatchDesc const& batch)
+            {
+                nb::gil_scoped_release release;
+                auto const floors = self.raiseHotMinSlots(batch);
+                return std::vector<kv::SlotCount>(floors.begin(), floors.end());
+            },
+            nb::arg("batch"),
+            "Raise the hot-level slot floors rebalancing respects to what `batch` needs, capped at the current "
+            "slot counts. Returns the floors per pool group.")
+        .def_prop_ro("planned_slot_counts",
+            [](kv::KvCacheManager const& self)
+            {
+                nb::gil_scoped_release release;
+                auto const planned = self.plannedSlotCounts();
+                return std::vector<kv::SlotCount>(planned.begin(), planned.end());
+            })
         .def_prop_ro("need_adjustment",
             [](kv::KvCacheManager const& self)
             {
