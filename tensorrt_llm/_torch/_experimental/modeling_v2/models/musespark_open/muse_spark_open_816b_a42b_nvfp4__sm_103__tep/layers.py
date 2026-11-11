@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import os
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -1098,6 +1099,15 @@ def adopt_model(
         _tp_agreement.agreed_install(
             model.layers[0].mapping,
             lambda: multi_request_append.install(model, min_seqs),
+        )
+    if os.environ.get("MUSESPARK_OPEN_FMK_CONTEXT_FMHA", "0") == "1":
+        # Opt-in (not a lever): after every other attention install, it replaces only the context
+        # phase of the full-attention layers' trtllm-gen FMHA library on mixed steps. Its refusal
+        # is agreed over the TP group, as the attention installs.
+        from .kernels.fmk_context_fmha import attention as fmk_context_fmha
+
+        _tp_agreement.agreed_install(
+            model.layers[0].mapping, lambda: fmk_context_fmha.install(model)
         )
     if decode_kv_splits is not None:
         # After every other attention re-class: the mixed-step mixin goes in front of all of
