@@ -5254,8 +5254,6 @@ class PyExecutor:
             effects=PyExecutorEffects(self),
             registry=PyExecutorRequestRegistry(self),
             enable_attention_dp=getattr(self, "enable_attention_dp", False),
-            force_terminate_ctx_for_partial_reuse=getattr(
-                self, "force_terminate_ctx_for_partial_reuse", False),
             admission_controller=getattr(
                 self, "_disagg_transfer_admission_controller", None),
             is_kv_manager_v2=is_kv_manager_v2,
@@ -11322,6 +11320,14 @@ class PyExecutor:
                         timed_out_requests.append(request)
                     continue
 
+                # Retired by the coordinator's poll: its retry loop owns the
+                # cancellation and multi-rank ADP defers the response to the
+                # loop-head error vote; re-cancelling here would desync that
+                # vote.
+                if request.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                    new_active_requests.append(request)
+                    continue
+
                 is_cancelled = self.disagg.request_cancellation(request)
                 if is_cancelled:
                     # _handle_errors enters response collectives under ADP.
@@ -11397,8 +11403,8 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
-                # PP=1-only early termination; the coordinator's release_transfer
-                # gates on the same flag so the request terminates exactly once.
+                # PP=1-only early termination; release_transfer completes it
+                # once the request's final transfer claim is released.
                 force_terminate_for_partial_reuse = (
                     self.force_terminate_ctx_for_partial_reuse)
                 if request.is_disagg_context_complete_state:

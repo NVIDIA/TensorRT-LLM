@@ -414,10 +414,54 @@ def _executor_with_real_error_path(monkeypatch) -> tuple:
         effects=PyExecutorEffects(executor),
         registry=PyExecutorRequestRegistry(executor),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
     executor._disagg_coordinator = coordinator
     return executor, coordinator, transceiver
+
+
+@pytest.mark.parametrize("outcome", ["complete", "error"])
+@pytest.mark.parametrize("early_terminate", [False, True])
+@pytest.mark.parametrize("owners", [1, 2])
+def test_departed_context_send_frees_resources_once_after_its_last_owner(
+    monkeypatch, outcome: str, early_terminate: bool, owners: int
+) -> None:
+    """A response can remove a context request before its KV send settles.
+    An early termination attempt must retain live transfer memory, and final
+    settlement must reclaim it even if the send failed or early termination
+    was requested. A connector owner delays cleanup until its own release.
+    """
+    executor, coordinator, transceiver = _executor_with_real_error_path(monkeypatch)
+    executor.async_transfer_manager = coordinator._transfers
+    executor._is_kv_manager_v2 = not early_terminate
+    coordinator._transfers.should_store_blocks = early_terminate
+    executor.force_terminate_ctx_for_partial_reuse = early_terminate
+    request = TransferRequest(1, is_dummy_request=False)
+    coordinator.send_completed_context([request])
+    for _ in range(owners - 1):
+        coordinator._transfers.start_transfer(request)
+
+    # The response pass has removed the request; an early termination attempt
+    # cannot free its blocks while the transfer still owns them.
+    executor._terminate_request(request)
+    executor.resource_manager.free_resources.assert_not_called()
+    transceiver.finish_send(request, outcome=outcome)
+
+    coordinator.reap_context_sends(0)
+
+    if owners > 1:
+        executor.resource_manager.free_resources.assert_not_called()
+        assert coordinator._transfers.has_any_inflight_requests()
+        coordinator.release_transfer(request)
+
+    assert not coordinator._transfers.has_any_inflight_requests()
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    assert executor.active_requests == []
+    assert executor.responses == {}
+    assert executor._pending_transfer_responses == []
+
+    coordinator.reap_context_sends(0)
+    coordinator.release_transfer(request)
+    executor.resource_manager.free_resources.assert_called_once_with(request)
 
 
 def _receiving_gen(rid: int) -> TransferRequest:
@@ -577,3 +621,103 @@ def test_cancelling_part_of_a_saturated_receive_batch_settles_only_those_request
     assert all(req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE for req in kept)
     assert transceiver.check_gen_transfer_complete()
     assert len(executor.resource_manager.free_resources.call_args_list) == 8
+
+
+def test_idle_legacy_gen_timeout_retries_then_frees_once_without_a_model_batch(monkeypatch):
+    executor, coordinator, transceiver = _executor_with_real_error_path(monkeypatch)
+    transceiver.kv_transfer_timeout_ms = 1000
+    timed_out, healthy, user_canceled = (_receiving_gen(i) for i in (1, 2, 3))
+    executor.active_requests.extend([timed_out, healthy, user_canceled])
+    executor.canceled_req_ids = [3]
+    for req in executor.active_requests:
+        transceiver.request_and_receive_async(req)
+        req.py_kv_transfer_start_time = 0.0 if req is not healthy else 1.5
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.orchestration.coordinator.time.monotonic",
+        lambda: 2.0,
+    )
+    cancel = transceiver.cancel_request
+    # A refused cancel or a cancel that raises is not retirement evidence,
+    # and the retries are spaced out: one attempt every second poll.
+    transceiver.cancel_request = Mock(side_effect=[False, RuntimeError("retry")])
+    coordinator.poll_gen_transfers()  # attempt 1: refused
+    assert transceiver.cancel_request.call_count == 1
+    executor.resource_manager.free_resources.assert_not_called()
+    assert executor.active_requests == [timed_out, healthy, user_canceled]
+    assert executor.responses == {}
+    coordinator.poll_gen_transfers()  # pacing: no attempt
+    assert transceiver.cancel_request.call_count == 1
+    coordinator.poll_gen_transfers()  # attempt 2: raises
+    assert transceiver.cancel_request.call_count == 2
+    executor.resource_manager.free_resources.assert_not_called()
+    assert executor.active_requests == [timed_out, healthy, user_canceled]
+    assert executor.responses == {}
+    transceiver.cancel_request.side_effect = cancel
+    coordinator.poll_gen_transfers()  # pacing: no attempt
+    assert transceiver.cancel_request.call_count == 2
+    coordinator.poll_gen_transfers()  # attempt 3: succeeds, frees once
+    assert transceiver.cancel_request.call_count == 3
+    assert executor.active_requests == [healthy, user_canceled]
+    executor.resource_manager.free_resources.assert_called_once_with(timed_out)
+    assert len(executor.responses[1]) == 1
+    coordinator.poll_gen_transfers()
+    executor.resource_manager.free_resources.assert_called_once_with(timed_out)
+    assert 2 not in executor.responses and 3 not in executor.responses
+
+
+def test_idle_legacy_gen_timeout_defers_adp_failure_to_existing_error_vote(monkeypatch):
+    """Retirement parks the request in DISAGG_TRANS_ERROR and no rank reports
+    the failure early; the next loop-head vote fails it on every rank. The
+    response pass must then leave the retired request for that vote instead
+    of re-cancelling it through the legacy timeout branch, which would fail
+    it through the executor's own timeout collective and desync the ADP
+    group.
+    """
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = _ranks(group, enable_attention_dp=True, kv_transfer_timeout_ms=1000)
+    request = _receiving_gen(7)
+    ranks[0].active.append(request)
+    ranks[0].transceiver.request_and_receive_async(request)
+    request.py_kv_transfer_start_time = 0.0
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.orchestration.coordinator.time.monotonic",
+        lambda: 2.0,
+    )
+    group.run(lambda rank: ranks[rank].coordinator.poll_gen_transfers())
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert [h.effects.failed for h in ranks] == [[], []]
+    assert [h.dist.calls for h in ranks] == [[], []]
+
+    # A model batch appears on the owning rank: the response pass skips the
+    # retired request (its error response belongs to the vote below).
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [request]
+    executor._is_kv_manager_v2 = False
+    executor.perf_manager = Mock()
+    executor.iter_counter = 0
+    executor.stream_interval = 1
+    executor.first_content_emit_iters = 1
+    executor.gather_all_responses = False
+    executor.enable_attention_dp = True
+    executor.dist = ranks[0].dist
+    # tp_gather only runs when a response is enqueued; none is here.
+    ranks[0].dist.mapping = SimpleNamespace(tp_group=[0, 1])
+    ranks[0].dist.tp_gather = Mock(return_value=[[], []])
+    executor.responses = {}
+    executor.response_cv = threading.Condition()
+    executor._pending_transfer_responses = []
+    executor._is_preemption_pending = lambda request: False
+    executor._disagg_coordinator = ranks[0].coordinator
+    request.py_decoding_iter = 1
+    assert executor._handle_responses() == []
+    assert executor.active_requests == [request]
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    # One cancel only (the coordinator's retirement); the response pass did
+    # not re-cancel the parked request.
+    assert ranks[0].transceiver.call_log.count("cancel_request:7") == 1
+
+    group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
+    assert ranks[0].effects.failed == [(_VOTE_MSG, [request], False)]
+    assert ranks[1].effects.failed == [(_VOTE_MSG, [], False)]
