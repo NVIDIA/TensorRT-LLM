@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
+from agent_flow.workflows.trtllm_modeling_v2.infra import git
 from agent_flow.workflows.trtllm_modeling_v2.run.contract import compile_contract
 from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, shorthand, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
@@ -355,6 +356,39 @@ def test_the_documents_say_what_the_code_does_where_a_reader_followed_them(tmp_p
     assert "python" not in written["environment"] and "benchmarks" not in written["deployments"][0]
     assert "`environment.python`, `accuracy.model_key`) and the spec's warnings" in intake
     assert "never from `derive`, which writes no anchor" in intake
+    # What a first user asks before a run: the agent CLI's permissions, the commit identity,
+    # and what a deployment costs. Each is where the code has it.
+    assert '`{"permissions": {"defaultMode": "bypassPermissions"}}`' in readme
+    probe = (package / "run" / "startup" / "agent_probe.py").read_text(encoding="utf-8")
+    assert '{{"permissions": {{"defaultMode": "bypassPermissions"}}}}' in probe
+    assert f"or as `{git.ENV_NAME}` and `{git.ENV_EMAIL}` when both are set" in readme
+    assert "Each check is one load of the checkpoint" in readme
+    # INTAKE names the keys `derive` reads of a site file, and the smallest options file.
+    keys = intake.split("Its keys: ")[1].split("\n")[0]
+    for key in ("trtllm_repo_path", "environment", "device", "agents", "commit_policy", "defaults"):
+        assert f"`{key}" in keys, key
+    assert set(derive.DEFAULT_WORKLOAD) == {"isl", "osl", "max_batch_size"}
+    assert "`workload` (`isl`, `osl`, `max_batch_size`)" in keys
+    assert "The smallest one is empty (`{}`: the engine's defaults)" in intake
+    (tmp_path / "engines").mkdir()
+    (tmp_path / "engines" / "empty.yaml").write_text("{}\n")
+    smallest = _valid_spec(tmp_path)
+    del smallest["parallel"], smallest["accuracy"]
+    smallest["deployments"] = [{"name": "tp1", "options": "engines/empty.yaml"}]
+    [only] = deployments.resolve(load_and_validate_task_yaml(_write(tmp_path, smallest)))
+    assert only.server.options == {} and only.benchmarks == ()
+    for key in yaml.safe_load((out / "engines" / "tp1.yaml").read_text()):
+        assert (
+            f"`{key}" in intake
+            or key.endswith("_parallel_size")
+            or key
+            in (
+                "enable_attention_dp",
+                "enable_chunked_prefill",
+                "disable_overlap_scheduler",
+                "speculative_config",
+            )
+        ), key
 
 
 def test_the_example_spec_loads_whole_and_so_do_its_smallest_and_its_disaggregated_form(tmp_path):

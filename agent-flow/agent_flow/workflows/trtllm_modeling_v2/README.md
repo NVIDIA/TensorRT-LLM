@@ -19,6 +19,8 @@ trtllm-modeling-v2 --task <spec-dir>/task.derived.yaml --workspace <ws> --dry-ru
 trtllm-modeling-v2 --task <spec-dir>/task.derived.yaml --workspace <ws>
 ```
 
+The agent CLI the run launches must run commands without asking (for Claude Code, `{"permissions": {"defaultMode": "bypassPermissions"}}` in the settings of its `CLAUDE_CONFIG_DIR`): preflight proves it with one tiny turn per agent and says what to set when it fails. Commits are made as the checkout's `git config user.name` and `user.email`, or as `MV2FLOW_GIT_NAME` and `MV2FLOW_GIT_EMAIL` when both are set.
+
 On one host with a simple environment, fill `checkpoint_path`, `trtllm_repo_path`, `arch`, `environment.python`, `agents.defaults` (`backend`, `model`) and one deployment with its options file. Accuracy runs offline: each benchmark's dataset is under `$LLM_MODELS_ROOT/datasets/` (GSM8K: `openai/gsm8k`), in the HuggingFace cache, or at its `dataset_path`; leave `accuracy` out to onboard on the boot alone. [spec/INTAKE.md](spec/INTAKE.md) says how to add deployments and benchmarks; `task.example.yaml` shows every key.
 
 ## How a run goes
@@ -30,7 +32,7 @@ On one host with a simple environment, fill `checkpoint_path`, `trtllm_repo_path
 5. **Final pass**, once: every check the done deployments owe, the target's tests, and the convention scan (an entry without `CELLS` or `ARCHS`, an import of Modeling V1 model code; reported, never a gate). What fails goes to one `fix` task, then every check of each deployment that had a failure, and `core`'s, run again.
 6. **Report**: `<ws>/delivery_report.md`.
 
-A check is `trtllm-modeling-v2 gate <boot|accuracy|tests> --task <ws>/task.yaml --deployment <name> --tree <tree>`, the same command for the run and for a worker. Its verdict line names the directory of its files; `tests` on a deployment that states none says `[NOTHING TO RUN]` and exits 0.
+A check is `trtllm-modeling-v2 gate <boot|accuracy|tests> --task <ws>/task.yaml --deployment <name> --tree <tree>`, the same command for the run and for a worker. Each check is one load of the checkpoint: a deployment with one benchmark is loaded twice, once for its boot and once for its score, a disaggregated one too. Its verdict line names the directory of its files; `tests` on a deployment that states none says `[NOTHING TO RUN]` and exits 0.
 
 ## The report
 
@@ -69,8 +71,8 @@ A disaggregated deployment (`ctx` and `gen`) states `cache_transceiver_config` w
 - Commits on the branch that no task of this run landed.
 - Conventions are findings in the report, not gates.
 
-Run on GPUs so far: every check once, standalone, on one node (aggregated and disaggregated, GSM8K). Two ranks per server have run (aggregated and disaggregated). Not yet: a prefix that leaves the host, `stop`, a restart after a killed process, image prompts. Through a proxy only GSM8K is scored; another benchmark there is refused, not judged.
+Run on GPUs so far, with a small dense checkpoint: every check standalone on two delivered trees, three times, the last without a patch (aggregated on this host with one and two ranks, behind a prefix, disaggregated with one and two ranks a side; GSM8K by `trtllm-eval` and through the proxy); and six whole runs with weak agents (two models, a one-deployment spec and one with a disaggregated deployment), of which the first four, on an earlier head, all onboarded in 1 h 43 min to 3 h 19 min. Not yet: a prefix that leaves the host, `stop`, a restart after a killed process, image prompts. Through a proxy only GSM8K is scored; another benchmark there is refused, not judged.
 
 ## An agent that operates a run
 
-An outside agent may drive a run without a person: change the environment, the spec, shared code or the target, send notes, and start again within the bounds above. Two rules: every change is a commit or a spec edit, so the report lists it; and it never alters an anchor, a tolerance or a check. A commit that touches `tensorrt_llm/evaluate/`, `tensorrt_llm/commands/eval.py` or the accuracy references is refused.
+An outside agent may drive a run without a person: change the environment, the spec, shared code or the target, send notes, and start again within the bounds above. Two rules: every change is a commit or a spec edit, so the report lists it; and it never alters an anchor, a tolerance or a check. A commit that touches `tensorrt_llm/evaluate/`, `tensorrt_llm/commands/eval.py` or the accuracy references is refused. A commit without a sign-off is signed off as it lands; a `Co-authored-by` line or another author lands and is listed in the report.

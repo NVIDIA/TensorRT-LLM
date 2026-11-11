@@ -13,13 +13,15 @@ Intake writes `task.yaml` and the native TensorRT-LLM options files before a run
 trtllm-modeling-v2 intake derive --checkpoint <ckpt-dir> --repo <trtllm-dir> --out <spec-dir>
 ```
 
-Pass `--site <site.yaml>` instead of `--repo` when the cluster has a site file (`trtllm_repo_path`, `environment`, `agents`, defaults). `derive` writes `task.derived.yaml` with one deployment, the first, and its options in `engines/<name>.yaml`. It prints what it left open (`open:` lines: `arch`, `agents.defaults.model`, `environment.python`, `accuracy.model_key`) and the spec's warnings; the dry run prints the same warnings again for the spec as you edited it:
+Pass `--site <site.yaml>` instead of `--repo` when the cluster has a site file. Its keys: `trtllm_repo_path` and `environment` (both required; `environment` is copied as it is), `device: {arch: sm_103}`, `agents` and `commit_policy` (copied), and `defaults`: `members` (the first names the deployment), `workload` (`isl`, `osl`, `max_batch_size`) and `accuracy` (`model_key`). `derive` writes `task.derived.yaml` with one deployment, the first, and its options in `engines/<name>.yaml`. It prints what it left open (`open:` lines: `arch`, `agents.defaults.model`, `environment.python`, `accuracy.model_key`) and the spec's warnings; the dry run prints the same warnings again for the spec as you edited it:
 
 - **first deployment too narrow:** the weights take more than 75% of the first deployment's devices (`environment.gpu_memory_gib` says how much one has).
 - **no accuracy anchor:** the first deployment names no benchmark, or has no reference row and no declared anchor: `onboarded` can then only mean it boots.
 - **accuracy without CUDA graphs:** a scored deployment states `cuda_graph_config: null`: a benchmark takes 10 to 50 times longer.
 - **host memory:** no `kv_cache_config.host_cache_size` under a memory limit.
 - **anchor under one percent** (from the dry run and every start; never from `derive`, which writes no anchor): a declared `anchor` below 1 with `unit: percent`.
+
+An options file is what `trtllm-serve --config` takes. The smallest one is empty (`{}`: the engine's defaults); `derive` writes `max_seq_len`, `max_batch_size`, `max_num_tokens`, the parallel widths (`tensor_parallel_size: 1` and the rest), `cuda_graph_config: {}`, `kv_cache_config` (`enable_block_reuse: false`, `free_gpu_memory_fraction: 0.9`), and chunked prefill and the drafter off.
 
 Validate without a GPU: `trtllm-modeling-v2 --task <spec> --workspace <ws> --dry-run`.
 
