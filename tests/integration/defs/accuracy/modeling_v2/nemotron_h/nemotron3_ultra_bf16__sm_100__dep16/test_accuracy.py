@@ -27,18 +27,27 @@ class TestModelingV2Nemotron3UltraBf16Sm100Dep16(NemotronHBf16Target):
     Attention data parallel over 16 ranks, everything but the routed experts whole on every
     rank; the routed experts in sixteen 32-expert windows, exchanged between ranks by the
     engine's MoE layer. Per rank: up to 32 requests (decode graphs to 32 rows, the generation
-    tier's 14-32) and 2048 tokens a step, the disaggregated context tier's chunk.
+    tier's 14-32) and 2048 tokens a step (4096 on the MegaMoE path, the disaggregated context
+    tier's chunk).
     """
 
     WORLD = 16
     MOE_EP = 16
     ATTENTION_DP = True
+    # The CUTLASS and TRTLLM gates keep the step at 2048 tokens a rank: their default MoE launch
+    # cap is the step times 16 (32768), the setting Modeling V1 ran this layout with.
     MAX_NUM_TOKENS = 2048
 
     def test_gsm8k_megamoe_cutedsl(self):
-        # The serving path: CuTe DSL MegaMoE (BF16 Relu2, top-22), at the disaggregated tiers'
-        # cap of 1024 rows a rank per launch, so a full prefill step runs two launches.
-        self._gsm8k(max_batch_size=32, moe_backend="MEGAMOE_CUTEDSL", moe_max_num_tokens=1024)
+        # The serving path: CuTe DSL MegaMoE (BF16 Relu2, top-22) at the disaggregated context
+        # tier's 4096 tokens a rank and its cap of 1024 rows a rank per launch, so a full prefill
+        # step runs four launches (the multi-chunk path).
+        self._gsm8k(
+            max_batch_size=32,
+            moe_backend="MEGAMOE_CUTEDSL",
+            moe_max_num_tokens=1024,
+            max_num_tokens=4096,
+        )
 
     def test_gsm8k(self):
         # AUTO: the CUTLASS leaf over the engine's all-to-all, Modeling V1's default here.
