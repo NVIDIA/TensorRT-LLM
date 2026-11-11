@@ -7678,6 +7678,13 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
             module.w3_w1_bias.data.div_(
                 module.fc31_input_gate_dequant.view(-1, 1))
             module.w2_bias.data.div_(module.fc2_input_dequant.view(-1, 1))
+        self._scale_activation_params(module)
+
+    def cache_derived_state(self, module: torch.nn.Module) -> None:
+        super().cache_derived_state(module)
+        self._scale_activation_params(module)
+
+    def _scale_activation_params(self, module: torch.nn.Module) -> None:
         for name in ("act_beta", "act_clamp"):
             value = getattr(module, name)
             if value is not None:

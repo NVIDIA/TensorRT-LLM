@@ -29,15 +29,19 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(monkeypatch, bias, gptoss, load
         def _get_quant_method(self):
             return method
 
-    module = WeightOwner()
-    module.num_experts = 4
-    module.expert_size_per_partition = 2
-    module.initial_local_expert_ids = [1, 3]
-    module.weight_loading_mode = loading_mode
-    module.bias = bias
-    module.register_buffer("act_alpha", torch.tensor([1.702, 1.5]) if gptoss else None)
-    module.register_buffer("act_beta", torch.tensor([1.0, 2.0]) if gptoss else None)
-    module.register_buffer("act_clamp", torch.tensor([7.0, 9.0]) if gptoss else None)
+    def create_module() -> WeightOwner:
+        owner = WeightOwner()
+        owner.num_experts = 4
+        owner.expert_size_per_partition = 2
+        owner.initial_local_expert_ids = [1, 3]
+        owner.weight_loading_mode = loading_mode
+        owner.bias = bias
+        owner.register_buffer("act_alpha", torch.tensor([1.702, 1.5]) if gptoss else None)
+        owner.register_buffer("act_beta", torch.tensor([1.0, 2.0]) if gptoss else None)
+        owner.register_buffer("act_clamp", torch.tensor([7.0, 9.0]) if gptoss else None)
+        return owner
+
+    module = create_module()
 
     def create_weight_storage(self, module):
         module.register_parameter("w3_w1_weight", torch.nn.Parameter(torch.zeros(2, 4, 2)))
@@ -96,3 +100,19 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(monkeypatch, bias, gptoss, load
             torch.testing.assert_close(module.w2_bias, fc2_bias / fc2_scale)
         assert "_act_beta_unscaled" not in module.state_dict()
         assert "_act_clamp_unscaled" not in module.state_dict()
+
+        # Runtime weights omit the non-persistent activation configuration.
+        restored = create_module()
+        restored.create_weights()
+        restored.load_state_dict(module.state_dict())
+        restored.post_load_weights()
+        restored.post_load_weights()
+        if gptoss:
+            torch.testing.assert_close(restored.act_beta, raw_beta / fc1_scale)
+            torch.testing.assert_close(restored.act_clamp, raw_clamp / fc1_scale)
+        else:
+            assert restored.act_beta is None
+            assert restored.act_clamp is None
+        if bias:
+            torch.testing.assert_close(restored.w3_w1_bias, module.w3_w1_bias)
+            torch.testing.assert_close(restored.w2_bias, module.w2_bias)
