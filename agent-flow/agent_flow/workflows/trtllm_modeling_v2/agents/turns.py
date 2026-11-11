@@ -23,7 +23,6 @@ written as the turn goes, so an operator can tail one while it runs::
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import itertools
 import json
@@ -44,11 +43,7 @@ from agent_flow.backends.claude_code import cli_stderr_to
 from ..infra.files import write_json_atomic, write_text_atomic
 
 
-class TurnExecutionError(RuntimeError):
-    """A turn could not be delivered or could not be answered."""
-
-
-class TurnTimeout(TurnExecutionError):
+class TurnTimeout(RuntimeError):
     """Nothing answered the turn inside its deadline."""
 
 
@@ -94,8 +89,6 @@ class TurnOutcome:
 
     role: str
     text: str
-    #: The id of the turn's records (``turns/<id>.*``), where it has them.
-    request_id: str = ""
 
 
 #: Given a request, the :class:`agent_flow.AgentLayer` that runs it: its
@@ -224,37 +217,6 @@ class TurnRecord:
             pass
 
 
-class _TurnLog:
-    """Where an executor and its bound views keep their records, and the ids they share."""
-
-    def __init__(self) -> None:
-        self.root: Path | None = None
-        self._lock = threading.Lock()
-        self._counter: Any = None
-
-    def keep_in(self, root: Path | str) -> None:
-        # Absolute, so the paths a record names hold from any working directory.
-        root = Path(root).absolute()
-        with self._lock:
-            if self.root == root:
-                return
-            root.mkdir(parents=True, exist_ok=True)
-            seen = [_seq(p.name) for p in root.glob("*.request.json")]
-            self.root = root
-            # Continued across a resume, so a later process never overwrites a record.
-            self._counter = itertools.count(max(seen, default=0) + 1)
-
-    def open(self, request: TurnRequest, timeout_s: float) -> TurnRecord | None:
-        with self._lock:
-            if self.root is None:
-                return None
-            request_id = f"{next(self._counter):03d}-{request.role}"
-            root = self.root
-        record = TurnRecord(root, request_id)
-        record.begin(request, timeout_s)
-        return record
-
-
 #: The record of the turn running in this context. A layer called in a turn's
 #: thread streams its events in that thread's context, so each event reaches
 #: its own turn's record however many turns of one layer run at once.
@@ -328,39 +290,32 @@ class InProcessTurnExecutor:
         self._provider = layer_provider
         self.timeout_s = DEFAULT_TURN_TIMEOUT_S if timeout_s is None else timeout_s
         self.role_timeouts = dict(DEFAULT_ROLE_TURN_TIMEOUTS) if timeout_s is None else {}
-        self._log = _TurnLog()
+        #: Where turns leave their files, or ``None`` before :meth:`keep_records`.
+        self.records: Path | None = None
+        self._counter: Any = None
         if records is not None:
-            self._log.keep_in(records)
+            self.keep_records(records)
 
     def timeout_for(self, role: str) -> float:
         """How long a turn of ``role`` may take before the run gives up on it."""
         return float(self.role_timeouts.get(role, self.timeout_s))
 
     def keep_records(self, root: Path | str) -> None:
-        """Leave each turn's files in ``root`` from now on, numbered on from those already there.
-
-        Shared with every view :meth:`bound` returns.
-        """
-        self._log.keep_in(root)
-
-    @property
-    def records(self) -> Path | None:
-        """Where turns leave their files, or ``None`` before :meth:`keep_records`."""
-        return self._log.root
-
-    def bound(self, session: Any) -> "InProcessTurnExecutor":
-        """Pin every turn to ``session``, whatever the request asks for."""
-        view = copy.copy(self)
-        view._provider = lambda request: session
-        return view
+        """Leave each turn's files in ``root`` from now on, numbered on from those already there."""
+        # Absolute, so the paths a record names hold from any working directory.
+        self.records = Path(root).absolute()
+        self.records.mkdir(parents=True, exist_ok=True)
+        seen = [_seq(p.name) for p in self.records.glob("*.request.json")]
+        # Continued across a resume, so a later process never overwrites a record.
+        self._counter = itertools.count(max(seen, default=0) + 1)
 
     def run(self, request: TurnRequest) -> TurnOutcome:
         layer = self._provider(request)
-        if layer is None:
-            raise TurnExecutionError(f"no layer available for role {request.role!r}")
         timeout_s = self.timeout_for(request.role)
-        record = self._log.open(request, timeout_s)
-        if record is not None:
+        record = None
+        if self.records is not None:
+            record = TurnRecord(self.records, f"{next(self._counter):03d}-{request.role}")
+            record.begin(request, timeout_s)
             _route_activity(layer)
         token = _ACTIVE.set(record)
         outcome, text, error = "raised", None, ""
@@ -380,11 +335,7 @@ class InProcessTurnExecutor:
             _ACTIVE.reset(token)
             if record is not None:
                 record.finish(outcome, text=text, error=error)
-        return TurnOutcome(
-            role=request.role,
-            text=text,
-            request_id=record.request_id if record is not None else "",
-        )
+        return TurnOutcome(role=request.role, text=text)
 
     @staticmethod
     def _call(layer: Any, request: TurnRequest, timeout_s: float, record: TurnRecord | None) -> Any:

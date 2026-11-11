@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agent_flow.workflows.trtllm_modeling_v2.run.contract import compile_contract
 from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, shorthand, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
@@ -223,6 +224,22 @@ def test_the_shorthand_is_read_once_at_load_and_a_loaded_spec_states_its_deploym
     assert found["mtp"].benchmarks[0].model_key == "org/toy-mtp"
 
 
+@pytest.mark.parametrize("form", ["parallel", "members", "deployments"])
+def test_accuracy_is_optional_on_every_form_of_the_spec(tmp_path, form):
+    spec = _valid_spec(tmp_path)
+    del spec["accuracy"]
+    if form == "members":
+        spec |= {"parallel": "unified", "members": ["tp1", "tep2"], "features": ["mtp"]}
+    elif form == "deployments":
+        del spec["parallel"]
+        spec["deployments"] = [{"name": "tp1", "options": {}}, {"name": "kv", "options": {}}]
+    loaded = load_and_validate_task_yaml(_write(tmp_path, spec))
+    found = deployments.resolve(loaded)
+    # Nothing scores them: each owes its boot, and the run onboards on the first one's.
+    assert found[0].name == "tp1" and all(d.benchmarks == () for d in found)
+    assert [c.gate for c in compile_contract(loaded).checks] == ["boot"] * len(found)
+
+
 def test_a_key_this_version_no_longer_reads_is_dropped_with_one_notice_each(tmp_path):
     spec = _valid_spec(tmp_path)
     quiet: list[str] = []
@@ -247,8 +264,6 @@ def test_a_key_this_version_no_longer_reads_is_dropped_with_one_notice_each(tmp_
 def test_each_deployment_owes_its_boot_its_benchmarks_and_its_tests_and_core_the_serve_gate(
     tmp_path,
 ):
-    from agent_flow.workflows.trtllm_modeling_v2.run.contract import compile_contract
-
     spec = _valid_spec(tmp_path) | {
         "parallel": "unified",
         "members": ["tep4", "dep4"],
