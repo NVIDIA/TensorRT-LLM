@@ -166,8 +166,10 @@ def test_full_context_plan_runs_primts_runtime_contract_on_cpu(
     )
     geometry = plan.GEOMETRY
     assert plan.tile_kv != plan.insts_kv
-    head_values = torch.arange(2 * geometry.heads, dtype=torch.uint8).view(torch.float8_e4m3fn)
-    query = head_values.view(1, -1, 1).expand(qlen, -1, geometry.head_dim).contiguous()[:, ::2]
+    head_values = torch.arange(1, 2 * geometry.heads + 1, dtype=torch.uint8)
+    token_sign_bits = torch.arange(qlen, dtype=torch.uint8).view(-1, 1) * 128
+    query_values = (head_values + token_sign_bits).view(torch.float8_e4m3fn)
+    query = query_values.unsqueeze(-1).expand(-1, -1, geometry.head_dim).contiguous()[:, ::2]
     expected_query = query.float().clone()
     key_pages = torch.zeros(1, geometry.kv_heads, geometry.page, geometry.head_dim).to(
         torch.float8_e4m3fn
