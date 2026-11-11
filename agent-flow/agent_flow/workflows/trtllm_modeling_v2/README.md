@@ -148,7 +148,7 @@ round goes on from the verdicts it recorded for the same commit. `--clean` start
 | `contract_status.jsonl` | every verdict, with the commit and round it belongs to |
 | `certification.yaml` | the last round's result |
 | `delivery_report.md` | the verdict, the certified commit, every check, the coverage |
-| `journal.md`, `reports/`, `turns/` | what happened, each dispatch and its answer, each turn's activity |
+| `journal.md`, `turns/` | what happened; each turn's prompt, activity and answer |
 
 ## Code map
 

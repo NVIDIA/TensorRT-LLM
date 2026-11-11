@@ -68,7 +68,7 @@ RUN_FILES: tuple[str, ...] = (
     conventions.CONVENTIONS_FILENAME,
     COMMIT_LABELS_FILENAME,
 )
-RUN_DIRS: tuple[str, ...] = ("reports", "decisions", report_mod.CHECKS_DIRNAME)
+RUN_DIRS: tuple[str, ...] = ("decisions", report_mod.CHECKS_DIRNAME)
 
 
 class TrtllmModelingV2Workflow:
@@ -227,7 +227,6 @@ class TrtllmModelingV2Workflow:
                     log,
                 )
                 return True
-            self.journal.mark_started()
             pipeline = Pipeline(self, state, log)
             pipeline.run()
             if pipeline.stopped is None:
@@ -244,7 +243,7 @@ class TrtllmModelingV2Workflow:
             raise
         said = report.read_text(encoding="utf-8").splitlines()[0].lstrip("# ")
         checks = self.gate_log.render() or "(none run)"
-        self.journal.close(summary=f"- {said}\n- report: `{report}`\n\n```\n{checks}\n```")
+        self.journal.section("run closed", f"- {said}\n- report: `{report}`\n\n```\n{checks}\n```")
         colour = "green" if state.onboarded else "red"
         print_message(f"[bold {colour}]{said}[/bold {colour}]\nreport: {report}", log)
         return bool(state.onboarded)

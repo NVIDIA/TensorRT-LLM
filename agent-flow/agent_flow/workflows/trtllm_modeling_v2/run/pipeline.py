@@ -461,9 +461,8 @@ class Pipeline:
         """One turn of ``role`` for ``task``, told to write its decision at ``path``."""
         parts = (self._prompt(task, block), self._context(task), decision_file_instruction(path))
         prompt = "\n\n".join(part.strip() for part in parts if part.strip())
-        report = self.w.journal.record_dispatch(role, task.id, prompt)
-        text = self.w._run_turn(role, task.id, prompt, decision_file=path)
-        self.w.journal.record_result(report, text)
+        self.w.journal.event(f"dispatch: {role}", f"{task.id}, to write {path}")
+        self.w._run_turn(role, task.id, prompt, decision_file=path)
 
     def table(self) -> str:
         """Every task and where it stands, as a markdown table."""

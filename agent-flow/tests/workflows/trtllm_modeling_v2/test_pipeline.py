@@ -756,6 +756,12 @@ def test_every_dispatch_says_to_read_the_operators_notes_and_feedback_appends_to
         assert "never a reason to change an anchor or a check" in said
     assert "## Your decision file is not valid" in calls[-1][1]
     assert _tasks(tmp_path)[-1]["attempts"] == 1  # the repair turn is no new attempt
+    # Each turn's prompt and answer are kept with its activity, one set of files a turn.
+    kept = {path.read_text() for path in (workspace / "turns").glob("*.prompt.md")}
+    assert kept == {prompt for _, prompt in calls}
+    assert len(list((workspace / "turns").glob("*.result.md"))) == len(calls)
+    journal = (workspace / "journal.md").read_text()
+    assert journal.count("**dispatch: assembler**: kv_fp8, to write ") == 2
 
 
 # --------------------------------------------------------------------- preflight, dry run

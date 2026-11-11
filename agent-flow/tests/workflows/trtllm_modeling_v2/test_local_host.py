@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
+from agent_flow.workflows.trtllm_modeling_v2.infra import monitor as monitor_mod
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute import executor, server_runtime
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import (
     TIMEOUT_RETURNCODE,
@@ -29,12 +30,11 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
     RunEnvironment,
 )
 from agent_flow.workflows.trtllm_modeling_v2.infra.files import write_json_atomic
-from agent_flow.workflows.trtllm_modeling_v2.infra.monitor import status
-from agent_flow.workflows.trtllm_modeling_v2.infra.monitor.heartbeat import (
+from agent_flow.workflows.trtllm_modeling_v2.infra.monitor import (
     ORCHESTRATOR_EXIT,
     ORCHESTRATOR_HEARTBEAT,
 )
-from agent_flow.workflows.trtllm_modeling_v2.infra.monitor.status import load_config
+from agent_flow.workflows.trtllm_modeling_v2.run import workflow as workflow_mod
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
     TaskSchemaError,
     load_and_validate_task_yaml,
@@ -143,7 +143,12 @@ def test_monitor_cli_tells_a_busy_orchestrator_from_one_that_has_exited(
     dispatch = tmp_path / "dispatch"
     dispatch.mkdir()
     write_json_atomic(dispatch / ORCHESTRATOR_HEARTBEAT, {"pid": 1, "host": "h", "at": time.time()})
-    assert status.orchestrator_state(load_config(tmp_path))[0] == "running"
+    assert monitor_mod.orchestrator_state(tmp_path)[0] == "running"
+    # From any node that sees the workspace: only the files are read, and a heartbeat that
+    # stopped says the orchestrator is gone.
+    late = time.time() + monitor_mod.ORCHESTRATOR_STALE_S + 1
+    state, said = monitor_mod.orchestrator_state(tmp_path, now=late)
+    assert state == "exited" and "pid 1 on h stopped heart-beating" in said
     assert monitor(["wait", "--timeout", "0"]) == 0
     assert capsys.readouterr().out.splitlines()[0] == "TIMEOUT  nothing new"
     # A closed run changes nothing else, so the waiter must notice the exit.
@@ -197,7 +202,7 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
         def mark_exit(self):
             beats.append("exit")
 
-    monkeypatch.setattr(cli, "start_orchestrator_heartbeat", lambda workspace, period: _Heartbeat())
+    monkeypatch.setattr(cli, "OrchestratorHeartbeat", lambda workspace, period: _Heartbeat())
 
     def run(*argv):
         with mock.patch.dict(os.environ), pytest.raises(SystemExit) as exited:
@@ -238,4 +243,10 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
     assert run("--task", str(task_file), "--workspace", str(failed), "--dry-run") == 1
     journal = (failed / "journal.md").read_text()
     assert "preflight failed" in journal and "the checkpoint is not readable" in journal
+    # The exit status says what the run came to: 0 onboarded, whatever else is not done.
+    for onboarded, code in ((True, 0), (False, 1)):
+        came_to = lambda self, task, onboarded=onboarded: onboarded  # noqa: E731
+        monkeypatch.setattr(workflow_mod.TrtllmModelingV2Workflow, "run", came_to)
+        workspace = tmp_path / f"ws-run-{code}"  # each start holds its workspace's lock
+        assert run("--task", str(task_file), "--workspace", str(workspace)) == code
     assert dict(os.environ) == before

@@ -21,7 +21,7 @@ from .infra.git import (
     resolve_commit_identity,
     trial_commit,
 )
-from .infra.monitor.heartbeat import ORCHESTRATOR_HEARTBEAT_S, start_orchestrator_heartbeat
+from .infra.monitor import ORCHESTRATOR_HEARTBEAT_S, OrchestratorHeartbeat
 from .run.pipeline import DEFAULT_MAX_ATTEMPTS, NOTES_FILENAME
 from .run.state import STATE_FILENAME
 from .spec.task_schema import TaskSchemaError, load_and_validate_task_yaml
@@ -53,7 +53,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("workspace/trtllm-modeling-v2"),
         help="Workspace directory for the run's shared state (task.yaml, "
-        "plan.md, vocabulary.yaml,journal.md, reports/). "
+        "plan.md, vocabulary.yaml, journal.md, turns/). "
         "Created on demand.",
     )
     parser.add_argument(
@@ -204,7 +204,7 @@ SUBCOMMANDS = {
     "intake": _lazy_main(".spec.derive"),
     "gate": _lazy_main(".checks.gate_cli"),
     # The operator's loop of a run: wait, status.
-    "monitor": _lazy_main(".infra.monitor.status"),
+    "monitor": _lazy_main(".infra.monitor"),
     # A note for the workers of a run: `feedback --workspace W "..."`.
     "feedback": _feedback,
 }
@@ -242,7 +242,7 @@ def main(argv: list[str] | None = None) -> None:
             file=sys.stderr,
         )
     # A driver watching the run tells a crashed orchestrator from a busy one by it.
-    heartbeat = start_orchestrator_heartbeat(args.workspace, ORCHESTRATOR_HEARTBEAT_S)
+    heartbeat = OrchestratorHeartbeat(args.workspace, ORCHESTRATOR_HEARTBEAT_S)
 
     # Claude Code's auto-memory is shared by every worktree of one repository: one
     # task's notes would reach the others, and one run's the next.
