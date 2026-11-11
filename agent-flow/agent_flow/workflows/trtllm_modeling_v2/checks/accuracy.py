@@ -102,7 +102,8 @@ def launch_command(
     launch = deployment.server.launch.strip()
     if not launch:
         return environment.command(" ".join(parts))
-    inner = f"{single_task_scrub(list(env))}; exec {launch} {' '.join(parts)}"
+    # The prefix is the site's own words (it may begin with assignments): run as written.
+    inner = f"{single_task_scrub(list(env))}; {launch} {' '.join(parts)}"
     return f"{' '.join(env_assignments(environment.env))} bash -c {shlex.quote(inner)}"
 
 

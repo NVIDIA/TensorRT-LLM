@@ -559,10 +559,10 @@ def run_preflight(
 
     arch = str(task_data["arch"])
     found = deployments_mod.resolve(task_data)
-    # What runs on this host: a deployment behind a launch prefix places its own ranks.
-    here = [d for d in found if not d.prefixed]
-    world_size = max((s.ranks for d in here for s in d.servers.values()), default=1)
-    need = max((d.ranks for d in here), default=0)
+    # What runs on this host: a server behind a launch prefix places its own ranks.
+    here = [[s for s in d.servers.values() if not s.launch.strip()] for d in found]
+    world_size = max((s.ranks for servers in here for s in servers), default=1)
+    need = max((sum(s.ranks for s in servers) for servers in here), default=0)
 
     # The checks that only read files run before anything that touches the host.
     check_checkpoint_fit(task_data)
@@ -585,7 +585,7 @@ def run_preflight(
         )
     if not need:
         devices = ()
-        notes.append("devices: none claimed here: every deployment starts behind its launch prefix")
+        notes.append("devices: none claimed here: every server starts behind its launch prefix")
     elif claim:
         devices = claim_devices(need, arch, python, runner=runner, notes=notes)
     else:

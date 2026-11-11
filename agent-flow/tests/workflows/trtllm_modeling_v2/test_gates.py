@@ -409,7 +409,7 @@ def test_accuracy_runs_trtllm_eval_behind_the_deployments_own_prefix(tmp_path):
     assert "anchor: reference" in result.detail and result.path == gate_cli.IN_PROCESS
     [command] = runner.seen
     # The prefix places the ranks: no device of this host and no launcher of the flow's.
-    assert "exec srun -N2 --ntasks=8 --mpi=pmix trtllm-llmapi-launch trtllm-eval " in command
+    assert "; srun -N2 --ntasks=8 --mpi=pmix trtllm-llmapi-launch trtllm-eval " in command
     assert "CUDA_VISIBLE_DEVICES" not in command and "mpirun" not in command
     # The evaluator runs offline, on the dataset this host holds, under the benchmark's env.
     assert "HF_DATASETS_OFFLINE=1" in command and "JUDGE=local" in command

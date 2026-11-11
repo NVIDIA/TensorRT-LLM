@@ -842,7 +842,7 @@ def test_a_run_reads_a_spec_that_states_its_deployments(tmp_path):
         "- `dep16` (core): aggregated, 16 rank(s), attention DP, behind a launch prefix" in journal
     )
     assert "- `pd`: disaggregated, ctx 16 rank(s), attention DP" in journal
-    assert "devices: none claimed here: every deployment starts behind its launch prefix" in journal
+    assert "devices: none claimed here: every server starts behind its launch prefix" in journal
     contract = yaml.safe_load((tmp_path / "ws" / "contract.yaml").read_text())
     assert [f"{c['deployment']}:{c['gate']}" for c in contract["checks"]] == [
         "dep16:boot",

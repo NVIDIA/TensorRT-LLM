@@ -108,7 +108,14 @@ def test_preflight_claims_the_devices_the_widest_deployment_on_this_host_takes(t
     stated = [{"name": "dep16", "options": {"tensor_parallel_size": 16}, "launch": "srun -N4"}]
     devices, world, notes = claimed(parallel=None, deployments=stated)
     assert (devices, world) == ((), 1)
-    assert any("every deployment starts behind its launch prefix" in n for n in notes)
+    assert any("every server starts behind its launch prefix" in n for n in notes)
+    # One side behind a prefix: the other is this host's, and takes its ranks here.
+    halves = {
+        "name": "pd",
+        "ctx": {"options": {"tensor_parallel_size": 4}, "launch": "srun -N1"},
+        "gen": {"options": {"tensor_parallel_size": 2}},
+    }
+    assert claimed(parallel=None, deployments=[halves])[:2] == ((0, 1), 2)
 
 
 def test_a_spec_the_checkpoint_cannot_meet_is_refused_with_every_reason(tmp_path):
@@ -151,7 +158,9 @@ def _files(path: Path) -> Path:
 
 
 def test_a_dataset_is_found_where_it_is_on_this_host_and_never_downloaded(tmp_path, monkeypatch):
+    # Nothing of the host this runs on: its models root and its caches are out of the way.
     monkeypatch.delenv("LLM_MODELS_ROOT")
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     # Nowhere: a host problem, said before a load is spent, with where to put it.
     path, said = datasets.find("gsm8k")

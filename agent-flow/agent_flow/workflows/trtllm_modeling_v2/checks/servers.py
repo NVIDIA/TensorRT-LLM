@@ -386,8 +386,8 @@ def start(
 
     def launched(server: Server, argv: list[str]) -> tuple[list[str], dict[str, str]]:
         """``argv`` and the environment ``server`` starts with, here or behind its prefix."""
-        own = [left.pop(0) for _ in range(min(server.ranks, len(left)))]
-        own = [] if server.launch.strip() else own
+        local = not server.launch.strip()
+        own = [left.pop(0) for _ in range(min(server.ranks, len(left)) if local else 0)]
         launcher, env = local_launch(
             server, own, launch_env(server.launch, declared), list(declared)
         )
