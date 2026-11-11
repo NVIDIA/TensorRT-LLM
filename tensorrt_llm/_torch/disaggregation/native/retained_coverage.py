@@ -730,6 +730,8 @@ def check_native_operation(
     plan: FrozenWritePlan, meta, *, source_info=None, destination_info=None, source_device_id=None
 ) -> None:
     """Source hook immediately before real native descriptor construction."""
+    from .transfer import _TransferGroup
+
     binding = plan.binding
     destination = RankInfo.from_bytes(plan.destination_rank_info_bytes)
     source = RankInfo.from_bytes(plan.source_rank_info_bytes)
@@ -746,6 +748,21 @@ def check_native_operation(
         != (plan.src_ptrs, plan.dst_ptrs, plan.sizes)
     ):
         raise ValueError("actual native operation differs from the certified retained frozen plan")
+    groups = meta.transfer_groups
+    if type(groups) is not tuple or len(groups) > 1:
+        raise ValueError("retained native transfer groups require one complete GPU span")
+    if groups:
+        group = groups[0]
+        if (
+            type(group) is not _TransferGroup
+            or group.src_memory_type != "VRAM"
+            or group.dst_memory_type != "VRAM"
+            or type(group.start) is not int
+            or type(group.stop) is not int
+            or group.start != 0
+            or group.stop != meta.src_ptrs.size
+        ):
+            raise ValueError("retained native transfer groups require one complete GPU span")
     if (
         (source_info is not None and source_info.to_bytes() != plan.source_rank_info_bytes)
         or (

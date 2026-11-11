@@ -228,6 +228,7 @@ def meta(plan, *, src=None, dst=None, sizes=None):
         src_ptrs=a.copy() if src is None else np.array(src, dtype=np.int64),
         dst_ptrs=b.copy() if dst is None else np.array(dst, dtype=np.int64),
         sizes=c.copy() if sizes is None else np.array(sizes, dtype=np.int64),
+        transfer_groups=(),
     )
 
 
@@ -440,6 +441,124 @@ class NativeFragmentCoverage(unittest.TestCase):
             coverage.check_native_operation(
                 plan, meta(plan), source_info=info, destination_info=changed
             )
+
+    def certified_native_operation(self):
+        from tensorrt_llm._torch.disaggregation.native import transfer
+
+        sources, destination, plans, _ = cohort(1, 1)
+        source, plan = sources[("src", 0)], plans[0]
+        info, peer = source.rank_info, destination.rank_info
+        registrar = PeerRegistrar(info, KVRegionExtractorV1(info.page_table))
+        registrar.register(peer.instance_name, peer.instance_rank, peer)
+        task = NS(
+            _chunk=source.chunk(),
+            _prompt_len=plan.binding.token_end,
+            _perf_timer=None,
+            _unique_rid=plan.binding.claim_id,
+            slice_id=0,
+            _retained_coverage_by_rank={peer.instance_rank: plan},
+            _retained_native_registrar=registrar,
+        )
+        request = transfer.RecvReqInfo(
+            sender_req_id=plan.binding.claim_id,
+            instance_name=peer.instance_name,
+            instance_rank=peer.instance_rank,
+            block_ids_per_layer_groups=destination.chunk().block_ids_per_layer_groups,
+            unique_rid=plan.binding.claim_id,
+            slice_id=0,
+            context_first=True,
+        )
+        operation = transfer.Sender._build_kv_write_meta(NS(_registrar=registrar), task, request)
+        return operation, info, plan
+
+    def test_actual_native_builder_preserves_complete_gpu_group(self):
+        from tensorrt_llm._torch.disaggregation.native import transfer
+
+        operation, info, plan = self.certified_native_operation()
+        expected = (transfer._TransferGroup("VRAM", "VRAM", 0, operation.src_ptrs.size),)
+        self.assertEqual(expected, operation.transfer_groups)
+        for groups in (operation.transfer_groups, ()):
+            with self.subTest(groups=groups):
+                operation.transfer_groups = groups
+                descriptors, request = Mock(), Mock()
+                with (
+                    patch.object(transfer, "MemoryDescs", descriptors),
+                    patch.object(transfer, "TransferRequest", request),
+                ):
+                    result = transfer.Sender._make_agent_request(operation, info.device_id)
+                self.assertIs(result, request.return_value)
+                request.assert_called_once()
+                self.assertEqual(2, descriptors.from_arrays_uniform_device.call_count)
+                for index, call in enumerate(descriptors.from_arrays_uniform_device.call_args_list):
+                    self.assertEqual(transfer.MemoryType.VRAM, call.args[0])
+                    np.testing.assert_array_equal(plan.arrays()[index], call.args[1])
+                    np.testing.assert_array_equal(plan.arrays()[2], call.args[2])
+
+    def test_actual_native_hook_rejects_changed_groups_before_descriptors(self):
+        from tensorrt_llm._torch.disaggregation.native import transfer
+
+        operation, info, _ = self.certified_native_operation()
+        size = operation.src_ptrs.size
+        group = transfer._TransferGroup
+        invalid = (
+            (group("DRAM", "VRAM", 0, size),),
+            (group("VRAM", "DRAM", 0, size),),
+            (group("VRAM", "VRAM", 1, size),),
+            (group("VRAM", "VRAM", 0, size - 1),),
+            (group("VRAM", "VRAM", 0, size + 1),),
+            (group("VRAM", "VRAM", 0, 0),),
+            (group("VRAM", "VRAM", 0, size), group("VRAM", "VRAM", 0, size)),
+            (group("VRAM", "VRAM", 0, 1), group("VRAM", "VRAM", 2, size)),
+            (group("VRAM", "VRAM", 0, 1), group("VRAM", "VRAM", 1, size)),
+            (group("VRAM", "VRAM", False, size),),
+            [group("VRAM", "VRAM", 0, size)],
+            None,
+        )
+        for groups in invalid:
+            with self.subTest(groups=groups):
+                operation.transfer_groups = groups
+                descriptors = Mock()
+                with patch.object(transfer, "MemoryDescs", descriptors):
+                    with self.assertRaisesRegex(ValueError, "retained native transfer groups"):
+                        transfer.Sender._make_agent_request(operation, info.device_id)
+                descriptors.from_arrays_uniform_device.assert_not_called()
+
+    def test_actual_native_descriptors_do_not_reread_mutated_groups(self):
+        from tensorrt_llm._torch.disaggregation.native import transfer
+
+        operation, info, plan = self.certified_native_operation()
+        check = coverage.check_native_operation
+
+        def checked_then_changed(*args, **kwargs):
+            check(*args, **kwargs)
+            operation.meta_type = transfer.WriteMetaType.AUX
+            operation.transfer_groups = (
+                transfer._TransferGroup("DRAM", "DRAM", 1, operation.src_ptrs.size - 1),
+            )
+
+        descriptors = Mock()
+        with (
+            patch.object(coverage, "check_native_operation", side_effect=checked_then_changed),
+            patch.object(transfer, "MemoryDescs", descriptors),
+            patch.object(transfer, "TransferRequest"),
+        ):
+            transfer.Sender._make_agent_request(operation, info.device_id)
+        self.assertEqual(2, descriptors.from_arrays_uniform_device.call_count)
+        for index, call in enumerate(descriptors.from_arrays_uniform_device.call_args_list):
+            self.assertEqual(transfer.MemoryType.VRAM, call.args[0])
+            np.testing.assert_array_equal(plan.arrays()[index], call.args[1])
+            np.testing.assert_array_equal(plan.arrays()[2], call.args[2])
+
+    def test_actual_native_retained_metadata_cannot_switch_to_auxiliary_descriptors(self):
+        from tensorrt_llm._torch.disaggregation.native import transfer
+
+        operation, info, _ = self.certified_native_operation()
+        operation.meta_type = transfer.WriteMetaType.AUX
+        descriptors = Mock()
+        with patch.object(transfer, "MemoryDescs", descriptors):
+            with self.assertRaisesRegex(ValueError, "requires GPU KV descriptors"):
+                transfer.Sender._make_agent_request(operation, info.device_id)
+        descriptors.from_arrays_uniform_device.assert_not_called()
 
 
 if __name__ == "__main__":

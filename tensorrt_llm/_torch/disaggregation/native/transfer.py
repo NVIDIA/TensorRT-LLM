@@ -1282,8 +1282,11 @@ class Sender(SenderBase):
     def _make_agent_request(
         write_meta: WriteMeta, device_id: int
     ) -> TransferRequest | _TransferRequestGroup:
+        retained_groups = None
         retained_plans = _retained_metadata(write_meta.task, "_retained_coverage_by_rank")
-        if retained_plans is not None and write_meta.meta_type == WriteMetaType.KV:
+        if retained_plans is not None:
+            if write_meta.meta_type is not WriteMetaType.KV:
+                raise ValueError("retained native operation requires GPU KV descriptors")
             from .retained_coverage import check_native_operation
 
             plan = retained_plans.get(write_meta.peer_rank)
@@ -1303,6 +1306,7 @@ class Sender(SenderBase):
                 ),
                 source_device_id=device_id,
             )
+            retained_groups = (_TransferGroup("VRAM", "VRAM", 0, write_meta.src_ptrs.size),)
         if not (write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size):
             raise ValueError(
                 f"Pointer/size mismatch for unique_rid={write_meta.unique_rid}: "
@@ -1310,7 +1314,9 @@ class Sender(SenderBase):
                 f"{write_meta.dst_ptrs.size=}, "
                 f"{write_meta.sizes.size=}"
             )
-        if write_meta.meta_type == WriteMetaType.AUX:
+        if retained_groups is not None:
+            groups = retained_groups
+        elif write_meta.meta_type == WriteMetaType.AUX:
             groups = (_TransferGroup("DRAM", "DRAM", 0, write_meta.src_ptrs.size),)
         else:
             if write_meta.dst_device_id is None:
