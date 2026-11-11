@@ -54,7 +54,6 @@ def task_file(tmp_path, repo, checkpoint):
             "benchmark": "gsm8k",
             "reference_yaml": "tests/integration/defs/accuracy/references/gsm8k.yaml",
             "model_key": "openai/gpt-oss-120b",
-            "tolerance": 5.0,
         },
     }
     path = tmp_path / "task.yaml"
@@ -99,15 +98,21 @@ def _no_agent_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_dataset_downloads(monkeypatch):
-    """Keep the run's dataset staging off the network; its own tests call ``stage`` themselves."""
-    from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
-
-    monkeypatch.setattr(datasets, "start", lambda *args, **kwargs: None)
+def _gsm8k_on_disk(monkeypatch, tmp_path_factory):
+    """The one dataset the checks know is under the models root, as on a prepared host."""
+    root = tmp_path_factory.mktemp("models")
+    split = root / "datasets" / "openai" / "gsm8k" / "main"
+    split.mkdir(parents=True)
+    (split / "test-00000-of-00001.parquet").write_text("rows")
+    monkeypatch.setenv("LLM_MODELS_ROOT", str(root))
 
 
 # A stand-in for `trtllm-serve`: it binds a port, reports it, answers /health and
 # /v1/completions, and writes down the command line and environment it was started with.
+# As a real server's ranks do under the rank hook, it prints what each rank runs: the
+# options it was given (FAKE_RANKS=0: nothing; FAKE_DTYPE: another KV dtype than asked),
+# from the directory it was started in. A prompt it has seen resumes from its cache
+# (FAKE_REUSE=0: never).
 _FAKE_SERVE = """#!{python}
 import http.server, json, os, signal, sys, threading
 
@@ -116,6 +121,21 @@ report = argv[argv.index("--report_addr") + 1]
 if os.environ.get("FAKE_SERVE_EXIT"):
     print("fake: refused to start")
     sys.exit(3)
+if "--config" in argv and os.environ.get("FAKE_RANKS", "1") == "1":
+    import yaml
+
+    options = yaml.safe_load(open(argv[argv.index("--config") + 1])) or {{}}
+    if os.environ.get("FAKE_DTYPE"):
+        options.setdefault("kv_cache_config", {{}})["dtype"] = os.environ["FAKE_DTYPE"]
+    for rank in range(int(options.get("tensor_parallel_size") or 1)):
+        record = {{
+            "rank": rank,
+            "options": options,
+            "target": "tensorrt_llm._torch._experimental.modeling_v2.models.fake.model.Model",
+            "origin": os.path.join(os.getcwd(), "tensorrt_llm", "__init__.py"),
+        }}
+        print("MV2FLOW_RANK_ENGINE " + json.dumps(record), flush=True)
+seen = []
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -134,7 +154,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         asked = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        self._send({{"choices": [{{"text": " Paris, after: " + asked["prompt"]}}]}})
+        again = asked["prompt"] in seen and os.environ.get("FAKE_REUSE", "1") == "1"
+        seen.append(asked["prompt"])
+        usage = {{"prompt_tokens_details": {{"cached_tokens": 448 if again else 0}}}}
+        text = " Paris, after: " + asked["prompt"]
+        self._send({{"choices": [{{"text": text}}], "usage": usage}})
 
 
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)

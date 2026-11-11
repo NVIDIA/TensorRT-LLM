@@ -25,7 +25,6 @@ from ...agents.prompts import PROMPTS_DIRNAME, build_trtllm_modeling_v2_prompts
 from ...agents.roles import packaged_skills
 from ...agents.turns import TURNS_DIRNAME
 from ...checks import anchors as anchors_mod
-from ...checks import datasets as datasets_mod
 from ...checks import gate_cli
 from ...infra.compute.environment import MAX_TMPDIR_LEN
 from ...infra.compute.executor import select_command_executor, shell_runner_for
@@ -37,11 +36,10 @@ from ...operators.inventory import (
     write_surface_file,
 )
 from ...spec import deployments as deployments_mod
-from ...spec import derive as derive_mod
-from ...spec.task_schema import assembly_units
 from .. import contract as contract_mod
 from ..state import WorkflowState
 from . import agent_probe
+from .advice import spec_warnings
 from .preflight import (
     PreflightError,
     PreflightResult,
@@ -97,19 +95,10 @@ def _run_preflight(workflow, state: WorkflowState, log) -> bool:
         header_lines=[
             f"- checkpoint: `{workflow.task_data['checkpoint_path']}`",
             f"- target: `{result.target_rel}`",
-            f"- units: {', '.join(assembly_units(workflow.task_data))}",
+            f"- deployments: {', '.join(d.name for d in deployments_mod.resolve(workflow.task_data))}",
         ],
     )
     workflow.journal.section("preflight", f"```\n{format_preflight_report(result)}\n```")
-    # The benchmarks' datasets, staged beside the first turns: never a blocker. A dry run
-    # downloads nothing.
-    if not workflow.dry_run:
-        datasets_mod.start(
-            workflow.task_data,
-            workflow.workspace,
-            python=getattr(result.environment, "python", None),
-            note=lambda said: workflow.journal.event("datasets", said),
-        )
     print_message(f"[bold green]✔ preflight[/bold green]\n{format_preflight_report(result)}", log)
 
     # Where this run's commands land, decided once, from the resolved
@@ -225,9 +214,7 @@ def _prove_agents(workflow, log) -> bool:
 
 def _compile_contract(workflow, log) -> bool:
     """Compile the checks the run owes from the spec."""
-    workflow._contract = contract_mod.compile_contract(
-        workflow.task_data, workflow._gate_env().world_size
-    )
+    workflow._contract = contract_mod.compile_contract(workflow.task_data)
     return True
 
 
@@ -239,49 +226,37 @@ def _write_contract(workflow) -> None:
         workflow._contract.render(),
     )
     _write_deployments(workflow)
-    _freeze_anchors(workflow)
     _write_spec_warnings(workflow)
 
 
 def _write_deployments(workflow) -> None:
-    """Journal the deployments the spec comes to, core's first.
+    """Freeze each benchmark's anchor, then say what the spec comes to: one line per deployment.
 
-    The checks still read the shorthand they are expanded from, and preflight reports a
-    shorthand that asks two values of one setting, so a failure here only says so.
+    Its name, its kind and servers, its benchmarks and where each one's anchor comes
+    from. Only what the workspace has not frozen yet is added: a resumed run is held to
+    the anchors its first start read.
     """
-    try:
-        found = deployments_mod.resolve(workflow.task_data, workflow._gate_env().world_size)
-    except Exception as exc:
-        workflow.journal.section("deployments: not expanded", f"{type(exc).__name__}: {exc}")
-        return
-    workflow.journal.section(f"deployments: {len(found)}", deployments_mod.describe(found))
-
-
-def _freeze_anchors(workflow) -> None:
-    """Freeze what each benchmark of each deployment is judged against, and journal it.
-
-    Only what the workspace has not frozen yet is added: a resumed run is held to the
-    anchors its first start read.
-    """
+    found = deployments_mod.resolve(workflow.task_data)
     try:
         frozen = anchors_mod.freeze(workflow.workspace, workflow.task_data)
         moved = anchors_mod.differences(workflow.workspace, workflow.task_data)
     except Exception as exc:
         workflow.journal.section("anchors: not frozen", f"{type(exc).__name__}: {exc}")
-        return
-    lines = [
-        f"- `{a.key}`: {a.kind}"
-        + (f" {a.value:g}" if a.value is not None else "")
-        + (f" ({a.source})" if a.source else "")
-        for a in frozen.values()
-    ]
+        frozen, moved = {}, []
+    sources = {
+        key: f"{a.kind}" + (f" {a.value:g}" if a.value is not None else "") + f": {a.source}"
+        for key, a in frozen.items()
+    }
+    lines = [deployments_mod.describe(found, sources)]
     lines += [f"- differs from the tree now: {line}" for line in moved]
-    workflow.journal.section(f"anchors: {len(frozen)} frozen", "\n".join(lines) or "None.")
+    body = "\n".join(lines)
+    workflow.journal.section(f"deployments: {len(found)}", body)
+    print_message(f"deployments ({len(found)}):\n{escape_markup(body)}")
 
 
 def _write_spec_warnings(workflow) -> None:
     """Journal what the spec is likely to cost or miss; a warning never stops the run."""
-    warnings = derive_mod.spec_warnings(workflow.task_data)
+    warnings = spec_warnings(workflow.task_data)
     body = "\n".join(f"- {warning}" for warning in warnings) or "None."
     workflow.journal.section(f"spec warnings: {len(warnings)}", body)
 

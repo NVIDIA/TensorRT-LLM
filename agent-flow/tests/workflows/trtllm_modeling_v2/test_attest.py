@@ -10,11 +10,11 @@ import textwrap
 from pathlib import Path
 
 import pytest
-import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import attest
 from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
+from agent_flow.workflows.trtllm_modeling_v2.spec.deployments import Deployment, Server
 
 from ._helpers import rank_lines
 
@@ -178,20 +178,14 @@ def _real_boot(tmp_path: Path, **env):
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(textwrap.dedent(text), encoding="utf-8")
-    options = tmp_path / "core.yaml"
-    options.write_text(yaml.safe_dump({"kv_cache_config": {"dtype": "fp8"}}), encoding="utf-8")
-    task = {
-        "checkpoint_path": "/ckpt/model",
-        "parallel": "tp1",
-        "trtllm_repo_path": str(repo),
-        "runtime": {"kv_cache_reuse": True},
-        "accuracy": {"llm_api_options": str(options)},
-    }
+    options = {"kv_cache_config": {"dtype": "fp8", "enable_block_reuse": True}}
+    deployment = Deployment(name="tp1", core=True, server=Server(options=options))
+    task = {"checkpoint_path": "/ckpt/model", "trtllm_repo_path": str(repo)}
     environment = RunEnvironment(
         kind="local", python=sys.executable, world_size=1, env={"PYTHONPATH": str(repo), **env}
     )
     return boot_checks.run_boot_gate(
-        environment, task_data=task, unit="core", member="tp1", workdir=tmp_path / "gates"
+        environment, task_data=task, deployment=deployment, workdir=tmp_path / "gates"
     )
 
 

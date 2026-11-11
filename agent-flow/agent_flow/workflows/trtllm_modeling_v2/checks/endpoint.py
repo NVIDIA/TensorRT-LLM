@@ -23,12 +23,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ..infra.compute.environment import RunEnvironment
-from ..spec.deployments import Benchmark, Deployment
+from ..spec.deployments import Benchmark, Deployment, Server
 from . import anchors as anchors_mod
-from . import servers
-from .accuracy import parse_eval_score, unparsed_score_detail
+from . import attest, datasets, servers
+from .accuracy import judged, parse_eval_score, unparsed_score_detail
 from .boot import BootSpec, missing_keywords
-from .check_runtime import ShellRunner, default_shell_runner
+from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner
 from .harness import endpoint_eval
 from .verdict import GateResult, inspect_tree, verdict_factory
 
@@ -43,6 +43,18 @@ ENDPOINT_ACCURACY_TIMEOUT_S = 4 * 60 * 60
 def _declared_env(task_data: Mapping[str, Any]) -> dict[str, str]:
     block = (task_data.get("environment") or {}).get("env") or {}
     return {str(k): str(v) for k, v in block.items()}
+
+
+def _attested(
+    running: servers.Running, role: str, server: Server, task_data: Mapping[str, Any]
+) -> attest.Attestation:
+    """What the ranks of ``role``'s server printed, against its options and the switch."""
+    return attest.attest(
+        running.log(role),
+        {**server.options, "modeling_v2": MODE_REQUIRE},
+        role=role,
+        tree=task_data.get("trtllm_repo_path"),
+    )
 
 
 def _stopped(running: servers.Running, env: Mapping[str, str]) -> str:
@@ -60,7 +72,6 @@ def run_endpoint_boot(
     task_data: Mapping[str, Any],
     workspace: str | Path,
     spec: BootSpec | None = None,
-    member: str | None = None,
     timeout: int | None = None,
 ) -> GateResult:
     """Start ``deployment``, hold its endpoint to the boot workload, and stop it.
@@ -73,8 +84,16 @@ def run_endpoint_boot(
     env = _declared_env(task_data)
     started = time.monotonic()
 
+    records: list[Mapping[str, Any]] = []
+
     def ran(**fields: Any) -> GateResult:
-        return verdict(name="boot", member=member, duration_s=time.monotonic() - started, **fields)
+        return verdict(
+            name="boot",
+            deployment=deployment.name,
+            duration_s=time.monotonic() - started,
+            engine=tuple(records),
+            **fields,
+        )
 
     try:
         running = servers.start(
@@ -83,10 +102,14 @@ def run_endpoint_boot(
             workspace=workspace,
             env=env,
             timeout=timeout,
+            tree=task_data.get("trtllm_repo_path"),
+            python=(task_data.get("environment") or {}).get("python"),
         )
     except servers.ServerError as exc:
         return ran(passed=False, detail=f"the deployment did not start: {exc}")
     texts: list[str | None] = []
+    cached: list[int | None] = []
+    roles = deployment.servers
     failure = ""
     try:
         prompts = [*spec.prompts, *(item.prompt for item in spec.items)]
@@ -96,14 +119,30 @@ def run_endpoint_boot(
                 texts.append(None)  # an image prompt is not sent as a text completion
                 continue
             texts.append(servers.ask(running, prompt, max_tokens=spec.max_tokens))
+        # With block reuse on, one more prompt is sent again and must resume from the cache.
+        sends = max(
+            (attest.reuse_sends(s.options) for s in roles.values() if attest.reuses(s.options)),
+            default=0,
+        )
+        for _ in range(sends):
+            reply = servers.complete(running, attest.REUSE_PROMPT, max_tokens=1)
+            cached.append(servers.cached_tokens(reply))
     except servers.ServerError as exc:
         failure = str(exc)
     finally:
+        attested = [_attested(running, role, server, task_data) for role, server in roles.items()]
+        records += [found.record() for found in attested]
         left = _stopped(running, env)
     if left:
         return ran(passed=False, detail=left, infrastructure=left)
     if failure:
         return ran(passed=False, detail=failure)
+    unmatched = next((found.failure() for found in attested if found.failure()), None)
+    if unmatched:
+        return ran(passed=False, detail=unmatched)
+    shortfall = attest.reuse_shortfall(cached) if cached else None
+    if shortfall:
+        return ran(passed=False, detail=shortfall)
     asked = [text for text in texts if text is not None]
     empty = sum(1 for text in asked if not text.strip())
     if empty or not asked:
@@ -157,18 +196,18 @@ def run_endpoint_accuracy(
     anchor: anchors_mod.Anchor,
     relative_score: float | None = None,
     runner: ShellRunner = default_shell_runner,
-    member: str | None = None,
     timeout: int | None = None,
 ) -> GateResult:
     """Score ``benchmark`` through ``deployment``'s endpoint and hold it to ``anchor``'s floor."""
     name = f"accuracy[{benchmark.name}]"
     verdict = verdict_factory(inspect_tree(task_data))
-    accuracy = dict(task_data.get("accuracy") or {})
     env = _declared_env(task_data)
     started = time.monotonic()
 
     def ran(**fields: Any) -> GateResult:
-        return verdict(name=name, member=member, duration_s=time.monotonic() - started, **fields)
+        return verdict(
+            name=name, deployment=deployment.name, duration_s=time.monotonic() - started, **fields
+        )
 
     if benchmark.name not in ENDPOINT_BENCHMARKS:
         return ran(
@@ -178,6 +217,9 @@ def run_endpoint_accuracy(
             f"through an endpoint ({', '.join(ENDPOINT_BENCHMARKS)} have); score it on an "
             f"aggregated deployment",
         )
+    dataset, said = datasets.find(benchmark.name, benchmark.dataset_path, env)
+    if said and not dataset:
+        return ran(passed=False, detail=said, infrastructure=said)
     try:
         running = servers.start(
             deployment,
@@ -185,6 +227,8 @@ def run_endpoint_accuracy(
             workspace=workspace,
             env=env,
             timeout=deployment.timeout,
+            tree=task_data.get("trtllm_repo_path"),
+            python=(task_data.get("environment") or {}).get("python"),
         )
     except servers.ServerError as exc:
         return ran(passed=False, detail=f"the deployment did not start: {exc}")
@@ -193,46 +237,39 @@ def run_endpoint_accuracy(
         url=running.url,
         model=str(task_data["checkpoint_path"]),
         benchmark=benchmark,
-        dataset_path=accuracy.get("dataset_path"),
+        dataset_path=dataset or None,
     )
     try:
         result = runner(command, benchmark.env or None, timeout or ENDPOINT_ACCURACY_TIMEOUT_S)
     finally:
+        attested = [
+            _attested(running, role, server, task_data)
+            for role, server in deployment.servers.items()
+        ]
         left = _stopped(running, env)
     combined = result.stdout + result.stderr
     fields: dict[str, Any] = dict(
-        command=command, stdout_tail="\n".join(combined.splitlines()[-40:])
+        command=command,
+        stdout_tail="\n".join(combined.splitlines()[-40:]),
+        engine=tuple(found.record() for found in attested),
     )
     if left:
         return ran(passed=False, detail=left, infrastructure=left, **fields)
     if not result.ok:
         return ran(passed=False, detail=f"the evaluator exited {result.returncode}", **fields)
-    measured = parse_eval_score(combined)
+    unmatched = next((found.failure() for found in attested if found.failure()), None)
+    if unmatched:
+        return ran(passed=False, detail=unmatched, **fields)
+    measured = parse_eval_score(combined, benchmark.score_pattern)
     if measured is None:
-        return ran(passed=False, detail=unparsed_score_detail(combined, None), **fields)
-    floor, source = anchors_mod.floor(
-        anchor, accuracy, benchmark, relative_score=relative_score, output=combined
-    )
-    if floor is None:
         return ran(
-            passed=False,
-            explained=True,
-            measured=measured,
-            detail=f"measured {measured:.4f} through the endpoint; a score with no verdict "
-            f"({anchor.source or source})",
-            **fields,
+            passed=False, detail=unparsed_score_detail(combined, benchmark.score_pattern), **fields
         )
-    passed = measured >= floor.value
+    how = " through the endpoint"
     return ran(
-        passed=passed,
-        measured=measured,
-        reference=floor.reference,
-        floor=floor.value,
-        se=floor.se,
-        samples=floor.samples,
-        floor_rule=floor.describe(),
-        detail=f"measured {measured:.4f} {'>=' if passed else '<'} {floor.value:.4f} through "
-        f"the endpoint ({floor.describe()}; count from {source}; anchor: {anchor.kind})",
+        **judged(
+            measured, anchor, benchmark, relative_score=relative_score, output=combined, how=how
+        ),
         **fields,
     )
 

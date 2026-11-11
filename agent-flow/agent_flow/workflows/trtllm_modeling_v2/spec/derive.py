@@ -14,10 +14,12 @@ The core configuration is what every unit is gated under: CUDA graphs and the
 overlap scheduler on, the KV cache in the checkpoint's own format, block reuse
 and chunked prefill off. A non-core runtime feature the goal names
 (``chunked_prefill``, ``prefix_reuse``) and each extra KV dtype (``kv=``) is one
-configuration variant of core, judged at one member against core's own score:
-each non-core feature on its own, never a cross product. The goal is one line of
+deployment of its own beside core, judged against core's own score where no
+reference row fits: each non-core feature on its own, never a cross product. The
+spec states its deployments natively: each one's options are written to
+``engines/<name>.yaml`` beside it (``spec/shorthand.py`` does the arithmetic). The goal is one line of
 words, separated by spaces, commas or semicolons; :func:`parse_goal` defines
-the accepted features, members, profiles and key=value settings.
+the accepted features, members and key=value settings.
 """
 
 from __future__ import annotations
@@ -31,28 +33,16 @@ from typing import Any, Mapping
 
 import yaml
 
-from ..operators import tree_anchors
 from . import deployments as deployments_mod
-from .task_schema import (
-    DISAGG_FEATURE,
-    DISAGG_KEYS,
-    FEATURE_FAMILIES,
-    PARALLEL_PATTERN,
-    PROFILE_CERTIFIED,
-    PROFILE_SMOKE,
-    PROFILE_STANDARD,
-    PROFILES,
-    SPECULATORS,
-    reject_unknown_keys,
-    resolve_per_unit,
-)
+from . import shorthand
+from .shorthand import DISAGG, DISAGG_KEYS, DRAFTERS, FEATURES, MEMBER
+from .task_schema import ACCURACY_FIELD, reject_unknown_keys
 
 #: The derived spec and its report, in the workspace.
 SPEC_FILENAME = "task.derived.yaml"
 REPORT_FILENAME = "derive.report.md"
-#: Where each unit's LLM-API options are written, beside the spec.
-LLM_API_DIRNAME = "llm_api"
-
+#: Where each deployment's native options are written, beside the spec.
+ENGINES_DIRNAME = "engines"
 #: Members when neither the goal nor the site names any.
 DEFAULT_MEMBERS: tuple[str, ...] = ("tp1",)
 #: The workload when neither the goal nor the site states one. Stated rather
@@ -89,16 +79,7 @@ NON_CORE_SWITCHES: dict[str, str] = {"chunked_prefill": "chunked", "kv_cache_reu
 #: benchmark's few-shot prompts, so their prefill is split.
 DEFAULT_CHUNK_TOKENS = 512
 #: The units a goal may name: every feature of the spec.
-UNIT_WORDS: frozenset[str] = frozenset(FEATURE_FAMILIES)
-#: ``<feature>:<depth>`` -> the profile the feature's checks follow.
-DEPTH_WORDS: dict[str, str] = {
-    "smoke": PROFILE_SMOKE,
-    "standard": PROFILE_STANDARD,
-    "full": PROFILE_CERTIFIED,
-}
-#: Speculative algorithm -> its reference rows' ``spec_dec_algo`` and the LLM
-#: API's ``speculative_config.decoding_type`` (the two spell them alike).
-SPEC_DEC_ALGO = {"mtp": "MTP", "eagle3": "Eagle3", "dflash": "DFlash", "dspark": "DSpark"}
+UNIT_WORDS: frozenset[str] = frozenset(FEATURES)
 #: Where a config states its multi-token-prediction layers.
 DRAFT_LAYER_KEYS: tuple[str, ...] = (
     "num_nextn_predict_layers",
@@ -116,7 +97,7 @@ SITE_KEYS = (
     "defaults",
 )
 SITE_DEVICE_KEYS = ("arch", "gpus_per_node", "nodes")
-SITE_DEFAULTS_KEYS = ("members", "workload", "accuracy", "boot", "disagg", "profile")
+SITE_DEFAULTS_KEYS = ("members", "workload", "accuracy", "boot", "disagg")
 #: ``reference`` (how the anchor was measured) is the operator's record; nothing reads it.
 SITE_ACCURACY_KEYS = ("benchmark", "protocol", "reference", "reference_yaml", "model_key")
 
@@ -153,10 +134,8 @@ class Goal:
     text: str = ""
     #: Unit -> whether the goal builds it (True) or puts it out of scope (False).
     units: dict[str, bool] = field(default_factory=dict)
-    #: Unit -> the members the goal narrows it to.
-    unit_members: dict[str, list[str]] = field(default_factory=dict)
-    #: Unit -> the profile the goal gives it (``multimodal:smoke``).
-    unit_profiles: dict[str, str] = field(default_factory=dict)
+    #: The member the goal serves disagg at (``disagg@tep4``); the first, unsaid.
+    disagg_member: str | None = None
     #: The goal asks for speculative decoding by the checkpoint's own drafter (True),
     #: or for none at all (False).
     speculative: bool | None = None
@@ -182,24 +161,14 @@ def parse_goal(text: str | None) -> Goal:
             _key_value(goal, word, errors)
             continue
         lowered = word.lower()
-        if PARALLEL_PATTERN.match(lowered):
+        if MEMBER.match(lowered):
             goal.members.append(lowered)
             continue
         if lowered == "text_only":
             goal.units["multimodal"] = False
             continue
         out = lowered.startswith(("-", "no-", "no_"))
-        lowered, _, depth = lowered.partition(":")
-        name, _, members = (
-            lowered.lstrip("-").removeprefix("no-").removeprefix("no_").partition("@")
-        )
-        if depth and (out or name not in UNIT_WORDS or depth not in DEPTH_WORDS):
-            errors.append(
-                f"goal: {word!r}: a depth follows a feature and is one of {sorted(DEPTH_WORDS)}"
-            )
-            continue
-        if depth:
-            goal.unit_profiles[name] = DEPTH_WORDS[depth]
+        name, _, member = lowered.lstrip("-").removeprefix("no-").removeprefix("no_").partition("@")
         if name in ("spec", "speculative"):
             goal.speculative = not out
         elif name in RUNTIME_WORDS and out:
@@ -210,14 +179,13 @@ def parse_goal(text: str | None) -> Goal:
                 goal.switches_on.add(RUNTIME_WORDS[name])
         elif name in UNIT_WORDS:
             goal.units[name] = not out
-            if members and not out:
-                listed = [m for m in members.split("/") if m]
-                if not listed or not all(PARALLEL_PATTERN.match(m) for m in listed):
-                    errors.append(
-                        f"goal: {word!r} names no members of the form tp<N>, tep<N>, dep<N>"
-                    )
-                else:
-                    goal.unit_members[name] = listed
+            if member and (out or name != DISAGG or not MEMBER.match(member)):
+                errors.append(
+                    f"goal: {word!r}: only disagg takes a member of its own (disagg@tep4); "
+                    f"every other feature is served at the first member"
+                )
+            elif member:
+                goal.disagg_member = member
         else:
             errors.append(f"goal: {word!r} is not a feature, a member or key=value")
     if errors:
@@ -368,7 +336,7 @@ def validate_site(site: Any) -> list[str]:
     if members is not None and (
         not isinstance(members, list)
         or not members
-        or not all(isinstance(m, str) and PARALLEL_PATTERN.match(m) for m in members)
+        or not all(isinstance(m, str) and MEMBER.match(m) for m in members)
     ):
         errors.append(
             "site.yaml: 'defaults.members' must be a non-empty list of tp<N>, tep<N>, dep<N>"
@@ -384,8 +352,6 @@ def validate_site(site: Any) -> list[str]:
             errors.append(f"site.yaml: 'defaults.{key}' must be a mapping")
         elif block and keys:
             reject_unknown_keys(block, keys, errors, where=f"site.yaml defaults.{key}")
-    if defaults.get("profile") is not None and defaults["profile"] not in PROFILES:
-        errors.append(f"site.yaml: 'defaults.profile' must be one of {list(PROFILES)}")
     return errors
 
 
@@ -478,11 +444,11 @@ def derive_spec(
     # goal that names its features asks for those: what else the checkpoint carries is left out.
     built: list[str] = []
     listed = any(goal.units.values()) or goal.speculative is True
-    speculator = next((u for u, on in goal.units.items() if on and u in SPECULATORS), None)
+    speculator = next((u for u, on in goal.units.items() if on and u in DRAFTERS), None)
     if (
         speculator is None
         and goal.speculative is not False
-        and not any(goal.units.get(u) is False for u in SPECULATORS)
+        and not any(goal.units.get(u) is False for u in DRAFTERS)
     ):
         if facts.speculator and listed and not goal.speculative:
             note("features (left out)", facts.speculator, "checkpoint carries it, goal names none")
@@ -505,9 +471,7 @@ def derive_spec(
         multimodal = note("features (multimodal)", True, "checkpoint")
     if multimodal:
         built.append("multimodal")
-    built += [
-        u for u, on in goal.units.items() if on and u not in SPECULATORS and u != "multimodal"
-    ]
+    built += [u for u, on in goal.units.items() if on and u not in DRAFTERS and u != "multimodal"]
 
     # The runtime: the core switches on unless the goal turns them off, the rest off.
     runtime: dict[str, Any] = {
@@ -543,11 +507,10 @@ def derive_spec(
             note(f"accuracy.{key}", value, "site")
     anchor = {**site_accuracy, **goal.accuracy}
     benchmark = anchor.get("benchmark") or note("accuracy.benchmark", DEFAULT_BENCHMARK, "default")
-    accuracy: dict[str, Any] = {
-        "benchmark": benchmark,
-        "reference_yaml": anchor.get("reference_yaml")
-        or f"{_tree_path(site, 'accuracy_references')}/{benchmark}.yaml",
-    }
+    # Unsaid, the reference rows are the tree's own file for the benchmark.
+    accuracy: dict[str, Any] = {"benchmark": benchmark}
+    if anchor.get("reference_yaml"):
+        accuracy["reference_yaml"] = anchor["reference_yaml"]
     model_key = anchor.get("model_key") or (
         note("accuracy.model_key", facts.name, "checkpoint") if facts.name else None
     )
@@ -572,14 +535,15 @@ def derive_spec(
         accuracy["boot"] = note("accuracy.boot", dict(defaults["boot"]), "site")
     else:
         accuracy["boot"] = note("accuracy.boot", json.loads(json.dumps(DEFAULT_BOOT)), "default")
-    if DISAGG_FEATURE in built:
-        accuracy["disagg"] = _disagg(defaults, facts, site, note, questions, checkpoint)
-
+    if DISAGG in built and defaults.get("disagg"):
+        accuracy[DISAGG] = note("accuracy.disagg", dict(defaults["disagg"]), "site")
     spec: dict[str, Any] = {
         "checkpoint_path": str(checkpoint),
         "trtllm_repo_path": site["trtllm_repo_path"],
         **({"arch": arch} if arch else {}),
-        **_parallel(members, goal.unit_members, built),
+        "members": {"default": members, DISAGG: [goal.disagg_member]}
+        if DISAGG in built and goal.disagg_member
+        else members,
         "features": built,
         "scope": "text_only" if multimodal is False else "full",
         "runtime": runtime,
@@ -589,7 +553,6 @@ def derive_spec(
     kv_variants = {
         f"kv_{dtype}": {
             "unit": "core",
-            "gates": ["accuracy"],
             "llm_api_options": {"kv_cache_config": {"dtype": dtype}},
             "note": f"KV cache stored as {dtype}, judged against the unit's own score",
         }
@@ -609,7 +572,6 @@ def derive_spec(
             said = "KV-cache block reuse on"
         kv_variants[name] = {
             "unit": "core",
-            "gates": ["accuracy"],
             "runtime": {switch: True},
             "llm_api_options": overlay,
             "note": f"{said}, judged against the unit's own score",
@@ -620,22 +582,6 @@ def derive_spec(
         spec["commit_policy"] = dict(site["commit_policy"])
     if site.get("agents"):
         spec["agents"] = dict(site["agents"])
-    if defaults.get("profile"):
-        spec["profile"] = note("profile", str(defaults["profile"]), "site")
-    chosen = {u: p for u, p in goal.unit_profiles.items() if u in built}
-    if chosen:
-        spec["profile"] = {"default": spec.get("profile") or PROFILE_STANDARD, **chosen}
-    layout = spec["members"] if isinstance(spec.get("members"), dict) else {}
-    everywhere = list(dict.fromkeys(m for listed in layout.values() for m in listed))
-    left_out = [
-        f"{unit}@{member}"
-        for unit in ["core", *built]
-        for member in everywhere
-        if member not in layout.get(unit, layout.get("default", ()))
-    ]
-    if left_out:
-        # Where the goal gates a unit on fewer members, the rest is its choice, not a gap.
-        spec["coverage"] = {"accept": left_out}
     # The chunk size is the chunked variant's, not core's.
     params = {k: v for k, v in goal.params.items() if not (chunked and k == "chunk_tokens")}
     options = _llm_api_options(runtime, built, kv_dtype, params, snapshot, max_batch_size)
@@ -648,18 +594,6 @@ def derive_spec(
         "at": stamp,
     }
     return Derivation(spec, options, unstated, questions, derived)
-
-
-def _parallel(
-    members: list[str], narrowed: Mapping[str, list[str]], built: list[str]
-) -> dict[str, Any]:
-    """The parallel segment and the member set, per unit where the goal narrows one."""
-    if len(members) == 1:
-        return {"parallel": members[0]}
-    per_unit = {unit: list(narrowed[unit]) for unit in built if unit in narrowed}
-    if not per_unit:
-        return {"parallel": "unified", "members": list(members)}
-    return {"parallel": "unified", "members": {"default": list(members), **per_unit}}
 
 
 def _discriminators(
@@ -680,7 +614,7 @@ def _discriminators(
     per_unit: dict[str, dict[str, Any]] = {}
     algo = None
     for unit in built:
-        algo = SPEC_DEC_ALGO.get(unit, algo)
+        algo = DRAFTERS.get(unit, algo)
         if algo:
             per_unit[unit] = {**base, "spec_dec_algo": algo}
     if per_unit:
@@ -728,220 +662,15 @@ def _llm_api_options(
     options = {"core": dict(base)}
     draft: dict[str, Any] | None = None
     for unit in built:
-        if unit in SPEC_DEC_ALGO:
+        if unit in DRAFTERS:
             draft = {
-                "decoding_type": SPEC_DEC_ALGO[unit],
+                "decoding_type": DRAFTERS[unit],
                 "max_draft_len": int(params.get("draft_len") or 1),
             }
             if params.get("drafter"):
                 draft["speculative_model"] = str(params["drafter"])
         options[unit] = {**base, **({"speculative_config": dict(draft)} if draft else {})}
     return options
-
-
-#: The share of a device's memory one engine's weights may take: the rest holds the KV cache,
-#: activations and CUDA graphs.
-ENGINE_WEIGHT_FRACTION = 0.75
-
-
-def checkpoint_weight_bytes(checkpoint: str | Path | None) -> int | None:
-    """The checkpoint's weights in bytes: its safetensors index's total, else its files' sizes."""
-    if not checkpoint:
-        return None
-    root = Path(str(checkpoint))
-    try:
-        index = json.loads((root / "model.safetensors.index.json").read_text(encoding="utf-8"))
-        total = int((index.get("metadata") or {}).get("total_size") or 0)
-        if total > 0:
-            return total
-    except (OSError, ValueError, TypeError):
-        pass
-    try:
-        total = sum(f.stat().st_size for f in root.glob("*.safetensors"))
-    except OSError:
-        return None
-    return total or None
-
-
-def engine_width(weight_bytes: int | None, gpu_memory_gib: Any) -> int | None:
-    """The fewest devices (a power of two) one engine's weights fit on; ``None`` unknown."""
-    memory = gpu_memory_gib
-    if not weight_bytes or not isinstance(memory, (int, float)) or memory <= 0:
-        return None
-    room = ENGINE_WEIGHT_FRACTION * float(memory) * 2**30
-    width = 1
-    while weight_bytes / width > room:
-        width *= 2
-    return width
-
-
-def spec_warnings(task: Mapping[str, Any]) -> list[str]:
-    """What a spec is likely to cost or miss, read off its deployments before any GPU is spent.
-
-    Three things, each a line that says what to do; none stops a run:
-
-    - the first deployment holds the checkpoint on too few devices
-      (``environment.gpu_memory_gib`` says how much one has);
-    - the first deployment has no anchor: no benchmark, or no reference row for
-      ``accuracy.model_key`` and no declared one, so ``onboarded`` can only mean it boots;
-    - a deployment is scored without CUDA graphs: a full benchmark takes 10 to 50 times
-      longer, and what is scored is not the captured path the target serves.
-
-    An anchor that exists is never questioned: a small model's measured score is low.
-    """
-    try:
-        found = deployments_mod.resolve(task)
-    except (ValueError, OSError, KeyError):
-        return []
-    if not found:
-        return []
-    said: list[str] = []
-    core = found[0]
-    memory = (task.get("environment") or {}).get("gpu_memory_gib")
-    weights = checkpoint_weight_bytes(task.get("checkpoint_path"))
-    width = engine_width(weights, memory)
-    for role, server in core.servers.items():
-        ranks = int(server.options.get("tensor_parallel_size") or 1)
-        if width is not None and ranks < width:
-            said.append(
-                f"first deployment too narrow: `{core.name}` holds the checkpoint's "
-                f"{weights / 2**30:.0f} GiB of weights on {ranks} device(s), more than "
-                f"{ENGINE_WEIGHT_FRACTION:.0%} of each {memory:g}-GiB device, which leaves the "
-                f"KV cache and CUDA graphs no room, if it loads at all; start at {width} or more"
-            )
-            break
-    accuracy = task.get("accuracy") or {}
-    if not core.benchmarks:
-        said.append(
-            f"no accuracy anchor: `{core.name}` names no benchmark, so `onboarded` means it "
-            f"boots and answers the boot prompts, and nothing judges its accuracy"
-        )
-    elif core.relative_to is None and not any(b.anchor is not None for b in core.benchmarks):
-        benchmark = core.benchmarks[0].name
-        if not _has_reference_row(task, accuracy, benchmark):
-            said.append(
-                f"no accuracy anchor: no reference row for `{accuracy.get('model_key') or '?'}` "
-                f"in the tree's `{benchmark}` references and no declared `anchor`, so the run "
-                f"cannot judge `{core.name}`'s accuracy; measure one with an implementation that "
-                f"already serves the checkpoint and write the row, or declare `anchor` with its "
-                f"`source`"
-            )
-    eager = [
-        d.name
-        for d in found
-        if d.benchmarks
-        and any(
-            "cuda_graph_config" in s.options and s.options["cuda_graph_config"] is None
-            for s in d.servers.values()
-        )
-    ]
-    if eager:
-        said.append(
-            f"accuracy without CUDA graphs: {', '.join(f'`{name}`' for name in eager)} "
-            f"scored with `cuda_graph_config: null`: a full benchmark takes 10-50x longer, each "
-            f"fix-and-recheck pays it again, and what is scored is not the captured path the "
-            f"target serves; turn the graphs on unless the eager score is the point"
-        )
-    return said
-
-
-def _has_reference_row(
-    task: Mapping[str, Any], accuracy: Mapping[str, Any], benchmark: str
-) -> bool:
-    """Whether the tree's references hold a row for the spec's model on ``benchmark``."""
-    key = accuracy.get("model_key")
-    if not key:
-        return False
-    stated = resolve_per_unit(accuracy, "reference_yaml", "core")
-    path = Path(
-        str(stated or f"{tree_anchors.ANCHORS['accuracy_references'].hint}/{benchmark}.yaml")
-    )
-    if not path.is_absolute():
-        path = Path(str(task.get("trtllm_repo_path") or "")) / path
-    try:
-        rows = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
-        return False
-    return isinstance(rows, Mapping) and bool(rows.get(key))
-
-
-def _tree_path(site: Mapping[str, Any], key: str) -> str:
-    """Where anchor ``key`` is in the site's checkout (``operators/tree_anchors.py``), else its hint."""
-    found = tree_anchors.resolve(site.get("trtllm_repo_path"), key)
-    return found.paths[0] if found.found else tree_anchors.ANCHORS[key].hint
-
-
-def disagg_layout(
-    weight_bytes: int | None, gpu_memory_gib: Any, gpus_per_node: Any
-) -> tuple[int, int] | None:
-    """``(devices per node, nodes)`` the disaggregated-serving test needs; ``None`` unknown.
-
-    One context and one generation engine, each on the fewest devices that hold
-    the checkpoint's weights (:func:`engine_width`): on one node when both fit,
-    as the tree's own disaggregated accuracy tests run (context and generation
-    sharing a node); else one engine per node, or as many nodes as an engine needs.
-    """
-    width = engine_width(weight_bytes, gpu_memory_gib)
-    if width is None or not isinstance(gpus_per_node, int) or gpus_per_node <= 0:
-        return None
-    if 2 * width <= gpus_per_node:
-        return 2 * width, 1
-    if width <= gpus_per_node:
-        return width, 2
-    per_engine = -(-width // gpus_per_node)
-    return gpus_per_node, 2 * per_engine
-
-
-def _disagg(
-    defaults: Mapping[str, Any],
-    facts: CheckpointFacts,
-    site: Mapping[str, Any],
-    note,
-    questions: list[str],
-    checkpoint: Path | None = None,
-) -> dict[str, Any]:
-    """The disaggregated-serving test the run writes: the site's settings, its node id, its layout.
-
-    The node id defaults to a class named for the architecture, in the file whose
-    tests share the tree's disaggregated launcher (``launch_disaggregated_llm``).
-    The layout (:func:`disagg_layout`) is derived from the checkpoint's size:
-    one node when a context and a generation engine fit it, more only when they
-    do not.
-    """
-    block = dict(defaults.get("disagg") or {})
-    if block:
-        note("accuracy.disagg", dict(block), "site")
-    if "devices" not in block and "nodes" not in block and checkpoint is not None:
-        environment = site.get("environment") or {}
-        per_node = environment.get("gpus_per_node") or (site.get("device") or {}).get(
-            "gpus_per_node"
-        )
-        layout = disagg_layout(
-            checkpoint_weight_bytes(checkpoint), environment.get("gpu_memory_gib"), per_node
-        )
-        if layout is not None:
-            devices, nodes = layout
-            block["devices"] = note("accuracy.disagg.devices", devices, "checkpoint size")
-            if nodes > 1:
-                block["nodes"] = note("accuracy.disagg.nodes", nodes, "checkpoint size")
-    if block.get("test"):
-        return block
-    launcher = tree_anchors.resolve(site.get("trtllm_repo_path"), "disagg_launcher")
-    if launcher.found:
-        name = re.sub(r"\W|For(?:CausalLM|ConditionalGeneration)$", "", facts.architecture)
-        name = name or "Model"
-        block["test"] = note(
-            "accuracy.disagg.test",
-            f"{launcher.paths[0]}::Test{name}::test_auto_dtype",
-            "default",
-        )
-    else:
-        questions.append(
-            "accuracy.disagg.test: name the node id of the disaggregated-serving accuracy test "
-            "the run will write, beside the tree's tests that serve through "
-            "`trtllm-serve disaggregated`"
-        )
-    return block
 
 
 def render_report(derivation: Derivation, spec_path: Path) -> str:
@@ -969,17 +698,38 @@ def render_report(derivation: Derivation, spec_path: Path) -> str:
 
 
 def write_derivation(workspace: Path, derivation: Derivation) -> Path:
-    """Write the spec, each unit's LLM-API options and the report into ``workspace``; the spec's path."""
+    """Write the spec, each deployment's options and the report into ``workspace``; the spec's path.
+
+    The derivation is expanded here (``spec/shorthand.py``) into the deployments the spec
+    states: the options go to ``engines/<name>.yaml`` and the spec names them by path.
+    """
     workspace.mkdir(parents=True, exist_ok=True)
-    options_dir = workspace.resolve() / LLM_API_DIRNAME
-    options_dir.mkdir(parents=True, exist_ok=True)
-    paths: dict[str, str] = {}
-    for unit, options in derivation.llm_api_options.items():
-        path = options_dir / f"{unit}.yaml"
-        path.write_text(yaml.safe_dump(options, sort_keys=False), encoding="utf-8")
-        paths[unit] = str(path)
-    spec = dict(derivation.spec)
-    spec["accuracy"] = {**spec["accuracy"], "llm_api_options": paths}
+    asked = dict(derivation.spec)
+    asked[ACCURACY_FIELD] = {**asked[ACCURACY_FIELD], "llm_api_options": derivation.llm_api_options}
+    spec = {k: v for k, v in asked.items() if k not in (*shorthand.SHORTHAND_KEYS, "parallel")}
+    kept = {k: v for k, v in asked[ACCURACY_FIELD].items() if k not in shorthand.ACCURACY_KEYS}
+    # The spec's own row tags are core's; a deployment that adds one states it on its benchmark.
+    tags = shorthand.per(kept, "discriminators", "core")
+    kept.pop("discriminators", None)
+    if tags:
+        kept["discriminators"] = dict(tags)
+    spec[ACCURACY_FIELD] = kept
+    default = [{"name": kept.get("benchmark") or deployments_mod.DEFAULT_BENCHMARK}]
+    stated = []
+    for deployment in shorthand.expand(asked):
+        paths = deployments_mod.write_options(deployment, workspace.resolve() / ENGINES_DIRNAME)
+        entry = deployment.as_dict()
+        for role, path in paths.items():
+            holder = entry if role == "server" else entry[role]
+            holder["options"] = f"{ENGINES_DIRNAME}/{path.name}"
+        # A benchmark states what differs from the spec's `accuracy` block, and no more.
+        for benchmark in entry.get("benchmarks") or ():
+            for key in [k for k, v in benchmark.items() if k != "name" and kept.get(k) == v]:
+                del benchmark[key]
+        if entry.get("benchmarks") == default:
+            del entry["benchmarks"]
+        stated.append(entry)
+    spec[deployments_mod.DEPLOYMENTS_FIELD] = stated
     path = workspace / SPEC_FILENAME
     path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
     (workspace / REPORT_FILENAME).write_text(render_report(derivation, path), encoding="utf-8")
@@ -1036,9 +786,10 @@ def hybrid_marker(config: Mapping[str, Any]) -> str | None:
 USAGE = """usage: trtllm-modeling-v2 intake derive --checkpoint DIR (--site FILE | --repo DIR) --out DIR [--goal "..."]
 
 Derive a spec from the checkpoint, the goal and an optional site.yaml; write it, each
-unit's LLM-API options and derive.report.md into --out, print what it is likely to cost
-or miss, and stop: no run, no GPU. spec/INTAKE.md in the workflow's package is the
-procedure. `trtllm-modeling-v2 --task SPEC --workspace W --dry-run` validates a spec.
+deployment's options (engines/<name>.yaml) and derive.report.md into --out, print what it
+is likely to cost or miss, and stop: no run, no GPU. spec/INTAKE.md in the workflow's
+package is the procedure. `trtllm-modeling-v2 --task SPEC --workspace W --dry-run`
+validates a spec.
 """
 
 
@@ -1096,7 +847,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     path = write_derivation(args.out, derivation)
     print(f"→ {path}\n→ {args.out / REPORT_FILENAME}")
-    for warning in spec_warnings(yaml.safe_load(path.read_text(encoding="utf-8")) or {}):
+    # Imported here: the warnings are the run's startup's, which reads this module.
+    from ..run.startup.advice import spec_warnings
+
+    written = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    deployments_mod.resolve_paths(written, path.resolve().parent)
+    warnings = spec_warnings(written)
+    for warning in warnings:
         print(f"  warning: {warning}")
     for question in derivation.questions:
         print(f"  open: {question}")
@@ -1104,30 +861,15 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
-    "hybrid_marker",
-    "DEFAULT_BOOT",
-    "DEFAULT_MEMBERS",
-    "DEFAULT_SNAPSHOT_INTERVAL",
-    "DEFAULT_WORKLOAD",
-    "DRAFT_LAYER_KEYS",
-    "LLM_API_DIRNAME",
+    "ENGINES_DIRNAME",
     "REPORT_FILENAME",
-    "SPEC_DEC_ALGO",
     "SPEC_FILENAME",
-    "CheckpointFacts",
     "DeriveError",
-    "Derivation",
-    "Goal",
     "derive_spec",
     "draft_layers",
-    "checkpoint_weight_bytes",
-    "engine_width",
-    "inspect_checkpoint",
+    "hybrid_marker",
     "main",
-    "spec_warnings",
     "parse_goal",
     "read_config",
-    "render_report",
-    "validate_site",
     "write_derivation",
 ]

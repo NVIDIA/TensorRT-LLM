@@ -14,13 +14,22 @@ from __future__ import annotations
 
 import re
 import shlex
+import time
 import xml.etree.ElementTree as ET  # nosec B405 - the report is written by the pytest this ran
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
+from ..infra.compute.commands import ended_early
+from ..infra.compute.environment import RunEnvironment
 from ..infra.git import git_output
+from ..spec.deployments import Deployment
+from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner, gate_workdir, with_mode
+from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
+#: Where a test keeps what it writes for after it: under the check's work directory, never
+#: in the tree it runs in, which a check leaves as it found it.
+ARTIFACTS_ENV = "MV2FLOW_GATE_ARTIFACTS"
 #: A pytest test file.
 TEST_FILE = re.compile(r"(?:^|/)(?:test_[^/]*|[^/]*_test)\.py$")
 #: What marks the directory pytest runs a test from, as pytest itself decides its root.
@@ -129,7 +138,69 @@ def read_report(report: str | Path) -> Outcome:
     return Outcome(passed=passed, skipped=tuple(skipped), failing=tuple(failing))
 
 
+def run_tests(
+    environment: RunEnvironment,
+    *,
+    task_data: Mapping[str, Any],
+    deployment: Deployment,
+    workdir: str | Path,
+    runner: ShellRunner = default_shell_runner,
+    timeout: int | None = None,
+    name: str = "tests",
+    missing: str = "the deployment names no test",
+) -> GateResult:
+    """Run each of ``deployment``'s native tests as one pytest job and judge the reports.
+
+    Every job runs under the deployment's environment with the Modeling V2 switch on. A
+    test that skipped proves nothing and fails the check, as does a node id that selects
+    nothing; the first job that does not pass ends it.
+    """
+    verdict = verdict_factory(inspect_tree(task_data))
+    if not deployment.tests:
+        return verdict(name=name, deployment=deployment.name, passed=False, detail=missing)
+    timeout = timeout or deployment.timeout or TIMEOUT_S
+    repo = task_data["trtllm_repo_path"]
+    directory = gate_workdir(workdir)
+    commands, said, tail, started = [], [], "", time.monotonic()
+
+    def ran(**fields: Any) -> GateResult:
+        return verdict(
+            name=name,
+            deployment=deployment.name,
+            command="\n".join(commands),
+            duration_s=time.monotonic() - started,
+            stdout_tail="\n".join(tail.splitlines()[-40:]),
+            **fields,
+        )
+
+    for index, test in enumerate(deployment.tests):
+        report = directory / f"{name}.{deployment.name}.{index}.xml"
+        report.unlink(missing_ok=True)
+        # What the test keeps goes beside the report, outside the tree it runs in.
+        kept = {ARTIFACTS_ENV: str(report.with_suffix(".artifacts"))}
+        env = with_mode(
+            replace(environment, env={**environment.env, **kept, **deployment.env}), MODE_REQUIRE
+        )
+        root, argv = pytest_argv(repo, [test], report)
+        command = f"cd {shlex.quote(str(root))} && {env.python_command(argv, single_process=True)}"
+        commands.append(command)
+        result = runner(command, None, timeout)
+        tail = result.stdout + result.stderr
+        if result.infrastructure:
+            return ran(**lost_session(result))
+        if result.timed_out:
+            return ran(passed=False, detail=f"{test}: {ended_early(result, timeout)}")
+        if result.returncode != 0:
+            return ran(passed=False, detail=f"{test}: pytest exited {result.returncode}")
+        outcome = read_report(report)
+        said.append(f"{test}: {outcome.describe(skips_fail=True)}")
+        if outcome.verdict(skips_fail=True) != "CLEAN":
+            return ran(passed=False, detail="; ".join(said))
+    return ran(passed=True, detail="; ".join(said))
+
+
 __all__ = [
+    "ARTIFACTS_ENV",
     "PYTEST_ROOT_MARKERS",
     "TEST_FILE",
     "TIMEOUT_S",
@@ -139,4 +210,5 @@ __all__ = [
     "pytest_command",
     "pytest_root",
     "read_report",
+    "run_tests",
 ]

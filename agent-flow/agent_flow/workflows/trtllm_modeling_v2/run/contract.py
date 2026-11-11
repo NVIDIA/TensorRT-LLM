@@ -3,8 +3,10 @@
 
 """The contract: every check a run must pass, compiled from the resolved task spec.
 
-The contract is the run's definition of "done". It names each check by unit,
-gate and member. Nothing runs it while the workers build: a worker runs the
+The contract is the run's definition of "done". It names each check by its
+deployment and gate: a boot, one accuracy check for each of the deployment's
+benchmarks, its native tests when it names any, and the serve gate for core
+when the spec turns it on. Nothing runs it while the workers build: a worker runs the
 checks of its own unit by hand (``trtllm-modeling-v2 gate``) and its conclusion
 is trusted. The contract is run once, whole, on the final commit
 (``run/certify.py``), and a run is delivered only when every required check
@@ -23,29 +25,15 @@ import json
 import os
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Mapping
 
 import yaml
 
-from ..checks import disagg, serve
+from ..checks import serve
 from ..infra.git import git_output
 from ..operators.coverage import MODELING_V2_PACKAGE
 from ..spec import deployments as deployments_mod
-from ..spec import shorthand
-from ..spec import variants as variants_mod
-from ..spec.shorthand import order_members_by_cost
-from ..spec.task_schema import (
-    DISAGG_FEATURE,
-    PROFILE_BRINGUP,
-    PROFILE_SMOKE,
-    SPECULATORS,
-    TaskSchemaError,
-    assembly_units,
-    members_for,
-    parse_parallel_segment,
-    profile_of,
-    resolve_per_unit,
-)
+from ..spec.deployments import AGGREGATED
 
 CONTRACT_FILENAME = "contract.yaml"
 STATUS_FILENAME = "contract_status.jsonl"
@@ -58,26 +46,29 @@ NATIVE_LIBRARY_PATTERNS: tuple[str, ...] = ("*.so", "*.so.*")
 
 @dataclass(frozen=True)
 class Check:
-    """One check: a gate, at one member, for one unit or configuration variant."""
+    """One check: a gate of one deployment."""
 
-    unit: str
+    deployment: str
     gate: str
-    member: str
     required: bool = True
 
     @property
     def key(self) -> str:
-        return f"{self.unit}:{self.gate}@{self.member}"
+        return f"{self.deployment}:{self.gate}"
 
 
 @dataclass(frozen=True)
 class Contract:
     checks: tuple[Check, ...]
-    #: Why a unit or variant owes less than every check at every member, one line each.
+    #: What a reader should know of what the checks do not judge, one line each.
     notes: tuple[str, ...] = ()
 
     def required(self) -> tuple[Check, ...]:
         return tuple(c for c in self.checks if c.required)
+
+    def of(self, deployment: str) -> tuple[Check, ...]:
+        """The checks ``deployment`` owes."""
+        return tuple(c for c in self.checks if c.deployment == deployment)
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"checks": [asdict(c) for c in self.checks]}
@@ -87,150 +78,47 @@ class Contract:
 
     def render(self) -> str:
         """A markdown table, one row per check."""
-        lines = ["| unit | gate | member | required |", "|---|---|---|---|"]
+        lines = ["| deployment | gate | required |", "|---|---|---|"]
         for c in self.checks:
-            lines.append(f"| {c.unit} | {c.gate} | {c.member} | {'yes' if c.required else 'no'} |")
+            lines.append(f"| {c.deployment} | {c.gate} | {'yes' if c.required else 'no'} |")
         if self.notes:
             lines += ["", *(f"- {note}" for note in self.notes)]
         return "\n".join(lines)
 
 
-def _width(member: str) -> int:
-    """How many ranks ``member`` serves on; 0 when it does not say."""
-    try:
-        return parse_parallel_segment(member)[1] or 0
-    except TaskSchemaError:
-        return 0
+def compile_contract(task_data: Mapping[str, Any]) -> Contract:
+    """Every check the spec's deployments owe, core's first.
 
-
-def benchmark_members(task_data: Mapping[str, Any], unit: str, members: Sequence[str]) -> list[str]:
-    """Where ``unit``'s accuracy benchmark runs: every member, or the one ``benchmark_members`` names."""
-    named = (task_data.get("accuracy") or {}).get("benchmark_members")
-    return [str(named)] if named in members else list(members)
-
-
-def benchmark_member(task_data: Mapping[str, Any], members: Sequence[str]) -> tuple[str, str]:
-    """The one member of ``members`` a configuration variant's benchmark runs at, and why.
-
-    The member ``accuracy.benchmark_members`` names; else an attention-DP member,
-    whose served engine takes the most paths (the router, dummy requests, per-rank
-    caches); else the widest, the cheapest to start among equals.
+    A deployment owes its boot, one accuracy check for each of its benchmarks, and its
+    native tests when it names any. Core, when it is one server, also owes the serve
+    gate where ``accuracy.serve.enabled`` asks for it.
     """
-    named = (task_data.get("accuracy") or {}).get("benchmark_members")
-    if named in members:
-        return str(named), "named in accuracy.benchmark_members"
-    ranked = order_members_by_cost(list(members))
-    for member in ranked:
-        if parse_parallel_segment(member)[0] == "dep":
-            return member, "attention DP serves through the most paths"
-    return max(ranked, key=_width), "the widest"
-
-
-def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
-    """Every check the run's units and variants owe, units first, each key once.
-
-    Each unit owes what its profile (``task_schema.profile_of``) asks:
-    ``smoke`` its boot alone, ``bringup`` its checks at its cheapest member,
-    ``certified`` what ``standard`` owes and the serve gate. ``disagg`` owes its
-    disaggregated-serving test alone, once (``checks/disagg.py``): its boot and
-    accuracy would run one aggregated engine, which the units before it prove.
-    A variant boots at
-    every member of its unit and runs its benchmark at one
-    (:func:`benchmark_member`) unless it names its members; a variant of
-    ``disagg`` owes nothing of its own, its axis being proven on core. A
-    ``smoke`` or ``bringup`` run owes no variant and no one-rank serve check.
-    """
-    accuracy = task_data.get("accuracy") or {}
     serving = serve.ServeSpec.from_task(task_data).enabled
-    units = assembly_units(task_data)
-    lean = profile_of(task_data) in (PROFILE_SMOKE, PROFILE_BRINGUP)
-    checks: dict[str, Check] = {}
+    checks: list[Check] = []
     notes: list[str] = []
-
-    def add(unit: str, gate: str, at: Iterable[str]) -> None:
-        for member in at:
-            check = Check(unit, gate, member)
-            checks.setdefault(check.key, check)
-
-    for index, unit in enumerate(units):
-        level = profile_of(task_data, unit)
-        members = order_members_by_cost(members_for(task_data, unit, world_size))
-        if level == PROFILE_BRINGUP and len(members) > 1:
-            notes.append(
-                f"{unit}: the bringup profile gates it at {members[0]} only, not at "
-                f"{', '.join(members[1:])}"
-            )
-            members = members[:1]
-        implemented = set(units[1 : index + 1])
-        if unit == DISAGG_FEATURE:
-            # The test sets its own engines' layout on one node: it runs once, at the
-            # member the request validates fully (benchmark_member).
-            member, why = benchmark_member(task_data, members)
-            add(unit, disagg.GATE_NAME, [member])
-            notes.append(
-                f"{unit}: its disaggregated-serving test alone proves it, once at {member} "
-                f"({why}); its boot and accuracy would run one aggregated engine"
-            )
-            continue
-        add(unit, "boot", members)
-        if level == PROFILE_SMOKE:
-            notes.append(f"{unit}: the smoke profile owes its boot alone")
-            continue
-        benchmark = resolve_per_unit(accuracy, "benchmark", unit) or "accuracy"
-        add(unit, f"accuracy[{benchmark}]", benchmark_members(task_data, unit, members))
-        if serving:
-            add(unit, serve.GATE_NAME, [serve.serve_member(members)])
+    for deployment in deployments_mod.resolve(task_data):
+        name = deployment.name
+        checks.append(Check(name, "boot"))
+        checks += [Check(name, f"accuracy[{b.name}]") for b in deployment.benchmarks]
+        if not deployment.benchmarks:
+            notes.append(f"{name}: it names no benchmark, so its boot alone judges it")
+        if deployment.tests:
+            checks.append(Check(name, "tests"))
+        if serving and deployment.core and deployment.kind == AGGREGATED:
+            checks.append(Check(name, serve.GATE_NAME))
         # Speculative decoding preserves the output distribution by construction, so a
         # draft path that computes the wrong thing passes boot and accuracy and shows only
-        # as speed. What detects it is a native test of the drafter, which no check here runs.
-        if SPECULATORS & implemented:
-            notes.append(
-                f"{unit}: its drafter's acceptance is judged by no check here; name a native "
-                f"test for it, or the report says it is unverified"
-            )
-    for name in () if lean else variants_mod.variants(task_data):
-        level = profile_of(task_data, name)
-        if level == PROFILE_BRINGUP:
-            notes.append(f"{name}: the bringup profile gates no configuration variant")
-            continue
-        spec = shorthand.variant_spec(task_data, name, world_size=world_size)
-        members = order_members_by_cost(members_for(spec, name, world_size))
-        base = variants_mod.base_unit(task_data, name)
-        if base == DISAGG_FEATURE:
-            notes.append(f"{name}: a variant of {base} owes no check; its axis is proven on core")
-            continue
-        benchmark = resolve_per_unit(spec.get("accuracy") or {}, "benchmark", name) or "accuracy"
-        gate_names = {"boot": "boot", "accuracy": f"accuracy[{benchmark}]"}
-        gates = tuple(g for g in variants_mod.variant_gates(task_data, name) if g in gate_names)
-        if level == PROFILE_SMOKE:
-            gates = ("boot",)
-        everywhere = order_members_by_cost(members_for(task_data, base, world_size))
-        named = variants_mod.variants(task_data)[name].get("members")
-        if (
-            variants_mod.anchor_state(task_data, name) == variants_mod.ANCHOR_RELATIVE
-            and "accuracy" in gates
-        ):
-            notes.append(f"{name}: its anchor is {base}'s own score at the same member and commit")
-        for gate in gates:
-            at = members
-            if gate == "boot":
-                at = [*members, *(m for m in everywhere if m not in members)]
-            elif gate == "accuracy" and not named and len(at) > 1:
-                member, why = benchmark_member(spec, members)
-                at = [member]
-                notes.append(f"{name}: accuracy at {member} ({why}); its other members boot")
-            add(name, gate_names[gate], at)
-    if lean and variants_mod.variants(task_data):
-        notes.append(
-            f"the {profile_of(task_data)} profile gates no configuration variant: "
-            + ", ".join(variants_mod.variants(task_data))
+        # as speed. What detects it is a native test of the drafter.
+        drafts = any(
+            (server.options.get("speculative_config") or {}).get("decoding_type")
+            for server in deployment.servers.values()
         )
-    if units and serving and not lean:
-        # The served target at one rank, where a user starts.
-        single = serve.delivery_member(members_for(task_data, units[-1], world_size))
-        if single is not None:
-            add(units[-1], serve.GATE_NAME, [single])
-    return Contract(checks=tuple(checks.values()), notes=tuple(notes))
+        if drafts and not deployment.tests:
+            notes.append(
+                f"{name}: its drafter's acceptance is judged by no check here; name a native "
+                f"test for it in `tests`, or the report says it is unverified"
+            )
+    return Contract(checks=tuple(checks), notes=tuple(notes))
 
 
 def write_contract(workspace: Path, contract: Contract) -> Path:
@@ -339,9 +227,8 @@ def tree_id(
 
 @dataclass
 class Verdict:
-    unit: str
+    deployment: str
     gate: str
-    member: str
     passed: bool
     detail: str = ""
     #: The tree the check measured (:func:`tree_id`).
@@ -351,7 +238,7 @@ class Verdict:
     #: How long the check's gate ran, in seconds; 0 when it did not say.
     duration_s: float = 0.0
     #: The score a benchmark measured (``GateResult.measured``), pass or fail, the reference
-    #: it was held to and its standard error: what the cross-member shift check reads.
+    #: it was held to and its standard error.
     measured: float | None = None
     reference: float | None = None
     se: float | None = None
@@ -360,7 +247,7 @@ class Verdict:
 
     @property
     def key(self) -> str:
-        return f"{self.unit}:{self.gate}@{self.member}"
+        return f"{self.deployment}:{self.gate}"
 
 
 _VERDICT_FIELDS = frozenset(f.name for f in fields(Verdict))
@@ -390,10 +277,14 @@ class ContractStatus:
                     data = json.loads(line)
                 except ValueError:
                     continue  # a torn line: the check it was for runs again
-                if isinstance(data, dict):
+                if not isinstance(data, dict):
+                    continue
+                try:
                     verdicts.append(
                         Verdict(**{k: v for k, v in data.items() if k in _VERDICT_FIELDS})
                     )
+                except TypeError:
+                    continue  # a line of another version of the ledger: its check runs again
         return cls(path=path, verdicts=verdicts)
 
     def record(self, check: Check, result: Any, *, tree: str, round: int = 0) -> Verdict:
@@ -404,9 +295,8 @@ class ContractStatus:
         """
         infrastructure = str(getattr(result, "infrastructure", "") or "")
         verdict = Verdict(
-            unit=check.unit,
+            deployment=check.deployment,
             gate=check.gate,
-            member=check.member,
             passed=bool(result.passed) and not infrastructure,
             detail=str(result.detail)[:500],
             tree=tree,
@@ -488,8 +378,6 @@ __all__ = [
     "ContractStatus",
     "Evaluation",
     "Verdict",
-    "benchmark_member",
-    "benchmark_members",
     "compile_contract",
     "evaluate",
     "flow_version",

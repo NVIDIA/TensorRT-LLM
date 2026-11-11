@@ -1,25 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+
 """What each benchmark of each deployment is judged against, frozen once per workspace.
 
 For a deployment and one of its benchmarks, in this order:
 
 1. ``declared``: the benchmark's own ``anchor``, with its ``source``;
-2. ``reference``: the row of the tree's reference file for ``accuracy.model_key`` whose
-   tags are exactly the deployment's;
+2. ``reference``: the row of the tree's reference file for the benchmark's ``model_key``
+   whose tags are exactly the deployment's (:func:`tags`);
 3. ``relative``: the score of the deployment named by ``relative_to``, measured as this
    one is, so the floor allows for the error of both (``sqrt(2) x SE``);
 4. ``none``: the score is reported and nothing judges it.
 
-:func:`freeze` writes them to ``anchors.yaml`` in the workspace the first time a run
-starts and adds only what is absent on a later start, so no commit of the run, to the
-reference file or anywhere else, can move what its checks are held to. The gates read
-the frozen copy (:func:`frozen`); :func:`differences` says where the tree's row now
-differs from it, for the report.
+The floor under a score is ``anchor - 2 x SE``, the binomial error at the anchor over the
+samples scored (:func:`floor`). :func:`freeze` writes the anchors to ``anchors.yaml`` in
+the workspace the first time a run starts and adds only what is absent on a later start,
+so no commit of the run, to the reference file or anywhere else, can move what its checks
+are held to. The checks read the frozen copy (:func:`frozen`); :func:`differences` says
+where the tree's row now differs from it, for the report.
 """
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -29,11 +33,6 @@ import yaml
 from ..infra.files import write_text_atomic
 from ..spec import deployments as deployments_mod
 from ..spec.deployments import Benchmark, Deployment
-from ..spec.shorthand import unit_of, variant_spec
-from ..spec.task_schema import resolve_per_unit, resolve_samples
-from ..spec.variants import is_variant
-from . import accuracy_policy
-from .accuracy import load_reference_score, resolve_discriminators, resolve_model_key
 
 ANCHORS_FILENAME = "anchors.yaml"
 DECLARED = "declared"
@@ -42,9 +41,24 @@ RELATIVE = "relative"
 NONE = "none"
 #: Where the tree keeps its reference rows, one file per benchmark.
 REFERENCES_DIR = "tests/integration/defs/accuracy/references"
-#: The reference rows' tag for each KV-cache dtype and speculative algorithm an options
-#: file can state.
+#: ``k`` in ``anchor - k x SE``.
+FLOOR_K = 2.0
+#: Questions in the split ``trtllm-eval`` scores for each benchmark it ships, for the
+#: standard error when neither the run's own output nor the spec states the count.
+KNOWN_SAMPLES: dict[str, int] = {
+    "gsm8k": 1319,
+    "mmlu": 14042,
+    "mmmu": 900,
+    "gpqa_diamond": 198,
+    "gpqa_main": 448,
+    "gpqa_extended": 546,
+}
+#: The reference rows' tag for each KV-cache dtype an options file can state.
 _KV_TAGS: dict[str, str] = {"fp8": "FP8", "nvfp4": "NVFP4"}
+# What a run prints of its own count: MMLU's total, and lm-eval's running score.
+_MMLU_SAMPLES = re.compile(r"MMLU weighted average accuracy:\s*[0-9.]+\s*\((\d+)\)")
+_PARTIAL_TOTAL = re.compile(r"Partial scores after\s+(\d+)/(\d+)\s+responses")
+_NUM_SAMPLES_ARG = re.compile(r"^--num_samples(?:=(\d+))?$")
 
 
 @dataclass(frozen=True)
@@ -66,54 +80,109 @@ class Anchor:
         return f"{self.deployment}:{self.benchmark}"
 
 
-def _tags(task_data: Mapping[str, Any], deployment: Deployment) -> dict[str, Any]:
-    """The reference row's tags for a deployment a spec states itself.
+@dataclass(frozen=True)
+class Floor:
+    """One accuracy floor and how it was derived."""
 
-    ``accuracy.discriminators`` (the checkpoint's own, such as its weight format) with
-    what the deployment's options add: a KV-cache dtype, a speculative algorithm.
+    value: float
+    reference: float
+    se: float
+    samples: int
+    #: The reference is another deployment's score, measured as this one is: the SE is
+    #: that of the difference of two measurements.
+    relative: bool = False
+
+    def describe(self) -> str:
+        """``reference 92.08 - 2.00 x SE 0.75 (n=1319) = 90.59``."""
+        se = f"SE {self.se:.2f} (n={self.samples})"
+        if self.relative:
+            return (
+                f"the other deployment's score {self.reference:.4f} - {FLOOR_K:.2f} x {se} "
+                f"of the difference = {self.value:.4f}"
+            )
+        return f"reference {self.reference:.4f} - {FLOOR_K:.2f} x {se} = {self.value:.4f}"
+
+
+def binomial_se(score: float, samples: int) -> float:
+    """The standard error, in points, of a percentage measured on ``samples`` items.
+
+    ``score`` is on the 0-100 scale. The proportion is clamped half a sample away from 0
+    and 1, so a score of exactly 100 still has a nonzero error.
     """
-    tags = dict((task_data.get("accuracy") or {}).get("discriminators") or {})
+    if samples < 1:
+        raise ValueError(f"a standard error needs at least one sample, got {samples}")
+    p = min(max(score / 100.0, 0.5 / samples), 1.0 - 0.5 / samples)
+    return 100.0 * math.sqrt(p * (1.0 - p) / samples)
+
+
+def model_key(task_data: Mapping[str, Any], benchmark: Benchmark) -> str:
+    """The name the benchmark's reference rows are keyed by: stated, else ``<org>/<model>``.
+
+    The fallback is the checkpoint path's last two components.
+    """
+    if benchmark.model_key:
+        return str(benchmark.model_key)
+    parts = Path(str(task_data["checkpoint_path"]).rstrip("/")).parts
+    return "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+
+
+def tags(deployment: Deployment, benchmark: Benchmark) -> dict[str, Any]:
+    """The tags of the reference row ``deployment`` is judged by on ``benchmark``.
+
+    What the deployment's options imply (a quantized KV cache, a speculative algorithm)
+    with the benchmark's own ``discriminators`` (the checkpoint's weight format) over
+    them. A row matches only its exact tags: the unquantized row never stands in for a
+    deployment that quantizes its cache.
+    """
     options = next(iter(deployment.servers.values())).options
+    implied: dict[str, Any] = {}
     dtype = str((options.get("kv_cache_config") or {}).get("dtype") or "").lower()
     if dtype in _KV_TAGS:
-        tags["kv_cache_quant_algo"] = _KV_TAGS[dtype]
+        implied["kv_cache_quant_algo"] = _KV_TAGS[dtype]
     speculative = options.get("speculative_config") or {}
     if speculative.get("decoding_type"):
-        tags["spec_dec_algo"] = str(speculative["decoding_type"])
-    return tags
+        implied["spec_dec_algo"] = str(speculative["decoding_type"])
+    stated = {k: v for k, v in (benchmark.discriminators or {}).items() if v is not None}
+    return {**implied, **stated}
 
 
-def _reference_row(
-    task_data: Mapping[str, Any], deployment: Deployment, benchmark: str, repo: Path
-) -> tuple[float, str]:
-    """The reference row for ``deployment`` on ``benchmark``: its score and where it was read.
+def load_reference_score(
+    reference_yaml: str | Path, key: str, *, discriminators: Mapping[str, Any] | None = None
+) -> float:
+    """Read the anchor for one model from TensorRT-LLM's accuracy references.
 
-    Raises ``KeyError`` or ``FileNotFoundError`` when no row, or more than one, fits.
+    An entry matches when its tags (``quant_algo``, ``kv_cache_quant_algo``,
+    ``spec_dec_algo``) are exactly the ones asked for, no more, no less. Raises
+    ``KeyError`` when no entry, or more than one, matches: the anchor is never invented.
     """
-    accuracy = task_data.get("accuracy") or {}
-    if deployments_mod.is_native(task_data):
-        key = accuracy.get("model_key")
-        if not key:
-            raise KeyError("the spec states no accuracy.model_key")
-        stated, tags = accuracy.get("reference_yaml"), _tags(task_data, deployment)
-    else:
-        # A shorthand spec names its rows per unit; a variant's are its unit's with its own.
-        unit = unit_of(deployment.name)
-        spec = (
-            variant_spec(task_data, unit, world_size=1)
-            if is_variant(task_data, unit)
-            else task_data
+    path = Path(reference_yaml)
+    if not path.is_file():
+        raise FileNotFoundError(f"accuracy reference file not found: {path}")
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if key not in data:
+        raise KeyError(
+            f"{path} has no entry for {key!r}. The anchor comes from a written source or from "
+            f"the user — it is never invented. Add the entry (citing where the score came "
+            f"from) before the accuracy gate can run: `{key}:` then `  - accuracy: <score>`, "
+            f"committed to the checkout. A score under the gate's own protocol comes from an "
+            f"implementation that already serves the checkpoint, e.g. `trtllm-eval --model "
+            f"<checkpoint> <benchmark>` on a TensorRT-LLM whose existing model class loads "
+            f"it, on the same GPU type."
         )
-        accuracy = spec.get("accuracy") or {}
-        key = resolve_model_key(spec, unit)
-        stated = resolve_per_unit(accuracy, "reference_yaml", unit)
-        tags = dict(resolve_discriminators(accuracy, unit) or {})
-    path = Path(str(stated or f"{REFERENCES_DIR}/{benchmark}.yaml"))
-    if not path.is_absolute():
-        path = repo / path
-    score = load_reference_score(path, str(key), discriminators=tags or None)
-    shown = f" with {tags}" if tags else ""
-    return score, f"{path}: the row of `{key}`{shown}"
+    wanted = {k: v for k, v in (discriminators or {}).items() if v is not None}
+    entries = [e for e in data[key] or [] if isinstance(e, dict)]
+    matches = [e for e in entries if {k: v for k, v in e.items() if k != "accuracy"} == wanted]
+    if not matches:
+        available = [{k: v for k, v in e.items() if k != "accuracy"} for e in entries]
+        raise KeyError(
+            f"{path}:{key} has no entry matching {wanted or '{}'}. Available tag sets: {available}"
+        )
+    if len(matches) > 1:
+        raise KeyError(
+            f"{path}:{key} has {len(matches)} entries matching {wanted or '{}'}; the anchor "
+            f"must be unambiguous"
+        )
+    return float(matches[0]["accuracy"])
 
 
 def resolve(
@@ -126,15 +195,19 @@ def resolve(
     base = dict(deployment=deployment.name, benchmark=benchmark.name)
     if benchmark.anchor is not None:
         return Anchor(kind=DECLARED, value=benchmark.anchor, source=benchmark.source, **base)
-    root = Path(str(repo or task_data.get("trtllm_repo_path") or "."))
-    why = ""
-    if not (deployment.relative_to and not deployments_mod.is_native(task_data)):
-        # A shorthand variant judged against its unit names no row of its own.
-        try:
-            score, where = _reference_row(task_data, deployment, benchmark.name, root)
-            return Anchor(kind=REFERENCE, value=score, source=where, **base)
-        except (KeyError, FileNotFoundError, TypeError, ValueError) as exc:
-            why = str(exc).strip("'\"").splitlines()[0][:200]
+    path = Path(str(benchmark.reference_yaml or f"{REFERENCES_DIR}/{benchmark.name}.yaml"))
+    if not path.is_absolute():
+        path = Path(str(repo or task_data.get("trtllm_repo_path") or ".")) / path
+    key, wanted = model_key(task_data, benchmark), tags(deployment, benchmark)
+    try:
+        score = load_reference_score(path, key, discriminators=wanted)
+    except (KeyError, FileNotFoundError, TypeError, ValueError, yaml.YAMLError) as exc:
+        why = str(exc).strip("'\"").splitlines()[0][:300]
+    else:
+        shown = f" with {wanted}" if wanted else ""
+        return Anchor(
+            kind=REFERENCE, value=score, source=f"{path}: the row of `{key}`{shown}", **base
+        )
     if deployment.relative_to:
         return Anchor(
             kind=RELATIVE,
@@ -164,19 +237,19 @@ def freeze(
     What is frozen stays: a later start, after a spec edit or a commit to the reference
     file, adds the new deployments' and benchmarks' and changes no other.
     """
-    frozen = load(workspace)
+    held = load(workspace)
     added = False
     for deployment in deployments_mod.resolve(task_data):
         for benchmark in deployment.benchmarks:
             key = f"{deployment.name}:{benchmark.name}"
-            if key not in frozen:
-                frozen[key] = resolve(task_data, deployment, benchmark, repo)
+            if key not in held:
+                held[key] = resolve(task_data, deployment, benchmark, repo)
                 added = True
     if added:
-        rows = [asdict(anchor) for anchor in frozen.values()]
+        rows = [asdict(anchor) for anchor in held.values()]
         Path(workspace).mkdir(parents=True, exist_ok=True)
         write_text_atomic(Path(workspace) / ANCHORS_FILENAME, yaml.safe_dump(rows, sort_keys=False))
-    return frozen
+    return held
 
 
 def frozen(workspace: str | Path | None, deployment: str, benchmark: str) -> Anchor | None:
@@ -192,9 +265,10 @@ def differences(
     by_name = {d.name: d for d in deployments_mod.resolve(task_data)}
     for anchor in load(workspace).values():
         deployment = by_name.get(anchor.deployment)
-        if anchor.kind != REFERENCE or deployment is None:
+        benchmark = deployment.benchmark(anchor.benchmark) if deployment else None
+        if anchor.kind != REFERENCE or benchmark is None:
             continue
-        now = resolve(task_data, deployment, Benchmark(name=anchor.benchmark), repo)
+        now = resolve(task_data, deployment, benchmark, repo)
         if now.kind != REFERENCE:
             said.append(f"{anchor.key}: frozen at {anchor.value:g}; the tree now has no such row")
         elif now.value != anchor.value:
@@ -204,57 +278,74 @@ def differences(
     return said
 
 
+def samples_of(benchmark: Benchmark, output: str = "") -> tuple[int | None, str]:
+    """How many samples a score was (or will be) measured on, and where the count is from.
+
+    Most specific first: the count the run itself printed (what was actually scored),
+    ``--num_samples`` among the benchmark's options, the benchmark's ``samples``, the
+    benchmark's known size. ``(None, why)`` when none of them answers.
+    """
+    printed = _MMLU_SAMPLES.findall(output) or [t for _, t in _PARTIAL_TOTAL.findall(output)]
+    if printed:
+        return int(printed[-1]), "the run's own output"
+    for index, arg in enumerate(benchmark.args):
+        matched = _NUM_SAMPLES_ARG.match(arg)
+        value = matched and (matched.group(1) or "".join(benchmark.args[index + 1 : index + 2]))
+        if value and value.isdigit():
+            return int(value), "--num_samples in the benchmark's args"
+    if benchmark.samples is not None:
+        return int(benchmark.samples), "the benchmark's `samples`"
+    if benchmark.name in KNOWN_SAMPLES:
+        return KNOWN_SAMPLES[benchmark.name], f"the {benchmark.name} split size"
+    return None, f"no sample count for `{benchmark.name}`: state its `samples`"
+
+
 def floor(
     anchor: Anchor,
-    accuracy: Mapping[str, Any],
     benchmark: Benchmark,
     *,
     relative_score: float | None = None,
     output: str = "",
-) -> tuple[accuracy_policy.Floor | None, str]:
+) -> tuple[Floor | None, str]:
     """The floor ``anchor`` puts under a score, and where its sample count came from.
 
-    ``reference - k x SE`` for a declared or reference anchor; for a relative one,
-    ``relative_score - k x sqrt(2) x SE``, the error of the difference of two scores.
+    ``reference - 2 x SE`` for a declared or reference anchor; for a relative one,
+    ``relative_score - 2 x sqrt(2) x SE``, the error of the difference of two scores.
     ``None`` for no anchor, a relative one whose deployment has no score, or an unknown
-    sample count. The count is, in this order: what the run printed, ``--num_samples``
-    among the benchmark's options, ``accuracy.samples``, the benchmark's known size.
+    sample count.
     """
-    reference = relative_score if anchor.kind == RELATIVE else anchor.value
+    relative = anchor.kind == RELATIVE
+    reference = relative_score if relative else anchor.value
     if anchor.kind == NONE or reference is None:
         return None, "no anchor"
-    counted = {**accuracy, "benchmark_args": list(benchmark.args)}
-    samples, source = resolve_samples(counted, None, benchmark.name, output)
-    policy = accuracy_policy.resolve_floor_policy(accuracy)
+    samples, source = samples_of(benchmark, output)
+    if samples is None:
+        return None, source
     # The binomial error is of a percentage: a score reported as a fraction is scaled.
     scale = 100.0 if 0 <= reference <= 1 else 1.0
-    found = accuracy_policy.floor_for(policy, reference * scale, samples, anchor.kind == RELATIVE)
-    if found is None or scale == 1.0:
-        return found, source
-    from dataclasses import replace
-
-    return (
-        replace(
-            found,
-            value=found.value / scale,
-            reference=reference,
-            se=None if found.se is None else found.se / scale,
-        ),
-        source,
-    )
+    se = binomial_se(reference * scale, samples) * (math.sqrt(2) if relative else 1.0) / scale
+    return Floor(reference - FLOOR_K * se, reference, se, samples, relative), source
 
 
 __all__ = [
     "ANCHORS_FILENAME",
     "DECLARED",
+    "FLOOR_K",
+    "KNOWN_SAMPLES",
     "NONE",
     "REFERENCE",
     "RELATIVE",
     "Anchor",
+    "Floor",
+    "binomial_se",
     "differences",
     "floor",
     "freeze",
     "frozen",
     "load",
+    "load_reference_score",
+    "model_key",
     "resolve",
+    "samples_of",
+    "tags",
 ]

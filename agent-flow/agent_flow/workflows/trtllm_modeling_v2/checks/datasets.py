@@ -1,241 +1,63 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The benchmark datasets, staged in the background from preflight on, never a blocker.
 
-Every accuracy gate runs offline (``HF_DATASETS_OFFLINE=1``), so the dataset must be on
-disk where the evaluator looks, before the first benchmark: ``trtllm-eval`` takes it as
-``--dataset_path``, and the tree's own accuracy tests (the disaggregated-serving one among
-them) read it under ``$LLM_MODELS_ROOT/datasets/...`` (``accuracy_core.py``). A run that
-found it missing there lost its benchmarks to it.
+"""Where a benchmark's dataset is on this host.
 
-:func:`start` runs beside the run's first turns: per benchmark, the spec's
-``accuracy.dataset_path``, else the copy under ``$LLM_MODELS_ROOT``, else a download of the
-dataset's repository into the workspace (``datasets/<repo>``), first from the local
-HuggingFace cache. ``datasets/status.json`` says where each stands. A gate that needs one
-still being staged waits for it (:func:`wait`); one that could not be staged runs as
-before, and the journal says why. :func:`staged_spec` is how a check reads it. Where the
-models root lacks the dataset, a root that holds it beside the models (:func:`models_root`)
-is what the tree's own tests read.
+Every accuracy check runs offline (``HF_DATASETS_OFFLINE=1``), so the dataset must be on
+disk before the engine loads. :func:`find` looks where it can be: the benchmark's stated
+``dataset_path``, the copy the tree's own tests read under ``$LLM_MODELS_ROOT/datasets``,
+the HuggingFace cache. A known benchmark whose dataset is nowhere is a host problem, said
+before a load is spent on it and never a verdict about the target. Nothing is downloaded.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
-import sys
-import threading
-import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Mapping
 
-from ..infra.files import write_text_atomic
-
-DIRNAME = "datasets"
-STATUS_FILENAME = "status.json"
-#: Benchmark -> the dataset repository and where the tree's tests read it under the models root.
+#: Benchmark -> its dataset's repository, as the tree's tests and the hub name it.
 KNOWN: dict[str, str] = {"gsm8k": "openai/gsm8k"}
-#: How long a gate waits for a dataset still being staged.
-WAIT_S = 30 * 60.0
-STAGING, READY, FAILED = "staging", "ready", "failed"
-
-_DOWNLOAD = """
-import sys
-from huggingface_hub import snapshot_download
-repo, target = sys.argv[1], sys.argv[2]
-try:
-    snapshot_download(repo_id=repo, repo_type="dataset", local_dir=target, local_files_only=True)
-except Exception:
-    snapshot_download(repo_id=repo, repo_type="dataset", local_dir=target)
-"""
-
-
-def status(workspace: Path) -> dict[str, dict[str, Any]]:
-    try:
-        data = json.loads((Path(workspace) / DIRNAME / STATUS_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _set(workspace: Path, benchmark: str, **entry: Any) -> None:
-    data = status(workspace)
-    data[benchmark] = {**entry, "at": time.time()}
-    (Path(workspace) / DIRNAME).mkdir(parents=True, exist_ok=True)
-    write_text_atomic(Path(workspace) / DIRNAME / STATUS_FILENAME, json.dumps(data, indent=1))
 
 
 def _holds_files(path: Path) -> bool:
     try:
-        return path.is_dir() and any(
-            p.is_file() for p in path.rglob("*") if ".cache" not in p.parts
-        )
+        return path.is_dir() and any(p.is_file() or p.is_symlink() for p in path.rglob("*"))
     except OSError:
         return False
 
 
-def benchmarks(task_data: Mapping[str, Any]) -> list[str]:
-    """The known benchmarks the run's units score."""
-    value = (task_data.get("accuracy") or {}).get("benchmark") or "gsm8k"
-    names = value.values() if isinstance(value, Mapping) else [value]
-    return sorted({str(n).lower() for n in names if str(n).lower() in KNOWN})
+def find(
+    benchmark: str, stated: str | None = None, env: Mapping[str, str] | None = None
+) -> tuple[str, str]:
+    """``(path, said)``: the dataset's directory and how it was found.
 
-
-def stage(
-    task_data: Mapping[str, Any],
-    workspace: Path,
-    benchmark: str,
-    *,
-    python: str | None = None,
-    run: Callable[..., Any] = subprocess.run,
-) -> dict[str, Any]:
-    """Stage one benchmark's dataset; its status entry."""
-    accuracy = task_data.get("accuracy") or {}
-    repo = KNOWN[benchmark]
-    given = accuracy.get("dataset_path")
-    if given and Path(str(given)).exists():
-        return {"state": READY, "path": str(given), "source": "accuracy.dataset_path"}
-    env = (task_data.get("environment") or {}).get("env") or {}
-    root = env.get("LLM_MODELS_ROOT") or os.environ.get("LLM_MODELS_ROOT")
-    if root and _holds_files(Path(root) / DIRNAME / repo):
-        return {"state": READY, "path": str(Path(root) / DIRNAME / repo), "source": "models root"}
-    target = Path(workspace) / DIRNAME / repo
-    if _holds_files(target):
-        return {"state": READY, "path": str(target), "source": "staged before"}
-    target.mkdir(parents=True, exist_ok=True)
-    last = ""
-    for interpreter in dict.fromkeys(p for p in (python, sys.executable) if p):
-        try:
-            done = run(
-                [interpreter, "-c", _DOWNLOAD, repo, str(target)],
-                capture_output=True,
-                text=True,
-                timeout=WAIT_S,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            last = str(exc)
-            continue
-        last = (done.stderr or done.stdout or "").strip().splitlines()[-1:] or [""]
-        last = last[0]
-        if done.returncode == 0 and _holds_files(target):
-            return {"state": READY, "path": str(target), "source": f"downloaded {repo}"}
-    return {"state": FAILED, "path": "", "detail": f"could not stage {repo}: {last}"[:400]}
-
-
-def start(
-    task_data: Mapping[str, Any],
-    workspace: Path,
-    *,
-    python: str | None = None,
-    note: Callable[[str], None] = lambda said: None,
-) -> threading.Thread | None:
-    """Stage every benchmark's dataset in a background thread; ``None`` with nothing to stage."""
-    names = benchmarks(task_data)
-    if not names:
-        return None
-    for name in names:
-        _set(workspace, name, state=STAGING)
-
-    def work() -> None:
-        for name in names:
-            try:
-                entry = stage(task_data, workspace, name, python=python)
-            except Exception as exc:  # a dataset is never the run's failure
-                entry = {"state": FAILED, "path": "", "detail": f"{type(exc).__name__}: {exc}"}
-            _set(workspace, name, **entry)
-            note(
-                f"{name}: {entry['path']} ({entry.get('source')})"
-                if entry["state"] == READY
-                else f"{name}: {entry.get('detail')}; its gates run as they would without it"
-            )
-
-    thread = threading.Thread(target=work, name="mv2-datasets", daemon=True)
-    thread.start()
-    return thread
-
-
-def wait(workspace: Path, benchmark: str, *, timeout: float = WAIT_S, poll: float = 5.0) -> str:
-    """The staged dataset's path once it is ready; "" if it failed, timed out or was never asked."""
-    deadline = time.monotonic() + timeout
-    while True:
-        entry = status(workspace).get(benchmark)
-        if not entry or entry.get("state") == FAILED:
-            return ""
-        if entry.get("state") == READY:
-            return str(entry.get("path") or "")
-        if time.monotonic() >= deadline:
-            return ""
-        time.sleep(poll)
-
-
-def models_root(workspace: Path, root: str, benchmark: str, path: str) -> str:
-    """A models root holding ``root``'s entries and the staged dataset; ``root`` if it has it.
-
-    The tree's own tests read ``$LLM_MODELS_ROOT/datasets/<repo>``: where the cluster's root
-    lacks the dataset, a root of links to its entries, with the staged copy under
-    ``datasets/``, stands in for it.
+    ``("", "")`` for a benchmark this module does not know: the evaluator looks it up
+    itself. ``("", why)`` when a known or a stated one is not on this host.
     """
-    repo = KNOWN[benchmark]
-    if not root or not path or _holds_files(Path(root) / DIRNAME / repo):
-        return root
-    overlay = Path(workspace) / DIRNAME / "models_root"
-    try:
-        overlay.mkdir(parents=True, exist_ok=True)
-        for entry in Path(root).iterdir():
-            link = overlay / entry.name
-            if entry.name != DIRNAME and not link.exists():
-                link.symlink_to(entry)
-        datasets = overlay / DIRNAME
-        datasets.mkdir(exist_ok=True)
-        original = Path(root) / DIRNAME
-        if original.is_dir():
-            for entry in original.iterdir():
-                link = datasets / entry.name
-                if entry.name != repo.split("/")[0] and not link.exists():
-                    link.symlink_to(entry)
-        owner = datasets / repo.split("/")[0]
-        owner.mkdir(exist_ok=True)
-        link = owner / repo.split("/")[1]
-        if not link.exists():
-            link.symlink_to(Path(path))
-    except OSError:
-        return root
-    return str(overlay)
+    if stated:
+        if Path(stated).exists():
+            return str(stated), "the benchmark's `dataset_path`"
+        return "", f"`dataset_path` {stated} does not exist on this host"
+    repo = KNOWN.get(benchmark)
+    if repo is None:
+        return "", ""
+    env = {**os.environ, **(env or {})}
+    if env.get("LLM_MODELS_ROOT") and _holds_files(
+        Path(env["LLM_MODELS_ROOT"]) / "datasets" / repo
+    ):
+        return str(Path(env["LLM_MODELS_ROOT"]) / "datasets" / repo), "the models root"
+    home = env.get("HF_HOME") or str(Path.home() / ".cache" / "huggingface")
+    for hub in (env.get("HF_HUB_CACHE"), str(Path(home) / "hub")):
+        snapshots = Path(hub or "") / f"datasets--{repo.replace('/', '--')}" / "snapshots"
+        newest = sorted(snapshots.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for snapshot in newest if hub else ():
+            if _holds_files(snapshot):
+                return str(snapshot), "the HuggingFace cache"
+    return "", (
+        f"the dataset of `{benchmark}` ({repo}) is not on this host, and accuracy runs "
+        f"offline: put it under $LLM_MODELS_ROOT/datasets/{repo}, or state `dataset_path`"
+    )
 
 
-def staged_spec(spec: Mapping[str, Any], gate: str, workspace: str | Path | None) -> Any:
-    """``spec`` with the staged dataset ``gate`` reads, once it is ready; ``spec`` itself otherwise.
-
-    A benchmark gets it as ``accuracy.dataset_path`` (``trtllm-eval --dataset_path``); the
-    disaggregated test, which reads it under ``$LLM_MODELS_ROOT``, a models root that holds
-    it. A dataset still being staged is waited for; one that could not be is left out, and
-    the gate runs as it would without it.
-    """
-    if workspace is None:
-        return spec
-    workspace = Path(workspace)
-    accuracy = dict(spec.get("accuracy") or {})
-    benchmark = gate[len("accuracy[") : -1] if gate.startswith("accuracy[") else "gsm8k"
-    if benchmark not in status(workspace):
-        return spec
-    path = wait(workspace, benchmark)
-    if not path:
-        return spec
-    if gate == "disagg":
-        block = dict(accuracy.get("disagg") or {})
-        env = dict(block.get("env") or {})
-        outer = (spec.get("environment") or {}).get("env") or {}
-        root = env.get("LLM_MODELS_ROOT") or outer.get("LLM_MODELS_ROOT") or ""
-        staged = models_root(workspace, str(root), benchmark, path)
-        if not staged or staged == root:
-            return spec
-        accuracy["disagg"] = {**block, "env": {**env, "LLM_MODELS_ROOT": staged}}
-    elif not accuracy.get("dataset_path"):
-        accuracy["dataset_path"] = path
-    else:
-        return spec
-    return {**spec, "accuracy": accuracy}
-
-
-__all__ = ["DIRNAME", "KNOWN", "benchmarks", "models_root", "stage", "start", "status", "wait"]
+__all__ = ["KNOWN", "find"]

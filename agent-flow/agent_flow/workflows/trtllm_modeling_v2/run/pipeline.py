@@ -6,10 +6,9 @@
 The order is the code's, not an agent's::
 
     survey
-    for each unit (core first, then each feature of the spec, in order):
-        one kernel task per vocabulary queue row the unit needs
-        the unit itself (assemble for core, feature for the rest)
-    one task per configuration variant
+    for each deployment of the spec, in order (the first is `core`):
+        one kernel task per vocabulary queue row it needs
+        the deployment itself (assemble for core, feature for the rest)
     certification of the final commit (run/certify.py)
 
 Tasks run one at a time, each from the commits of the ones before it (queue rows in
@@ -74,8 +73,7 @@ from ..operators.coverage import (
     queue_item_from_ref,
     shared_entry_paths,
 )
-from ..spec import variants as variants_mod
-from ..spec.task_schema import assembly_units
+from ..spec import deployments as deployments_mod
 from . import certify as certify_mod
 from . import contract as contract_mod
 from . import inbox as inbox_mod
@@ -96,7 +94,6 @@ ROLE_BY_KIND = {
     "kernel": "kernel_writer",
     "assemble": "assembler",
     "feature": "assembler",
-    "variant": "assembler",
     "fix": "assembler",
 }
 #: The kinds the planner may add with ``REPAIR``.
@@ -106,7 +103,6 @@ TAGS_BY_KIND = {
     "survey": ("survey",),
     "assemble": ("assemble",),
     "feature": ("feature",),
-    "variant": ("feature",),
     "fix": ("assemble", "fix"),
 }
 PENDING, RUNNING, DONE, FAILED, SKIPPED = "pending", "running", "done", "failed", "skipped"
@@ -131,7 +127,7 @@ class Task:
 
     id: str
     kind: str
-    #: The assembly unit, or the configuration variant, it works for.
+    #: The deployment it works for, by name; the first is ``core``.
     unit: str = ""
     #: A kernel task's vocabulary queue row, or ``<mode>:<entry>[@<site>]``.
     ref: str = ""
@@ -207,7 +203,8 @@ class Pipeline:
         self.log = log
         self.workspace: Path = workflow.workspace
         self.path = self.workspace / TASKS_FILENAME
-        self.units = assembly_units(workflow.task_data)
+        #: The run's units of work: its deployments by name, the first as ``core``.
+        self.units = unit_names(workflow.task_data)
         self.max_attempts = max(1, int(workflow.max_attempts))
         self.max_rounds = max(1, int(workflow.max_rounds))
         self._lock = threading.Lock()
@@ -293,25 +290,14 @@ class Pipeline:
                 )
             kind = "assemble" if unit == first else "feature"
             planned.append(Task(unit, kind, unit=unit, goal=_unit_goal(kind, unit)))
-        owed = {c.unit for c in self.w._contract.checks} if self.w._contract else set()
-        for name in variants_mod.variants(self.w.task_data):
-            if name in owed:
-                planned.append(
-                    Task(
-                        f"variant-{name}",
-                        "variant",
-                        unit=name,
-                        goal=f"make the target serve the configuration variant `{name}` as well",
-                    )
-                )
         return planned
 
     def _expand(self) -> None:
         """Once the survey is done: add the planned tasks the list lacks, and drop what the spec dropped.
 
-        The first time, that is every unit's tasks. On a resume it is what an
-        edited spec added (a feature, a variant); a unit or variant the spec no
-        longer has, and whose task has not run, is skipped.
+        The first time, that is every deployment's tasks. On a resume it is what an
+        edited spec added; a deployment the spec no longer has, and whose task has not
+        run, is skipped.
         """
         survey = self.by_id(SURVEY_ID)
         if survey is None or survey.status != DONE:
@@ -323,7 +309,7 @@ class Pipeline:
         dropped = [
             t
             for t in self.tasks
-            if t.open and t.kind in ("assemble", "feature", "variant") and t.id not in wanted
+            if t.open and t.kind in ("assemble", "feature") and t.id not in wanted
         ]
         if not added and not dropped and self.expanded:
             return
@@ -499,14 +485,14 @@ class Pipeline:
     def _static_problems(self, task: Task, tree: Path, data: Mapping[str, Any]) -> list[str]:
         """What the final certification's static checks would refuse in a landed task.
 
-        A kernel task's entry by the one entry rule; a unit, variant or fix task's tree by
+        A kernel task's entry by the one entry rule; a deployment's or a fix task's tree by
         the delivery checks that read files (layout, routing, the anchor row, the accuracy
         test and its test list, the entries the target imports), not the tests or the
         commits, which certification and integration check.
         """
         if task.kind == "kernel":
             return self._entry_problems(task, tree, data)
-        if task.kind in ("assemble", "feature", "variant", "fix") and self.w._preflight:
+        if task.kind in ("assemble", "feature", "fix") and self.w._preflight:
             return certify_mod.static_delivery_failures(self.w, tree)
         return []
 
@@ -645,7 +631,7 @@ class Pipeline:
         raw = data.get("tasks")
         if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_REPAIR_TASKS:
             return None, f"REPAIR needs `tasks`: a list of 1 to {MAX_REPAIR_TASKS} tasks"
-        targets = [*self.units, *variants_mod.variants(self.w.task_data)]
+        targets = self.units
         taken: set[str] = set()
         for index, row in enumerate(raw):
             if not isinstance(row, dict) or row.get("kind") not in REPAIR_KINDS:
@@ -656,8 +642,6 @@ class Pipeline:
             goal = clip(str(row.get("goal") or ""), 2000)
             ref = str(row.get("ref") or "").strip()
             if row["kind"] == "kernel":
-                if variants_mod.is_variant(self.w.task_data, unit):
-                    unit = variants_mod.base_unit(self.w.task_data, unit)
                 task_id = self._new_id("kx", taken)
                 if queue_item_from_ref(ref, task_id, goal) is None:
                     return None, (
@@ -716,7 +700,7 @@ class Pipeline:
         if REPAIR in allowed:
             lines += [
                 f"A `REPAIR` lists at most {MAX_REPAIR_TASKS} tasks under `tasks`; "
-                f"units and variants: {', '.join([*self.units, *variants_mod.variants(self.w.task_data)])}.",
+                f"a task's `unit` is one of: {', '.join(self.units)}.",
             ]
         if problem:
             lines += ["", "## Your last answer was refused", "", problem]
@@ -831,14 +815,15 @@ class Pipeline:
         return str(script) if script.is_file() else gate_cli.CLI_NAME
 
     def _checks_block(self, unit: str) -> str:
-        """The contract's checks for ``unit`` and the command that runs one: the worker's to run."""
-        owed = [c for c in (self.w._contract.checks if self.w._contract else ()) if c.unit == unit]
+        """The contract's checks for ``unit``'s deployment and the command that runs one."""
+        name = deployments_mod.named(self.w.task_data, unit).name
+        owed = self.w._contract.of(name) if self.w._contract else ()
         if not owed:
             return ""
         command = gate_cli.invocation(
-            self.w.task_path, self.workspace / "gates" / unit, unit, self._cli()
+            self.w.task_path, self.workspace / "gates" / unit, name, self._cli()
         )
-        listed = ", ".join(f"`{c.gate}@{c.member}`" for c in owed)
+        listed = ", ".join(f"`{c.key}`" for c in owed)
         return (
             f"## The checks `{unit}` owes\n\n{listed}\n\n"
             "**Run them yourself, on your worktree, before you finish**, and list each with "
@@ -847,12 +832,12 @@ class Pipeline:
             "Nothing else checks your work while the run builds: the run trusts your decision. "
             "Every check of the contract then runs once on the final commit, and one that "
             "fails there comes back as a `fix` task, after every later task was built on your "
-            "work. Start with the cheapest (a boot at the narrowest member); a benchmark you "
-            "cannot afford in this turn you say so under `checks`, with what you ran instead."
+            "work. Start with the cheapest (the boot); a benchmark you cannot afford in this "
+            "turn you say so under `checks`, with what you ran instead."
         )
 
     def _unit_prompt(self, task: Task) -> str:
-        """An assembler turn: on a unit, on a configuration variant, or on a repair."""
+        """An assembler turn: on core, on a further deployment, or on a repair."""
         w = self.w
         unit = task.unit or (self.units[0] if self.units else "core")
         head = (
@@ -864,24 +849,20 @@ class Pipeline:
             f"Read `{w.task_path}` (the spec), `{w.plan_path}` (the plan) and "
             f"`{w.vocabulary_path}` (the computation-step list you derive against)."
         )
-        if variants_mod.is_variant(w.task_data, unit):
-            base = variants_mod.base_unit(w.task_data, unit)
-            body = (
-                f"{head}Unit: **{base}**, configuration variant **{unit}**\n\n"
-                f"{variants_mod.describe(w.task_data, unit)}\n\n"
-                f"The `{base}` target exists. Make it serve this configuration as well, without "
-                f"changing what it does in its own: every `{base}` check must keep passing. The "
-                f"variant's checks run with `{base}`'s settings plus the overlay above. {read}"
+        deployment = deployments_mod.named(w.task_data, unit)
+        body = f"{head}Unit: **{unit}**\n\n{deployments_mod.describe((deployment,))}\n\n{read}"
+        if task.kind == "fix":
+            body += (
+                " Repair what your task names, and nothing else; every check that passed "
+                "must keep passing."
             )
+        elif deployment.core:
+            body += " Write the unit."
         else:
-            body = f"{head}Unit: **{unit}**\n\n{read}"
-            if task.kind == "fix":
-                body += (
-                    " Repair what your task names, and nothing else; every check that passed "
-                    "must keep passing."
-                )
-            else:
-                body += " Write the unit."
+            body += (
+                " The target exists. Make it serve this deployment as well, without changing "
+                "what it does in the ones before it: every check that passed must keep passing."
+            )
         return f"{body}\n\n{self._checks_block(unit)}\n\n{DECISION_REMINDER}"
 
     def _survey_prompt(self) -> str:
@@ -1007,7 +988,12 @@ def _entry_name(target: str) -> str:
 def _unit_goal(kind: str, unit: str) -> str:
     if kind == "assemble":
         return f"assemble the target's `{unit}`: modeling, weights and routing"
-    return f"add the feature `{unit}` to the target"
+    return f"make the target serve the deployment `{unit}` as well"
+
+
+def unit_names(task_data) -> list[str]:
+    """The run's units of work: its deployments by name, in order, the first as ``core``."""
+    return ["core", *(d.name for d in deployments_mod.resolve(task_data)[1:])]
 
 
 def _failure_note(result: TurnResult) -> str:
@@ -1033,6 +1019,7 @@ __all__ = [
     "FINISHED",
     "Pipeline",
     "ROLE_BY_KIND",
+    "unit_names",
     "SURVEY_ID",
     "TASKS_FILENAME",
     "Task",

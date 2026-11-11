@@ -277,6 +277,7 @@ def main(argv: list[str] | None = None) -> None:
     from .spec.derive import DeriveError
 
     lock = None
+    notices: list[str] = []
     try:
         if args.checkpoint is not None:
             # The spec is written into the workspace, so it is claimed first.
@@ -290,8 +291,11 @@ def main(argv: list[str] | None = None) -> None:
                     clean=args.clean,
                 )
             )
-        task_data = load_and_validate_task_yaml(args.task)
+        task_data = load_and_validate_task_yaml(args.task, notices)
     except (TaskSchemaError, DeriveError) as exc:
+        # A refused spec still says which of its keys were ignored on the way.
+        for notice in notices:
+            print(f"note: {notice}", file=sys.stderr)
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(2)
     identity = _commit_identity(task_data)

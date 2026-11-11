@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The serve gate: ``trtllm-serve`` starts the unit's target and answers over HTTP.
+"""The serve gate: ``trtllm-serve`` starts the deployment's target and answers over HTTP.
 
 The gate starts ``trtllm-serve <checkpoint>`` on the tree under test with the
 accuracy gate's LLM-API options, at the member's topology, waits for
@@ -26,10 +26,8 @@ import yaml
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
 from ..spec.deployments import Deployment
-from ..spec.shorthand import order_members_by_cost
-from ..spec.task_schema import TaskSchemaError, parse_parallel_segment
 from .boot import DEFAULT_BOOT_IMAGE_PROMPT, BootSpec, missing_keywords, resolve_boot_spec
-from .check_config import check_configuration, deployment_of
+from .check_config import check_configuration
 from .check_runtime import (
     BOOT_TIMEOUT_S,
     MODE_REQUIRE,
@@ -80,34 +78,6 @@ class ServeSpec:
             max_tokens=int(block.get("max_tokens") or default.max_tokens),
             timeout=int(block.get("timeout") or default.timeout),
         )
-
-
-def _width(member: str) -> int:
-    try:
-        return parse_parallel_segment(member)[1] or 0
-    except TaskSchemaError:
-        return 0
-
-
-def serve_member(members: Sequence[str]) -> str:
-    """The member a unit's serve check runs at: the widest, the cheapest to start among equals.
-
-    The server's own path is the same at every member, and the widest is the
-    one a checkpoint too large for fewer devices still fits at.
-    """
-    return max(order_members_by_cost(members), key=_width)
-
-
-def delivery_member(members: Sequence[str]) -> str | None:
-    """The one-rank member the delivered tree is also served at, when :func:`serve_member` is wider.
-
-    One rank serves in one process, with no ``mpirun`` and no launcher. ``None``
-    when the unit has no one-rank member, or serves at one rank already.
-    """
-    if _width(serve_member(members)) <= 1:
-        return None
-    single = [m for m in order_members_by_cost(members) if _width(m) == 1]
-    return single[0] if single else None
 
 
 def write_serve_options(
@@ -293,34 +263,24 @@ def run_serve_gate(
     environment: RunEnvironment,
     *,
     task_data: Mapping[str, Any],
+    deployment: Deployment,
     workdir: str | Path,
     runner: ShellRunner = default_shell_runner,
-    features: Any | None = None,
-    unit: str | None = None,
-    member: str | None = None,
     spec: ServeSpec | None = None,
     boot: BootSpec | None = None,
-    deployment: Deployment | None = None,
 ) -> GateResult:
     """Serve ``deployment`` with ``trtllm-serve``, ask it, and stop it.
 
-    Without ``deployment`` it is the one ``unit`` at ``member`` names.
-
-    ``boot`` is the unit's boot workload (default :func:`~.boot.resolve_boot_spec`
-    over ``features``).
+    ``boot`` is the deployment's boot workload (default :func:`~.boot.resolve_boot_spec`).
     """
     spec = spec or ServeSpec.from_task(task_data)
     _verdict = verdict_factory(inspect_tree(task_data))
 
     env = with_mode(environment, MODE_REQUIRE)
     if boot is None:
-        boot = resolve_boot_spec(
-            task_data, unit, task_data.get("features") if features is None else features
-        )
+        boot = resolve_boot_spec(task_data, deployment)
     directory = gate_workdir(workdir)
-    tag = f"{unit or 'unit'}.{member or 'member'}"
-    if deployment is None:
-        deployment = deployment_of(task_data, unit, member, env.world_size)
+    tag = deployment.name
     options = write_serve_options(
         directory / f"serve.{tag}.llm_api.yaml", task_data, env, deployment
     )
@@ -328,7 +288,7 @@ def run_serve_gate(
     driver_spec = {
         "model": str(task_data["checkpoint_path"]),
         "serve_args": serve_args(options),
-        "world_size": _width(member or "") or env.world_size,
+        "world_size": deployment.ranks,
         "server_log": str(directory / f"serve.{tag}.server.log"),
         "boot_timeout": spec.timeout,
         "request_timeout": REQUEST_TIMEOUT_S,
@@ -344,7 +304,7 @@ def run_serve_gate(
     combined = result.stdout + result.stderr
     ran = dict(
         name=GATE_NAME,
-        member=member,
+        deployment=deployment.name,
         command=command,
         duration_s=time.monotonic() - started,
         stdout_tail="\n".join(combined.splitlines()[-40:]),
@@ -363,12 +323,10 @@ __all__ = [
     "GATE_NAME",
     "SERVE_DRIVER",
     "ServeSpec",
-    "delivery_member",
     "judge",
     "run_serve_gate",
     "serve_args",
     "serve_command",
-    "serve_member",
     "serve_requests",
     "write_serve_options",
 ]

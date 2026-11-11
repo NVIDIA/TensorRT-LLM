@@ -61,6 +61,34 @@ RANK_FACTS_ENV = "MV2FLOW_RANK_FACTS"
 RANK_HOOK_DIR = Path(__file__).resolve().parent / "harness" / "rankhook"
 
 
+def engine_env(
+    env: Mapping[str, str],
+    *,
+    mode: str = MODE_REQUIRE,
+    tree: str | Path | None = None,
+    python: str | None = None,
+) -> dict[str, str]:
+    """``env`` for a server a check starts itself: the switch, the rank hook, the tree, the interpreter.
+
+    The rank hook's directory, then ``tree``, lead ``PYTHONPATH``, so every rank prints
+    its record and imports the tree being measured; ``python``'s directory leads ``PATH``,
+    so ``trtllm-serve`` is the one installed beside the interpreter the spec names.
+    """
+    inherited = env.get("PYTHONPATH") or os.environ.get("PYTHONPATH")
+    paths = [str(RANK_HOOK_DIR), *([str(Path(tree).resolve())] if tree else []), inherited]
+    out = {
+        **env,
+        MODELING_V2_ENV: mode,
+        STEP_CONTRACT_ENV: "1",
+        RANK_FACTS_ENV: "1",
+        "PYTHONPATH": os.pathsep.join(p for p in paths if p),
+    }
+    if python and os.path.isabs(python):
+        path = env.get("PATH") or os.environ.get("PATH", "")
+        out["PATH"] = f"{os.path.dirname(python)}{os.pathsep}{path}"
+    return out
+
+
 def with_mode(environment: RunEnvironment, mode: str) -> RunEnvironment:
     """Return a copy of ``environment`` with the modeling_v2 switch set.
 
@@ -212,6 +240,7 @@ __all__ = [
     "TRITON_CACHE_DIR_ENV",
     "default_shell_runner",
     "default_triton_cache",
+    "engine_env",
     "engine_driver_command",
     "gate_workdir",
     "parse_driver_records",

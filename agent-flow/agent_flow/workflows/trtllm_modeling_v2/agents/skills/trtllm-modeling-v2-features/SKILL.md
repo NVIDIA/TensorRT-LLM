@@ -70,17 +70,18 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
    manager test carrying the target's side buffer, a transfer test with its
    role. *Blind to* the target's forward under the real scheduler.
 3. **One-member boot with the feature on.** `trtllm-modeling-v2 gate boot
-   --task task.yaml --unit <unit or variant> --member <m> --tree <your worktree>` runs it
+   --task task.yaml --deployment <name> --tree <your worktree>` runs it
    as the final certification does, with `modeling_v2="require"` for target evidence;
-   `--mode off` reruns the same command on the stock path as a control. Read the verdict's `[engine ...]` segment: every declared field is
-   read back from every rank's worker (`MV2FLOW_RANK_ENGINE`), with the reuse
-   probe and pool sizes. A field read as UNKNOWN, or only from the request, is
-   not evidence. *Blind to* accuracy: boot checks a few short continuations
+   `--mode off` reruns the same command on the stock path as a control. Read the verdict's `[engine ...]` segment: every key of the
+   deployment's options is compared with what every rank's worker printed
+   (`MV2FLOW_RANK_ENGINE`), and with block reuse on a repeated prompt must
+   report cached tokens. A rank or a key that reads unknown is not evidence,
+   and the check fails on it. *Blind to* accuracy: boot checks a few short continuations
    for keywords.
 4. **Accuracy, disagg.** `gate accuracy` runs the benchmark
    with CUDA graphs (the spec's warnings name an eager accuracy check) and re-attests each
-   rank's KV dtype and chunking; `gate disagg --unit disagg` runs the target's
-   disaggregated-serving test as CI does; a drafter's acceptance is judged by
+   rank's options; `gate tests --deployment disagg` runs the target's
+   disaggregated-serving tests as CI does; a drafter's acceptance is judged by
    the tree's own acceptance test. *Blind spots* are per feature in the reference; they are why
    each feature carries a proof of its own.
 

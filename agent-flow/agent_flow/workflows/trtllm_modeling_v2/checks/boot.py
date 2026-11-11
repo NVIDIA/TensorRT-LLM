@@ -15,7 +15,7 @@ from ..infra.compute.environment import RunEnvironment
 from ..spec.deployments import Deployment
 from ..spec.task_schema import BOOT_KEYS, GATE_TIMEOUT_KEY, load_prompts_file, resolve_gate_timeout
 from . import attest
-from .check_config import check_configuration, deployment_of
+from .check_config import check_configuration
 from .check_runtime import (
     BOOT_TIMEOUT_S,
     MODE_REQUIRE,
@@ -158,36 +158,29 @@ class BootSpec:
         return requests
 
 
-def resolve_boot_spec(
-    task_data: Mapping[str, Any],
-    unit: str | None,
-    features: Sequence[str] | None = None,
-) -> BootSpec:
-    """The boot workload ``unit`` runs, declared in task.yaml.
+def resolve_boot_spec(task_data: Mapping[str, Any], deployment: Deployment) -> BootSpec:
+    """The boot workload ``deployment`` runs, declared in task.yaml.
 
-    ``accuracy.boot`` (run-wide keys, with a per-unit entry layered over
-    them) when task.yaml declares it, else the default. A unit whose target
-    implements ``multimodal`` (and whose scope is not ``text_only``) and whose
-    spec sends no image gets the default image prompt appended.
+    ``accuracy.boot`` (run-wide keys, with the deployment's own entry layered over them;
+    core's may be written ``core``) when task.yaml declares it, else the default. A
+    deployment that takes images and whose workload sends none gets the default image
+    prompt appended.
     """
     accuracy = task_data.get("accuracy") or {}
     block = accuracy.get("boot") if isinstance(accuracy, Mapping) else None
     if isinstance(block, Mapping) and _declares_workload(block):
         merged = {k: v for k, v in block.items() if k in BOOT_KEYS}
-        chosen = block.get(unit) if unit is not None else None
         where = "accuracy.boot"
-        if isinstance(chosen, Mapping) and _declares_workload(chosen):
-            merged.update(chosen)
-            where = f"accuracy.boot.{unit}"
+        for name in (deployment.name, *(("core",) if deployment.core else ())):
+            chosen = block.get(name)
+            if isinstance(chosen, Mapping) and _declares_workload(chosen):
+                merged.update(chosen)
+                where = f"accuracy.boot.{name}"
+                break
         spec = BootSpec.from_mapping(merged, where)
     else:
         spec = BootSpec()
-    implemented = {str(f) for f in (features or ())}
-    if (
-        "multimodal" in implemented
-        and task_data.get("scope", "full") != "text_only"
-        and not spec.has_images
-    ):
+    if "image" in deployment.inputs and not spec.has_images:
         image = BootPrompt(
             prompt=DEFAULT_BOOT_IMAGE_PROMPT,
             keywords_any=DEFAULT_BOOT_IMAGE_KEYWORDS,
@@ -210,34 +203,24 @@ def run_boot_gate(
     environment: RunEnvironment,
     *,
     task_data: Mapping[str, Any],
+    deployment: Deployment,
     workdir: str | Path,
     spec: BootSpec | None = None,
     runner: ShellRunner = default_shell_runner,
     timeout: int | None = None,
     mode: str = MODE_REQUIRE,
-    features: Any | None = None,
-    unit: str | None = None,
-    member: str | None = None,
-    deployment: Deployment | None = None,
 ) -> GateResult:
-    """Cold-start ``deployment``'s engine and check it generates, through the engine driver.
+    """Cold-start ``deployment``'s engine in process and check it generates, through the engine driver.
 
-    Without ``deployment`` it is the one ``unit`` at ``member`` names
-    (:func:`~.check_config.deployment_of`).
-
-    ``features`` is the features the target under test implements, not those
-    the run will finish with (default the run's). ``spec`` is the workload
-    (:func:`resolve_boot_spec`). Every rank's engine is held to the deployment's
-    options (``checks/attest.py``); with block reuse on, one more prompt is sent
-    again and must come back with cached tokens. ``mode`` other than ``require``
+    ``spec`` is the workload (:func:`resolve_boot_spec`). Every rank's engine is held to
+    the deployment's options (``checks/attest.py``); with block reuse on, one more prompt
+    is sent again and must come back with cached tokens. ``mode`` other than ``require``
     is a control run on the stock implementation, recorded as ``boot[<mode>]``.
     """
     spec = spec or BootSpec()
     env = with_mode(environment, mode)
     gate_name = "boot" if mode == MODE_REQUIRE else f"boot[{mode}]"
     _verdict = verdict_factory(inspect_tree(task_data))
-    if deployment is None:
-        deployment = deployment_of(task_data, unit, member, environment.world_size, features)
     config = check_configuration(task_data, deployment, max_tokens=spec.max_tokens)
     requests = spec.requests(task_data.get("trtllm_repo_path"))
     declared_requests = len(requests)
@@ -248,10 +231,10 @@ def run_boot_gate(
         for n in range(repeats)
     ]
     if timeout is None:
-        declared = resolve_gate_timeout(task_data.get("accuracy") or {}, "boot", unit)
+        declared = resolve_gate_timeout(task_data.get("accuracy") or {}, "boot", deployment.name)
         timeout = declared or BOOT_TIMEOUT_S
     spec_path = write_driver_spec(
-        gate_workdir(workdir) / f"boot.{unit or 'unit'}.{member or 'member'}.json",
+        gate_workdir(workdir) / f"boot.{deployment.name}.json",
         config=config,
         requests=requests,
         max_tokens=spec.max_tokens,
@@ -263,7 +246,13 @@ def run_boot_gate(
     elapsed = time.monotonic() - started
     combined = result.stdout + result.stderr
     tail = "\n".join(combined.splitlines()[-40:])
-    ran = dict(name=gate_name, member=member, command=command, duration_s=elapsed, stdout_tail=tail)
+    ran = dict(
+        name=gate_name,
+        deployment=deployment.name,
+        command=command,
+        duration_s=elapsed,
+        stdout_tail=tail,
+    )
 
     if result.infrastructure:
         return _verdict(**lost_session(result), **ran)

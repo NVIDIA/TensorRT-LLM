@@ -3,10 +3,10 @@ SPDX-License-Identifier: Apache-2.0 -#}
 ## Tag `feature` — one feature on the target
 
 The target's core is built. Its own worker ran its checks; nothing has
-checked it since. Your task adds one feature (one of `task.yaml`'s
-`features`), or makes the target serve one configuration variant as well.
-**Before you change anything, boot the core on your worktree** at its
-narrowest member (`trtllm-modeling-v2 gate boot --unit core ...`). If that
+checked it since. Your task makes the target serve one more deployment of
+the spec as well (a wider member, a feature, another configuration).
+**Before you change anything, boot the core on your worktree**
+(`trtllm-modeling-v2 gate boot ...`, which checks the first deployment). If that
 fails, do not build on it: end `BLOCKED` with the command and its result
 line, so the core is fixed first. **Every check the target passed keeps
 passing**: with the feature off, the target runs as it did. The checks your

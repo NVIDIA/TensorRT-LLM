@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -14,57 +15,16 @@ import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import accuracy as accuracy_checks
-from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
-from agent_flow.workflows.trtllm_modeling_v2.checks import delivery, disagg, gate_cli
-from agent_flow.workflows.trtllm_modeling_v2.checks import serve as sg
-from agent_flow.workflows.trtllm_modeling_v2.checks import verdict as check_result
+from agent_flow.workflows.trtllm_modeling_v2.checks import delivery, gate_cli
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import serve_driver, workload_io
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
-from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
-    RunEnvironment,
-    resolve_environment,
-)
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
-from agent_flow.workflows.trtllm_modeling_v2.run import certify
-from agent_flow.workflows.trtllm_modeling_v2.run import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.certify import (
     target_test_modules_check as target_tests,
 )
-from agent_flow.workflows.trtllm_modeling_v2.spec import shorthand, task_schema
+from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
 
 from ._helpers import _ENTRY, _REPO_ROOT, TARGET_REL, _build_repo, _verify, _write_entry, attested
-
-_gates_TASK = {
-    "checkpoint_path": "/ckpt/Qwen3-30B-A3B",
-    "parallel": "tp1",
-    "trtllm_repo_path": "/repo",
-    "accuracy": {
-        "benchmark": "gsm8k",
-        "reference_yaml": "tests/integration/defs/accuracy/references/gsm8k.yaml",
-        "tolerance": 5.0,
-    },
-}
-
-
-def _gates_env(world_size: int = 1, devices=(0,)):
-    return resolve_environment(
-        {"environment": {"kind": "local", "python": "/opt/venv/bin/python", "env": {}}},
-        devices=devices,
-        world_size=world_size,
-    )
-
-
-def _gates_recorder(result: CommandResult | list[CommandResult]):
-    """A runner that returns canned results and records the commands it saw."""
-    results = result if isinstance(result, list) else [result]
-    seen: list[str] = []
-
-    def run(command, env=None, timeout=0):
-        seen.append(command)
-        return results[min(len(seen) - 1, len(results) - 1)]
-
-    run.seen = seen  # type: ignore[attr-defined]
-    return run
 
 
 def test_normalization_preserves_source_skip_template_order_and_image_requests(tmp_path):
@@ -103,192 +63,6 @@ def test_normalization_preserves_source_skip_template_order_and_image_requests(t
     spec["dataset"]["skip"] = 99
     with pytest.raises(workload_io.DatasetError, match="no usable prompts"):
         workload_io.normalize_requests(spec)
-
-
-def test_the_gate_reads_the_driver_and_names_the_member(tmp_path):
-    options = tmp_path / "core.llm_api.yaml"
-    options.write_text("kv_cache_config: {free_gpu_memory_fraction: 0.6}\n", encoding="utf-8")
-    task = {
-        "checkpoint_path": "/ckpt/model",
-        "trtllm_repo_path": str(tmp_path / "repo"),
-        "parallel": "unified",
-        "members": ["tp1", "tp2", "tep2", "dep2", "tp4", "tep4", "dep4"],
-        "features": ["mtp", "multimodal"],
-        "accuracy": {
-            "benchmark": "gsm8k",
-            "reference_yaml": "x.yaml",
-            "llm_api_options": str(options),
-            "max_seq_len": 9216,
-            "max_batch_size": 128,
-        },
-    }
-    answer = {"index": 0, "status": 200, "text": " Paris."}
-    stdout = (
-        f"{workload_io.RECORD_MARKER} {json.dumps(answer)}\n"
-        f"{serve_driver.SERVER_MARKER} {json.dumps({'healthy': True, 'boot_s': 3.0})}\n"
-    )
-    block = {"kind": "local", "python": "/venv/bin/python", "env": {"HF_HUB_OFFLINE": "1"}}
-
-    def runner(command, env=None, timeout=0):
-        return CommandResult(returncode=0, stdout=stdout)
-
-    result = sg.run_serve_gate(
-        resolve_environment({"environment": block}, devices=(), world_size=1),
-        task_data=task,
-        runner=runner,
-        features=[],
-        unit="core",
-        member="tp1",
-        workdir=tmp_path,
-    )
-    assert result.passed, result.detail
-    assert result.summary().startswith("[PASS] serve@tp1: trtllm-serve healthy after 3.0s")
-
-
-NODE = "tests/integration/defs/accuracy/test_disaggregated_multinode.py::TestStep5::test_dep4"
-
-
-PASS = '<testsuite><testcase name="native_hop"/></testsuite>'
-
-
-@pytest.mark.parametrize(
-    "second,code,expected",
-    [
-        (PASS, 0, True),
-        ("<testsuite><testcase><skipped/></testcase></testsuite>", 0, False),
-        ("<testsuite><testcase><failure/></testcase></testsuite>", 0, False),
-        (None, 0, False),
-        ("<broken", 0, False),
-        (PASS, 7, False),
-    ],
-)
-def test_every_node_must_have_a_fresh_successful_report(tmp_path, second, code, expected):
-    work = tmp_path / "gate"
-    work.mkdir()
-    paths = [work / f"disagg.disagg.dep4.node{rank}.xml" for rank in range(2)]
-    for path in paths:
-        path.write_text(PASS)
-
-    def runner(command, env, timeout):
-        assert all(not path.exists() for path in paths), "stale reports must be removed"
-        paths[0].write_text(PASS)
-        if second is not None:
-            paths[1].write_text(second)
-        return CommandResult(returncode=code)
-
-    result = disagg.run_disagg_gate(
-        RunEnvironment(kind="local", python="python3"),
-        task_data={"trtllm_repo_path": str(tmp_path)},
-        workdir=work,
-        runner=runner,
-        unit="disagg",
-        member="dep4",
-        spec=disagg.DisaggSpec(test=NODE, devices=4, nodes=2),
-    )
-    assert result.passed == expected
-    if expected:
-        assert "node0" in result.detail and "node1" in result.detail
-
-
-def test_nonzero_single_node_exit_cannot_pass_from_a_successful_xml(tmp_path):
-    def runner(command, env, timeout):
-        (tmp_path / "disagg.disagg.dep4.xml").write_text(PASS)
-        return CommandResult(returncode=9)
-
-    result = disagg.run_disagg_gate(
-        RunEnvironment(kind="local", python="python3"),
-        task_data={"trtllm_repo_path": str(tmp_path)},
-        workdir=tmp_path,
-        runner=runner,
-        unit="disagg",
-        member="dep4",
-        spec=disagg.DisaggSpec(test=NODE),
-    )
-    assert not result.passed and "exited 9" in result.detail
-
-
-def _cli_task(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir(exist_ok=True)
-    ckpt = tmp_path / "ckpt"
-    ckpt.mkdir(exist_ok=True)
-    data = {
-        "checkpoint_path": str(ckpt),
-        "trtllm_repo_path": str(repo),
-        "arch": "sm_100",
-        "parallel": "unified",
-        "members": ["tp2", "tep2"],
-        "features": ["mtp", "disagg"],
-        "environment": {"kind": "local", "python": "/usr/bin/python3"},
-        "accuracy": {
-            "benchmark": "gsm8k",
-            "reference_yaml": "r.yaml",
-            "model_key": "M",
-            "disagg": {"test": DISAGG_TEST, "env": {"LLM_MODELS_ROOT": "/models"}},
-        },
-    }
-    path = tmp_path / "task.yaml"
-    path.write_text(yaml.safe_dump(data), encoding="utf-8")
-    return path
-
-
-DISAGG_TEST = (
-    "tests/integration/defs/accuracy/test_disaggregated_serving.py::TestM::test_auto_dtype"
-)
-
-
-def _records(*texts):
-    """The driver's records for ``texts``, then for the prompt a boot repeats where reuse is on."""
-    return "".join(
-        f"{workload_io.RECORD_MARKER} {json.dumps({'index': n, 'text': t, 'cached_tokens': 64})}\n"
-        for n, t in enumerate((*texts, "again", "again"))
-    )
-
-
-@pytest.fixture
-def shell(monkeypatch):
-    """Replace the executor-backed runner with a recorder answering `output`."""
-    state = {"output": _records("Paris", "the process"), "seen": [], "junit": None}
-
-    def fake_runner_for(executor, **kwargs):
-        def run(command, env=None, timeout=0):
-            state["seen"].append(command)
-            report = re.search(r"--junitxml=([^\s']+)", command)
-            if report and state["junit"] is not None:
-                Path(report.group(1)).write_text(state["junit"], encoding="utf-8")
-            output = state["output"]
-            said = output.pop(0) if isinstance(output, list) else output
-            return CommandResult(returncode=0, stdout=said + attested(command))
-
-        return run
-
-    monkeypatch.setattr(gate_cli, "shell_runner_for", fake_runner_for)
-    return state
-
-
-def test_a_relative_variant_is_judged_against_its_units_score_measured_first(
-    tmp_path, shell, capsys
-):
-    path = _cli_task(tmp_path)
-    data = yaml.safe_load(path.read_text())
-    data["variants"] = {"switched": {"env": {"MY_SWITCH": "1"}, "gates": ["accuracy"]}}
-    path.write_text(yaml.safe_dump(data))
-    shell["output"] = [f"lm-eval gsm8k average accuracy: {score}\n" for score in (92, 85)]
-    argv = ["accuracy", "--task", str(path), "--unit", "switched", "--workdir", str(tmp_path / "w")]
-    assert gate_cli.main([*argv, "--member", "tep2"]) == 1
-    out = capsys.readouterr().out
-    assert out.startswith("[FAIL] accuracy[gsm8k]@tep2: measured 85.0000 vs floor 89.8872")
-    assert "the unit's own score 92.0000" in out and len(shell["seen"]) == 2
-    assert "MY_SWITCH=1" not in shell["seen"][0] and "MY_SWITCH=1" in shell["seen"][1]
-    # The benchmark prints its running score, a heartbeat for a long run.
-    assert "TLLM_EVAL_PARTIAL_SCORES_EVERY=50" in shell["seen"][0]
-    # A score in another form is quoted for whoever decides how it is read, then read by pattern.
-    printed = "Partial scores after 100/100 responses\nJSON Mode Eval accuracy: 91.50 (100)\n"
-    assert accuracy_checks.parse_eval_score(printed) is None
-    assert "  JSON Mode Eval accuracy: 91.50 (100)" in accuracy_checks.unparsed_score_detail(
-        printed, None
-    )
-    assert accuracy_checks.parse_eval_score(printed, r"Eval accuracy: ([0-9.]+)") == 91.5
 
 
 def test_an_uncommitted_target_fails_even_though_the_file_is_there(tmp_path):
@@ -521,213 +295,6 @@ def test_target_initializer_and_optional_weights_dependencies_are_checked(tmp_pa
     assert any("router" in check.detail for check in _verify(root).failures)
 
 
-_ANCHOR = 92.30
-
-
-_statistical_floor_TASK = {
-    "checkpoint_path": "/ckpt/M",
-    "parallel": "tep4",
-    "trtllm_repo_path": "/repo",
-    "accuracy": {"benchmark": "gsm8k", "reference_yaml": "r.yaml", "tolerance": 5.0},
-}
-
-
-def _verdict(member, measured, reference=_ANCHOR, se=0.734):
-    return check_result.GateResult(
-        name="accuracy[gsm8k]",
-        passed=True,
-        detail="",
-        member=member,
-        measured=measured,
-        reference=reference,
-        se=se,
-    )
-
-
-def _spec(tmp_path) -> dict:
-    checkpoint, repo = tmp_path / "ckpt", tmp_path / "repo"
-    checkpoint.mkdir(exist_ok=True)
-    repo.mkdir(exist_ok=True)
-    (tmp_path / "mtp.yaml").write_text(
-        yaml.safe_dump({"speculative_config": {"decoding_type": "MTP", "max_draft_len": 3}})
-    )
-    spec = {
-        "checkpoint_path": str(checkpoint),
-        "arch": "sm_103",
-        "parallel": "unified",
-        "members": {"default": ["tp1", "tep2", "tep4"], "mtp": ["tep4"]},
-        "trtllm_repo_path": str(repo),
-        "features": ["mtp"],
-        "environment": {
-            "kind": "local",
-            "python": "/usr/bin/python3",
-            "env": {"TMPDIR": "/scratch/tmp"},
-        },
-        "runtime": {"cuda_graph": True, "extra_flags": ["--max_seq_len=9216"]},
-        "accuracy": {
-            "benchmark": "gsm8k",
-            "reference_yaml": "x.yaml",
-            "llm_api_options": {"mtp": str(tmp_path / "mtp.yaml")},
-            "discriminators": {"default": {}, "mtp": {"spec_dec_algo": "MTP"}},
-        },
-        "variants": {
-            "kv_fp8": {
-                "members": ["tp1"],
-                "runtime": {"extra_flags": ["--kv_cache_dtype=fp8"]},
-                "llm_api_options": {"kv_cache_config": {"dtype": "fp8"}},
-                "accuracy": {"discriminators": {"kv_cache_quant_algo": "FP8"}},
-            },
-            "mtp7": {
-                "unit": "mtp",
-                "gates": ["boot", "accuracy", "acceptance"],
-                "llm_api_options": {"speculative_config": {"max_draft_len": 7}},
-                "env": {"X": "1"},
-            },
-        },
-    }
-    return spec
-
-
-def _load(tmp_path, spec) -> dict:
-    path = tmp_path / "task.yaml"
-    path.write_text(yaml.safe_dump(spec), encoding="utf-8")
-    return task_schema.load_and_validate_task_yaml(path)
-
-
-def test_an_attention_dp_rank_serves_its_share_of_the_global_batch():
-    options = {
-        "max_batch_size": 128,
-        "cuda_graph_config": {
-            "max_batch_size": 128,
-            "batch_sizes": [1, 2, 4, 8, 16, 24, 32, 64, 128],
-        },
-    }
-    shorthand.share_batch(options, "dep4")
-    assert options["max_batch_size"] == 32
-    assert options["cuda_graph_config"] == {
-        "max_batch_size": 32,
-        "batch_sizes": [1, 2, 4, 8, 16, 24, 32],
-    }
-
-
-def test_the_shared_runner_resolves_each_gate_the_way_a_worker_and_the_certification_ask(
-    tmp_path, monkeypatch
-):
-    """One function runs a check: the contract's gate name, the unit, the member, the tree."""
-    spec = _spec(tmp_path)
-    spec["features"] = ["mtp", "disagg"]
-    spec["accuracy"]["disagg"] = {"test": "tests/accuracy/test_disagg.py::TestToy::test_auto"}
-    spec["accuracy"]["serve"] = {"enabled": True}
-    data = _load(tmp_path, spec)
-    tree = tmp_path / "worktree"
-    tree.mkdir()
-    seen: dict[str, dict] = {}
-
-    def gate(name):
-        def run(environment, **kwargs):
-            seen[name] = {"environment": environment, **kwargs}
-            return check_result.GateResult(name=name, passed=True, detail="ok", member="tep4")
-
-        return run
-
-    monkeypatch.setattr(boot_checks, "run_boot_gate", gate("boot"))
-    monkeypatch.setattr(accuracy_checks, "run_accuracy_gate", gate("accuracy"))
-    monkeypatch.setattr(sg, "run_serve_gate", gate("serve"))
-    monkeypatch.setattr(disagg, "run_disagg_gate", gate("disagg"))
-    monkeypatch.setattr(accuracy_checks, "resolve_reference", lambda *a, **k: 85.6)
-    runner = _gates_recorder(CommandResult(returncode=0, stdout=""))
-    common = dict(workdir=tmp_path / "w", tree=tree, runner=runner, devices=(4, 5, 6, 7))
-
-    # The contract names a benchmark `accuracy[gsm8k]`; a worker types `accuracy`.
-    for name in ("boot", "accuracy[gsm8k]", "serve"):
-        assert gate_cli.run_check(data, name, "mtp", "tep4", **common).passed
-    assert gate_cli.run_check(data, "disagg", "disagg", "tep2", **common).passed
-    assert set(seen) == {"boot", "accuracy", "serve", "disagg"}
-    for name in ("boot", "accuracy", "serve"):
-        call = seen[name]
-        assert (call["unit"], call["member"]) == ("mtp", "tep4")
-        # The tree measured is the one named, not the spec's checkout; the member's width
-        # of the run's own devices, in their order.
-        assert call["task_data"]["trtllm_repo_path"] == str(tree.resolve())
-        assert call["environment"].devices == (4, 5, 6, 7)
-        assert call["environment"].world_size == 4
-        assert call["workdir"] == (tmp_path / "w").resolve() / "mtp"
-    assert seen["boot"]["features"] == ["mtp"]
-    assert seen["accuracy"]["reference"] == 85.6
-    # Two engines at the member's width for the disaggregated test: four devices, not two.
-    assert seen["disagg"]["environment"].devices == (4, 5, 6, 7)
-    assert seen["disagg"]["environment"].world_size == 2
-    assert (seen["disagg"]["unit"], seen["disagg"]["member"]) == ("disagg", "tep2")
-    # A narrower member takes the first of the run's devices.
-    gate_cli.run_check(data, "boot", "core", "tp1", **common)
-    assert seen["boot"]["environment"].devices == (4,)
-    with pytest.raises(task_schema.TaskSchemaError, match="names no gate"):
-        gate_cli.run_check(data, "perf", "core", "tp1", **common)
-
-
-def test_each_member_is_launched_at_its_own_width(tmp_path):
-    """One shared runner resolves a check: a wider member's command starts its own ranks."""
-    data = _load(tmp_path, _spec(tmp_path))
-    seen: dict[str, list[str]] = {}
-    for member in ("tp1", "tep2"):
-        runner = _gates_recorder(CommandResult(returncode=0, stdout=""))
-        result = gate_cli.run_check(
-            data, "boot", "core", member, workdir=tmp_path / "w", runner=runner
-        )
-        assert result.member == member
-        seen[member] = runner.seen
-    assert any("mpirun -n 2" in command for command in seen["tep2"])
-    assert not any("mpirun" in command for command in seen["tp1"])
-    # Every command runs from inside the tree it measures, with it first on PYTHONPATH.
-    tree = str((tmp_path / "repo").resolve())
-    assert all(c.startswith(f"cd {tree} && export PYTHONPATH={tree}") for c in seen["tp1"])
-    assert "CUDA_VISIBLE_DEVICES=0,1" in seen["tep2"][0]
-    assert "CUDA_VISIBLE_DEVICES=0 " in seen["tp1"][0]
-
-
-def test_a_check_whose_engine_imported_another_tree_did_not_measure_this_one(tmp_path):
-    """The certification measures the checkout: an engine that loaded another tree's package fails."""
-    data = _load(tmp_path, _spec(tmp_path))
-
-    def boot(**changes):
-        def runner(command, env=None, timeout=0):
-            return CommandResult(
-                returncode=0, stdout=_records("Paris", "the") + attested(command, **changes)
-            )
-
-        return gate_cli.run_check(
-            data, "boot", "core", "tp1", workdir=tmp_path / "w", runner=runner
-        )
-
-    here = boot()
-    elsewhere = boot(origin="/opt/other/TensorRT-LLM/tensorrt_llm/__init__.py")
-    assert here.passed and "imported tensorrt_llm from" not in here.detail
-    assert not elsewhere.passed
-    assert (
-        "imported tensorrt_llm from /opt/other/TensorRT-LLM/tensorrt_llm/__init__.py, not from"
-        in (elsewhere.detail)
-    )
-
-
-def test_every_member_under_its_reference_is_a_finding_unless_the_spec_acknowledges_it():
-    """Each member can clear its own floor while all of them sit low: the round's verdicts say."""
-
-    def verdict(member, measured, unit="dspark"):
-        return contract_mod.Verdict(
-            unit, "accuracy[gsm8k]", member, True, measured=measured, reference=_ANCHOR, se=0.734
-        )
-
-    low = {v.key: v for v in (verdict("tep4", 91.0), verdict("tp4", 91.1))}
-    task = {"accuracy": dict(_statistical_floor_TASK["accuracy"])}
-    [finding] = certify.shift_findings(task, low)
-    assert finding.startswith("accuracy finding:") and "dspark" in finding
-    # One member within an SE of the reference: no systematic shift.
-    mixed = {**low, "dspark:accuracy[gsm8k]@tp4": verdict("tp4", _ANCHOR - 0.5)}
-    assert certify.shift_findings(task, mixed) == []
-    task["accuracy"]["floor"] = {"acknowledge": {"dspark": "the block drafter trades 1 point"}}
-    assert certify.shift_findings(task, low) == []
-
-
 def test_delivery_counts_the_targets_test_modules_and_warns_past_twenty(tmp_path):
     """An onboarded target arrived with 35 test modules, past what a reviewer accepts."""
     target = f"{catalog_paths.MODELING_V2_PACKAGE}/models/fam/target"
@@ -745,3 +312,231 @@ def test_delivery_counts_the_targets_test_modules_and_warns_past_twenty(tmp_path
     assert check.detail.startswith("21 test module(s)")
     assert "WARNING: more than the 20 a reviewer accepts" in check.detail
     assert target_tests(tmp_path, f"{catalog_paths.MODELING_V2_PACKAGE}/models/fam/other") is None
+
+
+# ------------------------------------------------------------------ the gates, by deployment
+
+NODE = "tests/integration/defs/accuracy/test_disaggregated_serving.py::TestM::test_auto_dtype"
+PASS = '<testsuite><testcase classname="t" name="native_hop"/></testsuite>'
+
+
+def _spec(tmp_path, **more) -> dict:
+    """A spec that states four deployments: one rank, two ranks behind a prefix, a pair, a drafter."""
+    for name in ("ckpt", "repo"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    spec = {
+        "checkpoint_path": str(tmp_path / "ckpt"),
+        "arch": "sm_103",
+        "trtllm_repo_path": str(tmp_path / "repo"),
+        "environment": {"python": "/usr/bin/python3", "env": {"TMPDIR": "/scratch/tmp"}},
+        "accuracy": {"model_key": "org/toy", "reference_yaml": "r.yaml"},
+        "deployments": [
+            {"name": "tp1", "options": {"max_seq_len": 5120}},
+            {
+                "name": "tep2",
+                "options": {"tensor_parallel_size": 2, "moe_expert_parallel_size": 2},
+                "relative_to": "tp1",
+                "env": {"MY_SWITCH": "1"},
+            },
+            {
+                "name": "pd",
+                "ctx": {"options": {"tensor_parallel_size": 2}},
+                "gen": {"options": {"tensor_parallel_size": 2}},
+                "relative_to": "tp1",
+                "env": {"LLM_MODELS_ROOT": "/models"},
+                "tests": [NODE, NODE.replace("auto", "fp8")],
+                "benchmarks": [],
+            },
+            {
+                "name": "remote",
+                "options": {"tensor_parallel_size": 8},
+                "launch": "srun -N2 --ntasks=8 --mpi=pmix trtllm-llmapi-launch",
+                "benchmarks": [{"name": "gsm8k", "env": {"JUDGE": "local"}}],
+                "tests": ["tests/unittest/test_accept.py::test_acceptance"],
+            },
+        ],
+    }
+    spec.update(more)
+    (tmp_path / "repo" / "r.yaml").write_text("org/toy:\n  - accuracy: 90.0\n")
+    path = tmp_path / "task.yaml"
+    path.write_text(yaml.safe_dump(spec), encoding="utf-8")
+    return task_schema.load_and_validate_task_yaml(path)
+
+
+def _engine(*said: str, reports: str | None = None, code: int = 0, **changes):
+    """A runner whose engines print ``said`` and what their ranks run; it notes each command."""
+    seen: list[str] = []
+
+    def run(command, env=None, timeout=0):
+        seen.append(command)
+        report = re.search(r"--junitxml=([^\s']+)", command)
+        if report and reports is not None:
+            Path(report.group(1)).write_text(reports, encoding="utf-8")
+        text = said[min(len(seen), len(said)) - 1] if said else ""
+        return CommandResult(returncode=code, stdout=text + attested(command, **changes))
+
+    run.seen = seen  # type: ignore[attr-defined]
+    return run
+
+
+def _records(*texts):
+    return "".join(
+        f"{workload_io.RECORD_MARKER} {json.dumps({'index': n, 'text': t})}\n"
+        for n, t in enumerate(texts)
+    )
+
+
+def test_one_function_runs_a_check_on_the_deployment_it_names(tmp_path):
+    data = _spec(tmp_path)
+    tree = tmp_path / "worktree"
+    tree.mkdir()
+    shutil.copy(tmp_path / "repo" / "r.yaml", tree / "r.yaml")
+    common = dict(workdir=tmp_path / "w", tree=tree, devices=(4, 5, 6, 7))
+    runner = _engine(_records("Paris", "the process"))
+    boot = gate_cli.run_check(data, "boot", "tep2", runner=runner, **common)
+    assert boot.passed, boot.detail
+    # The deployment's ranks, on the first of the run's devices, in the tree that was named.
+    [command] = runner.seen
+    assert command.startswith(f"cd {tree.resolve()} && export PYTHONPATH={tree.resolve()}")
+    assert "CUDA_VISIBLE_DEVICES=4,5 " in command and "mpirun -n 2" in command
+    assert "MV2FLOW_RANK_FACTS=1" in command and "TRTLLM_MODELING_V2=require" in command
+    assert boot.summary().startswith("[PASS] tep2:boot: engine cold-started")
+    assert boot.path == gate_cli.IN_PROCESS and "[in process]" in boot.summary()
+    assert (boot.engine[0]["status"], boot.engine[0]["ranks"]) == ("match", 2)
+    # Unnamed, the check is core's: one rank, no launcher.
+    runner = _engine(_records("Paris", "the process"))
+    core = gate_cli.run_check(data, "boot", runner=runner, **common)
+    assert core.deployment == "tp1" and "mpirun" not in runner.seen[0]
+    assert "CUDA_VISIBLE_DEVICES=4 " in runner.seen[0]
+    # An engine that imported another tree's package did not measure this one.
+    runner = _engine(_records("Paris", "the"), origin="/opt/other/tensorrt_llm/__init__.py")
+    elsewhere = gate_cli.run_check(data, "boot", runner=runner, **common)
+    assert not elsewhere.passed
+    assert "imported tensorrt_llm from /opt/other/tensorrt_llm/__init__.py, not from" in (
+        elsewhere.detail
+    )
+    with pytest.raises(task_schema.TaskSchemaError, match="names no gate"):
+        gate_cli.run_check(data, "perf", **common)
+    with pytest.raises(KeyError, match="'dep4' names no deployment of this spec"):
+        gate_cli.run_check(data, "boot", "dep4", **common)
+    with pytest.raises(task_schema.TaskSchemaError, match="`pd` names no benchmark"):
+        gate_cli.run_check(data, "accuracy", "pd", **common)
+    with pytest.raises(task_schema.TaskSchemaError, match="`pd` is disaggregated: its boot serves"):
+        gate_cli.run_check(data, "serve", "pd", **common)
+
+
+def test_accuracy_runs_trtllm_eval_behind_the_deployments_own_prefix(tmp_path):
+    data = _spec(tmp_path)
+    runner = _engine("lm-eval gsm8k average accuracy: 91.0\n")
+    result = gate_cli.run_check(
+        data, "accuracy[gsm8k]", "remote", workdir=tmp_path / "w", runner=runner
+    )
+    assert result.passed, result.detail
+    assert result.summary().startswith(
+        "[PASS] remote:accuracy[gsm8k]: measured 91.0000 vs floor 88.3479"
+    )
+    assert "anchor: reference" in result.detail and result.path == gate_cli.IN_PROCESS
+    [command] = runner.seen
+    # The prefix places the ranks: no device of this host and no launcher of the flow's.
+    assert "exec srun -N2 --ntasks=8 --mpi=pmix trtllm-llmapi-launch trtllm-eval " in command
+    assert "CUDA_VISIBLE_DEVICES" not in command and "mpirun" not in command
+    # The evaluator runs offline, on the dataset this host holds, under the benchmark's env.
+    assert "HF_DATASETS_OFFLINE=1" in command and "JUDGE=local" in command
+    assert " gsm8k --dataset_path=" in command and "TLLM_EVAL_PARTIAL_SCORES_EVERY=50" in command
+    options = yaml.safe_load(
+        (tmp_path / "w" / "remote" / "eval.remote.gsm8k.yaml").read_text(encoding="utf-8")
+    )
+    assert options == {"tensor_parallel_size": 8, "modeling_v2": "require"}
+    # An engine that ran another configuration fails whatever it scored; one rank silent is unknown.
+    other = _engine("lm-eval gsm8k average accuracy: 91.0\n", ranks=7)
+    unknown = gate_cli.run_check(data, "accuracy", "remote", workdir=tmp_path / "w", runner=other)
+    assert not unknown.passed and "rank 7: it printed no record" in unknown.detail
+    # A score in another form is quoted for whoever decides how it is read, then read by pattern.
+    printed = "Partial scores after 100/100 responses\nJSON Mode Eval accuracy: 91.50 (100)\n"
+    assert accuracy_checks.parse_eval_score(printed) is None
+    assert "  JSON Mode Eval accuracy: 91.50 (100)" in accuracy_checks.unparsed_score_detail(
+        printed, None
+    )
+    assert accuracy_checks.parse_eval_score(printed, r"Eval accuracy: ([0-9.]+)") == 91.5
+
+
+def test_a_relative_deployment_is_judged_against_the_other_ones_score_measured_first(
+    tmp_path, capsys, monkeypatch
+):
+    data = _spec(tmp_path)
+    # No row carries tep2's tags once its options differ from the row's: judged against tp1.
+    for entry in data["deployments"]:
+        if entry["name"] == "tep2":
+            entry["options"]["kv_cache_config"] = {"dtype": "fp8"}
+    path = tmp_path / "task.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    runner = _engine(*(f"lm-eval gsm8k average accuracy: {score}\n" for score in (92, 85)))
+    monkeypatch.setattr(gate_cli, "shell_runner_for", lambda executor, **kwargs: runner)
+    argv = [
+        "accuracy",
+        "--task",
+        str(path),
+        "--deployment",
+        "tep2",
+        "--workdir",
+        str(tmp_path / "w"),
+    ]
+    assert gate_cli.main(argv) == 1
+    out = capsys.readouterr().out
+    assert out.startswith("[FAIL] tep2:accuracy[gsm8k]: measured 85.0000 vs floor 89.8872")
+    assert "the other deployment's score 92.0000" in out and len(runner.seen) == 2
+    # The first run is tp1's, as tp1 runs; the second is the deployment's own.
+    assert "MY_SWITCH=1" not in runner.seen[0] and "MY_SWITCH=1" in runner.seen[1]
+    assert gate_cli.main(["boot", "--task", str(path), "--deployment", "nope"]) == 2
+    assert "error: 'nope' names no deployment of this spec" in capsys.readouterr().err
+
+
+def test_native_tests_run_one_job_each_and_a_skip_or_a_bad_exit_is_not_a_pass(tmp_path):
+    data = _spec(tmp_path)
+    common = dict(workdir=tmp_path / "w")
+    runner = _engine(reports=PASS)
+    result = gate_cli.run_check(data, "tests", "pd", runner=runner, **common)
+    assert result.passed, result.detail
+    assert result.summary().startswith("[PASS] pd:tests: ")
+    assert result.detail.count("CLEAN (1 passed, 0 skipped, 0 failing)") == 2
+    # One pytest process for each test, under the deployment's environment, on its four ranks.
+    assert len(runner.seen) == 2 and all("-m pytest" in c for c in runner.seen)
+    assert (
+        "LLM_MODELS_ROOT=/models" in runner.seen[0]
+        and "TRTLLM_MODELING_V2=require" in runner.seen[0]
+    )
+    assert "CUDA_VISIBLE_DEVICES=0,1,2,3 " in runner.seen[0]
+    assert "test_disaggregated_serving.py::TestM::test_auto_dtype" in runner.seen[0]
+    skipped = "<testsuite><testcase classname='t' name='hop'><skipped/></testcase></testsuite>"
+    for reports, code, said in (
+        (skipped, 0, "t::hop skipped"),
+        ("<testsuite><testcase><failure message='x'/></testcase></testsuite>", 0, "FAILING"),
+        (None, 0, "no test report"),
+        ("<broken", 0, "no test report"),
+        (PASS, 9, "pytest exited 9"),
+    ):
+        runner = _engine(reports=reports, code=code)
+        result = gate_cli.run_check(data, "tests", "pd", runner=runner, **common)
+        assert not result.passed and said in result.detail, (reports, result.detail)
+        assert len(runner.seen) == 1  # the first job that does not pass ends the check
+    # An aggregated deployment's native tests run the same way.
+    runner = _engine(reports=PASS)
+    assert gate_cli.run_check(data, "tests", "remote", runner=runner, **common).passed
+    assert "tests/unittest/test_accept.py::test_acceptance" in runner.seen[0]
+    none = gate_cli.run_check(data, "tests", "tp1", runner=runner, **common)
+    assert not none.passed and none.detail == "the deployment names no test"
+
+
+def test_the_serve_gate_reads_its_driver_and_names_the_deployment(tmp_path):
+    data = _spec(tmp_path)
+    answer = {"index": 0, "status": 200, "text": " Paris."}
+    stdout = (
+        f"{workload_io.RECORD_MARKER} {json.dumps(answer)}\n"
+        f"{serve_driver.SERVER_MARKER} {json.dumps({'healthy': True, 'boot_s': 3.0})}\n"
+    )
+    runner = _engine(stdout)
+    result = gate_cli.run_check(data, "serve", "tep2", workdir=tmp_path / "w", runner=runner)
+    assert result.passed, result.detail
+    assert result.summary().startswith("[PASS] tep2:serve: trtllm-serve healthy after 3.0s")
+    spec = json.loads((tmp_path / "w" / "tep2" / "serve.tep2.json").read_text())
+    assert spec["world_size"] == 2 and spec["serve_args"][-1] == "--num_serve_frontends=1"

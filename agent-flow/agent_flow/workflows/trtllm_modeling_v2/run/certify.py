@@ -34,22 +34,15 @@ from rich.markup import escape as escape_markup
 
 from agent_flow.console import print_message, print_rule
 
-from ..checks import accuracy_policy, gate_cli, pytest_runner
+from ..checks import anchors, gate_cli, pytest_runner
 from ..checks import verdict as check_result
-from ..checks.accuracy import resolve_model_key
 from ..checks.delivery import Check as DeliveryCheck
 from ..checks.delivery import DeliveryReport, accuracy_test_path, verify_delivery
 from ..infra.compute.commands import CommandSpec
 from ..infra.files import write_text_atomic
 from ..operators.coverage import model_ops_tests_dir
-from ..spec import variants as variants_mod
-from ..spec.task_schema import (
-    PROFILE_BRINGUP,
-    PROFILE_SMOKE,
-    assembly_units,
-    profile_of,
-    resolve_per_unit,
-)
+from ..spec import deployments as deployments_mod
+from ..spec.deployments import DEFAULT_BENCHMARK, Benchmark
 from . import contract as contract_mod
 
 #: Under the workspace: one directory per certification round, with its checks' files.
@@ -59,7 +52,7 @@ CERTIFICATION_FILENAME = "certification.yaml"
 #: The delivery report: the verdict, the commit, every check, what is covered.
 REPORT_FILENAME = "delivery_report.md"
 #: The delivery checks that set the target up for CI: its accuracy test, the test list that
-#: runs it and its anchor's row. A run whose every unit is ``smoke`` or ``bringup`` owes none.
+#: runs it and its anchor's row. A run whose first deployment names no benchmark owes none.
 CI_DELIVERY_CHECKS = frozenset({"accuracy:reference", "tests:accuracy-file", "tests:test-db"})
 #: The most test modules of its own a target delivers that a reviewer accepts: delivery
 #: warns past it and never fails on it.
@@ -78,7 +71,7 @@ class Certification:
     evaluation: contract_mod.Evaluation
     #: ``None`` when the round did not reach the delivery checks.
     delivery: DeliveryReport | None = None
-    #: What fails the round besides a check: a dirty or moved checkout, a shift finding.
+    #: What fails the round besides a check: a dirty or moved checkout.
     problems: tuple[str, ...] = ()
 
     @property
@@ -154,7 +147,7 @@ def _run_check(workflow, check: contract_mod.Check, round: int, anchor: float | 
         return check_result.GateResult(
             name=check.gate,
             passed=False,
-            member=check.member,
+            deployment=check.deployment,
             detail=f"the check could not be run: {type(exc).__name__}: {exc}",
         )
 
@@ -164,62 +157,42 @@ def _measure(workflow, check: contract_mod.Check, round: int, anchor: float | No
     return gate_cli.run_check(
         workflow.task_data,
         check.gate,
-        check.unit,
-        check.member,
+        check.deployment,
         workdir=directory / "gates",
         tree=workflow.task_data.get("trtllm_repo_path"),
         workspace=workflow.workspace,
         runner=workflow._shell_runner_override,
         devices=tuple(workflow._state.devices) or None,
-        anchor_score=anchor,
+        relative_score=anchor,
     )
 
 
-def _relative_anchor(
+def _relative_score(
     workflow, check: contract_mod.Check, have: dict[str, contract_mod.Verdict]
 ) -> float | None:
-    """The score a relative variant's benchmark is held to: its unit's, this round, same member."""
-    task = workflow.task_data
-    if not check.gate.startswith("accuracy[") or not variants_mod.is_variant(task, check.unit):
+    """The score a relative anchor holds ``check`` to: the other deployment's, this round."""
+    if not check.gate.startswith("accuracy["):
         return None
-    if variants_mod.anchor_state(task, check.unit) != variants_mod.ANCHOR_RELATIVE:
+    held = anchors.frozen(workflow.workspace, check.deployment, check.gate[len("accuracy[") : -1])
+    if held is None or held.kind != anchors.RELATIVE:
         return None
-    base = have.get(f"{variants_mod.base_unit(task, check.unit)}:{check.gate}@{check.member}")
+    base = have.get(f"{held.relative_to}:{check.gate}")
     return base.measured if base is not None else None
 
 
-def shift_findings(task_data, verdicts: dict[str, contract_mod.Verdict]) -> list[str]:
-    """Units whose every benchmarked member sits more than one SE under its reference.
+def ci_waiver(task_data) -> str:
+    """Why the run owes no :data:`CI_DELIVERY_CHECKS`; ``""`` when it owes them."""
+    if deployments_mod.named(task_data).benchmarks:
+        return ""
+    return "not owed: the first deployment names no benchmark"
 
-    Each member can clear its own floor while all of them are low: a systematic
-    shift. Computed from this round's verdicts alone; one ``task.yaml``
-    acknowledges (``accuracy.floor.acknowledge``) does not fail the round.
-    """
-    policy = accuracy_policy.resolve_floor_policy(task_data.get("accuracy") or {})
-    by_unit: dict[str, dict[str, tuple[float, float, float]]] = {}
-    for verdict in verdicts.values():
-        if (
-            verdict.gate.startswith("accuracy[")
-            and verdict.measured is not None
-            and verdict.reference is not None
-            and verdict.se is not None
-        ):
-            by_unit.setdefault(verdict.unit, {})[verdict.member] = (
-                verdict.measured,
-                verdict.reference,
-                verdict.se,
-            )
-    found = []
-    for unit, readings in by_unit.items():
-        finding = accuracy_policy.systematic_shift(
-            unit,
-            readings,
-            min_members=policy.shift_min_members,
-            acknowledged=policy.acknowledged,
-        )
-        if finding is not None and not finding.acknowledged:
-            found.append(f"accuracy finding: {finding.describe()}")
-    return found
+
+def _anchor_row(task_data) -> tuple[str, str]:
+    """The reference file and the row's key the first deployment's first benchmark is anchored by."""
+    listed = deployments_mod.named(task_data).benchmarks
+    benchmark = listed[0] if listed else Benchmark(name=DEFAULT_BENCHMARK)
+    path = benchmark.reference_yaml or f"{anchors.REFERENCES_DIR}/{benchmark.name}.yaml"
+    return path, anchors.model_key(task_data, benchmark)
 
 
 def certify(workflow, round: int, first: Sequence[str] = (), log=None) -> Certification:
@@ -255,7 +228,7 @@ def certify(workflow, round: int, first: Sequence[str] = (), log=None) -> Certif
             continue  # recorded before a restart, for this same tree and round
         outcome = None
         for _ in range(1 + INFRASTRUCTURE_RERUNS):
-            outcome = _run_check(workflow, check, round, _relative_anchor(workflow, check, have))
+            outcome = _run_check(workflow, check, round, _relative_score(workflow, check, have))
             if not getattr(outcome, "infrastructure", ""):
                 break
             workflow.journal.event(
@@ -263,12 +236,9 @@ def certify(workflow, round: int, first: Sequence[str] = (), log=None) -> Certif
             )
         verdict = status.record(check, outcome, tree=tree, round=round)
         workflow.gate_log.record(outcome)
-        workflow.journal.event("check", f"{check.unit}: {outcome.summary()}")
+        workflow.journal.event("check", outcome.summary())
         colour = "green" if verdict.passed else "yellow"
-        print_message(
-            f"[bold {colour}]{check.unit}: {escape_markup(outcome.summary())}[/bold {colour}]",
-            log,
-        )
+        print_message(f"[bold {colour}]{escape_markup(outcome.summary())}[/bold {colour}]", log)
         if workflow._identity() != tree:
             return result(
                 problems=["its commit or its native libraries changed while the checks ran"]
@@ -281,7 +251,7 @@ def certify(workflow, round: int, first: Sequence[str] = (), log=None) -> Certif
             return result()
     verdicts = status.on(tree, round)
     evaluation = contract_mod.evaluate(contract, verdicts)
-    problems = shift_findings(workflow.task_data, verdicts)
+    problems: list[str] = []
     if not evaluation.holds:
         return result(problems=problems)
     try:
@@ -318,14 +288,6 @@ def _record(workflow, certification: Certification) -> None:
 # ------------------------------------------------------------------------ delivery checks
 
 
-def ci_waiver(task_data) -> str:
-    """Why the run owes no :data:`CI_DELIVERY_CHECKS`; ``""`` when it owes them."""
-    profiles = {profile_of(task_data, unit) for unit in assembly_units(task_data) or [None]}
-    if not profiles or not profiles <= {PROFILE_SMOKE, PROFILE_BRINGUP}:
-        return ""
-    return f"not owed by the {'/'.join(sorted(profiles))} profile"
-
-
 def delivery_report(workflow, commit: str, round: int = 0) -> DeliveryReport:
     """The delivery checks on the checkout at ``commit``: files, commits, test lists, tests.
 
@@ -334,14 +296,13 @@ def delivery_report(workflow, commit: str, round: int = 0) -> DeliveryReport:
     task = workflow.task_data
     repo = task["trtllm_repo_path"]
     target_rel = workflow._preflight.target_rel
+    reference_yaml, model_key = _anchor_row(task)
     report = verify_delivery(
         repo_root=repo,
         target_rel=target_rel,
         family=workflow._preflight.family,
-        reference_yaml=resolve_per_unit(
-            task["accuracy"], "reference_yaml", (assembly_units(task) or [None])[-1]
-        ),
-        model_key=resolve_model_key(task),
+        reference_yaml=reference_yaml,
+        model_key=model_key,
         accuracy_test=accuracy_test_path(repo, workflow._preflight.family, Path(target_rel).name),
         arch=str(workflow.task_data.get("arch") or ""),
         commit_policy=workflow._commit_policy(),
@@ -374,14 +335,13 @@ def static_delivery_failures(workflow, tree: str | Path) -> list[str]:
     task = workflow.task_data
     target_rel = workflow._preflight.target_rel
     family = workflow._preflight.family
+    reference_yaml, model_key = _anchor_row(task)
     report = verify_delivery(
         repo_root=tree,
         target_rel=target_rel,
         family=family,
-        reference_yaml=resolve_per_unit(
-            task["accuracy"], "reference_yaml", (assembly_units(task) or [None])[-1]
-        ),
-        model_key=resolve_model_key(task),
+        reference_yaml=reference_yaml,
+        model_key=model_key,
         accuracy_test=accuracy_test_path(tree, family, Path(target_rel).name),
         arch=str(task.get("arch") or ""),
     )
@@ -563,7 +523,6 @@ __all__ = [
     "certify",
     "ci_waiver",
     "delivery_report",
-    "shift_findings",
     "target_test_modules_check",
     "tests_check",
     "write_report",

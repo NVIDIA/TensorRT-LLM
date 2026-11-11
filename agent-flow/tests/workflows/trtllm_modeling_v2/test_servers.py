@@ -37,7 +37,11 @@ def test_a_server_reports_its_address_is_asked_and_is_stopped(site):
         argv = _started(workspace, "tp1")["argv"]
         options = workspace / "deployments" / "tp1" / "tp1.yaml"
         assert argv[:3] == ["/ckpt/model", "--config", str(options)]
-        assert yaml.safe_load(options.read_text()) == {"max_seq_len": 5120}
+        # What the deployment states, and the switch every checked server runs under.
+        assert yaml.safe_load(options.read_text()) == {
+            "max_seq_len": 5120,
+            "modeling_v2": "require",
+        }
         # The kernel picks the port and the server says which; one frontend.
         assert argv[argv.index("--port") + 1] == "0" and "--num_serve_frontends=1" in argv
         assert "--server_role" not in argv

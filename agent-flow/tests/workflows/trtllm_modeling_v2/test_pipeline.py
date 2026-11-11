@@ -133,7 +133,7 @@ def test_the_tasks_run_in_the_fixed_order_and_every_check_runs_once_at_the_end(
         "core",
         "k2-draft",
         "mtp",
-        "variant-switched",
+        "switched",
     ]
     assert all(t["status"] == "done" and t["attempts"] == 1 for t in _tasks(tmp_path))
     assert "planner" not in {role for role, _ in calls}
@@ -143,21 +143,21 @@ def test_the_tasks_run_in_the_fixed_order_and_every_check_runs_once_at_the_end(
     assert checks and min(checks) > max(turns)
     # Every required check has exactly one verdict, all on one tree, all passed.
     contract = yaml.safe_load((workspace / "contract.yaml").read_text())["checks"]
-    keys = sorted(f"{c['unit']}:{c['gate']}@{c['member']}" for c in contract)
+    keys = sorted(f"{c['deployment']}:{c['gate']}" for c in contract)
     verdicts = _verdicts(tmp_path)
-    assert sorted(f"{v['unit']}:{v['gate']}@{v['member']}" for v in verdicts) == keys
-    assert {"mtp:accuracy[gsm8k]@tp1", "switched:accuracy[gsm8k]@tp1"} <= set(keys)
+    assert sorted(f"{v['deployment']}:{v['gate']}" for v in verdicts) == keys
+    assert {"mtp:accuracy[gsm8k]", "switched:accuracy[gsm8k]"} <= set(keys)
     assert not [key for key in keys if "acceptance" in key]  # a drafter's is a native test
     assert len({v["tree"] for v in verdicts}) == 1 and all(v["passed"] for v in verdicts)
     certification = yaml.safe_load((workspace / "certification.yaml").read_text())
     assert certification["certified"] and certification["round"] == 1
     assert certification["commit"] == "c0ffee1"
     report = (workspace / "delivery_report.md").read_text()
-    assert report.startswith("# Delivery report: delivered") and "`core:boot@tp1` | PASS" in report
+    assert report.startswith("# Delivery report: delivered") and "`tp1:boot` | PASS" in report
     # A worker is told which checks its unit owes and that it runs them itself.
     core_prompt = next(p for role, p in calls if role == "assembler" and _task_id(p) == "core")
-    assert "## The checks `core` owes" in core_prompt and "`boot@tp1`" in core_prompt
-    assert "gate <boot|accuracy|serve|disagg>" in core_prompt
+    assert "## The checks `core` owes" in core_prompt and "`tp1:boot`" in core_prompt
+    assert "gate <boot|accuracy|serve|tests>" in core_prompt and "--deployment tp1" in core_prompt
     mtp_prompt = next(p for role, p in calls if role == "assembler" and _task_id(p) == "mtp")
     assert "`core` (assemble): done UNIT_READY" in mtp_prompt
 
@@ -422,12 +422,12 @@ def test_a_failed_certification_is_repaired_and_certified_again_whole_on_the_new
     def assembler(turn, prompt):
         if _task_id(prompt) == "fix-1":
             state["fixed"], checkout.head = True, "f1x3d02"  # the repair lands a commit
-            assert "## Tag `fix`" in prompt and "core:boot@tp1 fails on a shape mismatch" in prompt
+            assert "## Tag `fix`" in prompt and "tp1:boot fails on a shape mismatch" in prompt
         return {"decision": "UNIT_READY", "summary": "done"}
 
     def planner(turn, prompt):
         asked.append(prompt)
-        goal = "core:boot@tp1 fails on a shape mismatch; see the round's files"
+        goal = "tp1:boot fails on a shape mismatch; see the round's files"
         return {
             "decision": "REPAIR",
             "summary": "one cause",
@@ -445,7 +445,7 @@ def test_a_failed_certification_is_repaired_and_certified_again_whole_on_the_new
     assert _state(tmp_path).verdict == "delivered"
     [prompt] = asked
     assert "certification round 1 of 4 did not certify the final commit `c0ffee1`" in prompt
-    assert "check core:boot@tp1 FAILED" in prompt
+    assert "check tp1:boot FAILED" in prompt
     verdicts = _verdicts(tmp_path)
     first = [v for v in verdicts if v["round"] == 1]
     second = [v for v in verdicts if v["round"] == 2]
@@ -498,7 +498,7 @@ def test_a_round_stops_when_a_repaired_check_fails_again_and_the_run_ends_uncert
     assert counts["accuracy"] == 1
     report = (tmp_path / "ws" / "delivery_report.md").read_text()
     assert report.startswith("# Delivery report: certification-failed")
-    assert "check core:accuracy[gsm8k]@tp1 has no verdict on this commit" in report
+    assert "check tp1:accuracy[gsm8k] has no verdict on this commit" in report
     certification = yaml.safe_load((tmp_path / "ws" / "certification.yaml").read_text())
     assert not certification["certified"]
 
@@ -550,10 +550,10 @@ def test_a_check_that_cannot_be_run_is_a_failed_check_not_a_crash(tmp_path, task
 
     real = gate_cli.run_check
 
-    def run_check(task_data, gate, unit, member=None, **kwargs):
+    def run_check(task_data, gate, deployment=None, **kwargs):
         if gate == "boot":
             raise FileNotFoundError("the boot prompts file is gone")
-        return real(task_data, gate, unit, member, **kwargs)
+        return real(task_data, gate, deployment, **kwargs)
 
     monkeypatch.setattr(gate_cli, "run_check", run_check)
     _run(tmp_path, task_file, monkeypatch, Script(), max_rounds=1)
@@ -564,19 +564,19 @@ def test_a_check_that_cannot_be_run_is_a_failed_check_not_a_crash(tmp_path, task
         "the check could not be run: FileNotFoundError: the boot prompts file is gone"
     )
     report = (tmp_path / "ws" / "delivery_report.md").read_text()
-    assert "check core:boot@tp1 FAILED" in report and "could not be run" in report
+    assert "check tp1:boot FAILED" in report and "could not be run" in report
 
 
 def test_a_passing_verdict_counts_only_for_the_tree_it_measured(tmp_path):
     repo = tmp_path / "repo"
     (repo / "tensorrt_llm").mkdir(parents=True)
     contract = contract_mod.Contract(
-        (contract_mod.Check("core", "boot", "tp1"), contract_mod.Check("core", "serve", "tp1"))
+        (contract_mod.Check("tp1", "boot"), contract_mod.Check("tp1", "serve"))
     )
     status = contract_mod.ContractStatus.load(tmp_path)
 
     class Result:
-        name, member, detail, passed, infrastructure = "boot", "tp1", "ok", True, ""
+        name, deployment, detail, passed, infrastructure = "boot", "tp1", "ok", True, ""
 
     before = contract_mod.tree_id(repo, "aaaa", git=lambda *args: "")
     status.record(contract.checks[0], Result(), tree=before, round=1)
@@ -595,8 +595,8 @@ def test_a_passing_verdict_counts_only_for_the_tree_it_measured(tmp_path):
     Result.infrastructure = "the session was lost"
     assert not status.record(contract.checks[1], Result(), tree=before, round=1).passed
     assert contract_mod.ContractStatus.load(tmp_path).on(before, 1).keys() == {
-        "core:boot@tp1",
-        "core:serve@tp1",
+        "tp1:boot",
+        "tp1:serve",
     }
 
 
@@ -639,8 +639,8 @@ def test_an_interrupted_run_goes_on_from_its_tasks_and_from_the_verdicts_of_its_
         _run(tmp_path, task, monkeypatch, Script(assembler=assembler), shell_runner=shell)
     assert turns == ["core", "mtp", "mtp"]  # core was not asked again; mtp kept its attempt
     assert [t["attempts"] for t in _tasks(tmp_path)][1:] == [1, 1]
-    recorded = [(v["round"], v["unit"], v["gate"]) for v in _verdicts(tmp_path)]
-    assert recorded == [(1, "core", "boot")]
+    recorded = [(v["round"], v["deployment"], v["gate"]) for v in _verdicts(tmp_path)]
+    assert recorded == [(1, "tp1", "boot")]
 
     # The third finishes the same round: the boot it already has is not run again.
     booted: list[str] = []
@@ -655,7 +655,7 @@ def test_an_interrupted_run_goes_on_from_its_tasks_and_from_the_verdicts_of_its_
     verdicts = _verdicts(tmp_path)
     assert {v["round"] for v in verdicts} == {1}
     assert [v["gate"] for v in verdicts].count("boot") == 2  # core's, then mtp's: once each
-    assert sum(1 for v in verdicts if (v["unit"], v["gate"]) == ("core", "boot")) == 1
+    assert sum(1 for v in verdicts if (v["deployment"], v["gate"]) == ("tp1", "boot")) == 1
 
 
 def test_a_spec_edited_between_two_runs_adds_and_drops_tasks(
@@ -668,7 +668,7 @@ def test_a_spec_edited_between_two_runs_adds_and_drops_tasks(
     task_file.write_text(yaml.safe_dump(with_variant))
 
     def blocked_variant(turn, prompt):
-        if _task_id(prompt) == "variant-switched":
+        if _task_id(prompt) == "switched":
             return {"decision": "BLOCKED", "summary": "the switch is not wired"}
         return {"decision": "UNIT_READY", "summary": "done"}
 
@@ -682,7 +682,7 @@ def test_a_spec_edited_between_two_runs_adds_and_drops_tasks(
     assert [(t["id"], t["status"]) for t in _tasks(tmp_path)] == [
         ("survey", "done"),
         ("core", "done"),
-        ("variant-switched", "skipped"),
+        ("switched", "skipped"),
         ("mtp", "done"),
     ]
 
@@ -715,7 +715,7 @@ def test_the_checkpoint_round_trips_and_an_older_one_is_refused(tmp_path):
         devices=[2, 3],
         round=2,
         round_open=True,
-        failed_checks=["core:boot@tp1"],
+        failed_checks=["tp1:boot"],
     )
     save_state(path, original)
     assert load_state(path) == original
@@ -736,10 +736,6 @@ def test_a_dry_run_stops_after_preflight_with_no_agent_turn_and_no_engine_comman
         ran.append(command)
         return CommandResult(returncode=0, stdout="ok\n")
 
-    from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
-
-    staged: list[str] = []
-    monkeypatch.setattr(datasets, "start", lambda *args, **kwargs: staged.append("started"))
     devices: list[list[str]] = []
 
     def no_gpu(argv, env=None, timeout=0):
@@ -750,8 +746,8 @@ def test_a_dry_run_stops_after_preflight_with_no_agent_turn_and_no_engine_comman
     calls = _install(monkeypatch, workflow, Script())
     with workflow:
         assert workflow.run(task_file) is True
-    # No device is queried or claimed, nothing is downloaded, no agent turn starts.
-    assert calls == [] and devices == [] and staged == []
+    # No device is queried or claimed, and no agent turn starts.
+    assert calls == [] and devices == []
     assert not any("engine_driver" in c or "trtllm-eval" in c or "trtllm-serve" in c for c in ran)
     state = _state(tmp_path)
     assert not state.done and state.stage == "preflight"
@@ -935,12 +931,12 @@ def test_a_verdict_is_identified_by_content(tmp_path):
 
     # The latest outcome counts, and every append reaches the disk.
     status = contract_mod.ContractStatus.load(tmp_path)
-    check = contract_mod.Check("core", "boot", "tp1")
+    check = contract_mod.Check("tp1", "boot")
 
     class Result:
-        name, member, detail, passed, infrastructure = "boot", "tp1", "ok", True, ""
+        name, deployment, detail, passed, infrastructure = "boot", "tp1", "ok", True, ""
 
     status.record(check, Result(), tree=base)
     Result.passed = False
     status.record(check, Result(), tree=base)
-    assert not contract_mod.ContractStatus.load(tmp_path).on(base)["core:boot@tp1"].passed
+    assert not contract_mod.ContractStatus.load(tmp_path).on(base)["tp1:boot"].passed

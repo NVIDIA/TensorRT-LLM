@@ -23,8 +23,8 @@ differently or lack it.
   feature units in `features`; configuration `variants` overlay `runtime`,
   `llm_api_options` or `env` on a unit. `task.example.yaml` documents each key,
   `spec/INTAKE.md` says which variant each request needs.
-- **Running one check.** `trtllm-modeling-v2 gate <boot|accuracy|serve|disagg>
-  --task task.yaml --unit <unit or variant> --member <m>`; `--mode off` (boot
+- **Running one check.** `trtllm-modeling-v2 gate <boot|accuracy|serve|tests>
+  --task task.yaml --deployment <name>`; `--mode off` (boot
   only) runs the stock path; `--tree <dir>` measures a worktree as it is;
   `--json` prints the verdict.
 - **Engine read-back.** The rank hook (`checks/harness/rankhook/sitecustomize.py`)
@@ -252,8 +252,9 @@ launcher also passes `--server_role`). Then `trtllm-serve disaggregated -c
 disagg_config.yaml`, which lists the `context_servers` and
 `generation_servers` URLs.
 
-**Flow proof.** The `disagg` unit owes only its disaggregated-serving test
-(`checks/disagg.py`; `gate disagg --unit disagg --member <m>`): a test the run
+**Flow proof.** The `disagg` deployment boots and is scored through its proxy, and
+owes the disaggregated-serving tests its spec names
+(`checks/disagg.py`; `gate tests --deployment disagg`): a test the run
 writes beside the tree's own in `accuracy/test_disaggregated_serving.py`
 (`launch_disaggregated_llm` starts both workers and `trtllm-serve
 disaggregated`), named by `accuracy.disagg.test`. The gate runs it from its

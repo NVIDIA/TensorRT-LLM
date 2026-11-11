@@ -1,24 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+"""The spec's deployments: stated natively, or expanded from the shorthand keys.
 
-"""The spec's deployments: stated as native options, or expanded from the shorthand keys."""
+The first part is the design's own cases (FINAL-v3 sections 3, 5 and 10, DECISIONS), written
+against the spec alone; the second is what the delivered specs, the messages a user sees
+and the derivation come to.
+"""
 
 from __future__ import annotations
 
 import copy
 import json
-import re
-from dataclasses import replace
+import shlex
 from pathlib import Path
 
 import pytest
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import accuracy as accuracy_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
-from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
-from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
-from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import advice, preflight
 from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
     TaskSchemaError,
@@ -26,6 +26,506 @@ from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
 )
 
 from ._helpers import _workflow
+
+
+@pytest.fixture
+def spec(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps({"architectures": ["ToyForCausalLM"]}))
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    return {
+        "checkpoint_path": str(checkpoint),
+        "trtllm_repo_path": str(tree),
+        "arch": "sm_103",
+        "agents": {"defaults": {"backend": "claude-code", "model": "test-model"}},
+        "environment": {"python": "python3"},
+    }
+
+
+def load(tmp_path, spec, notices=None):
+    path = tmp_path / "spec.yaml"
+    path.write_text(yaml.safe_dump(spec, sort_keys=False))
+    return load_and_validate_task_yaml(path, notices)
+
+
+def resolve(tmp_path, spec, notices=None):
+    return deployments.resolve(load(tmp_path, spec, notices))
+
+
+def native(spec, **extra):
+    return {**spec, "deployments": [{"name": "first", "options": {}, **extra}]}
+
+
+def shorthand(spec, **extra):
+    accuracy = {
+        "model_key": "org/toy",
+        "benchmark": "gsm8k",
+        "reference_yaml": "references.yaml",
+    }
+    accuracy.update(extra.pop("accuracy", {}))
+    return {**spec, "parallel": "tp1", "accuracy": accuracy, **extra}
+
+
+def test_native_aggregate_preserves_all_declared_fields(tmp_path, spec):
+    """D1/D6; v3 §§3,10: arbitrary native options and multiple benchmarks."""
+    options = {
+        "tensor_parallel_size": 4,
+        "pipeline_parallel_size": 2,
+        "kv_cache_config": {"dtype": "nvfp4"},
+        "future_native_key": 17,
+    }
+    (tmp_path / "engine.yaml").write_text(yaml.safe_dump(options))
+    value = native(
+        spec,
+        options="engine.yaml",
+        launch="launcher --nodes 2",
+        stop="stop-owned",
+        env={"UCX_TLS": "tcp,self", "OMP_NUM_THREADS": 2},
+        timeout=5400,
+        inputs=["text", "image"],
+        tests=["tests/test_native.py::test_acceptance"],
+        benchmarks=[
+            {"name": "gsm8k"},
+            {
+                "name": "aa_lcr",
+                "anchor": 0.62,
+                "source": "measured baseline",
+                "env": {"JUDGE": "local"},
+                "args": ["--limit", "8"],
+            },
+        ],
+    )
+    [dep] = resolve(tmp_path, value)
+    assert dep.core and dep.kind == "aggregated"
+    assert dep.server.options == options
+    assert dep.server.options_path == str(tmp_path / "engine.yaml")
+    assert dep.server.launch == "launcher --nodes 2"
+    assert dep.server.stop == "stop-owned" and dep.timeout == 5400
+    assert dep.env == {"UCX_TLS": "tcp,self", "OMP_NUM_THREADS": "2"}
+    assert dep.inputs == ("text", "image")
+    assert dep.tests == ("tests/test_native.py::test_acceptance",)
+    assert [(b.name, b.anchor) for b in dep.benchmarks] == [
+        ("gsm8k", None),
+        ("aa_lcr", 0.62),
+    ]
+    assert dep.benchmarks[1].source == "measured baseline"
+    assert dep.benchmarks[1].env == {"JUDGE": "local"}
+
+
+def test_disaggregated_sides_are_independent_and_relative(tmp_path, spec):
+    """D1: asymmetric attention-DP context and TEP generation remain distinct."""
+    ctx = {"tensor_parallel_size": 4, "enable_attention_dp": True}
+    gen = {"tensor_parallel_size": 2, "moe_expert_parallel_size": 2}
+    value = native(spec)
+    value["deployments"].append(
+        {
+            "name": "pd",
+            "ctx": {"options": ctx, "launch": "ctx-launch"},
+            "gen": {"options": gen, "launch": "gen-launch"},
+            "relative_to": "first",
+            "benchmarks": [{"name": "gsm8k"}],
+            "env": {"UCX_TLS": "tcp,self"},
+            "timeout": 100,
+        }
+    )
+    first, pd = resolve(tmp_path, value)
+    assert first.core and not pd.core and pd.relative_to == "first"
+    assert pd.ctx.options == ctx and pd.gen.options == gen
+    assert pd.ctx.launch == "ctx-launch" and pd.gen.launch == "gen-launch"
+    assert pd.env == {"UCX_TLS": "tcp,self"} and pd.timeout == 100
+
+
+def test_disaggregated_stop_is_per_server(tmp_path, spec):
+    """DECISIONS #5: stop sits beside launch on each server."""
+    value = {
+        **spec,
+        "deployments": [
+            {
+                "name": "pd",
+                "ctx": {"options": {}, "launch": "ctx-launch", "stop": "ctx-stop"},
+                "gen": {"options": {}, "launch": "gen-launch", "stop": "gen-stop"},
+            }
+        ],
+    }
+    [pd] = resolve(tmp_path, value)
+    assert pd.ctx.stop == "ctx-stop" and pd.gen.stop == "gen-stop"
+
+
+def test_first_disaggregated_deployment_is_core(tmp_path, spec):
+    value = {
+        **spec,
+        "deployments": [
+            {"name": "pd", "ctx": {"options": {}}, "gen": {"options": {}}},
+            {"name": "later", "options": {}},
+        ],
+    }
+    found = resolve(tmp_path, value)
+    assert [d.core for d in found] == [True, False]
+
+
+def test_native_benchmark_arguments_use_shell_quoting(tmp_path, spec):
+    """DECISIONS #6: a shell string and equivalent argv are identical."""
+    args = '--stop "END OF ANSWER" --path "/data/a b.json" --empty ""'
+    [dep] = resolve(tmp_path, native(spec, benchmarks=[{"name": "gsm8k", "args": args}]))
+    assert dep.benchmarks[0].args == tuple(shlex.split(args))
+
+
+def test_accuracy_model_key_supplies_default_gsm8k(tmp_path, spec):
+    """DECISIONS #7: model_key-only accuracy defaults to gsm8k, not boot-only."""
+    value = native(spec)
+    value["accuracy"] = {"model_key": "org/toy"}
+    [dep] = resolve(tmp_path, value)
+    assert [b.name for b in dep.benchmarks] == ["gsm8k"]
+
+
+def test_native_accepts_accuracy_defaults_and_per_benchmark_override(tmp_path, spec):
+    """DECISIONS #7: top-level defaults and benchmark entries coexist."""
+    value = native(spec, benchmarks=[{"name": "aa_lcr", "anchor": 0.62, "source": "measured"}])
+    value["accuracy"] = {
+        "model_key": "org/toy",
+        "benchmark": "gsm8k",
+        "reference_yaml": "references.yaml",
+        "discriminators": {"quant_algo": "NVFP4"},
+        "dataset_path": "/offline/data",
+    }
+    data = load(tmp_path, value)
+    [dep] = deployments.resolve(data)
+    assert data["accuracy"]["benchmark"] == "gsm8k"
+    assert [b.name for b in dep.benchmarks] == ["aa_lcr"]
+    assert dep.benchmarks[0].anchor == 0.62
+
+
+def test_benchmark_without_reference_is_allowed_and_unjudged(tmp_path, spec):
+    [dep] = resolve(tmp_path, native(spec, benchmarks=[{"name": "aa_lcr"}]))
+    assert dep.benchmarks[0].anchor is None
+    assert any(
+        "no accuracy anchor" in line
+        for line in advice.spec_warnings(
+            load(tmp_path, native(spec, benchmarks=[{"name": "aa_lcr"}]))
+        )
+    )
+
+
+def test_no_accuracy_is_boot_only_for_native_spec(tmp_path, spec):
+    [dep] = resolve(tmp_path, native(spec))
+    assert dep.benchmarks == ()
+
+
+def test_parallel_tp1_shorthand_preserves_known_engine_defaults(tmp_path, spec):
+    value = shorthand(
+        spec,
+        runtime={
+            "cuda_graph": True,
+            "chunked_prefill": False,
+            "kv_cache_reuse": False,
+            "extra_flags": ["--max_batch_size=64", "--max_seq_len=5120"],
+        },
+    )
+    [dep] = resolve(tmp_path, value)
+    options = dep.server.options
+    assert dep.core and options["tensor_parallel_size"] == 1
+    assert options["pipeline_parallel_size"] == options["moe_expert_parallel_size"] == 1
+    assert options["max_batch_size"] == 64 and options["max_seq_len"] == 5120
+    assert options["max_num_tokens"] == 8192
+    assert options["kv_cache_config"]["enable_block_reuse"] is False
+    assert options["kv_cache_config"]["free_gpu_memory_fraction"] == 0.9
+    assert options["enable_chunked_prefill"] is False
+    assert options["disable_overlap_scheduler"] is False
+    assert options["cuda_graph_config"] == {}
+
+
+def test_members_preserve_order_and_first_is_core(tmp_path, spec):
+    value = shorthand(spec, parallel="unified", members=["dep4", "tp1", "tep2"])
+    found = resolve(tmp_path, value)
+    assert [d.server.options["tensor_parallel_size"] for d in found] == [4, 1, 2]
+    assert [d.core for d in found] == [True, False, False]
+    assert found[0].server.options["enable_attention_dp"] is True
+    assert found[2].server.options["moe_expert_parallel_size"] == 2
+
+
+def test_dep_batch_division_is_once_and_native_is_not_redivided(tmp_path, spec):
+    options = {
+        "max_batch_size": 128,
+        "cuda_graph_config": {
+            "batch_sizes": [1, 4, 32, 64, 128],
+            "max_batch_size": 128,
+        },
+    }
+    (tmp_path / "core.yaml").write_text(yaml.safe_dump(options))
+    value = shorthand(
+        spec,
+        parallel="dep4",
+        accuracy={"model_key": "org/toy", "llm_api_options": "core.yaml"},
+    )
+    [expanded] = resolve(tmp_path, value)
+    assert expanded.server.options["max_batch_size"] == 32
+    assert expanded.server.options["cuda_graph_config"]["max_batch_size"] == 32
+    [stated] = resolve(tmp_path, native(spec, options=expanded.server.options))
+    assert stated.server.options == expanded.server.options
+
+
+def test_kv_variant_overlay_isolated_and_relative(tmp_path, spec):
+    value = shorthand(
+        spec,
+        variants={
+            "kv_fp8": {
+                "gates": ["accuracy"],
+                "llm_api_options": {"kv_cache_config": {"dtype": "fp8"}},
+            }
+        },
+    )
+    core, variant = resolve(tmp_path, value)
+    assert core.server.options["kv_cache_config"].get("dtype") is None
+    assert variant.server.options["kv_cache_config"]["dtype"] == "fp8"
+    assert variant.relative_to == core.name
+    assert [b.name for b in variant.benchmarks] == ["gsm8k"]
+
+
+def test_feature_expands_with_its_native_options(tmp_path, spec):
+    (tmp_path / "mtp.yaml").write_text(
+        yaml.safe_dump({"speculative_config": {"decoding_type": "MTP", "max_draft_len": 3}})
+    )
+    value = shorthand(
+        spec,
+        features=["mtp"],
+        accuracy={"model_key": "org/toy", "llm_api_options": {"mtp": "mtp.yaml"}},
+    )
+    core, feature = resolve(tmp_path, value)
+    assert core.server.options["speculative_config"] is None
+    assert feature.server.options["speculative_config"]["max_draft_len"] == 3
+    assert feature.server.options["speculative_config"]["decoding_type"] == "MTP"
+    assert not feature.core
+
+
+def test_a_variant_and_a_disaggregated_request_are_one_deployment_each_on_the_first_member(
+    tmp_path, spec
+):
+    """The ruled table: nothing of the old contract's choice of member is carried."""
+    fp8 = {"llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}}
+    value = shorthand(
+        spec,
+        parallel="unified",
+        members=["tp1", "tep4", "dep4"],
+        features=["disagg"],
+        accuracy={"benchmark_members": "dep4", "disagg": {"test": "tests/test_pd.py::test_hop"}},
+        variants={"kv_fp8": {**fp8, "members": ["tp1", "dep4"], "gates": ["accuracy"]}},
+    )
+    notices = []
+    found = resolve(tmp_path, value, notices)
+    assert [d.name for d in found] == ["tp1", "tep4", "dep4", "disagg", "kv_fp8"]
+    by_name = {d.name: d for d in found}
+    # One variant, on the first member, judged against it; what chose members before is ignored.
+    assert by_name["kv_fp8"].server.options["tensor_parallel_size"] == 1
+    assert all(d.relative_to == "tp1" for d in found[1:]) and found[0].relative_to is None
+    assert by_name["disagg"].ctx.options == by_name["disagg"].gen.options == found[0].server.options
+    assert by_name["disagg"].tests == ("tests/test_pd.py::test_hop",)
+    assert all([b.name for b in d.benchmarks] == ["gsm8k"] for d in found)
+    assert sorted(n.split("'")[1] for n in notices) == [
+        "accuracy.benchmark_members",
+        "variants.kv_fp8.gates",
+        "variants.kv_fp8.members",
+    ]
+    # The spec names the member a disaggregated deployment is served at.
+    value["members"] = {"default": ["tp1", "dep4"], "disagg": ["dep4"]}
+    pd = next(d for d in resolve(tmp_path, value) if d.kind == "disaggregated")
+    assert pd.ctx.options["tensor_parallel_size"] == pd.gen.options["tensor_parallel_size"] == 4
+    assert pd.ctx.options["enable_attention_dp"] is True
+
+
+def test_accuracy_specific_engine_limits_survive_shorthand(tmp_path, spec):
+    """D2/DECISIONS #11: legacy accuracy limits are measured engine inputs."""
+    value = shorthand(
+        spec,
+        accuracy={"model_key": "org/toy", "max_batch_size": 64, "max_seq_len": 4096},
+    )
+    [dep] = resolve(tmp_path, value)
+    assert dep.server.options["max_batch_size"] == 64
+    assert dep.server.options["max_seq_len"] == 4096
+
+
+def test_normalization_roundtrip_is_stable(tmp_path, spec):
+    value = shorthand(
+        spec,
+        parallel="unified",
+        members=["tp2", "dep4"],
+        variants={
+            "kv_fp8": {
+                "gates": ["accuracy"],
+                "llm_api_options": {"kv_cache_config": {"dtype": "fp8"}},
+            }
+        },
+    )
+    first = load(tmp_path, value)
+    before = [d.as_dict() for d in deployments.resolve(first)]
+    second = load(tmp_path, first)
+    assert [d.as_dict() for d in deployments.resolve(second)] == before
+
+
+def test_options_files_are_written_without_mutation(tmp_path, spec):
+    [dep] = resolve(
+        tmp_path,
+        native(spec, options={"tensor_parallel_size": 2, "future_key": {"nested": 9}}),
+    )
+    before = copy.deepcopy(dep.server.options)
+    paths = deployments.write_options(dep, tmp_path / "engines")
+    assert yaml.safe_load(paths["server"].read_text()) == before
+    assert dep.server.options == before
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"deployments": []},
+        {"deployments": [{"name": "only_ctx", "ctx": {"options": {}}}]},
+        {
+            "deployments": [
+                {
+                    "name": "mixed",
+                    "options": {},
+                    "ctx": {"options": {}},
+                    "gen": {"options": {}},
+                }
+            ]
+        },
+        {
+            "deployments": [
+                {"name": "duplicate", "options": {}},
+                {"name": "duplicate", "options": {}},
+            ]
+        },
+        {"deployments": [{"name": "badref", "options": {}, "relative_to": "missing"}]},
+        {
+            "deployments": [
+                {
+                    "name": "badanchor",
+                    "options": {},
+                    "benchmarks": [{"name": "gsm8k", "anchor": 80}],
+                }
+            ]
+        },
+        {"deployments": [{"name": "badopts", "options": "absent.yaml"}]},
+        {"deployments": [{"name": "typo", "options": {}, "benchmakrs": []}]},
+    ],
+)
+def test_invalid_native_structure_is_refused(tmp_path, spec, change):
+    with pytest.raises(TaskSchemaError):
+        load(tmp_path, {**spec, **change})
+
+
+@pytest.mark.parametrize("score", [float("nan"), float("inf")])
+def test_nonfinite_anchor_is_refused(tmp_path, spec, score):
+    value = native(
+        spec,
+        benchmarks=[{"name": "gsm8k", "anchor": score, "source": "not a measurement"}],
+    )
+    with pytest.raises(TaskSchemaError):
+        load(tmp_path, value)
+
+
+def test_bad_input_type_is_schema_error_not_crash(tmp_path, spec):
+    with pytest.raises(TaskSchemaError):
+        load(tmp_path, native(spec, inputs=["text", {"image": "file"}]))
+
+
+def test_only_dropped_accuracy_keys_are_noticed(tmp_path, spec):
+    notices = []
+    value = shorthand(
+        spec,
+        accuracy={
+            "model_key": "org/toy",
+            "envelope": {"enabled": True},
+            "reference_logits": {"path": "old.json"},
+        },
+    )
+    data = load(tmp_path, value, notices)
+    assert "envelope" not in data["accuracy"] and "reference_logits" not in data["accuracy"]
+    assert len(notices) == 2 and all("ignored" in n for n in notices)
+    assert all(any(key in n for n in notices) for key in ("envelope", "reference_logits"))
+    repeated = []
+    load(tmp_path, data, repeated)
+    assert repeated == []
+
+
+def test_unknown_key_is_not_silently_ignored(tmp_path, spec):
+    value = shorthand(spec)
+    value["accuracy"]["refernece_logits"] = {}
+    with pytest.raises(TaskSchemaError):
+        load(tmp_path, value)
+
+
+def test_policy_keys_of_the_old_contract_are_ignored_by_one_table_with_a_notice_each(
+    tmp_path, spec
+):
+    notices = []
+    value = shorthand(
+        spec,
+        profile="smoke",
+        coverage={"accept": ["kv_fp8@tp1"]},
+        accuracy={"floor": {"k": 3}, "tolerance": 5.0, "acceptance": {"min": 2}},
+    )
+    data = load(tmp_path, value, notices)
+    assert "profile" not in data and "coverage" not in data
+    assert sorted(n.split("'")[1] for n in notices) == [
+        "accuracy.acceptance",
+        "accuracy.floor",
+        "accuracy.tolerance",
+        "coverage",
+        "profile",
+    ]
+    assert all(" is ignored: " in n and n.endswith("; drop the key") for n in notices)
+    assert set(task_schema.IGNORED_KEYS) >= {"profile", "coverage", "accuracy.envelope"}
+
+
+def test_intake_lint_explains_replacement(tmp_path, capsys):
+    """DECISIONS #1: retain old command as a one-line migration notice."""
+    try:
+        derive.main(["lint"])
+    except SystemExit:
+        pass
+    output = capsys.readouterr()
+    assert "--dry-run" in output.out + output.err
+
+
+def test_three_warnings_are_advice_not_validation_failures(tmp_path, spec):
+    checkpoint = Path(spec["checkpoint_path"])
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": 300 * 2**30}})
+    )
+    spec["environment"]["gpu_memory_gib"] = 80
+    value = native(
+        spec,
+        options={"tensor_parallel_size": 1, "cuda_graph_config": None},
+        benchmarks=[{"name": "gsm8k"}],
+    )
+    data = load(tmp_path, value)
+    warnings = advice.spec_warnings(data)
+    assert len(warnings) == 3
+    assert any("too narrow" in w for w in warnings)
+    assert any("no accuracy anchor" in w for w in warnings)
+    assert any("without CUDA graphs" in w for w in warnings)
+
+
+def test_missing_matching_anchor_is_warned_even_if_other_format_has_row(tmp_path, spec):
+    """P6/D6: a BF16 row is not an NVFP4 measurement."""
+    reference = Path(spec["trtllm_repo_path"]) / "references.yaml"
+    reference.write_text("org/toy:\n  - accuracy: 90.0\n")
+    value = shorthand(spec, accuracy={"discriminators": {"quant_algo": "NVFP4"}})
+    warnings = advice.spec_warnings(load(tmp_path, value))
+    assert any("no accuracy anchor" in line for line in warnings)
+
+
+def test_warning_resolves_per_unit_model_key_without_crashing(tmp_path, spec):
+    """Existing per-unit shorthand stays loadable and warnings cannot terminate preflight."""
+    reference = Path(spec["trtllm_repo_path"]) / "references.yaml"
+    reference.write_text("org/toy:\n  - accuracy: 41.77\n")
+    value = shorthand(spec, accuracy={"model_key": {"default": "org/toy"}})
+    warnings = advice.spec_warnings(load(tmp_path, value))
+    assert not any("no accuracy anchor" in line for line in warnings)
+
+
+# ---------------------------------------------------------------- the delivered specs
 
 DISAGG_NODE = (
     "tests/integration/defs/accuracy/test_disaggregated_serving.py::TestQwen3::test_auto_dtype"
@@ -114,22 +614,15 @@ def _delivered(tmp_path, *, parallel: str, model_key: str, agent: str, disagg: b
     return spec
 
 
-# ------------------------------------------------------------- the delivered specs
-
-
-@pytest.mark.parametrize("agent", ["devin/kimi-k3-1-pro", "devin/deepseek-v4-1-flash-1017"])
-@pytest.mark.parametrize("model_key", ["Qwen/Qwen3-0.6B", "HuggingFaceTB/SmolLM2-1.7B"])
-def test_a_delivered_tp1_spec_is_core_and_its_kv_variant(tmp_path, agent, model_key):
+def test_a_delivered_spec_is_its_member_its_disaggregated_deployment_and_its_kv_variant(tmp_path):
     spec = _load(
         tmp_path,
-        _delivered(tmp_path, parallel="tp1", model_key=model_key, agent=agent, disagg=False),
+        _delivered(tmp_path, parallel="tp2", model_key="Qwen/Qwen3-0.6B", agent="m", disagg=True),
     )
-    core, kv = deployments.resolve(spec)
-    assert (core.name, core.core, core.kind) == ("tp1", True, deployments.AGGREGATED)
-    assert (kv.name, kv.core, kv.kind) == ("kv_fp8@tp1", False, deployments.AGGREGATED)
+    core, pd, kv = deployments.resolve(spec)
+    assert [d.name for d in (core, pd, kv)] == ["tp2", "disagg", "kv_fp8"]
     options = core.server.options
-    assert "model" not in options
-    assert (options["tensor_parallel_size"], options["enable_attention_dp"]) == (1, False)
+    assert core.core and "model" not in options and options["tensor_parallel_size"] == 2
     assert (options["max_seq_len"], options["max_batch_size"]) == (5120, 64)
     assert options["kv_cache_config"] == {
         "enable_block_reuse": False,
@@ -137,193 +630,22 @@ def test_a_delivered_tp1_spec_is_core_and_its_kv_variant(tmp_path, agent, model_
         "free_gpu_memory_fraction": 0.3,
     }
     assert options["cuda_graph_config"] == {"enable_padding": True, "max_batch_size": 64}
-    assert options["speculative_config"] is None
-    # The variant is its unit's options with its own setting, judged against the unit's score.
-    assert kv.server.options["kv_cache_config"]["dtype"] == "fp8"
+    # Disaggregation is a deployment of two servers on core's options, with the spec's test.
+    assert pd.kind == deployments.DISAGGREGATED and list(pd.servers) == ["ctx", "gen"]
+    assert pd.ctx.options == pd.gen.options == options
+    assert pd.tests == (DISAGG_NODE,) and pd.env == {"LLM_MODELS_ROOT": "/models"}
+    # The variant is core's options with its own setting, judged against core's score.
+    assert kv.relative_to == "tp2" and kv.server.options["kv_cache_config"]["dtype"] == "fp8"
     assert {k: v for k, v in kv.server.options.items() if k != "kv_cache_config"} == {
         k: v for k, v in options.items() if k != "kv_cache_config"
     }
-    assert kv.relative_to == "tp1" and core.relative_to is None
-    assert [b.name for b in core.benchmarks] == [b.name for b in kv.benchmarks] == ["gsm8k"]
-    assert core.inputs == ("text",) and not core.tests
-
-
-def test_a_delivered_tp2_spec_with_disagg_is_three_deployments(tmp_path):
-    spec = _load(
-        tmp_path,
-        _delivered(
-            tmp_path,
-            parallel="tp2",
-            model_key="Qwen/Qwen3-0.6B",
-            agent="devin/kimi-k3-1-pro",
-            disagg=True,
-        ),
-    )
-    core, pd, kv = deployments.resolve(spec)
-    assert [d.name for d in (core, pd, kv)] == ["tp2", "disagg@tp2", "kv_fp8@tp2"]
-    assert core.core and core.server.options["tensor_parallel_size"] == 2
-    # Disaggregation is a deployment of two servers, judged by the test the spec names.
-    assert pd.kind == deployments.DISAGGREGATED and list(pd.servers) == ["ctx", "gen"]
-    assert pd.ctx.options == pd.gen.options == core.server.options
-    assert pd.tests == (DISAGG_NODE,) and not pd.benchmarks
-    assert pd.env == {"LLM_MODELS_ROOT": "/models"}
-    assert kv.relative_to == "tp2" and kv.server.options["kv_cache_config"]["dtype"] == "fp8"
-
-
-def test_a_check_runs_its_deployments_options_and_adds_nothing(tmp_path):
-    spec = _load(
-        tmp_path,
-        _delivered(
-            tmp_path,
-            parallel="tp2",
-            model_key="Qwen/Qwen3-0.6B",
-            agent="devin/kimi-k3-1-pro",
-            disagg=True,
-        ),
-    )
-    core, _, kv = deployments.resolve(spec)
-    for deployment, unit in ((core, "core"), (kv, "kv_fp8")):
-        # The deployment a check named by unit and member finds is the one the spec comes to.
-        assert check_config.deployment_of(spec, unit, "tp2") == replace(deployment, core=False)
-        config = check_config.check_configuration(spec, deployment, max_tokens=32)
-        assert config["llm"] == {**deployment.server.options, "model": spec["checkpoint_path"]}
-        assert config["sampling"] == {"temperature": 0.0, "top_k": 1, "max_tokens": 32}
-        assert config["apply_chat_template"] is False
-    # A deployment the spec states itself: its file, the model, and not one default more.
-    native = _load(tmp_path, _native(tmp_path))
-    dep16 = check_config.deployment_of(native, None, None)
-    config = check_config.check_configuration(native, dep16, max_tokens=8)
-    stated = yaml.safe_load((tmp_path / "engines" / "dep16.yaml").read_text())
-    assert config["llm"] == {**stated, "model": native["checkpoint_path"]}
-    assert config["sampling"] == {"temperature": 0.0, "top_k": 1, "max_tokens": 8}
-    assert check_config.deployment_of(native, "pd", None).kind == deployments.DISAGGREGATED
+    # A check runs a deployment's options as they are, with the model and greedy sampling.
+    config = check_config.check_configuration(spec, kv, max_tokens=32)
+    assert config["llm"] == {**kv.server.options, "model": spec["checkpoint_path"]}
+    assert config["sampling"] == {"temperature": 0.0, "top_k": 1, "max_tokens": 32}
+    assert deployments.named(spec).name == deployments.named(spec, "core").name == "tp2"
     with pytest.raises(KeyError, match="'tp4' names no deployment of this spec"):
-        check_config.deployment_of(native, "tp4", None)
-
-
-def test_shorthand_defaults_and_the_attention_dp_share_are_written_once(tmp_path):
-    spec = _delivered(
-        tmp_path, parallel="dep4", model_key="org/model", agent="claude-test-model", disagg=False
-    )
-    spec["runtime"]["extra_flags"] = ["--max_seq_len=5120", "--temperature=0.5"]
-    spec["variants"] = {}
-    loaded = _load(tmp_path, spec)
-    [dep4] = deployments.resolve(loaded)
-    options = dep4.server.options
-    # What the shorthand implies is in the options, where a reader and the engine both see it.
-    assert options["kv_cache_config"]["enable_block_reuse"] is False
-    assert options["kv_cache_config"]["free_gpu_memory_fraction"] == 0.9
-    assert options["enable_chunked_prefill"] is False
-    assert options["disable_overlap_scheduler"] is False
-    assert (options["max_num_tokens"], options["max_seq_len"]) == (8192, 5120)
-    # 64 is the global batch (`accuracy.max_batch_size`): each of four ranks serves 16, and
-    # its graphs are captured to 16. One division, for the boot, the benchmark and the server.
-    assert options["max_batch_size"] == 16
-    assert options["cuda_graph_config"] == {"enable_padding": True, "max_batch_size": 16}
-    assert dep4.sampling == {"temperature": 0.5}
-    seen: list[str] = []
-
-    def runner(command, env=None, timeout=0):
-        seen.append(command)
-        return CommandResult(returncode=1, stdout="")
-
-    environment = resolve_environment(loaded, devices=(), world_size=4)
-    accuracy_checks.run_accuracy_gate(
-        environment, task_data=loaded, reference=50.0, workdir=tmp_path / "w", runner=runner,
-        unit="core", member="dep4",
-    )  # fmt: skip
-    config = re.search(r"--config=(\S+\.yaml)", seen[0]).group(1)
-    sent = yaml.safe_load(Path(config).read_text())
-    assert sent == {**options, "modeling_v2": "require"}
-
-
-# ------------------------------------------------------------------ shorthand, in general
-
-
-def test_parallel_m_and_members_m_state_the_same_deployments(tmp_path):
-    base = _delivered(
-        tmp_path,
-        parallel="tp1",
-        model_key="Qwen/Qwen3-0.6B",
-        agent="claude-test-model",
-        disagg=False,
-    )
-    listed = copy.deepcopy(base)
-    del listed["parallel"]
-    listed["members"] = ["tp1"]
-    one = deployments.resolve(_load(tmp_path, base))
-    other = deployments.resolve(_load(tmp_path, listed))
-    assert one == other and [d.name for d in one] == ["tp1", "kv_fp8@tp1"]
-
-
-def test_units_members_and_variants_expand_in_the_spec_order(tmp_path):
-    spec = _delivered(
-        tmp_path, parallel="unified", model_key="org/model", agent="claude-test-model", disagg=False
-    )
-    spec["members"] = {"default": ["tep4", "dep4", "tp4"], "multimodal": ["tep4"]}
-    spec["features"] = ["mtp", "multimodal"]
-    spec["accuracy"]["benchmark_members"] = "dep4"
-    spec["accuracy"]["benchmark_args"] = ["--apply_chat_template"]
-    spec["variants"]["chunked"] = {
-        "unit": "mtp",
-        "members": ["tep4", "tp4"],
-        "gates": ["boot"],
-        "runtime": {"chunked_prefill": True},
-        "env": {"MY_SWITCH": 1},
-    }
-    found = deployments.resolve(_load(tmp_path, spec))
-    assert [d.name for d in found] == [
-        "tep4", "dep4", "tp4",
-        "mtp@tep4", "mtp@dep4", "mtp@tp4",
-        "multimodal@tep4",
-        "kv_fp8@dep4",
-        "chunked@tep4", "chunked@tp4",
-    ]  # fmt: skip
-    by_name = {d.name: d for d in found}
-    assert [d.name for d in found if d.core] == ["tep4"]  # the first member listed is core's
-    # A member name is a topology, stated as the engine's own options.
-    shapes = {
-        name: (
-            by_name[name].server.options["tensor_parallel_size"],
-            by_name[name].server.options["moe_expert_parallel_size"],
-            by_name[name].server.options["enable_attention_dp"],
-        )
-        for name in ("tp4", "tep4", "dep4")
-    }
-    assert shapes == {"tp4": (4, 1, False), "tep4": (4, 4, False), "dep4": (4, 4, True)}
-    # A global batch is each attention-DP rank's share.
-    assert by_name["dep4"].server.options["max_batch_size"] == 16
-    assert by_name["tep4"].server.options["max_batch_size"] == 64
-    # A unit carries the speculator of every feature up to it; core carries none.
-    assert by_name["tep4"].server.options["speculative_config"] is None
-    for name in ("mtp@tep4", "multimodal@tep4", "chunked@tep4"):
-        assert by_name[name].server.options["speculative_config"]["decoding_type"] == "MTP"
-    assert by_name["multimodal@tep4"].inputs == ("text", "image")
-    assert by_name["mtp@tep4"].inputs == ("text",)
-    # The benchmark runs where `benchmark_members` says, or at every member of a unit that
-    # has not got that one; a boot-only variant has none.
-    scored = [d.name for d in found if d.benchmarks]
-    assert scored == ["dep4", "mtp@dep4", "multimodal@tep4", "kv_fp8@dep4"]
-    assert by_name["dep4"].benchmarks[0].args == ("--apply_chat_template",)
-    assert by_name["kv_fp8@dep4"].relative_to == "dep4"
-    chunked = by_name["chunked@tp4"]
-    assert chunked.server.options["enable_chunked_prefill"] is True
-    assert chunked.env == {"MY_SWITCH": "1"} and chunked.relative_to is None
-
-
-def test_shorthand_that_asks_two_values_of_one_setting_is_refused_when_expanded(tmp_path):
-    spec = _delivered(
-        tmp_path, parallel="tp1", model_key="org/model", agent="claude-test-model", disagg=False
-    )
-    spec["runtime"]["extra_flags"].append("--kv_cache_dtype=nvfp4")
-    spec["variants"] = {}
-    loaded = _load(tmp_path, spec)
-    (tmp_path / "llm_api" / "core.yaml").write_text("kv_cache_config: {dtype: fp8}\n")
-    with pytest.raises(ValueError, match="kv_cache_config.dtype: runtime.extra_flags asks 'nvfp4'"):
-        deployments.resolve(loaded)
-
-
-# ---------------------------------------------------------------- deployments, stated
+        deployments.named(spec, "tp4")
 
 
 def _native(tmp_path) -> dict:
@@ -383,118 +705,49 @@ def _native(tmp_path) -> dict:
     }
 
 
-def test_a_spec_states_its_deployments_as_native_options(tmp_path):
-    spec = _load(tmp_path, _native(tmp_path))
-    assert deployments.is_native(spec)
-    assert spec["environment"] == {
-        "python": "/opt/venv/bin/python",
-        "launch": "srun -N1 --gpus=1",
-        "kind": "local",
-        "env": {},
-    }
-    core, pd = deployments.resolve(spec)
-    assert (core.name, core.core, core.kind) == ("dep16", True, deployments.AGGREGATED)
-    assert core.server.options_path == str(tmp_path / "engines" / "dep16.yaml")
-    assert core.server.options["tensor_parallel_size"] == 16
-    assert core.server.launch == "srun -N4 --ntasks=16 --mpi=pmix" and core.timeout == 5400
-    assert core.inputs == ("text", "image")
-    gsm8k, mmmu, aa_lcr = core.benchmarks
-    assert (gsm8k.name, gsm8k.anchor, gsm8k.args) == ("gsm8k", None, ())
-    assert mmmu.args == ("--post_process_fn", "strip reasoning")  # split as a shell would
-    assert (aa_lcr.anchor, aa_lcr.env) == (0.62, {"NS_JUDGE_MODEL": "judge"})
-    assert aa_lcr.source.startswith("trtllm-eval aa_lcr")
-    # Context and generation are two servers with their own options and prefixes.
-    assert (pd.kind, pd.core, pd.relative_to) == (deployments.DISAGGREGATED, False, "dep16")
-    assert pd.ctx.options["enable_attention_dp"] and not pd.gen.options["enable_attention_dp"]
-    assert (pd.gen.launch, pd.gen.stop) == ("srun --nodelist=n[5-8]", "scancel --name gen")
-    assert pd.ctx.stop == ""
-    # A deployment that names no benchmark takes the spec's: gsm8k unless `accuracy` says another.
-    assert [b.name for b in pd.benchmarks] == ["gsm8k"]
-    assert pd.env == {"UCX_TLS": "tcp,self,sm,cuda_copy,cuda_ipc"} and pd.tests == (DISAGG_NODE,)
-    # What it loads is what it states: the resolved spec loads again to the same deployments.
-    assert deployments.resolve(_load(tmp_path, spec)) == (core, pd)
-    assert [d.as_dict()["name"] for d in (core, pd)] == ["dep16", "pd"]
+def test_what_the_table_cannot_state_is_one_line_and_a_missing_key_says_its_fix(tmp_path, spec):
+    def refused(value) -> str:
+        with pytest.raises(TaskSchemaError) as raised:
+            load(tmp_path, value)
+        return str(raised.value)
 
-
-def test_a_small_model_on_one_host_states_one_inline_deployment_and_no_accuracy(tmp_path):
-    checkpoint, repo = _dirs(tmp_path)
-    spec = {
-        "checkpoint_path": checkpoint,
-        "trtllm_repo_path": repo,
-        "arch": "sm_103",
-        "environment": {"python": "/opt/venv/bin/python"},
-        "deployments": [{"name": "tp1", "options": {"max_seq_len": 5120}}],
-    }
-    [only] = deployments.resolve(_load(tmp_path, spec))
-    assert only.core and only.server.options == {"max_seq_len": 5120}
-    assert (only.server.launch, only.server.options_path, only.benchmarks) == ("", "", ())
-
-
-def test_every_problem_with_stated_deployments_is_batched(tmp_path):
-    spec = _native(tmp_path)
-    core, pd = spec["deployments"]
-    core["options"] = "engines/absent.yaml"
-    core["benchmarks"][2].pop("source")
-    core["benchmarks"].append({"name": "gsm8k"})
-    core["inputs"] = ["image"]
-    core["relative_to"] = "pd"
-    pd["name"] = "dep16"
-    pd.pop("gen")
-    pd["launch"] = "srun"
-    pd["timeout"] = 0
-    spec["deployments"].append({"name": "Bad Name", "options": {}, "lanch": "x"})
-    spec["features"] = ["mtp"]
-    spec["accuracy"]["tolerance"] = 5.0
-    pd["ctx"]["stop"] = "scancel --name ctx"
-    del pd["ctx"]["launch"]
-    with pytest.raises(TaskSchemaError) as raised:
-        _load(tmp_path, spec)
-    message = str(raised.value)
-    for expected in (
-        "'deployments.dep16.options' does not exist",
-        "'deployments.dep16.benchmarks[2].source' is required with an anchor",
-        "'deployments.dep16.benchmarks[3]' repeats the benchmark 'gsm8k'",
-        "'deployments.dep16.inputs' must be `text` and any of ['image']",
-        "'deployments.dep16.relative_to' is 'pd', which names no deployment before this one",
-        "'deployments.dep16' is named twice",
-        "has `ctx` alone; disaggregated needs `ctx` and `gen`",
-        "'deployments.dep16.launch' sits beside `ctx` and `gen`",
-        "'deployments.dep16.timeout' must be an integer number of seconds >= 1",
-        "'deployments[2].name' must be lowercase letters, digits and '_'",
-        "unknown key 'deployments[2].lanch' — did you mean 'deployments[2].launch'?",
-        "'features' beside 'deployments': these keys are shorthand for deployments",
-        "'accuracy' carries ['tolerance'] beside 'deployments'",
-        "'deployments.dep16.ctx.stop' ends what `launch` started, and there is no `launch`",
-    ):
-        assert expected in message, expected
-
-
-def test_options_are_written_where_a_server_reads_them(tmp_path):
-    core, pd = deployments.resolve(_load(tmp_path, _native(tmp_path)))
-    out = tmp_path / "ws" / "deployments"
-    assert deployments.write_options(core, out) == {"server": out / "dep16.yaml"}
-    assert yaml.safe_load((out / "dep16.yaml").read_text()) == dict(core.server.options)
-    written = deployments.write_options(pd, out)
-    assert written == {"ctx": out / "pd.ctx.yaml", "gen": out / "pd.gen.yaml"}
-    assert yaml.safe_load(written["gen"].read_text())["enable_attention_dp"] is False
-
-
-def test_a_run_on_stated_deployments_says_what_it_read_and_that_it_does_not_run_them_yet(tmp_path):
-    path = tmp_path / "task.yaml"
-    path.write_text(yaml.safe_dump(_native(tmp_path)), encoding="utf-8")
-    workflow = _workflow(tmp_path)
-    with workflow, pytest.raises(TaskSchemaError) as raised:
-        workflow.run(path)
-    message = str(raised.value)
-    assert "states 2 deployment(s)" in message
-    assert (
-        "- `dep16` (core): aggregated, 16 rank(s), attention DP, behind a launch prefix" in message
+    by_unit = shorthand(spec, runtime={"default": {"cuda_graph": True}, "mtp": {}})
+    assert "state deployments: 'runtime' differs by unit" in refused(by_unit)
+    per_feature = shorthand(spec, parallel="unified", members={"default": ["tp1"], "mtp": ["tep4"]})
+    assert "state deployments: 'members' lists members for ['mtp']" in refused(per_feature)
+    flag = shorthand(spec, runtime={"extra_flags": ["--some_new_flag=1"]})
+    assert "state deployments: runtime.extra_flags has --some_new_flag" in refused(flag)
+    twice = shorthand(
+        spec,
+        runtime={"extra_flags": ["--kv_cache_fraction=0.7"]},
+        accuracy={
+            "llm_api_options": {"core": {"kv_cache_config": {"free_gpu_memory_fraction": 0.5}}}
+        },
     )
-    assert "- `pd`: disaggregated, ctx 16 rank(s), attention DP" in message
-    assert "validated here and not yet run" in message
-
-
-# ------------------------------------------------------------------------- the family
+    assert "two values for `kv_cache_config.free_gpu_memory_fraction`" in refused(twice)
+    both = {**native(spec), "features": ["mtp"]}
+    assert "'features' beside 'deployments'" in refused(both)
+    # A missing or wrong key is one line: what it is, and what to write.
+    bare = {k: v for k, v in native(spec).items() if k not in ("arch", "checkpoint_path")}
+    bare["environment"] = {}
+    said = refused(bare)
+    for line in (
+        "missing arch: the GPU architecture, never inferred (sm_100 is B200, sm_103 is GB300); "
+        "fix: `arch: sm_103`",
+        "missing checkpoint_path: the HuggingFace checkpoint directory; fix: `checkpoint_path: ",
+        "missing environment.python: the interpreter every Python command runs under; fix: ",
+    ):
+        assert line in said
+    no_options = {**spec, "deployments": [{"name": "first"}]}
+    assert "missing deployments.first.options: a native LLM-API options file; fix: " in refused(
+        no_options
+    )
+    quoting = native(spec, benchmarks=[{"name": "gsm8k", "args": '--stop "unclosed'}])
+    assert "args' cannot be split as a shell would: No closing quotation" in refused(quoting)
+    # The smallest spec loads: one member and the model's key.
+    smallest = {**spec, "parallel": "tp1", "accuracy": {"model_key": "org/toy"}}
+    [only] = resolve(tmp_path, smallest)
+    assert (only.name, [b.name for b in only.benchmarks]) == ("tp1", ["gsm8k"])
 
 
 def _routing(repo, family: str, body: str) -> None:
@@ -555,85 +808,84 @@ def test_a_run_journals_the_deployments_its_shorthand_comes_to(tmp_path, task_fi
     assert "- `tp1` (core): aggregated, 1 rank(s); judged by its boot, gsm8k" in journal
 
 
-# ------------------------------------------------------------------- the spec's warnings
+def test_a_dry_run_says_what_the_spec_comes_to_one_line_for_each_deployment(
+    tmp_path, task_file, capsys
+):
+    workflow = _workflow(tmp_path, dry_run=True)
+    with workflow:
+        assert workflow.run(task_file)
+    line = "- `tp1` (core): aggregated, 1 rank(s); judged by its boot, gsm8k (reference 85.6: "
+    assert "deployments: 1" in (tmp_path / "ws" / "journal.md").read_text()
+    assert line in (tmp_path / "ws" / "journal.md").read_text()
+    assert line in capsys.readouterr().out.replace("\n", "")
 
 
-def _warned(tmp_path, spec: dict) -> list[str]:
-    return derive.spec_warnings(_load(tmp_path, spec))
-
-
-def test_a_first_deployment_too_narrow_for_the_weights_is_warned_of(tmp_path):
-    spec = _delivered(
-        tmp_path, parallel="tp4", model_key="org/model", agent="claude-test-model", disagg=False
+def test_a_run_reads_a_spec_that_states_its_deployments(tmp_path):
+    path = tmp_path / "task.yaml"
+    stated = _native(tmp_path)
+    stated["environment"]["env"] = {
+        "TMPDIR": "/var/tmp/mv2w",
+        "CLAUDE_CODE_TMPDIR": "/var/tmp/mv2w",
+    }
+    path.write_text(yaml.safe_dump(stated), encoding="utf-8")
+    config = {"architectures": ["KimiK3"], "vision_config": {}}
+    (tmp_path / "ckpt" / "config.json").write_text(json.dumps(config))
+    workflow = _workflow(tmp_path, dry_run=True)
+    with workflow:
+        assert workflow.run(path)
+    journal = (tmp_path / "ws" / "journal.md").read_text()
+    assert (
+        "- `dep16` (core): aggregated, 16 rank(s), attention DP, behind a launch prefix" in journal
     )
-    spec["environment"]["gpu_memory_gib"] = 80
-    index = {"metadata": {"total_size": 300 * 2**30}, "weight_map": {}}
-    (tmp_path / "ckpt" / "model.safetensors.index.json").write_text(json.dumps(index))
-    # 300 GiB over 60 GiB a device (75% of 80): one engine needs 8 devices.
-    [narrow] = [w for w in _warned(tmp_path, spec) if w.startswith("first deployment too narrow")]
-    assert "`tp4` holds the checkpoint's 300 GiB of weights on 4 device(s)" in narrow
-    assert narrow.endswith("start at 8 or more")
-    # Unknown device memory: no estimate.
-    del spec["environment"]["gpu_memory_gib"]
-    assert not [w for w in _warned(tmp_path, spec) if "too narrow" in w]
+    assert "- `pd`: disaggregated, ctx 16 rank(s), attention DP" in journal
+    assert "devices: none claimed here: every deployment starts behind its launch prefix" in journal
+    contract = yaml.safe_load((tmp_path / "ws" / "contract.yaml").read_text())
+    assert [f"{c['deployment']}:{c['gate']}" for c in contract["checks"]] == [
+        "dep16:boot",
+        "dep16:accuracy[gsm8k]",
+        "dep16:accuracy[mmmu]",
+        "dep16:accuracy[aa_lcr]",
+        "pd:boot",
+        "pd:accuracy[gsm8k]",
+        "pd:tests",
+    ]
 
 
-def test_a_first_deployment_without_an_anchor_is_warned_of(tmp_path):
-    spec = _delivered(
-        tmp_path, parallel="tp1", model_key="org/model", agent="claude-test-model", disagg=False
-    )
-    [said] = _warned(tmp_path, spec)
-    assert said.startswith("no accuracy anchor: no reference row for `org/model`")
-    assert "declare `anchor` with its `source`" in said
-    references = tmp_path / "repo" / spec["accuracy"]["reference_yaml"]
-    references.parent.mkdir(parents=True)
-    references.write_text("org/model:\n  - accuracy: 41.77\n", encoding="utf-8")
-    assert _warned(tmp_path, spec) == []
-    # Stated deployments: a declared anchor is one; no benchmark at all is none.
-    native = _native(tmp_path)
-    native["deployments"][0]["benchmarks"] = native["deployments"][0]["benchmarks"][2:]
-    assert _warned(tmp_path, native) == []
-    native["deployments"][0]["benchmarks"] = []
-    [said] = _warned(tmp_path, native)
-    assert said.startswith("no accuracy anchor: `dep16` names no benchmark")
-
-
-def test_a_deployment_scored_without_cuda_graphs_is_warned_of(tmp_path):
-    spec = _delivered(
-        tmp_path, parallel="tp1", model_key="org/model", agent="claude-test-model", disagg=False
-    )
-    spec["variants"]["kv_fp8"]["llm_api_options"]["cuda_graph_config"] = None
-    spec["variants"]["boots"] = {"gates": ["boot"], "runtime": {"cuda_graph": False}}
-    [eager] = [w for w in _warned(tmp_path, spec) if w.startswith("accuracy without CUDA graphs")]
-    # The variant that only boots is scored nowhere, so it is not named.
-    assert "`kv_fp8@tp1` scored with `cuda_graph_config: null`" in eager
-
-
-def test_intake_derive_writes_the_spec_and_prints_its_warnings(tmp_path, capsys):
+def test_intake_derive_writes_native_deployments_and_prints_its_warnings(tmp_path, capsys):
     checkpoint, repo = _dirs(tmp_path)
     (tmp_path / "ckpt" / "config.json").write_text(
         json.dumps({"architectures": ["ToyForCausalLM"], "_name_or_path": "org/toy"})
     )
     out = tmp_path / "out"
-    argv = [
-        "derive",
-        "--checkpoint",
-        checkpoint,
-        "--repo",
-        repo,
-        "--goal",
-        "tp1",
-        "--out",
-        str(out),
-    ]
+    goal = "tp1 dep4 disagg@dep4 kv=bf16/fp8 arch=sm_103 max_batch_size=64"
+    argv = ["derive", "--checkpoint", checkpoint, "--repo", repo, "--goal", goal, "--out", str(out)]
     assert derive.main(argv) == 0
     printed = capsys.readouterr().out
-    assert (out / derive.SPEC_FILENAME).is_file() and (out / derive.REPORT_FILENAME).is_file()
-    assert "warning: no accuracy anchor: no reference row for `org/toy`" in printed
-    assert "open: arch: name the GPU architecture" in printed
+    written = yaml.safe_load((out / derive.SPEC_FILENAME).read_text())
+    assert "parallel" not in written and "members" not in written and "variants" not in written
+    assert [d["name"] for d in written["deployments"]] == ["tp1", "dep4", "disagg", "kv_fp8"]
+    assert written["deployments"][0] == {"name": "tp1", "options": "engines/tp1.yaml"}
+    assert written["deployments"][2]["ctx"] == {"options": "engines/disagg.ctx.yaml"}
+    assert written["deployments"][3]["relative_to"] == "tp1"
+    # The options are the engine's own: the attention-DP share of the batch is in the file.
+    dep4 = yaml.safe_load((out / "engines" / "dep4.yaml").read_text())
+    assert (dep4["tensor_parallel_size"], dep4["max_batch_size"]) == (4, 16)
+    assert (
+        yaml.safe_load((out / "engines" / "kv_fp8.yaml").read_text())["kv_cache_config"]["dtype"]
+        == "fp8"
+    )
+    # What was written loads as it is, and comes to the same deployments.
+    written["environment"]["python"] = "/opt/venv/bin/python"
+    written["agents"] = {"defaults": {"backend": "claude-code", "model": "m"}}
+    (out / derive.SPEC_FILENAME).write_text(yaml.safe_dump(written, sort_keys=False))
+    loaded = load_and_validate_task_yaml(out / derive.SPEC_FILENAME)
+    assert [d.name for d in deployments.resolve(loaded)] == ["tp1", "dep4", "disagg", "kv_fp8"]
+    assert "warning: no accuracy anchor: `tp1` on `gsm8k` has no declared anchor" in printed
     assert derive.main(["--help"]) == 0
     assert derive.main(["lint", "--task", "x.yaml"]) == 2
     said = capsys.readouterr().err
     assert said.count("\n") == 1 and "`intake lint` is replaced by" in said and "--dry-run" in said
     assert derive.main(["other"]) == 2
     assert "usage: trtllm-modeling-v2 intake derive" in capsys.readouterr().err
+    with pytest.raises(derive.DeriveError, match="only disagg takes a member of its own"):
+        derive.parse_goal("mtp@tep4")

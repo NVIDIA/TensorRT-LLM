@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import time
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -73,7 +74,7 @@ def test_a_spec_written_for_compute_sessions_is_refused_with_what_to_do(task_fil
         load_and_validate_task_yaml(task_file)
     said = str(refused.value)
     assert "'environment.spool', 'environment.session_wait'" in said
-    assert "Use `kind: local`" in said and "inside the allocation" in said
+    assert "Start the orchestrator where the GPUs are" in said and "`launch` prefix" in said
 
 
 def test_every_command_scrubs_the_allocations_launcher_environment():
@@ -219,9 +220,21 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
     assert run("--task", str(task_file), "--workspace", str(other), "--dry-run") == 2
     assert "states no model for" in capsys.readouterr().err
 
-    # A spec whose accuracy anchor cannot be read fails preflight: 1, and the journal says why.
+    # A refused spec still says which of its keys were ignored on the way.
+    spec["profile"], spec["feature"] = "smoke", ["mtp"]
+    task_file.write_text(yaml.safe_dump(spec))
+    assert run("--task", str(task_file), "--workspace", str(other), "--dry-run") == 2
+    said = capsys.readouterr().err
+    assert "note: 'profile' is ignored: " in said and "unknown key 'feature'" in said
+    del spec["profile"], spec["feature"]
+
+    # A spec the checkpoint cannot meet fails preflight: 1, and the journal says why.
     spec["agents"] = {"defaults": {"backend": "claude-code", "model": "claude-test-model"}}
-    spec["accuracy"]["model_key"] = "nobody/no-such-model"
+    spec["parallel"] = "tp2"
+    config = Path(spec["checkpoint_path"]) / "config.json"
+    config.write_text(
+        json.dumps({"architectures": ["GptOssForCausalLM"], "num_attention_heads": 3})
+    )
     task_file.write_text(yaml.safe_dump(spec))
     failed = tmp_path / "ws-no-anchor"
     assert run("--task", str(task_file), "--workspace", str(failed), "--dry-run") == 1

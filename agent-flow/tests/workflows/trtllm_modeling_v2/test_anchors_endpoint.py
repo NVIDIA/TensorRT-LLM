@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 
@@ -18,6 +19,7 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import Comma
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
 from agent_flow.workflows.trtllm_modeling_v2.spec import deployments
 from agent_flow.workflows.trtllm_modeling_v2.spec.deployments import Benchmark, Deployment, Server
+from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import TaskSchemaError
 
 from ._helpers import _workflow
 from .test_deployments import _delivered, _load, _native
@@ -91,13 +93,13 @@ def test_anchors_are_frozen_once_and_a_later_start_adds_only_what_is_absent(tmp_
     first = anchors.freeze(workspace, loaded)
     assert {k: (a.kind, a.value) for k, a in first.items()} == {
         "tp1:gsm8k": (anchors.REFERENCE, 41.77),
-        "kv_fp8@tp1:gsm8k": (anchors.RELATIVE, None),
+        "kv_fp8:gsm8k": (anchors.RELATIVE, None),
     }
     # A commit that moves the row, and a spec that asks for more, change nothing frozen.
     _rows(tmp_path, "gsm8k", {"Qwen/Qwen3-0.6B": [{"accuracy": 12.0}]})
     spec["variants"]["chunked"] = {"runtime": {"chunked_prefill": True}, "gates": ["accuracy"]}
     again = anchors.freeze(workspace, _load(tmp_path, spec))
-    assert again["tp1:gsm8k"].value == 41.77 and set(again) == {*first, "chunked@tp1:gsm8k"}
+    assert again["tp1:gsm8k"].value == 41.77 and set(again) == {*first, "chunked:gsm8k"}
     assert anchors.frozen(workspace, "tp1", "gsm8k").value == 41.77
     assert anchors.frozen(None, "tp1", "gsm8k") is None
     assert anchors.differences(workspace, loaded) == [
@@ -106,27 +108,32 @@ def test_anchors_are_frozen_once_and_a_later_start_adds_only_what_is_absent(tmp_
 
 
 def test_a_floor_is_two_standard_errors_and_a_relative_one_allows_for_both_scores():
-    accuracy = {}
     gsm8k = Benchmark(name="gsm8k")
     reference = anchors.Anchor("tp1", "gsm8k", anchors.REFERENCE, 41.77)
-    floor, source = anchors.floor(reference, accuracy, gsm8k)
+    floor, source = anchors.floor(reference, gsm8k)
     se = 100 * math.sqrt(0.4177 * (1 - 0.4177) / 1319)
     assert floor.value == pytest.approx(41.77 - 2 * se) and source == "the gsm8k split size"
     relative = anchors.Anchor("kv", "gsm8k", anchors.RELATIVE, relative_to="tp1")
-    floor, _ = anchors.floor(relative, accuracy, gsm8k, relative_score=41.77)
+    floor, _ = anchors.floor(relative, gsm8k, relative_score=41.77)
     assert floor.value == pytest.approx(41.77 - 2 * math.sqrt(2) * se) and floor.relative
-    assert anchors.floor(relative, accuracy, gsm8k)[0] is None  # its deployment has no score
+    assert anchors.floor(relative, gsm8k)[0] is None  # its deployment has no score
     # The count that sets the error: what the run printed, then --num_samples, then the split.
     subset = Benchmark(name="gsm8k", args=("--num_samples", "200"))
-    assert anchors.floor(reference, accuracy, subset)[0].samples == 200
+    assert anchors.floor(reference, subset)[0].samples == 200
     printed = "Partial scores after 150/150 responses"
-    assert anchors.floor(reference, accuracy, subset, output=printed)[0].samples == 150
+    assert anchors.floor(reference, subset, output=printed)[0].samples == 150
     # A benchmark that reports a fraction is held on its own scale.
     declared = anchors.Anchor("dep16", "aa_lcr", anchors.DECLARED, 0.62)
-    floor, _ = anchors.floor(declared, {"samples": 100}, Benchmark(name="aa_lcr"))
+    floor, _ = anchors.floor(declared, Benchmark(name="aa_lcr", samples=100))
     assert floor.value == pytest.approx(0.62 - 2 * math.sqrt(0.62 * 0.38 / 100))
     none = anchors.Anchor("lone", "mmmu", anchors.NONE)
-    assert anchors.floor(none, accuracy, Benchmark(name="mmmu")) == (None, "no anchor")
+    assert anchors.floor(none, Benchmark(name="mmmu")) == (None, "no anchor")
+    # A benchmark whose size nobody states has no error to hold it to.
+    uncounted = anchors.Anchor("dep16", "aa_lcr", anchors.DECLARED, 0.62)
+    assert anchors.floor(uncounted, Benchmark(name="aa_lcr")) == (
+        None,
+        "no sample count for `aa_lcr`: state its `samples`",
+    )
 
 
 def test_a_run_freezes_its_anchors_and_its_checks_read_the_frozen_copy(
@@ -137,7 +144,7 @@ def test_a_run_freezes_its_anchors_and_its_checks_read_the_frozen_copy(
         assert workflow.run(task_file)
     workspace = tmp_path / "ws"
     assert anchors.frozen(workspace, "tp1", "gsm8k").value == 85.6
-    assert "anchors: 1 frozen" in (workspace / "journal.md").read_text()
+    assert "gsm8k (reference 85.6: " in (workspace / "journal.md").read_text()
     # The tree's row moves; the check is still held to the frozen 85.6.
     (repo / REFERENCES / "gsm8k.yaml").write_text("openai/gpt-oss-120b:\n  - accuracy: 1.0\n")
     held = {}
@@ -148,12 +155,10 @@ def test_a_run_freezes_its_anchors_and_its_checks_read_the_frozen_copy(
 
     monkeypatch.setattr(gate_cli.accuracy_checks, "run_accuracy_gate", gate)
     common = dict(workdir=tmp_path / "w", runner=lambda *a, **k: CommandResult(0, ""))
-    gate_cli.run_check(
-        workflow.task_data, "accuracy[gsm8k]", "core", "tp1", workspace=workspace, **common
-    )
-    assert held["reference"] == 85.6 and held["deployment"].name == "tp1"
-    gate_cli.run_check(workflow.task_data, "accuracy[gsm8k]", "core", "tp1", **common)
-    assert held["reference"] == 1.0  # no workspace: the tree's row, as a bare command reads it
+    gate_cli.run_check(workflow.task_data, "accuracy[gsm8k]", workspace=workspace, **common)
+    assert held["anchor"].value == 85.6 and held["deployment"].name == "tp1"
+    gate_cli.run_check(workflow.task_data, "accuracy[gsm8k]", "core", **common)
+    assert held["anchor"].value == 1.0  # no workspace: the tree's row, as a bare command reads it
 
 
 # ------------------------------------------------------------------ through the endpoint
@@ -186,11 +191,46 @@ def test_a_boot_through_the_endpoint_needs_answers_with_their_keywords(site):
         result.detail
     )
     assert servers.load_owned(workspace) == []  # one load: started, asked, stopped
+    # Every rank of both servers said what it ran, from the tree being measured.
+    assert [(r["role"], r["status"], r["ranks"]) for r in result.engine] == [
+        ("ctx", "match", 1),
+        ("gen", "match", 1),
+    ]
     wrong = BootSpec(prompts=("x",), keywords=("Berlin",))
     result = endpoint.run_endpoint_boot(
         _pd(), task_data=_task(site), workspace=workspace, spec=wrong
     )
     assert not result.passed and "missing 1 expected keyword(s): ['Berlin']" in result.detail
+
+
+def test_a_boot_through_the_endpoint_holds_every_server_to_its_options(site, monkeypatch):
+    workspace = site / "ws"
+    reuse = {"kv_cache_config": {"dtype": "fp8", "enable_block_reuse": True}}
+    quantized = Deployment(name="q", ctx=Server(options=reuse), gen=Server(options=reuse))
+
+    def boot():
+        return endpoint.run_endpoint_boot(quantized, task_data=_task(site), workspace=workspace)
+
+    assert boot().passed
+    # Each server was started in the tree, with the switch on and the hook loaded.
+    started = json.loads((workspace / "deployments/q/address.ctx.started.json").read_text())
+    assert started["env"]["PYTHONPATH"].split(":")[1] == str(site.resolve())
+    assert started["env"]["MV2FLOW_RANK_FACTS"] == "1"
+    written = yaml.safe_load((workspace / "deployments/q/q.ctx.yaml").read_text())
+    assert written == {**reuse, "modeling_v2": "require"}
+    monkeypatch.setenv("FAKE_REUSE", "0")
+    cold = boot()
+    assert not cold.passed and "the engine reused nothing" in cold.detail
+    monkeypatch.delenv("FAKE_REUSE")
+    monkeypatch.setenv("FAKE_DTYPE", "auto")
+    other = boot()
+    assert not other.passed
+    assert "the ctx server did not run what its options declare" in other.detail
+    assert "kv_cache_config.dtype is 'auto', declared 'fp8'" in other.detail
+    monkeypatch.delenv("FAKE_DTYPE")
+    monkeypatch.setenv("FAKE_RANKS", "0")
+    silent = boot()
+    assert not silent.passed and "what the ctx server ran is unknown" in silent.detail
 
 
 def test_a_boot_through_the_endpoint_fails_when_nothing_starts_or_ranks_are_left(
@@ -230,7 +270,7 @@ def test_accuracy_through_the_endpoint_runs_the_trees_evaluator_and_is_held_to_t
     anchor = anchors.Anchor("pd", "gsm8k", anchors.REFERENCE, 41.77)
     result = endpoint.run_endpoint_accuracy(
         pd, pd.benchmarks[0], environment, task_data=_task(site), workspace=workspace,
-        anchor=anchor, runner=runner, member="tp1",
+        anchor=anchor, runner=runner,
     )  # fmt: skip
     # 200 samples: SE 3.49, floor 34.80.
     assert (
@@ -241,7 +281,8 @@ def test_accuracy_through_the_endpoint_runs_the_trees_evaluator_and_is_held_to_t
     assert re.search(
         r"endpoint_eval\.py --url http://127\.0\.0\.1:\d+ --model /ckpt/model", command
     )
-    assert command.endswith("--benchmark gsm8k --num_samples 200")
+    # Offline, with the dataset the host holds, then the benchmark's own options.
+    assert "--benchmark gsm8k --dataset_path " in command and command.endswith("--num_samples 200")
     assert servers.load_owned(workspace) == []
     # Relative: against the other deployment's score, with the error of both.
     relative = anchors.Anchor("pd", "gsm8k", anchors.RELATIVE, relative_to="tp1")
@@ -302,19 +343,17 @@ def test_a_disaggregated_deployments_boot_goes_through_its_endpoint_under_the_lo
         return real(workspace)
 
     monkeypatch.setattr(servers, "engine_lock", lock)
-    result = gate_cli.run_check(
-        spec, "boot", "disagg", "tp2", workdir=site / "w", workspace=site / "ws",
-        runner=lambda *a, **k: CommandResult(0, ""),
-    )  # fmt: skip
+    common = dict(
+        workdir=site / "w", workspace=site / "ws", runner=lambda *a, **k: CommandResult(0, "")
+    )
+    result = gate_cli.run_check(spec, "boot", "disagg", **common)
     assert result.passed, result.detail
-    assert "disaggregated deployment `disagg@tp2` started" in result.detail
+    assert "disaggregated deployment `disagg` started" in result.detail
+    # The verdict says which path judged.
+    assert result.path == gate_cli.THROUGH_ENDPOINT and "[through the endpoint]" in result.summary()
     assert locked == [site / "ws"]
-    started = (site / "ws" / "deployments" / "disagg@tp2" / "address.ctx.started.json").read_text()
+    started = (site / "ws" / "deployments" / "disagg" / "address.ctx.started.json").read_text()
     assert '"--server_role", "context"' in started
-    # Its accuracy names the benchmark; one the tree has not driven through an endpoint is
-    # reported, with no load.
-    result = gate_cli.run_check(
-        spec, "accuracy[mmmu]", "disagg", "tp2", workdir=site / "w", workspace=site / "ws",
-        runner=lambda *a, **k: CommandResult(0, ""),
-    )  # fmt: skip
-    assert not result.passed and result.detail.startswith("not judged through the hop")
+    # A benchmark the deployment is not scored on is a usage error, with no load.
+    with pytest.raises(TaskSchemaError, match="`disagg` is not scored on `mmmu`"):
+        gate_cli.run_check(spec, "accuracy[mmmu]", "disagg", **common)

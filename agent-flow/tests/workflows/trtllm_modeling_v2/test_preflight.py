@@ -11,12 +11,10 @@ import subprocess
 import sys
 import warnings
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
-from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
 from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
@@ -26,7 +24,6 @@ from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
     parse_inventory,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
-from agent_flow.workflows.trtllm_modeling_v2.run.startup.preflight import PreflightError
 
 
 def _smi_rows(*rows: str) -> str:
@@ -91,51 +88,43 @@ def test_run_preflight_resolves_identity(tmp_path):
     assert result.checkpoint_config["architectures"] == ["Qwen3MoeForCausalLM"]
 
 
-def test_a_relative_variant_needs_its_units_benchmark_and_disagg_one_node(tmp_path):
-    fp8 = {"llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}, "members": ["dep4"]}
-    task = _task(
-        tmp_path,
+def test_preflight_claims_the_devices_the_widest_deployment_on_this_host_takes(tmp_path):
+    """A disaggregated deployment starts two engines; one behind a launch prefix places its own."""
+
+    def claimed(**spec):
+        result = preflight.run_preflight(_task(tmp_path, **spec), claim=False)
+        return result.devices, result.world_size, result.notes
+
+    assert claimed(parallel="unified", members=["tp1", "tep2"])[:2] == ((0, 1), 2)
+    devices, world, notes = claimed(
         parallel="unified",
-        members=["tp4", "dep4"],
-        accuracy={"benchmark": "gsm8k", "reference_yaml": "x.yaml", "benchmark_members": "tp4"},
-        variants={"kv_fp8": {**fp8, "gates": ["accuracy"]}},
+        members={"default": ["tp1", "tep2"], "disagg": ["tep2"]},
+        features=["disagg"],
     )
-    with pytest.raises(PreflightError, match="`core`'s benchmark at none of dep4"):
-        preflight.check_variant_anchors(task, 4)
-    del task["accuracy"]["benchmark_members"]
-    assert "relative, core's own score at dep4" in preflight.check_variant_anchors(task, 4)[0]
-    task["features"] = ["disagg"]
-    task["environment"]["gpus_per_node"] = 4
-    task["accuracy"]["disagg"] = {"test": "tests/test_d.py::TestM::test_auto_dtype", "devices": 8}
-    with pytest.raises(PreflightError, match="more than the 4 devices one node holds"):
-        preflight.check_disagg_placement(task)
+    assert (devices, world) == ((0, 1, 2, 3), 2)
+    assert any(
+        "4 claimed, not 2: a disaggregated deployment starts two engines" in n for n in notes
+    )
+    stated = [{"name": "dep16", "options": {"tensor_parallel_size": 16}, "launch": "srun -N4"}]
+    devices, world, notes = claimed(parallel=None, deployments=stated)
+    assert (devices, world) == ((), 1)
+    assert any("every deployment starts behind its launch prefix" in n for n in notes)
 
 
-def test_preflight_claims_the_devices_the_widest_check_takes(tmp_path):
-    """The disaggregated test starts two engines: more devices than the widest member."""
-    task = _task(tmp_path, parallel="unified", members=["tp1", "tep2"])
-    assert preflight.devices_needed(task, 2) == 2
-    task["features"] = ["disagg"]
-    task["accuracy"] = {"disagg": {"test": "tests/test_d.py::TestM::test_auto_dtype"}}
-    assert preflight.devices_needed(task, 2) == 4  # two engines at tep2
-    task["accuracy"]["disagg"]["devices"] = 3
-    assert preflight.devices_needed(task, 2) == 3  # as declared
-    task["environment"]["gpus_per_node"] = 2
-    del task["accuracy"]["disagg"]["devices"]
-    assert preflight.devices_needed(task, 2) == 2  # never more than the host holds
-
-
-def _fake_boot(fails: dict[str, str], booted: list):
-    """A boot gate that fails the members named in ``fails`` with their detail."""
-
-    def run_boot_gate(environment, *, member=None, **_):
-        booted.append(member)
-        detail = fails.get(member)
-        return GateResult(
-            name="boot[off]", member=member, passed=detail is None, detail=detail or "generated"
-        )
-
-    return run_boot_gate
+def test_a_spec_the_checkpoint_cannot_meet_is_refused_with_every_reason(tmp_path):
+    task = _task(tmp_path, parallel="unified", members=["tp1", "tp4", "tep4", "dep4"])
+    task["features"] = ["mtp", "multimodal"]
+    config = {"architectures": ["X"], "num_attention_heads": 6, "num_experts": 6}
+    (tmp_path / "ckpt" / "config.json").write_text(json.dumps(config))
+    with pytest.raises(preflight.SpecInconsistencyError) as refused:
+        preflight.run_preflight(task, claim=False)
+    said = str(refused.value)
+    assert "tp4: 6 attention heads do not split 4 ways" in said
+    assert "tep4: 6 experts do not split 4 ways" in said
+    # Attention DP replicates attention: only its experts are split.
+    assert "dep4: 6 experts do not split 4 ways" in said and "dep4: 6 attention heads" not in said
+    assert "mtp: it drafts with MTP, and config.json states no draft layers" in said
+    assert "multimodal: it takes images, and the checkpoint has no tower" in said
 
 
 def test_multirank_probe_launches_the_run_interpreter_on_claimed_devices():
@@ -161,31 +150,24 @@ def _files(path: Path) -> Path:
     return path
 
 
-def test_a_missing_dataset_is_downloaded_into_the_workspace(tmp_path):
-    asked = []
-
-    def run(argv, **kwargs):
-        asked.append(argv[-2:])
-        _files(Path(argv[-1]))
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    entry = datasets.stage({"accuracy": {}}, tmp_path / "ws", "gsm8k", python="/py", run=run)
-    assert entry["state"] == "ready" and entry["source"] == "downloaded openai/gsm8k"
-    assert asked == [["openai/gsm8k", str(tmp_path / "ws/datasets/openai/gsm8k")]]
-
-
-def test_the_tree_tests_read_a_models_root_that_holds_the_staged_copy(tmp_path):
-    root = tmp_path / "models"
-    (root / "stepfun").mkdir(parents=True)
-    (root / "datasets" / "mmlu").mkdir(parents=True)
-    staged = _files(tmp_path / "ws" / "datasets" / "openai" / "gsm8k")
-    overlay = Path(datasets.models_root(tmp_path / "ws", str(root), "gsm8k", str(staged)))
-    assert overlay != root
-    assert (overlay / "stepfun").resolve() == (root / "stepfun").resolve()
-    assert (overlay / "datasets" / "mmlu").resolve() == (root / "datasets" / "mmlu").resolve()
-    assert (overlay / "datasets/openai/gsm8k/main").is_dir()
-    # A root that holds it already is used as it is.
-    assert datasets.models_root(tmp_path / "ws", str(overlay), "gsm8k", str(staged)) == str(overlay)
+def test_a_dataset_is_found_where_it_is_on_this_host_and_never_downloaded(tmp_path, monkeypatch):
+    monkeypatch.delenv("LLM_MODELS_ROOT")
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    # Nowhere: a host problem, said before a load is spent, with where to put it.
+    path, said = datasets.find("gsm8k")
+    assert path == "" and "is not on this host, and accuracy runs offline" in said
+    assert "$LLM_MODELS_ROOT/datasets/openai/gsm8k" in said
+    # A benchmark this module does not know is the evaluator's to look up.
+    assert datasets.find("mmlu") == ("", "")
+    # The HuggingFace cache, then the models root over it, then a stated path over both.
+    cached = _files(tmp_path / "hf/hub/datasets--openai--gsm8k/snapshots/abc123")
+    assert datasets.find("gsm8k") == (str(cached), "the HuggingFace cache")
+    rooted = _files(tmp_path / "models/datasets/openai/gsm8k")
+    env = {"LLM_MODELS_ROOT": str(tmp_path / "models")}
+    assert datasets.find("gsm8k", env=env) == (str(rooted), "the models root")
+    stated = _files(tmp_path / "mine")
+    assert datasets.find("gsm8k", str(stated), env)[0] == str(stated)
+    assert "does not exist on this host" in datasets.find("gsm8k", str(tmp_path / "gone"), env)[1]
 
 
 def _entry_source(impl, archs):

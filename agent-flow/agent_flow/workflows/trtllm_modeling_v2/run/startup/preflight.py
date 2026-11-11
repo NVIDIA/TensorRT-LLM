@@ -18,7 +18,6 @@ and the first failure ends the run before the branch exists.
 
 from __future__ import annotations
 
-import ast
 import json
 import os
 import re
@@ -27,43 +26,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-import yaml
-
-from ...checks import accuracy as accuracy_checks
-from ...checks import check_config
-from ...checks import disagg as disagg_checks
-from ...checks.check_config import speculation_flags
 from ...infra.compute import environment as environment_mod
 from ...infra.compute.commands import CommandResult, CommandSpec, LocalCommandExecutor
 from ...infra.compute.environment import RunEnvironment, resolve_environment
-from ...infra.git import git_output
 from ...operators.coverage import MODELING_V2_PACKAGE
-from ...spec import shorthand
-from ...spec.derive import hybrid_marker
-from ...spec.shorthand import resolve_llm_api_options
+from ...spec import deployments as deployments_mod
+from ...spec.derive import draft_layers, hybrid_marker, read_config
 from ...spec.task_schema import (
-    assembly_units,
+    DEFAULT_PARALLEL,
     derive_checkpoint_segment,
     derive_family,
     derive_slug,
-    features_through,
-    members_for,
-    parse_parallel_segment,
-    resolve_per_unit,
     routed_family,
-    widest_world_size,
 )
-from ...spec.variants import ANCHOR_RELATIVE, anchor_state, base_unit, variant_gates
-from ...spec.variants import variants as variants_of
-from .. import contract as contract_mod
 
 # A device is claimable when it is this close to empty. Not 100%: a healthy
 # idle card still shows a little in use (ECC tables, the driver's own context).
 MIN_FREE_MEMORY_FRACTION = 0.90
-
-# What a `unified` segment claims when neither it nor its members say: the
-# world size of the baseline TEP/DEP pair.
-DEFAULT_UNIFIED_WORLD_SIZE = 4
 
 # Above this, treat the card as broken rather than busy.
 MAX_UTILIZATION_PCT = 10
@@ -145,14 +124,6 @@ class SpecInconsistencyError(PreflightError):
 
     Direct the operator to the spec or tree; infrastructure diagnostics do not apply.
     """
-
-
-class UnsupportedSpeculationError(SpecInconsistencyError):
-    """A gate would ask a launch path for a speculation algorithm it has no branch for."""
-
-
-class CaptureListMismatchError(SpecInconsistencyError):
-    """A unit's launch paths would capture different decode CUDA-graph batch lists."""
 
 
 #: The one process-wide local executor for probes. Stateless.
@@ -289,16 +260,13 @@ def check_checkpoint(checkpoint_path: str | Path) -> dict[str, Any]:
     return data
 
 
-def check_checkpoint_fit(task_data: Mapping[str, Any], world_size: int) -> None:
+def check_checkpoint_fit(task_data: Mapping[str, Any]) -> None:
     """Refuse a spec the checkpoint cannot meet, every reason at once, from ``config.json`` alone.
 
-    The members split its attention heads, KV heads and experts; the
-    architecture runs its weight format; a speculative unit has the draft
-    layers it needs, spelled as the checkpoint ships them; a multimodal unit
-    has a tower.
+    Each server's ranks split the checkpoint's attention heads, KV heads and experts; the
+    architecture runs its weight format; a deployment that drafts has the draft layers it
+    needs, spelled as the checkpoint ships them; one that takes images has a tower.
     """
-    from ...spec.derive import draft_layers, read_config
-
     config = read_config(task_data["checkpoint_path"]) or {}
     heads = config.get("num_attention_heads")
     kv_heads = config.get("num_key_value_heads") or heads
@@ -307,337 +275,42 @@ def check_checkpoint_fit(task_data: Mapping[str, Any], world_size: int) -> None:
         or config.get("n_routed_experts")
         or config.get("num_local_experts")
     )
+    dspark = any(str(key).startswith("dspark") for key in config)
     problems = []
-    members = {
-        m for unit in assembly_units(task_data) for m in members_for(task_data, unit, world_size)
-    }
-    for member in sorted(members):
-        kind, world = parse_parallel_segment(member)
-        if not world:
-            continue
-        # Attention DP replicates attention; tp and tep split its heads.
-        if kind in ("tp", "tep") and heads and heads % world:
-            problems.append(f"{member}: {heads} attention heads do not split {world} ways")
-        if kind in ("tp", "tep") and kv_heads and kv_heads % world and world % kv_heads:
-            problems.append(f"{member}: {kv_heads} KV heads do not split {world} ways")
-        if kind in ("tep", "dep") and experts and experts % world:
-            problems.append(f"{member}: {experts} experts do not split {world} ways")
+    for deployment in deployments_mod.resolve(task_data):
+        for role, server in deployment.servers.items():
+            who = deployment.name if role == "server" else f"{deployment.name}.{role}"
+            options = server.options
+            ranks = server.ranks
+            split = int(options.get("moe_expert_parallel_size") or 1)
+            # Attention DP replicates attention; without it the ranks split its heads.
+            if ranks > 1 and not options.get("enable_attention_dp"):
+                if heads and heads % ranks:
+                    problems.append(f"{who}: {heads} attention heads do not split {ranks} ways")
+                if kv_heads and kv_heads % ranks and ranks % kv_heads:
+                    problems.append(f"{who}: {kv_heads} KV heads do not split {ranks} ways")
+            if split > 1 and experts and experts % split:
+                problems.append(f"{who}: {experts} experts do not split {split} ways")
+            drafter = str((options.get("speculative_config") or {}).get("decoding_type") or "")
+            if drafter.lower() == "mtp" and dspark:
+                problems.append(
+                    f"{who}: the checkpoint's draft stages are a DSpark drafter (dspark_* "
+                    f"keys): its decoding type is DSpark, not MTP"
+                )
+            if drafter.lower() in ("mtp", "dspark") and not draft_layers(config):
+                problems.append(
+                    f"{who}: it drafts with {drafter}, and config.json states no draft layers"
+                )
+        if "image" in deployment.inputs and not {"vision_config", "audio_config"} & set(config):
+            problems.append(f"{deployment.name}: it takes images, and the checkpoint has no tower")
     arch = re.match(r"^sm_(\d+)$", str(task_data.get("arch", "")))
     algo = str((config.get("quantization_config") or {}).get("quant_algo") or "").lower()
     if arch and "fp4" in algo and int(arch.group(1)) < 100:
         problems.append(f"the checkpoint's {algo} weights need sm_100 or later")
-    features = [str(f) for f in task_data.get("features") or ()]
-    dspark = any(str(key).startswith("dspark") for key in config)
-    if "mtp" in features and dspark:
-        problems.append(
-            "the checkpoint's draft stages are a DSpark drafter (dspark_* keys): build dspark, not mtp"
-        )
-    if {"mtp", "dspark"} & set(features) and not draft_layers(config):
-        problems.append("a speculative unit asks for draft layers, and config.json states none")
-    if "multimodal" in features and not {"vision_config", "audio_config"} & set(config):
-        problems.append("multimodal is built, and the checkpoint has no vision or audio tower")
     if problems:
         raise SpecInconsistencyError(
-            "the checkpoint cannot meet the spec:\n  - " + "\n  - ".join(problems)
+            "the checkpoint cannot meet the spec:\n  - " + "\n  - ".join(dict.fromkeys(problems))
         )
-
-
-def check_launch_settings(task_data: Mapping[str, Any]) -> list[str]:
-    """Each unit's runtime flags and options file agree on every setting both state.
-
-    Two values for one setting would measure two engines under one verdict, so
-    they are refused here, every disagreement at once. Returns notes.
-    """
-    problems: list[str] = []
-    notes: list[str] = []
-    for unit in assembly_units(task_data):
-        try:
-            problems.extend(
-                f"[{unit}] {line}" for line in shorthand.launch_conflicts(task_data, unit)
-            )
-        except ValueError as exc:
-            raise PreflightError(f"[{unit}] {exc}") from exc
-    if shorthand.checkpoint_remote_code(task_data.get("checkpoint_path")):
-        notes.append(
-            "launch: the checkpoint ships its own code (`auto_map`), so every launcher "
-            "trusts it (`--trust_remote_code`, `trust_remote_code: true`)"
-        )
-    if problems:
-        raise PreflightError(
-            "the runtime flags and the options file state different values for one setting, "
-            "so the shared check configuration is ambiguous:\n  "
-            + "\n  ".join(problems)
-            + "\nState each setting once, in either place: it reaches every launcher."
-        )
-    return notes
-
-
-#: An anchor at or under this is a fraction or a placeholder: anchors are in percent.
-PLACEHOLDER_ANCHOR_MAX = 1.0
-
-
-def check_accuracy_anchors(
-    task_data: Mapping[str, Any],
-    units: Sequence[str] | None = None,
-) -> list[str]:
-    """Assert every unit's anchor ROW resolves, before any unit is built.
-
-    The lookup is :func:`~.accuracy.resolve_reference`, the accuracy gate's own,
-    so this check fails exactly when the gate would. Skipped rather than
-    failed: a run with no ``accuracy`` block, a unit whose block names no
-    reference file, and a reference file that is not in this checkout (a
-    note records the weaker claim). Returns notes: every resolved anchor with
-    the number it found.
-    """
-    accuracy = dict(task_data.get("accuracy") or {})
-    if not accuracy:
-        return []
-
-    notes: list[str] = []
-    for unit in units if units is not None else assembly_units(task_data):
-        declared = str(resolve_per_unit(accuracy, "reference_yaml", unit) or "").strip()
-        if not declared:
-            notes.append(
-                f"accuracy anchor [{unit}]: no reference_yaml for this unit, so there "
-                f"is no row to check"
-            )
-            continue
-        benchmark = str(resolve_per_unit(accuracy, "benchmark", unit) or "").strip()
-        model_key = accuracy_checks.resolve_model_key(task_data, unit)
-        # Resolved once and passed in, so the message and the lookup cannot
-        # disagree about which row was searched for.
-        wanted = accuracy_checks.resolve_discriminators(accuracy, unit)
-        try:
-            score = accuracy_checks.resolve_reference(
-                task_data, model_key=model_key, discriminators=wanted, unit=unit
-            )
-        except FileNotFoundError as exc:
-            notes.append(
-                f"accuracy anchor [{unit}]: {exc}; the row is unchecked here, and if "
-                f"it is still absent at gate time the unit dies there"
-            )
-            continue
-        except (KeyError, TypeError, ValueError) as exc:
-            # `KeyError.__str__` is `repr` of its argument, which folds the
-            # multi-clause message into one escaped line: surface it as written.
-            detail = str(exc.args[0]) if isinstance(exc, KeyError) and exc.args else str(exc)
-            raise PreflightError(
-                f"accuracy anchor for unit `{unit}` does not resolve, so the gate that "
-                f"ENDS this unit cannot run.\n\n"
-                f"  unit:           {unit}\n"
-                f"  benchmark:      {benchmark or '(unset)'}\n"
-                f"  reference_yaml: {declared}\n"
-                f"  model_key:      {model_key}\n"
-                f"  discriminators: {dict(wanted) if wanted else '{}'}\n\n"
-                f"  {detail}\n\n"
-                f"Nothing here is about the target — no target exists yet. Add the row "
-                f"to the reference file, citing the written source the number came from "
-                f"(an anchor is never invented), or fix `accuracy.model_key` / "
-                f"`accuracy.discriminators` for this unit. Left alone, this unit would "
-                f"assemble, boot on every member and die at its accuracy gate hours "
-                f"from now, on this."
-            ) from exc
-        if score <= PLACEHOLDER_ANCHOR_MAX:
-            raise PreflightError(
-                f"accuracy anchor for unit `{unit}` is {score:g} ({declared}: {model_key}). "
-                f"Anchors are recorded in percent, so this reads as a fraction. Record the "
-                f"score in percent from a written source, or a low placeholder in percent "
-                f"(e.g. 10 for GSM8K: it catches an engine that answers nothing) until a "
-                f"measured one replaces it."
-            )
-        uncommitted = _uncommitted(task_data, declared)
-        if uncommitted:
-            raise PreflightError(
-                f"accuracy anchor for unit `{unit}`: the checkout holds {uncommitted} "
-                f"uncommitted. The certification reads the anchor table from the commit it "
-                f"measures and refuses a checkout with uncommitted changes: commit it."
-            )
-        notes.append(
-            f"accuracy anchor [{unit}]: {benchmark or 'eval'} {model_key} "
-            f"{dict(wanted) if wanted else '{}'} = {score:g} ({declared})"
-        )
-    return notes
-
-
-def _uncommitted(task_data: Mapping[str, Any], declared: str) -> str:
-    """``declared`` (an anchor table) as the checkout's git holds it uncommitted; "" otherwise."""
-    repo = Path(str(task_data.get("trtllm_repo_path") or ""))
-    path = Path(declared) if Path(declared).is_absolute() else repo / declared
-    try:
-        rel = path.resolve().relative_to(repo.resolve())
-    except (OSError, ValueError):
-        return ""  # outside the checkout: no commit holds it
-    dirt = git_output(repo, "status", "--porcelain", "--untracked-files=all", "--", str(rel))
-    return str(rel) if dirt and dirt.strip() else ""
-
-
-def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list[str]:
-    """Every configuration variant with an accuracy gate has an anchor its gate can read.
-
-    A variant that names a row of its own looks it up under the variant's name,
-    with its own ``accuracy`` overlay (``spec/shorthand.variant_spec``). A
-    relative one (``spec.variants.anchor_state``) is judged against its unit's
-    benchmark at the same member, which the contract must owe.
-    """
-    notes: list[str] = []
-    contract = None
-    for name in variants_of(task_data):
-        if "accuracy" not in variant_gates(task_data, name):
-            continue
-        if anchor_state(task_data, name) == ANCHOR_RELATIVE:
-            contract = contract or contract_mod.compile_contract(task_data, world_size)
-            own = [c for c in contract.checks if c.unit == name and c.gate.startswith("accuracy[")]
-            owed = {c.key for c in contract.checks}
-            base = base_unit(task_data, name)
-            alone = [c.member for c in own if f"{base}:{c.gate}@{c.member}" not in owed]
-            if alone:
-                raise PreflightError(
-                    f"configuration variant `{name}` is judged against its unit's own score "
-                    f"(its anchor is relative), but the contract measures "
-                    f"`{base_unit(task_data, name)}`'s benchmark at none of {', '.join(alone)}: "
-                    f"run the variant's benchmark where its unit's runs (its `members`), or give "
-                    f"it a reference row of its own (`accuracy: {{anchor: recorded, "
-                    f"discriminators: ...}}`)."
-                )
-            notes.append(
-                f"accuracy anchor [{name}]: relative, {base_unit(task_data, name)}'s own score "
-                f"at {', '.join(c.member for c in own) or 'its member'}"
-            )
-            continue
-        spec = shorthand.variant_spec(task_data, name, world_size=world_size)
-        notes.extend(check_accuracy_anchors(spec, [name]))
-    return notes
-
-
-def devices_needed(task_data: Mapping[str, Any], world_size: int) -> int:
-    """The most devices one check of the run takes: the widest member's, or the disaggregated test's.
-
-    Every check runs on this host, on the devices preflight claims. The
-    disaggregated-serving test starts two engines (``DisaggSpec.device_count``),
-    so it can take more than the widest member.
-    """
-    spec = disagg_checks.DisaggSpec.from_task(task_data)
-    if spec is None or disagg_checks.GATE_NAME not in assembly_units(task_data):
-        return world_size
-    members = members_for(task_data, disagg_checks.GATE_NAME, world_size)
-    return max([world_size, *(spec.device_count(member) or 0 for member in members)])
-
-
-def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
-    """The native test's per-node device request fits the allocation geometry."""
-    spec = disagg_checks.DisaggSpec.from_task(task_data)
-    if spec is None:
-        return []
-    if spec.nodes > 1:
-        raise PreflightError(
-            f"accuracy.disagg.nodes is {spec.nodes}: the workflow runs every check on the "
-            "orchestrator's own host, one node. Write the disaggregated test for one node "
-            "(its context and generation engines on that node's devices)."
-        )
-    if not spec.devices or not spec.node_gpus:
-        return []
-    if spec.devices > spec.node_gpus:
-        raise PreflightError(
-            f"accuracy.disagg.devices is {spec.devices}, more than the {spec.node_gpus} devices "
-            f"one node holds: the tree's disaggregated launcher starts every worker on one "
-            f"host, so the test runs on one node. Write it for {spec.node_gpus} devices or fewer "
-            f"(its context and generation workers between them) and set `devices` to match."
-        )
-    return [
-        f"disagg: the test {spec.test} runs on {spec.devices} devices per node across {spec.nodes} node(s)"
-    ]
-
-
-#: Public LLM configuration schema, read without importing the GPU runtime.
-LLM_ARGS_REL = "tensorrt_llm/llmapi/llm_args.py"
-_SPECULATIVE_UNION = "SpeculativeConfig"
-
-
-def llm_api_decoding_types(path: Path | str) -> set[str] | None:
-    """The ``speculative_config.decoding_type`` values the LLM API accepts.
-
-    The ``decoding_type`` literals of the classes in ``SpeculativeConfig``'s
-    union; every decoding config's literal when the union cannot be found.
-    None when the file is absent or does not parse.
-    """
-    try:
-        tree = ast.parse(Path(path).read_text(encoding="utf-8"))
-    except (OSError, SyntaxError):
-        return None
-    literals: dict[str, str] = {}
-    members: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if (
-                    isinstance(item, ast.AnnAssign)
-                    and isinstance(item.target, ast.Name)
-                    and item.target.id == "decoding_type"
-                    and isinstance(item.annotation, ast.Subscript)
-                ):
-                    value = item.annotation.slice
-                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                        literals[node.name] = value.value
-        target = None
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            target, value = node.target.id, node.value
-        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
-            first = node.targets[0]
-            target, value = (first.id if isinstance(first, ast.Name) else None), node.value
-        if target == _SPECULATIVE_UNION and value is not None:
-            members = {n.id for n in ast.walk(value) if isinstance(n, ast.Name)}
-    if members:
-        return {literal for name, literal in literals.items() if name in members}
-    return set(literals.values())
-
-
-def check_speculation_support(task_data: Mapping[str, Any]) -> list[str]:
-    """Every requested speculation type is accepted by the public LLM config union."""
-    repo = Path(str(task_data.get("trtllm_repo_path") or "."))
-    asked: set[str] = set()
-    for unit in assembly_units(task_data):
-        for flag in speculation_flags(features_through(task_data, unit)):
-            if flag.startswith("--spec_decode_algo="):
-                asked.add(flag.split("=", 1)[1])
-        path = resolve_llm_api_options(task_data.get("accuracy") or {}, unit)
-        loaded = shorthand.load_llm_api_options(path)
-        config = loaded.get("speculative_config") or {}
-        if config.get("decoding_type"):
-            asked.add(str(config["decoding_type"]))
-    if not asked:
-        return []
-    accepted = llm_api_decoding_types(repo / LLM_ARGS_REL)
-    if accepted is None:
-        return [
-            f"speculation: public LLM schema {repo / LLM_ARGS_REL} unavailable; support UNKNOWN until construction"
-        ]
-    missing = sorted(a for a in asked if a.lower() not in {v.lower() for v in accepted})
-    if missing:
-        raise UnsupportedSpeculationError(
-            f"public LLM speculative_config does not support {', '.join(missing)}; "
-            f"{repo / LLM_ARGS_REL} accepts {', '.join(sorted(accepted))}"
-        )
-    return [f"speculation: {', '.join(sorted(asked))} supported by public LLM configuration"]
-
-
-_LLM_API_GATE = "accuracy (trtllm-eval)"
-
-
-def check_capture_lists(task_data: Mapping[str, Any]) -> list[str]:
-    """Validate one shared graph configuration and report its planning preview."""
-    try:
-        captures = check_config.launch_captures(task_data)
-    except ValueError as exc:
-        raise CaptureListMismatchError(
-            f"CUDA-graph configuration cannot be resolved: {exc}"
-        ) from exc
-    except yaml.YAMLError as exc:
-        return [f"cuda graphs: an options file does not parse ({exc}); capture lists unchecked"]
-    return [
-        f"cuda graphs: {c.name}: {c.resolved.describe() if c.resolved else 'eager'}, "
-        "at boot and accuracy alike (preview, not actual capture evidence)"
-        for c in captures
-    ]
 
 
 #: Where a process's memory limit is, under cgroup v2 and v1.
@@ -705,37 +378,27 @@ def memory_limit_and_free() -> tuple[int | None, int | None]:
 def check_kv_cache_configs(
     task_data: Mapping[str, Any], checkpoint_config: Mapping[str, Any]
 ) -> list[str]:
-    """The shared requested KV-cache configuration and possible hybrid reuse loss.
+    """What each deployment's ``kv_cache_config`` will cost on this host, as notes.
 
-    A note states the resolved ``kv_cache_config`` keys every check takes.
-    A unit (or configuration variant) that asks for block reuse
-    with options that set no Mamba state snapshot policy, on a checkpoint
-    :func:`hybrid_marker` marks hybrid, gets a note: the engine turns block
-    reuse off in every gate it runs. A note rather than a refusal, because the
-    marker is read from ``config.json`` while the engine's own test decides.
+    A server that bounds no KV host tier, on a host whose cgroup allows less memory than
+    the node has free, pins that much host memory in every engine. A server that asks for
+    block reuse with no Mamba state snapshot policy, on a checkpoint :func:`hybrid_marker`
+    marks hybrid, has reuse turned off by the engine. Notes rather than refusals: the
+    engine's own test decides, and its boot shows it.
     """
-    try:
-        launches = check_config.launch_kv_caches(task_data)
-    except yaml.YAMLError as exc:
-        return [
-            f"kv cache: an options file does not parse ({exc}); KV-cache configuration unchecked"
-        ]
-
-    def label(launch: check_config.LaunchKvCache) -> str:
-        return launch.name if launch.name == launch.unit else f"{launch.name} ({launch.unit})"
-
+    unbounded: list[str] = []
+    exposed: list[str] = []
+    for deployment in deployments_mod.resolve(task_data):
+        for role, server in deployment.servers.items():
+            who = deployment.name if role == "server" else f"{deployment.name}.{role}"
+            kv = server.options.get("kv_cache_config") or {}
+            if "host_cache_size" not in kv:
+                unbounded.append(who)
+            state = kv.get("mamba_state_config") or {}
+            snapshots = kv.get("mamba_state_cache_interval") or any(state.values())
+            if kv.get("enable_block_reuse") and not snapshots:
+                exposed.append(who)
     notes: list[str] = []
-    handed: dict[str, list[str]] = {}
-    for launch in launches:
-        if launch.config:
-            described = json.dumps(dict(launch.config), sort_keys=True)
-            handed.setdefault(described, []).append(label(launch))
-    for described, labels in handed.items():
-        notes.append(
-            f"kv cache: {', '.join(labels)}: boot and {_LLM_API_GATE} use "
-            f"`kv_cache_config` {described}"
-        )
-    unbounded = [label(launch) for launch in launches if "host_cache_size" not in launch.config]
     limit, free = memory_limit_and_free()
     if unbounded and limit is not None and free is not None and limit < free:
         notes.append(
@@ -747,16 +410,14 @@ def check_kv_cache_configs(
             f"Set `host_cache_size` (bytes, e.g. 8589934592) in the options."
         )
     marker = hybrid_marker(checkpoint_config)
-    exposed = [label(launch) for launch in launches if launch.reuse and not launch.snapshots]
     if marker and exposed:
         notes.append(
             f"block reuse: {', '.join(exposed)}: ask for KV-cache block reuse, and their "
             f"options set no Mamba state snapshot policy, on a hybrid checkpoint "
-            f"({marker} in config.json). The engine turns block reuse off without one, so it "
-            f"will be off in every gate they run, and the boot and accuracy "
-            f"gates fail on the engine's warning. Set "
+            f"({marker} in config.json). The engine turns block reuse off without one, and "
+            f"their boot then fails on a repeated prompt that resumes nothing. Set "
             f"`kv_cache_config.mamba_state_config.periodic_snapshot_interval` (or snapshot "
-            f"offsets) in their options file, or turn `kv_cache_reuse` off for them"
+            f"offsets) in their options, or turn block reuse off for them"
         )
     return notes
 
@@ -788,14 +449,14 @@ def check_processor_dependencies(
     shell_runner: Any,
     timeout: int = PROCESSOR_PROBE_TIMEOUT_S,
 ) -> list[str]:
-    """Load the checkpoint's processor with the run's interpreter when a unit is multimodal.
+    """Load the checkpoint's processor with the run's interpreter when a deployment takes images.
 
     A module the processor imports and the environment lacks is an
     infrastructure error, raised here with the module's name. Any other
     failure is returned as a note: the target may supply what the stock
     processor cannot.
     """
-    if "multimodal" not in assembly_units(task_data):
+    if not any("image" in d.inputs for d in deployments_mod.resolve(task_data)):
         return []
     checkpoint = str(task_data["checkpoint_path"])
     command = environment.python_command(
@@ -897,28 +558,14 @@ def run_preflight(
     checkpoint_config = check_checkpoint(task_data["checkpoint_path"])
 
     arch = str(task_data["arch"])
-    segment = str(task_data["parallel"])
-    kind, declared_world_size = parse_parallel_segment(segment)
-    world_size = declared_world_size
-    if world_size is None:
-        # `unified` takes its world size from the MEMBER SET: the widest member,
-        # the most devices one gate asks for.
-        world_size = widest_world_size(task_data, DEFAULT_UNIFIED_WORLD_SIZE)
-        declared_members = members_for(task_data, None, world_size)
-        notes.append(
-            f"unified segment: world size {world_size}, the widest of the member set "
-            f"({', '.join(declared_members)})"
-        )
+    found = deployments_mod.resolve(task_data)
+    # What runs on this host: a deployment behind a launch prefix places its own ranks.
+    here = [d for d in found if not d.prefixed]
+    world_size = max((s.ranks for d in here for s in d.servers.values()), default=1)
+    need = max((d.ranks for d in here), default=0)
 
     # The checks that only read files run before anything that touches the host.
-    units = assembly_units(task_data)
-    check_checkpoint_fit(task_data, world_size)
-    notes.extend(check_accuracy_anchors(task_data, units))
-    notes.extend(check_variant_anchors(task_data, world_size))
-    notes.extend(check_launch_settings(task_data))
-    notes.extend(check_disagg_placement(task_data))
-    notes.extend(check_speculation_support(task_data))
-    notes.extend(check_capture_lists(task_data))
+    check_checkpoint_fit(task_data)
     notes.extend(check_kv_cache_configs(task_data, checkpoint_config))
 
     env_block = dict(task_data.get("environment") or {})
@@ -929,15 +576,17 @@ def run_preflight(
         raise PreflightError(str(exc)) from exc
 
     python = str(env_block.get("python", "python3"))
-    # The orchestrator and the GPUs are the same machine: the devices are claimed here, as
-    # many as the widest check takes.
-    need = devices_needed(task_data, world_size)
+    # The orchestrator and the GPUs are the same machine for what has no launch prefix: the
+    # devices are claimed here, as many as the widest such deployment takes.
     if need > world_size:
         notes.append(
-            f"devices: {need} claimed, not {world_size}: the disaggregated-serving test starts "
+            f"devices: {need} claimed, not {world_size}: a disaggregated deployment starts "
             "two engines"
         )
-    if claim:
+    if not need:
+        devices = ()
+        notes.append("devices: none claimed here: every deployment starts behind its launch prefix")
+    elif claim:
         devices = claim_devices(need, arch, python, runner=runner, notes=notes)
     else:
         devices = tuple(range(need))
@@ -946,7 +595,7 @@ def run_preflight(
             "a real start does both"
         )
     environment = resolve_environment(task_data, devices=devices, world_size=world_size)
-    if claim:
+    if claim and need:
         check_multirank_substrate(world_size, environment, runner)
 
     slug = derive_slug(task_data)
@@ -994,7 +643,7 @@ def resolve_target_identity(
 
     target_rel = (
         f"{MODELING_V2_PACKAGE}/models/{family}/"
-        f"{segment}__{task_data['arch']}__{task_data['parallel']}"
+        f"{segment}__{task_data['arch']}__{task_data.get('parallel') or DEFAULT_PARALLEL}"
     )
     return family, target_rel
 
@@ -1023,19 +672,10 @@ __all__ = [
     "PROCESSOR_PROBE_MARKER",
     "MAX_UTILIZATION_PCT",
     "MIN_FREE_MEMORY_FRACTION",
-    "CaptureListMismatchError",
     "PreflightError",
     "PreflightResult",
     "SpecInconsistencyError",
-    "UnsupportedSpeculationError",
-    "check_capture_lists",
-    "check_disagg_placement",
-    "devices_needed",
-    "check_variant_anchors",
     "check_kv_cache_configs",
-    "check_speculation_support",
-    "llm_api_decoding_types",
-    "check_accuracy_anchors",
     "check_checkpoint",
     "check_checkpoint_fit",
     "check_multirank_substrate",

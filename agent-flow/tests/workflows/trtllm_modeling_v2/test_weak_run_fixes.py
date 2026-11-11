@@ -58,15 +58,13 @@ import yaml
 from agent_flow.backends import claude_code
 from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import _common
 from agent_flow.workflows.trtllm_modeling_v2.agents.prompts.worker import ENDING_EXTRAS
-from agent_flow.workflows.trtllm_modeling_v2.checks import accuracy as accuracy_checks
-from agent_flow.workflows.trtllm_modeling_v2.checks import delivery
+from agent_flow.workflows.trtllm_modeling_v2.checks import anchors, delivery
 from agent_flow.workflows.trtllm_modeling_v2.checks import serve as serve_gate
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
 from agent_flow.workflows.trtllm_modeling_v2.run import certify
 from agent_flow.workflows.trtllm_modeling_v2.run import workflow as workflow_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import Pipeline, Task, static_repair_block
-from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe, preflight
-from agent_flow.workflows.trtllm_modeling_v2.spec import derive
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import advice, agent_probe, preflight
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
 from ._helpers import Script, _run, _state, _task_id, _tasks, _write_vocabulary
@@ -140,7 +138,7 @@ def test_a_missing_anchor_row_says_how_to_measure_and_write_one(tmp_path):
     references = tmp_path / "gsm8k.yaml"
     references.write_text("org/other:\n  - accuracy: 50.0\n", encoding="utf-8")
     with pytest.raises(KeyError) as raised:
-        accuracy_checks.load_reference_score(references, "org/model")
+        anchors.load_reference_score(references, "org/model")
     message = str(raised.value)
     assert "never invented" in message
     assert "`org/model:` then `  - accuracy: <score>`" in message
@@ -157,11 +155,12 @@ def test_a_measured_small_anchor_is_not_called_a_placeholder(task_file, repo):
     spec["accuracy"]["model_key"] = "Qwen/Qwen3-0.6B"
     task_file.write_text(yaml.safe_dump(spec))
     task = load_and_validate_task_yaml(task_file)
-    [missing] = derive.spec_warnings(task)
-    assert missing.startswith("no accuracy anchor: no reference row for `Qwen/Qwen3-0.6B`")
+    [missing] = advice.spec_warnings(task)
+    assert missing.startswith("no accuracy anchor: `tp1` on `gsm8k` has no declared anchor")
+    assert "has no entry for 'Qwen/Qwen3-0.6B'" in missing
     references = repo / spec["accuracy"]["reference_yaml"]
     references.write_text("Qwen/Qwen3-0.6B:\n  - accuracy: 41.77\n", encoding="utf-8")
-    assert derive.spec_warnings(task) == []
+    assert advice.spec_warnings(task) == []
 
 
 def test_delivered_tests_run_with_the_tree_first_on_pythonpath(tmp_path):
@@ -343,8 +342,9 @@ def test_a_landed_unit_is_read_with_the_static_delivery_checks(tmp_path, task_fi
     # An empty tree misses what the final certification reads: the target and its accuracy row.
     assert "target:modeling.py" in names
     assert "accuracy:reference" in names
-    # Smoke and bringup runs owe no CI files: the same waiver as the certification's.
-    spec["profile"] = "bringup"
+    # A run whose first deployment names no benchmark owes no CI files: the same waiver as
+    # the certification's.
+    del spec["accuracy"]
     waived = certify.static_delivery_failures(workflow, tree)
     assert not any(f.startswith(("accuracy:reference", "tests:test-db")) for f in waived)
     assert any(f.startswith("target:modeling.py") for f in waived)

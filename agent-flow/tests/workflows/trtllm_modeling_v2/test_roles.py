@@ -39,7 +39,6 @@ from agent_flow.workflows.trtllm_modeling_v2.agents.turns import (
     TurnRequest,
     TurnTimeout,
 )
-from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import ROLE_BY_KIND, TAGS_BY_KIND
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe, bootstrap
@@ -383,22 +382,20 @@ def test_kernel_sourcing_and_landing_branches(
     assert ("Start the variant as a copy" in text) is (mode != "onboard")
 
 
-def test_survey_capture_lists_name_units_and_variants(monkeypatch) -> None:
-    capture = check_config.CaptureList((1, 8), False, source="unit.yaml")
-    monkeypatch.setattr(
-        check_config,
-        "launch_captures",
-        lambda _: [
-            check_config.LaunchCapture("core", "core", "unit.yaml", capture),
-            check_config.LaunchCapture("same", "core", "same.yaml", capture),
-            check_config.LaunchCapture("disabled", "core", "disabled.yaml", None),
-        ],
-    )
-    text = survey.capture_lists_block({})
-    assert "`core`: 2 batches [1, 8], unpadded" in text
-    assert "variants same: their unit's list" in text
-    assert "variant `disabled` (unit `core`): no CUDA graphs at any gate" in text
-    assert "tune" not in text
+def test_the_survey_carries_what_each_deployment_states_for_cuda_graphs(tmp_path) -> None:
+    task = {
+        "deployments": [
+            {"name": "tp1", "options": {"cuda_graph_config": {"batch_sizes": [1, 8]}}},
+            {"name": "eager", "options": {"cuda_graph_config": None}},
+            {"name": "pd", "ctx": {"options": {}}, "gen": {"options": {"cuda_graph_config": {}}}},
+        ]
+    }
+    text = survey.capture_lists_block(task)
+    assert text.startswith(survey.CAPTURE_LISTS_HEADING)
+    assert '- `tp1`: `{"batch_sizes": [1, 8]}`' in text
+    assert "- `eager`: no CUDA graphs" in text
+    assert "- `pd.ctx`: not stated: the engine's default" in text
+    assert "- `pd.gen`: `{}` (the engine's default list)" in text
 
 
 def test_all_template_resources_are_declared_as_package_data() -> None:

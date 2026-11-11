@@ -45,9 +45,8 @@ class GateResult:
     name: str
     passed: bool
     detail: str
-    #: The parallel configuration this verdict was measured at; ``None`` when
-    #: the caller passes no member.
-    member: str | None = None
+    #: The deployment this verdict was measured on; ``None`` for a check of the tree alone.
+    deployment: str | None = None
     command: str = ""
     measured: float | None = None
     reference: float | None = None
@@ -65,7 +64,7 @@ class GateResult:
     floor: float | None = None
     se: float | None = None
     samples: int | None = None
-    #: How ``floor`` was derived, verbatim (see :meth:`.accuracy_policy.Floor.describe`).
+    #: How ``floor`` was derived, verbatim (see :meth:`.anchors.Floor.describe`).
     floor_rule: str = ""
     #: Things the verdict wants a reader to see that do not change it -- a
     #: floor not backed by a measurement, a comparison that had no baseline.
@@ -78,6 +77,9 @@ class GateResult:
     #: verdict about the target: the workflow re-runs the gate once a session
     #: is back instead of recording it or handing it to the assembler.
     infrastructure: str = ""
+    #: Which path judged: ``in process`` or ``through the endpoint``; empty for a check
+    #: that has one path only.
+    path: str = ""
     #: One record per server the check attested (:meth:`.attest.Attestation.record`):
     #: its options against what every rank's engine ran. Empty for a check that
     #: attested none. Not hashed: the records are mappings.
@@ -86,8 +88,8 @@ class GateResult:
     def summary(self) -> str:
         """One line for the journal, carrying the numbers verbatim."""
         verdict = "PASS" if self.passed else "FAIL"
-        label = f"{self.name}@{self.member}" if self.member else self.name
-        tree = f" [tree {self.tree_state}]"
+        label = f"{self.deployment}:{self.name}" if self.deployment else self.name
+        tree = f" [tree {self.tree_state}]" + (f" [{self.path}]" if self.path else "")
         breakdown = f" [{self.breakdown}]" if self.breakdown else ""
         breakdown += describe_engine(self.engine)
         if self.warnings:

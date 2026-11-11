@@ -451,7 +451,7 @@ def parse_vocabulary(
 ) -> tuple[QueueItem, ...]:
     """Validate a parsed mapping, batching every problem into one error, and return its queue.
 
-    ``units`` is the run's assembly units (``task_schema.assembly_units``).
+    ``units`` is the run's units of work (``run/pipeline.unit_names``).
     When given, every queue row's ``unit`` must be one of them; when not,
     only its shape is checked and the orchestrator checks membership where
     it knows the spec.

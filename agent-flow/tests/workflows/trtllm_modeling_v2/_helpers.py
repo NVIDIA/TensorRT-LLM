@@ -310,6 +310,8 @@ def attested(command: str, **changes) -> str:
     tree = re.match(r"cd (\S+) &&", command)
     spec = re.search(r"--spec '?([^\s']+)", command)
     config = re.search(r"--config=([^\s']+)", command)
+    if spec and "llm" not in json.loads(Path(spec.group(1)).read_text(encoding="utf-8")):
+        return ""  # a driver that starts no engine in its own process
     if spec:
         options = dict(json.loads(Path(spec.group(1)).read_text(encoding="utf-8"))["llm"])
         options.pop("model", None)

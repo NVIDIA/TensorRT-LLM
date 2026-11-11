@@ -12,8 +12,7 @@ import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
-from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
-from agent_flow.workflows.trtllm_modeling_v2.spec import derive, task_schema
+from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
 from .conftest import SCRATCH
@@ -72,12 +71,12 @@ def test_every_problem_is_batched_into_one_message(tmp_path):
 def test_a_misspelled_key_is_refused_with_its_spelling_at_any_depth(tmp_path):
     # A misspelled `features` must not silently build core only.
     spec = _valid_spec(tmp_path) | {"feature": ["mtp"]}
-    spec["accuracy"]["toleranace"] = "x"
+    spec["accuracy"]["benchmrk"] = "x"
     with pytest.raises(task_schema.TaskSchemaError) as excinfo:
         task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     assert "unknown key 'feature'" in str(excinfo.value)
     assert "did you mean 'features'" in str(excinfo.value)
-    assert "did you mean 'accuracy.tolerance'" in str(excinfo.value)
+    assert "did you mean 'accuracy.benchmark'" in str(excinfo.value)
 
 
 def test_source_restriction_is_not_a_supported_production_task_option(tmp_path):
@@ -90,9 +89,6 @@ def test_source_restriction_is_not_a_supported_production_task_option(tmp_path):
     spec["perf"] = {"enabled": True}
     with pytest.raises(task_schema.TaskSchemaError, match="'perf' is not read: the flow has no"):
         task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
-
-
-DISAGG_LAUNCHER = tree_anchors.ANCHORS["disagg_launcher"].hint
 
 
 def _checkpoint(root: Path) -> Path:
@@ -137,44 +133,38 @@ def _derive(root: Path, goal: str | None = None, *, clean: bool = False, **site)
     )
 
 
+def _engine(root: Path, name: str) -> dict:
+    return yaml.safe_load((root / "ws" / derive.ENGINES_DIRNAME / f"{name}.yaml").read_text())
+
+
 def test_the_goal_overrides_what_the_checkpoint_and_the_site_say(tmp_path):
     goal = (
-        "-mtp multimodal:smoke tp1 dep4 isl=1024 osl=256 arch=sm_103 disagg@dep4 kv=bf16/fp8 "
+        "-mtp multimodal tp1 dep4 isl=1024 osl=256 arch=sm_103 disagg@dep4 kv=bf16/fp8 "
         "concurrency=8/256"
     )
     site = dict(
         device={"arch": "sm_100", "gpus_per_node": 4},
         defaults={"disagg": {"env": {"LLM_MODELS_ROOT": "/models"}}},
     )
-    # The node id is named beside the tree's disaggregated launcher: asked for until it is found.
-    with pytest.raises(derive.DeriveError, match="accuracy.disagg.test"):
-        _derive(tmp_path, goal, **site)
-    launcher = tmp_path / "repo" / DISAGG_LAUNCHER
-    launcher.parent.mkdir(parents=True)
-    launcher.write_text("def launch_disaggregated_llm(config):\n    pass\n")
-    path = _derive(tmp_path, goal, clean=True, **site)
-    spec = load_and_validate_task_yaml(path)
-    assert spec["features"] == ["multimodal", "disagg"] and spec["arch"] == "sm_103"
-    assert spec["profile"] == {"default": "standard", "multimodal": "smoke"}
-    # The CI files are owed while one unit is standard, not by a smoke or bringup run.
-    from agent_flow.workflows.trtllm_modeling_v2.run.certify import ci_waiver
-
-    assert ci_waiver(spec) == ""
-    assert ci_waiver({**spec, "profile": "bringup"}) == "not owed by the bringup profile"
-    # disagg where the goal puts it; its test lays its two engines out on dep4's node.
-    assert spec["members"] == {"default": ["tp1", "dep4"], "disagg": ["dep4"]}
-    assert spec["coverage"] == {"accept": ["disagg@tp1"]}
-    # The first KV dtype is every gate's; each other one a variant judged against core's score.
-    assert "--kv_cache_dtype=fp8" not in spec["runtime"]["extra_flags"]
-    assert spec["variants"]["kv_fp8"]["gates"] == ["accuracy"]
-    assert spec["variants"]["kv_fp8"]["llm_api_options"] == {"kv_cache_config": {"dtype": "fp8"}}
-    assert spec["accuracy"]["disagg"] == {
-        "env": {"LLM_MODELS_ROOT": "/models"},
-        "test": f"{DISAGG_LAUNCHER}::TestNewModel::test_auto_dtype",
-    }
-    assert "--max_seq_len=1280" in spec["runtime"]["extra_flags"]
+    spec = load_and_validate_task_yaml(_derive(tmp_path, goal, **site))
+    assert spec["arch"] == "sm_103" and "features" not in spec and "members" not in spec
+    found = {d.name: d for d in deployments.resolve(spec)}
+    # The members in order, then each feature and each extra KV dtype, once.
+    assert list(found) == ["tp1", "dep4", "multimodal", "disagg", "kv_fp8"]
+    assert found["multimodal"].inputs == ("text", "image") and found["tp1"].inputs == ("text",)
+    # disagg where the goal puts it, with the site's environment.
+    assert found["disagg"].ctx.options["tensor_parallel_size"] == 4
+    assert found["disagg"].env == {"LLM_MODELS_ROOT": "/models"}
+    # The first KV dtype is core's; each other one a deployment judged against core's score.
+    assert "dtype" not in found["tp1"].server.options["kv_cache_config"]
+    assert found["kv_fp8"].server.options["kv_cache_config"]["dtype"] == "fp8"
+    assert found["kv_fp8"].relative_to == "tp1"
+    core = _engine(tmp_path, "tp1")
     # The batch holds the goal's concurrency, whatever the default says.
-    assert "--max_batch_size=256" in spec["runtime"]["extra_flags"]
+    assert (core["max_seq_len"], core["max_batch_size"]) == (1280, 256)
+    assert _engine(tmp_path, "dep4")["max_batch_size"] == 64  # one rank's share of it
+    with pytest.raises(derive.DeriveError, match="'multimodal:smoke' is not a feature"):
+        derive.parse_goal("multimodal:smoke")
 
 
 def test_a_goal_that_names_its_features_gets_those_and_what_derive_cannot_know_is_asked(tmp_path):
@@ -188,56 +178,40 @@ def test_a_goal_that_names_its_features_gets_those_and_what_derive_cannot_know_i
         )
     assert "accuracy.model_key" in str(excinfo.value)
     spec = yaml.safe_load((tmp_path / "ws" / derive.SPEC_FILENAME).read_text())
-    assert "perf" not in spec
     # The checkpoint's drafter is left out: the goal names its features and not it.
-    assert spec["features"] == ["multimodal"]
+    assert [d["name"] for d in spec["deployments"]] == ["tp1", "tep4", "dep4", "multimodal"]
     assert "features (left out)" in (tmp_path / "ws" / derive.REPORT_FILENAME).read_text()
     with pytest.raises(derive.DeriveError, match="kv= is named once"):
         derive.parse_goal("kv=fp8 kv=nvfp4")
 
 
-def test_core_keeps_reuse_and_chunking_off_and_each_named_one_is_its_own_variant(tmp_path):
+def test_core_keeps_reuse_and_chunking_off_and_each_named_one_is_its_own_deployment(tmp_path):
     spec = load_and_validate_task_yaml(
-        _derive(tmp_path, "chunked_prefill prefix_reuse kv=bf16/fp8 chunk=256 concurrency=1/128")
+        _derive(
+            tmp_path, "tp1 chunked_prefill prefix_reuse kv=fp8/nvfp4 chunk=256 concurrency=1/128"
+        )
     )
-    runtime = spec["runtime"]
-    assert runtime["cuda_graph"] and runtime["overlap_scheduler"]
-    assert not runtime["chunked_prefill"] and not runtime["kv_cache_reuse"]
-    core = yaml.safe_load(Path(spec["accuracy"]["llm_api_options"]["core"]).read_text())
+    assert [d.name for d in deployments.resolve(spec)] == ["tp1", "mtp", "multimodal"] + [
+        "kv_nvfp4",
+        "chunked",
+        "reuse",
+    ]
+    core = _engine(tmp_path, "tp1")
     assert core["kv_cache_config"]["enable_block_reuse"] is False
-    assert core["enable_chunked_prefill"] is False and "max_num_tokens" not in core
-    variants = spec["variants"]
-    assert set(variants) == {"kv_fp8", "chunked", "reuse"}
-    assert variants["chunked"]["llm_api_options"] == {
-        "enable_chunked_prefill": True,
-        "max_num_tokens": 256,
-    }
-    assert variants["reuse"]["llm_api_options"] == {"kv_cache_config": {"enable_block_reuse": True}}
-    # Each changes one non-core feature, gated by its benchmark alone.
-    assert all(v["unit"] == "core" and v["gates"] == ["accuracy"] for v in variants.values())
+    assert core["enable_chunked_prefill"] is False and core["max_num_tokens"] == 8192
+    assert core["cuda_graph_config"] and core["disable_overlap_scheduler"] is False
+    # The first KV dtype is the one every deployment stores its cache in.
+    assert core["kv_cache_config"]["dtype"] == "fp8"
+    assert _engine(tmp_path, "kv_nvfp4")["kv_cache_config"]["dtype"] == "nvfp4"
+    chunked = _engine(tmp_path, "chunked")
+    assert (chunked["enable_chunked_prefill"], chunked["max_num_tokens"]) == (True, 256)
+    assert _engine(tmp_path, "reuse")["kv_cache_config"]["enable_block_reuse"] is True
+    # Each changes one thing over core, the checkpoint's drafter included.
+    assert _engine(tmp_path, "mtp")["speculative_config"]["decoding_type"] == "MTP"
+    assert core["speculative_config"] is None
     report = (tmp_path / "ws" / derive.REPORT_FILENAME).read_text()
     # The batch the spec carries, raised to the concurrency, not the default it started from.
     assert "| `workload.max_batch_size` | concurrency | `128` |" in report
-    with pytest.raises(derive.DeriveError):
-        derive.parse_goal("chunked_prefill:smoke")
-
-
-@pytest.mark.parametrize(
-    "weights_gib, layout",
-    [(100, (2, 1)), (300, (4, 1)), (500, (4, 2)), (None, None)],
-)
-def test_the_disaggregated_test_takes_one_node_unless_its_two_engines_do_not_fit(
-    weights_gib, layout
-):
-    weights = None if weights_gib is None else weights_gib * 2**30
-    assert derive.disagg_layout(weights, 277, 4) == layout
-
-
-def test_quantized_core_has_one_kv_dtype_source_and_structural_hybrid_hints(tmp_path):
-    spec = yaml.safe_load(_derive(tmp_path, "kv=fp8/nvfp4").read_text())
-    assert not any(flag.startswith("--kv_cache_dtype") for flag in spec["runtime"]["extra_flags"])
-    options = yaml.safe_load(Path(spec["accuracy"]["llm_api_options"]["core"]).read_text())
-    assert options["kv_cache_config"]["dtype"] == "fp8"
     assert derive.hybrid_marker({"architectures": ["Unseen"], "linear_num_value_heads": 32})
     assert derive.hybrid_marker(
         {"text_config": {"layer_types": ["linear_attention", "full_attention"]}}
@@ -262,30 +236,15 @@ def test_a_key_this_version_no_longer_reads_is_dropped_with_one_notice_each(tmp_
     assert load_and_validate_task_yaml(_write(tmp_path, spec)) == resolved
 
 
-def test_the_certified_profile_is_standard_with_the_serve_gate(tmp_path):
+def test_each_deployment_owes_its_boot_its_benchmarks_and_its_tests_and_core_the_serve_gate(
+    tmp_path,
+):
     from agent_flow.workflows.trtllm_modeling_v2.run.contract import compile_contract
 
     spec = _valid_spec(tmp_path) | {
         "parallel": "unified",
         "members": ["tep4", "dep4"],
-        "variants": {"kv_fp8": {"llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}}},
-    }
-    standard = load_and_validate_task_yaml(_write(tmp_path, spec))
-    certified = load_and_validate_task_yaml(_write(tmp_path, spec | {"profile": "certified"}))
-    assert standard["accuracy"]["serve"] == {"enabled": False}  # nothing bounds the server
-    assert certified["accuracy"]["serve"] == {"enabled": True}
-    owed = {c.key for c in compile_contract(standard, 4).required()}
-    more = {c.key for c in compile_contract(certified, 4).required()} - owed
-    assert more and all(":serve@" in key for key in more)
-    # A relative variant's benchmark runs at one member under either profile.
-    assert [k for k in owed if k.startswith("kv_fp8:accuracy")] == ["kv_fp8:accuracy[gsm8k]@dep4"]
-
-
-def test_a_drafter_owes_no_acceptance_check_and_the_old_keys_are_ignored_with_a_notice(tmp_path):
-    from agent_flow.workflows.trtllm_modeling_v2.run.contract import compile_contract
-
-    spec = _valid_spec(tmp_path) | {
-        "features": ["mtp"],
+        "features": ["mtp", "disagg"],
         "variants": {
             "mtp7": {
                 "unit": "mtp",
@@ -296,16 +255,37 @@ def test_a_drafter_owes_no_acceptance_check_and_the_old_keys_are_ignored_with_a_
         },
     }
     spec["accuracy"]["acceptance"] = {"num_prompts": 32, "mtp": {"min_absolute": 1.5}}
+    spec["accuracy"]["disagg"] = {"test": "tests/test_pd.py::TestM::test_hop"}
     notices: list[str] = []
     resolved = load_and_validate_task_yaml(_write(tmp_path, spec), notices)
-    assert [n.split(" is ignored")[0] for n in notices] == [
+    assert sorted(n.split(" is ignored")[0] for n in notices) == [
         "'accuracy.acceptance'",
         "'variants.mtp7.accuracy.acceptance'",
+        "'variants.mtp7.gates'",
     ]
-    assert "judged by a native test" in notices[0]
-    contract = compile_contract(resolved, 1)
-    assert not [c.key for c in contract.required() if "acceptance" in c.key]
-    assert "mtp7:boot@tp1" in {c.key for c in contract.required()}
+    assert any("judged by a native test" in n for n in notices)
+    contract = compile_contract(resolved)
+    assert [c.key for c in contract.required()] == [
+        "tep4:boot",
+        "tep4:accuracy[gsm8k]",
+        "dep4:boot",
+        "dep4:accuracy[gsm8k]",
+        "mtp:boot",
+        "mtp:accuracy[gsm8k]",
+        "disagg:boot",
+        "disagg:accuracy[gsm8k]",
+        "disagg:tests",
+        "mtp7:boot",
+        "mtp7:accuracy[gsm8k]",
+    ]
     assert any(
         "mtp: its drafter's acceptance is judged by no check here" in n for n in contract.notes
     )
+    # The serve gate is core's, where the spec turns it on.
+    resolved["accuracy"]["serve"] = {"enabled": True}
+    more = {c.key for c in compile_contract(resolved).required()} - {c.key for c in contract.checks}
+    assert more == {"tep4:serve"}
+    # A spec with no accuracy block owes boots alone, and says so.
+    bare = compile_contract({"deployments": [{"name": "only", "options": {}}]})
+    assert [c.key for c in bare.checks] == ["only:boot"]
+    assert bare.notes == ("only: it names no benchmark, so its boot alone judges it",)

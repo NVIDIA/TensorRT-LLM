@@ -44,6 +44,7 @@ import yaml
 
 from ..infra.files import write_text_atomic
 from ..spec.deployments import ROLES, Deployment, Server, write_options
+from .check_runtime import MODE_REQUIRE, engine_env
 
 #: What this run started and has not ended, in the workspace.
 OWNED_FILENAME = "servers.json"
@@ -95,6 +96,15 @@ class Running:
     @property
     def url(self) -> str:
         return f"http://{self.address}"
+
+    def log(self, role: str) -> str:
+        """What the server of ``role`` printed so far: where its ranks say what they run."""
+        name = self.deployment.name + ("" if role == "server" else f".{role}")
+        path = next((record.log for record in self.owned if record.name == name), "")
+        try:
+            return Path(path).read_text(encoding="utf-8", errors="replace") if path else ""
+        except OSError:
+            return ""
 
 
 # ------------------------------------------------------------------------------ the lock
@@ -249,6 +259,7 @@ def _start_one(
     address_file: Path,
     workspace: Path,
     owned: list[Owned],
+    cwd: str | None = None,
 ) -> Owned:
     """Start one command behind ``server``'s prefix in its own group, and record it."""
     address_file.unlink(missing_ok=True)
@@ -262,6 +273,7 @@ def _start_one(
             stdout=sink,
             stderr=subprocess.STDOUT,
             env=process_env,
+            cwd=cwd,
             start_new_session=True,
         )
     record = Owned(
@@ -319,19 +331,25 @@ def start(
     workspace: str | Path,
     env: Mapping[str, str] | None = None,
     timeout: int | None = None,
+    tree: str | Path | None = None,
+    python: str | None = None,
 ) -> Running:
     """Start ``deployment``'s servers and wait until the one to ask is healthy.
 
     Ends first whatever an earlier process of the run left recorded. ``env`` is the
-    spec's environment; the deployment's own is laid over it. On any failure everything
-    started here is stopped before the error is raised.
+    spec's environment; the deployment's own is laid over it. Every server runs from
+    ``tree`` with the Modeling V2 switch on and the rank hook loaded
+    (``check_runtime.engine_env``), so its ranks say what they run. On any failure
+    everything started here is stopped before the error is raised.
     """
     workspace = Path(workspace)
     declared = {**(env or {}), **deployment.env}
     clean_owned(workspace, declared)
+    declared = engine_env(declared, tree=tree, python=python)
     directory = workspace / "deployments" / deployment.name
     directory.mkdir(parents=True, exist_ok=True)
-    options = write_options(deployment, directory)
+    options = write_options(deployment, directory, {"modeling_v2": MODE_REQUIRE})
+    cwd = str(tree) if tree is not None else None
     deadline = time.monotonic() + (timeout or deployment.timeout or START_TIMEOUT_S)
     owned: list[Owned] = []
     running = Running(deployment, "", owned, workspace)
@@ -347,6 +365,7 @@ def start(
                 directory / "address",
                 workspace,
                 owned,
+                cwd,
             )
             running.address = _await_address(record, deadline)
             _await_health(record, running.address, deadline)
@@ -363,6 +382,7 @@ def start(
                 directory / f"address.{role}",
                 workspace,
                 owned,
+                cwd,
             )
             addresses[role] = record
         for role, record in addresses.items():
@@ -383,6 +403,7 @@ def start(
             directory / "address.proxy",
             workspace,
             owned,
+            cwd,
         )
         running.address = _await_address(proxy, deadline)
         _await_health(proxy, running.address, deadline)
@@ -426,8 +447,10 @@ def stop(running: Running, *, env: Mapping[str, str] | None = None) -> None:
         )
 
 
-def ask(running: Running, prompt: str, *, max_tokens: int, timeout: float = 600) -> str:
-    """One greedy completion from the deployment's endpoint; its text."""
+def complete(
+    running: Running, prompt: str, *, max_tokens: int, timeout: float = 600
+) -> Mapping[str, Any]:
+    """One greedy completion from the deployment's endpoint: the response, as the server sent it."""
     body = {
         "model": "deployment",
         "prompt": prompt,
@@ -444,10 +467,22 @@ def ask(running: Running, prompt: str, *, max_tokens: int, timeout: float = 600)
             payload = json.loads(reply.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise ServerError(f"{running.deployment.name} did not answer a completion: {exc}") from exc
-    choices = payload.get("choices") if isinstance(payload, dict) else None
-    if not choices:
+    if not isinstance(payload, dict) or not payload.get("choices"):
         raise ServerError(f"{running.deployment.name} answered without a completion: {payload}")
-    return str(choices[0].get("text") or "")
+    return payload
+
+
+def ask(running: Running, prompt: str, *, max_tokens: int, timeout: float = 600) -> str:
+    """One greedy completion from the deployment's endpoint; its text."""
+    payload = complete(running, prompt, max_tokens=max_tokens, timeout=timeout)
+    return str(payload["choices"][0].get("text") or "")
+
+
+def cached_tokens(payload: Mapping[str, Any]) -> int | None:
+    """The prompt tokens a completion resumed from the cache, where the server reports them."""
+    details = (payload.get("usage") or {}).get("prompt_tokens_details") or {}
+    count = details.get("cached_tokens")
+    return count if isinstance(count, int) and not isinstance(count, bool) else None
 
 
 __all__ = [
@@ -457,7 +492,9 @@ __all__ = [
     "Running",
     "ServerError",
     "ask",
+    "cached_tokens",
     "clean_owned",
+    "complete",
     "engine_lock",
     "launch_env",
     "load_owned",

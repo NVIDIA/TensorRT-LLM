@@ -5,33 +5,38 @@
 A deployment is one served configuration of the checkpoint: the options
 ``trtllm-serve --config`` takes, behind an optional launch prefix. The first
 deployment is core's: it defines ``onboarded``. A disaggregated deployment is a
-context and a generation server (``ctx``, ``gen``), each with its own options
-and prefix::
+context and a generation server (``ctx``, ``gen``), each with its own options,
+prefix and stop command::
 
     deployments:
       - name: dep16
         options: engines/dep16.yaml      # a native options file, or the options as a mapping
         launch: "<site prefix>"          # empty: this host
+        stop: "<site command>"           # optional: ends what `launch` started
         timeout: 5400
         benchmarks:
           - name: gsm8k                  # judged against the reference row of accuracy.model_key
-          - {name: aa_lcr, anchor: 62.0, source: "<where it was measured>"}
+          - {name: aa_lcr, anchor: 0.62, source: "<where it was measured>"}
       - name: pd
         env: {UCX_TLS: "tcp,self,sm,cuda_copy,cuda_ipc"}
         ctx: {options: engines/ctx.yaml, launch: "<nodes 1 to 4>"}
         gen: {options: engines/gen.yaml, launch: "<nodes 5 to 8>"}
-        relative_to: dep16               # judged against dep16's own score
+        relative_to: dep16               # judged against dep16's own score where no row fits
 
-The spec's older keys (``parallel``, ``members``, ``features``, ``variants``,
-``runtime``, ``accuracy.llm_api_options``) are shorthand for the same thing.
-:func:`resolve` reads either form: it expands the shorthand so that each unit
-and each variant at each of its members is one deployment (:func:`name_for`),
-whose options are what the spec's switches, flags and options file come to.
-Nothing downstream needs to know which form the spec was written in.
+The spec's top-level ``accuracy`` block gives every benchmark its defaults (the
+reference rows' model, file and tags, the dataset's place, the sample count, how a
+score is read); a ``benchmarks`` entry overrides them for itself. A deployment that
+names no ``benchmarks`` takes ``accuracy.benchmark`` (``gsm8k`` unsaid) when the spec
+has an ``accuracy`` block, and none without one.
+
+:func:`resolve` is the one way anything below the spec loader learns what the run
+deploys: it returns these types whichever way the spec was written, the shorthand keys
+included (``spec/shorthand.py``).
 """
 
 from __future__ import annotations
 
+import math
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -51,11 +56,11 @@ ROLES: tuple[str, ...] = ("ctx", "gen")
 INPUTS: tuple[str, ...] = ("text", "image")
 DEFAULT_BENCHMARK = "gsm8k"
 
+#: What one server states: on an aggregated deployment itself, or inside ``ctx`` and ``gen``.
+SERVER_KEYS: tuple[str, ...] = ("options", "launch", "stop")
 DEPLOYMENT_KEYS: tuple[str, ...] = (
     "name",
-    "options",
-    "launch",
-    "stop",
+    *SERVER_KEYS,
     "env",
     "timeout",
     "relative_to",
@@ -64,32 +69,25 @@ DEPLOYMENT_KEYS: tuple[str, ...] = (
     "benchmarks",
     *ROLES,
 )
-#: What one server states: on an aggregated deployment itself, or inside ``ctx`` and ``gen``.
-#: ``stop`` is the site's command that ends what ``launch`` started, where a signal to the
-#: launcher is not enough.
-SERVER_KEYS: tuple[str, ...] = ("options", "launch", "stop")
-BENCHMARK_KEYS: tuple[str, ...] = ("name", "args", "anchor", "source", "env")
-#: Shorthand a spec that states ``deployments`` cannot also state: each says what runs.
-SHORTHAND_KEYS: tuple[str, ...] = (
-    "members",
-    "features",
-    "variants",
-    "runtime",
-    "scope",
-    "profile",
-    "coverage",
-)
-#: The ``accuracy`` keys a spec that states ``deployments`` keeps, the defaults of every
-#: deployment: the reference rows' model, file and tags, the benchmark of a deployment that
-#: names none, the dataset's place and the boot workload. A deployment's ``benchmarks``
-#: override them per benchmark; an engine setting is in its options.
-NATIVE_ACCURACY_KEYS: tuple[str, ...] = (
+#: What the spec's ``accuracy`` block gives every benchmark and a ``benchmarks`` entry may
+#: state for itself: the reference rows' model, file and tags, where the dataset is, the
+#: sample count behind the standard error, and how the score is read from the output.
+BENCHMARK_DEFAULTS: tuple[str, ...] = (
     "model_key",
-    "benchmark",
     "reference_yaml",
-    "dataset_path",
     "discriminators",
+    "dataset_path",
+    "samples",
+    "score_pattern",
+)
+BENCHMARK_KEYS: tuple[str, ...] = ("name", "args", "anchor", "source", "env", *BENCHMARK_DEFAULTS)
+#: The ``accuracy`` keys a spec that states ``deployments`` keeps.
+STATED_ACCURACY_KEYS: tuple[str, ...] = (
+    "benchmark",
+    *BENCHMARK_DEFAULTS,
     "boot",
+    "serve",
+    "timeout",
 )
 
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
@@ -98,11 +96,13 @@ _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 @dataclass(frozen=True)
 class Benchmark:
-    """One benchmark a deployment is scored on: a ``trtllm-eval`` subcommand and its options.
+    """One benchmark a deployment is scored on, with everything its judging reads.
 
-    Without ``anchor`` it is judged against the tree's reference row for
-    ``accuracy.model_key``, or the deployment's ``relative_to``; with neither, its score
-    is reported and not judged. ``anchor`` is on the scale the benchmark reports.
+    ``name`` is a ``trtllm-eval`` subcommand and ``args`` its own options. ``anchor``,
+    with its ``source``, is a declared score on the scale the benchmark reports; without
+    one the reference row of ``model_key`` in ``reference_yaml`` (the tree's file for the
+    benchmark, unsaid) whose tags are ``discriminators`` is the anchor, where one fits.
+    ``discriminators`` unsaid (``None``) are the tags the deployment's options imply.
     """
 
     name: str
@@ -110,6 +110,12 @@ class Benchmark:
     anchor: float | None = None
     source: str = ""
     env: Mapping[str, str] = field(default_factory=dict)
+    model_key: str | None = None
+    reference_yaml: str | None = None
+    discriminators: Mapping[str, Any] | None = None
+    dataset_path: str | None = None
+    samples: int | None = None
+    score_pattern: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"name": self.name}
@@ -119,6 +125,10 @@ class Benchmark:
             out.update(anchor=self.anchor, source=self.source)
         if self.env:
             out["env"] = dict(self.env)
+        for key in BENCHMARK_DEFAULTS:
+            value = getattr(self, key)
+            if value is not None:
+                out[key] = dict(value) if isinstance(value, Mapping) else value
         return out
 
 
@@ -135,6 +145,11 @@ class Server:
     #: The site's command that ends what ``launch`` started; empty: a signal is enough.
     stop: str = ""
 
+    @property
+    def ranks(self) -> int:
+        """How many devices the server takes: its options' tensor-parallel size."""
+        return max(1, int(self.options.get("tensor_parallel_size") or 1))
+
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"options": self.options_path or dict(self.options)}
         for key in ("launch", "stop"):
@@ -145,7 +160,7 @@ class Server:
 
 @dataclass(frozen=True)
 class Deployment:
-    """One deployment of the spec, in the form every later step reads."""
+    """One deployment of the spec, in the form every check and the run read."""
 
     name: str
     #: The first deployment: its boot and accuracy are what ``onboarded`` means.
@@ -179,6 +194,19 @@ class Deployment:
             return {"server": self.server}
         return {role: getattr(self, role) for role in ROLES}
 
+    @property
+    def ranks(self) -> int:
+        """The devices one load of it takes: every server's, together."""
+        return sum(server.ranks for server in self.servers.values())
+
+    @property
+    def prefixed(self) -> bool:
+        """Whether any of its servers starts behind a launch prefix, off this host."""
+        return any(server.launch for server in self.servers.values())
+
+    def benchmark(self, name: str) -> Benchmark | None:
+        return next((b for b in self.benchmarks if b.name == name), None)
+
     def as_dict(self) -> dict[str, Any]:
         """The deployment as a spec states one, with only what it sets."""
         out: dict[str, Any] = {"name": self.name}
@@ -199,20 +227,15 @@ class Deployment:
         return out
 
 
-def is_native(data: Mapping[str, Any]) -> bool:
+def is_stated(data: Mapping[str, Any]) -> bool:
     """Whether the spec states its deployments itself, not through the shorthand keys."""
     return data.get(DEPLOYMENTS_FIELD) is not None
-
-
-def name_for(unit: str, member: str) -> str:
-    """The deployment a shorthand unit or variant is at ``member``; core's is the member itself."""
-    return member if unit == "core" else f"{unit}@{member}"
 
 
 # --------------------------------------------------------------------- a stated block
 
 
-def _load_options(source: Any) -> dict[str, Any]:
+def load_options(source: Any) -> dict[str, Any]:
     """Native options from a path or an inline mapping. Raises ``ValueError`` saying what is wrong."""
     if isinstance(source, Mapping):
         return dict(source)
@@ -233,9 +256,7 @@ def _load_options(source: Any) -> dict[str, Any]:
 def resolve_paths(data: dict[str, Any], spec_dir: Path) -> None:
     """Make each options path written beside the spec absolute, in place."""
     block = data.get(DEPLOYMENTS_FIELD)
-    if not isinstance(block, list):
-        return
-    for entry in block:
+    for entry in block if isinstance(block, list) else ():
         if not isinstance(entry, dict):
             continue
         for holder in (entry, *(entry.get(role) for role in ROLES)):
@@ -245,7 +266,17 @@ def resolve_paths(data: dict[str, Any], spec_dir: Path) -> None:
                     holder["options"] = str((spec_dir / path).resolve())
 
 
-def _validate_env(env: Any, errors: list[str], where: str) -> None:
+def split_args(value: Any) -> tuple[str, ...]:
+    """A benchmark's options: a list of strings, or one string split as a shell would.
+
+    Raises ``ValueError`` for a string a shell could not split (an unclosed quote).
+    """
+    if isinstance(value, str):
+        return tuple(shlex.split(value))
+    return tuple(str(arg) for arg in value or ())
+
+
+def validate_env(env: Any, errors: list[str], where: str) -> None:
     if env is None:
         return
     if not isinstance(env, Mapping):
@@ -258,13 +289,47 @@ def _validate_env(env: Any, errors: list[str], where: str) -> None:
             errors.append(f"'{where}.{name}' must be a scalar the shell can carry")
 
 
+def validate_judging(block: Mapping[str, Any], errors: list[str], where: str) -> None:
+    """The keys of :data:`BENCHMARK_DEFAULTS`, in ``accuracy`` or in a ``benchmarks`` entry."""
+    for key in ("model_key", "reference_yaml", "dataset_path"):
+        value = block.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            errors.append(f"'{where}.{key}' must be a non-empty string")
+    tags = block.get("discriminators")
+    if tags is not None and not (
+        isinstance(tags, Mapping)
+        and all(isinstance(v, (str, int, float, bool)) for v in tags.values())
+    ):
+        errors.append(f"'{where}.discriminators' must map a reference row's tag to a scalar")
+    samples = block.get("samples")
+    if samples is not None and (
+        isinstance(samples, bool) or not isinstance(samples, int) or samples < 1
+    ):
+        errors.append(f"'{where}.samples' must be an integer >= 1")
+    pattern = block.get("score_pattern")
+    if pattern is not None:
+        try:
+            groups = re.compile(pattern).groups if isinstance(pattern, str) else 0
+        except re.error as exc:
+            errors.append(f"'{where}.score_pattern' is not a regular expression: {exc}")
+        else:
+            if groups < 1:
+                errors.append(
+                    f"'{where}.score_pattern' needs a group around the score, "
+                    f"e.g. `accuracy: ([0-9.]+)`"
+                )
+
+
 def _validate_server(holder: Mapping[str, Any], errors: list[str], where: str) -> None:
     """``options`` (required), ``launch`` and ``stop`` of an aggregated deployment or of one side."""
     if holder.get("options") is None:
-        errors.append(f"'{where}.options' is required: a native LLM-API options file")
+        errors.append(
+            f"missing {where}.options: a native LLM-API options file; "
+            f"fix: `options: engines/<name>.yaml`"
+        )
     else:
         try:
-            _load_options(holder["options"])
+            load_options(holder["options"])
         except ValueError as exc:
             errors.append(f"'{where}.options' {exc}")
     launch = holder.get("launch")
@@ -303,17 +368,26 @@ def _validate_benchmarks(block: Any, errors: list[str], where: str) -> None:
             or (isinstance(args, list) and all(isinstance(a, str) for a in args))
         ):
             errors.append(f"'{at}.args' must be a string or a list of strings")
+        elif isinstance(args, str):
+            try:
+                split_args(args)
+            except ValueError as exc:
+                errors.append(f"'{at}.args' cannot be split as a shell would: {exc}")
         anchor, source = entry.get("anchor"), entry.get("source")
         if anchor is not None:
-            if isinstance(anchor, bool) or not isinstance(anchor, (int, float)) or anchor < 0:
-                errors.append(f"'{at}.anchor' must be a score >= 0, on the benchmark's own scale")
+            number = isinstance(anchor, (int, float)) and not isinstance(anchor, bool)
+            if not number or not math.isfinite(anchor) or anchor < 0:
+                errors.append(
+                    f"'{at}.anchor' must be a finite score >= 0, on the benchmark's own scale"
+                )
             if not isinstance(source, str) or not source.strip():
                 errors.append(
                     f"'{at}.source' is required with an anchor: where and how it was measured"
                 )
         elif source is not None:
             errors.append(f"'{at}.source' says where an `anchor` comes from, and there is none")
-        _validate_env(entry.get("env"), errors, f"{at}.env")
+        validate_env(entry.get("env"), errors, f"{at}.env")
+        validate_judging(entry, errors, at)
 
 
 def validate(block: Any, errors: list[str]) -> None:
@@ -353,7 +427,7 @@ def validate(block: Any, errors: list[str]) -> None:
                 _validate_server(entry[role], errors, f"{at}.{role}")
         else:
             _validate_server(entry, errors, at)
-        _validate_env(entry.get("env"), errors, f"{at}.env")
+        validate_env(entry.get("env"), errors, f"{at}.env")
         timeout = entry.get("timeout")
         if timeout is not None and (
             isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1
@@ -376,9 +450,9 @@ def validate(block: Any, errors: list[str]) -> None:
         inputs = entry.get("inputs")
         if inputs is not None and not (
             isinstance(inputs, list)
+            and all(isinstance(i, str) and i in INPUTS for i in inputs)
             and "text" in inputs
             and len(set(inputs)) == len(inputs)
-            and all(i in INPUTS for i in inputs)
         ):
             errors.append(f"'{at}.inputs' must be `text` and any of {list(INPUTS[1:])}, each once")
         _validate_benchmarks(entry.get("benchmarks"), errors, f"{at}.benchmarks")
@@ -386,90 +460,48 @@ def validate(block: Any, errors: list[str]) -> None:
             names.append(name)
 
 
-def validate_native_spec(data: Mapping[str, Any], errors: list[str]) -> None:
-    """What a spec that states ``deployments`` may and may not say beside them."""
-    validate(data.get(DEPLOYMENTS_FIELD), errors)
-    stated = [key for key in SHORTHAND_KEYS if data.get(key)]
-    if stated:
-        errors.append(
-            f"{', '.join(repr(key) for key in stated)} beside '{DEPLOYMENTS_FIELD}': these keys "
-            f"are shorthand for deployments, and this spec states its deployments itself. Put "
-            f"what they ask for in a deployment's options, `inputs`, `benchmarks` or `tests`"
-        )
-    accuracy = data.get(ACCURACY_FIELD)
-    if accuracy is None:
-        return
-    if not isinstance(accuracy, Mapping):
-        errors.append(f"'{ACCURACY_FIELD}' must be a mapping, got {type(accuracy).__name__}")
-        return
-    extra = sorted(set(accuracy) - set(NATIVE_ACCURACY_KEYS))
-    if extra:
-        errors.append(
-            f"'{ACCURACY_FIELD}' carries {extra} beside '{DEPLOYMENTS_FIELD}': with deployments "
-            f"it keeps {list(NATIVE_ACCURACY_KEYS)} only, the defaults of every deployment; a "
-            f"benchmark's options and its anchor are a deployment's `benchmarks`, and an engine "
-            f"setting is in its options"
-        )
-    for key in ("benchmark", "reference_yaml", "dataset_path"):
-        value = accuracy.get(key)
-        if value is not None and (not isinstance(value, str) or not value.strip()):
-            errors.append(f"'{ACCURACY_FIELD}.{key}' must be a non-empty string")
-    tags = accuracy.get("discriminators")
-    if tags is not None and not (
-        isinstance(tags, Mapping)
-        and all(isinstance(v, (str, int, float, bool)) for v in tags.values())
-    ):
-        errors.append(
-            f"'{ACCURACY_FIELD}.discriminators' must map a reference row's tag to a scalar"
-        )
-    key = accuracy.get("model_key")
-    if key is not None and (not isinstance(key, str) or not key.strip()):
-        errors.append(f"'{ACCURACY_FIELD}.model_key' must be the model's id, `org/model`")
+def benchmark_of(entry: Mapping[str, Any], defaults: Mapping[str, Any]) -> Benchmark:
+    """One benchmark from a ``benchmarks`` entry, over the ``accuracy`` block's defaults."""
+
+    def stated(key: str) -> Any:
+        return entry[key] if entry.get(key) is not None else defaults.get(key)
+
+    tags = stated("discriminators")
+    return Benchmark(
+        name=str(entry["name"]),
+        args=split_args(entry.get("args")),
+        anchor=float(entry["anchor"]) if entry.get("anchor") is not None else None,
+        source=str(entry.get("source") or ""),
+        env={str(k): str(v) for k, v in (entry.get("env") or {}).items()},
+        model_key=stated("model_key"),
+        reference_yaml=stated("reference_yaml"),
+        discriminators=dict(tags) if isinstance(tags, Mapping) else None,
+        dataset_path=stated("dataset_path"),
+        samples=stated("samples"),
+        score_pattern=stated("score_pattern"),
+    )
 
 
 def _server(holder: Mapping[str, Any]) -> Server:
     source = holder.get("options")
     return Server(
-        options=_load_options(source),
+        options=load_options(source),
         options_path=source if isinstance(source, str) else "",
         launch=str(holder.get("launch") or ""),
         stop=str(holder.get("stop") or ""),
     )
 
 
-def _args(value: Any) -> tuple[str, ...]:
-    """A benchmark's options: a list of strings, or one string split as a shell would."""
-    if isinstance(value, str):
-        return tuple(shlex.split(value))
-    return tuple(str(arg) for arg in value or ())
-
-
 def _stated(data: Mapping[str, Any]) -> tuple[Deployment, ...]:
-    """The deployments of a validated spec that states them.
-
-    A deployment that names no ``benchmarks`` takes the spec's: ``accuracy.benchmark``
-    (``gsm8k`` unsaid) when the spec has an ``accuracy`` block, none without one.
-    """
+    """The deployments of a validated spec that states them."""
     accuracy = data.get(ACCURACY_FIELD)
-    default = (
-        [{"name": str(accuracy.get("benchmark") or DEFAULT_BENCHMARK)}]
-        if isinstance(accuracy, Mapping)
-        else []
-    )
+    judged = isinstance(accuracy, Mapping)
+    defaults = accuracy if judged else {}
+    default = [{"name": str(defaults.get("benchmark") or DEFAULT_BENCHMARK)}] if judged else []
     out = []
     for index, entry in enumerate(data[DEPLOYMENTS_FIELD]):
         disaggregated = entry.get(ROLES[0]) is not None
-        stated = entry.get("benchmarks")
-        benchmarks = tuple(
-            Benchmark(
-                name=str(b["name"]),
-                args=_args(b.get("args")),
-                anchor=float(b["anchor"]) if b.get("anchor") is not None else None,
-                source=str(b.get("source") or ""),
-                env={str(k): str(v) for k, v in (b.get("env") or {}).items()},
-            )
-            for b in (default if stated is None else stated)
-        )
+        listed = entry.get("benchmarks")
         out.append(
             Deployment(
                 name=str(entry["name"]),
@@ -482,32 +514,45 @@ def _stated(data: Mapping[str, Any]) -> tuple[Deployment, ...]:
                 relative_to=entry.get("relative_to"),
                 tests=tuple(entry.get("tests") or ()),
                 inputs=tuple(entry.get("inputs") or ("text",)),
-                benchmarks=benchmarks,
+                benchmarks=tuple(
+                    benchmark_of(b, defaults) for b in (default if listed is None else listed)
+                ),
             )
         )
     return tuple(out)
 
 
-def resolve(data: Mapping[str, Any], world_size: int | None = None) -> tuple[Deployment, ...]:
-    """The spec's deployments, core's first, whichever way a validated spec states them.
-
-    ``world_size`` is the world of a shorthand spec that names no member with one;
-    unsaid, it is the widest member's. Raises ``ValueError`` where the shorthand's
-    switches, flags and options file ask for two values of one setting.
-    """
-    if is_native(data):
+def resolve(data: Mapping[str, Any]) -> tuple[Deployment, ...]:
+    """The spec's deployments, core's first, whichever way a validated spec states them."""
+    if is_stated(data):
         return _stated(data)
     # Imported here: that module builds this one's types.
     from .shorthand import expand
 
-    return expand(data, world_size)
+    return expand(data)
 
 
-def write_options(deployment: Deployment, directory: str | Path) -> dict[str, Path]:
+def named(data: Mapping[str, Any], name: str | None = None) -> Deployment:
+    """The deployment called ``name``; core's when unnamed. ``KeyError`` naming the ones there are."""
+    found = resolve(data)
+    if name in (None, "", "core"):
+        return found[0]
+    for deployment in found:
+        if deployment.name == name:
+            return deployment
+    raise KeyError(
+        f"{name!r} names no deployment of this spec ({', '.join(d.name for d in found)})"
+    )
+
+
+def write_options(
+    deployment: Deployment, directory: str | Path, extra: Mapping[str, Any] | None = None
+) -> dict[str, Path]:
     """Write each server's options where ``trtllm-serve --config`` reads them; the files by role.
 
     ``<name>.yaml`` for an aggregated deployment, ``<name>.ctx.yaml`` and
-    ``<name>.gen.yaml`` for a disaggregated one.
+    ``<name>.gen.yaml`` for a disaggregated one. ``extra`` is laid over each server's
+    options: what the caller's check sets on every engine it starts.
     """
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
@@ -515,28 +560,32 @@ def write_options(deployment: Deployment, directory: str | Path) -> dict[str, Pa
     for role, server in deployment.servers.items():
         suffix = "" if role == "server" else f".{role}"
         path = root / f"{deployment.name}{suffix}.yaml"
-        path.write_text(yaml.safe_dump(dict(server.options), sort_keys=False), encoding="utf-8")
+        written = {**server.options, **(extra or {})}
+        path.write_text(yaml.safe_dump(written, sort_keys=False), encoding="utf-8")
         paths[role] = path
     return paths
 
 
-def describe(found: tuple[Deployment, ...]) -> str:
-    """One line for each deployment: its name, its servers' topology and what judges it."""
+def describe(found: tuple[Deployment, ...], anchors: Mapping[str, str] | None = None) -> str:
+    """One line for each deployment: its name, kind, servers, and what judges it.
+
+    ``anchors`` says where each benchmark's anchor comes from, by ``<deployment>:<benchmark>``.
+    """
     lines = []
     for deployment in found:
         shapes = []
         for role, server in deployment.servers.items():
-            options = server.options
-            ranks = options.get("tensor_parallel_size", 1)
-            shape = f"{ranks} rank(s)"
-            if options.get("enable_attention_dp"):
+            shape = f"{server.ranks} rank(s)"
+            if server.options.get("enable_attention_dp"):
                 shape += ", attention DP"
             if server.launch:
                 shape += ", behind a launch prefix"
             shapes.append(shape if role == "server" else f"{role} {shape}")
-        judged = [b.name for b in deployment.benchmarks] + [f"test {t}" for t in deployment.tests]
-        if deployment.relative_to:
-            judged.append(f"relative to {deployment.relative_to}")
+        judged = []
+        for benchmark in deployment.benchmarks:
+            source = (anchors or {}).get(f"{deployment.name}:{benchmark.name}")
+            judged.append(f"{benchmark.name} ({source})" if source else benchmark.name)
+        judged += [f"test {test}" for test in deployment.tests]
         lines.append(
             f"- `{deployment.name}`{' (core)' if deployment.core else ''}: {deployment.kind}, "
             f"{'; '.join(shapes)}; judged by its boot"
@@ -547,19 +596,26 @@ def describe(found: tuple[Deployment, ...]) -> str:
 
 __all__ = [
     "AGGREGATED",
+    "BENCHMARK_DEFAULTS",
+    "DEFAULT_BENCHMARK",
     "DEPLOYMENTS_FIELD",
     "DISAGGREGATED",
     "INPUTS",
     "ROLES",
+    "STATED_ACCURACY_KEYS",
     "Benchmark",
     "Deployment",
     "Server",
+    "benchmark_of",
     "describe",
-    "is_native",
-    "name_for",
+    "is_stated",
+    "load_options",
+    "named",
     "resolve",
     "resolve_paths",
+    "split_args",
     "validate",
-    "validate_native_spec",
+    "validate_env",
+    "validate_judging",
     "write_options",
 ]
