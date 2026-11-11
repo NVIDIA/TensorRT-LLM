@@ -144,32 +144,27 @@ class Integration:
         Only registering the worktree holds the repository lock. One whose
         checkout was cut short is made again, on the branch an earlier attempt
         left when there is one. A branch that holds nothing the checkout's
-        head lacks starts again at that head (:meth:`_caught_up`), so a retry
+        head lacks starts again at that head (:meth:`_catch_up`), so a retry
         sees what other tasks landed since.
         """
         tree = self.tree(task_id)
-        if _checked_out(tree):
-            self._catch_up(task_id, tree)
-        else:
+        if not _checked_out(tree):
             self._create(task_id, tree)
+        self._catch_up(task_id, tree)
         link_native(self.repo, tree)
         return tree
 
-    def _caught_up(self, task_id: str) -> str | None:
-        """The integration head, when the task's branch holds no commit it lacks; else ``None``.
+    def _catch_up(self, task_id: str, tree: Path) -> None:
+        """Move a worktree to the checkout's head when its branch has nothing of its own.
 
-        An earlier attempt that committed nothing, or whose commits all landed,
-        has nothing to keep, and no rule lets its worker rebase onto the head.
+        An earlier attempt that committed nothing, or whose commits all landed, has
+        nothing to keep, and no rule lets its worker rebase onto the head.
         """
         ahead = git_output(self.repo, "rev-list", "--count", f"HEAD..{self.branch(task_id)}")
-        if (ahead or "").strip() != "0":
-            return None
-        return (git_output(self.repo, "rev-parse", "HEAD") or "").strip() or None
-
-    def _catch_up(self, task_id: str, tree: Path) -> None:
-        """Move a reopened worktree to the integration head when its branch has nothing else."""
-        head = self._caught_up(task_id)
-        if head is None or (git_output(tree, "rev-parse", "HEAD") or "").strip() == head:
+        head = (git_output(self.repo, "rev-parse", "HEAD") or "").strip()
+        if (ahead or "").strip() != "0" or not head:
+            return
+        if (git_output(tree, "rev-parse", "HEAD") or "").strip() == head:
             return
         edits = git_output(tree, "status", "--porcelain", "--untracked-files=no")
         if (edits or "").strip():
@@ -192,9 +187,6 @@ class Integration:
                 exists = git_checked(
                     self.repo, "rev-parse", "--verify", "--quiet", branch, check=False
                 )
-                head = self._caught_up(task_id) if exists else None
-                if head is not None:
-                    self._git(self.repo, "branch", "-f", branch, head)
                 where = (str(tree), branch) if exists else ("-b", branch, str(tree), "HEAD")
                 added = self._git(self.repo, "worktree", "add", "--no-checkout", *where)
                 if added.returncode == 0:

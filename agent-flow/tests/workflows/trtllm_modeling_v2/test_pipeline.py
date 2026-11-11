@@ -201,6 +201,8 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     assert "`core` (core): done UNIT_READY" in last and "Nothing of a task not done landed" in last
     assert "## The checks `tep2` owes" in last and "`tep2:boot`, `tep2:accuracy[gsm8k]`" in last
     assert "gate <boot|accuracy|serve|tests>" in last and "--deployment tep2" in last
+    script = workspace / "bin" / "trtllm-modeling-v2"
+    assert os.access(script, os.X_OK) and f"    {script} gate <boot|" in last
     assert "the run runs each of them once on the checkout" in last
     core = _prompts(calls, "core")[0]
     assert "the run itself boots and scores this deployment on your committed worktree" in core
@@ -212,6 +214,9 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     assert "| PASS | in process | `c0ffee1` |" in report
     assert "| `tep2` | `boot` | - | - | PASS | in process | `c0ffee1` |" in report
     assert "| `kv_fp8` |" not in report.split("## Done")[1].split("##")[0]
+    survey = _prompts(calls, "survey")[0]
+    assert "## Tag `survey`" in survey and "## Surface survey" in survey
+    assert f"Write `{workspace}/plan.md` and `{workspace}/vocabulary.yaml`" in survey
     not_done = report.split("## Not done")[1].split("##")[0]
     assert "- `kv_fp8` (deployment): it ended BLOCKED: blocked_reason: environment" in not_done
     assert f"evidence: `{workspace}/decisions/kv_fp8-3.yaml`" in not_done
@@ -233,7 +238,11 @@ def test_a_kernel_row_that_is_not_done_is_skipped_and_the_run_goes_on(
     ]
     _write_vocabulary(workspace, rows)
 
+    defect = {"affects": "tensorrt_llm/x.py:f", "trigger": "rows above 2^31", "proposal": ""}
+
     def kernel_writer(turn, prompt):
+        if _task_id(prompt) == "k1-rms" and turn == 1:
+            return {"decision": "FAILED_RECEIPT", "summary": "overflow", "engine_defect": defect}
         if _task_id(prompt) == "k1-rms":
             return {"decision": "BLOCKED", "summary": "no kernel exports it on sm_103"}
         return {"decision": "LANDED", "summary": "landed", "entry": "x"}
@@ -242,6 +251,10 @@ def test_a_kernel_row_that_is_not_done_is_skipped_and_the_run_goes_on(
     calls = _run(tmp_path, _spec(task_file), monkeypatch, script)
     assert [_task_id(p) for _, p in calls] == [*["k1-rms"] * 3, "k2-scale", "core"]
     assert _state(tmp_path).onboarded
+    # A kernel task's next attempt is told why the last one ended, the defect it named included.
+    again = _prompts(calls, "k1-rms")[1]
+    assert "it ended FAILED_RECEIPT: engine_defect: affects tensorrt_llm/x.py:f; " in again
+    assert "trigger rows above 2^31; overflow" in again and "Attempt 2 of 3" in again
     # A later worker sees the row as skipped and is told what to do where it needs the entry.
     core = _prompts(calls, "core")[0]
     assert "- `k1-rms` (kernel): skipped BLOCKED. no kernel exports it on sm_103" in core
@@ -274,6 +287,21 @@ def test_a_task_that_changed_the_libraries_without_landing_is_named_in_the_repor
     assert f"are not the onboarded ones ({onboarded})" in report
     assert "the accepted ones are in" not in report
     assert "libraries were changed by" not in _prompts(calls, "kv_fp8")[0]
+
+
+def test_a_dispatch_lists_the_newest_ended_tasks_and_says_where_the_rest_are(
+    tmp_path, task_file, monkeypatch
+):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    rows = [{"n": n, "mode": "onboard", "target": f"ops/norm/op{n}"} for n in range(1, 34)]
+    _write_vocabulary(workspace, rows)
+    calls = _run(tmp_path, _spec(task_file), monkeypatch, Script())
+    core = _prompts(calls, "core")[0]
+    # Thirty-four ended before core (the survey and 33 rows): the newest thirty are listed.
+    assert f"- (4 earlier task(s): `{workspace}/tasks.yaml`)" in core
+    assert "`k3-op3` (kernel)" not in core and "- `k4-op4` (kernel): done LANDED" in core
+    assert core.count("(kernel): done LANDED") == 30
 
 
 def test_a_kernel_row_runs_after_the_rows_it_depends_on_in_the_first_unit_that_needs_it():
@@ -761,12 +789,25 @@ def test_a_stopped_run_goes_on_from_its_tasks_and_from_the_verdicts_on_record(
     assert [_task_id(p) for _, p in calls] == ["tep2"]
     assert shell.ran[2:] == ["kv_fp8:boot", "kv_fp8:accuracy", "tep2:boot", "tep2:accuracy"]
     assert _state(tmp_path).onboarded == onboarded
+    # What a role appended to the host facts is kept by the starts that follow.
+    workspace = tmp_path / "ws"
+    facts = workspace / "host_facts.md"
+    facts.write_text(facts.read_text() + "- `srun` needs `--mpi=pmix` on this cluster\n")
     # A start on a finished run has nothing left to do: every pass is on record.
     calls = _run(
         tmp_path, task, monkeypatch, Script(), shell_runner=shell, command_runner=healthy_smi(2)
     )
     assert calls == [] and len(shell.ran) == 6
     assert _report(tmp_path).startswith("# onboarded: commit `c0ffee1`")
+    assert facts.read_text().endswith("- `srun` needs `--mpi=pmix` on this cluster\n")
+    assert facts.read_text().count("Learned during this run") == 1
+    # One journal for the workspace, and one set of files a turn: a later start numbers its
+    # turns on from the earlier ones' and overwrites none. Three ran, and one was cut.
+    journal = (workspace / "journal.md").read_text()
+    assert journal.count("# Onboarding journal: ") == 1 and journal.count("**run opened**") == 1
+    assert journal.count("**run resumed**") == 2
+    ids = sorted(path.name.split("-")[0] for path in (workspace / "turns").glob("*.request.json"))
+    assert ids == ["001", "002", "003", "004"]
 
 
 def test_a_new_start_reopens_what_was_not_done_within_its_grants(tmp_path, task_file, monkeypatch):
@@ -836,6 +877,10 @@ def test_the_run_state_round_trips_and_another_versions_is_refused(tmp_path):
         onboarded={**record, "accuracy": "judged"},
     )
     save_state(path, original)
+    assert load_state(path) == original
+    # A key a later version adds is not this version's to refuse.
+    stored = json.loads(path.read_text())
+    path.write_text(json.dumps({**stored, "added_later": 1}))
     assert load_state(path) == original
     path.write_text(json.dumps({"version": 3, "task_path": "t", "stage": "execution"}))
     with pytest.raises(StateError, match="version 3, expected 4.*start over with --clean"):
@@ -1029,6 +1074,48 @@ def test_a_worker_whose_branch_is_behind_the_checkout_is_told_to_rebase_first(tm
     _git(repo, "commit", "-q", "-am", f"another{_SIGNED}")
     assert "is behind the checkout" not in worktree_block(integration.open("tep2"), repo)
     assert _git(fresh, "rev-parse", "HEAD") == _git(repo, "rev-parse", "HEAD")
+    # Unless an earlier attempt left edits it did not commit: they stay where they are.
+    (fresh / "shared.py").write_text("S = 'mine'\n")
+    (repo / "shared.py").write_text("S = 4\n")
+    _git(repo, "commit", "-q", "-am", f"a third{_SIGNED}")
+    integration.open("tep2")
+    assert (fresh / "shared.py").read_text() == "S = 'mine'\n"
+
+
+def test_a_worktree_is_made_whole_and_a_branch_left_in_a_bad_state_is_said_or_put_right(tmp_path):
+    repo = _checkout(tmp_path)
+    (repo / ".gitignore").write_text("tensorrt_llm/libs/\n")
+    (repo / "tensorrt_llm" / "libs").mkdir(parents=True)
+    (repo / "tensorrt_llm" / "libs" / "libtensorrt_llm.so").write_bytes(b"built")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", f"ignore the build{_SIGNED}")
+    integration = _integration(repo, tmp_path)
+    # A directory a cut-short creation left is no worktree: it is made again, whole.
+    half = integration.tree("core")
+    half.mkdir(parents=True)
+    (half / "stray.txt").write_text("left by a process that died\n")
+    tree = integration.open("core")
+    assert (tree / "shared.py").is_file() and not (tree / "stray.txt").exists()
+    assert _git(tree, "symbolic-ref", "HEAD") == "refs/heads/mv2/run/core"
+    # The checkout's native build, which git ignores, is linked into it.
+    assert (tree / "tensorrt_llm" / "libs").is_symlink()
+    assert (tree / "tensorrt_llm" / "libs" / "libtensorrt_llm.so").read_bytes() == b"built"
+    # A worker that left its worktree off its branch is told, in a turn of its own.
+    (tree / FAMILY / "a.py").write_text("A = 2\n")
+    _git(tree, "commit", "-q", "-am", f"core{_SIGNED}")
+    _git(tree, "checkout", "-q", "--detach")
+    outcome = integration.integrate("core")
+    assert not outcome.merged and outcome.repairable and "is not on its branch" in outcome.detail
+    _git(tree, "checkout", "-q", "mv2/run/core")
+    # A rebase a stopped process left open is put back before anything else: the conflict
+    # is then said as a conflict, with the files, for the worker to resolve.
+    (repo / FAMILY / "a.py").write_text("A = 3\n")
+    _git(repo, "commit", "-q", "-am", f"other{_SIGNED}")
+    head = _git(repo, "rev-parse", "HEAD")
+    assert subprocess.run(["git", "-C", str(tree), "rebase", head], capture_output=True).returncode
+    outcome = integration.integrate("core")
+    assert not outcome.merged and outcome.base == head and outcome.conflicts == (f"{FAMILY}/a.py",)
+    assert _git(tree, "symbolic-ref", "HEAD") == "refs/heads/mv2/run/core"
 
 
 def test_a_commit_lands_labelled_by_its_paths_and_only_a_judge_path_is_refused(tmp_path):
@@ -1208,6 +1295,7 @@ def test_on_a_real_checkout_core_lands_only_the_commit_the_onboard_check_passed(
     assert report.startswith(f"# onboarded: commit `{onboarded}`")
     final = report.split("## Final pass")[1].split("##")[0]
     assert "[ok] git:target-committed at `" in final
+    assert "[ok] git:commit-rules at `" in final and "signed off by its author" in final
     # Nothing later takes the record back, or writes it again.
     report_mod.record_onboarded(workflow, repo, base)
     assert _state(tmp_path).onboarded == record

@@ -248,9 +248,13 @@ def test_a_key_this_version_no_longer_reads_is_dropped_with_one_notice_each(tmp_
     spec["accuracy"]["envelope"] = {"enabled": True, "probes": ["1, 2, 3,"]}
     spec["accuracy"]["reference_logits"] = {"path": "reference.json"}
     spec["commit_policy"] = {"allowed_paths": ["tensorrt_llm/"], "base_ref": "main"}
+    spec["agents"]["roles"] = {"planner": {"model": "m", "reasoning_effort": "high"}}
     notices: list[str] = []
     resolved = load_and_validate_task_yaml(_write(tmp_path, spec), notices)
     assert "envelope" not in resolved["accuracy"] and "reference_logits" not in resolved["accuracy"]
+    # A spec written for the planner still loads: its role is dropped, with why.
+    assert notices.pop().startswith("'agents.roles.planner' is ignored: there is no planner")
+    assert resolved["agents"]["roles"] == {}
     assert len(notices) == 3
     assert notices[0].startswith("'accuracy.envelope' is ignored: a boot runs its workload only")
     assert notices[1].startswith("'accuracy.reference_logits' is ignored: ")

@@ -130,6 +130,21 @@ def test_a_delivered_file_that_did_not_run_is_not_covered_by_another(tmp_path):
     assert f"no test of {tests}/norm/test_b.py ran" in check.detail
 
 
+def test_a_nonzero_exit_beside_a_clean_report_is_not_a_pass(tmp_path):
+    tests = model_ops_tests_dir(TARGET)
+    stage = _Delivery(tmp_path, {f"{tests}/test_a.py": PASSING})
+    real = stage._shell_runner
+
+    def crashed_after(command, env=None, timeout=0):
+        done = real(command, env, timeout)
+        return CommandResult(returncode=3, stdout=done.stdout, stderr="worker crashed at exit")
+
+    stage._shell_runner = crashed_after
+    check = stage.check()
+    assert not check.passed and check.detail.startswith("INCOMPLETE (pytest exited 3): ")
+    assert "worker crashed at exit" in check.detail
+
+
 def test_no_report_and_a_skip_that_must_not_be_are_not_passes(tmp_path):
     unread = pytest_runner.read_report(tmp_path / "none.xml")
     assert unread.verdict() == "INCOMPLETE" and "no test report" in unread.describe()

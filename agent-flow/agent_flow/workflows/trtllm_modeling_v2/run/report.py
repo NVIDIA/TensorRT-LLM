@@ -389,14 +389,16 @@ def _stopped(workflow, pipeline) -> list[str]:
 
 def _uncertified(workspace: Path) -> list[str]:
     """Each task's `uncertified` list from its last decision file, one line per item."""
-    last: dict[str, tuple[tuple[int, ...], Path]] = {}
-    for path in (workspace / DECISIONS_DIRNAME).glob("*.yaml"):
+
+    def order(path: Path) -> tuple[str, list[int]]:
         task, _, token = path.stem.rpartition("-")
-        key = tuple(int(x) for x in token.split(".") if x.isdigit())
-        if task and key and (task not in last or key > last[task][0]):
-            last[task] = (key, path)
+        return task, [int(x) for x in token.split(".") if x.isdigit()]
+
+    # By task, attempt and turn: the last of a task is the latest word of its worker.
+    files = sorted((workspace / DECISIONS_DIRNAME).glob("*.yaml"), key=order)
+    last = {order(path)[0]: path for path in files if order(path)[0]}
     lines: list[str] = []
-    for task, (_, path) in sorted(last.items()):
+    for task, path in sorted(last.items()):
         try:
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         except (OSError, UnicodeError, yaml.YAMLError):

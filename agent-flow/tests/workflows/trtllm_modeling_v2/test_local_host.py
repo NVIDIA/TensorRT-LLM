@@ -155,6 +155,9 @@ def test_monitor_cli_tells_a_busy_orchestrator_from_one_that_has_exited(
     write_json_atomic(dispatch / ORCHESTRATOR_EXIT, {"pid": 1, "host": "h", "at": time.time() + 1})
     assert monitor(["--workspace", str(tmp_path), "wait", "--timeout", "0"]) == 0
     assert capsys.readouterr().out.splitlines()[0].startswith("ORCHESTRATOR_EXITED  pid 1")
+    # An exit older than the heartbeat is an earlier process's: this one is running.
+    write_json_atomic(dispatch / ORCHESTRATOR_EXIT, {"pid": 1, "host": "h", "at": time.time() - 60})
+    assert monitor_mod.orchestrator_state(tmp_path)[0] == "running"
 
 
 def test_monitor_status_says_where_the_run_stands(tmp_path, capsys):
