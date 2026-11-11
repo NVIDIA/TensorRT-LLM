@@ -2581,12 +2581,12 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
 
 
 @pytest.mark.parametrize(
-    "is_cuda_graph,fp8,query_width,with_stats",
+    "is_cuda_graph,fp8,query_width,with_stats,with_bounds",
     [
-        (False, False, 1, False),
-        (True, False, 6, True),
-        (True, True, 1, False),
-        (False, True, 8, True),
+        (False, False, 1, False, False),
+        (True, False, 6, True, True),
+        (True, True, 1, False, True),
+        (False, True, 8, True, False),
     ],
 )
 def test_mla_prepare_workspace_sizes_caller_owned_workspace(
@@ -2595,6 +2595,7 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     fp8: bool,
     query_width: int,
     with_stats: bool,
+    with_bounds: bool,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     workspace_size = Mock(return_value=48)
@@ -2610,6 +2611,9 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     q = torch.empty((2 * query_width, attn.num_heads * 576), dtype=torch.bfloat16)
     metadata = SimpleNamespace(
         is_cuda_graph=is_cuda_graph,
+        helix_position_offsets=torch.empty(2 * query_width, dtype=torch.int32)
+        if with_bounds
+        else None,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         max_num_requests=2,
         num_contexts=0,
@@ -2645,6 +2649,8 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     assert workspace_size.call_args.kwargs["out_dtype"] == torch.bfloat16
     assert workspace_size.call_args.kwargs["max_q_len"] == query_width
     assert workspace_size.call_args.kwargs["store_softmax_stats"] == with_stats
+    assert workspace_size.call_args.kwargs["use_kv_bounds"] == with_bounds
+    assert workspace_size.call_args.kwargs["validate"] is False
     assert workspace.numel() == 48
 
 
@@ -2670,6 +2676,7 @@ def test_mla_prepare_workspace_preserves_cached_wrappers_with_stable_allocation(
     q = torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16)
     metadata = SimpleNamespace(
         is_cuda_graph=True,
+        helix_position_offsets=None,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         max_num_requests=2,
         num_contexts=0,
@@ -2709,6 +2716,7 @@ def test_mla_caller_workspace_grows_across_plan_profiles(
     q = torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16)
     metadata = SimpleNamespace(
         is_cuda_graph=False,
+        helix_position_offsets=None,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         max_num_requests=2,
         num_contexts=0,
@@ -2752,6 +2760,7 @@ def test_mla_workspace_size_cache_tracks_request_geometry(
     fmha._multi_processor_count = 1
     metadata = SimpleNamespace(
         is_cuda_graph=False,
+        helix_position_offsets=None,
         kv_cache_block_offsets=torch.empty((4, 2, 3), dtype=torch.int32),
         max_num_requests=4,
         max_num_tokens=32,
@@ -2778,6 +2787,8 @@ def test_mla_workspace_size_cache_tracks_request_geometry(
         assert workspace.numel() >= 32 * batch * query_width + 96
 
     assert workspace_size.call_count == 3
+    assert all(call.kwargs["validate"] is False for call in workspace_size.call_args_list)
+    assert all(call.kwargs["use_kv_bounds"] is False for call in workspace_size.call_args_list)
     assert set(fmha._mla_decode_workspace_sizes) == {(2, 1), (2, 6), (4, 8)}
     assert all(isinstance(size, int) for size in fmha._mla_decode_workspace_sizes.values())
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
@@ -2818,6 +2829,7 @@ def test_mla_workspace_size_cache_preserves_allocation_checks(
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 1
     metadata = SimpleNamespace(
+        helix_position_offsets=None,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         num_contexts=0,
         num_generations=2,
@@ -2947,6 +2959,7 @@ def test_decode_prepare_workspace_reserves_tail_after_compact_preprocessing(
     assert workspace_size.call_args.kwargs["q_dtype"] == expected_dtype
     assert workspace_size.call_args.kwargs["kv_dtype"] == expected_dtype
     assert workspace_size.call_args.kwargs["out_dtype"] == torch.bfloat16
+    assert workspace_size.call_args.kwargs["validate"] is False
 
 
 def test_decode_workspace_tail_is_stable_across_mixed_context_layouts(

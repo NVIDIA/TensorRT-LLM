@@ -1269,7 +1269,9 @@ class PrimsTSFmha(PhasedFmha):
                     out_dtype=forward_args.output.dtype,
                     mask_type=mask_type,
                     store_softmax_stats=forward_args.softmax_stats_tensor is not None,
+                    use_kv_bounds=metadata.helix_position_offsets is not None,
                     device=q.device,
+                    validate=False,
                 )
                 self._mla_decode_workspace_sizes[size_key] = required_bytes
         else:
@@ -1291,6 +1293,7 @@ class PrimsTSFmha(PhasedFmha):
                 mask_type=mask_type,
                 window_left=window_left,
                 device=q.device,
+                validate=False,
             )
 
         decode_workspace_min_offset_bytes: Optional[int] = None
