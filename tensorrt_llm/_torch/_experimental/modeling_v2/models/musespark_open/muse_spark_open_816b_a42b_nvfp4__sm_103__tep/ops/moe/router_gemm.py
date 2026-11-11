@@ -38,11 +38,19 @@ TF32x3 kernel also rounds every weight to 22 bits, the TF32 ``Linear`` to 11.
 Programmatic dependent launch: the GEMM waits (``griddepcontrol.wait``) before its
 first load and releases its dependents after its last MMA; the sum kernel waits
 before reading the partials and releases its dependents.
+
+Row tile (opt-in ``TRTLLM_ROUTER_GEMM_ALIGNED_TILE=1``). The row tile is the MMA's N, any
+multiple of 8 up to 128; the next power of two wastes the padding of a call whose rows sit
+just above one (72 rows run a 128 tile, 44% of it padding; 136 rows run two 128 tiles, 47%).
+With the option each of the call's ``ceil(rows / 128)`` row tiles is ``ceil(rows / tiles)``
+rows rounded up to a multiple of 8. The tile count, the K splits and the order each logit
+accumulates in are unchanged, so every logit is bit-identical to the default tile's.
 """
 
 from __future__ import annotations
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -50,6 +58,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm.logger import logger
 
 #: The checkpoint's router: 256 experts over the 8192-wide residual.
 EXPERTS = 256
@@ -93,8 +102,18 @@ def staged_epilogue() -> Optional[str]:
     return _staged_epilogue
 
 
+#: Opt-in (read once at import): 8-aligned row tiles instead of power-of-two ones.
+ALIGNED_TILE_ENV = "TRTLLM_ROUTER_GEMM_ALIGNED_TILE"
+ALIGNED_ROW_TILE = os.environ.get(ALIGNED_TILE_ENV, "0") == "1"
+_logged_tile = False
+
+
 def row_tile(rows: int) -> int:
-    """The GEMM's N tile for a call of ``rows`` rows: the next power of two, 8..128."""
+    """The GEMM's N tile for a call of ``rows`` rows: the next power of two, 8..128; with
+    ``ALIGNED_ROW_TILE`` the call's share of the rows per 128-row tile, rounded up to 8."""
+    if ALIGNED_ROW_TILE:
+        per_tile = triton.cdiv(rows, triton.cdiv(rows, ROW_TILE))
+        return max(8, min(triton.cdiv(per_tile, 8) * 8, ROW_TILE))
     return min(max(triton.next_power_of_2(rows), 8), ROW_TILE)
 
 
@@ -176,7 +195,15 @@ class RouterGemm(OpWrapper):
         partials = torch.empty(
             (split_count, rows, EXPERTS), device=hidden_states.device, dtype=torch.float32
         )
-        _gemm(row_tile(rows))(hidden_states, weight, partials, split_count)
+        tile = row_tile(rows)
+        global _logged_tile
+        if ALIGNED_ROW_TILE and not _logged_tile:
+            _logged_tile = True
+            logger.info(
+                f"[musespark_open] router_gemm: 8-aligned row tiles ({ALIGNED_TILE_ENV}=1); first call "
+                f"{rows} rows -> tile {tile} (power of two: {min(max(triton.next_power_of_2(rows), 8), ROW_TILE)})"
+            )
+        _gemm(tile)(hidden_states, weight, partials, split_count)
         output = torch.empty((rows, EXPERTS), device=hidden_states.device, dtype=torch.float32)
         size = rows * EXPERTS
         splits_pow2 = triton.next_power_of_2(split_count)
