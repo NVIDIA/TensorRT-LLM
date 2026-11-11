@@ -3323,6 +3323,7 @@ def test_v2_hybrid_quota_error_when_even_batch_size_one_does_not_fit():
     message = str(exc_info.value)
     assert "max_batch_size=2" in message
     assert "pp_size=2" in message
+    assert "max_batch_size * pp_size = 4 sequences" in message
     assert "Even max_batch_size=1 does not fit this quota" in message
     assert "a value of" not in message
     assert mgr._largest_max_batch_size_for_gpu_quota(quota) == 0

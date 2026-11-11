@@ -131,8 +131,10 @@ def format_insufficient_mamba_gpu_quota_error(
         "The V2 Mamba GPU cache quota is too small for live recurrent "
         f"states and attention pages: got {gpu_quota} bytes, need at "
         f"least {minimum_live_quota} bytes. This floor reserves recurrent "
-        f"state for max_batch_size={max_batch_size} sequences on each "
-        f"pipeline-parallel rank (pp_size={pp_size})."
+        "state on each pipeline-parallel rank for max_batch_size * pp_size = "
+        f"{max_batch_size * pp_size} sequences (max_batch_size={max_batch_size}, "
+        f"pp_size={pp_size}), plus GEN preemption headroom and CUDA graph "
+        "padding dummy slots."
     )
     if feasible_max_batch_size > 0:
         message += (
