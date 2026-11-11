@@ -106,6 +106,7 @@ l0_cpu:
   # The qwen4_exp default target's cpu_only tests (its routing among them); this stage runs
   # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
+  - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_routing.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
@@ -186,6 +187,7 @@ l0_cpu:
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
   - unittest/_torch/misc/test_grammar_matcher.py
   - unittest/_torch/models/checkpoints
+  - unittest/_torch/modeling/test_modeling_pplx_decider.py
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
@@ -352,6 +354,7 @@ l0_cpu:
   - unittest/llmapi/test_config_overrides.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   - unittest/llmapi/test_executor.py
+  - unittest/llmapi/test_embedding_arch_routing.py
   - unittest/llmapi/test_gc_utils.py
   - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
