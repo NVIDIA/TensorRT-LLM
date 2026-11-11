@@ -3075,6 +3075,10 @@ def _generate_streaming_event(
         streaming_events_helper.is_output_item_added_sent = False
 
 
+_HARMONY_DELTA_EVENT_TYPES = ("response.output_text.delta",
+                              "response.reasoning_text.delta")
+
+
 def _generate_streaming_event_harmony(
     harmony_adapter: HarmonyAdapter,
     stream_request_id: str,
@@ -3083,12 +3087,39 @@ def _generate_streaming_event_harmony(
     streaming_events_helper: ResponsesStreamingEventsHelper,
 ):
     tools = [tool.model_dump() for tool in request.tools]
-    messages = harmony_adapter.stateful_stream_harmony_tokens_to_openai_messages(
-        stream_request_id, output.token_ids_diff, tools, request.tool_choice)
+    # A response can carry several tokens (stream_interval > 1, draft tokens),
+    # but the parser only reports the last token's state and delta.
+    events = []
+    for token in output.token_ids_diff:
+        messages = harmony_adapter.stateful_stream_harmony_tokens_to_openai_messages(
+            stream_request_id, [token], tools, request.tool_choice)
+        for event in _generate_harmony_token_events(harmony_adapter,
+                                                    stream_request_id, messages,
+                                                    streaming_events_helper):
+            # Deltas of one content part go out as one event, as on the chat path.
+            if (events and event.type in _HARMONY_DELTA_EVENT_TYPES
+                    and event.type == events[-1].type
+                    and event.output_index == events[-1].output_index
+                    and event.content_index == events[-1].content_index):
+                events[-1].delta += event.delta
+            else:
+                events.append(event)
+    yield from events
+
+
+def _generate_harmony_token_events(
+    harmony_adapter: HarmonyAdapter,
+    stream_request_id: str,
+    messages: list[Message],
+    streaming_events_helper: ResponsesStreamingEventsHelper,
+):
     stream_state = harmony_adapter.get_stream_state(stream_request_id)
     assert stream_state is not None
     parser = stream_state.get_parser()
-    if parser.state == StreamState.EXPECT_START:
+    # parser.state serializes every token of the current message; while a
+    # channel is open the parser is still inside that message.
+    if (parser.current_channel is None
+            and parser.state == StreamState.EXPECT_START):
         streaming_events_helper.output_index_increment()
         streaming_events_helper.is_output_item_added_sent = False
 

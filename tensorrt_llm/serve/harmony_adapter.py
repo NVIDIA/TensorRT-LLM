@@ -94,6 +94,11 @@ class HarmonyStreamState:
         # Track sent arguments for tool call streaming deltas
         self.sent_tool_arguments = {}  # tool_call_id -> sent_arguments_length
 
+        # The parser only adds a message on one of its stop tokens, so the
+        # converted messages are reused until a batch contains one.
+        self._message_stop_tokens = frozenset(encoding.stop_tokens())
+        self._messages: list[Message] | None = None
+
         logger.debug(f"Created HarmonyStreamState for request {request_id}")
 
     def get_parser(self) -> StreamableParser:
@@ -211,6 +216,8 @@ class HarmonyStreamState:
         Returns OpenAI Messages for Responses API
         """
         self.tokens_processed += len(tokens)
+        if not self._message_stop_tokens.isdisjoint(tokens):
+            self._messages = None
 
         for token in tokens:
             # Store previous state for transition detection
@@ -238,7 +245,9 @@ class HarmonyStreamState:
                 self.channel_started = False
                 self.current_channel_state = None
 
-        return self.parser.messages
+        if self._messages is None:
+            self._messages = self.parser.messages
+        return self._messages
 
     def _create_closing_token_delta(self) -> dict[str, Any] | None:
         """Create closing token delta for channel transition."""
