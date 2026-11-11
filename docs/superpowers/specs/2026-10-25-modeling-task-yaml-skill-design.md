@@ -155,16 +155,21 @@
 ### 收尾
 
 1. 展示完整的 task.yaml 草稿，请用户确认或修改。
-2. 直接给出一个新的 workspace 完整路径请用户确认或替换：`<trtllm_repo_path>/agent-flow/workspace/<name>`
-   （agent-flow 的 `.gitignore` 忽略 `workspace/`），`<name>` 是 checkpoint 目录名的小写加
-   `-v2-onboard` 或 `-bringup`，目录已存在就加 `-2`、`-3`。确认后创建目录并写入 `task.yaml`；
-   用户换成的目录里已有 task.yaml 时，先问再覆盖。
+2. 直接给出一个新的 workspace 完整路径请用户确认或替换：`<agent-flow>/workspace/<name>`，`<agent-flow>`
+   是用户的工作流命令实际安装自的 agent-flow 目录（`workspace/` 在它的 `.gitignore` 里）。这个目录在
+   `trtllm_repo_path` 里面、或者还没装 agent-flow 时，改用 checkout 旁边的 `<trtllm_repo_path 的上一级>/<name>`，
+   并说明原因：modeling-v2-onboard 拒绝放在 checkout 里的 workspace，因为最后一个任务会提交那里所有未跟踪的文件。
+   `<name>` 是 checkpoint 目录名的小写加 `-v2-onboard` 或 `-bringup`，目录已存在就加 `-2`、`-3`。
+   确认后创建目录并写入 `task.yaml`；用户换成的目录里已有 task.yaml 时，先问再覆盖。
 3. 用 `modeling-v2-onboard --check` 校验（schema、checkout、workspace、checkpoint、镜像、mounts、
    GPU pool）；没有 v2-onboard 时用 `load_and_validate_task_yaml`。失败时把问题告诉用户，改完再校验。
 4. Slurm + v2-onboard 时，问用户要不要现在跑运行时检查（`--check --smoke`：提交一个短 Slurm 作业，
    检查容器、GPU、mounts、CUDA PyTorch；要等节点）。不跑的话，planner 启动后由环境任务做同样的检查，
    并产出 worker 用的 wrapper。
-5. 告诉用户运行命令，例如 `modeling-bringup --task <path> --workspace <path>`。
+5. 给出运行命令。modeling-v2-onboard 先问 run 里的 planner 和 worker 用 Claude Code（默认）还是 Codex，
+   Codex 时命令加 `--backend codex`；modeling-bringup 没有统一的后端开关，直接给命令。然后问要不要由当前会话
+   代为启动：要的话用 `setsid nohup <命令> > <workspace>/launch.log 2>&1 &` 后台启动，报告 PID 和日志路径，
+   并说明重跑同一条命令会接着跑；不要就由用户自己运行。
 
 ## 交给实现者决定的事
 
