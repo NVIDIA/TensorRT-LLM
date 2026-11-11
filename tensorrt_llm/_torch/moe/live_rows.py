@@ -16,12 +16,12 @@
 
 The requests that pad a batch to a captured CUDA graph's size and the placeholder
 request of an idle attention-DP rank follow the real requests, so the real rows
-lead every token-indexed tensor of a forward. The engine writes, before each
-forward, one 32-bit word in device memory: bits 0-15 hold the real requests R,
-bits 16-31 the requests P of the forward. A kernel over T rows keeps
-:func:`live_row_count` of them: none when P is 0, all when R >= P or P does not
-divide T, else the leading T / P * R. Only the SM100/SM103 MegaMoE CuteDSL kernel
-reads the word; EPLB statistics still count the rows it drops.
+lead every token-indexed tensor of a forward. Before each forward the engine writes
+one 32-bit word in device memory, once a kernel that reads it has allocated it: bits
+0-15 hold the real requests R, bits 16-31 the requests P of the forward. A kernel over
+T rows keeps :func:`live_row_count` of them: none when P is 0, all when R >= P or P
+does not divide T, else the leading T / P * R. Only the SM100/SM103 MegaMoE CuteDSL
+kernel reads the word; EPLB statistics still count the rows it drops.
 
 That rule holds for a launch over all rows of the forward. A MoE layer that splits a
 forward into chunks launches over parts of it, so those launches read a word that keeps
