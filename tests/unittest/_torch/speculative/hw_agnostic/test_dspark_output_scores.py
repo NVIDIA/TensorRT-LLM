@@ -12,7 +12,11 @@ from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.pyexecutor import _util as executor_util
-from tensorrt_llm._torch.pyexecutor.llm_request import ContextLogitsOrigin, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    ContextLogitsOrigin,
+    LlmRequestState,
+    PyResult,
+)
 from tensorrt_llm._torch.speculative import spec_sampler_base as sampler_ops
 from tensorrt_llm._torch.speculative.logprobs import (
     GATHER_IDS_KEY,
@@ -256,6 +260,9 @@ def _request(**overrides: object) -> types.SimpleNamespace:
     fields = dict(
         py_return_log_probs=False,
         py_return_context_logits=False,
+        py_context_logits_explicit=True,
+        py_prompt_logprobs=None,
+        prepopulated_prompt_len=0,
         py_return_generation_logits=False,
         py_logprobs_mode=LogprobMode.RAW,
         py_num_logprobs=0,
@@ -311,12 +318,13 @@ def test_staging_selects_original_context_chunks_and_requested_target_rows() -> 
         return states
 
     sampler.logit_projection = project
-    context_chunks = []
-    context_origins = []
-
-    def record_context(rows: torch.Tensor, origin: ContextLogitsOrigin) -> None:
-        context_chunks.append(rows)
-        context_origins.append(origin)
+    context_result = PyResult(
+        prompt_len=2,
+        max_new_tokens=1,
+        use_device_memory=False,
+        return_context_logits=True,
+        use_chunked_generation_logits=False,
+    )
 
     first = _request(
         py_return_context_logits=True,
@@ -324,7 +332,7 @@ def test_staging_selects_original_context_chunks_and_requested_target_rows() -> 
         context_current_position=0,
         orig_prompt_len=2,
         py_client_id=17,
-        py_result=types.SimpleNamespace(append_context_logits=record_context),
+        py_result=context_result,
     )
     final = _request(context_chunk_size=3, py_return_log_probs=True)
     generation = _request(py_return_log_probs=True, py_num_logprobs=2)
@@ -342,9 +350,8 @@ def test_staging_selects_original_context_chunks_and_requested_target_rows() -> 
         scheduled, outputs, [final, _request(), generation], 2
     )
     assert indices == [0, 2]
-    assert len(context_chunks) == 1
-    assert torch.equal(context_chunks[0], hidden[:2])
-    assert context_origins == [ContextLogitsOrigin(17, 2, 0, 2)]
+    torch.testing.assert_close(context_result.context_logits, hidden[:2])
+    assert context_result.context_logits_origins == (ContextLogitsOrigin(17, 2, 0, 2),)
     assert torch.equal(projections[1], hidden[torch.tensor([4, 4, 4, 8, 9, 10])])
     expected = hidden[[4, 8, 9]].log_softmax(-1)
     torch.testing.assert_close(scores.sampled[0, 0], expected[0, 3])

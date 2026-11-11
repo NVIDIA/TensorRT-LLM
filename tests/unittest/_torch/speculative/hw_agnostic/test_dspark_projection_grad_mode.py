@@ -16,6 +16,7 @@ import torch
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 from tensorrt_llm._torch.speculative.logprobs import GATHER_IDS_KEY, HIDDEN_STATES_KEY
 from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
 from tensorrt_llm.mapping import Mapping
@@ -102,16 +103,23 @@ def test_actual_context_staging_uses_guarded_bound_projection_on_inference_view(
     handle = model.lm_head.register_forward_pre_hook(
         lambda module, inputs: seen.append((_flags(), inputs[0].is_inference()))
     )
-    context = []
+    context = PyResult(
+        prompt_len=2,
+        max_new_tokens=1,
+        use_device_memory=False,
+        return_context_logits=True,
+        use_chunked_generation_logits=False,
+    )
     request = types.SimpleNamespace(
         py_return_context_logits=True,
+        py_context_logits_explicit=True,
+        py_prompt_logprobs=None,
+        prepopulated_prompt_len=0,
         context_chunk_size=2,
         context_current_position=0,
         orig_prompt_len=2,
         py_client_id=17,
-        py_result=types.SimpleNamespace(
-            append_context_logits=lambda rows, _origin: context.append(rows)
-        ),
+        py_result=context,
     )
     scheduled = types.SimpleNamespace(context_requests=[request])
     sampler = SpecSampler.__new__(SpecSampler)
@@ -122,12 +130,13 @@ def test_actual_context_staging_uses_guarded_bound_projection_on_inference_view(
         scores, indices = sampler._stage_requested_logits(scheduled, outputs, [], 1)
         assert _flags() == before == (caller_grad, False)
     handle.remove()
-    assert scores is None and indices == [] and len(context) == 1
+    assert scores is None and indices == []
     assert seen == [((False, False), True)]
     with torch.no_grad():
         expected = hidden[:2] @ model.lm_head.weight.T
-    torch.testing.assert_close(context[0], expected)
-    assert not context[0].requires_grad and context[0].grad_fn is None
+    actual = context.context_logits
+    torch.testing.assert_close(actual, expected)
+    assert not actual.requires_grad and actual.grad_fn is None
     assert model.lm_head.weight.requires_grad and model.lm_head.weight.grad is None
 
 

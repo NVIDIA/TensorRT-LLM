@@ -301,3 +301,19 @@ def _host_query(qualname: str):
 _host_query(f"{_NS}::glm_dense_mlp_small_m_supported")
 _host_query(f"{_NS}::glm_intra_node_reduce_supported")
 _host_query(f"{_NS}::glm_mnnvl_hop_supported")
+_host_query(f"{_NS}::glm_megakernel_info")
+
+
+@torch.library.register_fake(f"{_NS}::glm_megakernel_indexer_tmap")
+def _glm_megakernel_indexer_tmap(pool: torch.Tensor, rows: int):
+    return torch.empty((128,), dtype=torch.uint8, device="cpu")
+
+
+@torch.library.register_fake(f"{_NS}::glm_megakernel_weight_table")
+def _glm_megakernel_weight_table(params: torch.Tensor, offset: int):
+    return None
+
+
+@torch.library.register_fake(f"{_NS}::glm_megakernel")
+def _glm_megakernel(params, x, residual, topk, block_table, kv_lens, state, kv_cache, pdl):
+    return torch.empty_like(x), torch.empty_like(residual)

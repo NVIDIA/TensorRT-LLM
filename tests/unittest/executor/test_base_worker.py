@@ -6,6 +6,7 @@ import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 from threading import Event, Lock
 from types import MethodType, ModuleType, SimpleNamespace
@@ -25,6 +26,7 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
 
+from tensorrt_llm._torch.pyexecutor.llm_request import ContextLogitsOrigin
 from tensorrt_llm.executor import base_worker
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
@@ -45,7 +47,7 @@ model_path = llm_models_root() / default_model_name
 def test_prompt_logprobs_computation_and_streaming_cache(
         monkeypatch, streaming, drop_context_logits, simple):
     prompt_logprobs = [-0.5, -0.25, -0.125] if simple else [{11: "logprob"}]
-    logits = object()
+    logits = torch.zeros(3, 2)
     calls = []
 
     def compute(k, context_logits, prompt_token_ids, *, simple_prompt_logprobs):
@@ -59,7 +61,8 @@ def test_prompt_logprobs_computation_and_streaming_cache(
                                       drop_context_logits=drop_context_logits,
                                       prompt_logprobs_simple_format=simple),
         _streaming=streaming,
-        _generation_request=SimpleNamespace(prompt_token_ids=[10, 11, 12]))
+        _generation_request=SimpleNamespace(prompt_token_ids=[10, 11, 12],
+                                            id=1))
     generation_result.clear_logprob_params = lambda: delattr(
         generation_result, "_logprob_params")
     worker = SimpleNamespace(_results={1: generation_result})
@@ -67,6 +70,8 @@ def test_prompt_logprobs_computation_and_streaming_cache(
     def make_response(context_logits):
         result = SimpleNamespace(
             context_logits=context_logits,
+            context_logits_origins=(ContextLogitsOrigin(1, 3, 0, 3), ),
+            context_prompt_logprob_rows=None,
             is_final=False,
             get_result=lambda: SimpleNamespace(output_token_ids=[[13]]))
         return SimpleNamespace(client_id=1,
@@ -278,6 +283,57 @@ def test_get_startup_metrics_promotes_model_engine_stages() -> None:
             "total_model_loading_seconds": 0.75
         },
     }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("primary_observed", [False, True])
+def test_get_startup_metrics_preserves_loader_policy_metadata(
+        primary_observed: bool) -> None:
+    """Forward nested target and draft policies without conflating their status."""
+    primary_policy = {
+        "requested": "auto",
+        "selected": "rank_striped_read_ahead",
+        "activated": True,
+        "effective": "native",
+        "fallback_reason": "reader failed after activation",
+    } if primary_observed else None
+    draft_policy = {
+        "requested": "native",
+        "selected": "native",
+        "activated": False,
+        "effective": "native",
+        "fallback_reason": None,
+    }
+    target_metadata = {
+        "checkpoint_io_policy": primary_policy,
+        "draft_checkpoint_io_policy": draft_policy,
+    }
+    draft_metadata = {"checkpoint_io_policy": draft_policy}
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker.engine = SimpleNamespace(
+        metrics={},
+        model_engine=SimpleNamespace(model_loader=SimpleNamespace(
+            metrics={"total_model_loading_seconds": 1.5},
+            startup_metadata=target_metadata)),
+        draft_model_engine=SimpleNamespace(model_loader=SimpleNamespace(
+            metrics={"total_model_loading_seconds": 0.75},
+            startup_metadata=draft_metadata)),
+    )
+
+    expected = deepcopy({
+        "py_executor": {},
+        "model_loader": {
+            "total_model_loading_seconds": 1.5,
+            **target_metadata,
+        },
+        "draft_model_loader": {
+            "total_model_loading_seconds": 0.75,
+            **draft_metadata,
+        },
+    })
+
+    assert worker.get_startup_metrics() == expected
 
 
 @pytest.mark.cpu_only
@@ -703,7 +759,7 @@ def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
 
     generation_result = SimpleNamespace(
         _streaming=streaming,
-        _generation_request=SimpleNamespace(prompt_token_ids=[0, 1, 2]),
+        _generation_request=SimpleNamespace(prompt_token_ids=[0, 1, 2], id=7),
         _logprob_params=LogprobParams(prompt_logprobs=top_k,
                                       drop_context_logits=drop_context_logits,
                                       prompt_logprobs_simple_format=simple),
@@ -712,6 +768,8 @@ def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
     response_result = SimpleNamespace(
         is_final=False,
         context_logits=torch.tensor([[0., 1., 2., 3.]] * 3),
+        context_logits_origins=(ContextLogitsOrigin(7, 3, 0, 3), ),
+        context_prompt_logprob_rows=None,
         get_result=lambda: SimpleNamespace(output_token_ids=[[0]]),
     )
 

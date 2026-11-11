@@ -24,7 +24,8 @@ import weakref
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Dict, List, Literal, Optional, Set, Tuple,
+                    Union)
 
 import torch
 
@@ -43,6 +44,7 @@ from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
+from ..llmapi.startup_checks import no_visible_gpu_error
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
@@ -53,7 +55,8 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
 from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
-                     compute_prompt_logprobs, get_metrics_dict)
+                     compute_prompt_logprobs, get_metrics_dict,
+                     prompt_logprobs_from_reduced, reduce_prompt_logprobs)
 from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
                     context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
@@ -145,6 +148,9 @@ class BaseWorker(GenerationExecutor):
         self._results: Dict[int, GenerationResult] = {}
         # mapping: client_id from Proxy -> request_id returned from runtime backend
         self._client_id_to_request_id: Dict[int, int] = {}
+        # Requests already answered with an error by _maybe_wrap_response and
+        # aborted; their remaining engine responses are dropped.
+        self._refused_client_ids: Set[int] = set()
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
         self._lora_config = llm_args.lora_config if llm_args is not None else None
@@ -164,7 +170,12 @@ class BaseWorker(GenerationExecutor):
         return self._resource_governor_queue
 
     def _configure_device(self):
-        device_id = self.global_rank % torch.cuda.device_count()
+        # Ranks launched on other nodes (mpirun, Slurm, trtllm-llmapi-launch)
+        # are not covered by the GPU check in the LLM's own process.
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            raise no_visible_gpu_error()
+        device_id = self.global_rank % device_count
         # Fail before loading the model: missing optimized kernels for this GPU otherwise
         # surface much later as unrelated errors such as running out of memory.
         check_cuda_architecture_supported(device_id)
@@ -548,6 +559,11 @@ class BaseWorker(GenerationExecutor):
                 PythonRequestInputs(
                     original_end_id=request.sampling_params.end_id,
                     num_logprobs=request.sampling_params.logprobs,
+                    context_logits_explicit=request.sampling_params.
+                    return_context_logits,
+                    prompt_logprobs=request.sampling_params.prompt_logprobs,
+                    prompt_logprobs_simple_format=request.sampling_params.
+                    prompt_logprobs_simple_format,
                     lora_path=py_lora_path,
                     lora_ckpt_source=py_lora_ckpt_source,
                     logprobs_mode=request.sampling_params.logprobs_mode,
@@ -566,6 +582,7 @@ class BaseWorker(GenerationExecutor):
                     conversation_params=request.conversation_params,
                     kv_hints=request.kv_hints,
                     arrival_time=request.arrival_time,
+                    watermarking=request.sampling_params.watermarking,
                 ),
             )
 
@@ -1580,9 +1597,12 @@ class AwaitResponseHelper:
         async_queues = []
         for response in responses:
             assert response is not None
+            is_error = isinstance(response, ErrorResponse)
+            if not is_error and _drop_refused_response(self.worker, response):
+                continue
             queue = self.worker.return_queue(response.client_id)
 
-            if not response.has_error():
+            if not is_error and not response.has_error():
                 response = _maybe_wrap_response(self.worker, response)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
@@ -1596,7 +1616,8 @@ class AwaitResponseHelper:
             else:
                 queue.put(response)
 
-            if response.has_error() or response.result.is_final:
+            if (isinstance(response, ErrorResponse) or response.has_error()
+                    or response.result.is_final):
                 self.worker._pop_result(response.client_id)
 
         # Notify the events in bulk for performance.
@@ -1619,6 +1640,8 @@ class AwaitResponseHelper:
 
             if isinstance(response, ErrorResponse):
                 pass  # send ErrorResponse directly
+            elif _drop_refused_response(self.worker, response):
+                continue
             elif self.worker._has_background_error():
                 response = self.worker._create_error_response(response)
             elif response.has_error():
@@ -1661,6 +1684,10 @@ def _get_params_for_first_rsp(
     return None, None, None
 
 
+class IncompleteContextLogitsError(RuntimeError):
+    """Context logits do not cover the whole prompt, so prompt logprobs cannot be aligned."""
+
+
 def _compute_pytorch_prompt_logprobs(
         generation_result: GenerationResult,
         response: LlmResponse) -> Optional[LogProbsResult]:
@@ -1671,17 +1698,22 @@ def _compute_pytorch_prompt_logprobs(
         cached = getattr(generation_result, '_cached_prompt_logprobs', None)
         if cached is not None:
             return LogProbsResult(prompt=cached)
-    context_logits = response.result.context_logits
+    try:
+        context_logits = response.result.context_logits
+        compact_rows = response.result.context_prompt_logprob_rows
+    except ValueError as error:
+        raise IncompleteContextLogitsError(str(error)) from error
     result = response.result.get_result()
     assert result is not None, "result must not be None when prompt_logprobs is requested."
-    if (context_logits is None and result.is_sequence_final
-            and result.finish_reasons
+    if (context_logits is None and compact_rows is None
+            and result.is_sequence_final and result.finish_reasons
             and all(reason == tllm.FinishReason.CANCELLED
                     for reason in result.finish_reasons)):
         # Cancellation before execution has no prompt logits to report. Keep
         # cached streaming logprobs above, but do not invent them for queued work.
         return None
-    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
+    assert context_logits is not None or compact_rows is not None, \
+        "context_logits must not be None when prompt_logprobs is requested."
     prompt_length = len(generation_result._generation_request.prompt_token_ids)
     origins = response.result.context_logits_origins
     if (not origins or len(origins) != 1
@@ -1689,10 +1721,11 @@ def _compute_pytorch_prompt_logprobs(
             or origins[0].client_id != generation_result._generation_request.id
             or origins[0].prompt_length != prompt_length
             or (origins[0].start, origins[0].end) != (0, prompt_length)):
-        raise ValueError(
+        raise IncompleteContextLogitsError(
             "prompt logprobs require complete original prompt-row origins")
-    if context_logits.ndim != 2 or context_logits.size(0) != prompt_length:
-        raise ValueError(
+    if context_logits is not None and (context_logits.ndim != 2 or
+                                       context_logits.size(0) != prompt_length):
+        raise IncompleteContextLogitsError(
             "prompt logprobs require one context-logit row per prompt token")
     # Single element list
     first_generation_token = result.output_token_ids[0][:1]
@@ -1700,6 +1733,33 @@ def _compute_pytorch_prompt_logprobs(
     # Pass prompt_token_ids with an offset of 1 for correct mapping to the context logits
     prompt_token_ids = generation_result._generation_request.prompt_token_ids[
         1:] + first_generation_token
+
+    if compact_rows is not None:
+        rows = torch.cat(compact_rows)
+        if rows.shape[0] + 1 != len(prompt_token_ids):
+            # Row t scores prompt token t + 1; a reused KV cache prefix produces
+            # no rows, so the remaining rows cannot be aligned with the prompt.
+            raise IncompleteContextLogitsError(
+                f"prompt logprobs need context logits for all "
+                f"{len(prompt_token_ids)} prompt tokens, got {rows.shape[0] + 1} "
+                "(a reused KV cache prefix is not rescored)")
+        tail = response.result.context_prompt_last_logprobs
+        assert tail is not None, "Completed prompt must retain its last prediction row"
+        # The executor already normalized the last row on the logits' device,
+        # matching the other rows; normalizing it again on the host would not.
+        rows = torch.cat([
+            rows,
+            reduce_prompt_logprobs(tail,
+                                   first_generation_token,
+                                   logprob_params.prompt_logprobs,
+                                   normalized=True)
+        ])
+        logprobs_result = LogProbsResult(prompt=prompt_logprobs_from_reduced(
+            rows, prompt_token_ids, logprob_params.prompt_logprobs,
+            logprob_params.prompt_logprobs_simple_format))
+        if generation_result._streaming:
+            generation_result._cached_prompt_logprobs = logprobs_result.prompt
+        return logprobs_result
 
     logprobs_result = compute_prompt_logprobs(
         logprob_params.prompt_logprobs,
@@ -1814,10 +1874,33 @@ def _send_rsp(
         raise ValueError(f"Unknown response type: {response}")
 
 
-def _maybe_wrap_response(
-        worker, response: LlmResponse) -> Union[LlmResponse, ResponseWrapper]:
+def _drop_refused_response(worker, response: LlmResponse) -> bool:
+    """Whether ``response`` belongs to a request already answered with an error.
 
-    logprobs_result = _get_logprobs(worker, response)
+    Such a request was aborted, so the engine may still emit steps that were in
+    flight and a final cancellation; the client must see none of them.
+    """
+    if response.client_id not in worker._refused_client_ids:
+        return False
+    if response.has_error() or response.result.is_final:
+        worker._refused_client_ids.discard(response.client_id)
+    return True
+
+
+def _maybe_wrap_response(
+    worker, response: LlmResponse
+) -> Union[LlmResponse, ResponseWrapper, ErrorResponse]:
+
+    try:
+        logprobs_result = _get_logprobs(worker, response)
+    except IncompleteContextLogitsError as error:
+        # Fail only this request, and stop the engine generating for a client
+        # that has already been answered.
+        if not response.result.is_final:
+            worker._refused_client_ids.add(response.client_id)
+            worker.abort_request(response.client_id)
+        return ErrorResponse(response.client_id, str(error),
+                             response.request_id)
     req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)

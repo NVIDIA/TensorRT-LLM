@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request as request_module
+from tensorrt_llm._torch.pyexecutor.context_logits_plan import store_context_logits
 from tensorrt_llm._torch.pyexecutor.handle_logits import HandleLogits
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -25,7 +26,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm._torch.speculative import spec_sampler_base as spec_module
 from tensorrt_llm.executor import base_worker
-from tensorrt_llm.executor.result import LogProbsResult
+from tensorrt_llm.executor.result import LogProbsResult, compute_prompt_logprobs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -192,7 +193,9 @@ def test_consumer_rejects_bad_binding_before_reduction(monkeypatch, failure):
         "compute_prompt_logprobs",
         lambda *a, **k: pytest.fail("reduction must not run"),
     )
-    with pytest.raises(ValueError, match="original prompt-row origins"):
+    with pytest.raises(
+        base_worker.IncompleteContextLogitsError, match="original prompt-row origins"
+    ):
         base_worker._compute_pytorch_prompt_logprobs(current_generation, response)
 
 
@@ -223,6 +226,8 @@ def request_for_store(value, prompt_length=4, start=0, chunk=4):
     return SimpleNamespace(
         py_result=value,
         py_return_context_logits=True,
+        py_context_logits_explicit=True,
+        py_prompt_logprobs=None,
         py_return_generation_logits=False,
         py_return_log_probs=False,
         py_use_chunked_generation_logits=False,
@@ -429,7 +434,9 @@ def test_cancelled_before_execution_returns_no_invented_prompt_scores(monkeypatc
         is_sequence_final=True, finish_reasons=[base_worker.tllm.FinishReason.CANCELLED]
     )
     response = SimpleNamespace(
-        result=SimpleNamespace(context_logits=None, get_result=lambda: cancelled)
+        result=SimpleNamespace(
+            context_logits=None, context_prompt_logprob_rows=None, get_result=lambda: cancelled
+        )
     )
     monkeypatch.setattr(
         base_worker,
@@ -437,3 +444,164 @@ def test_cancelled_before_execution_returns_no_invented_prompt_scores(monkeypatc
         lambda *args, **kwargs: pytest.fail("queued cancellation must not reduce"),
     )
     assert base_worker._compute_pytorch_prompt_logprobs(generation(), response) is None
+
+
+def compact_request(value, tokens, *, start=0, chunk=None, client_id=17):
+    return SimpleNamespace(
+        py_result=value,
+        py_return_context_logits=True,
+        py_context_logits_explicit=False,
+        py_prompt_logprobs=0,
+        py_client_id=client_id,
+        orig_prompt_len=len(tokens),
+        context_current_position=start,
+        context_chunk_size=len(tokens) if chunk is None else chunk,
+        prepopulated_prompt_len=0,
+        get_tokens=lambda beam: tokens,
+    )
+
+
+def compact_response(value, tokens):
+    response = response_for(value)
+    response.result.get_result = lambda: SimpleNamespace(output_token_ids=[[3]])
+    current = generation(len(tokens))
+    current._generation_request.prompt_token_ids = tokens
+    return current, response
+
+
+def test_compact_replay_and_pickle_keep_exact_original_target_positions():
+    source, target = result(), result()
+    tokens = [0, 2, 4, 1]
+    rows = torch.tensor(
+        [
+            [3.0, 1.0, 4.0, 2.0, 0.0, 5.0, -1.0],
+            [2.0, -1.0, 5.0, 0.0, 3.0, 1.0, 4.0],
+            [-2.0, 3.0, 0.0, 5.0, 1.0, 4.0, 2.0],
+            [1.0, 0.0, -3.0, 4.0, 2.0, 5.0, 3.0],
+        ]
+    )
+    request = compact_request(source, tokens, chunk=3)
+    store_context_logits(request, rows[:3])
+    target.apply_diff(pickle.loads(pickle.dumps(source.get_diff())))
+    source.reset_diff()
+    replacement = rows[1:] + torch.tensor([0.0, 1.0, -1.0, 2.0, 0.0, -2.0, 3.0])
+    request.context_current_position = 1
+    store_context_logits(request, replacement)
+    target.apply_diff(pickle.loads(pickle.dumps(source.get_diff())))
+    expected_logits = torch.cat([rows[:1], replacement])
+    expected = compute_prompt_logprobs(0, expected_logits, tokens[1:] + [3])
+    for value in (source, target):
+        assert value.context_logits is None
+        assert value._context_logits._storage is None
+        assert value.context_logits_origins == (origin(0, 4),)
+        assert torch.cat(value.context_prompt_logprob_rows).shape == (3, 2)
+        current, response = compact_response(value, tokens)
+        assert base_worker._compute_pytorch_prompt_logprobs(current, response) == expected
+    assert target.get_diff().prompt_logprob_rows == []
+
+
+def test_compact_single_token_prompt_keeps_its_final_prediction_row():
+    value = result(1)
+    tokens = [2]
+    rows = torch.tensor([[3.0, 1.0, 4.0, 2.0, 0.0, 5.0, -1.0]])
+    store_context_logits(compact_request(value, tokens), rows)
+    assert value.context_logits_origins == (origin(0, 1, 1),)
+    assert torch.cat(value.context_prompt_logprob_rows).shape == (0, 2)
+    current, response = compact_response(value, tokens)
+    expected = compute_prompt_logprobs(0, rows, [3])
+    assert base_worker._compute_pytorch_prompt_logprobs(current, response) == expected
+
+
+def test_compact_suffix_is_rejected_before_result_reduction(monkeypatch):
+    value = result()
+    tokens = [0, 2, 4, 1]
+    store_context_logits(compact_request(value, tokens, start=2, chunk=2), torch.ones(2, 7))
+    current, response = compact_response(value, tokens)
+    monkeypatch.setattr(
+        base_worker,
+        "reduce_prompt_logprobs",
+        lambda *args, **kwargs: pytest.fail("incomplete original rows must not be reduced"),
+    )
+    with pytest.raises(base_worker.IncompleteContextLogitsError, match="full original prompt"):
+        base_worker._compute_pytorch_prompt_logprobs(current, response)
+
+
+def test_compact_identity_change_is_rejected_before_device_reduction(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import context_logits_plan
+
+    value = result()
+    tokens = [0, 2, 4, 1]
+    request = compact_request(value, tokens, chunk=2)
+    store_context_logits(request, torch.ones(2, 7))
+    request.py_client_id = 18
+    request.context_current_position = 2
+    monkeypatch.setattr(
+        context_logits_plan,
+        "reduce_prompt_logprobs",
+        lambda *args, **kwargs: pytest.fail("misbound rows must not be reduced"),
+    )
+    with pytest.raises(ValueError, match="identity changed"):
+        store_context_logits(request, torch.ones(2, 7))
+
+
+def test_compact_recompute_excludes_generated_history_and_replaces_tail():
+    value = result()
+    tokens = [0, 2, 4, 1]
+    rows = torch.arange(42, dtype=torch.float32).reshape(6, 7)
+    request = compact_request(value, tokens, chunk=6)
+    store_context_logits(request, rows)
+    assert value.context_logits_origins == (origin(0, 4),)
+    current, response = compact_response(value, tokens)
+    expected = compute_prompt_logprobs(0, rows[:4], tokens[1:] + [3])
+    assert base_worker._compute_pytorch_prompt_logprobs(current, response) == expected
+    original = torch.cat(value.context_prompt_logprob_rows).clone()
+    request.context_current_position = 4
+    request.context_chunk_size = 2
+    store_context_logits(request, rows[4:])
+    torch.testing.assert_close(torch.cat(value.context_prompt_logprob_rows), original)
+
+
+def test_compact_diff_requires_one_origin_per_fragment():
+    value = result()
+    diff = PyResult.Diff(prompt_logprob_rows=[torch.ones(3, 2, dtype=torch.float64)])
+    with pytest.raises(ValueError, match="prompt logprobs and origin diff lengths"):
+        value.apply_diff(diff)
+    assert value.context_prompt_logprob_rows is None
+
+
+def test_reusable_context_scratch_is_owned_by_storage_and_transport():
+    value = result()
+    scratch = torch.arange(28, dtype=torch.float32).reshape(4, 7)
+    expected = scratch.clone()
+    value.append_context_logits(scratch, origin(0, 4), reusable=True)
+    scratch.fill_(-100)
+    torch.testing.assert_close(value.context_logits, expected)
+    torch.testing.assert_close(value.get_diff().context_logits_list[0], expected)
+
+
+def test_incomplete_origins_fail_only_their_request():
+    from unittest.mock import Mock
+
+    value = result()
+    tokens = [0, 2, 4, 1]
+    store_context_logits(compact_request(value, tokens, start=2, chunk=2), torch.ones(2, 7))
+    current, response = compact_response(value, tokens)
+    response.result.is_final = False
+    worker = SimpleNamespace(
+        _results={17: current}, _refused_client_ids=set(), abort_request=Mock()
+    )
+    wrapped = base_worker._maybe_wrap_response(worker, response)
+    assert isinstance(wrapped, base_worker.ErrorResponse)
+    assert "full original prompt" in wrapped.error_msg
+    worker.abort_request.assert_called_once_with(17)
+    assert worker._refused_client_ids == {17}
+
+
+def test_full_logits_cannot_mask_missing_compact_prefix_rows():
+    value, _ = full_result()
+    tokens = [0, 2, 4, 1]
+    store_context_logits(compact_request(value, tokens, start=2, chunk=2), torch.ones(2, 7))
+    assert value.context_logits_origins == (origin(0, 4),)
+    current, response = compact_response(value, tokens)
+    with pytest.raises(base_worker.IncompleteContextLogitsError, match="full original prompt"):
+        base_worker._compute_pytorch_prompt_logprobs(current, response)

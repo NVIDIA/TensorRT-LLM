@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The tp8 target's files that are byte copies of the tp4 target's stay so.
 
-The two MiniMax-M3 targets share no code by design (``test_modeling_v2_claims.test_targets_do_not_share_files``): the
+The two MiniMax-M3 targets share no code by design: the
 tp8 target was made as a copy of the tp4 one and keeps its own copy of every file, tp8-specific or not. The files
 listed here are still identical, so a fix to one copy applies to the other unchanged. This test fails on the first
 edit to either side: a change to one copy must be considered for the other -- applied to both, or the file dropped
