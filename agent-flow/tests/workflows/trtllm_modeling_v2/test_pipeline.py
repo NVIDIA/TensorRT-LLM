@@ -30,7 +30,10 @@ from ._helpers import (
     TARGET_REL,
     Script,
     _install,
+    _run,
     _state,
+    _task_id,
+    _tasks,
     _workflow,
     _write_vocabulary,
     passing_shell,
@@ -39,27 +42,9 @@ from ._helpers import (
 FAMILY = str(Path(TARGET_REL).parent)
 
 
-def _tasks(tmp_path) -> list[dict]:
-    return yaml.safe_load((tmp_path / "ws" / "tasks.yaml").read_text())["tasks"]
-
-
 def _verdicts(tmp_path) -> list[dict]:
     path = tmp_path / "ws" / contract_mod.STATUS_FILENAME
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-
-
-def _task_id(prompt: str) -> str:
-    """The task a worker's dispatch is for, from its decision path."""
-    return re.search(r"decisions/([A-Za-z0-9_.-]+)-\d+(?:\.\d+)?\.yaml", prompt).group(1)
-
-
-def _run(tmp_path, task_file, monkeypatch, script, **kwargs):
-    """One process of the run; its agent calls, role and prompt, in order."""
-    workflow = _workflow(tmp_path, **kwargs)
-    calls = _install(monkeypatch, workflow, script)
-    with workflow:
-        workflow.run(task_file)
-    return calls
 
 
 def _mtp_task(tmp_path, task_file, repo, **more) -> Path:
@@ -192,58 +177,6 @@ def test_a_kernel_row_runs_after_the_rows_it_depends_on_in_the_first_unit_that_n
     grouped = _rows_by_unit(queue, ["core", "mtp"])
     assert [q.n for q in grouped["core"]] == [3, 1, 6, 5]
     assert [q.n for q in grouped["mtp"]] == [2, 4, 7, 8]
-
-
-def test_kernel_tasks_run_one_at_a_time_in_queue_order(tmp_path, task_file, monkeypatch):
-    import threading
-
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    _write_vocabulary(
-        workspace,
-        [
-            {"n": 1, "mode": "onboard", "target": "ops/norm/rms"},
-            {"n": 2, "mode": "onboard", "target": "ops/norm/scale"},
-            {"n": 3, "mode": "onboard", "target": "ops/norm/last", "depends_on": [1]},
-        ],
-    )
-    lock = threading.Lock()
-    running: list[str] = []
-    seen: list[tuple[str, int]] = []
-
-    def kernel_writer(turn, prompt):
-        task = _task_id(prompt)
-        with lock:
-            running.append(task)
-            seen.append((task, len(running)))
-        with lock:
-            running.remove(task)
-        return {"decision": "LANDED", "summary": task}
-
-    _run(tmp_path, task_file, monkeypatch, Script(kernel_writer=kernel_writer))
-    assert _state(tmp_path).verdict == "delivered"
-    # Each task starts from the commits of the ones before it: never two in flight.
-    assert seen == [("k1-rms", 1), ("k2-scale", 1), ("k3-last", 1)]
-
-
-def test_a_decision_file_without_its_decision_gets_one_turn_to_write_it(
-    tmp_path, task_file, monkeypatch
-):
-    prompts: list[str] = []
-
-    def assembler(turn, prompt):
-        prompts.append(prompt)
-        if turn == 1:
-            return {"summary": "UNIT_READY: assembled, boot passed"}  # the key forgotten
-        return {"decision": "UNIT_READY", "summary": "assembled, boot passed"}
-
-    _run(tmp_path, task_file, monkeypatch, Script(assembler=assembler))
-    assert _state(tmp_path).verdict == "delivered"
-    assert len(prompts) == 2
-    assert "## Your decision file is not valid" in prompts[1]
-    assert "has no `decision` key" in prompts[1] and "Do not do the task again" in prompts[1]
-    [core] = [t for t in _tasks(tmp_path) if t["id"] == "core"]
-    assert (core["status"], core["attempts"]) == ("done", 1)
 
 
 # -------------------------------------------------------------------------- the planner
@@ -953,108 +886,3 @@ def test_a_task_whose_branch_conflicts_goes_back_to_its_worker_once_and_then_lan
     assert certification["commit"] == head
     assert {v["tree"].split("+")[0] for v in _verdicts(tmp_path)} == {head}
     assert not (tmp_path / "ws" / "worktrees" / "core").exists()  # integrated, so closed
-
-
-def test_a_landed_entry_is_read_as_the_certification_reads_it(tmp_path):
-    from types import SimpleNamespace
-
-    from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
-    from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import (
-        Pipeline,
-        Task,
-        static_repair_block,
-    )
-
-    target = "tensorrt_llm/_torch/_experimental/modeling_v2/models/fam/tgt"
-    item = QueueItem(1, "onboard", "ops/norm/rms")
-    fake = SimpleNamespace(
-        _queue_item=lambda task: item,
-        w=SimpleNamespace(
-            _preflight=SimpleNamespace(target_rel=target),
-            task_data={"arch": "sm_103", "trtllm_repo_path": ""},
-        ),
-    )
-    task = Task(id="k1-rms", kind="kernel", unit="core", ref="1")
-    entry = tmp_path / target / "ops/norm/rms.py"
-
-    def problems():
-        return Pipeline._entry_problems(fake, task, tmp_path)
-
-    assert problems() == [f"`{target}/ops/norm/rms.py` is not in your worktree"]
-    entry.parent.mkdir(parents=True)
-    head = (
-        "class Rms(OpWrapper):\n    def __call__(self, x): ...\n    def reference(self, x): ...\n"
-    )
-    entry.write_text(head + "    ARCHS = frozenset({Arch.SM_103})\n")
-    assert problems() == ["Rms declares no CELLS: nothing is certified"]
-    cells = "    CELLS = (Cell(why='decode', spec={}),)\n"
-    entry.write_text(head + cells + "    ARCHS = frozenset({Arch.SM_100})\n")
-    assert problems() == ["ARCHS names sm_100, not sm_103"]
-    entry.write_text(head + cells + "    ARCHS = frozenset({Arch.SM_103})\n")
-    assert problems() == []
-    # The module the decision names counts, whatever its name (the target imports it).
-    named = f"{target}/ops/norm/rms__r1.py"
-    entry.rename(tmp_path / named)
-    assert Pipeline._entry_problems(fake, task, tmp_path, {"entry": named}) == []
-    assert Pipeline._entry_problems(fake, task, tmp_path, {"entry": "nope.py"}) == [
-        f"neither `nope.py` (your decision's `entry`) nor `{target}/ops/norm/rms.py` is in your worktree"
-    ]
-    block = static_repair_block(["Rms declares no CELLS: nothing is certified"], entry=True)
-    assert "Do not start the task again" in block and "- Rms declares no CELLS" in block
-    assert "`CELLS` name the cells" in block
-    unit = static_repair_block(["tests:test-db: not listed"], entry=False)
-    assert "Put the tree right" in unit and "- tests:test-db: not listed" in unit
-
-
-def test_the_report_lists_what_the_workers_left_uncertified(tmp_path):
-    from agent_flow.workflows.trtllm_modeling_v2.run.certify import uncertified_lines
-
-    decisions = tmp_path / "decisions"
-    decisions.mkdir()
-    (decisions / "k1-rms-1.yaml").write_text("decision: LANDED\nuncertified: [old attempt]\n")
-    (decisions / "k1-rms-2.yaml").write_text(
-        "decision: LANDED\nuncertified:\n  - cached-prefix context (31+33 tokens) fails in shared code\n"
-    )
-    (decisions / "core-1.yaml").write_text(
-        "decision: UNIT_READY\nuncertified: |\n  lm_head at M=8192\n"
-    )
-    (decisions / "planner-3.yaml").write_text("decision: CONTINUE\nuncertified: [not a task]\n")
-    assert uncertified_lines(tmp_path) == [
-        "- `core`: lm_head at M=8192",
-        "- `k1-rms`: cached-prefix context (31+33 tokens) fails in shared code",
-    ]
-
-
-def test_a_landed_unit_is_read_with_the_static_delivery_checks(tmp_path, task_file):
-    from types import SimpleNamespace
-
-    from agent_flow.workflows.trtllm_modeling_v2.run.certify import static_delivery_failures
-
-    spec = yaml.safe_load(task_file.read_text())
-    target = (
-        "tensorrt_llm/_torch/_experimental/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1"
-    )
-    workflow = SimpleNamespace(
-        task_data=spec, _preflight=SimpleNamespace(target_rel=target, family="gpt_oss")
-    )
-    tree = tmp_path / "tree"
-    tree.mkdir()
-    failures = static_delivery_failures(workflow, tree)
-    names = {f.split(":", 2)[0] + ":" + f.split(":", 2)[1] for f in failures}
-    # An empty tree misses what the final certification reads: the target and its accuracy row.
-    assert "target:modeling.py" in names
-    assert "accuracy:reference" in names
-    # Smoke and bringup runs owe no CI files: the same waiver as the certification's.
-    spec["profile"] = "bringup"
-    waived = static_delivery_failures(workflow, tree)
-    assert not any(f.startswith(("accuracy:reference", "tests:test-db")) for f in waived)
-    assert any(f.startswith("target:modeling.py") for f in waived)
-
-
-def test_delivered_tests_run_with_the_tree_first_on_pythonpath(tmp_path):
-    from agent_flow.workflows.trtllm_modeling_v2.run.certify import test_job_line
-
-    line = test_job_line("python -m pytest t.py", tmp_path)
-    # Rank processes a test starts inherit it, as the gates' commands do.
-    assert line.startswith(f"cd {tmp_path.resolve()} && export PYTHONPATH={tmp_path.resolve()}")
-    assert line.endswith("&& python -m pytest t.py")

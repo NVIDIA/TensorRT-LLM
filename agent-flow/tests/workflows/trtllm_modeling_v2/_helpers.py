@@ -349,3 +349,21 @@ def _git(repo: Path, *args: str) -> str:
 
 def _state(tmp_path):
     return load_state(tmp_path / "ws" / _STATE)
+
+
+def _tasks(tmp_path) -> list[dict]:
+    return yaml.safe_load((tmp_path / "ws" / "tasks.yaml").read_text())["tasks"]
+
+
+def _task_id(prompt: str) -> str:
+    """The task a worker's dispatch is for, from its decision path."""
+    return re.search(r"decisions/([A-Za-z0-9_.-]+)-\d+(?:\.\d+)?\.yaml", prompt).group(1)
+
+
+def _run(tmp_path, task_file, monkeypatch, script, **kwargs):
+    """One process of the run; its agent calls, role and prompt, in order."""
+    workflow = _workflow(tmp_path, **kwargs)
+    calls = _install(monkeypatch, workflow, script)
+    with workflow:
+        workflow.run(task_file)
+    return calls

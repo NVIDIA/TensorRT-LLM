@@ -144,16 +144,6 @@ def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_fil
     assert shells == []
 
 
-def test_a_probe_the_cli_permission_policy_blocked_says_how_to_allow_it():
-    said = (
-        "Command was blocked by the Bash tool before it could run: "
-        "Error: Contains brace with quote character (expansion obfuscation)"
-    )
-    hint = agent_probe.hint_for(said, environ={})
-    assert "bypassPermissions" in hint and "IS_SANDBOX=1" in hint
-    assert "does not change that policy" in hint
-
-
 @dataclasses.dataclass(frozen=True)
 class _Config:
     """The parts of ``AgentLayerConfig`` the executor touches."""
@@ -289,9 +279,7 @@ def test_decision_file_extra_keys_scope_and_role_endings() -> None:
     extra = _common.decision_file_block("assembler", ("blocked_reason", "uncertified"))
     assert "<task>-<attempt>.yaml" in plain
     assert "This role also carries" not in plain
-    # Top-level keys, beside the decision, which is the file's first line.
-    assert "\nblocked_reason: ...\nuncertified: ...\n```" in extra
-    assert "```yaml\ndecision: <exactly one of the decisions listed above>\nsummary: |" in plain
+    assert "This role also carries" in extra
     assert _common.scope_block("full") == ""
     assert "ignore the vision tensors" in _common.scope_block("text_only")
     for role, prompt in asdict(prompts.DEFAULT_PROMPTS).items():

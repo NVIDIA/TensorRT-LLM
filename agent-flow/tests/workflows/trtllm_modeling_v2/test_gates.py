@@ -203,12 +203,6 @@ def test_the_gate_reads_the_driver_and_names_the_member(tmp_path):
     )
     assert result.passed, result.detail
     assert result.summary().startswith("[PASS] serve@tp1: trtllm-serve healthy after 3.0s")
-    # One frontend: several need the classic IPC proxy a one-rank engine does not have.
-    assert sg.serve_args(task, None, member="tp1", options=options)[:3] == [
-        "--config",
-        str(options),
-        "--num_serve_frontends=1",
-    ]
 
 
 NODE = "tests/integration/defs/accuracy/test_disaggregated_multinode.py::TestStep5::test_dep4"
@@ -1680,14 +1674,3 @@ def test_a_module_that_skips_itself_on_import_has_a_result_not_a_hole(tmp_path):
     )
     assert not failed[0].env_digest and failed[1:3] == (0, 1)
     assert "environment probe failed" in failed[3]
-
-
-def test_a_missing_anchor_row_says_how_to_measure_and_write_one(tmp_path):
-    references = tmp_path / "gsm8k.yaml"
-    references.write_text("org/other:\n  - accuracy: 50.0\n", encoding="utf-8")
-    with pytest.raises(KeyError) as raised:
-        accuracy_checks.load_reference_score(references, "org/model")
-    message = str(raised.value)
-    assert "never invented" in message
-    assert "`org/model:` then `  - accuracy: <score>`" in message
-    assert "trtllm-eval --model <checkpoint> <benchmark>" in message

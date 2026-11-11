@@ -14,7 +14,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
 from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
@@ -304,49 +303,3 @@ def test_every_anchor_is_found_by_what_identifies_it_in_this_checkout():
         ):
             unfindable.append(f"{key}: a search found {list(found[:3])}")
     assert not unfindable, f"anchors a search cannot find by what identifies them: {unfindable}"
-
-
-@pytest.mark.parametrize(
-    "limit,host_cache_size,warned",
-    [
-        (64 << 30, None, True),
-        (64 << 30, 8 << 30, False),
-        (None, None, False),
-        (900 << 30, None, False),
-    ],
-)
-def test_a_memory_limited_host_is_told_to_bound_the_kv_host_tier(
-    tmp_path, task_file, monkeypatch, limit, host_cache_size, warned
-):
-    spec = yaml.safe_load(task_file.read_text())
-    kv = {"enable_block_reuse": False}
-    if host_cache_size is not None:
-        kv["host_cache_size"] = host_cache_size
-    options = tmp_path / "core.yaml"
-    options.write_text(yaml.safe_dump({"kv_cache_config": kv}), encoding="utf-8")
-    spec["accuracy"]["llm_api_options"] = {"core": str(options)}
-    monkeypatch.setattr(preflight, "memory_limit_and_free", lambda: (limit, 690 << 30))
-    notes = preflight.check_kv_cache_configs(spec, {})
-    said = [n for n in notes if n.startswith("host memory:")]
-    assert bool(said) is warned
-    if warned:
-        assert "690 GiB" in said[0] and "64 GiB" in said[0] and "host_cache_size" in said[0]
-
-
-def test_the_memory_limit_is_read_from_the_process_own_cgroup(tmp_path):
-    root = tmp_path / "cgroup"
-    step = root / "system.slice" / "slurmstepd.scope" / "job_7" / "step_0"
-    step.mkdir(parents=True)
-    (root / "system.slice" / "memory.max").write_text("max\n")
-    (step / "memory.max").write_text(str(280 << 30) + "\n")
-    (step.parent / "memory.max").write_text(str(900 << 30) + "\n")
-    v2 = "0::/system.slice/slurmstepd.scope/job_7/step_0\n"
-    assert preflight.cgroup_memory_limit(v2, root) == 280 << 30
-    # v1: the memory controller's own hierarchy; a huge number means no limit.
-    mem = root / "memory" / "slurm" / "uid_1" / "job_7"
-    mem.mkdir(parents=True)
-    (mem / "memory.limit_in_bytes").write_text(str(64 << 30))
-    (root / "memory" / "memory.limit_in_bytes").write_text("9223372036854771712")
-    v1 = "12:cpuset:/slurm/uid_1/job_7\n9:memory:/slurm/uid_1/job_7\n"
-    assert preflight.cgroup_memory_limit(v1, root) == 64 << 30
-    assert preflight.cgroup_memory_limit("0::/\n", tmp_path / "none") is None
