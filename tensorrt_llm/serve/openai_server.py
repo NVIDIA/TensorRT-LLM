@@ -197,7 +197,14 @@ class _MsgspecRoute(APIRoute):
         return route_handler
 
 
-TIMEOUT_KEEP_ALIVE = 5  # seconds.
+# Idle-connection timeout of the HTTP listener, in seconds. The env var sets it,
+# as ``server_keep_alive_timeout`` does for the disaggregated server: a
+# non-negative integer; unset or empty keeps the default of 5.
+_KEEP_ALIVE_ENV = "TRTLLM_SERVER_KEEP_ALIVE_TIMEOUT"
+TIMEOUT_KEEP_ALIVE = int(os.getenv(_KEEP_ALIVE_ENV) or 5)  # seconds.
+if TIMEOUT_KEEP_ALIVE < 0:
+    raise ValueError(f"{_KEEP_ALIVE_ENV} must be a non-negative integer, "
+                     f"got {TIMEOUT_KEEP_ALIVE}")
 
 _warned_unresolvable_thinking = False
 
@@ -3934,6 +3941,9 @@ class OpenAIServer(_VideoRoutesMixin):
                                 port=port,
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+        if os.getenv(_KEEP_ALIVE_ENV):
+            logger.info(f"HTTP keep-alive timeout: {TIMEOUT_KEEP_ALIVE}s "
+                        f"({_KEEP_ALIVE_ENV})")
         server = create_uvicorn_server(config)
 
         async def _register_after_serving():
