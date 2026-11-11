@@ -1837,6 +1837,15 @@ class Glm5NextMoE(nn.Module):
         self, x: torch.Tensor, all_rank_num_tokens: list[int] | None = None
     ) -> torch.Tensor:
         flat = x.reshape(-1, self.hidden_size)
+        num_rows = flat.shape[0]
+        if self.use_dp and all_rank_num_tokens is not None:
+            # Peers dispatch and combine with the row count this rank announced
+            # in ``all_rank_num_tokens``. An eager pass over a prefill-graph-padded
+            # batch runs only its live rows (see ``Glm5NextModel.forward``), so
+            # the dispatch gets the announced rows back as zero padding.
+            missing = all_rank_num_tokens[self.mapping.tp_rank] - num_rows
+            if missing > 0:
+                flat = nn.functional.pad(flat, (0, 0, 0, missing))
         # The fused layer routes internally from the FP32 logits and runs
         # FC1 -> clamped SwiGLU -> FC2 in one backend call; one code path
         # serves prefill and decode with no host-dependent branching, so
@@ -1864,7 +1873,7 @@ class Glm5NextMoE(nn.Module):
         mixed = routed + shared
         if self.moe_all_reduce is not None:
             mixed = self.moe_all_reduce(mixed)
-        return mixed.view_as(x)
+        return mixed[:num_rows].view_as(x)
 
 
 # ---------------------------------------------------------------------------
@@ -2098,7 +2107,9 @@ class Glm5NextModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
         if attn_metadata.padded_num_tokens is not None and not is_in_breakable_cuda_graph():
             # Eager passes over a CUDA-graph-padded batch run only the live rows;
-            # the speculative wrapper trims the output to the same rows.
+            # the speculative wrapper trims the output to the same rows. Under
+            # attention DP the MoE pads its dispatch back to the padded count
+            # its peers expect.
             inputs_embeds = inputs_embeds[: attn_metadata.num_tokens]
         if runtime_ctx is None:
             runtime_ctx = build_glm5_next_runtime_context(attn_metadata)

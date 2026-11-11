@@ -22,6 +22,7 @@ from tensorrt_llm._torch.models.modeling_glm5_next import (
     Glm5NextDecoderLayer,
     Glm5NextForCausalLM,
     Glm5NextLinearAttention,
+    Glm5NextMoE,
     Glm5NextMTP,
     Glm5NextRuntimeContext,
     Glm5NextSparseAttention,
@@ -1523,6 +1524,41 @@ def test_sparse_attention_graph_op_fills_live_rows_and_zeros_padding(monkeypatch
         glm.glm5_sparse_attention_inplace(hidden, "7", output)
     torch.testing.assert_close(output[:3], hidden[:3] * 2)
     assert torch.equal(output[3:], torch.zeros(2, 4))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("attention_dp", [True, False], ids=["attention-dp", "tp"])
+@pytest.mark.parametrize("live_rows", [3, 0, 16], ids=["trimmed", "no-live-rows", "untrimmed"])
+def test_moe_dispatches_the_row_count_announced_to_attention_dp_peers(attention_dp, live_rows):
+    # An eager pass over a prefill-graph-padded batch runs only its live rows,
+    # while every attention-DP peer sizes the MoE dispatch from the padded
+    # count in all_rank_num_tokens. Rank 1 announced 16 rows.
+    all_rank_num_tokens = [32, 16, 32, 32]
+    hidden = torch.randn(live_rows, 8)
+    experts = Mock(side_effect=lambda flat, logits, all_rank_num_tokens: 2 * flat)
+    moe = SimpleNamespace(
+        hidden_size=8,
+        use_dp=attention_dp,
+        mapping=Mapping(world_size=4, tp_size=4, rank=1, enable_attention_dp=attention_dp),
+        gate=lambda flat: flat,
+        experts=experts,
+        shared_experts=lambda flat: flat,
+        shared_expert_start=None,
+        shared_expert_done=None,
+        shared_expert_stream=None,
+        moe_all_reduce=None,
+    )
+    out = Glm5NextMoE.forward(moe, hidden, all_rank_num_tokens)
+    dispatched = experts.call_args.args[0]
+    if attention_dp:
+        assert dispatched.shape == (16, 8)
+        assert experts.call_args.kwargs["all_rank_num_tokens"] is all_rank_num_tokens
+        assert not dispatched[live_rows:].any()
+    else:
+        assert dispatched.shape == (live_rows, 8)
+        assert experts.call_args.kwargs["all_rank_num_tokens"] is None
+    torch.testing.assert_close(dispatched[:live_rows], hidden)
+    torch.testing.assert_close(out, 3 * hidden)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
