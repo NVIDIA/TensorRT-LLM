@@ -101,7 +101,7 @@ class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
 
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
-    def test_gsm8k_identity_vs_mtp1_and_acceptance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_gsm8k_identity_vs_mtp1_and_acceptance(self) -> None:
         """The identity accuracy gate, the gate on MTP not moving it, and acceptance.
 
         Turning MTP on must not move the answers.
@@ -129,13 +129,6 @@ class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
         pass. The mtp1 leg therefore records iteration stats and checks its
         acceptance length against ``ACCEPTANCE_KEY``.
         """
-        # Test session reuse turns the HF weight cache on for reused pools
-        # (tests/test_common/session_reuse.py). With it on, `auto` loads natively and
-        # the MTP1 leg's cache hit reads SafeTensors pages that can be dropped during
-        # the identity leg's GSM8K run. Turn it off so both loads use rank-striped
-        # read-ahead. Remove this once session reuse stops turning the cache on or the
-        # loader stops caching SafeTensors entries.
-        monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "0")
         task = GSM8K(self.MODEL_NAME)
 
         # One dict for both legs: the comparison only means anything if the two
