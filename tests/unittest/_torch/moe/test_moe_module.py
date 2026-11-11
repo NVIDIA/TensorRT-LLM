@@ -747,6 +747,16 @@ def _test_moe_worker_impl(
             ref_fused_moe.load_weights([ref_weights])
             ref_fused_moe.cuda(f"cuda:{mapping.rank}")
 
+            if (
+                mapping.enable_attention_dp
+                and backend_type == MoeBackendType.TRTLLM
+                and quant_algo == QuantAlgo.W4A8_MXFP4_FP8
+            ):
+                # Keep checkpoint weights and scales identical across ranks,
+                # then vary inputs/routes without changing their calibration range.
+                x.copy_(x.roll(mapping.rank, dims=-1))
+                router_logits.copy_(router_logits.roll(mapping.rank, dims=-1))
+
             # Define forward function
             def run_forward():
                 with torch.inference_mode():
