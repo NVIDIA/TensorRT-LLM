@@ -1,33 +1,16 @@
 # Post Merge perf-sanity cases migrated to the QA multi-node pipeline.
 #
-# This list is intentionally independent of llm_perf_multinode.txt. It tracks
-# the GB200 and GB300 cases moved out of the development Post Merge lanes.
-# B200 cases are excluded by design.
-
-# GB200 Kimi-K3 aggregated
-perf/test_perf_sanity.py::test_e2e[aggr-kimi_k3_mxfp4_mv2_4_nodes_grace_blackwell-kimi_k3_tp16_moetp4ep4_dspark7_1k1k]
-perf/test_perf_sanity.py::test_e2e[aggr-kimi_k3_mxfp4_mv2_4_nodes_grace_blackwell-kimi_k3_tp16_moetp16ep1_nospec_1k1k]
-
-# GB300 Kimi-K3
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_kimi-k3-fp4-dspark_160k1k_con16_ctx16_dwdp16_gen1_helix8_bs16_dspark5_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_kimi-k3-fp4-dspark_160k1k_con32_ctx16_dwdp16_gen1_helix16_bs32_dspark6_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-gb300_kimi-k3-fp4-dspark_160k1k_con16_ctx16_dwdp16_gen1_helix8_bs16_dspark5_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[aggr-gen_only_no_context-gb300_kimi-k3-fp4-dspark_160k1k_con16_ctx16_dwdp16_gen1_helix8_bs16_dspark5_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[aggr-gen_only_no_context-gb300_kimi-k3-fp4-dspark_160k1k_con32_ctx16_dwdp16_gen1_helix16_bs32_dspark6_ccb-NIXL]
-
-# GB300 MiniMax-M3
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_150k1k_con1_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_150k1k_con64_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_150k1k_con128_ctx1_tp2_gen1_dep8_eplb0_eagle3_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_150k1k_con1_ctx1_tp2_gen1_tp8_eplb0_eagle3_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-gb300_minimax-m3-fp4_150k1k_con1_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[aggr-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con1_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[aggr-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con64_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[aggr-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con128_ctx1_tp2_gen1_dep8_eplb0_eagle3_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[aggr-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con1_ctx1_tp2_gen1_tp8_eplb0_eagle3_ccb-NIXL]
+# This focused list tracks the DeepSeek-V4-Pro and Qwen3.5-397B FP4 cases
+# requested for the LYRIS/HECATE validation run.
 
 # GB300 DeepSeek-V4-Pro gen-only
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb300_deepseek-v4-pro-fp4_8k1k_con180_ctx3_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL]
+
+# B200 Qwen3.5-397B FP4 aggregated
+perf/test_perf_sanity.py::test_e2e[aggr-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_tp4_8k1k]
+perf/test_perf_sanity.py::test_e2e[aggr-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_dep8_8k1k]
+perf/test_perf_sanity.py::test_e2e[aggr-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_tep4_mtp3_8k1k]
+perf/test_perf_sanity.py::test_e2e[aggr-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_dep8_mtp3_8k1k]
