@@ -134,6 +134,10 @@ _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
 
 
+def _format_ratio(ratio: Sequence[float]) -> str:
+    return "[" + ", ".join(f"{share:.4f}" for share in ratio) + "]"
+
+
 def _insert_draft_pool_ratio(
     target_ratio: Sequence[float],
     life_cycle_block_bytes: Sequence[int],
@@ -1267,6 +1271,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 is_draft = int(layer.layer_id) in self._appended_draft_layer_specs
                 (draft_keys if is_draft else target_keys).add(key)
         if len(ratio) == len(keys):
+            logger.info(
+                f"Unified draft pool: layer-group ratios {_format_ratio(ratio)} used as given "
+                f"(draft layer groups {sorted(keys.index(key) for key in draft_keys)}; "
+                f"bytes per block {block_bytes})"
+            )
             return config
         if len(draft_keys) != 1 or draft_keys & target_keys or len(ratio) != len(keys) - 1:
             raise ValueError(
@@ -1276,12 +1285,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         full_history = [
             key[0] != "ssm" and (key[0] is None or key[0] >= self.max_seq_len) for key in keys
         ]
-        return replace(
-            config,
-            initial_pool_ratio=_insert_draft_pool_ratio(
-                ratio, block_bytes, full_history, keys.index(draft_keys.pop())
-            ),
+        draft_group = keys.index(draft_keys.pop())
+        with_draft = _insert_draft_pool_ratio(ratio, block_bytes, full_history, draft_group)
+        draft_share = with_draft[draft_group]
+        logger.info(
+            f"Unified draft pool ratio {draft_share:.4f} (layer group {draft_group}); "
+            f"target layer-group ratios {_format_ratio(ratio)} scaled by {1 - draft_share:.4f}; "
+            f"layer-group ratios {_format_ratio(with_draft)} (bytes per block {block_bytes})"
         )
+        return replace(config, initial_pool_ratio=with_draft)
 
     def _setup_state_pool(self) -> None:
         """Resolve logical slots, bind base views, then initialize model state."""

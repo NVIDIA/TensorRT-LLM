@@ -394,9 +394,34 @@ def test_k3_target_pool_ratio_gets_the_draft_share_inserted():
     )
 
 
-def test_k3_pool_ratio_with_one_share_per_layer_group_is_used_as_given():
+def test_k3_draft_pool_ratio_is_logged(monkeypatch):
+    lines = []
+    monkeypatch.setattr(mamba_cache_manager_v2.logger, "info", lines.append)
+    manager, config = _k3_draft_pool_ratio_config(_K3_TARGET_POOL_RATIO)
+
+    resolved = manager._with_draft_pool_ratio(config).initial_pool_ratio
+
+    draft = resolved[3]
+    assert lines == [
+        f"Unified draft pool ratio {draft:.4f} (layer group 3); target layer-group ratios "
+        "[0.1400, 0.6350, 0.2050, 0.0200] "
+        f"scaled by {1 - draft:.4f}; layer-group ratios "
+        "[" + ", ".join(f"{share:.4f}" for share in resolved) + "] "
+        f"(bytes per block [{64 << 20}, {_K3_FP4_BLOCK_BYTES}, {_K3_FP8_BLOCK_BYTES}, "
+        f"{_K3_DRAFT_BLOCK_BYTES}, {22 * 19 * 576 * 2}])"
+    ]
+
+
+def test_k3_pool_ratio_with_one_share_per_layer_group_is_used_as_given(monkeypatch):
+    lines = []
+    monkeypatch.setattr(mamba_cache_manager_v2.logger, "info", lines.append)
     manager, config = _k3_draft_pool_ratio_config([0.1, 0.5, 0.2, 0.18, 0.02])
     assert manager._with_draft_pool_ratio(config) is config
+    assert len(lines) == 1
+    assert lines[0].startswith(
+        "Unified draft pool: layer-group ratios [0.1000, 0.5000, 0.2000, 0.1800, 0.0200] "
+        "used as given (draft layer groups [3];"
+    )
 
 
 def test_k3_pool_ratio_of_another_length_is_rejected():
