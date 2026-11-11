@@ -44,7 +44,10 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    MLAParams,
+    PositionalEmbeddingParams,
     PredefinedAttentionMask,
+    RopeParams,
 )
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.kimi_k3_cache_policy import (
@@ -57,7 +60,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
 )
+from tensorrt_llm._torch.utils import get_global_attrs
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
     DFlashDecodingConfig,
@@ -66,6 +71,7 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _DataType = tensorrt_llm.bindings.DataType
 _CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -1892,6 +1898,112 @@ def _create_fp4_mla_v2_manager(
         max_num_tokens=max_tokens,
         pretrained_config=SimpleNamespace(kv_lora_rank=512),
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="requires an SM100, SM103, or SM107 CUDA device",
+)
+def test_fp4_mla_rope_generation_quantizes_q(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    global_attrs = get_global_attrs()
+    monkeypatch.setattr(global_attrs, "attention_metadata", None, raising=False)
+    num_heads = 4
+    kv_lora_rank = 512
+    rope_dim = 64
+    head_dim = kv_lora_rank + rope_dim
+    manager = _create_fp4_mla_v2_manager(max_tokens=1024, max_seq_len=128, max_batch_size=1)
+    try:
+        manager.add_dummy_requests([0], [16])
+        metadata = trtllm_backend.TrtllmAttentionMetadata(
+            seq_lens=torch.tensor([15], dtype=torch.int32),
+            request_ids=[0],
+            max_num_requests=1,
+            num_contexts=1,
+            prompt_lens=[15],
+            max_num_tokens=16,
+            kv_cache_manager=manager,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        )
+        metadata.prepare()
+        scatter_fp4_mla_kv_cache(
+            metadata,
+            torch.zeros(15, head_dim, device="cuda", dtype=torch.bfloat16),
+            layer_idx=0,
+            token_offset=0,
+            phase="context",
+            local_layer=0,
+            v_head_dim=kv_lora_rank,
+        )
+        metadata.num_contexts = 0
+        metadata.seq_lens = torch.tensor([1], dtype=torch.int32)
+        metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[15])
+        metadata.prepare()
+        attention = trtllm_backend.TrtllmAttention(
+            layer_idx=0,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=1,
+            quant_config=QuantConfig(kv_cache_quant_algo="NVFP4"),
+            pos_embd_params=PositionalEmbeddingParams(
+                type=PositionEmbeddingType.yarn,
+                rope=RopeParams(dim=rope_dim, max_positions=128, duplicate_data=True),
+                is_neox=False,
+            ),
+            mla_params=MLAParams(
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=rope_dim,
+                qk_nope_head_dim=128,
+                v_head_dim=128,
+            ),
+        )
+        fused_q = torch.linspace(
+            -1, 1, num_heads * head_dim, device="cuda", dtype=torch.bfloat16
+        ).reshape(1, num_heads, head_dim)
+        projected_q = torch.linspace(
+            -1, 1, num_heads * 192, device="cuda", dtype=torch.bfloat16
+        ).reshape(1, num_heads, 192)
+        latent_cache = torch.linspace(-1, 1, head_dim, device="cuda", dtype=torch.bfloat16).reshape(
+            1, head_dim
+        )
+        attention.mla_rope_generation(
+            fused_q,
+            projected_q[..., -rope_dim:],
+            latent_cache,
+            metadata,
+            torch.empty(2, dtype=torch.int32, device="cuda"),
+            torch.empty(2, dtype=torch.int32, device="cuda"),
+            torch.empty(1, dtype=torch.uint32, device="cuda"),
+            torch.empty(2, dtype=torch.float32, device="cuda"),
+            torch.empty(1, dtype=torch.float32, device="cuda"),
+            torch.empty_like(fused_q, dtype=torch.uint8),
+            fuse_fp4_q_quant=True,
+        )
+        expected_q, expected_sf = torch.ops.trtllm.fp4_quantize_with_residual(
+            fused_q.reshape(-1, head_dim),
+            metadata.fp4_mla_state.q_global_scale,
+            FP4_MLA_Q_RESIDUAL_DIM,
+            is_act=True,
+        )
+        torch.testing.assert_close(metadata.fp4_mla_state.prequantized_q, expected_q)
+        scales_per_row = (head_dim + FP4_MLA_Q_RESIDUAL_DIM) // FP4_BLOCK_SIZE
+        scale_offsets = torch.tensor(
+            [
+                _swizzled_sf_offset(row_index, column_index, scales_per_row)
+                for row_index in range(num_heads)
+                for column_index in range(scales_per_row)
+            ],
+            device="cuda",
+        )
+        torch.testing.assert_close(
+            metadata.fp4_mla_state.prequantized_q_sf.view(torch.uint8)[scale_offsets],
+            expected_sf.view(torch.uint8).flatten()[scale_offsets],
+        )
+    finally:
+        torch.cuda.synchronize()
+        manager.shutdown()
 
 
 def _build_multi_seq_metadata(

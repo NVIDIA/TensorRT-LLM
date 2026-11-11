@@ -565,7 +565,12 @@ def apply_quant_config_exclude_modules(
                     for n in candidates) or any(fused_excluded)
                 if is_excluded and getattr(module, "quant_config",
                                            None) is not None:
-                    module.quant_config = new_config
+                    if getattr(module, '_skip_layerwise_quant_config', False):
+                        module.quant_config = QuantConfig(
+                            kv_cache_quant_algo=module.quant_config.
+                            kv_cache_quant_algo)
+                    else:
+                        module.quant_config = new_config
                     # Reset _weights_created so create_weights() in
                     # __post_init__ will re-create this module's weights
                     # with the updated (non-quantized) config. Some

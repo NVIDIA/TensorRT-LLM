@@ -185,6 +185,7 @@ class KimiK3MLAAttention(MLA):
             fuse_qkv_a_proj=fuse_qkv_a_proj,
             rms_norm_eps=rms_norm_eps,
         )
+        self._skip_layerwise_quant_config = True
         # Keep the base MLA registration enabled so breakable CUDA graphs use
         # the shared custom op. The output gate is a base hook and runs on both
         # the registered and eager paths before the row-parallel o_proj.

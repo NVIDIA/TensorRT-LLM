@@ -232,6 +232,44 @@ def _k3_mla_test_config(gate: bool, num_mla_layers: int = 1) -> KimiLinearConfig
     return config
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("exclude_attention", [False, True], ids=["layerwise", "excluded"])
+def test_mla_layerwise_weight_config_preserves_kv_precision(
+    monkeypatch: pytest.MonkeyPatch,
+    exclude_attention: bool,
+) -> None:
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "1")
+    config = _k3_mla_test_config(gate=False, num_mla_layers=2)
+    model_config = ModelConfig(
+        pretrained_config=config,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        quant_config=QuantConfig(
+            kv_cache_quant_algo=QuantAlgo.NVFP4,
+            exclude_modules=["*.mixer*"] if exclude_attention else None,
+        ),
+        quant_config_dict={
+            f"model.layers.{layer_index}.self_attn.mixer.kv_a_proj_with_mqa": QuantConfig(
+                quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                group_size=128,
+                kv_cache_quant_algo=QuantAlgo.NVFP4,
+            )
+            for layer_index in range(config.num_hidden_layers)
+        },
+    )
+    with torch.device("cuda"):
+        model = KimiLinearForCausalLM(model_config)
+    nvfp4_attention = model.model.layers[0].self_attn.mixer
+    fp8_attention = model.model.layers[1].self_attn.mixer
+    for attention in (nvfp4_attention, fp8_attention):
+        assert attention.kv_a_proj_with_mqa.quant_config.quant_algo == (
+            None if exclude_attention else QuantAlgo.FP8_BLOCK_SCALES
+        )
+    assert nvfp4_attention.mqa.has_fp4_kv_cache
+    assert not nvfp4_attention.mqa.has_fp8_kv_cache
+    assert fp8_attention.mqa.has_fp8_kv_cache
+    assert not fp8_attention.mqa.has_fp4_kv_cache
+
+
 def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return (
         torch.linalg.vector_norm(actual.float() - expected.float())
