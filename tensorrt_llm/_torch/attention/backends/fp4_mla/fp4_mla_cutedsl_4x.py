@@ -4030,6 +4030,8 @@ def _r93_prep_pv(
         # _r93_pack already waited before storing P. Visibility: tcgen05.wait::st +
         # tcgen05.fence::before_thread_sync below precede the bars[9+bank] arrive; the
         # issuer applies tcgen05.fence::after_thread_sync after its wait / handshake.
+        # Orders the store behind PV(local_tile-2)'s MMAs, whose commit barrier _r93_pack waited.
+        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         psf_words = ctm.Vector.from_elements((own_sf0, own_sf1), dtype=ctm.Int32)
         prims.tcgen05_st(
             prims.Tcgen05LdStShape.SHAPE_32X32B,
