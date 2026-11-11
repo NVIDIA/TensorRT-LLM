@@ -1,13 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-r"""``trtllm-modeling-v2 gate <name>``: run one check, the way the final certification runs it.
+r"""``trtllm-modeling-v2 gate <name>``: run one check, the way the run itself runs it.
 
 :func:`run_check` is the one place a check is resolved and run: the worker's ``gate``
-command calls it on the worker's own worktree (``--tree``) while it builds, and the
-certification (``run/certify.py``) calls it for every check of the contract on the final
-commit. The deployment, its options, the environment and the runner come from the same
-``task.yaml`` either way::
+command calls it on the worker's own worktree (``--tree``) while it builds, and the run
+calls it for the onboard check and the final pass (``run/report.py``). The deployment, its
+options, the environment, the frozen anchors and the engine lock are the same either way::
 
     trtllm-modeling-v2 gate boot --task <workspace>/task.yaml --deployment tp4 \
         --tree <your worktree>
@@ -54,7 +53,7 @@ _STATE_FILENAME = ".trtllm_modeling_v2_state.json"
 def _parse(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="trtllm-modeling-v2 gate",
-        description="Run one trtllm_modeling_v2 check standalone, as the certification runs it.",
+        description="Run one trtllm_modeling_v2 check standalone, as the run itself runs it.",
     )
     parser.add_argument(
         "name", help=f"the gate to run: one of {', '.join(GATE_NAMES)}, or accuracy[<benchmark>]"

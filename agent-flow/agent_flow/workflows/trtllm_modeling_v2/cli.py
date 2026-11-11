@@ -23,7 +23,7 @@ from .infra.git import (
 )
 from .infra.monitor import ORCHESTRATOR_HEARTBEAT_S, start_orchestrator_heartbeat
 from .run.pipeline import DEFAULT_MAX_ATTEMPTS, NOTES_FILENAME
-from .run.state import STATE_FILENAME
+from .run.state import STATE_FILENAME, StateError
 from .spec.task_schema import TaskSchemaError, load_and_validate_task_yaml
 
 
@@ -259,7 +259,7 @@ def main(argv: list[str] | None = None) -> None:
     ) as workflow:
         try:
             onboarded = workflow.run(args.task)
-        except TaskSchemaError as exc:
+        except (TaskSchemaError, StateError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(2)
         except KeyboardInterrupt:

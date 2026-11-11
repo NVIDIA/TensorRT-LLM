@@ -33,13 +33,18 @@ class WorkflowState:
     onboarded: dict[str, str] = field(default_factory=dict)
 
 
+class StateError(ValueError):
+    """The workspace holds a run state this version does not read."""
+
+
 def load_state(path: Path) -> WorkflowState:
     data = read_json(path)
     if not isinstance(data, dict) or data.get("version") != SCHEMA_VERSION:
         version = data.get("version") if isinstance(data, dict) else None
-        raise ValueError(
+        raise StateError(
             f"{path} is not this version's run state (version {version!r}, expected "
-            f"{SCHEMA_VERSION}): start over with --clean"
+            f"{SCHEMA_VERSION}): an earlier version of the flow ran in this workspace; start "
+            f"over with --clean, or take another --workspace"
         )
     known = {k: v for k, v in data.items() if k in WorkflowState.__dataclass_fields__}
     return WorkflowState(**known)

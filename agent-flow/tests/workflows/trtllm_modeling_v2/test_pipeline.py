@@ -29,7 +29,12 @@ from agent_flow.workflows.trtllm_modeling_v2.run.integration import (
     own_paths,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import NOTES_FILENAME
-from agent_flow.workflows.trtllm_modeling_v2.run.state import WorkflowState, load_state, save_state
+from agent_flow.workflows.trtllm_modeling_v2.run.state import (
+    StateError,
+    WorkflowState,
+    load_state,
+    save_state,
+)
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
 
 from ._helpers import (
@@ -710,7 +715,7 @@ def test_the_run_state_round_trips_and_another_versions_is_refused(tmp_path):
     save_state(path, original)
     assert load_state(path) == original
     path.write_text(json.dumps({"version": 3, "task_path": "t", "stage": "execution"}))
-    with pytest.raises(ValueError, match="version 3, expected 4.*start over with --clean"):
+    with pytest.raises(StateError, match="version 3, expected 4.*start over with --clean"):
         load_state(path)
 
 

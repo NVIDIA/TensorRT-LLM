@@ -243,6 +243,13 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
     assert run("--task", str(task_file), "--workspace", str(failed), "--dry-run") == 1
     journal = (failed / "journal.md").read_text()
     assert "preflight failed" in journal and "the checkpoint is not readable" in journal
+    # A workspace an earlier version of the flow ran in is refused in one line, with what to do.
+    old = tmp_path / "ws-old"
+    old.mkdir()
+    (old / ".trtllm_modeling_v2_state.json").write_text('{"version": 3, "stage": "execution"}')
+    assert run("--task", str(task_file), "--workspace", str(old)) == 2
+    said = capsys.readouterr().err
+    assert "error: " in said and "start over with --clean, or take another --workspace" in said
     # The exit status says what the run came to: 0 onboarded, whatever else is not done.
     for onboarded, code in ((True, 0), (False, 1)):
         came_to = lambda self, task, onboarded=onboarded: onboarded  # noqa: E731
