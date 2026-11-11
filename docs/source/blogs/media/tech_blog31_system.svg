@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 470" width="1000" height="470">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker><marker id="ahg" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#76B900" stroke-width="1"/></marker><marker id="ahb" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#2F80ED" stroke-width="1"/></marker><marker id="ahi" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#2d3142" stroke-width="1"/></marker></defs>
+<rect width="1000" height="470" fill="#f5f5f5"/>
+<rect x="20" y="24" width="960" height="140" rx="8" fill="none" stroke="#4f5d75" stroke-width="1.2"/>
+<text x="32" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" letter-spacing="1.4" fill="#2d3142" text-anchor="start">CONTEXT WORKER · PREFILL</text>
+<rect x="40" y="56" width="282" height="86" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="52" y="74" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">PREFILL</text>
+<text x="52" y="98" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">FP8 context attention</text>
+<text x="52" y="113" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">on an FP8 scratch cache;</text>
+<text x="52" y="128" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">cached prefix read from FP4</text>
+<rect x="352" y="56" width="282" height="86" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="364" y="74" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">WRITE</text>
+<text x="364" y="98" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Quantize and scatter</text>
+<text x="364" y="113" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">completed 16-token blocks</text>
+<text x="364" y="128" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">to NVFP4 pages</text>
+<rect x="664" y="56" width="296" height="86" rx="6" fill="#ffffff" stroke="#76B900" stroke-width="1"/>
+<text x="676" y="74" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">KV CACHE</text>
+<text x="676" y="98" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Canonical NVFP4 cache</text>
+<text x="676" y="113" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">128-token pages, 360 B per</text>
+<text x="676" y="128" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">token and layer; reusable</text>
+<path d="M324,94 L350,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M636,94 L662,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M812,144 L812,212" fill="none" stroke="#76B900" stroke-width="1.5" marker-end="url(#ahg)"/>
+<text x="798" y="184" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="end">NIXL transfer of the canonical state</text>
+<text x="798" y="200" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="end">360 B per token and layer (FP8 MLA: 576 B) + BF16 tail</text>
+<rect x="20" y="214" width="960" height="240" rx="8" fill="none" stroke="#4f5d75" stroke-width="1.2"/>
+<text x="32" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" letter-spacing="1.4" fill="#2d3142" text-anchor="start">GENERATION WORKER · DECODE</text>
+<rect x="664" y="246" width="296" height="86" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="676" y="264" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">IMPORT</text>
+<text x="676" y="288" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Rebuild BMM2 view</text>
+<text x="676" y="303" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">from the imported pages,</text>
+<text x="676" y="318" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">about 0.15 ms per request</text>
+<rect x="352" y="246" width="282" height="86" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="364" y="264" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">EACH DECODE STEP</text>
+<text x="364" y="288" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Fused pre-attention</text>
+<text x="364" y="303" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">RoPE, quantize Q,</text>
+<text x="364" y="318" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">update tail, write cache</text>
+<rect x="40" y="246" width="282" height="86" rx="6" fill="#ffffff" stroke="#76B900" stroke-width="1"/>
+<text x="52" y="264" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">ATTENTION</text>
+<text x="52" y="288" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">FP4 decode attention</text>
+<text x="52" y="303" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">BMM1 and BMM2 on</text>
+<text x="52" y="318" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">FP4 Tensor Cores</text>
+<path d="M662,284 L636,284" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M350,284 L324,284" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="352" y="358" width="282" height="86" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="364" y="376" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">PER REQUEST</text>
+<text x="364" y="400" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">BF16 tail · 16 tokens</text>
+<text x="364" y="415" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">newest tokens at full precision;</text>
+<text x="364" y="430" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">snapshot and restore for MTP</text>
+<line x1="493" y1="332" x2="493" y2="358" stroke="#4f5d75" stroke-width="1"/>
+<path d="M181,334 L181,345 L392,345 L392,334" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="191" y="363" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">next token</text>
+</svg>
