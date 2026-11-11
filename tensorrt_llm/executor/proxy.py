@@ -884,14 +884,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         if (res := self.result_queue.get()) is None:
             return False  # shutdown the thread
 
-        async_queues = []
-        event_loop = None
+        async_queues = collections.defaultdict(list)
 
         def process_res(res):
             client_id = res.client_id
-            nonlocal event_loop
-            nonlocal async_queues
-
             # The result may already be finalized and popped below — e.g. a
             # `terminate` verdict sent a final Output while the
             # engine still has in-flight responses (abort is async). Drop such
@@ -902,9 +898,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             queue = result.queue
             if isinstance(queue, _SyncQueue):
                 queue.put_nowait(res)
-                async_queues.append(queue)
-                # all the loops are identical
-                event_loop = event_loop or queue.loop
+                async_queues[queue.loop].append(queue)
             else:
                 queue.put(res)
 
@@ -924,9 +918,9 @@ class GenerationExecutorProxy(GenerationExecutor):
                 return False
             process_res(i)
 
-        if async_queues:
+        for event_loop, queues in async_queues.items():
             try:
-                _SyncQueue.notify_many(event_loop, async_queues)
+                _SyncQueue.notify_many(event_loop, queues)
             except AsyncQueue.EventLoopShutdownError:
                 logger.warning(
                     "proxy.py: EventLoopShutdownError because event loop is not running"

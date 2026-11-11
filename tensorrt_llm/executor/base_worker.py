@@ -21,6 +21,7 @@ import time
 import traceback
 import uuid
 import weakref
+from collections import defaultdict
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock
@@ -47,7 +48,8 @@ from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.startup_checks import no_visible_gpu_error
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
+from ..llmapi.utils import (AsyncQueue, _SyncQueue, configure_cpu_affinity,
+                            logger_debug)
 from ..sampling_params import SamplingParams
 from .executor import GenerationExecutor
 from .ipc import IpcQueue
@@ -1534,8 +1536,7 @@ class AwaitResponseHelper:
             f"Broadcasting event-loop error to {len(pending_client_ids)} "
             f"pending request(s): {error}")
 
-        event_loop = None
-        async_queues: List[_SyncQueue] = []
+        async_queues = defaultdict(list)
         # Counts queues a caller can actually read from. A _SyncQueue is only
         # readable once notify_many() has run, so those are counted there.
         woken = 0
@@ -1552,8 +1553,7 @@ class AwaitResponseHelper:
             try:
                 if isinstance(queue, _SyncQueue):
                     queue.put_nowait(err_resp)
-                    async_queues.append(queue)
-                    event_loop = event_loop or queue.loop
+                    async_queues[queue.loop].append(queue)
                 else:
                     queue.put(err_resp)
                     woken += 1
@@ -1563,10 +1563,10 @@ class AwaitResponseHelper:
                 continue
             self.worker._pop_result(client_id)
 
-        if async_queues:
+        for event_loop, queues in async_queues.items():
             try:
-                _SyncQueue.notify_many(event_loop, async_queues)
-                woken += len(async_queues)
+                _SyncQueue.notify_many(event_loop, queues)
+                woken += len(queues)
             except Exception as notify_error:
                 logger.error(
                     f"Failed to notify async queues on event-loop error: "
@@ -1592,8 +1592,7 @@ class AwaitResponseHelper:
 
     def handle_for_worker(self, responses: List[tllm.Response]) -> None:
         ''' Return the responses to asyncio.event_loop. '''
-        event_loop = None
-        async_queues = []
+        async_queues = defaultdict(list)
         for response in responses:
             assert response is not None
             is_error = isinstance(response, ErrorResponse)
@@ -1609,9 +1608,7 @@ class AwaitResponseHelper:
             if isinstance(queue, _SyncQueue):
                 global_tracer().log_instant("worker-rsp.put")
                 queue.put_nowait(response)
-                async_queues.append(queue)
-                # all the loops are identical
-                event_loop = event_loop or queue.loop
+                async_queues[queue.loop].append(queue)
             else:
                 queue.put(response)
 
@@ -1620,8 +1617,12 @@ class AwaitResponseHelper:
                 self.worker._pop_result(response.client_id)
 
         # Notify the events in bulk for performance.
-        if async_queues:
-            _SyncQueue.notify_many(event_loop, async_queues)
+        for event_loop, queues in async_queues.items():
+            try:
+                _SyncQueue.notify_many(event_loop, queues)
+            except AsyncQueue.EventLoopShutdownError:
+                logger.warning(
+                    "Skipping response notification to a stopped event loop")
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
         ''' Perform the IPC in batch explicitly. '''

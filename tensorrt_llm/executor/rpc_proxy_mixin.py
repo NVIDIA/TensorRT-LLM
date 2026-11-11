@@ -17,11 +17,12 @@ import asyncio
 import atexit
 import os
 import threading
+from collections import defaultdict
 from typing import Callable, List, Optional
 
 from .._utils import nvtx_range_debug
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue
+from ..llmapi.utils import AsyncQueue, _SyncQueue
 from ..logger import logger
 from .postproc_worker import PostprocWorker
 from .request import GenerationRequest
@@ -117,15 +118,11 @@ class RpcExecutorMixin:
         return result
 
     def handle_responses(self, responses: list[GenerationResult]) -> bool:
-        async_queues = []
-        event_loop = None
+        async_queues = defaultdict(list)
 
         def process_res(res: list):
             for r in res:
                 client_id = r.client_id
-                nonlocal event_loop
-                nonlocal async_queues
-
                 if client_id not in self._results:
                     logger.warning(f"Received response for unknown client_id: {client_id}")
                     continue
@@ -133,9 +130,7 @@ class RpcExecutorMixin:
                 queue = self._results[client_id].queue
                 if isinstance(queue, _SyncQueue):
                     queue.put_nowait(r)
-                    async_queues.append(queue)
-                    # all the loops are identical
-                    event_loop = event_loop or queue.loop
+                    async_queues[queue.loop].append(queue)
                 else:
                     queue.put(r)
 
@@ -159,8 +154,11 @@ class RpcExecutorMixin:
             global_tracer().log_instant("RPC.get")
             process_res(res)
 
-        if async_queues:
-            _SyncQueue.notify_many(event_loop, async_queues)
+        for event_loop, queues in async_queues.items():
+            try:
+                _SyncQueue.notify_many(event_loop, queues)
+            except AsyncQueue.EventLoopShutdownError:
+                logger.warning("Skipping response notification to a stopped event loop")
 
     async def _generic_fetch_loop_async(
         self, fetch_method_name: str, handler_method: Callable, method_name: str
