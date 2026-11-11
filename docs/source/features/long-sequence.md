@@ -37,7 +37,11 @@ Chunked attention divides a sequence into chunks of a specified size. Each token
 
 Currently TensorRT LLM can only support chunked attention in llama4 model with TRTLLM attention backend. TensorRT LLM will read `attention_chunk_size` from the model config. If it is not None, the chunked attention will be enabled with chunk size `attention_chunk_size`. If you want to enable chunked attention to other models, you can set the `attention_chunk_size` in attention API to a valid value.
 
-Generation chunking is not supported by the FlashInfer TRTLLM-Gen kernels, which are preferred by default for supported configurations with beam width 1 on Blackwell (SM100/SM103), or by tree-based speculative decoding. On Hopper, Llama4 disables chunked attention in both phases when speculative decoding is enabled. On the supported native generation paths, chunking is enabled by default; set `TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE=1` to disable it during generation.
+Generation chunking is not supported by the FlashInfer TRTLLM-Gen kernels, which are preferred by default for supported configurations with beam width 1 on Blackwell (SM100/SM103), or by tree-based speculative decoding. On Hopper, Llama4 disables chunked attention in both phases when speculative decoding is enabled. On the supported native generation paths, chunking is enabled by default.
+
+```{warning}
+Leave `TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE` unset when using chunked attention. In the MMHA fallback, setting it to `1` disables the chunk mask but retains the chunk-size limit used to size shared memory and distribute KV work. For sequences longer than a chunk, this can cause incorrect attention results or out-of-bounds shared-memory accesses. The setting is not a safe general-purpose way to disable generation chunking in the current implementation.
+```
 
 For configurations supported by the native fallback kernels, set `TLLM_FMHA_LIBS=fallback` before initializing the model to select that path. This setting also restricts kernel selection during context processing.
 
