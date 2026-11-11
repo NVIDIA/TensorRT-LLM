@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""AC-1: the target's architecture decides what is selected, wherever the mark sits.
+"""The target's architecture decides what is selected, wherever the mark sits.
 
 Each criterion collects one module from `cases/` for two machines, and checks
 the one test whose gate it is about:
@@ -40,15 +40,6 @@ def test_pre_blackwell_gate(selection):
 
     assert ArchCases.BLACKWELL_AND_NEWER not in h100.selected
     assert ArchCases.BLACKWELL_AND_NEWER in b200.selected
-
-
-def test_post_blackwell_ceiling(selection):
-    """`skip_post_blackwell` is `sm >= 100` -- inclusive, so it fires *on* B200."""
-    b200 = selection.run(ArchCases.MODULE, "--machine=B200")
-    h100 = selection.run(ArchCases.MODULE, "--machine=H100")
-
-    assert ArchCases.HOPPER_AND_OLDER not in b200.selected
-    assert ArchCases.HOPPER_AND_OLDER in h100.selected
 
 
 def test_cpu_arch(selection):

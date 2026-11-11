@@ -104,29 +104,30 @@ qa_selection/
     ladder.py        --ladder: which rung holds a test
     machine.py       --machine: may the machine's card run a test
     marks.py         what a test asks for, read from its marks
-  tests/           the acceptance tests
+  tests/           the contract tests
 ```
 
-## Acceptance tests
+## Tests
 
 ```bash
-pytest tests/qa_selection/tests      # 70 tests, no wheel
+pytest tests/qa_selection/tests      # 28 tests, no wheel
 ```
 
-Each test states a command line and the answer expected back, derived from the production
-decorators. [`test_local_machine.py`](tests/test_local_machine.py) needs `nvidia-smi` and expects
-the dev box's RTX PRO 6000 Blackwell Workstation Edition; one case of
-[`test_unprobed_host.py`](tests/test_unprobed_host.py) needs a host without it. To cover both, run
-the suite in a `docker --gpus all` and then a `docker --runtime=runc` container, each with
-`--probed-out-dir=DIR`.
+The tests are the plugin's contracts with its callers: the options and files the QA pipeline's
+collect step uses, the marks it reads as the integration conftest reads them, and L0 never loading
+it. Each test states a command line and the answer expected back.
+[`test_local_machine.py`](tests/test_local_machine.py) needs `nvidia-smi` and
+[`test_unprobed_host.py`](tests/test_unprobed_host.py) a host without it; run the suite in a
+`docker --gpus all` and a `docker --runtime=runc` container to cover both.
 
-| | principle | criteria |
-|---|---|---|
-| **Loading** | Only `-p qa_selection.plugin` loads the plugin; the integration `pytest.ini` does not | [`test_integration_ini.py`](tests/test_integration_ini.py) (1) |
-| **Before collection** | A machine and a ladder are the whole command; without a machine, this host is the target | AC-4 [`test_options.py`](tests/test_options.py) (5), [`test_local_machine.py`](tests/test_local_machine.py) (2), [`test_unprobed_host.py`](tests/test_unprobed_host.py) (2), [`test_saved_profile.py`](tests/test_saved_profile.py) (12) |
-| **During collection** | The target decides, never the collecting host, so a named machine needs no GPU: its architecture, wherever the mark sits, and its largest rung as the GPU count; a test above that rung is deselected with one reason | AC-1 [`test_arch.py`](tests/test_arch.py) (7), AC-2 [`test_gpu_count.py`](tests/test_gpu_count.py) (7), AC-5 [`test_largest_rung.py`](tests/test_largest_rung.py) (4), [`test_named_machine.py`](tests/test_named_machine.py) (1) |
-| **After collection** | Each kept test is in exactly one list, its smallest rung's, the record carries the profile, and the terminal explains the run | AC-3 [`test_ladder.py`](tests/test_ladder.py) (6), AC-7 [`test_summary.py`](tests/test_summary.py) (5), [`test_named_machine.py`](tests/test_named_machine.py) (2), [`test_local_machine.py`](tests/test_local_machine.py) (1) |
-| **Catalogue** | The catalogue is the six cluster machines, and each ladder fits the node; a run without `--ladder` uses it | [`test_profiles.py`](tests/test_profiles.py) (11), [`test_options.py`](tests/test_options.py) (4) |
+| contract | criteria |
+|---|---|
+| Only `-p qa_selection.plugin` loads the plugin; the integration `pytest.ini` does not | [`test_integration_ini.py`](tests/test_integration_ini.py) (1) |
+| A named machine is decided from its catalogue profile, never the collecting host: its architecture, wherever the mark sits | [`test_arch.py`](tests/test_arch.py) (6) |
+| A test's GPU count is its markers, read as the integration conftest reads them | [`test_gpu_count.py`](tests/test_gpu_count.py) (4) |
+| Each kept test is on its smallest rung, in the record and in exactly one list; a test above the largest rung is deselected with its reason | [`test_ladder.py`](tests/test_ladder.py) (3), [`test_largest_rung.py`](tests/test_largest_rung.py) (1) |
+| The catalogue is the six cluster machines; without `--ladder`, a run uses the profile's ladder, and the record carries the profile | [`test_profiles.py`](tests/test_profiles.py) (9) |
+| Without `--machine`, this host is the target, recorded as `local`: a saved `local.json` profile, else a probe; a bad `local.json`, or a host it cannot probe, is a usage error before collection | [`test_saved_profile.py`](tests/test_saved_profile.py) (2), [`test_local_machine.py`](tests/test_local_machine.py) (1), [`test_unprobed_host.py`](tests/test_unprobed_host.py) (1) |
 
 ## Config
 

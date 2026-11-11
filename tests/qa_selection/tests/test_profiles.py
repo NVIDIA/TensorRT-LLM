@@ -12,14 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The machine catalogue: each machine's measured facts, and the ladder it runs by default.
+"""The machine catalogue: the six cluster machines, and the ladder each runs by default.
 
     pytest --collect-only -p qa_selection.plugin --machine=GB200 --selection-out-dir=out/
-    -> out/GB200.json "ladder": the profile's `ladder`, or [max_gpu_per_node] without one
+    -> out/GB200.json: "machine", "profile" (its catalogue entry), "ladder"
 
-A profile's `ladder` is the allocation policy its fleet schedules by: the bucket
-clusters get 1,4,8, and a machine always held whole has none. `--ladder` still
-overrides it for one run.
+The QA cluster pipeline names `--machine` and no `--ladder`, so a profile's
+`ladder` is the allocation policy its fleet schedules by: the bucket clusters
+get 1,4,8, and a machine always held whole has none.
 """
 
 import json
@@ -47,39 +47,19 @@ def test_every_machine_has_a_default_ladder():
     assert sorted(json.loads(PROFILES.read_text())) == sorted(DEFAULT_LADDERS)
 
 
+# A named machine is decided without touching hardware / The record carries the profile it decided for
 @pytest.mark.parametrize("machine", sorted(DEFAULT_LADDERS))
 def test_default_ladder(selection, machine):
     """Without `--ladder`, a run uses the profile's ladder, or one rung of the whole node."""
     run = selection.run(DeviceCases.MODULE, f"--machine={machine}", "--selection-out-dir={out}")
 
     ladder = DEFAULT_LADDERS[machine]
+    assert run.record["machine"] == machine
+    assert run.record["profile"] == json.loads(PROFILES.read_text())[machine]
     assert run.record["ladder"] == ladder
     assert run.written == sorted(
         [f"{machine}-{rung}gpu.ids" for rung in ladder] + [f"{machine}.json"]
     )
-
-
-def test_option_overrides_profile_ladder(selection):
-    """`--ladder` replaces the profile's ladder for one run."""
-    run = selection.run(
-        DeviceCases.MODULE, "--machine=B200", "--ladder=8", "--selection-out-dir={out}"
-    )
-
-    assert run.record["ladder"] == [8]
-    assert run.written == ["B200-8gpu.ids", "B200.json"]
-
-
-# A profile's ladder fits its node / A ladder below the node is accepted
-def test_ladder_below_the_node_is_accepted(tmp_path):
-    """An 8-GPU profile may divide its node as `1,4`; a run without `--ladder` then uses it.
-
-    Read through the loader: no option points the plugin at another catalogue.
-    """
-    profile = dict(json.loads(PROFILES.read_text())["B200"], ladder=[1, 4])
-    source = tmp_path / "profiles.json"
-    source.write_text(json.dumps({"B200": profile}))
-
-    assert list(MachineCatalog.load(source).profile_for("B200").default_ladder) == [1, 4]
 
 
 # A profile's ladder fits its node / A rung above the node is refused

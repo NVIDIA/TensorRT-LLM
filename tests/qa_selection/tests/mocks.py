@@ -19,9 +19,9 @@
 
 One module per kind of fact selection reads:
 
-    ArchCases     the card's and host's architecture    AC-1
-    DeviceCases   how many GPUs a test needs            AC-2 .. AC-5, AC-7
-    MarkerCases   how marks combine across levels       AC-1 .. AC-3
+    ArchCases     the card's and host's architecture
+    DeviceCases   how many GPUs a test needs
+    MarkerCases   how marks combine across levels
 
 `cases/test_device_cases.py` is `DeviceCases`. Each id is named after its
 test: `test_eight_gpus` is `EIGHT_GPUS`, `TestClosestGpus::test_method_bound`
@@ -43,7 +43,6 @@ class ArchCases:
     MODULE = "test_arch_cases.py"
     UNMARKED = f"{MODULE}::test_unmarked"
     BLACKWELL_AND_NEWER = f"{MODULE}::test_blackwell_and_newer"
-    HOPPER_AND_OLDER = f"{MODULE}::test_hopper_and_older"
     X86_ONLY = f"{MODULE}::test_x86_only"
 
 
@@ -68,8 +67,6 @@ class MarkerCases:
     UNMARKED = f"{MODULE}::test_unmarked"
     CLOSEST_GPUS = f"{MODULE}::TestClosestGpus::test_method_bound"
     EVERY_LEVEL_MEMORY = f"{MODULE}::TestEveryLevelMemory::test_method_bound"
-    AGREEING_BOUNDS = f"{MODULE}::test_agreeing_bounds"
-    DISAGREEING_BOUNDS = f"{MODULE}::test_disagreeing_bounds"
     CURATED_SKIP = f"{MODULE}::test_curated_skip"
     UNCURATED_SKIP = f"{MODULE}::test_uncurated_skip"
     CLASS_SKIP = f"{MODULE}::TestClassSkip::test_method"

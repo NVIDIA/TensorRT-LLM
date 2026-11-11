@@ -42,11 +42,6 @@ skip_pre_blackwell = pytest.mark.skipif(
     reason="This test is not supported in pre-Blackwell architecture",
 )
 
-skip_post_blackwell = pytest.mark.skipif(
-    get_sm_version() >= 100,
-    reason="This test is not supported in post-Blackwell architecture",
-)
-
 skip_arm = pytest.mark.skipif(
     "aarch64" in platform.machine(),
     reason="This test is not supported on ARM architecture",

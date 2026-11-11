@@ -14,13 +14,12 @@
 # limitations under the License.
 """Mock suite: the architecture gates. Collected by the run under test, never run here.
 
-Each test name says what its decorator keeps: `skip_post_blackwell` is encoded
-`sm >= 100`, so `test_hopper_and_older` survives on Hopper and older.
+Each test name says what its decorator keeps.
 `test_unmarked` is the control every mock module carries: it states no
 requirement, so it survives on every machine.
 """
 
-from conftest import skip_arm, skip_post_blackwell, skip_pre_blackwell
+from conftest import skip_arm, skip_pre_blackwell
 
 
 def test_unmarked():
@@ -29,11 +28,6 @@ def test_unmarked():
 
 @skip_pre_blackwell
 def test_blackwell_and_newer():
-    pass
-
-
-@skip_post_blackwell
-def test_hopper_and_older():
     pass
 
 

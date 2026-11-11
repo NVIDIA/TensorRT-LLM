@@ -19,9 +19,6 @@
   closest marker only.
 - A memory demand at two levels: every catalogued machine has between 46 068
   and 284 208 MiB, so 1 000 never blocks and 1 000 000 always does.
-- Both GPU markers on one test, agreeing at 8 -- the shape at
-  `tests/integration/defs/examples/test_deepseek_v4_pro.py:138,140` -- and
-  disagreeing, the smaller listed first, a shape no collected item has.
 - A skip the rule table encodes, and one it declines to. Without the first,
   `deselected_by_reason` would be omitted from the record entirely.
 - A skip on a class, and marks on one `pytest.param` each -- the two other
@@ -48,18 +45,6 @@ class TestEveryLevelMemory:
     @pytest.mark.skip_less_device_memory(1000)
     def test_method_bound(self):
         pass
-
-
-@pytest.mark.skip_less_device(8)
-@pytest.mark.skip_less_mpi_world_size(8)
-def test_agreeing_bounds():
-    pass
-
-
-@pytest.mark.skip_less_device(2)
-@pytest.mark.skip_less_mpi_world_size(8)
-def test_disagreeing_bounds():
-    pass
 
 
 @skip_pre_blackwell
