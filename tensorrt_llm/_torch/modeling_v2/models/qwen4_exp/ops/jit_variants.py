@@ -19,15 +19,24 @@ import torch
 _WARMED: set = set()
 
 
+def _warm_key(name: str, key: Hashable) -> tuple:
+    """`(name, key, device)`: Triton compiles per device, so each device warms on its own."""
+    device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    return name, key, device
+
+
 def first_time(name: str, key: Hashable) -> bool:
-    """True once per `(name, key)` in a process; False inside a CUDA-graph capture (the key
-    stays unmarked, so the next eager call warms it)."""
-    if (name, key) in _WARMED:
+    """True while `(name, key)` is not yet warmed on the current device; False inside a
+    CUDA-graph capture (the next eager call warms it). The caller marks the key with
+    `mark_warmed` once its compiles succeed, so a failed compile is retried."""
+    if _warm_key(name, key) in _WARMED:
         return False
-    if torch.cuda.is_current_stream_capturing():
-        return False
-    _WARMED.add((name, key))
-    return True
+    return not torch.cuda.is_current_stream_capturing()
+
+
+def mark_warmed(name: str, key: Hashable) -> None:
+    """Record `(name, key)` as compiled on the current device."""
+    _WARMED.add(_warm_key(name, key))
 
 
 def compile_only(kernel, args: Sequence[Any], **kwargs: Any) -> None:
@@ -45,9 +54,11 @@ def warm_variants(
     variants: Iterable[Mapping[str, Any]],
     **kwargs: Any,
 ) -> None:
-    """Compile `kernel` once per `key` for every mapping of `variants` laid over `kwargs` (the
-    call's constexprs and launch options)."""
+    """Compile `kernel` once per `key` and device for every mapping of `variants` laid over
+    `kwargs` (the call's constexprs and launch options); the key is marked only after every
+    variant compiled."""
     name = getattr(getattr(kernel, "fn", None), "__name__", None) or repr(kernel)
     if first_time(name, key):
         for variant in variants:
             compile_only(kernel, args, **{**kwargs, **variant})
+        mark_warmed(name, key)

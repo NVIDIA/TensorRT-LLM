@@ -95,7 +95,7 @@ class Fp8Quantize1x128(OpWrapper):
         ),
         # The FP8 unified target's routed experts in its captured decode graph (1..128 rows).
         Cell(
-            why="FP8 unified captured decode: 8 rows (batch 8; dep2 2 x 4, dep4 4 x 2)",
+            why="FP8 unified captured attention-DP decode: 8 rows (dep2 2 x 4, dep4 4 x 2)",
             spec=dict(tokens=8, **_CKPT, capture=True),
         ),
         Cell(

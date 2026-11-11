@@ -1361,7 +1361,7 @@ def _rtl_build(spec, seed):
         q=qkv[:, :q_heads], k_cache=st.k, v_cache=st.v, block_table=st.table,
         selected_tokens=selected, request_indices=st.rows.to(spec["request_dtype"]),
         tokens_per_block=spec["tokens_per_block"], softmax_scale=d**-0.5,
-        query_positions=st.positions.to(spec["request_dtype"]),
+        query_positions=st.positions.to(spec.get("position_dtype", spec["request_dtype"])),
         compress_ratio=spec["compress_ratio"],
     )  # fmt: skip
 
@@ -1802,9 +1802,10 @@ def _family_index_scores_groups(contexts, monkeypatch) -> None:
     assert torch.equal(captured[inside], eager[inside]), "the replay differs from an eager call"
 
 
-def _family_index_scores_prefill(requests, monkeypatch) -> None:
-    """The tcgen05 context-row index scores, `requests` = ((prefix, rows), ...): bitwise the
-    family's kernel over every row's visible columns, and replayable."""
+def _family_index_scores_prefill(case, monkeypatch) -> None:
+    """The tcgen05 context-row index scores, `case` = (((prefix, rows), ...), position dtype):
+    bitwise the family's kernel over every row's visible columns, and replayable."""
+    requests, pos_dtype = case
     need = [-(-(p + r) // 32) for p, r in requests]
     gen, cache, table, slot_of = _index_pool(
         len(requests), need, sum(r for _, r in requests), 12000, 64
@@ -1812,7 +1813,7 @@ def _family_index_scores_prefill(requests, monkeypatch) -> None:
     req = torch.cat(
         [torch.full((r,), int(slot_of[i]), dtype=torch.int32) for i, (_, r) in enumerate(requests)]
     ).to(DEV)
-    pos = torch.cat([torch.arange(p, p + r, dtype=torch.int32) for p, r in requests]).to(DEV)
+    pos = torch.cat([torch.arange(p, p + r, dtype=pos_dtype) for p, r in requests]).to(DEV)
     q = torch.randn(pos.numel(), 6, 128, generator=gen, device=DEV).to(torch.bfloat16)[:, :4]
     assert _isc.supports(q, cache, 32, 4)
     assert not _isc.supports(q, cache, 64, 4)
@@ -1857,12 +1858,14 @@ _FAMILY_CASES = [
         )
     ),
     *(
-        pytest.param(_family_index_scores_prefill, requests, id=f"index scores prefill {name}")
-        for name, requests in (
-            ("88k_one", ((88064, 1024),)),
-            ("three_requests", ((88064, 700), (40000, 333), (3, 300))),
-            ("windows_from_0", ((0, 1500),)),
-            ("131k_250k", ((131072, 320), (250000, 64))),
+        pytest.param(_family_index_scores_prefill, (requests, pos_dtype),
+                     id=f"index scores prefill {name}")
+        for name, requests, pos_dtype in (
+            ("88k_one", ((88064, 1024),), torch.int32),
+            ("three_requests", ((88064, 700), (40000, 333), (3, 300)), torch.int32),
+            ("windows_from_0", ((0, 1500),), torch.int32),
+            ("131k_250k", ((131072, 320), (250000, 64)), torch.int32),
+            ("three_requests_int64", ((88064, 700), (40000, 333), (3, 300)), torch.int64),
         )
     ),
     *(

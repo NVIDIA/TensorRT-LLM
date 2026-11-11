@@ -44,23 +44,23 @@ def _worker() -> None:
         else:
             t.copy_(torch.randn(t.shape, generator=g, device=dev).to(t.dtype))
 
-    # check_create: the buffer holds the largest exchange, 8192 int32 rows of 2051.
+    # check_create: the buffer holds the largest cell, 8192 int32 rows of 2051.
     capacity = 72 << 20
     ce = ce_mod.CopyEngineExchange.create(mapping, capacity)
     assert ce is not None, f"rank {rank}: the exchange was not built"
 
-    # check_eager
-    for it in range(24):
-        rows = (8192, 1024, 77, 4096)[it % 4]
-        dtype = torch.int32 if it % 3 == 2 else torch.bfloat16
-        width = 2051 if dtype == torch.int32 else HIDDEN
-        x = torch.empty(rows, width, dtype=dtype, device=dev)
+    # check_eager: every certified cell, three rounds interleaved.
+    cells = [c.spec for c in ce_mod.ce_exchange.CELLS if c.spec["world"] == world]
+    assert cells, f"no cell is certified at world size {world}"
+    for it in range(3 * len(cells)):
+        spec = cells[it % len(cells)]
+        x = torch.empty(spec["rows"], spec["width"], dtype=spec["dtype"], device=dev)
         fill(x, rank, it)
-        got = ce.exchange(x).clone()
+        got = ce_mod.ce_exchange(ce, x).clone()
         want = torch.empty_like(x)
         fill(want, peer, it)
         torch.cuda.synchronize()
-        assert torch.equal(got, want), f"rank {rank}: eager exchange {it} differs"
+        assert torch.equal(got, want), f"rank {rank}: eager exchange {it} ({spec}) differs"
     comm.Barrier()
 
     # check_graph

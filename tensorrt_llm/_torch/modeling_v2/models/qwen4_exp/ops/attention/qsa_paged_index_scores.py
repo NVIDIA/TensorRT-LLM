@@ -516,15 +516,15 @@ def _qsa_index_scores_prefill_query_tile(
     launcher with `context_rows` and `only_visible_blocks`: columns at and past a row's
     visible bound are unspecified."""
     rows = q.shape[0]
-    if index_cache.ndim != 4 or index_cache.shape[2] != 1 or index_cache.shape[3] != q.shape[2]:
-        raise ValueError("QSA index cache must have shape [pages, tokens, 1, dim]")
-    if block_table.ndim != 2 or block_table.dtype != torch.int32:
-        raise ValueError("QSA index scoring requires a two-dimensional int32 block table")
-    if q.dtype != index_cache.dtype:
-        raise ValueError("QSA index query and cache dtypes must match")
-    if query_positions.shape != (rows,) or request_indices.shape != (rows,):
-        raise ValueError("QSA index-scoring metadata must have one entry per row")
-    max_blocks = block_table.shape[1] * tokens_per_block // compress_ratio
+    max_blocks = _check_index_scores_operands(
+        q,
+        index_cache,
+        block_table,
+        query_positions,
+        request_indices,
+        tokens_per_block,
+        compress_ratio,
+    )
     output = torch.empty((rows, max_blocks), dtype=torch.float32, device=q.device)
     grid = (
         triton.cdiv(rows, _PREFILL_QUERY_TILE),
@@ -566,7 +566,7 @@ def _qsa_index_scores_prefill_query_tile(
     return output
 
 
-def _qsa_index_scores_request_groups(
+def _check_index_scores_operands(
     q: torch.Tensor,
     index_cache: torch.Tensor,
     block_table: torch.Tensor,
@@ -574,15 +574,14 @@ def _qsa_index_scores_request_groups(
     request_indices: torch.Tensor,
     tokens_per_block: int,
     compress_ratio: int,
-    use_pdl: bool,
-    rows_per_request: int,
-) -> torch.Tensor:
-    """One launch of the request-group kernel after the callable's own checks."""
+) -> int:
+    """The engine launcher's operand checks for a `[rows, heads, dim]` query; returns the
+    output's compressed-block count."""
     if index_cache.ndim != 4 or index_cache.shape[2] != 1:
         raise ValueError("QSA index cache must have shape [pages, tokens, 1, dim]")
     if block_table.ndim != 2 or block_table.dtype != torch.int32:
         raise ValueError("QSA index scoring requires a two-dimensional int32 block table")
-    rows, num_index_heads, index_head_dim = q.shape
+    rows, _, index_head_dim = q.shape
     if index_head_dim <= 0 or index_cache.shape[3] != index_head_dim:
         raise ValueError("QSA index query and cache dimensions do not match")
     if q.dtype != index_cache.dtype:
@@ -599,6 +598,31 @@ def _qsa_index_scores_request_groups(
     max_compressed_blocks = block_table.shape[1] * tokens_per_block // compress_ratio
     if max_compressed_blocks <= 0:
         raise ValueError("QSA index scoring requires a non-empty block table")
+    return max_compressed_blocks
+
+
+def _qsa_index_scores_request_groups(
+    q: torch.Tensor,
+    index_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_positions: torch.Tensor,
+    request_indices: torch.Tensor,
+    tokens_per_block: int,
+    compress_ratio: int,
+    use_pdl: bool,
+    rows_per_request: int,
+) -> torch.Tensor:
+    """One launch of the request-group kernel after the callable's own checks."""
+    rows, num_index_heads, index_head_dim = q.shape
+    max_compressed_blocks = _check_index_scores_operands(
+        q,
+        index_cache,
+        block_table,
+        query_positions,
+        request_indices,
+        tokens_per_block,
+        compress_ratio,
+    )
     output = torch.empty((rows, max_compressed_blocks), dtype=torch.float32, device=q.device)
     if rows == 0:
         return output

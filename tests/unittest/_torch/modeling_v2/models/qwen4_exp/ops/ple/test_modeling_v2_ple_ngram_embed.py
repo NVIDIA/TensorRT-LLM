@@ -224,8 +224,9 @@ def test_cuda_graph_capture_and_replay(lengths, pool_slots) -> None:
     assert not torch.equal(args[1], pool_before)
 
 
-def test_per_sequence_rows_compile_one_variant() -> None:
-    """1 to 4 rows a sequence launch one compiled variant per carry flag, matching the reference."""
+def test_per_sequence_rows_compile_at_first_call() -> None:
+    """1 to 4 rows a sequence match the reference, and every `BLOCK_P` variant compiles at the
+    first call per carry flag: later row counts add no compiled variant."""
     kernel = _embed_module._ple_ngram_embed_kernel
     dev = torch.cuda.current_device()
     seen = {}

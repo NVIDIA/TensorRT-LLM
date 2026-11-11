@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The attention-DP MoE round trip as an all-to-all (`NVLinkOneSided`), run when
-`TRTLLM_MODELING_V2_MOE_ALLTOALL=1` (`modeling.MOE_ALLTOALL_ENV`) in place of the default
-all-gather / reduce-scatter. `moe_a2a_dispatch` sends every rank the rows with a top-k expert in
-its whole-expert window, with their top-k ids and weights; `moe_a2a_combine` returns each
-partial to the row's rank and sums them there. The strategy (`build_strategy`) holds the MNNVL
-workspace and the state between a dispatch and its combine: build it once, pass it to every call."""
+`TRTLLM_FORCE_COMM_METHOD=NVLINK_ONE_SIDED` (`modeling.MOE_COMM_METHOD_ENV`) in place of the
+default all-gather / reduce-scatter. `moe_a2a_dispatch` sends every rank the rows with a top-k
+expert in its whole-expert window, with their top-k ids and weights; `moe_a2a_combine` returns
+each partial to the row's rank and sums them there. The strategy (`build_strategy`) holds the
+MNNVL workspace and the state between a dispatch and its combine: build it once, pass it to every
+call."""
 
 from __future__ import annotations
 

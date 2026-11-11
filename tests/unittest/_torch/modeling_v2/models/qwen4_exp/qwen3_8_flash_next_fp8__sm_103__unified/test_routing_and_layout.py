@@ -101,7 +101,7 @@ def on_sm103(monkeypatch):
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
     for env in (
         "TRTLLM_USE_GDN_FLASHINFER_REPLAY",
-        M.MOE_ALLTOALL_ENV,
+        M.MOE_COMM_METHOD_ENV,
         M.ROWTILE_SCRATCH_GROUPS_ENV,
         W.MOE_TPB_ENV,
     ):
@@ -398,21 +398,24 @@ def test_another_moe_backend_or_gpu_or_no_gdn_replay_declines(on_sm103, monkeypa
         modeling_v2_resolve(_routed_config("tep4", _MTP3), _llm_args("require"))
     monkeypatch.delenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY")
     # An all-to-all MoE the deployment cannot run: no attention DP, or no MNNVL.
-    monkeypatch.setenv(M.MOE_ALLTOALL_ENV, "1")
-    with pytest.raises(ValueError, match=M.MOE_ALLTOALL_ENV):
+    monkeypatch.setenv(M.MOE_COMM_METHOD_ENV, "nvlink_one_sided")
+    with pytest.raises(ValueError, match=f"{M.MOE_COMM_METHOD_ENV}=NVLINK_ONE_SIDED"):
         modeling_v2_resolve(_routed_config("tep4"), _llm_args("require"))
     with mock.patch(
         "tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided.NVLinkOneSided"
         ".is_platform_supported",
         return_value=False,
     ):
-        with pytest.raises(ValueError, match=M.MOE_ALLTOALL_ENV):
+        with pytest.raises(ValueError, match=f"{M.MOE_COMM_METHOD_ENV}=NVLINK_ONE_SIDED"):
             modeling_v2_resolve(_routed_config("dep4"), _llm_args("require"))
-    # A misspelled switch raises rather than routing as if it were off.
-    monkeypatch.setenv(M.MOE_ALLTOALL_ENV, "enabled")
-    with pytest.raises(ValueError, match=f"{M.MOE_ALLTOALL_ENV}='enabled'"):
-        modeling_v2_resolve(_routed_config("tep4"), _llm_args("auto"))
-    monkeypatch.delenv(M.MOE_ALLTOALL_ENV)
+    # A stock method the target does not run declines rather than routing as the default.
+    monkeypatch.setenv(M.MOE_COMM_METHOD_ENV, "NVLINK_TWO_SIDED")
+    with pytest.raises(ValueError, match=f"{M.MOE_COMM_METHOD_ENV}=NVLINK_TWO_SIDED"):
+        modeling_v2_resolve(_routed_config("dep4"), _llm_args("require"))
+    # `ALLGATHER`, in any case, is the default round trip.
+    monkeypatch.setenv(M.MOE_COMM_METHOD_ENV, "allgather")
+    _admitted(_routed_config("dep4"))
+    monkeypatch.delenv(M.MOE_COMM_METHOD_ENV)
     monkeypatch.setenv(W.MOE_TPB_ENV, "1")
     with pytest.raises(ValueError, match=f"{W.MOE_TPB_ENV}='1': expected rr"):
         modeling_v2_resolve(_routed_config("tep4"), _llm_args("auto"))
@@ -853,8 +856,8 @@ class _HostA2a:
     ids=["dep2-trunk-ragged", "dep4-trunk-a-rank-without-rows", "dep4-draft-captured-batch"],
 )
 def test_the_attention_dp_alltoall_round_trip(counts, draft, monkeypatch) -> None:
-    """`TRTLLM_MODELING_V2_MOE_ALLTOALL=1`: each rank routes its own rows through the all-to-all
-    and returns what the combine sums; no all-gather, reduce-scatter or TP sum."""
+    """`TRTLLM_FORCE_COMM_METHOD=NVLINK_ONE_SIDED`: each rank routes its own rows through the
+    all-to-all and returns what the combine sums; no all-gather, reduce-scatter or TP sum."""
     world = len(counts)
     moe = _HostMoe(monkeypatch, chunk_rows=5)
     gen = torch.Generator().manual_seed(2)
@@ -864,7 +867,7 @@ def test_the_attention_dp_alltoall_round_trip(counts, draft, monkeypatch) -> Non
     def forbidden(*args, **kwargs):
         raise AssertionError("the all-to-all round trip took the default collectives")
 
-    monkeypatch.setenv(M.MOE_ALLTOALL_ENV, "1")
+    monkeypatch.setenv(M.MOE_COMM_METHOD_ENV, "NVLINK_ONE_SIDED")
     monkeypatch.setattr(M, "mpi_disabled", lambda: False)
     for name in ("allgather", "reducescatter"):
         monkeypatch.setattr(M, name, forbidden)
