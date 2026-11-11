@@ -885,31 +885,53 @@ def test_selfsampling_hopper_split_plans_fit_one_wave() -> None:
 
 
 def test_selfsampling_hopper_clusters_are_coresident() -> None:
-    """Hopper clustered plans launch no more clusters than the GPU co-schedules; Blackwell keeps
-    its tuned cluster rungs (32 rows of 4-CTA clusters)."""
+    """Hopper clustered plans launch no more clusters than the GPU co-schedules (H100 / H200 SXM:
+    132 SMs, H20: 78 SMs); Blackwell keeps its tuned cluster rungs (32 rows of 4-CTA clusters)."""
     assert ss_host.cluster_fits(4, 30, 132, 90) and not ss_host.cluster_fits(4, 32, 132, 90)
+    assert ss_host.cluster_fits(4, 15, 78, 90) and not ss_host.cluster_fits(4, 16, 78, 90)
+    assert ss_host.cluster_fits(12, 1, 78, 90) and not ss_host.cluster_fits(16, 1, 78, 90)
+    # other Hopper SM counts scale the 132-SM row and launch no non-portable clusters
+    assert ss_host.cluster_fits(8, 12, 114, 90) and not ss_host.cluster_fits(8, 13, 114, 90)
+    assert not ss_host.cluster_fits(10, 1, 114, 90)
     assert ss_host.cluster_fits(4, 32, 148, 100) and ss_host.cluster_fits(4, 32, 148, 103)
     assert ss_host.cluster_fits(1, 1024, 132, 90)  # a single CTA is no cluster
-    for b in (8, 15, 16, 30, 31, 32, 33, 64):
-        for k in (512, 1024, 2048):
-            for n in (32771, 65539, 131075, 262127):
-                for dtype in (None, torch.bfloat16, torch.float16):
-                    plan = (
-                        ss_host.route(b, n, n, k, 132, 90)
-                        if dtype is None
-                        else ss_host._route_16bit(b, n, n, k, 132, 90, dtype=dtype)
-                    )
-                    if plan["kernel"] in ("clus", "reg_clus"):
-                        assert ss_host.cluster_fits(plan["cluster"], b, 132, 90), (b, n, k, plan)
+    for num_sms in (132, 78):
+        for b in (1, 2, 4, 8, 15, 16, 30, 31, 32, 33, 64):
+            for k in (512, 1024, 2048):
+                for n in (32771, 32783, 65539, 131075, 163775, 262127):
+                    for dtype in (None, torch.bfloat16, torch.float16):
+                        plan = (
+                            ss_host.route(b, n, n, k, num_sms, 90)
+                            if dtype is None
+                            else ss_host._route_16bit(b, n, n, k, num_sms, 90, dtype=dtype)
+                        )
+                        if plan["kernel"] in ("clus", "reg_clus"):
+                            assert ss_host.cluster_fits(plan["cluster"], b, num_sms, 90), (
+                                num_sms,
+                                b,
+                                n,
+                                k,
+                                plan,
+                            )
     assert ss_host.route(32, 32771, 32832, 1024, 148, 100)["cluster"] == 4
     # FP16 code-radix register clusters: Hopper takes the first geometry that fits, Blackwell its
     # first preference (32 rows of 4-CTA clusters, 8 rows of 10-CTA clusters)
+    for num_sms in (132, 78):
+        for b in (1, 2, 4, 8, 16, 32, 64):
+            for k in (512, 1024, 2048):
+                for n in (8195, 16387, 32771, 65539, 131075, 163775, 262127):
+                    plan = ss_host._code_radix_cluster_plan_fp16(k, n, b, num_sms, 90)
+                    if plan is not None:
+                        assert ss_host.cluster_fits(plan[2], b, num_sms, 90), (
+                            num_sms,
+                            b,
+                            n,
+                            k,
+                            plan,
+                        )
     for b in (1, 8, 16, 32, 64):
         for k in (512, 1024, 2048):
             for n in (8195, 16387, 32771, 65539, 131075, 163775, 262127):
-                plan = ss_host._code_radix_cluster_plan_fp16(k, n, b, 132, 90)
-                if plan is not None:
-                    assert ss_host.cluster_fits(plan[2], b, 132, 90), (b, n, k, plan)
                 first = next(ss_host._code_radix_cluster_plans_fp16(k, n, b, 148), None)
                 assert ss_host._code_radix_cluster_plan_fp16(k, n, b, 148, 100) == first
     assert ss_host._code_radix_cluster_plan_fp16(1024, 32771, 32, 148, 100)[2] == 4
@@ -1070,16 +1092,19 @@ def test_selfsampling_hopper_fp16_wide_slabs_issue_samples_first(monkeypatch) ->
 
 @pytest.mark.skipif(
     getSMVersion() != 90
-    or torch.cuda.get_device_properties(0).multi_processor_count != ss_host._HOPPER_CLUSTER_SMS,
-    reason="requires a 132-SM Hopper GPU (the parts the cluster table was measured on)",
+    or torch.cuda.get_device_properties(0).multi_processor_count
+    not in ss_host._HOPPER_CLUSTER_ROWS,
+    reason="requires a Hopper GPU of a measured SM count (H100 / H200 SXM, H20)",
 )
 def test_selfsampling_hopper_cluster_table_within_device_occupancy() -> None:
-    """The Hopper cluster table never exceeds the clusters this GPU co-schedules at one
-    1024-thread CTA per SM."""
+    """The cluster rows of this GPU's SM count never exceed the clusters it co-schedules at one
+    CTA per SM."""
     from cutlass.utils import HardwareInfo
 
     hardware = HardwareInfo(torch.cuda.current_device())
-    for cluster_size, rows in ss_host._HOPPER_CLUSTER_ROWS.items():
+    num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    for cluster_size in range(2, 17):
+        rows = ss_host.hopper_cluster_rows(cluster_size, num_sms)
         assert rows <= hardware.get_max_active_clusters(cluster_size), (cluster_size, rows)
 
 
