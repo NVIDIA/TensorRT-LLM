@@ -25,6 +25,7 @@ from agent_flow.prompts import dump_prompt_bundle
 from ...agents.prompts import PROMPTS_DIRNAME, build_trtllm_modeling_v2_prompts
 from ...agents.roles import packaged_skills
 from ...agents.turns import TURNS_DIRNAME
+from ...checks import anchors as anchors_mod
 from ...checks import datasets as datasets_mod
 from ...checks import gate_cli
 from ...infra.compute.environment import MAX_TMPDIR_LEN
@@ -259,6 +260,7 @@ def _write_contract(workflow) -> None:
         "coverage: what the contract proves of the request", workflow._coverage.render()
     )
     _write_deployments(workflow)
+    _freeze_anchors(workflow)
     _write_spec_warnings(workflow)
 
 
@@ -274,6 +276,28 @@ def _write_deployments(workflow) -> None:
         workflow.journal.section("deployments: not expanded", f"{type(exc).__name__}: {exc}")
         return
     workflow.journal.section(f"deployments: {len(found)}", deployments_mod.describe(found))
+
+
+def _freeze_anchors(workflow) -> None:
+    """Freeze what each benchmark of each deployment is judged against, and journal it.
+
+    Only what the workspace has not frozen yet is added: a resumed run is held to the
+    anchors its first start read.
+    """
+    try:
+        frozen = anchors_mod.freeze(workflow.workspace, workflow.task_data)
+        moved = anchors_mod.differences(workflow.workspace, workflow.task_data)
+    except Exception as exc:
+        workflow.journal.section("anchors: not frozen", f"{type(exc).__name__}: {exc}")
+        return
+    lines = [
+        f"- `{a.key}`: {a.kind}"
+        + (f" {a.value:g}" if a.value is not None else "")
+        + (f" ({a.source})" if a.source else "")
+        for a in frozen.values()
+    ]
+    lines += [f"- differs from the tree now: {line}" for line in moved]
+    workflow.journal.section(f"anchors: {len(frozen)} frozen", "\n".join(lines) or "None.")
 
 
 def _write_spec_warnings(workflow) -> None:

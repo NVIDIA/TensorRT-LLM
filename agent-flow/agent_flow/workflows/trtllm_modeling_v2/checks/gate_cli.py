@@ -31,17 +31,19 @@ from ..infra.compute.executor import select_command_executor, shell_runner_for
 from ..infra.files import read_json
 from ..spec import shorthand
 from ..spec import variants as variants_mod
+from ..spec.deployments import DISAGGREGATED, Benchmark, Deployment
 from ..spec.task_schema import (
     TaskSchemaError,
     assembly_units,
     load_and_validate_task_yaml,
     members_for,
     parse_parallel_segment,
+    resolve_per_unit,
     widest_world_size,
 )
 from . import accuracy as accuracy_checks
+from . import anchors, check_config, check_runtime, datasets, disagg, endpoint, serve, servers
 from . import boot as boot_checks
-from . import check_config, check_runtime, datasets, disagg, serve
 from . import verdict as check_result
 from .accuracy import resolve_model_key
 from .harness import workload_io
@@ -256,9 +258,47 @@ def run_check(
     spec = datasets.staged_spec(spec, gate if "[" in gate else name, workspace)
     bound = {"timeout": timeout} if timeout else {}
     common = dict(task_data=spec, runner=runner, unit=unit, member=member, deployment=deployment)
+    through_endpoint = deployment.kind == DISAGGREGATED and name in ("boot", "accuracy")
+    if through_endpoint and workspace is None:
+        workspace = workdir
+
+    def frozen_or_tree(deployed: Deployment, benchmark: str, base_spec: Mapping[str, Any], of: str):
+        """The anchor a benchmark is held to: the workspace's frozen one, else the tree's row."""
+        held = anchors.frozen(workspace, deployed.name, benchmark)
+        if held is not None and held.value is not None:
+            return held.value
+        return accuracy_checks.resolve_reference(
+            base_spec, model_key=resolve_model_key(base_spec, of), unit=of
+        )
 
     def measure() -> check_result.GateResult:
         nonlocal anchor_score, disagg_spec
+        if through_endpoint and name == "boot":
+            return endpoint.run_endpoint_boot(
+                deployment,
+                task_data=spec,
+                workspace=workspace,
+                spec=boot_checks.resolve_boot_spec(spec, unit, features),
+                member=member,
+                **bound,
+            )
+        if through_endpoint:
+            [benchmark] = deployment.benchmarks or [Benchmark(name=gate.partition("[")[2][:-1])]
+            held = anchors.frozen(workspace, deployment.name, benchmark.name) or anchors.resolve(
+                spec, deployment, benchmark, tree
+            )
+            return endpoint.run_endpoint_accuracy(
+                deployment,
+                benchmark,
+                environment,
+                task_data=spec,
+                workspace=workspace,
+                anchor=held,
+                relative_score=anchor_score,
+                runner=runner,
+                member=member,
+                **bound,
+            )
         if name == "boot":
             return boot_checks.run_boot_gate(
                 environment,
@@ -270,13 +310,13 @@ def run_check(
                 **common,
             )
         if name == "accuracy":
+            benchmark_name = str(resolve_per_unit(spec.get("accuracy") or {}, "benchmark", unit))
             relative = variants_mod.anchor_state(declared, unit) == variants_mod.ANCHOR_RELATIVE
             if relative and anchor_score is None:
                 base = variants_mod.base_unit(declared, unit)
+                base_deployment = check_config.deployment_of(declared, base, member, world)
                 try:
-                    anchor = accuracy_checks.resolve_reference(
-                        declared, model_key=resolve_model_key(declared, base), unit=base
-                    )
+                    anchor = frozen_or_tree(base_deployment, benchmark_name, declared, base)
                 except (KeyError, FileNotFoundError, TypeError, ValueError):
                     anchor = 0.0  # only the score it measures is used, as the variant's anchor
                 first = accuracy_checks.run_accuracy_gate(
@@ -288,7 +328,7 @@ def run_check(
                         **common,
                         "task_data": datasets.staged_spec(declared, gate, workspace),
                         "unit": base,
-                        "deployment": check_config.deployment_of(declared, base, member, world),
+                        "deployment": base_deployment,
                     },
                 )
                 if first.infrastructure or first.measured is None:
@@ -308,9 +348,7 @@ def run_check(
                     **bound,
                     **common,
                 )
-            reference = accuracy_checks.resolve_reference(
-                spec, model_key=resolve_model_key(spec, unit), unit=unit
-            )
+            reference = frozen_or_tree(deployment, benchmark_name, spec, unit)
             return accuracy_checks.run_accuracy_gate(
                 environment, reference=reference, workdir=workdir / unit, **bound, **common
             )
@@ -331,7 +369,9 @@ def run_check(
             environment, workdir=workdir / unit, spec=disagg_spec, **common
         )
 
-    return watch.judge(measure())
+    # One load at a time: the run's checks and a worker's own never share the devices.
+    with servers.engine_lock(workspace):
+        return watch.judge(measure())
 
 
 def run_gate(args: argparse.Namespace) -> check_result.GateResult:

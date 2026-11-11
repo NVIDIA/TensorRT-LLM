@@ -11,6 +11,9 @@ task spec that points at both.
 from __future__ import annotations
 
 import json
+import os
+import stat
+import sys
 
 import pytest
 import yaml
@@ -101,3 +104,67 @@ def _no_dataset_downloads(monkeypatch):
     from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
 
     monkeypatch.setattr(datasets, "start", lambda *args, **kwargs: None)
+
+
+# A stand-in for `trtllm-serve`: it binds a port, reports it, answers /health and
+# /v1/completions, and writes down the command line and environment it was started with.
+_FAKE_SERVE = """#!{python}
+import http.server, json, os, signal, sys, threading
+
+argv = sys.argv[1:]
+report = argv[argv.index("--report_addr") + 1]
+if os.environ.get("FAKE_SERVE_EXIT"):
+    print("fake: refused to start")
+    sys.exit(3)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _send(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._send({{"status": "ok"}})
+
+    def do_POST(self):
+        asked = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self._send({{"choices": [{{"text": " Paris, after: " + asked["prompt"]}}]}})
+
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+with open(report + ".started.json", "w") as out:
+    json.dump({{"argv": argv, "env": dict(os.environ)}}, out)
+with open(report + ".tmp", "w") as out:
+    out.write("127.0.0.1:%d\\n" % server.server_address[1])
+os.replace(report + ".tmp", report)
+signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
+server.serve_forever()
+"""
+_FAKE_SMI = '#!/bin/bash\n[ -f "$FAKE_SMI" ] && cat "$FAKE_SMI"\nexit 0\n'
+
+
+@pytest.fixture
+def site(tmp_path, monkeypatch):
+    """A PATH with the stand-in `trtllm-serve` and an `nvidia-smi` that reads a file."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, text in (
+        ("trtllm-serve", _FAKE_SERVE.format(python=sys.executable)),
+        ("nvidia-smi", _FAKE_SMI),
+    ):
+        path = bin_dir / name
+        path.write_text(text)
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_SMI", str(tmp_path / "holders"))
+    from agent_flow.workflows.trtllm_modeling_v2.checks import servers
+
+    monkeypatch.setattr(servers, "RELEASE_TIMEOUT_S", 1)
+    monkeypatch.setattr(servers, "STOP_GRACE_S", 10)
+    return tmp_path

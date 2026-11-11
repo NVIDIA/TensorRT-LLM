@@ -501,6 +501,11 @@ def variant_spec(
     return out
 
 
+def unit_of(deployment: str) -> str:
+    """The unit or variant a shorthand deployment's name stands for (``deployments.name_for``)."""
+    return deployment.partition("@")[0] if "@" in deployment else "core"
+
+
 def deployment_for(
     data: Mapping[str, Any],
     name: str | None,
@@ -644,5 +649,6 @@ __all__ = [
     "resolve_max_draft_len",
     "resolve_runtime",
     "share_batch",
+    "unit_of",
     "variant_spec",
 ]
