@@ -16,10 +16,16 @@
 
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import requests
 from test_common.error_utils import check_error, report_error
-from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
+from test_common.http_utils import (
+    fail_if_proc_died,
+    wait_for_endpoint_down,
+    wait_for_endpoint_ready,
+)
 
 # The CPU-Generic CI stages select tests with `-m cpu_only`; without this
 # marker every test here is deselected and pytest exits with code 5.
@@ -107,6 +113,33 @@ def test_fail_if_proc_died_noop_when_alive_or_none(tmp_path):
     finally:
         proc.kill()
         proc.wait()
+
+
+def test_endpoint_down_requires_consecutive_failed_probes(monkeypatch):
+    probes = iter(
+        [
+            requests.ConnectTimeout("slow probe"),
+            SimpleNamespace(status_code=200),
+            requests.ConnectionError("router stopped"),
+            requests.ConnectionError("router still stopped"),
+        ]
+    )
+    probe_count = 0
+
+    def get(*args, **kwargs):
+        nonlocal probe_count
+        probe_count += 1
+        result = next(probes)
+        if isinstance(result, requests.RequestException):
+            raise result
+        return result
+
+    monkeypatch.setattr("test_common.http_utils.requests.get", get)
+    monkeypatch.setattr("test_common.http_utils.time.sleep", lambda _: None)
+
+    wait_for_endpoint_down(DEAD_URL, timeout=30, required_failures=2)
+
+    assert probe_count == 4
 
 
 def test_report_error_keyword_scan_fires(tmp_path):

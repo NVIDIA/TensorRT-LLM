@@ -2,9 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Two-node disaggregated serving test run directly under Slurm.
 
-Supported launches provide one or more tasks per node, for example:
-``srun --nodes=2 --ntasks-per-node=1 python -m pytest <this module>``.
-Only local rank zero starts a worker on each node.
+Run one selected parametrization with one task per node, for example:
+``srun --nodes=2 --ntasks-per-node=1 python -m pytest <this module>::test_completion[ctx_tp2pp1-gen_tp2pp1]``.
 """
 
 import os
@@ -47,7 +46,7 @@ GEN_TASK_HANDSHAKE_TIMEOUT_S = 300
 ROUTER_READY_TIMEOUT_S = (RemoteOpenAIServer.MAX_SERVER_START_WAIT_S +
                           DISAGG_SERVER_START_TIMEOUT_S)
 ROUTER_STOP_TIMEOUT_S = RemoteOpenAIServer.MAX_SERVER_START_WAIT_S
-READY_MESSAGE = b"ready"
+READY_MESSAGE_PREFIX = "ready "
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -58,6 +57,7 @@ def require_supported_slurm_topology() -> None:
         "SLURM_NODEID",
         "SLURM_LOCALID",
         "SLURM_NODELIST",
+        "SLURM_STEP_NUM_NODES",
     )
     missing_variables = [
         variable for variable in required_variables
@@ -66,12 +66,19 @@ def require_supported_slurm_topology() -> None:
     if missing_variables:
         launcher_hint = (" trtllm-llmapi-launch removes these variables."
                          if "SLURM_PROCID" in missing_variables else "")
+        pytest.fail("This test must run as a two-node srun step; "
+                    f"missing: {', '.join(missing_variables)}.{launcher_hint}")
+    if os.environ["SLURM_STEP_NUM_NODES"] != "2" or len(NODE_LIST) != 2:
         pytest.fail(
-            "This test must run directly under a two-node Slurm allocation; "
-            f"missing: {', '.join(missing_variables)}.{launcher_hint}")
-    if len(NODE_LIST) != 2:
-        pytest.fail("This test requires exactly two Slurm nodes; "
-                    f"SLURM_NODELIST expands to {NODE_LIST}")
+            "Launch one pytest task per node with srun, for example "
+            "srun --nodes=2 --ntasks-per-node=1 python -m pytest ...; "
+            f"got SLURM_STEP_NUM_NODES={os.environ['SLURM_STEP_NUM_NODES']}, "
+            f"SLURM_NODELIST={NODE_LIST}")
+    if LOCAL_RANK != 0 or RANK != NODE_RANK:
+        pytest.fail(
+            "This test supports exactly one pytest task per Slurm node; "
+            f"got SLURM_PROCID={RANK}, SLURM_NODEID={NODE_RANK}, "
+            f"SLURM_LOCALID={LOCAL_RANK}")
 
 
 # Exclude the current node from the node list, then return other nodes by idx
@@ -90,41 +97,56 @@ def get_the_other_host(idx=0):
     return node_list[idx]
 
 
-def wait_for_gen_task_handshake() -> None:
+def wait_for_gen_task_handshake(test_id: str) -> None:
     """Wait until the generation task is ready for router shutdown."""
+    expected_signal = f"{READY_MESSAGE_PREFIX}{test_id}".encode()
+    deadline = time.monotonic() + GEN_TASK_HANDSHAKE_TIMEOUT_S
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("0.0.0.0", GEN_TASK_HANDSHAKE_PORT))
-        listener.listen(1)
-        listener.settimeout(GEN_TASK_HANDSHAKE_TIMEOUT_S)
-        try:
-            connection, _ = listener.accept()
-        except TimeoutError as error:
-            raise RuntimeError(
-                "Generation task did not connect to rank 0 on port "
-                f"{GEN_TASK_HANDSHAKE_PORT} within "
-                f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s") from error
-        with connection:
-            connection.settimeout(GEN_TASK_HANDSHAKE_TIMEOUT_S)
-            ready_signal = b""
+        listener.listen()
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            listener.settimeout(remaining)
             try:
-                while len(ready_signal) < len(READY_MESSAGE):
-                    chunk = connection.recv(
-                        len(READY_MESSAGE) - len(ready_signal))
-                    if not chunk:
-                        break
-                    ready_signal += chunk
+                connection, _ = listener.accept()
             except TimeoutError as error:
                 raise RuntimeError(
-                    "Generation task did not complete its handshake within "
+                    "Generation task did not connect to rank 0 on port "
+                    f"{GEN_TASK_HANDSHAKE_PORT} within "
                     f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s") from error
-            if ready_signal != READY_MESSAGE:
+            with connection:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                connection.settimeout(remaining)
+                chunks = []
+                while True:
+                    try:
+                        chunk = connection.recv(4096)
+                    except TimeoutError as error:
+                        raise RuntimeError(
+                            "Generation task did not complete its handshake within "
+                            f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s") from error
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                ready_signal = b"".join(chunks)
+            if not ready_signal:
+                continue
+            if ready_signal != expected_signal:
                 raise RuntimeError(
-                    f"Generation task sent an invalid handshake: {ready_signal!r}"
-                )
+                    "Generation task handshake is for a different test: "
+                    f"expected {expected_signal!r}, got {ready_signal!r}")
+            return
+    raise RuntimeError(
+        f"Generation task did not connect within {GEN_TASK_HANDSHAKE_TIMEOUT_S}s"
+    )
 
 
-def send_gen_task_handshake(host: str) -> None:
+def send_gen_task_handshake(host: str, test_id: str) -> None:
     """Tell rank zero that the generation task is awaiting router shutdown."""
     deadline = time.monotonic() + GEN_TASK_HANDSHAKE_TIMEOUT_S
     last_error: OSError | None = None
@@ -132,7 +154,7 @@ def send_gen_task_handshake(host: str) -> None:
         try:
             with socket.create_connection((host, GEN_TASK_HANDSHAKE_PORT),
                                           timeout=5) as connection:
-                connection.sendall(READY_MESSAGE)
+                connection.sendall(f"{READY_MESSAGE_PREFIX}{test_id}".encode())
                 return
         except OSError as error:
             last_error = error
@@ -256,11 +278,11 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
 
 @pytest.fixture(scope="module")
 def disagg_server(worker: RemoteOpenAIServer):
-    """Start the disaggregated router on the pytest node."""
+    """Start the disaggregated router on global rank zero; other tasks yield None."""
     if is_rank_zero():
         print(f"starting disagg_server for rank {RANK} node rank {NODE_RANK}")
-        ctx_url = "localhost:8001"  # Use localhost since the ctx server is on the same node
-        gen_url = f"{get_the_other_host(0)}:8002"
+        ctx_url = f"localhost:{CTX_SERVER_PORT}"
+        gen_url = f"{get_the_other_host(0)}:{GEN_SERVER_PORT}"
         with RemoteDisaggOpenAIServer(
                 ctx_servers=[ctx_url],
                 gen_servers=[gen_url],
@@ -283,12 +305,13 @@ def client(disagg_server: RemoteDisaggOpenAIServer):
         return None
 
 
-def test_completion(client: openai.OpenAI,
-                    disagg_server: RemoteDisaggOpenAIServer, model_name: str):
+def test_completion(request, client: openai.OpenAI,
+                    disagg_server: RemoteDisaggOpenAIServer,
+                    worker: RemoteOpenAIServer, model_name: str):
     """Verify one completion while coordinating worker shutdown."""
     if is_rank_zero():
         print(f"running test_completion on rank {RANK} node rank {NODE_RANK}")
-        wait_for_gen_task_handshake()
+        wait_for_gen_task_handshake(request.node.callspec.id)
         prompt = "What is the result of 1+1? Answer in one word: "
         completion = client.completions.create(
             model=model_name,
@@ -305,10 +328,12 @@ def test_completion(client: openai.OpenAI,
 
     elif is_gen_node() and is_worker_task():
         # Keep the generation worker alive until the disaggregated server exits.
-        url = f"http://{get_the_other_host(0)}:{DISAGG_SERVER_PORT}/health/"
-        wait_for_endpoint_ready(url, timeout=ROUTER_READY_TIMEOUT_S)
-        send_gen_task_handshake(get_the_other_host(0))
+        router_host = get_the_other_host(0)
+        url = f"http://{router_host}:{DISAGG_SERVER_PORT}/health/"
+        wait_for_endpoint_ready(url,
+                                timeout=ROUTER_READY_TIMEOUT_S,
+                                server_proc=worker.proc)
+        send_gen_task_handshake(router_host, request.node.callspec.id)
         wait_for_endpoint_down(url, timeout=ROUTER_STOP_TIMEOUT_S)
-        assert True
-    else:
-        assert True
+        assert worker.proc.poll(
+        ) is None, "generation worker exited during the test"
