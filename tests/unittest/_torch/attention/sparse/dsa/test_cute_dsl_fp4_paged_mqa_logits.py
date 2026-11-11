@@ -329,6 +329,7 @@ def test_cute_dsl_fp4_paged_mqa_logits(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -494,6 +495,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_kernel_split(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -653,6 +655,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_block_meta(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -814,6 +817,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -850,6 +854,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -963,6 +968,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -1622,6 +1628,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -1656,6 +1663,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -1721,6 +1729,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
     if cap_mode == "tight":
         assert int(cand_ctl[:, 1].sum()) > 0, "tight caps never voided"
 
+
 @skip_not_sm100
 def test_cute_dsl_fp4_paged_mqa_logits_partial_final_tile():
     torch.manual_seed(42)
@@ -1735,13 +1744,13 @@ def test_cute_dsl_fp4_paged_mqa_logits_partial_final_tile():
     kv_cache = torch.randn((2, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16)
     weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
 
-    q_packed, sf_q_packed = per_token_cast_to_fp4(
+    q_packed, sf_q_packed = DSAVanillaIndexer.quantize_fp4(
         q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
     )
     q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
     sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
     q_simulated = (
-        cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32, use_packed_ue8m0=True)
+        DSAVanillaIndexer.dequantize_fp4(q_packed, sf_q_packed, gran_k=32, use_packed_ue8m0=True)
         .view(batch_size, next_n, num_heads, head_dim)
         .to(torch.bfloat16)
     )
@@ -1750,10 +1759,11 @@ def test_cute_dsl_fp4_paged_mqa_logits_partial_final_tile():
         context_lens.unsqueeze(-1), 64, deep_gemm.get_num_sms()
     )
 
-    ref = _ref_paged_mqa_logits(
+    ref = paged_mqa_logits(
         q_simulated.float(),
         kv_simulated.float(),
         weights,
+        context_lens,
         context_lens,
         block_table,
         max_model_len,
@@ -1763,6 +1773,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_partial_final_tile():
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
