@@ -1230,7 +1230,9 @@ def launch_rerank_server(
                           metadata_server_cfg=metadata_server_cfg,
                           tool_parser=None,
                           embedding_max_queue_delay=max_queue_delay,
-                          embedding_max_queue_size=max_queue_size)
+                          embedding_max_queue_size=max_queue_size,
+                          graceful_shutdown_timeout=llm.args.
+                          serve_graceful_shutdown_timeout_s)
     asyncio.run(server(host, port))
 
 
