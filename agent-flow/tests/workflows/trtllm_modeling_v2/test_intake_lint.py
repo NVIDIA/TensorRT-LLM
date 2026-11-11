@@ -93,7 +93,6 @@ def _slow():
     task["accuracy"] = {
         "benchmark": "gsm8k",
         "benchmark_args": ["--apply_chat_template"],
-        "envelope": {"enabled": True},
         "disagg": {"test": "tests/accuracy/test_disagg.py::TestToy::test_auto_dtype", "devices": 8},
     }
     task["notes"] = "Never inspect any preexisting implementation, including sibling checkouts."

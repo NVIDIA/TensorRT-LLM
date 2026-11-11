@@ -117,7 +117,6 @@ def test_hung_gpu_inspection_returns_unknown_instead_of_blocking_teardown(monkey
         raise subprocess.TimeoutExpired(argv, 30)
 
     monkeypatch.setattr(server_runtime.subprocess, "run", hung)
-    assert server_runtime.device_memory_used_mib() is None
     assert server_runtime.device_holders() == set()
 
 

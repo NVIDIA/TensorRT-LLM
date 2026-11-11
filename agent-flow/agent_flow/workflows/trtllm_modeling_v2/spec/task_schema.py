@@ -190,8 +190,7 @@ COVERAGE_KEYS: tuple[str, ...] = ("accept",)
 #: configuration variant and no delivery check. A run whose every unit is one of
 #: the two owes no CI files either (``completion.CI_DELIVERY_CHECKS``);
 #: ``standard`` is the contract as the spec states it; ``certified`` also turns on
-#: boot boundary phases and the serve gate. A switch the spec sets itself keeps
-#: its value.
+#: the serve gate. A switch the spec sets itself keeps its value.
 PROFILE_FIELD = "profile"
 PROFILE_SMOKE = "smoke"
 PROFILE_BRINGUP = "bringup"
@@ -213,6 +212,13 @@ TARGET_KEYS: tuple[str, ...] = ("family", "checkpoint_segment")
 #: The ``target`` keys that name a Python package directory.
 TARGET_NAME_KEYS: tuple[str, ...] = ("family", "checkpoint_segment")
 
+#: ``accuracy`` keys an earlier version of the spec read and this one does not, each with what
+#: went: dropped at load and named once in a notice, so a spec written for it still loads.
+IGNORED_ACCURACY_KEYS: dict[str, str] = {
+    "envelope": "a boot runs its workload only; there are no boundary phases",
+    "reference_logits": "a boot keeps no divergence record against a reference's logits",
+}
+
 ACCURACY_KEYS: tuple[str, ...] = (
     # The absolute `acceptance_length` floor a unit falls back to when the
     # `=off` leg cannot exist. Also the acceptance gate's declared workload;
@@ -225,9 +231,6 @@ ACCURACY_KEYS: tuple[str, ...] = (
     "timeout",
     "dataset_path",
     "llm_api_options",
-    # A reference's first-token log-probs per prompt, and the bounds a divergence from
-    # them is recorded past (``checks/divergence.py``): never a failure by itself.
-    "reference_logits",
     # Which ROW of reference_yaml this run anchors to. The references key a
     # model to a list discriminated by quant_algo / kv_cache_quant_algo /
     # spec_dec_algo, and the match is exact.
@@ -241,7 +244,6 @@ ACCURACY_KEYS: tuple[str, ...] = (
     "benchmark_args",
     "floor",
     "boot",
-    "envelope",
     "serve",
     # The benchmark's sample count, scalar or per unit, for the standard
     # error behind the statistical floor.
@@ -279,22 +281,6 @@ BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "keywords", "max_tokens
 GATE_TIMEOUT_KEY = "timeout"
 BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "keywords", "keywords_any", "images", "render")
 BOOT_RENDERS: tuple[str, ...] = ("loader", "raw")
-
-# Optional runtime-boundary phases of ordinary boot (checks/boot.py).
-# Disabled by default; certified enables them unless explicitly disabled.
-# timeout bounds the complete boot invocation, not a second engine launch.
-ENVELOPE_KEYS: tuple[str, ...] = (
-    "enabled",
-    "max_tokens",
-    "agree_tokens",
-    "long_prompts",
-    "probes",
-    "timeout",
-    # Nats within which two tokens a probe's legs part on are a near-tie, which passes.
-    "tie_margin",
-    # The members whose boot runs the phases; default one per unit (checks/boot.py).
-    "members",
-)
 
 # Serve defaults are derived from the declared sequence bound in derive_gate_defaults.
 SERVE_KEYS: tuple[str, ...] = ("enabled", "prompt", "max_tokens", "timeout")
@@ -1096,50 +1082,6 @@ def _validate_floor(block: Mapping[str, Any], errors: list[str]) -> None:
             )
 
 
-def _validate_envelope(block: Any, errors: list[str]) -> None:
-    """Validate ``accuracy.envelope``."""
-    where = f"{ACCURACY_FIELD}.envelope"
-    if not isinstance(block, dict):
-        errors.append(f"'{where}' must be a mapping")
-        return
-    reject_unknown_keys(block, ENVELOPE_KEYS, errors, where=where)
-    _validate_fields(
-        block,
-        {
-            "enabled": _FLAG,
-            "max_tokens": _POS_INT,
-            "agree_tokens": _POS_INT,
-            "timeout": _POS_INT,
-            "long_prompts": (
-                lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0,
-                "must be an integer >= 0",
-            ),
-            "probes": (
-                lambda v: bool(v) and _nonempty_strings(v),
-                "must be a non-empty list of prompts",
-            ),
-            "tie_margin": (
-                lambda v: _number(v) and v >= 0,
-                "must be a number of nats >= 0",
-            ),
-            "members": (
-                lambda v: (
-                    bool(v)
-                    and _nonempty_strings(v)
-                    and all(PARALLEL_PATTERN.match(str(m)) for m in v)
-                ),
-                "must be a non-empty list of members (tp<N>, tep<N>, dep<N>)",
-            ),
-        },
-        errors,
-        where,
-    )
-    max_tokens = block.get("max_tokens") or 16
-    agree_tokens = block.get("agree_tokens") or 4
-    if _positive_int(max_tokens) and _positive_int(agree_tokens) and agree_tokens > max_tokens:
-        errors.append(f"'{where}.agree_tokens' must not exceed max_tokens")
-
-
 def _validate_serve(block: Any, errors: list[str]) -> None:
     """Validate ``accuracy.serve``."""
     where = f"{ACCURACY_FIELD}.serve"
@@ -1172,20 +1114,19 @@ def _bounds_server_length(accuracy: Mapping[str, Any]) -> bool:
 
 
 def _profile_defaults(profile: Any, accuracy: dict[str, Any]) -> None:
-    """The switches the run's ``profile`` sets where ``accuracy`` leaves them unsaid, in place.
+    """The serve switch the run's ``profile`` sets where ``accuracy`` leaves it unsaid, in place.
 
-    ``certified`` turns on boot boundary phases and the serve gate; ``bringup``
-    and ``smoke`` turn them off. ``standard`` sets nothing.
+    ``certified`` is ``standard`` with the serve gate on; ``bringup`` and ``smoke``
+    turn it off. ``standard`` sets nothing.
     """
     if profile not in (PROFILE_SMOKE, PROFILE_BRINGUP, PROFILE_CERTIFIED):
         return
     on = profile == PROFILE_CERTIFIED
-    for key in ("envelope", "serve"):
-        block = accuracy.get(key)
-        if block is None:
-            accuracy[key] = {"enabled": on}
-        elif isinstance(block, dict):
-            block.setdefault("enabled", on)
+    block = accuracy.get("serve")
+    if block is None:
+        accuracy["serve"] = {"enabled": on}
+    elif isinstance(block, dict):
+        block.setdefault("enabled", on)
 
 
 def derive_gate_defaults(data: dict[str, Any], spec_dir: Path) -> None:
@@ -1305,27 +1246,10 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
     if block.get("acceptance") is not None:
         _validate_acceptance(block["acceptance"], errors)
 
-    reference = block.get("reference_logits")
-    if reference is not None:
-        where = f"{ACCURACY_FIELD}.reference_logits"
-        if not isinstance(reference, dict) or not _text(reference.get("path")):
-            errors.append(f"'{where}' must be a mapping with a `path` to the reference's file")
-        else:
-            from ..checks.divergence import REFERENCE_KEYS
-
-            reject_unknown_keys(reference, REFERENCE_KEYS, errors, where=where)
-            for key in ("tie_margin", "max_js", "min_cosine"):
-                value = reference.get(key)
-                if value is not None and (not _number(value) or value < 0):
-                    errors.append(f"'{where}.{key}' must be a number >= 0")
-
     _validate_floor(block, errors)
 
     if block.get("boot") is not None:
         _validate_boot(block["boot"], errors)
-
-    if block.get("envelope") is not None:
-        _validate_envelope(block["envelope"], errors)
 
     if block.get("disagg") is not None:
         _validate_disagg(block["disagg"], errors)
@@ -1524,11 +1448,27 @@ def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
                     ]
 
 
-def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
+def drop_ignored_keys(data: dict[str, Any], notices: list[str] | None) -> None:
+    """Take the keys this version no longer reads out of ``data``, one notice for each."""
+    accuracy = data.get(ACCURACY_FIELD)
+    if not isinstance(accuracy, dict):
+        return
+    for key, why in IGNORED_ACCURACY_KEYS.items():
+        if key in accuracy:
+            del accuracy[key]
+            if notices is not None:
+                notices.append(f"'{ACCURACY_FIELD}.{key}' is ignored: {why}; drop the key")
+
+
+def load_and_validate_task_yaml(
+    path: str | Path, notices: list[str] | None = None
+) -> dict[str, Any]:
     """Parse ``path`` as YAML, validate it, and fill in the workflow's defaults.
 
     Returns the resolved mapping. Raises :class:`TaskSchemaError` with
-    **every** detected problem batched into a single message.
+    **every** detected problem batched into a single message. A key this
+    version no longer reads (:data:`IGNORED_ACCURACY_KEYS`) is dropped, and
+    ``notices``, when given, gains one line saying so.
     """
     task_path = Path(path)
     if not task_path.is_file():
@@ -1547,6 +1487,7 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
             f"{task_path} must be a YAML mapping at the top level, got {type(data).__name__}"
         )
 
+    drop_ignored_keys(data, notices)
     # BEFORE validation, deliberately. `accuracy.llm_api_options` has an
     # existence check, and that check is a *consumer* of the resolved path.
     _resolve_spec_relative_paths(data, task_path.resolve().parent)
@@ -1732,6 +1673,7 @@ __all__ = [
     "BENCHMARK_MEMBERS",
     "BENCHMARK_MEMBERS_EVERY",
     "derive_gate_defaults",
+    "drop_ignored_keys",
     "DISAGG_FEATURE",
     "DISAGG_KEYS",
     "ACCEPTANCE_UNIT_KEYS",
@@ -1749,6 +1691,7 @@ __all__ = [
     "ENVIRONMENT_KINDS",
     "FEATURES_FIELD",
     "FEATURE_FAMILIES",
+    "IGNORED_ACCURACY_KEYS",
     "SPECULATORS",
     "PROFILES",
     "PROFILE_BRINGUP",

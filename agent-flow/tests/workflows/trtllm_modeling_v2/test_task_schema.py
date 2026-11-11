@@ -243,3 +243,39 @@ def test_quantized_core_has_one_kv_dtype_source_and_structural_hybrid_hints(tmp_
         {"text_config": {"layer_types": ["linear_attention", "full_attention"]}}
     )
     assert derive.hybrid_marker({"architectures": ["Unseen"]}) is None
+
+
+def test_a_key_this_version_no_longer_reads_is_dropped_with_one_notice_each(tmp_path):
+    spec = _valid_spec(tmp_path)
+    quiet: list[str] = []
+    load_and_validate_task_yaml(_write(tmp_path, spec), quiet)
+    assert quiet == []
+    spec["accuracy"]["envelope"] = {"enabled": True, "probes": ["1, 2, 3,"]}
+    spec["accuracy"]["reference_logits"] = {"path": "reference.json"}
+    notices: list[str] = []
+    resolved = load_and_validate_task_yaml(_write(tmp_path, spec), notices)
+    assert "envelope" not in resolved["accuracy"] and "reference_logits" not in resolved["accuracy"]
+    assert len(notices) == 2
+    assert notices[0].startswith("'accuracy.envelope' is ignored: a boot runs its workload only")
+    assert notices[1].startswith("'accuracy.reference_logits' is ignored: ")
+    # Without a list to fill, the spec loads the same, silently.
+    assert load_and_validate_task_yaml(_write(tmp_path, spec)) == resolved
+
+
+def test_the_certified_profile_is_standard_with_the_serve_gate(tmp_path):
+    from agent_flow.workflows.trtllm_modeling_v2.run.contract import compile_contract
+
+    spec = _valid_spec(tmp_path) | {
+        "parallel": "unified",
+        "members": ["tep4", "dep4"],
+        "variants": {"kv_fp8": {"llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}}},
+    }
+    standard = load_and_validate_task_yaml(_write(tmp_path, spec))
+    certified = load_and_validate_task_yaml(_write(tmp_path, spec | {"profile": "certified"}))
+    assert standard["accuracy"]["serve"] == {"enabled": False}  # nothing bounds the server
+    assert certified["accuracy"]["serve"] == {"enabled": True}
+    owed = {c.key for c in compile_contract(standard, 4).required()}
+    more = {c.key for c in compile_contract(certified, 4).required()} - owed
+    assert more and all(":serve@" in key for key in more)
+    # A relative variant's benchmark runs at one member under either profile.
+    assert [k for k in owed if k.startswith("kv_fp8:accuracy")] == ["kv_fp8:accuracy[gsm8k]@dep4"]

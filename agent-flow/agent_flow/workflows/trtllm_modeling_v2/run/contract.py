@@ -32,7 +32,6 @@ from ..spec import variants as variants_mod
 from ..spec.task_schema import (
     DISAGG_FEATURE,
     PROFILE_BRINGUP,
-    PROFILE_CERTIFIED,
     PROFILE_SMOKE,
     SPECULATORS,
     TaskSchemaError,
@@ -125,7 +124,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
 
     Each unit owes what its profile (``task_schema.profile_of``) asks:
     ``smoke`` its boot alone, ``bringup`` its checks at its cheapest member,
-    ``certified`` its boot boundaries and the serve gate. ``disagg`` owes its
+    ``certified`` what ``standard`` owes and the serve gate. ``disagg`` owes its
     disaggregated-serving test alone, once (``checks/disagg.py``): its boot and
     accuracy would run one aggregated engine, which the units before it prove.
     A storage or scheduling variant (one with no acceptance gate) boots at
@@ -210,7 +209,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
             at = members
             if gate == "boot" and "acceptance" not in gates:
                 at = [*members, *(m for m in everywhere if m not in members)]
-            elif gate == "accuracy" and not named and level != PROFILE_CERTIFIED and len(at) > 1:
+            elif gate == "accuracy" and not named and len(at) > 1:
                 member, why = benchmark_member(spec, members)
                 at = [member]
                 notes.append(f"{name}: accuracy at {member} ({why}); its other members boot")

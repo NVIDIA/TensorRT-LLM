@@ -43,39 +43,13 @@ def build_llm(spec: Mapping[str, Any]) -> tuple[Any, Any]:
     return LLM(**options), sampling
 
 
-def sampling_for(base: Any, max_tokens: int, ignore_eos: bool, logprobs: int = 0) -> Any:
-    """A copy of the declared sampling parameters with this request's budget.
-
-    ``logprobs`` asks for each generated token's top-k log-probs, as a request
-    whose tokens a gate compares up to a near-tie does.
-    """
+def sampling_for(base: Any, max_tokens: int, ignore_eos: bool) -> Any:
+    """A copy of the declared sampling parameters with this request's budget."""
     params = copy.deepcopy(base)
     params.max_tokens = int(max_tokens)
     if ignore_eos:
         params.ignore_eos = True
-    if logprobs:
-        params.logprobs = int(logprobs)
     return params
-
-
-def logprob_rows(entries: Any) -> list[list[list[Any]]]:
-    """The engine's log-probs, one ``{token id: Logprob}`` per position, as ``[id, log-prob, rank]`` lists.
-
-    Best first. A position the engine returned as a bare float (the simple
-    format) becomes one entry with no id, which a gate reads as missing.
-    """
-    rows: list[list[list[Any]]] = []
-    for entry in entries or ():
-        if isinstance(entry, Mapping):
-            row = [
-                [int(token), float(getattr(lp, "logprob", lp)), getattr(lp, "rank", None)]
-                for token, lp in entry.items()
-            ]
-            row.sort(key=lambda item: -item[1])
-        else:
-            row = [[None, float(entry), None]]
-        rows.append(row)
-    return rows
 
 
 def make_input(llm: Any, request: Mapping[str, Any], *, model: str = "") -> Any:
@@ -133,7 +107,7 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
         raise RuntimeError("the engine returned no sequences")
     first = sequences[0]
     prompt_ids = getattr(output, "prompt_token_ids", None)
-    record = {
+    return {
         "index": index,
         "id": request.get("id", str(index)),
         "prompt_sha": wio.prompt_digest(str(request.get("prompt", request.get("token_ids", "")))),
@@ -145,15 +119,10 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
         "images": len(request.get("images") or ()),
         "sequences": sequences,
     }
-    if request.get("logprobs"):
-        record["top_logprobs"] = logprob_rows(getattr(output.outputs[0], "logprobs", None))
-    return record
 
 
-def _run_requests(
-    llm: Any, base: Any, spec: Mapping[str, Any], *, phase: str = ""
-) -> dict[str, int]:
-    """Drain one phase before submitting the next, keeping the same engine and cache."""
+def _run_requests(llm: Any, base: Any, spec: Mapping[str, Any]) -> dict[str, int]:
+    """Send the workload's requests, ``concurrency`` at a time, and print one record for each."""
     if spec.get("dataset"):
         raise ValueError("dataset was not normalized before engine launch")
     requests = spec.get("requests") or []
@@ -176,12 +145,7 @@ def _run_requests(
         streams = [
             llm.generate_async(
                 inputs[start + i],
-                sampling_for(
-                    base,
-                    r["max_tokens"],
-                    bool(spec.get("ignore_eos")),
-                    int(r.get("logprobs") or 0),
-                ),
+                sampling_for(base, r["max_tokens"], bool(spec.get("ignore_eos"))),
                 streaming=True,
             )
             for i, r in enumerate(window)
@@ -194,8 +158,6 @@ def _run_requests(
                 raise RuntimeError("the engine streamed no output for a request")
             index = start + offset
             record = record_of(index, request, output, steps)
-            if phase:
-                record["phase"] = phase
             wio.emit(wio.RECORD_MARKER, record)
             summary["requests"] += 1
             cached = record["cached_tokens"]
@@ -207,17 +169,8 @@ def _run_requests(
 
 
 def run_workload(llm: Any, base: Any, spec: Mapping[str, Any]) -> None:
-    """Run ordinary requests then optional boot phases, with one final cache probe."""
-    summary = _run_requests(llm, base, spec, phase="boot" if spec.get("phases") else "")
-    for phase in spec.get("phases") or ():
-        result = _run_requests(
-            llm,
-            base,
-            {**spec, **phase},
-            phase=phase["id"],
-        )
-        for key, value in result.items():
-            summary[key] += value
+    """Run the workload's requests, then the cache probe where the spec asks for it."""
+    summary = _run_requests(llm, base, spec)
     probe = (
         reuse_probe.probe(llm, sampling_for(base, 1, True), spec["llm"])
         if spec.get("reuse_probe")

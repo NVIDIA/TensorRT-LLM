@@ -378,7 +378,11 @@ class TrtllmModelingV2Workflow:
         source = Path(task)
         if not source.is_file():
             raise FileNotFoundError(f"--task must be a path to an existing YAML file; got {source}")
-        self.task_data = load_and_validate_task_yaml(source)
+        notices: list[str] = []
+        self.task_data = load_and_validate_task_yaml(source, notices)
+        for notice in notices:
+            print_message(f"[yellow]note: {notice}[/yellow]", log)
+            self.journal.event("spec key ignored", notice)
         check_runtime.default_triton_cache(self.task_data, self.workspace)
 
         if self.resume:

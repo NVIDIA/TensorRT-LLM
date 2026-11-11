@@ -37,14 +37,6 @@ CATALOG_TESTS_DIR = "tests/unittest/_torch/modeling_v2"
 #: under ``CATALOG_TESTS_DIR/models/<family>/<target>/``.
 MODEL_OPS_DIRNAME = "ops"
 
-_CATALOG_IMPORT = re.compile(
-    r"tensorrt_llm\._torch\._experimental\.modeling_v2\.catalog\.([a-z_]+)\.([a-z0-9_]+)"
-)
-
-
-#: The survey's product, in the run's workspace.
-VOCABULARY_FILENAME = "vocabulary.yaml"
-
 STATE_OK = "OK"
 STATE_CERT = "CERT"
 STATE_GAP = "GAP"
@@ -663,7 +655,6 @@ __all__ = [
     "VERDICT_AFTER_ADDITIONS",
     "VERDICT_ASSEMBLABLE",
     "VERDICT_CEILING",
-    "VOCABULARY_FILENAME",
     "VocabularyError",
     "entry_paths",
     "load_vocabulary",

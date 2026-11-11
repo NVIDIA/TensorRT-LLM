@@ -5,13 +5,10 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import math
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -29,7 +26,6 @@ from agent_flow.workflows.trtllm_modeling_v2.checks import (
     check_config,
     delivery,
     disagg,
-    divergence,
     gate_cli,
     test_results,
 )
@@ -42,7 +38,6 @@ from agent_flow.workflows.trtllm_modeling_v2.checks.gate_records import (
     GateRecords,
 )
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import (
-    engine_driver,
     reuse_probe,
     serve_driver,
     workload_io,
@@ -366,13 +361,6 @@ def test_an_uncommitted_target_fails_even_though_the_file_is_there(tmp_path):
     assert "a clone would not have them" in check.detail and "modeling.py" in check.detail
 
 
-def test_an_op_imported_from_another_target_is_refused_and_copying_it_is_the_fix(tmp_path):
-    [check] = delivery.check_model_ops(tmp_path, "models/family/mine", [("theirs", "norm", "rms")])
-    assert not check.passed
-    assert "another target's ops/ (theirs)" in check.detail
-    assert "copy it into this target's ops/norm/" in check.detail
-
-
 def test_the_accuracy_test_path_follows_the_tree_layout(tmp_path):
     """Each accuracy layout the trees have used maps to its own path, and test-db is read by path."""
     package = tmp_path / delivery.ACCURACY_TESTS_DIR / "modeling_v2"
@@ -692,140 +680,6 @@ def test_a_significant_drop_against_the_previous_tree_fails(tmp_path, tree):
         **common,
     )
     assert again.passed and "against tree treeA" in again.detail
-
-
-_boot_boundaries_TASK = {
-    "checkpoint_path": "/ckpt/Qwen3-30B-A3B",
-    "parallel": "tp1",
-    "trtllm_repo_path": "/repo",
-    "runtime": {
-        "cuda_graph": True,
-        "chunked_prefill": True,
-        "extra_flags": ["--max_seq_len=64", "--max_batch_size=8", "--max_num_tokens=32"],
-    },
-    "accuracy": {
-        "benchmark": "gsm8k",
-        "reference_yaml": "x.yaml",
-        "envelope": {"enabled": True},
-    },
-}
-
-
-def _run_boot(tmp_path, monkeypatch, *, mutate=None, task=None, unit=None, member=None):
-    events = []
-    specs = []
-    active = 0
-
-    class Params:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-
-    class LLM:
-        def __init__(self, **kwargs):
-            events.append(("construct", kwargs))
-            self.tokenizer = SimpleNamespace(
-                apply_chat_template=lambda *args, **kwargs: "chat: " + args[0][0]["content"]
-            )
-
-        def generate_async(self, prompt, params, streaming=False):
-            nonlocal active
-            active += 1
-            events.append(("submit", prompt, params, active))
-            output = SimpleNamespace(
-                prompt_token_ids=(prompt["prompt_token_ids"] if isinstance(prompt, dict) else [1]),
-                cached_tokens=0,
-                outputs=[
-                    SimpleNamespace(
-                        token_ids=list(range(params.max_tokens)),
-                        text="Paris",
-                        finish_reason="length",
-                    )
-                ],
-            )
-
-            def stream():
-                nonlocal active
-                yield output
-                active -= 1
-                events.append(("drain", prompt))
-
-            return stream()
-
-        def shutdown(self):
-            events.append(("shutdown",))
-
-    monkeypatch.setitem(
-        sys.modules,
-        "tensorrt_llm",
-        SimpleNamespace(LLM=LLM, SamplingParams=Params, __file__="/fake"),
-    )
-    monkeypatch.setattr(engine_driver.engine_facts, "emit", lambda *args, **kwargs: None)
-    monkeypatch.setattr(engine_driver.reuse_probe, "probe", lambda *args: events.append(("reuse",)))
-
-    def run(command, env=None, timeout=0):
-        words = shlex.split(command)
-        path = words[words.index("--spec") + 1]
-        from pathlib import Path
-
-        specs.append(json.loads(Path(path).read_text()))
-        capture = io.StringIO()
-        with contextlib.redirect_stdout(capture):
-            assert engine_driver.main(["--spec", path]) == 0
-        output = capture.getvalue()
-        if mutate:
-            lines = []
-            for line in output.splitlines():
-                if line.startswith(workload_io.RECORD_MARKER):
-                    record = json.loads(line[len(workload_io.RECORD_MARKER) :])
-                    mutate(record)
-                    if record:
-                        lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
-                else:
-                    lines.append(line)
-            output = "\n".join(lines)
-        return CommandResult(returncode=0, stdout=output)
-
-    result = boot_checks.run_boot_gate(
-        _gates_env(),
-        task_data=task or _boot_boundaries_TASK,
-        runner=run,
-        workdir=tmp_path,
-        unit=unit,
-        member=member,
-    )
-    return result, specs, events
-
-
-def _parted(gap):
-    """Probe0's loaded leg takes another token at step 2, ``gap`` nats behind in both legs."""
-
-    def mutate(record):
-        if record.get("id") != "probe0":
-            return
-        own = 2 if record.get("phase") == "baseline" else 9
-        other = 9 if own == 2 else 2
-        if record.get("phase") == "loaded":
-            record["token_ids"] = [0, 1, 9, 3]
-        rows = [[[t, 0.0, 1]] for t in record["token_ids"]]
-        rows[2] = [[own, -0.1, 1], [other, -0.1 - gap, 2]]
-        record["top_logprobs"] = rows
-
-    return mutate
-
-
-def test_a_probe_that_parts_at_a_near_tie_passes_and_past_the_margin_fails(tmp_path, monkeypatch):
-    result, specs, events = _run_boot(tmp_path, monkeypatch, mutate=_parted(0.05))
-    assert result.passed, result.detail
-    assert "near-tie(s) (probe0 step 2: baseline 2, loaded 9, 0.050 apart)" in result.detail
-    # The probes ask the engine for their top log-probs; the fillers do not.
-    probes = [r for p in specs[0]["phases"] for r in p["requests"] if r["id"].startswith("probe")]
-    assert probes and all(r["logprobs"] == boot_checks.BOUNDARY_TOP_K for r in probes)
-    asked = [e[2] for e in events if e[0] == "submit" and getattr(e[2], "logprobs", 0)]
-    assert len(asked) == len(probes)
-    result, _, _ = _run_boot(tmp_path, monkeypatch, mutate=_parted(2.0))
-    assert not result.passed
-    assert "must agree on 4 tokens" in result.detail
-    assert "past the near-tie margin 0.150" in result.detail
 
 
 _SNAPSHOTS = {
@@ -1210,75 +1064,6 @@ def test_a_real_boot_fails_on_an_engine_that_reused_nothing(tmp_path):
         assert "the engine reused nothing: the reuse probe sent one 320-token prompt" in (
             result.detail
         )
-
-
-PARIS = {11: -0.05, 12: -3.2, 13: -4.0}
-
-
-def test_a_flip_inside_the_tie_margin_agrees_and_one_outside_it_is_recorded():
-    tied = {11: -0.70, 12: -0.75}
-    swapped = {11: -0.75, 12: -0.70}
-    assert divergence.first_token_agrees(tied, swapped, 0.15)
-    found = divergence.assess({"p0": PARIS}, {"p0": {12: -0.05, 11: -3.2, 13: -4.0}},
-                              divergence.Bounds())  # fmt: skip
-    assert not found.within and found.top1 == 0.0
-    assert "first token differs" in found.crossed[0]
-    assert 0 < found.max_js <= math.log(2)
-    assert "divergence recorded" in found.describe()
-
-
-def _reference(tmp_path, first_tokens):
-    path = tmp_path / "reference.json"
-    path.write_text(json.dumps({
-        "source": "transformers test", "top_k": 3,
-        "prompts": {"p0": "The capital of France is"},
-        "first_tokens": {"p0": {str(k): v for k, v in first_tokens.items()}},
-    }))  # fmt: skip
-    return {
-        **_gates_TASK,
-        "accuracy": {**_gates_TASK["accuracy"], "reference_logits": {"path": str(path)}},
-    }
-
-
-def _divergence_driver_output(texts, top):
-    lines = []
-    for n, text in enumerate(texts):
-        record = {"index": n, "text": text, "token_ids": [1, 2], "tokens": 2, "iterations": 2}
-        lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
-    record = {"index": len(texts), "text": "x", "token_ids": [1], "tokens": 1, "iterations": 1,
-              "top_logprobs": [[[t, lp] for t, lp in top.items()]]}  # fmt: skip
-    lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
-    return "\n".join(lines) + "\n"
-
-
-def test_the_boot_records_a_divergence_and_still_passes(tmp_path):
-    task = _reference(tmp_path, PARIS)
-    texts = ("Paris is the capital", "the way plants make food")
-    run = _gates_recorder(
-        CommandResult(returncode=0, stdout=_divergence_driver_output(texts, PARIS))
-    )
-    result = boot_checks.run_boot_gate(_gates_env(), task_data=task, runner=run, workdir=tmp_path)
-    assert result.passed and not result.warnings
-    assert "against the reference, first tokens agree on 100% of 1 prompt(s)" in result.detail
-    flipped = {12: -0.05, 11: -3.2, 13: -4.0}
-    run = _gates_recorder(
-        CommandResult(returncode=0, stdout=_divergence_driver_output(texts, flipped))
-    )
-    result = boot_checks.run_boot_gate(_gates_env(), task_data=task, runner=run, workdir=tmp_path)
-    assert result.passed, result.detail
-    assert "divergence from the reference recorded" in result.warnings[0]
-    assert "p0 (first token differs" in result.detail
-
-
-def test_an_unreadable_reference_is_unknown_not_a_failure(tmp_path):
-    task = {**_gates_TASK, "accuracy": {**_gates_TASK["accuracy"],
-                                  "reference_logits": {"path": str(tmp_path / "absent.json")}}}  # fmt: skip
-    texts = ("Paris is the capital", "the way plants make food")
-    run = _gates_recorder(
-        CommandResult(returncode=0, stdout=_divergence_driver_output(texts, {})[:-1])
-    )
-    result = boot_checks.run_boot_gate(_gates_env(), task_data=task, runner=run, workdir=tmp_path)
-    assert result.passed and "divergence UNKNOWN" in result.detail
 
 
 _ANCHOR = 92.30

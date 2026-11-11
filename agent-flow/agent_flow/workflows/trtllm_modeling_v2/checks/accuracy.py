@@ -380,10 +380,6 @@ def run_accuracy_gate(
     )
 
 
-#: The key a systematic-shift finding is recorded under, per unit.
-SHIFT_FINDING = "systematic_shift"
-
-
 def resolve_reference(
     task_data: Mapping[str, Any],
     *,
@@ -424,7 +420,6 @@ def resolve_model_key(task_data: Mapping[str, Any], unit: str | None = None) -> 
 __all__ = [
     "resolve_model_key",
     "ACCURACY_TIMEOUT_S",
-    "SHIFT_FINDING",
     "eval_command",
     "eval_harness_command",
     "load_reference_score",

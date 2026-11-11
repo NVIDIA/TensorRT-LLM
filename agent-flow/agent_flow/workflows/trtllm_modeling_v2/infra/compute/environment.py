@@ -87,8 +87,6 @@ def single_task_scrub(keep: Sequence[str] = ()) -> str:
     return f'for v in ${{!PMI@}} ${{!PMIX@}} ${{!MPI@}} ${{!OMPI@}} ${{!SLURM@}}; do {tests} && unset "$v"; done'
 
 
-SINGLE_TASK_MPI_SCRUB = single_task_scrub()
-
 # Above one task, under `mpirun`, the misleading variables are the Slurm task ones:
 # `trtllm-llmapi-launch` reads `SLURM_PROCID` before `OMPI_COMM_WORLD_RANK` for its rank and
 # `SLURM_NTASKS` before `OMPI_COMM_WORLD_SIZE` for `mpi_world_size`. Right under `srun`, wrong
@@ -295,7 +293,6 @@ __all__ = [
     "MULTI_TASK_SLURM_VARS",
     "RunEnvironment",
     "MPI_SETTINGS_KEPT",
-    "SINGLE_TASK_MPI_SCRUB",
     "single_task_scrub",
     "env_assignments",
     "prepend_to_inherited",

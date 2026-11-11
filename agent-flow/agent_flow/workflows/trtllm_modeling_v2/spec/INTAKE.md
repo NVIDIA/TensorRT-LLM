@@ -81,7 +81,7 @@ requested feature **once**, at the member the request validates fully, and accep
   `unit: core`. Each feature then has a check that exercises it (disagg its test, multimodal
   its boot), and each axis a variant; a variant on a feature unit (a KV dtype under MTP) is a
   combination, added only when the request names it. A variant of disagg owes nothing.
-- Leave the boot boundaries off (section 5) and the profile at `standard` unless the request asks.
+- Leave the profile at `standard` unless the request asks.
 
 The lint prints the checks per unit and variant; past ~30 deserves a second look.
 
@@ -113,16 +113,9 @@ benchmark you start by hand runs captured too.
   `score_pattern` (a regular expression whose first group is the score, on the anchor's scale)
   and `samples`; without one, its gate quotes the lines that look like a score and fails.
 - **What fails a check.** Output that is wrong (nothing generated, a boot keyword missing) or a
-  benchmark under its floor. Everything stricter is recorded, not gated: the golden rule is the
-  benchmark score close to its reference. A model-level reference, when the run has one
-  (`accuracy.reference_logits.path`: first-token top-k log-probs per prompt, written by
-  `checks/harness/hf_reference.py` where `transformers` loads the checkpoint natively), is
-  compared at every boot: the first token the reference's (a flip within `tie_margin`, 0.15
-  nats, is a near-tie) and the distribution not diverged (Jensen-Shannon <= `max_js`, 0.20 nats;
-  centered cosine >= `min_cosine`, 0.98). A divergence past them is written into the verdict
-  with its prompts and numbers, and the verdict stands: loosen the bounds there if they are too
-  tight; the user judges the record. Kernel entries are judged by their output distribution
-  against their reference the same way (`trtllm-modeling-v2-entry`).
+  benchmark under its floor. The golden rule is the benchmark score close to its reference.
+  Kernel entries are judged by their output distribution against their reference
+  (`trtllm-modeling-v2-entry`).
 - **Anchors.** Each unit's anchor is a row of `reference_yaml` under `accuracy.model_key`, which
   the spec states (`org/model`; the checkpoint path's last two components are no model's name):
   the user's score, else the reference implementation's (HuggingFace `transformers`, where it
@@ -147,12 +140,6 @@ benchmark you start by hand runs captured too.
 - **Boot prompts.** One checked factual prompt and one checked arithmetic word problem (a
   benchmark-style question with its numeric answer as the keyword): cheap semantic signal at every
   boot.
-- **Boot boundaries** (`accuracy.envelope`). Off unless the request asks for them (prompts at
-  `max_seq_len`, loaded batches). When on, one boot per unit runs them (`members` picks it), and a
-  probe whose legs part on a near-tie (`tie_margin`) passes with a note. Give `probes` with one
-  right continuation, e.g.
-  `["1, 2, 3, 4, 5, 6, 7,", "Monday, Tuesday, Wednesday,"]`: open-ended prompts have near-tied
-  tokens that flip with batch shape (MoE routing, low-precision GEMM tactics) far more often.
 
 ## 6. Environment
 

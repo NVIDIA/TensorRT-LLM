@@ -16,7 +16,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import yaml
 
@@ -27,22 +27,11 @@ from ..infra.git import (
     audit_commits,
     resolve_base,
 )
-from ..operators.coverage import (
-    CATALOG_DIR,
-    CATALOG_TESTS_DIR,
-    MODEL_OPS_DIRNAME,
-    MODELING_V2_PACKAGE,
-)
+from ..operators.coverage import CATALOG_DIR, CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
 
 ACCURACY_REFERENCES_DIR = "tests/integration/defs/accuracy/references"
 ACCURACY_TESTS_DIR = "tests/integration/defs/accuracy"
 TEST_DB_DIR = "tests/integration/test_lists/test-db"
-
-_MODEL_OPS_IMPORT = re.compile(
-    r"tensorrt_llm\._torch\._experimental\.modeling_v2\.models\.[a-z0-9_]+\."
-    r"([a-z0-9_]+)\.ops\.([a-z_]+)\.([a-z0-9_]+)"
-)
-_RELATIVE_OPS_IMPORT = re.compile(r"^ops\.([a-z_]+)\.([a-z0-9_]+)")
 
 
 @dataclass(frozen=True)
@@ -199,36 +188,6 @@ def entry_problems(wrapper: Path, arch: str = "") -> tuple[list[str], EntryContr
     if arch and contract.archs and arch not in contract.archs:
         problems.append(f"ARCHS names {', '.join(contract.archs)}, not {arch}")
     return problems, contract
-
-
-def check_model_ops(
-    repo_root: Path, target_rel: str, ops: Iterable[tuple[str, str, str]]
-) -> list[Check]:
-    """Every ``ops/`` entry the target imports is its own, and states a certified contract."""
-    own = Path(target_rel.rstrip("/")).name
-    checks: list[Check] = []
-    for target_dir, category, name in ops:
-        rel = f"{MODEL_OPS_DIRNAME}/{category}/{name}.py"
-        if target_dir != own:
-            checks.append(
-                Check(
-                    name=f"ops:{rel}",
-                    passed=False,
-                    detail=f"imported from another target's ops/ ({target_dir}); use family-shared "
-                    f"code or the catalog, or copy it into this target's "
-                    f"{MODEL_OPS_DIRNAME}/{category}/",
-                )
-            )
-            continue
-        problems, contract = entry_problems(repo_root / target_rel / rel)
-        checks.append(
-            Check(
-                name=f"ops:{rel}",
-                passed=not problems,
-                detail="; ".join(problems) or _contract_detail(contract),
-            )
-        )
-    return checks
 
 
 def _test_check(repo_root: Path, tests_dir: str, label: str, category: str, name: str) -> Check:
@@ -728,7 +687,6 @@ __all__ = [
     "TEST_DB_DIR",
     "check_accuracy_reference",
     "check_commit_hygiene",
-    "check_model_ops",
     "check_routing",
     "check_target",
     "check_test_registration",

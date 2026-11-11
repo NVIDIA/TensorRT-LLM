@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Cold-start generation, boot workload coverage and the optional boot boundary phases."""
+"""Cold-start generation and boot workload coverage."""
 
 from __future__ import annotations
 
@@ -12,17 +12,8 @@ from typing import Any, Mapping, Sequence
 
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
-from ..spec.task_schema import (
-    BOOT_KEYS,
-    GATE_TIMEOUT_KEY,
-    TaskSchemaError,
-    load_prompts_file,
-    members_for,
-    parse_parallel_segment,
-    resolve_gate_timeout,
-)
-from ..spec.variants import is_variant
-from . import check_config, divergence, feature_evidence
+from ..spec.task_schema import BOOT_KEYS, GATE_TIMEOUT_KEY, load_prompts_file, resolve_gate_timeout
+from . import check_config, feature_evidence
 from .check_config import (
     EngineLimits,
     check_configuration,
@@ -37,7 +28,6 @@ from .check_runtime import (
     engine_driver_command,
     gate_workdir,
     parse_driver_records,
-    pin_tuning,
     with_mode,
     write_driver_spec,
 )
@@ -221,226 +211,6 @@ def _declares_workload(block: Mapping[str, Any]) -> bool:
     )
 
 
-#: The top log-probs each boundary probe's tokens carry, to tell a near-tie from a defect.
-BOUNDARY_TOP_K = 5
-#: Kinds of member in the order the boundary phases prefer one: the member that batches most.
-_BOUNDARY_KINDS = {"dep": 0, "tep": 1, "tp": 2}
-
-
-def boundary_member(members: Sequence[str]) -> str | None:
-    """The member a unit's boundary phases run at: attention DP first, then the widest."""
-
-    def key(member: str) -> tuple[int, int, str]:
-        try:
-            kind, size = parse_parallel_segment(member)
-        except TaskSchemaError:
-            return (len(_BOUNDARY_KINDS) + 1, 0, member)
-        return (_BOUNDARY_KINDS.get(kind, len(_BOUNDARY_KINDS)), -(size or 0), member)
-
-    return min(members, key=key) if members else None
-
-
-def _tie_gap(alone: Mapping[str, Any], loaded: Mapping[str, Any], step: int) -> float | None:
-    """How far apart the two legs' tokens at ``step`` are in either leg's own log-probs.
-
-    ``None`` when neither leg's top-k holds both tokens.
-    """
-    tokens = (alone["token_ids"][step], loaded["token_ids"][step])
-    gaps = []
-    for record, (own, other) in ((alone, tokens), (loaded, tokens[::-1])):
-        rows = record.get("top_logprobs") or ()
-        if step >= len(rows):
-            continue
-        row = {entry[0]: entry[1] for entry in rows[step] if entry and entry[0] is not None}
-        if own in row and other in row:
-            gaps.append(abs(float(row[own]) - float(row[other])))
-    return min(gaps) if gaps else None
-
-
-@dataclass(frozen=True)
-class BootBoundarySpec:
-    """Optional runtime-boundary phases of boot, configured by ``accuracy.envelope``.
-
-    Sequential probes and loaded requests share the boot's engine, sampling and
-    tuning choices. Cache reuse remains as declared; this is not a cold-cache
-    comparison or evidence of scheduler batch sizes or CUDA graph execution.
-
-    They run once per unit, in its boot at one member (``members``, else
-    :func:`boundary_member`), never in a configuration variant's. A probe whose
-    legs part where the two tokens are within ``tie_margin`` of each other in a
-    leg's own log-probs is a near-tie: batch shape moves low-precision
-    arithmetic, and a near-tie flips with it without any defect.
-    """
-
-    enabled: bool = False
-    max_tokens: int = 16
-    agree_tokens: int = 4
-    long_prompts: int = 2
-    probes: tuple[str, ...] = (
-        "The capital of France is",
-        "Water boils at a temperature of",
-        "The largest planet in the solar system is",
-        "Two plus two equals",
-    )
-    timeout: int = 2 * BOOT_TIMEOUT_S
-    #: Nats between a probe's two legs' tokens that still reads as a near-tie.
-    tie_margin: float = 0.15
-    #: The members whose boot runs the phases; empty: one per unit.
-    members: tuple[str, ...] = ()
-
-    @classmethod
-    def from_task(cls, task_data: Mapping[str, Any]) -> "BootBoundarySpec":
-        block = {
-            key: value
-            for key, value in ((task_data.get("accuracy") or {}).get("envelope") or {}).items()
-            if value is not None
-        }
-        for key in ("probes", "members"):
-            if key in block:
-                block[key] = tuple(block[key])
-        return cls(**block)
-
-    def runs_at(
-        self, task_data: Mapping[str, Any], unit: str | None, member: str | None, world_size: int
-    ) -> bool:
-        """Whether ``unit``'s boot at ``member`` runs the phases: one member of each unit."""
-        if member is None:
-            return True
-        if unit is not None and is_variant(task_data, unit):
-            return False
-        if self.members:
-            return member in self.members
-        return member == boundary_member(members_for(task_data, unit or "core", world_size))
-
-    def prompt_tokens(self, limits: EngineLimits) -> int:
-        """Sequence-bound prompt length, capped by the unchunked token budget."""
-        length = int(limits.max_seq_len or 0) - self.max_tokens - 1
-        if not limits.chunked_prefill:
-            length = min(length, limits.max_num_tokens - 1)
-        return max(length, 0)
-
-    def phases(self, config: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """Sequential baseline then bounded loaded windows, without another LLM launch."""
-        limits = EngineLimits.from_config(config)
-        if limits.max_seq_len is None:
-            raise ValueError(
-                "boot boundaries require an explicit max_seq_len in the runtime options"
-            )
-        if self.agree_tokens > self.max_tokens:
-            raise ValueError("accuracy.envelope.agree_tokens must not exceed max_tokens")
-        length = self.prompt_tokens(limits)
-        if self.long_prompts and not length:
-            raise ValueError(
-                "boot boundaries leave no room for a long prompt and its output budget"
-            )
-        probes = [
-            {
-                "id": f"probe{n}",
-                "prompt": prompt,
-                "max_tokens": self.max_tokens,
-                "logprobs": BOUNDARY_TOP_K,
-            }
-            for n, prompt in enumerate(self.probes)
-        ]
-        loaded = [
-            {
-                "id": f"long{n}",
-                "token_ids": [1000 + (n + i) % 997 for i in range(length)],
-                "max_tokens": self.max_tokens,
-            }
-            for n in range(self.long_prompts)
-        ] + probes
-        concurrency = int(config["llm"]["max_batch_size"])
-        for n in range(max(concurrency - len(loaded), 0)):
-            loaded.append(
-                {
-                    "id": f"fill{n}",
-                    "prompt": self.probes[n % len(self.probes)],
-                    "max_tokens": 1 + n % self.max_tokens,
-                }
-            )
-        return [
-            {"id": "baseline", "requests": probes, "concurrency": 1, "ignore_eos": True},
-            {"id": "loaded", "requests": loaded, "concurrency": concurrency, "ignore_eos": True},
-        ]
-
-    def failure(
-        self, phases: Sequence[Mapping[str, Any]], records: Sequence[Mapping[str, Any]]
-    ) -> str:
-        """Why the phases fail (:meth:`judge`); ``""`` when they pass."""
-        return self.judge(phases, records)[0]
-
-    def judge(
-        self, phases: Sequence[Mapping[str, Any]], records: Sequence[Mapping[str, Any]]
-    ) -> tuple[str, list[str]]:
-        """Require complete nonempty outputs, exact long lengths and agreeing probe prefixes.
-
-        Returns why the phases fail (``""`` when they pass) and the probes whose
-        legs parted at a near-tie, which pass.
-        """
-        outputs: dict[tuple[str, str], Mapping[str, Any]] = {}
-        for record in records:
-            key = (str(record.get("phase", "")), str(record.get("id", "")))
-            if key in outputs:
-                return f"boot boundaries returned duplicate record {key}", []
-            outputs[key] = record
-        for phase in phases:
-            for request in phase["requests"]:
-                key = (phase["id"], request["id"])
-                record = outputs.get(key)
-                if record is None:
-                    return f"boot boundaries returned no record for {key}", []
-                if not record.get("token_ids"):
-                    return f"boot boundaries generated nothing for {key}", []
-                if "token_ids" in request:
-                    expected = len(request["token_ids"])
-                    observed = record.get("prompt_tokens")
-                    if type(observed) is not int or observed != expected:
-                        return (
-                            f"{key} reached {observed} prompt tokens, not the {expected} "
-                            "required by boot boundaries"
-                        ), []
-        ties: list[str] = []
-        for n in range(len(self.probes)):
-            key = f"probe{n}"
-            alone_record, loaded_record = outputs[("baseline", key)], outputs[("loaded", key)]
-            alone, loaded = alone_record["token_ids"], loaded_record["token_ids"]
-            need = self.agree_tokens
-            said = f"{key} must agree on {need} tokens: baseline {alone[:need]} vs loaded {loaded[:need]}"
-            if len(alone) < need or len(loaded) < need:
-                return said, ties
-            step = next((s for s in range(need) if alone[s] != loaded[s]), None)
-            if step is None:
-                continue
-            gap = _tie_gap(alone_record, loaded_record, step)
-            if gap is not None and gap <= self.tie_margin:
-                ties.append(
-                    f"{key} step {step}: baseline {alone[step]}, loaded {loaded[step]}, "
-                    f"{gap:.3f} apart"
-                )
-                continue
-            why = (
-                f"{gap:.3f} apart at step {step}, past the near-tie margin {self.tie_margin:.3f}"
-                if gap is not None
-                else f"at step {step} no leg's top-{BOUNDARY_TOP_K} log-probs hold both tokens"
-            )
-            return f"{said} ({why})", ties
-        return "", ties
-
-    def describe(self, config: Mapping[str, Any]) -> str:
-        limits = EngineLimits.from_config(config)
-        length = self.prompt_tokens(limits)
-        cap = (
-            "" if limits.chunked_prefill else "; long input capped by unchunked max_num_tokens - 1"
-        )
-        return (
-            f"; boot boundaries: {self.long_prompts} long request(s) with exactly {length} "
-            f"input tokens{cap}; {len(self.probes)} probe(s) agree on {self.agree_tokens} tokens "
-            f"at submitted concurrency up to {config['llm']['max_batch_size']}; "
-            "actual scheduler batches and CUDA graph execution are not measured"
-        )
-
-
 def run_boot_gate(
     environment: RunEnvironment,
     *,
@@ -460,10 +230,7 @@ def run_boot_gate(
     the run will finish with (default the run's). ``spec`` is the workload
     (:func:`resolve_boot_spec`). The engine is held to what the gate declared
     (:func:`engine_failure`). ``mode`` other than ``require`` is a control run
-    on the stock implementation, recorded as ``boot[<mode>]``. When enabled,
-    ``accuracy.envelope`` appends sequential baseline and loaded boundary phases
-    to this same engine, without adding a separate contract check, in one
-    member's boot of each unit (:meth:`BootBoundarySpec.runs_at`).
+    on the stock implementation, recorded as ``boot[<mode>]``.
     """
     spec = spec or BootSpec()
     env = with_mode(environment, mode)
@@ -496,39 +263,8 @@ def run_boot_gate(
                 f"leave no room for a prompt the engine would have to split",
             )
         requests.append({"id": "chunk", "probe_tokens": length, "max_tokens": 1})
-    # The reference's prompts, one token each with its top-k, on the same engine: the
-    # model-level divergence is recorded with the verdict, never a failure by itself.
-    reference, unread = None, ""
-    if mode == MODE_REQUIRE:
-        try:
-            reference = divergence.load_reference(task_data)
-        except (OSError, ValueError) as exc:
-            unread = f"the reference logits cannot be read ({exc}): divergence UNKNOWN"
-    reference_at = len(requests)
-    if reference is not None:
-        requests.extend(
-            {"id": f"reference:{key}", "prompt": text, "max_tokens": 1, "logprobs": reference.top_k}
-            for key, text in reference.prompts.items()
-        )
-    boundary = BootBoundarySpec.from_task(task_data)
-    declared = resolve_gate_timeout(task_data.get("accuracy") or {}, "boot", unit)
-    phases = []
-    if (
-        boundary.enabled
-        and mode == MODE_REQUIRE
-        and boundary.runs_at(task_data, unit, member, environment.world_size)
-    ):
-        try:
-            phases = boundary.phases(config)
-        except ValueError as exc:
-            return _verdict(name=gate_name, member=member, passed=False, detail=str(exc))
-        if timeout is None:
-            timeout = max(boundary.timeout, declared or 0)
-        env = replace(
-            env,
-            env={**env.env, **pin_tuning(Path(workdir) / f"boot.{unit}.{member}")},
-        )
     if timeout is None:
+        declared = resolve_gate_timeout(task_data.get("accuracy") or {}, "boot", unit)
         timeout = declared or BOOT_TIMEOUT_S
     spec_path = write_driver_spec(
         gate_workdir(workdir) / f"boot.{unit or 'unit'}.{member or 'member'}.json",
@@ -536,7 +272,6 @@ def run_boot_gate(
         requests=requests,
         max_tokens=spec.max_tokens,
         reuse_probe=True,
-        phases=phases,
     )
     command = engine_driver_command(env, spec_path)
 
@@ -575,15 +310,7 @@ def run_boot_gate(
     if unobserved:
         return _verdict(passed=False, detail=feature_evidence.unobserved_detail(unobserved), **ran)
 
-    all_records = parse_driver_records(combined)
-    boundary_ties: list[str] = []
-    if phases:
-        failure, boundary_ties = boundary.judge(phases, all_records)
-        if failure:
-            return _verdict(passed=False, detail=failure, **ran)
-    records = {
-        int(r.get("index", -1)): r for r in all_records if not phases or r.get("phase") == "boot"
-    }
+    records = {int(r.get("index", -1)): r for r in parse_driver_records(combined)}
     texts = [
         str(records[n].get("text", "")) if n in records else None for n in range(len(requests))
     ]
@@ -619,22 +346,6 @@ def run_boot_gate(
             f"{missing}. Keywords are matched against generated text only",
             **ran,
         )
-    compared, warnings = "", []
-    if reference is not None:
-        measured = {}
-        for n in range(reference_at, len(requests)):
-            steps = (records.get(n) or {}).get("top_logprobs") or [[]]
-            row = {int(e[0]): float(e[1]) for e in steps[0] or () if e and e[0] is not None}
-            measured[str(requests[n]["id"]).partition(":")[2]] = row
-        found = divergence.assess(reference.first_tokens, measured, reference.bounds)
-        compared = f"; {found.describe()}"
-        if not found.within:
-            warnings.append(
-                f"divergence from the reference recorded: {len(found.crossed)} of "
-                f"{found.prompts} prompt(s) past a bound (the verdict stands)"
-            )
-    elif unread:
-        compared, warnings = f"; {unread}", [unread]
     images = sum(len(r.get("images") or ()) for r in requests)
     checked = (
         f"{len(spec.keywords) + sum(1 for i in spec.items if i.keywords or i.keywords_any)} "
@@ -646,17 +357,7 @@ def run_boot_gate(
     return _verdict(
         passed=True,
         detail=f"engine cold-started and produced {checked} for {len(texts)} prompt(s)"
-        f"{sent}; workload: {spec.source}{chunked}"
-        + (boundary.describe(config) if phases else "")
-        + (
-            f"; boundary probes agreed up to {len(boundary_ties)} near-tie(s) "
-            f"({'; '.join(boundary_ties)})"
-            if boundary_ties
-            else ""
-        )
-        + compared,
-        warnings=tuple(warnings),
-        explained=bool(compared),
+        f"{sent}; workload: {spec.source}{chunked}",
         **ran,
     )
 
@@ -719,7 +420,6 @@ def chunk_probe_tokens(max_num_tokens: int, max_seq_len: int | None) -> int | No
 
 
 __all__ = [
-    "BootBoundarySpec",
     "BootPrompt",
     "BootSpec",
     "DEFAULT_BOOT_IMAGE",

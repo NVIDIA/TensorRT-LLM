@@ -10,7 +10,7 @@ cross products, a feature proven at several members or again under another
 axis, a member too narrow for one engine, a disaggregated member wider than a
 session), accuracy that
 cannot judge anything (a placeholder anchor, a chat-template protocol cut off
-early), boot probes that fail on near ties, a launch the environment cannot
+early), a launch the environment cannot
 start, a compute session no gate reaches, and notes that tell the roles what
 not to read but nothing about the model. Each finding names its rule, why it
 costs time and the usual fix.
@@ -44,7 +44,6 @@ from .task_schema import (
     gpus_per_node,
     members_for,
     parse_parallel_segment,
-    profile_of,
     widest_world_size,
 )
 
@@ -500,39 +499,6 @@ def accuracy_rules(ctx: LintContext) -> Iterator[Finding]:
         )
 
 
-def boot_rules(ctx: LintContext) -> Iterator[Finding]:
-    envelope = ctx.accuracy.get("envelope") or {}
-    on = envelope.get("enabled") or (envelope == {} and profile_of(ctx.task) == "certified")
-    if on and not envelope.get("probes"):
-        yield Finding(
-            "envelope-open-ended-probes",
-            WARN,
-            "boot boundaries compare each probe's first tokens alone and under load with the "
-            "default open-ended prompts; their near-tied tokens flip with batch shape (MoE "
-            "routing, low-precision GEMM tactics) and fail every boot without a defect",
-            "set accuracy.envelope.probes to continuations with one right answer, e.g. "
-            '["1, 2, 3, 4, 5, 6, 7,", "Monday, Tuesday, Wednesday,"]',
-        )
-    if envelope.get("enabled") and profile_of(ctx.task) != "certified":
-        from ..checks.boot import BootBoundarySpec
-
-        spec = BootBoundarySpec.from_task(ctx.task)
-        boots = ctx.contract.required() if ctx.contract is not None else ()
-        at = [
-            f"{c.unit}@{c.member}"
-            for c in boots
-            if c.gate == "boot" and spec.runs_at(ctx.task, c.unit, c.member, ctx.world)
-        ]
-        yield Finding(
-            "envelope-on",
-            INFO,
-            f"accuracy.envelope is on: the boot at {', '.join(at) or 'one member of each unit'} "
-            "also runs the boundary probes (alone, then under load, at the longest prompt the "
-            "engine takes); a probe whose legs part past a near-tie fails that boot. Leave it off "
-            "unless the request asks for boot boundaries; the certified profile turns it on",
-        )
-
-
 def disagg_rules(ctx: LintContext) -> Iterator[Finding]:
     """The disaggregated-serving test the run writes is named, and is there or planned."""
     spec = disagg_checks.DisaggSpec.from_task(ctx.task)
@@ -655,7 +621,6 @@ RULES: tuple[Rule, ...] = (
     contract_rules,
     coverage_rules,
     accuracy_rules,
-    boot_rules,
     disagg_rules,
     environment_rules,
     agents_rules,
@@ -760,7 +725,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="trtllm-modeling-v2 intake lint",
-        description="Lint a spec before launch: cost, scope, accuracy, boot probes, environment, "
+        description="Lint a spec before launch: cost, scope, accuracy, environment, "
         "notes, engine constraints and prior art. CPU only; reads the checkpoint config and the tree.",
     )
     parser.add_argument("--task", type=Path, required=True, help="The spec to lint.")
@@ -776,6 +741,7 @@ def main(argv: list[str] | None = None) -> int:
         schema_error = str(exc)
         # The rest of the lint reads the spec as a launch would: its paths and derived gates.
         try:
+            task_schema.drop_ignored_keys(task, None)
             task_schema._resolve_spec_relative_paths(task, args.task.resolve().parent)
             task_schema.derive_gate_defaults(task, args.task.resolve().parent)
         except Exception:  # a spec that cannot be resolved is already a schema block

@@ -52,8 +52,6 @@ def task_file(tmp_path, repo, checkpoint):
             "reference_yaml": "tests/integration/defs/accuracy/references/gsm8k.yaml",
             "model_key": "openai/gpt-oss-120b",
             "tolerance": 5.0,
-            # The fake shells answer the unit gates only.
-            "envelope": {"enabled": False},
         },
     }
     path = tmp_path / "task.yaml"

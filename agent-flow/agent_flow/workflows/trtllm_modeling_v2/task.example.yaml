@@ -62,9 +62,9 @@ features: []
 
 # `smoke` (a unit's boot alone), `bringup` (each unit at its cheapest member; no variant, no
 # delivery check, and no CI files: the accuracy test, its test list entry, the anchor's row,
-# when every unit is smoke or bringup), `standard` (the default: this file as written), `certified` (also the
-# boot boundary phases and the serve gate, and each benchmark at every member). For the
-# run, or per unit and variant over `default`. A switch the spec sets itself keeps its value.
+# when every unit is smoke or bringup), `standard` (the default: this file as written), `certified`
+# (standard, with the serve gate on). For the run, or per unit and variant over `default`. A switch
+# the spec sets itself keeps its value.
 # profile: {default: standard, multimodal: smoke}
 
 # REQUIRED: the checkout the target is built in.
@@ -221,27 +221,6 @@ accuracy:
   #         images: [examples/images/carrots.jpeg]   # beside this file, or in the tree
   #         render: raw                              # pre-rendered; or `loader`
   #         keywords_any: [carrot]
-
-  # Optional BOOT BOUNDARIES, off unless `enabled: true` or `profile: certified`.
-  # One member's boot of each unit (`members`, else attention DP first, then the widest; never a
-  # configuration variant's) adds sequential probes then loaded requests in the SAME engine.
-  # Both probe outputs must contain and match at least `agree_tokens` tokens (EOS ignored), but for
-  # a near-tie: legs that part on two tokens within `tie_margin` nats in a leg's own top-5 log-probs.
-  # Long inputs are exactly max_seq_len - max_tokens - 1 tokens, capped at max_num_tokens - 1
-  # without chunked prefill. Needs explicit max_seq_len; long_prompts: 0 disables long inputs.
-  # Submitted concurrency is at most max_batch_size, not proof of actual scheduler batches or
-  # CUDA graph execution. Cache reuse stays as declared.
-  # envelope:
-  #   enabled: true
-  #   max_tokens: 16               # default
-  #   agree_tokens: 4              # default
-  #   long_prompts: 2              # default
-  #   tie_margin: 0.15             # default, nats
-  #   members: [dep4]              # default: one per unit, as above
-  #   # One right continuation each: open-ended prompts have near-tied tokens that flip with batch
-  #   # shape (MoE routing, low-precision GEMM tactics) far more often than these.
-  #   probes: ["1, 2, 3, 4, 5, 6, 7,", "Monday, Tuesday, Wednesday,"]
-  #   timeout: 3600                # default, seconds for the complete boot; CLI --timeout overrides
 
   # The SERVE gate: `trtllm-serve` starts each unit's target with the accuracy gate's options at its
   # widest member and answers one completion (and an image chat for a unit whose boot sends one).
