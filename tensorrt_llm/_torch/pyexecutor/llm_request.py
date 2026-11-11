@@ -980,6 +980,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # any. The V2 scheduler drops it when the demotion aging bound lets the
         # request through.
         self.py_uncached_prefill_tokens: int | None = None
+        # Set once the V2 scheduler has checked that estimate against the prefix cache.
+        self.py_uncached_prefill_probed = False
         self.py_original_end_id = self.py_end_id
         self.py_bad_words = None
         self.py_no_repeat_ngram_size = None

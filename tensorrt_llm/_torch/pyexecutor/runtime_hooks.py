@@ -291,6 +291,13 @@ class RuntimeHooks:
     torch_mem_safety_margin: Optional[int] = None
     # Recurrent-state cache policies of a hybrid model (see HybridCachePolicy).
     hybrid_cache: HybridCachePolicy = HybridCachePolicy()
+    # With long-prefill demotion on (TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS > 0), the
+    # KV cache manager V2 scheduler classifies context requests by the prefix cache rather than
+    # the router's estimate alone: an estimate above the threshold is checked once against the
+    # radix tree (read-only probe), a request that already holds its cache is judged by its exact
+    # remainder, and a request ordered as short whose first preparation shows a long remainder is
+    # retried after the rest of the iteration. Without demotion it does nothing.
+    exact_context_demotion: bool = False
 
     @property
     def skips_unchanged_metadata_uploads(self) -> bool:
