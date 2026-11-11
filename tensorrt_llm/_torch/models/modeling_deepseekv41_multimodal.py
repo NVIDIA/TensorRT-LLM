@@ -236,7 +236,8 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
                 dtype=torch.bool,
                 device=mm_inputs.inputs_embeds.device,
             )
-            image_mask[indices] = True
+            # index_fill_ takes True as a kernel argument, so no host scalar is copied to the GPU.
+            image_mask.index_fill_(0, indices, True)
         return {
             "orig_input_ids": raw_input_ids,
             "image_mask": image_mask,

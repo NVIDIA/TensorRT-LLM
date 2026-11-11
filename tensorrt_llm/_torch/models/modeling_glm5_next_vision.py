@@ -748,10 +748,10 @@ def _glm5_next_build_batched_input(multimodal_params: List[MultimodalParams]) ->
         if bucket is not None:
             pixels.append(bucket["pixel_values_videos"])
             grids.append(_flatten_video_grid_thw(bucket["video_grid_thw"]))
-    device = pixels[0].device
     return {
         "pixel_values": torch.cat(pixels, dim=0),
-        "grid_thw": torch.cat([g.to(device) for g in grids], dim=0),
+        # The tower reads the grid only on the host, so it stays on the CPU.
+        "grid_thw": torch.cat(grids, dim=0),
     }
 
 
