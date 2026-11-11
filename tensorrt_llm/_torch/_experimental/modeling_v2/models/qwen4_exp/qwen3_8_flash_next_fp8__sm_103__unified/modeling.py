@@ -162,6 +162,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attentio
     qsa_rollback_restore,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
+    orders_rows as _topk_expand_orders_rows,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
     qsa_topk_expand_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
@@ -3303,14 +3306,15 @@ def _index_split_plan(split, qsa, num_tokens: int, rows_per_seq: int):
 
 
 def _decode_index_selection(
-    core, split, q, qsa, num_tokens, p, device, index_cache, plan=None, q_permuted=False
+    core, split, q, qsa, num_tokens, p, device, index_cache, plan=None, q_permuted=False, order=None
 ):
     """A sparse decode layer's int32 `[num_tokens, token_topk + compress_ratio - 1]` selection.
 
     Index scores of `q` (`p` rows a request), then `_selection`, over every row or, under `split`,
     over this rank's rows gathered in rank order. `qsa` is `(req_idx, logical, seq_lens_q,
     visible_blocks, topk_indices, topk_row_starts, block_table, tokens_per_block)`. With a `plan`,
-    this rank takes its slice of the permuted order (`q_permuted`: `q` is in it already)."""
+    this rank takes its slice of the permuted order (`q_permuted`: `q` is in it already). `order`:
+    the step's `_RowOrder`, shared by its layers."""
     req_idx, logical, seq_lens_q, visible_blocks, topk_indices, topk_row_starts = qsa[:6]
     block_table, tokens_per_block = qsa[6], qsa[7]
     part = _index_split_rows(split, num_tokens, p)
@@ -3377,6 +3381,7 @@ def _decode_index_selection(
         topk_indices[lo:hi],
         r_starts,
         selected,
+        order=order,
     )
     if part is None:
         return selected
@@ -3420,10 +3425,37 @@ def _draft_continue_rows(core, md, gen_seqs: int, p: int, share: bool):
     return torch.arange(gen_seqs, dtype=torch.int64, device=last.device) * p + last
 
 
+class _RowOrder:
+    """A step's sparse decode rows, longest visible window first, for the ordered launch of
+    `qsa_topk_expand_decode`: sorted at the first layer that launches it, then read by the step's
+    other layers, which select over the same rows."""
+
+    def __init__(self):
+        self._order = None
+
+    def __call__(self, visible_blocks):
+        if self._order is None:
+            self._order = torch.argsort(visible_blocks, descending=True, stable=True).to(
+                torch.int32
+            )
+        assert self._order.shape == visible_blocks.shape, "one row order serves one row set"
+        return self._order
+
+
 def _selection(
-    core, scores, visible_blocks, logical, seq_lens_q, topk_indices, row_starts, out, context=False
+    core,
+    scores,
+    visible_blocks,
+    logical,
+    seq_lens_q,
+    topk_indices,
+    row_starts,
+    out,
+    context=False,
+    order=None,
 ):
-    """The canonical block top-k and expansion of `scores`' rows into `out`, fused if possible."""
+    """The canonical block top-k and expansion of `scores`' rows into `out`, fused if possible.
+    `order`: a `_RowOrder` over these rows, for the ordered wide launch."""
     if (
         context
         and scores.shape[0] >= _TOPK_ROWS_MIN_ROWS
@@ -3453,6 +3485,9 @@ def _selection(
         )
         return
     if _topk_expand_supports(scores):
+        row_order = None
+        if order is not None and _topk_expand_orders_rows(scores):
+            row_order = order(visible_blocks)
         qsa_topk_expand_decode(
             scores,
             visible_blocks,
@@ -3462,7 +3497,7 @@ def _selection(
             core.compress_ratio,
             core.token_topk,
             out=out,
-            ordered_wide=True,
+            row_order=row_order,
         )
         return
     _select(core, scores, row_starts, visible_blocks, topk_indices)
@@ -5707,6 +5742,7 @@ class DecodeTarget:
                 core._bound.pools.index_cache[i],
                 plan,
                 q_permuted=prologue,
+                order=getattr(self, "_row_order", None),
             )
             attn = _sparse_gqa(
                 core,
@@ -5996,6 +6032,7 @@ class DecodeTarget:
         self._index_plan = None
         if sparse and split is not None:
             self._index_plan = _index_split_plan(split, qsa, num_tokens, gen_p)
+        self._row_order = _RowOrder() if sparse else None
 
         # Scratch shared by all attention layers; each layer rewrites what it reads.
         qkv = torch.empty([num_tokens, core.qkv_width], dtype=dt, device=dev)
