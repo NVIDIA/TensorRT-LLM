@@ -63,7 +63,7 @@ Figure 1 shows how dense DWDP changes this budget. At the recipe's 16K-token chu
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog33_hbm_breakdown.svg" alt="HBM of one Kimi-K3 context GPU with and without dense DWDP, at 16K-token chunks and at the longest chunk that fits" width="1000">
+  <img src="../media/tech_blog31_hbm_breakdown.svg" alt="HBM of one Kimi-K3 context GPU with and without dense DWDP, at 16K-token chunks and at the longest chunk that fits" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. HBM of one Kimi-K3 context GPU (DWDP16, Vera Rubin, NVFP4 KV cache), median over 16 ranks. The KV cache takes 70% of the memory left after weights and activations (65% in the 24K row); the rest is headroom.</em></sub></p>
@@ -82,7 +82,7 @@ Figure 2 shows the idea for a group of four GPUs.
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog33_overview.svg" alt="Overview of dense DWDP with a DWDP group of four GPUs" width="1000">
+  <img src="../media/tech_blog31_overview.svg" alt="Overview of dense DWDP with a DWDP group of four GPUs" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Dense DWDP with a DWDP group of four GPUs. Each GPU stores one row of every layer's dense weights and gathers full layers into a few staging slots; the figure shows GPU 0 gathering layer l+2. Every GPU does the same for its own slots.</em></sub></p>
@@ -199,7 +199,7 @@ On the model side, Kimi-K3's decoder layers in [`modeling_kimi_linear.py`](https
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog33_layer_pipeline.svg" alt="Per-layer pipeline of the compute stream and the shared copy stream" width="1000">
+  <img src="../media/tech_blog31_layer_pipeline.svg" alt="Per-layer pipeline of the compute stream and the shared copy stream" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. Per-layer pipeline of attached dense DWDP. The dense gather of layer l+2 starts after the attention of layer l has released its slot and finishes long before layer l+2 needs it. The expert prefetch of layer l+2 reuses the expert slot of layer l and starts once the routed experts of layer l have read it, before the MoE block ends. Copies are drawn to scale with each other; the compute lane is schematic.</em></sub></p>
@@ -273,7 +273,7 @@ The end-to-end study takes eight points of a Kimi-K3 Pareto curve, from concurre
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog33_e2e_pareto.svg" alt="End-to-end Pareto of Kimi-K3 on Vera Rubin: dense DWDP context tier against the base context tier" width="1000">
+  <img src="../media/tech_blog31_e2e_pareto.svg" alt="End-to-end Pareto of Kimi-K3 on Vera Rubin: dense DWDP context tier against the base context tier" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. End-to-end Pareto of Kimi-K3 on Vera Rubin NVL72. Each pair of points shares its generation servers and client; labels give the output throughput gain per GPU and the GPU counts of the deployment.</em></sub></p>

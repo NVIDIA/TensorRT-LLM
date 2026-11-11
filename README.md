@@ -22,8 +22,8 @@ TensorRT LLM
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
 
-* [11/06] Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72
-✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog33_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.md)
+* [11/11] Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.md)
 
 * [10/14] KV Cache Compression in TensorRT LLM
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.md)
