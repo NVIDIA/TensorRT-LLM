@@ -502,6 +502,51 @@ class TestSerializedTerminationKinds:
             assert captured_exit_payloads == []
 
     @pytest.mark.parametrize(
+        ("yaml_disabled", "cli_flags", "expect_report"),
+        [
+            (True, [], False),
+            (True, ["--telemetry"], True),
+            (False, ["--no-telemetry"], False),
+            (False, [], True),
+        ],
+    )
+    def test_video_eval_yaml_opt_out_before_missing_video(
+        self, tmp_path, captured_exit_payloads, yaml_disabled, cli_flags, expect_report
+    ):
+        from tensorrt_llm.commands.eval import main as eval_main
+
+        config = tmp_path / "generator.yaml"
+        config.write_text(f"telemetry_config:\n  disabled: {str(yaml_disabled).lower()}\n")
+        prompts = tmp_path / "prompts.jsonl"
+        prompts.write_text('{"id": 0, "prompt": "A fox"}\n')
+        (tmp_path / "generated").mkdir()
+        options = tmp_path / "evaluator.yaml"
+        options.write_text("generated_dir: generated\nreference_dir: references\n")
+        with pytest.raises(SystemExit) as raised:
+            eval_main(
+                args=[
+                    "--model",
+                    "unused",
+                    "--config",
+                    str(config),
+                    *cli_flags,
+                    "video_generation_eval",
+                    "--prompts",
+                    str(prompts),
+                    "--evaluator-options",
+                    str(options),
+                    "--output-dir",
+                    str(tmp_path / "out"),
+                ],
+                prog_name="trtllm-eval",
+            )
+        assert raised.value.code == 2
+        if expect_report:
+            assert _captured_terminal_parameters(captured_exit_payloads)["exitCode"] == 2
+        else:
+            assert captured_exit_payloads == []
+
+    @pytest.mark.parametrize(
         ("args", "expected"),
         [
             pytest.param(
