@@ -3,9 +3,9 @@
 
 """Compatibility imports from the pinned November 4 LTX core."""
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.enums import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.video_vae.enums import (
     NormLayerType as NormLayerType,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.enums import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.video_vae.enums import (
     PaddingModeType as PaddingModeType,
 )

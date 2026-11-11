@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: LicenseRef-LTX-2
 """TRTLLM interfaces for the pinned November 4, 2026 LTX core.
 
-Shared model algorithms live in ``models.ltx_core``. This package translates
+Shared model algorithms live in ``models.ltx2.ltx_core``. This package translates
 TRTLLM tensor layouts, cached transformer inputs, and checkpoint factories;
 it also retains TRTLLM's native scheduler and fused-kernel integration.
 """

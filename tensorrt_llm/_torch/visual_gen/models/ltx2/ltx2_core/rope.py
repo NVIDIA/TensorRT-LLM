@@ -5,11 +5,11 @@
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer import rope as upstream
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.rope import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.transformer import rope as upstream
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.transformer.rope import (
     LTXRopeType as LTXRopeType,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.rope import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.transformer.rope import (
     generate_freq_grid_pytorch as _generate_freq_grid_pytorch,
 )
 

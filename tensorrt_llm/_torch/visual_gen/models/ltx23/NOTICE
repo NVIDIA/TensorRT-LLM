@@ -6,6 +6,6 @@ Please refer to the file headers and the root LICENSE file for license informati
 LTX-2 repo commit id: 63fd9a4f8659989748623f635f3ed66b7c6ac076
 
 The original commit above identifies the retained pipeline/transformer integration.
-Core algorithm implementations now delegate to ../ltx_core, pinned to
+Core algorithm implementations now delegate to ../ltx2/ltx_core, pinned to
 4f521619ae0029e8fbb64d555030c2b121a33b4f (November 4, 2026), under Apache-2.0.
-See ../ltx_core/NOTICE for source provenance and compatibility modifications.
+See ../ltx2/ltx_core/NOTICE for source provenance and compatibility modifications.

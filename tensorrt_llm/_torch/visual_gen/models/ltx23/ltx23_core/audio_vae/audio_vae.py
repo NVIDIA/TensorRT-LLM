@@ -3,13 +3,13 @@
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.audio_vae import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.audio_vae.audio_vae import (
     AudioEncoder as AudioEncoder,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.audio_vae import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.audio_vae.audio_vae import (
     encode_audio as upstream_encode_audio,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.types import Audio
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.types import Audio
 
 
 def encode_audio(audio, audio_encoder):

@@ -3,12 +3,12 @@
 
 """Compatibility imports from the pinned November 4 LTX core."""
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.components.patchifiers import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.components.patchifiers import (
     AudioPatchifier as AudioPatchifier,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.components.patchifiers import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.components.patchifiers import (
     VideoLatentPatchifier as VideoLatentPatchifier,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.components.patchifiers import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.components.patchifiers import (
     get_pixel_coords as get_pixel_coords,
 )

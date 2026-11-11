@@ -5,7 +5,7 @@
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.feature_extractor import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.text_encoders.gemma.feature_extractor import (
     FeatureExtractorV2,
     _rescale_norm,
 )

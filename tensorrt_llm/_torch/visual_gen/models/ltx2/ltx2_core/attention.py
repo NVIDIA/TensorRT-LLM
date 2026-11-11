@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.attention import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.transformer.attention import (
     Attention as UpstreamAttention,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.feed_forward import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.transformer.feed_forward import (
     FeedForward as FeedForward,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.gelu_approx import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.transformer.gelu_approx import (
     GELUApprox as GELUApprox,
 )
 

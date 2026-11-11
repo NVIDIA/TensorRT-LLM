@@ -3,15 +3,15 @@
 
 """Compatibility imports from the pinned November 4 LTX core."""
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.resnet import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.audio_vae.resnet import (
     LRELU_SLOPE as LRELU_SLOPE,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.resnet import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.audio_vae.resnet import (
     ResBlock1 as ResBlock1,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.resnet import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.audio_vae.resnet import (
     ResBlock2 as ResBlock2,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.resnet import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.audio_vae.resnet import (
     ResnetBlock as ResnetBlock,
 )

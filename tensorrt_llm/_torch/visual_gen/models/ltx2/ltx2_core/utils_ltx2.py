@@ -8,8 +8,8 @@ import torch
 
 from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
-from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import rms_norm as _upstream_rms_norm
-from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.utils import rms_norm as _upstream_rms_norm
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.utils import (
     to_velocity as _upstream_to_velocity,
 )
 

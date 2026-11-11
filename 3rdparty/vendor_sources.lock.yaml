@@ -28,12 +28,12 @@ vendors:
     branch: main
     commit: 4f521619ae0029e8fbb64d555030c2b121a33b4f
     source: packages/ltx-core/src/ltx_core
-    destination: tensorrt_llm/_torch/visual_gen/models/ltx_core
+    destination: tensorrt_llm/_torch/visual_gen/models/ltx2/ltx_core
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/ltx-core.patch
-    patch_digest: sha256:24d0a3b80b1c436c5c4410ed11a3cc49aaae9f410c631be639b10dd449019168
-    digest: sha256-tree-v1:7938de02616575cf707e42911bb9beecee93b826fc50c2471abd0dd14e28b51c
+    patch_digest: sha256:9e4deebd205edd9124b99b6183a4f3d886b8da8a6b9ff816ce5effd1d583f8b8
+    digest: sha256-tree-v1:64d70dfb64f80af57d76e9b00e720a0be67cc918b85f24a121599ea5d2e776c3
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

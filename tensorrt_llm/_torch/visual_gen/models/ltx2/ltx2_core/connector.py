@@ -3,17 +3,17 @@
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.embeddings_connector import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.text_encoders.gemma.embeddings_connector import (
     Embeddings1DConnector as UpstreamConnector,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.embeddings_connector import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.text_encoders.gemma.embeddings_connector import (
     _BasicTransformerBlock1D as _BasicTransformerBlock1D,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.embeddings_processor import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.text_encoders.gemma.embeddings_processor import (
     _apply_right_pad_order,
     _compute_right_pad_order,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.feature_extractor import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.text_encoders.gemma.feature_extractor import (
     FeatureExtractorV1,
 )
 

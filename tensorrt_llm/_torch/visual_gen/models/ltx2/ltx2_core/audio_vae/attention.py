@@ -3,6 +3,6 @@
 
 """Compatibility imports from the pinned November 4 LTX core."""
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.attention import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.audio_vae.attention import (
     AttnBlock as AttnBlock,
 )

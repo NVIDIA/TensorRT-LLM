@@ -4,13 +4,13 @@
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.components.schedulers import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.components.schedulers import (
     BASE_SHIFT_ANCHOR as BASE_SHIFT_ANCHOR,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.components.schedulers import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.components.schedulers import (
     MAX_SHIFT_ANCHOR as MAX_SHIFT_ANCHOR,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.components.schedulers import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.components.schedulers import (
     LTX2Scheduler as UpstreamScheduler,
 )
 

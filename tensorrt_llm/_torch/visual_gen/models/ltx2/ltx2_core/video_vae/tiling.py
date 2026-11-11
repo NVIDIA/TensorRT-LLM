@@ -5,29 +5,29 @@
 
 from dataclasses import dataclass
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.tiling import (
     DEFAULT_MAPPING_OPERATION as DEFAULT_MAPPING_OPERATION,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.tiling import (
     DEFAULT_SPLIT_OPERATION as DEFAULT_SPLIT_OPERATION,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.tiling import (
     DimensionIntervals as DimensionIntervals,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.tiling import (
     DimensionSizeConfig,
     TileSizeConfig,
     _validate_size_axis,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import Tile as Tile
-from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.tiling import Tile as Tile
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.tiling import (
     compute_rectangular_mask_1d as compute_rectangular_mask_1d,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.tiling import (
     compute_trapezoidal_mask_1d as compute_trapezoidal_mask_1d,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import create_tiles as create_tiles
-from tensorrt_llm._torch.visual_gen.models.ltx_core.types import VIDEO_SCALE_FACTORS
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.tiling import create_tiles as create_tiles
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.types import VIDEO_SCALE_FACTORS
 
 
 @dataclass(frozen=True)

@@ -5,19 +5,19 @@
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.conv_video_decoder import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.video_vae.conv_video_decoder import (
     ConvVideoDecoder,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.conv_video_decoder import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.video_vae.conv_video_decoder import (
     _make_decoder_block as _make_decoder_block,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.video_vae.video_vae import (
     VideoEncoder as UpstreamVideoEncoder,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.video_vae.video_vae import (
     _make_encoder_block as _make_encoder_block,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.video_vae.video_vae import (
     get_video_chunks_number as get_video_chunks_number,
 )
 

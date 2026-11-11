@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.model_configurator import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.audio_vae.model_configurator import (
     VocoderConfigurator,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.model_configurator import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.audio_vae.model_configurator import (
     _vocoder_from_config as _vocoder_from_config,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.vocoder import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.audio_vae.vocoder import (
     Vocoder as Vocoder,
 )
 

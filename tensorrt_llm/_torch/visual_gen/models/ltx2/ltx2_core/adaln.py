@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer import adaln as upstream
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.transformer import adaln as upstream
 
 from ._linear import use_linear_factory
 

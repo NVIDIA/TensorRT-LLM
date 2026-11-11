@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.model.transformer import (
     transformer_args as upstream,
 )
 

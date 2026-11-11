@@ -3,16 +3,16 @@
 
 """Adapt current upstream perturbation masks to TRTLLM's cached graph interface."""
 
-from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.guidance.perturbations import (
     BatchedPerturbationConfig as UpstreamBatchedPerturbationConfig,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.guidance.perturbations import (
     Perturbation as Perturbation,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.guidance.perturbations import (
     PerturbationConfig as PerturbationConfig,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import (
+from tensorrt_llm._torch.visual_gen.models.ltx2.ltx_core.guidance.perturbations import (
     PerturbationType as PerturbationType,
 )
 
