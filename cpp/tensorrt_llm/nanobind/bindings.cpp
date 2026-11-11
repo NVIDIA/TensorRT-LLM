@@ -89,7 +89,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 {
 #if defined(TORCH_CUDA)
     // Native Logger rank filtering may query CUDA before any device is available.
-    auto const diagnostic = tc::initializeProfiler();
+    auto const diagnostic = tc::initializeProfilerRegions();
     if (diagnostic)
     {
         std::fprintf(stderr, "TensorRT-LLM profiler warning: %s\n", diagnostic->c_str());

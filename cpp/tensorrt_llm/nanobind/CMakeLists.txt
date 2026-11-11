@@ -87,10 +87,8 @@ target_link_libraries(
          th_common
          pg_utils)
 target_compile_definitions(
-  ${TRTLLM_NB_MODULE}
-  PUBLIC TRTLLM_NB_MODULE=${TRTLLM_NB_MODULE}
-         PYBIND11_DETAILED_ERROR_MESSAGES=1
-         TRTLLM_ENABLE_NCCL_PROFILING=$<BOOL:${ENABLE_NCCL_PROFILING}>)
+  ${TRTLLM_NB_MODULE} PUBLIC TRTLLM_NB_MODULE=${TRTLLM_NB_MODULE}
+                             PYBIND11_DETAILED_ERROR_MESSAGES=1)
 
 if(NOT WIN32)
   set(TRTLLM_NB_MODULE_RPATH_LIST
