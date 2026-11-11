@@ -860,7 +860,8 @@ class MultimodalConfig(StrictBaseModel):
          "such as '512MB' and '1GiB' use binary units. Both inline encoding and "
          "item scheduling cache individual items, including those of "
          "mixed-modality requests. "
-         "Compatible with side-stream prefetch."),
+         "Compatible with side-stream prefetch, which requires inline encoding "
+         "(item scheduling rejects it)."),
         status="prototype",
     )
 
