@@ -547,6 +547,8 @@ class CoordinatorClient(DisaggCoordinator):
         self._startup_timeout_s = startup_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
         self._sync_task: Optional[asyncio.Task] = None
+        self._state_sync_lock = asyncio.Lock()
+        self._state_sync_version = 0
         self._is_ready = False
         if config.disagg_cluster_config is not None:
             self._state_sync_interval_s = config.disagg_cluster_config.heartbeat_interval_sec
@@ -609,14 +611,17 @@ class CoordinatorClient(DisaggCoordinator):
 
     async def _sync_coordinator_state(self, interval_s: float) -> None:
         while True:
-            try:
-                await asyncio.sleep(interval_s)
-                await self._apply_cluster_info(await self.cluster_info())
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001
-                self._is_ready = False
-                logger.warning(f"CoordinatorClient state sync failed: {error}")
+            await asyncio.sleep(interval_s)
+            async with self._state_sync_lock:
+                await self._refresh_coordinator_state()
+
+    async def _refresh_coordinator_state(self) -> None:
+        try:
+            await self._apply_cluster_info(await self.cluster_info())
+        except Exception as error:  # noqa: BLE001
+            self._is_ready = False
+            logger.warning(f"CoordinatorClient state sync failed: {error}")
+        self._state_sync_version += 1
 
     async def _await_coordinator(self) -> Dict[str, Any]:
         """Poll the coordinator's /cluster_info until reachable, or raise.
@@ -663,13 +668,21 @@ class CoordinatorClient(DisaggCoordinator):
         return get_global_disagg_request_id(self._node_id, self._process_id)
 
     async def is_ready(self) -> bool:
+        if not self._is_ready:
+            # Another fleet worker may have passed /health before this worker's
+            # next background poll. Refresh its local routing state before rejecting.
+            version = self._state_sync_version
+            async with self._state_sync_lock:
+                if not self._is_ready and version == self._state_sync_version:
+                    await self._refresh_coordinator_state()
         return self._is_ready
 
     async def _apply_cluster_info(self, info: Dict[str, Any]) -> None:
-        self._is_ready = info.get("is_ready", False)
+        self._is_ready = False
         self._sync_delegating_router_configs(info)
         await self._sync_router_server_lists(info)
         self._sync_render_fingerprints(info)
+        self._is_ready = info.get("is_ready", False)
 
     def _sync_render_fingerprints(self, info: Dict[str, Any]) -> None:
         published = info.get("render_fingerprints")
