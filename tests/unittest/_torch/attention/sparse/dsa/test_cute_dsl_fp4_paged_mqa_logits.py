@@ -180,31 +180,28 @@ def test_cute_dsl_fp4_paged_mqa_logits_short_context_epilogues(epi_dtype):
     block_values = torch.tensor(
         [0.5, -1.0, 2.0, -0.5, 1.0, -2.0], dtype=torch.bfloat16, device=device
     )
-    kv_cache = block_values[:, None, None, None].expand(
-        -1, phys_block_kv, 1, head_dim
-    ).contiguous()
+    kv_cache = block_values[:, None, None, None].expand(-1, phys_block_kv, 1, head_dim).contiguous()
     weights = torch.ones((batch_size * next_n, num_heads), dtype=torch.float32, device=device)
     weights[:, 1::2] = -2
     weights *= torch.arange(1, batch_size * next_n + 1, device=device).unsqueeze(1) / 64
 
-    query_packed, query_sf_packed = per_token_cast_to_fp4(
+    query_packed, query_sf_packed = DSAVanillaIndexer.quantize_fp4(
         query.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
     )
-    query_fp4 = query_packed.view(torch.uint8).view(
-        batch_size, next_n, num_heads, head_dim // 2
-    )
+    query_fp4 = query_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
     query_sf = query_sf_packed.view(torch.int32).view(batch_size, next_n, num_heads)
-    query_simulated = cast_back_from_fp4(
+    query_simulated = DSAVanillaIndexer.dequantize_fp4(
         query_packed, query_sf_packed, gran_k=32, use_packed_ue8m0=True
     ).view(batch_size, next_n, num_heads, head_dim)
     kv_fused, kv_simulated = kv_cache_cast_to_fp4(kv_cache)
     schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
         context_lens.unsqueeze(-1), 64, deep_gemm.get_num_sms()
     )
-    expected = _ref_paged_mqa_logits(
+    expected = paged_mqa_logits(
         query_simulated.float(),
         kv_simulated.float(),
         weights,
+        context_lens,
         context_lens,
         block_table,
         max_model_len,
@@ -214,6 +211,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_short_context_epilogues(epi_dtype):
         query_sf,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -398,6 +396,7 @@ def test_cute_dsl_fp4_paged_mqa_logits(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -563,6 +562,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_kernel_split(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -722,6 +722,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_block_meta(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -883,6 +884,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -919,6 +921,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -1032,6 +1035,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -1691,6 +1695,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -1725,6 +1730,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
