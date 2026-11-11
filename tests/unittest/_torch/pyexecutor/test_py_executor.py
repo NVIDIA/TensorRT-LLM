@@ -5095,6 +5095,45 @@ def test_prefill_logprobs_lead_the_generation_logprobs_one_entry_per_token():
     assert beam_result.log_probs is None
 
 
+def test_disagg_beam_handoff_seeds_beam_state_and_latches_finished_beams():
+    """The context-side first tokens and their log-probs seed each beam, and
+    only the beams whose first token is the end id are latched for harvest."""
+    num_slots, beam_width, max_seq_len, prompt_len, end_id = 3, 4, 8, 5, 2
+    store = types.SimpleNamespace(
+        original_tokens=torch.zeros(num_slots, beam_width, max_seq_len, dtype=torch.int32),
+        cache_indirection=torch.zeros(num_slots, beam_width, max_seq_len, dtype=torch.int32),
+        cum_log_probs=torch.zeros(num_slots, beam_width, dtype=torch.float32),
+        pending_harvest=torch.zeros(num_slots, beam_width, dtype=torch.bool),
+    )
+    executor = object.__new__(PyExecutor)
+    executor.sampler = types.SimpleNamespace(store=types.SimpleNamespace(beam_search_store=store))
+    first_gen_tokens = [7, end_id, 9, end_id]
+    first_gen_log_probs = [
+        {token: types.SimpleNamespace(logprob=-0.5 * (beam + 1))}
+        for beam, token in enumerate(first_gen_tokens)
+    ]
+    request = types.SimpleNamespace(
+        py_request_id=1,
+        py_seq_slot=1,
+        prompt_len=prompt_len,
+        py_end_id=end_id,
+        py_disaggregated_params=types.SimpleNamespace(first_gen_log_probs=first_gen_log_probs),
+    )
+
+    assert executor._update_sampler_state_for_disagg_gen_request(
+        request, beam_width, first_gen_tokens
+    )
+
+    assert store.original_tokens[1, :, prompt_len].tolist() == first_gen_tokens
+    assert store.cache_indirection[1, :, prompt_len].tolist() == list(range(beam_width))
+    assert store.cum_log_probs[1].tolist() == [-0.5, -1.0, -1.5, -2.0]
+    assert store.pending_harvest.tolist() == [
+        [False] * beam_width,
+        [False, True, False, True],
+        [False] * beam_width,
+    ]
+
+
 @pytest.mark.parametrize("overlap", [False, True], ids=["overlap_off", "overlap_on"])
 def test_first_token_response_carries_the_prefill_logits(monkeypatch, overlap):
     """The logits prefill produced for the first token arrive in the

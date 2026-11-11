@@ -28,7 +28,8 @@ except ImportError:
     from cuda import cudart
 
 from tensorrt_llm._startup import _StartupTimer
-from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
+from tensorrt_llm._utils import (CUASSERT, async_tensor_h2d,
+                                 customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
                                  global_mpi_size, is_trace_enabled, mpi_comm,
                                  mpi_disabled, nvtx_range,
@@ -9981,9 +9982,9 @@ class PyExecutor:
             first_gen_scores.append(token_log_prob.logprob)
 
         original_tokens = beam_search_store.original_tokens
-        first_gen_token_values = torch.tensor(first_gen_tokens[:beam_width],
-                                              device=original_tokens.device,
-                                              dtype=original_tokens.dtype)
+        first_gen_token_values = async_tensor_h2d(first_gen_tokens[:beam_width],
+                                                  original_tokens.dtype,
+                                                  original_tokens.device)
         original_tokens[seq_slot, :beam_width,
                         req.prompt_len].copy_(first_gen_token_values)
         cache_indirection = beam_search_store.cache_indirection
@@ -9994,9 +9995,8 @@ class PyExecutor:
                           req.prompt_len].copy_(beam_idx_arange)
 
         cum_log_probs = beam_search_store.cum_log_probs
-        values = torch.tensor(first_gen_scores,
-                              device=cum_log_probs.device,
-                              dtype=cum_log_probs.dtype)
+        values = async_tensor_h2d(first_gen_scores, cum_log_probs.dtype,
+                                  cum_log_probs.device)
         cum_log_probs[seq_slot, :beam_width].copy_(values)
 
         # The handoff carries one token already produced upstream, seeded above
@@ -10019,10 +10019,12 @@ class PyExecutor:
             ]
             if finished_beams:
                 pending_harvest = beam_search_store.pending_harvest
-                pending_harvest[seq_slot,
-                                torch.tensor(finished_beams,
-                                             device=pending_harvest.device,
-                                             dtype=torch.long)] = True
+                # index_fill_ takes the fill value as a Python scalar, so no
+                # value tensor is copied to the GPU.
+                pending_harvest[seq_slot].index_fill_(
+                    0,
+                    async_tensor_h2d(finished_beams, torch.long,
+                                     pending_harvest.device), True)
         return True
 
     @staticmethod
@@ -10055,8 +10057,10 @@ class PyExecutor:
             else:
                 device = torch.device('cuda', self.device_id)
                 for logits_tensor in disagg_params.first_gen_logits:
-                    req.py_result.append_generation_logits(
-                        logits_tensor.to(device))
+                    if not logits_tensor.is_cuda:
+                        logits_tensor = async_tensor_h2d(
+                            logits_tensor, logits_tensor.dtype, device)
+                    req.py_result.append_generation_logits(logits_tensor)
 
     def _has_prepended_logits(self, req) -> bool:
         """Check whether the request has first-gen logits prepended from
