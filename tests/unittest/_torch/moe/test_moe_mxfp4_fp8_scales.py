@@ -36,9 +36,15 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(monkeypatch, bias, gptoss, load
         owner.initial_local_expert_ids = [1, 3]
         owner.weight_loading_mode = loading_mode
         owner.bias = bias
-        owner.register_buffer("act_alpha", torch.tensor([1.702, 1.5]) if gptoss else None)
-        owner.register_buffer("act_beta", torch.tensor([1.0, 2.0]) if gptoss else None)
-        owner.register_buffer("act_clamp", torch.tensor([7.0, 9.0]) if gptoss else None)
+        owner.register_buffer(
+            "act_alpha", torch.tensor([1.702, 1.5]) if gptoss else None, persistent=False
+        )
+        owner.register_buffer(
+            "act_beta", torch.tensor([1.0, 2.0]) if gptoss else None, persistent=False
+        )
+        owner.register_buffer(
+            "act_clamp", torch.tensor([7.0, 9.0]) if gptoss else None, persistent=False
+        )
         return owner
 
     module = create_module()
