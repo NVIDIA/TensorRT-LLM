@@ -2,7 +2,7 @@
 
 By NVIDIA TensorRT LLM Team
 
-DWDP ([Tech Blog 19](blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md)) lets each context GPU of a disaggregated deployment store only a slice of the routed experts and prefetch the rest from its peers before each MoE layer. On a hybrid model such as Kimi-K3, sharding the experts leaves a second large block of replicated memory: the attention weights, the shared expert, the latent projections and the router of every MoE decoder layer, about 54 GiB that every context GPU holds in full. Dense DWDP shards these weights as well. Each GPU keeps a 1/N row shard of every layer and gathers a layer's full weights from its peers over NVLink two layers before the layer runs, on the copy stream that already carries the expert prefetch. On NVIDIA Vera Rubin NVL72, this gives each Kimi-K3 context GPU 52.7 GiB of HBM back, about a fifth of its memory. Spent on longer prefill chunks and a larger KV cache, the freed memory lets the context tier serve the same agentic coding load with 4 or 8 fewer GPUs: across eight points of an end-to-end Pareto curve, output tokens per second per GPU rise by 6.1% to 19.1% (median 12.5%) at the same tokens per second per user. Dense DWDP has been merged into TensorRT LLM ([PR #21012](https://github.com/NVIDIA/TensorRT-LLM/pull/21012)).
+DWDP ([Tech Blog 19](blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md)) lets each context GPU of a disaggregated deployment store only a slice of the routed experts and prefetch the rest from its peers before each MoE layer. On a hybrid model such as Kimi-K3, sharding the experts leaves a second large block of replicated memory: the attention weights, the shared expert, the latent projections and the router of every MoE decoder layer, about 54 GiB that every context GPU holds in full. Dense DWDP shards these weights as well. Each GPU keeps a 1/N row shard of every layer and gathers a layer's full weights from its peers over NVLink two layers before the layer runs, on the copy stream that already carries the expert prefetch. On NVIDIA Vera Rubin NVL72, this gives each Kimi-K3 context GPU 52.7 GiB of HBM back, about a fifth of its memory. Spent on longer prefill chunks and a larger KV cache, the freed memory lets the context tier serve the same agentic coding load with 4 or 8 fewer GPUs: across eight points of an end-to-end Pareto curve, output tokens per second per GPU rise by 6.1% to 19.1% (median 12.5%) at the same tokens per second per user, with a longer time-to-first-token (TTFT) tail at the two points of highest load (TTFT p90 rises from 15.9 s to 23.0 s where the gain is 19.1%). Dense DWDP has been merged into TensorRT LLM ([PR #21012](https://github.com/NVIDIA/TensorRT-LLM/pull/21012)).
 
 ## Table of Contents
 
@@ -31,7 +31,6 @@ DWDP ([Tech Blog 19](blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Pe
   - [Accuracy](#accuracy)
   - [Reproducing Steps](#reproducing-steps)
 - [Summary](#summary)
-- [Acknowledgment](#acknowledgment)
 
 ## Motivation
 
@@ -196,14 +195,14 @@ On the model side, Kimi-K3's decoder layers in [`modeling_kimi_linear.py`](https
 
    If any rank fails, every rank restores its weights (P1-P5) or releases the dense state (P6) and raises: there is no fallback to replicated weights. In attached mode, the expert DWDP setup runs only after dense DWDP has committed, and the KV cache is sized after both, so it receives the freed memory. Setup takes about 7 s.
 
-3. **Every forward.** H0 primes the first two layers. In every layer, H1 waits for the slots, H2 enqueues `L(l+2)` once the attention of layer `l` has released the attention slot that `l+2` reuses, and H3 releases the MoE-dense slot. Expert DWDP enqueues `E(l+2)` after the experts of layer `l`, so the shared copy stream runs `... E(l+1), L(l+2), E(l+2), L(l+3) ...`: every copy is enqueued in the order its data is needed (Figure 3). At the end of a forward, the copies of the first layers of the next forward are already enqueued, so the next forward starts primed.
+3. **Every forward.** H0 primes the first two layers. In every layer, H1 waits for the slots, H2 enqueues `L(l+2)` once the attention of layer `l` has released the attention slot that `l+2` reuses, and H3 releases the MoE-dense slot. Expert DWDP enqueues `E(l+2)` right after the routed experts of layer `l`, inside the MoE block and before H3: the routed experts are the only kernels that read the expert slot that `E(l+2)` reuses, and the copy waits for them. Within a forward, the shared copy stream therefore runs `... E(l+1), L(l+2), E(l+2), L(l+3) ...`, each copy enqueued in the order its data is needed (Figure 3). At the end of a forward, the copies of the first layers of the next forward are already enqueued, so the next forward starts primed.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog33_layer_pipeline.svg" alt="Per-layer pipeline of the compute stream and the shared copy stream" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 3. Per-layer pipeline of attached dense DWDP. The dense gather of layer l+2 starts after the attention of layer l has released its slot and finishes long before layer l+2 needs it. Copies are drawn to scale with each other; the compute lane is schematic.</em></sub></p>
+<p align="center"><sub><em>Figure 3. Per-layer pipeline of attached dense DWDP. The dense gather of layer l+2 starts after the attention of layer l has released its slot and finishes long before layer l+2 needs it. The expert prefetch of layer l+2 reuses the expert slot of layer l and starts once the routed experts of layer l have read it, before the MoE block ends. Copies are drawn to scale with each other; the compute lane is schematic.</em></sub></p>
 
 Every dependency in this flow is a CUDA event between the compute stream and the copy stream. Between setup and teardown, the host never waits for the GPU.
 
@@ -211,7 +210,7 @@ Every dependency in this flow is a CUDA event between the compute stream and the
 
 Dense DWDP replaces the weights of a running model, so its protocol is built around one invariant: a slot is written only when no kernel can read it, and read only after its copy has finished.
 
-- **Read windows.** All reads of `A(l)` happen between H1 and H2 of layer `l`, and all reads of `D(l)` between H1 and H3. A copy into a slot waits for the end of the read window of the layer that held it (write after read), and compute waits for the copy (read after write).
+- **Read windows.** All reads of `A(l)` happen between H1 and H2 of layer `l`, and all reads of `D(l)` between H1 and H3. A copy into a slot waits for the end of the read window of the layer that held it (write after read), and compute waits for the copy (read after write). Expert DWDP applies the same rule to its two expert slots, where the routed experts of a layer are the only readers.
 - **All or nothing.** Setup compares layouts, checks every gathered byte before and after the repointing, and commits only if every rank agrees.
 - **Guards.** Weight reloads and incremental weight updates refuse a model whose dense weights dense DWDP has moved.
 
@@ -236,7 +235,7 @@ A separate pipeline for the dense weights, for example copy engines on a second 
 
 The order of the two setups matters for the peak memory. The expert prefetch ring is large: two slots for the remote experts of one layer each, 27 GiB per GPU at DWDP8 and 29 GiB at DWDP16. If the ring were allocated while the replicated dense weights are still resident, the setup peak would be the sum of both. Dense DWDP therefore commits first and returns the replicated weights to the allocator before the ring is allocated, so the peak is the larger of the two phases.
 
-This is what makes small DWDP groups possible. A DWDP8 context GPU stores 112 experts per layer; after dense DWDP commits it has about 64 GiB free for the 27 GiB ring, which leaves about 30 GiB of KV cache. With the dense weights still replicated, the same GPU would have about 11 GiB, not enough for the ring.
+This is what makes small DWDP groups possible. A DWDP8 context GPU stores 112 experts per layer; after dense DWDP commits it has about 64 GiB free for the 27 GiB ring, which leaves about 30 GiB of KV cache. With the dense weights still replicated, the same GPU would have about 17 GiB, not enough for the ring.
 
 ### A Balanced Expert Partition for Any Group Size
 
@@ -292,7 +291,7 @@ The end-to-end study takes eight points of a Kimi-K3 Pareto curve, from concurre
 
 *Table 6. End-to-end results, base → dense DWDP. Gain is the change of output tokens per second per GPU.*
 
-Dense DWDP raises the output throughput per GPU at every point, by 6.1% to 19.1% with a median of 12.5%, while tokens per second per user stay within 2.1%. The gain comes from serving the same load with fewer GPUs, not from faster ones: at seven of the eight points the total output throughput of the deployment stays within -1.8% to +2.3% of the base, so the gain follows the share of GPUs that the smaller context tier saves. Removing 8 of 64 GPUs gives +13% to +17%, 4 of 64 or 56 gives +6% to +8%, 4 of 32 gives +12% and 8 of 40 gives +19%.
+Dense DWDP raises the output throughput per GPU at every point, by 6.1% to 19.1% with a median of 12.5%, while tokens per second per user stay within 2.1%. The gain comes from serving the same load with fewer GPUs, not from faster ones: at seven of the eight points the total output throughput of the deployment stays within -1.8% to +2.3% of the base, so the gain follows the share of GPUs that the smaller context tier saves. Removing 8 of 64 GPUs gives +13% to +17%, 4 of 64 or 56 gives +6% to +8% and 4 of 32 gives +12%. The eighth point is concurrency 623: removing 8 of 40 GPUs would give +25% at equal output, but the 16-GPU context tier becomes the bottleneck there and the total output falls by 4.7% (from 17,621 to 16,793 tokens per second), which leaves +19.1% ([Trading Throughput for Time to First Token](#trading-throughput-for-time-to-first-token)).
 
 A smaller context tier keeps up because, at most points, compute does not set its size. At concurrency 24 to 240 the base tier serves 0.7 to 7.7 requests per second, while a saturated 16-GPU DWDP16 tier sustains about 13 (measured with the context tier on its own at concurrency 128). Memory sets the floor instead. A DWDP8 group fits only with dense DWDP ([Committing Dense Weights Before the Expert Prefetch Ring](#committing-dense-weights-before-the-expert-prefetch-ring)), and with fewer context GPUs each GPU holds the KV pages and KDA states of more conversations, which the freed memory pays for. Only close to saturation, at concurrency 383 and 623, does a smaller tier lengthen the TTFT tail.
 
@@ -405,7 +404,3 @@ Launch the context workers with `--server_role CONTEXT`, then replay the AgentX 
 - The freed memory is worth what it buys: longer prefill chunks and a larger KV cache. On Vera Rubin NVL72 this lets the context tier serve the same agentic load with fewer GPUs, for 6.1% to 19.1% more output throughput per GPU along the Pareto curve.
 - Fewer context GPUs means more load per GPU. At the throughput end the context tier can be sized to the TTFT budget, from lower latency at the same GPUs to the most throughput with a longer tail.
 - Dense DWDP needs high-bandwidth peer memory access and a compute window that covers the expert prefetch, which is why it targets context servers on NVL72 systems.
-
-## Acknowledgment
-
-We would like to thank everyone who contributed to this work.
