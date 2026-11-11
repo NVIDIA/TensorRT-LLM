@@ -2681,6 +2681,9 @@ class DecoderInputPreparer:
             total_draft_lens = sum(host.lists.draft_lens)
             spec_metadata.draft_tokens = self._buffers.draft_tokens_cuda[:total_draft_lens]
             spec_metadata.request_ids = host.lists.request_ids
+            spec_metadata.paused_in_place_ids = getattr(
+                scheduled_requests, "paused_in_place_ids", frozenset()
+            )
             spec_metadata.gather_ids = self._gather_ids_buffer.tensor[: len(host.lists.gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
@@ -3323,6 +3326,23 @@ class DecoderInputPreparer:
         """Return the one-model speculative worker when it is initialized."""
         return getattr(self.model, "spec_worker", None)
 
+    def _dspark_tp_rank0_rows(self):
+        """Return a hook that swaps this rank's confidence rows for TP rank 0's.
+
+        Without attention DP every TP rank runs one token layout, but confidence
+        can differ in the last bits between ranks. Returns None when each rank
+        owns its layout.
+        """
+        if self.mapping.tp_size <= 1 or self._config.enable_attention_dp:
+            return None
+        from tensorrt_llm._torch.distributed import allgather
+
+        def sync_rows(rows):
+            rows = rows.contiguous()
+            return allgather(rows, self.mapping, dim=0)[: rows.shape[0]]
+
+        return sync_rows
+
     def _apply_device_window_prologue(self, inputs, new_tensors_device) -> bool:
         """Re-rank this step's verify windows on device, with fresh confidence.
 
@@ -3414,6 +3434,7 @@ class DecoderInputPreparer:
             stamp=stamps,
             expected_stamp=expected_stamp,
             pad_len=pad_len_tok,
+            sync_rows=self._dspark_tp_rank0_rows(),
         )
 
         lens_buf[:padded_bs].copy_(result.verify_lens)

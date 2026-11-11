@@ -28,8 +28,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ModelRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
@@ -43,7 +41,7 @@ pytestmark = pytest.mark.cpu_only
         (True, False, False, False, EncoderRunner),
         (True, True, False, False, MultimodalEncoderRunner),
         (False, True, False, False, MultimodalEncoderRunner),
-        (False, False, False, True, PoolingRunner),
+        (False, False, False, True, EncoderRunner),
         (False, False, True, True, EncoderDecoderRunner),
         (False, False, True, False, DecoderRunner),
     ],
@@ -68,9 +66,7 @@ def test_resolve_runner_dispatches_startup_families(
 @pytest.mark.parametrize(
     ("runner_type", "initializer_name"),
     [
-        (EncoderRunner, None),
         (EncoderDecoderRunner, "_initialize_encoder_decoder_runner"),
-        (NoKVCacheRunner, "_initialize_no_kv_cache_runner"),
         (DecoderRunner, "_initialize_decoder_runner"),
         (ModelRunner, None),
     ],

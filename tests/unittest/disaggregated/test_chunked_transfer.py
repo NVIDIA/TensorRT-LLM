@@ -48,6 +48,15 @@ pytestmark = pytest.mark.cpu_only
 # ---------------------------------------------------------------------------
 
 
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
+
+
 def _make_params(rid: int = 42) -> DisaggregatedParams:
     return DisaggregatedParams(disagg_request_id=rid)
 
@@ -152,11 +161,19 @@ def _make_projection_sender() -> Sender:
     )
 
     extractor = MagicMock()
+    # Write metas group fragments by the memory type of each view's physical pool, so each
+    # group's single view resolves to a device pool.
     extractor.page_table = SimpleNamespace(
         tokens_per_block=_PROJECTION_TPB,
+        pool_groups=[SimpleNamespace(pools=[SimpleNamespace(memory_type="VRAM")])],
         layer_groups=[
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS),
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS),
+            SimpleNamespace(
+                kind=CacheKind.PAGED,
+                sliding_window_size=_PROJECTION_PROMPT_TOKENS,
+                pool_group_idx=0,
+                pool_views=[SimpleNamespace(pool_idx=0)],
+            )
+            for _ in range(2)
         ],
     )
     # extract(region_ids, layer_group_id, pool_idx) - the caller passes the
@@ -326,12 +343,14 @@ def test_process_kv_agent_result_resolves_task_by_receiver_slice_id():
     """The receiver resolves the task using its own slice id."""
     session = _make_rx_session(1)
     session._kv_tasks[0].expected_transfers = 1
+    _publish_report_tokens(session)
 
     session.process_kv_agent_result(
         peer_rank=0,
         receiver_slice_id=0,
         is_last_slice=True,
         status=AgentResult.SUCCESS,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
 
     assert session._kv_tasks[0].status == TaskStatus.TRANSFERRED
@@ -341,7 +360,7 @@ def test_process_kv_agent_result_rejects_unknown_receiver_slice_id():
     """Indexing is bounded by the receiver's own task count."""
     session = _make_rx_session(1)
 
-    with pytest.raises(AssertionError, match=r"receiver_slice_id=2"):
+    with pytest.raises(ValueError, match=r"receiver_slice_id=2"):
         session.process_kv_agent_result(
             peer_rank=0,
             receiver_slice_id=2,
@@ -614,7 +633,7 @@ def test_pipelined_transfer_requires_gen_first_flow():
     """ValueError when a real request is not using gen-first flow."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
     executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
@@ -642,7 +661,7 @@ def test_pipelined_transfer_requires_chunked_prefill():
     """Pipelined context transfer requires chunked prefill."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine = SimpleNamespace(
         attn_runtime_features=SimpleNamespace(chunked_prefill=False)
@@ -665,7 +684,7 @@ def test_pipelined_transfer_rejects_pipeline_parallelism_for_context_request():
     """Context workers require all layers on one pipeline rank."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
     executor.model_engine._dspark_confidence_enabled = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine.attn_runtime_features.chunked_prefill = True
@@ -700,7 +719,7 @@ def test_pipelined_transfer_requires_single_beam_for_context_request():
     """Context-side pipelining rejects beam search before scheduling."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
     executor.model_engine._dspark_confidence_enabled = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine.attn_runtime_features.chunked_prefill = True
@@ -721,7 +740,7 @@ def test_pipelined_transfer_allows_non_disaggregated_request():
     """Requests without disaggregated parameters do not transfer KV cache."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
     executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.max_beam_width = 1
@@ -745,7 +764,7 @@ def test_pipelined_transfer_allows_generation_only_request():
     """Generation workers do not build prefill chunks or enforce sender-only limits."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
     executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.max_beam_width = 2
@@ -1269,6 +1288,9 @@ def _make_transfer_state_transceiver(session=None, rid: int = 42):
     transceiver._retire_send_session = MethodType(
         KvCacheTransceiverV2._retire_send_session, transceiver
     )
+    transceiver._retire_cancelled_receive_fence = MethodType(
+        KvCacheTransceiverV2._retire_cancelled_receive_fence, transceiver
+    )
     return transceiver
 
 
@@ -1359,7 +1381,6 @@ def _make_send_kv_coordinator(canceled_req_ids, active_requests=()):
             canceled_request_ids=lambda: list(canceled_req_ids),
         ),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
     return coordinator, transceiver, transfer_manager
 

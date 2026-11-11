@@ -25,6 +25,8 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import Decoder
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
+from tensorrt_llm._torch.speculative.dspark_schedule import DSparkScheduleConfig
+from tensorrt_llm._torch.speculative.dspark_select import select_windows_device
 from tensorrt_llm._torch.speculative.ragged_helpers import ragged_gather_index_lists
 
 
@@ -555,6 +557,41 @@ def test_device_window_prologue_declines_an_unavailable_planner(
 
     assert not decoder._apply_device_window_prologue({}, None)
     assert decoder._dspark_device_budget is None
+
+
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_device_reranking_takes_tp_rank_zero_rows(monkeypatch, enable_attention_dp) -> None:
+    from tensorrt_llm._torch import distributed
+
+    rows_by_rank = [
+        torch.tensor([[10.0] * 5, [-10.0] * 5]),
+        torch.tensor([[-10.0] * 5, [10.0] * 5]),
+    ]
+
+    def allgather(rows, mapping, dim):
+        assert dim == 0 and torch.equal(rows, rows_by_rank[mapping.tp_rank])
+        return torch.cat(rows_by_rank)
+
+    monkeypatch.setattr(distributed, "allgather", allgather)
+    verify_lens = []
+    for rank, rows in enumerate(rows_by_rank):
+        decoder = object.__new__(DecoderInputPreparer)
+        decoder.mapping = SimpleNamespace(tp_size=2, tp_rank=rank)
+        decoder._config = SimpleNamespace(enable_attention_dp=enable_attention_dp)
+        result = select_windows_device(
+            confidence_logits=rows,
+            slot_idx=torch.tensor([0, 1]),
+            num_real=torch.tensor(2),
+            budget=torch.tensor(2),
+            graph_num_tokens=6,
+            cfg=DSparkScheduleConfig(block_size=5, min_verify_len=1),
+            sync_rows=decoder._dspark_tp_rank0_rows(),
+        )
+        verify_lens.append(result.verify_lens.tolist())
+
+    # With attention DP each rank keeps its own layout; otherwise both ranks
+    # must build TP rank 0's.
+    assert verify_lens == ([[4, 2], [2, 4]] if enable_attention_dp else [[4, 2], [4, 2]])
 
 
 def test_confidence_without_an_sps_table_is_eager_only() -> None:
