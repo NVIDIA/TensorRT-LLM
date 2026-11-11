@@ -105,42 +105,6 @@ MTP_NAMESPACE_FEATURES: tuple[str, ...] = ("mtp", "dspark")
 DISAGG_FEATURE = "disagg"
 DISAGG_KEYS: tuple[str, ...] = ("test", "tests", "devices", "nodes", "timeout", "env")
 
-# Workload and field documentation lives in task.example.yaml. These key sets
-# close the accepted blocks; cross-field constraints are validated below.
-ACCEPTANCE_WORKLOAD_KEYS: tuple[str, ...] = (
-    "prompts",
-    "prompts_file",
-    "dataset",
-    "num_prompts",
-    "text_field",
-    "prompt_template",
-    "split",
-    "dataset_config",
-    "max_tokens",
-    "min_draft_iterations",
-    "min_prompts",
-)
-# The paired t-test against the previous tree's verdict, at the block's top
-# level only: `alpha` (one-sided, default 0.05), `min_effect` (accepted tokens
-# per iteration, default 0.1). A drop must be both significant and at least
-# `min_effect` to fail.
-ACCEPTANCE_REGRESSION_KEYS: tuple[str, ...] = ("alpha", "min_effect")
-ACCEPTANCE_BLOCK_KEYS: tuple[str, ...] = (*ACCEPTANCE_WORKLOAD_KEYS, "regression", "timeout")
-# What one unit's entry in `accuracy.acceptance` may carry:
-#   min_absolute        the absolute floor used when the `=off` leg cannot run
-#   measured_reference  what a reference drafter measured on this workload; the
-#                       floor is this x 0.95 when `min_absolute` is not given
-#   floor_source        where that measurement was taken. A floor with neither
-#                       a measured reference nor a source is used, and every
-#                       verdict says it is not tied to a measurement
-ACCEPTANCE_UNIT_KEYS: tuple[str, ...] = (
-    "min_absolute",
-    "measured_reference",
-    "floor_source",
-    "timeout",
-    *ACCEPTANCE_WORKLOAD_KEYS,
-)
-
 TARGET_FIELD = "target"
 RUNTIME_FIELD = "runtime"
 SCOPE_FIELD = "scope"
@@ -223,13 +187,11 @@ TARGET_NAME_KEYS: tuple[str, ...] = ("family", "checkpoint_segment")
 IGNORED_ACCURACY_KEYS: dict[str, str] = {
     "envelope": "a boot runs its workload only; there are no boundary phases",
     "reference_logits": "a boot keeps no divergence record against a reference's logits",
+    "acceptance": "a drafter's acceptance is judged by a native test, named in a deployment's "
+    "`tests`; the flow measures no acceptance length of its own",
 }
 
 ACCURACY_KEYS: tuple[str, ...] = (
-    # The absolute `acceptance_length` floor a unit falls back to when the
-    # `=off` leg cannot exist. Also the acceptance gate's declared workload;
-    # see `ACCEPTANCE_WORKLOAD_KEYS`.
-    "acceptance",
     "benchmark",
     "reference_yaml",
     "model_key",
@@ -281,8 +243,8 @@ BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_EVERY,)
 # Boot workloads allow run-wide keys and per-unit overlays. Keywords match
 # generated text, never logs; absent multimodal images use the repository asset.
 BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "keywords", "max_tokens")
-# How long one boot gate, or one acceptance leg, may run: `timeout` at either level of
-# `accuracy.boot` and `accuracy.acceptance` (default 1800 s). Not a workload key: it
+# How long one boot gate may run: `timeout` at either level of
+# `accuracy.boot` (default 1800 s). Not a workload key: it
 # changes no verdict, only how long a slow load is waited for.
 GATE_TIMEOUT_KEY = "timeout"
 BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "keywords", "keywords_any", "images", "render")
@@ -801,7 +763,7 @@ def _validate_disagg(block: Any, errors: list[str]) -> None:
 
 
 def load_prompts_file(path: str | Path) -> tuple[str, ...]:
-    """Read a prompt list for the acceptance gate's declared workload.
+    """Read a prompt list for the boot gate's declared workload.
 
     A YAML or JSON **list** of strings, or a **mapping** with a ``prompts:``
     list. Raises :class:`TaskSchemaError` naming the file for anything else,
@@ -824,122 +786,6 @@ def load_prompts_file(path: str | Path) -> tuple[str, ...]:
     if not all(isinstance(p, str) and p.strip() for p in data):
         raise TaskSchemaError(f"every prompt in {source} must be a non-empty string")
     return tuple(data)
-
-
-def _validate_acceptance_workload(entry: Mapping[str, Any], errors: list[str], where: str) -> None:
-    """Validate the workload keys one level of ``accuracy.acceptance`` declares."""
-    prompts = entry.get("prompts")
-    prompts_file = entry.get("prompts_file")
-    if prompts is not None and prompts_file is not None:
-        errors.append(
-            f"'{where}' declares both 'prompts' and 'prompts_file'; keep one, so the "
-            f"workload a verdict was measured on has a single source"
-        )
-    if prompts is not None and (
-        not isinstance(prompts, list)
-        or not prompts
-        or not all(isinstance(p, str) and p.strip() for p in prompts)
-    ):
-        errors.append(f"'{where}.prompts' must be a non-empty list of non-empty strings")
-    if prompts_file is not None:
-        if not isinstance(prompts_file, str) or not prompts_file.strip():
-            errors.append(f"'{where}.prompts_file' must be a non-empty path")
-        elif not Path(prompts_file).is_file():
-            errors.append(f"'{where}.prompts_file' does not exist: {prompts_file}")
-        else:
-            try:
-                load_prompts_file(prompts_file)
-            except TaskSchemaError as exc:
-                errors.append(f"'{where}.prompts_file': {exc}")
-    sources = [k for k in ("prompts", "prompts_file", "dataset") if entry.get(k) is not None]
-    if "dataset" in sources and len(sources) > 1:
-        errors.append(
-            f"'{where}' declares 'dataset' beside {sources[0]!r}; keep one, so the workload "
-            f"a verdict was measured on has a single source"
-        )
-    dataset = entry.get("dataset")
-    if dataset is not None and (not isinstance(dataset, str) or not dataset.strip()):
-        errors.append(
-            f"'{where}.dataset' must be a local path or a cached dataset id (no download)"
-        )
-    _validate_fields(
-        entry,
-        dict.fromkeys(("text_field", "prompt_template", "split", "dataset_config"), _TEXT),
-        errors,
-        where,
-    )
-    template = entry.get("prompt_template")
-    if isinstance(template, str) and "{text}" not in template:
-        errors.append(f"'{where}.prompt_template' must name the question as {{text}}")
-    _validate_fields(
-        entry,
-        dict.fromkeys(
-            ("max_tokens", "min_draft_iterations", "num_prompts", "min_prompts", GATE_TIMEOUT_KEY),
-            _POS_INT,
-        ),
-        errors,
-        where,
-    )
-
-
-def _validate_acceptance_regression(block: Any, errors: list[str], where: str) -> None:
-    """Validate ``accuracy.acceptance.regression``."""
-    if not isinstance(block, dict):
-        errors.append(f"'{where}' must be a mapping with keys {list(ACCEPTANCE_REGRESSION_KEYS)}")
-        return
-    reject_unknown_keys(block, ACCEPTANCE_REGRESSION_KEYS, errors, where=where)
-    alpha = block.get("alpha")
-    if alpha is not None and (not _number(alpha) or not 0 < alpha < 1):
-        errors.append(f"'{where}.alpha' must be a probability in (0, 1), got {alpha!r}")
-    effect = block.get("min_effect")
-    if effect is not None and (not _number(effect) or effect < 0):
-        errors.append(f"'{where}.min_effect' must be a number >= 0, got {effect!r}")
-
-
-def _validate_acceptance(block: Any, errors: list[str]) -> None:
-    """Validate ``accuracy.acceptance``: per-unit floors plus the gate's workload.
-
-    Every key that is not a workload key names a unit, and its value is the
-    unit's floor -- a number, or a mapping with ``min_absolute`` -- optionally
-    with that unit's own workload beside it.
-    """
-    where = f"{ACCURACY_FIELD}.acceptance"
-    if not isinstance(block, dict):
-        errors.append(
-            f"'{where}' must be a mapping from unit to floor, plus the optional "
-            f"workload keys {list(ACCEPTANCE_WORKLOAD_KEYS)}"
-        )
-        return
-    _validate_acceptance_workload(block, errors, where)
-    if block.get("regression") is not None:
-        _validate_acceptance_regression(block["regression"], errors, f"{where}.regression")
-    for unit, entry in block.items():
-        if unit in ACCEPTANCE_BLOCK_KEYS:
-            continue
-        unit_where = f"{where}.{unit}"
-        if isinstance(entry, dict):
-            reject_unknown_keys(entry, ACCEPTANCE_UNIT_KEYS, errors, where=unit_where)
-            _validate_acceptance_workload(entry, errors, unit_where)
-            floor = entry.get("min_absolute")
-            floor_where = f"{unit_where}.min_absolute"
-            measured = entry.get("measured_reference")
-            if measured is not None and (not _number(measured) or measured < 1.0):
-                errors.append(
-                    f"'{unit_where}.measured_reference' must be a number >= 1.0; got {measured!r}"
-                )
-            source = entry.get("floor_source")
-            if source is not None and (not isinstance(source, str) or not source.strip()):
-                errors.append(f"'{unit_where}.floor_source' must be a non-empty string")
-        else:
-            floor = entry
-            floor_where = unit_where
-        if floor is None:
-            continue
-        # Acceptance length counts the target's own token on every step, so
-        # it is at least 1.0 by construction and a floor below that passes
-        # everything.
-        if not _number(floor) or floor < 1.0:
-            errors.append(f"'{floor_where}' must be a number >= 1.0; got {floor!r}")
 
 
 def _validate_boot_level(level: Mapping[str, Any], errors: list[str], where: str) -> None:
@@ -1309,9 +1155,6 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
         ACCURACY_FIELD,
     )
 
-    if block.get("acceptance") is not None:
-        _validate_acceptance(block["acceptance"], errors)
-
     _validate_floor(block, errors)
 
     if block.get("boot") is not None:
@@ -1455,7 +1298,7 @@ def _require_disagg_test(data: Mapping[str, Any], errors: list[str]) -> None:
 def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
     """Make paths the user writes NEXT TO the spec portable, in place.
 
-    ``accuracy.llm_api_options``, the acceptance prompt files and boot images
+    ``accuracy.llm_api_options``, the boot prompt files and boot images
     are resolved against the **spec's own directory** and written back as
     absolute. Absolute paths are untouched, so a workspace copy of an
     already-resolved spec re-resolves to itself.
@@ -1480,18 +1323,6 @@ def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
         accuracy["llm_api_options"] = {k: absolute(v) for k, v in options.items()}
     elif options is not None:
         accuracy["llm_api_options"] = absolute(options)
-
-    # A `dataset` may be a cached dataset id ("openai/gsm8k"), which reads like
-    # a relative path, so it is resolved only when the spec's directory holds it.
-    acceptance = accuracy.get("acceptance")
-    if isinstance(acceptance, dict):
-        for level in (acceptance, *(v for v in acceptance.values() if isinstance(v, dict))):
-            if level.get("prompts_file") is not None:
-                level["prompts_file"] = absolute(level["prompts_file"])
-            dataset = level.get("dataset")
-            if isinstance(dataset, str) and dataset.strip() and not Path(dataset).is_absolute():
-                if (spec_dir / dataset).exists():
-                    level["dataset"] = absolute(dataset)
 
     # Boot prompt files, and boot images that sit beside the spec. An image
     # that does not is left relative: the gate resolves it against the tree
@@ -1601,11 +1432,17 @@ def drop_ignored_keys(data: dict[str, Any], notices: list[str] | None) -> None:
     accuracy = data.get(ACCURACY_FIELD)
     if not isinstance(accuracy, dict):
         return
-    for key, why in IGNORED_ACCURACY_KEYS.items():
-        if key in accuracy:
-            del accuracy[key]
-            if notices is not None:
-                notices.append(f"'{ACCURACY_FIELD}.{key}' is ignored: {why}; drop the key")
+    blocks = [(ACCURACY_FIELD, accuracy)]
+    declared = data.get(VARIANTS_FIELD)
+    for name, entry in declared.items() if isinstance(declared, dict) else ():
+        if isinstance(entry, dict) and isinstance(entry.get(ACCURACY_FIELD), dict):
+            blocks.append((f"{VARIANTS_FIELD}.{name}.{ACCURACY_FIELD}", entry[ACCURACY_FIELD]))
+    for where, block in blocks:
+        for key, why in IGNORED_ACCURACY_KEYS.items():
+            if key in block:
+                del block[key]
+                if notices is not None:
+                    notices.append(f"'{where}.{key}' is ignored: {why}; drop the key")
 
 
 def load_and_validate_task_yaml(
@@ -1767,8 +1604,6 @@ __all__ = [
     "drop_ignored_keys",
     "DISAGG_FEATURE",
     "DISAGG_KEYS",
-    "ACCEPTANCE_UNIT_KEYS",
-    "ACCEPTANCE_WORKLOAD_KEYS",
     "ACCURACY_FIELD",
     "ACCURACY_KEYS",
     "ARCH_FIELD",

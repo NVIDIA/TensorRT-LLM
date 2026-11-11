@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import shutil
@@ -19,7 +18,6 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import acceptance as acceptance_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import accuracy as accuracy_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import delivery, disagg, gate_cli, test_results
@@ -27,10 +25,6 @@ from agent_flow.workflows.trtllm_modeling_v2.checks import serve as sg
 from agent_flow.workflows.trtllm_modeling_v2.checks import test_results as tc
 from agent_flow.workflows.trtllm_modeling_v2.checks import verdict as check_result
 from agent_flow.workflows.trtllm_modeling_v2.checks.delivery import Check as DeliveryCheck
-from agent_flow.workflows.trtllm_modeling_v2.checks.gate_records import (
-    KIND_STOCK_UNAVAILABLE,
-    GateRecords,
-)
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import (
     reuse_probe,
     serve_driver,
@@ -570,112 +564,6 @@ def test_target_initializer_and_optional_weights_dependencies_are_checked(tmp_pa
     assert any("router" in check.detail for check in _verify(root).failures)
 
 
-_acceptance_gate_TASK = {
-    "checkpoint_path": "/ckpt/M",
-    "parallel": "tep4",
-    "trtllm_repo_path": "/repo",
-    "features": ["dspark"],
-    "accuracy": {"benchmark": "gsm8k", "reference_yaml": "r.yaml"},
-}
-
-
-def _acceptance_gate_env():
-    return resolve_environment(
-        {"environment": {"kind": "local", "python": "/py", "env": {}}}, devices=(0,), world_size=1
-    )
-
-
-def _acceptance_gate_driver_output(rates, *, prompts=None, iterations=100):
-    """What the engine driver prints for prompts accepting at ``rates``.
-
-    ``iterations`` is every prompt's, or a list with one per prompt.
-    """
-    lines = []
-    for n, rate in enumerate(rates):
-        steps = iterations[n] if isinstance(iterations, list) else iterations
-        tokens = int(round(rate * steps))
-        workload_io_line = {
-            "index": n,
-            "id": f"d{n}",
-            "prompt_sha": (prompts or [f"p{i}" for i in range(len(rates))])[n],
-            "tokens": tokens,
-            "iterations": steps,
-            "token_ids": [],
-            "text": "",
-        }
-        lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(workload_io_line)}")
-    return "\n".join(lines) + "\n"
-
-
-def _acceptance_gate_legs(require, off=None):
-    """A runner: the require leg prints ``require``; the off leg ``off`` or cannot load."""
-    seen = []
-
-    def run(command, env=None, timeout=0):
-        seen.append(command)
-        if "TRTLLM_MODELING_V2=off" in command:
-            if off is None:
-                return CommandResult(returncode=1, stderr="Unknown model architecture: X")
-            return CommandResult(returncode=0, stdout=off)
-        return CommandResult(returncode=0, stdout=require)
-
-    run.seen = seen
-    return run
-
-
-def _acceptance_gate_task(**acceptance):
-    return {
-        **_acceptance_gate_TASK,
-        "accuracy": {**_acceptance_gate_TASK["accuracy"], "acceptance": acceptance},
-    }
-
-
-_BASE = [2.6 + 0.5 * math.sin(i) for i in range(32)]
-
-
-@pytest.fixture
-def tree(monkeypatch):
-    """Pin the tree a gate believes it measured, so a baseline can come from another."""
-    current = {"name": "treeA"}
-    monkeypatch.setattr(acceptance_checks, "inspect_tree", lambda task_data: current["name"])
-    return current
-
-
-def test_a_significant_drop_against_the_previous_tree_fails(tmp_path, tree):
-    records = GateRecords(tmp_path / "r.jsonl")
-    common = dict(
-        task_data=_acceptance_gate_task(), member="tep4", records=records, workdir=tmp_path / "w"
-    )
-    acceptance_checks.run_acceptance_gate(
-        _acceptance_gate_env(),
-        runner=_acceptance_gate_legs(
-            _acceptance_gate_driver_output(_BASE), _acceptance_gate_driver_output(_BASE)
-        ),
-        **common,
-    )
-    tree["name"] = "treeB"
-    dropped = [r - 0.3 for r in _BASE]
-    result = acceptance_checks.run_acceptance_gate(
-        _acceptance_gate_env(),
-        runner=_acceptance_gate_legs(
-            _acceptance_gate_driver_output(dropped), _acceptance_gate_driver_output(dropped)
-        ),
-        **common,
-    )
-    assert not result.passed
-    assert "against tree treeA: REGRESSED" in result.detail
-    # A failed verdict is recorded, but is not the next tree's baseline.
-    tree["name"] = "treeC"
-    again = acceptance_checks.run_acceptance_gate(
-        _acceptance_gate_env(),
-        runner=_acceptance_gate_legs(
-            _acceptance_gate_driver_output(_BASE), _acceptance_gate_driver_output(_BASE)
-        ),
-        **common,
-    )
-    assert again.passed and "against tree treeA" in again.detail
-
-
 _SNAPSHOTS = {
     "periodic_snapshot_interval": 2048,
     "additional_snapshot_offsets_from_start": [256, 512, 768],
@@ -790,47 +678,6 @@ def _boot_runner(*outputs: str):
 
     run.seen = seen  # type: ignore[attr-defined]
     return run
-
-
-def test_the_acceptance_gate_holds_each_leg_to_its_own_mode(tmp_path):
-    task = _engine_attestation_task(tmp_path, features=["mtp"])
-    options = {**_OPTIONS, "speculative_config": {"decoding_type": "MTP", "max_draft_len": 3}}
-    Path(task["accuracy"]["llm_api_options"]["core"]).write_text(yaml.safe_dump(options))
-    mtp = {"algorithm": "MTP", "max_draft_len": 3}
-    legs = [
-        _engine_line(_engine_config(speculative=mtp)),
-        _engine_line(_engine_config(speculative=mtp, modeling_v2="require")),
-    ]
-    run = _boot_runner(*legs)
-    result = acceptance_checks.run_acceptance_gate(
-        _engine_attestation_env(),
-        task_data=task,
-        runner=run,
-        unit="core",
-        member="tp1",
-        workdir=tmp_path,
-    )
-    assert len(run.seen) == 2 and not result.passed
-    assert result.detail.startswith("the engine of the off leg did not run the declared")
-    assert "modeling_v2: declared off, engine require" in result.detail
-    assert [r["leg"] for r in result.engine] == ["require", "off"]
-
-    # A prompt the engine refuses for its length fails the workload, not the target; a leg
-    # waits as long as the spec gives a slow load.
-    task["accuracy"]["acceptance"] = {**(task["accuracy"].get("acceptance") or {}), "timeout": 3600}
-    waited = []
-
-    def refused(command, env=None, timeout=0):
-        waited.append(timeout)
-        error = "RequestError: The prompt length (5000.0) should not exceed max_num_tokens (4096)"
-        return CommandResult(returncode=1, stdout=error)
-
-    result = acceptance_checks.run_acceptance_gate(
-        _engine_attestation_env(), task_data=task, runner=refused, unit="core", member="tp1",
-        workdir=tmp_path,
-    )  # fmt: skip
-    assert "refused a prompt of 5000 tokens, longer than max_num_tokens 4096" in result.detail
-    assert "a property of the workload, not of the target" in result.detail and waited == [3600]
 
 
 _engine_attestation_FAKE_TRTLLM = {
@@ -1149,23 +996,6 @@ def test_an_attention_dp_rank_serves_its_share_of_the_global_batch():
     }
 
 
-def test_the_stock_leg_is_asked_once_per_checkpoint(tmp_path, monkeypatch):
-    monkeypatch.setattr(acceptance_checks, "inspect_tree", lambda task_data: "t")
-    task = _acceptance_gate_task(dspark={"min_absolute": 1.5, "floor_source": "a measured drafter"})
-    rates = [2.6 + 0.5 * math.sin(i) for i in range(32)]
-    records = GateRecords(tmp_path / "gate_results.jsonl")
-    common = dict(task_data=task, records=records, unit="dspark", workdir=tmp_path / "w")
-    first = _acceptance_gate_legs(_acceptance_gate_driver_output(rates))
-    ran = acceptance_checks.run_acceptance_gate(_acceptance_gate_env(), runner=first, **common)
-    assert ran.passed, ran.detail
-    assert any("=off" in cmd for cmd in first.seen)
-    assert records.all(KIND_STOCK_UNAVAILABLE)
-    again = _acceptance_gate_legs(_acceptance_gate_driver_output(rates))
-    result = acceptance_checks.run_acceptance_gate(_acceptance_gate_env(), runner=again, **common)
-    assert result.passed and not any("=off" in cmd for cmd in again.seen)
-    assert "not run again" in result.detail
-
-
 def test_the_shared_runner_resolves_each_gate_the_way_a_worker_and_the_certification_ask(
     tmp_path, monkeypatch
 ):
@@ -1188,7 +1018,6 @@ def test_the_shared_runner_resolves_each_gate_the_way_a_worker_and_the_certifica
 
     monkeypatch.setattr(boot_checks, "run_boot_gate", gate("boot"))
     monkeypatch.setattr(accuracy_checks, "run_accuracy_gate", gate("accuracy"))
-    monkeypatch.setattr(acceptance_checks, "run_acceptance_gate", gate("acceptance"))
     monkeypatch.setattr(sg, "run_serve_gate", gate("serve"))
     monkeypatch.setattr(disagg, "run_disagg_gate", gate("disagg"))
     monkeypatch.setattr(accuracy_checks, "resolve_reference", lambda *a, **k: 85.6)
@@ -1196,11 +1025,11 @@ def test_the_shared_runner_resolves_each_gate_the_way_a_worker_and_the_certifica
     common = dict(workdir=tmp_path / "w", tree=tree, runner=runner, devices=(4, 5, 6, 7))
 
     # The contract names a benchmark `accuracy[gsm8k]`; a worker types `accuracy`.
-    for name in ("boot", "accuracy[gsm8k]", "acceptance", "serve"):
+    for name in ("boot", "accuracy[gsm8k]", "serve"):
         assert gate_cli.run_check(data, name, "mtp", "tep4", **common).passed
     assert gate_cli.run_check(data, "disagg", "disagg", "tep2", **common).passed
-    assert set(seen) == {"boot", "accuracy", "acceptance", "serve", "disagg"}
-    for name in ("boot", "accuracy", "acceptance", "serve"):
+    assert set(seen) == {"boot", "accuracy", "serve", "disagg"}
+    for name in ("boot", "accuracy", "serve"):
         call = seen[name]
         assert (call["unit"], call["member"]) == ("mtp", "tep4")
         # The tree measured is the one named, not the spec's checkout; the member's width
@@ -1209,7 +1038,7 @@ def test_the_shared_runner_resolves_each_gate_the_way_a_worker_and_the_certifica
         assert call["environment"].devices == (4, 5, 6, 7)
         assert call["environment"].world_size == 4
         assert call["workdir"] == (tmp_path / "w").resolve() / "mtp"
-    assert seen["boot"]["features"] == seen["acceptance"]["features"] == ["mtp"]
+    assert seen["boot"]["features"] == ["mtp"]
     assert seen["accuracy"]["reference"] == 85.6
     # Two engines at the member's width for the disaggregated test: four devices, not two.
     assert seen["disagg"]["environment"].devices == (4, 5, 6, 7)

@@ -23,7 +23,7 @@ differently or lack it.
   feature units in `features`; configuration `variants` overlay `runtime`,
   `llm_api_options` or `env` on a unit. `task.example.yaml` documents each key,
   `spec/INTAKE.md` says which variant each request needs.
-- **Running one check.** `trtllm-modeling-v2 gate <boot|accuracy|acceptance|serve|disagg>
+- **Running one check.** `trtllm-modeling-v2 gate <boot|accuracy|serve|disagg>
   --task task.yaml --unit <unit or variant> --member <m>`; `--mode off` (boot
   only) runs the stock path; `--tree <dir>` measures a worktree as it is;
   `--json` prints the verdict.
@@ -500,15 +500,12 @@ statistics (`numAcceptedTokens`).
 greedy output with drafting off should agree up to near-ties; read acceptance
 from the iteration statistics.
 
-**Flow proof.** Features `mtp`, `eagle3`, `dflash` and `dspark` owe the
-acceptance gate (`checks/acceptance.py`; `gate acceptance --unit <feature>
---member <m>`): accepted tokens per iteration, iteration-weighted per prompt
-(32 prompts and 32 draft iterations by default), held against
-`TRTLLM_MODELING_V2=off` on the same prompts (fails under a 0.95 ratio when a
-paired test finds the drop significant), against the previous tree, and above
-1.0. Without a stock path the unit declares `measured_reference` or
-`min_absolute` with its `floor_source`. Each rank also reports the algorithm and
-draft depth it runs.
+**Flow proof.** The flow measures no acceptance length of its own. Features
+`mtp`, `eagle3`, `dflash` and `dspark` are judged by the tree's acceptance test
+above (`compute_acceptance_length` / `assert_acceptance_length` against
+`accuracy/references/acceptance_length.yaml`): write it for the target and name
+its node id; without one the report says the drafter is unverified. Each rank
+also reports the algorithm and draft depth it runs.
 
 **Blind spots.** Boot and accuracy: rejection sampling preserves the output
 distribution, so a wrong draft path yields correct text, slower. For a new architecture the floor is a number the

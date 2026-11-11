@@ -47,11 +47,12 @@ parallel: tp1
 #     ctx: {options: engines/ctx.yaml, launch: "<nodes 1 to 4>"}
 #     gen: {options: engines/gen.yaml, launch: "<nodes 5 to 8>"}
 #     relative_to: dep16              # judged against dep16's own score
-# With `deployments`, `accuracy` is optional and keeps `model_key`, `boot` and `dataset_path`.
+# With `deployments`, `accuracy` is optional and gives every deployment's defaults: `model_key`,
+# `benchmark` (gsm8k), `reference_yaml`, `dataset_path`, `discriminators`, `boot`.
 
 # Feature units, built after core in the order listed: mtp, eagle3, dflash, dspark, multimodal,
-# host_offload, disagg, kv_quant, decoder_replay, encoder_replay. Speculators get the acceptance
-# gate. disagg owes its disaggregated-serving test alone (`accuracy.disagg`, below), once, at the
+# host_offload, disagg, kv_quant, decoder_replay, encoder_replay. A drafter's acceptance is judged by
+# a native test of the tree, not by a check of the flow. disagg owes its disaggregated-serving test alone (`accuracy.disagg`, below), once, at the
 # member the request validates fully, on one node: its boot and accuracy would run an aggregated
 # engine. `mtp.*` stages that are a DSpark block drafter (`dspark_*` config keys) are `dspark`,
 # never `mtp`.
@@ -66,12 +67,12 @@ features: []
 #     members: [tep4]               # default: the unit's, and the benchmark runs at one of them
 #     gates: [accuracy]             # default [boot, accuracy]: a variant that boots, boots at every
 #                                   # member of its unit; accuracy alone checks the setting took
-#                                   # effect (spec/INTAKE.md). `acceptance` needs a speculator unit
+#                                   # effect (spec/INTAKE.md)
 #     runtime: {extra_flags: [--kv_cache_dtype=fp8]}      # over the unit's; flags appended
 #     llm_api_options: {kv_cache_config: {dtype: fp8}}    # merged into the unit's YAML
 #     env: {}                       # added to the gate command's environment
 #     # Where they differ: benchmark, reference_yaml, model_key, discriminators, benchmark_args,
-#     # samples, acceptance, anchor. Naming no row of its own, a variant is judged against its
+#     # samples, anchor. Naming no row of its own, a variant is judged against its
 #     # unit's own score at the same member and target (`anchor: relative`: KV fp8 against auto).
 #     # With a row: `{discriminators: {kv_cache_quant_algo: FP8}}`, layered over the unit's.
 #     note: KV cache stored as FP8
@@ -213,24 +214,6 @@ accuracy:
   #   tests: []                    # more node ids, each run as a job of its own
   #   timeout: 7200                # default, seconds
 
-  # The ACCEPTANCE gate, where a unit keeps speculation on: accepted tokens per iteration per prompt
-  # against built-in modeling (`=off`; fails under a 0.95 ratio when a paired test finds the drop
-  # significant), against the previous tree's verdict, and against 1.0. With no `=off` path, declare
-  # `measured_reference` (floor 0.95 x it) or `min_absolute` with its `floor_source`, per unit.
-  # acceptance:
-  #   # Default: the first `num_prompts` questions of the accuracy dataset, from the local cache.
-  #   # Each workload key below also works inside a unit's entry, for that unit alone.
-  #   # dataset: /data/gsm8k        # or a cached id; dataset_config, split, text_field pick them
-  #   num_prompts: 32               # default
-  #   prompt_template: "{text} Solve it step by step, then give the answer."
-  #   # prompts: [...]              # or the prompts outright, or prompts_file: a YAML/JSON list
-  #   max_tokens: 256               # default
-  #   min_draft_iterations: 32      # default; fewer fails as "workload too short"
-  #   min_prompts: 32               # default; fewer fails as "workload too small"
-  #   regression: {alpha: 0.05, min_effect: 0.1}   # the defaults
-  #   mtp: {min_absolute: 1.5, floor_source: "03-plan/acceptance-spike.md: reference 2.31"}
-  #   dspark: {measured_reference: 3.32}   # floor 3.15
-
   # The BOOT gate's workload, run-wide or per unit; keywords match
   # generated text only. A `multimodal` unit with no image prompt sends the tree's
   # tests/integration/test_input_files/merlion.png.
@@ -268,7 +251,7 @@ accuracy:
 
   # The LLM-API YAML the accuracy gate runs under: a path, or per unit, relative to THIS FILE. A
   # speculator unit's carries its `speculative_config`, or its gates re-measure the base path; the
-  # boot and acceptance gates read the draft depth there (`max_draft_len`; DSpark: `block_size`).
+  # boot gate reads the draft depth there (`max_draft_len`; DSpark: `block_size`).
   # llm_api_options: {core: scripts/core_llm_api.yaml, mtp: scripts/mtp_llm_api.yaml}
 
   # The benchmark subcommand's own options: the PROTOCOL, which must match the anchor's (a chat

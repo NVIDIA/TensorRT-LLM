@@ -15,7 +15,7 @@ variant `{{ capture.name }}` (unit `{{ capture.unit }}`):
 {%- endif %} {% if capture.description is none -%}
 no CUDA graphs at any gate
 {% else -%}
-{{ capture.description }}, at boot, acceptance and accuracy, from {{ capture.source }}
+{{ capture.description }}, at boot and accuracy, from {{ capture.source }}
 {% endif -%}
 {% endfor -%}
 {% if inherited -%}

@@ -424,12 +424,9 @@ def engine_options(
 def _per_unit(key: str, value: Any, name: str, chosen: Any) -> dict[str, Any]:
     """Accuracy key ``key`` in its per-unit form, with ``name`` set to ``chosen``.
 
-    ``acceptance`` holds the workload and the per-unit floors side by side;
     ``discriminators`` is per-unit when its values are mappings; every other
     key is per-unit exactly when it is a mapping.
     """
-    if key == "acceptance":
-        return {**dict(value or {}), name: chosen}
     if key == "discriminators":
         per_unit = isinstance(value, Mapping) and any(
             isinstance(v, Mapping) for v in value.values()

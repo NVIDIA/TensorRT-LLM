@@ -286,7 +286,7 @@ def passing_shell(score: float = 90.0, accepted: int = 320, iterations: int = 10
         if "trtllm-eval" in command:
             return CommandResult(returncode=0, stdout=f"lm-eval gsm8k average accuracy: {score}\n")
         # The gates that need per-request structure run the engine driver,
-        # which prints one record per prompt; the acceptance gate wants 32 of them.
+        # which prints one record per prompt.
         if "engine_driver.py" in command:
             return CommandResult(returncode=0, stdout=driver_records(accepted, iterations))
         return CommandResult(

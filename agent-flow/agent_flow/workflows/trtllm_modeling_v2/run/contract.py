@@ -128,7 +128,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
     ``certified`` what ``standard`` owes and the serve gate. ``disagg`` owes its
     disaggregated-serving test alone, once (``checks/disagg.py``): its boot and
     accuracy would run one aggregated engine, which the units before it prove.
-    A storage or scheduling variant (one with no acceptance gate) boots at
+    A variant boots at
     every member of its unit and runs its benchmark at one
     (:func:`benchmark_member`) unless it names its members; a variant of
     ``disagg`` owes nothing of its own, its axis being proven on core. A
@@ -175,10 +175,13 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         if serving:
             add(unit, serve.GATE_NAME, [serve.serve_member(members)])
         # Speculative decoding preserves the output distribution by construction, so a
-        # draft path that computes the wrong thing passes boot and accuracy and shows
-        # only as speed: per-prompt acceptance is the detector.
+        # draft path that computes the wrong thing passes boot and accuracy and shows only
+        # as speed. What detects it is a native test of the drafter, which no check here runs.
         if SPECULATORS & implemented:
-            add(unit, "acceptance", members)
+            notes.append(
+                f"{unit}: its drafter's acceptance is judged by no check here; name a native "
+                f"test for it, or the report says it is unverified"
+            )
     for name in () if lean else variants_mod.variants(task_data):
         level = profile_of(task_data, name)
         if level == PROFILE_BRINGUP:
@@ -191,12 +194,8 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
             notes.append(f"{name}: a variant of {base} owes no check; its axis is proven on core")
             continue
         benchmark = resolve_per_unit(spec.get("accuracy") or {}, "benchmark", name) or "accuracy"
-        gate_names = {
-            "boot": "boot",
-            "accuracy": f"accuracy[{benchmark}]",
-            "acceptance": "acceptance",
-        }
-        gates = variants_mod.variant_gates(task_data, name)
+        gate_names = {"boot": "boot", "accuracy": f"accuracy[{benchmark}]"}
+        gates = tuple(g for g in variants_mod.variant_gates(task_data, name) if g in gate_names)
         if level == PROFILE_SMOKE:
             gates = ("boot",)
         everywhere = order_members_by_cost(members_for(task_data, base, world_size))
@@ -208,7 +207,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
             notes.append(f"{name}: its anchor is {base}'s own score at the same member and commit")
         for gate in gates:
             at = members
-            if gate == "boot" and "acceptance" not in gates:
+            if gate == "boot":
                 at = [*members, *(m for m in everywhere if m not in members)]
             elif gate == "accuracy" and not named and len(at) > 1:
                 member, why = benchmark_member(spec, members)

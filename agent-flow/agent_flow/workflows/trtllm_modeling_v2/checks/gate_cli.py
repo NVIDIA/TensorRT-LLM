@@ -39,10 +39,9 @@ from ..spec.task_schema import (
     parse_parallel_segment,
     widest_world_size,
 )
-from . import acceptance as acceptance_checks
 from . import accuracy as accuracy_checks
 from . import boot as boot_checks
-from . import check_runtime, datasets, disagg, gate_records, serve
+from . import check_runtime, datasets, disagg, serve
 from . import verdict as check_result
 from .accuracy import resolve_model_key
 from .harness import workload_io
@@ -51,7 +50,6 @@ from .harness import workload_io
 GATE_NAMES: tuple[str, ...] = (
     "boot",
     "accuracy",
-    "acceptance",
     "serve",
     "disagg",
 )
@@ -92,13 +90,6 @@ def _parse(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=Path("trtllm-modeling-v2-gates"),
         help="where the gate writes its files. Default ./trtllm-modeling-v2-gates",
-    )
-    parser.add_argument(
-        "--results",
-        type=Path,
-        default=None,
-        help="the results file the acceptance gate compares against and appends "
-        "to (default <workdir>/gate_results.jsonl); share one across trees to compare them",
     )
     parser.add_argument(
         "--features",
@@ -201,7 +192,6 @@ def run_check(
     tree: str | Path | None = None,
     workspace: str | Path | None = None,
     runner: Callable[..., Any] | None = None,
-    records: gate_records.GateRecords | None = None,
     devices: Sequence[int] | None = None,
     world_size: int | None = None,
     python: str | None = None,
@@ -264,7 +254,6 @@ def run_check(
         features = features_for(spec, unit)
     features = list(features)
     spec = datasets.staged_spec(spec, gate if "[" in gate else name, workspace)
-    records = records or gate_records.GateRecords(workdir / gate_records.RESULTS_FILENAME)
     bound = {"timeout": timeout} if timeout else {}
     common = dict(task_data=spec, runner=runner, unit=unit, member=member)
 
@@ -324,15 +313,6 @@ def run_check(
             return accuracy_checks.run_accuracy_gate(
                 environment, reference=reference, workdir=workdir / unit, **bound, **common
             )
-        if name == "acceptance":
-            return acceptance_checks.run_acceptance_gate(
-                environment,
-                features=features,
-                workdir=workdir / unit,
-                records=records,
-                **bound,
-                **common,
-            )
         if name == "serve":
             serve_spec = serve.ServeSpec.from_task(spec)
             return serve.run_serve_gate(
@@ -364,7 +344,6 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         tree=args.tree,
         # The run's own task.yaml sits in its workspace, beside its datasets and its state.
         workspace=task.resolve().parent,
-        records=gate_records.GateRecords(args.results) if args.results else None,
         devices=tuple(int(d) for d in args.devices.split(",")) if args.devices else None,
         world_size=args.world_size,
         python=args.python,

@@ -145,7 +145,8 @@ def test_the_tasks_run_in_the_fixed_order_and_every_check_runs_once_at_the_end(
     keys = sorted(f"{c['unit']}:{c['gate']}@{c['member']}" for c in contract)
     verdicts = _verdicts(tmp_path)
     assert sorted(f"{v['unit']}:{v['gate']}@{v['member']}" for v in verdicts) == keys
-    assert {"mtp:acceptance@tp1", "switched:accuracy[gsm8k]@tp1"} <= set(keys)
+    assert {"mtp:accuracy[gsm8k]@tp1", "switched:accuracy[gsm8k]@tp1"} <= set(keys)
+    assert not [key for key in keys if "acceptance" in key]  # a drafter's is a native test
     assert len({v["tree"] for v in verdicts}) == 1 and all(v["passed"] for v in verdicts)
     certification = yaml.safe_load((workspace / "certification.yaml").read_text())
     assert certification["certified"] and certification["round"] == 1
@@ -155,7 +156,7 @@ def test_the_tasks_run_in_the_fixed_order_and_every_check_runs_once_at_the_end(
     # A worker is told which checks its unit owes and that it runs them itself.
     core_prompt = next(p for role, p in calls if role == "assembler" and _task_id(p) == "core")
     assert "## The checks `core` owes" in core_prompt and "`boot@tp1`" in core_prompt
-    assert "gate <boot|accuracy|acceptance|serve|disagg>" in core_prompt
+    assert "gate <boot|accuracy|serve|disagg>" in core_prompt
     mtp_prompt = next(p for role, p in calls if role == "assembler" and _task_id(p) == "mtp")
     assert "`core` (assemble): done UNIT_READY" in mtp_prompt
 

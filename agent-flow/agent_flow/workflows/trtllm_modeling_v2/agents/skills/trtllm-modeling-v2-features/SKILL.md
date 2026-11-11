@@ -77,11 +77,11 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
    probe and pool sizes. A field read as UNKNOWN, or only from the request, is
    not evidence. *Blind to* accuracy: boot checks a few short continuations
    for keywords.
-4. **Accuracy, disagg, acceptance.** `gate accuracy` runs the benchmark
+4. **Accuracy, disagg.** `gate accuracy` runs the benchmark
    with CUDA graphs (the spec's warnings name an eager accuracy check) and re-attests each
    rank's KV dtype and chunking; `gate disagg --unit disagg` runs the target's
-   disaggregated-serving test as CI does; `gate acceptance` judges
-   speculators. *Blind spots* are per feature in the reference; they are why
+   disaggregated-serving test as CI does; a drafter's acceptance is judged by
+   the tree's own acceptance test. *Blind spots* are per feature in the reference; they are why
    each feature carries a proof of its own.
 
 | feature | on in `task.yaml` by | proof that it ran | judged by |

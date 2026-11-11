@@ -34,7 +34,7 @@ from rich.markup import escape as escape_markup
 
 from agent_flow.console import print_message, print_rule
 
-from ..checks import accuracy_policy, gate_cli, gate_records, test_results
+from ..checks import accuracy_policy, gate_cli, test_results
 from ..checks import verdict as check_result
 from ..checks.accuracy import resolve_model_key
 from ..checks.delivery import Check as DeliveryCheck
@@ -171,8 +171,6 @@ def _measure(workflow, check: contract_mod.Check, round: int, anchor: float | No
         tree=workflow.task_data.get("trtllm_repo_path"),
         workspace=workflow.workspace,
         runner=workflow._shell_runner_override,
-        # The round's own results file: nothing an earlier tree measured is read.
-        records=gate_records.GateRecords(directory / gate_records.RESULTS_FILENAME),
         devices=tuple(workflow._state.devices) or None,
         anchor_score=anchor,
     )

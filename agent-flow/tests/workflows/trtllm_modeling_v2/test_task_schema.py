@@ -279,3 +279,33 @@ def test_the_certified_profile_is_standard_with_the_serve_gate(tmp_path):
     assert more and all(":serve@" in key for key in more)
     # A relative variant's benchmark runs at one member under either profile.
     assert [k for k in owed if k.startswith("kv_fp8:accuracy")] == ["kv_fp8:accuracy[gsm8k]@dep4"]
+
+
+def test_a_drafter_owes_no_acceptance_check_and_the_old_keys_are_ignored_with_a_notice(tmp_path):
+    from agent_flow.workflows.trtllm_modeling_v2.run.contract import compile_contract
+
+    spec = _valid_spec(tmp_path) | {
+        "features": ["mtp"],
+        "variants": {
+            "mtp7": {
+                "unit": "mtp",
+                "gates": ["boot", "acceptance"],
+                "llm_api_options": {"speculative_config": {"max_draft_len": 7}},
+                "accuracy": {"acceptance": {"min_absolute": 2.0}},
+            }
+        },
+    }
+    spec["accuracy"]["acceptance"] = {"num_prompts": 32, "mtp": {"min_absolute": 1.5}}
+    notices: list[str] = []
+    resolved = load_and_validate_task_yaml(_write(tmp_path, spec), notices)
+    assert [n.split(" is ignored")[0] for n in notices] == [
+        "'accuracy.acceptance'",
+        "'variants.mtp7.accuracy.acceptance'",
+    ]
+    assert "judged by a native test" in notices[0]
+    contract = compile_contract(resolved, 1)
+    assert not [c.key for c in contract.required() if "acceptance" in c.key]
+    assert "mtp7:boot@tp1" in {c.key for c in contract.required()}
+    assert any(
+        "mtp: its drafter's acceptance is judged by no check here" in n for n in contract.notes
+    )

@@ -9,7 +9,7 @@ checks run with the unit's spec overlaid with the variant's switches::
       kv_fp8:
         unit: core                       # whose target and settings it starts from
         members: [tep4]                  # default: the unit's members
-        gates: [boot, accuracy]          # the default; `acceptance` needs a speculator
+        gates: [boot, accuracy]          # the default
         runtime: {extra_flags: [--kv_cache_dtype=fp8]}      # boot: appended to the unit's
         llm_api_options: {kv_cache_config: {dtype: fp8}}    # merged into the unit's YAML
         env: {}                          # added to the gate command's environment
@@ -41,6 +41,8 @@ VARIANT_KEYS: tuple[str, ...] = (
     "accuracy",
     "note",
 )
+#: ``acceptance`` is accepted for a spec written when the flow measured acceptance lengths;
+#: it owes no check now: a drafter's acceptance is a native test in a deployment's ``tests``.
 VARIANT_GATES: tuple[str, ...] = ("boot", "accuracy", "acceptance")
 DEFAULT_VARIANT_GATES: tuple[str, ...] = ("boot", "accuracy")
 #: Accuracy keys a variant may set for itself; every other key is the unit's.
@@ -51,7 +53,6 @@ VARIANT_ACCURACY_KEYS: tuple[str, ...] = (
     "discriminators",
     "benchmark_args",
     "samples",
-    "acceptance",
     "anchor",
 )
 #: The variant accuracy keys that name a reference row of the variant's own.

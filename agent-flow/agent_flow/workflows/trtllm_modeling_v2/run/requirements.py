@@ -9,7 +9,7 @@ checks do not reach), one column per member, and per cell the checks that
 prove it:
 
 - ``certified``: a check that judges the feature's output runs at that member
-  (accuracy, acceptance, the disaggregated-serving test);
+  (accuracy, the disaggregated-serving test);
 - ``sampled``: the feature boots at that member and its output is judged at
   others, named in the cell (accuracy is sampled at the members
   ``contract.benchmark_members`` picks);
@@ -51,7 +51,7 @@ COVERAGE_FILENAME = "coverage.yaml"
 
 CERTIFIED, SAMPLED, NOT_COVERED = "certified", "sampled", "not covered"
 #: Gates that judge a feature's output, as opposed to proving it starts.
-_JUDGING = ("accuracy[", "acceptance", disagg.GATE_NAME)
+_JUDGING = ("accuracy[", disagg.GATE_NAME)
 #: Pairs of units whose interaction no unit's own checks reach, and why.
 INTERACTIONS: dict[tuple[str, str], str] = {
     ("disagg", "multimodal"): (

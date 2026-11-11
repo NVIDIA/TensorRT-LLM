@@ -18,7 +18,7 @@ the delivered target.
 | Unit | Core implementation or one feature added to it |
 | Member | One parallel configuration, such as `tp4`, `tep4` or `dep4` |
 | Variant | A unit's target served another way (a KV dtype, chunked prefill, a draft depth) |
-| Check | One gate (boot, accuracy, serve, disagg, acceptance) for one unit or variant at one member |
+| Check | One gate (boot, accuracy, serve, disagg) for one unit or variant at one member |
 | Contract | Every check the run must pass, compiled from the spec |
 | Task | One piece of work for one agent turn: the survey, a kernel entry, a unit, a variant, a fix |
 | Entry | A kernel wrapper with executable input, architecture and correctness contracts |

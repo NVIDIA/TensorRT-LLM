@@ -635,7 +635,7 @@ def check_capture_lists(task_data: Mapping[str, Any]) -> list[str]:
         return [f"cuda graphs: an options file does not parse ({exc}); capture lists unchecked"]
     return [
         f"cuda graphs: {c.name}: {c.resolved.describe() if c.resolved else 'eager'}, "
-        "at boot, acceptance and accuracy alike (preview, not actual capture evidence)"
+        "at boot and accuracy alike (preview, not actual capture evidence)"
         for c in captures
     ]
 
@@ -732,7 +732,7 @@ def check_kv_cache_configs(
             handed.setdefault(described, []).append(label(launch))
     for described, labels in handed.items():
         notes.append(
-            f"kv cache: {', '.join(labels)}: boot, acceptance and {_LLM_API_GATE} use "
+            f"kv cache: {', '.join(labels)}: boot and {_LLM_API_GATE} use "
             f"`kv_cache_config` {described}"
         )
     unbounded = [label(launch) for launch in launches if "host_cache_size" not in launch.config]
@@ -753,7 +753,7 @@ def check_kv_cache_configs(
             f"block reuse: {', '.join(exposed)}: ask for KV-cache block reuse, and their "
             f"options set no Mamba state snapshot policy, on a hybrid checkpoint "
             f"({marker} in config.json). The engine turns block reuse off without one, so it "
-            f"will be off in every gate they run, and the boot, acceptance and accuracy "
+            f"will be off in every gate they run, and the boot and accuracy "
             f"gates fail on the engine's warning. Set "
             f"`kv_cache_config.mamba_state_config.periodic_snapshot_interval` (or snapshot "
             f"offsets) in their options file, or turn `kv_cache_reuse` off for them"
