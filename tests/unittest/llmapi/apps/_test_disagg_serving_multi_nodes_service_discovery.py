@@ -34,6 +34,7 @@ DISAGG_SERVER_PORT = 8000
 DISAGG_SERVER_START_TIMEOUT_S = 1200
 WORKER_READY_PORT = 8003
 WORKER_READY_TIMEOUT_S = 300
+WORKER_SHUTDOWN_TIMEOUT_S = 7200
 
 
 @pytest.fixture(autouse=True)
@@ -271,6 +272,7 @@ def test_completion(
         wait_for_endpoint_ready(disagg_health_url, timeout=DISAGG_SERVER_START_TIMEOUT_S)
     if is_pytest_node():
         print(f"running test_completion on rank {RANK} node rank {NODE_RANK}")
+        wait_for_worker_ready()
         prompt = "What is the result of 1+1? Answer in one word: "
         for _ in range(10):
             completion = client.completions.create(
@@ -284,13 +286,12 @@ def test_completion(
             message = completion.choices[0].text
             assert message.startswith("2.")
 
-        wait_for_worker_ready()
         disagg_server.terminate()
 
     elif is_gen_node() and is_worker_task():
         # Keep the generation worker alive until the test ends.
         signal_worker_ready(disagg_host)
-        wait_for_endpoint_down(disagg_health_url)
+        wait_for_endpoint_down(disagg_health_url, timeout=WORKER_SHUTDOWN_TIMEOUT_S)
         assert True
     else:
         assert True
