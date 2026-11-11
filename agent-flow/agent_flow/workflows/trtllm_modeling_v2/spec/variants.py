@@ -27,8 +27,6 @@ import copy
 import re
 from typing import Any, Mapping
 
-from .schema_keys import reject_unknown_keys
-
 VARIANTS_FIELD = "variants"
 #: What an accuracy floor stands on (`accuracy.anchor`; see task_schema.ANCHOR_STATES).
 ANCHOR_RECORDED = "recorded"
@@ -119,6 +117,9 @@ def validate_variants(
     errors: list[str],
 ) -> None:
     """Every problem with the ``variants`` block, batched into ``errors``."""
+    # Imported here: the schema module imports this one.
+    from .task_schema import TaskSchemaError, parse_parallel_segment, reject_unknown_keys
+
     if block is None:
         return
     if not isinstance(block, Mapping):
@@ -159,8 +160,6 @@ def validate_variants(
             elif not isinstance(members, list) or not members:
                 errors.append(f"'{where}.members' must be a non-empty list of parallel segments")
             else:
-                from .task_schema import TaskSchemaError, parse_parallel_segment
-
                 for member in members:
                     try:
                         _, size = parse_parallel_segment(str(member))

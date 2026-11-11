@@ -256,8 +256,8 @@ def _feedback(argv: list[str]) -> int:
 #: A run is ``trtllm-modeling-v2 --task ...``; a first argument named here
 #: dispatches instead, and everything after it is the subcommand's own.
 SUBCOMMANDS = {
-    # From a request to a spec, before launch: `intake derive|lint ...` (spec/INTAKE.md).
-    "intake": _lazy_main(".spec.intake"),
+    # From a request to a spec, before launch: `intake derive ...` (spec/INTAKE.md).
+    "intake": _lazy_main(".spec.derive"),
     "gate": _lazy_main(".checks.gate_cli"),
     # The operator's loop of a run: wait, status.
     "monitor": _lazy_main(".infra.monitor.status"),

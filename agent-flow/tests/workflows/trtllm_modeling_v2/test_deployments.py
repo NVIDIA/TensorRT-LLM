@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 import yaml
@@ -13,7 +14,7 @@ import yaml
 from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
-from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, task_schema
+from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
     TaskSchemaError,
     load_and_validate_task_yaml,
@@ -497,3 +498,84 @@ def test_a_run_journals_the_deployments_its_shorthand_comes_to(tmp_path, task_fi
     journal = (tmp_path / "ws" / "journal.md").read_text()
     assert "deployments: 1" in journal
     assert "- `tp1` (core): aggregated, 1 rank(s); judged by its boot, gsm8k" in journal
+
+
+# ------------------------------------------------------------------- the spec's warnings
+
+
+def _warned(tmp_path, spec: dict) -> list[str]:
+    return derive.spec_warnings(_load(tmp_path, spec))
+
+
+def test_a_first_deployment_too_narrow_for_the_weights_is_warned_of(tmp_path):
+    spec = _delivered(
+        tmp_path, parallel="tp4", model_key="org/model", agent="claude-test-model", disagg=False
+    )
+    spec["environment"]["gpu_memory_gib"] = 80
+    index = {"metadata": {"total_size": 300 * 2**30}, "weight_map": {}}
+    (tmp_path / "ckpt" / "model.safetensors.index.json").write_text(json.dumps(index))
+    # 300 GiB over 60 GiB a device (75% of 80): one engine needs 8 devices.
+    [narrow] = [w for w in _warned(tmp_path, spec) if w.startswith("first deployment too narrow")]
+    assert "`tp4` holds the checkpoint's 300 GiB of weights on 4 device(s)" in narrow
+    assert narrow.endswith("start at 8 or more")
+    # Unknown device memory: no estimate.
+    del spec["environment"]["gpu_memory_gib"]
+    assert not [w for w in _warned(tmp_path, spec) if "too narrow" in w]
+
+
+def test_a_first_deployment_without_an_anchor_is_warned_of(tmp_path):
+    spec = _delivered(
+        tmp_path, parallel="tp1", model_key="org/model", agent="claude-test-model", disagg=False
+    )
+    [said] = _warned(tmp_path, spec)
+    assert said.startswith("no accuracy anchor: no reference row for `org/model`")
+    assert "declare `anchor` with its `source`" in said
+    references = tmp_path / "repo" / spec["accuracy"]["reference_yaml"]
+    references.parent.mkdir(parents=True)
+    references.write_text("org/model:\n  - accuracy: 41.77\n", encoding="utf-8")
+    assert _warned(tmp_path, spec) == []
+    # Stated deployments: a declared anchor is one; no benchmark at all is none.
+    native = _native(tmp_path)
+    native["deployments"][0]["benchmarks"] = native["deployments"][0]["benchmarks"][2:]
+    assert _warned(tmp_path, native) == []
+    del native["deployments"][0]["benchmarks"]
+    [said] = _warned(tmp_path, native)
+    assert said.startswith("no accuracy anchor: `dep16` names no benchmark")
+
+
+def test_a_deployment_scored_without_cuda_graphs_is_warned_of(tmp_path):
+    spec = _delivered(
+        tmp_path, parallel="tp1", model_key="org/model", agent="claude-test-model", disagg=False
+    )
+    spec["variants"]["kv_fp8"]["llm_api_options"]["cuda_graph_config"] = None
+    spec["variants"]["boots"] = {"gates": ["boot"], "runtime": {"cuda_graph": False}}
+    [eager] = [w for w in _warned(tmp_path, spec) if w.startswith("accuracy without CUDA graphs")]
+    # The variant that only boots is scored nowhere, so it is not named.
+    assert "`kv_fp8@tp1` scored with `cuda_graph_config: null`" in eager
+
+
+def test_intake_derive_writes_the_spec_and_prints_its_warnings(tmp_path, capsys):
+    checkpoint, repo = _dirs(tmp_path)
+    (tmp_path / "ckpt" / "config.json").write_text(
+        json.dumps({"architectures": ["ToyForCausalLM"], "_name_or_path": "org/toy"})
+    )
+    out = tmp_path / "out"
+    argv = [
+        "derive",
+        "--checkpoint",
+        checkpoint,
+        "--repo",
+        repo,
+        "--goal",
+        "tp1",
+        "--out",
+        str(out),
+    ]
+    assert derive.main(argv) == 0
+    printed = capsys.readouterr().out
+    assert (out / derive.SPEC_FILENAME).is_file() and (out / derive.REPORT_FILENAME).is_file()
+    assert "warning: no accuracy anchor: no reference row for `org/toy`" in printed
+    assert "open: arch: name the GPU architecture" in printed
+    assert derive.main(["--help"]) == 0
+    assert derive.main(["lint", "--task", "x.yaml"]) == 2
+    assert "usage: trtllm-modeling-v2 intake derive" in capsys.readouterr().err

@@ -262,9 +262,7 @@ node: `launch_disaggregated_llm` starts every worker on one host. It gets two
 engines' devices at the member's width, at most a node's (`dep4` on a 4-GPU
 node: write the test for two engines of two; `accuracy.disagg.devices`
 overrides, never past a node), and passes only when every test the node id
-selects passed: a skip (too few devices, no `LLM_MODELS_ROOT`) fails it. The
-intake lint's `disagg-placement` says whether two engines of the checkpoint fit
-the node.
+selects passed: a skip (too few devices, no `LLM_MODELS_ROOT`) fails it.
 
 **Blind spots.** Boot and accuracy never cross the hop; only the test does, and
 it judges a benchmark score, not token identity with an aggregated engine. A
@@ -330,8 +328,7 @@ unit's own score at the same member on the same target (`anchor: relative`, a
 floor 2 SE of the difference under it); with
 `accuracy.discriminators.kv_cache_quant_algo` it is judged against that dtype's
 own row instead. The accuracy check fails unless every rank's worker resolved the
-declared dtype (an NVFP4 request that resolved FP8 is a mismatch); intake lint
-blocks a dtype the engine does not load. Feature `kv_quant` (native storage
+declared dtype (an NVFP4 request that resolved FP8 is a mismatch). Feature `kv_quant` (native storage
 instead of bf16 containers) is a unit like the others: its boot and accuracy
 run with the native storage on.
 
@@ -395,8 +392,8 @@ in `_torch/pyexecutor/cuda_graph_runner.py`, `DecoderCudaGraphs` in
 captured exactly and at one that is padded. Add
 `TLLM_CUDA_GRAPH_STRICT_BUFFERS=1` while debugging.
 
-**Flow proof.** `runtime.cuda_graph: true` in every gate (lint blocks an eager
-accuracy check). Each rank reports its CUDA-graph settings (batch sizes,
+**Flow proof.** `runtime.cuda_graph: true` in every gate (the spec's warnings name an
+eager accuracy check). Each rank reports its CUDA-graph settings (batch sizes,
 padding), held to the declaration, and must also report the engine's planned
 capture list. `overlap_scheduler` is read back only as an argument.
 

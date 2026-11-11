@@ -74,12 +74,10 @@ checkout and workspace paths, the feature and parallelism scope and the accuracy
 The agent prepares the spec and launches the workflow; missing inputs must be resolved, not guessed.
 
 **The agent writes the spec by following [spec/INTAKE.md](spec/INTAKE.md)**: `trtllm-modeling-v2 intake
-derive` writes a starting spec, and `trtllm-modeling-v2 intake lint` checks it for what would stop
-a launch or judge it wrongly (an accuracy check without CUDA graphs, a member too narrow for one
-engine, an accuracy anchor that cannot be read or is a placeholder, a requested cell no check
-covers, a KV-cache dtype the engine does not load) and prints the contract's checks per unit and
-variant. Launch only once the lint is clean or its findings are accepted in `notes`, and after a
-`--dry-run`, which touches no GPU.
+derive` writes a starting spec and prints three warnings where they apply: a first deployment
+too narrow for the checkpoint's weights, a first deployment with no accuracy anchor, and a
+deployment scored without CUDA graphs. Launch after a `--dry-run`, which validates the spec,
+journals the same warnings and the deployments the spec comes to, and touches no GPU.
 
 **Example prompt** — replace placeholders and omit requirements you do not need.
 
@@ -147,7 +145,7 @@ round goes on from the verdicts it recorded for the same commit. `--clean` start
 
 | Location | Responsibility |
 |---|---|
-| `cli.py`, `spec/` | Entry point; task schema, derivation, lint and configuration variants |
+| `cli.py`, `spec/` | Entry point; task schema, deployments, derivation and configuration variants |
 | `agents/` | Role and model routing, turns, the decision table, prompts and skills |
 | `operators/` | Inventory, prior art and the vocabulary (`vocabulary.yaml`) |
 | `run/workflow.py` | Lifecycle: init, resume, turn dispatch, close |

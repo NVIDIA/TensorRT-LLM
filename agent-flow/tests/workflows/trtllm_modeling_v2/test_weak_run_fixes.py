@@ -66,7 +66,8 @@ from agent_flow.workflows.trtllm_modeling_v2.run import certify
 from agent_flow.workflows.trtllm_modeling_v2.run import workflow as workflow_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import Pipeline, Task, static_repair_block
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe, preflight
-from agent_flow.workflows.trtllm_modeling_v2.spec import lint
+from agent_flow.workflows.trtllm_modeling_v2.spec import derive
+from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
 from ._helpers import Script, _run, _state, _task_id, _tasks, _write_vocabulary
 
@@ -148,22 +149,21 @@ def test_a_missing_anchor_row_says_how_to_measure_and_write_one(tmp_path):
     assert "trtllm-eval --model <checkpoint> <benchmark>" in message
 
 
-def test_a_measured_small_anchor_is_not_called_a_placeholder(tmp_path):
-    """Review of the runs: Qwen3-0.6B's measured 41.77 is an anchor, not a guess to replace."""
-    references = tmp_path / "gsm8k.yaml"
+def test_a_measured_small_anchor_is_not_called_a_placeholder(task_file, repo):
+    """Review of the runs: Qwen3-0.6B's measured 41.77 is an anchor, not a guess to replace.
+
+    The spec's warnings say when the first deployment has no anchor; an anchor that is
+    there is never questioned for being low.
+    """
+    spec = yaml.safe_load(task_file.read_text())
+    spec["accuracy"]["model_key"] = "Qwen/Qwen3-0.6B"
+    task_file.write_text(yaml.safe_dump(spec))
+    task = load_and_validate_task_yaml(task_file)
+    [missing] = derive.spec_warnings(task)
+    assert missing.startswith("no accuracy anchor: no reference row for `Qwen/Qwen3-0.6B`")
+    references = repo / spec["accuracy"]["reference_yaml"]
     references.write_text("Qwen/Qwen3-0.6B:\n  - accuracy: 41.77\n", encoding="utf-8")
-    task = {
-        "accuracy": {
-            "benchmark": "gsm8k",
-            "reference_yaml": str(references),
-            "model_key": "Qwen/Qwen3-0.6B",
-        }
-    }
-    [finding] = lint.accuracy_rules(lint.LintContext(task=task, world=1))
-    assert finding.severity == lint.WARN
-    assert "is a low placeholder" not in finding.message
-    assert "if it is a placeholder" in finding.message
-    assert "a measured score of a small model is right as it is" in finding.fix
+    assert derive.spec_warnings(task) == []
 
 
 def test_delivered_tests_run_with_the_tree_first_on_pythonpath(tmp_path):

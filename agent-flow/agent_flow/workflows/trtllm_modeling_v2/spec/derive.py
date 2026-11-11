@@ -32,7 +32,7 @@ from typing import Any, Mapping
 import yaml
 
 from ..operators import tree_anchors
-from .schema_keys import reject_unknown_keys
+from . import deployments as deployments_mod
 from .task_schema import (
     DISAGG_FEATURE,
     DISAGG_KEYS,
@@ -43,6 +43,8 @@ from .task_schema import (
     PROFILE_STANDARD,
     PROFILES,
     SPECULATORS,
+    reject_unknown_keys,
+    resolve_per_unit,
 )
 
 #: The derived spec and its report, in the workspace.
@@ -737,6 +739,132 @@ def _llm_api_options(
     return options
 
 
+#: The share of a device's memory one engine's weights may take: the rest holds the KV cache,
+#: activations and CUDA graphs.
+ENGINE_WEIGHT_FRACTION = 0.75
+
+
+def checkpoint_weight_bytes(checkpoint: str | Path | None) -> int | None:
+    """The checkpoint's weights in bytes: its safetensors index's total, else its files' sizes."""
+    if not checkpoint:
+        return None
+    root = Path(str(checkpoint))
+    try:
+        index = json.loads((root / "model.safetensors.index.json").read_text(encoding="utf-8"))
+        total = int((index.get("metadata") or {}).get("total_size") or 0)
+        if total > 0:
+            return total
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        total = sum(f.stat().st_size for f in root.glob("*.safetensors"))
+    except OSError:
+        return None
+    return total or None
+
+
+def engine_width(weight_bytes: int | None, gpu_memory_gib: Any) -> int | None:
+    """The fewest devices (a power of two) one engine's weights fit on; ``None`` unknown."""
+    memory = gpu_memory_gib
+    if not weight_bytes or not isinstance(memory, (int, float)) or memory <= 0:
+        return None
+    room = ENGINE_WEIGHT_FRACTION * float(memory) * 2**30
+    width = 1
+    while weight_bytes / width > room:
+        width *= 2
+    return width
+
+
+def spec_warnings(task: Mapping[str, Any]) -> list[str]:
+    """What a spec is likely to cost or miss, read off its deployments before any GPU is spent.
+
+    Three things, each a line that says what to do; none stops a run:
+
+    - the first deployment holds the checkpoint on too few devices
+      (``environment.gpu_memory_gib`` says how much one has);
+    - the first deployment has no anchor: no benchmark, or no reference row for
+      ``accuracy.model_key`` and no declared one, so ``onboarded`` can only mean it boots;
+    - a deployment is scored without CUDA graphs: a full benchmark takes 10 to 50 times
+      longer, and what is scored is not the captured path the target serves.
+
+    An anchor that exists is never questioned: a small model's measured score is low.
+    """
+    try:
+        found = deployments_mod.resolve(task)
+    except (ValueError, OSError, KeyError):
+        return []
+    if not found:
+        return []
+    said: list[str] = []
+    core = found[0]
+    memory = (task.get("environment") or {}).get("gpu_memory_gib")
+    weights = checkpoint_weight_bytes(task.get("checkpoint_path"))
+    width = engine_width(weights, memory)
+    for role, server in core.servers.items():
+        ranks = int(server.options.get("tensor_parallel_size") or 1)
+        if width is not None and ranks < width:
+            said.append(
+                f"first deployment too narrow: `{core.name}` holds the checkpoint's "
+                f"{weights / 2**30:.0f} GiB of weights on {ranks} device(s), more than "
+                f"{ENGINE_WEIGHT_FRACTION:.0%} of each {memory:g}-GiB device, which leaves the "
+                f"KV cache and CUDA graphs no room, if it loads at all; start at {width} or more"
+            )
+            break
+    accuracy = task.get("accuracy") or {}
+    if not core.benchmarks:
+        said.append(
+            f"no accuracy anchor: `{core.name}` names no benchmark, so `onboarded` means it "
+            f"boots and answers the boot prompts, and nothing judges its accuracy"
+        )
+    elif core.relative_to is None and not any(b.anchor is not None for b in core.benchmarks):
+        benchmark = core.benchmarks[0].name
+        if not _has_reference_row(task, accuracy, benchmark):
+            said.append(
+                f"no accuracy anchor: no reference row for `{accuracy.get('model_key') or '?'}` "
+                f"in the tree's `{benchmark}` references and no declared `anchor`, so the run "
+                f"cannot judge `{core.name}`'s accuracy; measure one with an implementation that "
+                f"already serves the checkpoint and write the row, or declare `anchor` with its "
+                f"`source`"
+            )
+    eager = [
+        d.name
+        for d in found
+        if d.benchmarks
+        and any(
+            "cuda_graph_config" in s.options and s.options["cuda_graph_config"] is None
+            for s in d.servers.values()
+        )
+    ]
+    if eager:
+        said.append(
+            f"accuracy without CUDA graphs: {', '.join(f'`{name}`' for name in eager)} "
+            f"scored with `cuda_graph_config: null`: a full benchmark takes 10-50x longer, each "
+            f"fix-and-recheck pays it again, and what is scored is not the captured path the "
+            f"target serves; turn the graphs on unless the eager score is the point"
+        )
+    return said
+
+
+def _has_reference_row(
+    task: Mapping[str, Any], accuracy: Mapping[str, Any], benchmark: str
+) -> bool:
+    """Whether the tree's references hold a row for the spec's model on ``benchmark``."""
+    key = accuracy.get("model_key")
+    if not key:
+        return False
+    stated = resolve_per_unit(accuracy, "reference_yaml", "core")
+    path = Path(
+        str(stated or f"{tree_anchors.ANCHORS['accuracy_references'].hint}/{benchmark}.yaml")
+    )
+    if not path.is_absolute():
+        path = Path(str(task.get("trtllm_repo_path") or "")) / path
+    try:
+        rows = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return False
+    return isinstance(rows, Mapping) and bool(rows.get(key))
+
+
 def _tree_path(site: Mapping[str, Any], key: str) -> str:
     """Where anchor ``key`` is in the site's checkout (``operators/tree_anchors.py``), else its hint."""
     found = tree_anchors.resolve(site.get("trtllm_repo_path"), key)
@@ -749,12 +877,10 @@ def disagg_layout(
     """``(devices per node, nodes)`` the disaggregated-serving test needs; ``None`` unknown.
 
     One context and one generation engine, each on the fewest devices that hold
-    the checkpoint's weights (``lint.engine_width``): on one node when both fit,
+    the checkpoint's weights (:func:`engine_width`): on one node when both fit,
     as the tree's own disaggregated accuracy tests run (context and generation
     sharing a node); else one engine per node, or as many nodes as an engine needs.
     """
-    from .lint import engine_width
-
     width = engine_width(weight_bytes, gpu_memory_gib)
     if width is None or not isinstance(gpus_per_node, int) or gpus_per_node <= 0:
         return None
@@ -786,8 +912,6 @@ def _disagg(
     if block:
         note("accuracy.disagg", dict(block), "site")
     if "devices" not in block and "nodes" not in block and checkpoint is not None:
-        from .lint import checkpoint_weight_bytes
-
         environment = site.get("environment") or {}
         per_node = environment.get("gpus_per_node") or (site.get("device") or {}).get(
             "gpus_per_node"
@@ -909,6 +1033,68 @@ def hybrid_marker(config: Mapping[str, Any]) -> str | None:
     return None
 
 
+USAGE = """usage: trtllm-modeling-v2 intake derive --checkpoint DIR (--site FILE | --repo DIR) --out DIR [--goal "..."]
+
+Derive a spec from the checkpoint, the goal and an optional site.yaml; write it, each
+unit's LLM-API options and derive.report.md into --out, print what it is likely to cost
+or miss, and stop: no run, no GPU. spec/INTAKE.md in the workflow's package is the
+procedure. `trtllm-modeling-v2 --task SPEC --workspace W --dry-run` validates a spec.
+"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``trtllm-modeling-v2 intake derive ...``: 0 written, 2 a goal or site it cannot derive from."""
+    import argparse
+    import sys
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("-h", "--help"):
+        print(USAGE)
+        return 0 if argv else 2
+    if argv[0] != "derive":
+        print(USAGE, file=sys.stderr)
+        return 2
+    parser = argparse.ArgumentParser(
+        prog="trtllm-modeling-v2 intake derive",
+        description="Derive a spec and stop: no run, no GPU. The derived spec is a starting "
+        "point to edit, not a launch.",
+    )
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--goal", default=None, help="Features, members and workload in one line.")
+    parser.add_argument("--site", type=Path, default=None, help="The cluster's site.yaml, if any.")
+    parser.add_argument(
+        "--repo",
+        type=Path,
+        default=None,
+        help="The TensorRT-LLM checkout, when there is no --site.",
+    )
+    parser.add_argument("--out", type=Path, required=True, help="Directory to write into.")
+    args = parser.parse_args(argv[1:])
+    if args.site is not None:
+        site = yaml.safe_load(args.site.read_text(encoding="utf-8")) or {}
+    elif args.repo is not None:
+        site = {"trtllm_repo_path": str(args.repo.resolve()), "environment": {"kind": "local"}}
+    else:
+        parser.error("give --site, or --repo when the cluster has no site.yaml")
+    try:
+        derivation = derive_spec(args.checkpoint, site, parse_goal(args.goal), site_path=args.site)
+    except DeriveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.site is None:
+        derivation.questions.append(
+            "environment: no --site was given, so the spec carries `environment: {kind: local}`; "
+            "replace it with the cluster's (its interpreter, image, mounts)"
+        )
+    path = write_derivation(args.out, derivation)
+    print(f"→ {path}\n→ {args.out / REPORT_FILENAME}")
+    for warning in spec_warnings(yaml.safe_load(path.read_text(encoding="utf-8")) or {}):
+        print(f"  warning: {warning}")
+    for question in derivation.questions:
+        print(f"  open: {question}")
+    return 0
+
+
 __all__ = [
     "hybrid_marker",
     "DEFAULT_BOOT",
@@ -926,7 +1112,11 @@ __all__ = [
     "Goal",
     "derive_spec",
     "draft_layers",
+    "checkpoint_weight_bytes",
+    "engine_width",
     "inspect_checkpoint",
+    "main",
+    "spec_warnings",
     "parse_goal",
     "read_config",
     "render_report",

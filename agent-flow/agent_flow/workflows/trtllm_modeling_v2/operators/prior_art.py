@@ -15,7 +15,7 @@ Intake reads it from disk only: no engine import, no GPU. Two products:
   trtllm-gen FMHA has no kernel for, say), with the design it usually implies.
   Each limit is one :data:`ENGINE_RULES` entry.
 
-All are printed by ``trtllm-modeling-v2 intake lint`` so the operator can put
+The survey's dispatch carries the ranking, so the operator can put
 the leads that hold into the spec's ``notes``, which every role reads.
 
 Every place read off the tree is an anchor (:mod:`.tree_anchors`): found where
@@ -351,7 +351,7 @@ def fmha_rule(repo: str | Path | None) -> tuple[tuple[int, ...], int, str] | Non
     """The head dimensions the trtllm-gen FMHA has kernels for and ``path:line`` it was read at.
 
     ``None`` when this checkout states the rule nowhere: no limit is then
-    claimed, and the lint names the missing anchor.
+    claimed.
     """
     found = tree_anchors.read(repo, "fmha_head_dims")
     if found is None:
@@ -487,7 +487,7 @@ def engine_kv_dtypes(repo: str | Path | None) -> tuple[tuple[str, ...], str] | N
     return (values, where) if values else None
 
 
-#: The anchors this module reads; the lint names each this checkout has nowhere.
+#: The anchors this module reads.
 PRIOR_ART_ANCHORS: tuple[str, ...] = (
     *(key for key, _ in ENGINE_ANCHORS),
     "fmha_head_dims",

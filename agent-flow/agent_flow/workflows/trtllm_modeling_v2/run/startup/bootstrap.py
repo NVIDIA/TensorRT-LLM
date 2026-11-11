@@ -37,6 +37,7 @@ from ...operators.inventory import (
     write_surface_file,
 )
 from ...spec import deployments as deployments_mod
+from ...spec import derive as derive_mod
 from ...spec.task_schema import assembly_units
 from .. import contract as contract_mod
 from .. import requirements as requirements_mod
@@ -258,7 +259,7 @@ def _write_contract(workflow) -> None:
         "coverage: what the contract proves of the request", workflow._coverage.render()
     )
     _write_deployments(workflow)
-    _write_intake_lint(workflow)
+    _write_spec_warnings(workflow)
 
 
 def _write_deployments(workflow) -> None:
@@ -275,20 +276,11 @@ def _write_deployments(workflow) -> None:
     workflow.journal.section(f"deployments: {len(found)}", deployments_mod.describe(found))
 
 
-def _write_intake_lint(workflow) -> None:
-    """Journal the intake lint of the spec the run starts from; a finding never stops the run."""
-    from ...spec import lint as lint_mod
-
-    try:
-        report = lint_mod.lint_task(
-            workflow.task_data,
-            contract=workflow._contract,
-            world_size=workflow._gate_env().world_size,
-        )
-    except Exception as exc:  # the lint is advice: it must not cost the run its start
-        workflow.journal.section("intake lint: not run", f"{type(exc).__name__}: {exc}")
-        return
-    workflow.journal.section(f"intake lint: {report.summary()}", report.render(prior_art_limit=8))
+def _write_spec_warnings(workflow) -> None:
+    """Journal what the spec is likely to cost or miss; a warning never stops the run."""
+    warnings = derive_mod.spec_warnings(workflow.task_data)
+    body = "\n".join(f"- {warning}" for warning in warnings) or "None."
+    workflow.journal.section(f"spec warnings: {len(warnings)}", body)
 
 
 def _write_host_facts(workflow, result) -> None:

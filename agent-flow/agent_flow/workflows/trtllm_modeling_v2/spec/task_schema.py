@@ -14,9 +14,10 @@ into the workspace is fully explicit.
 from __future__ import annotations
 
 import ast
+import difflib
 import re
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
@@ -27,7 +28,6 @@ from ..checks import accuracy_policy
 from ..infra.compute.environment import EnvironmentError, check_tmpdir
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
 from ..operators.coverage import MODELING_V2_PACKAGE
-from .schema_keys import reject_unknown_keys
 from .variants import ANCHOR_RECORDED, ANCHOR_RELATIVE, VARIANTS_FIELD, validate_variants
 
 REQUIRED_PATH_FIELDS: tuple[str, ...] = (
@@ -302,11 +302,11 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
     "launch",
     "env",
     # The image the GPU jobs run in, if any, and how host paths appear inside it
-    # (`host:inside`): the intake lint checks the run's paths through them.
+    # (`host:inside`).
     "container_image",
     "mounts",
     "gpus_per_node",
-    # Each device's memory, GiB: the intake lint sizes engines and disaggregation by it.
+    # Each device's memory, GiB: the spec's warnings and derive size engines by it.
     "gpu_memory_gib",
 )
 
@@ -331,6 +331,28 @@ DEFAULT_ACCURACY_TOLERANCE = 5.0
 
 class TaskSchemaError(ValueError):
     """Raised when ``task.yaml`` fails trtllm-modeling-v2 schema validation."""
+
+
+def reject_unknown_keys(
+    block: Mapping[str, Any],
+    known: Sequence[str],
+    errors: list[str],
+    *,
+    where: str = "",
+) -> None:
+    """Append an error for any key in ``block`` that ``known`` does not list.
+
+    Every block in this schema is closed: a misspelled key that is silently
+    ignored produces a run that gates a configuration nobody asked for. The
+    nearest known key is suggested.
+    """
+    prefix = f"{where}." if where else ""
+    for key in sorted(set(block) - set(known)):
+        close = difflib.get_close_matches(str(key), [str(k) for k in known], n=1, cutoff=0.6)
+        hint = f" — did you mean '{prefix}{close[0]}'?" if close else ""
+        errors.append(
+            f"unknown key '{prefix}{key}'{hint} Known keys here: {sorted(str(k) for k in known)}"
+        )
 
 
 def parse_parallel_segment(segment: str) -> tuple[str, int | None]:

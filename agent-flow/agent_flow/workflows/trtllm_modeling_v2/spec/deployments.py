@@ -39,7 +39,6 @@ from typing import Any, Mapping
 
 import yaml
 
-from .schema_keys import reject_unknown_keys
 from .task_schema import (
     ACCURACY_FIELD,
     DISAGG_FEATURE,
@@ -47,6 +46,7 @@ from .task_schema import (
     assembly_units,
     features_through,
     members_for,
+    reject_unknown_keys,
     resolve_per_unit,
     widest_world_size,
 )

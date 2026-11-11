@@ -40,8 +40,8 @@ trtllm-modeling-v2 intake derive --checkpoint <ckpt> --repo <trtllm checkout> \
     --out <dir>
 ```
 
-It writes `task.derived.yaml`, `derive.report.md` (every value the goal did not state and where
-it came from) and `intake.report.md` (the lint below, with prior art). With a `site.yaml` pass
+It writes `task.derived.yaml` and `derive.report.md` (every value the goal did not state and where
+it came from), and prints the spec's warnings (section 9). With a `site.yaml` pass
 `--site` instead of `--repo`. Edit the derived spec; copy `task.example.yaml` only for what the
 goal words cannot say.
 
@@ -83,11 +83,8 @@ requested feature **once**, at the member the request validates fully, and accep
   combination, added only when the request names it. A variant of disagg owes nothing.
 - Leave the profile at `standard` unless the request asks.
 
-The lint prints the checks per unit and variant; past ~30 deserves a second look.
-
 **The disagg test.** The run writes it; the flow deploys nothing of its own. Name the node id it
-will have, say in `notes` which task writes it (the lint's `disagg-test-pending` notes it until
-it exists), and give it what it reads in `accuracy.disagg.env`. A test that skips (too few
+will have, say in `notes` which task writes it, and give it what it reads in `accuracy.disagg.env`. A test that skips (too few
 devices, a missing model root) fails the gate: set `accuracy.disagg.devices` when it needs more
 than two engines at its member's width.
 
@@ -96,8 +93,7 @@ than two engines at its member's width.
 `cuda_graph: true`, `overlap_scheduler: true`, `chunked_prefill: false`, `kv_cache_reuse: false`
 (the core configuration; chunking and reuse are variants), `--kv_cache_fraction` around 0.7. Every accuracy gate runs a full benchmark with CUDA graphs: eager
 is 10-50x slower, each fix-and-recheck pays it, and it scores a path the target does not serve.
-The lint blocks a unit or variant whose accuracy runs eager unless the notes keep it on purpose
-(`intake-accept: accuracy-eager -- <why>`: a short subset, a capture still being built); a
+The spec's warnings name a deployment whose accuracy runs eager (section 9); a
 benchmark you start by hand runs captured too.
 
 ## 5. Accuracy and boot
@@ -122,7 +118,7 @@ benchmark you start by hand runs captured too.
   runs the checkpoint natively), else an earlier run's. **Get a real anchor before launch.** The
   certification holds each benchmark to the row as written: no score the run measures replaces
   it. A low placeholder (e.g. 10 on GSM8K, in percent) only catches an engine that answers
-  nothing, so a run delivered on it certifies no accuracy, and the lint warns. Commit the row to
+  nothing, so a run delivered on it certifies no accuracy. Commit the row to
   the checkout: the certification reads the anchor table from the commit it measures and refuses
   a checkout with uncommitted changes.
 - **Datasets.** Staged from preflight on, beside the first turns: the spec's
@@ -178,10 +174,10 @@ what the roles need while they work:
 - **Reference** — where it is, what it supports, how it loads this checkpoint's weights.
 - **Architecture** — layer pattern, attention kinds with head dims, sparse/indexer configuration,
   MoE (experts, top-k, clamps, router), norm and residual dtypes, towers.
-- **Prior art in this tree worth surveying** — the leads in `intake.report.md` that hold
+- **Prior art in this tree worth surveying** — the leads you checked in the tree that hold
   (attention backends, custom ops, other targets' `ops/`, catalog entries), one line each named by
   its `<dir>/<file>.py`: what it offers.
-- **Engine constraints** — from `intake.report.md` and the design they imply.
+- **Engine constraints** — what the engine's kernels refuse for this geometry, and the design they imply.
 - **Scope decisions** — what is gated where, what is checked outside the flow, and why.
 - **References outside the tree** — where you know them: another engine's implementation of
   this model (a checkout path, a package, a URL) and the kernels it uses.
@@ -193,17 +189,16 @@ Nothing about the intake itself: what intake may or may not do, launch blockers,
 provenance and questions for the user belong in your own summary beside the spec. Notes are read
 as standing orders, so "no build is allowed" written for the intake stops the run's own builds.
 
-## 9. Lint, then launch
+## 9. Warnings, then launch
 
-```bash
-trtllm-modeling-v2 intake lint --task task.yaml --report intake.report.md
-```
+`intake derive` prints them, and preflight journals them again (`--dry-run` runs preflight, touches
+no GPU and exits 0 when it passes). Each says what to do; none stops a run:
 
-Fix every `block` and every `warn`, or keep one on purpose with a line in `notes`:
-`intake-accept: <rule>[, <rule>] -- <why>`. A `block` is what preflight or the first boot would stop
-on (a requested cell no check covers, a KV-cache dtype the engine does not load) and cannot be
-accepted, except an accuracy check run eager on purpose. The report also prints the contract
-size; a contract past ~30 checks deserves a second look. Then `--dry-run` (it touches no GPU and
-exits 0 when preflight passes), then launch. Preflight journals the same lint, so the run's record
-shows what was accepted. Once it runs, steer it only through `feedback` (the README's "While it
+- **first deployment too narrow**: the checkpoint's weights take more than 75% of the memory of
+  the devices the first deployment has (`environment.gpu_memory_gib` says how much one holds).
+- **no accuracy anchor**: the first deployment names no benchmark, or the tree has no reference
+  row for `accuracy.model_key` and the benchmark declares no `anchor`.
+- **accuracy without CUDA graphs**: a scored deployment's options set `cuda_graph_config: null`.
+
+Then launch. Once it runs, steer it only through `feedback` (the README's "While it
 runs").

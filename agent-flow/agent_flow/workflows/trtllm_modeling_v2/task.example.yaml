@@ -1,5 +1,5 @@
 # trtllm-modeling-v2 task specification: every key the spec accepts, with its default. Fill it in
-# by following spec/INTAKE.md, lint it with `trtllm-modeling-v2 intake lint --task task.yaml`, and check it
+# by following spec/INTAKE.md and check it
 # with `trtllm-modeling-v2 --task task.yaml --workspace W --dry-run`. `trtllm-modeling-v2 intake
 # derive --checkpoint <dir> --repo <checkout> --goal "..." --out D` writes a starting spec. Or derive one:
 # `trtllm-modeling-v2 --checkpoint <dir> --site site.yaml --goal "..." --workspace W` writes
@@ -137,7 +137,7 @@ environment:
   # launch: "<site prefix>"
 
   # REQUIRED: the interpreter every Python command runs under, the editable install to measure.
-  # It must exist at launch (`intake lint` checks a path visible from this host).
+  # It must exist at launch.
   python: /path/to/TensorRT-LLM/.venv-3.12/bin/python
 
   # Exported to every command. Preflight requires TMPDIR and CLAUDE_CODE_TMPDIR outside /tmp, and
@@ -147,9 +147,9 @@ environment:
     CLAUDE_CODE_TMPDIR: /path/to/scratch/tmp
 
   # gpus_per_node: 4                        # the devices this host holds
-  # gpu_memory_gib: 288                     # per device: the lint sizes engines and disagg by it
-  # The image the GPU jobs run in, if any, and how host paths appear inside it: the intake lint
-  # checks the run's paths through them. How the image is started is yours.
+  # gpu_memory_gib: 288                     # per device: derive sizes engines and disagg by it
+  # The image the GPU jobs run in, if any, and how host paths appear inside it. How the image is
+  # started is yours.
   # container_image: /path/to/image
   # mounts: [/data:/data]
 
