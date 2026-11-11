@@ -201,6 +201,21 @@ CERTIFIED_SPLITK_PRODUCERS_TP8 = frozenset(
             ("95e7ff00cb4507f61ead2ef332c6e22c", (64, 16, 4, 10), "owner", "v4", "opt-in", True),
             ("95e7ff00cb4507f61ead2ef332c6e22c", (64, 32, 4, 8), "owner", "v4", "opt-in", True),
         ),
+        # The same census, carried over to the reformatted kernel file: the pre-commit pass (ruff format) re-wrapped
+        # lines inside splitk_gemm.py's device-code region, which changed its line md5 (95e7ff00... -> 534e6f63...)
+        # and dropped the certification, so TP8 decode steps of 33..448 rows stopped publishing. The region's AST is
+        # unchanged (ast.dump md5 30bd80a0a5c20168c7c143158b0d631c before and after), so the kernel is the certified
+        # one; the sidestream gate also checks its outputs bitwise against the pre-reformat file's on device.
+        (
+            212,
+            ("534e6f639ccb0b27b855884d278a2883", (64, 16, 4, 10), "owner", "v4", "opt-in", True),
+            ("534e6f639ccb0b27b855884d278a2883", (64, 32, 4, 8), "owner", "v4", "opt-in", True),
+        ),
+        (
+            152,
+            ("534e6f639ccb0b27b855884d278a2883", (64, 16, 4, 10), "owner", "v4", "opt-in", True),
+            ("534e6f639ccb0b27b855884d278a2883", (64, 32, 4, 8), "owner", "v4", "opt-in", True),
+        ),
     }
 )
 #: Whether the kernel launches with programmatic dependent launch (the model's ``dispatch.LAUNCH_PDL``): it reads only
