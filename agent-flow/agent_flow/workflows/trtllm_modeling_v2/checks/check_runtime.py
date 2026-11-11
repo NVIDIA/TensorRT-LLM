@@ -157,25 +157,18 @@ def write_driver_spec(
     *,
     config: Mapping[str, Any],
     requests: Sequence[Mapping[str, Any]] = (),
-    dataset: Mapping[str, Any] | None = None,
     max_tokens: int = 64,
-    concurrency: int = 1,
-    ignore_eos: bool = False,
 ) -> Path:
-    """Write public engine options and the workload to materialize before engine launch."""
-    spec = {
-        **config,
-        "requests": [dict(r) for r in requests],
-        "dataset": dict(dataset) if dataset else None,
-        "max_tokens": int(max_tokens),
-        "concurrency": int(concurrency),
-        "ignore_eos": bool(ignore_eos),
-    }
-    if not dataset:
-        spec["requests"] = workload_io.normalize_requests(spec)
-        spec.pop("dataset")
+    """Write the engine's public options and the requests the driver sends, in order."""
+    listed = []
+    for index, entry in enumerate(requests):
+        request = dict(entry)
+        request.setdefault("id", f"r{index}")
+        request.setdefault("max_tokens", int(max_tokens))
+        listed.append(request)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    spec = {**config, "requests": listed, "max_tokens": int(max_tokens)}
     target.write_text(json.dumps(spec, indent=1, ensure_ascii=False), encoding="utf-8")
     return target
 
@@ -183,21 +176,8 @@ def write_driver_spec(
 def engine_driver_command(
     environment: RunEnvironment, spec_path: str | Path, *, script: Path = ENGINE_DRIVER
 ) -> str:
-    """Normalize offline data in one CPU process, then launch the public request entry."""
-    path = Path(spec_path)
-    spec = json.loads(path.read_text(encoding="utf-8"))
-    prefix = ""
-    if spec.get("dataset"):
-        normalized = path.with_suffix(".requests.json")
-        normalizer = ENGINE_DRIVER.with_name("workload_io.py")
-        prefix = (
-            environment.python_command(
-                [str(normalizer), str(path), str(normalized)], single_process=True
-            )
-            + " && "
-        )
-        path = normalized
-    return prefix + environment.python_command([str(script), "--spec", str(path)])
+    """The driver's launch over ``spec_path``, on the environment's ranks."""
+    return environment.python_command([str(script), "--spec", str(spec_path)])
 
 
 def parse_driver_records(output: str) -> list[dict[str, Any]]:

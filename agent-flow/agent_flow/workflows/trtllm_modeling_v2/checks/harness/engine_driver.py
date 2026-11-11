@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run normalized requests through public LLM / SamplingParams / generate APIs.
+"""Run a check's requests through the public LLM / SamplingParams / generate APIs.
 
-The spec contains ``llm`` constructor options, ``sampling`` options and ordered
-``requests``, streamed in windows of ``concurrency`` and recorded one per request.
+The spec holds the ``llm`` constructor options, the ``sampling`` options and the
+``requests``, sent in order, each after the one before it finished, with one record
+printed for each.
 """
 
 from __future__ import annotations
@@ -29,8 +30,6 @@ def build_llm(spec: Mapping[str, Any]) -> tuple[Any, Any]:
     """Construct the measured tree's public API directly, without replacing classes."""
     from tensorrt_llm import LLM, SamplingParams
 
-    if spec.get("dataset"):
-        raise ValueError("dataset was not normalized before engine launch")
     options = dict(spec["llm"])
     mode = os.environ.get(MODELING_V2_ENV)
     if mode:
@@ -41,19 +40,15 @@ def build_llm(spec: Mapping[str, Any]) -> tuple[Any, Any]:
     return LLM(**options), sampling
 
 
-def sampling_for(base: Any, max_tokens: int, ignore_eos: bool) -> Any:
+def sampling_for(base: Any, max_tokens: int) -> Any:
     """A copy of the declared sampling parameters with this request's budget."""
     params = copy.deepcopy(base)
     params.max_tokens = int(max_tokens)
-    if ignore_eos:
-        params.ignore_eos = True
     return params
 
 
 def make_input(llm: Any, request: Mapping[str, Any], *, model: str = "") -> Any:
-    """Public text, token or multimodal input; images are local and never downloaded."""
-    if request.get("token_ids") is not None:
-        return {"prompt_token_ids": [int(t) for t in request["token_ids"]]}
+    """Public text or multimodal input; images are local and never downloaded."""
     prompt = str(request.get("prompt", ""))
     images = [str(p) for p in request.get("images") or ()]
     if not images:
@@ -108,7 +103,7 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
     return {
         "index": index,
         "id": request.get("id", str(index)),
-        "prompt_sha": wio.prompt_digest(str(request.get("prompt", request.get("token_ids", "")))),
+        "prompt_sha": wio.prompt_digest(str(request.get("prompt", ""))),
         "prompt_tokens": len(prompt_ids) if prompt_ids is not None else None,
         "cached_tokens": cached_tokens(output),
         **first,
@@ -120,29 +115,17 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
 
 
 def run_requests(llm: Any, base: Any, spec: Mapping[str, Any]) -> None:
-    """Send the workload's requests, ``concurrency`` at a time, and print one record for each."""
-    if spec.get("dataset"):
-        raise ValueError("dataset was not normalized before engine launch")
-    requests = spec.get("requests") or []
-    inputs = [make_input(llm, r, model=str(spec["llm"]["model"])) for r in requests]
-    concurrency = max(1, int(spec.get("concurrency", 1)))
-    for start in range(0, len(requests), concurrency):
-        window = requests[start : start + concurrency]
-        streams = [
-            llm.generate_async(
-                inputs[start + i],
-                sampling_for(base, r["max_tokens"], bool(spec.get("ignore_eos"))),
-                streaming=True,
-            )
-            for i, r in enumerate(window)
-        ]
-        for offset, (request, stream) in enumerate(zip(window, streams)):
-            steps, output = 0, None
-            for output in stream:
-                steps += 1
-            if output is None:
-                raise RuntimeError("the engine streamed no output for a request")
-            wio.emit(wio.RECORD_MARKER, record_of(start + offset, request, output, steps))
+    """Send the requests in order, each after the one before it finished; print a record for each."""
+    for index, request in enumerate(spec.get("requests") or []):
+        prompt = make_input(llm, request, model=str(spec["llm"]["model"]))
+        steps, output = 0, None
+        for output in llm.generate_async(
+            prompt, sampling_for(base, request["max_tokens"]), streaming=True
+        ):
+            steps += 1
+        if output is None:
+            raise RuntimeError("the engine streamed no output for a request")
+        wio.emit(wio.RECORD_MARKER, record_of(index, request, output, steps))
 
 
 def main(argv: list[str] | None = None) -> int:

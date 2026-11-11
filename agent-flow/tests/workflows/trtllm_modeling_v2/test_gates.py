@@ -27,44 +27,6 @@ from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
 from ._helpers import _ENTRY, _REPO_ROOT, TARGET_REL, _build_repo, _verify, _write_entry, attested
 
 
-def test_normalization_preserves_source_skip_template_order_and_image_requests(tmp_path):
-    data = tmp_path / "data.jsonl"
-    data.write_text(
-        "\n".join(
-            json.dumps(r)
-            for r in [
-                {"q": "skip", "tag": "x"},
-                {},
-                {"q": "first", "tag": "a"},
-                {"q": "second", "tag": "b"},
-            ]
-        )
-    )
-    image = {
-        "id": "image",
-        "prompt": "look",
-        "images": ["/local/image.png"],
-        "render": "raw",
-        "max_tokens": 3,
-    }
-    spec = {
-        "requests": [image],
-        "dataset": {
-            "source": str(data),
-            "text_field": "q",
-            "skip": 1,
-            "num": 2,
-            "template": "{tag}: {text}",
-        },
-    }
-    requests = workload_io.normalize_requests(spec)
-    assert requests[0] == image
-    assert [r["prompt"] for r in requests[1:]] == ["a: first", "b: second"]
-    spec["dataset"]["skip"] = 99
-    with pytest.raises(workload_io.DatasetError, match="no usable prompts"):
-        workload_io.normalize_requests(spec)
-
-
 def test_an_uncommitted_target_fails_even_though_the_file_is_there(tmp_path):
     def git(*args):
         subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
