@@ -1081,6 +1081,7 @@ def test_promote_synchronized_releases_reads_epoch_before_sync(monkeypatch):
         "promote_nccl_window_buffer_releases",
         lambda device, epoch: events.append(("promote", device, epoch)),
     )
+    monkeypatch.setattr(nccl_window_graph.torch.cuda, "current_device", lambda: 0)
 
     nccl_window_graph.promote_synchronized_nccl_window_releases()
 
