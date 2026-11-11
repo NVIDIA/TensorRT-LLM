@@ -107,6 +107,15 @@ def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monk
     finish_cleanup = threading.Event()
     released = threading.Event()
     release_errors = []
+    phase_wait_entered = threading.Event()
+    wait_for_phase = ex._worker_phase_done.wait
+
+    def record_phase_wait():
+        assert not ex._worker_phase_done.is_set()
+        phase_wait_entered.set()
+        return wait_for_phase()
+
+    monkeypatch.setattr(ex._worker_phase_done, "wait", record_phase_wait)
 
     def event_loop():
         ex.shutdown_event.set()
@@ -128,7 +137,8 @@ def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monk
         assert cleanup_started.wait(5)
         releaser = threading.Thread(target=release, daemon=True)
         releaser.start()
-        assert not released.wait(0.05)
+        assert phase_wait_entered.wait(5)
+        assert not released.is_set()
         ex.model_engine.release_executor_resources.assert_not_called()
         finish_cleanup.set()
         assert released.wait(5)
