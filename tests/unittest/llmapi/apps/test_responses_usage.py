@@ -307,7 +307,7 @@ class _FinishedGeneration:
     """What the engine hands back for a request: finished, one output, one step."""
 
     def __init__(self, prompt_token_ids, disaggregated_params=None, cached_tokens=_CACHED_TOKENS):
-        self.id = 1
+        self.id = self.request_id = 1
         self.prompt_token_ids = prompt_token_ids
         self.cached_tokens = cached_tokens
         self.outputs = [

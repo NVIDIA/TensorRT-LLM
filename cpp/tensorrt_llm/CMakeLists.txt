@@ -192,11 +192,6 @@ endif()
 find_package(Threads REQUIRED)
 add_subdirectory(common)
 
-add_library(ipc_nvls_memory_src STATIC runtime/ipcNvlsMemory.cu)
-set_target_properties(
-  ipc_nvls_memory_src PROPERTIES POSITION_INDEPENDENT_CODE ON
-                                 CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-
 add_subdirectory(kernels)
 add_subdirectory(runtime)
 
@@ -254,7 +249,6 @@ set(TRTLLM_LINK_LIBS
     compressorKernels_src
     fusedSamplingKernels_src
     mhcKernels_src
-    userbuffers_src
     ${DECODER_SHARED_TARGET_0}
     ${DECODER_SHARED_TARGET_1})
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
@@ -318,15 +312,48 @@ endif()
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
-target_link_libraries(
-  ${SHARED_TARGET}
-  PRIVATE
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_error,tllm_common_logging,tllm_common_cuda,tllm_executor_types,tllm_executor_serialization,tllm_runtime_memory,tllm_runtime_buffers,tllm_runtime_distributed,tllm_runtime_topology>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_environment,tllm_executor_values,tllm_executor_transfer_agent,tllm_kv_cache_host_memory,tllm_kv_cache,tllm_kv_cache_legacy,tllm_batch_scheduler,tllm_kernel_kv_cache_copy>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+set(TLLM_FACADE_COMPONENT_TARGETS
+    ipc_nvls_memory_src
+    tllm_batch_request_info
+    tllm_batch_scheduler
+    tllm_common_cuda
+    tllm_common_environment
+    tllm_common_error
+    tllm_common_logging
+    tllm_common_profiler
+    tllm_context_transfer_consensus
+    tllm_executor_agent_name
+    tllm_executor_memory_desc
+    tllm_executor_serialization
+    tllm_executor_transfer_agent
+    tllm_executor_types
+    tllm_executor_values
+    tllm_kernel_kv_cache_copy
+    tllm_kv_cache
+    tllm_kv_cache_host_memory
+    tllm_kv_cache_legacy
+    tllm_peft_cache
+    tllm_runtime_buffers
+    tllm_runtime_distributed
+    tllm_runtime_gdr
+    tllm_runtime_host_accessible_memory
+    tllm_runtime_locality
+    tllm_runtime_lora
+    tllm_runtime_lora_cache
+    tllm_runtime_memory
+    tllm_runtime_numpy
+    tllm_runtime_topology
+    tllm_runtime_utils
+    tllm_runtime_worker_pool
+    userbuffers_src)
+
+foreach(
+  component
+  ${TLLM_FACADE_COMPONENT_TARGETS} ${BATCH_MANAGER_TARGET} ${EXECUTOR_TARGET}
+  fp8_blockscale_gemm_src ${INTERNAL_CUTLASS_KERNELS_TARGET})
+  target_link_libraries(${SHARED_TARGET}
+                        PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${component}>)
+endforeach()
 
 foreach(component IN LISTS TLLM_KERNEL_COMPONENT_TARGETS)
   target_link_libraries(${SHARED_TARGET}
@@ -336,29 +363,7 @@ foreach(component IN LISTS TLLM_KERNEL_COMPONENT_TARGETS)
 endforeach()
 
 # Components also link each other normally; retain all component exports here.
-set_property(TARGET ${SHARED_TARGET}
-             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_error WHOLE_ARCHIVE)
-set_property(TARGET ${SHARED_TARGET}
-             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_logging WHOLE_ARCHIVE)
-set_property(TARGET ${SHARED_TARGET}
-             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_executor_types WHOLE_ARCHIVE)
-
-foreach(
-  component
-  tllm_common_cuda
-  tllm_runtime_memory
-  tllm_runtime_buffers
-  tllm_runtime_distributed
-  tllm_runtime_topology
-  tllm_executor_serialization
-  tllm_common_environment
-  tllm_executor_values
-  tllm_executor_transfer_agent
-  tllm_kv_cache_host_memory
-  tllm_kv_cache
-  tllm_kv_cache_legacy
-  tllm_batch_scheduler
-  tllm_kernel_kv_cache_copy)
+foreach(component IN LISTS TLLM_FACADE_COMPONENT_TARGETS)
   set_property(TARGET ${SHARED_TARGET}
                PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
 endforeach()

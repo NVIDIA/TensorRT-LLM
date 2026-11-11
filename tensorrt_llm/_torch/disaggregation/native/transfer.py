@@ -18,12 +18,13 @@ from __future__ import annotations
 import math
 import os
 import queue
+import secrets
 import struct
 import threading
 import time
 import weakref
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union
 
@@ -88,7 +89,7 @@ from tensorrt_llm._torch.disaggregation.native.ownership import (
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo, validate_protocol_version
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -152,6 +153,9 @@ class RecvReqInfo:
     # Context-first receivers send REQUEST_DATA only after the context phase
     # produced the KV cache, so a TxSession must already exist (or have ended).
     context_first: bool = False
+    # Single-use token the receiver minted for this writer; echoed in every
+    # KV result. Carried as a separate REQUEST_DATA frame, not in to_bytes().
+    kv_result_report_token: bytes = field(default=b"", repr=False, compare=False)
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -178,6 +182,8 @@ class RecvReqInfo:
         ]
         from_older_release = _OLDER_RELEASE_REQUEST_KEY in d
         d.pop(_OLDER_RELEASE_REQUEST_KEY, None)
+        # The report token comes only from its own checked REQUEST_DATA frame.
+        d.pop("kv_result_report_token", None)
         info = cls(**d)
         if from_older_release:
             raise OlderReleaseRequestError(info)
@@ -213,6 +219,7 @@ class WriteMeta:
     receiver_slice_id: int = 0
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
+    kv_result_report_token: bytes = b""
     # Snapshot for this descriptor; a task's per-peer timer may be reused by a later dispatch.
     transfer_bytes: Optional[int] = None
 
@@ -389,6 +396,8 @@ class AgentResult(Enum):
 # KV_AGENT_RESULT is [type, frame]; the frame is one binary struct carrying instance_rank,
 # unique_rid, slice_id, is_last, status and transfer_size.
 _KV_RESULT_FRAME = struct.Struct("<qqq?Bq")
+# Per-writer KV result report token length.
+_KV_RESULT_REPORT_TOKEN_BYTES = 16
 _AGENT_RESULT_CODE = {
     AgentResult.SUCCESS: 0,
     AgentResult.FAILED: 1,
@@ -403,12 +412,26 @@ _AGENT_RESULT_BY_CODE = {
 }
 
 
+def _check_kv_result_report_token(token: bytes) -> bytes:
+    if not isinstance(token, bytes) or len(token) != _KV_RESULT_REPORT_TOKEN_BYTES:
+        raise ValueError(f"KV result report token must be {_KV_RESULT_REPORT_TOKEN_BYTES} bytes")
+    return token
+
+
 def _make_kv_result_msg(
-    instance_rank, unique_rid, slice_id, is_last_slice, agent_result, transfer_size=0
+    instance_rank,
+    unique_rid,
+    slice_id,
+    is_last_slice,
+    agent_result,
+    *,
+    kv_result_report_token: bytes,
+    transfer_size=0,
 ):
     """Build a KV_AGENT_RESULT message. ALL result sends (success AND failed/cancelled) must go
     through this single binary frame so the receiver's _KV_RESULT_FRAME.unpack never hits a stale
-    ascii payload (which would fail to decode and leave the RX task stuck forever)."""
+    ascii payload (which would fail to decode and leave the RX task stuck forever). The writer
+    echoes the report token the receiver handed it, so a forged result is dropped."""
     return [
         MessageType.KV_AGENT_RESULT,
         _KV_RESULT_FRAME.pack(
@@ -419,6 +442,7 @@ def _make_kv_result_msg(
             _AGENT_RESULT_CODE[agent_result],
             int(transfer_size),
         ),
+        bytes(kv_result_report_token),
     ]
 
 
@@ -1090,6 +1114,7 @@ class Sender(SenderBase):
                         meta.receiver_slice_id,
                         True,
                         AgentResult.FAILED_QUIESCED,
+                        kv_result_report_token=meta.kv_result_report_token,
                     )
                 dealer.send(message)
             except Exception as error:
@@ -1199,6 +1224,7 @@ class Sender(SenderBase):
                     write_meta.receiver_slice_id,
                     True,  # is_last_slice — ensures receiver resolves its task future
                     AgentResult.FAILED,
+                    kv_result_report_token=write_meta.kv_result_report_token,
                 )
             )
             return
@@ -1237,6 +1263,7 @@ class Sender(SenderBase):
                         write_meta.receiver_slice_id,
                         True,  # is_last_slice — ensures receiver resolves its task future
                         AgentResult.FAILED,
+                        kv_result_report_token=write_meta.kv_result_report_token,
                     )
                 )
                 return
@@ -1312,6 +1339,7 @@ class Sender(SenderBase):
             write_meta.is_last_slice,
             agent_result,
             transfer_size=transfer_size,
+            kv_result_report_token=write_meta.kv_result_report_token,
         )
         if agent_result == AgentResult.IN_DOUBT:
             self._retain_in_doubt_transfer(write_meta, result_msg)
@@ -1665,6 +1693,7 @@ class Sender(SenderBase):
             slice_id=task.slice_id,
             receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._chunk.is_last,
+            kv_result_report_token=req_info.kv_result_report_token,
             transfer_bytes=transfer_bytes,
         )
 
@@ -1919,6 +1948,9 @@ class Sender(SenderBase):
             logger.debug(str(error))
             self._send_failed_result_to_receiver(info)
             return
+        if len(message) != 3:
+            raise ValueError("REQUEST_DATA must carry a KV result report token")
+        info.kv_result_report_token = _check_kv_result_report_token(message[2])
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
         received_timestamp = None
@@ -1994,6 +2026,7 @@ class Sender(SenderBase):
                     slice_id,
                     True,  # is_last_slice
                     AgentResult.FAILED,
+                    kv_result_report_token=info.kv_result_report_token,
                 )
             ]
             if include_aux:
@@ -2053,6 +2086,7 @@ class Sender(SenderBase):
                     receiver_slice_id,
                     True,
                     AgentResult.FAILED,
+                    kv_result_report_token=info.kv_result_report_token,
                 )
             else:
                 with self._sessions_lock:
@@ -2797,6 +2831,8 @@ class KVRecvTask(_LogicalTask):
         self._aux_slot = aux_slot
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
         self._physical_owner: Optional[_ReceiveOperationOwner] = None
+        # Per-writer report tokens this receiver published for the task.
+        self._kv_result_report_tokens: dict[int, bytes] = {}
 
     def fail(self, exc: Exception) -> None:
         """Mark the task ERROR.
@@ -3202,6 +3238,11 @@ class Receiver(ReceiverBase):
             )
         sender_endpoints = {peer_infos.sender_endpoints[rank] for rank in peer_overlap.ranks}
         receiver_req_bytes = receiver_req.to_bytes()
+        # One single-use token per writer rank: a KV result is trusted only if it
+        # echoes the token handed to that writer here, so a forged result is dropped.
+        task._kv_result_report_tokens = {
+            rank: secrets.token_bytes(_KV_RESULT_REPORT_TOKEN_BYTES) for rank in peer_overlap.ranks
+        }
         if not session._enforce_physical_ownership:
             session.mark_transferring(task.slice_id)
             # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
@@ -3213,7 +3254,11 @@ class Receiver(ReceiverBase):
                 if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                     with disagg_diagnostics.suppress_diagnostic_errors():
                         send_timestamp = disagg_diagnostics.capture_timestamp()
-                self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
+                self._request_sender_data(
+                    peer_infos.sender_endpoints[rank],
+                    receiver_req_bytes,
+                    task._kv_result_report_tokens[rank],
+                )
                 if send_timestamp is not None:
                     with disagg_diagnostics.suppress_diagnostic_errors():
                         disagg_diagnostics.emit_event(
@@ -3244,7 +3289,11 @@ class Receiver(ReceiverBase):
                         send_timestamp = disagg_diagnostics.capture_timestamp()
                 published_writers.add(rank)
                 try:
-                    self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
+                    self._request_sender_data(
+                        peer_infos.sender_endpoints[rank],
+                        receiver_req_bytes,
+                        task._kv_result_report_tokens[rank],
+                    )
                 except Exception:
                     published_writers.discard(rank)
                     raise
@@ -3315,7 +3364,6 @@ class Receiver(ReceiverBase):
             try:
                 messenger.send([MessageType.REQUEST_INSTANCE_INFO])
                 message = messenger.receive()
-                sender_info = RankInfo.from_bytes(message[0])
             finally:
                 messenger.stop()
 
@@ -3328,6 +3376,9 @@ class Receiver(ReceiverBase):
             # (handled in dispatch_task) so only requests targeting this peer
             # fail, and cached so later requests fail fast.
             try:
+                # from_bytes rejects a peer on another protocol version.
+                sender_info = RankInfo.from_bytes(message[0])
+                validate_protocol_version(sender_info)
                 self._registrar.validate_bounded_replay_compatible(sender_info)
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
@@ -3442,9 +3493,13 @@ class Receiver(ReceiverBase):
                 f"_process_kv_agent_result: unexpected msg_type={message[0]!r}, expected KV_AGENT_RESULT"
             )
             return
+        if len(message) != 3:
+            logger.error("_process_kv_agent_result: malformed KV result, dropping")
+            return
         peer_rank, unique_rid, receiver_slice_id, is_last_slice, status_code, transfer_size = (
             _KV_RESULT_FRAME.unpack(message[1])
         )
+        kv_result_report_token = message[2]
         session = self._get_session(unique_rid)
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
             with disagg_diagnostics.suppress_diagnostic_errors():
@@ -3481,6 +3536,7 @@ class Receiver(ReceiverBase):
             receiver_slice_id,
             is_last_slice,
             agent_result,
+            kv_result_report_token,
             transfer_size=transfer_size,
         )
 
@@ -3496,11 +3552,14 @@ class Receiver(ReceiverBase):
             return
         session.process_aux_agent_result(peer_rank, AgentResult(status))
 
-    def _request_sender_data(self, endpoint: str, receiver_info_bytes: bytes):
+    def _request_sender_data(
+        self, endpoint: str, receiver_info_bytes: bytes, kv_result_report_token: bytes
+    ):
         # receiver_info serialized once and reused for every peer rank (block-table msgpack isn't free at fan-out).
+        # The report token is per-writer, so it travels as its own frame.
         logger.debug("Sending data request to endpoint '%s'", endpoint)
         messenger = self._get_or_connect_dealer(endpoint)
-        messenger.send([MessageType.REQUEST_DATA, receiver_info_bytes])
+        messenger.send([MessageType.REQUEST_DATA, receiver_info_bytes, kv_result_report_token])
 
     def __del__(self):
         try:
@@ -3894,18 +3953,32 @@ class RxSession(RxSessionBase):
         receiver_slice_id: int,
         is_last_slice: bool,
         status: AgentResult,
+        kv_result_report_token: bytes = b"",
         transfer_size: int = 0,
     ):
         with self._ownership_evidence_guard(), self.lock:
             if self._retirement is not None and self._closed:
                 return
-            assert receiver_slice_id < len(self._kv_tasks), (
-                f"Receiver got receiver_slice_id={receiver_slice_id} but only has "
-                f"{len(self._kv_tasks)} receive task(s) for request {self.request_id}. "
-                f"The sender echoes this index back from RecvReqInfo, so it must "
-                f"address a task this receiver posted."
-            )
+            # Signed 64-bit field from the wire: a negative or out-of-range
+            # index must raise, not select another task by Python wraparound.
+            if not 0 <= receiver_slice_id < len(self._kv_tasks):
+                raise ValueError(
+                    f"Receiver got receiver_slice_id={receiver_slice_id} but only has "
+                    f"{len(self._kv_tasks)} receive task(s) for request {self.request_id}. "
+                    f"The sender echoes this index back from RecvReqInfo, so it must "
+                    f"address a task this receiver posted."
+                )
             task = self._kv_tasks[receiver_slice_id]
+            # Trust the result only if it echoes the token this receiver gave
+            # that writer; an unknown writer or a wrong token is dropped.
+            expected_token = task._kv_result_report_tokens.get(peer_rank)
+            if expected_token is None or not secrets.compare_digest(
+                expected_token, kv_result_report_token
+            ):
+                raise ValueError(
+                    f"KV result for request {self.request_id} slice={receiver_slice_id} "
+                    f"does not match the report token published for writer {peer_rank}"
+                )
             if status not in (
                 AgentResult.SUCCESS,
                 AgentResult.FAILED,
@@ -4536,6 +4609,26 @@ class TransferWorker:
             prompt_len=request.prompt_len,
             overall_timeout_s=self._config.tx_overall_timeout_s,
             retirement_watchdog=getattr(self, "_retirement_watchdog", None),
+        )
+
+    def create_receive_retirement(self, request_id: int) -> RetirementDeadline:
+        """Track an unpublished destination's local access during cancellation.
+
+        Args:
+            request_id: Executor-local identity of the retained destination.
+
+        Returns:
+            A fresh owner using the configured receive grace and containment
+            watchdog. Its caller starts grace with retain_unproven at cancellation;
+            this does not reuse or extend an existing session's deadline.
+
+        Raises:
+            RuntimeError: Physical retirement enforcement is not configured.
+        """
+        if self._retirement_watchdog is None:
+            raise RuntimeError("receive retirement requires an ownership watchdog")
+        return self._retirement_watchdog.create_owner(
+            request_id, "receive", self._config.rx_timeout_s
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:

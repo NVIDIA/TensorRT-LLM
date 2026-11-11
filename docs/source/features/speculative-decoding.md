@@ -156,7 +156,7 @@ Reference: [DFlash: Distilled Flash Speculative Decoding](https://arxiv.org/pdf/
 * `speculative_model`: Path or HuggingFace model ID for the DFlash draft model.
 * `mask_token_id`: Token ID used as the mask token for parallel prediction. If not set, it is read from the draft model config.
 * `target_layer_ids`: List of target model layer indices whose hidden states are captured for cross-attention in the draft model. If not set, read from the draft model config.
-* `attention_backend`: Cross-attention backend for the draft model, independent of the drafter's standard attention modules. `"VANILLA"` (the default) uses FlashAttention with a contiguous context K/V cache and runs anywhere. `"TRTLLM"` uses TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache and supports SM100/SM103 only. `"FA4"` uses the flash-attn CuTe DSL kernels on the same paged cache and supports SM90 only.
+* `attention_backend`: Cross-attention backend for the draft model, independent of the drafter's standard attention modules. `"VANILLA"` (the default) uses FlashAttention with a contiguous context K/V cache and runs anywhere. `"TRTLLM"` uses TRTLLM-Gen FMHA (via FlashInfer) over a paged context K/V cache held by the KV cache manager (see [Draft KV cache](#dflash-draft-kv-cache)) and supports SM100/SM103 only. `"FA4"` uses the flash-attn CuTe DSL kernels on the same paged cache and supports SM90 only.
 
 ```python
 from tensorrt_llm.llmapi import DFlashDecodingConfig
@@ -169,6 +169,37 @@ speculative_config = DFlashDecodingConfig(
 
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
+
+#### DFlash draft KV cache
+
+With `attention_backend="TRTLLM"`, TRTLLM target attention, and the default
+`KVCacheManagerV2`, the drafter's layers are allocated in the target's KV cache
+manager. Target and draft layers share one page table, so one KV budget covers
+both and each request's draft pages are allocated, padded and freed with its
+target pages. The draft layers keep the drafter's own dtype, so an FP8 target KV
+cache (`kv_cache_config.dtype: fp8`) is paired with a BF16 draft cache.
+
+In disaggregated serving, direct worker launches require
+`TRTLLM_DISAGG_SHARED_DRAFT_KV=1` on both the context and generation workers
+to enable shared draft-KV transfer. The `disaggregated_mpi_worker` launcher
+enables this setting automatically when both servers enable compatible
+speculation and use the same `tensor_parallel_size` and
+`enable_attention_dp`.
+
+When sharing is enabled, the context server's draft pages are transferred to
+the generation server with the target pages, so the drafter starts generation
+with the prompt context instead of an empty one. This requires the draft layers
+to have the target's rank-local KV-head count; the draft dtype and head
+dimension may differ, except that an NVFP4 target KV cache requires an
+identical draft layout. Both servers must use the same layout.
+
+The drafter keeps a separate draft KV cache manager instead when any of the
+following applies: context parallelism larger than 1, a per-layer KV-head count
+on the target or drafter, a specialized KV cache manager (for example, hybrid Mamba
+models), Gemma 4 hybrid attention, or, in disaggregated serving, a draft layout
+that cannot be transferred with the target's. When the layers are shared, the
+worker log reports `target and draft KV layers share one KV cache manager` at
+startup.
 
 [DFlash 2](https://inco.ai/blog/dflash2/) is also supported. The same `DFlashDecodingConfig` can be used for DFlash 2; no extra arguments are required.
 
@@ -265,7 +296,7 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 * `MTP`
 * `Eagle3`
 * `NGram` (deprecated; use `SA` instead)
-* `DraftTarget`
+* `Draft_Target`
 * `PARD`
 * `DFlash`
 * `SA`
@@ -320,3 +351,20 @@ The field name `speculative_model_dir` can also be used as an alias for `specula
       max_draft_len: 4
       speculative_model_dir: /path/to/draft/model
 ```
+
+### DSpark attention projection precision
+
+`TRTLLM_DSPARK_LINEAR_BACKEND=bf16|fp8` selects the attention projection
+precision of the embedded DeepSeek-V4 DSpark drafter. When unset, projections
+use FP8 on Rubin SM107 with TP=1 or attention DP, and BF16 otherwise. Set
+bf16 to use dequantized BF16 draft weights. An explicit fp8 selection
+requires TP=1 or attention DP; unsupported tensor-parallel mappings are
+rejected during initialization. Non-Rubin FP8 is opt-in and requires workload
+accuracy and acceptance-length validation.
+
+### Packed FP4 MLA wave planning
+
+`TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=1` enables the optional wave-simulation
+planner for packed FP4 MLA decode. The default is disabled (0); the
+rule-based split plan remains active. Validate end-to-end latency on the
+serving workload before enabling wave simulation.

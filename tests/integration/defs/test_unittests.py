@@ -17,7 +17,7 @@ import re
 import shlex
 import warnings
 from subprocess import CalledProcessError
-from typing import NoReturn
+from typing import NoReturn, Optional
 
 from defs.conftest import tests_path
 
@@ -115,22 +115,27 @@ def _nodeid_matches_case(nodeid: str, case_selector: str) -> bool:
             or node_selection.startswith(case_selection + "["))
 
 
-def _fail_unittests(reason: str, output_xml: str, output_dir: str,
-                    case: str) -> NoReturn:
+def _fail_unittests(reason: str,
+                    output_xml: str,
+                    output_dir: str,
+                    case: str,
+                    unfinished_test_path: Optional[str] = None) -> NoReturn:
     """Raise a unittest failure naming the specific culprit test(s).
 
     Culprits are failed/errored tests from the JUnit report, plus tests from
     this case that were still in flight when a fatal OOM/timeout killed the run
     (nodeids left by --periodic-save-unfinished-test).
 
-    unfinished_test.txt is shared per node and only cleared on teardown, so it
-    may retain stale entries from other cases; it is filtered to this case's
-    test path(s). Reading it is best-effort and never masks the original
-    failure.
+    unfinished_test_path is where the run recorded its unfinished tests; it
+    defaults to the shared unfinished_test.txt in output_dir. That default is
+    shared per node and only cleared on teardown, so it may retain stale
+    entries from other cases; it is filtered to this case's test path(s).
+    Reading it is best-effort and never masks the original failure.
     """
     junit_culprits = _junit_culprits(output_xml)
     in_flight_culprits = []
-    unfinished = os.path.join(output_dir, "unfinished_test.txt")
+    unfinished = unfinished_test_path or os.path.join(output_dir,
+                                                      "unfinished_test.txt")
     case_selectors = []
     for arg in shlex.split(case):
         selector = arg.rstrip("/")
@@ -255,12 +260,19 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     # MoE entries expand to too many sub-tests, which introduces noise into
     # the overall TRT-LLM test quality metrics. Skip per-sub-test reporting
     # for MoE by prefixing with "moe-" (CI only collects files starting
-    # with "results" for JUnit reporting).
+    # with "results" for JUnit reporting). Their unfinished tests go to a
+    # separate file too, so the stage does not report them as terminated
+    # unexpectedly from the shared unfinished_test.txt. Otherwise, MoE sub-test
+    # history can contain only terminated unexpectedly errors without corresponding
+    # passing results, skewing the test quality metrics.
     case_path = case.rstrip("/")
+    unfinished_test_path = None
     if case_path == "unittest/_torch/moe" or case_path.startswith(
             "unittest/_torch/moe/"):
         output_xml = os.path.join(output_dir,
                                   f'moe-results-sub-unittests-{case_fn}.xml')
+        unfinished_test_path = os.path.join(
+            output_dir, f'moe-unfinished-sub-unittests-{case_fn}.txt')
     else:
         output_xml = os.path.join(output_dir,
                                   f'results-sub-unittests-{case_fn}.xml')
@@ -279,6 +291,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         "--periodic-save-unfinished-test",
         "--periodic-hang-traceback",
     ]
+    if unfinished_test_path:
+        command += [f"--periodic-unfinished-test-path={unfinished_test_path}"]
+
     if test_prefix:
         command += [f"--test-prefix={test_prefix}"]
 
@@ -422,7 +437,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         if not os.path.exists(parallel_output_xml):
             _fail_unittests(
                 "no report generated, fatal failure in unittests (parallel phase)",
-                parallel_output_xml, output_dir, case)
+                parallel_output_xml, output_dir, case, unfinished_test_path)
 
         if dry_run or passed:
             os.rename(parallel_output_xml, output_xml)
@@ -445,11 +460,11 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 os.rename(parallel_output_xml, output_xml)
                 _fail_unittests(
                     "no report generated, fatal failure in unittests (retry phase)",
-                    output_xml, output_dir, case)
+                    output_xml, output_dir, case, unfinished_test_path)
 
     if not passed:
         _fail_unittests("failure reported in unittests", output_xml, output_dir,
-                        case)
+                        case, unfinished_test_path)
 
 
 def test_csa2_tensor_parallel(llm_root, llm_venv, output_dir):

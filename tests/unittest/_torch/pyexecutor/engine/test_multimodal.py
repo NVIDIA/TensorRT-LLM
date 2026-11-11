@@ -258,7 +258,10 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     model.encoder = Encoder(mm_config)
     model.config = SimpleNamespace(torch_dtype=torch.float32)
     model.model_config = SimpleNamespace(
-        pretrained_config=model.config, mapping=mapping, sparse_attention_config=None
+        pretrained_config=model.config,
+        mapping=mapping,
+        sparse_attention_config=None,
+        is_generation=True,
     )
     llm_args = SimpleNamespace(
         encode_only=False,
