@@ -2,12 +2,12 @@
 SPDX-License-Identifier: Apache-2.0 -#}
 ## Tag `fix` — repair what a check found
 
-Your task repairs one failure: a check that failed on the final commit, or
-what a failed task could not do. Its goal names the failure and where its
-evidence is. Find the cause before you change anything.
+Your task repairs what its goal names: each check that failed in the final
+pass and each convention finding, or what keeps the tree from loading the
+checkpoint's config. Find each cause before you change anything.
 
 - Read the evidence first: the check's summary line and its files under the
-  certification round's directory, and the decision file of the task that
+  workspace's `gates/` directory, and the decision file of the task that
   built the code.
 - Reproduce the failure on your worktree with the same command the check
   uses (`trtllm-modeling-v2 gate ... --tree <your worktree>`), then where the

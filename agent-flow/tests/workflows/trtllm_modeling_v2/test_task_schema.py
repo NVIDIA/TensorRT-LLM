@@ -273,7 +273,7 @@ def test_each_deployment_owes_its_boot_its_benchmarks_and_its_tests_and_core_the
     ]
     assert any("judged by a native test" in n for n in notices)
     contract = compile_contract(resolved)
-    assert [c.key for c in contract.required()] == [
+    assert [c.key for c in contract.checks] == [
         "tep4:boot",
         "tep4:accuracy[gsm8k]",
         "dep4:boot",
@@ -291,7 +291,7 @@ def test_each_deployment_owes_its_boot_its_benchmarks_and_its_tests_and_core_the
     )
     # The serve gate is core's, where the spec turns it on.
     resolved["accuracy"]["serve"] = {"enabled": True}
-    more = {c.key for c in compile_contract(resolved).required()} - {c.key for c in contract.checks}
+    more = {c.key for c in compile_contract(resolved).checks} - {c.key for c in contract.checks}
     assert more == {"tep4:serve"}
     # A spec with no accuracy block owes boots alone, and says so.
     bare = compile_contract({"deployments": [{"name": "only", "options": {}}]})

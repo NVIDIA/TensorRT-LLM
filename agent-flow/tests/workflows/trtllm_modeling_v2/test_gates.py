@@ -19,15 +19,13 @@ from agent_flow.workflows.trtllm_modeling_v2.checks import gate_cli
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import serve_driver, workload_io
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
-from agent_flow.workflows.trtllm_modeling_v2.run.certify import (
-    target_test_modules_check as target_tests,
-)
+from agent_flow.workflows.trtllm_modeling_v2.run.report import test_modules as target_tests
 from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
 
 from ._helpers import attested
 
 
-def test_delivery_counts_the_targets_test_modules_and_warns_past_twenty(tmp_path):
+def test_the_report_counts_the_targets_test_modules_and_warns_past_twenty(tmp_path):
     """An onboarded target arrived with 35 test modules, past what a reviewer accepts."""
     target = f"{catalog_paths.MODELING_V2_PACKAGE}/models/fam/target"
     tests = tmp_path / catalog_paths.model_ops_tests_dir(target)
@@ -40,7 +38,7 @@ def test_delivery_counts_the_targets_test_modules_and_warns_past_twenty(tmp_path
     assert "WARNING" not in check.detail
     (tests / "test_forward.py").write_text("def test_b():\n    pass\n")
     check = target_tests(tmp_path, target)
-    assert check.passed, "the budget never blocks delivery"
+    assert check.passed, "the budget is reported, never a failure"
     assert check.detail.startswith("21 test module(s)")
     assert "WARNING: more than the 20 a reviewer accepts" in check.detail
     assert target_tests(tmp_path, f"{catalog_paths.MODELING_V2_PACKAGE}/models/fam/other") is None

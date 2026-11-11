@@ -44,7 +44,7 @@ shortfall is a debug signal, not a verdict**: back every re-gate with one
 explicit causal hypothesis, and after three hypothesis-backed fixes without
 improvement, stop and block with `accuracy_shortfall` and the trail. Turning
 a runtime switch off (block reuse, say) to get a green gate hides a defect,
-unless `task.yaml`'s runtime block turns it off. The anchor is read-only. A
-call no entry covers is a `vocabulary_gap`: block as soon as you know, naming
-it. Formatting is not your job: the operator lints the branch once, before it
+unless the deployment's own options turn it off. The anchor is read-only. A
+call no entry covers is no reason to block: write its wrapper in the target's
+own `ops/`, with its test. Formatting is not your job: the operator lints the branch once, before it
 becomes a PR.

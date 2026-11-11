@@ -235,7 +235,7 @@ accuracy:
 # agents:
 #   defaults: {backend: claude-code, model: <your-model-id>, reasoning_effort: <your-effort>}
 #   roles:
-#     planner: {backend: codex, model: <your-codex-model-id>, reasoning_effort: high}
+#     surveyor: {backend: codex, model: <your-codex-model-id>, reasoning_effort: high}
 #   # defaults: {extra_mcp_servers: {knowledge-base: {type: http, url: https://example.test/mcp}}}
 
 # ----------------------------------------------------------- commit policy

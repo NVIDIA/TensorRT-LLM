@@ -1,20 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The contract: every check a run must pass, compiled from the resolved task spec.
+"""The checks each deployment owes, and the ledger of what they measured.
 
-The contract is the run's definition of "done". It names each check by its
-deployment and gate: a boot, one accuracy check for each of the deployment's
-benchmarks, its native tests when it names any, and the serve gate for core
-when the spec turns it on. Nothing runs it while the workers build: a worker runs the
-checks of its own unit by hand (``trtllm-modeling-v2 gate``) and its conclusion
-is trusted. The contract is run once, whole, on the final commit
-(``run/certify.py``), and a run is delivered only when every required check
-passed on that one commit.
+A deployment owes its boot, one accuracy check for each of its benchmarks, its native
+tests when it names any, and, for core where the spec turns it on, the serve gate
+(:func:`compile_contract`). Code runs core's boot and benchmarks when `core` lands (the
+onboard check) and every other check of a done deployment once, in the final pass
+(``run/report.py``); a worker runs its own deployment's by hand while it builds.
 
-Verdicts are appended to ``contract_status.jsonl``, each with the tree it
-measured (:func:`tree_id`: the git tree and the contents of the native libraries built into the
-checkout). A verdict about any other tree does not count (:func:`evaluate`).
+Every result is appended to ``contract_status.jsonl`` with the commit it was measured on
+and what it measured by content (:func:`tree_id`: the git tree, the native libraries built
+into it, what the checks read of the spec, this workflow's version, the environment). A
+pass on record for the same content is reused, never re-run; a verdict about any other
+content says nothing about this one.
 """
 
 from __future__ import annotations
@@ -27,15 +26,12 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-import yaml
-
 from ..checks import serve
 from ..infra.git import git_output
 from ..operators.coverage import MODELING_V2_PACKAGE
 from ..spec import deployments as deployments_mod
 from ..spec.deployments import AGGREGATED
 
-CONTRACT_FILENAME = "contract.yaml"
 STATUS_FILENAME = "contract_status.jsonl"
 #: Where the native libraries an engine loads are built: inside the checkout, ignored by git.
 NATIVE_LIBRARY_DIRS: tuple[str, ...] = ("tensorrt_llm", "tensorrt_llm/libs")
@@ -50,7 +46,6 @@ class Check:
 
     deployment: str
     gate: str
-    required: bool = True
 
     @property
     def key(self) -> str:
@@ -63,36 +58,13 @@ class Contract:
     #: What a reader should know of what the checks do not judge, one line each.
     notes: tuple[str, ...] = ()
 
-    def required(self) -> tuple[Check, ...]:
-        return tuple(c for c in self.checks if c.required)
-
     def of(self, deployment: str) -> tuple[Check, ...]:
         """The checks ``deployment`` owes."""
         return tuple(c for c in self.checks if c.deployment == deployment)
 
-    def as_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"checks": [asdict(c) for c in self.checks]}
-        if self.notes:
-            out["notes"] = list(self.notes)
-        return out
-
-    def render(self) -> str:
-        """A markdown table, one row per check."""
-        lines = ["| deployment | gate | required |", "|---|---|---|"]
-        for c in self.checks:
-            lines.append(f"| {c.deployment} | {c.gate} | {'yes' if c.required else 'no'} |")
-        if self.notes:
-            lines += ["", *(f"- {note}" for note in self.notes)]
-        return "\n".join(lines)
-
 
 def compile_contract(task_data: Mapping[str, Any]) -> Contract:
-    """Every check the spec's deployments owe, core's first.
-
-    A deployment owes its boot, one accuracy check for each of its benchmarks, and its
-    native tests when it names any. Core, when it is one server, also owes the serve
-    gate where ``accuracy.serve.enabled`` asks for it.
-    """
+    """Every check the spec's deployments owe, core's first."""
     serving = serve.ServeSpec.from_task(task_data).enabled
     checks: list[Check] = []
     notes: list[str] = []
@@ -116,15 +88,9 @@ def compile_contract(task_data: Mapping[str, Any]) -> Contract:
         if drafts and not deployment.tests:
             notes.append(
                 f"{name}: its drafter's acceptance is judged by no check here; name a native "
-                f"test for it in `tests`, or the report says it is unverified"
+                f"test for it in `tests`"
             )
     return Contract(checks=tuple(checks), notes=tuple(notes))
-
-
-def write_contract(workspace: Path, contract: Contract) -> Path:
-    path = Path(workspace) / CONTRACT_FILENAME
-    path.write_text(yaml.safe_dump(contract.as_dict(), sort_keys=False), encoding="utf-8")
-    return path
 
 
 # ------------------------------------------------------------------ the tree a verdict is about
@@ -234,7 +200,7 @@ def tree_id(
     return "+".join(parts)
 
 
-# ------------------------------------------------------------------------------ verdicts
+# ------------------------------------------------------------------------------ the ledger
 
 
 @dataclass
@@ -243,25 +209,28 @@ class Verdict:
     gate: str
     passed: bool
     detail: str = ""
-    #: The tree the check measured (:func:`tree_id`).
+    #: What the check measured, by content (:func:`tree_id`), and the commit it was at.
     tree: str = ""
-    #: The certification round that ran it.
-    round: int = 0
-    #: How long the check's gate ran, in seconds; 0 when it did not say.
+    commit: str = ""
     duration_s: float = 0.0
-    #: The score a benchmark measured (``GateResult.measured``), pass or fail, the reference
-    #: it was held to and its standard error.
+    #: The score a benchmark measured, pass or fail, and the reference it was held to.
     measured: float | None = None
     reference: float | None = None
-    se: float | None = None
     #: The gate's one-line summary, with its numbers.
     summary: str = ""
     #: A score nothing judged: reported, neither a pass nor a failure.
     unjudged: bool = False
+    #: Which path judged: in process or through the endpoint.
+    path: str = ""
 
     @property
     def key(self) -> str:
         return f"{self.deployment}:{self.gate}"
+
+    @property
+    def said(self) -> str:
+        """The verdict in a word, as the report prints it."""
+        return "no verdict" if self.unjudged else "PASS" if self.passed else "FAIL"
 
 
 _VERDICT_FIELDS = frozenset(f.name for f in fields(Verdict))
@@ -276,7 +245,7 @@ def _number(value: Any) -> float | None:
 
 @dataclass
 class ContractStatus:
-    """The verdicts recorded against a contract, append-only on disk."""
+    """The verdicts recorded for a workspace, append-only on disk, oldest first."""
 
     path: Path
     verdicts: list[Verdict] = field(default_factory=list)
@@ -285,27 +254,19 @@ class ContractStatus:
     def load(cls, workspace: Path) -> "ContractStatus":
         path = Path(workspace) / STATUS_FILENAME
         verdicts: list[Verdict] = []
-        if path.is_file():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                try:
-                    data = json.loads(line)
-                except ValueError:
-                    continue  # a torn line: the check it was for runs again
-                if not isinstance(data, dict):
-                    continue
-                try:
-                    verdicts.append(
-                        Verdict(**{k: v for k, v in data.items() if k in _VERDICT_FIELDS})
-                    )
-                except TypeError:
-                    continue  # a line of another version of the ledger: its check runs again
+        for line in path.read_text(encoding="utf-8").splitlines() if path.is_file() else ():
+            try:
+                data = json.loads(line)
+                verdicts.append(Verdict(**{k: v for k, v in data.items() if k in _VERDICT_FIELDS}))
+            except (ValueError, TypeError, AttributeError):
+                continue  # a torn line, or another version's: the check it was for runs again
         return cls(path=path, verdicts=verdicts)
 
-    def record(self, check: Check, result: Any, *, tree: str, round: int = 0) -> Verdict:
-        """Append one gate result for ``check``, measured on ``tree``.
+    def record(self, check: Check, result: Any, *, tree: str, commit: str = "") -> Verdict:
+        """Append one gate result for ``check``, measured on ``tree`` at ``commit``.
 
-        A result that says the infrastructure ended it measured nothing: it is
-        recorded as not passed, never as a pass.
+        A result that says the infrastructure ended it measured nothing: it is recorded
+        as not passed, never as a pass.
         """
         infrastructure = str(getattr(result, "infrastructure", "") or "")
         verdict = Verdict(
@@ -314,13 +275,13 @@ class ContractStatus:
             passed=bool(result.passed) and not infrastructure,
             detail=str(result.detail)[:500],
             tree=tree,
-            round=round,
-            duration_s=round_seconds(getattr(result, "duration_s", 0.0)),
+            commit=commit,
+            duration_s=round(_number(getattr(result, "duration_s", 0.0)) or 0.0, 3),
             measured=_number(getattr(result, "measured", None)),
             reference=_number(getattr(result, "reference", None)),
-            se=_number(getattr(result, "se", None)),
             summary=str(result.summary())[:1000] if hasattr(result, "summary") else "",
-            unjudged=bool(getattr(result, "unjudged", False)),
+            unjudged=bool(getattr(result, "unjudged", False)) and not infrastructure,
+            path=str(getattr(result, "path", "") or ""),
         )
         self.verdicts.append(verdict)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -337,74 +298,29 @@ class ContractStatus:
             os.fsync(handle.fileno())
         return verdict
 
-    def on(self, tree: str, round: int | None = None) -> dict[str, Verdict]:
-        """The latest verdict per check key measured on ``tree`` (in ``round``, when given).
+    def on(self, tree: str) -> dict[str, Verdict]:
+        """The latest verdict per check key measured on ``tree``; none for an unknown tree.
 
         The latest outcome counts: a failure recorded after a pass replaces it.
         """
-        last: dict[str, Verdict] = {}
-        for v in self.verdicts:
-            if tree and v.tree == tree and (round is None or v.round == round):
-                last[v.key] = v
-        return last
+        return {v.key: v for v in self.verdicts if tree and v.tree == tree}
 
-
-def round_seconds(value: Any) -> float:
-    number = _number(value)
-    return round(number, 3) if number is not None else 0.0
-
-
-@dataclass(frozen=True)
-class Evaluation:
-    passed: tuple[Check, ...]
-    failed: tuple[tuple[Check, Verdict], ...]
-    missing: tuple[Check, ...]
-
-    @property
-    def holds(self) -> bool:
-        return not self.failed and not self.missing
-
-    def render(self) -> str:
-        lines = [
-            f"{len(self.passed)} passed, {len(self.failed)} failed, {len(self.missing)} missing"
-        ]
-        lines += [f"- FAILED {c.key}: {v.detail}" for c, v in self.failed]
-        lines += [f"- MISSING {c.key}" for c in self.missing]
-        return "\n".join(lines)
-
-
-def evaluate(contract: Contract, verdicts: Mapping[str, Verdict]) -> Evaluation:
-    """Each required check against its verdict in ``verdicts`` (:meth:`ContractStatus.on` a tree).
-
-    A check with no verdict there is missing. Nothing is shared between checks
-    and nothing is carried over from another tree.
-    """
-    passed, failed, missing = [], [], []
-    for check in contract.required():
-        verdict = verdicts.get(check.key)
-        if verdict is None:
-            missing.append(check)
-        elif verdict.passed:
-            passed.append(check)
-        else:
-            failed.append((check, verdict))
-    return Evaluation(tuple(passed), tuple(failed), tuple(missing))
+    def last(self, key: str, *, passed: bool | None = None) -> Verdict | None:
+        """The latest verdict of ``key`` on any content; with ``passed``, the latest that was."""
+        found = [v for v in self.verdicts if v.key == key and passed in (None, v.passed)]
+        return found[-1] if found else None
 
 
 __all__ = [
-    "CONTRACT_FILENAME",
     "STATUS_FILENAME",
     "Check",
     "Contract",
     "ContractStatus",
-    "Evaluation",
     "Verdict",
     "compile_contract",
-    "evaluate",
     "flow_version",
     "inputs_digest",
     "library_digest",
     "native_libraries",
     "tree_id",
-    "write_contract",
 ]

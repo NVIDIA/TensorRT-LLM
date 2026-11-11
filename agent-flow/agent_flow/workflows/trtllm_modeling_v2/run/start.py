@@ -3,10 +3,10 @@
 
 """The start of a run: preflight, then what every turn and every check of the run reads.
 
-Runs on every start, a resume's included: the hard blockers (``startup/preflight.py``),
-the agent probe, then the journal's header, the contract, the survey's inventory, the
-prompts and the host facts. Any failure stops the run before its first turn; the run stays
-open for the same command to resume. A dry run does the same without touching a GPU.
+Runs on every start: the hard blockers (``startup/preflight.py``), the agent probe, then
+the journal's header, the checks each deployment owes, the survey's inventory, the prompts
+and the host facts. Any failure stops the run before its first turn; the same command
+starts it again. A dry run does the same without touching a GPU.
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ def start(workflow, state, log) -> bool:
         runner = workflow._command_runner or shell_runner_for(
             select_command_executor(resolve_environment(task))
         )
+        workflow._preflight_runner = runner
         result = run_preflight(
             task, runner=runner, claim=not workflow.dry_run, workspace=workflow.workspace
         )
@@ -114,9 +115,9 @@ def start(workflow, state, log) -> bool:
     dump_prompt_bundle(workflow.prompts, workflow.workspace / PROMPTS_DIRNAME)
     _write_host_facts(workflow, result)
     workflow._materialize_skills()
-    contract_mod.write_contract(workflow.workspace, workflow._contract)
-    required = len(workflow._contract.required())
-    workflow.journal.section(f"contract: {required} required check(s)", workflow._contract.render())
+    owed = [f"- `{check.key}`" for check in workflow._contract.checks]
+    owed += [f"- note: {note}" for note in workflow._contract.notes]
+    workflow.journal.section(f"checks owed: {len(workflow._contract.checks)}", "\n".join(owed))
     sources = {
         key: f"{a.kind}" + (f" {a.value:g}" if a.value is not None else "") + f": {a.source}"
         for key, a in result.anchors.items()

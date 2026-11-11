@@ -177,8 +177,7 @@ class Script:
     """Per-role scripted decisions, keyed by role and turn number.
 
     A role given as a callable ``(turn, prompt) -> decision mapping | None`` answers for
-    itself. Unscripted, every worker finishes its task, and the planner, which a run whose
-    tasks all finish never asks, escalates so that a test that did not expect it fails loudly.
+    itself. Unscripted, every worker finishes its task.
     """
 
     def __init__(self, ctx=None, **roles):
@@ -189,8 +188,6 @@ class Script:
         override = self.roles.get(role)
         if callable(override):
             return override(turn, prompt)
-        if role == "planner":
-            return {"decision": "ESCALATE", "summary": "an unscripted planner was asked"}
         if role == "surveyor":
             return {"decision": "DRAFT_READY", "summary": "drafted"}
         if role == "kernel_writer":

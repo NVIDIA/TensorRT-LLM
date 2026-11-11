@@ -21,12 +21,7 @@ def packaged_skills() -> tuple[str, ...]:
     return tuple(sorted(p.name for p in PACKAGED_SKILLS_DIR.iterdir() if p.is_dir()))
 
 
-ROLES: tuple[str, ...] = (
-    "surveyor",
-    "kernel_writer",
-    "assembler",
-    "planner",
-)
+ROLES: tuple[str, ...] = ("surveyor", "kernel_writer", "assembler")
 
 
 def resolve_role_agents(

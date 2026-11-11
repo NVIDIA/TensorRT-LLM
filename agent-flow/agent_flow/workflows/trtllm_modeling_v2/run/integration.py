@@ -1,21 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""One worktree per task, integrated into the checkout when the task finishes.
+"""One worktree per task, landed in the checkout when the task finishes.
 
-A task that changes the tree (a kernel entry, a deployment, a fix) works
-on its own branch in its own worktree, cut from the checkout's head when the
-task starts. When its worker finishes, the branch's commits are audited
-against the run's commit rules (``infra/git.py``): who made them, how they are
-signed, and that none touches the workspace or a judge path. A branch that breaks
-them goes back to its worker. Every commit that lands is labelled ``target``,
-``shared`` or ``mixed`` by whether its paths are the target's own
-(``commit_labels.json`` in the workspace, for the report). The branch is then rebased onto the head as it
-is then and fast-forwarded in, under one lock: the checkout only ever moves by
-whole tasks and carries no merge commits. Tasks run one at a time but for
-kernel entries, so a rebase rarely conflicts; one that does is aborted and
-goes back to its worker once (:func:`rebase_block`).
-
-A task's next attempt keeps its worktree and branch.
+A task that changes the tree works on its own branch in its own worktree, cut from the
+checkout's head when the task starts; its next attempt keeps both. When its worker says
+it is ready, the branch's commits are audited against the run's commit rules
+(``infra/git.py``): who made them, how they are signed, and that none touches the
+workspace or a judge path. The branch is rebased onto the head, held to the task's own
+check where it has one (the onboard check for `core`), and fast-forwarded in: the
+checkout only moves by whole tasks, carries no merge commit, and holds exactly the commit
+that was checked. Every commit that lands is labelled ``target``, ``shared`` or ``mixed``
+by whether its paths are the target's own (``commit_labels.json``, for the report).
 """
 
 from __future__ import annotations
@@ -25,7 +20,6 @@ import os
 import posixpath
 import shutil
 import subprocess
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,15 +55,14 @@ LOCK_RETRIES, LOCK_RETRY_S = 5, 3.0
 REPAIR_TURNS = 1
 
 
-class TaskNotStarted(RuntimeError):
-    """A task's worktree could not be prepared, so no worker ran: the attempt is not the worker's."""
-
-
 @dataclass(frozen=True)
 class Outcome:
     merged: bool
     detail: str
-    commits: int = 0
+    #: The checkout's head once the branch is in.
+    commit: str = ""
+    #: The task's own check failed on the rebased commit: ``detail`` is its result line.
+    checked: bool = False
     #: A rebase that stopped: the integration head it was onto, and the files
     #: that conflicted. The worker can resolve it in its worktree.
     base: str = ""
@@ -132,7 +125,6 @@ class Integration:
         #: The rules a task's commits are audited against before they are integrated;
         #: ``None``: they are not audited.
         self.policy = policy
-        self._lock = threading.Lock()
 
     def branch(self, task_id: str) -> str:
         return f"{self.prefix}/{task_id}"
@@ -257,11 +249,17 @@ class Integration:
             return False
         return self._git(self.repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode == 0
 
-    def integrate(self, task_id: str) -> Outcome:
-        """Rebase the task's branch onto the checkout's head and fast-forward it in."""
+    def integrate(self, task_id: str, check: Callable[[Path, str], str] | None = None) -> Outcome:
+        """Rebase the task's branch onto the checkout's head and fast-forward it in.
+
+        ``check(tree, commit)`` runs on the rebased, clean worktree before the checkout
+        moves; what it returns, when not empty, is why the branch does not land.
+        """
         tree, branch = self.tree(task_id), self.branch(task_id)
         if self._already_in(task_id):
-            return Outcome(True, f"{branch} was integrated before the restart", 0)
+            # Checked before it went in: a process that stopped there does not check again.
+            tip = self.integrated_tip(task_id)
+            return Outcome(True, f"{branch} was integrated before the restart", tip)
         if not (tree / ".git").exists():
             return Outcome(False, f"task {task_id} has no worktree at {tree}")
         if _rebase_in_progress(tree):
@@ -285,13 +283,15 @@ class Integration:
                 "finishing:\n" + dirty.strip(),
                 repairable=True,
             )
-        with self._lock, repo_lock(self.repo):
+        with repo_lock(self.repo):
             head = git_checked(self.repo, "rev-parse", "HEAD")
             ahead = git_checked(
                 tree, "rev-list", "--count", f"{head}..{branch}", check=False
             ).strip()
             if ahead in ("", "0"):
-                return Outcome(True, "nothing to integrate", 0)
+                # The worker changed nothing: what its check judges is the head itself.
+                failed = check(tree, head) if check else ""
+                return Outcome(not failed, failed or "nothing to integrate", head, bool(failed))
             broken = self._audit(tree, head, branch)
             if broken:
                 return Outcome(False, broken, repairable=True)
@@ -308,6 +308,10 @@ class Integration:
                     base=head,
                     conflicts=tuple(conflicts),
                 )
+            tip = git_checked(tree, "rev-parse", "HEAD")
+            failed = check(tree, tip) if check else ""
+            if failed:
+                return Outcome(False, failed, checked=True)
             merged = self._git(self.repo, "merge", "--ff-only", "--quiet", branch)
             for _ in range(LOCK_RETRIES):
                 # Another git process held the checkout's index lock for a moment.
@@ -317,9 +321,9 @@ class Integration:
                 merged = self._git(self.repo, "merge", "--ff-only", "--quiet", branch)
             if merged.returncode != 0:
                 return Outcome(False, f"fast-forward of {branch} failed: {merged.stderr.strip()}")
-            self._record(task_id, git_checked(self.repo, "rev-parse", branch))
+            self._record(task_id, tip)
             self._label(task_id, head, branch)
-            return Outcome(True, f"integrated {branch} ({ahead} commit(s))", int(ahead))
+            return Outcome(True, f"integrated {branch} ({ahead} commit(s))", tip)
 
     def _label(self, task_id: str, head: str, branch: str) -> None:
         """Record each commit the task landed as the target's own, shared code, or both."""
@@ -460,7 +464,6 @@ __all__ = [
     "Integration",
     "Outcome",
     "REPAIR_TURNS",
-    "TaskNotStarted",
     "rebase_block",
     "repair_block",
     "worktree_block",

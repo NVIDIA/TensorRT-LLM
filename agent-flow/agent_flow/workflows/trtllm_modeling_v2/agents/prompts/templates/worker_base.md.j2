@@ -20,10 +20,10 @@ write.
   are claims, including what their authors could not finish.
 - **Commit as you go**, the way your prompt names. Uncommitted work is never
   integrated.
-- **You check your own work, and the run trusts your decision.** When your
-  turn ends finished, your branch is audited and integrated, and the next
-  task builds on it. No check runs in between. Every check of the contract
-  runs once at the end, on the final commit. So run your task's checks
+- **You check your own work first.** When your turn ends finished, your
+  branch is audited and lands, and the next task builds on it. The run itself
+  boots and scores the first deployment before its commits land; every other
+  deployment's checks run once after the last task. So run your task's checks
   yourself with `trtllm-modeling-v2 gate` before you say you finished, and
   say only what you ran and saw.
 - **The workflow's checks are the reference, not the only checks.** Start

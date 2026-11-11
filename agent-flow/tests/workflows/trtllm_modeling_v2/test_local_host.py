@@ -155,7 +155,7 @@ def test_monitor_cli_tells_a_busy_orchestrator_from_one_that_has_exited(
 def test_monitor_status_says_where_the_run_stands(tmp_path, capsys):
     (tmp_path / "task.yaml").write_text("{}\n", encoding="utf-8")
     (tmp_path / ".trtllm_modeling_v2_state.json").write_text(
-        json.dumps({"version": 3, "stage": "execution", "done": False})
+        json.dumps({"version": 4, "onboarded": {"commit": "c0ffee1234567890"}})
     )
     tasks = [
         {"id": "survey", "status": "done"},
@@ -163,15 +163,14 @@ def test_monitor_status_says_where_the_run_stands(tmp_path, capsys):
         {"id": "mtp", "status": "pending"},
     ]
     (tmp_path / "tasks.yaml").write_text(yaml.safe_dump({"tasks": tasks}))
-    (tmp_path / "certification.yaml").write_text(
-        yaml.safe_dump({"certified": False, "round": 1, "commit": "c0ffee1234567890"})
-    )
     assert cli.SUBCOMMANDS["monitor"](["--workspace", str(tmp_path), "status"]) == 0
     line = capsys.readouterr().out.splitlines()[1]
     assert line == (
-        "run: stage execution; tasks 1 done, 1 pending, 1 running; running core; "
-        "certification round 1: not certified c0ffee123456"
+        "run: onboarded at c0ffee123456; tasks 1 done, 1 pending, 1 running; running core"
     )
+    (tmp_path / ".trtllm_modeling_v2_state.json").write_text(json.dumps({"version": 4}))
+    assert cli.SUBCOMMANDS["monitor"](["--workspace", str(tmp_path), "status"]) == 0
+    assert capsys.readouterr().out.splitlines()[1].startswith("run: not onboarded; tasks ")
 
 
 def _git(repo, *args):
@@ -213,7 +212,7 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
     said = capsys.readouterr()
     assert "--dry-run: preflight passed" in said.out
     assert "note: --max-rounds is ignored: " in said.err
-    assert (workspace / "contract.yaml").is_file() and not (workspace / "tasks.yaml").exists()
+    assert (workspace / "anchors.yaml").is_file() and not (workspace / "tasks.yaml").exists()
 
     # A spec that states no model for its roles is a spec error: 2, before anything runs.
     spec = yaml.safe_load(task_file.read_text())

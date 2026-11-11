@@ -60,7 +60,6 @@ DEFAULT_ROLE_TURN_TIMEOUTS: dict[str, float] = {
     "surveyor": 4 * 3600.0,
     "kernel_writer": 6 * 3600.0,
     "assembler": 16 * 3600.0,
-    "planner": 15 * 60.0,
 }
 
 #: Where in-process turns leave their files, under the workspace.

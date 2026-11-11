@@ -24,7 +24,8 @@ engine_defect:
   proposal: the fix, in a sentence or two
 ```
 
-The planner reads it and decides what happens next.
+The run records it: the task runs again with it as its note, and once its attempts are
+spent the row is skipped and the report says so.
 
 When the callable is more than one kernel-launching call and nothing better
 than the native PyTorch composition exists, the composition is the entry:

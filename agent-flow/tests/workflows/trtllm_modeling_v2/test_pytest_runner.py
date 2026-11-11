@@ -16,7 +16,7 @@ import pytest
 from agent_flow.workflows.trtllm_modeling_v2.checks import pytest_runner
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import model_ops_tests_dir
-from agent_flow.workflows.trtllm_modeling_v2.run import certify
+from agent_flow.workflows.trtllm_modeling_v2.run import report
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is not available")
 
@@ -68,7 +68,7 @@ class _Delivery:
         return CommandResult(returncode=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
     def check(self):
-        return certify.tests_check(self, self.head)
+        return report.delivered_tests(self, self.head)
 
 
 def test_the_delivered_tests_run_once_at_the_commit_and_hold_on_their_passing(tmp_path):
@@ -80,7 +80,7 @@ def test_the_delivered_tests_run_once_at_the_commit_and_hold_on_their_passing(tm
     check = stage.check()
     assert check.passed, check.detail
     assert check.detail.startswith("CLEAN (2 passed, 0 skipped, 0 failing)")
-    assert f"2 test file(s) asked for at {stage.head[:10]}" in check.detail
+    assert "2 test file(s) asked for" in check.detail and check.commit == stage.head
     # One job, from inside the tree, with the tree first on PYTHONPATH.
     [command] = stage.ran
     assert command.startswith(f"cd {stage.repo} && export PYTHONPATH={stage.repo}")
@@ -116,7 +116,7 @@ def test_a_selection_is_judged_from_its_report(tmp_path, files, verdict):
     assert pytest_runner.read_report(report).describe().startswith(verdict)
 
 
-def test_a_delivered_file_that_did_not_run_is_not_certified_by_another(tmp_path):
+def test_a_delivered_file_that_did_not_run_is_not_covered_by_another(tmp_path):
     tests = model_ops_tests_dir(TARGET)
     files = {
         f"{tests}/test_a.py": PASSING,

@@ -6,8 +6,7 @@
 Every task's agent is a worker (:mod:`.worker`): one system prompt, which the
 roles a task can be dispatched to (``surveyor``, ``kernel_writer``, ``assembler``)
 end each the way its turn ends. What a task asks is said by its
-tags, whose sections its dispatch carries (:mod:`.tags`). The planner has a
-prompt of its own.
+tags, whose sections its dispatch carries (:mod:`.tags`).
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ from typing import TYPE_CHECKING
 from ...infra.git import CommitPolicy, commit_instruction
 from ..decisions import DECISIONS_BY_AGENT, EXTRA_KEYS_BY_AGENT
 from ._common import decision_file_block, notes_block, scope_block
-from .planner import SYSTEM_PROMPT as PLANNER_SYSTEM_PROMPT
 from .worker import role_prompt
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard for type checkers only
@@ -32,15 +30,9 @@ class PromptBundle:
     surveyor: str
     kernel_writer: str
     assembler: str
-    planner: str = PLANNER_SYSTEM_PROMPT
 
     def with_extensions(
-        self,
-        *,
-        surveyor: str = "",
-        kernel_writer: str = "",
-        assembler: str = "",
-        planner: str = "",
+        self, *, surveyor: str = "", kernel_writer: str = "", assembler: str = ""
     ) -> "PromptBundle":
         """Return a new bundle with each non-empty extension appended after one blank line."""
 
@@ -53,7 +45,6 @@ class PromptBundle:
             surveyor=_append(self.surveyor, surveyor),
             kernel_writer=_append(self.kernel_writer, kernel_writer),
             assembler=_append(self.assembler, assembler),
-            planner=_append(self.planner, planner),
         )
 
 
@@ -61,19 +52,13 @@ def _for_every_role(prompts: PromptBundle, block: str) -> PromptBundle:
     """Append one block to every role, including the ones that mostly read."""
     if not block.strip():
         return prompts
-    return prompts.with_extensions(
-        surveyor=block,
-        kernel_writer=block,
-        assembler=block,
-        planner=block,
-    )
+    return prompts.with_extensions(surveyor=block, kernel_writer=block, assembler=block)
 
 
 _ROLE_PROMPTS = PromptBundle(
     surveyor=role_prompt("surveyor"),
     kernel_writer=role_prompt("kernel_writer"),
     assembler=role_prompt("assembler"),
-    planner=PLANNER_SYSTEM_PROMPT,
 )
 
 DEFAULT_PROMPTS = _ROLE_PROMPTS.with_extensions(

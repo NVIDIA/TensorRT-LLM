@@ -833,8 +833,7 @@ def test_a_run_reads_a_spec_that_states_its_deployments(tmp_path):
     )
     assert "- `pd`: disaggregated, ctx 16 rank(s), attention DP" in journal
     assert "devices:     (none claimed here)" in journal
-    contract = yaml.safe_load((tmp_path / "ws" / "contract.yaml").read_text())
-    assert [f"{c['deployment']}:{c['gate']}" for c in contract["checks"]] == [
+    assert [check.key for check in workflow._contract.checks] == [
         "dep16:boot",
         "dep16:accuracy[gsm8k]",
         "dep16:accuracy[mmmu]",

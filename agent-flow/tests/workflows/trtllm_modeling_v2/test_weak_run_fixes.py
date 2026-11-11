@@ -29,8 +29,8 @@ What each run lost, and the case that holds its fix:
   ``test_the_memory_limit_is_read_from_the_process_own_cgroup``
 - a defect in shared code became a fix task the commit policy refused:
   ``test_a_kernel_writer_guards_a_cell_the_target_never_serves``
-- an entry without ``CELLS`` landed and failed the final round, a static delivery problem
-  cost a whole certification round, and a valid entry under another file name was refused
+- an entry without ``CELLS`` landed and failed the final checks, a static delivery problem
+  cost a whole pass of them, and a valid entry under another file name was refused
   and renamed: ``test_a_landing_is_read_for_the_conventions_and_no_finding_holds_it``
 - nothing read what the workers left uncertified:
   ``test_the_report_lists_what_the_workers_left_uncertified``
@@ -39,7 +39,8 @@ What each run lost, and the case that holds its fix:
 - a large tool result ended a turn at the SDK's 1 MiB message limit:
   ``test_the_claude_backend_reads_stream_messages_past_the_sdk_default``
 - delivered tests' rank processes imported another checkout:
-  ``test_delivered_tests_run_with_the_tree_first_on_pythonpath``
+  ``test_the_delivered_tests_run_once_at_the_commit_and_hold_on_their_passing``
+  (``test_pytest_runner.py``)
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ from agent_flow.workflows.trtllm_modeling_v2.agents.prompts.worker import ENDING
 from agent_flow.workflows.trtllm_modeling_v2.checks import anchors, conventions
 from agent_flow.workflows.trtllm_modeling_v2.checks import serve as serve_gate
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
-from agent_flow.workflows.trtllm_modeling_v2.run import certify
+from agent_flow.workflows.trtllm_modeling_v2.run import report as report_mod
 from agent_flow.workflows.trtllm_modeling_v2.run import workflow as workflow_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import Pipeline, Task
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe
@@ -120,7 +121,7 @@ def test_tasks_run_one_at_a_time(tmp_path, task_file, monkeypatch):
         return {"decision": "LANDED", "summary": task}
 
     _run(tmp_path, task_file, monkeypatch, Script(kernel_writer=kernel_writer))
-    assert _state(tmp_path).verdict == "delivered"
+    assert _state(tmp_path).onboarded
     assert met == [] and list(earlier) == ["k1-rms", "k2-scale", "k3-last"]
     # Each dispatch says the tasks before it are done: it starts from their commits.
     assert "`k1-rms` (kernel): done LANDED" in earlier["k2-scale"]
@@ -164,22 +165,6 @@ def test_a_measured_small_anchor_is_not_called_a_placeholder(task_file, repo):
     references = repo / spec["accuracy"]["reference_yaml"]
     references.write_text("Qwen/Qwen3-0.6B:\n  - accuracy: 41.77\n", encoding="utf-8")
     assert advice.spec_warnings(task) == []
-
-
-def test_delivered_tests_run_with_the_tree_first_on_pythonpath(tmp_path):
-    """Defect 15: rank processes a test starts inherit the tree, as the gates' commands do."""
-    ran: list[str] = []
-
-    def shell(line, env, timeout):
-        ran.append(line)
-        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
-
-    workflow = SimpleNamespace(_shell_runner_override=shell, _shell_runner=shell)
-    # What the executor is handed, not a helper beside it.
-    certify._test_job(workflow, "python -m pytest t.py", tmp_path, 60)
-    [line] = ran
-    assert line.startswith(f"cd {tmp_path.resolve()} && export PYTHONPATH={tmp_path.resolve()}")
-    assert line.endswith("&& python -m pytest t.py")
 
 
 # ----------------------------------------------------------------------------- host memory
@@ -249,7 +234,7 @@ def test_a_decision_file_without_its_decision_gets_one_turn_to_write_it(
         return {"decision": "UNIT_READY", "summary": "assembled, boot passed"}
 
     _run(tmp_path, task_file, monkeypatch, Script(assembler=assembler))
-    assert _state(tmp_path).verdict == "delivered"
+    assert _state(tmp_path).onboarded
     assert len(prompts) == 2
     assert "## Your decision file is not valid" in prompts[1]
     assert "has no `decision` key" in prompts[1] and "Do not do the task again" in prompts[1]
@@ -303,8 +288,8 @@ def _land(tmp_path, *decisions: dict) -> tuple[object, list[str]]:
     """
     answers, prompts = list(decisions), []
 
-    def dispatch(task, role, prompt, path):
-        prompts.append(prompt)
+    def dispatch(task, role, block, path):
+        prompts.append(block)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(yaml.safe_dump(answers.pop(0)), encoding="utf-8")
 
@@ -313,8 +298,7 @@ def _land(tmp_path, *decisions: dict) -> tuple[object, list[str]]:
     pipeline.workspace = tmp_path / "ws"
     pipeline.w.journal = SimpleNamespace(event=lambda *said: None)
     pipeline._dispatch = dispatch
-    pipeline._prompt = lambda task, block: block
-    pipeline._integrate = lambda task, role, tree, block: ""
+    pipeline._land = lambda task, role, tree, block: ""
     pipeline.w.task_data["trtllm_repo_path"] = str(tmp_path)
     pipeline._scan = lambda *a: Pipeline._scan(pipeline, *a)
     task = Task(id="k1-rms", kind="kernel", unit="core", ref="1", attempts=1)
@@ -354,7 +338,7 @@ def test_a_landing_is_read_for_the_conventions_and_no_finding_holds_it(tmp_path)
     assert len(conventions.load(tmp_path / "ws")) == 4
 
 
-def test_the_report_lists_what_the_workers_left_uncertified(tmp_path):
+def test_the_report_lists_what_the_workers_left_uncertified(tmp_path, task_file, monkeypatch):
     """Review of the runs: each task's last ``uncertified`` list reaches the report."""
     decisions = tmp_path / "decisions"
     decisions.mkdir()
@@ -362,19 +346,21 @@ def test_the_report_lists_what_the_workers_left_uncertified(tmp_path):
     (decisions / "k1-rms-2.yaml").write_text(
         "decision: LANDED\nuncertified:\n  - cached-prefix context (31+33 tokens) fails in shared code\n"
     )
-    (decisions / "core-1.yaml").write_text(
+    # A short turn after the first of an attempt is the later word of that attempt.
+    (decisions / "core-1.yaml").write_text("decision: UNIT_READY\nuncertified: [first turn]\n")
+    (decisions / "core-1.2.yaml").write_text(
         "decision: UNIT_READY\nuncertified: |\n  lm_head at M=8192\n"
     )
-    (decisions / "planner-3.yaml").write_text("decision: CONTINUE\nuncertified: [not a task]\n")
-    listed = [
-        "- `core`: lm_head at M=8192",
-        "- `k1-rms`: cached-prefix context (31+33 tokens) fails in shared code",
+    assert report_mod._uncertified(tmp_path) == [
+        "- `core` left uncertified: lm_head at M=8192",
+        "- `k1-rms` left uncertified: cached-prefix context (31+33 tokens) fails in shared code",
     ]
-    assert certify.uncertified_lines(tmp_path) == listed
     # In the report a reader opens, not only in the helper that collects them.
-    workflow = SimpleNamespace(task_data={}, _preflight=None, workspace=tmp_path)
-    report = certify.write_report(workflow, "escalated", None, "").read_text()
-    assert "## What the workers left uncertified\n\n" + "\n".join(listed) in report
+    said = {"decision": "UNIT_READY", "summary": "x", "uncertified": ["lm_head at M=8192"]}
+    _run(tmp_path, task_file, monkeypatch, Script(assembler=lambda turn, prompt: said))
+    report = (tmp_path / "ws" / "delivery_report.md").read_text()
+    unchecked = report.split("## What the run did not check")[1].split("##")[0]
+    assert "- `core` left uncertified: lm_head at M=8192" in unchecked
 
 
 # ----------------------------------------------------------------------------- the backend

@@ -65,7 +65,7 @@ def test_a_claude_role_keeps_its_stop_hook_and_a_codex_role_gets_none(tmp_path):
             "defaults": {"backend": "claude-code", "model": "claude-test-model"},
             "roles": {
                 "assembler": {"reasoning_effort": "high"},
-                "planner": {
+                "surveyor": {
                     "backend": "codex",
                     "model": "codex-test-model",
                     "extra_mcp_servers": kb,
@@ -84,7 +84,7 @@ def test_a_claude_role_keeps_its_stop_hook_and_a_codex_role_gets_none(tmp_path):
     assert backend.cwd == workflow.workspace
     assert layer.config.required_tools == ()
 
-    layer = workflow._make_agent("planner", "system")
+    layer = workflow._make_agent("surveyor", "system")
     backend = layer.config.backend
     assert (backend.kind, backend.model) == ("codex", "codex-test-model")
     assert backend.hooks is None
@@ -93,7 +93,7 @@ def test_a_claude_role_keeps_its_stop_hook_and_a_codex_role_gets_none(tmp_path):
     # Without the user's plugins, and, once the agent probe has read them, their skills.
     assert backend.plugins is False and backend.disabled_skills == ()
     workflow._foreign_skills = {"codex": ("imagegen", "cluster-jobs")}
-    backend = workflow._make_agent("planner", "system").config.backend
+    backend = workflow._make_agent("surveyor", "system").config.backend
     assert backend.disabled_skills == ("imagegen", "cluster-jobs")
 
 
@@ -139,7 +139,7 @@ class SayingLayer:
 
 
 @pytest.mark.usefixtures("_probe_runs")
-def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_file, monkeypatch):
+def test_a_failed_probe_stops_the_run_before_any_turn(tmp_path, task_file, monkeypatch):
     said = "Bash failed: Error: connect EPERM /tmp/claude/srt-mux-9.sock"
     monkeypatch.setattr(agent_probe, "make_probe_layer", lambda a, w: SayingLayer(a, w, said))
     shells: list[str] = []

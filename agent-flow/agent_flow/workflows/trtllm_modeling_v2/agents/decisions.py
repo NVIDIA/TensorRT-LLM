@@ -6,7 +6,7 @@ One table for the places that must agree on it: the role's prompt, whose
 "Ending your turn" section is rendered from it (:func:`ending_section`); the
 decision-file validation, whose enum per role is its names
 (:func:`read_decision`); and the pipeline, for which a decision that
-``finishes`` a task ends it done and any other ends it failed
+``finishes`` a task lets it land and any other ends the attempt
 (``run/pipeline.py``).
 
 A turn reports by writing one YAML file at the one path its dispatch names
@@ -35,15 +35,14 @@ class Decision:
     when: str
     #: What the run does next.
     then: str
-    #: The task the turn worked on ends done (``True``) or failed (``False``);
-    #: ``None`` for the planner, whose turn is not a task's.
-    finishes: bool | None = None
+    #: The worker did what the task asked (``True``), or the attempt ends here (``False``).
+    finishes: bool = False
 
 
-_FAILS = "the task fails, and the planner decides what happens next"
-
-#: The planner's decisions, which the pipeline branches on.
-CONTINUE, REPAIR, SKIP, ESCALATE = "CONTINUE", "REPAIR", "SKIP", "ESCALATE"
+_FAILS = (
+    "the attempt ends: the task runs again with what you wrote as its note, and once its "
+    "attempts are spent it is reported not done and the run goes on without it"
+)
 
 DECISIONS: dict[str, tuple[Decision, ...]] = {
     "kernel_writer": (
@@ -69,7 +68,7 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "nothing in this turn can move the entry: the environment, a prerequisite outside "
             "it, or a better fused replacement that must be sourced first (name its entries "
             "in `summary`); say which",
-            f"{_FAILS} from your summary",
+            f"{_FAILS}",
             False,
         ),
     ),
@@ -78,17 +77,18 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "UNIT_READY",
             "the work the task asks is written and committed, and every check of the unit you "
             "ran yourself passed; list what you ran under `checks`",
-            "the task is done: its branch is audited and integrated. Nothing re-checks it "
-            "until the final certification, which runs every check on the final commit",
+            "its branch is audited and lands. For the first deployment the run boots and "
+            "scores it on your committed worktree first, and nothing lands unless that "
+            "passes; a later deployment's checks run once in the final pass",
             True,
         ),
         Decision(
             "BLOCKED",
-            "the work cannot go on in this turn: a callable no catalog entry covers "
-            "(`blocked_reason: vocabulary_gap`, the callable in `missing_entry`), or what "
-            "you lack (`knowledge_gap`), an accuracy you cannot close (`accuracy_shortfall`) "
-            "or the host (`environment`). Block as soon as you know",
-            f"{_FAILS} from `blocked_reason`, `missing_entry` and your summary",
+            "the work cannot go on in this turn: what you lack (`blocked_reason: "
+            "knowledge_gap`), an accuracy you cannot close (`accuracy_shortfall`) or the host "
+            "(`environment`). A callable no catalog entry covers is no reason to block: write "
+            "its wrapper in the target's own `ops/`. Block as soon as you know",
+            f"{_FAILS}",
             False,
         ),
     ),
@@ -97,8 +97,8 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "DRAFT_READY",
             "both files are written and coherent; `summary` names what you wrote and the "
             "counts by state",
-            "the survey is done: the pipeline adds one kernel task per queue row, then the "
-            "units in order",
+            "the survey is done: the pipeline adds one kernel task per queue row and one "
+            "task per deployment, in the spec's order",
             True,
         ),
         Decision(
@@ -107,33 +107,6 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "go in `vocabulary.yaml`'s `ceiling` block",
             f"{_FAILS}",
             False,
-        ),
-    ),
-    "planner": (
-        Decision(
-            CONTINUE,
-            "the pipeline should go on as it is: after a failed task this runs the task "
-            "again, with your `note` for its worker; after a failed certification it "
-            "certifies again; after an operator message it changes nothing",
-            "the pipeline goes on",
-        ),
-        Decision(
-            REPAIR,
-            "other work must land first: list it under `tasks`, at most three, each a "
-            "`kernel` task (one catalog entry) or a `fix` task (a change to the target)",
-            "the pipeline runs your tasks in order, then goes on as for CONTINUE",
-        ),
-        Decision(
-            SKIP,
-            "a failed `kernel` task is not needed: the unit that would call the entry can be "
-            "written without it; say why",
-            "the pipeline leaves the task out and goes on",
-        ),
-        Decision(
-            ESCALATE,
-            "the run cannot meet a requirement as the spec states it; name the requirement "
-            "and the evidence",
-            "the run stops `escalated`, and the operator reads your summary",
         ),
     ),
 }
@@ -174,9 +147,7 @@ EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
     "kernel_writer": ("entry", "receipt", "engine_defect", "uncertified", "macro"),
     # `checks` are the unit's checks the worker ran itself, each with its result;
     # `uncertified` names the calls a unit makes, correct, outside their entries' CELLS.
-    "assembler": ("checks", "blocked_reason", "missing_entry", "uncertified"),
-    # `note` is what a retried task's worker is told; `tasks` is a REPAIR's work.
-    "planner": ("note", "tasks"),
+    "assembler": ("checks", "blocked_reason", "uncertified"),
 }
 
 
@@ -271,16 +242,12 @@ def first_paragraph(text: Any, limit: int = 400) -> str:
 
 
 __all__ = [
-    "CONTINUE",
     "DECISIONS",
     "DECISIONS_BY_AGENT",
     "DECISIONS_DIRNAME",
     "DECISION_REMINDER",
-    "ESCALATE",
     "EXTRA_KEYS_BY_AGENT",
     "Decision",
-    "REPAIR",
-    "SKIP",
     "clip",
     "decision_file_instruction",
     "decision_list",

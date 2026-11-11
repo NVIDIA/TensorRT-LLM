@@ -125,11 +125,12 @@ def _yaml(path: Path) -> Any:
 
 
 def _run(workspace: Path) -> str | None:
-    """Where the run stands: its stage or verdict, its tasks by status, its last certification."""
+    """Where the run stands: onboarded or not, and its tasks by status."""
     state = read_json(workspace / ".trtllm_modeling_v2_state.json")
     if not state:
         return None
-    said = [f"verdict {state['verdict']}" if state.get("done") else f"stage {state.get('stage')}"]
+    record = state.get("onboarded") or {}
+    said = [f"onboarded at {str(record.get('commit'))[:12]}" if record else "not onboarded"]
     tasks = (_yaml(workspace / "tasks.yaml") or {}).get("tasks")
     if tasks:
         counts: dict[str, int] = {}
@@ -139,13 +140,6 @@ def _run(workspace: Path) -> str | None:
         running = [str(t.get("id")) for t in tasks if t.get("status") == "running"]
         if running:
             said.append("running " + ", ".join(running))
-    certification = _yaml(workspace / "certification.yaml")
-    if certification:
-        said.append(
-            f"certification round {certification.get('round')}: "
-            + ("certified" if certification.get("certified") else "not certified")
-            + f" {str(certification.get('commit') or '')[:12]}"
-        )
     return "; ".join(said)
 
 

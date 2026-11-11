@@ -128,6 +128,7 @@ def run_check(
     timeout: int | None = None,
     mode: str = check_runtime.MODE_REQUIRE,
     relative_score: float | None = None,
+    measure_base: bool = True,
     locked: bool = False,
 ) -> check_result.GateResult:
     """Run ``gate`` on the deployment named ``deployment`` (core's when unnamed), on ``tree``.
@@ -137,8 +138,8 @@ def run_check(
     ``workspace`` is the run's: its frozen anchors and claimed devices are used when it is
     given. ``runner`` replaces the environment's own, for tests. A benchmark whose anchor
     is another deployment's score is judged against ``relative_score``; without one that
-    deployment's benchmark runs here first, and when it measures no score this one's is
-    reported with no verdict. ``locked``: the caller already holds the
+    deployment's benchmark runs here first (``measure_base``), and when there is no such
+    score this one's is reported with no verdict. ``locked``: the caller already holds the
     workspace's engine lock.
     """
     name = gate_name(gate)
@@ -181,7 +182,7 @@ def run_check(
         held = anchors.frozen(workspace, found.name, benchmark.name) or anchors.resolve(
             spec, found, benchmark, tree
         )
-        if held.kind == anchors.RELATIVE and relative_score is None:
+        if held.kind == anchors.RELATIVE and relative_score is None and measure_base:
             first = run_check(
                 task_data,
                 f"accuracy[{benchmark.name}]",

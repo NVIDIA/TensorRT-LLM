@@ -108,6 +108,7 @@ IGNORED_KEYS: dict[str, str] = {
     "commit_policy.allowed_paths": "no path is refused but the workspace and the judge's "
     "(the evaluator, the accuracy references); a landed commit is labelled target, shared "
     "or mixed",
+    "agents.roles.planner": "there is no planner: the order of the tasks is fixed in code",
     "variants.*.gates": "every deployment boots and is scored on its benchmarks",
     "variants.*.members": "a variant is one deployment on the first member",
     "variants.*.accuracy.acceptance": "a drafter's acceptance is a native test in `tests`",

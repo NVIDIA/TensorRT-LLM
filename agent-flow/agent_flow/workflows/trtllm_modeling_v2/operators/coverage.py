@@ -15,7 +15,6 @@ a row on ``ops/<category>/<name>`` in place: :func:`entry_paths` says which file
 from __future__ import annotations
 
 import re
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -216,24 +215,33 @@ def load_vocabulary(
     return parse_vocabulary(data or {}, str(source), units=units)
 
 
-def queue_item_from_ref(ref: str, task_id: str, goal: str = "") -> QueueItem | None:
-    """The dispatch a kernel task names by ``ref`` instead of a queue row; ``None`` if it names none.
+def rows_by_unit(queue: Sequence[QueueItem], units: Sequence[str]) -> dict[str, list[QueueItem]]:
+    """The queue rows each unit's kernel tasks come from, each after the rows it depends on.
 
-    ``onboard:<entry>`` and ``verify:<entry>`` name one entry; after a shared one,
-    ``@<site>`` names the call site its local variant is for, else the task id does. The
-    dispatch number is the task id's, above every queue row's, so a retry finds its
-    decision file.
+    A row belongs to the first unit that needs it: its own, or an earlier unit's when a
+    row of that unit depends on it. Within a unit, rows keep their numbers' order but for
+    a row that depends on a later one, which follows it; rows that depend on each other
+    in a circle keep their numbers' order.
     """
-    mode, _, rest = ref.strip().partition(":")
-    target, _, site = (part.strip() for part in rest.strip().partition("@"))
-    if mode not in MODES or not target:
-        return None
-    if site and not (_SITE.match(site) and _shared(target)):
-        return None
-    if _shared(target) and not site:
-        site = re.sub(r"[^a-z0-9]+", "_", task_id.lower()).strip("_")
-    n = REF_DISPATCH_BASE + zlib.crc32(task_id.encode("utf-8")) % REF_DISPATCH_SPAN
-    return QueueItem(n=n, mode=mode, target=target, note=goal, site=site or None)
+    index = {unit: i for i, unit in enumerate(units)}
+    by_n = {item.n: item for item in queue}
+    place = {n: index.get(item.unit, 0) for n, item in by_n.items()}
+    changed = True
+    while changed:
+        changed = False
+        for n, item in by_n.items():
+            for dep in item.depends_on:
+                if dep in place and place[dep] > place[n]:
+                    place[dep], changed = place[n], True
+    grouped: dict[str, list[QueueItem]] = {unit: [] for unit in units}
+    for i, unit in enumerate(units):
+        left = sorted(n for n in by_n if place[n] == i)
+        while left:
+            ready = [n for n in left if not (set(by_n[n].depends_on) & set(left) - {n})]
+            take = ready[0] if ready else left[0]
+            grouped[unit].append(by_n[take])
+            left.remove(take)
+    return grouped
 
 
 def model_ops_tests_dir(target_rel: str) -> str:

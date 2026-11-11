@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The conventions scan, and the delivery checks the certification still runs."""
+"""The conventions scan, and what the final pass still holds the tree to in git."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import subprocess
 from agent_flow.workflows.trtllm_modeling_v2.checks import conventions
 from agent_flow.workflows.trtllm_modeling_v2.infra.git import CommitPolicy
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import model_ops_tests_dir
-from agent_flow.workflows.trtllm_modeling_v2.run import certify
+from agent_flow.workflows.trtllm_modeling_v2.run import report
 
 from ._helpers import _ENTRY, TARGET_REL, _build_repo
 
@@ -70,16 +70,18 @@ def test_the_scan_reads_each_entry_its_test_and_the_targets_v1_imports(tmp_path)
     assert conventions.load(workspace) == {"a": "core", "b": "core", "c": "mtp"}
 
 
-def test_the_certification_still_holds_the_tree_to_git(tmp_path):
+def test_the_final_pass_still_holds_the_tree_to_git(tmp_path):
     def git(*args):
         subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
 
-    assert certify.git_checks(tmp_path, CommitPolicy(), ("modeling.py",)) == []  # not a checkout
+    assert report.git_lines(tmp_path, CommitPolicy(), ("modeling.py",)) == []  # not a checkout
     git("init", "-q")
     (tmp_path / "seed").write_text("s\n", encoding="utf-8")
     git("add", "seed")
     git("-c", "user.email=t@e.st", "-c", "user.name=t", "commit", "-qm", "seed")
     (tmp_path / "modeling.py").write_text("# never committed\n", encoding="utf-8")
-    [check] = certify.git_checks(tmp_path, CommitPolicy(), ("modeling.py",))
+    [check] = report.git_lines(tmp_path, CommitPolicy(), ("modeling.py",), "abc")
     assert not check.passed and check.name == "git:target-committed"
     assert "a clone would not have them" in check.detail and "modeling.py" in check.detail
+    # A line of the report: it says where it was measured, and fails nothing by itself.
+    assert check.render().startswith("[FAIL] git:target-committed at `abc`: uncommitted")

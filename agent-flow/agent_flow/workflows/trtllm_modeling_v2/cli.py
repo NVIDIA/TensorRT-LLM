@@ -22,7 +22,7 @@ from .infra.git import (
     trial_commit,
 )
 from .infra.monitor.heartbeat import ORCHESTRATOR_HEARTBEAT_S, start_orchestrator_heartbeat
-from .run.pipeline import DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ROUNDS
+from .run.pipeline import DEFAULT_MAX_ATTEMPTS, NOTES_FILENAME
 from .run.state import STATE_FILENAME
 from .spec.task_schema import TaskSchemaError, load_and_validate_task_yaml
 
@@ -31,8 +31,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="trtllm-modeling-v2",
         description=(
-            "Bring one checkpoint to a certified modeling_v2 target: preflight, the tasks in "
-            "a fixed order, then the certification of the final commit."
+            "Onboard one checkpoint as a modeling_v2 target: preflight, the tasks in a fixed "
+            "order, the onboard check on the first deployment, each further deployment, one "
+            "final pass and the report. Exit status 0 means onboarded: the first deployment's "
+            "boot and benchmarks passed on the commit that landed, whatever else is not done; "
+            "1 anything else the run came to (`delivery_report.md` and the journal say what); "
+            "2 a spec or usage error. The same command against the same workspace goes on "
+            "from where the last start stopped."
         ),
     )
     parser.add_argument(
@@ -56,14 +61,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_ATTEMPTS,
         help="How many worker runs one task gets, its first included. A task that spent "
-        f"them is the planner's to repair around or escalate. Default {DEFAULT_MAX_ATTEMPTS}.",
+        "them is not done: the run goes on without it, and the next start gives it fresh "
+        f"ones. Default {DEFAULT_MAX_ATTEMPTS}.",
     )
     parser.add_argument(
         "--max-rounds",
         type=int,
         default=None,
-        help="Ignored, with a notice: a run certifies its final commit and repairs it at most "
-        f"{DEFAULT_MAX_ROUNDS - 1} time(s).",
+        help="Ignored, with a notice: the run has one final pass and no rounds.",
     )
     parser.add_argument(
         "--clean",
@@ -78,7 +83,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Run preflight and stop before the first agent turn: the spec, the checkout, "
-        "the checkpoint, the contract and the agent probe. It touches no GPU (no device is "
+        "the checkpoint, the anchors and the agent probe. It touches no GPU (no device is "
         "queried or claimed), so it also runs on a host without one.",
     )
     parser.add_argument(
@@ -164,32 +169,30 @@ def _lazy_main(module: str) -> Callable[[list[str]], int]:
 
 
 def _feedback(argv: list[str]) -> int:
-    from .run import inbox
+    """``feedback --workspace W "text"``: append ``text``, time-stamped, to the operator's notes."""
+    from .run.journal import utc_now
 
     parser = argparse.ArgumentParser(
         prog="trtllm-modeling-v2 feedback",
-        description="Leave a message for the planner of the run in a workspace. The run "
-        "asks the planner about it between two tasks. A message steers the work in a few "
-        f"sentences, evidence in a file it names; past {inbox.MESSAGE_MAX_CHARS} characters "
-        "the planner reads its head and the path of the whole. It does not change the "
-        "contract's checks, which task.yaml defines, and is no place for status reports.",
+        description=f"Append a note, with its time, to `<workspace>/{NOTES_FILENAME}`. Every "
+        "later turn of the run is told to read that file first and again before it ends; "
+        "no agent interprets it and it adds no task. To reach the turn in progress, stop the "
+        "run and start it again with the same command: the cut turn restarts. It is "
+        "information for the workers, never a reason to change an anchor or a check.",
     )
     parser.add_argument("--workspace", type=Path, required=True, help="The run's workspace.")
     text = parser.add_mutually_exclusive_group(required=True)
-    text.add_argument("message", nargs="?", help="The message.")
-    text.add_argument("--file", type=Path, help="Read the message from this file.")
+    text.add_argument("message", nargs="?", help="The note.")
+    text.add_argument("--file", type=Path, help="Read the note from this file.")
     args = parser.parse_args(argv)
-    message = args.file.read_text(encoding="utf-8") if args.file else args.message
-    try:
-        path = inbox.post(args.workspace, message)
-    except ValueError as exc:
-        parser.error(str(exc))
-    print(f"left for the planner, which is asked between two tasks: {path}")
-    if len(message.strip()) > inbox.MESSAGE_MAX_CHARS:
-        print(
-            f"note: the message is {len(message.strip())} characters; the planner reads its "
-            f"first {inbox.MESSAGE_MAX_CHARS} and the path of the whole"
-        )
+    message = (args.file.read_text(encoding="utf-8") if args.file else args.message).strip()
+    if not message:
+        parser.error("the note is empty")
+    args.workspace.mkdir(parents=True, exist_ok=True)
+    path = args.workspace / NOTES_FILENAME
+    with path.open("a", encoding="utf-8") as notes:
+        notes.write(f"\n## {utc_now()}\n\n{message}\n")
+    print(f"appended to {path}: every later turn reads it")
     return 0
 
 
@@ -202,7 +205,7 @@ SUBCOMMANDS = {
     "gate": _lazy_main(".checks.gate_cli"),
     # The operator's loop of a run: wait, status.
     "monitor": _lazy_main(".infra.monitor.status"),
-    # A message for the planner of a running run: `feedback --workspace W "..."`.
+    # A note for the workers of a run: `feedback --workspace W "..."`.
     "feedback": _feedback,
 }
 
@@ -234,8 +237,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.max_rounds is not None:
         print(
-            f"note: --max-rounds is ignored: a run certifies its final commit and repairs it "
-            f"at most {DEFAULT_MAX_ROUNDS - 1} time(s); drop the flag",
+            "note: --max-rounds is ignored: the run has one final pass and no rounds; "
+            "drop the flag",
             file=sys.stderr,
         )
     # A driver watching the run tells a crashed orchestrator from a busy one by it.
@@ -255,7 +258,7 @@ def main(argv: list[str] | None = None) -> None:
         agent_turn_timeout=args.agent_turn_timeout,
     ) as workflow:
         try:
-            delivered = workflow.run(args.task)
+            onboarded = workflow.run(args.task)
         except TaskSchemaError as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(2)
@@ -266,9 +269,9 @@ def main(argv: list[str] | None = None) -> None:
             sys.stderr.flush()
             heartbeat.mark_exit()
             os._exit(130)
-    # 0: delivered, or a dry run whose preflight passed. 1: anything else the run came to
-    # (a failed preflight, escalated, certification-failed); the journal and the report say what.
-    sys.exit(0 if delivered else 1)
+    # 0: onboarded, whatever else is not done; or a dry run whose preflight passed. 1: anything
+    # else the run came to (a failed preflight, not onboarded): the journal and the report say.
+    sys.exit(0 if onboarded else 1)
 
 
 if __name__ == "__main__":
