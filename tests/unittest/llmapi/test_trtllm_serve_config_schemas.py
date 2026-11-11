@@ -508,6 +508,10 @@ def test_dspark_device_reranking_field(
         ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 9}, False),
         ({"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "private"}, False),
         ({"mode": "dynamic", "num_slots": 320}, False),
+        ({"mode": "adaptive", "num_slots": 512}, True),
+        ({"mode": "adaptive"}, False),
+        ({"mode": "adaptive", "num_slots": 512, "auxiliary_sms": 4}, False),
+        ({"mode": "adaptive", "num_slots": 0}, False),
     ],
 )
 def test_load_balancer_schema_matches_runtime(

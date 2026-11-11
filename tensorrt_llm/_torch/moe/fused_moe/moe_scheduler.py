@@ -42,12 +42,14 @@ exchange runs:
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+from tensorrt_llm._torch.moe import live_rows
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
@@ -1304,19 +1306,22 @@ class FusedCommMoEScheduler(MoEScheduler):
             routing_aux_chunks = _split_rows(
                 _leading_rows(routing_aux, x_real.shape[0]), all_rank_chunk_size_list[ep_rank]
             )
-        outputs = self._run_chunks(
-            x_chunks,
-            rl_chunks,
-            input_ids_chunks,
-            num_chunks=num_chunks,
-            x_real=x_real,
-            rl_real=rl_real,
-            all_rank_chunk_size_list=all_rank_chunk_size_list,
-            had_meta=had_meta,
-            output_dtype=output_dtype,
-            do_finalize=do_finalize,
-            routing_aux_chunks=routing_aux_chunks,
-        )
+        # With more than one chunk, each chunk's launches cover part of the forward's rows.
+        part = live_rows.part_of_the_forward() if num_chunks > 1 else contextlib.nullcontext()
+        with part:
+            outputs = self._run_chunks(
+                x_chunks,
+                rl_chunks,
+                input_ids_chunks,
+                num_chunks=num_chunks,
+                x_real=x_real,
+                rl_real=rl_real,
+                all_rank_chunk_size_list=all_rank_chunk_size_list,
+                had_meta=had_meta,
+                output_dtype=output_dtype,
+                do_finalize=do_finalize,
+                routing_aux_chunks=routing_aux_chunks,
+            )
         if not outputs:
             cast_dtype = output_dtype if output_dtype is not None else x.dtype
             return x.new_empty((0, x.shape[1]), dtype=cast_dtype)
@@ -1609,6 +1614,14 @@ class FusedCommMoEScheduler(MoEScheduler):
                 device=device,
             )
 
+        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
+        # one adaptive bucket on every EP rank; using a local token count could
+        # diverge and deadlock its in-kernel NVLink barrier. Set before the
+        # route and the input quantization, which may write into that bucket's staging.
+        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
+        if set_adaptive is not None:
+            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
+
         # ----- EPLB: update stats + remap expert ids -> slot ids -----
         # Per-layer dynamic EPLB plans from the routes that the layer-wise
         # calibrator records or replays, so they are recorded before the route,
@@ -1631,7 +1644,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                     is_last_call,
                     ignore_allreduce=False,
                 )
-                token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+                token_selected_slots = moe._load_balancer_route(
+                    token_selected_experts, moe.use_dp, token_final_scales=token_final_scales
+                )
             else:
                 token_selected_slots = token_selected_experts
             token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
@@ -1655,13 +1670,6 @@ class FusedCommMoEScheduler(MoEScheduler):
             moe_input, x_sf = moe.backend.quantize_input(
                 x_chunk_real, reserved_sms=replica_plan.reserved_sms
             )
-
-        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
-        # one adaptive bucket on every EP rank; using a local token count could
-        # diverge and deadlock its in-kernel NVLink barrier.
-        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
-        if set_adaptive is not None:
-            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
 
         # ----- MoE compute -----
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's

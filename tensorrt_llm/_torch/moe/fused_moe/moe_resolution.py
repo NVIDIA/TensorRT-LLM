@@ -17,6 +17,7 @@
 Records rejected candidates; falls back when the requested backend cannot serve.
 """
 
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional, Tuple, Union
 
@@ -403,9 +404,17 @@ def build_moe_deployment(
 # against. They fail with the rejection trail instead.
 NO_FALLBACK_BACKENDS: FrozenSet[str] = frozenset({"VANILLA"})
 
+# Families a request tries, in this order, after its own family and before the
+# Cutlass fallback. MegaMoE CuteDSL serves NVFP4 only, so a layer stored in
+# another format -- such as the MXFP4 MTP experts of an NVFP4 DeepSeek-V4
+# checkpoint -- runs on TRTLLM-Gen.
+DEGRADATION_FAMILIES: Dict[str, Tuple[str, ...]] = {
+    "MEGAMOE_CUTEDSL": ("TRTLLM",),
+}
+
 
 def _candidates_for(backend: str) -> List[MoEImplClass]:
-    """Requested family in priority order, then fallback."""
+    """Requested family in priority order, then its degradation families, then fallback."""
     normalized = backend.upper()
     if normalized == "WIDEEP":
         raise ValueError(WIDEEP_DEPRECATION_MESSAGE)
@@ -413,6 +422,13 @@ def _candidates_for(backend: str) -> List[MoEImplClass]:
     if family is None:
         raise ValueError(f"Unsupported moe backend: {backend}")
     candidates = [impl_cls for impl_cls in IMPL_PRIORITY if impl_cls in family]
+    for degradation_family in DEGRADATION_FAMILIES.get(normalized, ()):
+        members = BACKEND_FAMILY[degradation_family]
+        candidates.extend(
+            impl_cls
+            for impl_cls in IMPL_PRIORITY
+            if impl_cls in members and impl_cls not in candidates
+        )
     # A request for CUTLASS already holds every fallback leaf.
     if family.isdisjoint(FALLBACK_IMPLS) and normalized not in NO_FALLBACK_BACKENDS:
         candidates.extend(FALLBACK_IMPLS)
@@ -573,6 +589,15 @@ def resolve_moe_impl(
                 )
             )
             continue
+        if deployment.eplb_mode == "adaptive" and not candidate.capabilities.supports_adaptive_eplb:
+            rejected.append(
+                MoERejection(
+                    _legacy_backend_name(candidate),
+                    MoERejectReason.EPLB_UNSUPPORTED,
+                    f"{candidate.__name__} does not support adaptive EPLB",
+                )
+            )
+            continue
         if deployment.eplb_enabled and not candidate.capabilities.supports_eplb:
             rejected.append(
                 MoERejection(
@@ -632,6 +657,34 @@ def resolve_moe_impl(
     )
 
     location = "" if layer_idx is None else f" [layer_idx={layer_idx}]"
+
+    if winner_cls is None and deployment.eplb_mode == "adaptive":
+        # No implementation that serves this layer supports adaptive EPLB:
+        # the layer runs as plain EP outside the balancer instead, the
+        # balancer covering the other layers (``create_moe`` builds it so).
+        plain = resolve_moe_impl(
+            model_config,
+            problem=problem,
+            deployment=dataclasses.replace(
+                deployment,
+                eplb_enabled=False,
+                eplb_mode="disabled",
+                num_slots=problem.num_experts,
+            ),
+            layer_idx=layer_idx,
+            allow_degradation=allow_degradation,
+            impl_id=impl_id,
+        )
+        if plain.winner is not None:
+            reason = (
+                "no implementation that serves it supports adaptive EPLB "
+                f"({report.describe_rejections()})"
+            )
+            logger.info(
+                f"MoE layer{location} runs {plain.winner} as plain EP, outside the "
+                f"adaptive EPLB balancer: {reason}"
+            )
+            return dataclasses.replace(plain, load_balancer_off=reason)
 
     if report.degraded and not allow_degradation:
         raise UnsupportedError(

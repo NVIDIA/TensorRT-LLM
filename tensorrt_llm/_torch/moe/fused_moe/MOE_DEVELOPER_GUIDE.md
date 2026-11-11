@@ -65,7 +65,7 @@ Each backend declares one of two scheduler kinds via the `scheduler_kind` class 
 | Kind | Scheduler class | Used by | Cross-rank EP exchange |
 |------|-----------------|---------|------------------------|
 | `EXTERNAL_COMM` | `ExternalCommMoEScheduler` | Cutlass, DeepGemm, CuteDSL, DenseGEMM, TRTLLMGen, Marlin | Host issues `Communication.dispatch` / `.combine` outside the MoE kernel; supports per-chunk EPLB hooks and multi-stream chunk overlap |
-| `FUSED_COMM` | `FusedCommMoEScheduler` | DeepgemmCudaW4a8Mxfp4Mxfp8Impl, TrtllmCutedslMegaMoeNvfp4Impl | Comm is fused into the backend kernel via SymmBuffer / NVSHMEM-equivalent peer-pointer mapping; no host comm; lockstep chunk launches; EPLB stats AllReduced internally |
+| `FUSED_COMM` | `FusedCommMoEScheduler` | DeepgemmCudaW4a8Mxfp4Mxfp8Impl, TrtllmCutedslMegaMoeNvfp4Impl | Comm is fused into the backend kernel via SymmBuffer / NVSHMEM-equivalent peer-pointer mapping; no host comm; lockstep chunk launches; EPLB stats AllReduced by the load balancer before the launch |
 
 The two paths have *deliberately opposite* invariants (`use_dp_padding` honored vs ignored, ADP padding kept vs stripped, empty-chunk substituted vs zero-token kernel launch, multi-stream overlap allowed vs forbidden). See `moe_scheduler.py` class docstrings and `MOE_SCHEDULER_DESIGN.md` for the full contract.
 
@@ -286,6 +286,7 @@ Still on old path (standalone, with embedded communication):
 | `moe_comm_timeout_guard.py` | Device-side timeouts of communication kernels, relaxed during warmup — budget resolution and `MoECommTimeoutProxy` registration (see [Communication timeouts](#communication-timeouts)) |
 | `moe_load_balancer.py` | EPLB implementation |
 | `per_layer_dynamic_eplb/` | Per-layer dynamic EPLB, created by `maybe_create_moe_load_balancer`: model-level `manager`, per-layer handle `layer`, live-weight `arena`, and HALO-Q/TMA `planner` |
+| `adaptive_eplb/` | Adaptive EPLB, created by `maybe_create_moe_load_balancer`: model-level and per-layer `balancer`, decision `policy`, statistics windows and installs in `runtime`, expert weights in MNNVL memory in `transport`. A backend opts in with `supports_adaptive_eplb`, the methods of `transport.AdaptiveEplbBackend` and a measured time model of its kernels for each GPU type it supports (`has_decode_time_model`) |
 | `moe_op_backend.py` | Op backend registry for TRTLLMGen: `trtllm` ops for every quantized leaf, the FlashInfer bf16 runner for the unquantized one |
 
 ### Backends (`fused_moe/`)
@@ -629,6 +630,13 @@ serve the layer is turned down and a substitute runs — production depends on
 this, because an unquantized MTP draft layer in a MIXED_PRECISION checkpoint
 must not take down a model whose other layers are NVFP4.
 
+The substitutes are asked in a fixed order: the requested family's own leaves,
+then the families `DEGRADATION_FAMILIES` names for the request, then the
+Cutlass leaves (`FALLBACK_IMPLS`). `MEGAMOE_CUTEDSL` names `TRTLLM`, so a layer
+the NVFP4-only MegaMoE kernel cannot serve, such as the MXFP4 MTP experts of an
+NVFP4 DeepSeek-V4 checkpoint, runs on the TRTLLM-Gen leaf for its format and
+reaches Cutlass only when TRTLLM-Gen declines it too.
+
 What is not allowed is doing it quietly. Every resolution returns a
 `MoEResolutionReport` naming the winner, every rejected candidate, its
 `MoERejectReason`, and the environment fingerprint; a degradation additionally
@@ -954,7 +962,7 @@ set wrong has a test that catches it:
 - `FUSED_COMM` backends (`DeepgemmCudaW4a8Mxfp4Mxfp8Impl`, `TrtllmCutedslMegaMoeNvfp4Impl`) **must not** layer host-side `Communication.dispatch` / `.combine` on top of the fused kernel — `ConfigurableMoE._create_comm_strategy_auto` returns `None` for them.
 - `FusedCommMoEScheduler` calls `backend.quantize_input(...)` for every chunk including zero-token chunks (so peer ranks can cross the in-kernel NVLink barrier). Each fused-comm backend therefore MUST make `quantize_input` tolerate `x.shape[0] == 0` and return its own empty tensor layout; the scheduler does NOT synthesize backend-specific empty tensors.
 - Dynamic EPLB requires backend and quantization-method support; backends gate wrapper-level constraints in `validate_configurable_moe`. `MegaMoEDeepGemm` routes to slot IDs and migrates the transformed DG weights its quantization method registers (`num_slots % ep_size == 0`). `TrtllmCutedslMegaMoeNvfp4Impl` declares `supports_eplb=True`; its quantization method registers the MegaMoE-format derived params and `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
-- `FUSED_COMM` backends use `ignore_allreduce=False` for EPLB statistic update because the fused kernel AllReduces routing stats internally.
+- `FUSED_COMM` backends call the EPLB statistic update with `ignore_allreduce=False`: the fused kernel has no side channel for an external statistics gather, so the load balancer runs its own EP-wide AllReduce on its auxiliary stream. In an eager multi-stream forward it joins that AllReduce before returning, because the fused kernel fills the GPU and synchronizes across ranks inside the kernel; captured graphs keep the overlap.
 - Per-layer dynamic EPLB uses `MoeConfig.load_balancer.mode=per_layer_dynamic` with
   `num_slots` greater than the model expert count. Backend resolution selects
   `MEGAMOE_CUTEDSL` when no concrete backend is requested and rejects an

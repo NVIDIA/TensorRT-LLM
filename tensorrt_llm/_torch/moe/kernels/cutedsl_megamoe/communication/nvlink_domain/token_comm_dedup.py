@@ -941,6 +941,9 @@ class _DedupMetadataPushRouter(KernelComponent):
         if self._router_thread_idx == Int32(0):
             while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="sys") != Int32(self.world_size):
                 nanosleep(150)
+            # The acquire orders the peers' rows for the generic proxy only; the TMA load below reads them through the
+            # async proxy, so the issuing thread fences the two proxies in between.
+            cute.arch.fence_proxy("async.global")
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
         iket.range_pop()
@@ -1977,6 +1980,8 @@ class TokenCommDedup(KernelComponent):
 
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
+        # The peers' token rows that this flag publishes are pulled with TMA (async proxy) by any lane of the warp.
+        cute.arch.fence_proxy("async.global")
         iket.range_pop()
 
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
@@ -2225,8 +2230,10 @@ class TokenCommDedup(KernelComponent):
                         if completed_expert_prefix <= local_expert:
                             nanosleep(wait_sleep_ns)
                             wait_sleep_ns = cutlass.min(wait_sleep_ns * Int32(2), Int32(self.fc2_done_wait_sleep_max_ns))
-                    # Order every lane's fc2_done acquire before the TMA that reads the completed copies.
+                    # Order every lane's fc2_done acquire before the TMA that reads the completed copies: the warp
+                    # barrier orders the lanes, the proxy fence orders the async-proxy read after the acquires.
                     cute.arch.sync_warp()
+                    cute.arch.fence_proxy("async.global")
                     iket.range_pop()
                     block_index = Int64(metadata.src_token) * Int64(self.world_size) + Int64(metadata.src_rank)
                     block_address = order_pointer.toint() + block_index * Int64(self.order_block_bytes)

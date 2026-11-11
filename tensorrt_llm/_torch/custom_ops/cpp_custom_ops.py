@@ -659,6 +659,19 @@ def _register_fake():
             return _fp4_quantize_fake(input, global_scale, sf_vec_size,
                                       sf_use_ue8m0, swizzled_layout)
 
+    @torch.library.register_fake("trtllm::fp4_quantize_into")
+    def _(input: torch.Tensor,
+          global_scale: torch.Tensor,
+          out: torch.Tensor,
+          out_sf: torch.Tensor,
+          is_sf_swizzled_layout: bool = False) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::megamoe_stage_routes")
+    def _(ids: torch.Tensor, weights: torch.Tensor, ids_out: torch.Tensor,
+          weights_out: torch.Tensor) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
     def _(
         X: torch.Tensor,
@@ -882,6 +895,36 @@ def _register_fake():
         metainfo: torch.Tensor,
         ep_rank: int,
         invalid_expert_id: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::adaptive_eplb_route_into")
+    def _(
+        ids: torch.Tensor,
+        counts: torch.Tensor,
+        starts: torch.Tensor,
+        slots: torch.Tensor,
+        cumulative_shares: torch.Tensor,
+        ep_rank: int,
+        out: torch.Tensor,
+        weights: Optional[torch.Tensor] = None,
+        weights_out: Optional[torch.Tensor] = None,
+        rows: Optional[torch.Tensor] = None,
+        forwards: Optional[torch.Tensor] = None,
+        enabled: Optional[torch.Tensor] = None,
+        first: bool = True,
+        live_row_word: Optional[torch.Tensor] = None,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::adaptive_eplb_record")
+    def _(
+        ids: torch.Tensor,
+        rows: torch.Tensor,
+        forwards: torch.Tensor,
+        enabled: torch.Tensor,
+        first: bool = True,
+        live_row_word: Optional[torch.Tensor] = None,
     ) -> None:
         return None
 

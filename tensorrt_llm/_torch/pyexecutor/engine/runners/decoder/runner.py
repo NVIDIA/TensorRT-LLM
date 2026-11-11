@@ -24,6 +24,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.moe.live_rows import ALL_ROWS, MODEL_EXTRA_ATTR, LiveRowWord, forward_word
 from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
@@ -289,6 +290,10 @@ class DecoderRunner(ScheduledModelRunner):
             self._graphs.cuda_graph_runner, self._graphs.breakable_cuda_graph_runner
         )
         self._initialize_moe_workspace_reclaimer()
+        # Read by the kernels of every forward through the model's extra attrs (a test stub may lack them).
+        self._live_rows = LiveRowWord()
+        if hasattr(model, "extra_attrs"):
+            model.extra_attrs[MODEL_EXTRA_ATTR] = self._live_rows
         self._warmup = DecoderWarmup(
             config=self._config,
             mapping=mapping,
@@ -828,6 +833,17 @@ class DecoderRunner(ScheduledModelRunner):
             pending_beam_histories = self._start_beam_histories(semantic_requests)
 
             graph_key = key if can_run_graph else None
+            # Warmup and capture keep every row; otherwise the attention metadata of the
+            # forward says whether its requests own equal rows.
+            self._live_rows.write(
+                ALL_ROWS
+                if is_dummy
+                else forward_word(
+                    execution_requests.all_requests(),
+                    num_contexts=attn_metadata.num_contexts,
+                    sequence_rows=attn_metadata.seq_lens,
+                )
+            )
             captures_model_body = self._graphs.captures_model_body(graph_key)
             with (
                 self._maybe_bypass_torch_compile(bypass=context_plan is not None),

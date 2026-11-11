@@ -101,9 +101,12 @@ _DEEPSEEK_V41_ARCHITECTURES = {
     "DeepseekV41ForCausalLM",
     "DeepseekV41ForConditionalGeneration",
 }
-# Shared by V4 and V4.1: both name the first routed expert identically, and both
-# encode the routed-MoE format in its dtype (I8 -> MXFP4, U8 -> NVFP4).
-_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
+# Shared by V4 and V4.1: both name the first routed expert of a MoE block
+# identically, and both encode the routed-MoE format in its dtype (I8 -> MXFP4,
+# U8 -> NVFP4). A block is ``layers.{i}`` or, for an MTP layer, ``mtp.{j}``.
+_DEEPSEEK_V4_BLOCK_ROUTED_EXPERT_WEIGHT = "{block}.ffn.experts.0.w1.weight"
+_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = _DEEPSEEK_V4_BLOCK_ROUTED_EXPERT_WEIGHT.format(
+    block="layers.0")
 
 _KIMI_K3_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
@@ -894,34 +897,61 @@ class ModelConfig(Generic[TConfig]):
             return json.loads(f.read(header_size))
 
     @staticmethod
-    def _get_safetensors_header_for_tensor(checkpoint_dir: str,
-                                           tensor_name: str) -> Optional[Dict]:
+    def _get_safetensors_headers_for_tensors(
+            checkpoint_dir: str,
+            tensor_names: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Return the safetensors header entry of each named tensor found.
+
+        A tensor is looked up first in the shard that
+        ``model.safetensors.index.json`` assigns it, then in every shard in
+        sorted order. Each shard header is read at most once.
+        """
         checkpoint_path = Path(checkpoint_dir)
-        candidates = []
+        weight_map = {}
         index_path = checkpoint_path / "model.safetensors.index.json"
         if index_path.exists():
             with open(index_path) as f:
-                index = json.load(f)
-            shard_name = index.get("weight_map", {}).get(tensor_name)
-            if shard_name is not None:
-                candidates.append(checkpoint_path / shard_name)
+                weight_map = json.load(f).get("weight_map", {})
 
-        candidates.extend(sorted(checkpoint_path.glob("*.safetensors")))
-        seen = set()
-        for candidate in candidates:
-            if candidate in seen or not candidate.exists():
+        headers: dict[Path, dict[str, Any]] = {}
+
+        def read_header(path: Path) -> dict[str, Any]:
+            if path not in headers:
+                headers[path] = ModelConfig._read_safetensors_header(path)
+            return headers[path]
+
+        found = {}
+        for tensor_name in tensor_names:
+            shard_name = weight_map.get(tensor_name)
+            if shard_name is None:
                 continue
-            seen.add(candidate)
-            header = ModelConfig._read_safetensors_header(candidate)
-            if tensor_name in header:
-                return header[tensor_name]
-        return None
+            shard_path = checkpoint_path / shard_name
+            if shard_path.exists():
+                header = read_header(shard_path)
+                if tensor_name in header:
+                    found[tensor_name] = header[tensor_name]
+
+        missing = [name for name in tensor_names if name not in found]
+        for shard_path in sorted(checkpoint_path.glob("*.safetensors")):
+            if not missing:
+                break
+            header = read_header(shard_path)
+            for tensor_name in missing:
+                if tensor_name in header:
+                    found[tensor_name] = header[tensor_name]
+            missing = [name for name in missing if name not in found]
+        return found
 
     @staticmethod
-    def _detect_deepseek_v4_routed_moe_layout(
-            checkpoint_dir: str) -> Optional[str]:
-        tensor_info = ModelConfig._get_safetensors_header_for_tensor(
-            checkpoint_dir, _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT)
+    def _get_safetensors_header_for_tensor(checkpoint_dir: str,
+                                           tensor_name: str) -> Optional[Dict]:
+        return ModelConfig._get_safetensors_headers_for_tensors(
+            checkpoint_dir, [tensor_name]).get(tensor_name)
+
+    @staticmethod
+    def _deepseek_v4_routed_moe_layout_of(
+            tensor_info: dict[str, Any] | None) -> str | None:
+        """Routed-MoE format encoded by a first routed expert weight's header."""
         if tensor_info is None:
             return None
 
@@ -932,6 +962,34 @@ class ModelConfig(Generic[TConfig]):
         if dtype == "U8":
             return "nvfp4"
         return None
+
+    @staticmethod
+    def _detect_deepseek_v4_routed_moe_layout(
+            checkpoint_dir: str) -> Optional[str]:
+        return ModelConfig._deepseek_v4_routed_moe_layout_of(
+            ModelConfig._get_safetensors_header_for_tensor(
+                checkpoint_dir, _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT))
+
+    @staticmethod
+    def _detect_deepseek_v4_routed_moe_block_layouts(
+            checkpoint_dir: str,
+            blocks: Sequence[str]) -> dict[str, str | None]:
+        """Routed-MoE format of each checkpoint block, e.g. ``mtp.0``.
+
+        A block maps to ``None`` when its first routed expert weight is absent
+        or is stored in neither the MXFP4 nor the NVFP4 layout.
+        """
+        weight_names = {
+            block: _DEEPSEEK_V4_BLOCK_ROUTED_EXPERT_WEIGHT.format(block=block)
+            for block in blocks
+        }
+        headers = ModelConfig._get_safetensors_headers_for_tensors(
+            checkpoint_dir, list(weight_names.values()))
+        return {
+            block:
+            ModelConfig._deepseek_v4_routed_moe_layout_of(headers.get(name))
+            for block, name in weight_names.items()
+        }
 
     @staticmethod
     def _is_deepseek_v4_base_checkpoint(checkpoint_dir: str) -> bool:
@@ -998,37 +1056,65 @@ class ModelConfig(Generic[TConfig]):
                     "for MXFP4 or U8 for NVFP4.")
             return layer_quant_config
 
-        experts_quant_config = QuantConfig()
-        if layout == "mxfp4":
-            experts_quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
-                moe_backend)
-            experts_quant_config.group_size = 32
-        else:
-            experts_quant_config.quant_algo = QuantAlgo.NVFP4
-            experts_quant_config.group_size = 16
-        experts_quant_config.exclude_modules = [
-            'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
-            'embedding', 'unembedding'
-        ]
+        def build_experts_quant_config(layout_name: str) -> QuantConfig:
+            experts_quant_config = QuantConfig()
+            if layout_name == "mxfp4":
+                experts_quant_config.quant_algo = (
+                    ModelConfig.get_mxfp4_quant_algo(moe_backend))
+                experts_quant_config.group_size = 32
+            else:
+                experts_quant_config.quant_algo = QuantAlgo.NVFP4
+                experts_quant_config.group_size = 16
+            experts_quant_config.exclude_modules = [
+                'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
+                'embedding', 'unembedding'
+            ]
+            return experts_quant_config
+
+        experts_quant_configs = {layout: build_experts_quant_config(layout)}
+        logger.info(
+            "Detected DeepSeek-V4 routed MoE %s checkpoint layout; using "
+            "%s for routed experts.", layout.upper(),
+            experts_quant_configs[layout].quant_algo)
 
         if layer_quant_config is None:
             layer_quant_config = {}
         else:
             layer_quant_config = dict(layer_quant_config)
 
-        num_moe_layers = pretrained_config.num_hidden_layers
+        # MoE layer ``i`` reads checkpoint block ``layers.{i}``. MTP layer ``j``
+        # is MoE layer ``num_hidden_layers + j`` and, like the weight loader,
+        # reads block ``mtp.{j % num_nextn_predict_layers}`` of the checkpoint.
+        num_mtp_layers = 0
         if (spec_config is not None
                 and spec_config.spec_dec_mode.is_mtp_one_model()):
-            num_moe_layers += spec_config.num_nextn_predict_layers
+            num_mtp_layers = spec_config.num_nextn_predict_layers
+        num_checkpoint_mtp_blocks = getattr(
+            pretrained_config, "num_nextn_predict_layers", None) or 1
+        blocks = [
+            f"layers.{layer_idx}"
+            for layer_idx in range(pretrained_config.num_hidden_layers)
+        ] + [
+            f"mtp.{mtp_idx % num_checkpoint_mtp_blocks}"
+            for mtp_idx in range(num_mtp_layers)
+        ]
+        block_layouts = ModelConfig._detect_deepseek_v4_routed_moe_block_layouts(
+            checkpoint_dir, sorted(set(blocks)))
 
-        for layer_idx in range(num_moe_layers):
-            layer_quant_config[
-                f"model.layers.{layer_idx}.mlp.experts"] = experts_quant_config
-
-        logger.info(
-            "Detected DeepSeek-V4 routed MoE %s checkpoint layout; using "
-            "%s for routed experts.", layout.upper(),
-            experts_quant_config.quant_algo)
+        for layer_idx, block in enumerate(blocks):
+            # A block whose own layout cannot be read keeps the layers.0 one.
+            block_layout = block_layouts[block] or layout
+            if block_layout not in experts_quant_configs:
+                experts_quant_configs[block_layout] = (
+                    build_experts_quant_config(block_layout))
+            if block_layout != layout:
+                logger.info(
+                    "DeepSeek-V4 routed MoE block %s has the %s checkpoint "
+                    "layout; using %s for the routed experts of MoE layer %d.",
+                    block, block_layout.upper(),
+                    experts_quant_configs[block_layout].quant_algo, layer_idx)
+            layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"] = (
+                experts_quant_configs[block_layout])
         return layer_quant_config
 
     @staticmethod

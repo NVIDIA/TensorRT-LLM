@@ -19,6 +19,7 @@ from ...helpers.device_workspace import DeviceWorkspace
 from ...helpers.dsl_helpers import mark_alignment, smem_exclusive_prefix
 from ...helpers.iket_compat import iket
 from ...helpers.flag_batch import make_flag_batch_tracker
+from ...helpers.live_rows import live_row_count
 from ...helpers.software_sync import NvlinkBarrier
 from ...helpers.ptx_helpers import (
     cp_async_bulk_s2g,
@@ -392,6 +393,8 @@ class _MetadataPushRouter(KernelComponent):
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
         activation_scales: Optional[cute.Tensor] = None,  # (max_tokens_per_rank,) fp32, local
+        live_row_word: Optional[cute.Pointer] = None,  # helpers/live_rows.py: route the live rows only
+        token_rows: Optional[Int32] = None,  # the launch's rows, which the word's live rows lead
     ) -> None:
         """Launch counting-sort DATA, size-exchange HELPER, and metadata PUSH roles."""
         if cutlass.const_expr(self.apply_topk_at_fc1 and topk_scores is None):
@@ -408,6 +411,8 @@ class _MetadataPushRouter(KernelComponent):
             shared_workspace,
             peer_rank_ptr_mapper,
             device_workspace,
+            live_row_word,
+            token_rows,
         ).launch(
             grid=[self.router_grid_cta_count, 1, 1],
             block=[self.router_warps_per_cta * 32, 1, 1],
@@ -426,6 +431,8 @@ class _MetadataPushRouter(KernelComponent):
         shared_workspace: cute.Pointer,
         peer_rank_ptr_mapper: SymmetricBufferDevice,
         device_workspace: DeviceWorkspace,
+        live_row_word: Optional[cute.Pointer],
+        token_rows: Optional[Int32],
     ) -> None:
         thread_idx, _, _ = cute.arch.thread_idx()
         linear_cta_idx, _, _ = cute.arch.block_idx()
@@ -450,6 +457,8 @@ class _MetadataPushRouter(KernelComponent):
         self._router_warp_idx = warp_idx
         self._router_lane_idx = lane_idx
         self._router_activation_scales = activation_scales
+        self._router_live_row_word = live_row_word
+        self._router_token_rows = token_rows
 
         if cutlass.const_expr(self.router_data_cta_count == 1):
             self._router_single_cta(topk_indices, topk_scores, smem_base)
@@ -468,6 +477,8 @@ class _MetadataPushRouter(KernelComponent):
         self._router_warp_idx = None
         self._router_lane_idx = None
         self._router_activation_scales = None
+        self._router_live_row_word = None
+        self._router_token_rows = None
 
     @cute.jit
     def _router_single_cta(
@@ -494,6 +505,9 @@ class _MetadataPushRouter(KernelComponent):
             iket.range_pop()
 
             iket.range_push("router.prefix_and_publish")
+            # Ordinary stores wrote the counts; the bulk copy that publishes them reads them through the async proxy.
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.sync_threads()
             publish_sizes = self._broadcast_sizes_to_peers(
                 cute.make_tensor(histogram.iterator, cute.make_layout((self.expert_count_padded,)))
             )
@@ -651,6 +665,8 @@ class _MetadataPushRouter(KernelComponent):
             expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
             if expert < Int32(self.expert_count_padded):
                 totals[expert] = size_counter[expert]
+        # Ordinary stores wrote the counts; the bulk copy that publishes them reads them through the async proxy.
+        cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_threads()
 
         publish_sizes = self._broadcast_sizes_to_peers(totals)
@@ -859,6 +875,9 @@ class _MetadataPushRouter(KernelComponent):
         if self._router_thread_idx == Int32(0):
             while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="sys") != Int32(self.world_size):
                 nanosleep(150)
+            # The acquire orders the peers' rows for the generic proxy only; the TMA load below reads them through the
+            # async proxy, so the issuing thread fences the two proxies in between.
+            cute.arch.fence_proxy("async.global")
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
         iket.range_pop()
@@ -936,6 +955,12 @@ class _MetadataPushRouter(KernelComponent):
         maximum_elements = self.max_tokens_per_rank * self.topk
         actual_token_count = Int32(self.max_tokens_per_rank)
         actual_elements = Int32(maximum_elements)
+        if cutlass.const_expr(self._router_live_row_word is not None):
+            # Padding rows are neither loaded nor routed: an unloaded register goes to the trash below.
+            actual_token_count = cutlass.min(
+                live_row_count(self._router_live_row_word, self._router_token_rows), actual_token_count
+            )
+            actual_elements = actual_token_count * Int32(self.topk)
         load_round_count = ceil_div(maximum_elements, tile_span)
         elements_per_thread = load_round_count * elements_per_vector
 
@@ -1520,6 +1545,8 @@ class TokenCommNonDeterministic(KernelComponent):
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
         activation_scales: Optional[cute.Tensor] = None,
+        live_row_word: Optional[cute.Pointer] = None,
+        token_rows: Optional[Int32] = None,
     ) -> None:
         self._router.launch_router(
             topk_indices,
@@ -1531,6 +1558,8 @@ class TokenCommNonDeterministic(KernelComponent):
             device_workspace,
             stream,
             activation_scales,
+            live_row_word,
+            token_rows,
         )
 
     @cute.jit
@@ -2289,6 +2318,8 @@ class TokenCommNonDeterministic(KernelComponent):
 
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
+        # The peers' token rows that this flag publishes are pulled with TMA (async proxy) by any lane of the warp.
+        cute.arch.fence_proxy("async.global")
         iket.range_pop()
 
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
@@ -2654,6 +2685,8 @@ class TokenCommNonDeterministic(KernelComponent):
                 iket.range_push("token_back.wait_fc2")
                 while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
                     nanosleep(500)
+                # The FC2 rows this counter publishes are read back with TMA (async proxy).
+                cute.arch.fence_proxy("async.global")
                 iket.range_pop()
             chunk_total = token_count * Int32(chunk_count)
             pool_expert_base = pool_expert_bases[local_expert]
@@ -2879,6 +2912,8 @@ class TokenCommNonDeterministic(KernelComponent):
                     iket.range_push("token_back.wait_fc2")
                     while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
                         nanosleep(500)
+                    # The FC2 rows this counter publishes are read back with TMA (async proxy).
+                    cute.arch.fence_proxy("async.global")
                     iket.range_pop()
 
             while next_dense_token < expert_valid_end:
@@ -2892,6 +2927,8 @@ class TokenCommNonDeterministic(KernelComponent):
                             self.fc2_done_signals_per_token_tile
                         ):
                             nanosleep(500)
+                        # The FC2 rows this counter publishes are read back with TMA (async proxy).
+                        cute.arch.fence_proxy("async.global")
                         iket.range_pop()
                         last_ready_slot = ready_slot
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert

@@ -1790,17 +1790,25 @@ def test_executors_of_one_engine_share_the_execution_stream():
 
 def test_route_wait_occurs_after_independent_staging():
     source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
+    trace = []
+
+    def stage_routes(ids, weights, ids_out, weights_out):
+        trace.append(f"stage_routes:{ids_out.name},{weights_out.name}")
+
     impl = _extract_class(
         source,
         "TrtllmCutedslMegaMoeNvfp4Impl",
         {"_stage_inputs"},
-        {"torch": SimpleNamespace(uint8="uint8")},
+        {
+            "torch": SimpleNamespace(
+                uint8="uint8",
+                ops=SimpleNamespace(trtllm=SimpleNamespace(megamoe_stage_routes=stage_routes)),
+            )
+        },
     )
 
     def run():
-        trace = []
         owner = impl()
-        owner._last_staged_T = {8: 8}
         owner._wait_rebalance_routes = lambda replica_plan=None: trace.append("wait")
         bufs = SimpleNamespace(
             **{
@@ -1818,13 +1826,16 @@ def test_route_wait_occurs_after_independent_staging():
             top_k=6,
             stage_activation=True,
         )
-        return trace, owner
 
-    trace, owner = run()
-    assert trace.index("copy:activation") < trace.index("wait")
-    assert trace.index("copy:topk_weights") < trace.index("wait")
-    assert trace.index("wait") < trace.index("copy:topk_idx_local")
-    assert owner._last_staged_T[8] == 4
+    run()
+    # The activation stages before the wait; one op after it writes the slot ids and
+    # gate weights of the whole bucket.
+    assert trace == [
+        "copy:activation",
+        "copy:activation_sf",
+        "wait",
+        "stage_routes:topk_idx_local,topk_weights",
+    ]
 
 
 @pytest.mark.parametrize("has_sm_budget", [True, False])
@@ -1868,6 +1879,7 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
     impl = _extract_class(source, "TrtllmCutedslMegaMoeNvfp4Impl", {"quantize_input"}, namespace)
     owner = impl()
     owner.fc31_input_scale = "scale"
+    owner._staging_of_next_run = lambda num_tokens: None  # a forward that run_moe does not stage
 
     owner.quantize_input(Activation(3, 64))
     owner.quantize_input(Activation(3, 64), reserved_sms=4)
@@ -1987,6 +1999,7 @@ def _autotune_helpers(torch):
         "validate_megamoe_tactic",
         "_epi_flag_batch_for_tokens",
         "_expand_megamoe_ready_tactics",
+        "_with_atomic_counter_work_ids",
         "enumerate_megamoe_candidate_tactics",
     }
     constants = {
@@ -1998,6 +2011,7 @@ def _autotune_helpers(torch):
         "_TOKEN_BACK_READY_GRANULARITIES",
         "_TACTIC_LEN",
         "_TACTIC_LEN_V4",
+        "_ATOMIC_COUNTER_HELPER_SMS",
         "_LEGACY_TACTIC_LEN",
         "_FLAG_BATCH_MAX",
         "_GEOMETRIES",
@@ -2421,7 +2435,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         )
     )
 
-    def route(routes, use_dp):
+    def route(routes, use_dp, token_final_scales=None):
         trace.append(("route", routes.name))
         return _ChunkRoutes("physical" if mode == "per_layer_dynamic" else "slots")
 
@@ -2472,30 +2486,32 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     )
 
     assert out == "out"
-    tail = [("quantize", {}), ("bucket", 6)]
+    # The bucket hint precedes the route and the quantization, which may write
+    # into that bucket's staging.
     if mode == "per_layer_dynamic":
         # The planner consumes the logical routes the calibrator records or
         # replays, and quantization leaves the plan's SMs to its copy kernel.
         # The layer has no CPU stage or host statistics, so only the post-MoE
         # hook that releases its plan runs.
         expected = [
+            ("bucket", 6),
             ("statistic", "logical"),
             ("calibrator", "logical"),
             ("route", "replayed logical"),
             ("quantize", {"reserved_sms": 4}),
-            ("bucket", 6),
             ("run_moe", "physical", plan),
             "start_set_cpu",
         ]
     elif mode == "standard":
         expected = [
             "start_wait_gpu",
+            ("bucket", 6),
             "done_wait_gpu",
             ("update_statistic", "logical"),
             ("route", "logical"),
             ("statistic", "slots"),
             ("calibrator", "slots"),
-            *tail,
+            ("quantize", {}),
             ("run_moe", "replayed slots", None),
             "start_set_cpu",
             "done_set_cpu",
@@ -2503,9 +2519,10 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     else:
         expected = [
             "start_wait_gpu",
+            ("bucket", 6),
             ("statistic", "logical"),
             ("calibrator", "logical"),
-            *tail,
+            ("quantize", {}),
             ("run_moe", "replayed logical", None),
             "start_set_cpu",
             "done_set_cpu",

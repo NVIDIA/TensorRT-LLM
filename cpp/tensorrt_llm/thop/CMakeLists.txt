@@ -92,6 +92,7 @@ add_th_common_family(
   fp4GemmTrtllmGen.cpp
   fp8BatchedGemmTrtllmGen.cpp
   fp4Quantize.cpp
+  fp4QuantizeInto.cpp
   fp4BatchedQuantize.cpp
   fp4xFp8GemmTrtllmGen.cpp
   fp8BlockScalingGemm.cpp
