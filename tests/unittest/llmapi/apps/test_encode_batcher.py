@@ -421,6 +421,54 @@ async def test_submit_many_queue_full_enqueues_nothing():
         await batcher.shutdown()
 
 
+async def test_submit_many_queue_full_counts_already_queued_inputs():
+    """Group admission accounts for inputs already waiting in the queue.
+
+    One live input waits in a queue of capacity two, so a two-input group does
+    not fit even though it is no larger than the queue. The group is rejected
+    without enqueuing anything and the waiting input still completes.
+    """
+    import asyncio
+    import threading
+
+    from tensorrt_llm.serve.encode_batcher import QueueFullError
+
+    calls = []
+    encode_started = threading.Event()
+    release = threading.Event()
+
+    def encode_fn(batch):
+        calls.append([list(t) for t in batch])
+        encode_started.set()
+        release.wait(timeout=5.0)
+        return [sum(token_ids) for token_ids in batch]
+
+    batcher = EncodeBatcher(
+        encode_fn,
+        max_batch_size=1,
+        max_queue_delay=0.01,
+        max_queue_size=2,
+    )
+    await batcher.start()
+    try:
+        # The first request occupies the worker; the second waits in the queue.
+        first = asyncio.ensure_future(batcher.submit([1]))
+        await asyncio.get_running_loop().run_in_executor(None, encode_started.wait, 5.0)
+        queued = asyncio.ensure_future(batcher.submit([2]))
+        await asyncio.sleep(0)
+        assert batcher._queue.qsize() == 1
+        with pytest.raises(QueueFullError):
+            await batcher.submit_many([[3], [4]])
+        assert batcher._queue.qsize() == 1
+        release.set()
+        assert await first == 1
+        assert await asyncio.wait_for(queued, timeout=1.0) == 2
+        assert calls == [[[1]], [[2]]]
+    finally:
+        release.set()
+        await batcher.shutdown()
+
+
 async def test_submit_many_input_too_long_enqueues_nothing():
     """An oversize input rejects the whole group before any input is enqueued."""
     import asyncio
@@ -521,4 +569,45 @@ async def test_request_cancelled_while_queued_is_not_encoded():
         assert await asyncio.wait_for(batcher.submit([3]), timeout=1.0) == 3
         assert calls == [[[1]], [[3]]]
     finally:
+        await batcher.shutdown()
+
+
+async def test_cancelled_submit_many_skips_its_queued_inputs():
+    """Cancelling a grouped request while its inputs are queued skips all of them."""
+    import asyncio
+    import threading
+
+    calls = []
+    encode_started = threading.Event()
+    release = threading.Event()
+
+    def encode_fn(batch):
+        calls.append([list(t) for t in batch])
+        encode_started.set()
+        release.wait(timeout=5.0)
+        return [sum(token_ids) for token_ids in batch]
+
+    batcher = EncodeBatcher(
+        encode_fn,
+        max_batch_size=1,
+        max_queue_delay=0.01,
+        max_queue_size=100,
+    )
+    await batcher.start()
+    try:
+        # An unrelated request occupies the worker; the group waits in the queue.
+        first = asyncio.ensure_future(batcher.submit([1]))
+        await asyncio.get_running_loop().run_in_executor(None, encode_started.wait, 5.0)
+        group = asyncio.ensure_future(batcher.submit_many([[2], [3], [4]]))
+        await asyncio.sleep(0)
+        assert batcher._queue.qsize() == 3
+        group.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await group
+        release.set()
+        assert await first == 1
+        assert await asyncio.wait_for(batcher.submit([5]), timeout=1.0) == 5
+        assert calls == [[[1]], [[5]]]
+    finally:
+        release.set()
         await batcher.shutdown()
