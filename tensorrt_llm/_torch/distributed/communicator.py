@@ -18,10 +18,11 @@ import os
 import pickle  # nosec B403
 import threading
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager, nullcontext
-from enum import IntEnum
+from collections.abc import Generator, Iterable
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from enum import Enum, IntEnum
 from functools import lru_cache, wraps
-from typing import Any, Callable, List, Literal, Optional, Tuple
+from typing import Any, Callable, List, Literal, Optional, Tuple, cast
 
 import numpy as np
 import torch
@@ -35,9 +36,10 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
-from tensorrt_llm._profiler import (_MISSING, MetadataValue, MpiDirection,
-                                    MpiOperationKind, custom_region_enabled,
-                                    record_mpi_function)
+from tensorrt_llm._profiler import (MISSING_METADATA, MetadataValue,
+                                    custom_region_enabled,
+                                    record_function_metadata_scope,
+                                    tensor_metadata)
 from tensorrt_llm._torch.distributed.mnnvl_memory import init_helix_cp_comm
 from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
                                  mpi_comm, mpi_disabled, mpi_isend,
@@ -55,6 +57,102 @@ except ModuleNotFoundError:
     from tensorrt_llm.executor.ray import stub as ray
 
 _INACTIVE_MPI_SCOPE: AbstractContextManager[None] = nullcontext()
+
+
+def _mpi_metadata_value(value: object) -> MetadataValue:
+    """Normalize direct enum and NumPy scalar fields to Python literals."""
+    if isinstance(value, Enum):
+        value = value.value
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return cast(MetadataValue, value)
+
+
+def _mpi_payload_metadata(payload: object) -> dict[str, MetadataValue]:
+    """Describe payload size and layout without traversing container contents."""
+    fields: dict[str, MetadataValue] = {
+        "mpi.payload.type": type(payload).__name__
+    }
+    if isinstance(payload, torch.Tensor):
+        numel = payload.numel()
+        fields.update(tensor_metadata(payload, "mpi.payload."))
+        fields["mpi.payload.numel"] = numel
+        fields["mpi.payload.bytes"] = numel * payload.element_size()
+    elif isinstance(payload, np.ndarray):
+        fields.update({
+            "mpi.payload.shape": list(payload.shape),
+            "mpi.payload.dtype": str(payload.dtype),
+            "mpi.payload.numel": int(payload.size),
+            "mpi.payload.bytes": int(payload.nbytes),
+        })
+    elif isinstance(payload, memoryview):
+        fields["mpi.payload.bytes"] = payload.nbytes
+    elif isinstance(payload, (bytes, bytearray)):
+        fields["mpi.payload.bytes"] = len(payload)
+    elif isinstance(payload, (str, list, tuple, dict, set)):
+        fields["mpi.payload.length"] = len(payload)
+    return fields
+
+
+@contextmanager
+def record_mpi_function(
+    operation: str,
+    *,
+    communicator: str,
+    group: Callable[[], Iterable[int]],
+    rank: int | Callable[[], int],
+    direction: Literal["send", "recv"] | None = None,
+    payload: object = MISSING_METADATA,
+    **fields: MetadataValue,
+) -> Generator[None, None, None]:
+    """Record shallow MPI metadata through the shared observational scope.
+
+    Args:
+        operation: Wrapped MPI method name, without the ``mpi_`` prefix.
+        communicator: Logical world, TP, PP, or CP communicator label.
+        group: Lazy ordered members in the active parent MPI communicator's rank space.
+        rank: Rank in that same space, or a lazy rank query.
+        direction: Send or receive direction for point-to-point operations.
+        payload: Optional object described without serialization or recursive traversal.
+            Tensors/NumPy arrays of any shape/dtype provide only shape, dtype and byte
+            counts; tensors also provide stride/device. No tensor values are read or
+            copied, including during CUDA capture. Other objects provide type and,
+            for built-in containers, length; byte buffers provide byte size.
+        **fields: Additional direct fields, such as communicator-local root/peer, tag,
+            reduction enum or chunk size. Direct NumPy scalars/enums become literals.
+
+    Yields:
+        None while the operation executes. Group, rank and payload inspection are
+        skipped for disabled/inactive scopes. Metadata/setup/cleanup failures are
+        observational and operation exceptions propagate unchanged.
+    """
+
+    def metadata() -> dict[str, MetadataValue]:
+        """Resolve lazy communicator fields and describe the optional payload."""
+        values: dict[str, MetadataValue] = {
+            "mpi.operation": operation,
+            "mpi.communicator": communicator,
+            "mpi.group": ",".join(str(int(member)) for member in group()),
+            "mpi.kind": "p2p" if direction is not None else "collective",
+            "mpi.rank": _mpi_metadata_value(rank() if callable(rank) else rank),
+        }
+        if direction is not None:
+            values["mpi.direction"] = direction
+        values.update({
+            f"mpi.{name}": _mpi_metadata_value(value)
+            for name, value in fields.items() if value is not None
+        })
+        if payload is not MISSING_METADATA:
+            values.update(_mpi_payload_metadata(payload))
+        return values
+
+    with record_function_metadata_scope(f"trtllm::mpi_{operation}", "mpi",
+                                        metadata):
+        yield
 
 
 class ReduceOp(IntEnum):
@@ -772,6 +870,9 @@ class MPIDist(Distributed):
         self._cp_comm = None
         self._tp_comm = None
         self._pp_comm = None
+        # Comm identity and active parent bind each cached membership to its
+        # rank space; externally supplied/replaced comms are translated once.
+        self._profile_groups: dict[str, tuple[object, object, list[int]]] = {}
 
     def _validate_world_size(self):
         """Validate world size before creating sub-communicators to prevent segfaults."""
@@ -806,6 +907,9 @@ class MPIDist(Distributed):
             if communicator == "pp":
                 return list(self.mapping.pp_group)
             return list(self.mapping.cp_group)
+        cached = self._profile_groups.get(communicator)
+        if cached is not None and cached[0] is comm and cached[1] is parent:
+            return list(cached[2])
         group = comm.Get_group()
         try:
             parent_group = parent.Get_group()
@@ -816,7 +920,8 @@ class MPIDist(Distributed):
                 if any(member < 0 for member in members):
                     raise ValueError(
                         "MPI subgroup is outside the active parent")
-                return members
+                self._profile_groups[communicator] = (comm, parent, members)
+                return list(members)
             finally:
                 parent_group.Free()
         finally:
@@ -826,38 +931,18 @@ class MPIDist(Distributed):
                     operation: str,
                     communicator: Literal["world", "tp", "pp", "cp"] = "world",
                     *,
-                    kind: MpiOperationKind = "collective",
-                    direction: MpiDirection | None = None,
-                    payload: object = _MISSING,
+                    direction: Literal["send", "recv"] | None = None,
+                    payload: object = MISSING_METADATA,
                     **fields: MetadataValue) -> AbstractContextManager[None]:
-        """Create a lazy MPI metadata scope only while the selected profiler
-        is active.
-        """
+        """Avoid constructing metadata scopes for inactive MPI calls."""
         if not custom_region_enabled(
                 "mpi") or not torch.autograd._profiler_enabled():
             return _INACTIVE_MPI_SCOPE
-        return self._record_active_mpi(operation,
-                                       communicator,
-                                       kind=kind,
-                                       direction=direction,
-                                       payload=payload,
-                                       **fields)
-
-    def _record_active_mpi(
-            self,
-            operation: str,
-            communicator: Literal["world", "tp", "pp", "cp"] = "world",
-            *,
-            kind: MpiOperationKind = "collective",
-            direction: MpiDirection | None = None,
-            payload: object = _MISSING,
-            **fields: MetadataValue) -> AbstractContextManager[None]:
         return record_mpi_function(
             operation,
             communicator=communicator,
             group=lambda: self._profile_group(communicator),
             rank=lambda: mpi_comm().Get_rank(),
-            kind=kind,
             direction=direction,
             payload=payload,
             **fields)
@@ -897,7 +982,6 @@ class MPIDist(Distributed):
               tag: int = 0) -> MPI.Request | None:
         # non-blocking send numpy buffer
         with self._record_mpi("isend",
-                              kind="p2p",
                               direction="send",
                               payload=buf,
                               peer=dest,
@@ -907,7 +991,6 @@ class MPIDist(Distributed):
     def send(self, buf: np.ndarray, dest: int, tag: int = 0) -> None:
         # blocking send numpy buffer
         with self._record_mpi("send",
-                              kind="p2p",
                               direction="send",
                               payload=buf,
                               peer=dest,
@@ -917,7 +1000,6 @@ class MPIDist(Distributed):
     def recv(self, buf: np.ndarray, src: int, tag: int = 0) -> None:
         # in-place recv numpy buffer
         with self._record_mpi("recv",
-                              kind="p2p",
                               direction="recv",
                               payload=buf,
                               peer=src,
@@ -926,7 +1008,6 @@ class MPIDist(Distributed):
 
     def send_object(self, obj: object, dest: int, tag: int = 0) -> None:
         with self._record_mpi("send_object",
-                              kind="p2p",
                               direction="send",
                               payload=obj,
                               peer=dest,
@@ -938,7 +1019,6 @@ class MPIDist(Distributed):
                      dest: int,
                      tag: int = 0) -> MPI.Request | None:
         with self._record_mpi("isend_object",
-                              kind="p2p",
                               direction="send",
                               payload=obj,
                               peer=dest,
@@ -947,7 +1027,6 @@ class MPIDist(Distributed):
 
     def recv_object(self, src: int, tag: int = 0) -> object:
         with self._record_mpi("recv_object",
-                              kind="p2p",
                               direction="recv",
                               peer=src,
                               tag=tag):
@@ -960,6 +1039,8 @@ class MPIDist(Distributed):
             mapping = self.mapping
             new_group = mpi_comm().group.Incl(mapping.tp_group)
             self._tp_comm = mpi_comm().Create_group(new_group)
+            self._profile_groups["tp"] = (self._tp_comm, mpi_comm(),
+                                          list(self.mapping.tp_group))
         return self._tp_comm
 
     @property
@@ -969,6 +1050,8 @@ class MPIDist(Distributed):
             mapping = self.mapping
             new_group = mpi_comm().group.Incl(mapping.pp_group)
             self._pp_comm = mpi_comm().Create_group(new_group)
+            self._profile_groups["pp"] = (self._pp_comm, mpi_comm(),
+                                          list(self.mapping.pp_group))
         return self._pp_comm
 
     @property
@@ -977,6 +1060,8 @@ class MPIDist(Distributed):
             self._validate_world_size()
             new_group = mpi_comm().group.Incl(self.mapping.cp_group)
             self._cp_comm = mpi_comm().Create_group(new_group)
+            self._profile_groups["cp"] = (self._cp_comm, mpi_comm(),
+                                          list(self.mapping.cp_group))
         return self._cp_comm
 
     def cp_allgather(self,

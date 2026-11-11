@@ -158,10 +158,13 @@ ordered comma-separated group members use the active parent `mpi_comm()` rank
 space, not necessarily `MPI.COMM_WORLD` or the mapping's world size/rank. This
 uses the emitting thread's communicator override when that thread is profiled. World membership is queried from
 that parent's actual size. Uninitialized subgroups use their ordered mapping
-members; cached subgroups translate their actual group into the parent's rank
-space. Inspection is lazy and noncollective, frees temporary MPI groups, and
-never creates a communicator solely for profiling. Unmappable members or inspection failures discard
-the scope without changing the operation's result or exception.
+members. Subgroups created by `MPIDist` cache those known members with the
+communicator and active parent identities. Externally supplied or replaced
+subgroups translate their actual group once into the parent's rank space;
+a changed communicator or parent invalidates that cached translation.
+Inspection is lazy and noncollective, frees temporary MPI groups, and never
+creates a communicator solely for profiling. Unmappable members or inspection
+failures omit metadata while preserving the named scope and operation outcome.
 
 `mpi.root` and `mpi.peer` are passed through in the operated communicator's
 local rank space, **not** the parent rank space: for TP/PP/CP, a root of `1`
