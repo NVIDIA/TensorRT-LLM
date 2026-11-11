@@ -45,6 +45,12 @@ namespace tensorrt_llm::testing
 class KVCacheTransferManagerTestAccess
 {
 public:
+    static std::size_t transferBytes(
+        legacy::KVCacheTransferManager const& manager, std::vector<legacy::KVCacheBlockPool> const& pools, int tokens)
+    {
+        return manager.computeBlockTransferBytes(pools, tokens);
+    }
+
     static void copy(legacy::KVCacheTransferManager& manager, legacy::BlockPtr const& src, legacy::BlockPtr const& dst,
         std::vector<legacy::KVCacheBlockPool> const& pools, bool offload, int tokens)
     {
@@ -59,6 +65,7 @@ struct Observation
 {
     std::string name;
     std::string metadata;
+    bool inputsEmpty;
 };
 
 std::vector<Observation>& observations()
@@ -67,19 +74,13 @@ std::vector<Observation>& observations()
     return values;
 }
 
-bool& observerNeedsInputs()
-{
-    static thread_local bool value{true};
-    return value;
-}
-
 //! Retain KV scope names and requested metadata, ignoring unrelated user scopes.
 std::unique_ptr<at::ObserverContext> observe(at::RecordFunction const& record)
 {
     if (std::string_view{record.name()}.find("trtllm::kv_cache_") == 0)
     {
-        observations().push_back({record.name(),
-            !observerNeedsInputs() || record.inputs().empty() ? "" : record.inputs().front().toStringRef()});
+        observations().push_back({record.name(), record.inputs().empty() ? "" : record.inputs().front().toStringRef(),
+            record.inputs().empty()});
     }
     return nullptr;
 }
@@ -92,7 +93,6 @@ public:
             at::RecordFunctionCallback(observe, nullptr).needsInputs(inputs).scopes({at::RecordScope::USER_SCOPE})))
     {
         observations().clear();
-        observerNeedsInputs() = inputs;
     }
 
     ~CallbackGuard()
@@ -179,7 +179,7 @@ protected:
             ASSERT_EQ(setenv("TLLM_PROFILE_CUSTOM_REGIONS", "kv", 1), 0);
 #endif
         }
-        ASSERT_FALSE(tc::initializeProfiler().has_value());
+        ASSERT_FALSE(tc::initializeProfilerRegions().has_value());
         if (!tc::customRegionEnabled(tc::ProfilerRegion::kKv))
         {
             GTEST_SKIP() << "Positive observation cases require kv selection at process startup";
@@ -337,23 +337,23 @@ void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected, bool 
     ASSERT_EQ(observations().size(), 2);
     ASSERT_EQ(observedCodec->streamIds.size(), observations().size());
     EXPECT_EQ(observations()[0].name, "trtllm::kv_cache_offload");
-    EXPECT_EQ(observations()[1].name, "trtllm::kv_cache_restore");
+    EXPECT_EQ(observations()[1].name, "trtllm::kv_cache_onboard");
     for (size_t index = 0; index < observations().size(); ++index)
     {
         auto const& value = observations()[index];
         if (!inputs)
         {
-            EXPECT_TRUE(value.metadata.empty());
+            EXPECT_TRUE(value.inputsEmpty);
             continue;
         }
-        expectField(value, index == 0 ? "'kv.operation':'offload'" : "'kv.operation':'restore'");
-        expectField(value, index == 0 ? "'kv.source_tier':'gpu'" : "'kv.source_tier':'host'");
-        expectField(value, index == 0 ? "'kv.destination_tier':'host'" : "'kv.destination_tier':'gpu'");
-        expectField(value, "'kv.manager_version':'v2'");
-        expectField(value, "'kv.copy_count':2");
-        expectField(value, "'kv.bytes_per_copy':" + std::to_string(kDevicePageBytes));
-        expectField(value, "'kv.payload_bytes':" + std::to_string(2 * kDevicePageBytes));
-        std::string const streamField = "'kv.cuda_stream_id':";
+        expectField(value, index == 0 ? "\"kv.operation\":\"offload\"" : "\"kv.operation\":\"onboard\"");
+        expectField(value, index == 0 ? "\"kv.source_tier\":\"gpu\"" : "\"kv.source_tier\":\"host\"");
+        expectField(value, index == 0 ? "\"kv.destination_tier\":\"host\"" : "\"kv.destination_tier\":\"gpu\"");
+        expectField(value, "\"kv.manager_version\":\"v2\"");
+        expectField(value, "\"kv.copy_count\":2");
+        expectField(value, "\"kv.bytes_per_copy\":" + std::to_string(kDevicePageBytes));
+        expectField(value, "\"kv.payload_bytes\":" + std::to_string(2 * kDevicePageBytes));
+        std::string const streamField = "\"kv.cuda_stream_id\":";
         auto const fieldPosition = value.metadata.find(streamField);
         ASSERT_NE(fieldPosition, std::string::npos) << value.metadata;
         auto const valuePosition = fieldPosition + streamField.size();
@@ -410,7 +410,7 @@ protected:
 #else
         ASSERT_EQ(setenv("TLLM_PROFILE_CUSTOM_REGIONS", "none", 1), 0);
 #endif
-        ASSERT_FALSE(tc::initializeProfiler().has_value());
+        ASSERT_FALSE(tc::initializeProfilerRegions().has_value());
         ASSERT_FALSE(tc::customRegionEnabled(tc::ProfilerRegion::kKv));
     }
 };
@@ -439,6 +439,8 @@ void expectLegacyRoundTrip(
     legacy::KVCacheBlockPool pool(2, 2, 1, 4, 8, primary, secondary, scales);
     pool.layerFirstLayout = layerFirst;
     legacy::KVCacheTransferManager manager(buffers);
+    EXPECT_EQ(tensorrt_llm::testing::KVCacheTransferManagerTestAccess::transferBytes(manager, {pool}, tokens),
+        static_cast<std::size_t>(expectedBytes));
     auto src = std::make_shared<legacy::KVCacheBlock>(11, tensorrt_llm::kernels::KVCacheIndex(1));
     auto dst = std::make_shared<legacy::KVCacheBlock>(12, tensorrt_llm::kernels::KVCacheIndex(2, true));
     ASSERT_EQ(cudaMemset(primary->data(), 0x5A, primary->getSizeInBytes()), cudaSuccess);
@@ -465,10 +467,10 @@ void expectLegacyRoundTrip(
     if (selected)
     {
         ASSERT_EQ(observations().size(), 1);
-        expectField(observations()[0], "'kv.payload_bytes':" + std::to_string(expectedBytes));
-        expectField(observations()[0], "'kv.manager_version':'legacy'");
-        expectField(observations()[0], "'kv.pool_index':0");
-        expectField(observations()[0], "'kv.source_block_id':11");
+        expectField(observations()[0], "\"kv.payload_bytes\":" + std::to_string(expectedBytes));
+        expectField(observations()[0], "\"kv.manager_version\":\"v1\"");
+        expectField(observations()[0], "\"kv.pool_index\":0");
+        expectField(observations()[0], "\"kv.source_block_id\":11");
         EXPECT_EQ(observations()[0].name, "trtllm::kv_cache_offload");
     }
     else
@@ -483,8 +485,8 @@ void expectLegacyRoundTrip(
     if (selected)
     {
         ASSERT_EQ(observations().size(), 2);
-        EXPECT_EQ(observations()[1].name, "trtllm::kv_cache_restore");
-        expectField(observations()[1], "'kv.payload_bytes':" + std::to_string(expectedBytes));
+        EXPECT_EQ(observations()[1].name, "trtllm::kv_cache_onboard");
+        expectField(observations()[1], "\"kv.payload_bytes\":" + std::to_string(expectedBytes));
     }
     else
     {
