@@ -33,7 +33,7 @@ import yaml
 
 import tensorrt_llm.commands.serve as serve_module
 import tensorrt_llm.commands.serve_cli._net as net_module
-from tensorrt_llm.commands.serve import DisaggLauncherEnvs, DisaggWorkerEnvs
+from tensorrt_llm.commands.serve_cli._disagg_fleet import DisaggLauncherEnvs, DisaggWorkerEnvs
 from tensorrt_llm.commands.serve_cli._net import _bind_listener, _listener_address_family
 from tensorrt_llm.logger import Logger
 from tensorrt_llm.serve.multi_frontend import LAUNCHER_UDS_ENV
