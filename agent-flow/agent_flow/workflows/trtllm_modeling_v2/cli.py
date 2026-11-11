@@ -21,7 +21,7 @@ from .infra.git import (
     resolve_commit_identity,
     trial_commit,
 )
-from .infra.monitor import ORCHESTRATOR_HEARTBEAT_S, OrchestratorHeartbeat
+from .infra.monitor import ORCHESTRATOR_HEARTBEAT_S, start_orchestrator_heartbeat
 from .run.pipeline import DEFAULT_MAX_ATTEMPTS, NOTES_FILENAME
 from .run.state import STATE_FILENAME
 from .spec.task_schema import TaskSchemaError, load_and_validate_task_yaml
@@ -242,7 +242,7 @@ def main(argv: list[str] | None = None) -> None:
             file=sys.stderr,
         )
     # A driver watching the run tells a crashed orchestrator from a busy one by it.
-    heartbeat = OrchestratorHeartbeat(args.workspace, ORCHESTRATOR_HEARTBEAT_S)
+    heartbeat = start_orchestrator_heartbeat(args.workspace, ORCHESTRATOR_HEARTBEAT_S)
 
     # Claude Code's auto-memory is shared by every worktree of one repository: one
     # task's notes would reach the others, and one run's the next.

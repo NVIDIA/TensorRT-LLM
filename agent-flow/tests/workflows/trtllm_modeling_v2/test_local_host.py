@@ -202,7 +202,7 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
         def mark_exit(self):
             beats.append("exit")
 
-    monkeypatch.setattr(cli, "OrchestratorHeartbeat", lambda workspace, period: _Heartbeat())
+    monkeypatch.setattr(cli, "start_orchestrator_heartbeat", lambda workspace, period: _Heartbeat())
 
     def run(*argv):
         with mock.patch.dict(os.environ), pytest.raises(SystemExit) as exited:

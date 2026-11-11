@@ -75,6 +75,11 @@ class OrchestratorHeartbeat:
             pass
 
 
+def start_orchestrator_heartbeat(workspace: Path | str, interval_s: float) -> OrchestratorHeartbeat:
+    """Start this process's heartbeat in ``workspace``; what the CLI calls once it holds the lock."""
+    return OrchestratorHeartbeat(workspace, interval_s)
+
+
 def orchestrator_state(workspace: Path, now: float | None = None) -> tuple[str, str]:
     """``("running"|"exited"|"unknown", detail)`` for the orchestrator of ``workspace``."""
     now = time.time() if now is None else now

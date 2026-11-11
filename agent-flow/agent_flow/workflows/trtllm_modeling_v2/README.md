@@ -5,28 +5,26 @@ SPDX-License-Identifier: Apache-2.0
 
 # trtllm-modeling-v2
 
-Build a TensorRT-LLM ModelingV2 target from a HuggingFace checkpoint: reuse or certify catalog
-operators, assemble the model, and prove the requested features. Agents write code; Python owns
-the order of the work, integration and the verdicts. Performance tuning is another tool's work, on
-the delivered target.
+Onboard a HuggingFace checkpoint as a TensorRT-LLM ModelingV2 target: reuse or certify catalog
+operators, assemble the model, bring up its first deployment and then each further one the spec
+states. Agents write code; Python owns the order of the work, the landing of each task, the checks
+and the report. Performance tuning is another tool's work, on the onboarded target.
 
 ## Terms
 
 | Term | Meaning |
 |---|---|
-| Target | Model implementation for a checkpoint family and supported deployment configurations |
-| Unit | Core implementation or one feature added to it |
-| Member | One parallel configuration, such as `tp4`, `tep4` or `dep4` |
-| Variant | A unit's target served another way (a KV dtype, chunked prefill, a draft depth) |
-| Check | One gate (boot, accuracy, serve, disagg) for one unit or variant at one member |
-| Contract | Every check the run must pass, compiled from the spec |
-| Task | One piece of work for one agent turn: the survey, a kernel entry, a unit, a variant, a fix |
+| Target | Model implementation for a checkpoint family and the deployments it supports |
+| Deployment | One way the target is served: its engine options, its launch, its benchmarks. The first is `core` |
+| Check | One gate (boot, accuracy, serve, tests) of one deployment |
+| Task | One piece of work for one agent turn: the survey, a kernel entry, a deployment, a fix |
 | Entry | A kernel wrapper with executable input, architecture and correctness contracts |
+| Onboarded | The first deployment's boot and benchmarks passed, by code, on the commit that landed |
 
 ## How a run goes
 
 ```text
-preflight -> tasks, in a fixed order -> certification of the final commit -> verdict and report
+preflight -> tasks in a fixed order, the onboard check after core -> the final pass -> the report
 ```
 
 1. **Preflight** (Python, plus one probe turn per agent configuration). It stops the run before
@@ -36,44 +34,46 @@ preflight -> tasks, in a fixed order -> certification of the final commit -> ver
    The tree, the devices and the temporary directory are probed where the first deployment runs
    (behind its launch prefix). Everything else it sees is a note; a later deployment that cannot be
    attempted, and a checkpoint config the tree cannot load yet, are recorded in `preflight.json`.
-   It freezes the accuracy anchors (`anchors.yaml`) and compiles the contract. The same command
-   resumes once a blocker is fixed.
+   It freezes the accuracy anchors (`anchors.yaml`). The same command starts again once a blocker
+   is fixed.
 2. **Tasks**, in this order, which no agent chooses:
+   - a config task, only when the tree cannot load the checkpoint's config;
    - the survey: `plan.md` and `vocabulary.yaml`, the checkpoint mapped onto the catalog;
-   - for each unit, core first, then each feature of the spec: one kernel task per vocabulary
-     queue row the unit needs, then the unit itself;
-   - one task per configuration variant.
+   - `core`, the first deployment, after one kernel task per vocabulary queue row it needs;
+   - each further deployment in the spec's order, after the kernel rows it needs.
 
    Tasks run one at a time, each starting from the commits of the tasks before it. Each task
-   is one agent turn in its own git worktree. When the worker
-   says it finished, its commits are audited (who made them, the sign-off, and that none touches
-   the workspace or a judge path), fast-forwarded into the checkout and labelled `target`,
-   `shared` or `mixed` by whether their paths are the target's own. **A worker checks its own task**
-   with `trtllm-modeling-v2 gate` and its decision is trusted: no check runs between tasks. Each
-   landing is read by the conventions scan (an entry's `CELLS`, `ARCHS` and test, Modeling V1
-   imports, the landing name): its findings are kept for the report and never hold a task.
-3. **Certification**: every check of the contract runs once, on the commit the checkout is at, then
-   the delivery checks (the commit audit, the target's own tests; the conventions scan's findings
-   are report lines). One rule decides what counts: **a verdict counts for the commit it measured and for no
-   other.** The checkout must be clean and must not move while the checks run.
-4. **Verdict**: `delivered` when all of it passed on that one commit. `delivery_report.md` in the
-   workspace says what was certified, on which commit, and what was not.
+   is one agent turn in its own git worktree. When the worker says it is ready, its commits are
+   audited (who made them, the sign-off, and that none touches the workspace or a judge path),
+   rebased, fast-forwarded into the checkout and labelled `target`, `shared` or `mixed` by whether
+   their paths are the target's own. Each landing is read by the conventions scan (an entry's
+   `CELLS`, `ARCHS` and test, Modeling V1 imports, the landing name): its findings are kept for
+   the report and never hold a task.
+3. **The onboard check**, by code: when `core` says it is ready, the run boots and scores the first
+   deployment under `modeling_v2=require` on the worker's clean, committed worktree, against the
+   frozen anchors. A pass lands that commit, records `onboarded` (the commit, the content hash of
+   its native libraries, the time) and points `refs/mv2/<slug>/onboarded` at it; nothing later
+   takes that back. A failure is the attempt's result line and the next attempt's note. A
+   benchmark nothing anchors is a score with no verdict, and with none judged the record says
+   `accuracy unjudged (boot only)`.
+4. **The final pass**, once, after the last task: the remaining checks of every done deployment,
+   the target's own tests and the commit audit, each a report line naming the commit it was
+   measured on. A pass on record for the same content is reused. When something failed or the
+   conventions scan has findings, one `fix` task names them all; then what failed and core's own
+   checks run once more.
+5. **The report**, `delivery_report.md`: its first line says `onboarded` (commit, ref, time) or
+   `not onboarded` (where it stopped, the gate command that shows it again, the last commit where
+   that check passed); then what is done, not done, not attempted, changed outside the target, the
+   skipped kernel rows, the findings left, what the run did not check and each role's model.
 
-**The planner** is asked only when the order cannot go on by itself: a worker ended its task
-without finishing it, a task spent its attempts (`--max-attempts`), the certification failed, or
-you left a message. It answers with one of four decisions: `CONTINUE` (go on; a failed task runs
-again with the planner's note), `REPAIR` (run up to three tasks first: a kernel entry or a fix),
-`SKIP` (leave out a failed kernel task) or `ESCALATE` (stop). A round after a repair runs the
-checks that failed first and stops when one fails again; a run gets `--max-rounds` rounds.
+**The bounds are numbers.** A task gets three attempts (`--max-attempts`); a failed attempt runs
+again with its result line as its note. An attempt whose turn a stopped process cut restarts free
+twice. A task that spent its attempts is not done: nothing of it lands and the run goes on, except
+for the config task, the survey and `core`, where the run ends not onboarded. Each new start
+reopens a task not done with fresh attempts, four times for those three and twice for any other.
 
-| Verdict | Meaning | Re-running the same command |
-|---|---|---|
-| `delivered` | every required check and delivery check passed on one commit | nothing to do |
-| `escalated` | the planner named a requirement the run cannot meet | re-enters once you fixed it |
-| `certification-failed` | the rounds are spent and the final commit is not certified | re-enters |
-
-Exit status: 0 delivered (or a dry run whose preflight passed), 1 any other outcome, 2 a spec or
-usage error, 3 the workspace is held by another process.
+Exit status: 0 onboarded, whatever else is not done (or a dry run whose preflight passed), 1 any
+other outcome, 2 a spec or usage error, 3 the workspace is held by another process.
 
 ## Use through your agent
 
@@ -119,35 +119,38 @@ and surfaces startup errors to the run's journal. Configure permissions before l
 unattended capability probe must complete without interactive approval.
 
 **Compute.** `environment.kind: local`, the one kind: every command, a worker's and the
-certification's, runs on the orchestrator's own host, on the devices preflight claims. On a
+run's own checks, runs on the orchestrator's own host, on the devices preflight claims. On a
 cluster, start the orchestrator inside the allocation that holds the GPUs, on a host that sees the
 checkout, the checkpoint and the workspace. The workflow has no launcher, queue or scheduler of its
 own; `infra/compute/executor.py` is the one function to wrap for a package that wants commands to
 land elsewhere.
 
 **While it runs**, leave the work to the run. `trtllm-modeling-v2 monitor status --workspace <ws>`
-says whether the orchestrator is alive, which tasks ended and how the last certification round
-went. To change the direction, send
-`trtllm-modeling-v2 feedback --workspace <ws> "<what to change and why>"`: a few sentences naming
-any evidence by its path (past 1200 characters the planner reads the head and the path of the
-whole). The planner is asked about it between two tasks. A message does not change a check:
-`task.yaml` defines the contract.
+says whether the orchestrator is alive (from any node that sees the workspace), whether the run is
+onboarded and where its tasks stand. To tell the workers something, run
+`trtllm-modeling-v2 feedback --workspace <ws> "<what, and why>"`: the text is appended, with its
+time, to `operator_notes.md`, which every later turn is told to read first and again before it
+decides. No agent interprets it and it adds no task; to reach the turn in progress, stop the run
+and start it again. A note never changes an anchor or a check: the spec defines those, and it is
+read again on every start, so a new deployment is an edit of the spec.
 
-**If it stops**, run the same command again. It resumes from `tasks.yaml`: a finished task is not
-asked again, a task whose worker had already answered keeps that answer, and a certification
-round goes on from the verdicts it recorded for the same commit. `--clean` starts over.
+**If it stops**, run the same command again. It goes on from `tasks.yaml`: a done task is not
+asked again, a task whose worker had already answered keeps that answer, a cut turn restarts, a
+task not done gets fresh attempts within its grants, and a check that passed on the same content
+is not run again. `--clean` starts over; the frozen anchors and your notes stay.
 
 ## What is where in the workspace
 
 | File | What it is |
 |---|---|
 | `task.yaml` | the resolved spec every agent reads |
-| `contract.yaml` | every check the final commit must pass |
-| `tasks.yaml` | the tasks in order, and where each stands: pending, running, done, failed, skipped |
+| `tasks.yaml` | the tasks in order, and where each stands: pending, running, done, not done, skipped |
 | `decisions/<task>-<attempt>.yaml` | what each turn decided, written by the agent |
-| `contract_status.jsonl` | every verdict, with the commit and round it belongs to |
-| `certification.yaml` | the last round's result |
-| `delivery_report.md` | the verdict, the certified commit, every check, the coverage |
+| `contract_status.jsonl` | every verdict, with the commit and the content it measured |
+| `delivery_report.md` | whether the run is onboarded, and every deployment where it stands |
+| `operator_notes.md` | what `feedback` appended, for the workers |
+| `anchors.yaml`, `preflight.json` | the frozen anchors; what preflight left out and why |
+| `conventions.json`, `commit_labels.json` | the scan's findings by first task; each landed commit's label |
 | `journal.md`, `turns/` | what happened; each turn's prompt, activity and answer |
 
 ## Code map
@@ -157,10 +160,10 @@ round goes on from the verdicts it recorded for the same commit. `--clean` start
 | `cli.py`, `spec/` | Entry point; task schema, deployments, derivation and configuration variants |
 | `agents/` | Role and model routing, turns, the decision table, prompts and skills |
 | `operators/` | The vocabulary (`vocabulary.yaml`) and the inventory of the tree's operators |
-| `run/workflow.py` | Lifecycle: init, resume, turn dispatch, close |
-| `run/pipeline.py` | The fixed order of tasks, the planner's four decisions |
-| `run/integration.py` | One worktree per task, the commit audit, rebase and fast-forward |
-| `run/contract.py`, `run/certify.py` | The contract and its verdicts; the certification, the delivery checks, the report |
+| `run/workflow.py` | One start of a run: the spec, the state, the agents, the report |
+| `run/pipeline.py` | The fixed order of tasks, attempts, cut turns, grants, landing |
+| `run/integration.py` | One worktree per task, the commit audit, rebase, the landing check, fast-forward |
+| `run/contract.py`, `run/report.py` | The checks each deployment owes and their verdicts; the onboard check, the final pass, the report |
 | `run/startup/`, `run/start.py` | Preflight's hard blockers and the agent probe; what a run starts from |
-| `checks/`, `checks/harness/` | The gates and their evidence; `gate_cli.run_check` runs one for a worker and for the certification alike |
+| `checks/`, `checks/harness/` | The gates and their evidence; `gate_cli.run_check` runs one for a worker and for the run alike |
 | `infra/` | Command execution on this host, Git operations, the heartbeat and `monitor` |
