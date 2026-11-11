@@ -13,6 +13,9 @@ At step *n*, the system launches GPU computation for step *n+1* without waiting 
 
 The optimization introduces one extra decoding step but significantly improves throughput.
 
+Variable-width beam search with changing entries in `beam_width_array` requires
+`disable_overlap_scheduler=True`. Fixed-width beam search supports overlap.
+
 ## Usage
 
 Enabled by default. To disable, set `disable_overlap_scheduler=True` in the configuration.
