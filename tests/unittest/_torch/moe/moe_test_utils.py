@@ -266,6 +266,8 @@ def should_skip_trtllm(
     seq_len: Optional[int] = None,
     moe_tp_size: int = 1,
     parallel_mode: Optional[str] = None,
+    dtype: Optional[torch.dtype] = None,
+    activation_type: Optional[ActivationType] = None,
 ) -> Optional[str]:
     """
     Check TRTLLM Gen backend specific constraints.
@@ -284,6 +286,8 @@ def should_skip_trtllm(
         moe_tp_size: MoE TP parallelism size (default: 1, no TP sharding)
         parallel_mode: Optional multi-GPU parallel mode label (e.g. "DEP",
             "DTP", "TTP", "TEP") for parallel-mode-specific constraints.
+        dtype: Activation dtype for configuration-specific accuracy skips.
+        activation_type: Activation kind for configuration-specific accuracy skips.
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
@@ -303,6 +307,7 @@ def should_skip_trtllm(
         from tensorrt_llm._torch.moe.fused_moe import (
             DeepSeekV3MoeRoutingMethod,
             Llama4RenormalizeMoeRoutingMethod,
+            RenormalizeMoeRoutingMethod,
         )
 
         # Llama4 routing only supports top_k=1
@@ -432,15 +437,23 @@ def should_skip_trtllm(
                 f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
             )
         # NVFP4 flaky tactic failures with large model configs at seq=8.
-        # For example of observed failures:
-        #   - act=Relu2-e60_k4_h2048_i1408-seq=8: tactic[28] tile [32,36],
-        #     12.79% mismatch, 187/188 tactics pass.
         if (
             num_experts >= 60
             and model_config.top_k >= 4
             and model_config.hidden_size >= 2048
             and model_config.intermediate_size >= 1408
             and seq_len == 8
+            and not (
+                model_config == MoeModelConfig(60, 4, 2048, 1408)
+                and dtype == torch.bfloat16
+                and activation_type == ActivationType.Relu2
+                and routing_method_cls is not None
+                and routing_method_cls == RenormalizeMoeRoutingMethod
+                and not swiglu_gptoss_style
+                and moe_tp_size == 1
+                and parallel_mode is None
+                and comm_method is None
+            )
         ):
             return (
                 f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model config"
@@ -1224,6 +1237,8 @@ def get_quick_skip_reason(
                 routing_method_cls,
                 swiglu_gptoss_style,
                 seq_len=seq_len,
+                dtype=dtype,
+                activation_type=activation_type,
             ),
             lambda: should_skip_cutlass(
                 backend_type,
@@ -1564,7 +1579,15 @@ def module_timer(request):
 # Base Test Config Iterator
 # ============================================================================
 def iter_base_test_configs(
-    swiglu_combos, model_configs, seq_lens, dtypes, backend_types, quant_algos, routing_methods=None
+    swiglu_combos,
+    model_configs,
+    seq_lens,
+    dtypes,
+    backend_types,
+    quant_algos,
+    routing_methods=None,
+    *,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ):
     """
     Iterate over base test configurations using itertools.product.
@@ -1580,6 +1603,7 @@ def iter_base_test_configs(
         backend_types: List of backend types
         quant_algos: List of quantization algorithms
         routing_methods: List of routing method classes (default: [RenormalizeMoeRoutingMethod])
+        activation_type: Activation kind for eligibility and accuracy skip checks.
 
     Yields:
         Tuple of (swiglu_alpha, swiglu_beta, swiglu_limit, model_config, seq_len,
@@ -1606,6 +1630,7 @@ def iter_base_test_configs(
             routing_method_cls,
             swiglu_gptoss_style=swiglu_gptoss_style,
             seq_len=seq_len,
+            activation_type=activation_type,
         )
         routing_name = routing_method_cls.__name__.replace("MoeRoutingMethod", "")
         swiglu_id = (

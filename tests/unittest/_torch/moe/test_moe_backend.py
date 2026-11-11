@@ -1258,6 +1258,52 @@ def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int
     )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides,expected_skip",
+    [
+        ({}, False),
+        ({"dtypes": [torch.float16]}, True),
+        ({"activation_type": ActivationType.Swiglu}, True),
+        ({"activation_type": ActivationType.Silu}, True),
+        ({"model_configs": [MoeModelConfig(64, 4, 2048, 1408)]}, True),
+        ({"model_configs": [MoeModelConfig(60, 8, 2048, 1408)]}, True),
+        ({"routing_methods": [DeepSeekV3MoeRoutingMethod]}, True),
+    ],
+    ids=[
+        "restored",
+        "float16",
+        "swiglu",
+        "silu",
+        "more-experts",
+        "larger-top-k",
+        "deepseek-routing",
+    ],
+)
+def test_trtllm_nvfp4_seq8_skip(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+    expected_skip: bool,
+) -> None:
+    backend = Mock()
+    backend.can_implement.return_value = SimpleNamespace(eligible=True)
+    monkeypatch.setattr("_torch.moe.moe_test_utils.find_backend_classes", lambda *_: [backend])
+    params = dict(
+        swiglu_combos=[(1, 0, float("inf"))],
+        model_configs=[MoeModelConfig(60, 4, 2048, 1408)],
+        seq_lens=[8],
+        dtypes=[torch.bfloat16],
+        backend_types=[MoeBackendType.TRTLLM],
+        quant_algos=[QuantAlgo.NVFP4],
+        routing_methods=[RenormalizeMoeRoutingMethod],
+        activation_type=ActivationType.Relu2,
+    )
+    params.update(overrides)
+    configs = list(iter_base_test_configs(**params))
+    assert len(configs) == 1
+    assert (configs[0][-2] is not None) == expected_skip
+
+
 def should_skip_gptoss(
     backend_type: MoeBackendType,
     quant_algo: Optional[QuantAlgo],
@@ -5302,6 +5348,7 @@ def generate_element_wise_test_params() -> List:
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS, MoeBackendType.TRTLLM],
             [None, QuantAlgo.NVFP4, QuantAlgo.W8A16],
+            activation_type=activation_type,
         ):
             if skip_reason:
                 continue
