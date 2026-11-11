@@ -38,8 +38,8 @@ def _make_model_config(
     return DiffusionModelConfig(
         pretrained_config=SimpleNamespace(
             num_attention_heads=2,
-            attention_head_dim=128 if backend == "FA4" else 16,
-            hidden_size=256 if backend == "FA4" else 32,
+            attention_head_dim=128 if backend in ("FA4", "TRTLLM", "FLASHINFER") else 16,
+            hidden_size=256 if backend in ("FA4", "TRTLLM", "FLASHINFER") else 32,
             num_layers=2,
             num_refiner_layers=1,
             ffn_dim=32,
@@ -190,8 +190,10 @@ def _logic_h3_ulysses_and_parallel_vae(
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
 @pytest.mark.parametrize("async_ulysses", [False, True], ids=["nccl", "async"])
-@pytest.mark.parametrize("backend", ["VANILLA", "FA4"])
+@pytest.mark.parametrize("backend", ["VANILLA", "FA4", "TRTLLM", "FLASHINFER"])
 def test_h3_ulysses_and_parallel_vae(backend: str, async_ulysses: bool) -> None:
+    if backend == "TRTLLM" and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("TRTLLM H3 requires SM100 or SM103")
     if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("FA4 requires SM100 or newer")
     if torch.cuda.device_count() < 2:
@@ -261,11 +263,13 @@ def test_h3_partial_vae_groups() -> None:
 
 
 @pytest.mark.parametrize("tp_size,ulysses_size", [(2, 1), (4, 1), (2, 2)])
-@pytest.mark.parametrize("backend", ["VANILLA", "FA4"])
+@pytest.mark.parametrize("backend", ["VANILLA", "FA4", "TRTLLM", "FLASHINFER"])
 def test_h3_tensor_parallel(tp_size: int, ulysses_size: int, backend: str) -> None:
     world_size = tp_size * ulysses_size
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} CUDA GPUs")
+    if backend == "TRTLLM" and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("TRTLLM H3 requires SM100 or SM103")
     if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("FA4 requires SM100 or newer")
     run_distributed(

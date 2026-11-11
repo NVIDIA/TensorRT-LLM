@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from ... import native_ops
 
 HIDDEN_SIZE = 6144
 NUM_EXPERTS = 256
@@ -63,7 +64,7 @@ class GlmRouterGemm(OpWrapper):
     """
 
     def __call__(self, hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        return torch.ops.trtllm.glm_router_gemm(hidden_states, weight)
+        return native_ops.glm_router_gemm(hidden_states, weight)
 
     def reference(self, hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         """`hidden_states @ weight.T` accumulated in FP64 and rounded to FP32 once.

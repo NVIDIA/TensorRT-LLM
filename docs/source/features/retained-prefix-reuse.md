@@ -23,8 +23,6 @@ The provider checks exact token, model, layout, nonce and generation bindings. I
 
 ## Validation and limits
 
-The checks below ran against initial public main `0fe3f26a9f6c2ba5ae360f2491d228aafa36dd06` with candidate010. The port onto `9484c5921027f2024e888bc129f3b73a582c1939` has not yet run native validation.
+Unit coverage checks immutable references, malformed/raw-coordinate rejection, stale bindings, complete native write coverage, source lifetime, effective model identity, and decoder suffix packing. Such checks do not establish loaded-model reverse reuse or native physical-route qualification.
 
-Those initial unit checks cover immutable wire validation, malformed/raw-coordinate rejection, stale/foreign bindings, complete role coverage, cursor/decoder packing, source lifetime and strict effective identity. Physical native component checks covered dense matching and asymmetric TP mappings and synthetic MiniMax cache layouts. These component identities are not checkpoint or inference qualification.
-
-A full Qwen3-4B final-executor startup and sealed manifest were verified. A complete HTTP prefill-to-decode-to-next-prefill cycle has not passed. Full MiniMax-M3 checkpoint qualification, its block-reuse restriction, retained-HBM backing/route evidence, and performance/quality studies remain open. Forward or component success must not be reported as reverse model reuse. CUDA-graph compatibility and arbitrary asymmetric ordinary-forward ownership are not established by these checks.
+A complete HTTP prefill-to-decode-to-next-prefill cycle, source-pressure and in-flight cancellation tests, retained-HBM backing/route evidence, and checkpoint quality and performance studies remain qualification requirements before production promotion. Full MiniMax-M3 support is additionally blocked by its unresolved block-reuse restriction and unqualified sparse-state semantics. CUDA-graph compatibility and arbitrary asymmetric ordinary-forward ownership are not established. A forward-only or synthetic component success must not be reported as complete reverse model reuse.

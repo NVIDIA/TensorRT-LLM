@@ -1404,6 +1404,121 @@ class IterationResult:
             raise StopAsyncIteration
 
 
+def _reduce_prompt_logprobs_chunk(logits: torch.Tensor,
+                                  token_ids: Optional[list[int]], top_k: int,
+                                  normalized: bool) -> torch.Tensor:
+    logprobs = logits.to(dtype=torch.float32)
+    if not normalized:
+        logprobs = F.log_softmax(logprobs, dim=-1)
+    columns = []
+    if token_ids is not None:
+        targets = torch.tensor(token_ids,
+                               dtype=torch.int64,
+                               device=logprobs.device).unsqueeze(1)
+        target_logprobs = logprobs.gather(1, targets)
+        ranks = (logprobs > target_logprobs).sum(dim=1, keepdim=True) + 1
+        columns += [target_logprobs, ranks]
+    if top_k > 0:
+        top_values, top_ids = torch.topk(logprobs, k=top_k, dim=-1)
+        columns += [top_values, top_ids]
+    if not columns:
+        return torch.empty((logprobs.shape[0], 0), dtype=torch.float64)
+    # FP64 holds FP32 logprobs and integer ranks/token ids exactly.
+    return torch.cat([column.to(torch.float64) for column in columns],
+                     dim=1).cpu()
+
+
+def reduce_prompt_logprobs(logits: torch.Tensor,
+                           token_ids: Optional[list[int]],
+                           top_k: int,
+                           *,
+                           normalized: bool = False) -> torch.Tensor:
+    """Reduce context logits to the values reported as prompt logprobs.
+
+    The reduction runs on the logits' device and copies one small host tensor
+    per bounded chunk, so no per-token host synchronization is needed.
+
+    Args:
+        logits: ``[rows, vocab]`` (or ``[1, rows, vocab]``) logits of any
+            floating dtype; row ``t`` predicts ``token_ids[t]``.
+        token_ids: Target token ids, one per used row, or None to report only
+            the top-k tokens.
+        top_k: Number of most likely tokens to report per row.
+        normalized: ``logits`` already hold log probabilities, so they are
+            reported as is instead of being log-softmaxed again.
+
+    Returns:
+        ``[rows, columns]`` FP64 host tensor. With ``token_ids``, the columns
+        start with the target logprob and its 1-based vocabulary rank; ``top_k``
+        logprobs and then ``top_k`` token ids follow.
+    """
+    if logits.dim() == 3:
+        logits = logits.squeeze(0)
+    if token_ids is not None:
+        logits = logits[:len(token_ids)]
+    # Bound softmax scratch independently of prompt length. On the GPU, a
+    # slice can fall back to CPU without retaining a full-vocabulary GPU result.
+    rows_per_chunk = max(1, (16 * 1024 * 1024) // (4 * logits.shape[-1]))
+    chunks = []
+    for start in range(0, logits.shape[0], rows_per_chunk):
+        chunk = logits[start:start + rows_per_chunk]
+        tokens = None if token_ids is None else token_ids[start:start +
+                                                          chunk.shape[0]]
+        try:
+            reduced = _reduce_prompt_logprobs_chunk(chunk, tokens, top_k,
+                                                    normalized)
+        except torch.OutOfMemoryError:
+            if not chunk.is_cuda:
+                raise
+            reduced = None
+        if reduced is None:
+            reduced = _reduce_prompt_logprobs_chunk(chunk.cpu(), tokens, top_k,
+                                                    normalized)
+        chunks.append(reduced)
+    if not chunks:
+        columns = (0 if token_ids is None else 2) + 2 * top_k
+        return torch.empty((0, columns), dtype=torch.float64)
+    return torch.cat(chunks)
+
+
+def prompt_logprobs_from_reduced(
+        reduced: torch.Tensor, token_ids: Optional[list[int]], top_k: int,
+        simple: bool) -> TokenLogprobs | SimpleTokenLogprobs:
+    """Build the user-facing prompt logprobs from ``reduce_prompt_logprobs`` rows.
+
+    Args:
+        reduced: ``[rows, columns]`` FP64 host tensor from
+            ``reduce_prompt_logprobs`` with the same ``token_ids`` presence
+            and ``top_k``.
+        token_ids: The target token ids the rows were reduced against, or None.
+        top_k: Number of top tokens reduced per row.
+        simple: Return a flat list of target logprobs when ``top_k`` is 0.
+    """
+    rows = reduced.tolist()
+    if top_k == 0:
+        if token_ids is None:
+            return []
+        if simple:
+            return [row[0] for row in rows]
+        return [{
+            token_id: Logprob(logprob=row[0], rank=int(row[1]))
+        } for token_id, row in zip(token_ids, rows)]
+    first = 0 if token_ids is None else 2
+    results: TokenLogprobs = []
+    for index, row in enumerate(rows):
+        values = row[first:first + top_k]
+        ids = row[first + top_k:first + 2 * top_k]
+        token_dict = {
+            int(token_id): Logprob(logprob=value, rank=rank + 1)
+            for rank, (value, token_id) in enumerate(zip(values, ids))
+        }
+        if token_ids is not None and token_ids[index] not in token_dict:
+            token_dict[token_ids[index]] = Logprob(logprob=row[0],
+                                                   rank=int(row[1]))
+        results.append(token_dict)
+    return results
+
+
 def compute_prompt_logprobs(
     k_prompt_logprobs: int,
     context_logits: Optional[torch.Tensor],
@@ -1415,69 +1530,14 @@ def compute_prompt_logprobs(
     When ``simple_prompt_logprobs`` is True and ``k_prompt_logprobs`` is 0,
     return a flat list of sampled-token logprobs instead of per-token dicts.
     """
-
-    def _topk_logprobs(logits: torch.Tensor, top_k: int,
-                       tokens: Optional[list[int]],
-                       simple: bool) -> TokenLogprobs | SimpleTokenLogprobs:
-        if logits.dim() == 3:
-            # reshape from [1, T, V] to [T, V]
-            logits = logits.squeeze(0)
-
-        if tokens is not None and logits.size(0) > len(tokens):
-            # Only consume logits corresponding to the supplied tokens.
-            logits = logits[:len(tokens)]
-
-        logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
-
-        # only return sampled token
-        if top_k == 0:
-            if simple:
-                simple_results: list[float] = []
-                if tokens is not None:
-                    for t in range(logprobs.size(0)):
-                        simple_results.append(logprobs[t, tokens[t]].item())
-                return simple_results
-
-            results: TokenLogprobs = []
-            if tokens is not None:
-                for t in range(logprobs.size(0)):
-                    token_id = tokens[t]
-                    token_logprob = logprobs[t, token_id].item()
-                    rank = (logprobs[t] > token_logprob).sum().item() + 1
-                    token_dict = {
-                        token_id: Logprob(logprob=token_logprob, rank=rank)
-                    }
-                    results.append(token_dict)
-            return results
-
-        topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
-
-        results: TokenLogprobs = []
-        # for each token position
-        for t in range(logprobs.size(0)):
-            token_dict = {
-                idx.item(): Logprob(logprob=val.item(), rank=r + 1)
-                for r, (val,
-                        idx) in enumerate(zip(topk_vals[t], topk_indices[t]))
-            }
-
-            # If we have the sampled token list and it's not in top-k, add it
-            if tokens is not None:
-                token_id = tokens[t]
-                if token_id not in token_dict:
-                    token_logprob = logprobs[t, token_id].item()
-                    rank = (logprobs[t] > token_logprob).sum().item() + 1
-                    token_dict[token_id] = Logprob(logprob=token_logprob,
-                                                   rank=rank)
-
-            results.append(token_dict)
-        return results
-
-    prompt_logprobs = _topk_logprobs(
-        context_logits, k_prompt_logprobs, prompt_token_ids,
-        simple_prompt_logprobs
-    ) if k_prompt_logprobs is not None and context_logits is not None else None
-    return LogProbsResult(prompt=prompt_logprobs)
+    if k_prompt_logprobs is None or context_logits is None:
+        return LogProbsResult(prompt=None)
+    reduced = reduce_prompt_logprobs(context_logits, prompt_token_ids,
+                                     k_prompt_logprobs)
+    tokens = None if prompt_token_ids is None else prompt_token_ids[:reduced.
+                                                                    shape[0]]
+    return LogProbsResult(prompt=prompt_logprobs_from_reduced(
+        reduced, tokens, k_prompt_logprobs, simple_prompt_logprobs))
 
 
 def _build_perf_metrics_dict(

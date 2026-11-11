@@ -46,6 +46,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PredefinedAttentionMask
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduceParams, allgather)
 from ..distributed.ops import MNNVLAllReduce
@@ -53,7 +54,8 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import (FP8QDQLinearMethod, Linear, TensorParallelMode,
+from ..modules.linear import (FP8QDQLinearMethod, FP8RowwiseLinearMethod,
+                              Linear, TensorParallelMode,
                               is_static_nvfp4_input_eligible)
 from ..modules.low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
                                   low_m_gemm_dispatcher, prepare_low_m_gemm)
@@ -930,6 +932,8 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
 
 class Qwen3NextLinearDecoderLayer(_Qwen3NextDecoderLayerBase):
 
+    linear_attn_cls = Qwen3NextGatedDeltaNet
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen3NextConfig],
@@ -938,7 +942,7 @@ class Qwen3NextLinearDecoderLayer(_Qwen3NextDecoderLayerBase):
         shared_gate_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
-        self.linear_attn = Qwen3NextGatedDeltaNet(
+        self.linear_attn = self.linear_attn_cls(
             model_config,
             aux_stream,
             layer_idx,
@@ -992,6 +996,8 @@ class Qwen3NextAttention(Qwen3Attention):
 
 class Qwen3NextFullAttentionDecoderLayer(_Qwen3NextDecoderLayerBase):
 
+    attention_mask = PredefinedAttentionMask.CAUSAL
+
     def __init__(self,
                  model_config: ModelConfig[Qwen3NextConfig],
                  layer_idx: int,
@@ -1011,6 +1017,7 @@ class Qwen3NextFullAttentionDecoderLayer(_Qwen3NextDecoderLayerBase):
 
     def mixer_forward(self, position_ids, hidden_states, attn_metadata,
                       spec_metadata, lora_params, all_reduce_params, **kwargs):
+        kwargs.setdefault("attention_mask", self.attention_mask)
         return self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1279,6 +1286,8 @@ ALL_DECODER_LAYER_TYPES = {
 
 class Qwen3NextModel(DecoderModel):
 
+    decoder_layer_types = ALL_DECODER_LAYER_TYPES
+
     def __init__(self, model_config: ModelConfig[Qwen3NextConfig]):
         super().__init__(model_config)
         config = self.model_config
@@ -1330,10 +1339,10 @@ class Qwen3NextModel(DecoderModel):
         shared_gate_stream = self.aux_stream_dict.get(
             AuxStreamType.MoeSharedGate)
         self.layers = nn.ModuleList([
-            ALL_DECODER_LAYER_TYPES[layer_types[layer_idx]](model_config,
-                                                            layer_idx,
-                                                            self.aux_stream,
-                                                            shared_gate_stream)
+            self.decoder_layer_types[layer_types[layer_idx]](model_config,
+                                                             layer_idx,
+                                                             self.aux_stream,
+                                                             shared_gate_stream)
             for layer_idx in range(pretrained_config.num_hidden_layers)
         ])
         self.num_hidden_layers = pretrained_config.num_hidden_layers
@@ -1514,3 +1523,10 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                     and norm.is_nvfp4
                     and is_static_nvfp4_input_eligible(mlp.mlp.gate_up_proj)):
                 norm.nvfp4_scale = mlp.mlp.gate_up_proj.input_scale
+        # Quantize per token in the input norm when in_proj_qkvz is FP8 rowwise.
+        for layer in self.model.layers[:self.config.num_hidden_layers]:
+            linear_attn = getattr(layer, "linear_attn", None)
+            if linear_attn is not None:
+                layer.input_layernorm.fp8_per_token_out = isinstance(
+                    linear_attn.in_proj_qkvz.quant_method,
+                    FP8RowwiseLinearMethod)

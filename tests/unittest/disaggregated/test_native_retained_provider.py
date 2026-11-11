@@ -187,9 +187,37 @@ class Ownership(unittest.TestCase):
         provider = self.provider()
         request = NS()
         provider.quarantined = [(request, NS(), NS(), NS())]
-        executor = NS(native_retained_prefix=provider, _do_terminate_request=Mock())
+        executor = NS(
+            native_retained_prefix=provider,
+            disagg=NS(defer_gen_termination=Mock(return_value=False)),
+            _do_terminate_request=Mock(),
+        )
         PyExecutor._terminate_request(executor, request)
+        executor.disagg.defer_gen_termination.assert_not_called()
         executor._do_terminate_request.assert_not_called()
+
+    def test_actual_executor_retains_ordinary_generation_deferral(self):
+        request = NS()
+        executor = NS(
+            native_retained_prefix=self.provider(),
+            disagg=NS(defer_gen_termination=Mock(return_value=True)),
+            _do_terminate_request=Mock(),
+        )
+        PyExecutor._terminate_request(executor, request)
+        executor.disagg.defer_gen_termination.assert_called_once_with(request)
+        executor._do_terminate_request.assert_not_called()
+
+    def test_actual_executor_unowned_request_uses_ordinary_teardown(self):
+        request = NS(is_dummy_request=False)
+        executor = NS(
+            native_retained_prefix=self.provider(),
+            disagg=NS(defer_gen_termination=Mock(return_value=False)),
+            _disagg_pp_termination_handler=None,
+            _do_terminate_request=Mock(),
+        )
+        PyExecutor._terminate_request(executor, request)
+        executor.disagg.defer_gen_termination.assert_called_once_with(request)
+        executor._do_terminate_request.assert_called_once_with(request)
 
     def test_expired_foreign_generation_and_forged_identity_never_contact_native(self):
         for supplied, identity in (

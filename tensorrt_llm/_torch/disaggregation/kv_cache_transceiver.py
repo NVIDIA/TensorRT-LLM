@@ -15,7 +15,10 @@
 
 from abc import ABC, abstractmethod
 from os import getenv
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional
+
+if TYPE_CHECKING:
+    import torch
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -451,6 +454,26 @@ class KvCacheTransceiver(ABC):
         and the caller must retry on a later iteration.
         """
         raise NotImplementedError
+
+    def cancel_gen_logically(
+            self,
+            req: LlmRequest,
+            ready: Optional["torch.cuda.Event"] = None) -> bool:
+        """Accept logical GEN cancellation without authorizing memory release.
+
+        Args:
+            req: Model-idle generation request to cancel.
+            ready: Unpublished destination's outstanding admission fence, if any.
+
+        Returns:
+            Whether cancellation was accepted under a qualified retirement policy.
+            The caller must still use cancel_request to establish safe retirement.
+            Under that policy, the transceiver retains a passed ready fence until
+            cancel_request returns True, even if an earlier failure makes this
+            method return False. Unsupported implementations return False without
+            taking ownership of ready.
+        """
+        return False
 
     def supports_inflight_request_cancellation(self) -> bool:
         """Return True when in-flight transfers can be cancelled safely."""
