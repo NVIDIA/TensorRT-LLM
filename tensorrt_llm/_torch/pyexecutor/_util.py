@@ -4584,11 +4584,12 @@ def should_enable_overlap_headroom(mapping: Mapping,
     seat until the next iteration's ``_process_previous_batch``, which runs
     after that iteration has already admitted new work. Admission excludes such
     retiring requests whenever this gate is on (``ADPRouter`` on the
-    attention-DP path, ``_fetch_new_requests`` otherwise), so the replacement
-    cohort needs seats of its own. Without the extra micro-batch, a workload
-    whose requests retire after one iteration -- a context server, where every
-    request finishes in its prefill step -- can only refill the seats the
-    previous iteration did not use, and runs at roughly half its batch.
+    attention-DP path, ``_fetch_new_requests`` otherwise, except aggregated
+    requests), so the replacement cohort needs seats of its own. Without the
+    extra micro-batch, a workload whose requests retire after one iteration --
+    a context server, where every request finishes in its prefill step -- can
+    only refill the seats the previous iteration did not use, and runs at
+    roughly half its batch.
 
     Widening the pool is only safe when every ``py_seq_slot``-indexed pool is
     sized from ``compute_max_num_sequences``. Two model families size one from

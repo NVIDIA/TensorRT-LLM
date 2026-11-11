@@ -139,7 +139,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
-                                   count_retiring_requests)
+                                   count_retiring_requests, is_retiring_request)
 from .scheduler.ctx_decoder_batch import (CtxDecoderBatcher,
                                           install_ctx_decoder_batch)
 from .scheduler.gen_admission_queue import (GenAdmissionConfig,
@@ -9122,8 +9122,12 @@ class PyExecutor:
                 # Retiring requests hold a seat from the overlap headroom, not
                 # one that admission hands out (see
                 # should_enable_overlap_headroom). They still count as live.
-                total_num_active_requests -= count_retiring_requests(
-                    active_requests)
+                # A retiring context-and-generation request keeps its seat:
+                # its last response is sent after the next forward.
+                total_num_active_requests -= sum(
+                    1 for req in active_requests
+                    if is_retiring_request(req) and req.llm_request_type !=
+                    LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION)
             all_rank_states = None
             new_requests_hint = None
 
@@ -12229,7 +12233,8 @@ class PyExecutor:
         """
         new_responses = []
         for req in scheduled_batch.generation_requests:
-            if req.py_decoding_iter == 1:
+            # A batch index: the request's first step ran in an earlier overlap-loop pass.
+            if req.py_decoding_iter == 1 and req.py_batch_idx is None:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )

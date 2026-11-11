@@ -357,15 +357,17 @@ def test_steady_decode_reuses_converted_tables(
 )
 @torch.inference_mode()
 def test_steady_spec_steps_match_full_prepare(monkeypatch, scratch, seed, block):
-    """Steady DSpark verification steps read exactly what a full preparation writes."""
+    """Steady DSpark verification steps read exactly what a full preparation writes, also when a
+    new request takes a finished request's row."""
     rng = random.Random(seed)
-    hits = []
+    hits, joins = [], []
     predicate = CSA2TrtllmMetadata._steady_generation_step
 
     def counted(self, snapshot):
         hit = predicate(self, snapshot)
         if not getattr(self, "_full_reference", False):
             hits.append(hit is not None)
+            joins.append(isinstance(hit, np.ndarray) and bool((hit < 0).any()))
         return hit
 
     monkeypatch.setattr(CSA2TrtllmMetadata, "_steady_generation_step", counted)
@@ -388,6 +390,13 @@ def test_steady_spec_steps_match_full_prepare(monkeypatch, scratch, seed, block)
                 done = active.pop(rng.randrange(len(active)))
                 pending.pop(done.py_request_id, None)
                 manager.free_resources(done)
+            elif active and rng.random() < 0.05:
+                # A finished request leaves and a new one takes its row in the same step.
+                row = rng.randrange(len(active))
+                pending.pop(active[row].py_request_id, None)
+                manager.free_resources(active[row])
+                active[row] = _admit(manager, next_id, rng.randrange(block - 8, 5 * block + 60))
+                next_id += 1
             if len(active) > 1 and rng.random() < 0.03:
                 rng.shuffle(active)
             for request in active:
@@ -418,7 +427,7 @@ def test_steady_spec_steps_match_full_prepare(monkeypatch, scratch, seed, block)
                 for r in active
                 if rng.random() < 0.97
             )
-        assert sum(hits) > len(hits) // 2, (sum(hits), len(hits))
+        assert sum(hits) > len(hits) // 2 and any(joins), (sum(hits), len(hits), sum(joins))
     finally:
         for request in active:
             manager.free_resources(request)

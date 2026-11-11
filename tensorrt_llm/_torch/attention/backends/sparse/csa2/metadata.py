@@ -2028,9 +2028,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 # step: every geometry tensor of the previous prepare is still
                 # valid, so only the host positions, the routing state and the
                 # live device endpoints are refreshed, plus the page tables
-                # when a request crossed a page. When requests left the batch,
-                # the others moved rows: their start bases are uploaded again
-                # and every table is re-read.
+                # when a request crossed a page. When requests left or joined
+                # the batch, the rows changed: their start bases are uploaded
+                # again and every table is re-read.
                 moved = self._steady_pages_moved(snapshot, rows)
                 remapped = not isinstance(rows, slice)
                 refresh = remapped or moved.any()
@@ -2055,6 +2055,25 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                         allocated_until,
                         page_count,
                         page_versions,
+                    )
+                joined = np.flatnonzero(rows < 0) if remapped else ()
+                if len(joined):
+                    # No earlier prepare checked a joining request's pages.
+                    self._check_swa_write_pages(
+                        starts_np[joined],
+                        lengths_np[joined],
+                        replay_starts_np[joined],
+                        allocated_until[joined],
+                        page_count,
+                        joined,
+                    )
+                    self._check_owner_pages(
+                        manager.layout.kv_source_layer_ids,
+                        starts_np[joined],
+                        starts_np[joined] + lengths_np[joined],
+                        allocated_until[joined],
+                        page_count,
+                        joined,
                     )
                 self.csa2_request_start_positions = tuple(starts)
                 self.reset_routing()
@@ -2404,7 +2423,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         move. The rows are ``slice(None)`` when the order is unchanged too; a
         batch of the same size and query lengths from which requests left (the
         others moved up, padding rows filled the end) maps each row to a previous
-        row of its request. Positions and slots follow the live device lengths.
+        row of its request, and a request that joined it to row -1 (its pages are
+        re-read like a moved request's). Positions and slots follow the live device
+        lengths.
         """
         previous = getattr(self, "_csa2_steady_snapshot", None)
         if previous is None or self.num_contexts or snapshot[2] != previous[2]:
@@ -2415,39 +2436,42 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         if bank.get(_BANK_WRITER) != getattr(self, "_csa2_forward_serial", None):
             return None
         rows = slice(None)
+        kept = slice(None)
         if snapshot[:2] != previous[:2]:
             # The query lengths are uniform, so a moved request keeps its length.
             # Padding rows repeat one request: any of its previous rows serves.
             if len(set(snapshot[2])) > 1:
                 return None
             previous_rows = dict(zip(zip(previous[0], previous[1]), range(len(previous[0]))))
-            try:
-                rows = np.fromiter(
-                    map(previous_rows.__getitem__, zip(snapshot[0], snapshot[1])),
-                    dtype=np.int64,
-                    count=len(snapshot[0]),
-                )
-            except KeyError:
-                return None
-        advance = snapshot[3] - previous[3][rows]
-        return rows if np.all((advance >= 0) & (advance <= snapshot[5])) else None
+            rows = np.fromiter(
+                (previous_rows.get(key, -1) for key in zip(snapshot[0], snapshot[1])),
+                dtype=np.int64,
+                count=len(snapshot[0]),
+            )
+            kept = rows >= 0
+        advance = snapshot[3][kept] - previous[3][rows][kept]
+        return rows if np.all((advance >= 0) & (advance <= snapshot[5][kept])) else None
 
     def _steady_pages_moved(self, snapshot, rows) -> np.ndarray:
         """Per request, whether a steady step's last position, SWA window start or
         allocated capacity crossed a page boundary since its previous ``rows``, or its
-        page-storage version moved, so its page tables may have changed."""
+        page-storage version moved, so its page tables may have changed. A request that
+        joined the batch (row -1) always has."""
         previous = self._csa2_steady_snapshot
         block = self.kv_cache_manager.tokens_per_block
         window = self.kv_cache_manager.layout.window_size
         starts, allocated, lengths, page_versions = snapshot[3:]
         last = starts + lengths - 1
         prev_last = last - (starts - previous[3][rows])
-        return (
+        moved = (
             (page_versions != previous[6][rows])
             | (last // block != prev_last // block)
             | ((last - window) // block != (prev_last - window) // block)
             | ((allocated - 1) // block != (previous[4][rows] - 1) // block)
         )
+        if not isinstance(rows, slice):
+            moved |= rows < 0
+        return moved
 
     def _refresh_steady_page_tables(
         self,

@@ -5054,6 +5054,7 @@ def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> typ
     request = types.SimpleNamespace(
         py_request_id=rid,
         py_decoding_iter=1,
+        py_batch_idx=None,
         py_result=py_result,
         py_disaggregated_params=types.SimpleNamespace(**transferred),
     )
