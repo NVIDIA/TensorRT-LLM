@@ -47,8 +47,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         help="A HuggingFace checkpoint directory: derive the run's spec from its "
-        "config.json, --site and --goal into `<workspace>/task.derived.yaml` (beside "
-        "`derive.report.md`) and run it. A question the derivation cannot answer stops "
+        "config.json, --site and --goal into `<workspace>/task.derived.yaml` and run "
+        "it. A question the derivation cannot answer stops "
         "here, to be answered in the spec. Re-running the same command takes the spec "
         "as it stands, edits included; --clean derives it again.",
     )
@@ -63,7 +63,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--goal",
         default=None,
         help="With --checkpoint: the features, members and workload in one line, e.g. "
-        '"mtp disagg@tp1/tp2 tp1 tep4 dep4 isl=8192 osl=1024" (spec/derive.py). '
+        '"mtp disagg@tep4 tp1 tep4 dep4 isl=8192 osl=1024" (spec/derive.py). '
         "Features the checkpoint carries are built unless named `-<feature>`.",
     )
     parser.add_argument(
@@ -188,7 +188,7 @@ def _derive_spec(
     """The fast path: the workspace's derived spec, derived anew when there is none or on ``clean``.
 
     Raises :class:`~.spec.derive.DeriveError` with every open question of a
-    new derivation: the spec and its report are written first, to be answered in.
+    new derivation: the spec is written first, to be answered in.
     """
     import yaml
 
@@ -203,7 +203,7 @@ def _derive_spec(
         checkpoint, site_data, derive_mod.parse_goal(goal), site_path=site
     )
     derive_mod.write_derivation(workspace, derivation)
-    print(f"→ derived {path} (see {workspace / derive_mod.REPORT_FILENAME})")
+    print(f"→ derived {path}")
     if derivation.questions:
         raise derive_mod.DeriveError(
             f"{path} leaves {len(derivation.questions)} question(s) open; answer them in it and "

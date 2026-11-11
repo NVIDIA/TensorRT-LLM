@@ -479,16 +479,6 @@ def test_policy_keys_of_the_old_contract_are_ignored_by_one_table_with_a_notice_
     assert set(task_schema.IGNORED_KEYS) >= {"profile", "coverage", "accuracy.envelope"}
 
 
-def test_intake_lint_explains_replacement(tmp_path, capsys):
-    """DECISIONS #1: retain old command as a one-line migration notice."""
-    try:
-        derive.main(["lint"])
-    except SystemExit:
-        pass
-    output = capsys.readouterr()
-    assert "--dry-run" in output.out + output.err
-
-
 def test_three_warnings_are_advice_not_validation_failures(tmp_path, spec):
     checkpoint = Path(spec["checkpoint_path"])
     (checkpoint / "model.safetensors.index.json").write_text(
@@ -891,5 +881,3 @@ def test_intake_derive_writes_native_deployments_and_prints_its_warnings(tmp_pat
     assert said.count("\n") == 1 and "`intake lint` is replaced by" in said and "--dry-run" in said
     assert derive.main(["other"]) == 2
     assert "usage: trtllm-modeling-v2 intake derive" in capsys.readouterr().err
-    with pytest.raises(derive.DeriveError, match="only disagg takes a member of its own"):
-        derive.parse_goal("mtp@tep4")

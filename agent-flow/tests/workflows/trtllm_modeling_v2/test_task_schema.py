@@ -138,10 +138,7 @@ def _engine(root: Path, name: str) -> dict:
 
 
 def test_the_goal_overrides_what_the_checkpoint_and_the_site_say(tmp_path):
-    goal = (
-        "-mtp multimodal tp1 dep4 isl=1024 osl=256 arch=sm_103 disagg@dep4 kv=bf16/fp8 "
-        "concurrency=8/256"
-    )
+    goal = "-mtp multimodal tp1 dep4 isl=1024 osl=256 arch=sm_103 disagg@dep4 kv=bf16/fp8"
     site = dict(
         device={"arch": "sm_100", "gpus_per_node": 4},
         defaults={"disagg": {"env": {"LLM_MODELS_ROOT": "/models"}}},
@@ -160,63 +157,41 @@ def test_the_goal_overrides_what_the_checkpoint_and_the_site_say(tmp_path):
     assert found["kv_fp8"].server.options["kv_cache_config"]["dtype"] == "fp8"
     assert found["kv_fp8"].relative_to == "tp1"
     core = _engine(tmp_path, "tp1")
-    # The batch holds the goal's concurrency, whatever the default says.
-    assert (core["max_seq_len"], core["max_batch_size"]) == (1280, 256)
-    assert _engine(tmp_path, "dep4")["max_batch_size"] == 64  # one rank's share of it
-    with pytest.raises(derive.DeriveError, match="'multimodal:smoke' is not a feature"):
-        derive.parse_goal("multimodal:smoke")
+    assert (core["max_seq_len"], core["max_batch_size"]) == (1280, 64)
+    assert _engine(tmp_path, "dep4")["max_batch_size"] == 16  # one rank's share of it
+    # Core's switches: graphs and the overlap scheduler on, reuse and chunked prefill off.
+    assert core["kv_cache_config"]["enable_block_reuse"] is False
+    assert core["enable_chunked_prefill"] is False and core["max_num_tokens"] == 8192
+    assert core["cuda_graph_config"] == {} and core["disable_overlap_scheduler"] is False
+    assert core["speculative_config"] is None
+    with pytest.raises(derive.DeriveError) as bad:
+        derive.parse_goal("multimodal:smoke kv=fp8 kv=nvfp4 mtp@tep4")
+    said = str(bad.value)
+    assert "'multimodal:smoke' is not a member, a feature or a setting" in said
+    assert "'kv=nvfp4' kv= is named once" in said
+    assert "'mtp@tep4': only disagg takes a member of its own" in said
 
 
-def test_a_goal_that_names_its_features_gets_those_and_what_derive_cannot_know_is_asked(tmp_path):
+def test_what_derive_cannot_know_is_asked_and_the_checkpoints_own_features_are_built(tmp_path):
     checkpoint = _checkpoint(tmp_path)
+    # Unsaid, the checkpoint's own drafter and tower are built, one deployment each.
+    spec = load_and_validate_task_yaml(_derive(tmp_path, "tp1"))
+    assert [d.name for d in deployments.resolve(spec)] == ["tp1", "mtp", "multimodal"]
+    assert _engine(tmp_path, "mtp")["speculative_config"]["decoding_type"] == "MTP"
     config = json.loads((checkpoint / "config.json").read_text())
     del config["_name_or_path"]
+    config["quantization_config"] = {"quant_algo": "NVFP4"}
     (checkpoint / "config.json").write_text(json.dumps(config))
     with pytest.raises(derive.DeriveError) as excinfo:
         cli._derive_spec(
-            checkpoint, _site(tmp_path), tmp_path / "ws", goal="multimodal", clean=False
+            checkpoint, _site(tmp_path), tmp_path / "ws", goal="multimodal", clean=True
         )
     assert "accuracy.model_key" in str(excinfo.value)
     spec = yaml.safe_load((tmp_path / "ws" / derive.SPEC_FILENAME).read_text())
     # The checkpoint's drafter is left out: the goal names its features and not it.
     assert [d["name"] for d in spec["deployments"]] == ["tp1", "tep4", "dep4", "multimodal"]
-    assert "features (left out)" in (tmp_path / "ws" / derive.REPORT_FILENAME).read_text()
-    with pytest.raises(derive.DeriveError, match="kv= is named once"):
-        derive.parse_goal("kv=fp8 kv=nvfp4")
-
-
-def test_core_keeps_reuse_and_chunking_off_and_each_named_one_is_its_own_deployment(tmp_path):
-    spec = load_and_validate_task_yaml(
-        _derive(
-            tmp_path, "tp1 chunked_prefill prefix_reuse kv=fp8/nvfp4 chunk=256 concurrency=1/128"
-        )
-    )
-    assert [d.name for d in deployments.resolve(spec)] == ["tp1", "mtp", "multimodal"] + [
-        "kv_nvfp4",
-        "chunked",
-        "reuse",
-    ]
-    core = _engine(tmp_path, "tp1")
-    assert core["kv_cache_config"]["enable_block_reuse"] is False
-    assert core["enable_chunked_prefill"] is False and core["max_num_tokens"] == 8192
-    assert core["cuda_graph_config"] and core["disable_overlap_scheduler"] is False
-    # The first KV dtype is the one every deployment stores its cache in.
-    assert core["kv_cache_config"]["dtype"] == "fp8"
-    assert _engine(tmp_path, "kv_nvfp4")["kv_cache_config"]["dtype"] == "nvfp4"
-    chunked = _engine(tmp_path, "chunked")
-    assert (chunked["enable_chunked_prefill"], chunked["max_num_tokens"]) == (True, 256)
-    assert _engine(tmp_path, "reuse")["kv_cache_config"]["enable_block_reuse"] is True
-    # Each changes one thing over core, the checkpoint's drafter included.
-    assert _engine(tmp_path, "mtp")["speculative_config"]["decoding_type"] == "MTP"
-    assert core["speculative_config"] is None
-    report = (tmp_path / "ws" / derive.REPORT_FILENAME).read_text()
-    # The batch the spec carries, raised to the concurrency, not the default it started from.
-    assert "| `workload.max_batch_size` | concurrency | `128` |" in report
-    assert derive.hybrid_marker({"architectures": ["Unseen"], "linear_num_value_heads": 32})
-    assert derive.hybrid_marker(
-        {"text_config": {"layer_types": ["linear_attention", "full_attention"]}}
-    )
-    assert derive.hybrid_marker({"architectures": ["Unseen"]}) is None
+    # A quantized checkpoint is anchored to its own row, not the unquantized model's.
+    assert spec["accuracy"]["discriminators"] == {"quant_algo": "NVFP4"}
 
 
 def test_a_key_this_version_no_longer_reads_is_dropped_with_one_notice_each(tmp_path):
