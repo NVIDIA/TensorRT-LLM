@@ -364,6 +364,79 @@ class TestQwenImageTeacacheTable:
         assert pipeline.model_config.teacache.coefficients == [1.0, 2.0, 3.0]
 
 
+@pytest.mark.parametrize("per_token", [False, True], ids=["t2v", "i2v"])
+@pytest.mark.parametrize("use_ret_steps", [False, True], ids=["standard", "ret_steps"])
+@torch.no_grad()
+def test_wan_teacache_timestep_embedding_matches_condition_embedder(
+    per_token: bool, use_ret_steps: bool
+) -> None:
+    """L1/T1: TeaCache timestep embeddings match Wan's normal condition embedder.
+
+    Compare standard/ret_steps outputs against the same weights and timesteps,
+    preserving batch and per-token dimensions for image-conditioned timesteps.
+    """
+    from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTimeTextImageEmbedding
+
+    class FP32ModelConfig(DiffusionModelConfig):
+        @property
+        def torch_dtype(self) -> torch.dtype:
+            return torch.float32
+
+    dim = 8
+    with torch.random.fork_rng(devices=[]), torch.device("cpu"):
+        torch.manual_seed(0)
+        condition_embedder = WanTimeTextImageEmbedding(
+            dim=dim,
+            time_freq_dim=8,
+            time_proj_dim=6 * dim,
+            text_embed_dim=8,
+            model_config=FP32ModelConfig(device="cpu"),
+        ).eval()
+        # TRT-LLM Linear allocates empty weights; initialize the real projection.
+        torch.nn.init.normal_(condition_embedder.time_proj.weight, std=0.1)
+        torch.nn.init.normal_(condition_embedder.time_proj.bias, std=0.1)
+        encoder_hidden_states = torch.randn(2, 2, 8)
+        raw_timestep = torch.tensor(
+            [[0.0, 750.0, 500.0], [0.0, 250.0, 125.0]] if per_token else [750.0, 250.0],
+            dtype=torch.float32,
+        )
+
+    pipeline = SimpleNamespace(
+        scheduler=SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000)),
+        pipeline_config=SimpleNamespace(teacache=TeaCacheConfig(use_ret_steps=use_ret_steps)),
+    )
+    actual = WanPipeline._compute_wan_timestep_embedding(
+        pipeline,
+        SimpleNamespace(condition_embedder=condition_embedder),
+        timestep=raw_timestep / 1000,
+    )
+    temb, temb_proj, _, _ = condition_embedder(
+        raw_timestep.flatten(),
+        encoder_hidden_states,
+        timestep_seq_len=raw_timestep.shape[1] if per_token else None,
+    )
+    expected = temb_proj if use_ret_steps else temb
+
+    assert actual.shape == (*raw_timestep.shape, 6 * dim if use_ret_steps else dim)
+    assert not torch.equal(actual[0], actual[1])
+    if per_token:
+        assert not torch.equal(actual[:, 0], actual[:, 1])
+    reference_norm = torch.linalg.vector_norm(expected)
+    assert reference_norm > 0
+    relative_l2 = (torch.linalg.vector_norm(actual - expected) / reference_norm).item()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.flatten(), expected.flatten(), dim=0
+    ).item()
+    max_abs = (actual - expected).abs().max().item()
+    diagnostic = (
+        f"Wan TeaCache {use_ret_steps=}, dtype={actual.dtype}, shape={tuple(actual.shape)}, "
+        f"relative_l2={relative_l2:.3e}, cosine={cosine:.8f}, max_abs={max_abs:.3e}"
+    )
+    print(diagnostic)
+    assert relative_l2 <= 1e-2 and cosine >= 0.9999 and max_abs <= 1e-3, diagnostic
+
+
 class _TupleTransformer(torch.nn.Module):
     def forward(
         self,

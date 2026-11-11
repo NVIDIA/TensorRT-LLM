@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 from pathlib import Path
 from typing import Optional, Type
@@ -82,12 +85,16 @@ class ToolParserFactory:
     }
 
     @staticmethod
-    def create_tool_parser(tool_parser: str) -> BaseToolParser:
+    def create_tool_parser(
+        tool_parser: str, *, grammar_constrained: bool = False
+    ) -> BaseToolParser:
         try:
             tool_parser_class = ToolParserFactory.parsers[tool_parser.lower()]
-            return tool_parser_class()
         except KeyError as e:
             raise ValueError(
                 f"Invalid tool_parser: {tool_parser}\n"
                 f"Supported parsers: {list(ToolParserFactory.parsers.keys())}"
             ) from e
+        parser = tool_parser_class()
+        parser.grammar_constrained = grammar_constrained
+        return parser

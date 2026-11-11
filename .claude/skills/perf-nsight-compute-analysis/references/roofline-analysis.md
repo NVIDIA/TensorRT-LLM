@@ -38,6 +38,10 @@ The roofline model plots kernel performance against arithmetic intensity to iden
 
 Overview roofline showing kernel position relative to peak memory and compute roofs. Best for quick visual classification.
 
+The roofline sections are charts. On the CLI, add `--print-details all`: without it ncu prints
+nothing for them, and with it ncu prints the numbers behind the chart (achieved and peak work
+and traffic). To see the chart, save a report with `-o` and open it in the Nsight Compute UI.
+
 ### Hierarchical Roofline Charts
 
 Show multiple memory roofs at different cache levels (L1, L2, DRAM), revealing where in the memory hierarchy the bottleneck occurs.
@@ -47,6 +51,7 @@ Show multiple memory roofs at different cache levels (L1, L2, DRAM), revealing w
 | `SpeedOfLight_HierarchicalSingleRooflineChart` | FP32 | `--section SpeedOfLight_HierarchicalSingleRooflineChart` |
 | `SpeedOfLight_HierarchicalHalfRooflineChart` | FP16 | `--section SpeedOfLight_HierarchicalHalfRooflineChart` |
 | `SpeedOfLight_HierarchicalTensorRooflineChart` | Tensor Core | `--section SpeedOfLight_HierarchicalTensorRooflineChart` |
+| `SpeedOfLight_HierarchicalDoubleRooflineChart` | FP64 | `--section SpeedOfLight_HierarchicalDoubleRooflineChart` |
 
 Use the precision-specific chart matching your kernel's dominant operation type.
 
@@ -105,9 +110,10 @@ Run the appropriate roofline section and locate the kernel dot on the chart.
 ### Step 4: Track Progress
 Re-profile after optimization. The kernel dot should move up (better performance) and/or right (better AI).
 
-## Roofline with Profile Series
+## Roofline Across Configurations
 
-Use profile series to run the same kernel with different configurations and compare their roofline positions:
+Profile each variant of a sweep and compare their roofline positions (the UI's Profile Series
+automates this for one kernel):
 
 ```bash
 ncu --section SpeedOfLight_RooflineChart \
@@ -116,4 +122,4 @@ ncu --section SpeedOfLight_RooflineChart \
     -- python sweep.py
 ```
 
-This plots multiple dots, showing how different launch configs or input sizes affect the compute/memory balance.
+Opened in the UI, the report plots one dot per profiled launch, showing how launch configs or input sizes affect the compute/memory balance.

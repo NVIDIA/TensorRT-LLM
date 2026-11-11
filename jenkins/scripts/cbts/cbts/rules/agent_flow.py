@@ -35,6 +35,7 @@ from cbts.blocks import Stage, YAMLIndex
 
 from .base import PRInputs, Rule, RuleResult
 from .docs import is_docs_path
+from .out_of_scope import is_out_of_scope
 
 # Stage key as declared in jenkins/L0_Test.groovy. Keep in sync.
 AGENT_FLOW_STAGE = "CPU-AgentFlow-UnitTest"
@@ -46,15 +47,13 @@ _AGENT_FLOW_PREFIX = "agent-flow/"
 def _is_agent_flow_claim(path: str) -> bool:
     """Decide whether AgentFlowRule claims ``path``.
 
-    Claims everything under ``agent-flow/`` — source, tests, and build
-    metadata (``pyproject.toml``, ``.pre-commit-config.yaml``) all affect
-    what the pytest stage installs and runs — except documentation files,
-    which ``DocsRule`` routes to the dedicated docs build so a docs-only
-    edit doesn't force the agent-flow test stage.
+    Claims source, tests, and build metadata under ``agent-flow/``.
+    Documentation goes to ``DocsRule``; metadata paths matched by
+    ``OutOfScopeRule`` contribute no agent-flow tests.
     """
     if not path.startswith(_AGENT_FLOW_PREFIX):
         return False
-    if is_docs_path(path):
+    if is_docs_path(path) or is_out_of_scope(path):
         return False
     return True
 

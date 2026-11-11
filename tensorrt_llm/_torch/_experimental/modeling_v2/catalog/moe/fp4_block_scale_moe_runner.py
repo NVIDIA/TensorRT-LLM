@@ -100,8 +100,9 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     `topk_weights` the combine weights, neither renormalized here. This rank
     answers for `[local_expert_offset, local_expert_offset + local_num_experts)`
     and contributes zero for every other id, so an expert-parallel split is N
-    calls whose outputs sum -- which is what the deepseek dep4 target does;
-    qwen4_exp makes one call over its whole expert stack.
+    calls whose outputs sum -- which is what the deepseek default target does
+    under moe_ep, one call per rank over its window; qwen4_exp makes one call
+    over its whole expert stack.
 
     With `do_finalize=True` the result is a one-element list holding the
     combined `[T, H]` bf16 rows, or an empty tensor when `output` was given.
@@ -109,61 +110,28 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     unwritten scale buffer, and the expanded-index -> permuted-row map.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # DeepSeek-R1-0528's routed geometry. The dep4 target gathers four ranks'
-    # tokens before the expert call and issues one call per 64-wide window, so
-    # the window cells are the shape it runs and the full stack is the
-    # single-rank one.
-    _R1 = dict(hidden=7168, intermediate=2048, num_experts=256, top_k=8)
-
-    # qwen4_exp's (Qwen3.8-Flash-Next) routed geometry: many small experts, a
-    # top_k past 8, an intermediate width of 640, all 512 experts local. Its
-    # router renormalizes the top-10 softmax weights to sum to 1 before the
-    # call (`routing="renormalized"`, a test axis rather than an op argument;
-    # the R1 cells draw uniform [0, 1) weights). Nothing is padded:
-    # H % 256, 2I % 128, H/16 % 4 and I/16 % 4 are all zero.
-    _QWEN4_EXP = dict(
-        hidden=2560,
-        intermediate=640,
-        num_experts=512,
-        top_k=10,
-        local_expert_offset=0,
-        local_num_experts=512,
-        routing="renormalized",
-    )
+    # DeepSeek-R1-0528's routed geometry. The deepseek default target makes one
+    # call per rank over its moe_ep window at its moe_tp slice of the
+    # intermediate (dep4 with moe ep4: a 64-wide window at the full 2048; tp8:
+    # all 256 experts at 256), so the window cells here and the
+    # intermediate-slice ones in this entry's test are the shapes it runs, and the
+    # full stack is the single-rank one.
+    R1 = dict(hidden=7168, intermediate=2048, num_experts=256, top_k=8)
 
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="dep4's own call: the 64-wide expert window at offset 0, R1 geometry",
-            spec=dict(tokens=64, local_expert_offset=0, local_num_experts=64, **_R1),
+            spec=dict(tokens=64, local_expert_offset=0, local_num_experts=64, **R1),
         ),
         Cell(
             why="a window at a non-zero offset -- the ids this rank must answer for move with it",
-            spec=dict(tokens=64, local_expert_offset=192, local_num_experts=64, **_R1),
+            spec=dict(tokens=64, local_expert_offset=192, local_num_experts=64, **R1),
         ),
         Cell(
             why="the single-rank shape: all 256 experts local, and one token, the decode row count",
-            spec=dict(tokens=1, local_expert_offset=0, local_num_experts=256, **_R1),
-        ),
-        Cell(
-            why="qwen4_exp decode: one token over 512 experts, top-10 renormalized, H 2560 / I 640",
-            spec=dict(tokens=1, **_QWEN4_EXP),
-        ),
-        Cell(
-            why="qwen4_exp at 4 rows: the last count the pre-routed path's static-block "
-            "permutation kernel takes",
-            spec=dict(tokens=4, **_QWEN4_EXP),
-        ),
-        Cell(
-            why="qwen4_exp at 5 rows: the first count on the single-cluster permutation "
-            "kernel (the dynamic-block one stops at 256 experts)",
-            spec=dict(tokens=5, **_QWEN4_EXP),
-        ),
-        Cell(
-            why="qwen4_exp prefill: 8192 rows, the single-cluster kernel's cap and the top "
-            "of the certified column",
-            spec=dict(tokens=8192, **_QWEN4_EXP),
+            spec=dict(tokens=1, local_expert_offset=0, local_num_experts=256, **R1),
         ),
     )
 

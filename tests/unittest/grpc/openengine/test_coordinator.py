@@ -8,8 +8,11 @@ from contextlib import asynccontextmanager, suppress
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-import grpc
 import pytest
+
+grpc = pytest.importorskip("grpc", reason="gRPC runtime not installed")
+pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
+from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.coordinator as coordination  # noqa: E402
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
@@ -74,7 +77,10 @@ async def test_cross_frontend_ownership_load_and_abort():
             "instance_id": "shared-engine",
             "stopping": False,
         }
-        assert await second.request("abort", request_id="request") == {"aborted": 1, "failed": 0}
+        assert await second.request("abort", request_id="request") == {
+            "aborted": 1,
+            "failed": 0,
+        }
         assert handle.aborted
         assert (await second.request("status"))["count"] == 1
         await reservation.release()
@@ -145,7 +151,10 @@ async def test_delayed_abort_cannot_cancel_reused_request_id(all_requests):
         replacement = await first.reserve("reused")
         # Replayed cleanup from the previous stream cannot release its successor.
         await first.request(
-            "release", request_id=old.request_id, token=old.token, frontend=first.frontend_id
+            "release",
+            request_id=old.request_id,
+            token=old.token,
+            frontend=first.frontend_id,
         )
         handle = Handle()
         replacement.bind(handle)
@@ -172,7 +181,10 @@ async def test_coordinator_loss_fails_closed():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "model, expected_code",
-    [("test-model", grpc.StatusCode.UNAVAILABLE), ("", grpc.StatusCode.INVALID_ARGUMENT)],
+    [
+        ("test-model", grpc.StatusCode.UNAVAILABLE),
+        ("", grpc.StatusCode.INVALID_ARGUMENT),
+    ],
 )
 async def test_generate_cleanup_failure_preserves_grpc_status(model, expected_code):
     """Lost release acknowledgments must not escape as UNKNOWN or mask an abort."""
@@ -237,6 +249,62 @@ async def test_generate_cleanup_failure_preserves_grpc_status(model, expected_co
 
 
 @pytest.mark.asyncio
+async def test_standard_health_tracks_frontend_group_readiness():
+    async with group() as (coordinator, (frontend, _), _):
+        llm = SimpleNamespace(
+            llm_id="shared-engine",
+            args=SimpleNamespace(guided_decoding_backend=None),
+            tokenizer=None,
+            _check_health=lambda: True,
+        )
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", frontend=frontend)
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+                control = openengine_pb2_grpc.ControlStub(channel)
+                request = health_pb2.HealthCheckRequest(service="inference")
+                assert (
+                    await health.Check(request, timeout=5)
+                ).status == health_pb2.HealthCheckResponse.SERVING
+                assert (
+                    await control.Health(lifecycle_pb2.HealthRequest(), timeout=5)
+                ).state == lifecycle_pb2.HEALTH_STATE_READY
+
+                coordinator.ready = False
+                await server._refresh_inference_health()
+                assert (
+                    await health.Check(request, timeout=5)
+                ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                assert (
+                    await control.Health(lifecycle_pb2.HealthRequest(), timeout=5)
+                ).state == lifecycle_pb2.HEALTH_STATE_NOT_READY
+                assert (
+                    await health.Check(health_pb2.HealthCheckRequest(service="liveness"), timeout=5)
+                ).status == health_pb2.HealthCheckResponse.SERVING
+
+                coordinator.ready = True
+                await server._refresh_inference_health()
+                assert (
+                    await health.Check(request, timeout=5)
+                ).status == health_pb2.HealthCheckResponse.SERVING
+                assert (
+                    await control.Health(lifecycle_pb2.HealthRequest(), timeout=5)
+                ).state == lifecycle_pb2.HEALTH_STATE_READY
+
+                coordinator.stopping = True
+                await server._refresh_inference_health()
+                assert (
+                    await health.Check(request, timeout=5)
+                ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                assert (
+                    await control.Health(lifecycle_pb2.HealthRequest(), timeout=5)
+                ).state == lifecycle_pb2.HEALTH_STATE_NOT_READY
+        finally:
+            await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_health_probe_cleanup_failure_is_unavailable():
     """Coordinator loss after a completed probe must not surface as UNKNOWN."""
     async with group() as (coordinator, (frontend, _), failures):
@@ -267,7 +335,8 @@ async def test_health_probe_cleanup_failure_is_unavailable():
                 control = openengine_pb2_grpc.ControlStub(channel)
                 with pytest.raises(grpc.aio.AioRpcError) as error:
                     await control.Health(
-                        lifecycle_pb2.HealthRequest(include_inference_probe=True), timeout=5
+                        lifecycle_pb2.HealthRequest(include_inference_probe=True),
+                        timeout=5,
                     )
                 assert error.value.code() == grpc.StatusCode.UNAVAILABLE
             assert failures
@@ -277,7 +346,9 @@ async def test_health_probe_cleanup_failure_is_unavailable():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "request_id", ["\x01" * (12 * 1024 * 1024), "é" * 513], ids=["json-expansion", "utf8-size"]
+    "request_id",
+    ["\x01" * (12 * 1024 * 1024), "é" * 513],
+    ids=["json-expansion", "utf8-size"],
 )
 async def test_oversized_request_id_does_not_stop_group(request_id):
     """A rejected public ID must not kill unrelated requests or strand ownership."""

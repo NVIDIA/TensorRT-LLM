@@ -5,6 +5,7 @@ from .base_checkpoint_loader import BaseCheckpointLoader
 from .hf.afmoe_weight_mapper import AfmoeHfWeightMapper
 from .hf.checkpoint_loader import HfCheckpointLoader
 from .hf.config_loader import HfConfigLoader
+from .hf.cosmos3_edge_weight_mapper import Cosmos3EdgeHfWeightMapper
 from .hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
 from .hf.gemma3_weight_mapper import Gemma3HfWeightMapper
 from .hf.gemma4_weight_mapper import Gemma4HfWeightMapper
@@ -16,7 +17,8 @@ from .hf.nemotron_h_weight_mapper import NemotronHHfWeightMapper
 from .hf.nemotron_nas_weight_mapper import NemotronNasHfWeightMapper
 from .hf.qwen2_moe_weight_mapper import Qwen2MoeHfWeightMapper
 from .hf.qwen2vl_weight_mapper import Qwen2VLHfWeightMapper
-from .hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
+from .hf.qwen3_5_weight_mapper import (PplxDeciderHfWeightMapper,
+                                       Qwen3_5MoeHfWeightMapper)
 from .hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from .hf.qwen3_next_weight_mapper import Qwen3NextHfWeightMapper
 from .hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
@@ -37,9 +39,10 @@ __all__ = [
     "NemotronNasHfWeightMapper", "Gemma3HfWeightMapper",
     "MixtralHfWeightMapper", "Llama4HfWeightMapper", "Qwen2MoeHfWeightMapper",
     "Qwen3MoeHfWeightMapper", "Qwen2VLHfWeightMapper",
-    "Qwen3_5MoeHfWeightMapper", "Qwen3NextHfWeightMapper",
-    "Gemma4HfWeightMapper", "LlavaNextHfWeightMapper",
-    "MistralLarge3CheckpointLoader", "MistralLarge3WeightMapper",
-    "MXCheckpointLoader", "Qwen3VLHfWeightMapper", "Cosmos3HfWeightMapper",
+    "PplxDeciderHfWeightMapper", "Qwen3_5MoeHfWeightMapper",
+    "Qwen3NextHfWeightMapper", "Gemma4HfWeightMapper",
+    "LlavaNextHfWeightMapper", "MistralLarge3CheckpointLoader",
+    "MistralLarge3WeightMapper", "MXCheckpointLoader", "Qwen3VLHfWeightMapper",
+    "Cosmos3HfWeightMapper", "Cosmos3EdgeHfWeightMapper",
     "Qwen4ExpHfWeightMapper", "Glm5NextHfWeightMapper"
 ]

@@ -61,6 +61,7 @@ tensorrt_llm/disaggregated_params.py and executor/result.py.
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -69,7 +70,9 @@ import secrets
 import signal
 import socket
 import sys
+import tempfile
 import time
+import traceback
 
 __extra_import_path__ = ["."]
 try:
@@ -235,12 +238,10 @@ def load_internal_apis():
     import tensorrt_llm.bindings
     import tensorrt_llm.bindings.executor as trtllm_executor
     from tensorrt_llm import DisaggregatedParams
-    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
-        create_kv_cache_transceiver,
-        maybe_enable_fabric_memory_for_python_transceiver,
-    )
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import create_kv_cache_transceiver
     from tensorrt_llm._torch.distributed import Distributed
     from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+    from tensorrt_llm._torch.pyexecutor.config_utils import resolve_cache_transceiver_config
     from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -276,9 +277,6 @@ def load_internal_apis():
         KVCacheManager=KVCacheManager,
         KVCacheManagerV2=KVCacheManagerV2,
         create_kv_cache_transceiver=create_kv_cache_transceiver,
-        maybe_enable_fabric_memory_for_python_transceiver=(
-            maybe_enable_fabric_memory_for_python_transceiver
-        ),
         LlmRequest=LlmRequest,
         LlmRequestState=LlmRequestState,
         LlmRequestType=LlmRequestType,
@@ -288,6 +286,7 @@ def load_internal_apis():
         TorchLlmArgs=TorchLlmArgs,
         resolve_kv_cache_manager_v2_auto=_resolve_kv_cache_manager_v2_auto,
         resolve_transceiver_runtime_auto=_resolve_transceiver_runtime_auto,
+        resolve_cache_transceiver_config=resolve_cache_transceiver_config,
         Mapping=Mapping,
         SamplingParams=SamplingParams,
     )
@@ -390,11 +389,16 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
 
     api = load_internal_apis()
     model_cls, hf_view = _lookup_model_cls(model_dir)
+    declared = side.get("architecture")
+    if model_dir is None and declared:
+        model_cls = api.get_registered_model_class(declared)
     setting = side["use_kv_cache_manager_v2"]
     if setting == "auto" and model_cls is None:
         raise RuntimeError(
             "use_kv_cache_manager_v2 is 'auto', but the precheck could not resolve "
-            f"a registered model class from model_dir={model_dir!r}; refusing to assume V1"
+            f"a registered model class from model_dir={model_dir!r} or "
+            f"metadata.architecture={declared!r}; refusing to assume V1. "
+            "Check LLM_MODELS_ROOT/checkpoint staging or declare the model architecture."
         )
 
     # Runtime BEFORE V2, like serving: the V2 resolver's disagg gating reads
@@ -413,7 +417,7 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
         try:
             parallel = side["parallel"]
             llm_args_kwargs = {
-                "model": model_dir,
+                "model": model_dir or "",
                 "tensor_parallel_size": parallel["tp"],
                 "pipeline_parallel_size": parallel["pp"],
                 "context_parallel_size": parallel["cp"],
@@ -445,10 +449,9 @@ def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len, use_v2):
         "bf16": api.DataType.BF16,
     }
     dtype_str = side["kv_dtype"].lower()
-    dtype = dtype_map.get(dtype_str)
-    if dtype is None:
+    dtype = dtype_map[pcfg.normalized_kv_dtype(dtype_str)]
+    if dtype_str not in dtype_map:
         print(f"[precheck] kv dtype {dtype_str!r} not mapped, using BF16", flush=True)
-        dtype = api.DataType.BF16
 
     spec_config = None
     if side["num_nextn_predict_layers"] > 0:
@@ -614,6 +617,33 @@ def run_token():
     return os.environ.get("SLURM_JOB_ID", "")
 
 
+def atomic_write_shared_file(path, text, mode=0o644, fsync=False):
+    """Atomically replace a work-dir file that other ranks or instances read.
+
+    The work dir may be NFS, where creating a file can fail with a spurious
+    EEXIST. Every write therefore uses a fresh mkstemp() name, and mkstemp()
+    itself moves on to another name when a create fails with EEXIST. The temp
+    name starts with a dot, so a leftover never matches the gate's
+    status/*.status glob. mkstemp() creates the file 0600; `mode` sets the
+    final permissions.
+    """
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{os.path.basename(path)}.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), mode)
+            f.write(text)
+            if fsync:
+                f.flush()
+                os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def write_addr(path, payload):
     """Atomically publish an addr file.
 
@@ -621,22 +651,16 @@ def write_addr(path, payload):
     carries the session HMAC key, so restrict it to the owning user before it
     becomes visible.
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = dict(payload, job=run_token())
-    tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "w") as f:
-        os.fchmod(f.fileno(), 0o600)
-        json.dump(payload, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    atomic_write_shared_file(path, json.dumps(payload), mode=0o600, fsync=True)
 
 
-def wait_for_addr(path, timeout_s):
+def wait_for_addr(path, timeout_s, work_dir=None):
     """Wait for THIS run's addr file.
 
     Files stamped with another run's job id are treated as stale and skipped
-    (keep polling).
+    (keep polling). With `work_dir`, stop waiting once its abort flag is up:
+    the instance that should publish may have failed and never will.
     """
     expect_job = run_token()
     deadline = time.monotonic() + timeout_s
@@ -652,6 +676,10 @@ def wait_for_addr(path, timeout_s):
                 if not expect_job or not stamped or stamped == expect_job:
                     return payload
                 # Stale addr from a previous run in a reused work dir.
+        if work_dir is not None:
+            reason = abort_flag_reason(work_dir)
+            if reason is not None:
+                raise _PeerAbort(f"rendezvous file {path} abandoned: {reason}")
         time.sleep(1.0)
     raise _Timeout(f"rendezvous file {path} not published within {timeout_s}s")
 
@@ -673,18 +701,12 @@ def publish_peer_progress(runner, phase):
     path = peer_progress_path(runner.work_dir, runner.role, runner.server_idx)
     try:
         runner._precheck_progress_seq = getattr(runner, "_precheck_progress_seq", 0) + 1
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.tmp.{os.getpid()}"
-        with open(tmp, "w") as f:
-            json.dump(
-                {
-                    "job": run_token(),
-                    "phase": str(phase)[:400],
-                    "seq": runner._precheck_progress_seq,
-                },
-                f,
-            )
-        os.replace(tmp, path)
+        marker = {
+            "job": run_token(),
+            "phase": str(phase)[:400],
+            "seq": runner._precheck_progress_seq,
+        }
+        atomic_write_shared_file(path, json.dumps(marker))
     except OSError:
         # Missing progress only removes watchdog refreshes; the normal bounded
         # timeout and external gate remain authoritative.
@@ -722,13 +744,8 @@ def raise_abort_flag(work_dir, reason):
     if abort_flag_reason(work_dir) is not None:
         return
     try:
-        tmp = f"{path}.tmp.{os.getpid()}"
-        with open(tmp, "w") as f:
-            json.dump(
-                {"reason": (reason or "peer failure").splitlines()[0][:400], "job": run_token()},
-                f,
-            )
-        os.replace(tmp, path)
+        flag = {"reason": (reason or "peer failure").splitlines()[0][:400], "job": run_token()}
+        atomic_write_shared_file(path, json.dumps(flag))
     except OSError:
         pass  # best-effort: a missed flag only costs the usual per-peer timeout
 
@@ -757,17 +774,19 @@ class StatusRecorder:
     """Leader-side result sink.
 
     Rewritten on every record so a SIGKILL'd run still leaves the completed
-    cases + the in-flight failure on disk.
+    cases + the in-flight failure on disk. A write error is printed as
+    STATUS_WRITE_ERROR, never raised: only the leader writes, so a raise
+    would strand the other ranks in their next collective. The next
+    successful rewrite repairs both files.
     """
 
-    def __init__(self, work_dir, role, server_idx, is_leader):
+    def __init__(self, work_dir, role, server_idx, is_leader, metadata=None):
         self.role = role
         self.server_idx = server_idx
         self.is_leader = is_leader
         self.cases = []
-        status_dir = os.path.join(work_dir, "status")
-        if is_leader:
-            os.makedirs(status_dir, exist_ok=True)
+        self.metadata = dict(metadata or {})
+        status_dir = os.path.join(work_dir, "status")  # created on the first write
         self.json_path = os.path.join(status_dir, f"{role}_{server_idx}.json")
         self.text_path = os.path.join(status_dir, f"{role}_{server_idx}.status")
         # NIXL_* is deliberately absent: the only such variable seen in
@@ -800,30 +819,38 @@ class StatusRecorder:
             "overall": overall,
             "cases": self.cases,
             "env": self.env,
+            **self.metadata,
         }
         if extra:
             doc.update(extra)
-        tmp = f"{self.json_path}.tmp"
-        with open(tmp, "w") as f:
-            json.dump(doc, f, indent=2)
-        os.replace(tmp, self.json_path)
-        with open(f"{self.text_path}.tmp", "w") as f:
-            if failed:
-                first = failed[0]
-                # One-line summary for the launch-script console output: root
-                # cause only (first line, bounded); the full reason incl. any
-                # backtrace stays in the .json.
-                reason = " | ".join(first["reason"].splitlines()[:2])[:400]
-                f.write(
-                    f"FAIL {self.role}_{self.server_idx}: {len(failed)} case(s) failed; "
-                    f"first: peer={first['peer']} req_len={first['req_len']} "
-                    f"{first['status']}: {reason}\n"
-                )
-            elif final:
-                f.write(f"PASS {self.role}_{self.server_idx}: {len(self.cases)} case(s)\n")
-            else:
-                f.write(f"RUNNING {self.role}_{self.server_idx}\n")
-        os.replace(f"{self.text_path}.tmp", self.text_path)
+        if failed:
+            first = failed[0]
+            # One-line summary for the launch-script console output: root
+            # cause only (first two lines joined, bounded); the full reason
+            # incl. any backtrace stays in the .json.
+            reason = " | ".join(first["reason"].splitlines()[:2])[:400]
+            line = (
+                f"FAIL {self.role}_{self.server_idx}: {len(failed)} case(s) failed; "
+                f"first: peer={first['peer']} req_len={first['req_len']} "
+                f"{first['status']}: {reason}"
+            )
+        elif final:
+            line = f"PASS {self.role}_{self.server_idx}: {len(self.cases)} case(s)"
+        else:
+            line = f"RUNNING {self.role}_{self.server_idx}"
+        try:
+            # The gate reads the one-line .status file, so write it first.
+            atomic_write_shared_file(self.text_path, line + "\n")
+            atomic_write_shared_file(self.json_path, json.dumps(doc, indent=2))
+        except OSError as e:
+            # Log the verdict too: the gate's error excerpt is then the only
+            # place left that names the root cause.
+            print(
+                f"[precheck {self.role}_{self.server_idx}] STATUS_WRITE_ERROR: "
+                f"{type(e).__name__}: {e}; verdict: {line}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def parse_bandwidth_gbps(csv_dir, rank, tag="recv"):
@@ -922,13 +949,30 @@ class PrecheckRunner:
         self.rank = comm.Get_rank()
         self.is_leader = self.rank == 0
         self.work_dir = args.work_dir
-        self.recorder = StatusRecorder(self.work_dir, self.role, self.server_idx, self.is_leader)
+        model_dir_resolved = plan.get("_model_dir") is not None
+        kv_shape = plan.get("_kv_shape", {})
+        self.synthetic_kv_shape = (
+            not model_dir_resolved
+            or bool(kv_shape.get("simplified"))
+            or kv_shape.get("source") == "fallback"
+        )
+        self.recorder = StatusRecorder(
+            self.work_dir,
+            self.role,
+            self.server_idx,
+            self.is_leader,
+            metadata={
+                "model_dir_resolved": model_dir_resolved,
+                "synthetic_kv_shape": self.synthetic_kv_shape,
+            },
+        )
         self.zmq_ctx = None
         self.kvm = None
         self.xcvr = None
         self.runtime = "CPP"
         # Resolved in setup(): "auto" needs the model preference hook.
         self.use_v2 = False
+        self.transfer_contract = {}
         self.mapping = None
         self.llm_request_state = None
         self.csv_dir = os.path.join(self.work_dir, "csv", f"{self.role}_{self.server_idx}")
@@ -944,9 +988,79 @@ class PrecheckRunner:
         return f"rank(s) {ranks}: {bad[0][1]}"
 
     # ---- setup -------------------------------------------------------------
-    def setup(self, kv_shape, max_req_len):
-        api = load_internal_apis()
+    def _resolve_transfer_config(self, kv_shape: dict) -> object:
+        """Resolve local settings without constructing GPU or distributed resources.
 
+        Args:
+            kv_shape: Global synthetic cache dimensions resolved on this rank.
+
+        Returns:
+            The resolved CacheTransceiverConfig consumed by setup.
+
+        Raises:
+            RuntimeError: If preferences cannot be resolved or the manager/runtime pairing is invalid.
+        """
+        api = load_internal_apis()
+        role_configs = {}
+        contracts = {}
+        # Both role resolutions are compared, preserving supported asymmetry
+        # (e.g. a V1 sender and V2 receiver) while detecting local model drift.
+        for role in ("ctx", "gen"):
+            side = pcfg.side_plan(self.plan, role)
+            cache_cfg = api.CacheTransceiverConfig(**side["cache_transceiver_config"])
+            use_v2 = resolve_model_prefs(self.plan.get("_model_dir"), side, cache_cfg)
+            api.resolve_cache_transceiver_config(cache_cfg)
+            runtime = cache_cfg.transceiver_runtime or "CPP"
+            if use_v2 and runtime != "PYTHON":
+                raise RuntimeError(
+                    "KVCacheManagerV2 requires cache_transceiver_config."
+                    f"transceiver_runtime: PYTHON, got {runtime!r}"
+                )
+            if not use_v2 and runtime == "PYTHON":
+                raise RuntimeError(
+                    "The Python transceiver requires KVCacheManagerV2; "
+                    "set use_kv_cache_manager_v2: true or transceiver_runtime: CPP."
+                )
+            role_configs[role] = cache_cfg
+            contracts[role] = {
+                "use_v2": use_v2,
+                "runtime": runtime,
+                "backend": cache_cfg._resolve_default_backend()[0],
+                "kv_dtype": pcfg.normalized_kv_dtype(side["kv_dtype"]),
+            }
+        self.use_v2 = contracts[self.role]["use_v2"]
+        self.transfer_contract = {
+            **contracts,
+            "tokens_per_block": self.plan["tokens_per_block"],
+            "kv_shape": {
+                key: kv_shape[key] for key in ("num_layers", "num_kv_heads", "head_dim", "is_mla")
+            },
+        }
+        if self.is_leader and self.synthetic_kv_shape:
+            print(
+                f"[precheck {self.role}_{self.server_idx}] synthetic KV pool; "
+                f"model_dir={self.plan.get('_model_dir')!r}, "
+                f"architecture={self.plan['architecture']!r}. "
+                "This checks cache transport; serving still requires a staged checkpoint.",
+                flush=True,
+            )
+        return role_configs[self.role]
+
+    def setup(self, kv_shape, max_req_len):
+        cache_cfg = None
+        local_err = None
+        try:
+            cache_cfg = self._resolve_transfer_config(kv_shape)
+        except Exception as exc:  # noqa: BLE001 - every rank must reach consensus
+            local_err = exc
+        reason = self._consensus_error(local_err)
+        if reason is not None:
+            raise RuntimeError(f"model/cache configuration resolution failed: {reason}")
+        contracts = self.comm.allgather(self.transfer_contract)
+        if any(contract != contracts[0] for contract in contracts[1:]):
+            raise RuntimeError(f"resolved transfer contract mismatch within instance: {contracts}")
+
+        api = load_internal_apis()
         self.llm_request_state = api.LlmRequestState
         par = self.side["parallel"]
         self.mapping = api.Mapping(
@@ -966,32 +1080,6 @@ class PrecheckRunner:
         # side).
         os.environ["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = self.csv_dir
 
-        # Built VERBATIM from the disagg yaml's cache_transceiver_config so
-        # backend/max_tokens_in_buffer/timeouts match the real test exactly.
-        cache_cfg = api.CacheTransceiverConfig(**self.side["cache_transceiver_config"])
-        # Yaml-absent settings resolve against the model's preferences, like
-        # serving does (kv manager version + transceiver runtime) -- this holds
-        # even for the simplified stand-in pool: only the KV SHAPE is generic;
-        # the V1/V2 manager version and the transceiver runtime must still
-        # match what the real model runs (e.g. V4 -> V2 + Python).
-        self.use_v2 = resolve_model_prefs(self.plan.get("_model_dir"), self.side, cache_cfg)
-        if kv_shape.get("simplified") and self.is_leader:
-            print(
-                f"[precheck {self.role}_{self.server_idx}] SIMPLIFIED: {kv_shape['simplified']}",
-                flush=True,
-            )
-        # KVCacheManagerV2 only works with the Python transceiver (see
-        # cache_transceiver_test/report.py); reject the pairing up front with
-        # a clear INIT_ERROR instead of a C++ binding type error.
-        if self.use_v2 and cache_cfg.transceiver_runtime != "PYTHON":
-            raise RuntimeError(
-                "KVCacheManagerV2 requires cache_transceiver_config."
-                f"transceiver_runtime: PYTHON, got {cache_cfg.transceiver_runtime!r} "
-                "(the C++ transceiver only supports the V1 manager)"
-            )
-
-        manager_cls = api.KVCacheManagerV2 if self.use_v2 else api.KVCacheManager
-        api.maybe_enable_fabric_memory_for_python_transceiver(cache_cfg, manager_cls)
         self.kvm = build_kv_cache_manager(
             kv_shape, self.plan, self.side, self.mapping, max_req_len, self.use_v2
         )
@@ -1480,7 +1568,7 @@ def _recv_ctx_control(
 # test, never over ZMQ):
 #
 #   gen leader                                ctx leader
-#    | -- hello {fingerprint} --------------> |  yaml mismatch -> abort
+#    | -- hello {fingerprint, contract} ----> |  config mismatch -> abort
 #    | <---------------- welcome ------------ |
 #    | -- go {li, rep, wave} --------------> |  every rank posts its sends
 #    | <----- params {pair: ctx_phase} ------ |  (from the owning dp ranks)
@@ -1515,7 +1603,19 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
     if msg[0] != "hello" or msg[1].get("fingerprint") != plan["fingerprint"]:
         leader_reply(("abort", "plan fingerprint mismatch (ctx/gen yaml disagree)"))
         raise _TransferError(f"handshake with gen_{peer_idx} failed: {msg[:1]}")
-    leader_reply(("welcome", {"fingerprint": plan["fingerprint"]}))
+    if msg[1].get("transfer_contract") != runner.transfer_contract:
+        reason = (
+            "resolved transfer contract mismatch: "
+            f"ctx={runner.transfer_contract}, gen={msg[1].get('transfer_contract')}"
+        )
+        leader_reply(("abort", reason))
+        raise _TransferError(reason)
+    leader_reply(
+        (
+            "welcome",
+            {"fingerprint": plan["fingerprint"], "transfer_contract": runner.transfer_contract},
+        )
+    )
 
     for li, req_len, rep, wave in _schedule(plan):
         msg = _recv_ctx_control(
@@ -1614,6 +1714,7 @@ def _gen_open_session(runner, peer_idx, arm):
             addr = wait_for_addr(
                 addr_path(runner.work_dir, peer_idx, runner.server_idx),
                 plan["rendezvous_timeout_s"],
+                runner.work_dir,
             )
             # Session HMAC key: shared only through the work-dir addr file,
             # never over the network.
@@ -1634,7 +1735,14 @@ def _gen_open_session(runner, peer_idx, arm):
     try:
         reply = runner._leader_send_recv_with_progress(
             sock,
-            ("hello", {"gen_idx": runner.server_idx, "fingerprint": plan["fingerprint"]}),
+            (
+                "hello",
+                {
+                    "gen_idx": runner.server_idx,
+                    "fingerprint": plan["fingerprint"],
+                    "transfer_contract": runner.transfer_contract,
+                },
+            ),
             key,
             peer_role="ctx",
             peer_idx=peer_idx,
@@ -1646,6 +1754,13 @@ def _gen_open_session(runner, peer_idx, arm):
             raise _TransferError(f"ctx_{peer_idx} aborted handshake: {reply[1]}")
         if reply[0] != "welcome":
             raise _TransferError(f"unexpected handshake reply from ctx_{peer_idx}: {reply[:1]}")
+        if (
+            reply[1].get("fingerprint") != plan["fingerprint"]
+            or reply[1].get("transfer_contract") != runner.transfer_contract
+        ):
+            reason = f"ctx_{peer_idx} handshake contract mismatch: {reply[1]}"
+            runner._leader_send_recv(sock, ("abort", reason), key)
+            raise _TransferError(reason)
         if runner.is_leader:
             zmq, _ = runner._zmq()
             sock.setsockopt(zmq.RCVTIMEO, hello_s * 1000)
@@ -1880,6 +1995,45 @@ def _make_peer_failure_recorder(runner, disarm, current_cell):
         raise_abort_flag(runner.work_dir, f"{peer} {status}: {reason}")
 
     return record_peer_failure
+
+
+def _hard_abort_unhandled(runner, exc):
+    """Record an error that escaped the peer loop on this rank, then abort every rank.
+
+    The error may be local to this rank (e.g. a failed leader-only file write)
+    while the other ranks wait in a collective this rank will never join, so
+    returning from main() would hang in MPI_Finalize.
+    """
+    try:
+        signal.alarm(0)  # a pending phase alarm must not interrupt the verdict write
+        traceback.print_exception(exc)
+        name = f"{runner.role}_{runner.server_idx}"
+        detail = f"{type(exc).__name__}: {exc}"  # str() keeps an OSError's path; repr() drops it
+        print(
+            f"[precheck {name} r{runner.rank}] UNHANDLED_ERROR: {detail[:400]}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if runner.is_leader:
+            with contextlib.suppress(Exception):  # peers must still get the abort flag
+                runner.recorder.record("-", 0, "UNHANDLED_ERROR", detail)
+            raise_abort_flag(runner.work_dir, f"{name} UNHANDLED_ERROR: {detail}")
+        else:
+            # If the leader hit the same error, give it time to write its verdict
+            # before this rank's abort kills it. No barrier: the other ranks may
+            # be blocked in a different collective.
+            time.sleep(ABORT_COORDINATION_TIMEOUT_S)
+            # The leader may not have failed and is about to be killed, so peer
+            # instances would otherwise wait out their timeouts. Write-once: if
+            # the leader already raised the flag, this is a no-op.
+            raise_abort_flag(runner.work_dir, f"{name} r{runner.rank} UNHANDLED_ERROR: {detail}")
+    except Exception:  # noqa: BLE001 - abort must still happen
+        pass
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        _hard_abort_process(runner.comm)
 
 
 def _hard_abort_unquiesced(runner, current_cell, exc):
@@ -2120,6 +2274,8 @@ def main(argv=None):
         except Exception:  # noqa: BLE001 - abort must still happen
             pass
         _hard_abort_unquiesced(runner, current_cell, e)
+    except Exception as e:  # noqa: BLE001 - a rank-local error must still abort all ranks
+        _hard_abort_unhandled(runner, e)
     finally:
         stop_watchdog()
 

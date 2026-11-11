@@ -104,32 +104,24 @@ class TestAttentionConfigQuantValidation:
                     ),
                 )
 
-    @pytest.mark.parametrize(
-        ("backend", "quant_config"),
-        [
-            (
-                "TRTLLM",
-                QuantAttentionConfig(
-                    qk_dtype="fp8",
-                    q_block_size=1,
-                    k_block_size=1,
-                    v_block_size=1,
-                ),
-            ),
-            (
-                "CUTEDSL",
-                QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
-            ),
-        ],
-    )
-    def test_vsa_and_quantization_are_mutually_exclusive(self, backend, quant_config):
+    def test_vsa_and_quantization_compose_only_on_trtllm(self):
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            sage = QuantAttentionConfig(
+                qk_dtype="fp8", q_block_size=1, k_block_size=1, v_block_size=1
+            )
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=sage,
+                sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+            )
+            assert attention.quant_attention_config is sage
+
             with pytest.raises(
                 ValidationError, match="VSA and quant_attention_config are mutually exclusive"
             ):
                 AttentionConfig(
-                    backend=backend,
-                    quant_attention_config=quant_config,
+                    backend="CUTEDSL",
+                    quant_attention_config=QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
                     sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
                 )
 
@@ -160,8 +152,10 @@ class TestAttentionConfigQuantValidation:
             (100, "int8", 1, 16, 1),
             (100, "fp8", 1, 1, 1),
             (100, "fp8", 1, 4, 1),
+            (100, "fp8", 1, 16, 1),
             (103, "fp8", 1, 1, 1),
             (103, "fp8", 1, 4, 1),
+            (103, "fp8", 1, 16, 1),
             (100, "bf16", 0, 0, 0),
             (100, "fp8", 0, 0, 0),
             (103, "bf16", 0, 0, 0),
@@ -184,16 +178,170 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
+    @pytest.mark.parametrize("sm_ver", [100, 103])
+    @pytest.mark.parametrize("qk_dtype", ["bf16", "fp8"])
+    @pytest.mark.parametrize("vc_repair_budget", [0.0, 0.005])
+    def test_supported_quant_config_vc_attention(self, sm_ver, qk_dtype, vc_repair_budget):
+        """VC-Attention-QK16 and VC-Attention-QK8 validate on Blackwell, with tile means or repair rows."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype, vc_attention=True, vc_repair_budget=vc_repair_budget
+                ),
+            )
+
+        assert attention.quant_attention_config.vc_attention
+        assert attention.quant_attention_config.vc_repair_budget == vc_repair_budget
+        q_config = attention.quant_attention_config
+        assert (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size) == (
+            (0, 0, 1) if qk_dtype == "bf16" else (128, 128, 1)
+        )
+
+    @pytest.mark.parametrize(
+        ("backend", "sm_ver", "quant", "sparse", "match"),
+        [
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="fp8", q_block_size=1, k_block_size=16, v_block_size=1),
+                None,
+                "fixes the block sizes",
+            ),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16", vc_attention=False, vc_repair_budget=0.005),
+                None,
+                "vc_repair_budget is a VC-Attention",
+            ),
+            ("TRTLLM", 100, dict(qk_dtype="bf16", vc_repair_budget=-0.1), None, "vc_repair_budget"),
+            ("TRTLLM", 100, dict(qk_dtype="bf16", vc_repair_budget=1.0), None, "vc_repair_budget"),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16", smooth_k=True),
+                None,
+                "are SageAttention options",
+            ),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16", smooth_v=True),
+                None,
+                "are SageAttention options",
+            ),
+            ("TRTLLM", 90, dict(qk_dtype="bf16"), None, "Supported VC-Attention recipes"),
+            ("TRTLLM", 120, dict(qk_dtype="bf16"), None, "Supported VC-Attention recipes"),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16"),
+                VideoSparseAttentionConfig(vsa_sparsity=0.9),
+                "does not compose with sparse_attention",
+            ),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16"),
+                SkipSoftmaxAttentionConfig(threshold_scale_factor=0.3),
+                "does not compose with sparse_attention",
+            ),
+            (
+                "CUTEDSL",
+                100,
+                dict(qk_dtype="bf16"),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+            ("CUDNN", 100, dict(qk_dtype="bf16"), None, "vc_attention is a TRTLLM backend option"),
+            (
+                "FLASHINFER",
+                100,
+                dict(qk_dtype="bf16"),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+            (
+                "VANILLA",
+                100,
+                dict(qk_dtype="bf16"),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+            (
+                "VANILLA",
+                100,
+                dict(qk_dtype="bf16", vc_attention=False, vc_repair_budget=0.005),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+        ],
+        ids=[
+            "block_sizes",
+            "repair_without_vc",
+            "budget_below_zero",
+            "budget_at_one",
+            "smooth_k",
+            "smooth_v",
+            "sm90",
+            "sm120",
+            "vsa",
+            "skip_softmax",
+            "cutedsl",
+            "cudnn",
+            "flashinfer",
+            "vanilla",
+            "vanilla_repair",
+        ],
+    )
+    def test_vc_attention_rejections(self, backend, sm_ver, quant, sparse, match):
+        """VC-Attention fixes its block sizes, owns the repair budget, is TRTLLM and Blackwell only,
+        and never composes with SageAttention smoothing or a sparse algorithm."""
+        quant = {"vc_attention": True, **quant}
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            with pytest.raises(ValidationError, match=match):
+                AttentionConfig(
+                    backend=backend,
+                    quant_attention_config=QuantAttentionConfig(**quant),
+                    sparse_attention_config=sparse,
+                )
+
+    @pytest.mark.parametrize("smoothing", ["smooth_k", "smooth_v"])
     @pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
-    def test_smooth_k_rejected_without_sage_recipe(self, backend):
+    def test_smoothing_rejected_without_sage_recipe(self, backend, smoothing):
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
-            with pytest.raises(ValidationError, match="smooth_k is a SageAttention option"):
+            with pytest.raises(ValidationError, match="are SageAttention options"):
                 AttentionConfig(
                     backend=backend,
                     quant_attention_config=QuantAttentionConfig(
-                        qk_dtype="bf16", v_dtype="fp8", smooth_k=True
+                        qk_dtype="bf16", v_dtype="fp8", **{smoothing: True}
                     ),
                 )
+
+    @pytest.mark.parametrize(
+        ("sm_ver", "qk_dtype", "q_block_size", "accepted"),
+        [(90, "int8", 2, False), (100, "int8", 1, True), (103, "fp8", 1, True)],
+    )
+    def test_smooth_v_requires_primts_architecture(self, sm_ver, qk_dtype, q_block_size, accepted):
+        def build():
+            return AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype,
+                    q_block_size=q_block_size,
+                    k_block_size=16,
+                    v_block_size=1,
+                    smooth_v=True,
+                ),
+            )
+
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            if accepted:
+                assert build().quant_attention_config.smooth_v
+            else:
+                with pytest.raises(ValidationError, match="smooth_v needs the PrimTS kernels"):
+                    build()
 
     def test_supported_quant_config_cute(self):
         attention = AttentionConfig(
@@ -575,6 +723,16 @@ class TestParallelConfigValidation:
     def test_parallel_vae_size_must_be_positive(self):
         with pytest.raises(ValidationError):
             ParallelConfig(parallel_vae_size=0)
+
+    def test_text_encoder_tp_size_does_not_change_worker_count(self):
+        pc = ParallelConfig(ulysses_size=2, text_encoder_tp_size=2)
+        assert pc.n_workers == 2
+        pc.validate_world_size(2)
+
+    def test_text_encoder_tp_size_validate_world_size_fails(self):
+        pc = ParallelConfig(text_encoder_tp_size=2)
+        with pytest.raises(ValueError, match="text_encoder_tp_size"):
+            pc.validate_world_size(1)
 
     def test_attn2d_and_ulysses_seq_parallel_size(self):
         pc = ParallelConfig(

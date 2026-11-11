@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, List, Optional, Protocol, Type
+from typing import TYPE_CHECKING, ClassVar, List, Optional, Protocol, Type
 
 import torch
 from packaging.version import Version
@@ -32,6 +32,7 @@ from ..attention.backends.interface import AttentionMetadata
 from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..pyexecutor import step_inputs
 from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
@@ -43,10 +44,78 @@ if IS_FLASHINFER_AVAILABLE:
 
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
+from ...watermark.sampling import gumbel_sample_from_probs, keyed_recovery
 from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from ..pyexecutor.sampler.watermark import WatermarkSpecState
+from .fused_accept import MAX_DRAFT_LEN, fused_strict_accept
+from .greedy_argmax import greedy_argmax
+from .spec_tail_kernels import strict_accept
+from .vocab_parallel import VocabParallelHead, VocabShardedLogits
+
+
+def _watermark_active(spec_metadata) -> bool:
+    """Whether text watermarking is configured and prepared on this metadata.
+
+    Metadata objects that predate the feature have no ``watermark_ready``; they are not
+    watermarked.
+    """
+    return getattr(spec_metadata, "watermark_ready", False) is True
+
+
+def supports_sharded_target_sampling(spec_config, mapping) -> bool:
+    """Whether a one-model MTP-Eagle worker samples its target tokens on
+    vocabulary-sharded logits where a batch allows it: TP > 1 without
+    attention DP, strict acceptance (the TP key exchange then decides per
+    batch). Temperature-only batches (sampled rows with temperature only, no
+    top-k / top-p / min-p and no seed of their own) then replay their own
+    CUDA graph variant, which draws the target tokens by Gumbel-max in the key
+    exchange instead of the all-gather, the fp32 cast and the stock sampler.
+    """
+    return (spec_config is not None
+            and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+            and not getattr(spec_config, "use_relaxed_acceptance_for_thinking",
+                            False) and mapping is not None
+            and mapping.tp_size > 1 and not mapping.enable_attention_dp)
+
+
+def _temperature_only(spec_metadata, temperature_capable: bool) -> bool:
+    """Graph key bit of the temperature-only variant: the variant is captured,
+    the batch samples, every sampled row can be drawn on the sharded logits
+    (temperature only, no seed of its own), and the batch takes neither
+    rejection sampling nor penalties. Seeded rows keep main's per-row Philox
+    streams on the stock sampler."""
+    return bool(spec_metadata.temperature_only_graphs and temperature_capable
+                and not spec_metadata.is_all_greedy_sample
+                and not spec_metadata.use_rejection_sampling
+                and not spec_metadata.enable_penalty)
+
+
+def _sampling_scan_cache_key(spec_metadata, requests: list["LlmRequest"]):
+    """Key under which ``SpecMetadata._scan_one_model_sampling`` may reuse its
+    last result, or None to scan.
+
+    Ragged verification is never cached (a request's row count can change
+    between steps), nor are batches holding warmup / attention-DP dummy
+    requests: those reuse request ids across CUDA graph capture passes with
+    different sampling params. The CUDA graph padding request keeps its id and
+    its greedy params, so it does not prevent caching.
+    """
+    if spec_metadata.is_ragged_verify:
+        return None
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+    entries = []
+    for request in requests:
+        if (getattr(request, "is_dummy_request", False)
+                and not getattr(request, "is_cuda_graph_dummy", False)):
+            return None
+        entries.append((request.py_request_id,
+                        request.state == LlmRequestState.GENERATION_IN_PROGRESS,
+                        request.py_seq_slot))
+    return (tuple(entries), spec_metadata.runtime_draft_len,
+            spec_metadata.group_all_greedy_sample, spec_metadata.dummy_slot_row)
 
 
 def rejection_sampling_one_model(
@@ -142,8 +211,8 @@ def draft_prompt_lookahead(spec_config) -> Optional[int]:
         return None
     spec_mode = spec_config.spec_dec_mode
     if not spec_mode.use_one_engine():
-        # Two-model drafting runs the draft as its own engine over its own
-        # request view, so nothing here is shifted against the target prompt.
+        # Drafter-based modes keep no draft KV in the target's request view,
+        # so nothing here is shifted against the target prompt.
         return None
     if spec_mode.is_mtp_vanilla():
         # Known limitation: an internal chunk lacks target_hidden[i + k], so reuse
@@ -177,7 +246,8 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     Call restore_attn_metadata_after_draft_replay in a finally block.
     Returns saved state or None if no-op.
     """
-    if draft_kv_cache_manager is None:
+    if (draft_kv_cache_manager is None
+            or draft_kv_cache_manager is attn_metadata.kv_cache_manager):
         return None
     if not isinstance(attn_metadata, TrtllmAttentionMetadata):
         return None
@@ -236,7 +306,7 @@ def get_force_num_accepted_tokens() -> int:
     variable as an integer.
 
     Used by speculative decoding paths that operate on Python lists/slices and
-    therefore require an integer count (e.g. the two-model path in
+    therefore require an integer count (e.g. draft-token verification in
     ``TorchSampler``). For the one-model path, see
     :func:`get_force_num_accepted_tokens_float`, which supports fractional
     synthetic acceptance rates.
@@ -459,6 +529,9 @@ class SpecMetadata:
     """
     Metadata for speculative decoding.
     """
+    # Whether prepare() reads only the fields the steady one-model MTP decode
+    # prepare sets (pyexecutor/steady_spec_prepare.py).
+    supports_steady_prepare: ClassVar[bool] = False
     # The max number of requests in a single batch.
     max_num_requests: int
     # The number of draft layers. (Also the number of draft tokens for the linear tree.)
@@ -489,8 +562,6 @@ class SpecMetadata:
     host_position_ids: Optional[torch.Tensor] = None
     # The gather ids for logits.
     gather_ids: Optional[torch.Tensor] = None
-    # The number of accepted draft tokens for each request.
-    num_accepted_draft_tokens: Optional[torch.Tensor] = None
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
@@ -564,18 +635,38 @@ class SpecMetadata:
     # value). Under ADP + LM-head TP with rejection sampling, the greedy-vs-
     # advanced choice gates group collectives, so all ranks must take the same
     # path even though their batches (and thus local flags) differ. Set by
-    # ``_sync_group_all_greedy_sample`` before the CUDA graph key is built and
+    # ``sync_group_all_greedy_sample`` before the CUDA graph key is built and
     # re-applied by ``_scan_one_model_sampling`` on every rescan. AND is safe:
     # a greedy rank pulled onto the advanced path still samples greedily via
     # its sentinel params.
     group_all_greedy_sample: Optional[bool] = None
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
+    # Whether this step's target logits are this rank's vocabulary shard (set
+    # by the worker's target_logits), so the worker samples the target tokens
+    # with a cross-rank argmax (Gumbel-max for the temperature rows of a
+    # temperature_only batch).
+    sharded_target_logits: bool = False
+    # Whether the temperature-only CUDA graph variant is captured (see
+    # supports_sharded_target_sampling), and the graph key bit that selects it
+    # for the current batch (see _temperature_only).
+    temperature_only_graphs: bool = False
+    temperature_only: bool = False
+    # Skip the Philox seed and offset uploads on all-greedy batches (deploy-time;
+    # from the model's RuntimeHooks). The argmax path never reads them, and the
+    # next sampled batch rewrites every row it reads.
+    skip_greedy_rng_upload: bool = False
+    # Stage the per-step Philox seed/offset uploads into the engine's step-input
+    # pack (RuntimeHooks.pack_spec_rng_uploads) instead of copying each one.
+    pack_rng_uploads: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Whether the occurrence penalties are enabled (deploy-time; from
     # DecodingBaseConfig.enable_penalty). Gates the occurrence workspace allocation.
     enable_penalty: bool = False
+    # Text watermarking: set from TorchLlmArgs.watermark_config, None when it is off. Its device
+    # state is allocated by prepare_watermark_buffers.
+    watermark: Optional[WatermarkSpecState] = None
     # Occurrence-penalty device state; None until prepare_penalty_buffers runs.
     # See penalty_ops.PenaltyState for what each buffer holds and why the prompt is
     # split from generated tokens.
@@ -629,6 +720,9 @@ class SpecMetadata:
     # answer and let one skip a fill another view invalidated.
     _sampling_params_signature: list = field(
         default_factory=lambda: [None, None], repr=False)
+    # Last result of _scan_one_model_sampling with its key (see
+    # _sampling_scan_cache_key).
+    _sampling_scan_cache: Optional[tuple] = field(default=None, repr=False)
     # Per-row Philox state for user-specified ``SamplingParams.seed``, laid out
     # to match the logits rows the sampling kernels consume.
     #
@@ -881,11 +975,23 @@ class SpecMetadata:
                                        device='cuda')
 
         def _upload(dst: torch.Tensor, values: list[int]) -> None:
-            dst[:len(values)].copy_(torch.tensor(values,
-                                                 dtype=torch.int64,
-                                                 pin_memory=prefer_pinned()),
-                                    non_blocking=True)
+            src = torch.tensor(values,
+                               dtype=torch.int64,
+                               pin_memory=prefer_pinned())
+            if self.pack_rng_uploads:
+                # The forward is the first reader of these buffers, so the copy
+                # may move to the pack's flush (a plain copy when no pack is open).
+                step_inputs.copy_(dst[:len(values)], src)
+            else:
+                dst[:len(values)].copy_(src, non_blocking=True)
 
+        # An all-greedy batch runs the argmax graph, which reads none of these
+        # buffers. The offset windows above still advance, so skipping the
+        # copies changes no later batch's streams. A temperature-only batch
+        # still uploads: a target head the worker cannot shard (vocab padding)
+        # samples it on the stock path, which reads them.
+        if self.is_all_greedy_sample:
+            return
         _upload(self.request_seeds, request_seeds)
         _upload(self.request_offsets, request_offsets)
         _upload(self.seeds, flat_seeds)
@@ -964,6 +1070,63 @@ class SpecMetadata:
             self.batch_slot_ids = torch.empty((self.max_num_requests, ),
                                               dtype=torch.long,
                                               device='cuda')
+
+    def prepare_watermark_buffers(self):
+        """Allocate the watermark state. Idempotent; no-op when watermarking is off.
+
+        Sized and indexed like the penalty buffers (see ``prepare_penalty_buffers``): the slot
+        pool is ``num_seq_slots`` plus one scratch row for dummy/padding requests.
+        """
+        if self.watermark is None or self.watermark.ready:
+            return
+        slot_capacity = self.num_seq_slots or self.max_num_requests
+        self.watermark.prepare(
+            num_slots=slot_capacity,
+            max_num_requests=self.max_num_requests,
+            max_draft_len=self.max_draft_len,
+            use_rejection_sampling=self.use_rejection_sampling)
+        if not self.watermark.ready:
+            return
+        self.dummy_slot_row = slot_capacity
+        if self.batch_slot_ids is None and self.max_num_requests > 0:
+            self.batch_slot_ids = torch.empty((self.max_num_requests, ),
+                                              dtype=torch.long,
+                                              device='cuda')
+
+    @property
+    def watermark_ready(self) -> bool:
+        """Whether the watermark's device state exists (it is configured and prepared)."""
+        return self.watermark is not None and self.watermark.ready
+
+    def _populate_watermark_params(self, requests):
+        """Reset the state of new slot occupants and flag which requests carry a watermark.
+
+        Runs on the host before the forward. A request that is still prefilling in chunks
+        samples nothing in this step and must not advance its context.
+        """
+        state = self.watermark
+        if not self.watermark_ready:
+            return
+        handler = state.handler
+        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+
+        def samples_a_token(request) -> bool:
+            if request.py_seq_slot is None:
+                return False
+            return (request.state == LlmRequestState.GENERATION_IN_PROGRESS
+                    or request.is_last_context_chunk)
+
+        sampling = [r for r in requests if samples_a_token(r)]
+        handler.observe(sampling)
+        flags = [
+            samples_a_token(r) and handler.is_enabled(r.py_seq_slot)
+            for r in requests
+        ]
+        flags += [False] * (state.enabled.shape[0] - len(flags))
+        state.enabled.copy_(torch.tensor(flags,
+                                         dtype=torch.bool,
+                                         pin_memory=prefer_pinned()),
+                            non_blocking=True)
 
     @staticmethod
     def _request_prompt_tokens(request):
@@ -1121,6 +1284,19 @@ class SpecMetadata:
             return
         onehot_vocab = (self.draft_probs_last_dim if self.draft_probs_last_dim
                         > 0 else self.draft_probs_vocab_size)
+        bad = [
+            s for s in padding_slot_ids
+            if s is None or s < 0 or s >= self.draft_probs.shape[0]
+        ]
+        if bad:
+            # Writing a different row would leave the real slot's distribution
+            # stale and break lossless acceptance, so fail loudly instead.
+            raise RuntimeError(
+                f"rejection sampling: padding slot ids {bad[:8]} outside "
+                f"draft_probs rows [0, {self.draft_probs.shape[0]}) "
+                f"(num_seq_slots={self.num_seq_slots}, "
+                f"max_num_requests={self.max_num_requests}, "
+                f"is_cuda_graph={self.is_cuda_graph})")
         slots = torch.tensor(padding_slot_ids,
                              dtype=torch.long,
                              device=self.draft_probs.device)
@@ -1159,6 +1335,12 @@ class SpecMetadata:
         if self.is_cuda_graph:
             return self
 
+        # Slot-indexed state persists across steps that may run eagerly or under
+        # different graphs, so every view must share one allocation: allocate it
+        # here before the shallow copy rather than lazily in each view.
+        self.prepare_rejection_sampling_buffers()
+        self.prepare_penalty_buffers()
+        self.prepare_watermark_buffers()
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.max_num_requests = max_batch_size
@@ -1246,8 +1428,28 @@ class SpecMetadata:
             )
 
         # Phase 1: collect per-request flags and normalized values.
+        # Run twice per step: the last result is reused for the same requests,
+        # states, slots, draft length and group override (a request's sampling
+        # config is fixed for its lifetime).
+        scan_key = _sampling_scan_cache_key(self, requests)
+        if scan_key is not None:
+            cached = self._sampling_scan_cache
+            if cached is not None and cached[0] == scan_key:
+                (_, per_request_normalized, per_request_slot_ids,
+                 self.is_all_greedy_sample, temperature_capable) = cached
+                self.temperature_only = _temperature_only(
+                    self, temperature_capable)
+                return per_request_normalized, per_request_slot_ids
+
         per_request_normalized: list[tuple[float, int, float, float, int]] = []
         has_non_greedy_requests = False
+        # Whether every sampled row can be drawn on the sharded logits (see
+        # _temperature_only).
+        temperature_capable = True
+        temperature_graphs = self.temperature_only_graphs
+        if temperature_graphs:
+            from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import \
+                request_random_seed
         per_request_slot_ids: list[int] = []
         ragged_verify = self.is_ragged_verify
         default_generation_tokens = 1 + self.runtime_draft_len
@@ -1284,6 +1486,10 @@ class SpecMetadata:
             )
 
             has_non_greedy_requests |= not is_greedy
+            if (temperature_graphs and not is_greedy and
+                (tk_val != DISABLE_TOPK_VAL or tp_val < 1.0 or mp_val > 0.0
+                 or request_random_seed(request) is not None)):
+                temperature_capable = False
 
             per_request_normalized.append(
                 (temp_val, tk_val, tp_val, mp_val, num_tokens))
@@ -1308,6 +1514,12 @@ class SpecMetadata:
         # value rather than resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
+        self.temperature_only = _temperature_only(self, temperature_capable)
+        if scan_key is not None:
+            self._sampling_scan_cache = (scan_key, per_request_normalized,
+                                         per_request_slot_ids,
+                                         self.is_all_greedy_sample,
+                                         temperature_capable)
         return per_request_normalized, per_request_slot_ids
 
     @property
@@ -1357,6 +1569,8 @@ class SpecMetadata:
         self.prepare_rejection_sampling_buffers()
         # Likewise for the occurrence-penalty workspace. No-op unless enable_penalty.
         self.prepare_penalty_buffers()
+        # And the watermark's per-slot context state. No-op unless watermark_config is set.
+        self.prepare_watermark_buffers()
 
         if self.temperatures is None:
             # Ensures determinism across ranks.
@@ -1411,8 +1625,8 @@ class SpecMetadata:
         # is configured: it's tiny (max_num_requests longs) and needed at
         # draft-sampler time to scatter draft probs by slot. The penalties need the
         # same table to map logits rows back to their slot, so they enable it too.
-        if (self.use_rejection_sampling
-                or self.enable_penalty) and self.batch_slot_ids is not None:
+        if (self.use_rejection_sampling or self.enable_penalty
+                or self.watermark_ready) and self.batch_slot_ids is not None:
             self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
                 torch.tensor(per_request_slot_ids,
                              dtype=torch.long,
@@ -1424,6 +1638,8 @@ class SpecMetadata:
         # logits before sampling, so an all-greedy batch is penalized too (its argmax
         # is taken over the penalized logits). Filled before the early return below.
         self._populate_penalty_params(requests)
+        # Likewise the watermark: a greedy request is simply not flagged.
+        self._populate_watermark_params(requests)
 
         # All-greedy: sampler takes the argmax branch (and rejection sampling
         # is also bypassed for all-greedy), so the per-token buffers are never
@@ -1571,6 +1787,52 @@ class SpecMetadata:
         self._sampling_params_signature[0] = None
         self._sampling_params_signature[1] = None
 
+    def remap_expanded_sampling_params(self, req_idx: torch.Tensor,
+                                       num_tokens: int) -> None:
+        """Repack per-logits-row sampling state after device window selection.
+
+        Device window selection can redistribute a fixed token budget among
+        requests immediately before replay. The expanded sampling buffers must
+        follow the resulting token owners.
+        """
+        if num_tokens <= 0:
+            return
+        owners = req_idx[:num_tokens].to(torch.long)
+        pairs = (
+            (self.request_temperatures, self.temperatures),
+            (self.request_top_ks, self.top_ks),
+            (self.request_top_ps, self.top_ps),
+            (self.request_min_ps, self.min_ps),
+            (self.request_seeds, self.seeds),
+            (self.request_offsets, self.offsets),
+        )
+        for request_values, expanded_values in pairs:
+            if request_values is None or expanded_values is None:
+                continue
+            if expanded_values.numel() < num_tokens:
+                raise RuntimeError(
+                    "device-selected DSpark layout exceeds the captured "
+                    "sampling-parameter buffer")
+            torch.index_select(request_values,
+                               0,
+                               owners,
+                               out=expanded_values[:num_tokens])
+
+        if self.request_offsets is not None and self.offsets is not None:
+            if self.qo_indptr is None:
+                raise RuntimeError(
+                    "device-selected DSpark sampling requires ragged row starts"
+                )
+            row_slots = torch.arange(num_tokens,
+                                     device=owners.device,
+                                     dtype=torch.int64)
+            row_slots -= self.qo_indptr.index_select(0, owners)
+            self.offsets[:num_tokens].add_(row_slots * _RNG_SLOT_SPAN)
+
+        # The expanded cache now follows the device-selected layout. Force the
+        # next host-prepared iteration to restore its own row expansion.
+        self._sampling_params_signature[1] = None
+
 
 class AuxiliarySpeculativeStateHandler(Protocol):
     """Model-side state that verification writes once per draft token.
@@ -1622,8 +1884,14 @@ class SpecWorkerBase(nn.Module, ABC):
     Provides common functionality for sampling and token handling.
     """
 
-    def __init__(self, use_separate_draft_kv_cache: bool = False):
+    def __init__(self,
+                 use_separate_draft_kv_cache: bool = False,
+                 key_exchange=None):
+        """``key_exchange``: the TP key exchange (``ll_exchange.TPKeyExchange``)
+        that samples greedy and temperature-only tokens of vocabulary-sharded
+        logits, or None (NCCL all-gather)."""
         super().__init__()
+        self.key_exchange = key_exchange
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens: float = get_force_num_accepted_tokens_float(
         )
@@ -1647,8 +1915,23 @@ class SpecWorkerBase(nn.Module, ABC):
         # seed/offset pattern in `_sample_tokens_for_batch`).
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
+        # Device step counter seeding the temperature-only target sampling
+        # with the key exchange (allocated in cache_derived_state).
+        self._gumbel_seed: Optional[torch.Tensor] = None
         self._auxiliary_state_handlers: list[
             AuxiliarySpeculativeStateHandler] = []
+
+    def cache_derived_state(self) -> None:
+        if self.key_exchange is not None and self._gumbel_seed is None:
+            self._gumbel_seed = torch.zeros(1,
+                                            dtype=torch.int64,
+                                            device=torch.device(
+                                                "cuda",
+                                                torch.cuda.current_device()))
+
+    def post_load_weights(self) -> None:
+        # The loader's default post-load walk calls post_load_weights only.
+        self.cache_derived_state()
 
     def register_auxiliary_state_handler(
             self, handler: AuxiliarySpeculativeStateHandler) -> None:
@@ -1702,6 +1985,25 @@ class SpecWorkerBase(nn.Module, ABC):
     @abstractmethod
     def _forward_impl(self, *args, **kwargs):
         """Worker-specific forward logic, called by SpecWorkerBase.forward."""
+
+    def target_logits(self, hidden_states: torch.Tensor, lm_head,
+                      logits_processor, attn_metadata, spec_metadata,
+                      draft_model) -> torch.Tensor:
+        """The target logits of the gathered rows ``hidden_states``, which
+        the model hands to ``forward`` as ``logits``: fp32 [rows, vocab].
+
+        A worker whose acceptance reads another layout overrides this. If its
+        ``forward`` then returns this TP rank's vocabulary shard as
+        ``"logits"``, it also returns ``"logits_vocab_shard": True``, and the
+        engine gathers the logits (on every TP rank together, so not under
+        attention DP) before any logits post-processor sees them; the
+        post-processors get a read-only view, since the acceptance already
+        ran inside ``forward``. Such a worker applies a guided decoder's
+        bitmask to its shard at the shard's column offset, or rejects guided
+        decoding.
+        """
+        return logits_processor.forward(hidden_states, lm_head, attn_metadata,
+                                        True)
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         """Restore attn-metadata spec-dec state if a failure skipped it.
@@ -1781,8 +2083,13 @@ class SpecWorkerBase(nn.Module, ABC):
 
         self._execute_guided_decoder_if_present(logits)
 
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
+        if _watermark_active(spec_metadata):
+            target_tokens, watermark_plans = self._sample_tokens_and_watermark_plans(
+                logits, spec_metadata, num_contexts, batch_size)
+        else:
+            watermark_plans = None
+            target_tokens = self._sample_tokens_for_batch(
+                logits, spec_metadata, num_contexts, batch_size)
 
         accepted_tokens = torch.zeros((batch_size, 1),
                                       dtype=torch.int,
@@ -1792,6 +2099,14 @@ class SpecWorkerBase(nn.Module, ABC):
         num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
+        if watermark_plans is not None:
+            self._commit_watermark(spec_metadata,
+                                   watermark_plans,
+                                   accepted_tokens,
+                                   num_accepted_tokens,
+                                   num_contexts,
+                                   batch_size,
+                                   has_drafts=False)
 
         next_draft_tokens = torch.zeros((batch_size, 0),
                                         dtype=torch.int,
@@ -1821,6 +2136,21 @@ class SpecWorkerBase(nn.Module, ABC):
         when the draft and target vocabularies differ; stays None otherwise.
         """
         self._d2t = getattr(getattr(draft_model, "model", None), "d2t", None)
+
+    def set_target_model(self, target_model: nn.Module) -> None:
+        """Called at construction with the target model that owns this worker.
+
+        Workers that select target tokens from a vocab-sharded head override
+        this and decide after loading; see :attr:`target_vocab_parallel_head`.
+        """
+        del target_model
+
+    @property
+    def target_vocab_parallel_head(self) -> Optional[VocabParallelHead]:
+        """The head whose vocab-shard logits this worker's
+        :meth:`target_logits` returns, as :class:`VocabShardedLogits`, in
+        place of the gathered target logits. None to receive gathered logits."""
+        return None
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         """
@@ -1958,6 +2288,31 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return num_accepted_tokens
 
+    def _fused_force_params(self, runtime_draft_len: int, spec_metadata,
+                            device: torch.device):
+        """The decisions of :meth:`_apply_force_accepted_tokens` as the
+        ``force`` argument of ``fused_accept.fused_strict_accept``: None for
+        natural acceptance (no forcing, or eager CUDA-graph warmup)."""
+        if self.force_num_accepted_tokens == 0.0:
+            return None
+        if spec_metadata is not None and (
+                spec_metadata.is_cuda_graph
+                and not torch.cuda.is_current_stream_capturing()):
+            return None
+        int_part = int(self.force_num_accepted_tokens)
+        frac_part = self.force_num_accepted_tokens - int_part
+        max_total = runtime_draft_len + 1
+        base_total = min(int_part + 1, max_total)
+        if frac_part > 0.0 and base_total < max_total:
+            self._ensure_force_accept_rng_state(device)
+            return (base_total, max_total, frac_part,
+                    self._force_accept_rng_pool, self._force_accept_rng_counter,
+                    _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
+                    _FORCE_ACCEPT_RNG_SLOT_STRIDE, _FORCE_ACCEPT_RNG_POOL_SIZE)
+        return (base_total, max_total, 0.0, None, None,
+                _FORCE_ACCEPT_RNG_COUNTER_STRIDE, _FORCE_ACCEPT_RNG_SLOT_STRIDE,
+                _FORCE_ACCEPT_RNG_POOL_SIZE)
+
     def _sample_and_accept_draft_tokens_base(
         self,
         logits: torch.Tensor,
@@ -1974,7 +2329,8 @@ class SpecWorkerBase(nn.Module, ABC):
         acceptance is disabled).
 
         Args:
-            logits: [num_tokens, vocab_size] - Target model logits
+            logits: [num_tokens, vocab_size] - Target model logits, or their
+                vocab shard as ``VocabShardedLogits``
             draft_tokens: [num_gens, runtime_draft_len] - Previously predicted draft tokens
             num_contexts: Number of context requests
             batch_size: Total number of requests
@@ -1988,12 +2344,56 @@ class SpecWorkerBase(nn.Module, ABC):
         # spec_metadata.runtime_draft_len, because callers may slice a wider
         # runtime token layout down to the K draft tokens used for acceptance.
         runtime_draft_len = draft_tokens.shape[-1]
-        num_gens = batch_size - num_contexts
 
-        if logits.dim() == 1:
+        if isinstance(logits, torch.Tensor) and logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
-        # Allocate return buffers
+        # Sample tokens using per-request sampling parameters
+        if _watermark_active(spec_metadata):
+            target_tokens, watermark_plans = self._sample_tokens_and_watermark_plans(
+                logits, spec_metadata, num_contexts, batch_size, draft_tokens)
+        else:
+            watermark_plans = None
+            target_tokens = self._sample_tokens_for_batch(
+                logits, spec_metadata, num_contexts, batch_size)
+
+        if spec_metadata is None or not spec_metadata.is_ragged_verify:
+            force = self._fused_force_params(runtime_draft_len, spec_metadata,
+                                             target_tokens.device)
+            if force is not None and runtime_draft_len <= MAX_DRAFT_LEN:
+                # Forced acceptance in the acceptance launch (same draws as
+                # _apply_force_accepted_tokens).
+                accepted_tokens, num_accepted_tokens = fused_strict_accept(
+                    target_tokens, draft_tokens, num_contexts, batch_size,
+                    force)
+                if watermark_plans is not None:
+                    self._commit_watermark(spec_metadata,
+                                           watermark_plans,
+                                           accepted_tokens,
+                                           num_accepted_tokens,
+                                           num_contexts,
+                                           batch_size,
+                                           has_drafts=True)
+                return accepted_tokens, num_accepted_tokens
+            # Context requests accept the sampled token only; generation
+            # requests count the leading draft tokens equal to the target's.
+            accepted_tokens, num_accepted_tokens = strict_accept(
+                target_tokens, draft_tokens, num_contexts, batch_size)
+            num_accepted_tokens = self._apply_force_accepted_tokens(
+                num_accepted_tokens,
+                num_contexts,
+                runtime_draft_len,
+                spec_metadata=spec_metadata)
+            if watermark_plans is not None:
+                self._commit_watermark(spec_metadata,
+                                       watermark_plans,
+                                       accepted_tokens,
+                                       num_accepted_tokens,
+                                       num_contexts,
+                                       batch_size,
+                                       has_drafts=True)
+            return accepted_tokens, num_accepted_tokens
+
         accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
                                       dtype=torch.int,
                                       device=logits.device)
@@ -2001,45 +2401,30 @@ class SpecWorkerBase(nn.Module, ABC):
                                          dtype=torch.int,
                                          device=logits.device)
 
-        # Sample tokens using per-request sampling parameters
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
-
         # Context requests: only accept the sampled token (no draft tokens yet)
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
-        # Generation requests: verify draft tokens against target tokens
-        if spec_metadata is not None and spec_metadata.is_ragged_verify:
-            from .ragged_helpers import (count_accepted_ragged,
-                                         scatter_ragged_to_padded)
-            verify_lens = spec_metadata.verify_lens
-            total = spec_metadata.total_verify_tokens
-            qo_indptr = spec_metadata.qo_indptr
-            if verify_lens is None or total is None or qo_indptr is None:
-                raise RuntimeError("ragged verification metadata is incomplete")
-            gen_target_tokens = scatter_ragged_to_padded(
-                target_tokens[num_contexts:num_contexts + total],
-                verify_lens=verify_lens,
-                qo_indptr=qo_indptr,
-                max_len=runtime_draft_len + 1)
-            # verify_lens counts tokens (bonus position included), so a
-            # request drafted verify_lens - 1 positions. Masking past that is
-            # what stops a stale padded slot from comparing equal and crediting
-            # an acceptance the target never made.
-            num_accepted_tokens[num_contexts:] += count_accepted_ragged(
-                draft_tokens=draft_tokens,
-                target_tokens=gen_target_tokens[:, :runtime_draft_len],
-                verify_lens=verify_lens - 1)
-        else:
-            gen_target_tokens = target_tokens[num_contexts:].reshape(
-                num_gens, runtime_draft_len + 1)
-
-            # Compare draft tokens with target tokens using cumulative product
-            # Counts consecutive matches from the start
-            num_accepted_tokens[num_contexts:] += torch.cumprod((
-                draft_tokens == gen_target_tokens[:, :runtime_draft_len]).int(),
-                                                                dim=-1).sum(1)
-
+        # Generation requests: verify the ragged draft windows
+        from .ragged_helpers import (count_accepted_ragged,
+                                     scatter_ragged_to_padded)
+        verify_lens = spec_metadata.verify_lens
+        total = spec_metadata.total_verify_tokens
+        qo_indptr = spec_metadata.qo_indptr
+        if verify_lens is None or total is None or qo_indptr is None:
+            raise RuntimeError("ragged verification metadata is incomplete")
+        gen_target_tokens = scatter_ragged_to_padded(
+            target_tokens[num_contexts:num_contexts + total],
+            verify_lens=verify_lens,
+            qo_indptr=qo_indptr,
+            max_len=runtime_draft_len + 1)
+        # verify_lens counts tokens (bonus position included), so a
+        # request drafted verify_lens - 1 positions. Masking past that is
+        # what stops a stale padded slot from comparing equal and crediting
+        # an acceptance the target never made.
+        num_accepted_tokens[num_contexts:] += count_accepted_ragged(
+            draft_tokens=draft_tokens,
+            target_tokens=gen_target_tokens[:, :runtime_draft_len],
+            verify_lens=verify_lens - 1)
         accepted_tokens[num_contexts:, :runtime_draft_len +
                         1] = gen_target_tokens
 
@@ -2050,14 +2435,13 @@ class SpecWorkerBase(nn.Module, ABC):
             runtime_draft_len,
             spec_metadata=spec_metadata)
 
-        if spec_metadata is not None and spec_metadata.is_ragged_verify:
-            # The synthetic-acceptance override caps at the batch-wide
-            # runtime_draft_len; under ragged a request may have verified
-            # fewer positions, and accepting past its window would commit
-            # tokens the target never produced.
-            num_accepted_tokens[num_contexts:] = torch.minimum(
-                num_accepted_tokens[num_contexts:],
-                spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
+        # The synthetic-acceptance override caps at the batch-wide
+        # runtime_draft_len; under ragged a request may have verified
+        # fewer positions, and accepting past its window would commit
+        # tokens the target never produced.
+        num_accepted_tokens[num_contexts:] = torch.minimum(
+            num_accepted_tokens[num_contexts:],
+            spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
         return accepted_tokens, num_accepted_tokens
 
     def _apply_occurrence_penalties(
@@ -2416,6 +2800,10 @@ class SpecWorkerBase(nn.Module, ABC):
             vocab = probs.shape[-1]
             spec_metadata.draft_probs[batch_slots, draft_step, :vocab] = probs
             spec_metadata.draft_probs_last_dim = vocab
+            if (_watermark_active(spec_metadata)
+                    and spec_metadata.watermark.keys_drafts):
+                draft_tokens = self._watermark_draft_step(
+                    spec_metadata, batch_size, draft_step, draft_tokens, probs)
         else:
             draft_tokens = self._sample_from_logits(
                 spec_metadata.advanced_sampling_mode,
@@ -2572,10 +2960,18 @@ class SpecWorkerBase(nn.Module, ABC):
                                          device=device)
 
         # === Context subset: sample target's first token directly ===
+        context_plan = generation_plan = None
         if num_contexts > 0:
-            ctx_target_tokens = self._sample_tokens_for_batch(
-                logits[:num_contexts], spec_metadata, num_contexts,
-                num_contexts)
+            if _watermark_active(spec_metadata):
+                ctx_target_tokens, context_plans = (
+                    self._sample_tokens_and_watermark_plans(
+                        logits[:num_contexts], spec_metadata, num_contexts,
+                        num_contexts))
+                context_plan = context_plans[0] if context_plans else None
+            else:
+                ctx_target_tokens = self._sample_tokens_for_batch(
+                    logits[:num_contexts], spec_metadata, num_contexts,
+                    num_contexts)
             accepted_tokens[:num_contexts, 0] = ctx_target_tokens
 
         # === Generation subset: rejection sampling on the gen slice ===
@@ -2696,6 +3092,20 @@ class SpecWorkerBase(nn.Module, ABC):
                 offset=offset,
             )
 
+            if _watermark_active(spec_metadata):
+                # The kernel decides which drafts are accepted and draws the token that
+                # follows them. Redraw that token under the watermark's second key so the
+                # output distribution stays the target's (see keyed_recovery).
+                _, generation_plan = self._plan_watermark(spec_metadata,
+                                                          num_contexts,
+                                                          batch_size,
+                                                          draft_tokens,
+                                                          plan_contexts=False)
+                gen_accepted = keyed_recovery(gen_accepted, gen_num_accepted,
+                                              target_probs, full_draft_probs,
+                                              generation_plan.seeds_secondary,
+                                              generation_plan.active)
+
             if self.force_num_accepted_tokens != 0.0:
                 # Fill gen_accepted positions 1..runtime_draft_len with all draft tokens
                 # so that when _apply_force_accepted_tokens inflates num_accepted_tokens
@@ -2721,6 +3131,14 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens[num_contexts:] = torch.minimum(
                 num_accepted_tokens[num_contexts:],
                 spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
+        if _watermark_active(spec_metadata):
+            self._commit_watermark(spec_metadata,
+                                   (context_plan, generation_plan),
+                                   accepted_tokens,
+                                   num_accepted_tokens,
+                                   num_contexts,
+                                   batch_size,
+                                   has_drafts=True)
         return accepted_tokens, num_accepted_tokens
 
     def _rng_state_per_request(
@@ -2854,6 +3272,23 @@ class SpecWorkerBase(nn.Module, ABC):
         if (sharded and mapping is not None
                 and getattr(mapping, "tp_size", 1) > 1
                 and not mapping.enable_attention_dp):
+            # Row maxima, (value, index) key packing and the LL exchange over
+            # peer memory in one launch instead of the NCCL all-gather; same
+            # tokens (global argmax, lowest index on ties).
+            exchange = self.key_exchange
+            if exchange is not None and 1 <= logits.shape[
+                    0] <= exchange.MAX_ROWS:
+                if logits.stride(-1) == 1:
+                    return exchange.argmax_logits(logits,
+                                                  mapping.tp_rank *
+                                                  logits.shape[-1],
+                                                  channel=0)
+                local_max, local_argmax = torch.max(logits, dim=-1)
+                return exchange.argmax_tokens(local_max,
+                                              local_argmax,
+                                              mapping.tp_rank *
+                                              logits.shape[-1],
+                                              channel=0)
             from ..distributed.ops import allgather
             combined = self._get_local_max_and_combined(logits)
             gathered = allgather(combined, mapping, dim=-1)
@@ -2862,7 +3297,40 @@ class SpecWorkerBase(nn.Module, ABC):
         # requests with replicated full-vocab logits, so a per-rank argmax is
         # the correct proposal and a gather would desync the ranks (see
         # _draft_logits_are_sharded). Plain argmax; caller applies d2t.
-        return torch.argmax(logits, dim=-1).type(torch.int32)
+        return greedy_argmax(logits,
+                             torch.int32,
+                             small_rows=spec_metadata is not None
+                             and spec_metadata.is_cuda_graph)
+
+    def _watermark_draft_step(self, spec_metadata: "SpecMetadata",
+                              batch_size: int, draft_step: int,
+                              draft_tokens: torch.Tensor,
+                              probs: torch.Tensor) -> torch.Tensor:
+        """Draw one draft token per request under the watermark key.
+
+        ``probs`` is the draft distribution the token was sampled from. Its columns are
+        draft-vocabulary ids, but the random numbers are indexed by target-vocabulary id (what
+        the detector sees), so the draft-to-target map is passed along.
+        """
+        handler = spec_metadata.watermark.handler
+        slots = spec_metadata.batch_slot_ids[:batch_size]
+        enabled = spec_metadata.watermark.enabled[:batch_size]
+        seeds, active = handler.plan_draft_step(
+            slots, enabled,
+            spec_metadata.watermark.drafts[:batch_size, :draft_step],
+            spec_metadata.watermark.draft_seeds[:batch_size, :draft_step])
+        id_map = None
+        if self._d2t is not None:
+            id_map = self._d2t.data.to(torch.int64) + torch.arange(
+                probs.shape[-1], device=probs.device)
+        keyed = gumbel_sample_from_probs(probs, seeds, active, id_map)
+        tokens = torch.where(active, keyed, draft_tokens.to(keyed.dtype))
+        target_ids = tokens.to(torch.int64)
+        if id_map is not None:
+            target_ids = id_map[target_ids]
+        spec_metadata.watermark.drafts[:batch_size, draft_step] = target_ids
+        spec_metadata.watermark.draft_seeds[:batch_size, draft_step] = seeds
+        return tokens
 
     def advanced_sample_draft_block(self, gen_logits: torch.Tensor,
                                     spec_metadata: "SpecMetadata",
@@ -3151,8 +3619,10 @@ class SpecWorkerBase(nn.Module, ABC):
         Get the draft KV cache manager if using separate KV cache layouts.
         """
         if self.use_separate_draft_kv_cache and resource_manager is not None:
-            return resource_manager.get_resource_manager(
+            draft = resource_manager.get_resource_manager(
                 ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+            if draft is not None:
+                return draft
         if resource_manager is not None:
             target = resource_manager.get_resource_manager(
                 ResourceManagerType.KV_CACHE_MANAGER)
@@ -3173,7 +3643,8 @@ class SpecWorkerBase(nn.Module, ABC):
         """
 
         # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
-        if draft_kv_cache_manager is None:
+        if (draft_kv_cache_manager is None
+                or draft_kv_cache_manager is attn_metadata.kv_cache_manager):
             yield attn_metadata
             return
 
@@ -3197,6 +3668,30 @@ class SpecWorkerBase(nn.Module, ABC):
         finally:
             restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
 
+    def _sample_sharded_temperature(self, logits: torch.Tensor,
+                                    temperatures: torch.Tensor) -> torch.Tensor:
+        """Target tokens of a temperature-only batch from this rank's
+        vocabulary shard of the logits.
+
+        Gumbel-max over the shard + LL key exchange is an exact temperature
+        sample (rows below GREEDY_TEMPERATURE_THRESHOLD stay greedy), in one
+        launch. The seed is a device counter advanced inside the captured
+        graph, so every step draws fresh noise; every rank replays the same
+        graphs, so all ranks pass the same seed, as the exchange requires. A
+        row's noise follows its batch position, not its request: such batches
+        hold no seeded request (see _temperature_only).
+        """
+        from ..pyexecutor.sampler.ops.vanilla import \
+            GREEDY_TEMPERATURE_THRESHOLD
+        self._gumbel_seed.add_(1)
+        return self.key_exchange.argmax_logits(
+            logits,
+            vocab_offset=self.mapping.tp_rank * logits.shape[-1],
+            temperature=temperatures,
+            seed=self._gumbel_seed,
+            greedy_threshold=GREEDY_TEMPERATURE_THRESHOLD,
+            channel=1)
+
     def _sample_tokens_for_batch(
         self,
         logits: torch.Tensor,
@@ -3209,7 +3704,9 @@ class SpecWorkerBase(nn.Module, ABC):
         Supports both greedy and non-greedy sampling.
 
         Args:
-            logits: [num_tokens, vocab_size] - Logits to sample from
+            logits: [num_tokens, vocab_size] - Logits to sample from, or their
+                vocab shard as ``VocabShardedLogits`` when the worker selects
+                tokens vocab-parallel for this batch's sampling mode
             spec_metadata: Metadata containing sampling parameters
             num_contexts: Number of context requests in the batch
             batch_size: Number of requests in the batch
@@ -3217,6 +3714,8 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
+        if isinstance(logits, VocabShardedLogits):
+            return logits.select_tokens(spec_metadata)
         if not spec_metadata.is_all_greedy_sample:
             # Use logits.shape[0] directly: for PARD under CUDA graph capture
             # runtime_draft_len may reflect the PARD-max while the captured
@@ -3225,6 +3724,10 @@ class SpecWorkerBase(nn.Module, ABC):
             num_tokens = logits.shape[0]
 
             temperatures = spec_metadata.temperatures[:num_tokens]
+            if spec_metadata.sharded_target_logits:
+                # Temperature-only batch: the logits are this rank's
+                # vocabulary shard.
+                return self._sample_sharded_temperature(logits, temperatures)
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
             min_ps = spec_metadata.min_ps[:num_tokens]
@@ -3241,7 +3744,166 @@ class SpecWorkerBase(nn.Module, ABC):
                 min_ps,
                 seed=seed,
                 offset=offset)
+        elif spec_metadata.sharded_target_logits:
+            # The logits are this rank's vocabulary shard; global greedy
+            # tokens from one launch (local first maximum + LL key exchange;
+            # same tokens as torch.argmax).
+            sampled_tokens = self.key_exchange.argmax_logits(
+                logits,
+                vocab_offset=self.mapping.tp_rank * logits.shape[-1],
+                channel=1)
         else:
-            sampled_tokens = torch.argmax(logits, dim=-1)
+            sampled_tokens = greedy_argmax(
+                logits, small_rows=spec_metadata.is_cuda_graph)
 
         return sampled_tokens
+
+    @staticmethod
+    def _reject_watermark(spec_metadata: SpecMetadata) -> None:
+        """Refuse a watermark on a sampling path that cannot commit it.
+
+        A watermarked sample must be committed to the slot's context state by whoever accepts
+        the tokens, which callers of ``_sample_tokens_for_batch`` do not do. Rejecting the
+        configuration at the first forward (warmup or CUDA-graph capture) matters: a
+        per-request check would run once, at capture, and a later watermarked request would
+        replay the captured unwatermarked sampler.
+        """
+        if _watermark_active(spec_metadata):
+            raise NotImplementedError(
+                "this model's speculative sampling path does not support text watermarking: "
+                "remove watermark_config")
+
+    def _sample_tokens_and_watermark_plans(
+        self,
+        logits: torch.Tensor,
+        spec_metadata: SpecMetadata,
+        num_contexts: int,
+        batch_size: int,
+        draft_tokens: Optional[torch.Tensor] = None,
+    ):
+        """``_sample_tokens_for_batch`` for a batch that carries a watermark.
+
+        Callers use it only when ``_watermark_active``; other batches keep calling
+        ``_sample_tokens_for_batch``. ``draft_tokens`` ([num_gens, k]) are the drafts verified by the generation rows, whose
+        logits rows follow the ``num_contexts`` context rows; None means one row per request.
+        Returns the sampled tokens and, when a watermark is in play, the plans to hand to
+        ``_commit_watermark`` once the accepted tokens are known (else None).
+        """
+        watermark_plans = None
+        if isinstance(logits, VocabShardedLogits):
+            # A sampled, watermarked row needs the whole distribution, not this rank's shard.
+            if spec_metadata.is_all_greedy_sample:
+                return logits.select_tokens(spec_metadata), None
+            logits = logits.gather()
+        if not spec_metadata.is_all_greedy_sample:
+            # Use logits.shape[0] directly: for PARD under CUDA graph capture
+            # runtime_draft_len may reflect the PARD-max while the captured
+            # graph was built for a shorter draft_len, causing a shape mismatch
+            # in sample_from_logits_op (which is torch.compiled).
+            num_tokens = logits.shape[0]
+
+            temperatures = spec_metadata.temperatures[:num_tokens]
+            if spec_metadata.sharded_target_logits:
+                # Temperature-only batch: the logits are this rank's
+                # vocabulary shard.
+                return self._sample_sharded_temperature(logits,
+                                                        temperatures), None
+            top_ks = spec_metadata.top_ks[:num_tokens]
+            top_ps = spec_metadata.top_ps[:num_tokens]
+            min_ps = spec_metadata.min_ps[:num_tokens]
+
+            # One row per logits row here, the same slice the per-token
+            # sampling params above use.
+            seed, offset = self._rng_state_per_token(spec_metadata, num_tokens)
+            sampled_tokens = self._sample_from_logits(
+                spec_metadata.advanced_sampling_mode,
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed=seed,
+                offset=offset)
+            # Rows of watermarked requests replace the ordinary draw by the keyed
+            # Gumbel-max draw over the same filtered distribution.
+            watermark_plans = self._plan_watermark(spec_metadata, num_contexts,
+                                                   batch_size, draft_tokens)
+            planned = [plan for plan in watermark_plans if plan is not None]
+            seeds = torch.cat([plan.seeds.reshape(-1) for plan in planned])
+            active = torch.cat([plan.active.reshape(-1) for plan in planned])
+            assert seeds.shape[0] == num_tokens, (
+                "watermark windows do not match the sampled rows")
+            probs = self._compute_probs_from_logits(
+                spec_metadata.advanced_sampling_mode, logits, temperatures,
+                top_ks, top_ps, min_ps)
+            keyed = gumbel_sample_from_probs(probs, seeds, active)
+            sampled_tokens = torch.where(active, keyed, sampled_tokens)
+        elif spec_metadata.sharded_target_logits:
+            # The logits are this rank's vocabulary shard; global greedy
+            # tokens from one launch (local first maximum + LL key exchange;
+            # same tokens as torch.argmax).
+            sampled_tokens = self.key_exchange.argmax_logits(
+                logits,
+                vocab_offset=self.mapping.tp_rank * logits.shape[-1],
+                channel=1)
+        else:
+            sampled_tokens = greedy_argmax(
+                logits, small_rows=spec_metadata.is_cuda_graph)
+
+        return sampled_tokens, watermark_plans
+
+    @staticmethod
+    def _plan_watermark(spec_metadata: SpecMetadata,
+                        num_contexts: int,
+                        batch_size: int,
+                        draft_tokens: Optional[torch.Tensor],
+                        plan_contexts: bool = True):
+        """Seeds for every position the batch samples: ``(first_plan, second_plan)``.
+
+        With ``draft_tokens`` the context requests (one position each) and the generation
+        requests (``1 + k`` positions each) are planned separately, in the order of their
+        logits rows (``plan_contexts=False`` skips the contexts, for a caller that planned
+        them already). Without drafts every request has one position and the first plan
+        covers the whole batch.
+        """
+        if spec_metadata.is_ragged_verify:
+            raise NotImplementedError(
+                "text watermarking is not supported with ragged speculative verification"
+            )
+        handler = spec_metadata.watermark.handler
+        slots = spec_metadata.batch_slot_ids[:batch_size]
+        enabled = spec_metadata.watermark.enabled[:batch_size]
+        if draft_tokens is None:
+            return handler.plan(slots, enabled), None
+        context_plan = generation_plan = None
+        if num_contexts > 0 and plan_contexts:
+            context_plan = handler.plan(slots[:num_contexts],
+                                        enabled[:num_contexts])
+        if batch_size > num_contexts:
+            generation_plan = handler.plan(slots[num_contexts:],
+                                           enabled[num_contexts:], draft_tokens)
+        return context_plan, generation_plan
+
+    @staticmethod
+    def _commit_watermark(spec_metadata: SpecMetadata, watermark_plans,
+                          accepted_tokens: torch.Tensor,
+                          num_accepted_tokens: torch.Tensor, num_contexts: int,
+                          batch_size: int, has_drafts: bool) -> None:
+        """Advance the watermark context of every request by the tokens it accepted."""
+        if watermark_plans is None:
+            return
+        handler = spec_metadata.watermark.handler
+        first, second = watermark_plans
+        if not has_drafts:
+            # One position per request.
+            handler.commit(first, accepted_tokens[:batch_size, :1],
+                           num_accepted_tokens[:batch_size])
+            return
+        if first is not None:
+            handler.commit(first, accepted_tokens[:num_contexts, :1],
+                           num_accepted_tokens[:num_contexts])
+        if second is not None:
+            window = second.seeds.shape[1]
+            handler.commit(second,
+                           accepted_tokens[num_contexts:batch_size, :window],
+                           num_accepted_tokens[num_contexts:batch_size])

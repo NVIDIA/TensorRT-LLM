@@ -20,6 +20,7 @@ mutable state left on ``SpecMetadata`` to leak, so these tests assert that
 property rather than a specific teardown step.
 """
 
+import itertools
 import types
 import unittest
 
@@ -27,7 +28,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import (
     NON_GREEDY_CAPTURE_SAMPLING_PARAMS,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -94,6 +95,9 @@ class TestAddDummyRequestsCaptureSamplingParams(unittest.TestCase):
             kv_cache_manager.shutdown()
 
 
+_request_ids = itertools.count()
+
+
 def _request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
     return types.SimpleNamespace(
         sampling_config=types.SimpleNamespace(
@@ -104,6 +108,7 @@ def _request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
         ),
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         py_seq_slot=slot,
+        py_request_id=next(_request_ids),
     )
 
 
@@ -113,6 +118,8 @@ def _fake_meta():
         is_ragged_verify=False,
         dummy_slot_row=0,
         group_all_greedy_sample=None,
+        temperature_only_graphs=False,
+        _sampling_scan_cache=None,
     )
 
 
@@ -245,6 +252,8 @@ def _populate_meta(mode, draft_len=1):
         is_ragged_verify=False,
         dummy_slot_row=0,
         group_all_greedy_sample=None,
+        temperature_only_graphs=False,
+        _sampling_scan_cache=None,
         max_num_requests=4,
         max_draft_len=draft_len,
         max_total_draft_tokens=draft_len,
@@ -267,8 +276,11 @@ def _populate_meta(mode, draft_len=1):
         # Not under test.
         prepare_rejection_sampling_buffers=lambda: None,
         prepare_penalty_buffers=lambda: None,
+        prepare_watermark_buffers=lambda: None,
+        watermark_ready=False,
         _populate_request_rng_state=lambda requests, normalized: None,
         _populate_penalty_params=lambda requests: None,
+        _populate_watermark_params=lambda requests: None,
     )
     for name in (
         "_scan_one_model_sampling",

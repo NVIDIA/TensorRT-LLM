@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,11 +66,6 @@ public:
     static void serialize(AdditionalModelOutput const& additionalModelOutput, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(AdditionalModelOutput const& additionalModelOutput);
 
-    // PromptTuningConfig
-    [[nodiscard]] static PromptTuningConfig deserializePromptTuningConfig(std::istream& is);
-    static void serialize(PromptTuningConfig const& config, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(PromptTuningConfig const& config);
-
     // MultimodalInput
     [[nodiscard]] static MultimodalInput deserializeMultimodalInput(std::istream& is);
     static void serialize(MultimodalInput const& multimodalInput, std::ostream& os);
@@ -128,20 +123,10 @@ public:
     static void serialize(Tensor const& tensor, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(Tensor const& tensor);
 
-    // SpeculativeDecodingFastLogitsInfo
-    [[nodiscard]] static SpeculativeDecodingFastLogitsInfo deserializeSpecDecFastLogitsInfo(std::istream& is);
-    static void serialize(SpeculativeDecodingFastLogitsInfo const& info, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(SpeculativeDecodingFastLogitsInfo const& info);
-
     // Result
     [[nodiscard]] static Result deserializeResult(std::istream& is);
     static void serialize(Result const& result, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(Result const& result);
-
-    // AdditionalOutput
-    [[nodiscard]] static AdditionalOutput deserializeAdditionalOutput(std::istream& is);
-    static void serialize(AdditionalOutput const& additionalOutput, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(AdditionalOutput const& additionalOutput);
 
     // Response
     [[nodiscard]] static Response deserializeResponse(std::istream& is);
@@ -166,11 +151,6 @@ public:
     static SchedulerConfig deserializeSchedulerConfig(std::istream& is);
     static void serialize(SchedulerConfig const& schedulerConfig, std::ostream& os);
     static size_t serializedSize(SchedulerConfig const& schedulerConfig);
-
-    // ExtendedRuntimePerfKnobConfig
-    static ExtendedRuntimePerfKnobConfig deserializeExtendedRuntimePerfKnobConfig(std::istream& is);
-    static void serialize(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::ostream& os);
-    static size_t serializedSize(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
 
     // PeftCacheConfig
     static PeftCacheConfig deserializePeftCacheConfig(std::istream& is);

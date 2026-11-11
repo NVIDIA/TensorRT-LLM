@@ -499,3 +499,336 @@ def test_default_slurm_partition_empty_when_none_flagged(
 ):
     _fake_sinfo(monkeypatch, local_submit_module, "batch\ninteractive\n")
     assert local_submit_module.default_slurm_partition() == ""
+
+
+def _dwdp_disagg_config(num_ctx_servers=16, dwdp_size=16, num_groups=1, ctx_tp=1):
+    return {
+        "hardware": {"gpus_per_node": 4, "num_ctx_servers": num_ctx_servers, "num_gen_servers": 3},
+        "worker_config": {
+            "ctx": {
+                "tensor_parallel_size": ctx_tp,
+                "dwdp_config": {"dwdp_size": dwdp_size, "num_groups": num_groups},
+            },
+            "gen": {"tensor_parallel_size": 1, "context_parallel_size": 8},
+        },
+    }
+
+
+def _disagg_hardware(module: ModuleType, config: dict, benchmark_mode: str = "e2e") -> dict:
+    if Path(module.__file__).parent.name == "local":
+        return module.get_hardware_config(config, "disaggregated", benchmark_mode)
+    return module.get_hardware_config(config, "disaggregated", benchmark_mode, None)
+
+
+def test_dwdp_ctx_servers_pack_into_one_mpi_step(submit_module: ModuleType):
+    # 16 single-GPU ctx servers fill 4 nodes as one MPI step instead of taking
+    # a node each; the 3 helix CP8 gen servers keep 2 nodes apiece.
+    hardware = _disagg_hardware(submit_module, _dwdp_disagg_config())
+    assert hardware["dwdp_size"] == 16
+    assert hardware["ctx_nodes"] == 4
+    assert hardware["total_nodes"] == 4 + 3 * 2
+    assert hardware["total_gpus"] == 40
+
+
+def test_non_dwdp_ctx_servers_keep_one_node_slice_each(submit_module: ModuleType):
+    config = _dwdp_disagg_config()
+    del config["worker_config"]["ctx"]["dwdp_config"]
+    hardware = _disagg_hardware(submit_module, config)
+    assert hardware["dwdp_size"] == 0
+    assert hardware["ctx_nodes"] == 16
+    assert hardware["total_nodes"] == 16 + 3 * 2
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"ctx_tp": 2}, r"tp \* pp \* cp == 1"),
+        ({"num_ctx_servers": 8}, "num_ctx_servers must equal dwdp_size"),
+        ({"num_ctx_servers": 6, "dwdp_size": 3, "num_groups": 2}, "fill whole nodes"),
+    ),
+)
+def test_dwdp_ctx_layout_rejects_unlaunchable_configs(
+    submit_module: ModuleType, overrides: dict, message: str
+):
+    with pytest.raises(ValueError, match=message):
+        _disagg_hardware(submit_module, _dwdp_disagg_config(**overrides))
+
+
+def test_dwdp_ctx_worker_command_replaces_llmapi_launch(ci_submit_module: ModuleType):
+    worker_line = (
+        'export partialPytestCommandWorker="LLM_ROOT=/src COLUMNS=300 '
+        '/src/tensorrt_llm/llmapi/trtllm-llmapi-launch pytest -vv --test-list=/w/list.txt"'
+    )
+    assert ci_submit_module.get_dwdp_ctx_worker_command(worker_line, "bash /rank.sh") == (
+        'export partialPytestCommandDWDPCtxWorker="LLM_ROOT=/src COLUMNS=300 '
+        'bash /rank.sh pytest -vv --test-list=/w/list.txt"'
+    )
+
+
+def _aggregated_hardware(module: ModuleType, config: dict, benchmark_mode: str) -> dict:
+    if Path(module.__file__).parent.name == "local":
+        return module.get_hardware_config(config, "aggregated", benchmark_mode)
+    return module.get_hardware_config(config, "aggregated", benchmark_mode, None)
+
+
+def test_ctx_only_folds_dwdp_ctx_servers_into_one_server(submit_module: ModuleType):
+    # ctx_only runs the 16 single-GPU DWDP ctx servers as one 16-GPU
+    # attention-DP server, not as a single one-GPU server.
+    hardware = _aggregated_hardware(submit_module, _dwdp_disagg_config(), "ctx_only")
+    assert hardware["gpus_per_server"] == 16
+    assert hardware["total_nodes"] == 4
+
+
+def test_ctx_only_without_dwdp_sizes_from_ctx_parallelism(submit_module: ModuleType):
+    config = _dwdp_disagg_config(num_ctx_servers=2, ctx_tp=8)
+    del config["worker_config"]["ctx"]["dwdp_config"]
+    hardware = _aggregated_hardware(submit_module, config, "ctx_only")
+    assert hardware["gpus_per_server"] == 8
+    assert hardware["total_nodes"] == 2
+
+
+# ------------------------- online-EPLB /dev/shm mount ----------------------------
+BENCHMARK_UTILS_PATH = REPO_ROOT / "jenkins" / "scripts" / "perf" / "benchmark_utils.py"
+KIMI_K25_EPLB416_CONFIG = (
+    "tests/scripts/perf-sanity/disaggregated/"
+    "gb300_kimi-k25-thinking-fp4_8k1k_con1024_ctx1_dep4_gen1_dep32_eplb416_mtp3_ccb-NIXL.yaml"
+)
+DSV4_STATIC_EPLB_CONFIG = (
+    "tests/scripts/perf-sanity/disaggregated/"
+    "gb300_deepseek-v4-pro-fp4_8k1k_con180_ctx3_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL.yaml"
+)
+
+
+@pytest.fixture
+def benchmark_utils_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    return _load_module(BENCHMARK_UTILS_PATH, monkeypatch)
+
+
+def _load_repo_yaml(relative_path: str) -> dict:
+    import yaml
+
+    with open(REPO_ROOT / relative_path) as f:
+        return yaml.safe_load(f)
+
+
+def _lb_config(load_balancer, role="gen") -> dict:
+    return {"worker_config": {role: {"moe_config": {"load_balancer": load_balancer}}}}
+
+
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        (_lb_config({"num_slots": 416, "layer_updates_per_iter": 1}), True),
+        (_lb_config({"num_slots": 416, "layer_updates_per_iter": 1}, role="ctx"), True),
+        (_lb_config({"num_slots": 384, "layer_updates_per_iter": 0}), False),
+        (_lb_config({"num_slots": 384}), False),
+        (_lb_config(None), False),
+        ({"worker_config": {"gen": {"moe_config": None}}}, False),
+        ({"worker_config": {"gen": None}}, False),
+        (
+            {
+                "server_configs": [
+                    {"moe_config": {"load_balancer": {"layer_updates_per_iter": 0}}},
+                    {"moe_config": {"load_balancer": {"layer_updates_per_iter": 2}}},
+                ]
+            },
+            True,
+        ),
+        ({}, False),
+        (None, False),
+    ],
+)
+def test_uses_online_eplb(benchmark_utils_module: ModuleType, config, expected):
+    assert benchmark_utils_module.uses_online_eplb(config) is expected
+
+
+def test_uses_online_eplb_reads_load_balancer_file(
+    benchmark_utils_module: ModuleType, tmp_path: Path
+):
+    (tmp_path / "online.yaml").write_text("num_slots: 288\nlayer_updates_per_iter: 1\n")
+    (tmp_path / "static.yaml").write_text("num_slots: 288\nlayer_updates_per_iter: 0\n")
+    assert benchmark_utils_module.uses_online_eplb(_lb_config("online.yaml"), str(tmp_path))
+    assert not benchmark_utils_module.uses_online_eplb(_lb_config("static.yaml"), str(tmp_path))
+    assert benchmark_utils_module.uses_online_eplb(
+        _lb_config(str(tmp_path / "online.yaml")), "/nonexistent"
+    )
+
+
+@pytest.mark.parametrize(
+    "server_config, expected",
+    [
+        ({"extra_llm_api_config_path": "online_extra.yaml"}, True),
+        ({"extra_llm_api_config_path": "lb_file_extra.yaml"}, True),
+        ({"extra_llm_api_config_path": "static_extra.yaml"}, False),
+        ({"extra_llm_api_config_path": "empty_extra.yaml"}, False),
+        # Inline fields replace the file's top-level keys, so this moe_config wins.
+        (
+            {
+                "extra_llm_api_config_path": "online_extra.yaml",
+                "moe_config": {"backend": "CUTEDSL"},
+            },
+            False,
+        ),
+    ],
+)
+def test_uses_online_eplb_reads_extra_llm_api_config(
+    benchmark_utils_module: ModuleType, tmp_path: Path, server_config, expected
+):
+    (tmp_path / "online_extra.yaml").write_text(
+        "moe_config:\n  load_balancer:\n    num_slots: 288\n    layer_updates_per_iter: 1\n"
+    )
+    (tmp_path / "static_extra.yaml").write_text(
+        "moe_config:\n  load_balancer:\n    num_slots: 288\n    layer_updates_per_iter: 0\n"
+    )
+    (tmp_path / "lb_file_extra.yaml").write_text("moe_config:\n  load_balancer: online.yaml\n")
+    (tmp_path / "online.yaml").write_text("num_slots: 288\nlayer_updates_per_iter: 1\n")
+    (tmp_path / "empty_extra.yaml").write_text("")
+    disagg_config = {"worker_config": {"gen": server_config}}
+    aggr_config = {"server_configs": [server_config]}
+    assert benchmark_utils_module.uses_online_eplb(disagg_config, str(tmp_path)) is expected
+    assert benchmark_utils_module.uses_online_eplb(aggr_config, str(tmp_path)) is expected
+
+
+def test_uses_online_eplb_rejects_non_mapping_extra_llm_api_config(
+    benchmark_utils_module: ModuleType, tmp_path: Path
+):
+    (tmp_path / "list_extra.yaml").write_text("- moe_config\n")
+    config = {"worker_config": {"gen": {"extra_llm_api_config_path": "list_extra.yaml"}}}
+    with pytest.raises(ValueError, match="does not contain a YAML mapping"):
+        benchmark_utils_module.uses_online_eplb(config, str(tmp_path))
+
+
+def test_uses_online_eplb_on_checked_in_configs(benchmark_utils_module: ModuleType):
+    assert benchmark_utils_module.uses_online_eplb(
+        _load_repo_yaml(KIMI_K25_EPLB416_CONFIG), str(REPO_ROOT)
+    )
+    assert not benchmark_utils_module.uses_online_eplb(
+        _load_repo_yaml(DSV4_STATIC_EPLB_CONFIG), str(REPO_ROOT)
+    )
+
+
+@pytest.mark.parametrize(
+    "mounts, expected_suffix",
+    [
+        ("", "tmpfs:/dev/shm:size=640G"),
+        ("/a:/a", "/a:/a,tmpfs:/dev/shm:size=640G"),
+        ("/a:/a,", "/a:/a,tmpfs:/dev/shm:size=640G"),
+        ("/x:/dev/shm/sub", "/x:/dev/shm/sub,tmpfs:/dev/shm:size=640G"),
+        ("/dev/shm:/host_shm", "/dev/shm:/host_shm,tmpfs:/dev/shm:size=640G"),
+    ],
+)
+def test_add_eplb_shm_mount_appends_for_online_eplb(
+    benchmark_utils_module: ModuleType, mounts, expected_suffix
+):
+    config = _lb_config({"num_slots": 416, "layer_updates_per_iter": 1})
+    assert benchmark_utils_module.add_eplb_shm_mount(mounts, config) == expected_suffix
+
+
+@pytest.mark.parametrize(
+    "mounts",
+    [
+        "/a:/a,tmpfs:/dev/shm:size=900G",
+        "/dev/shm",
+        "/a:/a,/dev/shm",
+        "/host/shm:/dev/shm/",
+    ],
+)
+def test_add_eplb_shm_mount_keeps_caller_dev_shm(benchmark_utils_module: ModuleType, mounts):
+    config = _lb_config({"num_slots": 416, "layer_updates_per_iter": 1})
+    assert benchmark_utils_module.add_eplb_shm_mount(mounts, config) == mounts
+
+
+def test_add_eplb_shm_mount_noop_without_online_eplb(benchmark_utils_module: ModuleType):
+    config = _lb_config({"num_slots": 384, "layer_updates_per_iter": 0})
+    assert benchmark_utils_module.add_eplb_shm_mount("/a:/a", config) == "/a:/a"
+
+
+def test_ci_submit_adds_eplb_shm_mount_to_launch_script(
+    ci_submit_module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    test_id = (
+        "perf/test_perf_sanity.py::test_e2e[disagg-gen_only-"
+        "gb300_kimi-k25-thinking-fp4_8k1k_con1024_ctx1_dep4_gen1_dep32_eplb416_mtp3_ccb-NIXL]"
+    )
+    test_list = tmp_path / "test_list.txt"
+    test_list.write_text(test_id + "\n")
+    prefix = tmp_path / "prefix.sh"
+    prefix.write_text(
+        "#!/bin/bash\n"
+        "export jobWorkspace=/ws\n"
+        'export pytestCommand="LLM_ROOT=/src LLM_MODELS_ROOT=/models '
+        "/src/tensorrt_llm/llmapi/trtllm-llmapi-launch pytest perf/test_perf_sanity.py "
+        '--test-prefix=/src/tests/integration/defs --test-list=/ws/test_list.txt --output-dir=/ws"\n'
+    )
+    srun_args = tmp_path / "srun_args.txt"
+    srun_args.write_text("--container-image=/img.sqsh --container-mounts=/a:/a,/b:/b\n")
+    launch = tmp_path / "launch.sh"
+    draft = REPO_ROOT / "jenkins" / "scripts" / "perf" / "disaggregated" / "slurm_launch_draft.sh"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "submit.py",
+            "--draft-launch-sh",
+            str(draft),
+            "--launch-sh",
+            str(launch),
+            "--run-sh",
+            "/run.sh",
+            "--install-sh",
+            "/install.sh",
+            "--llm-src",
+            str(REPO_ROOT),
+            "--test-list",
+            str(test_list),
+            "--script-prefix",
+            str(prefix),
+            "--srun-args",
+            str(srun_args),
+            "--stage-name",
+            "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-Post-Merge-1",
+        ],
+    )
+    ci_submit_module.main()
+    assert '"--container-mounts=/a:/a,/b:/b,tmpfs:/dev/shm:size=640G"' in launch.read_text()
+
+
+def test_local_submit_adds_eplb_shm_mount_to_launch_script(
+    local_submit_module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    test_id = (
+        "perf/test_perf_sanity.py::test_e2e[disagg-e2e-"
+        "gb300_kimi-k25-thinking-fp4_8k1k_con1024_ctx1_dep4_gen1_dep32_eplb416_mtp3_ccb-NIXL]"
+    )
+    _fake_sinfo(monkeypatch, local_submit_module, "gpu:4\n")
+    launch = tmp_path / "launch.sh"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "submit.py",
+            "--test-list",
+            test_id,
+            "--partition",
+            "batch",
+            "--account",
+            "acct",
+            "--job-name",
+            "job",
+            "--image",
+            "/img.sqsh",
+            "--mounts",
+            "/a:/a",
+            "--work-dir",
+            str(tmp_path),
+            "--launch-sh",
+            str(launch),
+            "--llm-src",
+            str(REPO_ROOT),
+            "--llm-models-root",
+            "/models",
+            "--cluster-name",
+            "oci-aga",
+        ],
+    )
+    local_submit_module.main()
+    content = launch.read_text()
+    assert f'"--container-mounts=/a:/a,{REPO_ROOT}:{REPO_ROOT},tmpfs:/dev/shm:size=640G"' in content

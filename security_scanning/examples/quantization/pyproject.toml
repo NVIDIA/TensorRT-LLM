@@ -7,7 +7,9 @@ authors = [
 ]
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "python-dateutil (<3.0.0)",
     "datasets (==3.1.0)",
+    "nemo-toolkit[all] (==2.0.0rc1)",
     "rouge-score (>=0.1.2,<0.2.0)",
     "transformers-stream-generator (==0.0.4)",
     "tiktoken (>=0.14.0,<0.15.0)",

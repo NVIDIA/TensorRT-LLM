@@ -8,8 +8,9 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Callable, ClassVar, Dict, Generic, Iterator, List,
-                    Literal, Optional, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Generic,
+                    Iterator, List, Literal, Optional, Tuple, Type, TypeVar,
+                    Union)
 
 import torch
 from torch import nn
@@ -17,8 +18,11 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm._errors import (ConfigInputError, ModelLoadError,
+                                  UnsupportedError)
 from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import local_mpi_rank
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
@@ -33,8 +37,15 @@ from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..speculative import SpecMetadata
+from ..utils import split
 from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
                           is_builtin_zoo_module)
+
+if TYPE_CHECKING:
+    # The checkpoints package imports this module, so import its loader base
+    # classes for type checking only.
+    from .checkpoints.base_config_loader import BaseConfigLoader
+    from .checkpoints.base_weight_loader import BaseWeightLoader
 
 
 @contextlib.contextmanager
@@ -106,6 +117,44 @@ class MetaInitMode(TorchDispatchMode):
             raise MetaInitException(
                 f"Meta tensor used in unsupported function: {func}")
         return func(*args, **kwargs)
+
+
+def concatenate_weights_by_tp_rank(components: list[torch.Tensor],
+                                   tp_size: int) -> torch.Tensor:
+    """Concatenate projection components in rank-major row order.
+
+    Args:
+        components: Tensors shaped ``[rows_i, ...]`` with matching trailing
+            dimensions. Each physical row count must be divisible by
+            ``tp_size``. Packed weights remain packed; callers must ensure
+            logical channel boundaries align with physical row boundaries.
+        tp_size: Number of tensor-parallel ranks.
+
+    Returns:
+        A tensor ordered as ``[c0_r0 | c1_r0 | ... | c0_r1 | c1_r1 | ...]``.
+        A contiguous row split gives each rank its slice of every component.
+        With one rank, this is a plain concatenation along dimension zero.
+    """
+    if not components:
+        raise ValueError("rank blocking requires at least one projection")
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    trailing_shape = components[0].shape[1:]
+    for component in components:
+        if component.ndim == 0 or component.shape[1:] != trailing_shape:
+            raise ValueError(
+                "rank-blocked projections must have matching trailing dimensions"
+            )
+        if component.shape[0] % tp_size:
+            raise ValueError(
+                f"projection rows {component.shape[0]} are not divisible by tp_size={tp_size}"
+            )
+    if tp_size == 1:
+        return torch.cat(components, dim=0)
+    rows: list[torch.Tensor] = []
+    for rank in range(tp_size):
+        rows.extend(split(c, tp_size, rank) for c in components)
+    return torch.cat(rows, dim=0)
 
 
 def duplicate_kv_weight(weight: torch.Tensor, num_kv_heads: int,
@@ -366,6 +415,44 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 remove_weights(layer)
 
 
+def layerwise_moe_quant_config(quant_config_dict: dict[str, QuantConfig],
+                               moe_name: str) -> QuantConfig | None:
+    """The ``quant_config_dict`` entry of the MoE module named ``moe_name``.
+
+    An entry naming the module itself answers first. ``ModelConfig`` injects
+    one per MoE layer for DeepSeek-V4 and MiniMax-M3 exactly because the
+    checkpoint's fine-grained per-linear expert keys do not describe the module
+    as a whole, and it appends it to an insertion-ordered dict, so those keys
+    would otherwise shadow it.
+
+    Failing that, all linear layers inside a MoE share one quant config, so the
+    first key that contains the module name answers for the whole module.
+    """
+    own_entry = quant_config_dict.get(moe_name)
+    if own_entry is not None:
+        return own_entry
+    for key, quant_config in quant_config_dict.items():
+        if moe_name in key:
+            return quant_config
+    return None
+
+
+def fused_checkpoint_names(module: nn.Module, name: str) -> list[str]:
+    """Checkpoint names of the projections fused into ``module``.
+
+    A fused ``Linear`` whose parts are not spelled ``gate_proj``/``up_proj`` or
+    ``q_proj``/``k_proj``/``v_proj`` declares their leaf names in a
+    ``fused_checkpoint_names`` attribute, e.g. ``("index_q_proj",
+    "index_k_proj")``. Both quantization passes match those names instead of
+    the fused module's own name. Returns an empty list when none are declared.
+    """
+    leaves = getattr(module, "fused_checkpoint_names", None)
+    if not leaves:
+        return []
+    prefix = name.rsplit('.', 1)[0]
+    return [f"{prefix}.{leaf}" for leaf in leaves]
+
+
 def apply_layerwise_quant_config(
         model_config: ModelConfig,
         named_modules: Iterator[tuple[str, nn.Module]]) -> None:
@@ -375,15 +462,26 @@ def apply_layerwise_quant_config(
             if getattr(module, '_skip_layerwise_quant_config', False):
                 continue
             if isinstance(module, (MoE, VanillaMoE)):
-                for n, q in quant_config_dict.items():
-                    # all linear layers inside FusedMoE share the same quant config
-                    if name in n:
-                        module.quant_config = q
-                        break
+                q = layerwise_moe_quant_config(quant_config_dict, name)
+                if q is not None:
+                    module.quant_config = q
             elif isinstance(module, Linear):
                 weight_mode = module.weights_loading_config.weight_mode
                 prefix_name = '.'.join(name.split('.')[:-1])
-                if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                fused_names = fused_checkpoint_names(module, name)
+                if fused_names:
+                    # The parts load into one weight, so they must agree.
+                    configs = [quant_config_dict.get(n) for n in fused_names]
+                    if any(q is not None for q in configs):
+                        if any(q is None
+                               for q in configs) or any(q != configs[0]
+                                                        for q in configs[1:]):
+                            raise ValueError(
+                                f"{', '.join(fused_names)} load into one fused "
+                                f"projection and need the same quantization, "
+                                f"got {configs}.")
+                        module.quant_config = configs[0]
+                elif weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
                     for n, q in quant_config_dict.items():
                         # gate_proj and up_proj share the same quant config
                         if prefix_name + '.gate_proj' in n or prefix_name + '.gate_up_proj' in n:
@@ -452,9 +550,19 @@ def apply_quant_config_exclude_modules(
                             name.replace('qkv_proj', 'k_proj'),
                             name.replace('qkv_proj', 'v_proj')
                         ]
+                fused_names = fused_checkpoint_names(module, name)
+                fused_excluded = [
+                    quant_config.is_module_excluded_from_quantization(n)
+                    for n in fused_names
+                ]
+                if any(fused_excluded) and not all(fused_excluded):
+                    raise ValueError(
+                        f"{', '.join(fused_names)} load into one fused "
+                        f"projection, but exclude_modules excludes only some "
+                        f"of them.")
                 is_excluded = any(
                     quant_config.is_module_excluded_from_quantization(n)
-                    for n in candidates)
+                    for n in candidates) or any(fused_excluded)
                 if is_excluded and getattr(module, "quant_config",
                                            None) is not None:
                     module.quant_config = new_config
@@ -465,6 +573,37 @@ def apply_quant_config_exclude_modules(
                     # update to their child backend.
                     if hasattr(module, '_weights_created'):
                         module._weights_created = False
+
+
+def moe_experts_quant_config(model_config: ModelConfig,
+                             experts_prefix: str) -> QuantConfig | None:
+    """The final quantization of the MoE experts at ``experts_prefix``.
+
+    What a model passes to ``create_moe`` as ``override_quant_config``: what
+    the ``__post_init__`` passes would leave on the layer, i.e. its
+    ``quant_config_dict`` entry (by the match ``apply_layerwise_quant_config``
+    uses), then the ``exclude_modules`` match, which wins.
+
+    Args:
+        model_config: The model's configuration.
+        experts_prefix: The experts module name, e.g.
+            ``"model.layers.3.mlp.experts"``.
+
+    Returns:
+        The experts' quantization, or ``None`` when it is the model-level
+        ``quant_config``.
+    """
+    override = None
+    if model_config.quant_config_dict is not None:
+        override = layerwise_moe_quant_config(model_config.quant_config_dict,
+                                              experts_prefix)
+    global_quant_config = model_config.quant_config
+    if (global_quant_config is not None
+            and global_quant_config.is_module_excluded_from_quantization(
+                experts_prefix)):
+        override = QuantConfig(
+            kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+    return override
 
 
 class PostInitCaller(type):
@@ -491,6 +630,9 @@ class DecoderModelForCausalLM(nn.Module,
 
     # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
     use_fx_for_pcg_fallback: ClassVar[bool] = True
+    # The model-specific TorchLlmArgs fields this model implements; the loader
+    # rejects a set one that is not listed.
+    model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(
@@ -573,13 +715,20 @@ class DecoderModelForCausalLM(nn.Module,
         # Quant config for lm_head (applies to both the attention-DP replicated
         # and TP lm_head below); None keeps it unquantized.
         lm_head_quant_config = self._resolve_lm_head_quant_config(config)
+        # The LM head sees every row; under helix + attention DP at tp_size 1
+        # the TP group shares requests, so it stays vocab-parallel. A tied LM
+        # head shares the embedding weight, so it keeps the embedding layout.
+        tied = getattr(config.pretrained_config, "tie_word_embeddings", False)
+        lm_head_mapping = (config.mapping
+                           if tied else config.mapping.mapping_for_full_rows())
 
-        if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
+        if lm_head_mapping.enable_attention_dp and not lm_head_mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
                 quant_config=lm_head_quant_config,
+                output_dtype=config.lm_head_output_dtype,
             )
         else:
             if (hasattr(config, 'lora_config')
@@ -602,13 +751,14 @@ class DecoderModelForCausalLM(nn.Module,
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
-                mapping=config.mapping,
+                mapping=lm_head_mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=config.lm_head_gather_output,
                 reduce_output=False,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
                 quant_config=lm_head_quant_config,
+                output_dtype=config.lm_head_output_dtype,
             )
 
             if self.has_custom_lm_head:
@@ -624,10 +774,13 @@ class DecoderModelForCausalLM(nn.Module,
 
         # use embedding weights in lm_head if tie word embedding is enabled
         if getattr(config.pretrained_config, 'tie_word_embeddings', False):
-            assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
-                "lm_head and vocab embedding should use the same TP size")
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
                 "lm_head and vocab embedding should use the same TP mode")
+            # Replicated weights have the same layout even when ADP's embedding
+            # retains the owner mapping and the LM head uses a singleton mapping.
+            if self.lm_head.tp_mode is not None:
+                assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
+                    "lm_head and vocab embedding should use the same TP size")
             self.lm_head.weight = self.model.embed_tokens.weight
             if config.mapping.is_last_pp_rank():
                 self.model.keep_embed_tokens = True
@@ -1092,6 +1245,21 @@ def register_external_model_modules(arch_to_module: Dict[str, str]) -> None:
     _rebuild_arch_registries(declared)
 
 
+def _model_arch_provider(model_arch: str) -> Optional[str]:
+    """The module to import for ``model_arch``, or ``None`` if no source lists it.
+
+    External declarations take precedence over the static index of built-in
+    architectures. Imports nothing; ``_ensure_model_registered`` and
+    ``is_model_arch_known`` both resolve providers through this function.
+    """
+    full_name = _EXTERNAL_ARCH_TO_MODULE.get(model_arch)
+    if full_name is None:
+        module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
+        if module_name is not None:
+            full_name = f"tensorrt_llm._torch.models.{module_name}"
+    return full_name
+
+
 def _ensure_model_registered(model_arch: str) -> None:
     """Import the module that provides ``model_arch``, if it isn't loaded yet.
 
@@ -1112,12 +1280,9 @@ def _ensure_model_registered(model_arch: str) -> None:
     registration decorator; the import itself is idempotent via
     ``sys.modules``.
     """
-    full_name = _EXTERNAL_ARCH_TO_MODULE.get(model_arch)
+    full_name = _model_arch_provider(model_arch)
     if full_name is None:
-        module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
-        if module_name is None:
-            return
-        full_name = f"tensorrt_llm._torch.models.{module_name}"
+        return
     try:
         importlib.import_module(full_name)
     except ModuleNotFoundError as e:
@@ -1142,6 +1307,18 @@ def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
     if model_arch not in MODEL_CLASS_MAPPING:
         _ensure_model_registered(model_arch)
     return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def is_model_arch_known(model_arch: str) -> bool:
+    """Whether ``get_registered_model_class`` has a source for ``model_arch``.
+
+    Checks the registry and then ``_model_arch_provider``, the same steps as
+    the lookup, but imports nothing, so it is cheap enough for checks that run
+    before the model is built. A provider whose module later fails to import
+    still counts as known; that error surfaces where the model is built.
+    """
+    return (model_arch in MODEL_CLASS_MAPPING
+            or _model_arch_provider(model_arch) is not None)
 
 
 def _is_builtin_draft_model_builder(builder) -> bool:
@@ -1318,7 +1495,7 @@ def register_vision_encoder(
     return wrapper
 
 
-def register_mapper(format: str, name: Optional[str] = None):
+def register_mapper(format: CheckpointFormat | str, name: Optional[str] = None):
 
     def decorator(cls):
         if name is not None:
@@ -1332,7 +1509,7 @@ def register_mapper(format: str, name: Optional[str] = None):
     return decorator
 
 
-def register_checkpoint_weight_loader(name: str):
+def register_checkpoint_weight_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name] = cls
@@ -1341,7 +1518,7 @@ def register_checkpoint_weight_loader(name: str):
     return decorator
 
 
-def register_checkpoint_loader(name: str):
+def register_checkpoint_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING[name] = cls
@@ -1350,7 +1527,7 @@ def register_checkpoint_loader(name: str):
     return decorator
 
 
-def register_config_loader(name: str):
+def register_config_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name] = cls
@@ -1359,13 +1536,14 @@ def register_config_loader(name: str):
     return decorator
 
 
-def get_checkpoint_weight_loader(name: str) -> Type["BaseWeightLoader"]:
+def get_checkpoint_weight_loader(
+        name: CheckpointFormat | str) -> Type["BaseWeightLoader"]:
     if name not in MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default checkpoint weight loader {name} not found.")
     return MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name]
 
 
-def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
+def get_config_loader(name: CheckpointFormat | str) -> Type["BaseConfigLoader"]:
     if name not in MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default config loader {name} not found.")
     return MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name]
@@ -1385,16 +1563,17 @@ def get_model_architecture(
             model_config.architectures) > 0:
         cls = get_registered_model_class(model_config.architectures[0])
     else:
-        raise RuntimeError("Model architecture is not provided.")
+        raise ModelLoadError("Model architecture is not provided.")
 
     if cls is None:
         arch = model_config.architectures[0]
         if arch in _GEMMA4_ARCHITECTURES:
-            raise RuntimeError(
+            raise ConfigInputError(
                 f"Gemma4 model support requires transformers>=5.5.0, "
                 f"please upgrade: pip install 'transformers>=5.5.0' "
-                f"(architecture: {arch}).")
-        raise RuntimeError(f"Unknown model architecture: {arch}")
+                f"(architecture: {arch}).",
+                reason="import")
+        raise UnsupportedError(f"Unknown model architecture: {arch}")
     return cls, model_config.architectures[0]
 
 
@@ -1459,6 +1638,26 @@ def filter_weights(prefix, weights: Dict):
             new_k = k[len(prefix) + 1:]
             result[new_k] = v
     return result
+
+
+_TORCH_COMPILE_WRAPPER_ATTR = "_orig_mod"
+
+
+def strip_torch_compile_wrapper(name: str) -> str:
+    """Drop the ``torch.compile`` wrapper segments from a module path.
+
+    ``torch.compile(module)`` returns an ``OptimizedModule`` whose only child
+    is the original module under the attribute ``_orig_mod``, so every path
+    below the compiled scope gains a ``_orig_mod`` component in
+    ``named_modules()`` / ``named_parameters()`` -- e.g.
+    ``model._orig_mod.layers.0.mlp`` for a checkpoint key prefix of
+    ``model.layers.0.mlp``. The wrapper owns no parameters of its own, so
+    removing the component gives back the path the checkpoint uses.
+    """
+    if _TORCH_COMPILE_WRAPPER_ATTR not in name:
+        return name
+    return '.'.join(part for part in name.split('.')
+                    if part != _TORCH_COMPILE_WRAPPER_ATTR)
 
 
 def _get_load_weights_num_workers() -> Optional[int]:
@@ -1582,6 +1781,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
+            # A torch.compile wrapper in the tree (refit into a compiled
+            # engine) inserts `_orig_mod` into the path; checkpoint keys
+            # never carry it.
+            name = strip_torch_compile_wrapper(name)
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
                 return
@@ -1732,8 +1935,12 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
 
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
-        if len(module._parameters) == 0 or weight_mapper.should_skip_module(
-                name):
+        if len(module._parameters) == 0:
+            return
+        # A torch.compile wrapper in the tree (refit into a compiled engine)
+        # inserts `_orig_mod` into the path; checkpoint keys never carry it.
+        name = strip_torch_compile_wrapper(name)
+        if weight_mapper.should_skip_module(name):
             return
 
         names = name.split('.')

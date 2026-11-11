@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA decode dispatch and Triton/CuTeDSL launch preparation."""
 
+import os
 from typing import Any
 
 import torch
@@ -27,6 +28,7 @@ from .config import (
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
     _fp4_mla_cutedsl_kernel_module,
+    _fp4_mla_packed_rows_per_seq,
 )
 from .layout import (
     _ensure_workspace_tensor,
@@ -46,6 +48,12 @@ from .metadata import (
     _infer_assume_full_pages,
     _materialize_fp4_mla_device_page_table_for_forward,
     _max_generation_pages,
+)
+from .packed_plan import (
+    _fp4_mla_packed_plan_geometry,
+    _get_sm_count,
+    _launch_fp4_mla_packed_plan,
+    _PackedPlanGeometry,
 )
 from .v_cache import (
     _get_cutedsl_persistent_v_packed_cache,
@@ -120,19 +128,6 @@ def _cutedsl_pad_q_and_sf_kernel(
         sf_values,
         mask=sf_col_mask[None, :],
     )
-
-
-_SM_COUNT_CACHE: dict[int, int] = {}
-
-
-def _get_sm_count(device: torch.device) -> int:
-    """Return the SM (multiprocessor) count for ``device``, cached per index."""
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    count = _SM_COUNT_CACHE.get(index)
-    if count is None:
-        count = torch.cuda.get_device_properties(index).multi_processor_count
-        _SM_COUNT_CACHE[index] = count
-    return count
 
 
 def _run_triton_attention_decode(
@@ -764,6 +759,159 @@ def _run_triton_attention_decode(
             )
 
 
+def _run_cutedsl_packed_decode(
+    module: Any,
+    metadata: Any,
+    q_fp4: torch.Tensor,
+    q_sf: torch.Tensor,
+    kv_cache: torch.Tensor,
+    sf_cache: torch.Tensor,
+    v_packed: torch.Tensor,
+    v_sf: torch.Tensor,
+    kv_global_scale: torch.Tensor,
+    q_global_scale: torch.Tensor,
+    src_page_ids: torch.Tensor,
+    page_indptr: torch.Tensor,
+    kv_lens: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    num_heads: int,
+    query_len: int,
+    num_requests: int,
+    rows_per_seq: int,
+    sm_scale: float,
+    v_page_offset: int,
+    helix_kv_bounds: torch.Tensor | None,
+    softmax_stats_tensor: torch.Tensor | None,
+    plan_geometry: _PackedPlanGeometry | None = None,
+) -> None:
+    """Packed CuTe DSL decode: one kernel over (split, request) tasks.
+
+    A single split writes the output (and Helix stats) directly; several
+    splits write FP32 partials that one reduction kernel folds into the
+    output and stats. Nothing pads, replicates, or copies Q or the output.
+    """
+    valid_m, physical_m = module.packed_query_rows(num_heads, query_len)
+    if physical_m != rows_per_seq:
+        raise RuntimeError(
+            f"FP4 MLA packed Q rows {rows_per_seq} do not match the kernel geometry {physical_m}."
+        )
+    if v_packed is None:
+        raise RuntimeError("FP4 MLA packed decode requires the persistent packed-V cache.")
+    if not output.is_contiguous() or output.numel() != num_requests * valid_m * 512:
+        raise RuntimeError(
+            "FP4 MLA packed decode requires a contiguous [tokens, heads, 512] output."
+        )
+    device = output.device
+    if plan_geometry is None:
+        plan_geometry = _fp4_mla_packed_plan_geometry(
+            metadata,
+            num_heads=num_heads,
+            query_len=query_len,
+            num_requests=num_requests,
+            device=device,
+            helix_kv_bounds=helix_kv_bounds,
+        )
+        if plan_geometry is None:
+            raise RuntimeError("FP4 MLA packed decode requires generation cache pages.")
+    splits = plan_geometry.splits
+    output_rows = output.view(num_requests * valid_m, 512)
+    stats_rows = None
+    if softmax_stats_tensor is not None:
+        stats_rows = softmax_stats_tensor.view(num_requests * valid_m, 2)
+    common = dict(
+        max_kv_len=plan_geometry.split_kv_len,
+        sm_scale=sm_scale,
+        num_heads=num_heads,
+        query_len=query_len,
+        num_requests=num_requests,
+        num_splits=splits,
+        q_global_scale=q_global_scale,
+        v_page_offset=v_page_offset,
+        helix_kv_bounds=helix_kv_bounds,
+    )
+    if splits == 1:
+        module.run_trtllm_fp4_mla_decode_packed(
+            q_fp4,
+            q_sf,
+            kv_cache,
+            sf_cache,
+            v_packed,
+            v_sf,
+            kv_global_scale,
+            src_page_ids,
+            page_indptr,
+            kv_lens,
+            output_rows,
+            softmax_stats=stats_rows,
+            **common,
+        )
+        return
+    from .fp4_mla_packed_reduce import reduce_packed_splits
+
+    tasks = splits * num_requests
+    task_capacity = plan_geometry.task_capacity
+    plan = plan_geometry.plan
+    # The first FP4 MLA kernel of the step wrote the plan fused with the
+    # generation lengths; a stale key means this call plans on other bounds.
+    if metadata.fp4_mla_state.packed_plan_key != plan_geometry.key:
+        _launch_fp4_mla_packed_plan(plan_geometry, kv_lens, metadata)
+    partial = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_packed_split_partial",
+        (task_capacity, physical_m, 512),
+        dtype=torch.float32,
+        device=device,
+    )[:tasks]
+    maxima = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_packed_split_maxima",
+        (task_capacity, physical_m),
+        dtype=torch.float32,
+        device=device,
+    )[:tasks]
+    sums = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_packed_split_sums",
+        (task_capacity, physical_m),
+        dtype=torch.float32,
+        device=device,
+    )[:tasks]
+    module.run_trtllm_fp4_mla_decode_packed(
+        q_fp4,
+        q_sf,
+        kv_cache,
+        sf_cache,
+        v_packed,
+        v_sf,
+        kv_global_scale,
+        src_page_ids,
+        page_indptr,
+        kv_lens,
+        output_rows,
+        split_kv_buffers=(partial, maxima, sums),
+        plan=plan,
+        **common,
+    )
+    reduce_packed_splits(
+        partial,
+        maxima,
+        sums,
+        output_rows,
+        q_global_scale,
+        kv_global_scale,
+        num_requests=num_requests,
+        num_splits=splits,
+        valid_m=valid_m,
+        physical_m=physical_m,
+        sm_scale=sm_scale,
+        plan=plan,
+        output_scale=1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
+        stats=stats_rows,
+        sm_count=_get_sm_count(device),
+    )
+
+
 def run_fp4_mla_attention_decode(
     metadata: Any,
     layer_idx: int,
@@ -877,30 +1025,57 @@ def run_fp4_mla_attention_decode(
         )
 
     capacity = int(q_batch_capacity)
-    expected_q_shape = (capacity * num_heads, FP4_MLA_Q_PACKED_DIM)
-    expected_q_sf_shape = (
-        _get_fp4_mla_swizzled_scale_size(
-            capacity * num_heads,
-            FP4_MLA_Q_LOGICAL_DIM,
-        ),
+    # The fused generation update records the Q layout it produced; metadata
+    # that never went through it (contract tests) carries the legacy layout.
+    recorded_rows_per_seq = getattr(
+        getattr(metadata, "fp4_mla_state", None), "prequantized_q_rows_per_seq", None
     )
-    if (
-        q.dtype != torch.bfloat16
-        or capacity <= 0
-        or num_queries > capacity
-        or tuple(prequantized_q.shape) != expected_q_shape
-        or prequantized_q.dtype != torch.uint8
-        or not prequantized_q.is_contiguous()
-        or tuple(prequantized_q_sf.shape) != expected_q_sf_shape
-        or prequantized_q_sf.dtype != torch.float8_e4m3fn
-        or not prequantized_q_sf.is_contiguous()
+    packed_rows_per_seq = int(recorded_rows_per_seq or 0)
+    if recorded_rows_per_seq is not None and packed_rows_per_seq != _fp4_mla_packed_rows_per_seq(
+        num_heads, query_len_per_seq
     ):
-        raise ValueError("FP4 MLA prequantized Q does not satisfy the fused-Q contract.")
-    active_q_rows = num_queries * num_heads
+        raise RuntimeError(
+            "FP4 MLA prequantized Q layout does not match the packed decode "
+            f"configuration (rows per request {packed_rows_per_seq})."
+        )
+    if packed_rows_per_seq:
+        active_q_rows = num_gen_seqs * packed_rows_per_seq
+    else:
+        active_q_rows = num_queries * num_heads
     active_q_sf_bytes = _get_fp4_mla_swizzled_scale_size(
         active_q_rows,
         FP4_MLA_Q_LOGICAL_DIM,
     )
+    if packed_rows_per_seq:
+        q_contract_ok = (
+            prequantized_q.ndim == 2
+            and prequantized_q.shape[0] >= active_q_rows
+            and prequantized_q.shape[1] == FP4_MLA_Q_PACKED_DIM
+            and prequantized_q_sf.numel() >= active_q_sf_bytes
+        )
+    else:
+        expected_q_shape = (capacity * num_heads, FP4_MLA_Q_PACKED_DIM)
+        expected_q_sf_shape = (
+            _get_fp4_mla_swizzled_scale_size(
+                capacity * num_heads,
+                FP4_MLA_Q_LOGICAL_DIM,
+            ),
+        )
+        q_contract_ok = (
+            tuple(prequantized_q.shape) == expected_q_shape
+            and tuple(prequantized_q_sf.shape) == expected_q_sf_shape
+        )
+    if (
+        q.dtype != torch.bfloat16
+        or capacity <= 0
+        or num_queries > capacity
+        or not q_contract_ok
+        or prequantized_q.dtype != torch.uint8
+        or not prequantized_q.is_contiguous()
+        or prequantized_q_sf.dtype != torch.float8_e4m3fn
+        or not prequantized_q_sf.is_contiguous()
+    ):
+        raise ValueError("FP4 MLA prequantized Q does not satisfy the fused-Q contract.")
     q_fp4 = prequantized_q[:active_q_rows]
     q_sf = prequantized_q_sf[:active_q_sf_bytes]
     q_global_scale = _get_fp4_mla_q_global_scale(metadata, q.device)
@@ -922,7 +1097,17 @@ def run_fp4_mla_attention_decode(
     # CUDA graph / one-engine MTP; recover the true total per sequence so the
     # per-query causal masking sees the full 1 + draft_len window (no-op when the
     # alias already matches).
-    kv_lens, _ = _fp4_mla_uniform_generation_lengths(metadata, num_queries, num_gen_seqs)
+    plan_geometry = _fp4_mla_packed_plan_geometry(
+        metadata,
+        num_heads=num_heads,
+        query_len=query_len_per_seq,
+        num_requests=num_gen_seqs,
+        device=q.device,
+        helix_kv_bounds=helix_kv_bounds,
+    )
+    kv_lens, _ = _fp4_mla_uniform_generation_lengths(
+        metadata, num_queries, num_gen_seqs, plan_geometry=plan_geometry
+    )
     _materialize_fp4_mla_device_page_table_for_forward(metadata, kv_lens)
     src_page_ids = _fp4_mla_generation_page_ids(metadata, num_gen_seqs)
     max_pages = _max_generation_pages(metadata)
@@ -955,10 +1140,28 @@ def run_fp4_mla_attention_decode(
             cutedsl_kernel.run_trtllm_fp4_mla_decode_page_native_from_raw
         )
 
+        # Keep general cases on the original path. This specialization uses
+        # the prepacked-V mufu16 core and linear six-query MTP only.
+        fold_queries = (
+            not packed_rows_per_seq
+            and num_heads == 6
+            and query_len_per_seq == 6
+            and num_gen_seqs == 1
+            and helix_kv_bounds is None
+            and softmax_stats_tensor is None
+            and getattr(cutedsl_kernel, "SUPPORTS_FOLDED_QUERIES", False)
+            and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
+            and getattr(metadata, "_fp4_mla_fold_q", True)
+            and os.environ.get("TRTLLM_FP4_MLA_FOLD_Q", "1") != "0"
+        )
+        if fold_queries:
+            from .fp4_mla_splitkv import select_split_count
+
+            fold_queries = select_split_count(max_pages * metadata.page_size) > 1
         physical_heads = 128
         kernel_q = q_fp4
         kernel_q_sf = q_sf
-        if num_heads < physical_heads:
+        if not packed_rows_per_seq and num_heads < physical_heads and not fold_queries:
             kernel_q_storage, kernel_q_sf_storage, q_batch_capacity = _prepare_fp4_mla_q_buffers(
                 metadata,
                 num_queries,
@@ -1064,6 +1267,71 @@ def run_fp4_mla_attention_decode(
                     "full-pool base and page offset."
                 )
 
+        if packed_rows_per_seq:
+            _run_cutedsl_packed_decode(
+                cutedsl_kernel,
+                metadata,
+                q_fp4,
+                q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                q_global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                output,
+                num_heads=num_heads,
+                query_len=query_len_per_seq,
+                num_requests=num_gen_seqs,
+                rows_per_seq=packed_rows_per_seq,
+                sm_scale=float(sm_scale),
+                v_page_offset=v_page_offset,
+                helix_kv_bounds=helix_kv_bounds,
+                softmax_stats_tensor=softmax_stats_tensor,
+                plan_geometry=plan_geometry,
+            )
+            return
+
+        from .fp4_mla_splitkv import run_fp4_mla_splitkv, select_split_count
+
+        if fold_queries:
+            from .fp4_mla_foldq import run_fp4_mla_foldq
+
+            run_fp4_mla_foldq(
+                cutedsl_kernel,
+                metadata,
+                q_fp4,
+                q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                output,
+                splits=select_split_count(max_pages * metadata.page_size),
+                max_kv_len=max_pages * metadata.page_size,
+                sm_scale=float(sm_scale),
+                q_global_scale=q_global_scale,
+                query_len_per_seq=query_len_per_seq,
+                v_page_offset=v_page_offset,
+            )
+            return
+
+        # Helix also needs per-query bounds and softmax stats from the native path.
+        splits = (
+            select_split_count(max_pages * metadata.page_size)
+            if helix_kv_bounds is None and softmax_stats_tensor is None
+            else 1
+        )
+        direct_split_output = splits > 1 and getattr(
+            metadata, "_fp4_mla_splitkv_direct_output", True
+        )
         kernel_output = output
         kernel_softmax_stats = None
         if softmax_stats_tensor is not None:
@@ -1074,40 +1342,64 @@ def run_fp4_mla_attention_decode(
                 dtype=torch.float32,
                 device=output.device,
             )
-        if num_heads < physical_heads:
+        if num_heads < physical_heads and not direct_split_output:
             kernel_output = _ensure_workspace_tensor(
                 metadata,
                 "_fp4_mla_cutedsl_output_buf",
-                (num_queries, physical_heads, kv_lora_rank),
+                (q_batch_capacity, physical_heads, kv_lora_rank),
                 dtype=output.dtype,
                 device=output.device,
-            )
+            )[:num_queries]
 
-        run_trtllm_fp4_mla_decode_page_native_from_raw(
-            kernel_q,
-            kernel_q_sf,
-            kv_cache,
-            sf_cache,
-            core_v_packed,
-            core_v_sf,
-            global_scale,
-            src_page_ids,
-            metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
-            kv_lens,
-            kernel_output,
-            max_kv_len=max_pages * metadata.page_size,
-            sm_scale=float(sm_scale),
-            num_heads=physical_heads,
-            q_global_scale=q_global_scale,
-            page_size=metadata.page_size,
-            query_len_per_seq=query_len_per_seq,
-            v_page_offset=v_page_offset,
-            q_batch_capacity=q_batch_capacity,
-            partition_runtime_valid_k=bool(getattr(metadata, "is_cuda_graph", False)),
-            softmax_row_max=(None if kernel_softmax_stats is None else kernel_softmax_stats[0]),
-            softmax_row_sum=(None if kernel_softmax_stats is None else kernel_softmax_stats[1]),
-            helix_kv_bounds=helix_kv_bounds,
-        )
+        if splits > 1:
+            run_fp4_mla_splitkv(
+                _fp4_mla_cutedsl_kernel_module(),
+                metadata,
+                kernel_q,
+                kernel_q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                kernel_output,
+                splits=splits,
+                max_kv_len=max_pages * metadata.page_size,
+                sm_scale=float(sm_scale),
+                q_global_scale=q_global_scale,
+                query_len_per_seq=query_len_per_seq,
+                v_page_offset=v_page_offset,
+                q_batch_capacity=q_batch_capacity,
+            )
+        else:
+            run_trtllm_fp4_mla_decode_page_native_from_raw(
+                kernel_q,
+                kernel_q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                kernel_output,
+                max_kv_len=max_pages * metadata.page_size,
+                sm_scale=float(sm_scale),
+                num_heads=physical_heads,
+                q_global_scale=q_global_scale,
+                page_size=metadata.page_size,
+                query_len_per_seq=query_len_per_seq,
+                v_page_offset=v_page_offset,
+                q_batch_capacity=q_batch_capacity,
+                partition_runtime_valid_k=bool(getattr(metadata, "is_cuda_graph", False)),
+                softmax_row_max=(None if kernel_softmax_stats is None else kernel_softmax_stats[0]),
+                softmax_row_sum=(None if kernel_softmax_stats is None else kernel_softmax_stats[1]),
+                helix_kv_bounds=helix_kv_bounds,
+            )
         if kernel_output is not output:
             output.copy_(kernel_output[:, :num_heads])
         if kernel_softmax_stats is not None:

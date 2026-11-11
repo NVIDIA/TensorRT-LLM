@@ -31,6 +31,7 @@ from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.usage import usage_lib
 from tensorrt_llm.usage.config import TelemetryField
 from tensorrt_llm.usage.llmapi_config import collect_llm_api_config_payloads
+from tensorrt_llm.watermark import WatermarkConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -216,6 +217,22 @@ def test_collect_llm_api_config_is_deterministic_for_effective_torch_args():
     assert meta["args_class"] == "TorchLlmArgs"
     assert meta["schema_digest"]
     assert meta["capture_manifest_digest"]
+
+
+def test_collect_llm_api_config_excludes_the_watermark_key():
+    key = 987654321012345
+    args = TorchLlmArgs(
+        model="/customer/private/Llama",
+        skip_tokenizer_init=True,
+        watermark_config=WatermarkConfig(key=key, context_width=6),
+    )
+
+    config_json, meta_json = collect_llm_api_config_payloads(args)
+    config = json.loads(config_json)
+
+    assert config["watermark_config.context_width"] == 6
+    assert "watermark_config.key" not in config
+    assert str(key) not in config_json + meta_json
 
 
 def test_collect_llm_api_config_captures_nvfp4_kv_cache_dtype():
@@ -709,6 +726,24 @@ def test_collect_llm_api_config_captures_decoding_type_for_every_arm():
     assert _walk_captured_keys(auto) >= {"decoding_type"}
 
 
+def test_collect_llm_api_config_captures_spec_dec_variant_with_decoding_type():
+    """The algorithm version is captured next to its decoding_type family."""
+    from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig
+
+    args = TorchLlmArgs(
+        model="/customer/private/Llama",
+        skip_tokenizer_init=True,
+        speculative_config=NGramDecodingConfig(max_draft_len=2),
+    )
+    config, _ = _loads_payloads(args)
+    assert config["speculative_config.decoding_type"] == "NGram"
+    assert config["speculative_config.spec_dec_variant"] == 1
+
+    args.speculative_config.spec_dec_variant = 2
+    config, _ = _loads_payloads(args)
+    assert config["speculative_config.spec_dec_variant"] == 2
+
+
 def test_collect_llm_api_config_captures_max_total_draft_tokens_for_every_arm():
     """Inherited safe fields remain capturable on concrete model arms."""
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -866,15 +901,18 @@ def test_collect_llm_api_config_honors_raw_json_schema_extra_exclude():
     assert config == {"kept": 1}
 
 
-def test_manifest_excludes_loosely_typed_model_children():
-    # B-1 regression: moe_config.load_balancer is Optional[Union[object, str]];
-    # a validator coerces it into a MoeLoadBalancerConfig at runtime, but the
-    # annotation names no BaseModel, so its children must NOT be capturable.
+def test_manifest_includes_safe_load_balancer_fields():
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
     from tensorrt_llm.usage.llmapi_config import build_capture_manifest
 
-    paths = {e.path for e in build_capture_manifest(TorchLlmArgs)}
-    assert not any(p.startswith("moe_config.load_balancer.") for p in paths)
+    paths = {entry.path for entry in build_capture_manifest(TorchLlmArgs)}
+    assert {
+        "moe_config.load_balancer.auxiliary_sms",
+        "moe_config.load_balancer.layer_updates_per_iter",
+        "moe_config.load_balancer.mode",
+        "moe_config.load_balancer.num_slots",
+    } <= paths
+    assert "moe_config.load_balancer.initial_global_assignments" not in paths
 
 
 def test_collect_llm_api_config_caps_total_payload_size(monkeypatch):

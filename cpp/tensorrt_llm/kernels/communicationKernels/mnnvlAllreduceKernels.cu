@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cuda/atomic>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_pipeline.h>
 #include <optional>
 #include <tuple>
@@ -976,13 +977,223 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(MnnvlAllReduceKern
     }
 }
 
+// =============================== E4M3 two-shot payload ===============================
+// AllReduceFusionParams::fp8Payload (BF16, H % 1024 == 0, residual RMSNorm fusion, 2 / 4 / 8 ranks): both Lamport
+// stages carry E4M3 instead of BF16. A row is H E4M3 bytes followed by H / 256 FP32 scales, one per warp of the
+// all-reduce kernel (32 lanes x 8 elements): values x * (448 / amax) rounded to E4M3 (RN, satfinite), scale
+// amax * (1 / 448). The owner of a token sums the other ranks' dequantized vectors and its own exact input in rank
+// order (FP32), quantizes the sum the same way and multicasts it; rmsNormLamport takes BF16(E4M3 x scale). Each stage
+// moves half the bytes; the reduced value carries two E4M3 roundings, so this is not bitwise the BF16 path. A word
+// equal to the Lamport sentinel (E4M3 +0, +0, +0, -0) is stored as four +0.
+namespace fp8payload
+{
+constexpr uint32_t kSentinel = 0x80000000u;
+constexpr uint32_t kScaleBlock = 256;
+
+__host__ __device__ inline uint32_t rowBytes(uint32_t tokenDim)
+{
+    return tokenDim + tokenDim / kScaleBlock * 4;
+}
+
+inline __device__ uint32_t ldVolatileU32(void const* ptr)
+{
+    uint32_t v;
+    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(v) : "l"(ptr) : "memory");
+    return v;
+}
+
+inline __device__ uint2 ldVolatileU32x2(void const* ptr)
+{
+    uint2 v;
+    asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr) : "memory");
+    return v;
+}
+
+// Two FP32 -> two E4M3 (RN, satfinite) in the low 16 bits, lo first. The PTX needs SM 8.9+.
+inline __device__ uint32_t e4m3x2(float lo, float hi)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+    uint16_t h;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(h) : "f"(hi), "f"(lo));
+    return h;
+#else
+    return __nv_cvt_float2_to_fp8x2(make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3);
+#endif
+}
+
+// Four E4M3 (byte i = element i) -> four FP32 (exact, through FP16).
+inline __device__ void e4m3x4ToFloat(uint32_t w, float* out)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+    uint32_t h01, h23;
+    asm("{\n\t.reg .b16 lo, hi;\n\tmov.b32 {lo, hi}, %2;\n\tcvt.rn.f16x2.e4m3x2 %0, lo;\n\t"
+        "cvt.rn.f16x2.e4m3x2 %1, hi;\n\t}"
+        : "=r"(h01), "=r"(h23)
+        : "r"(w));
+    asm("{\n\t.reg .b16 a, b;\n\tmov.b32 {a, b}, %2;\n\tcvt.f32.f16 %0, a;\n\tcvt.f32.f16 %1, b;\n\t}"
+        : "=f"(out[0]), "=f"(out[1])
+        : "r"(h01));
+    asm("{\n\t.reg .b16 a, b;\n\tmov.b32 {a, b}, %2;\n\tcvt.f32.f16 %0, a;\n\tcvt.f32.f16 %1, b;\n\t}"
+        : "=f"(out[2]), "=f"(out[3])
+        : "r"(h23));
+#else
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+    {
+        out[i]
+            = __half2float(__half(__nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(w >> (8 * i)), __NV_E4M3)));
+    }
+#endif
+}
+
+// max |x| over the warp's 32 x 8 values (every lane gets it), at least 1e-30.
+inline __device__ float warpAmax(float const (&x)[8])
+{
+    float m = fabsf(x[0]);
+#pragma unroll
+    for (int i = 1; i < 8; i++)
+    {
+        m = fmaxf(m, fabsf(x[i]));
+    }
+#pragma unroll
+    for (int k = 16; k > 0; k >>= 1)
+    {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, k));
+    }
+    return fmaxf(m, 1e-30f);
+}
+
+// Eight values -> eight E4M3 (two words) on the warp's scale; returns the scale. Every lane of the warp must call it.
+inline __device__ float quantize8(float const (&x)[8], uint2& q)
+{
+    float const amax = warpAmax(x);
+    float const inv = __fdiv_rn(448.F, amax);
+    uint32_t const w0 = e4m3x2(__fmul_rn(x[0], inv), __fmul_rn(x[1], inv))
+        | (e4m3x2(__fmul_rn(x[2], inv), __fmul_rn(x[3], inv)) << 16);
+    uint32_t const w1 = e4m3x2(__fmul_rn(x[4], inv), __fmul_rn(x[5], inv))
+        | (e4m3x2(__fmul_rn(x[6], inv), __fmul_rn(x[7], inv)) << 16);
+    q.x = w0 == kSentinel ? 0U : w0;
+    q.y = w1 == kSentinel ? 0U : w1;
+    return __fmul_rn(amax, 1.F / 448.F);
+}
+} // namespace fp8payload
+
+// The two-shot all-reduce with the E4M3 payload (grid and stages as twoshotAllreduceKernel; H % 1024 == 0, so every
+// thread is in bounds and a warp covers one 256-element scale block). The fused rmsNormLamport (Fp8Payload) waits for
+// the BROADCAST stage and updates the flags.
+template <uint8_t WorldSize>
+__global__ __launch_bounds__(128) void twoshotAllreduceKernelFp8(MnnvlAllReduceKernelParams<__nv_bfloat16> params)
+{
+    using T = __nv_bfloat16;
+    constexpr int kELTS_PER_THREAD = 8;
+
+    int const packedIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    int const token = blockIdx.x;
+    int const threadOffset = token * params.tokenDim + packedIdx * kELTS_PER_THREAD;
+    int const destRank = token % WorldSize;
+    int const destTokenOffset = token / WorldSize;
+    uint32_t const rowBytes = fp8payload::rowBytes(params.tokenDim);
+    uint32_t const dataOff = packedIdx * kELTS_PER_THREAD;
+    uint32_t const scaleOff = params.tokenDim + packedIdx / 32 * 4;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+    LamportFlags<float4> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
+
+    char* scatterBufLocal
+        = reinterpret_cast<char*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], MNNVLTwoShotStage::SCATTER));
+    char* scatterBufDest
+        = reinterpret_cast<char*>(flag.getCurLamportBuf(params.inputPtrs[destRank], MNNVLTwoShotStage::SCATTER));
+    char* broadcastBufW = reinterpret_cast<char*>(flag.getCurLamportBuf(params.mcastPtr, MNNVLTwoShotStage::BROADCAST));
+
+    // =============================== Scatter: E4M3 + the warp's scale ===============================
+    float x[kELTS_PER_THREAD];
+    {
+        PackedVec<float4, T> val;
+        val.packed = loadPacked<float4>(&params.shardPtr[threadOffset]);
+#pragma unroll
+        for (int i = 0; i < kELTS_PER_THREAD; i++)
+        {
+            x[i] = cuda_cast<float, T>(val.elements[i]);
+        }
+        uint2 q;
+        float const scale = fp8payload::quantize8(x, q);
+        char* row = scatterBufDest + (static_cast<size_t>(destTokenOffset) * WorldSize + params.rank) * rowBytes;
+        *reinterpret_cast<uint2*>(row + dataOff) = q;
+        if (threadIdx.x % 32 == 0)
+        {
+            *reinterpret_cast<uint32_t*>(row + scaleOff) = __float_as_uint(scale);
+        }
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
+    flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], MNNVLTwoShotStage::SCATTER);
+
+    // =============================== Reduction and Broadcast ===============================
+    // Owner (uniform per CTA): every rank's E4M3 vector and scale, FP32 sum in rank order with its own input exact,
+    // then the sum quantized the same way into every rank's BROADCAST stage.
+    if (destRank == params.rank)
+    {
+        char const* rows = scatterBufLocal + static_cast<size_t>(destTokenOffset) * WorldSize * rowBytes;
+        uint32_t got[WorldSize][3];
+        bool valid = false;
+        while (!valid)
+        {
+            valid = true;
+#pragma unroll
+            for (int r = 0; r < WorldSize; r++)
+            {
+                uint2 const d = fp8payload::ldVolatileU32x2(rows + r * rowBytes + dataOff);
+                uint32_t const sw = fp8payload::ldVolatileU32(rows + r * rowBytes + scaleOff);
+                got[r][0] = d.x;
+                got[r][1] = d.y;
+                got[r][2] = sw;
+                valid &= d.x != fp8payload::kSentinel && d.y != fp8payload::kSentinel && sw != fp8payload::kSentinel;
+            }
+        }
+        float accum[kELTS_PER_THREAD];
+#pragma unroll
+        for (int i = 0; i < kELTS_PER_THREAD; i++)
+        {
+            accum[i] = 0.F;
+        }
+#pragma unroll
+        for (int r = 0; r < WorldSize; r++)
+        {
+            float const sc = __uint_as_float(got[r][2]);
+            float d[kELTS_PER_THREAD];
+            fp8payload::e4m3x4ToFloat(got[r][0], d);
+            fp8payload::e4m3x4ToFloat(got[r][1], d + 4);
+#pragma unroll
+            for (int i = 0; i < kELTS_PER_THREAD; i++)
+            {
+                accum[i] = __fadd_rn(accum[i], r == params.rank ? x[i] : __fmul_rn(d[i], sc));
+            }
+        }
+        uint2 q;
+        float const scale = fp8payload::quantize8(accum, q);
+        char* row = broadcastBufW + static_cast<size_t>(token) * rowBytes;
+        *reinterpret_cast<uint2*>(row + dataOff) = q;
+        if (threadIdx.x % 32 == 0)
+        {
+            *reinterpret_cast<uint32_t*>(row + scaleOff) = __float_as_uint(scale);
+        }
+    }
+
+    flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], MNNVLTwoShotStage::BROADCAST);
+}
+
 // This kernel works performant when loads_per_thread is 1.
 // For this mode, we are able to support up to 1024 (threads) x 8 (elements) = 8192 hidden dimension.
 // There are two options for further scaling up:
 //      1. Use CGA if supported. It expands the hidden dimension to 8k x 8 = 64k.
 //      2. Set loads_per_thread >1. Which can be used if CGA is not supported. Note that this will be limited by the
 //      shared memory size and register count.
-template <typename T, ar_fusion::AllReduceFusionPattern Pattern, bool UseCGA, int LoadsPerThread = 1>
+template <typename T, ar_fusion::AllReduceFusionPattern Pattern, bool UseCGA, int LoadsPerThread = 1,
+    bool Fp8Payload = false>
 __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParams<T> params)
 {
     static int const kELTS_PER_LOAD = sizeof(float4) / sizeof(T);
@@ -1081,12 +1292,38 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
             {
 
                 float4* dst4 = reinterpret_cast<float4*>(&smemInput[threadLoadOffset]);
-                float4 const* src4 = reinterpret_cast<float4 const*>(&input[offsets[i]]);
+                if constexpr (Fp8Payload)
+                {
+                    // This token's E4M3 row (H bytes, then H / 256 FP32 scales): BF16(E4M3 x scale) into smem.
+                    uint32_t const elt = blockOffset * blockChunkSize + threadLoadOffset;
+                    char const* row = reinterpret_cast<char const*>(input)
+                        + static_cast<size_t>(token) * fp8payload::rowBytes(params.tokenDim);
+                    uint2 const d = fp8payload::ldVolatileU32x2(row + elt);
+                    uint32_t const sw
+                        = fp8payload::ldVolatileU32(row + params.tokenDim + elt / fp8payload::kScaleBlock * 4);
+                    valid
+                        &= d.x != fp8payload::kSentinel && d.y != fp8payload::kSentinel && sw != fp8payload::kSentinel;
+                    float f[8];
+                    fp8payload::e4m3x4ToFloat(d.x, f);
+                    fp8payload::e4m3x4ToFloat(d.y, f + 4);
+                    float const sc = __uint_as_float(sw);
+                    PackedVec<float4, T> deq;
+#pragma unroll
+                    for (int j = 0; j < 8; j++)
+                    {
+                        deq.elements[j] = cuda_cast<T, float>(__fmul_rn(f[j], sc));
+                    }
+                    *dst4 = deq.packed;
+                }
+                else
+                {
+                    float4 const* src4 = reinterpret_cast<float4 const*>(&input[offsets[i]]);
 
-                auto loaded = loadPackedVolatile<float4>(src4);
-                // Assume that the 16B were written atomically, so we only need to check one value
-                valid &= !isLamportDirty(loaded);
-                *dst4 = loaded.packed;
+                    auto loaded = loadPackedVolatile<float4>(src4);
+                    // Assume that the 16B were written atomically, so we only need to check one value
+                    valid &= !isLamportDirty(loaded);
+                    *dst4 = loaded.packed;
+                }
             }
         }
     }
@@ -1188,9 +1425,18 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
 #endif
 
     // Update the buffer pointers
-    flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(params.numTokens, params.nRanks) * params.nRanks
-                            * params.tokenDim * kELTS_SIZE),
-        static_cast<uint32_t>(params.numTokens * params.tokenDim * kELTS_SIZE), 0, 0});
+    if constexpr (Fp8Payload)
+    {
+        uint32_t const rowBytes = fp8payload::rowBytes(params.tokenDim);
+        flag.waitAndUpdate({divUp<uint32_t>(params.numTokens, params.nRanks) * params.nRanks * rowBytes,
+            static_cast<uint32_t>(params.numTokens) * rowBytes, 0, 0});
+    }
+    else
+    {
+        flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(params.numTokens, params.nRanks) * params.nRanks
+                                * params.tokenDim * kELTS_SIZE),
+            static_cast<uint32_t>(params.numTokens * params.tokenDim * kELTS_SIZE), 0, 0});
+    }
 }
 
 void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
@@ -1207,6 +1453,13 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     int const arNumBlocksPerToken = divUp(arNumThreads, 128);
 
     dim3 arGrid(numTokens, arNumBlocksPerToken);
+
+    // E4M3 Lamport payload (fp8payload above); the norm kernel reads the E4M3 rows.
+    bool const fp8Payload = params.fp8Payload && params.dType == tensorrt_llm::DataType::kBF16 && params.rmsNormFusion
+        && tokenDim % 1024 == 0 && (params.nRanks == 2 || params.nRanks == 4 || params.nRanks == 8)
+        && (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm
+            || params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP8Quant
+            || params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
 
     cudaLaunchAttribute arAttrs[1];
     arAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -1226,6 +1479,8 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T)                                                                         \
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&arConfig, &twoshotAllreduceKernel<WORLD_SIZE, T>, kernelParams));
+#define LAUNCH_ALLREDUCE_KERNEL_FP8(WORLD_SIZE)                                                                        \
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&arConfig, &twoshotAllreduceKernelFp8<WORLD_SIZE>, kernelParams));
     auto dispatchAR = [&](auto* type_ptr) -> bool
     {
         using T = std::remove_pointer_t<decltype(type_ptr)>;
@@ -1238,6 +1493,19 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             reinterpret_cast<T*>(params.bufferPtrLocal), mcastPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
             !params.rmsNormFusion, params.layout};
+        if constexpr (std::is_same_v<T, __nv_bfloat16>)
+        {
+            if (fp8Payload)
+            {
+                switch (params.nRanks)
+                {
+                case 2: LAUNCH_ALLREDUCE_KERNEL_FP8(2); return true;
+                case 4: LAUNCH_ALLREDUCE_KERNEL_FP8(4); return true;
+                case 8: LAUNCH_ALLREDUCE_KERNEL_FP8(8); return true;
+                }
+                return false;
+            }
+        }
         switch (params.nRanks)
         {
         case 2: LAUNCH_ALLREDUCE_KERNEL(2, T); return true;
@@ -1251,6 +1519,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     };
 
 #undef LAUNCH_ALLREDUCE_KERNEL
+#undef LAUNCH_ALLREDUCE_KERNEL_FP8
 
     bool launched = (params.dType == tensorrt_llm::DataType::kFLOAT && dispatchAR((float*) nullptr))
         || (params.dType == tensorrt_llm::DataType::kBF16 && dispatchAR((__nv_bfloat16*) nullptr))
@@ -1306,12 +1575,32 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             "threads_needed: %d",
             numTokens, rnClusterSize, rnBlockSize, rnClusterSize, rnLoadsPerThread, divUp(tokenDim, numEltsPerThread));
 
-#define RUN_RMSNORM_KERNEL(T, PATTERN, USE_CGA, LOADS_PER_THREAD)                                                      \
-    TLLM_CUDA_CHECK(cudaFuncSetAttribute(&rmsNormLamport<T, PATTERN, USE_CGA, LOADS_PER_THREAD>,                       \
+#define RUN_RMSNORM_KERNEL_IMPL(T, PATTERN, USE_CGA, LOADS_PER_THREAD, FP8)                                            \
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(&rmsNormLamport<T, PATTERN, USE_CGA, LOADS_PER_THREAD, FP8>,                  \
         cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));                                                       \
     rnConfig.dynamicSmemBytes = smemSize;                                                                              \
     TLLM_CUDA_CHECK(                                                                                                   \
-        cudaLaunchKernelEx(&rnConfig, &rmsNormLamport<T, PATTERN, USE_CGA, LOADS_PER_THREAD>, kernelParams));
+        cudaLaunchKernelEx(&rnConfig, &rmsNormLamport<T, PATTERN, USE_CGA, LOADS_PER_THREAD, FP8>, kernelParams));
+#define RUN_RMSNORM_KERNEL(T, PATTERN, USE_CGA, LOADS_PER_THREAD)                                                      \
+    RUN_RMSNORM_KERNEL_IMPL(T, PATTERN, USE_CGA, LOADS_PER_THREAD, false)
+
+// The E4M3-payload norm (fp8Payload: BF16 and one of these three patterns).
+#define DISPATCH_RMSNORM_PATTERN_FP8(T, USE_CGA, LOADS_PER_THREAD)                                                     \
+    if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm)                                       \
+    {                                                                                                                  \
+        RUN_RMSNORM_KERNEL_IMPL(                                                                                       \
+            T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm, USE_CGA, LOADS_PER_THREAD, true);                \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP8Quant)                          \
+    {                                                                                                                  \
+        RUN_RMSNORM_KERNEL_IMPL(                                                                                       \
+            T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP8Quant, USE_CGA, LOADS_PER_THREAD, true);        \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        RUN_RMSNORM_KERNEL_IMPL(                                                                                       \
+            T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, USE_CGA, LOADS_PER_THREAD, true);     \
+    }
 
 #define DISPATCH_RMSNORM_PATTERN(T, USE_CGA, LOADS_PER_THREAD)                                                         \
     if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm)                                       \
@@ -1372,6 +1661,32 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
                 reinterpret_cast<T*>(params.multicastPtr), params.quantOut, params.scaleOut, params.scaleFactor,
                 numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
                 false, params.layout};
+            if constexpr (std::is_same_v<T, __nv_bfloat16>)
+            {
+                if (fp8Payload)
+                {
+                    if (rnUseCGA)
+                    {
+                        DISPATCH_RMSNORM_PATTERN_FP8(T, true, 1);
+                    }
+                    else
+                    {
+                        switch (rnLoadsPerThread)
+                        {
+                        case 1: DISPATCH_RMSNORM_PATTERN_FP8(T, false, 1); break;
+                        case 2: DISPATCH_RMSNORM_PATTERN_FP8(T, false, 2); break;
+                        case 3: DISPATCH_RMSNORM_PATTERN_FP8(T, false, 3); break;
+                        case 4: DISPATCH_RMSNORM_PATTERN_FP8(T, false, 4); break;
+                        case 5: DISPATCH_RMSNORM_PATTERN_FP8(T, false, 5); break;
+                        case 6: DISPATCH_RMSNORM_PATTERN_FP8(T, false, 6); break;
+                        case 7: DISPATCH_RMSNORM_PATTERN_FP8(T, false, 7); break;
+                        case 8: DISPATCH_RMSNORM_PATTERN_FP8(T, false, 8); break;
+                        default: return false;
+                        }
+                    }
+                    return true;
+                }
+            }
             if (rnUseCGA)
             {
                 DISPATCH_RMSNORM_PATTERN(T, true, 1);
@@ -1402,7 +1717,9 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] Failed to dispatch rmsnorm lamport kernel.");
         }
 #undef RUN_RMSNORM_KERNEL
+#undef RUN_RMSNORM_KERNEL_IMPL
 #undef DISPATCH_RMSNORM_PATTERN
+#undef DISPATCH_RMSNORM_PATTERN_FP8
     }
 }
 

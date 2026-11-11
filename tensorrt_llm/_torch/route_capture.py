@@ -91,7 +91,7 @@ ROUTE_CAPTURE_ATTR = "route_capture"
 def get_active_route_capture() -> Optional["RouteCapture"]:
     """The capturer of the model engine whose forward is currently running.
 
-    Reads the per-forward model extra attrs set by ``PyTorchModelEngine.forward``;
+    Reads the per-forward model extra attrs set by ``ModelEngine.forward``;
     ``None`` outside a forward or when Router Replay is disabled for that engine.
     """
     attrs = get_model_extra_attrs()
@@ -182,7 +182,7 @@ class RouteCapture:
     store is immutable history. Each committed position holds the full [L, K]
     (all MoE layers for that token, filled in one forward).
 
-    One instance per ``PyTorchModelEngine`` (``model_engine.route_capture``),
+    One instance per ``ModelEngine`` (``model_engine.route_capture``),
     built by ``RouteCapture.create``; the engine exposes it to the MoE routing
     hook through its model extra attrs (see ``get_active_route_capture``).
     """
@@ -460,7 +460,7 @@ class RouteCapture:
         self._had_context = False
         for req in scheduled_batch.context_requests:
             # A context request contributes ONLY this forward's chunk of prompt
-            # tokens, mirroring DecoderRunner._prepare_inputs:
+            # tokens, mirroring DecoderInputPreparer.prepare_inputs:
             #   begin = req.context_current_position
             #   toks  = req.get_tokens(0)[begin : begin + req.context_chunk_size]
             # Using py_prompt_len (the full prompt) misattributes every row under

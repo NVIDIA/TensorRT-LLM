@@ -13,6 +13,7 @@ is strictly unchanged from the inlined version.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -145,7 +146,7 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional image_reference / video_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference / audio_reference files
         """
         request_received = raw_request.state.server_arrival_time
         # Prefixes this request's output files (``{video_id}_{i}``).
@@ -234,16 +235,13 @@ class _VideoRoutesMixin:
                 format=resolved_fmt,
                 frame_rate=output.frame_rate or request.frame_rate or params.frame_rate,
             )
-            if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "1") != "0":
-                # Offload the blocking ffmpeg encode to a thread-pool executor so
-                # the event loop can start the next request's diffusion while this
-                # video encodes. Only overlaps when >=2 requests are in flight per
-                # server (i.e. client num_workers > server count).
-                saved_paths = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: output.save(paths_in, **_save_kwargs)
-                )
-            else:
-                saved_paths = output.save(paths_in, **_save_kwargs)
+            # Offload the blocking ffmpeg encode to a thread-pool executor so
+            # the event loop can start the next request's diffusion while this
+            # video encodes. Only overlaps when >=2 requests are in flight per
+            # server (i.e. client num_workers > server count).
+            saved_paths = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: output.save(paths_in, **_save_kwargs)
+            )
             latency = time.perf_counter() - sync_video_start  # seconds
             metrics = output.metrics
             generation = metrics.generation if metrics is not None else 0.0
@@ -309,10 +307,35 @@ class _VideoRoutesMixin:
             form = await raw_request.form()
             data = {}
             for key in form:
+                if key in _REFERENCE_FIELDS:
+                    # Preserve repeated uploads and JSON objects/lists in their
+                    # per-slot wire order. FormData[key] keeps only the last part.
+                    references = []
+                    for value in form.getlist(key):
+                        if hasattr(value, "file"):
+                            references.append(value)
+                            continue
+                        if value == "":
+                            continue
+                        try:
+                            reference = json.loads(value)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(
+                                f"'{key}' must be an uploaded file or a JSON object/list string "
+                                f'like {{"content": ..., "format": "url"}}; {exc}'
+                            ) from exc
+                        references.append(reference)
+                    if len(references) == 1:
+                        data[key] = references[0]
+                    elif references:
+                        data[key] = [
+                            item
+                            for reference in references
+                            for item in (reference if isinstance(reference, list) else [reference])
+                        ]
+                    continue
                 value = form[key]
                 if hasattr(value, "file"):
-                    # Uploaded reference file (image_reference / video_reference)
-                    # — pass through so the conversion layer reads ``.file``.
                     data[key] = value
                     continue
                 if key == "extra_params":
@@ -323,19 +346,6 @@ class _VideoRoutesMixin:
                     except json.JSONDecodeError as exc:
                         raise ValueError(
                             f"'extra_params' must be a JSON object string; {exc}"
-                        ) from exc
-                    continue
-                if key in _REFERENCE_FIELDS:
-                    # A reference sent as a text part is the object form; a file
-                    # part was already routed above and carries its own format.
-                    if value == "":
-                        continue
-                    try:
-                        data[key] = json.loads(value)
-                    except json.JSONDecodeError as exc:
-                        raise ValueError(
-                            f"'{key}' must be an uploaded file or a JSON object string "
-                            f'like {{"content": ..., "format": "url"}}; {exc}'
                         ) from exc
                     continue
                 if value == "":
@@ -388,7 +398,7 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional image_reference / video_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference / audio_reference files
         """
         request_received = raw_request.state.server_arrival_time
         # Prefixes this request's output files and keys its VIDEO_STORE entry.
@@ -528,15 +538,23 @@ class _VideoRoutesMixin:
                     format=resolved_fmt,
                     frame_rate=output.frame_rate or request.frame_rate or params.frame_rate,
                 )
-                if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "1") != "0":
-                    # Offload the blocking encode to a thread so the event loop
-                    # stays responsive during ``postprocessing`` — pollers can
-                    # observe the state and other requests progress meanwhile.
-                    saved_paths = await asyncio.get_running_loop().run_in_executor(
-                        None, lambda: output.save(paths_in, **_save_kwargs)
-                    )
-                else:
-                    saved_paths = output.save(paths_in, **_save_kwargs)
+                # Offload the blocking encode to a thread so the event loop
+                # stays responsive during ``postprocessing`` — pollers can
+                # observe the state and other requests progress meanwhile.
+                save_future = asyncio.get_running_loop().run_in_executor(
+                    None, lambda: output.save(paths_in, **_save_kwargs)
+                )
+                try:
+                    saved_paths = await asyncio.shield(save_future)
+                except asyncio.CancelledError:
+                    # A cancel cannot stop the encode once the thread picked it
+                    # up, and ``delete_video`` cleans up by path before this
+                    # coroutine records them. Outwait the thread and remove what
+                    # it wrote, so the cancellation leaves nothing behind.
+                    with contextlib.suppress(Exception):
+                        for path in await save_future:
+                            Path(path).unlink(missing_ok=True)
+                    raise
             latency = time.perf_counter() - background_start  # seconds
             metrics = output.metrics
             generation = metrics.generation if metrics is not None else 0.0

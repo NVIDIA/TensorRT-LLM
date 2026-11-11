@@ -16,4 +16,3 @@ kv_cache_config:
 cache_transceiver_config:
   backend: NIXL
   transceiver_runtime: PYTHON
-  max_tokens_in_buffer: 8192

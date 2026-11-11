@@ -41,6 +41,7 @@ report -- the caller of ``subscribe()`` chooses what, if anything, to send; see 
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import os
@@ -78,10 +79,22 @@ _PEER_GONE = frozenset(
 )
 
 
+def safe_print(message: str) -> None:
+    """Write one diagnostic line to stderr; a write failure is dropped, not raised.
+
+    Used by callers throughout this package for whom this is the last line of defense
+    before control returns to product, pytest, or mpi4py code -- a closed or broken
+    stream there must not turn a diagnostic into a second, unrelated failure. CPython's
+    own ``warnings`` and ``logging`` modules guard their stderr writes the same way.
+    """
+    with contextlib.suppress(Exception):
+        print(message, file=sys.stderr)
+
+
 def _report_unexpected(what: str, exc: OSError) -> None:
     """Surface an errno the protocol does not treat as routine."""
     if getattr(exc, "errno", None) not in _PEER_GONE:
-        print(f"[cbts] {what}: {exc!r}", file=sys.stderr)
+        safe_print(f"[cbts] {what}: {exc!r}")
 
 
 _CONTEXT = "C"
@@ -131,14 +144,30 @@ TAINT_STOPPED_RECORDING = "subscriber_stopped_recording"
 # while those tests lose its coverage entirely, and never having heard an announcement is
 # exactly what stops it naming them.
 TAINT_NOT_SUBSCRIBED = "context_channel_unreachable"
-# Recorded by an MPI pool worker's own bootstrap (sitecustomize.py) when the backstop
-# timer (CBTS_WORKER_ACTIVATE_MAX_SECONDS) fires before the framework import completes.
-# An MPI pool worker always leaves its import phase unrecorded, by design, and that gap
-# alone is not tainted. This reason is for the rarer case where the deferral itself ran
-# unusually long: the default budget is already past the documented worst-case cold
-# import, so hitting it signals an abnormally slow run worth flagging. Stage-scoped: the
-# process cannot name which tests ran during the delay, only that it does not know.
-TAINT_ACTIVATION_TIMEOUT = "worker_activation_timeout"
+# Recorded by the process itself: sys.monitoring's PY_START tool could not be enabled
+# (another tool already held the id, or registering the callback failed), so this
+# process records zero touches for its entire life. Stage-scoped of necessity -- it may
+# go on to serve many tests, all silently blank, and nothing else can see the failure.
+TAINT_PY_START_UNAVAILABLE = "py_start_unavailable"
+# Recorded by the coordinator about itself: forwarding the channel address into a pool
+# worker's env failed (``install_pool_env_patch``), so that worker is spawned without
+# it and -- unlike a worker whose address is merely late -- has no later retry to find
+# it either. Stage-scoped of necessity: which future tests that worker goes on to serve
+# is unknown from the coordinator's side, and not knowing is exactly the failure.
+TAINT_POOL_ENV_UNAVAILABLE = "pool_env_unavailable"
+# Recorded by the producer about itself: its own per-test context switch
+# (``hooks.active.switch_test_context``) or announcement to subscribers failed. The
+# current test is tainted directly (its rows may belong to the superseded context);
+# every later test is tainted too, stage-scoped, since whether the failure was a
+# one-off or a sign the mechanism is now broken for the rest of the session cannot be
+# told from here.
+TAINT_CONTEXT_SWITCH_FAILED = "context_switch_failed"
+# Recorded by the producer about itself: something in ``pytest_sessionfinish``'s own
+# teardown (closing the channel, folding in collected taints or diagnostics) failed
+# outside the narrower paths that already self-taint. Stage-scoped of necessity, same
+# reasoning as ``TAINT_NO_CHANNEL`` -- a producer-side session failure has no way to
+# name which tests it affects.
+TAINT_SESSION_TEARDOWN_FAILED = "session_teardown_failed"
 
 # AF_UNIX paths are capped near 108 bytes, well below what a CI workspace path can reach,
 # so the socket lives in a short per-user directory rather than beside the coverage data.

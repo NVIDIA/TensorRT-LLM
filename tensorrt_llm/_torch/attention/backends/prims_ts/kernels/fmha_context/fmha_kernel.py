@@ -33,6 +33,13 @@ Schedule phase terms follow TS schedule-builder naming. HEAD is the one-time
 schedule before the repeated K/V tile loop, LOOP is the repeated K/V tile body,
 and TAIL is the one-time cleanup and drain after LOOP exits.
 
+VC-Attention is the low-bit attention recipe of Li et al. 2026, arXiv
+2609.15810, value smoothing with a softmax cast. Names with the ``vc`` prefix
+belong to its recipes: QK16 keeps bf16 Q and K, QK8 adds centred, Hadamard
+rotated E4M3 Q and K with block scales, and both store E4M3 V as residuals
+around each 128-token tile mean, which the kernel restores inside the online
+softmax.
+
 Feature Support Matrix:
 
   | Feature          | Support                                                                                       |
@@ -137,13 +144,15 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any, Tuple
 
+import importlib
+
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cuda.bindings import driver as cuda_drv
-from cutlass import Int32
+from cutlass import Float32, Int32
 from ..tensor_map import create_tensor_map_ragged_from_tensor
 
 from cutlass.experimental.task_scheduling.memory import (
@@ -170,6 +179,7 @@ from .fmha_resources import (
     SmemKVResource,
     SmemOResource,
     SmemPageOffsetsKvResource,
+    SmemSageKScalesResource,
     SmemQResource,
     TmemOResource,
     TmemPResource,
@@ -178,7 +188,13 @@ from .fmha_resources import (
     TmemStatsResource,
     TmemStatsDoneResource,
     TmemPPrefixReadyResource,
+    MX_SCALE_TILE_BYTES,
 )
+from ...vc_attention import vc_mean_operand_shape
+from .vc_attention.vc_resources import SmemMuResource
+from .sage_scales import validate_context_sage_layout
+from ...sage.layout import _SageScaleLayout
+from ...sage.modes import SageKTransport
 from .fmha_tasks import (
     PackedContextWorkQueue,
     create_correction_task,
@@ -198,6 +214,22 @@ from .helpers import (
     variable_window_cta_min_start,
 )
 from cutlass.experimental import primitives as prims
+
+
+def _compact_q_prefix_min_rows(q: cute.Tensor) -> int | None:
+    """Rows needed for a proven 128 KiB contiguous prefix, or None if unproven."""
+    if len(q.shape) != 3:
+        return None
+    h, d = q.shape[1:]
+    element_bits = q.element_type.width
+    if not all(isinstance(x, int) for x in (h, d, element_bits, *q.stride)):
+        return None
+    if h <= 0 or d <= 0 or element_bits not in (8, 16):
+        return None
+    if tuple(q.stride) != (h * d, d, 1):
+        return None
+    row_bytes = h * d * (element_bits // 8)
+    return (128 * 1024 + row_bytes - 1) // row_bytes
 
 
 def _as_i32(x: int | Int32) -> Int32:
@@ -665,18 +697,28 @@ def build_context_task_manager(
     tma_k_desc: cutlass.Pointer | None,
     tma_v_desc: cutlass.Pointer | None,
     tma_o_desc: cutlass.Pointer | None,
+    tma_mu_desc: cutlass.Pointer | None = None,
+    vc_q_scale: cute.Tensor | None = None,
+    vc_k_scale: cute.Tensor | None = None,
+    q_scales: cute.Tensor | None = None,
+    k_scales: cute.Tensor | None = None,
+    vc_repair_tiles: int = 0,
     cum_seqlen_q: cute.Tensor | None,
     cum_seqlen_k: cute.Tensor | None,
     variable_window_token_starts: cute.Tensor | None = None,
     variable_window_token_ends: cute.Tensor | None = None,
     variable_window_cta_starts: cute.Tensor | None = None,
     variable_window_q_stride: int | Int32 = 0,
-    scale_softmax_log2: cute.Tensor | None = None,
-    output_scale: cute.Tensor | None = None,
+    scale_softmax_log2: Float32 | None = None,
+    output_scale: Float32 | cute.Tensor | None = None,
+    lse_output: cute.Tensor | None = None,
+    attention_sinks: cute.Tensor | None = None,
     g_block_tables: cute.Pointer | None = None,
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
+    sage_scales: cute.Pointer | None = None,
+    num_kv_heads: int | Int32 = 0,
     num_kv_tiles: int | Int32,
     q_offset: int | Int32,
     domain_n_kwargs: DomainKwargs,
@@ -687,7 +729,7 @@ def build_context_task_manager(
     is_persistent: bool = True,
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
-    exhaustive_deadlock_race_check: bool = True,
+    exhaustive_deadlock_race_check: bool | None = None,
 ) -> Tuple[
     TaskManager,
     list[MemoryResource],
@@ -699,9 +741,13 @@ def build_context_task_manager(
 ]:
     """Build the FMHA TaskManager with all resources, tasks, and dependency graph.
 
-    ``scale_softmax_log2`` and ``output_scale`` are optional one-element
-    float32 device tensors. Resource setup loads element 0 once before the K/V
-    loop and reuses the value through task-local dataflow. ``scale_softmax_log2``
+    ``sage_scales`` is a Sage plan's prepared FP32 scale buffer
+    (``cfg.sage_scale_layout``), whose sequences are strided by
+    ``num_kv_heads``; the softmax groups and the correction warps read it in
+    place.
+
+    ``scale_softmax_log2`` and ``output_scale`` are runtime float32 scalars.
+    Resources carry these operands through task-local dataflow. ``scale_softmax_log2``
     is the base-2 softmax multiplier, normally
     ``softmax_scale * log2(e)``; FP8 callers can fold Q/K dequant scales into
     it. ``output_scale`` multiplies the final O store; FP8 output can fold the
@@ -723,6 +769,16 @@ def build_context_task_manager(
         TMA descriptor pointers for Q, K, V, O.
     cum_seqlen_q, cum_seqlen_k : cute.Tensor, optional
         Cumulative sequence-length metadata for varlen launches.
+    tma_mu_desc : cutlass.Pointer, optional
+        TMA descriptor of the VC-Attention tile-mean operands, the B operand of
+        the mean UMMA step. None unless the kernel restores means.
+    vc_q_scale, vc_k_scale : cute.Tensor, optional
+        VC-Attention-QK8 dequantization scales, one per 128-token Q block and
+        per K/V tile, in the flat per-sequence slot order of ``vc_scales``.
+        None under QK16.
+    vc_repair_tiles : int
+        VC-Attention repair tiles appended to the K/V sequence, kept out of
+        the softmax denominator. Zero without V repair.
     num_kv_tiles : int or Int32
         Number of KV tiles in the loop domain.
     q_offset : int or Int32
@@ -744,9 +800,10 @@ def build_context_task_manager(
     clc_response_ptr : cute.Pointer, optional
         SMEM pointer for the CLC response buffer, required when
         ``is_clc_dynamic`` is true.
-    exhaustive_deadlock_race_check : bool
-        Whether TaskManager runs the exhaustive schedule checker during
-        construction.
+    exhaustive_deadlock_race_check : bool, optional
+        Whether TaskManager runs the exhaustive schedule checker. By default,
+        concrete offline domains enable it; symbolic JIT domains retain the
+        structural checks. An explicit Boolean overrides that default.
     Returns
     -------
     tuple
@@ -802,9 +859,11 @@ def build_context_task_manager(
     # SmemQ: TmaUmma, topology-derived stages, Load -> MMA. The paired D128
     # schedule uses two Q instances; staged D256 uses one.
     # advance_on_wait=True advances consumer_state on ConsumerWait.
+    # MXFP8 Q/K adds one scale atom to every Q and K load.
+    scale_bytes = MX_SCALE_TILE_BYTES if cfg.use_mxfp8_qk else 0
     smem_q_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.q_stage,
-        num_bytes=cfg.tma_copy_q_bytes * cfg.cta_group_size,
+        num_bytes=(cfg.tma_copy_q_bytes + scale_bytes) * cfg.cta_group_size,
         producer_group=tma_producer_group,
         consumer_group=pipeline.CooperativeGroup(Agent.Thread),
         cta_layout_vmnk=cluster_shape_vmnk,
@@ -820,7 +879,7 @@ def build_context_task_manager(
     # K and V share this pipeline unless their dtypes differ in width.
     smem_kv_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.kv_stage_k,
-        num_bytes=cfg.tma_copy_kv_bytes * cfg.cta_group_size,
+        num_bytes=(cfg.tma_copy_kv_bytes + scale_bytes) * cfg.cta_group_size,
         producer_group=tma_producer_group,
         consumer_group=pipeline.CooperativeGroup(Agent.Thread),
         cta_layout_vmnk=cluster_shape_vmnk,
@@ -863,6 +922,7 @@ def build_context_task_manager(
 
         # The load warp (1 warp = 32 threads) is the only consumer; signal-All
         # requires the consumer group to size match num_warps × warp_size.
+        # Connect the auxiliary page-ID producer to the load warp for num_stages slots.
         def make_page_offsets_pipeline_cfg(num_stages: int) -> PipelineConfig:
             return PipelineConfig.create_async_async_pipeline_cfg(
                 num_stages=num_stages,
@@ -1017,6 +1077,7 @@ def build_context_task_manager(
         tma_q_desc=tma_q_desc,
         pipeline_config=smem_q_pipeline_cfg,
         cfg=cfg,
+        q_scales=q_scales,
         name="smem_q",
     )
     smem_page_offsets_kv: SmemPageOffsetsKvResource | None = None
@@ -1054,6 +1115,7 @@ def build_context_task_manager(
         tma_k_desc=tma_k_desc,
         tma_v_desc=None if split_kv else tma_v_desc,
         pipeline_config=smem_kv_pipeline_cfg,
+        k_scales=k_scales,
         role="k" if split_kv else "kv",
         name="smem_k" if split_kv else "smem_kv",
         **kv_resource_kwargs,
@@ -1067,6 +1129,35 @@ def build_context_task_manager(
             role="v",
             name="smem_v",
             **kv_resource_kwargs,
+        )
+    # Mu is the per-tile mean of V. V tile t is stored as E4M3 residuals
+    # V8_t = V_t - mu_t, so the PV product splits into
+    #   O = sum_t P_t V8_t + sum_t rowsum(P_t) mu_t
+    # and the second term is a bf16 K=16 UMMA per group of sixteen tiles with
+    # the row sums as A and the means as B. Mu is therefore a UMMA operand
+    # like K and V and must sit in shared memory. The load warp stages it
+    # beside each V tile and the UMMA warp consumes it.
+    smem_mu: SmemMuResource | None = None
+    if cfg.vc_restores_means:
+        smem_mu_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
+            num_stages=cfg.vc_mean_stages,
+            # Under two-CTA UMMA each CTA stages the N/2 channels of the mean
+            # operand its half of the M=256 step reads (like V columns).
+            num_bytes=cfg.vc_mean_tile_bytes,
+            producer_group=tma_producer_group,
+            consumer_group=pipeline.CooperativeGroup(Agent.Thread),
+            cta_layout_vmnk=cluster_shape_vmnk,
+            advance_on_wait=True,
+            num_bytes_per_warp_per_cta=cfg.vc_mean_tile_bytes // cfg.cta_group_size
+            if two_cta
+            else None,
+            **tma_umma_leader_kwargs,
+        )
+        smem_mu = SmemMuResource(
+            tma_mu_desc=tma_mu_desc,
+            pipeline_config=smem_mu_pipeline_cfg,
+            cfg=cfg,
+            name="smem_mu",
         )
 
     # WorkQueue: persistent tile scheduler state (static or CLC dynamic), not
@@ -1105,15 +1196,12 @@ def build_context_task_manager(
             "pipeline_config": work_queue_pipeline_cfg,
             "name": "work_queue",
         }
-        if (
-            cfg.is_causal
-            and cfg.has_varlen
-            and not cfg.has_uniform_varlen
-            and cum_seqlen_q is not None
-        ):
+        if (cfg.has_varlen and not cfg.has_uniform_varlen) or g_seq_lens_kv is not None:
             work_queue = PackedContextWorkQueue(
                 cfg=cfg,
                 cum_seqlen_q=cum_seqlen_q,
+                cum_seqlen_k=cum_seqlen_k,
+                seq_lens_kv=g_seq_lens_kv,
                 **work_queue_kwargs,
             )
         else:
@@ -1128,15 +1216,12 @@ def build_context_task_manager(
             "tile_scheduler_config": tile_scheduler_config,
             "name": "work_queue",
         }
-        if (
-            cfg.is_causal
-            and cfg.has_varlen
-            and not cfg.has_uniform_varlen
-            and cum_seqlen_q is not None
-        ):
+        if (cfg.has_varlen and not cfg.has_uniform_varlen) or g_seq_lens_kv is not None:
             work_queue = PackedContextWorkQueue(
                 cfg=cfg,
                 cum_seqlen_q=cum_seqlen_q,
+                cum_seqlen_k=cum_seqlen_k,
+                seq_lens_kv=g_seq_lens_kv,
                 **work_queue_kwargs,
             )
         else:
@@ -1164,6 +1249,26 @@ def build_context_task_manager(
             for index in range(cfg.num_qkv_instances)
         ]
     smem_p0, smem_p1 = smem_p_resources
+    # Sage ring transport (``SageKTransport.SMEM``): the load warp stages each
+    # K tile's sfK words in a ring both softmax groups read.
+    smem_sage_k: SmemSageKScalesResource | None = None
+    if cfg.sage_k_transport is SageKTransport.SMEM:
+        smem_sage_k = SmemSageKScalesResource(
+            pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
+                num_stages=cfg.sage_k_scale_stages,
+                producer_group=pipeline.CooperativeGroup(Agent.Thread, warp_size),
+                consumer_group=pipeline.CooperativeGroup(
+                    Agent.Thread,
+                    cfg.num_qkv_instances * num_softmax_warps * warp_size,
+                ),
+                cta_layout_vmnk=cluster_shape_vmnk,
+                producer_op=pipeline.PipelineOp.AsyncLoad,
+            ),
+            cfg=cfg,
+            sage_scales=sage_scales,
+            num_kv_heads=num_kv_heads,
+            name="smem_sage_k",
+        )
     tmem_sp0 = TmemSPResource(
         pipeline_config=tmem_sp0_pipeline_cfg,
         cfg=cfg,
@@ -1174,12 +1279,19 @@ def build_context_task_manager(
         cum_seqlen_q=cum_seqlen_q,
         cum_seqlen_k=cum_seqlen_k,
         seq_lens_kv=g_seq_lens_kv,
+        max_seq_len_kv=max_seq_len_kv,
         variable_window_token_starts=variable_window_token_starts,
         variable_window_token_ends=variable_window_token_ends,
         variable_window_cta_starts=variable_window_cta_starts,
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         smem_p=smem_p0,
+        vc_q_scale=vc_q_scale,
+        vc_k_scale=vc_k_scale,
+        vc_repair_tiles=vc_repair_tiles,
+        sage_scales=sage_scales,
+        num_kv_heads=num_kv_heads,
+        smem_k=smem_kv,
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
@@ -1196,6 +1308,11 @@ def build_context_task_manager(
         tmem_vec_offset=cfg.tmem_vec0_offset,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
+        lse_output=lse_output,
+        attention_sinks=attention_sinks,
+        cum_seqlen_q=cum_seqlen_q,
+        query_seq_len=variable_window_q_stride,
+        peer_idx=0,
         name="tmem_vec0",
     )
     smem_o_0 = SmemOResource(
@@ -1203,6 +1320,8 @@ def build_context_task_manager(
         cfg=cfg,
         stage_idx=0,
         tmem_vec_resource=tmem_vec0,
+        sage_scales=sage_scales,
+        num_kv_heads=num_kv_heads,
         name="smem_o_0",
     )
     gmem_o_0 = GmemOResource(
@@ -1267,12 +1386,20 @@ def build_context_task_manager(
             cum_seqlen_q=cum_seqlen_q,
             cum_seqlen_k=cum_seqlen_k,
             seq_lens_kv=g_seq_lens_kv,
+            max_seq_len_kv=max_seq_len_kv,
             variable_window_token_starts=variable_window_token_starts,
             variable_window_token_ends=variable_window_token_ends,
             variable_window_cta_starts=variable_window_cta_starts,
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             smem_p=smem_p1,
+            vc_q_scale=vc_q_scale,
+            vc_k_scale=vc_k_scale,
+            vc_repair_tiles=vc_repair_tiles,
+            sage_scales=sage_scales,
+            num_kv_heads=num_kv_heads,
+            score_seed_owner=tmem_sp0,
+            smem_k=smem_kv,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -1281,6 +1408,11 @@ def build_context_task_manager(
             tmem_vec_offset=cfg.tmem_vec1_offset,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
+            lse_output=lse_output,
+            attention_sinks=attention_sinks,
+            cum_seqlen_q=cum_seqlen_q,
+            query_seq_len=variable_window_q_stride,
+            peer_idx=1,
             name="tmem_vec1",
         )
         smem_o_1 = SmemOResource(
@@ -1288,6 +1420,8 @@ def build_context_task_manager(
             cfg=cfg,
             stage_idx=1,
             tmem_vec_resource=tmem_vec1,
+            sage_scales=sage_scales,
+            num_kv_heads=num_kv_heads,
             name="smem_o_1",
         )
         gmem_o_1 = GmemOResource(
@@ -1355,6 +1489,8 @@ def build_context_task_manager(
         work_queue,
         smem_page_offsets_kv=smem_page_offsets_kv,
         smem_page_offsets_v=smem_page_offsets_v,
+        smem_mu=smem_mu,
+        smem_sage_k=smem_sage_k,
         **domain_n_kwargs,
     )
     mma_task = create_mma_task(
@@ -1373,6 +1509,7 @@ def build_context_task_manager(
         tmem_p_prefix_ready_1=tmem_p_prefix_ready_1,
         smem_p0=smem_p0,
         smem_p1=smem_p1,
+        smem_mu=smem_mu,
         **mma_domain_kwargs,
     )
 
@@ -1387,6 +1524,7 @@ def build_context_task_manager(
         work_queue,
         tmem_p_prefix_ready=tmem_p_prefix_ready_0,
         smem_p=smem_p0,
+        smem_sage_k=smem_sage_k,
         **softmax0_domain_kwargs,
     )
     softmax1_task: Task | None = None
@@ -1402,6 +1540,7 @@ def build_context_task_manager(
             work_queue,
             tmem_p_prefix_ready=tmem_p_prefix_ready_1,
             smem_p=smem_p1,
+            smem_sage_k=smem_sage_k,
             **softmax1_domain_kwargs,
         )
     correction_task = create_correction_task(
@@ -1526,6 +1665,8 @@ def build_context_task_manager(
         if smem_page_offsets_v is not None:
             smem_v_deps.append(smem_page_offsets_v)
         resource_dependency_graph[smem_v] = scheduler_deps(*smem_v_deps)
+    if smem_mu is not None:
+        resource_dependency_graph[smem_mu] = scheduler_deps(gmem_qkv)
     resource_dependency_graph.update(
         {
             tmem_sp0: scheduler_deps(
@@ -1570,6 +1711,8 @@ def build_context_task_manager(
         resource_dependency_graph[work_queue] = [work_queue] if is_clc_dynamic else []
     if smem_page_offsets_kv is not None:
         resource_dependency_graph[smem_page_offsets_kv] = scheduler_deps(gmem_qkv)
+    if smem_sage_k is not None:
+        resource_dependency_graph[smem_sage_k] = scheduler_deps(gmem_qkv)
     if smem_page_offsets_v is not None:
         resource_dependency_graph[smem_page_offsets_v] = scheduler_deps(gmem_qkv)
 
@@ -1587,10 +1730,13 @@ def build_context_task_manager(
     add_smem_resource(smem_kv)
     if cfg.split_kv_pipelines:
         add_smem_resource(smem_v)
+    if smem_mu is not None:
+        add_smem_resource(smem_mu)
     if smem_page_offsets_kv is not None:
         add_smem_resource(smem_page_offsets_kv)
     if smem_page_offsets_v is not None:
         add_smem_resource(smem_page_offsets_v)
+    add_smem_resource(smem_sage_k)
     # Register every pipeline resource, including pipeline-only TMEM handoffs,
     # with the unified allocator.  Otherwise CUTLASS materializes those
     # barriers as separate dynamic-SMEM arrays that the capacity selector
@@ -1720,6 +1866,10 @@ def build_context_task_manager(
     tmem_allocator.compute_layout()
 
     skip = not isinstance(num_kv_tiles, int)
+    # skip_validation only downgrades errors to warnings. Exhaustive searches
+    # over a symbolic JIT domain add cold-start cost without an offline proof.
+    if exhaustive_deadlock_race_check is None:
+        exhaustive_deadlock_race_check = not skip
     task_manager = TaskManager(
         tasks=task_list,
         resource_dependency_graph=resource_dependency_graph,
@@ -1788,12 +1938,16 @@ def _context_pipeline_stage_counts(
         ),
         "tmem_sp": cfg.mma_softmax_stage * cfg.num_qkv_instances,
         "tmem_p": cfg.mma_softmax_stage if cfg.has_tmem_p_pipeline else 0,
+        "smem_sage_k": cfg.sage_k_scale_stages
+        if cfg.sage_k_transport is SageKTransport.SMEM
+        else 0,
         "tmem_vec": cfg.softmax_corr_stage * cfg.num_qkv_instances,
         "tmem_o": cfg.mma_corr_stage,
         "smem_o": cfg.num_qkv_instances,
         "s0s1_seq": 0 if cfg.single_qkv_instance else 1,
         "tmem_p_prefix_ready": 2 if cfg.pv_half_overlap else 0,
         "smem_p": cfg.num_qkv_instances if cfg.p_in_smem else 0,
+        "smem_mu": cfg.vc_mean_stages if cfg.vc_restores_means else 0,
         "tmem_stats_done": 0 if cfg.stats_via_smem else cfg.num_qkv_instances,
         "work_queue": 1 if is_clc_dynamic else 0,
     }
@@ -1808,8 +1962,9 @@ def _kv_ring_smem_budget_bytes(
 ) -> int:
     """Return the SMEM left for the K/V ring(s) after every fixed allocation.
 
-    Fixed terms are Q, O, correction statistics, page-ID rings, control
-    records, and one 16-byte barrier per stage. The task manager still checks.
+    Fixed terms are Q, O, correction statistics, page-ID rings, the Sage sfK
+    ring, control records, and one 16-byte barrier per stage. The task
+    manager still checks.
     """
     q_row_bytes = (cfg.q_dtype.width * cfg.smem_q_head_dim + 7) // 8
     q_row_bytes = (
@@ -1854,9 +2009,20 @@ def _kv_ring_smem_budget_bytes(
     align = cfg.buffer_align_bytes
     smem_p_bytes = 0
     if cfg.p_in_smem:
+        p_block_bytes = cfg.smem_p_bytes
+        if cfg.vc_restores_means:
+            # The row-sum operand lives behind each P tile.
+            p_block_bytes += cfg.vc_rowsum_tile_bytes
+        if cfg.vc_qk8:
+            # VC-Attention-QK8 keeps its K-scale table behind the P tile.
+            p_block_bytes += cfg.vc_kscale_table_bytes
         smem_p_bytes = (
-            (cfg.smem_p_bytes + align - 1) // align * align * cfg.num_qkv_instances
+            (p_block_bytes + align - 1) // align * align * cfg.num_qkv_instances
         )
+    sage_k_bytes = 0
+    if cfg.sage_k_transport is SageKTransport.SMEM:
+        sage_k_bytes = cfg.sage_k_scale_stages * cfg.sage_k_tile_bytes
+    score_seed_bytes = cfg.sage_score_seed_tile_bytes if cfg.uses_int32_scores else 0
     control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8
     if is_clc_dynamic:
         control_bytes = (control_bytes + 15) // 16 * 16 + cutlass.Int128.width // 8
@@ -1867,12 +2033,19 @@ def _kv_ring_smem_budget_bytes(
             is_clc_dynamic=is_clc_dynamic,
         ).values()
     )
+    if cfg.vc_restores_means:
+        # The callers charge the tile-mean ring per K/V stage.
+        fixed_barrier_stages -= cfg.vc_mean_stages
+    if cfg.use_mxfp8_qk:
+        q_tile_bytes += MX_SCALE_TILE_BYTES
     fixed_smem_bytes = (
         (q_tile_bytes * cfg.q_stage + align - 1) // align * align
         + (o_stage_bytes + align - 1) // align * align * cfg.num_qkv_instances
         + smem_p_bytes
         + (stats_bytes + 15) // 16 * 16
         + (page_offsets_bytes + 15) // 16 * 16
+        + (sage_k_bytes + 15) // 16 * 16
+        + (score_seed_bytes + 127) // 128 * 128
         + (control_bytes + 7) // 8 * 8
         + fixed_barrier_stages * _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
@@ -1906,6 +2079,10 @@ def _infer_single_instance_kv_stages(
         cfg.qk_mma_tiler[1] // cfg.cta_group_size * kv_head_dim * kv_dtype_width // 8
     )
     kv_stage_footprint_bytes = kv_stage_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
+    if cfg.vc_restores_means:
+        kv_stage_footprint_bytes += (
+            cfg.vc_mean_tile_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
+        )
     memory_fit_stages = kv_budget_bytes // kv_stage_footprint_bytes
     cadence_stages = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
     if require_cadence and memory_fit_stages < cadence_stages:
@@ -1918,8 +2095,11 @@ def _infer_single_instance_kv_stages(
 
 
 def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
-    """Select one shared K/V ring or, for mixed dtypes, size K and V independently."""
-    cfg.split_kv_pipelines = cfg.k_dtype.width != cfg.v_dtype.width
+    """Select one shared K/V ring or, for mixed dtypes, size K and V independently.
+
+    MXFP8 Q/K also splits the rings, since only the K stages carry a scale atom
+    and one ring has one transaction byte count."""
+    cfg.split_kv_pipelines = cfg.k_dtype.width != cfg.v_dtype.width or cfg.use_mxfp8_qk
     cfg.kv_stage_k = cfg.kv_stage
     cfg.kv_stage_v = cfg.kv_stage
     if not cfg.split_kv_pipelines:
@@ -1931,6 +2111,16 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
                 cfg, is_clc_dynamic=is_clc_dynamic, require_cadence=False
             ),
         )
+        if cfg.kv_ring_stages:
+            n_stages = max(
+                cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v,
+                cfg.kv_ring_stages,
+            )
+        if cfg.vc_restores_means and n_stages < 2:
+            # The tail holds the last two tile-mean operands at once.
+            raise ValueError(
+                f"VC-Attention needs at least 2 K/V stages, kv_ring_stages gives {n_stages}"
+            )
         cfg.kv_stage = n_stages
         cfg.kv_stage_k = n_stages
         cfg.kv_stage_v = n_stages
@@ -1944,12 +2134,15 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
     kv_rows_per_cta = cfg.qk_mma_tiler[1] // cfg.cta_group_size
     k_stage_footprint = (
         kv_rows_per_cta * kv_head_dim * cfg.k_dtype.width // 8
+        + (MX_SCALE_TILE_BYTES if cfg.use_mxfp8_qk else 0)
         + _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
     v_stage_footprint = (
         kv_rows_per_cta * kv_head_dim * cfg.v_dtype.width // 8
         + _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
+    if cfg.vc_restores_means:
+        v_stage_footprint += cfg.vc_mean_tile_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
     # K and V share the same head_dim and head_dim_per_stage_kv, so their
     # minimum ring depths (num_head_dim_stages) are equal and both rings are sized identically.
     cadence = cfg.num_head_dim_stages_k
@@ -1960,6 +2153,14 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
             f"({cadence * (k_stage_footprint + v_stage_footprint)} bytes), but the "
             f"shared-memory budget fits only {budget_bytes} bytes"
         )
+    if cfg.vc_restores_means and n_stages < 2:
+        # The tail holds the last two tile-mean operands at once.
+        raise ValueError(
+            f"VC-Attention needs at least 2 stages per K/V ring, but the "
+            f"shared-memory budget of {budget_bytes} bytes fits only {n_stages}"
+        )
+    if cfg.kv_ring_stages:
+        n_stages = max(cadence, cfg.kv_ring_stages)
     cfg.kv_stage_k = n_stages
     cfg.kv_stage_v = n_stages
 
@@ -2127,6 +2328,55 @@ def _configure_single_instance_warp_layout(cfg: FmhaConfig) -> None:
     cfg.num_regs_other = 112
 
 
+def _check_sage_attention(cfg: FmhaConfig) -> None:
+    """Check a Sage plan's scale layout against the dense query-paired FP8 schedule.
+
+    Sage attention runs on the dense query-paired D128 schedule with FP8 P
+    staged in SMEM, in its single-CTA or two-CTA UMMA form. Its row max
+    reduces 16-column score blocks, with LDTM.STAT where the hardware has it.
+    """
+    layout = cfg.sage_scale_layout
+    validate_context_sage_layout(layout, cfg.kv_tile_n)
+    if (
+        cfg.single_qkv_instance
+        or cfg.head_paired
+        or cfg.is_causal
+        or cfg.has_variable_window
+        or cfg.use_paged_kv
+        or cfg.split_kv_pipelines
+        or cfg.kv_tile_start_window_size_left > 0
+    ):
+        raise ValueError("Sage attention requires the dense query-paired D128 schedule")
+    if not cfg.p_in_smem:
+        raise ValueError(
+            "Sage attention requires E4M3 V with a 16-bit output (P in SMEM)"
+        )
+    if (
+        layout.v_rows.headdim != cfg.pv_mma_tiler[1]
+        or layout.q_rows.rows_per_tile != cfg.q_tile_m
+    ):
+        raise ValueError("the Sage scale layout does not match the kernel's tiles")
+
+
+def _check_mxfp8_qk(cfg: FmhaConfig) -> None:
+    """MXFP8 Q/K runs the contiguous query-paired D128 schedule with P in SMEM
+    on one CTA, whose peer S tails hold the scales."""
+    if (
+        # S0, S1, O0 and O1 fill tensor memory, so the scales borrow the peer
+        # S tail. With P in TMEM that tail holds the peer's P until its PV step.
+        not cfg.p_in_smem
+        # The pair-wide scale copy ties each QK step to the slower CTA's
+        # softmax load. Measured slower than one CTA.
+        or cfg.two_cta_umma
+        or cfg.use_paged_kv
+        or cfg.use_sage_attention
+    ):
+        raise ValueError(
+            "MXFP8 Q/K requires the contiguous query-paired D128 schedule with "
+            "E4M3 V, a 16-bit output and one CTA"
+        )
+
+
 def _uses_smem_p(cfg: FmhaConfig, *, has_variable_window: bool) -> bool:
     """Stage fp8 P in SMEM for the dense query-paired D128 schedule with a 16-bit
     output. It needs a 128-byte P row, one SW128 atom, and an O tile stored in
@@ -2145,8 +2395,10 @@ def _uses_smem_p(cfg: FmhaConfig, *, has_variable_window: bool) -> bool:
     )
 
 
-def _configure_head_dim_staging(cfg: FmhaConfig) -> None:
-    """Stage K/V in 128-wide slices and size O staging to the paired footprint."""
+def _configure_head_dim_staging(
+    cfg: FmhaConfig, *, head_dim_per_stage: int = 128
+) -> None:
+    """Stage K/V by head slices and keep O staging within the SMEM budget."""
     cfg.head_dim_per_stage_kv = 0
     cfg.num_head_dim_stages_k = 1
     cfg.num_head_dim_stages_v = 1
@@ -2161,25 +2413,43 @@ def _configure_head_dim_staging(cfg: FmhaConfig) -> None:
         return
     if cfg.num_qkv_instances != 1 and cfg.logical_head_dim_qk != 192:
         return
-    cfg.head_dim_per_stage_kv = 128
+    if head_dim_per_stage not in (128, 192):
+        raise ValueError("head staging must use 128 or 192 channels")
+    if head_dim_per_stage == 192:
+        if not (
+            cfg.logical_head_dim_qk == 192
+            and cfg.single_qkv_instance
+            and cfg.q_dtype.width == cfg.v_dtype.width == 16
+        ):
+            raise ValueError(
+                "Full D192 staging requires single-instance D192 with 16-bit Q/K/V"
+            )
+        cfg.qk_mma_tiler = (*cfg.qk_mma_tiler[:2], 192)
+        cfg.pv_mma_tiler = (cfg.pv_mma_tiler[0], 192, cfg.pv_mma_tiler[2])
+        cfg.epi_tile = cfg.pv_mma_tiler[:2]
+    cfg.head_dim_per_stage_kv = head_dim_per_stage
     cfg.num_head_dim_stages_k = cfg.qk_mma_tiler[2] // cfg.head_dim_per_stage_kv
-    cfg.num_head_dim_stages_v = cfg.pv_mma_tiler[1] // cfg.head_dim_per_stage_kv
-    # K/V transfers remain 128-wide. Unlike the single-query schedule, paired
+    cfg.num_head_dim_stages_v = (
+        cfg.pv_mma_tiler[1] + cfg.head_dim_per_stage_kv - 1
+    ) // cfg.head_dim_per_stage_kv
+    # Output staging can use narrower head bands. Unlike the single-query schedule, paired
     # 16-bit Q/O needs two 64-wide O buffers to leave room for both Q tiles
     # and a complete K/K/V cadence. FP8 can retain 128-wide O stores.
     cfg.head_dim_per_stage_o = (
         64
         if (
-            not cfg.single_qkv_instance
+            (not cfg.single_qkv_instance or head_dim_per_stage == 192)
             and cfg.q_dtype.width == 16
             and cfg.o_dtype.width == 16
         )
         else 128
     )
-    cfg.num_o_head_dim_stages = cfg.epi_tile[1] // cfg.head_dim_per_stage_o
+    cfg.num_o_head_dim_stages = (
+        cfg.epi_tile[1] + cfg.head_dim_per_stage_o - 1
+    ) // cfg.head_dim_per_stage_o
     cfg.stage_kv_by_head_dim = True
     cfg.stage_o_by_head_dim = cfg.single_qkv_instance or cfg.num_o_head_dim_stages > 1
-    # K/V stays 128-wide. Smaller O stages let paired 16-bit geometry
+    # Default K/V staging stays 128-wide. Smaller O stages let paired geometry
     # retain its K/V ring without exceeding Blackwell's SMEM budget.
 
 
@@ -2208,13 +2478,13 @@ def _configure_head_paired_tma_copy_metadata(
     o_dtype: type,
 ) -> None:
     """Derive TMA copy granularities for head-paired Q/K/V/O tensors."""
-    inner_dim_size = cfg.qk_mma_tiler[2] * q_dtype.width // 8
+    inner_dim_size = cfg.smem_q_head_dim * q_dtype.width // 8
     cfg.tma_copy_qkv_iters = 1
     if inner_dim_size % 128 == 0:
         cfg.tma_copy_qkv_iters = inner_dim_size // 128
     elif inner_dim_size != 64 and inner_dim_size != 32:
         raise RuntimeError(f"Unsupported inner dimension size: {inner_dim_size}")
-    tma_copy_qkv_granu_inner = cfg.qk_mma_tiler[2] // cfg.tma_copy_qkv_iters
+    tma_copy_qkv_granu_inner = cfg.smem_q_head_dim // cfg.tma_copy_qkv_iters
 
     cfg.q_tile_m = cfg.qk_mma_tiler[0]
     cfg.tma_copy_q_elements = cfg.sQ_shape[1]
@@ -2235,18 +2505,18 @@ def _configure_head_paired_tma_copy_metadata(
     )
     cfg.tma_copy_kv_bytes = cfg.tma_copy_kv_elements * k_dtype.width // 8
 
-    v_inner_dim_size = cfg.pv_mma_tiler[1] * v_dtype.width // 8
+    v_inner_dim_size = cfg.smem_v_head_dim * v_dtype.width // 8
     cfg.tma_copy_v_iters = 1
     if v_inner_dim_size % 128 == 0:
         cfg.tma_copy_v_iters = v_inner_dim_size // 128
     elif v_inner_dim_size != 64 and v_inner_dim_size != 32:
         raise RuntimeError(f"Unsupported inner dimension size: {v_inner_dim_size}")
-    cfg.tma_copy_v_granu_inner = cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters
+    cfg.tma_copy_v_granu_inner = cfg.smem_v_head_dim // cfg.tma_copy_v_iters
     cfg.tma_copy_v_stage_iters = kv_head_dim // cfg.tma_copy_v_granu_inner
     cfg.tma_copy_v_granu_elems = cfg.tma_copy_kv_elements // cfg.tma_copy_v_stage_iters
     cfg.tma_copy_v_bytes = cfg.tma_copy_kv_elements * v_dtype.width // 8
 
-    output_inner_dim_size = cfg.epi_tile[1] * o_dtype.width // 8
+    output_inner_dim_size = cfg.smem_o_head_dim * o_dtype.width // 8
     cfg.tma_copy_o_iters = 1
     if output_inner_dim_size % 128 == 0:
         cfg.tma_copy_o_iters = output_inner_dim_size // 128
@@ -2254,7 +2524,7 @@ def _configure_head_paired_tma_copy_metadata(
         raise RuntimeError(
             f"Unsupported output inner dimension size: {output_inner_dim_size}"
         )
-    cfg.tma_copy_o_granu_inner = cfg.epi_tile[1] // cfg.tma_copy_o_iters
+    cfg.tma_copy_o_granu_inner = cfg.smem_o_head_dim // cfg.tma_copy_o_iters
     o_head_dim = (
         cfg.head_dim_per_stage_o if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
     )
@@ -2557,21 +2827,31 @@ def build_fmha_task_manager(
     cum_seqlen_q: cute.Tensor | None,
     cum_seqlen_k: cute.Tensor | None,
     num_kv_tiles: int | Int32,
+    q_scales: cute.Tensor | None = None,
+    k_scales: cute.Tensor | None = None,
     variable_window_token_starts: cute.Tensor | None = None,
     variable_window_token_ends: cute.Tensor | None = None,
     variable_window_cta_starts: cute.Tensor | None = None,
     variable_window_q_stride: int | Int32 = 0,
-    scale_softmax_log2: cute.Tensor | None = None,
-    output_scale: cute.Tensor | None = None,
+    scale_softmax_log2: Float32 | None = None,
+    output_scale: Float32 | cute.Tensor | None = None,
+    lse_output: cute.Tensor | None = None,
+    attention_sinks: cute.Tensor | None = None,
     q_offset: int | Int32 = 0,
     g_block_tables: cute.Pointer | None = None,
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
+    tma_mu_desc: cutlass.Pointer | None = None,
+    vc_q_scale: cute.Tensor | None = None,
+    vc_k_scale: cute.Tensor | None = None,
+    vc_repair_tiles: int = 0,
+    sage_scales: cute.Pointer | None = None,
+    num_kv_heads: int | Int32 = 0,
     is_persistent: bool = True,
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
-    exhaustive_deadlock_race_check: bool = True,
+    exhaustive_deadlock_race_check: bool | None = None,
 ) -> Tuple[
     TaskManager,
     list[MemoryResource],
@@ -2584,8 +2864,8 @@ def build_fmha_task_manager(
     """Build the FMHA TaskManager using the shared context TS graph.
 
     Runtime scale arguments follow the same contract as
-    :func:`build_context_task_manager`: one-element float32 device tensors,
-    indexed at element 0 and cached by resource auxiliary work.
+    :func:`build_context_task_manager`: runtime float32 scalar operands
+    carried through task-local auxiliary dataflow.
     """
     if (
         cfg.causal_single_kv_tile
@@ -2648,6 +2928,12 @@ def build_fmha_task_manager(
         tma_k_desc=tma_k_desc,
         tma_v_desc=tma_v_desc,
         tma_o_desc=tma_o_desc,
+        tma_mu_desc=tma_mu_desc,
+        vc_q_scale=vc_q_scale,
+        vc_k_scale=vc_k_scale,
+        q_scales=q_scales,
+        k_scales=k_scales,
+        vc_repair_tiles=vc_repair_tiles,
         cum_seqlen_q=cum_seqlen_q,
         cum_seqlen_k=cum_seqlen_k,
         variable_window_token_starts=variable_window_token_starts,
@@ -2656,6 +2942,10 @@ def build_fmha_task_manager(
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
+        sage_scales=sage_scales,
+        num_kv_heads=num_kv_heads,
+        lse_output=lse_output,
+        attention_sinks=attention_sinks,
         g_block_tables=g_block_tables,
         block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
@@ -2694,7 +2984,8 @@ class FmhaTs:
     pv_acc_dtype : type, optional
         Accumulator dtype for PV GEMM (default: Float32).
     in_qk_dtype : type, optional
-        Input tensor dtype for Q and K (default: Float16).
+        Input tensor dtype for Q and K (default: Float16). Float8E8M0FNU selects
+        MXFP8 Q and K, E4M3 data with one E8M0 scale per 32 channels.
     in_pv_dtype : type, optional
         Input tensor dtype for V (default: Float16).
     out_dtype : type, optional
@@ -2728,6 +3019,10 @@ class FmhaTs:
         into the TMEM S load on the non-masked path (default: False). The
         context runner enables this by default on SM103 (B300) and SM107
         (Rubin).
+    kv_ring_stages : int, optional
+        K/V ring depth. Zero derives the depth from the shared-memory budget.
+    umma_fp8_k64 : bool, optional
+        Issue the fp8 PV UMMAs with K=64 per instruction.
     two_cta_umma : bool, optional
         Issue the QK and PV UMMAs in ``cta_group::2`` across a 2-CTA cluster, each
         CTA staging half of every K/V tile. Dense contiguous query-paired D128 with
@@ -2743,6 +3038,9 @@ class FmhaTs:
         Use the fixed causal one-K/V-tile task domains. The context runner
         enables this only for query-paired, fixed-length inputs whose K/V
         extent fits one 128-token tile (default: False).
+    use_blackwell_tma_oob_workaround : bool, optional
+        Use conservative OOB address generation for ragged Q tensor maps.
+        Enable only for a Blackwell execution device (default: False).
     """
 
     def __init__(
@@ -2765,13 +3063,18 @@ class FmhaTs:
         enable_skip_correction: bool = True,
         uses_ldtm_stat: bool = False,
         fp8_psmem_early_token: bool = False,
+        kv_ring_stages: int = 0,
+        umma_fp8_k64: bool = False,
         two_cta_umma: bool = False,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
-        max_kv_len: int = 1,
+        max_kv_len: int | None = 1,
         causal_single_kv_tile: bool = False,
-        exhaustive_deadlock_race_check: bool = True,
+        exhaustive_deadlock_race_check: bool | None = None,
         d_v: int | None = None,
+        vc_attention: str | None = None,
+        use_blackwell_tma_oob_workaround: bool = False,
+        sage_scale_layout: _SageScaleLayout | None = None,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -2779,6 +3082,9 @@ class FmhaTs:
             is_causal=is_causal,
             window_size_left=window_size_left,
         )
+        # Load helpers before staged Sage copies enter GPU control flow.
+        importlib.import_module(f"{__package__}.helpers_paged")
+
         if causal_single_kv_tile and (not is_causal or head_paired):
             raise ValueError(
                 "causal_single_kv_tile requires query-paired causal attention"
@@ -2807,7 +3113,7 @@ class FmhaTs:
                     f"{_SUPPORTED_CONTEXT_PAGE_SIZES}; got "
                     f"{num_tokens_per_page}"
                 )
-            if max_kv_len < 1:
+            if max_kv_len is not None and max_kv_len < 1:
                 raise ValueError(
                     f"max_kv_len must be >= 1 for paged context, got {max_kv_len}"
                 )
@@ -2815,18 +3121,22 @@ class FmhaTs:
         self.is_causal = is_causal
         self.is_clc_dynamic = is_clc_dynamic
         self.exhaustive_deadlock_race_check = exhaustive_deadlock_race_check
+        self.use_blackwell_tma_oob_workaround = use_blackwell_tma_oob_workaround
 
         q_dtype = in_qk_dtype or cutlass.Float16
         k_dtype = in_qk_dtype or cutlass.Float16
+        # MXFP8 Q/K names the E8M0 scale dtype. The operands are E4M3.
+        if in_qk_dtype == cutlass.Float8E8M0FNU:
+            q_dtype = k_dtype = cutlass.Float8E4M3FN
         v_dtype = in_pv_dtype or cutlass.Float16
 
         o_dtype = out_dtype or cutlass.Float16
 
         # Validate the logical Q/K and V head dimensions before choosing tiles.
         d_v = d if d_v is None else d_v
-        if (d_v != d or d == 192) and (d, d_v) != (192, 128):
+        if d_v != d and (d, d_v) != (192, 128):
             raise ValueError("asymmetric context requires QK=192 and V=128")
-        if d == 192 and (head_paired or use_paged_kv):
+        if (d, d_v) == (192, 128) and (head_paired or use_paged_kv):
             raise NotImplementedError(
                 "192/128 requires contiguous query-paired context"
             )
@@ -2844,6 +3154,7 @@ class FmhaTs:
             or d != 128
             or d_v != 128
             or q_dtype.width not in (8, 16)
+            or q_dtype == cutlass.Int8
         ):
             raise ValueError(
                 "two-CTA UMMA requires the non-persistent dense contiguous "
@@ -2852,26 +3163,27 @@ class FmhaTs:
         cfg.two_cta_umma = two_cta_umma
         if two_cta_umma:
             cfg.cluster_shape_mn = (2, 1)
+        cfg.vc_attention = vc_attention
+        cfg.fp8_psmem_early_token = fp8_psmem_early_token
         self.cfg = cfg
+        self.runtime_dense_tail = False
         # Compact Q and staged O fit two resident query tiles plus the K/V
         # ring. Pairing overlaps the two softmax groups with MMA work.
-        paired_mla = d == 192 and not has_variable_window
+        paired_mla = (d, d_v) == (192, 128) and not has_variable_window
         if d > 128 and not paired_mla:
             cfg.num_qkv_instances = 1
         cfg.use_paged_kv = use_paged_kv
-        single_instance_persistent = (
-            is_persistent and cfg.single_qkv_instance and not head_paired
-        )
-        # Paired Q2 and persistent D256 schedules route correction statistics
-        # through a compact SMEM ring and omit the per-K StatsDone
-        # serialization. This keeps the stats payload disjoint from the S/P
-        # TMEM columns while producer latency varies across storage layouts.
-        cfg.stats_via_smem = single_instance_persistent or (not cfg.single_qkv_instance)
+        # Keep correction statistics disjoint from the S/P TMEM columns for
+        # every scheduler. Non-persistent single-instance schedules can also
+        # overwrite aliased statistics before correction consumes them.
+        cfg.stats_via_smem = True
         cfg.fuse_epilogue_into_correction = cfg.single_qkv_instance
         cfg.num_tokens_per_page = num_tokens_per_page
         cfg.max_num_pages_per_seq_kv = (
-            max_kv_len + num_tokens_per_page - 1
-        ) // num_tokens_per_page
+            0
+            if max_kv_len is None
+            else (max_kv_len + num_tokens_per_page - 1) // num_tokens_per_page
+        )
         cfg.causal_single_kv_tile = causal_single_kv_tile
         # FP16/BF16 causal attention retains the default 192/96/32
         # softmax/correction/auxiliary split. Other topologies start from
@@ -2882,10 +3194,15 @@ class FmhaTs:
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
-        if enable_skip_correction:
+        # VC-Attention skips no correction. The skip keeps a stale row max,
+        # under which a larger score codes past VC_EXPCAST_CODE_BIAS and out of
+        # the E4M3 range. The exact per-tile max keeps every code at or below it.
+        if enable_skip_correction and not cfg.vc_attention:
             cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
+        cfg.kv_ring_stages = kv_ring_stages
+        cfg.umma_fp8_k64 = umma_fp8_k64
         cfg.qk_acc_dtype = qk_acc_dtype or cutlass.Float32
         cfg.pv_acc_dtype = pv_acc_dtype or cutlass.Float32
 
@@ -2896,12 +3213,21 @@ class FmhaTs:
         cfg.o_dtype = o_dtype
         cfg.head_paired = head_paired
         cfg.is_causal = is_causal
+        cfg.h_r = h_r
+        cfg.has_variable_window = has_variable_window
         balance_causal_workload = balance_causal_workload or (
             is_causal and is_clc_dynamic and not cfg.single_qkv_instance
         )
 
+        if head_paired and cfg.vc_attention:
+            raise ValueError(
+                "VC-Attention requires the query-paired context kernel; a positive "
+                "window_left selects the head-paired kernel"
+            )
         if head_paired:
-            _configure_head_paired_tilers(cfg, mma_tiler_mn=mma_tiler_mn, d=d)
+            _configure_head_paired_tilers(cfg, mma_tiler_mn=mma_tiler_mn, d=padded_d)
+            cfg.pv_mma_tiler = (cfg.pv_mma_tiler[0], d_v, cfg.pv_mma_tiler[2])
+            cfg.epi_tile = cfg.pv_mma_tiler[:2]
             _configure_head_dim_staging(cfg)
             _configure_pipeline_stages(
                 cfg, is_clc_dynamic=is_clc_dynamic, is_persistent=is_persistent
@@ -2935,7 +3261,13 @@ class FmhaTs:
         cfg.pv_mma_tiler = (mma_tiler[0], d_v, mma_tiler[1])
         cfg.epi_tile = cfg.pv_mma_tiler[:2]
         cfg.p_in_smem = _uses_smem_p(cfg, has_variable_window=has_variable_window)
+        cfg.validate_vc_profile()
         _configure_head_dim_staging(cfg)
+        # The Sage layout decides whether an sfK ring takes shared memory, so
+        # it is bound before the K/V ring is sized; its schedule checks follow
+        # the pipeline configuration below.
+        cfg.sage_scale_layout = sage_scale_layout
+        cfg.use_mxfp8_qk = in_qk_dtype == cutlass.Float8E8M0FNU
         _configure_pipeline_stages(
             cfg, is_clc_dynamic=is_clc_dynamic, is_persistent=is_persistent
         )
@@ -2977,13 +3309,13 @@ class FmhaTs:
         cfg.tma_copy_kv_bytes = cfg.tma_copy_kv_elements * k_dtype.width // 8
 
         # TMA copy granularity for V
-        v_inner_dim_size = cfg.pv_mma_tiler[1] * v_dtype.width // 8
+        v_inner_dim_size = cfg.smem_v_head_dim * v_dtype.width // 8
         cfg.tma_copy_v_iters = 1
         if v_inner_dim_size % 128 == 0:
             cfg.tma_copy_v_iters = v_inner_dim_size // 128
         elif v_inner_dim_size != 64 and v_inner_dim_size != 32:
             raise RuntimeError(f"Unsupported inner dimension size: {v_inner_dim_size}")
-        cfg.tma_copy_v_granu_inner = cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters
+        cfg.tma_copy_v_granu_inner = cfg.smem_v_head_dim // cfg.tma_copy_v_iters
         cfg.tma_copy_v_stage_iters = kv_head_dim // cfg.tma_copy_v_granu_inner
         if cfg.two_cta_umma:
             cfg.tma_copy_v_iters = 1
@@ -2995,8 +3327,8 @@ class FmhaTs:
         cfg.tma_copy_v_bytes = cfg.tma_copy_kv_elements * v_dtype.width // 8
 
         # TMA copy granularity for O
-        cfg.tma_copy_o_iters = (cfg.epi_tile[1] * o_dtype.width) // 1024
-        cfg.tma_copy_o_granu_inner = cfg.epi_tile[1] // cfg.tma_copy_o_iters
+        cfg.tma_copy_o_iters = (cfg.smem_o_head_dim * o_dtype.width) // 1024
+        cfg.tma_copy_o_granu_inner = cfg.smem_o_head_dim // cfg.tma_copy_o_iters
         o_head_dim = (
             cfg.head_dim_per_stage_o if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
         )
@@ -3015,6 +3347,10 @@ class FmhaTs:
             window_size_left=window_size_left,
             has_variable_window=has_variable_window,
         )
+        if cfg.sage_scale_layout is not None:
+            _check_sage_attention(cfg)
+        if cfg.use_mxfp8_qk:
+            _check_mxfp8_qk(cfg)
 
     # ---------------------------------------------------------------------------
     # Host entry point
@@ -3026,10 +3362,12 @@ class FmhaTs:
         k_cute: cute.Tensor,
         v_cute: cute.Tensor,
         o_cute: cute.Tensor,
-        scale_softmax_log2: cute.Tensor,
-        output_scale: cute.Tensor,
+        scale_softmax: Float32 | cute.Tensor,
+        output_scale: Float32 | cute.Tensor,
         max_active_clusters: int,
         stream: cuda_drv.CUstream,
+        q_scales: cute.Tensor | None = None,
+        k_scales: cute.Tensor | None = None,
         cum_seqlen_q: cute.Tensor | None = None,
         cum_seqlen_k: cute.Tensor | None = None,
         max_seqlen_q: Int32 | None = None,
@@ -3039,16 +3377,40 @@ class FmhaTs:
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_token_ends: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
+        vc_mu: cute.Tensor | None = None,
+        vc_q_scale: cute.Tensor | None = None,
+        vc_k_scale: cute.Tensor | None = None,
+        vc_repair_tiles: int = 0,
+        sage_scales: cute.Tensor | None = None,
+        lse_output: cute.Tensor | None = None,
+        attention_sinks: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
-        ``scale_softmax_log2`` and ``output_scale`` must be one-element float32
-        device tensors. Example host values are
-        ``[math.log2(math.e) / math.sqrt(d)]`` for the softmax scale and
-        ``[1.0]`` for FP16 output. FP8 callers may fold Q/K/V and output
-        quantization scales into these runtime tensors.
+        VC-Attention adds the tile means, the bf16 UMMA operands packed by the
+        host with sixteen tiles per group, and the repair tile count, a
+        compile-time constant giving how many outlier tiles end the K/V loop of
+        an outlier plan. VC-Attention-QK8 also takes the Q and K dequant scales
+        as ``[H, B, blocks]`` tables with one scale per 128-token block.
+
+        ``q_scales`` and ``k_scales`` are the MXFP8 scale atoms, one 512-byte
+        128x4 atom per 128-token tile and head, as ``[B, H, tiles, 512]`` byte
+        tensors.
+
+        Each global scale independently accepts a float32 scalar or a (1,)
+        float32 device tensor. Softmax operands use natural-exponential units;
+        host scalars convert in this launcher and device tensors convert on device.
+        FP8 callers fold Q/K/V descales and output quantization into them.
+
+        VC-Attention additionally binds tile means and a static repair-tile count.
+        Its output_scale is a per-channel V scale table.
         """
+        if cutlass.const_expr(self.cfg.use_sage_attention != (sage_scales is not None)):
+            raise ValueError("sage_scales is required by, and only by, a Sage kernel")
         cfg = self.cfg
+        softmax_scale_operand = scale_softmax
+        if cutlass.const_expr(not isinstance(scale_softmax, cute.Tensor)):
+            softmax_scale_operand = scale_softmax * Float32(1.4426950408889634)
         if cutlass.const_expr(
             cfg.use_paged_kv
             and (
@@ -3142,7 +3504,7 @@ class FmhaTs:
                 v_box_dims = (
                     cfg.pv_mma_tiler[2],
                     1,
-                    cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters,
+                    cfg.tma_copy_v_granu_inner,
                 )
                 kv_stride_order = stride_order
         if cutlass.const_expr(cum_seqlen_q is not None):
@@ -3162,6 +3524,24 @@ class FmhaTs:
                 # Zero-fill partial Q rows and head-dimension fragments.
                 oob_fill=cuda.TensorMapFloatOOBFill.none,
             )
+            if cutlass.const_expr(self.use_blackwell_tma_oob_workaround):
+                # Only the real Q layout can establish a mapped prefix;
+                # synthetic ragged dimensions and padded head sizes cannot.
+                minimum_rows = _compact_q_prefix_min_rows(q_cute)
+                correct_oob_addressing = True
+                if cutlass.const_expr(minimum_rows is not None):
+                    correct_oob_addressing = q_cute.shape[0] < minimum_rows
+                if correct_oob_addressing:
+                    # Work around the Blackwell driver TMA descriptor issue documented at
+                    # https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-615-71-09/index.html#known-issues
+                    # Clear Blackwell descriptor bit 85 on the host when a
+                    # contiguous 128 KiB prefix has not been established.
+                    descriptor_word1 = (
+                        cutlass.Pointer(tma_q_desc.get_ptr(), dtype=cutlass.Uint64) + 1
+                    )
+                    descriptor_word1.store(
+                        descriptor_word1.load() & ~cutlass.Uint64(1 << 21)
+                    )
         else:
             tma_q_desc = cuda.create_tensor_map_tiled_from_view(
                 q_cute,
@@ -3244,6 +3624,32 @@ class FmhaTs:
                 l2_promotion=cuda.TensorMapL2Promotion.none,
             )
 
+        # VC-Attention tile-mean operands, one packed tile per K/V tile.
+        tma_mu_desc = tma_v_desc
+        if cutlass.const_expr(
+            cfg.vc_qk8 and (vc_q_scale is None or vc_k_scale is None)
+        ):
+            raise ValueError("VC-Attention-QK8 requires vc_q_scale and vc_k_scale")
+        if cutlass.const_expr(cfg.vc_restores_means):
+            if cutlass.const_expr(vc_mu is None):
+                raise ValueError("VC-Attention requires vc_mu")
+            mu_rows, mu_cols = vc_mean_operand_shape(cfg.pv_mma_tiler[1])
+            tma_mu_desc = cuda.create_tensor_map_tiled_from_view(
+                vc_mu,
+                # Two-CTA loads the half of the rows its channels need.
+                box_dims=(1, 1, 1, mu_rows // cfg.cta_group_size, mu_cols),
+                stride_order=(4, 3, 2, 1, 0),
+                swizzle=cuda.TensorMapSwizzle.none,
+                l2_promotion=cuda.TensorMapL2Promotion.none,
+            )
+
+        if cutlass.const_expr(
+            (cfg.use_mxfp8_qk) != (q_scales is not None and k_scales is not None)
+        ):
+            raise ValueError(
+                "q_scales and k_scales are required only by an MXFP8 Q/K kernel"
+            )
+
         # Compute tile scheduler and grid
         if cutlass.const_expr(cum_seqlen_q is None):
             b = o_cute.shape[0]
@@ -3253,13 +3659,16 @@ class FmhaTs:
                 # k_cute is the page pool — its sequence axis is per-page,
                 # not the logical max_seq_len_kv. Caller must pass it in.
                 s_k = max_seqlen_k
+                h_kv = k_cute.shape[1]
             else:
                 s_k = k_cute.shape[1]
+                h_kv = k_cute.shape[2]
         else:
             b = cute.size(cum_seqlen_q) - 1
             s_q = max_seqlen_q
             h_q = o_cute.shape[1]
             s_k = max_seqlen_k
+            h_kv = k_cute.shape[1]
 
         num_seq_tiles = cute.ceil_div(s_q, cfg.cta_tiler[0])
         num_kv_tiles = cute.ceil_div(s_k, cfg.kv_tile_n)
@@ -3330,37 +3739,63 @@ class FmhaTs:
             if cutlass.const_expr(seq_lens_kv is not None)
             else None
         )
-
-        self.kernel(
-            tma_q_desc,
-            tma_k_desc,
-            tma_v_desc,
-            tma_o_desc,
-            tile_sched_params,
-            scale_softmax_log2,
-            output_scale,
-            num_kv_tiles,
-            num_seq_tiles,
-            q_offset,
-            cum_seqlen_q,
-            cum_seqlen_k,
-            block_tables_iter,
-            block_table_row_stride,
-            seq_lens_kv_iter,
-            Int32(s_k),
-            variable_window_token_starts,
-            variable_window_token_ends,
-            variable_window_cta_starts,
-            Int32(s_q),
-            self.is_persistent,
-            self.is_clc_dynamic,
-        ).launch(
-            grid=grid,
-            block=[block_size, 1, 1],
-            cluster=cfg.cluster_shape_mn + (1,),
-            stream=stream,
-            min_blocks_per_mp=1,
+        sage_scales_iter = (
+            sage_scales.iterator
+            if cutlass.const_expr(sage_scales is not None)
+            else None
         )
+
+        def launch_kernel(capacity: cutlass.Constexpr[int]):
+            self.kernel(
+                tma_q_desc,
+                tma_k_desc,
+                tma_v_desc,
+                tma_o_desc,
+                tma_mu_desc,
+                vc_q_scale,
+                vc_k_scale,
+                q_scales,
+                k_scales,
+                tile_sched_params,
+                softmax_scale_operand,
+                output_scale,
+                num_kv_tiles,
+                num_seq_tiles,
+                q_offset,
+                cum_seqlen_q,
+                cum_seqlen_k,
+                block_tables_iter,
+                block_table_row_stride,
+                seq_lens_kv_iter,
+                Int32(s_k),
+                variable_window_token_starts,
+                variable_window_token_ends,
+                variable_window_cta_starts,
+                Int32(s_q),
+                sage_scales_iter,
+                Int32(h_kv),
+                vc_repair_tiles,
+                self.is_persistent,
+                self.is_clc_dynamic,
+                lse_output,
+                attention_sinks,
+                dense_tail_capacity=capacity,
+            ).launch(
+                grid=grid,
+                block=[block_size, 1, 1],
+                cluster=cfg.cluster_shape_mn + (1,),
+                stream=stream,
+                min_blocks_per_mp=1,
+            )
+
+        if cutlass.const_expr(self.runtime_dense_tail):
+            tail_rows = (Int32(s_k) - Int32(1)) % Int32(cfg.kv_tile_n) + Int32(1)
+            if tail_rows <= Int32(4):
+                launch_kernel(4)
+            else:
+                launch_kernel(0)
+        else:
+            launch_kernel(0)
 
     # ---------------------------------------------------------------------------
     # Device kernel
@@ -3372,13 +3807,18 @@ class FmhaTs:
         tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_o_desc: cutlass.GridConstant[cuda.TensorMap],
+        tma_mu_desc: cutlass.GridConstant[cuda.TensorMap],
+        vc_q_scale: cute.Tensor | None,
+        vc_k_scale: cute.Tensor | None,
+        q_scales: cute.Tensor | None,
+        k_scales: cute.Tensor | None,
         tile_sched_params: (
             utils.PersistentTileSchedulerParams
             | utils.ClcDynamicPersistentTileSchedulerParams
             | None
         ),
-        scale_softmax_log2: cute.Tensor,
-        output_scale: cute.Tensor,
+        softmax_scale_operand: Float32 | cute.Tensor,
+        output_scale: Float32 | cute.Tensor,
         num_kv_tiles: Int32,
         num_seq_tiles: Int32,
         q_offset: Int32,
@@ -3392,15 +3832,22 @@ class FmhaTs:
         variable_window_token_ends: cute.Tensor | None,
         variable_window_cta_starts: cute.Tensor | None,
         variable_window_q_stride: Int32,
+        sage_scales: cute.Pointer | None,
+        num_kv_heads: Int32,
+        vc_repair_tiles: cutlass.Constexpr[int] = 0,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
+        lse_output: cute.Tensor | None = None,
+        attention_sinks: cute.Tensor | None = None,
+        dense_tail_capacity: cutlass.Constexpr[int] = 0,
     ) -> None:
         """Warp-specialised persistent FMHA TS kernel.
 
-        ``scale_softmax_log2`` and ``output_scale`` are one-element float32
-        device tensors passed through to the TS resources. The resources load
-        element 0 in auxiliary setup before the K/V loop, so the hot loop uses
-        the cached task-local values rather than reloading global memory.
+        Global scale operands specialize independently as floats or device
+        tensors. Device softmax scales use natural-exponential units. After
+        loading/conversion, resources carry scalar values through task dataflow.
+        VC output scales remain a per-channel table.
+        ``sage_scales`` is the prepared per-block/channel scale buffer.
 
         Structure:
         1. Prefetch TMA descriptors
@@ -3413,7 +3860,22 @@ class FmhaTs:
         8. TMEM deallocation
         """
         cfg = self.cfg
+        if cutlass.const_expr(dense_tail_capacity > 0):
+            from copy import copy
+
+            cfg = copy(cfg)
+            cfg.fixed_dense_k_tail = dense_tail_capacity
         cfg.num_seq_tiles = num_seq_tiles
+        # Host scalars arrive in log2 units; device scalar buffers retain the
+        # public natural-exponential units until this load.
+        if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
+            scale_softmax_log2 = softmax_scale_operand[0] * Float32(1.4426950408889634)
+        else:
+            scale_softmax_log2 = softmax_scale_operand
+        if cutlass.const_expr(
+            isinstance(output_scale, cute.Tensor) and not cfg.vc_attention
+        ):
+            output_scale = output_scale[0]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         # 1. Prefetch TMA descriptors on load warp
@@ -3422,6 +3884,8 @@ class FmhaTs:
             prims.prefetch_tensormap(tma_k_desc.get_ptr())
             prims.prefetch_tensormap(tma_v_desc.get_ptr())
             prims.prefetch_tensormap(tma_o_desc.get_ptr())
+            if cutlass.const_expr(cfg.vc_restores_means):
+                prims.prefetch_tensormap(tma_mu_desc.get_ptr())
 
         # 2. CLC dynamic: the response buffer is declared by the builder and
         # bound from the unified task-manager SMEM allocation below.
@@ -3443,6 +3907,8 @@ class FmhaTs:
             tma_k_desc=tma_k_desc.get_ptr(),
             tma_v_desc=tma_v_desc.get_ptr(),
             tma_o_desc=tma_o_desc.get_ptr(),
+            q_scales=q_scales,
+            k_scales=k_scales,
             cum_seqlen_q=cum_seqlen_q,
             cum_seqlen_k=cum_seqlen_k,
             g_block_tables=block_tables,
@@ -3456,7 +3922,15 @@ class FmhaTs:
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
+            sage_scales=sage_scales,
+            num_kv_heads=num_kv_heads,
+            lse_output=lse_output,
+            attention_sinks=attention_sinks,
             q_offset=q_offset,
+            tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_restores_means else None,
+            vc_q_scale=vc_q_scale if cfg.vc_qk8 else None,
+            vc_k_scale=vc_k_scale if cfg.vc_qk8 else None,
+            vc_repair_tiles=vc_repair_tiles,
             is_persistent=is_persistent,
             is_clc_dynamic=is_clc_dynamic,
             clc_response_ptr=clc_response_ptr,
@@ -3546,7 +4020,17 @@ class FmhaTs:
             r.tmem_addr_cached = tmem_addr_cached
 
         # 7. Execute all tasks via the TS scheduler
-        task_manager.run()
+        active_request = cutlass.Boolean(True)
+        if cutlass.const_expr(not is_persistent):
+            batch_coord = cute.arch.block_idx()[cfg.work_tile_coord_indices[2]]
+            if cutlass.const_expr(seq_lens_kv is not None):
+                active_request = Int32(seq_lens_kv[batch_coord]) > Int32(0)
+            elif cutlass.const_expr(cfg.has_varlen and not cfg.has_uniform_varlen):
+                active_request = (
+                    cum_seqlen_k[batch_coord + Int32(1)] > cum_seqlen_k[batch_coord]
+                )
+        if active_request:
+            task_manager.run()
 
         # 8. TMEM deallocation
         is_softmax_warp = (

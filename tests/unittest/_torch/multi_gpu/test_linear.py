@@ -19,6 +19,8 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    nccl_window_tensor_scope
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
@@ -48,9 +50,11 @@ def run_single_rank(tensor_parallel_size, single_rank_forward_func, input,
                     weights, hidden_size, dtype):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
+    input = input.cuda()
     try:
-        single_rank_forward_func(input, hidden_size, dtype,
-                                 tensor_parallel_size, rank, weights)
+        with nccl_window_tensor_scope(input):
+            single_rank_forward_func(input, hidden_size, dtype,
+                                     tensor_parallel_size, rank, weights)
     except Exception:
         traceback.print_exc()
         raise
@@ -419,12 +423,15 @@ def fp4_row_linear_allreduce(tp_size,
 
     # TODO: parameters['weight']' size mismatch at index 0
     # l0 = torch.compile(l0)
-    with torch.inference_mode(), autotune():
+    with torch.inference_mode(), autotune(), nccl_window_tensor_scope(
+        (x_fp4, x_sf_block)):
         if use_locality_domain:
             output = l0.forward((x_fp4, x_sf_block),
                                 all_reduce_params=AllReduceParams())
         else:
             output = l0.forward((x_fp4, x_sf_block))
+        # Accuracy checks consume a snapshot after the window lease is released.
+        output = output.clone()
 
     torch.cuda.synchronize()
     atol = 0.15 if use_locality_domain else 0.05

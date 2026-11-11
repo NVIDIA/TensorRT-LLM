@@ -121,8 +121,6 @@ def validate_node_budget(
     """
     from tensorrt_llm._utils import local_mpi_size
 
-    from .staging import MAX_STAGING_BUFFER_BYTES
-
     if ranks_on_node is None:
         try:
             ranks_on_node = max(1, local_mpi_size())
@@ -131,10 +129,14 @@ def validate_node_budget(
 
     segment_claim = ranks_on_node * max(0, config.global_segment_size)
     # Staging is pinned for the process's lifetime and comes out of the same
-    # DRAM, so it belongs in the sum even when no segment is mounted. One pool
-    # per direction, and a capacity-only rank opens neither.
-    directions = int(config.role.loads) + int(config.role.saves)
-    staging_claim = ranks_on_node * directions * MAX_STAGING_BUFFER_BYTES
+    # DRAM, so it belongs in the sum even when no segment is mounted.
+    staging_claim = 0
+    if config.stage_through_host:
+        from .staging import MAX_STAGING_BUFFER_BYTES
+
+        # One pool per direction, and a capacity-only rank opens neither.
+        directions = int(config.role.loads) + int(config.role.saves)
+        staging_claim = ranks_on_node * directions * MAX_STAGING_BUFFER_BYTES
 
     claimed = segment_claim + staging_claim
     if claimed <= 0:
@@ -170,7 +172,7 @@ def validate_node_budget(
         remedy = (
             f"Lending nothing would not be enough: the {staging_claim / _GIB:.1f} "
             f"GiB of pinned staging buffers alone overruns the budget. Run fewer "
-            f"ranks per node."
+            f"ranks per node, or turn off stage_through_host."
         )
     raise ValueError(
         f"mooncake-store: this node cannot afford what the pool is configured "

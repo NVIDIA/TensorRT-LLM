@@ -20,6 +20,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.mixtral_weight_mapper import \
     MixtralHfWeightMapper
 from tensorrt_llm._torch.models.modeling_mixtral import (MixtralAttention,
                                                          MixtralForCausalLM)
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -329,7 +330,7 @@ class TestMixtral(unittest.TestCase):
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                key = (1, 0)
+                key = KeyType(batch_size=1, draft_len=0)
                 graph_runner.capture(key,
                                      lambda inputs: mixtral.forward(**inputs),
                                      inputs)

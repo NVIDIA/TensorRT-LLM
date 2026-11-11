@@ -22,8 +22,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from tensorrt_llm._torch.disaggregation.base import Cancelled, Delivered, Failed, Outcome
-
+from .extent import Cancelled, Delivered, Failed, Outcome
 from .transfer import KVRecvTask, KVSendTask, RxSession, SessionStatus, TaskStatus, TxSession
 
 

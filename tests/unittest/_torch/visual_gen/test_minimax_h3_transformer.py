@@ -25,15 +25,20 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
     MiniMaxH3Transformer3DModel as HFMiniMaxH3Transformer3DModel,
 )
 
+from tensorrt_llm._torch.modules import gated_mlp as gated_mlp_module
+from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
+from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import transformer_minimax_h3 as h3
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
 
 try:
     from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
@@ -419,6 +424,84 @@ def _reference_rotary_emb(
     )
 
 
+@requires_cuda
+def test_rope_dispatch_compiles_fullgraph():
+    hidden_states = torch.randn((1, 17, 2, 128), device="cuda", dtype=torch.bfloat16)
+    angles = torch.randn((17, 96), device="cuda")
+    cos, sin = angles.cos(), angles.sin()
+    compiled = torch.compile(h3.apply_minimax_h3_rotary_emb, fullgraph=True)
+    # Inductor fuses the products and the add into FP32 with one rounding, so the compiled
+    # result differs from the eager reference by BF16 rounding noise only.
+    torch.testing.assert_close(
+        compiled(hidden_states, cos, sin),
+        _reference_rotary_emb(hidden_states, cos, sin),
+        rtol=2**-6,
+        atol=2**-6,
+    )
+
+
+@requires_cuda
+def test_attention_dispatches_fused_qk_norm_rope_per_instance(monkeypatch):
+    """The fused QK-norm + RoPE kernel is selected by the attention instance's flag.
+
+    The same tiny model runs with the flag on (kernel observed) and off (eager norm + RoPE);
+    the kernel computes in FP32 with one rounding where eager rounds at every step, so the
+    outputs agree to BF16 rounding noise rather than bit for bit.
+    """
+    inputs = _model_inputs("cuda")
+    calls = []
+    fused = h3.apply_minimax_h3_qk_norm_rope_bf16
+
+    def tracked(*args, **kwargs):
+        calls.append(True)
+        return fused(*args, **kwargs)
+
+    monkeypatch.setattr(h3, "apply_minimax_h3_qk_norm_rope_bf16", tracked)
+    outputs = {}
+    for fuse in (True, False):
+        torch.manual_seed(0)
+        # The kernel needs head_dim 128 and a rotary width that is a multiple of 32
+        # (rope_freq_dim 16 gives the checkpoint's 96), not _TINY_CONFIG's 8 and 6.
+        config = _make_model_config(
+            num_layers=1, num_refiner_layers=1, attention_head_dim=128, rope_freq_dim=16
+        )
+        model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
+        _initialize_weights(model, scale=0.1)
+        model.requires_grad_(False)
+        attentions = [m for m in model.modules() if isinstance(m, h3.MiniMaxH3Attention)]
+        assert attentions and all(m.fuse_qk_norm_rope for m in attentions)
+        for attention in attentions:
+            attention.fuse_qk_norm_rope = fuse
+        before = len(calls)
+        with torch.inference_mode():
+            outputs[fuse] = model(**inputs)
+        if fuse:
+            assert len(calls) > before
+        else:
+            assert len(calls) == before
+
+    torch.testing.assert_close(outputs[True].sample, outputs[False].sample, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(
+        outputs[True].audio_sample, outputs[False].audio_sample, rtol=2e-2, atol=2e-3
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("grad_input", ["hidden_states", "cos", "sin"])
+def test_rope_preserves_autograd_fallback(grad_input):
+    hidden_states = torch.randn((1, 7, 2, 8), device="cuda", dtype=torch.bfloat16)
+    angles = torch.randn((7, 6), device="cuda")
+    cos, sin = angles.cos(), angles.sin()
+    target = {"hidden_states": hidden_states, "cos": cos, "sin": sin}[grad_input]
+    target.requires_grad_(True)
+    actual = h3.apply_minimax_h3_rotary_emb(hidden_states, cos, sin)
+    expected = _reference_rotary_emb(hidden_states, cos, sin)
+    (actual_grad,) = torch.autograd.grad(actual.sum(), target)
+    (expected_grad,) = torch.autograd.grad(expected.sum(), target)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_grad, expected_grad)
+
+
 def _reference_rope(
     module: nn.Module,
     position_ids: torch.Tensor,
@@ -706,6 +789,7 @@ def test_forward_builds_timestep_modality_adaln_indices() -> None:
             rotary_emb: tuple[torch.Tensor, torch.Tensor],
             key_padding_mask: torch.Tensor | None,
             timestep: torch.Tensor,
+            valid_seq_len: int | None = None,
         ) -> torch.Tensor:
             del temb, rotary_emb, key_padding_mask
             self.adaln_indices = adaln_indices.clone()
@@ -852,7 +936,7 @@ def test_transformer_block_is_fullgraph_compile_safe(
 
 @pytest.mark.parametrize(
     ("backend", "supported"),
-    [("VANILLA", True), ("FA4", True), ("TRTLLM", False), ("CUTEDSL", False)],
+    [("VANILLA", True), ("FA4", True), ("TRTLLM", True), ("FLASHINFER", True), ("CUTEDSL", False)],
 )
 def test_key_padding_mask_support_tracks_attention_backend(backend: str, supported: bool) -> None:
     config = _make_model_config()
@@ -864,7 +948,7 @@ def test_key_padding_mask_support_tracks_attention_backend(backend: str, support
 
 @requires_cuda
 def test_forward_rejects_padded_rows_on_backend_that_ignores_the_mask() -> None:
-    """TRTLLM/CUTEDSL swallow key_padding_mask via **kwargs, so fail loudly instead."""
+    """Reject padding when the selected backend cannot express it."""
     model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
     _initialize_weights(model)
     inputs = _model_inputs("cuda")
@@ -875,7 +959,7 @@ def test_forward_rejects_padded_rows_on_backend_that_ignores_the_mask() -> None:
     model(**inputs)
 
     model._supports_key_padding_mask = False
-    model._attn_backend = "TRTLLM"
+    model._attn_backend = "CUTEDSL"
     with pytest.raises(NotImplementedError, match="key_padding_mask"):
         model(**inputs)
 
@@ -1268,11 +1352,76 @@ def test_ref2va_norm_initialization_supports_deferred_weight_loading() -> None:
             torch.testing.assert_close(module.weight, torch.ones_like(module.weight))
 
 
+def _ff_modules(model: h3.MiniMaxH3Transformer3DModel) -> list[nn.Module]:
+    return [block.ff for block in model.token_refiner.refiner_blocks] + [
+        block.ff for block in model.transformer_blocks
+    ]
+
+
+def test_bf16_configuration_opts_into_the_fused_swiglu_epilogue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model decides once: on for BF16 on every block, off for quantized configurations."""
+    monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_available", lambda: True)
+    bf16 = h3.MiniMaxH3Transformer3DModel(_make_model_config(num_layers=2, num_refiner_layers=1))
+    assert len(_ff_modules(bf16)) == 3
+    assert all(ff.fuse_bf16_gate_up_swiglu for ff in _ff_modules(bf16))
+    for config in (
+        _make_dynamic_fp8_model_config(num_layers=1, num_refiner_layers=1),
+        _make_dynamic_nvfp4_model_config(num_layers=1, num_refiner_layers=1),
+    ):
+        assert not any(
+            ff.fuse_bf16_gate_up_swiglu
+            for ff in _ff_modules(h3.MiniMaxH3Transformer3DModel(config))
+        )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and get_sm_version() in (100, 103)),
+    reason="needs an SM100/SM103 GPU",
+)
+def test_bf16_blocks_run_the_fused_swiglu_epilogue(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With eligible shapes every refiner and transformer block's FFN takes the fused op once."""
+    if not gated_mlp_module.gate_up_swiglu_quack_available():
+        pytest.skip("QuACK gemm_act is unavailable")
+    # The kernel is built on first use; when it does not build against the installed CUTLASS
+    # DSL it disables itself and GatedMLP falls back, which is not what this test is about.
+    gated_mlp_module.gate_up_swiglu_quack_bf16(
+        torch.randn(16, 64, dtype=torch.bfloat16, device="cuda"),
+        torch.randn(128, 64, dtype=torch.bfloat16, device="cuda"),
+    )
+    if not gated_mlp_module.gate_up_swiglu_quack_available():
+        pytest.skip("QuACK gemm_act does not run against the installed CUTLASS DSL (see warning)")
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_model_config(num_layers=2, num_refiner_layers=1, **_NVFP4_SHAPES)
+    ).to("cuda")
+    _initialize_weights(model, scale=0.1)
+    calls: list[int] = []
+    op = gated_mlp_module.gate_up_swiglu_quack_bf16
+
+    def tracked(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append(1)
+        return op(*args, **kwargs)
+
+    monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_bf16", tracked)
+    hidden_states = torch.randn(7, 32, dtype=torch.bfloat16, device="cuda")
+    with torch.inference_mode():
+        for ff in _ff_modules(model):
+            assert ff.fuse_bf16_gate_up_swiglu
+            assert ff._can_fuse_gate_up_swiglu_bf16(hidden_states)
+            ff(hidden_states)
+    assert len(calls) == 3
+
+
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("sequence_length", [1, 7, 8, 9, 16])
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "FLASHINFER"])
+@pytest.mark.parametrize("inference_mode", [False, True])
 def test_ulysses_refiner_masks_padding_and_restores_sequence(
     world_size: int,
     sequence_length: int,
+    backend: str,
+    inference_mode: bool,
 ) -> None:
     hidden = torch.arange(2 * sequence_length * 4, dtype=torch.float32).reshape(
         2, sequence_length, 4
@@ -1298,28 +1447,39 @@ def test_ulysses_refiner_masks_padding_and_restores_sequence(
                 return (expected_padded + 1)[:, :unpad_to]
 
         class MaskedBlock(nn.Module):
-            def forward(self, tensor, key_padding_mask):
-                if padded_length == sequence_length:
+            def forward(self, tensor, key_padding_mask, valid_seq_len):
+                assert valid_seq_len == (
+                    sequence_length if padded_length != sequence_length else None
+                )
+                if backend == "TRTLLM" or padded_length == sequence_length:
                     assert key_padding_mask is None
                 else:
                     torch.testing.assert_close(key_padding_mask, expected_mask)
+                    assert not key_padding_mask.is_inference()
+                    assert key_padding_mask._version >= 0
                 return tensor + 1
 
         refiner = h3.MiniMaxH3TokenRefiner.__new__(h3.MiniMaxH3TokenRefiner)
         nn.Module.__init__(refiner)
+        refiner._attn_backend = backend
         refiner._supports_key_padding_mask = True
         refiner.sharder = RankSharder()
         refiner.refiner_blocks = nn.ModuleList([MaskedBlock()])
         refiner.final_norm = nn.Identity()
-        torch.testing.assert_close(refiner(hidden), hidden + 1)
+        with torch.inference_mode(inference_mode):
+            torch.testing.assert_close(refiner(hidden), hidden + 1)
 
 
 @requires_cuda
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("existing_padding", [False, True])
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "FLASHINFER"])
+@pytest.mark.parametrize("inference_mode", [False, True])
 def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
     world_size: int,
     existing_padding: bool,
+    backend: str,
+    inference_mode: bool,
 ) -> None:
     """Exercise each rank's H3 forward; emulate only the collective transport."""
     model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
@@ -1373,13 +1533,27 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
 
         class CaptureBlock(nn.Module):
             def forward(
-                self, hidden_states, temb, adaln_indices, rotary_emb, key_padding_mask, timestep
+                self,
+                hidden_states,
+                temb,
+                adaln_indices,
+                rotary_emb,
+                key_padding_mask,
+                timestep,
+                valid_seq_len=None,
             ):
                 torch.testing.assert_close(adaln_indices, full_indices.chunk(world_size)[rank])
                 for actual, expected_rope in zip(rotary_emb, full_rope):
                     torch.testing.assert_close(actual, expected_rope.chunk(world_size)[rank])
-                if pad or existing_padding:
+                if backend == "TRTLLM":
+                    assert valid_seq_len == (
+                        int(full_mask.sum().item()) if pad or existing_padding else None
+                    )
+                    assert key_padding_mask is None
+                elif pad or existing_padding:
                     torch.testing.assert_close(key_padding_mask, full_mask)
+                    assert not key_padding_mask.is_inference()
+                    assert key_padding_mask._version >= 0
                 else:
                     assert key_padding_mask is None
                 return hidden_states
@@ -1387,10 +1561,12 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
         def check_norm_indices(module, args):
             torch.testing.assert_close(args[2], full_timesteps.chunk(world_size)[rank])
 
+        model._attn_backend = backend
         model.sharder = RankSharder()
         model.transformer_blocks = nn.ModuleList([CaptureBlock()])
         handle = model.norm_out.register_forward_pre_hook(check_norm_indices)
-        actual = model(**inputs)
+        with torch.inference_mode(inference_mode):
+            actual = model(**inputs)
         handle.remove()
         torch.testing.assert_close(actual.sample, expected.sample, rtol=0, atol=0)
         torch.testing.assert_close(actual.audio_sample, expected.audio_sample, rtol=0, atol=0)
@@ -1406,15 +1582,151 @@ def test_refiner_rejects_padding_without_mask_support() -> None:
 
 
 @requires_cuda
-def test_fa4_rejects_interior_padding() -> None:
+@pytest.mark.parametrize("backend", ["FA4", "TRTLLM"])
+def test_prefix_backend_rejects_interior_padding(backend: str) -> None:
     if not _sm_at_least(10):
         pytest.skip("FA4 requires SM100 or newer")
-    assert FA4_AVAILABLE
+    if backend == "FA4":
+        assert FA4_AVAILABLE
     config = _make_model_config(num_layers=1, num_refiner_layers=1, attention_head_dim=128)
-    config.attention = AttentionConfig(backend="FA4")
+    config.attention = AttentionConfig(backend=backend)
+    if backend == "TRTLLM":
+        config.attention_metadata_state = create_attention_metadata_state()
     model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
     _initialize_weights(model)
     inputs = _model_inputs("cuda")
     inputs["token_tags"] = torch.tensor([1, -1, 2, 0], device="cuda")
     with torch.inference_mode(), pytest.raises(NotImplementedError, match="trailing"):
         model(**inputs)
+
+
+class _RecordingAsyncUlysses:
+    """Stands in for an async UlyssesAttention: runs the three closures and returns Q."""
+
+    preferred_layout = AttentionTensorLayout.NHD
+
+    def __init__(self) -> None:
+        self.captured: dict[str, object] = {}
+
+    def forward_async(self, compute_q, compute_k, compute_v, **kwargs: object) -> torch.Tensor:
+        self.captured.update(q=compute_q(), k=compute_k(), v=compute_v(), kwargs=kwargs)
+        return self.captured["q"]
+
+
+def _make_ulysses_config(async_ulysses: bool) -> DiffusionModelConfig:
+    config = _make_model_config()
+    config.visual_gen_mapping = SimpleNamespace(ulysses_size=2, cp_size=1, ring_size=1, cfg_size=1)
+    config.parallel = ParallelConfig(ulysses_size=2, async_ulysses=async_ulysses)
+    return config
+
+
+def test_attention_keeps_fused_qkv_without_async_ulysses() -> None:
+    attention = h3.MiniMaxH3Attention(
+        hidden_size=12,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        qk_norm_eps=1e-5,
+        model_config=_make_model_config(),
+        layer_idx=0,
+        module_name="test.attn",
+    )
+    assert attention.qkv_mode is QKVMode.FUSE_QKV
+    assert not attention.use_async_ulysses
+
+
+def test_async_ulysses_projections_match_the_sync_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The async closures apply the per-head norm and partial RoPE to Q and K only, like forward."""
+    recorder = _RecordingAsyncUlysses()
+    monkeypatch.setattr(
+        attention_module,
+        "wrap_parallel_attention",
+        lambda attn, **kwargs: recorder if kwargs["async_ulysses"] else attn,
+    )
+    kwargs = dict(
+        hidden_size=12, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5, layer_idx=0
+    )
+    asynchronous = h3.MiniMaxH3Attention(
+        model_config=_make_ulysses_config(async_ulysses=True), module_name="async.attn", **kwargs
+    )
+    synchronous = h3.MiniMaxH3Attention(
+        model_config=_make_ulysses_config(async_ulysses=False), module_name="sync.attn", **kwargs
+    )
+    assert asynchronous.qkv_mode is QKVMode.SEPARATE_QKV and asynchronous.use_async_ulysses
+    assert synchronous.qkv_mode is QKVMode.FUSE_QKV and not synchronous.use_async_ulysses
+    _initialize_weights(asynchronous)
+    _initialize_weights(synchronous)
+    with torch.no_grad():
+        synchronous.qkv_proj.weight.copy_(
+            torch.cat(
+                [asynchronous.to_q.weight, asynchronous.to_k.weight, asynchronous.to_v.weight]
+            )
+        )
+        synchronous.to_out[0].weight.copy_(asynchronous.to_out[0].weight)
+    sync_inputs: dict[str, torch.Tensor] = {}
+
+    def _identity_attention(query, key, value, **attn_kwargs):
+        sync_inputs.update(q=query, k=key, v=value, kwargs=attn_kwargs)
+        return query
+
+    synchronous._attn_impl = _identity_attention
+    hidden_states = torch.randn(1, 3, 12, dtype=torch.bfloat16)
+    rotary_emb = h3.MiniMaxH3RotaryPosEmbed(rope_freq_dim=1)(
+        torch.tensor([[0, 0, 0], [1, 0, 0], [1, 1, 0]])
+    )
+    mask = torch.tensor([[True, True, False]])
+
+    async_out = asynchronous(hidden_states, rotary_emb, key_padding_mask=mask, valid_seq_len=2)
+    sync_out = synchronous(hidden_states, rotary_emb, key_padding_mask=mask, valid_seq_len=2)
+
+    for name in ("q", "k", "v"):
+        torch.testing.assert_close(
+            recorder.captured[name].flatten(2), sync_inputs[name], rtol=0, atol=0
+        )
+    assert recorder.captured["kwargs"]["key_padding_mask"] is mask
+    assert recorder.captured["kwargs"]["valid_seq_len"] == 2
+    assert sync_inputs["kwargs"]["valid_seq_len"] == 2
+    torch.testing.assert_close(async_out, sync_out, rtol=0, atol=0)
+
+
+def test_load_weights_accepts_diffusers_layout_with_async_ulysses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The separate to_q / to_k / to_v modules load straight from the checkpoint's keys."""
+    monkeypatch.setattr(attention_module, "wrap_parallel_attention", lambda attn, **kwargs: attn)
+    config = _make_model_config(num_layers=1, num_refiner_layers=1)
+    config.visual_gen_mapping = SimpleNamespace(
+        ulysses_size=2,
+        cp_size=1,
+        ring_size=1,
+        cfg_size=1,
+        seq_size=2,
+        seq_rank=0,
+        seq_group=lambda: object(),
+    )
+    config.parallel = ParallelConfig(ulysses_size=2, async_ulysses=True)
+    model = h3.MiniMaxH3Transformer3DModel(config)
+    attention_modules = [m for m in model.modules() if isinstance(m, h3.MiniMaxH3Attention)]
+    assert attention_modules and all(m.use_async_ulysses for m in attention_modules)
+
+    # The released Diffusers layout: to_q / to_k / to_v (no qkv_proj) and ff.net.{0.proj,2}
+    # with SwiGLU stored as [up, gate].
+    checkpoint: dict[str, torch.Tensor] = {}
+    expected: dict[str, torch.Tensor] = {}
+    for name, value in model.state_dict().items():
+        value = torch.randn_like(value) if value.is_floating_point() else value.clone()
+        expected[name] = value
+        if ".ff.gate_up_proj." in name:
+            gate, up = value.chunk(2, dim=0)
+            checkpoint[name.replace(".ff.gate_up_proj.", ".ff.net.0.proj.")] = torch.cat((up, gate))
+        elif ".ff.down_proj." in name:
+            checkpoint[name.replace(".ff.down_proj.", ".ff.net.2.")] = value
+        else:
+            checkpoint[name] = value
+    assert not any("qkv_proj" in key for key in checkpoint)
+    assert any(key.endswith("attn.to_k.weight") for key in checkpoint)
+
+    model.load_weights(checkpoint)
+
+    # Every parameter, including the re-ordered gate_up_proj and the renamed down_proj.
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(parameter, expected[name].to(parameter.dtype), rtol=0, atol=0)

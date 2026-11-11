@@ -17,6 +17,7 @@ all available backends (FMA, DeepGEMM split-K, DeepGEMM no-split) at warmup.
 Falls back to FMA when DeepGEMM is unavailable or autotuner cache misses.
 """
 
+import os
 from functools import lru_cache, partial
 from typing import Any, List
 
@@ -669,6 +670,60 @@ _FUSED_HC_ALL_FMA_TN_KS_TM = tuple(
 )
 # Shared BigFuse block-size options (same as pre_mapping autotuner).
 _FUSED_HC_BIGFUSE_BS = _BIGFUSE_BLOCK_SIZE_OPTIONS
+# On SM103 (B300/GB300) the small-M half-fused FMA candidates share one split count and one
+# BigFuse block size per token bucket: 4 splits up to 4 tokens, 2 splits up to 32, block size 512.
+# Both change the floating-point summation order (the K partition and the fused-norm reduction
+# width), while the tile width only assigns output columns to CTAs and computes the same sums. The
+# split counts are near-ties at these sizes, so leaving them all to the autotuner lets timing noise
+# pick the numerics of small decode steps. The values are the autotuner's majority pick on B300;
+# other GPUs keep every split count and block size.
+#
+# This fixes one choice only. Each tactic is reproducible on its own, but the autotuner still picks
+# among tactics that sum in different orders:
+#   - fused_all_fma at ks 1 or 2 (M <= 32), and off SM103 every half-FMA split count and block size;
+#   - FMA or MMA at M == 32, and fused_half_mma or fused_all_mma (M >= 64);
+#   - on SM107, the MMA split count in every M >= 32 bucket;
+#   - the two BigFuse block sizes offered at M == 1024 and M >= 8192;
+#   - in mhc_pre_mapping, FMA, DeepGEMM split-K or DeepGEMM without split, and the BigFuse block
+#     size, in every token bucket.
+# Separate tuning runs can settle any of these on different numerics.
+_FUSED_HC_SMALL_M_HALF_FMA_BS = 512
+# The tactic filters cap the CTA count in units of B200's 148 SMs, the same on every SKU; the SM107
+# MMA candidates scale with the device's own SM count instead.
+_B200_NUM_SMS = 148
+
+
+def _fused_hc_small_m_half_fma_ks(M: int) -> int:
+    """Split count of the pinned small-M half-fused FMA candidates for token bucket ``M <= 32``."""
+    return 4 if M <= 4 else 2
+
+
+def _fused_hc_pins_small_m_half_fma(device: torch.device) -> bool:
+    """Whether the small-M half-fused FMA candidates are pinned on ``device`` (SM103 only)."""
+    props = torch.cuda.get_device_properties(device)
+    return (props.major, props.minor) == (10, 3)
+
+
+def _fused_hc_small_m_half_fma_tactics(
+    M: int, n: int, pinned: bool
+) -> list[tuple[str, int, int, int, int]]:
+    """Half-fused FMA candidates for token bucket ``M <= 32``.
+
+    Pinned, every candidate uses the bucket's split count and BigFuse block size, so they differ
+    only in tile width and compute the same bits. Unpinned, every split count and block size is
+    offered.
+    """
+    pinned_ks = _fused_hc_small_m_half_fma_ks(M) if pinned else None
+    block_sizes = (_FUSED_HC_SMALL_M_HALF_FMA_BS,) if pinned else _FUSED_HC_BIGFUSE_BS
+    tactics = []
+    for tn, ks in _FUSED_HC_HALF_FMA_TN_KS:
+        if pinned_ks is not None and ks != pinned_ks:
+            continue
+        if ks > 1 and M * (n * (2 + n) // tn) >= _B200_NUM_SMS * 2:
+            continue
+        for bs in block_sizes:
+            tactics.append(("fused_half_fma", tn, ks, bs, 1))
+    return tactics
 
 
 def _fused_hc_mma_ks_options(hidden_size: int) -> tuple[int, ...]:
@@ -785,6 +840,24 @@ def _fused_hc_call(
     )
 
 
+def _fused_hc_mma_k_splits(M: int, num_k_splits: int, all_in_one: bool) -> int:
+    """Split count the TF32 MMA fused-HC launchers run with (C++ ``mhcFusedHcMmaKSplits``).
+
+    ``num_k_splits <= 0`` selects the launcher's built-in heuristic. The runner resolves the
+    count here once, sizes the workspaces with it and passes it to the op, so the launch never
+    depends on the C++ copy of the ladder; keep the two in sync for direct callers of the op,
+    whose workspace check uses the C++ one.
+    """
+    if num_k_splits > 0:
+        return num_k_splits
+    if all_in_one:
+        return 1
+    for max_m, ks in ((512, 16), (1024, 8), (2048, 4), (4096, 2)):
+        if M <= max_m:
+            return ks
+    return 1
+
+
 def _alloc_fused_hc_scratch(
     backend: str,
     B: int,
@@ -793,12 +866,23 @@ def _alloc_fused_hc_scratch(
     tile_m: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Allocate backend-specific scratch for one fused-HC invocation."""
+    """Allocate backend-specific scratch for one fused-HC invocation.
+
+    The split-K backends other than Path F keep one GEMM partial per split
+    ([ks, B, shape_n] / [ks, B]) and sum the splits in a fixed order, so their
+    output does not depend on how the split CTAs were scheduled.
+    """
     shape_n = n * (2 + n)
 
-    if backend == "fused_half_fma" and num_k_splits > 1:
-        y_acc_ws = torch.empty((num_k_splits, B, shape_n), dtype=torch.float32, device=device)
-        r_acc_ws = torch.empty((num_k_splits, B), dtype=torch.float32, device=device)
+    if backend in ("fused_half_mma", "fused_all_mma"):
+        num_splits = _fused_hc_mma_k_splits(B, num_k_splits, backend == "fused_all_mma")
+    elif backend == "fused_half_fma":
+        num_splits = max(num_k_splits, 1)
+    else:
+        num_splits = 1
+    if num_splits > 1:
+        y_acc_ws = torch.empty((num_splits, B, shape_n), dtype=torch.float32, device=device)
+        r_acc_ws = torch.empty((num_splits, B), dtype=torch.float32, device=device)
     else:
         y_acc_ws = torch.empty((B, shape_n), dtype=torch.float32, device=device)
         r_acc_ws = torch.empty((B,), dtype=torch.float32, device=device)
@@ -817,10 +901,10 @@ def _alloc_fused_hc_scratch(
 
 # Fallback tactic: backend, tile_n, num_k_splits, bigfuse_bs, tile_m.
 #
-# The MMA (tcgen05) default delegates ks/bs to the C++ heuristic (pickKSplits
-# + selectBigFuseBS). That backend requires SM100+, so on pre-SM100 GPUs we
-# fall back to the half-fused FMA path with an explicit ks=1 tactic that is
-# valid everywhere.
+# The MMA (tcgen05) default takes ks from _fused_hc_mma_k_splits (the Python copy of the C++
+# mhcFusedHcMmaKSplits ladder) and bs from the C++ selectBigFuseBS.
+# That backend requires SM100+, so on pre-SM100 GPUs we fall back to the
+# half-fused FMA path with an explicit ks=1 tactic that is valid everywhere.
 _FUSED_HC_FALLBACK_TACTIC_MMA = ("fused_half_mma", 0, 0, 0, 1)
 _FUSED_HC_FALLBACK_TACTIC_FMA = ("fused_half_fma", 2, 1, 256, 1)
 
@@ -917,14 +1001,12 @@ class MhcFusedHcRunner(TunableRunner):
             for tn, ks, tm in _FUSED_HC_ALL_FMA_TN_KS_TM:
                 # Skip grids that wildly oversubscribe SMs.
                 m_batches = (M + tm - 1) // tm
-                if m_batches * (self.n * (2 + self.n) // tn) * ks > 148 * 4:
+                if m_batches * (self.n * (2 + self.n) // tn) * ks > _B200_NUM_SMS * 4:
                     continue
                 add(("fused_all_fma", tn, ks, 0, tm))
-            for tn, ks in _FUSED_HC_HALF_FMA_TN_KS:
-                if ks > 1 and M * (self.n * (2 + self.n) // tn) >= 148 * 2:
-                    continue
-                for bs in _FUSED_HC_BIGFUSE_BS:
-                    add(("fused_half_fma", tn, ks, bs, 1))
+            pinned = _fused_hc_pins_small_m_half_fma(inputs[0].device)
+            for tactic in _fused_hc_small_m_half_fma_tactics(M, self.n, pinned):
+                add(tactic)
 
         if mma_ok and M >= 32:
             props = torch.cuda.get_device_properties(inputs[0].device)
@@ -932,7 +1014,7 @@ class MhcFusedHcRunner(TunableRunner):
             ks = _fused_hc_target_mma_ks(self.hidden_size, M, props.multi_processor_count, is_sm107)
             if ks is not None:
                 m_tiles = (M + 63) // 64
-                max_grid_ctas = props.multi_processor_count * 5 if is_sm107 else 148 * 4
+                max_grid_ctas = props.multi_processor_count * 5 if is_sm107 else _B200_NUM_SMS * 4
                 # The wave-count heuristic goes first; on SM107 every other schedulable
                 # split count follows so the autotuner measures instead of guessing (at
                 # hidden 5120 the heuristic's pick is 9-12% off the best one at 1k-4k
@@ -1009,6 +1091,9 @@ class MhcFusedHcRunner(TunableRunner):
                 pre_mix_ext = torch.ones((B, self.n), dtype=torch.float32, device=x_prev.device)
             pre_mix_ext = pre_mix_ext.reshape(B, self.n).to(torch.float32).contiguous()
             pre_mix_out = torch.empty((B, self.n), dtype=torch.float32, device=x_prev.device)
+        if backend in ("fused_half_mma", "fused_all_mma"):
+            # Resolve the split count once, so the scratch below and the launcher use the same one.
+            num_k_splits = _fused_hc_mma_k_splits(B, num_k_splits, backend == "fused_all_mma")
         y_acc_ws, r_acc_ws, done_counter_ws = _alloc_fused_hc_scratch(
             backend=backend,
             B=B,
@@ -1120,7 +1205,7 @@ def mhc_fused_hc(
     backend carries it as a template variant, so the tactic space is unchanged.
 
     The autotuner chooses between four backends:
-      * "fused_half_mma" — 2-kernel tcgen05 TF32 pmap+GEMM atomic + bigfuse.
+      * "fused_half_mma" — 2-kernel tcgen05 TF32 pmap+GEMM (per-split partials) + bigfuse.
       * "fused_half_fma" — 2-kernel pmap inline + FMA GEMM + sqrsum + bigfuse.
       * "fused_all_mma"  — 1-kernel TF32 tcgen05 all-in-one (Path D).
       * "fused_all_fma"  — 1-kernel FMA all-in-one (Path F).
@@ -1150,16 +1235,33 @@ def mhc_fused_hc(
         sinkhorn_repeat=sinkhorn_repeat,
     )
 
-    tuner = AutoTuner.get()
-    _, best_tactic = tuner.choose_one(
-        "trtllm::mhc_fused_hc",
-        [runner],
-        MhcFusedHcRunner.tuning_config,
-        [x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t_cur, hc_scale_cur, hc_base_cur],
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
-        pre_mix_ext=pre_mix_ext,
-    )
+    if (
+        os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+        or os.getenv("FORCE_MHC_KERNEL_DETERMINISTIC", "0") == "1"
+    ):
+        # This fixed FMA tactic has no cross-CTA floating-point atomics and
+        # uses the same reduction order for context and generation shapes.
+        # Bypass tuning so a cached tactic cannot change the reduction order.
+        best_tactic = _FUSED_HC_FALLBACK_TACTIC_FMA
+    else:
+        tuner = AutoTuner.get()
+        _, best_tactic = tuner.choose_one(
+            "trtllm::mhc_fused_hc",
+            [runner],
+            MhcFusedHcRunner.tuning_config,
+            [
+                x_prev,
+                residual_prev,
+                post_mix_prev,
+                comb_mix_prev,
+                w_t_cur,
+                hc_scale_cur,
+                hc_base_cur,
+            ],
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            pre_mix_ext=pre_mix_ext,
+        )
 
     return runner(
         inputs=[

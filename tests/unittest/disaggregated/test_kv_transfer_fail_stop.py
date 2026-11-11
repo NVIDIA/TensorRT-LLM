@@ -16,9 +16,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base import Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.retirement import (
     QuiescenceFatalEvent,
     RetirementWatchdog,
@@ -176,6 +177,23 @@ def test_fatal_callback_uses_captured_world_on_background_thread(
     global_world.Abort.assert_not_called()
     lookup.assert_not_called()
     kill.assert_not_called()
+
+
+def test_fatal_log_identifies_retirement_grace_without_changing_the_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The containment report labels its own clock, not an executor timeout."""
+    from tensorrt_llm._torch.disaggregation import transceiver
+
+    event = QuiescenceFatalEvent(12, "receive", "cancelled", 1.0, 2.0, 2.0)
+    critical = Mock()
+    monkeypatch.setattr(transceiver.logger, "critical", critical)
+    transceiver._log_unproven_kv_transfer(event)
+    message = critical.call_args.args[0]
+    assert "deadline_owner=retirement_grace" in message
+    assert "progress_at_observation=unproven_quiescence" in message
+    assert "deadline=2.0, expired_at=2.0" in message
+    assert event == QuiescenceFatalEvent(12, "receive", "cancelled", 1.0, 2.0, 2.0)
 
 
 @pytest.mark.parametrize("thread_error", [None, "start", "join"])
@@ -337,7 +355,7 @@ def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
     task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=12))
     task.bind_logical_outcomes(transfer_mod._LogicalOutcomes(owner))
     assert task.begin_physical_operation(7)
-    request = object()
+    request = Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
     status = Mock(wait=Mock(return_value=False), is_completed=Mock(return_value=False))
     status.last_status_str.return_value = "ERROR"
     sender = object.__new__(transfer_mod.Sender)
@@ -346,7 +364,10 @@ def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
     sender._enforce_physical_ownership = True
     sender._ownership_poisoned = None
     sender._ownership_poison_lock = watchdog.lock
-    sender._agent = Mock(submit_transfer_requests=Mock(return_value=status))
+    sender._agent = Mock(
+        submit_transfer_requests=Mock(return_value=status),
+        check_remote_descs=Mock(return_value=True),
+    )
 
     assert sender._submit_transfer(task, 7, request) == (False, "ERROR")
     operation = task._physical_operations[7]
@@ -359,7 +380,9 @@ def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
     later = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=13))
     assert later.begin_physical_operation(8)
     with pytest.raises(transfer_mod._TransferNotSubmittedError, match="before backend submission"):
-        sender._submit_transfer(later, 8, object())
+        sender._submit_transfer(
+            later, 8, Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
+        )
     sender._agent.submit_transfer_requests.assert_called_once_with(request)
     assert later._physical_operations[8].state is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
     assert later.resources_drained
@@ -520,7 +543,6 @@ def _shutdown_transceiver() -> tuple[KvCacheTransceiverV2, transfer_mod.RxSessio
     receiver._shutdown = False
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
-    receiver._bounce = Mock()
     receiver._dealers = {}
     receiver._messenger = Mock()
     receiver.send_cancel_to_senders = Mock(return_value=None)
@@ -539,7 +561,6 @@ def _shutdown_transceiver() -> tuple[KvCacheTransceiverV2, transfer_mod.RxSessio
     worker = transfer_mod.TransferWorker.__new__(transfer_mod.TransferWorker)
     worker._retirement_watchdog = watchdog
     worker._receiver = receiver
-    worker._bounce = receiver._bounce
     worker._registered_mem = []
     instance = KvCacheTransceiverV2.__new__(KvCacheTransceiverV2)
     instance._transfer_worker = worker
@@ -624,8 +645,8 @@ def test_shutdown_retains_receive_reserved_for_blocked_publication() -> None:
         thread.join(timeout=1)
     assert not thread.is_alive()
     assert not errors
-    task.record_writer_result(7, True, wait_for_local_completion=False)
-    session._aux_physical_owner.record_writer_result(7, True, wait_for_local_completion=False)
+    task.record_writer_result(7, True)
+    session._aux_physical_owner.record_writer_result(7, True)
     instance.shutdown()
     assert session.status is SessionStatus.CANCELLED
     aux.free_slot.assert_called_once_with(3)

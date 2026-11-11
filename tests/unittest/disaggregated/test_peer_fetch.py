@@ -17,16 +17,15 @@ import numpy as np
 import pytest
 
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import (
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
+from tensorrt_llm._torch.disaggregation.native.extent import (
     CacheExtent,
-    CacheKind,
     Cancelled,
     Chunk,
     Delivered,
     Failed,
-    TokenRange,
 )
-from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     KVRecvTask,
@@ -307,11 +306,12 @@ def _transceiver_over(worker):
     transceiver._recv_sessions = {}
     transceiver._recv_reqs = {}
     transceiver._kv_size_rank_factor = 1
+    transceiver._page_table = None
+    transceiver._mapping = SimpleNamespace(cp_size=1)
     transceiver._validate_bridge_req = lambda req, synchronous=False: True
     # Named after the request, the way the real builder does it: the adapter refuses an extent
     # built for anyone else.
     transceiver._create_cache_extent = lambda req: _extent(name=get_unique_rid(req))
-    transceiver._chunk_num_bytes = lambda chunk: 0
     return transceiver
 
 

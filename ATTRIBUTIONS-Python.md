@@ -5261,7 +5261,7 @@ For more information, please refer to <http://unlicense.org>
   - `Tracker`: https://github.com/tox-dev/py-filelock/issues
 
 
-## flashinfer-python (0.6.18)
+## flashinfer-python (0.7.2)
 
 ### Licenses
 License: `Apache-2.0`
@@ -33239,7 +33239,7 @@ License: `NVIDIA Proprietary Software`
   - `Homepage`: https://developer.nvidia.com/cusparselt
 
 
-## nvidia-cutlass-dsl (4.8.0.dev0)
+## nvidia-cutlass-dsl (4.8.0)
 
 ### Licenses
 License: `None`
@@ -63471,7 +63471,7 @@ SOFTWARE.
   - `Homepage`: https://github.com/akshaynagpal/w2n
 
 
-## xgrammar (0.1.32)
+## xgrammar (0.2.8)
 
 ### Licenses
 License: `Apache 2.0`

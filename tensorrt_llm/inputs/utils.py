@@ -3,7 +3,6 @@
 
 import asyncio
 import base64
-import tempfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
@@ -24,16 +23,14 @@ from tensorrt_llm.inputs.chat_template_guard import \
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
 from tensorrt_llm.inputs.data import prompt_inputs
-from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY,
-                                          _get_aiohttp_session,
+from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, VideoMediaIO,
+                                          _decode_base64_with_limit,
                                           _load_and_convert_image,
-                                          _load_video_by_cv2,
                                           _normalize_file_uri,
                                           _safe_aiohttp_get, _safe_request_get)
 from tensorrt_llm.inputs.media_io import \
     convert_image_mode as convert_image_mode
-from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
-                                            default_hasher)
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.multimodal_data import \
     BaseModalityData as BaseModalityData
 from tensorrt_llm.inputs.multimodal_data import VideoData as VideoData
@@ -108,8 +105,7 @@ async def async_load_image(
     parsed_url = urlparse(image)
 
     if parsed_url.scheme in ["http", "https"]:
-        session = await _get_aiohttp_session()
-        content = await _safe_aiohttp_get(image, session=session)
+        content = await _safe_aiohttp_get(image)
         image = await asyncio.to_thread(_load_and_convert_image,
                                         BytesIO(content))
     elif parsed_url.scheme == "data":
@@ -136,8 +132,7 @@ def load_base64_video(video: str) -> BytesIO:
         msg = "Only base64 data URLs are supported for now."
         raise NotImplementedError(msg)
 
-    content = base64.b64decode(data)
-    return content
+    return _decode_base64_with_limit(data)
 
 
 def load_video(video: str,
@@ -146,38 +141,31 @@ def load_video(video: str,
                format: str = "pt",
                device: str = "cpu",
                extract_audio: bool = False) -> VideoData:
+    """Load video frames with the shared source-byte cache identity.
+
+    Encoded video inputs share the serving loader's size limit. Local files
+    are read fully into memory during decoding. Local-file I/O failures raise
+    ValueError, with the original OSError as their cause.
+    """
+    # Decode through `VideoMediaIO`, the loader `trtllm-serve` uses, so the
+    # same video gets the same source-byte anchor (`raw_bytes_hash`) and
+    # therefore the same multimodal hash offline and in serving.
+    video_io = VideoMediaIO(num_frames=num_frames,
+                            fps=fps,
+                            format=format,
+                            device=device,
+                            extract_audio=extract_audio)
     parsed_url = urlparse(video)
     if parsed_url.scheme in ["http", "https"]:
         resp = _safe_request_get(video, stream=False)
-        with tempfile.NamedTemporaryFile(delete=True,
-                                         suffix=".mp4") as tmp_file:
-            tmp_file.write(resp.content)
-            tmp_file.flush()
-            return _load_video_by_cv2(tmp_file.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
+        return video_io.load_bytes(resp.content)
     elif parsed_url.scheme in ("", "file"):
-        return _load_video_by_cv2(video,
-                                  num_frames,
-                                  fps,
-                                  format,
-                                  device,
-                                  extract_audio=extract_audio)
+        try:
+            return video_io.load_file(video)
+        except OSError as error:
+            raise ValueError(f"Video '{video}' could not be opened.") from error
     elif parsed_url.scheme == "data":
-        decoded_video = load_base64_video(video)
-        with tempfile.NamedTemporaryFile(delete=True,
-                                         suffix='.mp4') as tmp_file:
-            tmp_file.write(decoded_video)
-            tmp_file.flush()
-            return _load_video_by_cv2(tmp_file.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
+        return video_io.load_bytes(load_base64_video(video))
     else:
         raise ValueError(f"Unsupported video scheme: {parsed_url.scheme}")
 
@@ -188,36 +176,32 @@ async def async_load_video(video: str,
                            format: str = "pt",
                            device: str = "cpu",
                            extract_audio: bool = False) -> VideoData:
+    """Load video frames without blocking the event loop.
+
+    Encoded video inputs share the serving loader's size limit. Local files
+    are read fully into memory during decoding. Local-file I/O failures raise
+    ValueError, with the original OSError as their cause.
+    """
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
+    # See `load_video`: share the serving decode path so hashes agree.
+    video_io = VideoMediaIO(num_frames=num_frames,
+                            fps=fps,
+                            format=format,
+                            device=device,
+                            extract_audio=extract_audio)
     parsed_url = urlparse(video)
-
-    def _load_from_bytes(data: bytes) -> VideoData:
-        with tempfile.NamedTemporaryFile(delete=True, suffix='.mp4') as tmp:
-            tmp.write(data)
-            tmp.flush()
-            return _load_video_by_cv2(tmp.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
-
     if parsed_url.scheme in ["http", "https"]:
-        session = await _get_aiohttp_session()
-        video_data = await _safe_aiohttp_get(video, session=session)
-        return await asyncio.to_thread(_load_from_bytes, video_data)
+        video_data = await _safe_aiohttp_get(video)
+        return await asyncio.to_thread(video_io.load_bytes, video_data)
     elif parsed_url.scheme == "data":
         decoded_video = await asyncio.to_thread(load_base64_video, video)
-        return await asyncio.to_thread(_load_from_bytes, decoded_video)
+        return await asyncio.to_thread(video_io.load_bytes, decoded_video)
     elif parsed_url.scheme in ("", "file"):
-        return await asyncio.to_thread(_load_video_by_cv2,
-                                       video,
-                                       num_frames,
-                                       fps,
-                                       format,
-                                       device,
-                                       extract_audio=extract_audio)
+        try:
+            return await asyncio.to_thread(video_io.load_file, video)
+        except OSError as error:
+            raise ValueError(f"Video '{video}' could not be opened.") from error
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
@@ -254,8 +238,7 @@ async def async_load_audio(
     parsed_url = urlparse(audio)
 
     if parsed_url.scheme in ["http", "https"]:
-        session = await _get_aiohttp_session()
-        audio_data = await _safe_aiohttp_get(audio, session=session)
+        audio_data = await _safe_aiohttp_get(audio)
         audio = BytesIO(audio_data)
     elif parsed_url.scheme in ("", "file"):
         audio = _normalize_file_uri(
@@ -657,11 +640,15 @@ def resolve_hf_chat_template(
             return templates[chat_template]
         return chat_template
 
-    # 2. If tool is not provided, use the processor's default chat template
-    if not tools and processor and hasattr(processor, 'chat_template'):
-        return processor.chat_template
+    # 2. Without tools, prefer the processor's chat template when it has one.
+    #    A processor without one (some keep the template on their tokenizer
+    #    only) falls through to the tokenizer below.
+    if not tools and processor:
+        processor_template = getattr(processor, "chat_template", None)
+        if processor_template is not None:
+            return processor_template
 
-    # 3. If tool is provided, use the tool
+    # 3. Use the tokenizer's chat template, which accounts for the tools
     try:
         return tokenizer.get_chat_template(chat_template, tools=tools)
     except Exception:
@@ -1002,6 +989,7 @@ async def async_build_multimodal_prompt(
     inputs = prompt_inputs(rendered)
     if mm_data:
         inputs["multi_modal_data"] = mm_data
+        inputs["chat_template_applied"] = True
         item_order = mm_data_tracker.item_order()
         if item_order:
             inputs["mm_item_order"] = item_order
@@ -1185,6 +1173,7 @@ def default_multimodal_input_loader(
         input = {"prompt": prompt}
 
         if mm_placeholder_counts:
+            input["chat_template_applied"] = True
             if mm_embeddings is not None:
                 _, input[
                     "multi_modal_embeddings"] = mm_data_tracker.retrieve_all_sync(
@@ -1199,14 +1188,3 @@ def default_multimodal_input_loader(
         inputs.append(input)
 
     return inputs
-
-
-def get_cache_salt_id(cache_salt: str) -> int:
-    b = cache_salt.encode("utf-8")
-    h = default_hasher(b).digest(length=8)
-    cache_salt_id = int.from_bytes(h, "little", signed=False)
-    if cache_salt_id < 0 or cache_salt_id >= (1 << 64):
-        raise ValueError(
-            f"cache_salt_id must be in [0, 2**64 - 1], got {cache_salt_id}.")
-
-    return cache_salt_id

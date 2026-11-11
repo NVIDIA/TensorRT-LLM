@@ -68,6 +68,11 @@ ncu --call-stack-type python --python-include "FileA.py@FuncA" python script.py
 
 Format: `<Module>@<File>@<Function>` (module and file optional).
 
+A C++ function matches only by its full demangled signature as `nm -C` prints it, such
+as `launch(Bufs const&)`; its bare name matches nothing. A function whose last statement
+is the kernel launch can be tail-called off the stack at -O2/-O3: match its caller, or
+build with `-fno-optimize-sibling-calls`. "No kernels were profiled" means no frame matched.
+
 ## Section and Metric Collection
 
 ### List Available Sections/Sets
@@ -91,8 +96,8 @@ ncu --section "regex:.*Stats" app          # Regex section matching
 
 ```bash
 ncu --set basic app       # LaunchStats, Occupancy, SpeedOfLight, WorkloadDistribution
-ncu --set detailed app    # basic + ComputeWorkloadAnalysis, MemoryWorkloadAnalysis, SourceCounters
-ncu --set full app        # All sections (~8051 metrics)
+ncu --set detailed app    # basic + ComputeWorkloadAnalysis, MemoryWorkloadAnalysis(_Chart), SourceCounters, RooflineChart, Tile
+ncu --set full app        # Nearly all sections (~9000 metrics in Nsight Compute 2026.3)
 ncu --set roofline app    # SpeedOfLight + all roofline charts
 ```
 
@@ -100,8 +105,11 @@ ncu --set roofline app    # SpeedOfLight + all roofline charts
 
 ```bash
 ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed app
-ncu --metrics sm__throughput,dram__throughput app
+ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed app
 ```
+
+A throughput metric needs its full name: a bare `dram__throughput` fails with
+"Failed to find metric". List a metric's full names with `--query-metrics-mode suffix`.
 
 ### Query Metric Availability
 
@@ -135,7 +143,8 @@ ncu --print-fp app                   # Floating point formatting
 ### Report Files
 
 ```bash
-ncu -o report app                    # Save as report.ncu-rep
+ncu -o report app                    # report.ncu-repz (2026.3+) or report.ncu-rep (older)
+ncu -o report.ncu-rep app            # Name the extension to fix the file name
 ncu -o report_%h_%p app              # With hostname and PID macros
 ncu -o report_%q{OMPI_COMM_WORLD_RANK} app  # With env var macro
 ncu -f -o report app                 # Force overwrite
@@ -143,13 +152,21 @@ ncu -f -o report app                 # Force overwrite
 
 File macro expansions: `%h` hostname, `%p` PID, `%q{VAR}` env var, `%i` auto-increment, `%%` literal %.
 
+Without an extension, `-o` adds `.ncu-repz` (zstd-compressed) from Nsight Compute 2026.3 on and
+`.ncu-rep` before. `--import` and `ncu_report` read both formats.
+
 ### Source Code Display
 
 ```bash
-ncu --print-source sass app          # SASS assembly
-ncu --print-source cuda app          # CUDA-C source
-ncu --print-source cuda,sass app     # Both correlated
+ncu --page source --print-source sass app          # SASS assembly (the default view)
+ncu --page source --print-source cuda app          # CUDA-C source
+ncu --page source --print-source cuda,sass app     # Both correlated
 ```
+
+`--print-source` requires `--page source`. The CUDA-C views need a build with
+`-lineinfo`; the SASS view and its per-instruction metrics do not. Other views are `ptx`
+and, for CUDA Tile kernels, `tileir`, `cuda,tileir`, `tileir,ptx` and `tileir,sass`
+(Nsight Compute 2026.3+).
 
 ### Summary Modes
 
@@ -180,9 +197,12 @@ ncu --import old.ncu-rep --export new.ncu-rep --kernel-name "regex:foo"
 ```bash
 --cache-control all          # Flush caches before replays (default)
 --cache-control none         # No cache flushing
---clock-control base         # Base frequency (default)
---clock-control boost        # Boost frequency
+--clock-control base         # Base frequency (default before Nsight Compute 2026.1)
+--clock-control boost        # Boost frequency, or base where boost is unsupported (default from 2026.1)
+--clock-control force-boost  # Boost frequency, no fallback
 --clock-control none         # No clock changes
+--clock-control reset        # Reset GPU clocks and exit
+--pipeline-boost-state stable # Stable Tensor Core boost state (default); dynamic lets it vary
 ```
 
 ## Replay Modes
@@ -190,7 +210,7 @@ ncu --import old.ncu-rep --export new.ncu-rep --kernel-name "regex:foo"
 ```bash
 --replay-mode kernel         # Individual kernel replay (default)
 --replay-mode application    # Full application reruns
---replay-mode range          # Range-based (cudaProfilerStart/Stop)
+--replay-mode range          # Ranges from cudaProfilerStart/Stop, or NVTX with --nvtx-include
 --replay-mode app-range      # Application-level range replay
 ```
 
@@ -230,13 +250,20 @@ ncu --target-processes all -o report mpirun app
 mpirun ncu -o report_%q{OMPI_COMM_WORLD_RANK} app
 
 # Synchronized profiling (for NCCL/NVSHMEM dependent kernels)
-mpirun -np 4 ncu --communicator=tcp --communicator-num-peers=4 \
+mpirun -np 4 ncu --communicator=tcp --communicator-tcp-num-peers=4 \
   --lockstep-kernel-launch -o report app
 
-# Restrict synchronization to specific NVTX ranges
-mpirun ncu --communicator=tcp --communicator-num-peers=4 \
+# Restrict synchronization to specific NVTX ranges (requires --lockstep-kernel-launch)
+mpirun ncu --communicator=tcp --communicator-tcp-num-peers=4 --lockstep-kernel-launch \
   --lockstep-nvtx-include "nccl/" -o report app
+
+# One ncu over every rank of one node (2026.1+)
+ncu --communicator shmem --communicator-shmem-num-peers 2 -k regex:nccl -o report \
+  torchrun --nnodes=1 --nproc_per_node=2 app.py
 ```
+
+On NVLink systems where NCCL uses NVLS, NCCL kernels need `NCCL_NVLS_ENABLE=0` under kernel
+replay; see `advanced-profiling.md`.
 
 ### Process Filtering
 
@@ -248,15 +275,25 @@ ncu --target-processes-filter "exclude:MatrixMul" app
 
 ## MPS (Multi-Process Service)
 
+`ncu --mps client` only launches a client, suspended; a separate `ncu --mps control` process
+attaches to the clients and profiles them, so profiling options go on the control process:
+
 ```bash
-ncu --mps client app                    # Profile as MPS client
-ncu --mps primary-client app            # Primary client role
-ncu --mps-num-clients 4 app             # Expected client count
+ncu --mps client ./client_app 1                    # Launch each client (add --nvtx if ranges use NVTX)
+ncu --mps client ./client_app 2
+ncu --mps control --mps-num-clients 2 --replay-mode range -o report    # Wait for 2 clients, profile
+ncu --mps control --replay-mode range -o report ./client_app           # Or launch a single client itself
 ```
+
+Launch a client with `--mps primary-client` to limit the profiled window to that client's
+duration. Only kernel and range replay work; prefer range replay, because with kernel replay
+each client contributes a single kernel launch. MPS profiling is CLI-only.
 
 ## Configuration Files
 
-Default location: `$HOME/.config/NVIDIA Corporation/config.ncu-cfg`
+ncu reads `config.ncu-cfg` from the current working directory, then from
+`$HOME/.config/NVIDIA Corporation/`. A stray one in the working directory
+silently changes every run there; `--config-file off` ignores it.
 
 ```ini
 [Launch-and-attach]
@@ -280,10 +317,13 @@ ncu @myoptions.txt app    # Read options from file
 
 ## PM and Warp Sampling
 
+These options tune sampling that a section requests: PM sampling for `PmSampling`, warp state
+sampling for `SourceCounters`. Without such a section they collect nothing.
+
 ```bash
-ncu --pm-sampling-interval 0 app          # Auto interval
-ncu --warp-sampling-interval auto app     # Auto warp sampling
-ncu --warp-sampling-max-passes 5 app
+ncu --section PmSampling --pm-sampling-interval 0 app              # Auto interval
+ncu --section SourceCounters --warp-sampling-interval auto app     # Auto warp sampling
+ncu --section SourceCounters --warp-sampling-max-passes 5 app
 ```
 
 ## Kernel Renaming
@@ -293,6 +333,11 @@ ncu --rename-kernels-path renames.yaml --kernel-name "MyKernel" app
 ncu --rename-kernels-export on -o report app   # Export names for renaming
 ```
 
+The export writes `$HOME/.config/NVIDIA Corporation/ncu-kernel-renames.yaml`
+(or `--rename-kernels-path`), and later runs apply it automatically: renaming
+is on by default and also reads `ncu-kernel-renames.yaml` from the working
+directory.
+
 ## Environment Variables
 
 | Variable | Purpose |
@@ -300,12 +345,13 @@ ncu --rename-kernels-export on -o report app   # Export names for renaming
 | `NV_COMPUTE_PROFILER_DISABLE_STOCK_FILE_DEPLOYMENT` | Skip versioned section dir |
 | `NV_COMPUTE_PROFILER_LOCAL_CONNECTION_OVERRIDE` | Connection: `uds`, `tcp`, `named-pipes` |
 | `NV_COMPUTE_PROFILER_DISABLE_CONCURRENT_PROFILING` | Single-profiler system lock |
+| `NV_NSIGHT_PYTHON_ISOLATED` | `0` lets rules use the user's Python packages and `PYTHONPATH` (isolated by default from 2026.3) |
 
 ## Miscellaneous Options
 
 ```bash
 ncu --null-stdin app                # Suppress stdin blocking
 ncu --check-exit-code yes app       # Validate app exit code
-ncu --support-32bit app             # Linux 32-bit support
+ncu --support-32bit app             # Only for processes launched from a 32-bit app; 2026.1.1 hung on a 64-bit app, 2026.3.1 did not
 ncu --section-folder /path app      # Custom section file location
 ```

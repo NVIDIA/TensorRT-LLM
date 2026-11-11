@@ -17,10 +17,11 @@ from __future__ import annotations
 
 from typing import Optional
 
-from cbts.blocks import Stage, YAMLIndex, _entry_target
+from cbts.blocks import Stage, YAMLIndex, _entry_target, _target_in_filter_subtree
 
 from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
+from .out_of_scope import is_out_of_scope
 
 # Stage key declared in jenkins/L0_Test.groovy::docBuildConfigs. This stage is
 # not test-db-driven, so CBTS contributes its name literally.
@@ -30,49 +31,62 @@ CPU_TEST_YAML_STEM = "l0_cpu"
 _DOCS_PREFIX = "docs/"
 _DOCS_SUFFIXES: tuple[str, ...] = (".md", ".rst")
 
+# Documentation helpers/extensions, API documentation contracts, and tests that
+# read documentation as data. Parent YAML entries retain their complete suite.
+_DOCS_CPU_TEST_PATHS = (
+    "unittest/docs",
+    "unittest/api_stability",
+    "unittest/tools",
+    "unittest/usage",
+    "unittest/llmapi/test_trtllm_serve_config_schemas.py",
+    "unittest/_torch/pyexecutor/test_model_loader_mx.py",
+)
+
 
 def is_docs_path(path: str) -> bool:
     """Return whether ``path`` contributes to the repository documentation."""
-    return path.startswith(_DOCS_PREFIX) or path.endswith(_DOCS_SUFFIXES)
+    return not is_out_of_scope(path) and (
+        path.startswith(_DOCS_PREFIX) or path.endswith(_DOCS_SUFFIXES)
+    )
 
 
 class DocsRule(Rule):
     name = "docs"
-    needs_diff_for: tuple[str, ...] = ()
+    needs_diff_for: tuple[str, ...] = ("**/*.py",)
+    handles_docstrings = True
 
     def __init__(self, yaml_index: YAMLIndex, stages: dict[str, Stage]) -> None:
         self.yaml_index = yaml_index
         self._stages_by_yaml = stages_by_yaml_stem(stages)
 
     def _cpu_block_filters(self) -> dict[tuple[str, int], dict[str, set[str]]]:
-        """Keep every entry in every CPU test-db block.
-
-        Tests read files under ``docs/`` directly: model-loader validation
-        parses ``docs/source/features/model-express.md``, and telemetry tests
-        import ``docs/source/_ext/llmapi_config_telemetry.py``. Until those
-        consumers have a complete explicit inventory, changes under ``docs/``
-        conservatively run the complete CPU suite. Using each entry's own
-        canonical target and raw text preserves `-k` variants through Layer
-        3's normal subtree and keyword filtering.
-        """
-        block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
+        """Select registered documentation consumers, preserving YAML options."""
+        filters: dict[tuple[str, int], dict[str, set[str]]] = {}
         for block in self.yaml_index.blocks:
             if block.yaml_stem != CPU_TEST_YAML_STEM:
                 continue
-            prefix_to_entries: dict[str, set[str]] = {}
-            for entry in block.tests:
-                target = _entry_target(entry)
-                if target:
-                    prefix_to_entries.setdefault(target, set()).add(entry)
-            block_filters[(block.yaml_stem, block.block_index)] = prefix_to_entries
-        return block_filters
+            entries: dict[str, set[str]] = {}
+            for raw in block.tests:
+                target = _entry_target(raw)
+                if any(
+                    _target_in_filter_subtree(target, path)
+                    or _target_in_filter_subtree(path, target)
+                    for path in _DOCS_CPU_TEST_PATHS
+                ):
+                    entries.setdefault(target, set()).add(raw)
+            if entries:
+                filters[(block.yaml_stem, block.block_index)] = entries
+        return filters
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
-        claimed = {path for path in pr.changed_files if is_docs_path(path)}
-        if not claimed:
+        docstring_files = {path for path in pr.docstring_files if not is_out_of_scope(path)}
+        claimed = {path for path in pr.changed_files if is_docs_path(path)} | {
+            path for path in pr.docstring_only_files if not is_out_of_scope(path)
+        }
+        if not claimed and not docstring_files:
             return None
 
-        if not any(path.startswith(_DOCS_PREFIX) for path in claimed):
+        if not docstring_files and not any(path.startswith(_DOCS_PREFIX) for path in claimed):
             return RuleResult(
                 handled_files=claimed,
                 affected_stages={DOCS_STAGE},
@@ -93,7 +107,7 @@ class DocsRule(Rule):
                 affected_stages=set(),
                 scope=None,
                 reason=(
-                    f"docs: {len(claimed)} documentation file(s); "
+                    f"docs: {len(claimed | docstring_files)} documentation/docstring file(s); "
                     "no CPU test-db blocks or stages resolved — fallback"
                 ),
             )
@@ -107,7 +121,8 @@ class DocsRule(Rule):
             sanity_relevant=False,
             perfsanity_relevant=False,
             reason=(
-                f"docs: {len(claimed)} documentation file(s) → {DOCS_STAGE} + "
+                f"docs: {len(claimed | docstring_files)} documentation/docstring file(s) → "
+                f"{DOCS_STAGE} + "
                 f"{len(cpu_stages)} CPU test stage(s)"
             ),
         )

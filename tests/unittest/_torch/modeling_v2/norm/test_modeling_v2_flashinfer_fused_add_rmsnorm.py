@@ -13,11 +13,13 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (
     flashinfer_fused_add_rmsnorm as op,
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "flashinfer_fused_add_rmsnorm requires a CUDA device"
@@ -32,7 +34,27 @@ def _build(spec, seed):
     return x, residual, weight, spec["eps"]
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:40] for c in op.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="decode-shaped, deepseek-r1 hidden",
+            spec=dict(shape=(1, 7168), dtype=torch.bfloat16, eps=1e-6),
+        ),
+    ),
+    "gpt_oss/gpt_oss_120b__sm_10x__default": (
+        Cell(
+            why="decode-shaped, gpt-oss-120b hidden",
+            spec=dict(shape=(1, 2880), dtype=torch.bfloat16, eps=1e-5),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:40] for c in CELLS])
 def test_certified_cells(cell) -> None:
     """Every certified configuration, kernel against reference.
 

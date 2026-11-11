@@ -594,6 +594,54 @@ INSTANTIATE_ROUTER_LATENT_GEMM_MMA(15)
 INSTANTIATE_ROUTER_LATENT_GEMM_MMA(16)
 #undef INSTANTIATE_ROUTER_LATENT_GEMM_MMA
 
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 1, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 2, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 3, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 4, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 5, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 6, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 7, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 8, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 9, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 10, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 11, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 12, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 13, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 14, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 15, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 16, 288, 4096>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
 } // namespace kernels::dsv3MinLatencyKernels
 
 TRTLLM_NAMESPACE_END

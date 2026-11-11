@@ -23,6 +23,7 @@ import torch
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.attention.backends import prims_ts
+from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
 from tensorrt_llm._torch.attention.backends.fmha import prims_ts_block_sparse as block_sparse_fmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
@@ -35,14 +36,15 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
     SparseRuntimeParams,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.kernels.sage_quant import SageQuantized
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.functional import PositionEmbeddingType
-
-pytestmark = pytest.mark.cpu_only
+from tensorrt_llm.quantization.mode import QuantMode
 
 _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="PrimTS block-sparse attention requires SM100 or SM103",
+    getSMVersion() not in (100, 103, 107),
+    reason="PrimTS block-sparse attention requires SM100, SM103, or SM107",
 )
 
 
@@ -102,24 +104,50 @@ def _proxy_reference(
     block_size = 64
     exact_tokens = torch.arange(
         exact_block * block_size,
-        (exact_block + 1) * block_size,
+        min((exact_block + 1) * block_size, k.shape[1]),
         device=q.device,
     )
     proxy_blocks = [block for block in range(k_summary.shape[1]) if block != exact_block]
+    proxy_token_counts = torch.tensor(
+        [min(block_size, k.shape[1] - block * block_size) for block in proxy_blocks],
+        device=q.device,
+        dtype=torch.float32,
+    )
     q_rows = q[0, :, 0].float()
     exact_logits = q_rows @ k[0, exact_tokens, 0].float().T
     proxy_logits = q_rows @ k_summary[0, proxy_blocks, 0].float().T
     logits = torch.cat((exact_logits, proxy_logits), dim=1) / math.sqrt(q.shape[-1])
     weights = torch.exp(logits - logits.amax(dim=1, keepdim=True))
-    exact_weights, proxy_weights = weights.split((block_size, len(proxy_blocks)), dim=1)
+    exact_weights, proxy_weights = weights.split((exact_tokens.numel(), len(proxy_blocks)), dim=1)
+    proxy_weights = proxy_weights * proxy_token_counts
     numerator = exact_weights @ v[0, exact_tokens, 0].float()
-    numerator += (proxy_weights * block_size) @ v_summary[0, proxy_blocks, 0].float()
+    numerator += proxy_weights @ v_summary[0, proxy_blocks, 0].float()
     denominator = exact_weights.sum(dim=1, keepdim=True)
-    denominator += proxy_weights.sum(dim=1, keepdim=True) * block_size
+    denominator += proxy_weights.sum(dim=1, keepdim=True)
     return (numerator / denominator).to(q.dtype)[None, :, None]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("kv_seq_len", [160, 192])
+@pytest.mark.parametrize("exact_block", [0, 2])
+def test_proxy_reference_weights_present_tokens(kv_seq_len: int, exact_block: int) -> None:
+    q = torch.zeros((1, 64, 1, 128))
+    k = torch.zeros((1, kv_seq_len, 1, 128))
+    v = torch.zeros_like(k)
+    v[:, 128:] = 1
+    k_summary = torch.stack([block.mean(dim=1) for block in k.split(64, dim=1)], dim=1)
+    v_summary = torch.stack([block.mean(dim=1) for block in v.split(64, dim=1)], dim=1)
+
+    actual = _proxy_reference(q, k, v, k_summary, v_summary, exact_block)
+
+    # Uniform logits give every present token equal weight, including the tail.
+    expected = v.mean(dim=1, keepdim=True).expand_as(q)
+    torch.testing.assert_close(actual, expected)
+
+
 class _Attention:
+    out_head_size = TrtllmAttention.out_head_size
+
     def __init__(self) -> None:
         self.sparse_params = None
         self.num_heads = 2
@@ -148,7 +176,10 @@ def _contiguous_case():
         num_sparse_topk=0,
         helix_position_offsets=None,
         kv_cache_manager=None,
+        num_contexts=2,
         seq_lens=torch.tensor([64, 64], dtype=torch.int32),
+        seq_lens_cuda=torch.tensor([64, 64], dtype=torch.int32),
+        seq_lens_kv_cuda=torch.tensor([256, 256], dtype=torch.int32),
         fmha_plan_caches={},
     )
     args = AttentionForwardArgs(
@@ -209,6 +240,29 @@ def _paged_case():
     return attention, fmha, q, metadata, args
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", [100, 103, 107])
+def test_default_block_sparse_selection_shares_dense_architectures(monkeypatch, sm) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts as prims_ts_fmha
+    from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_classes
+
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    monkeypatch.setattr(prims_ts_fmha, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(
+        prims_ts_fmha, "import_module", lambda _: SimpleNamespace(target_version=lambda **_: True)
+    )
+    monkeypatch.setattr(
+        prims_ts_fmha.PrimsTSFmha, "_missing_fused_nanobind_ops", staticmethod(lambda: [])
+    )
+    cls = block_sparse_fmha.PrimsTSBlockSparseFmha
+
+    attention = SimpleNamespace(skip_correction_threshold=0.0, is_mla_enable=False)
+    assert cls in get_enabled_fmha_lib_classes()
+    assert cls.is_available(attention)
+    assert prims_ts_fmha.PrimsTSFmha.is_available(attention)
+
+
+@pytest.mark.cpu_only
 def test_block_sparse_route_mode_is_derived_from_payload() -> None:
     bsr = _bsr_inputs()
     exact = _bitmask_inputs(proxy=False)
@@ -231,6 +285,7 @@ def test_block_sparse_route_mode_is_derived_from_payload() -> None:
         ({"k_summary": torch.empty(0)}, "k_summary and v_summary"),
     ],
 )
+@pytest.mark.cpu_only
 def test_block_sparse_payload_rejects_ambiguous_combinations(overrides, message) -> None:
     kwargs = {
         "q_block_size": 64,
@@ -245,6 +300,7 @@ def test_block_sparse_payload_rejects_ambiguous_combinations(overrides, message)
         BlockSparseForwardInputs(**kwargs)
 
 
+@pytest.mark.cpu_only
 def test_block_sparse_support_is_phase_specific_and_paged_proxy_is_rejected(
     monkeypatch,
 ) -> None:
@@ -262,6 +318,21 @@ def test_block_sparse_support_is_phase_specific_and_paged_proxy_is_rejected(
     assert reason == "paged block-sparse attention only supports BSR exact routes"
 
 
+@pytest.mark.cpu_only
+def test_paged_block_sparse_rejects_fp8_kv_cache() -> None:
+    attention, fmha, q, metadata, args = _paged_case()
+    attention.quant_mode = QuantMode.FP8_KV_CACHE
+    metadata.kv_cache_manager.dtype = torch.float8_e4m3fn
+
+    supported, reason = fmha._is_supported_with_reason(
+        q, None, None, metadata, args, phase=FmhaPhase.GENERATION
+    )
+
+    assert not supported
+    assert "quantized KV cache" in reason
+
+
+@pytest.mark.cpu_only
 def test_contiguous_proxy_routes_reject_causal_mask_before_planning(monkeypatch) -> None:
     _attention, fmha, q, k, v, metadata, args = _contiguous_case()
     _set_block_sparse_inputs(args, _bitmask_inputs(proxy=True))
@@ -282,6 +353,7 @@ def test_contiguous_proxy_routes_reject_causal_mask_before_planning(monkeypatch)
 
 
 @pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.cpu_only
 def test_block_sparse_support_rejects_invalid_static_kernel_profile(
     monkeypatch,
     paged,
@@ -321,6 +393,7 @@ def test_block_sparse_support_rejects_invalid_static_kernel_profile(
     assert reason == "block-sparse requires head_dim=128"
 
 
+@pytest.mark.cpu_only
 def test_contiguous_wrappers_cache_static_profile_and_keep_routes_live(monkeypatch) -> None:
     _attention, fmha, q, k, v, metadata, args = _contiguous_case()
     wrapper = Mock()
@@ -364,6 +437,7 @@ def test_contiguous_wrappers_cache_static_profile_and_keep_routes_live(monkeypat
         assert call.kwargs["v_summary"] is inputs.v_summary
 
 
+@pytest.mark.cpu_only
 def test_block_sparse_plan_key_includes_attention_head_topology() -> None:
     inputs = _bitmask_inputs(proxy=True)
     q = torch.empty((128, 256), dtype=torch.bfloat16)
@@ -387,6 +461,7 @@ def test_block_sparse_plan_key_includes_attention_head_topology() -> None:
     assert _key(first) != _key(second)
 
 
+@pytest.mark.cpu_only
 def test_block_sparse_plan_cache_lives_on_the_metadata(monkeypatch) -> None:
     """Layers that run with one metadata object share its planned wrappers."""
     wrapper = Mock()
@@ -408,6 +483,123 @@ def test_block_sparse_plan_cache_lives_on_the_metadata(monkeypatch) -> None:
     assert factory.call_count == 2
 
 
+def _set_sage_recipe(args: AttentionForwardArgs) -> None:
+    args.sage_attn_num_elts_per_blk_q = 1
+    args.sage_attn_num_elts_per_blk_k = 16
+    args.sage_attn_num_elts_per_blk_v = 1
+
+
+@pytest.mark.cpu_only
+def test_attention_core_quantizes_sage_inputs_ahead_of_the_fmha(monkeypatch) -> None:
+    attention, _fmha, q, k, v, metadata, args = _contiguous_case()
+    # The core quantizes whichever libraries the layer has; each library decides whether it
+    # takes the quantized inputs.
+    attention._fmha_manager = SimpleNamespace(fmha_libs=[])
+    quantized = SageQuantized._make(Mock(name=name) for name in SageQuantized._fields)
+    sage_quantize = Mock(return_value=quantized)
+    monkeypatch.setattr(trtllm_backend, "sage_quantize", sage_quantize)
+
+    def quantize():
+        return trtllm_backend.TrtllmAttention._quantize_sage_inputs(
+            attention, q, k, v, metadata, args
+        )
+
+    assert quantize() is None
+    _set_sage_recipe(args)
+    args.sage_attn_smooth_k = True
+    assert quantize() is quantized
+    (query, key, value, cu_seqlens_q, cu_seqlens_kv), kwargs = sage_quantize.call_args
+    assert query.shape == (128, 2, 128)
+    assert key.shape == value.shape == (512, 1, 128)
+    assert cu_seqlens_q.tolist() == [0, 64, 128]
+    assert cu_seqlens_kv.tolist() == [0, 256, 512]
+    assert kwargs == {
+        "q_block_size": 1,
+        "k_block_size": 16,
+        "qk_quant_dtype": torch.float8_e4m3fn,
+        "smooth_k": True,
+        "smooth_v": False,
+    }
+    assert sage_quantize.call_count == 1
+
+    # Proxy summaries are keys of their own, with the V scales and means of the call's own K/V.
+    proxy = _bitmask_inputs(proxy=True)
+    _set_block_sparse_inputs(args, proxy)
+    summary = SageQuantized._make(Mock(name=name) for name in SageQuantized._fields)
+    sage_quantize.reset_mock()
+    sage_quantize.side_effect = [quantized, summary]
+    actual = quantize()
+    (query, key, value, cu_seqlens_q, cu_seqlens_blocks), kwargs = sage_quantize.call_args
+    assert query is None and cu_seqlens_q is None
+    assert key.shape == value.shape == (8, 1, 128)
+    assert cu_seqlens_blocks.tolist() == [0, 4, 8]
+    assert kwargs == {"k_block_size": 1, "qk_quant_dtype": torch.float8_e4m3fn, "stats": quantized}
+    assert actual.k_summary is summary.k.view.return_value
+    assert actual.v_summary is summary.v.view.return_value
+    assert actual.k_summary_scale is summary.k_scale
+    sage_quantize.side_effect = None
+
+    # Dense calls keep the attention op's quantization unless they need V smoothing, which
+    # the attention op cannot apply.
+    sage_quantize.reset_mock()
+    _set_block_sparse_inputs(args, None)
+    assert quantize() is None
+    args.sage_attn_smooth_v = True
+    assert quantize() is quantized
+    assert sage_quantize.call_args.kwargs["smooth_v"]
+
+    # Calls with a KV cache quantize nothing.
+    sage_quantize.reset_mock()
+    _set_block_sparse_inputs(args, proxy)
+    metadata.kv_cache_manager = Mock()
+    assert quantize() is None
+    sage_quantize.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_contiguous_sage_requires_inputs_quantized_by_the_attention_core() -> None:
+    _attention, fmha, q, k, v, metadata, args = _contiguous_case()
+    _set_sage_recipe(args)
+
+    reason = fmha._contiguous_unsupported_reason(q, k, v, metadata, args)
+
+    assert reason == "SageAttention requires inputs quantized by the attention core"
+
+
+@pytest.mark.cpu_only
+def test_dense_sage_with_v_smoothing_runs_on_a_dense_plan() -> None:
+    _attention, fmha, q, k, v, metadata, args = _contiguous_case()
+    _set_block_sparse_inputs(args, None)
+    _set_sage_recipe(args)
+    supported, reason = fmha._is_supported_with_reason(
+        q, k, v, metadata, args, phase=FmhaPhase.CONTEXT
+    )
+    assert not supported
+    assert reason == "block-sparse forward inputs are required"
+
+    args.sage_attn_smooth_v = True
+    args.sage_quantized = Mock()
+    supported, reason = fmha._is_supported_with_reason(
+        q, k, v, metadata, args, phase=FmhaPhase.CONTEXT
+    )
+    assert supported, reason
+    key = fmha._make_plan_key(
+        q.view(2, 64, 2, 128),
+        None,
+        batch_size=2,
+        seq_len_q=64,
+        kv_capacity=256,
+        page_size=None,
+        mask_type="dense",
+        sage=block_sparse_fmha._sage_recipe(args),
+    )
+    assert not key.use_block_sparse
+    assert (key.q_block_size, key.kv_block_size, key.max_blocks_per_row) == (128, 128, None)
+    assert key.sage.v_mean
+    assert key.unsupported_reason() is None
+
+
+@pytest.mark.cpu_only
 def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch) -> None:
     attention, fmha, q, metadata, args = _paged_case()
     wrapper = Mock()
@@ -484,6 +676,7 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
     assert snapshots[1][3] is _get_block_sparse_inputs(args).block_indptr
 
 
+@pytest.mark.cpu_only
 def test_paged_block_tables_remain_live_across_graph_replay(monkeypatch) -> None:
     attention, fmha, q, metadata, args = _paged_case()
     wrapper = Mock()
@@ -531,6 +724,7 @@ def test_paged_block_tables_remain_live_across_graph_replay(monkeypatch) -> None
     torch.testing.assert_close(seen[1][1], torch.arange(8, dtype=torch.int32).view(2, 4) + 10)
 
 
+@pytest.mark.cpu_only
 def test_prepare_workspace_checks_capture_before_resize(monkeypatch) -> None:
     _attention, fmha, _q, _metadata, _args = _paged_case()
     query_device = torch.device("cuda:1")
@@ -565,6 +759,7 @@ def test_prepare_workspace_checks_capture_before_resize(monkeypatch) -> None:
     assert workspace.numel() == 0
 
 
+@pytest.mark.cpu_only
 def test_prepare_workspace_skips_generation_layout_for_contiguous_requests(monkeypatch) -> None:
     _attention, fmha, q, _k, _v, metadata, args = _contiguous_case()
     layout = Mock()
@@ -623,16 +818,19 @@ def test_real_gpu_raw_routes_and_token_mask_match_reference() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("kv_seq_len", [160, 192])
 @torch.no_grad()
-def test_real_gpu_proxy_adapter_replays_live_routes_and_summaries() -> None:
+def test_real_gpu_proxy_adapter_replays_live_routes_and_summaries(kv_seq_len: int) -> None:
     torch.manual_seed(20260901)
     q = torch.randn((1, 64, 1, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((1, 192, 1, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, kv_seq_len, 1, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    k_blocks = k.float().view(1, 3, 64, 1, 128)
-    v_blocks = v.float().view(1, 3, 64, 1, 128)
-    initial_k_summary = k_blocks.mean(dim=2).to(k.dtype)
-    initial_v_summary = v_blocks.mean(dim=2).to(v.dtype)
+    initial_k_summary = torch.stack(
+        [block.float().mean(dim=1) for block in k.split(64, dim=1)], dim=1
+    ).to(k.dtype)
+    initial_v_summary = torch.stack(
+        [block.float().mean(dim=1) for block in v.split(64, dim=1)], dim=1
+    ).to(v.dtype)
     live_k_summary = initial_k_summary.clone()
     live_v_summary = initial_v_summary.clone()
     live_exact_bits = torch.tensor([[[[1]]]], device="cuda", dtype=torch.uint32)
@@ -891,6 +1089,7 @@ def test_real_gpu_paged_routes_match_reference_across_topologies(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.cpu_only
 def test_paged_support_rejects_pages_smaller_than_a_route_fragment() -> None:
     page_size = 32
     _attention, fmha, q, metadata, args = _paged_case()

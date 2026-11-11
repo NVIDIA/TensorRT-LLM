@@ -305,15 +305,15 @@ __device__ __forceinline__ void mtp_float_save_vec_to(float* dst, float const* s
 
 template <int VEC_SIZE, bool HAS_D, bool HAS_Z, bool HAS_DT_BIAS, bool DT_SOFTPLUS, bool RETRIEVE_PARENT_TOKEN,
     typename ssm_D, typename in_out_D, typename weight_D, typename A_D>
-__global__ void __launch_bounds__(MTP_NUM_BLOCK_THREADS)
-    mamba2MTPSSMCacheKernel(ssm_D* state, in_out_D const* x, weight_D const* dt, A_D const* A, in_out_D const* B,
-        in_out_D const* C, in_out_D* out, ssm_D* intermediate_states, weight_D const* D, in_out_D const* z,
-        weight_D const* dt_bias, int32_t const* ssm_batch_indices, int32_t const* intermediate_ssm_batch_indices,
-        int32_t const* retrieve_parent_token, int const cache_steps, bool const has_ssm_batch_indices,
-        bool const has_intermediate_ssm_batch_indices, int const pad_slot_id, bool const disable_state_update,
-        int const nheads, int const head_dim, int const ssm_dim, int const heads_groups_ratio,
-        int const stride_nheads_hdim_ssm_dim, int const stride_hdim_ssm_dim, int const stride_cache_nheads_hdim,
-        int const stride_nheads_hdim, int const stride_cache_ngroups_ssm_dim, int const stride_ngroups_ssm_dim)
+__global__ void __launch_bounds__(MTP_NUM_BLOCK_THREADS) mamba2MTPSSMCacheKernel(ssm_D* state, in_out_D const* x,
+    weight_D const* dt, A_D const* A, in_out_D const* B, in_out_D const* C, in_out_D* out, ssm_D* intermediate_states,
+    weight_D const* D, in_out_D const* z, weight_D const* dt_bias, int32_t const* ssm_batch_indices,
+    int32_t const* intermediate_ssm_batch_indices, int32_t const* retrieve_parent_token, int const cache_steps,
+    bool const has_ssm_batch_indices, bool const has_intermediate_ssm_batch_indices, int const pad_slot_id,
+    bool const disable_state_update, int const nheads, int const head_dim, int const ssm_dim,
+    int const heads_groups_ratio, int64_t const ssm_batch_stride, int const stride_nheads_hdim_ssm_dim,
+    int const stride_hdim_ssm_dim, int const stride_cache_nheads_hdim, int const stride_nheads_hdim,
+    int const stride_cache_ngroups_ssm_dim, int const stride_ngroups_ssm_dim)
 {
     int const tid = threadIdx.x;
     int const lane_id = tid & 31;
@@ -335,10 +335,10 @@ __global__ void __launch_bounds__(MTP_NUM_BLOCK_THREADS)
 
     float state_4_a[VEC_SIZE], state_4_b[VEC_SIZE];
     mtp_load_vec_to_float<VEC_SIZE>(state_4_a,
-        state + state_idx * stride_nheads_hdim_ssm_dim + head_id * stride_hdim_ssm_dim + hdim_id_a * ssm_dim
+        state + state_idx * ssm_batch_stride + head_id * stride_hdim_ssm_dim + hdim_id_a * ssm_dim
             + lane_id * VEC_SIZE);
     mtp_load_vec_to_float<VEC_SIZE>(state_4_b,
-        state + state_idx * stride_nheads_hdim_ssm_dim + head_id * stride_hdim_ssm_dim + hdim_id_b * ssm_dim
+        state + state_idx * ssm_batch_stride + head_id * stride_hdim_ssm_dim + hdim_id_b * ssm_dim
             + lane_id * VEC_SIZE);
 
     float A_val = 1.0f;
@@ -465,10 +465,10 @@ __global__ void __launch_bounds__(MTP_NUM_BLOCK_THREADS)
 
     if (!disable_state_update)
     {
-        mtp_float_save_vec_to<VEC_SIZE>(state + state_idx * stride_nheads_hdim_ssm_dim + head_id * stride_hdim_ssm_dim
+        mtp_float_save_vec_to<VEC_SIZE>(state + state_idx * ssm_batch_stride + head_id * stride_hdim_ssm_dim
                 + hdim_id_a * ssm_dim + lane_id * VEC_SIZE,
             state_4_a);
-        mtp_float_save_vec_to<VEC_SIZE>(state + state_idx * stride_nheads_hdim_ssm_dim + head_id * stride_hdim_ssm_dim
+        mtp_float_save_vec_to<VEC_SIZE>(state + state_idx * ssm_batch_stride + head_id * stride_hdim_ssm_dim
                 + hdim_id_b * ssm_dim + lane_id * VEC_SIZE,
             state_4_b);
     }
@@ -560,6 +560,7 @@ void launchMamba2MTPSSMCacheKernel(Mamba2MTPSSMCacheParams const& params, dim3 g
                                                                                 has_inter_indices, params.pad_slot_id,
                                                                                 params.disable_state_update, nheads,
                                                                                 head_dim, ssm_dim, heads_groups_ratio,
+                                                                                params.ssm_batch_stride,
                                                                                 nheads * head_dim * ssm_dim,
                                                                                 head_dim * ssm_dim,
                                                                                 params.cache_steps * nheads * head_dim,

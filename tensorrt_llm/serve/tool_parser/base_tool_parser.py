@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
+from xgrammar.structural_tag import StructuralTag
 
 from tensorrt_llm.logger import logger
 
@@ -23,6 +24,10 @@ _QUALIFIED_NAME = re.compile(
 # An opening or closing tag of the XML-ish tool-call markup, e.g. `<tool_call>`
 # or `</arg_value>`, which models sometimes emit unbalanced into a tool name.
 _MARKUP_TAG = re.compile(r"</?[A-Za-z_][A-Za-z0-9_-]*>")
+# A bound on the empty increments ``finish`` feeds. Each pass that changes the
+# state reports or consumes part of the buffer, so a reply ends far below it;
+# a parser that reaches it never converges, and ``finish`` warns about it.
+_MAX_FINISH_PASSES = 1024
 
 
 def warn_if_tool_call_unparsed(parser_name: str, tool_parser: "BaseToolParser",
@@ -78,6 +83,7 @@ class BaseToolParser(ABC):
     streaming_matches_whole_parse: bool = False
 
     def __init__(self):
+        self.grammar_constrained: bool = False
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
         self._buffer = ""
@@ -205,16 +211,45 @@ class BaseToolParser(ABC):
                 return i
         return 0
 
+    def parse_partial(self, text: str,
+                      tools: List[Tool]) -> StreamingParseResult:
+        """Inspect unfinished output without updating the streaming state."""
+        return self.detect_and_parse(text, tools)
+
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
-        """Finalize a stream that ended before the format's closing markers.
+        """Report what the stream left in the buffer when generation ends.
 
         Called once by the serving layer when generation finishes, after the
-        last ``parse_streaming_increment`` call, so parsers that buffer whole
-        sections can emit whatever the truncated stream still holds. The
-        default is a no-op to preserve the existing behavior of parsers that
-        manage ``self._buffer`` incrementally.
+        last ``parse_streaming_increment`` call. A streaming pass reports one
+        step of one call (its name, then its arguments) and keeps the rest of
+        the buffer for the next increment. When the last increment brings
+        whole calls, no increment follows to report them, so this feeds empty
+        increments until one changes nothing. Parsers that buffer whole
+        sections override it.
         """
-        return StreamingParseResult()
+        normal_text = ""
+        calls: List[ToolCallItem] = []
+        for _ in range(_MAX_FINISH_PASSES):
+            before = self._streaming_state()
+            result = self.parse_streaming_increment("", tools)
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+            if self._streaming_state() == before:
+                break
+        else:
+            parser_name = type(self).__name__
+            logger.warning_once(
+                f"Tool parser {parser_name} still changed its streaming state "
+                f"after {_MAX_FINISH_PASSES} empty increments at the end of "
+                "the stream; the calls it reported may be incomplete. This is "
+                "a bug in the parser's parse_streaming_increment.",
+                key=f"{parser_name}.finish_did_not_converge")
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _streaming_state(self) -> tuple:
+        """What a streaming pass changes when it makes progress."""
+        return (self._buffer, self.current_tool_id, self.current_tool_name_sent,
+                tuple(self.streamed_args_for_tool))
 
     def parse_streaming_increment(self, new_text: str,
                                   tools: List[Tool]) -> StreamingParseResult:
@@ -428,6 +463,12 @@ class BaseToolParser(ABC):
         XTML call tags). Returns the xgrammar structural-tag format dict,
         or None to fall back to the `structure_info` path.
         """
+        return None
+
+    def build_required_structural_tag(
+            self, tools: List[Tool], *,
+            thinking: bool) -> Optional[StructuralTag]:
+        """Build a mandatory native tool-call format, or return None if unsupported."""
         return None
 
     @abstractmethod

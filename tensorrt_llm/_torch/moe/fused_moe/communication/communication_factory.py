@@ -42,7 +42,6 @@ from .deep_ep_low_latency import DeepEPLowLatency
 from .nccl_ep import NcclEP
 from .nvlink_one_sided import NVLinkOneSided
 from .nvlink_two_sided import NVLinkTwoSided
-from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 
 # Temporary NCCL-EP v0.1.0 limitation. The LL combine kernel derives its
 # warp-group count and dynamic-SMEM requirement here:
@@ -92,9 +91,9 @@ class CommunicationFactory:
         expert_size_per_partition: int,
         payload_in_workspace: bool = False,
         alltoall_result_do_sum: bool = True,
-        use_flashinfer: bool = False,
         hidden_size: Optional[int] = None,
         communication_method: Optional[str] = None,
+        allow_alltoall: bool = True,
     ) -> Optional[Communication]:
         """
         Create the best communication method for the given configuration
@@ -122,6 +121,7 @@ class CommunicationFactory:
                 Falls back to pretrained_config.hidden_size when not provided.
             communication_method: Optional model-selected communication method.
                 ``TRTLLM_FORCE_COMM_METHOD`` takes precedence when set.
+            allow_alltoall: Whether the backend supports all-to-all dispatch.
             # TODO: Need a way to indicate whether EPLB is enabled.
 
         Returns:
@@ -173,6 +173,17 @@ class CommunicationFactory:
         else:
             force_method, force_source = communication_method, "communication_method"
 
+        if not allow_alltoall:
+            if force_method is not None and force_method.upper() != "ALLGATHER":
+                raise ValueError(
+                    f"{force_source}={force_method} requires all-to-all, which the "
+                    "selected MoE backend does not support; use ALLGATHER"
+                )
+            logger.info(
+                "Selected communication strategy: AllGatherReduceScatter (backend capability)"
+            )
+            return AllGatherReduceScatter(mapping)
+
         if force_method is not None:
             strategy = CommunicationFactory._create_forced_method(
                 force_method,
@@ -183,7 +194,6 @@ class CommunicationFactory:
                 expert_size_per_partition,
                 payload_in_workspace,
                 alltoall_result_do_sum,
-                use_flashinfer,
                 hidden_size=hidden_size,
             )
             logger.info(
@@ -228,24 +238,14 @@ class CommunicationFactory:
             return AllGatherReduceScatter(mapping)
 
         try:
-            if use_flashinfer:
-                strategy = NVLinkTwoSidedFlashinfer(
-                    mapping,
-                    num_experts,
-                    num_slots,
-                    top_k,
-                    use_low_precision_combine,
-                    alltoall_result_do_sum=alltoall_result_do_sum,
-                )
-            else:
-                strategy = NVLinkTwoSided(
-                    mapping,
-                    num_experts,
-                    num_slots,
-                    top_k,
-                    use_low_precision_combine,
-                    alltoall_result_do_sum=alltoall_result_do_sum,
-                )
+            strategy = NVLinkTwoSided(
+                mapping,
+                num_experts,
+                num_slots,
+                top_k,
+                use_low_precision_combine,
+                alltoall_result_do_sum=alltoall_result_do_sum,
+            )
             logger.info("Selected communication strategy: NVLinkTwoSided")
             return strategy
         except Exception as e:
@@ -338,7 +338,6 @@ class CommunicationFactory:
         expert_size_per_partition: int,
         payload_in_workspace: bool,
         alltoall_result_do_sum: bool,
-        use_flashinfer: bool,
         hidden_size: Optional[int] = None,
     ) -> Communication:
         """
@@ -372,24 +371,14 @@ class CommunicationFactory:
 
         # Create strategy - will raise RuntimeError if platform not supported
         if method in ["NVLINK_TWO_SIDED"]:
-            if use_flashinfer:
-                return NVLinkTwoSidedFlashinfer(
-                    mapping,
-                    num_experts,
-                    num_slots,
-                    top_k,
-                    use_low_precision_combine,
-                    alltoall_result_do_sum=alltoall_result_do_sum,
-                )
-            else:
-                return NVLinkTwoSided(
-                    mapping,
-                    num_experts,
-                    num_slots,
-                    top_k,
-                    use_low_precision_combine,
-                    alltoall_result_do_sum=alltoall_result_do_sum,
-                )
+            return NVLinkTwoSided(
+                mapping,
+                num_experts,
+                num_slots,
+                top_k,
+                use_low_precision_combine,
+                alltoall_result_do_sum=alltoall_result_do_sum,
+            )
         elif method in ["NVLINK_ONE_SIDED"]:
             enable_eplb = model_config.moe_load_balancer is not None
             ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
@@ -482,6 +471,15 @@ class CommunicationFactory:
             return (
                 "NcclEP requires positive num_slots, hidden_size, and max_num_tokens, got "
                 f"{num_slots=}, {hidden_size=}, {max_num_tokens=}."
+            )
+        # LL combine consumes BF16 and requires 512-element alignment, including
+        # NVFP4 combine. FP8 dispatch uses a BF16 view of width hidden_size / 2,
+        # whose 256-element alignment also requires hidden_size divisible by 512.
+        # TODO: Remove this guard when the pinned NCCL-EP supports unaligned hidden sizes.
+        if hidden_size % 512 != 0:
+            return (
+                "NcclEP low-latency dispatch/combine requires hidden_size divisible by 512, "
+                f"got {hidden_size=}."
             )
         if moe_max_num_tokens is not None and moe_max_num_tokens <= 0:
             return (

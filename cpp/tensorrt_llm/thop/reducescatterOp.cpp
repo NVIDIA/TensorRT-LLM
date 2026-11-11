@@ -24,6 +24,7 @@
 #include <torch/extension.h>
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
+#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #endif // ENABLE_MULTI_DEVICE
 
@@ -286,6 +287,30 @@ extern std::vector<torch::Tensor> reducescatter_list_pg(torch::TensorList input_
     return input_list.vec();
 #endif // ENABLE_MULTI_DEVICE
 }
+
+torch::Tensor reducescatter_pg_by_name(torch::Tensor input, torch::optional<torch::List<int64_t>> sizes,
+    torch::List<int64_t> group, int64_t /*rank*/, std::string const& group_name)
+{
+#if ENABLE_MULTI_DEVICE
+    return reducescatter_pg(
+        std::move(input), std::move(sizes), std::move(group), c10d::resolve_process_group(group_name));
+#else
+    return input;
+#endif
+}
+
+std::vector<torch::Tensor> reducescatter_list_pg_by_name(torch::TensorList input_list,
+    torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group, int64_t /*rank*/,
+    std::string const& group_name)
+{
+#if ENABLE_MULTI_DEVICE
+    return reducescatter_list_pg(
+        input_list, std::move(sizes), std::move(group), c10d::resolve_process_group(group_name));
+#else
+    return input_list.vec();
+#endif
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -296,16 +321,22 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "reducescatter_pg(Tensor input, SymInt[]? sizes, int[] group, __torch__.torch.classes.c10d.ProcessGroup "
         "process_group) -> Tensor");
+    m.def("reducescatter_pg_by_name(Tensor input, SymInt[]? sizes, int[] group, int rank, str group_name) -> Tensor");
     m.def("reducescatter_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -> Tensor[]");
     m.def(
         "reducescatter_list_pg(Tensor[] input_list, SymInt[]? sizes, int[] group, "
         "__torch__.torch.classes.c10d.ProcessGroup process_group) -> Tensor[]");
+    m.def(
+        "reducescatter_list_pg_by_name(Tensor[] input_list, SymInt[]? sizes, int[] group, int rank, str group_name) "
+        "-> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("reducescatter", &tensorrt_llm::torch_ext::reducescatter);
     m.impl("reducescatter_pg", &tensorrt_llm::torch_ext::reducescatter_pg);
+    m.impl("reducescatter_pg_by_name", &tensorrt_llm::torch_ext::reducescatter_pg_by_name);
     m.impl("reducescatter_list", &tensorrt_llm::torch_ext::reducescatter_list);
     m.impl("reducescatter_list_pg", &tensorrt_llm::torch_ext::reducescatter_list_pg);
+    m.impl("reducescatter_list_pg_by_name", &tensorrt_llm::torch_ext::reducescatter_list_pg_by_name);
 }

@@ -16,7 +16,7 @@
 
 @Library(['trtllm-jenkins-shared-lib@main']) _
 
-DOCKER_IMAGE = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202510291120-8621"
+DOCKER_IMAGE = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-26.09-py3-x86_64-ubuntu24.04-skip-tritondevel-202610150933-20252"
 ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
 // LLM repository configuration

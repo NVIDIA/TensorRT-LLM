@@ -178,6 +178,9 @@ public:
         return mHashAlgoName;
     }
 
+    //! Salt hashing used by the V1 BlockKeyHasher; independent of radix-tree identity.
+    static uint64_t hashV1CacheSalt(std::string const& salt);
+
     static uint64_t hashV1BlockKey(std::vector<TokenId> const& tokens, uint64_t parentHash = 0,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt,
         std::optional<std::uint64_t> cacheSaltId = std::nullopt);
@@ -188,6 +191,8 @@ public:
     void addRemovedLifeCycle(Digest const& blockKey, LifeCycleId lifeCycle) override;
     void addCacheLevelUpdated(
         Digest const& blockKey, CacheLevel oldLevel, CacheLevel newLevel, LifeCycleId lifeCycle) override;
+    void addPriorityUpdated(
+        Digest const& blockKey, Priority oldPriority, Priority newPriority, LifeCycleId lifeCycle) override;
 
 private:
     enum class HashAlgorithm

@@ -25,6 +25,9 @@ from typing import NamedTuple, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
+    fp8_e4m3_saturate,
+)
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
 from .msa_utils import check_decode_span_shape
@@ -39,12 +42,10 @@ def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> i
     run, while computing it reaches C++ through a deferred import and a
     device-properties query on every dense layer of every step.
     """
-    from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-        _get_multi_ctas_kv_counter_size,
-    )
+    from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_ctas_kv_counter_size
 
     multi_processor_count = torch.cuda.get_device_properties(device_index).multi_processor_count
-    return int(_get_multi_ctas_kv_counter_size(num_heads, max_num_requests, multi_processor_count))
+    return int(get_multi_ctas_kv_counter_size(num_heads, max_num_requests, multi_processor_count))
 
 
 def _device_index(device: torch.device) -> int:
@@ -278,7 +279,7 @@ def minimax_m3_trtllm_gen_dense_decode(
     # q/k/v, so an FP8 pool needs FP8 Q. M3 stores unscaled E4M3, so this is a
     # plain cast and a no-op when the fused producer already emitted FP8.
     if kv_pool.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
-        q = q.to(torch.float8_e4m3fn)
+        q = fp8_e4m3_saturate(q)
 
     reserve = torch.cuda.is_current_stream_capturing()
     workspace_size = _workspace(q.dtype, num_heads, int(q.shape[2]), int(kv_pool.shape[1]))

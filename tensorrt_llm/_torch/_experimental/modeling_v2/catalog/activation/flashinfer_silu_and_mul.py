@@ -19,7 +19,7 @@ class FlashinferSiluAndMul(OpWrapper):
     is why the op takes one tensor and halves it rather than taking two.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # deepseek-r1 is the only shipped caller. It reaches this op from two
     # widths -- the routed/shared expert intermediate and the dense layers'

@@ -78,11 +78,12 @@ python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
 
 | Value | GPU Family |
 |-------|-----------|
-| `"100-real"` | Blackwell (B200, GB200) |
-| `"90-real"` | Hopper (H100, H200) |
-| `"89-real"` | Ada Lovelace (L40S) |
-| `"80-real"` | Ampere (A100) |
-| `"90;100-real"` | Multiple architectures |
+| `"103"` | Blackwell Ultra (B300, GB300) |
+| `"100"` | Blackwell (B200, GB200) |
+| `"90"` | Hopper (H100, H200) |
+| `"89"` | Ada Lovelace (L40S) |
+| `"80"` | Ampere (A100) |
+| `"90;100"` | Multiple architectures |
 
 ## Incremental vs. Clean Builds
 

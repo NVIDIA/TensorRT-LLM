@@ -94,9 +94,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cute_dsl_megamoe_nvfp4_blackwell
         __all__ += ['cute_dsl_megamoe_nvfp4_blackwell']
 
-if IS_CUTLASS_DSL_AVAILABLE and IS_FLASHINFER_AVAILABLE:
-    from .cute_dsl_kimi_k3_custom_ops import kda_prefill
-    __all__ += ['kda_prefill']
+if IS_CUTLASS_DSL_AVAILABLE:
+    from .cute_dsl_kimi_k3_custom_ops import kda_prefill, kda_prefill_conv
+    __all__ += ['kda_prefill', 'kda_prefill_conv']
 
 if IS_CUDA_TILE_AVAILABLE:
     from .cuda_tile_custom_ops import (cuda_tile_rms_norm,

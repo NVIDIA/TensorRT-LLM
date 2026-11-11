@@ -3,4 +3,3 @@
 disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: NIXL
-  max_tokens_in_buffer: 2048

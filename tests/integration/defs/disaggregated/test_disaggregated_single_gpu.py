@@ -17,7 +17,7 @@ from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._utils import set_mpi_comm
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
                                  KvCacheConfig, MpiCommSession)
-from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
+from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, SchedulerConfig
 
 # With the Ray orchestrator, workers spawned through MPI hang inside ray.init()
 # on the Open MPI 5 shipped by the DLFW 26.08 base image: the raylet forked from
@@ -163,7 +163,8 @@ async def run_worker(kv_cache_config,
                      pytorch_config,
                      model_name,
                      rank,
-                     support_cancel=False):
+                     support_cancel=False,
+                     preemption_events=None):
     assert isinstance(pytorch_config, dict)
     print(f"Running worker {rank}")
     try:
@@ -207,6 +208,9 @@ async def run_worker(kv_cache_config,
                 break
 
             # Handle special commands
+            if requests == "GET_PREEMPTION_EVENTS":
+                intercomm.send(preemption_events, dest=0, tag=MPI_RESULT)
+                continue
             if requests == "GET_STATE":
                 state = llm.get_data_transceiver_state()
                 intercomm.send(state, dest=0, tag=MPI_RESULT)
@@ -322,7 +326,40 @@ def worker_entry_point(kv_cache_config,
                        pytorch_config,
                        model_name,
                        rank,
-                       support_cancel=False):
+                       support_cancel=False,
+                       exercise_preemption=False):
+    if exercise_preemption:
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import \
+            GenPreemption
+
+        events = {"paused": 0, "resumed": 0}
+        original_step = GenPreemption.step
+
+        def step(controller, active_requests, *args, **kwargs):
+            count = original_step(controller, active_requests, *args, **kwargs)
+            events["resumed"] += len(controller.resumed_ids)
+            if not events["paused"]:
+                for req in active_requests:
+                    if (req.is_generation_only_request
+                            and not req.is_dummy_request
+                            and req.py_decoding_iter >= 2):
+                        # Force the policy event so this short GPU test verifies actual
+                        # pause/resume scheduling without waiting for TTFT warmup.
+                        controller._pause(req)
+                        events["paused"] += 1
+                        return count - 1
+            return count
+
+        with patch.object(GenPreemption, "step", step):
+            return asyncio.run(
+                run_worker(kv_cache_config,
+                           cache_transceiver_config,
+                           pytorch_config,
+                           model_name,
+                           rank,
+                           preemption_events=events))
     return asyncio.run(
         run_worker(kv_cache_config,
                    cache_transceiver_config,
@@ -332,23 +369,41 @@ def worker_entry_point(kv_cache_config,
                    support_cancel=support_cancel))
 
 
-def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
-                         expected_output, expected_output_ids):
+def verify_disaggregated(model: str,
+                         generation_overlap: bool,
+                         enable_cuda_graph: bool,
+                         prompt: str,
+                         gen_preemption: bool = False) -> None:
     worker_pytorch_configs = []
 
     # Context worker
     worker_pytorch_configs.append(
-        dict(
-            disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
+        dict(disable_overlap_scheduler=True,
+             max_batch_size=1,
+             max_num_tokens=64,
+             max_seq_len=64,
+             cuda_graph_config=CudaGraphConfig(
+                 batch_sizes=[1]) if enable_cuda_graph else None))
 
     # Generation worker
     worker_pytorch_configs.append(
-        dict(
-            disable_overlap_scheduler=not generation_overlap,
-            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
+        dict(disable_overlap_scheduler=not generation_overlap,
+             max_batch_size=1,
+             max_num_tokens=64,
+             max_seq_len=64,
+             cuda_graph_config=CudaGraphConfig(
+                 batch_sizes=[1]) if enable_cuda_graph else None))
 
-    kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
+    if gen_preemption:
+        worker_pytorch_configs[1]["scheduler_config"] = SchedulerConfig(
+            gen_preemption={"tpot_budget": 0.1})
+
+    # Both engines share one GPU and process one short request at a time.
+    # Disable prefix reuse so the reference cannot populate the transfer path.
+    kv_cache_configs = [
+        KvCacheConfig(max_tokens=128, enable_block_reuse=False)
+        for _ in range(2)
+    ]
     cache_transceiver_configs = [
         CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
     ]
@@ -358,12 +413,20 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
         zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
             model_names, ranks))
 
+    if gen_preemption:
+        worker_args = [(*args, False, rank == 1)
+                       for rank, args in enumerate(worker_args)]
     port_name = mpi_publish_name()
 
     with MPIPoolExecutor(max_workers=2,
                          env={
-                             "UCX_TLS": get_ucx_tls(),
-                             "UCX_MM_ERROR_HANDLING": "y"
+                             "UCX_TLS":
+                             get_ucx_tls(),
+                             "UCX_MM_ERROR_HANDLING":
+                             "y",
+                             **({
+                                 "TLLM_GEN_ADMISSION_TTFT_PERCENTILE": "90"
+                             } if gen_preemption else {})
                          }) as executor:
         futures = []
         try:
@@ -383,11 +446,16 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
                 intercomm.recv(tag=MPI_READY)
                 print("Received ready signal.")
             max_tokens = 25
+            sampling_params = SamplingParams(max_tokens=max_tokens,
+                                             ignore_eos=True,
+                                             top_k=1)
+            reference = send_requests_to_worker(
+                [(prompt, sampling_params, None)], 0, intercomm)[0][0]
+            assert len(reference.token_ids) == max_tokens
 
             requests = []
-            requests.append(
-                (prompt, SamplingParams(max_tokens=max_tokens, ignore_eos=True),
-                 DisaggregatedParams(request_type="context_only")))
+            requests.append((prompt, sampling_params,
+                             DisaggregatedParams(request_type="context_only")))
 
             responses = send_requests_to_worker(requests, 0, intercomm)
             output = responses[0]
@@ -396,22 +464,24 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             assert output[0].disaggregated_params is not None
             print(f"Output: {output[0].disaggregated_params.request_type}")
             assert output[0].disaggregated_params.request_type == "context_only"
-            assert output[0].token_ids[0] == expected_output_ids[0]
+            assert output[0].token_ids[0] == reference.token_ids[0]
             assert len(output[0].token_ids) == 1
 
             generation_request_disagg_params = output[0].disaggregated_params
             generation_request_disagg_params.request_type = "generation_only"
             requests = []
             requests.append(
-                (prompt, SamplingParams(max_tokens=max_tokens, ignore_eos=True),
-                 generation_request_disagg_params))
+                (prompt, sampling_params, generation_request_disagg_params))
 
             responses = send_requests_to_worker(requests, 1, intercomm)
             output = responses[0]
-            assert output[0].text == expected_output
-            assert output[0].token_ids == expected_output_ids
-        except Exception as e:
-            print(f"Exception encountered: {e}", flush=True)
+            assert output[0].text == reference.text
+            assert output[0].token_ids == reference.token_ids
+            if gen_preemption:
+                intercomm.send("GET_PREEMPTION_EVENTS", dest=1, tag=MPI_REQUEST)
+                events = intercomm.recv(source=1, tag=MPI_RESULT)
+                assert events["paused"] == 1
+                assert events["resumed"] == 1
         finally:
             print("Sending termination request", flush=True)
             mpi_send_termination_request(intercomm)
@@ -423,37 +493,34 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             print("All workers terminated.")
 
 
+@skip_pre_hopper
+@pytest.mark.parametrize("generation_overlap", [False, True])
+def test_disaggregated_gen_preemption_greedy_parity(generation_overlap):
+    verify_disaggregated("Qwen3-0.6B",
+                         generation_overlap,
+                         True,
+                         "What is the capital of Germany?",
+                         gen_preemption=True)
+
+
 @skip_no_hopper
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
-def test_disaggregated_simple_deepseek(model, generation_overlap,
-                                       enable_cuda_graph):
-    verify_disaggregated(
-        model, generation_overlap, enable_cuda_graph,
-        "What is the capital of Germany?",
-        " | Berlin \nWhat is the capital of France? | Paris \nWhat is the capital of Italy? | Rome \nWhat is",
-        [
-            369, 17575, 539, 3085, 344, 270, 6102, 294, 8760, 33, 369, 11111,
-            539, 3085, 344, 270, 6102, 294, 14251, 33, 369, 16235, 539, 3085,
-            344
-        ])
+def test_disaggregated_simple_deepseek(model: str, generation_overlap: bool,
+                                       enable_cuda_graph: bool) -> None:
+    verify_disaggregated(model, generation_overlap, enable_cuda_graph,
+                         "What is the capital of Germany?")
 
 
 @skip_no_hopper
 @pytest.mark.parametrize("model", ["Qwen3-8B-FP8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
-def test_disaggregated_simple_qwen3(model, generation_overlap,
-                                    enable_cuda_graph):
-    verify_disaggregated(
-        model, generation_overlap, enable_cuda_graph,
-        " What is the capital of China?",
-        " The capital of China is Beijing. 2. What is the population of China? The population of China is about 1",
-        [
-            576, 6722, 315, 5616, 374, 26549, 13, 220, 17, 13, 3555, 374, 279,
-            7042, 315, 5616, 30, 576, 7042, 315, 5616, 374, 911, 220, 16
-        ])
+def test_disaggregated_simple_qwen3(model: str, generation_overlap: bool,
+                                    enable_cuda_graph: bool) -> None:
+    verify_disaggregated(model, generation_overlap, enable_cuda_graph,
+                         " What is the capital of China?")
 
 
 @skip_pre_hopper

@@ -16,6 +16,60 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 def _register_fake():
 
+    @torch.library.register_fake("trtllm::rotate_rows_")
+    def rotate_rows_(self: torch.Tensor, shift: int) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::scatter_kv_slots_")
+    def scatter_kv_slots_(
+        pool: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dst: torch.Tensor,
+        dst2: Optional[torch.Tensor] = None,
+        src: Optional[torch.Tensor] = None,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::block_causal_layout_")
+    def block_causal_layout_(
+        table: torch.Tensor,
+        private_pages: torch.Tensor,
+        causal_block_pages: torch.Tensor,
+        causal_block_offsets: torch.Tensor,
+        seq_len_kv: torch.Tensor,
+        own_slots: torch.Tensor,
+        current_private_src: torch.Tensor,
+        current_private_dst: torch.Tensor,
+        committed_private_src: torch.Tensor,
+        committed_private_dst: torch.Tensor,
+        staged_slots: Optional[torch.Tensor],
+        refill_src: Optional[torch.Tensor],
+        refill_dst: Optional[torch.Tensor],
+        causal_block_size: int,
+        tokens_per_page: int,
+        past: int,
+        fixed_tokens: int,
+        window_tokens: int,
+        num_pages: int,
+        drop_pages: int,
+        kv_factor: int,
+        kv_offset: int,
+        rows_per_page: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::copy_kv_slots_")
+    def copy_kv_slots_(
+        pool: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        num_layers: int,
+        num_heads: int,
+        tokens_per_page: int,
+    ) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
         input: torch.Tensor,
@@ -94,15 +148,12 @@ def _register_fake():
     ) -> None:
         return None
 
-    @torch.library.register_fake("trtllm::validate_allreduce_tuning_buckets")
-    def _(buckets: List[int]) -> None:
-        return None
-
     @torch.library.register_fake("trtllm::clear_allreduce_tactic_cache")
     def _() -> None:
         return None
 
     @torch.library.register_fake("trtllm::allreduce_pg")
+    @torch.library.register_fake("trtllm::allreduce_pg_by_name")
     def _(
         input: torch.Tensor,
         residual: Optional[torch.Tensor],
@@ -121,6 +172,11 @@ def _register_fake():
         return allreduce(input, residual, norm_weight, scale, bias, workspace,
                          group, strategy, op, eps, trigger_completion_at_end)
 
+    @torch.library.register_fake("trtllm::allreduce_pg_warmup_by_name")
+    def _(token: torch.Tensor, group: List[int], rank: int,
+          group_name: str) -> torch.Tensor:
+        return token
+
     # MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_fusion_allreduce")
     def _(input,
@@ -131,7 +187,8 @@ def _register_fake():
           buffer_flags,
           rmsnorm_fusion,
           scale=None,
-          fusion_op: int = 0):
+          fusion_op: int = 0,
+          fp8_payload: bool = False):
         from tensorrt_llm.functional import AllReduceFusionOp
         op = AllReduceFusionOp(fusion_op)
         if op == AllReduceFusionOp.NONE and rmsnorm_fusion:
@@ -223,10 +280,13 @@ def _register_fake():
     @torch.library.register_fake("trtllm::attn_res_add_rmsnorm_persistent_fwd")
     def _(layer_residual: torch.Tensor,
           layer_residual_add: Optional[torch.Tensor],
-          block_residual: torch.Tensor, res_weight: torch.Tensor,
-          rms_weight: torch.Tensor, output_rms_weight: torch.Tensor,
+          block_residual: torch.Tensor,
+          res_weight: torch.Tensor,
+          rms_weight: torch.Tensor,
+          output_rms_weight: torch.Tensor,
           rms_eps: float,
-          output_rms_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+          output_rms_eps: float,
+          sm_reserve: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         # Returns (updated_layer_residual, output), both [T, B, H]. The eager
         # implementation returns layer_residual itself as the first result when
         # layer_residual_add is None; that conditional aliasing cannot be
@@ -261,6 +321,7 @@ def _register_fake():
         return input.new_empty(output_shape)
 
     @torch.library.register_fake("trtllm::allgather_pg")
+    @torch.library.register_fake("trtllm::allgather_pg_by_name")
     def _(input, sizes, group, process_group):
         return allgather(input, sizes, group)
 
@@ -382,6 +443,17 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::inplace_slice_copy")
     def _(dest, src, dim1_start, dim1_end):
+        pass
+
+    @torch.library.register_fake("trtllm::dwdp_fabric_gather")
+    def _(dst_ptrs,
+          src_ptrs,
+          lines,
+          row_starts,
+          blocks_per_row,
+          threads,
+          use_tma=False):
+        # Copies through raw device pointers; no return value.
         pass
 
     @torch.library.register_fake("trtllm::indexer_topk_prefill")
@@ -562,7 +634,7 @@ def _register_fake():
                 activation.new_empty(scale_shape, dtype=activation.dtype))
 
     @torch.library.register_fake("trtllm::fp4_quantize")
-    def _(
+    def _fp4_quantize_fake(
         input: torch.Tensor,
         global_scale: torch.Tensor,
         sf_vec_size: int,
@@ -574,6 +646,18 @@ def _register_fake():
 
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
+
+    if hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
+
+        @torch.library.register_fake("trtllm::fp4_quantize.sm_budget")
+        def _(input: torch.Tensor,
+              global_scale: torch.Tensor,
+              sf_vec_size: int,
+              sf_use_ue8m0: bool = False,
+              swizzled_layout: bool = True,
+              reserved_sms: int = 0):
+            return _fp4_quantize_fake(input, global_scale, sf_vec_size,
+                                      sf_use_ue8m0, swizzled_layout)
 
     @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
     def _(
@@ -987,6 +1071,25 @@ def _register_fake():
                                 dtype=torch.int32), logits.new_empty(
                                     (batch_size, ), dtype=torch.int32)
 
+    @torch.library.register_fake("trtllm::sage_quantize")
+    def _(query: Optional[torch.Tensor],
+          key: torch.Tensor,
+          value: torch.Tensor,
+          cu_seqlens_q: Optional[torch.Tensor],
+          cu_seqlens_kv: torch.Tensor,
+          q_quant: Optional[torch.Tensor],
+          k_quant: torch.Tensor,
+          v_quant: torch.Tensor,
+          q_scale: Optional[torch.Tensor],
+          k_scale: torch.Tensor,
+          v_scale: torch.Tensor,
+          k_mean: Optional[torch.Tensor],
+          v_mean: Optional[torch.Tensor],
+          q_block_size: int,
+          k_block_size: int,
+          reuse_stats: bool = False) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::fp8_quantize_1x128")
     def _(input: torch.Tensor, use_ue8m0: bool = False):
         pad_m = fp4_utils.pad_up(input.shape[0], 4)
@@ -1020,8 +1123,10 @@ def _register_fake():
         return packed, scale
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
-    def _(input: torch.Tensor,
-          use_r128c4_layout: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    def _fp8_quantize_packed_fake(
+        input: torch.Tensor,
+        use_r128c4_layout: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         m, k = input.shape[0], input.shape[1]
         num_n_blocks = (k + 127) // 128
         num_packed_sf_k = (num_n_blocks + 3) // 4
@@ -1035,6 +1140,15 @@ def _register_fake():
                                             (1, m_aligned),
                                             dtype=torch.int32)
         return torch.empty_like(input, dtype=torch.float8_e4m3fn), scale
+
+    if hasattr(torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0, "sm_budget"):
+
+        @torch.library.register_fake(
+            "trtllm::fp8_quantize_1x128_packed_ue8m0.sm_budget")
+        def _(input: torch.Tensor,
+              use_r128c4_layout: bool = True,
+              reserved_sms: int = 0):
+            return _fp8_quantize_packed_fake(input, use_r128c4_layout)
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_cutedsl_ue8m0")
     def _(input: torch.Tensor):
@@ -1081,6 +1195,29 @@ def _register_fake():
         out: Optional[torch.Tensor] = None,
     ) -> None:
         pass
+
+    @torch.library.register_fake("trtllm::gdn_verify")
+    def _(
+        qkv: torch.Tensor,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        norm_weight: torch.Tensor,
+        fp8_scale: Optional[torch.Tensor],
+        norm_eps: float,
+        ssm_states: torch.Tensor,
+        state_indices: torch.Tensor,
+        old_u: torch.Tensor,
+        old_k: torch.Tensor,
+        old_g: torch.Tensor,
+        cache_buf_idx: torch.Tensor,
+        prev_num_accepted_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        dtype = torch.float8_e4m3fn if fp8_scale is not None else qkv.dtype
+        return qkv.new_empty((qkv.shape[0], z.shape[1] * z.shape[2]),
+                             dtype=dtype)
 
     @torch.library.register_fake("trtllm::causal_conv1d_update")
     def _(
@@ -1343,6 +1480,20 @@ def _register_fake():
             device=input.device)
         return output, output_sf
 
+    @torch.library.register_fake("trtllm::swiglu_nvfp4_quantize")
+    def _(
+        input: torch.Tensor,
+        global_sf: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = input.size(0)
+        interm_size = input.size(1) // 2
+        output = input.new_empty((num_tokens, interm_size // 2),
+                                 dtype=torch.float4_e2m1fn_x2)
+        output_sf = input.new_empty((fp4_utils.pad_up(num_tokens, 128) *
+                                     fp4_utils.pad_up(interm_size // 16, 4), ),
+                                    dtype=torch.uint8)
+        return output, output_sf
+
     @torch.library.register_fake("trtllm::moe_gelu")
     def _(
         input: torch.Tensor,
@@ -1367,6 +1518,7 @@ def _register_fake():
         return [create_output_tensor(i) for i in input_list]
 
     @torch.library.register_fake("trtllm::allgather_list_pg")
+    @torch.library.register_fake("trtllm::allgather_list_pg_by_name")
     def _(input_list, sizes, group, process_group):
         return allgather_list(input_list, sizes, group)
 
@@ -1385,6 +1537,29 @@ def _register_fake():
     @torch.library.register_fake("trtllm::reducescatter_pg")
     def _(input, sizes, group, process_group):
         return reducescatter(input, sizes, group)
+
+    @torch.library.register_fake("trtllm::reducescatter_pg_by_name")
+    def _(input, sizes, group, rank, group_name):
+        shape = list(input.shape)
+        shape[0] = input.shape[0] // len(
+            group) if sizes is None else sizes[rank]
+        return input.new_empty(shape)
+
+    @torch.library.register_fake("trtllm::reducescatter_list")
+    @torch.library.register_fake("trtllm::reducescatter_list_pg")
+    def _(input_list, sizes, group, process_group=None):
+        return [reducescatter(value, sizes, group) for value in input_list]
+
+    @torch.library.register_fake("trtllm::reducescatter_list_pg_by_name")
+    def _(input_list, sizes, group, rank, group_name):
+
+        def create_output(value):
+            shape = list(value.shape)
+            shape[0] = (value.shape[0] //
+                        len(group) if sizes is None else sizes[rank])
+            return value.new_empty(shape)
+
+        return [create_output(value) for value in input_list]
 
     @torch.library.register_fake("trtllm::block_scale_interleave")
     def _(sf: torch.Tensor):
@@ -1462,6 +1637,17 @@ def _register_fake():
             return base.transpose(1, 2) if layout == 0 else base
 
         return (_mk(q_in), _mk(k_in), _mk(v_in))
+
+    @torch.library.register_fake("trtllm::ulysses_packed_qkv_post_unscatter")
+    def _(qkv_in, layout=0):
+        P, B, Sp, qkv_count, H, D = qkv_in.shape
+        assert qkv_count == 3
+
+        def _mk():
+            base = qkv_in.new_empty((B, P * Sp, H, D))
+            return base.transpose(1, 2) if layout == 0 else base
+
+        return (_mk(), _mk(), _mk())
 
     @torch.library.register_fake("trtllm::helix_post_process")
     def _(gathered_o, gathered_stats, scale):
@@ -1552,6 +1738,19 @@ def _register_fake():
         return b_q_weight.new_empty(
             (size_k // tile_size, size_n * tile_size // pack_factor),
             dtype=b_q_weight.dtype)
+
+    @torch.library.register_fake("trtllm::reorder_helix_mla_kv")
+    def _(gathered: torch.Tensor, cu_global: torch.Tensor,
+          global_offsets: torch.Tensor, cu_local: torch.Tensor,
+          local_offsets: torch.Tensor, rank_offsets: torch.Tensor,
+          tokens_per_block: int, lora_size: int,
+          rope_size: int) -> List[torch.Tensor]:
+        # One output row per gathered row: the compressed KV and k_pe parts.
+        num_tokens = gathered.shape[0]
+        return [
+            gathered.new_empty((num_tokens, lora_size)),
+            gathered.new_empty((num_tokens, rope_size)),
+        ]
 
     @torch.library.register_fake("trtllm::mla_rope_generation")
     def _(
@@ -1715,6 +1914,43 @@ def _register_fake():
         sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
         sf_out = x.new_empty((sf_size, ), dtype=torch.uint8)
         return y_fp4, sf_out
+
+    @torch.library.register_fake("trtllm::fmha_dense_fp8")
+    def _(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        scale_bmm1: Optional[torch.Tensor],
+        scale_out: torch.Tensor,
+        fp16_softmax: bool,
+        out_dtype: torch.dtype,
+    ):
+        return q.new_empty(q.shape, dtype=out_dtype)
+
+    @torch.library.register_fake("trtllm::dit_v_amax")
+    def _(qkv: torch.Tensor, num_heads: int, head_dim: int):
+        return qkv.new_empty((1, ), dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::fused_dit_qk_norm_rope_fp8")
+    def _(
+        qkv: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        eps: float,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos_emb: torch.Tensor,
+        sin_emb: torch.Tensor,
+        interleave: bool,
+        qk_mul: float,
+        v_amax: Optional[torch.Tensor],
+    ):
+        shape = (qkv.shape[0], num_heads, head_dim)
+        q8, k8, v8 = (qkv.new_empty(shape, dtype=torch.float8_e4m3fn)
+                      for _ in range(3))
+        return q8, k8, v8, qkv.new_empty((1, ), dtype=torch.float32)
 
     @torch.library.register_fake("trtllm::fused_adaptive_layernorm")
     def _(

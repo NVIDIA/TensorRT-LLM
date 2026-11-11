@@ -18,10 +18,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_vanilla import VanillaMoE
+from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
     PostTransformQualificationDecision,
@@ -32,8 +37,111 @@ from tensorrt_llm._torch.weight_sharing import (
 ModelFactory = Callable[[], nn.Module]
 ModelQualifier = Callable[[nn.Module], PostTransformQualificationDecision]
 ReceiverPreparer = Callable[[nn.Module, nn.Module], None]
+ProducerPreparer = Callable[[nn.Module], None]
 StateProbe = Callable[[nn.Module], object]
 OutputProbe = Callable[[nn.Module], object]
+
+# Runtime constraints that a profile qualifying a model with routed experts
+# must pin: the routed-expert layout depends on the MoE backend and partition.
+_MOE_RUNTIME_CONSTRAINTS = ("moe_backends", "moe_tp_sizes", "moe_ep_sizes", "moe_cluster_sizes")
+
+
+class AllReduceStub(nn.Module):
+    """Identity all-reduce for simulating one tensor-parallel rank in a single process."""
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        super().__init__()
+
+    def uses_nccl_symmetric_memory_window(self) -> bool:
+        """Report that no NCCL symmetric memory window is in use."""
+        return False
+
+    def forward(self, tensor: torch.Tensor, **_kwargs: object) -> torch.Tensor:
+        """Return the local partial result unchanged."""
+        return tensor
+
+
+def mx_canonical_parameter_catalog(
+    model: nn.Module,
+) -> dict[str, tuple[int, tuple[int, ...], torch.dtype]]:
+    """Mirror the parameter view that MX registers and transfers, without importing MX.
+
+    MX walks `named_parameters(remove_duplicate=False)`, skips the runtime
+    alias names, and deduplicates by storage.
+    """
+    catalog = {}
+    seen_storages = set()
+    runtime_alias_components = {"next_attn", "next_layer_layernorm"}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        storage = (parameter.device.type, parameter.device.index, parameter.data_ptr())
+        if runtime_alias_components.intersection(name.split(".")):
+            continue
+        if storage in seen_storages:
+            continue
+        seen_storages.add(storage)
+        catalog[name] = (parameter.data_ptr(), tuple(parameter.shape), parameter.dtype)
+    return catalog
+
+
+def module_state_snapshot(model: nn.Module) -> dict[str, object]:
+    """Snapshot the non-tensor state of every module for a state probe.
+
+    Captures scalar, string, enum, and `None` attributes of each module and the
+    contents of every Hugging Face config that a module holds. A staged
+    receiver never runs `load_weights()`, so any of this state that only the
+    load path sets differs from a producer prepared with `prepare_producer`.
+    """
+    state: dict[str, object] = {}
+    seen_configs: set[int] = set()
+    for module_name, module in model.named_modules():
+        for attribute, value in vars(module).items():
+            key = f"{module_name}.{attribute}"
+            if isinstance(value, (bool, int, float, str, Enum, type(None))):
+                state[key] = value
+            elif isinstance(value, PretrainedConfig) and id(value) not in seen_configs:
+                seen_configs.add(id(value))
+                state[key] = value.to_dict()
+    return state
+
+
+def keep_factory_parameters(
+    prepare_producer: ProducerPreparer,
+) -> tuple[ProducerPreparer, dict[str, torch.Tensor]]:
+    """Wrap `prepare_producer` to copy the factory parameters before it overwrites them.
+
+    Returns the wrapped preparer for `PostTransformQualificationCase` and the
+    copies, keyed by parameter name, for `assert_every_parameter_was_loaded`.
+    """
+    factory_parameters: dict[str, torch.Tensor] = {}
+
+    def prepare(model: nn.Module) -> None:
+        factory_parameters.update(
+            (name, parameter.detach().clone()) for name, parameter in model.named_parameters()
+        )
+        prepare_producer(model)
+
+    return prepare, factory_parameters
+
+
+def assert_every_parameter_was_loaded(
+    producer: nn.Module, factory_parameters: dict[str, torch.Tensor]
+) -> None:
+    """Assert that `prepare_producer` overwrote every parameter of the factory fill.
+
+    The lifecycle probes then compare bytes that came from the checkpoint
+    through the weight mapper rather than the factory's placeholder values.
+    `factory_parameters` comes from `keep_factory_parameters`.
+    """
+    assert factory_parameters, "The producer was never prepared"
+    # Look parameters up by the factory's canonical names: after
+    # `setup_aliases()` the producer also reaches some of them through
+    # `next_layer_layernorm` alias names.
+    unchanged = [
+        name
+        for name, factory_parameter in factory_parameters.items()
+        if torch.equal(producer.get_parameter(name), factory_parameter)
+    ]
+    assert unchanged == [], f"Parameters not written by the producer load: {unchanged}"
 
 
 def copy_post_transform_parameters(producer: nn.Module, receiver: nn.Module) -> None:
@@ -86,6 +194,11 @@ class PostTransformQualificationCase:
     `prepare_receiver` simulates installation of a producer's post-transform
     tensors when a family needs value-level coverage. A real MX donor/receiver
     test is still required before enabling a production profile.
+
+    `prepare_producer`, when set, runs the family's real checkpoint load path
+    on the producer before its full post-load walk. The receiver never loads,
+    as on a staged MX receiver, so the state and output probes then also cover
+    any state that only `load_weights()` or the weight mapper sets.
     """
 
     profile_id: str
@@ -95,6 +208,7 @@ class PostTransformQualificationCase:
     state_probes: tuple[tuple[str, StateProbe], ...]
     output_probes: tuple[tuple[str, OutputProbe], ...]
     prepare_receiver: ReceiverPreparer = copy_post_transform_parameters
+    prepare_producer: ProducerPreparer | None = None
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -171,6 +285,26 @@ def _assert_named_tensors_equal(
             raise AssertionError(f"Post-transform {tensor_kind} {name!r} bytes differ")
 
 
+def _holds_routed_experts(model: nn.Module) -> bool:
+    return any(
+        is_moe_weight_owner(module) or isinstance(module, VanillaMoE) for module in model.modules()
+    )
+
+
+def _runs_real_transform(module: nn.Module) -> bool:
+    """Whether `ModelLoader._walk_transform` would run a transform on `module`.
+
+    Reads the hook from the class, because the call recorders replace it on the
+    instance; the no-op default of `DecoderModelForCausalLM` transforms nothing.
+    """
+    hook = getattr(type(module), "transform_weights", None)
+    return (
+        hook is not None
+        and hook is not DecoderModelForCausalLM.transform_weights
+        and not getattr(module, "_weights_removed", False)
+    )
+
+
 def _install_transform_call_recorders(model: nn.Module) -> list[str]:
     calls: list[str] = []
     for name, module in model.named_modules():
@@ -212,6 +346,16 @@ def assert_post_transform_lifecycle_equivalent(
     )
     assert decision.profile is not None
     assert decision.profile.profile_id == case.profile_id
+    # MoE-ness comes from the constructed model, not from the profile, so a
+    # profile that leaves the routed-expert backend or partition open cannot
+    # pass as a dense one.
+    if _holds_routed_experts(receiver):
+        constraints = decision.profile.runtime_constraints
+        unpinned = [name for name in _MOE_RUNTIME_CONSTRAINTS if getattr(constraints, name) is None]
+        assert not unpinned, (
+            f"Profile {case.profile_id!r} qualifies a model with routed experts but leaves "
+            f"{unpinned} unconstrained"
+        )
 
     unqualified_model = case.unqualified_model_factory()
     unqualified_decision = case.qualify_model(unqualified_model)
@@ -228,6 +372,8 @@ def assert_post_transform_lifecycle_equivalent(
     )
 
     transform_calls = _install_transform_call_recorders(receiver)
+    if case.prepare_producer is not None:
+        case.prepare_producer(producer)
     ModelLoader._walk_full_post_load(producer)
     ModelLoader._setup_aliases(receiver)
     case.prepare_receiver(producer, receiver)
@@ -239,6 +385,16 @@ def assert_post_transform_lifecycle_equivalent(
     ModelLoader._walk_cache_state(receiver)
 
     assert transform_calls == [], f"Staged receiver invoked transform_weights(): {transform_calls}"
+    # Staged finalization marks only modules that already carry the guard, and
+    # a later transform walk runs every module left unmarked, so each module
+    # with a transform must declare the guard before any weight load.
+    unmarked = [
+        name or type(module).__name__
+        for name, module in receiver.named_modules()
+        if _runs_real_transform(module)
+        and getattr(module, "_weights_transformed", False) is not True
+    ]
+    assert unmarked == [], f"Staged finalization left transform modules unmarked: {unmarked}"
     assert _transform_guard_state(receiver) == _transform_guard_state(producer)
 
     _assert_named_tensors_equal(

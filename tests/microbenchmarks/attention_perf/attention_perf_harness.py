@@ -718,7 +718,6 @@ def _build_dsa_ctx(case: AttnCase, device: torch.device):
         request_ids=request_ids,
         token_nums=[case.seq_len] * case.batch_size,
         is_gen=False,
-        prepare_resource=True,
     )
     assert requests is not None
 

@@ -240,7 +240,10 @@ def test_main_posts_case_skip_rate_to_opensearch(
     monkeypatch.setattr(report_module, "_case_counts", lambda *_args, **_kwargs: (25, 100))
 
     decision_path = tmp_path / "decision.json"
-    decision_path.write_text('{"scope": "testsonly", "affected_stages": []}')
+    decision_path.write_text(
+        '{"scope": "testsonly", "affected_stages": [], '
+        '"shadow_selection_artifact_path": "repo/build/cbts/cbts_test_db.tar.gz"}'
+    )
 
     # `main` is now a click.Command; call the undecorated callback directly, which
     # still runs the never-fail try/except wrapping `_run` — equivalent to invoking
@@ -262,3 +265,6 @@ def test_main_posts_case_skip_rate_to_opensearch(
     assert posted_documents[0]["b_multi_gpu_label_gate_open"] is True
     assert posted_documents[0]["b_cbts_applied"] is cbts_applied
     assert posted_documents[0]["b_coverage_pilot_eligible"] is coverage_pilot_eligible
+    assert posted_documents[0]["s_shadow_selection_artifact_path"] == (
+        "repo/build/cbts/cbts_test_db.tar.gz"
+    )

@@ -4,7 +4,6 @@
 ## Issue Tracking
 
 * All enhancement, bugfix, or change requests must begin with the creation of a [TensorRT-LLM Issue Request](https://github.com/nvidia/TensorRT-LLM/issues).
-  * The issue request must be reviewed by TensorRT-LLM engineers and approved prior to code review.
 
 ## Coding Guidelines
 
@@ -13,7 +12,7 @@ TensorRT-LLM Coding Style can be found [in this document](CODING_GUIDELINES.md).
 We use `pre-commit` for automatic code formatting and validation. Install the `pre-commit` package in your local Python environment.
 
 ```bash
-pip install pre-commit mypy
+pip install pre-commit pyrefly
 pre-commit install
 ```
 

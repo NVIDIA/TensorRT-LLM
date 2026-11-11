@@ -4,16 +4,14 @@
 
 import asyncio
 import io
-from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import soundfile as sf
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
-from tensorrt_llm.serve.openai_server import OpenAIServer
+from test_common.serve.app_factory import AggConfig
+from test_common.serve.routes import effective_routes
 
 pytestmark = pytest.mark.cpu_only
 
@@ -38,19 +36,14 @@ class _Result:
 
 
 @pytest.fixture
-def server():
-    instance = object.__new__(OpenAIServer)
-    instance.app = FastAPI()
-    instance.model = "whisper-test"
+def server(serve_env):
+    instance = serve_env.build_openai_server(AggConfig(model_name="whisper-test"))
     instance.model_config = SimpleNamespace(
         model_type="whisper", decoder_start_token_id=1, max_target_positions=448
     )
     instance.processor = SimpleNamespace(
         feature_extractor=SimpleNamespace(sampling_rate=16000, n_samples=16000)
     )
-    instance.use_harmony = False
-    instance._register_runtime_control_routes = lambda: None
-    instance._register_rl_control_routes = lambda: None
     instance.result = _Result()
     instance.calls = []
     instance.preprocessed = []
@@ -71,15 +64,10 @@ def server():
             instance.watch_stopped = True
 
     instance.await_disconnected = watch
-    instance.generator = SimpleNamespace(
-        preprocess=preprocess,
-        generate_async=generate,
-        _executor=SimpleNamespace(resource_governor_queue=None),
-        args=SimpleNamespace(return_perf_metrics=False),
-    )
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        instance._input_proc_executor = pool
-        yield instance
+    instance.generator.preprocess = preprocess
+    instance.generator.generate_async = generate
+    instance._transcription_test_client = serve_env.client(instance.app, lifespan=False)
+    yield instance
 
 
 def _upload(client: TestClient, **fields):
@@ -93,10 +81,7 @@ def _upload(client: TestClient, **fields):
 
 
 def _client(server) -> TestClient:
-    server.app.add_api_route(
-        "/v1/audio/transcriptions", server.openai_transcription, methods=["POST"]
-    )
-    return TestClient(server.app)
+    return server._transcription_test_client
 
 
 def test_generation_and_disconnect_cleanup(server) -> None:
@@ -161,5 +146,8 @@ def test_cancelled_generation_aborts_backend(server) -> None:
 
 
 def test_route_is_registered(server) -> None:
-    server.register_routes()
-    assert "/v1/audio/transcriptions" in {route.path for route in server.app.routes}
+    routes = [
+        route for path, route in effective_routes(server.app) if path == "/v1/audio/transcriptions"
+    ]
+    assert len(routes) == 1
+    assert routes[0].methods == {"POST"}

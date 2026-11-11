@@ -27,10 +27,14 @@ from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    CustomAttentionMask,
+    PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
+
+_FLASHINFER_TRTLLM_GEN_MODULE = "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen"
 
 
 def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
@@ -62,6 +66,7 @@ def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("page_size,paged_context", [(32, False), (128, True)])
 def test_small_context_fallback_preserves_mixed_batch_generation(
+    monkeypatch: pytest.MonkeyPatch,
     num_contexts: int,
     num_generations: int,
     dtype: torch.dtype,
@@ -69,6 +74,7 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
     page_size: int,
     paged_context: bool,
 ) -> None:
+    monkeypatch.setattr(f"{_FLASHINFER_TRTLLM_GEN_MODULE}.get_sm_version", lambda: 100)
     attn = FakeAttention()
     attn.head_dim = 256
     attn.sparse_params = None
@@ -130,6 +136,9 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
 
 @pytest.mark.parametrize("kv_cache_dtype", [DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize(
+    "attention_mask", [PredefinedAttentionMask.CAUSAL, CustomAttentionMask.CUSTOM]
+)
+@pytest.mark.parametrize(
     "dtype,sm_version",
     [(torch.bfloat16, 100), (torch.float16, 103)],
     ids=["small_bf16_batch", "sm103_fp16"],
@@ -139,6 +148,7 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
     kv_cache_dtype: DataType,
     dtype: torch.dtype,
     sm_version: int,
+    attention_mask: PredefinedAttentionMask | CustomAttentionMask,
 ) -> None:
     monkeypatch.setattr(
         "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
@@ -176,6 +186,7 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
         attention_input_type=AttentionInputType.context_only,
         is_fused_qkv=True,
         update_kv_cache=True,
+        attention_mask=attention_mask,
     )
 
     for phase in (None, FmhaPhase.CONTEXT):
@@ -189,5 +200,111 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
             phase=phase,
         )
 
-        assert supported, reason
-        assert reason == ""
+        if attention_mask == CustomAttentionMask.CUSTOM:
+            assert not supported
+            assert "unsupported attention mask" in reason
+        else:
+            assert supported, reason
+            assert reason == ""
+
+
+@pytest.mark.parametrize(
+    "sm_version,expected",
+    [(90, False), (100, True), (103, True), (107, True), (120, False)],
+)
+def test_flashinfer_availability_by_sm(
+    monkeypatch: pytest.MonkeyPatch,
+    sm_version: int,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(f"{_FLASHINFER_TRTLLM_GEN_MODULE}.IS_FLASHINFER_AVAILABLE", True)
+    monkeypatch.setattr(
+        FlashInferTrtllmGenFmha, "_missing_fused_nanobind_ops", staticmethod(lambda: [])
+    )
+    monkeypatch.setattr(f"{_FLASHINFER_TRTLLM_GEN_MODULE}.get_sm_version", lambda: sm_version)
+    attn = FakeAttention()
+    attn.sparse_params = None
+
+    assert FlashInferTrtllmGenFmha._is_available(attn) is expected
+
+
+@pytest.mark.parametrize(
+    "input_type",
+    [AttentionInputType.context_only, AttentionInputType.generation_only],
+    ids=["context", "generation"],
+)
+@pytest.mark.parametrize(
+    "sm_version,tokens_per_block,extra_tokens_per_block,expected",
+    [
+        (107, 128, frozenset({128}), True),
+        (107, 32, frozenset({128}), False),
+        (107, 32, frozenset(), False),
+        (103, 32, frozenset(), True),
+        (103, 128, frozenset({128}), True),
+    ],
+    ids=[
+        "sm107_extra_page_size",
+        "sm107_default_page_size_with_extra",
+        "sm107_default_page_size",
+        "sm103_default_page_size",
+        "sm103_extra_page_size",
+    ],
+)
+def test_sm107_serves_only_extra_page_sizes(
+    monkeypatch: pytest.MonkeyPatch,
+    input_type: AttentionInputType,
+    sm_version: int,
+    tokens_per_block: int,
+    extra_tokens_per_block: frozenset,
+    expected: bool,
+) -> None:
+    """FP8-KV GQA 16:1 head-128 paged attention, the MiniMax-M3 Eagle3 draft layer shape."""
+    monkeypatch.setattr(f"{_FLASHINFER_TRTLLM_GEN_MODULE}.get_sm_version", lambda: sm_version)
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha.kv_factor = 2
+    monkeypatch.setattr(fmha, "_get_total_num_blocks", lambda _: 0)
+    attn = SimpleNamespace(
+        is_mla_enable=False,
+        sparse_params=None,
+        position_embedding_type=0,
+        head_dim=128,
+        num_heads=16,
+        num_kv_heads=1,
+    )
+    is_context = input_type == AttentionInputType.context_only
+    num_tokens = 4
+    q_hidden_size = attn.num_heads * attn.head_dim
+    qkv_hidden_size = q_hidden_size + 2 * attn.num_kv_heads * attn.head_dim
+    q = torch.empty((num_tokens, qkv_hidden_size), dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        num_contexts=1 if is_context else 0,
+        num_generations=0 if is_context else 1,
+        helix_position_offsets=None,
+        num_sparse_topk=0,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        kv_cache_block_offsets=object(),
+        kv_cache_manager=SimpleNamespace(
+            dtype=DataType.FP8,
+            trtllm_gen_extra_tokens_per_block=extra_tokens_per_block,
+        ),
+        is_cross=False,
+        is_spec_decoding_enabled=False,
+        tokens_per_block=tokens_per_block,
+        beam_width=1,
+    )
+    forward_args = AttentionForwardArgs(
+        output=torch.empty((num_tokens, q_hidden_size), dtype=torch.bfloat16),
+        attention_input_type=input_type,
+        is_fused_qkv=True,
+        update_kv_cache=True,
+    )
+
+    phase = FmhaPhase.CONTEXT if is_context else FmhaPhase.GENERATION
+    for requested_phase in (None, phase):
+        supported, reason = fmha._is_supported_with_reason(
+            q, None, None, attn, metadata, forward_args, phase=requested_phase
+        )
+        assert supported is expected, reason
+        if not expected:
+            assert "SM107" in reason

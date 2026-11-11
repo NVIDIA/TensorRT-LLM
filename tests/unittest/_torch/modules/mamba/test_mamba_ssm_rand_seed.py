@@ -11,12 +11,16 @@ reset without per-forward `torch.randint`.
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    PythonMambaCacheManager,
-    _allocate_mamba_seed_buffer,
-    _compute_deterministic_mamba_seed,
-    _mamba_rank_offset,
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    allocate_mamba_seed_buffer as _allocate_mamba_seed_buffer,
 )
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    compute_deterministic_mamba_seed as _compute_deterministic_mamba_seed,
+)
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    mamba_seed_rank_offset as _mamba_rank_offset,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import PythonMambaCacheManager
 from tensorrt_llm.mapping import Mapping
 
 

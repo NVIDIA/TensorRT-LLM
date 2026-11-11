@@ -18,10 +18,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from tensorrt_llm._torch.disaggregation.base import Attempt, CacheExtent, Cancelled, Outcome
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
+from .extent import Attempt, CacheExtent, Cancelled, Outcome
 from .handle import NothingPublished, TaskHandle
 from .transfer import RxSession, SessionStatus, TransferWorker
 

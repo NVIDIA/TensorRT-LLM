@@ -18,7 +18,7 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_pre_hopper
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models import Qwen3_5VLModel
+from tensorrt_llm._torch.models import Qwen3_5ForCausalLM, Qwen3_5VLModel
 from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
@@ -31,9 +31,19 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
     load_pretrained_config,
 )
-from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_mamba_ssm_cache_dtype
+from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader as TorchModelLoader
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    construct_checkpoint_loader,
+    validate_and_set_mamba_ssm_cache_dtype,
+)
 from tensorrt_llm.inputs import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.llmapi.llm_args import Nvfp4GemmConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_utils import (
+    ModelLoader,
+    _resolve_kv_cache_manager_v2_auto,
+    apply_model_defaults_to_llm_args,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -191,6 +201,166 @@ def test_qwen35_dense_vl_resolves_model_and_mapper(tmp_path: Path, extra_config:
     )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("quant_algo", "sm_version", "use_marlin"),
+    [
+        pytest.param(QuantAlgo.NVFP4, 90, True, id="hopper-nvfp4"),
+        pytest.param(QuantAlgo.MIXED_PRECISION, 90, True, id="hopper-mixed-precision"),
+        pytest.param(QuantAlgo.NVFP4, 89, True, id="ada-nvfp4"),
+        pytest.param(QuantAlgo.FP8, 90, False, id="hopper-fp8"),
+        pytest.param(QuantAlgo.NVFP4, 100, False, id="blackwell-nvfp4"),
+        pytest.param(QuantAlgo.MIXED_PRECISION, 120, False, id="sm120-mixed-precision"),
+    ],
+)
+def test_qwen35_dense_model_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_algo: QuantAlgo,
+    sm_version: int,
+    use_marlin: bool,
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        lambda: sm_version,
+    )
+
+    expected_gemm_backends = ["marlin"] if use_marlin else Nvfp4GemmConfig().allowed_backends
+    for model_cls in (Qwen3_5ForCausalLM, Qwen3_5VLModel):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        llm_args.quant_config = QuantConfig(quant_algo=quant_algo)
+        defaults = model_cls.get_model_defaults(llm_args)
+        apply_model_defaults_to_llm_args(llm_args, defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_cls)
+
+        assert llm_args.kv_cache_config.enable_block_reuse is False
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+        assert llm_args.nvfp4_gemm_config.allowed_backends == expected_gemm_backends
+        assert llm_args.moe_config.backend == "AUTO"
+
+
+@pytest.mark.cpu_only
+def test_qwen35_dense_model_defaults_keep_explicit_backends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        lambda: 90,
+    )
+
+    for model_cls in (Qwen3_5ForCausalLM, Qwen3_5VLModel):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model", nvfp4_gemm_config={"allowed_backends": ["cublaslt"]}
+        )
+        llm_args.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+        apply_model_defaults_to_llm_args(llm_args, model_cls.get_model_defaults(llm_args))
+
+        assert llm_args.nvfp4_gemm_config.allowed_backends == ["cublaslt"]
+
+
+def _qwen38_layers(*suffixes: str) -> List[str]:
+    return [f"model.language_model.layers.{i}.{suffix}" for i in (0, 1) for suffix in suffixes]
+
+
+# hf_quant_config.json of RadixArk/Qwen3.8-27B-NVFP4 (rev 319f741c) and
+# Inferact/Qwen3.8-27B-NVFP4 (rev 6128240e), cut to the two layers of the
+# synthetic config above.
+_QWEN38_27B_NVFP4_HF_QUANT_CONFIGS = {
+    "radixark-mixed-precision": {
+        "producer": {"name": "modelopt", "version": "0.47.0.dev0"},
+        "quantization": {
+            "quant_algo": "MIXED_PRECISION",
+            "kv_cache_quant_algo": "FP8",
+            "quantized_layers": {
+                **{
+                    name: {"quant_algo": "FP8"}
+                    for name in _qwen38_layers(
+                        "linear_attn.out_proj", "linear_attn.in_proj_qkv", "linear_attn.in_proj_z"
+                    )
+                },
+                **{
+                    name: {"quant_algo": "NVFP4", "group_size": 16}
+                    for name in _qwen38_layers("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+                },
+                "lm_head": {"quant_algo": "NVFP4", "group_size": 16},
+            },
+            "exclude_modules": ["mtp*", "mtp.layers.0*"],
+        },
+    },
+    "inferact-nvfp4": {
+        "producer": {"name": "modelopt", "version": "0.0.1.dev1+ga21173a4d"},
+        "quantization": {
+            "exclude_modules": [
+                "lm_head",
+                "model.language_model.embed_tokens",
+                *_qwen38_layers(
+                    "linear_attn.conv1d",
+                    "linear_attn.in_proj_a",
+                    "linear_attn.in_proj_b",
+                    "linear_attn.in_proj_qkv",
+                    "linear_attn.in_proj_z",
+                ),
+                "model.visual*",
+                "mtp*",
+            ],
+            "group_size": 16,
+            "kv_cache_quant_algo": None,
+            "quant_algo": "NVFP4",
+        },
+    },
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "hf_quant_config",
+    list(_QWEN38_27B_NVFP4_HF_QUANT_CONFIGS.values()),
+    ids=list(_QWEN38_27B_NVFP4_HF_QUANT_CONFIGS),
+)
+@pytest.mark.parametrize(
+    ("llm_kwargs", "expected_gemm_backends"),
+    [
+        pytest.param({}, ["marlin"], id="default"),
+        pytest.param(
+            {"nvfp4_gemm_config": {"allowed_backends": ["cublaslt"]}}, ["cublaslt"], id="explicit"
+        ),
+    ],
+)
+def test_qwen38_nvfp4_checkpoint_load_applies_hopper_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hf_quant_config: dict,
+    llm_kwargs: dict,
+    expected_gemm_backends: List[str],
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        lambda: 90,
+    )
+    checkpoint_dir = _write_qwen35_dense_vl_config(tmp_path, language_model_only=False)
+    (checkpoint_dir / "hf_quant_config.json").write_text(
+        json.dumps(hf_quant_config), encoding="utf-8"
+    )
+
+    llm_args = TorchLlmArgs(model=str(checkpoint_dir), **llm_kwargs)
+    assert ModelLoader(llm_args)._update_from_hf_quant_config() is True
+    assert llm_args.quant_config.quant_algo == hf_quant_config["quantization"]["quant_algo"]
+
+    checkpoint_loader = construct_checkpoint_loader(
+        llm_args.checkpoint_loader,
+        llm_args.checkpoint_format,
+        mx_config=llm_args.mx_config,
+        checkpoint_io_policy=llm_args.checkpoint_io_policy,
+        load_format=llm_args.load_format,
+        partial_model_loading=llm_args.is_partial_model_loading,
+    )
+    TorchModelLoader.load_config_and_apply_defaults(
+        str(checkpoint_dir), llm_args, checkpoint_loader
+    )
+
+    assert llm_args.nvfp4_gemm_config.allowed_backends == expected_gemm_backends
+    assert llm_args.moe_config.backend == "AUTO"
+
+
 @pytest.mark.parametrize("sm_version", [90, 100, 103, 120, 121])
 def test_qwen35_dense_vl_normalizes_native_nvfp4_mlp_paths(sm_version: int) -> None:
     model_config = SimpleNamespace(
@@ -213,6 +383,42 @@ def test_qwen35_dense_vl_normalizes_native_nvfp4_mlp_paths(sm_version: int) -> N
     assert all(
         config.quant_algo == QuantAlgo.NVFP4 for config in model_config.quant_config_dict.values()
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("qkv_algo", "z_algo", "fused_algo"),
+    [
+        (QuantAlgo.FP8, QuantAlgo.FP8, QuantAlgo.FP8),
+        (
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+        ),
+        # Mixed FP8 schemes cannot share one fused Linear: no fused entry.
+        (QuantAlgo.FP8, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN, None),
+    ],
+)
+def test_qwen35_fuses_fp8_linear_attn_in_proj_entries(
+    qkv_algo: QuantAlgo, z_algo: QuantAlgo, fused_algo: QuantAlgo | None
+) -> None:
+    prefix = "model.language_model.layers.0.linear_attn"
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={
+            f"{prefix}.in_proj_qkv": QuantConfig(quant_algo=qkv_algo),
+            f"{prefix}.in_proj_z": QuantConfig(quant_algo=z_algo),
+            f"{prefix}.out_proj": QuantConfig(quant_algo=z_algo),
+        },
+    )
+
+    _normalize_qwen35_quant_config_dict(model_config)
+
+    qcd = model_config.quant_config_dict
+    fused = qcd.get("model.layers.0.linear_attn.in_proj_qkvz")
+    assert (fused.quant_algo if fused is not None else None) == fused_algo
+    assert qcd["model.layers.0.linear_attn.out_proj"].quant_algo == z_algo
+    assert "model.layers.0.linear_attn.in_proj_qkv" not in qcd
 
 
 @pytest.mark.parametrize(
@@ -372,17 +578,22 @@ def test_qwen35_mapper_dequantizes_lm_head_nvfp4_by_scale_shape(group_size: int)
         )
 
 
-def test_qwen35_dense_vl_leaves_fp8_mlp_paths_unchanged() -> None:
-    name = "model.language_model.layers.0.mlp.gate_proj"
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.FP8, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN])
+def test_qwen35_dense_vl_normalizes_fp8_mlp_paths(quant_algo: QuantAlgo) -> None:
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(num_hidden_layers=64),
-        quant_config_dict={name: QuantConfig(quant_algo=QuantAlgo.FP8)},
+        quant_config_dict={
+            f"model.language_model.layers.0.mlp.{proj}": QuantConfig(quant_algo=quant_algo)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        },
     )
 
     _normalize_qwen35_quant_config_dict(model_config)
 
     assert model_config.quant_config_dict == {
-        "model.layers.0.mlp.gate_proj": QuantConfig(quant_algo=QuantAlgo.FP8)
+        f"model.layers.0.mlp.mlp.{proj}": QuantConfig(quant_algo=quant_algo)
+        for proj in ("gate_proj", "up_proj", "down_proj")
     }
 
 
@@ -607,7 +818,7 @@ class TestQwen3_5VL(TestModelingMultimodal):
             )
         else:
             # Mrope position ids. For chunked prefill / KV cache reuse we must
-            # mirror production `PyTorchModelEngine` and slice each request's
+            # mirror production `ModelEngine` and slice each request's
             # full `mrope_position_ids` to the current chunk's token range —
             # the fused QK-norm-RoPE op requires position_ids tokens to match
             # the QKV token count.

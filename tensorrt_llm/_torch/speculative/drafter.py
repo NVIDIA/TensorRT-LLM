@@ -64,7 +64,7 @@ class Drafter(ABC):
         num_effective_requests = min(len(requests), max_batch_size, token_cap)
         return num_effective_requests <= self.max_concurrency
 
-    # Drafters that use TorchSampler (NGram, two-model) compute py_rewind_len
+    # Drafters that use TorchSampler (NGram, user-provided) compute py_rewind_len
     # from len(py_draft_tokens), which includes padding.  They must set this
     # to True so that extend_capacity_for_tokens is called after padding.
     # One-model drafters (MTP / Eagle3 / SA) use SpecSampler which

@@ -56,8 +56,29 @@ The `MiniMax-M3-NVFP4` checkpoint uses MXFP8 base layers and NVFP4 routed expert
 (`MIXED_PRECISION`). Its name describes weight precision; set
 `kv_cache_config.dtype` explicitly to select FP8 or NVFP4 KV cache.
 
+The compressed-tensors NVFP4 MoE packaging of the MiniMax M3 architecture is
+also loaded as mixed MXFP8/NVFP4. Such a checkpoint declares
+`quant_method: mxfp8` together with `moe_quant_algo: NVFP4`,
+`moe_quant_format: nvfp4-pack-quantized` and `group_size: 16`, and stores each
+routed expert projection as `weight_packed`, `weight_scale`,
+`weight_global_scale` and `input_global_scale`. TensorRT LLM keeps the packed
+FP4 bytes and E4M3 block scales as stored and converts the global scales at
+load time: the stored `2688 / amax` multipliers become the reciprocal
+`weight_scale_2` and `input_scale` divisors of the NVFP4 MoE weight contract.
+A global scale that cannot be inverted (zero, as stored for an expert without
+calibration data, or negative or not finite) is set to 0 with a warning; a
+weight global scale of 0 zeroes that expert's output. The routed experts then
+run the standard static NVFP4 MoE recipe (static input scale, BF16 rounding
+after FC1, routing weights applied in the finalize) on any NVFP4-capable MoE
+backend; `moe_config.backend: CUTLASS` and `TRTLLM` are both qualified on this
+packaging.
+
 Use the checkpoint's chat template (`chat_template.jinja`) when launching the
 server (see [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server)).
+Evaluate a checkpoint in this packaging through the chat template as well, for
+example `trtllm-eval ... gsm8k --apply_chat_template --chat_template_kwargs
+'{"thinking_mode": "disabled"}'`; the raw eight-shot prompts of the `gsm8k`
+default bypass the template the model was trained with.
 
 ## Feature Support Notes
 
@@ -65,6 +86,11 @@ server (see [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server)).
 * **Weight and KV precision.** BF16, MXFP8, and mixed MXFP8/NVFP4 checkpoints are supported. On SM100/SM103, the MSA backend supports FP8 and NVFP4 KV cache. NVFP4 storage is used in sparse target layers; dense target layers and the shared Eagle3 draft layer use FP8. The curated BF16-KV YAML remains a separate starting configuration.
 * **KV cache reuse must be disabled.** KV cache reuse is not supported on the sparse-attention path, so set `kv_cache_config.enable_block_reuse: false`.
 * **Eagle3.** The MSA path supports one shared GQA draft layer with linear Eagle3 drafting. Other MTP and tree-drafting configurations are unsupported. Keep NVFP4 KV and piecewise CUDA graph qualification separate: the existing PCG accuracy cases use FP8 KV.
+* **Rubin (SM107) Eagle3 draft layer.** On SM107 the shared Eagle3 draft layer runs at 128-token pages through FlashInfer's TRTLLM-Gen FMHA, the only FMHA with kernels for that page size there: keep `flashinfer_trtllm_gen` enabled in `TLLM_FMHA_LIBS`. `flashinfer-python` downloads those kernels on first use. On nodes without internet access, or to keep the download off the serving path, pre-populate the cubin directory and serve offline:
+  1. On one node with internet access, start the server with the production configuration (same tensor-parallel size and KV cache dtype: the kernels depend on the per-rank head layout and KV dtype), `FLASHINFER_CUBIN_DIR` set to an empty directory, and serve one Eagle3 request with a long prompt (a context and a generation step at 128-token pages).
+  2. Copy that directory to each serving node, set `FLASHINFER_CUBIN_DIR` to it and `FLASHINFER_NO_DOWNLOAD=1`; see [FlashInfer JIT workspaces for MPI workers](../llm-api/index.md#flashinfer-jit-workspaces-for-mpi-workers).
+
+  For the FP8 KV draft layer at TP2 (16 query heads and 1 KV head per rank, head size 128) the directory holds, under `<artifact hash>/fmha/trtllm-gen/`, `include/flashInferMetaInfo.h`, `checksums.txt` and 10 cubins: the `fmhaSm107aKernel_QkvE4m3OBfloat16H128PagedKvCausalPaged` context kernel `VarSeqQ256Kv128PersistentContext` and three generation kernels (`MultiCtasKvCgaVarSeqQ64Kv256StaticGroupedKeepsAbForGen`, `MultiCtasKvVarSeqQ64Kv256StaticGroupedKeepsAbForGen`, `VarSeqQ64Kv256PersistentGroupedKeepsAbForGen`), plus six `fmhaSm100fKernel_QkvE4m3OBfloat16H128PagedKvCausalPaged` generation kernels (`Q16` and `Q32` variants).
 * **Use matching builds for disaggregated context and generation workers.** The Triton unquantized main KV cache uses HND physical storage. Builds using the previous NHD storage are not compatible for KV transfer; upgrade both workers together.
 * **Size `max_seq_len` for the active attention paths.** On SM100/SM103, supported dense layers with unquantized KV cache in the Triton configuration use native paged attention and do not gather historical KV or expand GQA heads into temporary tensors. The SDPA dense fallback still allocates those buffers when TRTLLM-Gen is unavailable, disabled, ordered after the C++ fallback in `TLLM_FMHA_LIBS`, or the Triton configuration uses FP8/NVFP4 KV. FP8 KV retains SDPA to preserve its existing Q precision. The Triton sparse decode path separately has per-query FP32 temporary buffers that grow with the attended KV length. Keep `max_seq_len` bounded for paths with these allocations: checkpoint defaults (1M for MXFP8, 512K for BF16) can cause OOM or CUDA graph capture failures. The curated YAML sets `max_seq_len` just above ISL+OSL (`2068` for the 1k/1k benchmark); longer-context workloads may require a lower `max_batch_size`. MSA retains its own dense/sparse kernels and cache layout.
 * **Parallelism.** MoE experts run with expert parallelism. The attention layers support both Tensor-Expert Parallelism (TEP) and Data-Expert Parallelism (DEP, via `enable_attention_dp: true`). The overlap scheduler is enabled by default.

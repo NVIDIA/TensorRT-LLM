@@ -141,7 +141,7 @@ class SlotSamplingParams:
             assert slot is not None
             self.modes[slot] = row.mode
             self.request_ids[slot] = request.py_request_id
-            return_log_probs = request.return_log_probs
+            return_log_probs = request.py_return_log_probs
             self.need_processed_logprobs[slot] = (
                 return_log_probs and request.py_logprobs_mode == LogprobMode.PROCESSED
             )

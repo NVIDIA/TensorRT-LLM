@@ -15,17 +15,19 @@
 import os
 import threading
 import time
+import traceback
 import uuid
 from collections import Counter, defaultdict
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.agent import use_pure_python_transfer_agent
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     RxSessionBase,
@@ -35,21 +37,27 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     get_unique_rid,
 )
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
+    _KV_LIFECYCLE_ENFORCEMENT_ENV,
     CtxTransferStatus,
     GenTransferStatus,
     KvCacheTransceiver,
 )
-from tensorrt_llm._torch.disaggregation.native.bounce import (
-    config_from_size as bounce_config_from_size,
+from tensorrt_llm._torch.disaggregation.native.context_first_profile import (
+    supports_context_first_bf16,
 )
+from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
-from tensorrt_llm._torch.disaggregation.native.retirement import QuiescenceFatalEvent
+from tensorrt_llm._torch.disaggregation.native.retirement import (
+    QuiescenceFatalEvent,
+    RetirementDeadline,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
     TransferWorker,
     TransferWorkerConfig,
+    TxSession,
 )
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -62,12 +70,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MambaHybridCacheManager,
-    MambaHybridCacheManagerV2,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, nvtx_range
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
@@ -94,6 +99,7 @@ def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
             "other executors in the same job. Retaining KV "
             f"and transport roots until process teardown. request_id={event.request_id}, "
             f"direction={event.direction}, reason={event.reason}, "
+            "deadline_owner=retirement_grace progress_at_observation=unproven_quiescence, "
             f"deadline={event.deadline}, expired_at={event.expired_at}"
         )
     except Exception:  # noqa: BLE001 - diagnostics cannot alter containment
@@ -135,7 +141,23 @@ def _fail_unproven_kv_transfer(
         hang_detector.propagate_hard_kill(diagnostics=False, communicator=communicator)
 
 
-def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
+def _warn_retirement_termination_scope(mapping: Mapping) -> None:
+    """Warn the executor's lead rank about the configured containment boundary.
+
+    Args:
+        mapping: The executor's rank mapping.
+    """
+    if mapping.rank == 0:
+        logger.warning(
+            "KV transfer lifecycle enforcement ENABLED. KV retirement fail-stop may "
+            "terminate the entire MPI job, including other "
+            "CTX/GEN executors sharing the launch. A split communicator does not isolate "
+            "MPI_Abort. Use separate launcher jobs when independent availability is required, "
+            "and qualify their termination boundaries."
+        )
+
+
+def _retirement_executor_comm(mapping: Mapping, *, warn: bool = True) -> "MPI.Comm":
     """Capture the MPI executor world that the deadline watchdog may abort.
 
     Rank/size validation does not isolate termination. Shared MPI launches can
@@ -143,6 +165,7 @@ def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
 
     Args:
         mapping: The executor's expected worker rank and world size.
+        warn: Emit the launcher-wide termination warning when selecting the communicator.
 
     Returns:
         The exact communicator, retained rather than resolved on another thread.
@@ -169,13 +192,8 @@ def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
         or communicator.Get_rank() != mapping.rank
     ):
         raise ValueError(message)
-    if mapping.rank == 0:
-        logger.warning(
-            "KV retirement fail-stop may terminate the entire MPI job, including other "
-            "CTX/GEN executors sharing the launch. A split communicator does not isolate "
-            "MPI_Abort. Use separate launcher jobs when independent availability is required, "
-            "and qualify their termination boundaries."
-        )
+    if warn:
+        _warn_retirement_termination_scope(mapping)
     return communicator
 
 
@@ -194,11 +212,15 @@ def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
 
 def _validate_fp4_mla_bridge_profile(
     mapping: Mapping,
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager: KVCacheManagerV2,
     cache_transceiver_config: CacheTransceiverConfig,
+    *,
+    enabled: bool | None = None,
 ) -> bool:
     """Select the bridge only for its explicit no-retry FP4-MLA deployment cell."""
-    if os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") != "1":
+    if enabled is None:
+        enabled = os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") == "1"
+    if not enabled:
         return False
     fp4_mla_layout = (
         isinstance(kv_cache_manager, KVCacheManagerV2)
@@ -215,6 +237,9 @@ def _validate_fp4_mla_bridge_profile(
         and mapping.enable_attention_dp
         and mapping.pp_size == 1
         and mapping.cp_size == 1
+        # The C++ agent bounce scatters into the destination on the receiver agent's threads,
+        # which can still be writing after a failure is reported; the bridge cannot prove that
+        # those writes stopped.
         and cache_transceiver_config.kv_cache_bounce_size_mb == 0
         and not cache_transceiver_config.enable_pipelined_transfer
         and os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1"
@@ -225,12 +250,120 @@ def _validate_fp4_mla_bridge_profile(
             "FP4 MLA lifecycle bridge requires a disaggregated NVFP4 SELFKONLY "
             "KVCacheManagerV2, the C++ NIXL agent binding, a finite timeout, "
             "no-retry ADP, PP1/CP1, "
-            "async monolithic non-layerwise transfer, and bounce disabled"
+            "async monolithic non-layerwise transfer, and kv_cache_bounce_size_mb=0 "
+            "(transfer-agent bounce disabled)"
         )
     return True
 
 
+def _select_lifecycle_ownership(
+    mapping: Mapping,
+    manager: KVCacheManagerV2,
+    config: CacheTransceiverConfig,
+    dist: Distributed,
+) -> tuple[bool, bool, Optional["MPI.Comm"]]:
+    """Agree on protection before any rank publishes transfer metadata.
+
+    The global setting requires a supported profile when explicitly enabled.
+    Unset preserves the legacy FP4 opt-in and leaves context-first inactive.
+    Selection failures participate in the collective so peers cannot continue
+    with a different ownership mode. This is executor-local agreement, not
+    negotiation with a remote executor or a general startup-failure handler.
+
+    Args:
+        mapping: Executor rank and topology.
+        manager: Initialized local cache manager.
+        config: Resolved transfer settings.
+        dist: The executor's startup collective interface.
+
+    Returns:
+        FP4 and context-first activation, and the local containment communicator.
+
+    Raises:
+        ValueError: Requested protection cannot be established on every rank.
+    """
+    fp4 = context_first = False
+    communicator = None
+    failure = None
+    try:
+        setting = os.getenv(_KV_LIFECYCLE_ENFORCEMENT_ENV)
+        legacy_fp4 = os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") == "1"
+        if setting not in (None, "0", "1"):
+            raise ValueError(f"{_KV_LIFECYCLE_ENFORCEMENT_ENV} must be 0 or 1")
+        if setting == "0" and legacy_fp4:
+            raise ValueError("KV lifecycle enforcement is disabled but the FP4 bridge is enabled")
+        if setting != "0":
+            fp4 = _validate_fp4_mla_bridge_profile(mapping, manager, config)
+        if setting == "1" and not fp4:
+            if manager.dtype == DataType.NVFP4:
+                fp4 = _validate_fp4_mla_bridge_profile(mapping, manager, config, enabled=True)
+            else:
+                context_first = supports_context_first_bf16(mapping, manager, config)
+                if not context_first:
+                    raise ValueError(
+                        "KV lifecycle enforcement requires a supported no-retry FP4 MLA or "
+                        "direct BF16 context-first profile; the local configuration is unsupported"
+                    )
+        if fp4 or context_first:
+            communicator = _retirement_executor_comm(mapping, warn=False)
+    except Exception as error:
+        # Exchange all rank-local failures before raising so peers reach agreement.
+        failure = f"{type(error).__name__}: {error}"
+
+    selections = dist.allgather((fp4, context_first, failure))
+    failures = [f"rank {rank}: {item[2]}" for rank, item in enumerate(selections) if item[2]]
+    if failures:
+        raise ValueError("KV lifecycle initialization rejected: " + "; ".join(failures))
+    if len(selections) != mapping.world_size or any(
+        item[:2] != (fp4, context_first) for item in selections
+    ):
+        raise ValueError("KV lifecycle ownership must agree on every executor rank")
+    if fp4 or context_first:
+        _warn_retirement_termination_scope(mapping)
+    return fp4, context_first, communicator
+
+
+def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
+    """This rank's (paged, STATE) KV bytes in a chunk, as the mappers move them.
+
+    Per view, the valid block count (one slot for STATE) times the view's transferable slot
+    region. The sum is expected_write_bytes: verified-reuse admission compares the sender's
+    attested bytes against it. The pair also feeds kv_cache_size. So count the bytes the
+    mappers move, never physical slot bytes: a coalesced pool carries one view per role class
+    (summing slot_bytes per view would double count the slot) and ignored-role buffers occupy
+    slot offsets no view transfers.
+    """
+    if page_table is None:
+        return 0, 0
+    paged_bytes = state_bytes = 0
+    for lg_id, block_ids in enumerate(chunk.block_ids_per_layer_groups):
+        if block_ids is None or block_ids.size == 0:
+            continue
+        n = int((block_ids >= 0).sum())
+        if n == 0:
+            continue
+        lg = page_table.layer_groups[lg_id]
+        for pool_idx, pv in enumerate(lg.pool_views):
+            if (lg_id, pool_idx) in chunk.excluded_pool_views:
+                continue
+            # The view's byte regions within one slot (all of its layers).
+            view_bytes = get_pool_view_slot_bytes(pv)
+            if lg.kind == CacheKind.STATE:
+                # STATE: one slot per request; the transfer covers each
+                # view region once regardless of the block count.
+                state_bytes += view_bytes
+            else:
+                # Paged: n blocks, each covering the view's regions.
+                paged_bytes += n * view_bytes
+    return paged_bytes, state_bytes
+
+
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    # GEN idle-poll skip state; _init_gen_idle_poll sets the instance values.
+    _gen_idle_poll_skip: bool = False
+    _gen_idle_agreed: bool = False
+    _gen_deferred_receives: int = 0
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         return False
@@ -239,9 +372,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self,
         mapping: Mapping,
         dist: Distributed,
-        kv_cache_manager: KVCacheManager,
+        kv_cache_manager: KVCacheManagerV2,
         cache_transceiver_config: CacheTransceiverConfig,
     ):
+        if not isinstance(kv_cache_manager, KVCacheManagerV2):
+            raise ValueError(
+                "KvCacheTransceiverV2 does not support KV cache manager V1. "
+                f"Selected manager: {type(kv_cache_manager).__name__}. "
+                "Use a compatible KVCacheManagerV2 configuration for "
+                "transceiver_runtime='PYTHON'; enabling "
+                "use_kv_cache_manager_v2=True does not override incompatible "
+                "model features. To use V1, select transceiver_runtime='CPP' "
+                "with use_kv_cache_manager_v2=False for a model that supports V1."
+            )
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._dist: Distributed = dist
@@ -261,13 +404,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None
         )
         self._check_compatible()
-        enforce_physical_ownership = _validate_fp4_mla_bridge_profile(
-            mapping, kv_cache_manager, cache_transceiver_config
-        )
+        (
+            enforce_physical_ownership,
+            self._context_first_ownership,
+            self._retirement_mpi_comm,
+        ) = _select_lifecycle_ownership(mapping, kv_cache_manager, cache_transceiver_config, dist)
         self._fp4_mla_bridge_enabled = enforce_physical_ownership
-        self._retirement_mpi_comm = (
-            _retirement_executor_comm(mapping) if enforce_physical_ownership else None
-        )
+        self._context_first_ownership_logged = False
+        ownership_capable = enforce_physical_ownership or self._context_first_ownership
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
         self._device_id = torch.cuda.current_device()
@@ -297,25 +441,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 tx_overall_timeout_s=transfer_timeout_s,
                 rx_timeout_s=transfer_timeout_s,
                 enforce_physical_ownership=enforce_physical_ownership,
+                context_first_ownership=self._context_first_ownership,
                 quiescence_fatal_callback=(
-                    self._fail_unproven_transfer if enforce_physical_ownership else None
+                    self._fail_unproven_transfer if ownership_capable else None
                 ),
-                # kv_cache_bounce_size_mb is the shared bounce capacity; agent_bounce_buffer_enable
-                # routes it to exactly one implementation: the Python bounce below (per-region,
-                # size 0 = off; the per-transfer size gates are internal, tuned via env:
-                # TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
-                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads) or the C++
-                # transfer-agent staging buffer (bounce v2, one buffer shared by send and recv).
-                bounce=bounce_config_from_size(
-                    0
-                    if cache_transceiver_config.agent_bounce_buffer_enable
-                    else cache_transceiver_config.kv_cache_bounce_size_mb
-                ),
-                agent_buffer_size_mb=(
-                    cache_transceiver_config.kv_cache_bounce_size_mb
-                    if cache_transceiver_config.agent_bounce_buffer_enable
-                    else 0
-                ),
+                # kv_cache_bounce_size_mb sizes the C++ transfer-agent bounce buffer (one
+                # arena shared by send and receive); 0 disables it.
+                agent_buffer_size_mb=cache_transceiver_config.kv_cache_bounce_size_mb,
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
             )
         )
@@ -343,6 +475,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_sessions: Dict[int, RxSessionBase] = {}
         self._send_reqs = {}
         self._recv_reqs = {}
+        self._cancelled_receive_fences: Dict[int, tuple[torch.cuda.Event, RetirementDeadline]] = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
         try:
@@ -353,18 +486,43 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # The transfer worker is already live by this point.
             self._transfer_worker.shutdown()
             raise
-        # _chunk_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
-        # except under attention DP where the local count already is the total.
-        # Helix CP ranks hold disjoint block sets, so they scale the request
-        # total the same way TP shards do (metric only).
-        self._kv_size_rank_factor = (
-            1 if mapping.enable_attention_dp else max(1, mapping.tp_size * mapping.cp_size)
-        )
+        self._kv_size_rank_factor = self._kv_size_rank_factor_for(mapping)
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+
+    @staticmethod
+    def _gen_idle_poll_skip_applies(mapping: Mapping, gen_need_sync: bool) -> bool:
+        """Whether an idle generation worker may skip its receive-status collectives.
+
+        Requires a synchronized status poll in which every rank owns every
+        request (no attention DP, one PP stage, no context parallelism), so
+        every rank requests the same receives in the same iteration.
+        """
+        return (
+            gen_need_sync
+            and not mapping.enable_attention_dp
+            and mapping.pp_size == 1
+            and mapping.cp_size == 1
+        )
+
+    def _init_gen_idle_poll(self, enabled: bool) -> None:
+        """Set up the idle-poll skip of check_gen_transfer_status (called by _init_sync_policy).
+
+        Precondition of ``enabled``: every rank requests the same receives in the
+        same iteration (_gen_idle_poll_skip_applies), so all ranks clear the
+        agreement together and never split on whether to enter a collective.
+        """
+        self._gen_idle_poll_skip = enabled
+        # Set from a gathered status round in which no rank held a receive session,
+        # cleared by every receive request; while set, every rank skips the
+        # status-poll collectives.
+        self._gen_idle_agreed = False
+        # Admitted receives the caller has not started yet (set_gen_deferred_receives);
+        # they count as sessions in the idle check.
+        self._gen_deferred_receives = 0
 
     def _fail_unproven_transfer(self, event: QuiescenceFatalEvent) -> None:
         """Fail-stop while the watchdog retains this transceiver's resource roots.
@@ -392,23 +550,101 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return endpoint
         return cast(str, self._dist.broadcast(None, 0))
 
+    @staticmethod
+    def _kv_size_rank_factor_for(mapping) -> int:
+        """Number of TP ranks that receive each request's KV.
+
+        Every TP rank receives the same number of bytes, split or replicated, so the TP
+        total is tp_size times this rank's bytes; under attention DP one DP rank holds the
+        request. Helix CP ranks receive different paged bytes, so CP is scaled per request
+        (see _request_kv_bytes).
+        """
+        return 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
+
+    def _request_kv_bytes(self, req: LlmRequest, paged_bytes: int, state_bytes: int) -> int:
+        """KV bytes the request's transfer moves into the TP and CP ranks of this PP stage.
+
+        A metric only. The C++ transceiver can sum what every rank received, PP stages
+        included. This computes that sum for this PP stage alone from this rank's paged
+        and STATE bytes (_chunk_bytes_by_kind), with no collective. Both scale by the
+        TP factor. Each CP rank also holds a STATE (recurrent) slot of the same size, so
+        STATE bytes scale by the CP size too. Paged bytes follow the prompt blocks each
+        CP rank holds instead (_request_paged_bytes).
+        """
+        tp_paged = paged_bytes * self._kv_size_rank_factor
+        tp_state = state_bytes * self._kv_size_rank_factor
+        return self._request_paged_bytes(req, tp_paged) + tp_state * self._mapping.cp_size
+
+    def _request_paged_bytes(self, req: LlmRequest, paged_bytes: int) -> int:
+        """Request-total paged bytes, given this CP rank's paged bytes times the TP factor.
+
+        Helix deals prompt blocks round-robin over the CP ranks, so this rank holds
+        ceil(prompt_len / tpb) of the ceil(total_input_len_cp / tpb) blocks (prompt_len
+        is the rank-local slice) and the shares differ by up to one block. Scaling the
+        per-block bytes by the global block count gives the request total. A CP rank that
+        owns no block has no paged bytes; responses come from CP rank 0, which owns block 0.
+        """
+        if paged_bytes == 0 or self._mapping.cp_size == 1:
+            return paged_bytes
+        tpb = self._reuse_adapter.tokens_per_block
+        local_blocks = (req.prompt_len + tpb - 1) // tpb
+        global_blocks = (req.total_input_len_cp + tpb - 1) // tpb
+        if local_blocks == 0:
+            return paged_bytes
+        return paged_bytes * global_blocks // local_blocks
+
     def _init_sync_policy(self):
         m = self._mapping
+        # The ctx side never syncs over CP: helix pairs a cp=1 context instance
+        # with a cp=N generation instance (see attention/peer.py check_peer_compatible),
+        # so on the context side the CP group is always a single rank.
         self._ctx_need_tp_sync = m.tp_size > 1 and not m.enable_attention_dp
         self._ctx_need_pp_sync = m.pp_size > 1
-        self._gen_need_sync = not (m.world_size == 1 or (m.enable_attention_dp and m.pp_size == 1))
-        pp_allgather: Callable = getattr(self._dist, "pp_allgather")
-        self._gen_allgather: Callable = (
-            pp_allgather if m.enable_attention_dp else self._dist.allgather
-        )
+        if m.enable_attention_dp:
+            # DP groups schedule independently, but the PP or helix CP ranks of
+            # one DP group share the same requests, so gen-side consensus spans
+            # that group (like the C++ transceiver's mGroupDataComm). Without it
+            # a CP rank can start decoding before its partner received the KV and
+            # the helix all-to-all deadlocks.
+            #
+            # Invariant: check_gen_transfer_status gathers over this group, and
+            # besides the per-iteration poll the executor also enters it from
+            # receive_gen_init, only on ranks that admitted gen-init requests.
+            # The CP ranks of one DP group must therefore admit the same requests
+            # in the same iteration. Equal KV capacity is not enough: a client
+            # cancel or transfer timeout retires a request rank-locally, so one
+            # CP rank can have room before its peer. The pp=1 loops intersect
+            # the admitted ids over CP first
+            # (DisaggTransferCoordinator.align_gen_admission_across_cp).
+            # The PP loop does not, so _check_compatible rejects attention-DP
+            # with both helix CP and pp_size > 1.
+            #
+            # Non-DP tp x cp gathers over the world behind the same predicate and
+            # goes through the same step, which lines up its CP ranks but not its
+            # TP ranks; a rank-local cancel or timeout can still skew those, as it
+            # can without CP.
+            self._gen_need_sync = m.pp_size * m.cp_size > 1
+            self._gen_allgather: Callable = self._dp_group_allgather
+        else:
+            self._gen_need_sync = m.world_size > 1
+            self._gen_allgather = self._dist.allgather
+        self._init_gen_idle_poll(self._gen_idle_poll_skip_applies(m, self._gen_need_sync))
+
+    def _dp_group_allgather(self, obj):
+        """Allgather over the CP ranks, then the PP ranks, of this DP group.
+
+        Under attention-DP, _check_compatible keeps cp_size or pp_size at 1, so
+        at most one of the two gathers runs.
+        """
+        m = self._mapping
+        gathered = list(self._dist.cp_allgather(obj)) if m.cp_size > 1 else [obj]
+        if m.pp_size > 1:
+            gathered = [x for part in self._dist.pp_allgather(gathered) for x in part]
+        return gathered
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
         layer_num = len(self._kv_cache_manager.pp_layers)
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManager) and not isinstance(
-            self._kv_cache_manager, MambaHybridCacheManagerV2
-        ):
-            layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
             endpoints=endpoints, layer_num_per_pp=layer_num_per_pp
@@ -472,6 +708,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Preflight may refuse closure while DMA remains active. Start the
         # bounded drain before that refusal, not only in worker.shutdown().
         self._transfer_worker.request_shutdown()
+        for rid in list(getattr(self, "_cancelled_receive_fences", {})):
+            if not self._retire_cancelled_receive_fence(rid):
+                raise RuntimeError(f"Unpublished receive {rid} still owns destination memory")
         # This flag records completed teardown, not an attempted shutdown. If
         # an active owner refuses closure, leave it false so shutdown can be
         # retried after the physical operation drains.
@@ -504,8 +743,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             if self._kv_cache_manager.local_num_mamba_layers > 0:
                 return self._kv_cache_manager._request_id_to_state_index[req.py_request_id]
-        elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
-            return self._kv_cache_manager.mamba_cache_index[req.py_request_id]
         return None
 
     def _create_chunk(self, req: LlmRequest) -> Chunk:
@@ -593,67 +830,50 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         window[: min(cached_blocks, prompt_blocks)] = -1
         return window
 
-    def _chunk_num_bytes(self, chunk: Chunk) -> int:
-        """Local-rank KV bytes covered by a chunk: per view, the valid block count times the view's
-        transferable slot region. Populates kv_cache_size (and the perf-metric timestamps that gate
-        on it) and is the exact expected-write total the verified-reuse admission checks attested
-        sender bytes against, so it must count what the mappers move, never physical slot bytes: a
-        coalesced pool carries one view per role class (summing slot_bytes per view would double
-        count the slot) and ignored-role buffers occupy slot offsets no view transfers.
-
-        Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
-        computes per-block bytes for the same layer groups but reads pool 0 only, while this sums
-        every pool view of a group. The pool-0-only sizing gap for multi-pool attention groups is
-        tracked under TRTLLM-15194; keep the two accountings in mind together when changing either.
-        """
-        pt = self._page_table
-        if pt is None:
-            return 0
-        total = 0
-        for lg_id, block_ids in enumerate(chunk.block_ids_per_layer_groups):
-            if block_ids is None or block_ids.size == 0:
-                continue
-            n = int((block_ids >= 0).sum())
-            if n == 0:
-                continue
-            lg = pt.layer_groups[lg_id]
-            for pool_idx, pv in enumerate(lg.pool_views):
-                if (lg_id, pool_idx) in chunk.excluded_pool_views:
-                    continue
-                # The view's byte regions within one slot (all of its layers).
-                view_bytes = get_pool_view_slot_bytes(pv)
-                if lg.kind == CacheKind.STATE:
-                    # STATE: one slot per request; the transfer covers each
-                    # view region once regardless of the block count.
-                    total += view_bytes
-                else:
-                    # Attention: n blocks, each covering the view's regions.
-                    total += n * view_bytes
-        return total
-
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
         params = req.py_disaggregated_params
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
     def _validate_bridge_req(self, req: LlmRequest, synchronous: bool = False) -> bool:
-        if not getattr(self, "_fp4_mla_bridge_enabled", False):
-            return True
         params = req.py_disaggregated_params
+        fp4_bridge = getattr(self, "_fp4_mla_bridge_enabled", False)
+        context_first = (
+            getattr(self, "_context_first_ownership", False)
+            and params is not None
+            and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
+        if not fp4_bridge and not context_first:
+            return True
+        required_schedule = (
+            DisaggScheduleStyle.GENERATION_FIRST
+            if fp4_bridge
+            else DisaggScheduleStyle.CONTEXT_FIRST
+        )
         rid = None if params is None else params.disagg_request_id
         if (
             synchronous
             or params is None
-            or params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST
+            or params.schedule_style != required_schedule
             or type(rid) is not int
             or rid < 0
         ):
             logger.error(
-                "FP4 MLA lifecycle bridge requires async generation-first requests "
+                f"KV ownership requires async {required_schedule.name} requests "
                 "with a non-negative integer disagg_request_id"
             )
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
             return False
+        if context_first and not self._context_first_ownership_logged:
+            logger.info(
+                "Context-first BF16 KV ownership ENABLED: "
+                f"rank={self._mapping.rank}/{self._mapping.world_size}, "
+                "backend=NIXL/UCX, runtime=PYTHON, attention_dp=False, pp=1, cp=1, "
+                "retry=False, async=True, layerwise=False, bounce_mb=0, "
+                "unproven_retirement=fail_stop, termination_scope=mpi_job_or_launcher; "
+                "MPI abort may terminate other CTX/GEN executors in the same launcher job"
+            )
+            self._context_first_ownership_logged = True
         return True
 
     def _ctx_consensus(self, local_ids: list) -> list:
@@ -678,11 +898,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return ready_ids
 
     def _gen_consensus(self, local_ids: list) -> list:
-        sync_size = (
-            self._mapping.pp_size if self._mapping.enable_attention_dp else self._mapping.world_size
-        )
-        all_ranks = self._gen_allgather(local_ids) if self._gen_need_sync else [local_ids]
-        return _find_consensus_request_ids(all_ranks, sync_size)
+        if not self._gen_need_sync:
+            return list(local_ids)
+        all_ranks = self._gen_allgather(local_ids)
+        return _find_consensus_request_ids(all_ranks, len(all_ranks))
 
     @staticmethod
     def _union(all_lists: List[List[int]]) -> set:
@@ -711,16 +930,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         need_sync: bool,
         locally_quiesced=None,
         locally_verified=None,
+        local_session_count: Optional[int] = None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
         # Quiescence and write-verification, when requested, also require
         # agreement from every rank.
         # Batch the id lists into one allgather to cut the per-step collective count.
+        # With local_session_count, the payload also carries each rank's
+        # receive-session count and the result ends with whether every rank
+        # reported zero sessions.
         local_outcome = [list(cancelled), list(failed), list(completed)]
         if locally_quiesced is not None:
             local_outcome.append(list(locally_quiesced))
         if locally_verified is not None:
             local_outcome.append(list(locally_verified))
+        if local_session_count is not None:
+            local_outcome.append([local_session_count])
         if not need_sync:
             packed = [local_outcome]
         else:
@@ -751,8 +976,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # the same tokens, so a request counts as write-verified only
             # when EVERY rank verified its local shard.
             all_verified = [p[idx] for p in packed]
+            idx += 1
             global_verified = self._intersection(all_verified, n)
             result.append({rid for rid in to_process if rid in global_verified})
+        if local_session_count is not None:
+            result.append(all(p[idx][0] == 0 for p in packed))
         return tuple(result)
 
     def _gen_consensus_outcome(self, to_process, cancelled, failed, completed, locally_verified):
@@ -763,18 +991,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             if not self._ownership_blocks_retirement(session):
                 locally_retirable.append(rid)
-        new_cancelled, new_failed, new_completed, globally_retirable, verified = (
-            self._consensus_outcome(
-                to_process,
-                cancelled,
-                failed,
-                completed,
-                self._gen_allgather,
-                self._gen_need_sync,
-                locally_retirable,
-                locally_verified,
-            )
+        idle_skip = self._gen_idle_poll_skip
+        deferred = self._gen_deferred_receives
+        outcome = self._consensus_outcome(
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            self._gen_allgather,
+            self._gen_need_sync,
+            locally_retirable,
+            locally_verified,
+            local_session_count=len(self._recv_sessions) + deferred if idle_skip else None,
         )
+        new_cancelled, new_failed, new_completed, globally_retirable, verified = outcome[:5]
+        if idle_skip:
+            # Every rank derives this from the same gathered payload.
+            self._gen_idle_agreed = outcome[5]
         retirable = set(globally_retirable)
         return (
             [rid for rid in new_cancelled if rid in retirable],
@@ -860,7 +1093,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             elif session.has_failed():
                 if self._ownership_blocks_retirement(session):
                     if isinstance(session, RxSession):
-                        session.notify_cancel()
+                        try:
+                            session.notify_cancel()
+                        except RuntimeError as error:
+                            # Notification failure is not retirement evidence.
+                            # Keep the owner under its original grace deadline.
+                            logger.warning(
+                                f"Receive {rid} cancellation notification failed; "
+                                f"retaining resources and retrying: {error}\n{traceback.format_exc()}"
+                            )
                     continue
                 failed.append(rid)
         return completed, failed
@@ -936,6 +1177,60 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"refusing to retire {outcome} KV transfer rid={rid}: session close refused"
             )
 
+    def _emit_transfer_settled(
+        self,
+        side: str,
+        rid: Optional[int],
+        req: Optional[LlmRequest],
+        session: Optional[object],
+        outcome: str,
+    ) -> None:
+        """Report session retirement, not physical drain, without polling state."""
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            request_id_scope = "unknown"
+            if req is not None:
+                rid = disagg_diagnostics.get_request_id(req)
+                request_id_scope = disagg_diagnostics.get_request_id_scope(
+                    req.py_disaggregated_params
+                )
+            elif session is not None:
+                rid = session.disagg_request_id
+                request_id_scope = disagg_diagnostics.get_request_id_scope(
+                    session._base_args.params
+                )
+            disagg_diagnostics.emit_event(
+                f"{side}_transfer_settled",
+                side=side,
+                request_id=rid,
+                request_id_scope=request_id_scope,
+                local_request_id=(req.py_request_id if req is not None else None),
+                rank=self._mapping.rank,
+                instance=self._instance_name,
+                outcome=outcome,
+                session_retired=True,
+                tp_rank=self._mapping.tp_rank,
+                pp_rank=self._mapping.pp_rank,
+                cp_rank=self._mapping.cp_rank,
+                dp_rank=self._dp_rank,
+            )
+
+    def _emit_receive_start(
+        self, req: LlmRequest, transfer_bytes: int, *, timeout_expected: bool
+    ) -> None:
+        """Record the receive publication boundary using existing payload metadata."""
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            disagg_diagnostics.emit_request_event(
+                "gen_receive_start",
+                req,
+                side="gen",
+                dist=self._mapping,
+                instance=self._instance_name,
+                slice_id=0,
+                transfer_bytes=transfer_bytes,
+                timeout_expected=timeout_expected,
+                dp_rank=self._dp_rank,
+            )
+
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
         session.unpack_aux(req)
@@ -993,9 +1288,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return self._enable_pipelined_transfer
 
     def has_inflight_transfer(self, req: LlmRequest) -> bool:
-        """Whether a transfer session still owns this request's resources."""
+        """Whether a transfer session or cancelled admission fence retains resources."""
         rid = get_unique_rid(req)
-        return rid in self._send_sessions or rid in self._recv_sessions
+        return (
+            rid in self._send_sessions
+            or rid in self._recv_sessions
+            or rid in getattr(self, "_cancelled_receive_fences", {})
+        )
 
     def has_retired_send_session(self, req: LlmRequest) -> bool:
         """Whether req's send session was torn down before its last slice."""
@@ -1070,7 +1369,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         session = self._get_or_create_send_session(req)
         if session is None:
             return
-        bridge_enabled = getattr(self, "_fp4_mla_bridge_enabled", False)
+        bridge_enabled = getattr(session, "_enforce_physical_ownership", False)
         if bridge_enabled:
             # Root the request before backend admission so its source pages
             # outlive every ownership-enabled NIXL operation.
@@ -1108,6 +1407,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest) -> None:
+        # Before anything that can return or raise: every rank requests the
+        # same receives, so they all resume status polling together.
+        self._gen_idle_agreed = False
         if not self._validate_bridge_req(req, synchronous=True):
             return
         rid = get_unique_rid(req)
@@ -1120,12 +1422,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = None
         fetches = None
+        receive_started = False
+        settlement_outcome = None
         try:
             extent = self._create_cache_extent(req)
+            paged_bytes, state_bytes = _chunk_bytes_by_kind(self._page_table, extent.local)
             fetches = self._open_peer_source(req)
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    diagnostic_transfer_bytes = self._request_kv_bytes(
+                        req, paged_bytes, state_bytes
+                    )
+                    self._emit_receive_start(req, diagnostic_transfer_bytes, timeout_expected=False)
+            receive_started = True
             # Same submission the asynchronous entry makes; what differs is who waits. The session
             # underneath is read back for the blocking wait, the auxiliary buffer and the close.
-            fetches.fetch(extent, expected_write_bytes=self._chunk_num_bytes(extent.local))
+            fetches.fetch(extent, expected_write_bytes=paged_bytes + state_bytes)
             session = self._legacy_session(fetches)
             self._recv_sessions[rid] = session
             self._recv_reqs[rid] = req
@@ -1136,17 +1448,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # blocking path has no cross-rank outcome consensus).
                 req.py_kv_transfer_verified = session.kv_write_verified()
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
-                req.set_kv_cache_size(
-                    self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
-                )
+                req.set_kv_cache_size(self._request_kv_bytes(req, paged_bytes, state_bytes))
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+                settlement_outcome = "completed"
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                settlement_outcome = "failed"
         except Exception:
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            settlement_outcome = "failed"
             raise
         finally:
             # The adapter opens the session before it submits, so a submission that raises leaves
@@ -1157,6 +1470,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if close_succeeded:
                 self._recv_sessions.pop(rid, None)
                 self._recv_reqs.pop(rid, None)
+                if (
+                    disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+                    and receive_started
+                    and settlement_outcome is not None
+                ):
+                    self._emit_transfer_settled("gen", rid, req, session, settlement_outcome)
             else:
                 logger.error(
                     f"request_and_receive_sync: retaining rid={rid} because receive "
@@ -1177,6 +1496,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """
         return fetches.session
 
+    def set_gen_deferred_receives(self, count: int) -> None:
+        """Report the admitted receives whose start the caller defers.
+
+        The disagg coordinator starts each admitted receive only once that
+        rank's admission readiness event completes, so ranks start the same
+        receive in different iterations, while admission is the same on every
+        rank. A nonzero count clears the idle-poll agreement on every rank in
+        the admitting iteration, and the count joins the session count of the
+        idle check, so no rank agrees it is idle while a peer still has a
+        receive to start (the start would clear the flag on that rank only and
+        send it into a status collective its peers skip).
+        """
+        if count:
+            self._gen_idle_agreed = False
+        self._gen_deferred_receives = count
+
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest) -> None:
         """Start background KV cache receive from the context server.
@@ -1189,6 +1524,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req: The generation request whose KV cache blocks to receive
                 into.
         """
+        # Before anything that can return or raise: every rank requests the
+        # same receives, so they all resume status polling together.
+        self._gen_idle_agreed = False
         if not self._validate_bridge_req(req):
             return
         self._ever_had_recv_session = True
@@ -1200,8 +1538,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
             return
         extent = self._create_cache_extent(req)
-        chunk_bytes = self._chunk_num_bytes(extent.local)
-        req.py_kv_cache_xfer_bytes = chunk_bytes * self._kv_size_rank_factor
+        paged_bytes, state_bytes = _chunk_bytes_by_kind(self._page_table, extent.local)
+        req.py_kv_cache_xfer_bytes = self._request_kv_bytes(req, paged_bytes, state_bytes)
         fetches = self._open_peer_source(req)
         # Claimed to be transferring only once there is something to transfer: a builder that
         # raises above leaves the request where it was, not in a state nothing advances.
@@ -1210,9 +1548,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # failed publication as a session the sweep can see but cannot pair with a request.
         self._recv_reqs[rid] = req
         try:
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    self._emit_receive_start(
+                        req,
+                        req.py_kv_cache_xfer_bytes,
+                        timeout_expected=self.kv_transfer_timeout_ms is not None,
+                    )
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
-            fetches.fetch(extent, expected_write_bytes=chunk_bytes)
+            fetches.fetch(extent, expected_write_bytes=paged_bytes + state_bytes)
         except Exception:
             # No session means no publication and nothing the sweep could ever pair the request
             # with, so the registration made here is undone here and the request goes terminal.
@@ -1222,10 +1567,40 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             raise
         finally:
             # The session exists even when publication failed, and the legacy sweep owns it.
-            # TODO: An idle bounce reservation is not handed back on the failure path.
             session = self._legacy_session(fetches)
             if session is not None:
                 self._recv_sessions[rid] = session
+
+    @staticmethod
+    def _describe_timeout_session(session: TxSessionBase | RxSessionBase | None) -> str:
+        """Read optional native progress without changing timeout handling.
+
+        Args:
+            session: Existing local transfer session, if still retained.
+
+        Returns:
+            Local progress or an explicit unavailable reason.
+        """
+        if isinstance(session, (TxSession, RxSession)):
+            try:
+                return session._timeout_progress_description()
+            except Exception:  # noqa: BLE001 - Reporting must not change timeout handling.
+                return "progress_at_observation=unavailable(snapshot_failed)"
+        reason = "session_not_found" if session is None else "alternate_session"
+        return f"progress_at_observation=unavailable({reason})"
+
+    def _describe_transfer_timeout(self, req: LlmRequest) -> str:
+        """Describe local progress for an executor-owned timeout observation.
+
+        Args:
+            req: Request whose existing executor clock expired.
+
+        Returns:
+            Best-effort native progress; no deadline or backend is polled.
+        """
+        rid = get_unique_rid(req)
+        sessions = self._send_sessions if req.is_context_only_request else self._recv_sessions
+        return self._describe_timeout_session(sessions.get(rid))
 
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
@@ -1275,7 +1650,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 logger.warning(
                     f"TxSession rid={session.disagg_request_id} exceeded "
                     f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}ms; "
-                    "keeping it in progress"
+                    "keeping it in progress; deadline_owner=native_sender_overall_wait "
+                    f"{self._describe_timeout_session(session)}"
                 )
             else:
                 logger.warning(f"TxSession rid={session.disagg_request_id} failed")
@@ -1293,31 +1669,68 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         quiesced = set(quiesced_ids)
         cancelled = [rid for rid in cancelled if rid in quiesced]
         failed = [rid for rid in failed if rid in quiesced]
+        owned_cancelled = [
+            rid
+            for rid in cancelled
+            if getattr(self._send_sessions[rid], "_enforce_physical_ownership", False)
+        ]
+
+        diagnostics_enabled = disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
 
         for rid in cancelled:
+            diagnostic_record = None
+            if diagnostics_enabled:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    diagnostic_record = (
+                        self._send_reqs.get(rid),
+                        self._send_sessions[rid],
+                    )
             self._retire_send_session(rid, outcome="cancelled")
+            if diagnostic_record is not None:
+                req, session = diagnostic_record
+                self._emit_transfer_settled("ctx", rid, req, session, "cancelled")
 
         for rid in completed:
             req = self._send_reqs[rid]
+            diagnostic_session = None
+            if diagnostics_enabled:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    diagnostic_session = self._send_sessions[rid]
             self._retire_send_session(rid, outcome="completed")
             if mark_complete:
                 req.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+            if diagnostic_session is not None:
+                self._emit_transfer_settled("ctx", rid, req, diagnostic_session, "completed")
+
+        failed_records = None
+        if diagnostics_enabled:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                failed_records = []
+                for rid in failed:
+                    session = self._send_sessions.get(rid)
+                    if session is not None:
+                        failed_records.append((rid, self._send_reqs.get(rid), session))
         self._close_failed_sessions(self._send_sessions, self._send_reqs, failed, mark_retired=True)
+        if failed_records:
+            for rid, req, session in failed_records:
+                self._emit_transfer_settled("ctx", rid, req, session, "failed")
 
         # Sweep orphaned RecvReqInfo entries from ADP broadcast on non-assigned
         # DP ranks (entries that will never have a TxSession created for them).
         self._transfer_worker.sweep_stale_req_infos()
 
-        if getattr(self, "_fp4_mla_bridge_enabled", False):
-            # CtxTransferStatus has no cancellation channel. In the qualified
-            # no-retry bridge, a globally quiesced cancellation is a terminal
-            # send failure that the executor must consume to release its
-            # matching AsyncTransferManager claim.
-            failed.extend(rid for rid in cancelled if rid not in failed)
+        # CtxTransferStatus has no cancellation channel. An owned session's
+        # quiesced cancellation must release its AsyncTransferManager claim.
+        failed.extend(rid for rid in owned_cancelled if rid not in failed)
         return CtxTransferStatus(completed, failed)
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:
         if not self._ever_had_recv_session and not self._gen_need_sync:
+            return GenTransferStatus([], [], [])
+        if self._gen_idle_agreed:
+            # Zero sessions on every rank last round and no receive requested
+            # since (that clears the flag on all ranks in the same iteration):
+            # this round's consensus would be empty everywhere.
             return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
@@ -1373,14 +1786,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         cancelled, failed, completed, verified = self._gen_consensus_outcome(
             to_process, cancelled, failed, completed, locally_verified
         )
+        diagnostics_enabled = disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
 
         cancelled_reqs = []
         for rid in cancelled:
             session = self._recv_sessions[rid]
+            req = self._recv_reqs[rid]
             self._close_session_or_raise(session, rid, "cancelled")
-            cancelled_reqs.append(self._recv_reqs[rid])
+            cancelled_reqs.append(req)
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+            if diagnostics_enabled:
+                self._emit_transfer_settled("gen", rid, req, session, "cancelled")
 
         # Log gen-side transfer summary after consensus.
         if completed and os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH"):
@@ -1412,12 +1829,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+            if diagnostics_enabled:
+                self._emit_transfer_settled("gen", rid, req, session, "completed")
         if failed:
             logger.warning(
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "
                 f"rids={failed} gen_need_sync={self._gen_need_sync}"
             )
+        failed_records = None
+        if diagnostics_enabled:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                failed_records = []
+                for rid in failed:
+                    session = self._recv_sessions.get(rid)
+                    if session is not None:
+                        failed_records.append((rid, self._recv_reqs.get(rid), session))
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
+        if failed_records:
+            for rid, req, session in failed_records:
+                self._emit_transfer_settled("gen", rid, req, session, "failed")
 
         return GenTransferStatus(completed, failed, cancelled_reqs)
 
@@ -1461,7 +1891,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             time.sleep(min(0.001, remaining_s))
 
     def check_gen_transfer_complete(self):
-        return len(self._recv_sessions) == 0
+        return not self._recv_sessions and not getattr(self, "_cancelled_receive_fences", {})
 
     def _assert_disagg_history_declared(self, req: LlmRequest) -> None:
         """Verify the V2 scheduler pre-declared prompt_len as history.
@@ -1475,19 +1905,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         V2 scheduler can deadlock under high concurrency (e.g., benchmark
         fill-phase).
 
-        No-op for V1 managers (which lack ``get_history_length``) and for
-        V2 caches with only full-context life cycles (where the watermark
-        has no allocation effect).
         """
-        get_history = getattr(self._kv_cache_manager, "get_history_length", None)
-        if get_history is None:
-            return
         prompt_len = getattr(req, "py_csa2_remote_tail_start", None)
         if prompt_len is None:
             prompt_len = getattr(req, "prompt_len", None)
         if not prompt_len or prompt_len <= 0:
             return
-        history = get_history(req)
+        history = self._kv_cache_manager.get_history_length(req)
         if history is None:
             # Cache was already released (e.g., cancelled mid-transfer); nothing to verify.
             return
@@ -1499,13 +1923,79 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"_try_schedule_disagg_gen_init."
             )
 
+    def supports_idle_request_cancellation(self, req: Optional[LlmRequest] = None) -> bool:
+        """Allow bridge cancellation or a session-free generation-first CTX wait."""
+        if getattr(self, "_fp4_mla_bridge_enabled", False) is True:
+            return True
+        return (
+            req is not None
+            and req.is_context_only_request
+            and req.py_disaggregated_params is not None
+            and req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+            and not self.has_inflight_transfer(req)
+        )
+
+    def cancel_gen_logically(
+        self, req: LlmRequest, ready: Optional[torch.cuda.Event] = None
+    ) -> bool:
+        """Close GEN admission while retaining unquiesced destination resources.
+
+        Args:
+            req: Model-idle generation request in the ownership-enabled profile.
+            ready: Unpublished destination's local CUDA admission fence, if any.
+
+        Returns:
+            Whether cancellation is the committed logical outcome. An earlier
+            failure and legacy configurations keep their existing response path.
+            With the bridge enabled, a passed ready fence remains retained until
+            cancel_request returns True, even when this method returns False.
+        """
+        if not getattr(self, "_fp4_mla_bridge_enabled", False):
+            return False
+        rid = get_unique_rid(req)
+        if ready is not None:
+            fences = getattr(self, "_cancelled_receive_fences", None)
+            if fences is None:
+                fences = self._cancelled_receive_fences = {}
+            if rid not in fences:
+                # Register before querying: a CUDA error must not drop the only
+                # root or leave an unobservable accessor without a grace clock.
+                owner = self._transfer_worker.create_receive_retirement(req.py_request_id)
+                self._recv_reqs[rid] = req
+                fences[rid] = (ready, owner)
+                owner.retain_unproven(req, "cancelled receive admission")
+        session = self._recv_sessions.get(rid)
+        if session is not None:
+            session.cancel_local()
+        return req.state != LlmRequestState.DISAGG_TRANS_ERROR and (
+            session is None or session.status != SessionStatus.ERROR
+        )
+
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 
-        Returns False if any task is mid-write (TRANSFERRING); caller must
-        retry next iteration. Returns True when safe to free KV memory.
+        Returns False while a session or cancelled admission fence may access
+        request memory; caller must retry next iteration. Returns True only
+        after transfer and local CUDA claims settle, permitting resource release.
         """
         rid = get_unique_rid(req)
+
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                for side, sessions in (
+                    ("ctx", self._send_sessions),
+                    ("gen", self._recv_sessions),
+                ):
+                    if rid not in sessions:
+                        continue
+                    disagg_diagnostics.emit_request_event(
+                        "transfer_cancel_requested",
+                        req,
+                        side=side,
+                        dist=self._mapping,
+                        instance=self._instance_name,
+                        dp_rank=self._dp_rank,
+                    )
 
         # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)
@@ -1513,10 +2003,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         has_transferring = False
 
         if rid in self._send_sessions:
-            self._send_sessions[rid].cancel()
-            if self._send_sessions[rid].has_transferring_tasks():
+            session = self._send_sessions[rid]
+            session.cancel()
+            if session.has_transferring_tasks():
                 has_transferring = True
-            elif self._send_sessions[rid].close() is False:
+            elif session.close() is False:
                 has_transferring = True
             else:
                 self._retire_send_session(
@@ -1525,19 +2016,60 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     outcome="cancelled",
                     session_already_closed=True,
                 )
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    self._emit_transfer_settled("ctx", rid, req, session, "cancelled")
 
         if rid in self._recv_sessions:
-            self._recv_sessions[rid].cancel()
-            if self._recv_sessions[rid].has_transferring_tasks():
+            session = self._recv_sessions[rid]
+            if getattr(self, "_fp4_mla_bridge_enabled", False):
+                session.cancel_local()
+                # Logical acceptance may already have closed admission. Peer
+                # notification is retryable and deduplicated by the session.
+                session.notify_cancel()
+            else:
+                session.cancel()
+            if session.has_transferring_tasks():
                 has_transferring = True
-            elif self._recv_sessions[rid].close() is False:
+            elif session.close() is False:
                 has_transferring = True
             else:
+                # The bridge has a stable, rank-local receive outcome. Keep
+                # an earlier failure when cancellation retires the session.
+                if (
+                    getattr(self, "_fp4_mla_bridge_enabled", False)
+                    and self._recv_sessions[rid].status == SessionStatus.ERROR
+                ):
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 del self._recv_reqs[rid]
                 del self._recv_sessions[rid]
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    self._emit_transfer_settled("gen", rid, req, session, "cancelled")
+
+        if not self._retire_cancelled_receive_fence(rid):
+            has_transferring = True
 
         if has_transferring:
             return False
+        return True
+
+    def _retire_cancelled_receive_fence(self, rid: int) -> bool:
+        """Release an unpublished receive root only after its CUDA fence completes.
+
+        Args:
+            rid: Transfer identity of the destination being retired.
+
+        Returns:
+            Whether no unproven local access remains for this destination.
+        """
+        fences = getattr(self, "_cancelled_receive_fences", {})
+        if rid not in fences:
+            return True
+        ready, owner = fences[rid]
+        if not ready.query() or not owner.settle(self._recv_reqs[rid]) or not owner.close():
+            return False
+        del fences[rid]
+        if rid not in self._recv_sessions:
+            self._recv_reqs.pop(rid, None)
         return True
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
@@ -1589,11 +2121,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             del self._wait_reqs[rid]
 
     def _check_compatible(self):
-        if self._mapping.cp_size != 1 and not self._mapping.has_cp_helix():
+        m = self._mapping
+        if m.cp_size != 1 and not m.has_cp_helix():
             raise ValueError(
                 f"KvCacheTransceiverV2: _check_compatible: unsupported context parallelism "
-                f"(cp_size={self._mapping.cp_size}, cp_type={self._mapping.cp_config.get('cp_type')}); "
+                f"(cp_size={m.cp_size}, cp_type={m.cp_config.get('cp_type')}); "
                 f"only cp_size == 1 or helix CP is supported"
+            )
+        # Under attention-DP the gen-side completion consensus spans the helix CP
+        # ranks of a DP group, so they must admit the same gen-init requests in
+        # the same iteration. The pp=1 executor loops align that admission
+        # (DisaggTransferCoordinator.align_gen_admission_across_cp). The PP loop
+        # does not: under attention-DP with tp_size > 1, each rank of the first
+        # PP stage schedules and admits on its own
+        # (PyExecutor._pp_schedule_and_propagate), so a CP rank can admit a
+        # request its peers did not and hang alone in the gen transfer status
+        # collective. With tp_size == 1 only rank 0 schedules and the CP ranks
+        # follow it, but the check rejects that case too to keep one rule; it
+        # costs nothing, since attention-DP then has a single DP rank.
+        # KVCacheManagerV2 rejects the same combination at construction; lift
+        # both checks together.
+        if m.enable_attention_dp and m.has_cp_helix() and m.pp_size > 1:
+            raise ValueError(
+                "KvCacheTransceiverV2 does not support attention-DP with helix "
+                f"context parallelism when pp_size > 1 (got pp_size={m.pp_size}). "
+                "Set pipeline_parallel_size=1 or enable_attention_dp=False."
             )
 
     def _resolve_pipelined_transfer(self, cfg: CacheTransceiverConfig) -> bool:
@@ -1601,16 +2153,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if not cfg.enable_pipelined_transfer:
             return False
         blockers = []
-        # The Python bounce reserves a receiver region for the whole request, not per chunk.
-        # The C++ transfer-agent bounce (agent_bounce_buffer_enable) stages each transfer request
-        # independently below the Python layer, so a pipelined chunk is just another request.
-        # TODO: This only sees the local config, so a chunking sender and a bouncing receiver pass.
-        if cfg.kv_cache_bounce_size_mb != 0 and not cfg.agent_bounce_buffer_enable:
-            blockers.append(
-                f"the Python bounce buffer (kv_cache_bounce_size_mb="
-                f"{cfg.kv_cache_bounce_size_mb} without agent_bounce_buffer_enable)"
-            )
-        if isinstance(self._kv_cache_manager, (MambaHybridCacheManager, MambaHybridCacheManagerV2)):
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             blockers.append("a Mamba/hybrid cache manager")
         # Refused for the configuration, not for the piece: the per-chunk guard downstream only sees
         # a piece short of the whole prompt, so a prompt that fits one chunk would slip past it.
@@ -1621,8 +2164,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # rebases it onto that request's page and frees ours, which an earlier chunk's
         # in-flight read may still be sourcing from.
         if (
-            isinstance(self._kv_cache_manager, KVCacheManagerV2)
-            and self._kv_cache_manager.enable_block_reuse
+            self._kv_cache_manager.enable_block_reuse
             and self._kv_cache_manager.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
         ):
             blockers.append(

@@ -18,6 +18,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <limits>
 #include <torch/extension.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -155,6 +156,104 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
         static_cast<int>(num_txt_tokens), interleave, static_cast<int>(tokens_per_batch), cos_seq_per_batch, stream);
 }
 
+// Fused FLUX QK norm + RoPE with static per-tensor E4M3 Q/K/V outputs.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_dit_qk_norm_rope_quant_fp8(torch::Tensor const& qkv,
+    int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_dim, double eps,
+    torch::Tensor const& q_weight, torch::Tensor const& k_weight, c10::optional<torch::Tensor> q_add_weight,
+    c10::optional<torch::Tensor> k_add_weight, torch::Tensor const& q_dequant_scale,
+    torch::Tensor const& k_dequant_scale, torch::Tensor const& v_dequant_scale, torch::Tensor const& cos_emb,
+    torch::Tensor const& sin_emb, c10::SymInt num_txt_tokens_sym, bool interleave, c10::SymInt tokens_per_batch_sym)
+{
+    int64_t const num_txt_tokens = num_txt_tokens_sym.guard_int(__FILE__, __LINE__);
+    int64_t const tokens_per_batch = tokens_per_batch_sym.guard_int(__FILE__, __LINE__);
+
+    TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, total_heads*head_dim]");
+    TORCH_CHECK(q_weight.dim() == 1 && q_weight.size(0) == head_dim, "q_weight must be 1D [head_dim]");
+    TORCH_CHECK(k_weight.dim() == 1 && k_weight.size(0) == head_dim, "k_weight must be 1D [head_dim]");
+    TORCH_CHECK(cos_emb.dim() >= 2 && cos_emb.dim() <= 4, "cos_emb must have rank in [2, 4]; got ", cos_emb.dim());
+    TORCH_CHECK(sin_emb.sizes() == cos_emb.sizes(), "sin_emb shape must match cos_emb exactly");
+    CHECK_INPUT(qkv, torch::kBFloat16);
+    CHECK_INPUT(q_weight, torch::kBFloat16);
+    CHECK_INPUT(k_weight, torch::kBFloat16);
+    CHECK_INPUT(q_dequant_scale, torch::kFloat32);
+    CHECK_INPUT(k_dequant_scale, torch::kFloat32);
+    CHECK_INPUT(v_dequant_scale, torch::kFloat32);
+    TORCH_CHECK(q_dequant_scale.numel() == 1, "q_dequant_scale must contain one FP32 value");
+    TORCH_CHECK(k_dequant_scale.numel() == 1, "k_dequant_scale must contain one FP32 value");
+    TORCH_CHECK(v_dequant_scale.numel() == 1, "v_dequant_scale must contain one FP32 value");
+
+    int64_t const num_tokens = qkv.size(0);
+    int64_t const total_heads = num_heads_q + num_heads_k + num_heads_v;
+    TORCH_CHECK(num_heads_q > 0 && num_heads_k > 0 && num_heads_v > 0, "Q/K/V head counts must be positive");
+    TORCH_CHECK(qkv.size(1) == total_heads * head_dim, "QKV tensor size must match total_heads * head_dim");
+    TORCH_CHECK(num_tokens <= std::numeric_limits<int>::max(), "num_tokens exceeds the kernel's supported range");
+    TORCH_CHECK(
+        total_heads * head_dim <= std::numeric_limits<int>::max(), "QKV width exceeds the kernel's supported range");
+
+    int64_t const cos_last_raw = cos_emb.size(-1);
+    bool const fold_last_two = cos_emb.dim() >= 3 && cos_last_raw == head_dim && cos_emb.size(-2) == num_heads_q;
+    int64_t const cos_new_last = fold_last_two ? num_heads_q * head_dim : cos_last_raw;
+    torch::Tensor cos_2d = cos_emb.reshape({-1, cos_new_last}).contiguous();
+    torch::Tensor sin_2d = sin_emb.reshape({-1, cos_new_last}).contiguous();
+    CHECK_INPUT(cos_2d, torch::kFloat32);
+    CHECK_INPUT(sin_2d, torch::kFloat32);
+    TORCH_CHECK(cos_2d.size(1) == head_dim,
+        "Static FP8 fused DiT path requires per-token, head-shared cos/sin with last dimension head_dim");
+
+    int64_t const cos_rows = cos_2d.size(0);
+    int cos_seq_per_batch = 0;
+    if (cos_rows != num_tokens)
+    {
+        TORCH_CHECK(cos_rows > 0 && num_tokens % cos_rows == 0, "cos rows must equal or evenly divide num_tokens");
+        cos_seq_per_batch = static_cast<int>(cos_rows);
+    }
+
+    void const* q_add_ptr = nullptr;
+    void const* k_add_ptr = nullptr;
+    if (q_add_weight.has_value())
+    {
+        CHECK_INPUT(q_add_weight.value(), torch::kBFloat16);
+        TORCH_CHECK(q_add_weight.value().dim() == 1 && q_add_weight.value().size(0) == head_dim,
+            "q_add_weight must be 1D [head_dim]");
+        q_add_ptr = q_add_weight.value().data_ptr();
+    }
+    if (k_add_weight.has_value())
+    {
+        CHECK_INPUT(k_add_weight.value(), torch::kBFloat16);
+        TORCH_CHECK(k_add_weight.value().dim() == 1 && k_add_weight.value().size(0) == head_dim,
+            "k_add_weight must be 1D [head_dim]");
+        k_add_ptr = k_add_weight.value().data_ptr();
+    }
+
+    auto options = qkv.options().dtype(torch::kFloat8_e4m3fn);
+    auto q_out = torch::empty({num_tokens, num_heads_q * head_dim}, options);
+    auto k_out = torch::empty({num_tokens, num_heads_k * head_dim}, options);
+    auto v_out = torch::empty({num_tokens, num_heads_v * head_dim}, options);
+    auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
+    tensorrt_llm::kernels::launchFusedDiTQKNormRopeQuantFp8(qkv.data_ptr(), q_out.data_ptr(), k_out.data_ptr(),
+        v_out.data_ptr(), static_cast<int>(num_tokens), static_cast<int>(num_heads_q), static_cast<int>(num_heads_k),
+        static_cast<int>(num_heads_v), static_cast<int>(head_dim), static_cast<float>(eps), q_weight.data_ptr(),
+        k_weight.data_ptr(), q_add_ptr, k_add_ptr, q_dequant_scale.data_ptr<float>(), k_dequant_scale.data_ptr<float>(),
+        v_dequant_scale.data_ptr<float>(), cos_2d.data_ptr<float>(), sin_2d.data_ptr<float>(),
+        static_cast<int>(num_txt_tokens), interleave, static_cast<int>(tokens_per_batch), cos_seq_per_batch, stream);
+    return {q_out, k_out, v_out};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_dit_qk_norm_rope_quant_fp8_meta(torch::Tensor const& qkv,
+    int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_dim, double /*eps*/,
+    torch::Tensor const& /*q_weight*/, torch::Tensor const& /*k_weight*/, c10::optional<torch::Tensor> /*q_add_weight*/,
+    c10::optional<torch::Tensor> /*k_add_weight*/, torch::Tensor const& /*q_dequant_scale*/,
+    torch::Tensor const& /*k_dequant_scale*/, torch::Tensor const& /*v_dequant_scale*/,
+    torch::Tensor const& /*cos_emb*/, torch::Tensor const& /*sin_emb*/, c10::SymInt /*num_txt_tokens*/,
+    bool /*interleave*/, c10::SymInt /*tokens_per_batch*/)
+{
+    auto options = qkv.options().dtype(torch::kFloat8_e4m3fn);
+    int64_t const num_tokens = qkv.size(0);
+    return {torch::empty({num_tokens, num_heads_q * head_dim}, options),
+        torch::empty({num_tokens, num_heads_k * head_dim}, options),
+        torch::empty({num_tokens, num_heads_v * head_dim}, options)};
+}
+
 // Register the PyTorch operator schema
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -164,12 +263,23 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? q_add_weight, Tensor? k_add_weight, "
         "Tensor cos_emb, Tensor sin_emb, SymInt num_txt_tokens, "
         "bool interleave, SymInt tokens_per_batch) -> ()");
+    m.def(
+        "fused_dit_qk_norm_rope_quant_fp8(Tensor qkv, int num_heads_q, int num_heads_k, int num_heads_v, "
+        "int head_dim, float eps, Tensor q_weight, Tensor k_weight, Tensor? q_add_weight, Tensor? k_add_weight, "
+        "Tensor q_dequant_scale, Tensor k_dequant_scale, Tensor v_dequant_scale, Tensor cos_emb, Tensor sin_emb, "
+        "SymInt num_txt_tokens, bool interleave, SymInt tokens_per_batch) -> (Tensor, Tensor, Tensor)");
 }
 
 // Register the CUDA implementation
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fused_dit_qk_norm_rope", &fused_dit_qk_norm_rope);
+    m.impl("fused_dit_qk_norm_rope_quant_fp8", &fused_dit_qk_norm_rope_quant_fp8);
+}
+
+TORCH_LIBRARY_IMPL(trtllm, Meta, m)
+{
+    m.impl("fused_dit_qk_norm_rope_quant_fp8", &fused_dit_qk_norm_rope_quant_fp8_meta);
 }
 
 } // namespace torch_ext

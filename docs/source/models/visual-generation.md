@@ -37,6 +37,8 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video (3-step distilled) |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
+| `Lightricks/LTX-2.3` | Text-to-Video (with Audio), Video-to-Video (with Audio) |
+| `FastVideo/FastVideo-FastH3-8-Step-V2` | Text-to-Video (with Audio, 8-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -48,7 +50,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text-to-Video |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video |
-| `MiniMaxAI/MiniMax-H3` | Text-to-Video (with Audio), First/Last-Frame-to-Video (with Audio) |
+| `MiniMaxAI/MiniMax-H3` | Text-to-Video, First/Last-Frame-to-Video, Reference-to-Video (all with Audio) |
 | `zai-org/GLM-Image` | Text-to-Image |
 
 
@@ -56,22 +58,24 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism\* | SOL-Attn |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
-| **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | Yes |
-| **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | No | No |
-| **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image-Layered** | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
-| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | No | No | Yes | Yes | Yes | No | No | No | No |
-| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
-| **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
-| **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism\* | Text Encoder TP | SOL-Attn |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
+| **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
+| **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes |
+| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
+| **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
+| **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+| **LTX-2.3** | Yes | Yes | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
+| **MiniMax-H3** | Yes | Yes | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
+| **FastH3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
+| **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
+| **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
+| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No |
+| **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
+| **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
 
 \* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
 
@@ -118,7 +122,8 @@ The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queue
 Qwen-Image-Layered supports BF16 image-conditioned layer decomposition through
 `trtllm-serve` image-edit routing. It returns one RGBA image per generated layer;
 set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable
-image grid. Quantization, cache acceleration, attention-parallel/Sage/VSA backends,
+image grid. FP8 block-scale quantization and Cache-DiT are supported; NVFP4,
+TeaCache, the attention-parallel backends (CFG, Ulysses, Attention2D, ring), VSA,
 and Tensor Parallelism are not enabled for this pipeline yet.
 
 Conditioning references are supplied through the typed fields `image_reference`, `video_reference`, and `audio_reference`. Each field takes a single reference or a list. A reference is `MediaRef(content=..., format=...)`, and `format` is required.
@@ -165,8 +170,15 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 ## MiniMax-H3 Notes
 
 MiniMax-H3 parallel VAE uses independent spatial tiles via
-`parallel_config.parallel_vae_size`, with size from 1 through the Ulysses world size.
+`parallel_config.parallel_vae_size`, with size from 1 through the world size (`tp_size * ulysses_size`).
 Tile geometry and blending follow the loaded Diffusers VAE.
+
+Tensor parallelism shards the DiT attention and gated MLP weights via
+`parallel_config.tp_size`. The text encoder, AdaLN modulation, and media
+input/output projections remain replicated. TP can be combined with Ulysses;
+Ulysses supports VANILLA, FA4, TRTLLM, and FLASHINFER attention. CFG, ring, and Attention2D parallelism
+are not supported. See the
+[2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml).
 
 - Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
   with audio (Ref2VA) are supported on one GPU. Enable Ref2VA with
@@ -179,6 +191,22 @@ Tile geometry and blending follow the loaded Diffusers VAE.
   model-specific restriction, not a general VisualGen backend requirement.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
+
+- FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
+  distilled 8-step V2 checkpoint. Model-specific VSA is the supported inference path
+  for this checkpoint and is selected by default with the TRTLLM backend and the
+  checkpoint's sparsity (80% for V2). Explicit incompatible backends
+  or sparse attention algorithms are rejected. Dense attention omits the trained
+  compression gate and is not equivalent to this checkpoint's VSA inference.
+  The example reads nine sigma-grid points (eight transformer forwards) from
+  `fastvideo_inference.json` and uses its trained DMD ladder with video/audio
+  scheduler shifts of 10/3. Changing only the step count is not equivalent.
+  For single-GPU text-to-video with audio, see
+  `fasth3-bf16-trtllm-vsa-1gpu.yaml`. To use CUTEDSL instead, set
+  `attention_config.backend: CUTEDSL` in that config.
+  Both backends preserve the trained compression gate and dense text/audio routes.
+  CUTEDSL VSA requires supported Blackwell hardware and at most 4096 tiles;
+  unsupported shapes fail explicitly rather than silently running dense attention.
 
 ## Optimizations
 
@@ -291,7 +319,7 @@ args = VisualGenArgs(
 
 The loader accepts safetensors adapters that use Comfy/Kohya-style `lora_down` / `lora_up` keys or PEFT-style `lora_A` / `lora_B` keys. It applies `.alpha` tensors when present, and reads `lora_alpha` from a colocated `adapter_config.json` for PEFT adapters. `scale` multiplies the resulting alpha/rank factor.
 
-By default, `strict=True` raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set `target_components` explicitly for pipelines with multiple transformer components. Runtime LoRA is not supported with VisualGen weight quantization, and startup fusion does not support per-request adapter switching.
+By default, `strict=True` raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set `target_components` explicitly for pipelines with multiple transformer components. Runtime LoRA cannot target a transformer component with weight quantization enabled, and startup fusion does not support per-request adapter switching.
 
 ### Quantized Attention
 
@@ -321,12 +349,12 @@ cache_config:
 |---|---|---|---|
 | `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use `0.6` for FLUX.1 and `0.2` for all other supported models. |
 | `use_ret_steps` | bool | `false` | Enable retention-step caching variant. |
-| `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. Set automatically at load time based on the checkpoint. |
+| `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. When not supplied, filled automatically at load time if a built-in coefficient table matches the checkpoint; otherwise, set explicitly. |
 
 Wan 2.2 and LTX-2 have no built-in TeaCache coefficient tables. Set
-`cache_config.coefficients` explicitly for LTX-2. Wan 2.2 requires both
-`cache_config.coefficients` for its high-noise transformer and
-`cache_config.coefficients_2` for its low-noise transformer.
+`cache_config.coefficients` explicitly for LTX-2 and Wan 2.2 TI2V-5B. Wan 2.2
+A14B models require both `cache_config.coefficients` for the high-noise
+transformer and `cache_config.coefficients_2` for the low-noise transformer.
 
 #### Cache-DiT
 
@@ -383,7 +411,7 @@ Skip Softmax and SOL share the `disabled_until_timestep` schedule that keeps the
 
 ### CPU Offloading
 
-CPU offloading stages move selected Wan and Cosmos3 T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`.
+CPU offloading stages move selected Wan, Cosmos3 T2V, and MiniMax-H3 pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`.
 
 ### Multi-GPU Parallelism
 
@@ -391,13 +419,17 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
 
 - **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs. FLUX uses embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to FLUX or the distilled FastWan 2.2 model.
 - **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
-    - **Async Ulysses A2A pipeline** (`async_ulysses: true` in `parallel_config`): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires `ulysses_size > 1` and an NVLink-connected GPU domain (uses PyTorch `_SymmetricMemory` with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN and LTX-2 self-attention.
-- **Parallel VAE** (`parallel_vae_size: N`): Parallelizes the final VAE decode (constraint: `parallel_vae_size ≤ world_size`). WAN/Cosmos3 shard along a spatial axis; LTX-2 and MiniMax-H3 distribute independent tiles.
+    - **Async Ulysses A2A pipeline** (`async_ulysses: true` in `parallel_config`): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires `ulysses_size > 1` and an NVLink-connected GPU domain (uses PyTorch `_SymmetricMemory` with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN, LTX-2 and MiniMax-H3 self-attention. MiniMax-H3 async is validated in BF16 only; FP8/NVFP4 combinations remain unvalidated.
+- **Parallel VAE** (`parallel_vae_size: N`): Parallelizes the final VAE decode (constraint: `parallel_vae_size ≤ world_size`). WAN/Cosmos3 shard along a spatial axis; LTX-2, LTX-2.3, and MiniMax-H3 distribute independent tiles.
 - **Context Parallel (CP)** — Partitions the sequence into shards so that each rank computes partial attention. Requires an LSE-capable attention backend (`FA4` or `CUTEDSL`). CP can be composed with Ulysses, giving a total sequence-parallel (SP) degree = `cp_size · ulysses_size`. The CP degree depends on the implementation below:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
-    - **Token-sharded TP** (`tp_layout: token_sharded` in `parallel_config`, prototype): Keeps the residual stream sharded by tokens across the TP group, so each all-reduce becomes a reduce-scatter plus an all-gather and the norms, modulation and quantization between projections run on `1/tp_size` of the tokens. Requires `tp_size > 1`; composes with CFG parallelism, not with Ulysses, Ring Attention, Attention2D or VSA. Supported for Wan 2.1 and Wan 2.2.
+    - **Token-sharded TP** (`tp_layout: token_sharded` in `parallel_config`, prototype): Keeps the residual stream sharded by tokens across the TP group, so each all-reduce becomes a reduce-scatter plus an all-gather and the norms, modulation and quantization between projections run on `1/tp_size` of the tokens. Requires `tp_size > 1`; composes with CFG parallelism, not with Ulysses, Ring Attention, Attention2D or VSA. Supported for Wan 2.1 and Wan 2.2. Static (calibrated) NVFP4 checkpoints all-gather the activations between projections as NVFP4 and `FP8_BLOCK_SCALES` checkpoints on SM100-family GPUs (the DeepGEMM path) as FP8 with per-token block scales; other models all-gather BF16.
+- **Text encoder tensor parallelism** (`text_encoder_tp_size: N`): MiniMax-H3
+  only. Shards the Qwen3-VL text encoder over the first N ranks for text-only
+  prompt encoding, then broadcasts prompt embeddings to the remaining VisualGen
+  ranks. This does not enable DiT tensor parallelism for MiniMax-H3.
 
 For multi-node execution, VisualGen relies on the external launcher to terminate
 the remaining ranks when any rank exits. `torchrun` provides this behavior. With
@@ -427,10 +459,15 @@ pipeline.wake_up()
 ```
 
 `CPU` uses pageable host backing; `PINNED` uses pinned host backing. Host backups
-remain allocated after wake and are reused on later sleeps. Budget host RAM for
+remain allocated after wake by default and are reused on later sleeps. Budget host RAM for
 each instance's captured allocation pool, which can include cached loading and
 quantization buffers in addition to weights. This is process-local offload:
 the process, CUDA context, host memory, and node must remain alive.
+
+Set `sleep_release_host_backup=True` alongside `sleep_restore_mode` when loading
+to free the instance's host backups before wake returns. This synchronous cleanup
+can increase wake latency, and each subsequent sleep must allocate fresh backups.
+Host RAM must still hold the full backup while asleep. The default is `False`.
 
 Sleep rejects new generation and waits for the active call to finish before
 releasing memory. Sleep/wake transitions are serialized per instance; overlapping

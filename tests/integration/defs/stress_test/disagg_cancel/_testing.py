@@ -43,8 +43,8 @@ DUMMY_YAML = textwrap.dedent(
     generation_servers: {}
     stress_config:
       duration_min: 1
-      kv_cache_manager: v1
-      transceiver: cpp
+      kv_cache_manager: v2
+      transceiver: python
       log_scan:
         hard_zero_patterns:
           - "Broken promise"

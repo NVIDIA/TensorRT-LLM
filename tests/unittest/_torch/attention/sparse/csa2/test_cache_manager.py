@@ -31,6 +31,19 @@ skip_pre_blackwell = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("cache_salt", [None, "", "tenant-中文", "a\x00b"])
+@pytest.mark.parametrize("encoder_replay", [False, True])
+def test_reuse_salt_preserves_string_namespace(cache_salt, encoder_replay):
+    manager = object.__new__(CSA2CacheManager)
+    manager._encoder_replay_enabled = encoder_replay
+    expected = (
+        "deepseek-v41-csa2-encoder:approximate:" + repr(cache_salt)
+        if encoder_replay
+        else cache_salt
+    )
+    assert manager._derive_reuse_salt(cache_salt) == expected
+
+
 @pytest.mark.parametrize("disk_bytes", [0, 1 << 30])
 @pytest.mark.parametrize("custom_codec", [False, True])
 def test_encoder_replay_passes_cold_storage_to_base(
@@ -326,7 +339,7 @@ def test_cache_manager_preserves_disabled_or_enabled_scratch_config(enable_scrat
 @pytest.mark.parametrize("fallback", ["scratch", "attention_dp", "disaggregated", "late_engram"])
 @pytest.mark.parametrize("partial_reuse", [False, True])
 def test_decoder_replay_selects_cache_lifecycles(monkeypatch, fallback, partial_reuse):
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
     monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "0")
@@ -365,12 +378,12 @@ def test_decoder_replay_selects_cache_lifecycles(monkeypatch, fallback, partial_
             for layer in manager.impl.init_config.layers:
                 decoder = layer.layer_id == manager._layer_roles[1, 1, CSA2CacheRole.SWA]
                 assert layer.reuse_policy == (
-                    AttentionReusePolicy.PRIVATE if decoder else AttentionReusePolicy.REQUIRED
+                    ReusePolicy.PRIVATE if decoder else ReusePolicy.REQUIRED
                 )
         else:
             assert manager._decoder_replay_window == 0
             assert all(
-                layer.reuse_policy == AttentionReusePolicy.REQUIRED
+                layer.reuse_policy == ReusePolicy.REQUIRED
                 for layer in manager.impl.init_config.layers
             )
     finally:

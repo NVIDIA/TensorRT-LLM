@@ -25,7 +25,6 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
-#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/funcGuard.h"
 
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
@@ -35,6 +34,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -113,42 +113,6 @@ TEST(KvCacheManagerV2ConcurrencyTest, LevelStatsAreConservedAcrossConcurrentDrai
     EXPECT_EQ(manager->getAndResetIterationDiskPrefetchBlocks(), 0);
 }
 
-TEST(KvCacheManagerV2ConcurrencyTest, PageStorageSnapshotWaitsForSharedApiReaders)
-{
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    cudaStream_t stream{};
-    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
-    auto destroyStream = FuncGuard([&]() { EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess); });
-    auto config = makeTieredConfig();
-    std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().isSparse = true;
-    auto manager = std::make_shared<KvCacheManager>(std::move(config));
-    auto cache = manager->createKvCache();
-    auto closeCache = FuncGuard([&]() { cache->close(); });
-    ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(stream)));
-    ASSERT_TRUE(cache->resize(4, 4));
-    ASSERT_TRUE(cache->enterDecode());
-
-    std::promise<void> started;
-    auto startedFuture = started.get_future();
-    std::future<PageStorageSnapshot> snapshotFuture;
-    {
-        auto const apiLock = manager->lockShared();
-        snapshotFuture = std::async(std::launch::async,
-            [&]
-            {
-                started.set_value();
-                return cache->getPageStorageSnapshot(LifeCycleId{0});
-            });
-        EXPECT_EQ(startedFuture.wait_for(std::chrono::seconds{5}), std::future_status::ready);
-        // Inspecting a locked host page changes non-atomic holder refcounts, so even a
-        // shared API reader must exclude the snapshot until it releases its lock.
-        EXPECT_EQ(snapshotFuture.wait_for(std::chrono::milliseconds{100}), std::future_status::timeout);
-    }
-    auto const snapshot = snapshotFuture.get();
-    EXPECT_EQ(snapshot.eligibleHistoryBlocks(), 1);
-    EXPECT_EQ(snapshot.cacheLevels(), (std::vector<std::optional<CacheLevel>>{kSparseHistoryLevel}));
-}
-
 // Creates `count` roots and proposes all of them for erasure, leaving that many pending entries and
 // an unchanged root map. Returns the number of roots now present.
 size_t seedPendingRootErases(BlockRadixTree& tree, size_t count)
@@ -158,13 +122,13 @@ size_t seedPendingRootErases(BlockRadixTree& tree, size_t count)
     for (size_t index = 0; index < count; ++index)
     {
         ReuseScope scope;
-        scope.salt = static_cast<std::uint64_t>(index) + 1;
+        scope.salt = std::to_string(index + 1);
         tree.addOrGetExisting(scope);
     }
     for (size_t index = 0; index < count; ++index)
     {
         ReuseScope scope;
-        scope.salt = static_cast<std::uint64_t>(index) + 1;
+        scope.salt = std::to_string(index + 1);
         // Freshly created roots are childless, which is exactly the state the drain acts on.
         tree.proposeToEraseEmptyRoot(RootBlock::makeKey(scope));
     }
@@ -195,14 +159,14 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseDoesNotMutateTheRadixTree)
     for (int attempt = 0; attempt < 4; ++attempt)
     {
         ReuseScope scope;
-        scope.salt = 1;
+        scope.salt = "1";
         EXPECT_EQ(manager->probeReuse(scope, toSpan(tokens), /*knownNoDigest=*/true), 0);
         EXPECT_EQ(tree.roots().size(), kNumRoots) << "probeReuse() drained pending root erases on attempt " << attempt;
     }
 
     // The drain still happens, just at an exclusive-locked entry point.
     ReuseScope fresh;
-    fresh.salt = 9999;
+    fresh.salt = "9999";
     tree.addOrGetExisting(fresh);
     EXPECT_EQ(tree.roots().size(), 1U) << "addOrGetExisting() must drain the pending root erases";
 
@@ -256,7 +220,7 @@ TEST(KvCacheManagerV2ConcurrencyTest, ConcurrentProbeReuseIsSafe)
                 for (int iteration = 0; iteration < kIterations; ++iteration)
                 {
                     ReuseScope scope;
-                    scope.salt = static_cast<std::uint64_t>((threadIndex + iteration) % kNumRoots) + 1;
+                    scope.salt = std::to_string((threadIndex + iteration) % kNumRoots + 1);
                     if (manager->probeReuse(scope, toSpan(tokens), /*knownNoDigest=*/true) != 0)
                     {
                         nonZeroMatches.fetch_add(1, std::memory_order_relaxed);

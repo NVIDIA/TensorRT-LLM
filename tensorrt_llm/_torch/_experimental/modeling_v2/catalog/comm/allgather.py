@@ -21,13 +21,14 @@ class Allgather(OpWrapper):
     freshly allocated tensor on every rank; `input` is left untouched.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # deepseek-r1 at dep4 is the only caller and always passes `sizes=None`:
-    # it pads every rank to a common height first, so the ragged form the op
-    # also supports is not something a shipped target reaches. Row counts span
-    # what an attention-DP rank feeds its expert-parallel MoE call, from one
-    # decode token to a full prefill chunk.
+    # deepseek-r1 at dep4 and the gpt-oss default target under attention DP
+    # are the callers, and both always pass `sizes=None`: each pads every rank
+    # to a common height first, so the ragged form the op also supports is
+    # not something a shipped target reaches. Row counts span what an
+    # attention-DP rank feeds its expert-parallel MoE call, from one decode
+    # token to a full prefill chunk.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: one row per rank, hidden 7168",

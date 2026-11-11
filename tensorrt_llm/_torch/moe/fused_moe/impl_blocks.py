@@ -85,6 +85,11 @@ class MoEExecutionContractMixin:
         return False
 
     @property
+    def supports_alltoall(self) -> bool:
+        """Whether the kernel can consume tokens dispatched with all-to-all."""
+        return True
+
+    @property
     def uses_locality_domain(self) -> bool:
         """True when this impl runs partitioned across locality domains."""
         return False
@@ -144,6 +149,10 @@ class MoEWeightOwnerMixin:
     # Declared here so the mixin's own lifecycle methods never depend on a
     # subclass constructor having assigned it first.
     _weights_created: bool = False
+    # The one-shot transform guard exists before any weight load, so a staged
+    # receiver that installs already transformed bytes without loading can
+    # mark this owner transformed, as it does for `Linear`.
+    _weights_transformed: bool = False
 
     # ---- weight lifecycle -------------------------------------------------
     def create_weights(self) -> None:
@@ -197,7 +206,7 @@ class MoEWeightOwnerMixin:
         self.quant_method.load_weights(self, weights[0], self.weight_loading_mode, **kargs)
 
     def transform_weights(self) -> None:
-        if getattr(self, "_weights_transformed", False):
+        if self._weights_transformed:
             return
         self.quant_method.transform_weights(self)
         self._weights_transformed = True
@@ -271,34 +280,6 @@ class MoEWeightOwnerMixin:
             self.quant_config is not None
             and self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8()
         )
-
-    @property
-    def has_w4a8_mxfp4_fp8(self):
-        assert self._weights_created
-        return (
-            self.quant_config is not None
-            and self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8()
-        )
-
-    @property
-    def has_w4a8_mxfp4_mxfp8(self):
-        assert self._weights_created
-        return (
-            self.quant_config is not None
-            and self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8()
-        )
-
-    @property
-    def has_w4a16_mxfp4(self):
-        assert self._weights_created
-        return (
-            self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a16_mxfp4()
-        )
-
-    @property
-    def has_mxfp8(self):
-        assert self._weights_created
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_mxfp8()
 
     # ---- shape / partition -------------------------------------------------
     @property

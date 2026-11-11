@@ -210,6 +210,7 @@ def build_document(
         "s_build_url": os.getenv("BUILD_URL", ""),
         "s_cbts_status": status,
         "s_scope": str(scope) if scope is not None else "",
+        "s_shadow_selection_artifact_path": decision.get("shadow_selection_artifact_path") or "",
         "s_reason": reason,
         "l_hit_stages": len(affected),
         "l_total_cases": total_cases,

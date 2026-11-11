@@ -239,53 +239,52 @@ def get_physical_pool(page_table: KVCachePageTable, lg_idx: int, pool_idx: int) 
 
 
 def get_unique_pool_memory_descs(
-    page_table: KVCachePageTable, device_id: int
+    page_table: KVCachePageTable, device_id: int, memory_type: str | None = None
 ) -> list[tuple[int, int, int, str]]:
-    """Return deduplicated (ptr, size, device_id, name) tuples for all physical pools."""
-    unique_pools: dict[tuple[int, int], int] = {}  # (ptr, size) -> index
+    """Return deduplicated pool descriptors, optionally filtered by memory type.
+
+    Host descriptors use device ID zero; device descriptors use the rank's GPU.
+    """
+    unique_pools: dict[tuple[int, int, str], int] = {}
     pool_counter = 0
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if lg.kind == CacheKind.STATE:
             assert isinstance(lg, MambaLayerGroup)
-            if lg.slot_major_layout:
-                # MambaHybridCacheManagerV2: roles may share one allocation
-                # (interleaved, equal sizes) or be separate (unequal sizes).
-                # Process lowest-base first so the covering region registers
-                # before higher-offset roles that fall inside it.
-                pools = sorted(
-                    (get_physical_pool(page_table, lg_idx, pv.pool_idx) for pv in lg.pool_views),
-                    key=lambda p: p.base_address,
-                )
-                for pool in pools:
-                    pool_size = pool.num_slots * pool.slot_stride_bytes
-                    if any(b <= pool.base_address < b + s for (b, s) in unique_pools):
-                        continue
-                    pool_key = (pool.base_address, pool_size)
-                    if pool_key not in unique_pools:
-                        unique_pools[pool_key] = pool_counter
-                        pool_counter += 1
-            else:
-                # Layer-major (MambaHybridCacheManager): each role is a separate
-                # allocation. Register each: size = num_layers * layer_stride.
-                for pv in lg.pool_views:
-                    pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
-                    num_layers = len({int(e["local_layer_id"]) for e in pv.buffer_entries})
-                    pool_size = num_layers * pool.layer_stride_bytes
-                    pool_key = (pool.base_address, pool_size)
-                    if pool_key not in unique_pools:
-                        unique_pools[pool_key] = pool_counter
-                        pool_counter += 1
+            # MambaHybridCacheManagerV2: roles may share one allocation
+            # (interleaved, equal sizes) or be separate (unequal sizes).
+            # Process lowest-base first so the covering region registers
+            # before higher-offset roles that fall inside it.
+            pools = sorted(
+                (get_physical_pool(page_table, lg_idx, pv.pool_idx) for pv in lg.pool_views),
+                key=lambda p: p.base_address,
+            )
+            for pool in pools:
+                pool_size = pool.num_slots * pool.slot_stride_bytes
+                if any(
+                    kind == pool.memory_type and b <= pool.base_address < b + s
+                    for b, s, kind in unique_pools
+                ):
+                    continue
+                pool_key = (pool.base_address, pool_size, pool.memory_type)
+                if pool_key not in unique_pools:
+                    unique_pools[pool_key] = pool_counter
+                    pool_counter += 1
         else:
             # PAGED (attention): each pool view is an independent allocation
             for pv in lg.pool_views:
                 pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
-                pool_key = (pool.base_address, pool.num_slots * pool.slot_stride_bytes)
+                pool_key = (
+                    pool.base_address,
+                    pool.num_slots * pool.slot_stride_bytes,
+                    pool.memory_type,
+                )
                 if pool_key not in unique_pools:
                     unique_pools[pool_key] = pool_counter
                     pool_counter += 1
     return [
-        (pool_ptr, pool_size, device_id, f"kv_cache_memory_pool{idx}")
-        for (pool_ptr, pool_size), idx in unique_pools.items()
+        (pool_ptr, pool_size, 0 if kind == "DRAM" else device_id, f"kv_cache_memory_pool{idx}")
+        for (pool_ptr, pool_size, kind), idx in unique_pools.items()
+        if memory_type is None or memory_type == kind
     ]
 
 

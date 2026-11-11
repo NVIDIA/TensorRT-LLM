@@ -42,6 +42,7 @@ from report import (
     emit_launch_vars,
     emit_ucx_env,
 )
+from submit import validate
 
 
 @pytest.fixture
@@ -99,12 +100,39 @@ def sample_cfg():
 # build_cases
 # ---------------------------------------------------------------------------
 class TestBuildCases:
+    @pytest.mark.parametrize("versions", [None, ["V1"]])
+    def test_python_only_without_v2_rejects_empty_matrix(self, sample_cfg, versions):
+        """A requested Python test cannot silently succeed without running a case."""
+        sample_cfg["test_matrix"]["combinations"] = [{"backend": "NIXL", "runtime": "PYTHON"}]
+        if versions is None:
+            sample_cfg["test_matrix"].pop("cache_manager_versions")
+        else:
+            sample_cfg["test_matrix"]["cache_manager_versions"] = versions
+        with pytest.raises(ValueError, match="no supported cases"):
+            build_cases(sample_cfg)
+
+    def test_dropped_combination_identified(self, sample_cfg, caplog):
+        """Warn about a requested runtime even when other combinations remain valid."""
+        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V1"]
+        cases = build_cases(sample_cfg)
+        assert cases
+        assert "NIXL/PYTHON has no supported cache manager version" in caplog.text
+
+    def test_submit_rejects_empty_matrix_before_launch(self, sample_cfg, capfd):
+        """Submission fails before reserving GPUs for an unsupported matrix."""
+        sample_cfg["test_matrix"]["combinations"] = [{"backend": "NIXL", "runtime": "PYTHON"}]
+        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V1"]
+        with pytest.raises(SystemExit) as error:
+            validate(sample_cfg)
+        assert error.value.code == 1
+        assert "Test matrix contains no supported cases" in capfd.readouterr().err
+
     def test_basic(self, sample_cfg):
         cases = build_cases(sample_cfg)
         labels = [c["label"] for c in cases]
         assert "UCX/CPP/V1" in labels
         assert "NIXL/CPP/V1" in labels
-        assert "NIXL/PYTHON/V1" in labels
+        assert "NIXL/PYTHON/V1" not in labels
         assert "NIXL/PYTHON/V2" in labels
         # V2 + CPP should be skipped
         assert "UCX/CPP/V2" not in labels
@@ -380,7 +408,7 @@ class TestParseProtoInfo:
                 "[CTT_CASE_BEGIN] ci=0 label=UCX/CPP/V1",
                 "cfg#0 ucp_put (cuda/cuda)",
                 "  | rendezvous | cuda_ipc/cuda |",
-                "[CTT_CASE_BEGIN] ci=1 label=NIXL/PYTHON/V1",
+                "[CTT_CASE_BEGIN] ci=1 label=NIXL/PYTHON/V2",
                 "cfg#0 ucp_put (cuda/cuda)",
                 "  | rendezvous | rc_mlx5/cuda |",
             ],
@@ -393,7 +421,7 @@ class TestParseProtoInfo:
         self._write_log(
             tmp_path / "rank0.log",
             [
-                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V1",
+                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V2",
                 "export UCX_TLS=all,self",
                 "cfg#0 tagged message (cuda/cuda)",
                 "  | eager short | self/memory |",
@@ -442,7 +470,7 @@ class TestRankBest:
     def test_picks_highest_bw(self):
         by_combination = [
             {
-                "combination": "NIXL/PYTHON/V1",
+                "combination": "NIXL/PYTHON/V2",
                 "sweeps": [
                     {
                         "sweep": "all",
@@ -497,7 +525,7 @@ class TestAggregate:
         sample_cfg["environment"]["work_dir"] = str(work)
         # Use only 1 sweep and 1 combination for simplicity
         sample_cfg["test_matrix"]["combinations"] = [{"backend": "NIXL", "runtime": "PYTHON"}]
-        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V1"]
+        sample_cfg["test_matrix"]["cache_manager_versions"] = ["V2"]
         sample_cfg["ucx_env_sweep"] = [{"name": "default", "env": {"UCX_TLS": "all"}}]
         sample_cfg["test_matrix"]["request_lengths"] = [100, 1000]
         sample_cfg["test_matrix"]["warmup_requests"] = 1
@@ -553,7 +581,7 @@ class TestAggregate:
         assert "by_combination" in data
         assert data["req_len"] == 1000
         assert len(data["by_combination"]) == 1
-        assert data["by_combination"][0]["combination"] == "NIXL/PYTHON/V1"
+        assert data["by_combination"][0]["combination"] == "NIXL/PYTHON/V2"
 
         # Best file should also be written
         best_path = str(work / "results.best.json")
@@ -563,7 +591,7 @@ class TestAggregate:
         work = self._setup_work_dir(tmp_path, sample_cfg)
         with open(work / "logs" / "sweep0_gen_rank0.log", "w") as f:
             f.write(
-                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V1\n"
+                "[CTT_CASE_BEGIN] ci=0 label=NIXL/PYTHON/V2\n"
                 "export UCX_TLS=all,self\n"
                 "cfg#0 tagged message (cuda/cuda)\n"
                 "  | eager short | self/memory |\n"

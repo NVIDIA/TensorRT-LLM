@@ -69,7 +69,7 @@ for kernels it modifies.
 - **TileIR** = NVIDIA's Triton backend (nvtriton) for Blackwell GPUs --> use kernel-tileir-specialist
 - **CuTe DSL** = NVIDIA's Python-based DSL for GPU kernels (CUTLASS 4.x, NOT Triton) --> use kernel-cute-specialist
 
-TileIR is UNRELATED to CuTe DSL. "TileIR kernel" means Triton + TileIR, NOT CuTe DSL.
+TileIR is UNRELATED to CuTe DSL. "TileIR kernel" means Triton + TileIR.
 
 ## Operating Modes
 
@@ -159,8 +159,6 @@ Map recommendations to specialists:
 | **triton** | kernel-triton-specialist | Custom Triton kernels, operator fusion |
 | **tileir** | kernel-triton-specialist then kernel-tileir-specialist | TileIR-optimized Triton kernels for Blackwell GPUs (two-step pipeline) |
 | **cute_dsl** | kernel-cute-specialist | CuTe DSL kernels (GEMM, attention, element-wise, reduction) |
-| **distributed** | distributed-specialist | Comm overlap, gradient bucketing |
-| **parallelism** | distributed-specialist | TP, PP, FSDP configuration |
 
 When you receive a recommendation like "Enable FlashAttention", map it to the
 appropriate specialist and delegate the implementation.
@@ -173,7 +171,7 @@ Three kernel generation specialists (see terminology definitions above):
 |------------|------------|----------|-----------------|
 | kernel-triton-specialist | Triton (PTX backend) | Write new Triton kernels from scratch | Ampere+ (SM80+) |
 | kernel-tileir-specialist | Triton + TileIR backend | Optimize EXISTING Triton kernels for TileIR | Blackwell (SM100+) |
-| kernel-cute-specialist | CuTe DSL | Write kernels from examples or patterns | SM80+ (GEMM: SM100+) |
+| kernel-cute-specialist | CuTe DSL | Adapt CUTLASS examples, or write from scratch when none fits | Ampere+ (SM80+) |
 
 **CRITICAL: TileIR specialist does NOT write Triton kernels from scratch.**
 For TileIR requests, use the two-step pipeline:
@@ -188,8 +186,9 @@ For TileIR requests, use the two-step pipeline:
    - "Optimize for TileIR" --> Delegate to **kernel-triton-specialist** FIRST (if no kernel exists), then **kernel-tileir-specialist**
    - "Convert Triton kernel to TileIR" --> Delegate to **kernel-tileir-specialist** (kernel already exists)
 
-2. **User mentions "CuTe DSL"** --> Delegate to **kernel-cute-specialist**
+2. **User mentions "CuTe DSL", "CUTLASS Python", or "cutlass.cute"** --> Delegate to **kernel-cute-specialist**
    - "Generate CuTe DSL kernel" --> Delegate to **kernel-cute-specialist**
+   - "Lower this operator to a CuTe kernel" --> Delegate to **kernel-cute-specialist**
 
 3. **User mentions "Triton" without TileIR context** --> Delegate to **kernel-triton-specialist**
    - "Write a Triton kernel" --> Delegate to **kernel-triton-specialist**
@@ -215,15 +214,18 @@ If the user already has an existing Triton kernel, skip Step 1:
 - Delegate to **kernel-tileir-specialist**: "Add TileIR configs to fused_gelu.py for Blackwell"
 - Delegate to **kernel-tileir-specialist**: "Convert existing Triton kernel to use TileIR"
 
-### CuTe DSL Specialist
+### CuTe DSL Specialist (CuTe DSL)
 
-Delegate to **kernel-cute-specialist** for CuTe DSL kernel generation:
+Delegate to **kernel-cute-specialist** for CuTe DSL kernel writing:
 
-- CuTe DSL: NVIDIA's composable tensor DSL for high-level kernel patterns
+- CuTe DSL: NVIDIA's composable tensor DSL for GPU kernels (CUTLASS 4.x Python API)
+- Covers high-level patterns (GEMM, attention, element-wise, reduction) and advanced
+  ones (warp specialization, custom pipelines, explicit SMEM/TMEM management)
 
 Examples:
 - Delegate to **kernel-cute-specialist**: "Generate CuTe DSL kernel for the SiLU-mul element-wise op"
 - Delegate to **kernel-cute-specialist**: "Generate CuTe DSL kernel for the GEMM operation"
+- Delegate to **kernel-cute-specialist**: "Lower the attention operator to a warp-specialized CuTe kernel"
 
 ### Triton Specialist (Triton / PTX Backend)
 

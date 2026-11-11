@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
-from os import environ, getenv
-from typing import Any, Dict, List, NamedTuple, Optional
+from os import getenv
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional
+
+if TYPE_CHECKING:
+    import torch
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -27,42 +30,13 @@ CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheT
 BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
 
 _DISAGG_INFLIGHT_CANCEL_ENABLED_ENV = "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL"
+_KV_LIFECYCLE_ENFORCEMENT_ENV = "TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT"
 _NIXL_KVCACHE_BACKEND_ENV = "TRTLLM_NIXL_KVCACHE_BACKEND"
 _DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV = "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"
 _DISAGG_LAYERWISE_ENV = "TRTLLM_DISAGG_LAYERWISE"
 _TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV = "TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER"
-_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV = "TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"
 _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND = "UCX"
 _disagg_inflight_cancel_enabled_cache: Optional[bool] = None
-
-
-def maybe_enable_fabric_memory_for_python_transceiver(
-        cache_transceiver_config: Optional[CacheTransceiverConfig],
-        kv_cache_manager_cls: type) -> None:
-    """Default the C++ V1 KV pool to fabric memory for the Python transceiver.
-
-    This must run before any KV pool allocation because the C++ environment
-    getter caches the value on first read. Explicit user settings are always
-    respected.
-
-    Args:
-        cache_transceiver_config: Configuration used to select the cache
-            transceiver runtime and backend.
-        kv_cache_manager_cls: KV-cache manager class to check for C++ V1 pool
-            allocation.
-    """
-    if (cache_transceiver_config is None
-            or cache_transceiver_config.backend is None
-            or cache_transceiver_config.transceiver_runtime != "PYTHON"):
-        return
-    if not issubclass(kv_cache_manager_cls, KVCacheManager):
-        return
-    if getenv(_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV) is None:
-        environ[_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV] = "1"
-        logger.info(
-            "Python cache transceiver with C++ KV cache manager detected; "
-            f"defaulting {_KVCACHE_POOL_USE_FABRIC_MEMORY_ENV}=1 (set it "
-            "to 0 explicitly to disable)")
 
 
 def is_disagg_inflight_cancel_enabled() -> bool:
@@ -145,12 +119,25 @@ def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 def create_kv_cache_transceiver(
     mapping: Mapping,
     dist: Distributed,
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager: KVCacheManager | KVCacheManagerV2,
     attention_type: AttentionTypeCpp,
     cache_transceiver_config: CacheTransceiverConfig,
     mamba_cache_manager: Optional[BaseMambaCacheManager] = None
 ) -> Optional["KvCacheTransceiver"]:
     resolve_cache_transceiver_config(cache_transceiver_config)
+    lifecycle_policy = getenv(_KV_LIFECYCLE_ENFORCEMENT_ENV)
+    bypasses_python = (cache_transceiver_config is None
+                       or cache_transceiver_config.backend is None or
+                       cache_transceiver_config.transceiver_runtime != "PYTHON")
+    # Python ranks report policy errors through their startup collective.
+    if bypasses_python:
+        if lifecycle_policy not in (None, "0", "1"):
+            raise ValueError(f"{_KV_LIFECYCLE_ENFORCEMENT_ENV} must be 0 or 1")
+        if lifecycle_policy == "1":
+            raise ValueError(
+                f"{_KV_LIFECYCLE_ENFORCEMENT_ENV}=1 requires an enabled Python/NIXL "
+                "transceiver; disabled and C++ transceivers do not support this policy"
+            )
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
@@ -220,10 +207,23 @@ def create_kv_cache_transceiver(
                 "Please use transceiver_runtime='CPP' with "
                 "kv_cache_config.use_kv_cache_manager_v2=False for MPI, UCX, "
                 "or MOONCAKE backends, with a model that supports V1.")
+        if (not isinstance(kv_cache_manager, KVCacheManagerV2) or
+            (mamba_cache_manager is not None and
+             not isinstance(mamba_cache_manager, MambaHybridCacheManagerV2))):
+            raise ValueError(
+                "KvCacheTransceiverV2 does not support KV cache manager V1. "
+                f"Selected managers: KV={type(kv_cache_manager).__name__}, "
+                f"Mamba={type(mamba_cache_manager).__name__}. "
+                "Use a compatible KVCacheManagerV2 configuration for "
+                "transceiver_runtime='PYTHON'; enabling "
+                "use_kv_cache_manager_v2=True does not override incompatible "
+                "model features. To use V1, select transceiver_runtime='CPP' "
+                "with use_kv_cache_manager_v2=False for a model that supports V1."
+            )
         from tensorrt_llm._torch.disaggregation.transceiver import \
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
-        # MixedMambaHybridCacheManager contains both the KV and Mamba pools.
+        # MambaHybridCacheManagerV2 contains both the KV and Mamba pools.
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
                                     cache_transceiver_config)
 
@@ -432,8 +432,43 @@ class KvCacheTransceiver(ABC):
         """
         raise NotImplementedError
 
+    def cancel_gen_logically(
+            self,
+            req: LlmRequest,
+            ready: Optional["torch.cuda.Event"] = None) -> bool:
+        """Accept logical GEN cancellation without authorizing memory release.
+
+        Args:
+            req: Model-idle generation request to cancel.
+            ready: Unpublished destination's outstanding admission fence, if any.
+
+        Returns:
+            Whether cancellation was accepted under a qualified retirement policy.
+            The caller must still use cancel_request to establish safe retirement.
+            Under that policy, the transceiver retains a passed ready fence until
+            cancel_request returns True, even if an earlier failure makes this
+            method return False. Unsupported implementations return False without
+            taking ownership of ready.
+        """
+        return False
+
     def supports_inflight_request_cancellation(self) -> bool:
         """Return True when in-flight transfers can be cancelled safely."""
+        return False
+
+    def supports_idle_request_cancellation(self,
+                                           req: Optional[LlmRequest] = None
+                                           ) -> bool:
+        """Whether cancellation may progress before a model batch.
+
+        Args:
+            req: An executor-selected model-idle request, or None to query
+                support for removing queued, not-yet-activated requests.
+
+        Returns:
+            Eligibility only, not retirement proof. For activated requests,
+            cancel_request must still confirm that resources can be released.
+        """
         return False
 
     def has_poisoned_transfer_buffer(self) -> bool:
@@ -461,6 +496,9 @@ class KvCacheTransceiver(ABC):
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
 
+    def set_gen_deferred_receives(self, count: int) -> None:
+        """Report how many admitted receives the caller has not started yet. No-op by default."""
+
     def get_data_transceiver_state(self) -> bytes:
         """Get the serialized DataTransceiverState (CacheState + CommState)."""
         return b""
@@ -482,6 +520,18 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                  attention_type: AttentionTypeCpp,
                  cache_transceiver_config: CacheTransceiverConfig,
                  mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+        logger.warning_once(
+            "The C++ cache transceiver "
+            "(cache_transceiver_config.transceiver_runtime='CPP' or None) is "
+            "deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed "
+            "after the 3-month migration period; it keeps working until then. "
+            "Use the Python transceiver (transceiver_runtime='PYTHON', the "
+            "default) with backend='NIXL' and KV cache manager V2. "
+            "Experimental in-flight cancellation "
+            "(TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1) still requires a "
+            "supported C++ configuration until Python support is available. See "
+            "https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy",
+            key="deprecated_cpp_cache_transceiver")
         _validate_disagg_inflight_cancel_config(cache_transceiver_config)
         world_config = mapping_to_world_config(mapping)
         # Filter out mamba/recurrent state layers (kv_heads == 0) so that
@@ -541,11 +591,11 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                     f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
                 )
 
-        if (cache_transceiver_config.kv_cache_bounce_size_mb > 0
-                or cache_transceiver_config.agent_bounce_buffer_enable):
+        if cache_transceiver_config.kv_cache_bounce_size_mb > 0:
             logger.warning(
-                "bounce is only supported by the Python (v2) transceiver; "
-                "ignored on the C++ transceiver path")
+                "kv_cache_bounce_size_mb (the transfer-agent bounce buffer) is only supported by "
+                "the Python (v2) transceiver; ignored on the C++ transceiver path"
+            )
 
         self.impl = CacheTransceiverCpp(
             kv_cache_manager.impl, total_num_kv_heads_per_layer, head_dim,

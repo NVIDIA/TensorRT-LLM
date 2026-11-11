@@ -23,6 +23,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32
 from cutlass.experimental.task_scheduling.enums import WorkAttr
+from cutlass.experimental.task_scheduling.memory import SmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
     StageInfo,
     TaskLocalVariable,
@@ -40,16 +41,18 @@ from ...helpers.layout import (
     decode_gen_task_cache,
     num_packed_p_regs,
     num_softmax_scale_groups,
+    smem_array,
 )
 from ...helpers.math import (
     fadd2,
+    ffma2,
     fmul2,
     neg_max_f32,
     pack_float2_to_bf16,
 )
 from ...helpers.ops import (
     float_to_u32_bits,
-    fp8_log2_quant_scale,
+    fp8_log2_p_scale,
     pack_float4_to_fp8_e4m3,
     softmax_sum_state_ptr,
     tcgen05_second_panel_addr,
@@ -71,7 +74,7 @@ from .common import (
 class TmemPResource(MlaResource):
     """TMEM probability tile exchanged from softmax to PV MMA.
 
-    The keeps-MMA-AB schedule uses one P pipe: softmax writes BF16 P directly
+    The keeps-MMA-AB schedule uses one P pipe: softmax writes native BF16/FP8 P directly
     into the score TMEM stage, and MmaTask consumes that TMEM stage with
     ``tcgen05.mma`` A-from-TMEM.
     """
@@ -85,6 +88,21 @@ class TmemPResource(MlaResource):
     p_stage_idx: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+
+    # Two ping-pong M64 x N128 E4M3 probability tiles in SMEM. WS PV reads
+    # this packed A operand rather than the usual A-from-TMEM score alias;
+    # P's pipeline protects each slot while softmax fills the next one.
+    _ws_p_alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
+
+    def get_smem_requirements(self):
+        """Reserve two FP8 probability panels when WS PV reads P from shared memory."""
+        if not self.cfg.ws_pv:
+            return []
+        if self._ws_p_alloc is None:
+            self._ws_p_alloc = SmemAllocation(
+                name=f"{self.name}_ws_p", size_bytes=2 * 64 * 128, alignment=1024
+            )
+        return [self._ws_p_alloc]
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=p_stage_idx)
     @cute.jit
@@ -147,6 +165,9 @@ class TmemPResource(MlaResource):
             neg_scaled_max[idx] = -self.scale_softmax_log2 * safe_new_max
             local_sums[idx] = Float32(0.0)
 
+        sums = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
+        for i in cutlass.range_constexpr(4):
+            sums[i] = Float32(0)
         packed_p_reg_count = num_packed_p_regs(cfg)
         regs_p = cutlass.Array(
             Int32, packed_p_reg_count, space=cutlass.AddressSpace.rmem
@@ -156,8 +177,8 @@ class TmemPResource(MlaResource):
         ):
             log2_scale_pair = (self.scale_softmax_log2, self.scale_softmax_log2)
             neg_scaled_pair = (
-                neg_scaled_max[0] + fp8_log2_quant_scale(),
-                neg_scaled_max[0] + fp8_log2_quant_scale(),
+                neg_scaled_max[0] + fp8_log2_p_scale(cfg),
+                neg_scaled_max[0] + fp8_log2_p_scale(cfg),
             )
             has_finite_max = new_max_arr[0] != neg_max_f32()
             for packed_idx in cutlass.range_constexpr(packed_p_reg_count):
@@ -167,34 +188,44 @@ class TmemPResource(MlaResource):
                 p2 = Float32(0.0)
                 p3 = Float32(0.0)
                 if has_finite_max:
-                    scaled01 = fadd2(
-                        fmul2(
-                            (
-                                s_arr[s_base + 0],
-                                s_arr[s_base + 1],
-                            ),
+                    if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                        scaled01 = ffma2(
+                            (s_arr[s_base + 0], s_arr[s_base + 1]),
                             log2_scale_pair,
-                        ),
-                        neg_scaled_pair,
-                    )
-                    scaled23 = fadd2(
-                        fmul2(
-                            (
-                                s_arr[s_base + 2],
-                                s_arr[s_base + 3],
+                            neg_scaled_pair,
+                        )
+                    else:
+                        scaled01 = fadd2(
+                            fmul2(
+                                (s_arr[s_base + 0], s_arr[s_base + 1]), log2_scale_pair
                             ),
+                            neg_scaled_pair,
+                        )
+                    if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                        scaled23 = ffma2(
+                            (s_arr[s_base + 2], s_arr[s_base + 3]),
                             log2_scale_pair,
-                        ),
-                        neg_scaled_pair,
-                    )
+                            neg_scaled_pair,
+                        )
+                    else:
+                        scaled23 = fadd2(
+                            fmul2(
+                                (s_arr[s_base + 2], s_arr[s_base + 3]), log2_scale_pair
+                            ),
+                            neg_scaled_pair,
+                        )
                     p0 = cute.math.exp2(scaled01[0], fastmath=True)
                     p1 = cute.math.exp2(scaled01[1], fastmath=True)
                     p2 = cute.math.exp2(scaled23[0], fastmath=True)
                     p3 = cute.math.exp2(scaled23[1], fastmath=True)
-                local_sums[0] += p0
-                local_sums[0] += p1
-                local_sums[0] += p2
-                local_sums[0] += p3
+                if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                    sums[0], sums[1] = fadd2((sums[0], sums[1]), (p0, p1))
+                    sums[2], sums[3] = fadd2((sums[2], sums[3]), (p2, p3))
+                else:
+                    local_sums[0] += p0
+                    local_sums[0] += p1
+                    local_sums[0] += p2
+                    local_sums[0] += p3
                 regs_p[packed_idx] = pack_float4_to_fp8_e4m3(p0, p1, p2, p3)
         elif cutlass.const_expr(cfg.is_fp8_qkv()):
             for packed_idx in cutlass.range_constexpr(packed_p_reg_count):
@@ -211,7 +242,7 @@ class TmemPResource(MlaResource):
                         p_val = cute.math.exp2(
                             s_arr[s_idx] * self.scale_softmax_log2
                             + neg_scaled_max[scale_idx]
-                            + fp8_log2_quant_scale(),
+                            + fp8_log2_p_scale(cfg),
                             fastmath=True,
                         )
                     p_vals[elem_idx] = p_val
@@ -228,16 +259,31 @@ class TmemPResource(MlaResource):
                 if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
                     new_max = new_max_arr[0]
                     if new_max != neg_max_f32():
-                        p0 = cute.math.exp2(
-                            s_arr[s0] * self.scale_softmax_log2 + neg_scaled_max[0],
-                            fastmath=True,
+                        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                            scaled = ffma2(
+                                (s_arr[s0], s_arr[s1]),
+                                (self.scale_softmax_log2, self.scale_softmax_log2),
+                                (neg_scaled_max[0], neg_scaled_max[0]),
+                            )
+                            p0 = cute.math.exp2(scaled[0], fastmath=True)
+                            p1 = cute.math.exp2(scaled[1], fastmath=True)
+                        else:
+                            p0 = cute.math.exp2(
+                                s_arr[s0] * self.scale_softmax_log2 + neg_scaled_max[0],
+                                fastmath=True,
+                            )
+                            p1 = cute.math.exp2(
+                                s_arr[s1] * self.scale_softmax_log2 + neg_scaled_max[0],
+                                fastmath=True,
+                            )
+                    if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                        offset = (pair_idx % 2) * 2
+                        sums[offset], sums[offset + 1] = fadd2(
+                            (sums[offset], sums[offset + 1]), (p0, p1)
                         )
-                        p1 = cute.math.exp2(
-                            s_arr[s1] * self.scale_softmax_log2 + neg_scaled_max[0],
-                            fastmath=True,
-                        )
-                    local_sums[0] += p0
-                    local_sums[0] += p1
+                    else:
+                        local_sums[0] += p0
+                        local_sums[0] += p1
                 else:
                     scale0 = ((pair_idx % (2 * max(cfg.tile_size_q // 8, 1))) // 2) * 2
                     scale1 = scale0 + 1
@@ -259,11 +305,18 @@ class TmemPResource(MlaResource):
                     local_sums[scale1] += p1
                 regs_p[pair_idx] = pack_float2_to_bf16(p0, p1)
 
+        if cutlass.const_expr(
+            cfg.kernel_variant == "keeps_mma_ab" and cfg.num_tokens_per_page == 1
+        ):
+            local_sums[0] = (sums[0] + sums[1]) + (sums[2] + sums[3])
+
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             self.tmem_alias_ref._p_local_sum_arr[scale_idx] = local_sums[scale_idx]
             local_sum_arr[scale_idx] = local_sums[scale_idx]
 
-        if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
+        if cutlass.const_expr(
+            cfg.kernel_variant == "keeps_mma_ab" and cfg.num_tokens_per_page != 1
+        ):
             state_idx = cute.arch.thread_idx()[0]
             state_ptr = self.tmem_alias_ref._softmax_scratch.data_ptr(state_idx)
             old_max = u32_bits_to_float(state_ptr.load(is_volatile=True, alignment=4))
@@ -287,6 +340,32 @@ class TmemPResource(MlaResource):
                 alignment=4,
             )
 
+        if cutlass.const_expr(cfg.ws_pv):
+            # Materialize P in K-major SMEM for WS MMA A. Native WS QK uses
+            # Layout E; the non-WS M64 path uses Layout F and remaps its rows.
+            # These are PTX data-path layouts, not global-cache layouts:
+            # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-data-path-layout-e
+            # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-data-path-layout-f
+            dst = smem_array(stage_info.context, self._ws_p_alloc, Int32, 4096)
+            tid = cute.arch.thread_idx()[0]
+            row = (tid // 32) * 16 + tid % 16
+            col = (tid % 32 // 16) * 16
+            if cutlass.const_expr(cfg.ws_native_e):
+                row = tid % Int32(64)
+                col = (tid // Int32(64)) * Int32(16)
+            for part in cutlass.range_constexpr(4):
+                offset = (
+                    stage_info.stage_idx * 2048
+                    + row * 32
+                    + ((col + part * 4) ^ ((row % 8) * 4))
+                )
+                dst.data_ptr(offset).store(regs_p.load(part * 4, 4), alignment=16)
+            cute.arch.fence_view_async_shared()
+            prims.barrier_cta_sync(barrier_id=0, thread_count=128)
+            if cutlass.const_expr(cfg.ws_native_e):
+                # PV consumes shared A; no redundant F-layout TMEM P copies.
+                return
+
         p_base = self._p_base_addr(stage_info, task_cache)
         if cutlass.const_expr(cfg.is_fp8_qkv()):
             tcgen05_store_p_fp8_16x32bx2_x16(p_base, regs_p)
@@ -295,15 +374,31 @@ class TmemPResource(MlaResource):
                     tcgen05_second_panel_addr(p_base), regs_p
                 )
         else:
-            tcgen05_store_p_16x32bx2_x16(p_base, regs_p, 0)
-            tcgen05_store_p_16x32bx2_x16(p_base + Int32(16), regs_p, 16)
-            if cutlass.const_expr(cfg.head_dim_per_cta_v > 256):
-                tcgen05_store_p_16x32bx2_x16(
-                    tcgen05_second_panel_addr(p_base), regs_p, 0
-                )
-                tcgen05_store_p_16x32bx2_x16(
-                    tcgen05_second_panel_addr(p_base) + Int32(16), regs_p, 16
-                )
+            if cutlass.const_expr(cfg.tile_size_kv == 128):
+                tcgen05_store_p_16x32bx2_x16(p_base, regs_p, 0)
+                tcgen05_store_p_16x32bx2_x16(p_base + Int32(16), regs_p, 16)
+                if cutlass.const_expr(cfg.head_dim_per_cta_v > 256):
+                    tcgen05_store_p_16x32bx2_x16(
+                        tcgen05_second_panel_addr(p_base), regs_p, 0
+                    )
+                    tcgen05_store_p_16x32bx2_x16(
+                        tcgen05_second_panel_addr(p_base) + Int32(16), regs_p, 16
+                    )
+            else:
+                for part in cutlass.range_constexpr(packed_p_reg_count // 16):
+                    tcgen05_store_p_16x32bx2_x16(
+                        p_base + Int32(part * 16),
+                        regs_p,
+                        part * 16,
+                        stride=cfg.tile_size_kv // 4,
+                    )
+                    if cutlass.const_expr(cfg.head_dim_per_cta_v > 256):
+                        tcgen05_store_p_16x32bx2_x16(
+                            tcgen05_second_panel_addr(p_base) + Int32(part * 16),
+                            regs_p,
+                            part * 16,
+                            stride=cfg.tile_size_kv // 4,
+                        )
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
         cute.arch.fence_view_async_tmem_store()
 

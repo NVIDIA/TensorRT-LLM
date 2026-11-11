@@ -6,5 +6,6 @@ trtllm-serve
    :maxdepth: 1
 
    trtllm-serve
+   render-endpoints
    run-benchmark-with-trtllm-serve
    audio-transcriptions

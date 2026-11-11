@@ -732,32 +732,6 @@ std::unordered_map<uint64_t, std::unordered_set<uint64_t>> const& PeftCacheManag
     return mTaskIdToPausedReqIds;
 }
 
-void NoOpPeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bool tryGpuCache) {}
-
-PeftCacheManager::PeftTable NoOpPeftCacheManager::ensureBatch(
-    RequestVector const& contextRequests, RequestVector const& generationRequests, bool resetGpuCache)
-{
-    return PeftTable{};
-}
-
-void NoOpPeftCacheManager::resetDeviceCache() {}
-
-void NoOpPeftCacheManager::markRequestDone(LlmRequest const& llmReq, bool pause) {}
-
-SizeType32 NoOpPeftCacheManager::getMaxDevicePages() const
-{
-    return std::numeric_limits<SizeType32>::max();
-}
-
-SizeType32 NoOpPeftCacheManager::getMaxHostPages() const
-{
-    return std::numeric_limits<SizeType32>::max();
-}
-
-SizeType32 NoOpPeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> llmReqeust) const
-{
-    return 0;
-}
 } // namespace tensorrt_llm::batch_manager
 
 // TODO: merge C++ LoRA caching status with Py Slot manager

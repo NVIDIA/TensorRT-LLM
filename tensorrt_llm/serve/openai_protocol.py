@@ -43,7 +43,7 @@ from openai.types.responses import (
     ResponseReasoningTextDoneEvent, ResponseStatus, ResponseTextConfig,
     ResponseWebSearchCallCompletedEvent, ResponseWebSearchCallInProgressEvent,
     ResponseWebSearchCallSearchingEvent)
-from openai.types.responses.response import ToolChoice
+from openai.types.responses.response import IncompleteDetails, ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
@@ -54,6 +54,8 @@ from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
+from tensorrt_llm.kv_hints import KvHintsEnvelope
+from tensorrt_llm.kv_hints.protocol import admit_kv_hints
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
@@ -150,6 +152,20 @@ def _logit_bias_to_embedding_bias(
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("kv_hints", mode="before", check_fields=False)
+    @classmethod
+    def admit_hint_envelope(cls, value: Any) -> Optional[KvHintsEnvelope]:
+        """Apply optional-hint admission before nested schema validation.
+
+        Args:
+            value: The decoded hint field from a trusted ingress.
+
+        Returns:
+            Supported metadata or None for ignored hints, including malformed
+            envelopes. Validation of other request fields remains unchanged.
+        """
+        return admit_kv_hints(value)
 
 
 class SpeculativeDecodingStats(OpenAIBaseModel):
@@ -328,6 +344,8 @@ class DisaggregatedParams(OpenAIBaseModel):
     # worker read off the prompt it rendered. The generation worker only sees
     # prompt_token_ids, so it cannot resolve this for itself.
     resolved_thinking: Optional[bool] = None
+    # Orchestrator -> generation worker: seconds since arrival at the orchestrator.
+    orig_elapsed_s: Optional[float] = None
 
     @model_validator(mode="after")
     def validate_multimodal_spans(self) -> "DisaggregatedParams":
@@ -637,6 +655,12 @@ def _record_sampling_params_request_fields(
 
 
 class CompletionRequest(OpenAIBaseModel):
+    kv_hints: Optional[KvHintsEnvelope] = Field(
+        default=None,
+        repr=False,
+        description=
+        "Prototype KV hint metadata; transported without executing actions.",
+    )
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str
@@ -682,6 +706,13 @@ class CompletionRequest(OpenAIBaseModel):
     return_context_logits: bool = False
     detokenize: bool = True
     thinking_token_budget: Optional[int] = None
+    watermarking: Optional[bool] = Field(
+        default=None,
+        description=
+        ("Whether to watermark the generated text. Takes effect only when the "
+         "server is configured with `watermark_config`. None or true requests a "
+         "watermark; false opts out when the server allows it."),
+    )
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -724,7 +755,6 @@ class CompletionRequest(OpenAIBaseModel):
                            gather_generation_logits: bool = False,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_logprobs = None
-        return_log_probs = False
         if self.logprobs:
             if backend == "pytorch" or gather_generation_logits:
                 sampling_logprobs = self.logprobs
@@ -732,8 +762,6 @@ class CompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
                 )
-            else:
-                return_log_probs = True
 
         sampling_params = SamplingParams(
             best_of=self.best_of,
@@ -769,6 +797,7 @@ class CompletionRequest(OpenAIBaseModel):
                 self.response_format),
             detokenize=self.detokenize,
             thinking_token_budget=self.thinking_token_budget,
+            watermarking=self.watermarking,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -777,8 +806,6 @@ class CompletionRequest(OpenAIBaseModel):
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if return_log_probs:
-            sampling_params._return_log_probs = True
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
@@ -1046,6 +1073,21 @@ class ChatCompletionToolsParam(OpenAIBaseModel):
     function: FunctionDefinition
 
 
+class NamespacedFunctionToolParam(ChatCompletionToolsParam):
+    """A tool that a Responses request declared inside a namespace.
+
+    ``function`` is what a chat template without namespaces is given: the
+    tool as a function named ``<namespace>.<name>``. That is all a dump
+    carries. The declaration itself is kept beside it, out of every dump, for
+    a model whose renderer reads namespaces (``ServingExtension.serialize_tool``).
+    """
+
+    namespace: str = Field(exclude=True)
+    namespace_description: Optional[str] = Field(default=None, exclude=True)
+    declared_name: str = Field(exclude=True)
+    declared_description: Optional[str] = Field(default=None, exclude=True)
+
+
 class ChatCompletionNamedFunction(OpenAIBaseModel):
     name: str
 
@@ -1069,6 +1111,12 @@ class ChatCompletionThinkingParam(OpenAIBaseModel):
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
+    kv_hints: Optional[KvHintsEnvelope] = Field(
+        default=None,
+        repr=False,
+        description=
+        "Prototype KV hint metadata; transported without executing actions.",
+    )
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -1089,7 +1137,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = Field(None)
+    service_tier: Optional[Literal["auto", "default", "flex", "scale",
+                                   "priority", "fast"]] = Field(
+                                       default=None,
+                                       description=(
+                                           "Accepted for OpenAI compatibility "
+                                           "and ignored: the server has no "
+                                           "service tiers. Scheduling priority "
+                                           "is the separate `priority` field."))
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
+    # Standard OpenAI field, accepted for compatibility and otherwise ignored:
+    # the server keeps no copy of a chat completion, so there is nothing to
+    # store or to leave unstored.
+    store: Optional[bool] = None
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = None
@@ -1116,7 +1176,21 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # template understands it (e.g. kimi_k3); other models ignore it.
     thinking: Optional[ChatCompletionThinkingParam] = None
     thinking_token_budget: Optional[int] = None
+    watermarking: Optional[bool] = Field(
+        default=None,
+        description=
+        ("Whether to watermark the generated text. Takes effect only when the "
+         "server is configured with `watermark_config`. None or true requests a "
+         "watermark; false opts out when the server allows it."),
+    )
     prompt_ignore_length: Optional[int] = 0
+    # Match Codex CLI's string-map contract; widen only for a client that needs
+    # other value types, even though the metadata is otherwise ignored.
+    client_metadata: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=("Not an OpenAI field: opaque per-request metadata that "
+                     "agent clients attach, a map of strings to strings. "
+                     "Accepted and ignored."))
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
@@ -1253,7 +1327,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                            reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_logprobs = None
-        return_log_probs = False
         if self.logprobs:
             logprobs = 1 if not self.top_logprobs else self.top_logprobs
             if backend == "pytorch" or gather_generation_logits:
@@ -1262,8 +1335,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "`gather_generation_logits` must be `True` to use `top_logprobs`"
                 )
-            else:
-                return_log_probs = True
 
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
@@ -1299,6 +1370,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 reasoning_parser=reasoning_parser,
                 chat_template_kwargs=self.chat_template_kwargs),
             thinking_token_budget=self.thinking_token_budget,
+            watermarking=self.watermarking,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -1307,8 +1379,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if return_log_probs:
-            sampling_params._return_log_probs = True
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
@@ -1505,6 +1575,12 @@ def _materialize_validator_iterators(value, _depth=0):
 
 
 class ResponsesRequest(OpenAIBaseModel):
+    kv_hints: Optional[KvHintsEnvelope] = Field(
+        default=None,
+        repr=False,
+        description=
+        "Prototype KV hint metadata; transported without executing actions.",
+    )
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
     #
@@ -1640,6 +1716,59 @@ class ResponsesRequest(OpenAIBaseModel):
             "through out the inference process and return in response."),
     )
 
+    # doc: begin-responses-extra-params
+    # TensorRT-LLM extensions carrying the disaggregated-serving handoff between
+    # the orchestrator and the workers; clients do not set them.
+    disaggregated_params: Optional[DisaggregatedParams] = Field(
+        default=None,
+        description=("Parameters for disaggregated serving"),
+    )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
+    )
+    # The context worker's tokenized prompt, so the generation worker does not
+    # render it again; the _b64 form is a base64 int32 buffer.
+    prompt_token_ids: Optional[List[int]] = None
+    prompt_token_ids_b64: Optional[str] = None
+
+    # doc: end-responses-extra-params
+
+    @field_validator("prompt_token_ids_b64")
+    @classmethod
+    def _check_prompt_token_ids_b64(cls, value: Optional[str]) -> Optional[str]:
+        # Decoded during routing and preprocessing, after validation; a bad
+        # value must be a 400 here rather than an internal error there.
+        if not value:
+            return value
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except ValueError as error:
+            raise ValueError(
+                "prompt_token_ids_b64 is not valid base64") from error
+        if len(raw) % 4:
+            raise ValueError(
+                "prompt_token_ids_b64 is not a buffer of int32 token ids")
+        return value
+
+    def relayed_prompt_token_ids(self) -> Optional[List[int]]:
+        """The prompt the orchestrator relayed from the context worker, if any.
+
+        Only a generation-only handoff carries one. On any other request the
+        fields are ignored, so the prompt is rendered from the request and the
+        response echoes what was actually prefilled.
+        """
+        params = self.disaggregated_params
+        if params is None or params.request_type != "generation_only":
+            return None
+        if self.prompt_token_ids is not None:
+            return self.prompt_token_ids
+        if not self.prompt_token_ids_b64:
+            return None
+        import numpy as np
+        return np.frombuffer(base64.b64decode(self.prompt_token_ids_b64),
+                             dtype=np.int32).tolist()
+
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
         "top_p": 1.0,
@@ -1694,6 +1823,38 @@ class ResponsesRequest(OpenAIBaseModel):
         if not isinstance(data, dict):
             return data
         return {k: v for k, v in data.items() if v is not None}
+
+    @model_validator(mode="before")
+    @classmethod
+    def hoist_additional_tools(cls, data: Any) -> Any:
+        """Move the tools of an ``additional_tools`` input item into ``tools``.
+
+        Codex declares its tools that way; hoisted here, they are validated as
+        tools and resolve when the reply's calls are parsed. Malformed shapes
+        are left in place for validation to reject.
+        """
+        if not isinstance(data, dict):
+            return data
+        items = data.get("input")
+        tools = data.get("tools")
+        if not isinstance(items, list) or not isinstance(
+                tools, (list, type(None))):
+            return data
+        hoisted = []
+        kept = []
+        for item in items:
+            if (isinstance(item, dict)
+                    and item.get("type") == "additional_tools"
+                    and isinstance(item.get("tools"), list)):
+                hoisted.extend(item["tools"])
+            else:
+                kept.append(item)
+        if not hoisted:
+            return data
+        data = dict(data)
+        data["input"] = kept
+        data["tools"] = list(data.get("tools") or []) + hoisted
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -1759,12 +1920,19 @@ StreamingResponsesResponse: TypeAlias = Union[
     ResponseCodeInterpreterCallCompletedEvent,
 ]
 
+_RESPONSES_HANDOFF_FIELDS = (
+    "disaggregated_params",
+    "prompt_token_ids",
+    "prompt_token_ids_b64",
+    "finish_reason",
+)
+
 
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
     # error: Optional[ResponseError] = None
-    # incomplete_details: Optional[IncompleteDetails] = None
+    incomplete_details: Optional[IncompleteDetails] = None
     instructions: Optional[str] = None
     metadata: Optional[Metadata] = None
     model: str
@@ -1788,6 +1956,26 @@ class ResponsesResponse(OpenAIBaseModel):
     truncation: Literal["auto", "disabled"]
     usage: Optional[ResponseUsage] = None
     user: Optional[str] = None
+
+    # TensorRT-LLM extensions, set only on a context-only response: the
+    # disaggregated handoff, and the engine's raw finish reason, which tells the
+    # orchestrator whether a generation phase is pending ("length" and
+    # "not_finished" both map to status "incomplete").
+    disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+    prompt_token_ids: Optional[List[int]] = None
+    prompt_token_ids_b64: Optional[str] = None
+    finish_reason: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_handoff(self, handler: Any) -> Any:
+        # The handoff fields are unset on every response a client sees, so they
+        # are left out rather than serialized as null in each body and event.
+        data = handler(self)
+        if isinstance(data, dict):
+            for key in _RESPONSES_HANDOFF_FIELDS:
+                if data.get(key, ...) is None:
+                    data.pop(key)
+        return data
 
     @classmethod
     def from_request(
@@ -2025,6 +2213,7 @@ def to_llm_disaggregated_params(
         remote_tail_start=disaggregated_params.remote_tail_start,
         multimodal_positions=disaggregated_params.multimodal_positions,
         multimodal_lengths=disaggregated_params.multimodal_lengths,
+        orig_elapsed_s=disaggregated_params.orig_elapsed_s,
     )
 
 
@@ -2261,34 +2450,37 @@ class VideoGenerationRequest(OpenAIBaseModel):
     seed: Optional[int] = Field(default=None,
                                 ge=0,
                                 description="Random seed for reproducibility.")
-    image_reference: Optional[Union[
-        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+    image_reference: Optional[Union[UploadFile, MediaReferenceItem, List[Union[
+        UploadFile, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Image reference(s) conditioning generation (e.g. image-to-video "
              "first frame). Send a ``{content, format, role}`` object or a list "
              "of them, where ``format`` is ``path`` / ``url`` / ``base64``; or "
-             "upload a single image file via multipart, whose form is implied. "
+             "upload image files via repeated multipart fields, whose format "
+             "is implied. "
              "PNG or JPEG only — HEIF/AVIF are not supported."),
         )
-    video_reference: Optional[Union[
-        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+    video_reference: Optional[Union[UploadFile, MediaReferenceItem, List[Union[
+        UploadFile, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Video reference(s) conditioning generation (video-to-video). Send "
              "a ``{content, format}`` object or a list of them, where ``format`` "
-             "is ``path`` / ``url`` / ``base64``; or upload a single video file "
-             "via multipart, whose form is implied. MP4 or AVI, with H.264 the "
+             "is ``path`` / ``url`` / ``base64``; or upload video files "
+             "via repeated multipart fields, whose format is implied. MP4 or AVI, "
+             "with H.264 the "
              "tested codec and others best-effort."),
         )
-    audio_reference: Optional[Union[
-        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+    audio_reference: Optional[Union[UploadFile, MediaReferenceItem, List[Union[
+        UploadFile, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Audio reference(s) conditioning generation. Send a "
              "``{content, format}`` object or a list of them, where ``format`` "
-             "is ``path`` / ``url`` / ``base64``; or upload a single audio "
-             "file via multipart, whose form is implied. Accepted only by "
+             "is ``path`` / ``url`` / ``base64``; or upload audio "
+             "files via repeated multipart fields, whose format is implied. "
+             "Accepted only by "
              "models that declare an audio reference slot."),
         )
     input_reference: Optional[Union[str, UploadFile]] = Field(

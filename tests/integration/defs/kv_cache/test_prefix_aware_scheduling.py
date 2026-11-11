@@ -711,14 +711,12 @@ def _run_lmbenchmark(
     stdout_thread.start()
     stderr_thread.start()
 
-    # Grace window above the scripted duration. LMBenchmark keeps requests
-    # in flight after `--time` expires, and at higher QPS the backlog the
-    # server still has to drain scales roughly linearly with offered load.
-    # Observed worst-case drain on H100 PCIe + Qwen3-0.6B (5 scheduler
-    # variants, 3 stages each): drain ≈ 1.7·qps + 1 s. The coefficient below
-    # gives ≥2.8× margin over the observed worst case at every tested qps
-    # while still catching genuine stalls within a few minutes.
-    grace_s = max(45, int(qps * 5))
+    # The submission window does not include draining all multi-round requests.
+    # Non-overlapping and offloaded execution can keep making progress beyond
+    # the drain time of the baseline scheduler. Allow a bounded backlog drain
+    # proportional to offered load; health and error checks remain independent
+    # of this overall deadline.
+    grace_s = max(90, int(qps * 10))
     deadline = time.time() + duration + grace_s
     last_health_ok = time.time()
     last_poll = time.time()
@@ -1030,7 +1028,15 @@ def ensure_lmbenchmark(llm_venv: PythonVenvRunnerImpl) -> PythonVenvRunnerImpl:
     """Install and resolve the pinned LMBenchmark script used by this module."""
     global LMBENCHMARK_SCRIPT
 
-    llm_venv.run_cmd(["-m", "pip", "install", _LMBENCHMARK_INSTALL_SPEC], timeout=600)
+    # Retry installs that fail early on transient network errors; the timeout
+    # already bounds a stalled install.
+    for attempt in range(3):
+        try:
+            llm_venv.run_cmd(["-m", "pip", "install", _LMBENCHMARK_INSTALL_SPEC], timeout=600)
+            break
+        except subprocess.CalledProcessError:
+            if attempt == 2:
+                raise
     LMBENCHMARK_SCRIPT = _resolve_lmbenchmark_install(llm_venv)
     return llm_venv
 
@@ -1169,8 +1175,8 @@ class TestServePrefixAwareScheduling:
           * the CSV contains no NaN ttft values
           * the server log is free of error patterns
 
-        NOTE: This test is intended for post-merge / nightly CI due to its
-        ~10 min runtime per config.
+        This is a correctness stress test; request latency is reported but is
+        not a pass/fail threshold.
         """
         config_path = _write_config(tmp_path, sched_cfg)
         server_log_base = str(tmp_path / "server.log")

@@ -11,12 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""OutOfScopeRule — claims paths that have no pre-merge CI impact.
+"""OutOfScopeRule — claims changes outside product-test selection.
 
-Emits scope="noop" with empty stages and sanity / perfsanity off, so when
-this is the only rule that fires, no test stage runs (Build still runs
-upstream of CBTS Layer 2). When other rules also fire, the "noop" scope
-gives way in `_combine_scopes` to the actionable scope.
+Emits scope="noop" with no product-test contribution and sanity / perfsanity
+off. CBTS infrastructure edits select CPU scripts tests. Noop changes add no
+CPU stages. Build and repository checks run upstream.
 
 `is_out_of_scope` is the single source of truth for these path patterns;
 `TestsDefRule` imports it to skip the same paths, so out-of-scope claims
@@ -25,18 +24,62 @@ are not overridden by a same-file narrow contribution.
 
 from __future__ import annotations
 
+import re
+from fnmatch import fnmatchcase
+from pathlib import Path
 from typing import Optional
 
 from cbts.blocks import Stage, YAMLIndex
 
+from ._helpers import reconstruct_diff_pre_image, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 
 # Exact files that affect repository metadata or external gates, but not the
 # pre-merge test stages CBTS selects. Do not widen this to `.github/`: workflow
 # changes can alter CI execution and must keep falling back.
-OUT_OF_SCOPE_EXACT_PATHS: tuple[str, ...] = (".github/CODEOWNERS",)
+OUT_OF_SCOPE_EXACT_PATHS: tuple[str, ...] = (
+    ".github/CODEOWNERS",
+    "LICENSE",
+    ".pre-commit-config.yaml",
+    "agent-flow/.pre-commit-config.yaml",
+    ".clang-format",
+    ".clang-tidy",
+    ".clangd",
+    ".cmake-format.json",
+    ".editorconfig",
+    ".cursorignore",
+    ".coderabbit.yaml",
+    ".nspect-allowlist.toml",
+    "scripts/bandit.yaml",
+    "jenkins/license_cpp.json",
+    "legacy-files.txt",
+    "ruff-legacy.toml",
+    "ruff-legacy-baseline.json",
+    "scripts/templates/precommit-legacy-files.j2",
+    "scripts/templates/pyproject-format-exclude.j2",
+    "scripts/templates/ruff-legacy.toml.j2",
+)
+
+# Git uses this exact basename at every repository depth.
+OUT_OF_SCOPE_FILENAMES: tuple[str, ...] = (".gitignore",)
+
+# These conventional filenames identify clang tooling throughout the C++ tree.
+# Match complete basenames so product files with a similar ending stay unclaimed.
+OUT_OF_SCOPE_DIRECTORY_FILENAMES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("cpp", (".clang-format", ".clang-tidy", ".clangd")),
+    ("cpp/**", (".clang-format", ".clang-tidy", ".clangd")),
+)
+
+_STATIC_CHECK_TABLES = frozenset(
+    {"tool.ruff", "tool.isort", "tool.yapf", "tool.codespell", "tool.autoflake", "tool.pyrefly"}
+)
+_TABLE_RE = re.compile(r"^\s*(\[\[?)([\w.-]+)(\]\]?)\s*(?:#.*)?$")
+
 
 # Path prefixes whose changes neither pre-merge nor post-merge L0 consumes.
+# - .github/ISSUE_TEMPLATE/           : issue intake forms and guidance.
+# - .codex/ and .claude/              : developer assistant configuration,
+#   instructions, and local tooling.
 # - tests/integration/test_lists/qa/   : QA test lists, run by separate
 #   nightly QA workflows.
 # - tests/integration/test_lists/dev/  : developer-side artifacts, not
@@ -51,11 +94,12 @@ OUT_OF_SCOPE_EXACT_PATHS: tuple[str, ...] = (".github/CODEOWNERS",)
 #   results.
 # - tests/microbenchmarks/             : benchmarking scripts, not run
 #   by any L0 stage.
-# - jenkins/scripts/cbts/              : CBTS itself — rules, main, and
-#   debug tools that run at decision time. Edits change narrowing logic
-#   for future PRs but cannot affect the outcome of any test stage in
-#   the current PR.
+# - jenkins/scripts/cbts/              : CBTS infrastructure, validated by
+#   the CPU scripts suite rather than product test stages.
 OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
+    ".github/ISSUE_TEMPLATE/",
+    ".codex/",
+    ".claude/",
     "tests/integration/test_lists/qa/",
     "tests/integration/test_lists/dev/",
     "tests/integration/defs/.test_durations",
@@ -65,8 +109,9 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
 )
 
 # Excluded on purpose:
-# - `.md` / `.rst`: DocsRule routes documentation changes to CPU-Build_Docs.
-# - `.txt`: requirements.txt / constraints.txt are runtime-relevant.
+# - General `.md` / `.rst` matches: outside the exempt subtrees, DocsRule
+#   routes documentation changes to CPU-Build_Docs.
+# - General `.txt` matches: requirements.txt / constraints.txt affect runtime dependencies.
 # - `.png` / `.jpg` / `.jpeg` / `.gif` / `.svg` / `.webp`: image files
 #   under `examples/visual_gen/` are real test fixtures (e.g.
 #   `cat_piano.png`, `woman_skyline_original_720p.jpeg` loaded by
@@ -75,31 +120,108 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
 #   baseline rather than being claimed as noop here.
 
 
+def _non_check_toml(source: str) -> list[str] | None:
+    """Preserve text outside static-check tables; reject ambiguous TOML syntax."""
+    if '"""' in source or "'''" in source:
+        return None
+    outside: list[str] = []
+    check_table = False
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("["):
+            match = _TABLE_RE.fullmatch(line)
+            if match is None or len(match.group(1)) != len(match.group(3)):
+                return None
+            section = match.group(2)
+            check_table = any(
+                section == root or section.startswith(root + ".") for root in _STATIC_CHECK_TABLES
+            )
+        if not check_table:
+            outside.append(line)
+    return outside
+
+
+def _check_tables_only_change(before: str, after: str) -> bool:
+    if not before.strip():
+        return False
+    old = _non_check_toml(before)
+    return old is not None and old == _non_check_toml(after)
+
+
 def is_out_of_scope(path: str) -> bool:
     if path in OUT_OF_SCOPE_EXACT_PATHS:
         return True
     if any(path.startswith(p) for p in OUT_OF_SCOPE_PREFIXES):
         return True
-    return False
+    directory, _, name = path.rpartition("/")
+    if name in OUT_OF_SCOPE_FILENAMES:
+        return True
+    # Outside the exempt subtrees, a pyproject can change runtime dependencies
+    # or the wheel build and needs a verified diff.
+    if name == "pyproject.toml":
+        return False
+    return any(
+        fnmatchcase(directory, pattern) and name in filenames
+        for pattern, filenames in OUT_OF_SCOPE_DIRECTORY_FILENAMES
+    )
 
 
 class OutOfScopeRule(Rule):
     name = "outofscope"
-    needs_diff_for: tuple[str, ...] = ()
+    needs_diff_for: tuple[str, ...] = ("pyproject.toml", "**/pyproject.toml")
 
-    def __init__(self, yaml_index: YAMLIndex, stages: dict[str, Stage]) -> None:
-        # Stored for parity with other rules' constructor shape; not used.
+    def __init__(
+        self, yaml_index: YAMLIndex, stages: dict[str, Stage], repo_root: Path | None = None
+    ) -> None:
         self.yaml_index = yaml_index
+        self._repo_root = repo_root
+        self._stages_by_yaml = stages_by_yaml_stem(stages)
+
+    def _is_check_only_pyproject(self, path: str, pr: PRInputs) -> bool:
+        if self._repo_root is None or Path(path).name != "pyproject.toml":
+            return False
+        diff = pr.raw_diffs.get(path) or pr.diffs.get(path) or ""
+        try:
+            source = (self._repo_root / path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
+        before = reconstruct_diff_pre_image(source, diff)
+        return before is not None and _check_tables_only_change(before, source)
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
-        claimed = {f for f in pr.changed_files if is_out_of_scope(f)}
+        claimed = {
+            path
+            for path in pr.changed_files
+            if is_out_of_scope(path) or self._is_check_only_pyproject(path, pr)
+        }
         if not claimed:
             return None
+        if any(path.startswith("jenkins/scripts/cbts/") for path in claimed):
+            # The scripts suite includes CBTS tests and the infrastructure
+            # consumers of its command-line interfaces and selection artifacts.
+            filters = {
+                (block.yaml_stem, block.block_index): {"unittest/scripts": {"unittest/scripts"}}
+                for block in self.yaml_index.blocks
+                if block.yaml_stem == "l0_cpu" and "unittest/scripts" in block.tests
+            }
+            scripts_registered = bool(filters)
+            stages = resolve_affected_stages(filters, self.yaml_index, self._stages_by_yaml)
+            return RuleResult(
+                handled_files=claimed,
+                affected_stages=stages,
+                scope="testsonly" if scripts_registered and stages else None,
+                block_filters=filters,
+                sanity_relevant=False,
+                perfsanity_relevant=False,
+                reason="outofscope: CBTS infrastructure changes require CPU scripts tests",
+            )
         return RuleResult(
             handled_files=claimed,
             affected_stages=set(),
             scope="noop",
             sanity_relevant=False,
             perfsanity_relevant=False,
-            reason=f"outofscope: {len(claimed)} file(s) match no-pre-merge-impact pattern",
+            reason=f"outofscope: {len(claimed)} file(s) have no product-test contribution",
         )

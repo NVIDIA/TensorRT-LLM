@@ -26,12 +26,17 @@ through to DSL division or GMEM reduction layout errors.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace as dataclass_replace, replace
 from math import ceil
 from typing import Any
 
 from ....split_kv_mode_policy import select_split_kv_modes
-from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.nvfp4_kv import (
+    Nvfp4KVConfig,
+    is_sm107_target,
+    nvfp4_row_bytes,
+)
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.query import FlatQueryTileLayout
 
@@ -46,6 +51,18 @@ SUPPORTED_TILE_SIZE_Q = (8, 16, 32, 64)
 SM100A_SMEM_CAPACITY_BYTES = 232448
 ESTIMATED_TS_BARRIER_BYTES = 512
 MAX_CLUSTER_SMEM_DATA_BYTES = SM100A_SMEM_CAPACITY_BYTES - ESTIMATED_TS_BARRIER_BYTES
+# SM107 exposes 327 KiB of dynamic SMEM per CTA. Only resources gated on an
+# SM107 compile target (see is_sm107_target) may use the difference.
+SM107_SMEM_CAPACITY_BYTES = 327 * 1024
+
+
+def target_smem_capacity_bytes() -> int:
+    """Return the per-CTA dynamic SMEM capacity of the CuTe DSL compile target."""
+    return (
+        SM107_SMEM_CAPACITY_BYTES if is_sm107_target() else SM100A_SMEM_CAPACITY_BYTES
+    )
+
+
 # CUDA's nonportable cluster launch attribute accepts at most 32 CTAs.  This is
 # a launch-geometry limit, not a problem-shape policy.
 MAX_CLUSTER_SIZE = 32
@@ -78,7 +95,7 @@ def estimated_throughput_latency_smem_data_bytes(cfg: "MlaConfig") -> int:
 
 
 @dataclass(frozen=True)
-class MlaConfig:
+class MlaConfig(Nvfp4KVConfig):
     """Kernel traits for one throughput-latency 1CTA MLA schedule.
 
     The dataclass groups shape dimensions, tile sizes, CTA decomposition,
@@ -92,12 +109,20 @@ class MlaConfig:
     batch_size: int = 1
     num_heads_q: int = 16
     seq_len_q: int = 4
-    seq_len_kv: int = 4096
+    seq_len_kv: int | None = 4096
     logical_num_heads_q: int = 16
     logical_seq_len_q: int = 4
+    # True: the Q lengths are compile-time. Sparse flattened Q is always fixed.
+    fixed_seqlen: bool = False
     # Causal is bottom-right aligned for speculative decode. Dense keeps only
     # the ordinary per-batch KV-tail predicate.
     mask_type: str = MaskType.CAUSAL.value
+    # Threshold skip correction in log2 units (binades; 0 disables it): freeze
+    # the running row max while a K tile raises it by at most this
+    # compile-time amount and skip that tile's O rescale.  E4M3 P then uses
+    # the scale ``448 * 2**-T`` instead of 448.
+    softmax_rescale_threshold_log2: float = 0.0
+    lse_base_on_e: bool = False
     head_dim_qk: int = 576
     head_dim_v: int = 512
     latent_dim: int = 512
@@ -165,6 +190,33 @@ class MlaConfig:
     correction_num_warps: int = 4
     mma_num_warps: int = 1
     load_num_warps: int = 1
+    whole_kv_tile: bool = False
+    single_raw_prefetch: bool = False
+    # Whole-tile raw NVFP4 record buffers (1 or 2); see raw_record_stages.
+    raw_record_ring: int = 1
+    compact_nv_rope: bool = False
+    q_tma_stage: bool = False
+    q_nope_tmem: bool = False
+    # Softmax/correction already use the native WS Layout-E row ownership.
+    ws_native_e: bool = False
+    ws_qk: bool = False
+    # Use M64 tcgen05.mma.ws for PV; P is staged in SMEM, O follows Layout E.
+    ws_pv: bool = False
+    kv_cache_format: str = "native"
+    extra_kv_cache_format: str = "native"
+    sparse_reuse_kv: bool = False
+    paired_sparse_correction: bool = False
+    defer_sparse_max_update: bool = False
+    cache_uniform_sparse_quads: bool = False
+    fuse_sparse_epilogue: bool = False
+    fuse_sparse_cluster_epilogue: bool = False
+    fuse_sparse_reduction: bool = False
+    sparse_direct: bool = False
+    sparse_valid_prefix: bool = False
+    sparse_direct_capacities: tuple[int, int] = (0, 0)
+    # Planned KV tiles per instruction group (1 Keeps, 2 Swaps); zero selects
+    # a runtime loop domain, while None derives the group from static lengths.
+    sparse_instruction_group: int | None = None
     page_offsets_num_warps: int = 1
     scheduler_num_warps: int = 1
     clc_padding_warp_idx: int = 14
@@ -192,6 +244,144 @@ class MlaConfig:
     use_attention_sinks: int = 0
     use_sliding_window_causal: int = 0
     attention_window_size: int = 0
+
+    @property
+    def sparse_d512(self) -> bool:
+        """Two-source D512 sparse MLA: one token row per index (page size
+        one), RoPE folded into the 512 columns."""
+        return self.num_tokens_per_page == 1 and self.rope_dim == 0
+
+    @property
+    def sparse_d576_reload(self) -> bool:
+        """Use the native FP8 q64 loader that releases K before reloading V.
+
+        Retained native tiles and packed caches share D576 geometry but own
+        different descriptors, coordinate caches and output finalization.
+        The existing format and pipeline traits identify this reload schedule.
+        """
+        return (
+            self.num_tokens_per_page == 1
+            and self.rope_dim == 64
+            and self.qkv_dtype == "e4m3"
+            and self.cache_uniform_sparse_quads
+            and not self.sparse_reuse_kv
+            and not self.has_nvfp4_kv
+        )
+
+    @property
+    def kv_load_regs(self) -> int:
+        """Give raw-record loaders 96 registers without raising the MMA warp budget.
+
+        Loader warps retain packed values/scales across raw-buffer release.
+        MMA/page warps keep mma_load_regs; raising both exceeds the CTA budget.
+        This is derived from the existing pipeline choice, not a tuning field.
+        """
+        return 96 if self.async_nvfp4_kv_gather else self.mma_load_regs
+
+    @property
+    def nvfp4_row_bytes(self) -> int:
+        """Return packed bytes per token, including scales and the optional FP8 RoPE tail."""
+        return nvfp4_row_bytes(self.rope_dim)
+
+    @property
+    def whole_kv_tile_bytes(self) -> int:
+        """Return SMEM bytes retained for one complete converted K/V tile."""
+        return self.tile_size_kv * self.head_dim_qk * self.qkv_dtype_bytes
+
+    @property
+    def async_nvfp4_kv_gather(self) -> bool:
+        """Use independent gather/transform warps with two retained tiles."""
+        return self.has_nvfp4_kv and self.whole_kv_tile
+
+    def raw_record_ring_fits(self) -> bool:
+        """Return whether a second 128-row raw record buffer fits in SMEM.
+
+        D512 pure-NVFP4 records (288 B, 36 KiB per buffer) leave room beside
+        the two retained whole tiles. D576 records (352 B, 44 KiB per buffer)
+        take the H64 whole-tile schedule to 264 KB, which fits only SM107's
+        327 KiB. Mixed FP8 sources (512 B records) keep one raw buffer.
+        """
+        if self.rope_dim:
+            return is_sm107_target() and self.raw_record_stride <= 352
+        return self.raw_record_stride <= 288
+
+    @property
+    def raw_record_stages(self) -> int:
+        """Return how many whole-tile raw NVFP4 record buffers the gather ring holds.
+
+        With two buffers the metadata warps gather tile i+1 while converters
+        still read tile i; see configure_sparse_mla for when it is selected.
+        """
+        if not self.single_raw_prefetch:
+            return 1
+        assert self.raw_record_ring in (1, 2)
+        assert self.raw_record_ring == 1 or self.raw_record_ring_fits()
+        return self.raw_record_ring
+
+    @property
+    def early_raw_snapshot(self) -> bool:
+        """Snapshot raw NVFP4 records into registers before acquiring the KV tile.
+
+        Enabled with the two-slot raw ring (pure NVFP4 D512 sources only), so
+        the converter's raw-slot release no longer waits for PV to free a
+        retained whole-tile stage and two gathers stay in flight.
+        """
+        return (
+            self.async_nvfp4_kv_gather
+            and self.raw_record_stages == 2
+            and self.kv_cache_format != "fp8"
+        )
+
+    @property
+    def raw_record_stage_bytes(self) -> int:
+        """Return SMEM bytes of one raw record buffer (128 gathered rows)."""
+        return 128 * self.raw_record_stride
+
+    @property
+    def one_insts_kv_swap(self) -> bool:
+        """One KV stream with swapped MMA operands (P remains in SMEM)."""
+        return self.num_insts_kv == 1 and self.kernel_variant == "swaps_mma_ab"
+
+    @property
+    def compact_softmax_stats(self) -> bool:
+        """Store one warp-reduced statistic per Swap-AB column group."""
+        return self.whole_kv_tile and self.one_insts_kv_swap
+
+    @property
+    def single_kv_pipe(self) -> bool:
+        """Use one softmax/P stream while retaining two score stages."""
+        return self.num_insts_kv == 1
+
+    @property
+    def short_merged_softmax(self) -> bool:
+        """Process two independent KV streams with one softmax warp group.
+
+        Each planned split fits one two-tile group, so no online-correction
+        loop runs. Keep both streams' final statistics and PV accumulators;
+        live lengths still mask partial/empty tiles. This is num_insts_kv=2,
+        not the one-stream schedule selected by one_insts_kv_swap.
+        """
+        return (
+            self.sparse_direct
+            and not self.one_insts_kv_swap
+            and self.kernel_variant == "swaps_mma_ab"
+            and self.fixed_sparse_kv_tiles > 0
+        )
+
+    @property
+    def serial_swap_reuse(self):
+        return (
+            self.sparse_reuse_kv
+            and self.num_insts_kv == 2
+            and not self.is_fp8_qkv()
+            and self.kernel_variant == "swaps_mma_ab"
+        )
+
+    @property
+    def sparse_cache_words(self):
+        if self.cache_uniform_sparse_quads:
+            return 6 + self.tile_size_kv // self.load_num_warps
+        return 6
 
     @property
     def softmax0_num_warps(self) -> int:
@@ -227,16 +417,22 @@ class MlaConfig:
 
         return ceil(self.tile_size_kv / self.num_tokens_per_page)
 
+    # Return the static KV tile count, or zero when live metadata owns the domain.
     @property
     def total_kv_tiles(self) -> int:
+        if self.seq_len_kv is None:
+            return 0
         return ceil(self.seq_len_kv / self.tile_size_kv)
 
     @property
     def kv_tiles_per_multi_cta_group(self) -> int:
         return self.num_ctas_per_seq_kv * self.num_insts_kv
 
+    # Return static loop steps per split CTA, or zero for a runtime KV domain.
     @property
     def num_steps_per_cta_kv(self) -> int:
+        if self.seq_len_kv is None:
+            return 0
         tokens_per_multi_cta_step = (
             self.num_ctas_per_seq_kv * self.num_insts_kv * self.tile_size_kv
         )
@@ -368,6 +564,23 @@ class MlaConfig:
         """Return whether Q/K/V tensors use E4M3 data."""
 
         return self.qkv_dtype == "e4m3"
+
+    @property
+    def fixed_sparse_kv_tiles(self) -> int:
+        """Return the minimum instruction group when bounded by the plan.
+
+        Keep-AB uses one KV tile and Swap-AB uses two independent streams.
+        If the maximum planned split fits that group, every shorter valid
+        prefix already has the same partition. Live lengths still mask data.
+        """
+        if self.sparse_instruction_group is not None:
+            return self.sparse_instruction_group
+        tiles = self.local_kv_tiles(self.total_kv_tiles)
+        return (
+            self.num_insts_kv
+            if self.sparse_direct and tiles == self.num_insts_kv
+            else 0
+        )
 
     def local_kv_tiles(self, total_kv_tiles: int) -> int:
         """Return per-CTA KV tiles after multi-CTA KV splitting."""
@@ -560,10 +773,15 @@ def q_tile_work_count(
 
 
 def automatic_split_kv_step_tokens(tile_size_q: int) -> int:
-    """Return one steady-state K step for the selected task graph."""
+    """Return a profitable K span per split, at least two physical KV tiles.
+
+    One-tile splits do not amortize CTA setup and final reduction. The
+    one-instance Q64+ schedules retain two tiles as a policy work bound,
+    while the kernel and its hardware ceiling still accept larger counts.
+    """
 
     num_kv_insts = 1 if tile_size_q >= 64 else MlaConfig.num_insts_kv
-    return MlaConfig.tile_size_kv * num_kv_insts
+    return MlaConfig.tile_size_kv * max(num_kv_insts, 2)
 
 
 def select_auto_split_kv(
@@ -580,7 +798,6 @@ def select_auto_split_kv(
     split_kv = min(
         max_split_kv,
         max(1, target_work // base_work),
-        MAX_MLA_SPLITS_KV,
     )
     local_k_steps = ceil(max_split_kv / split_kv)
     return ceil(max_split_kv / local_k_steps)
@@ -667,7 +884,12 @@ def correction_register_budget(tile_size_q: int) -> int:
     return MlaConfig.correction_regs
 
 
-def keeps_mma_ab_config_kwargs(profile: MlaProfile, qkv_dtype: str) -> dict[str, int]:
+def keeps_mma_ab_config_kwargs(
+    profile: MlaProfile,
+    qkv_dtype: str,
+    *,
+    sparse_d576: bool = False,
+) -> dict[str, int]:
     """Return keeps-MMA-AB scheduler, pipeline, and register traits."""
 
     kv_stages = MlaConfig.kv_stages
@@ -682,7 +904,7 @@ def keeps_mma_ab_config_kwargs(profile: MlaProfile, qkv_dtype: str) -> dict[str,
         use_persistent_scheduler = 0
         use_clc_dynamic_persistent_scheduler = 0
 
-    return {
+    kwargs = {
         # Keeps-MMA-AB has one QK/PV pipe.  Raising this value would change the
         # KV work partition without adding the second stream used by the swaps
         # schedule, and would therefore skip every other KV tile.
@@ -704,6 +926,32 @@ def keeps_mma_ab_config_kwargs(profile: MlaProfile, qkv_dtype: str) -> dict[str,
         "use_persistent_scheduler": use_persistent_scheduler,
         "use_clc_dynamic_persistent_scheduler": use_clc_dynamic_persistent_scheduler,
     }
+    if sparse_d576:
+        # D576 sparse: one warp cannot issue 32 Gather4 per 16 KB stage fast
+        # enough (~0.6 us per stage measured), so the K/V loader spans warps
+        # 12-15 (8 gathers each, issued from warp-uniform cached rows) and
+        # warp 9 pads.  Register budget for 16 warps: 4x168 + 4x160 + 8x80 =
+        # 62464 <= 65536.  QK(t + 1) is issued before PV(t) and V is gathered
+        # again from L2 (trtllm-gen's order): softmax(t) overlaps QK(t + 1).
+        # Retained K/V schedules can also issue QK(t + 1) before PV(t), but
+        # retain the current tile's stages through its V use. Releasing K
+        # early here changes stage availability for the next prefetch.
+        # One CTA runs one work tile, so a single Q stage suffices and its second 36 KB pays
+        # for two more KV stages.
+        kwargs.update(
+            {
+                "q_stages": 1,
+                "kv_stages": 10,
+                "cache_uniform_sparse_quads": True,
+                "load_warp_idx": 12,
+                "load_num_warps": 4,
+                "threads_per_cta": 512,
+                "softmax_regs": 168,
+                "correction_regs": 160,
+                "mma_load_regs": 80,
+            }
+        )
+    return kwargs
 
 
 def resolve_split_kv_reduction_policy(
@@ -795,11 +1043,11 @@ def resolve_runtime_cluster_reduction_mode(
     cfg: MlaConfig | None,
     *,
     reduction_mode: str | None,
-    hardware_info,
+    hardware_info=None,
     stream=None,
     log=None,
 ) -> str | None:
-    """Query cluster occupancy and return the final runtime reduction mode."""
+    """Use cached device occupancy to resolve the runtime reduction mode."""
 
     if (
         cfg is None
@@ -810,7 +1058,13 @@ def resolve_runtime_cluster_reduction_mode(
 
     cluster_shape = cluster_reduction_cluster_shape(cfg)
     cluster_size = cluster_shape[0] * cluster_shape[1] * cluster_shape[2]
-    active_clusters = hardware_info.get_max_active_clusters(cluster_size, stream)
+    from ...._hardware import get_max_active_clusters
+
+    active_clusters = (
+        get_max_active_clusters(cluster_size)
+        if hardware_info is None
+        else hardware_info.get_max_active_clusters(cluster_size, stream)
+    )
     cluster_count = cluster_reduction_cluster_count(cfg)
     if log is not None:
         log(
@@ -922,7 +1176,10 @@ def persistent_override_profile(
         return profile
     if profile.use_multi_ctas_kv == 1:
         if explicit_persistent:
-            raise ValueError("persistent scheduling is not supported with split-KV")
+            raise ValueError(
+                "1CTA persistent scheduling is not supported with split-KV; "
+                "use split_kv=1 or nonpersistent scheduling"
+            )
         return profile
     if explicit_persistent:
         return replace(
@@ -1233,10 +1490,13 @@ def is_throughput_latency_mla_supported_shape(
     del batch_size
     return (
         latent_dim == 512
-        and rope_dim == 64
+        and rope_dim in (0, 64)
         and 1 <= num_heads_q <= 128
         and is_power_of_two(num_heads_q)
-        and num_tokens_per_page in SUPPORTED_MLA_PAGE_SIZES
+        and (
+            num_tokens_per_page in SUPPORTED_MLA_PAGE_SIZES
+            or (num_tokens_per_page == 1 and rope_dim in (0, 64))
+        )
         and seq_len_q >= 1
         and seq_len_kv >= 128
     )
@@ -1279,7 +1539,10 @@ def enumerate_throughput_latency_mla_profiles(
     )
     if explicit_split_kv is not None and explicit_split_kv > 0:
         if explicit_split_kv > 1 and explicit_persistent is True:
-            raise ValueError("persistent scheduling is not supported with split-KV")
+            raise ValueError(
+                "1CTA persistent scheduling is not supported with split-KV; "
+                "use split_kv=1 or nonpersistent scheduling"
+            )
         if explicit_split_kv == 1 and explicit_persistent is not None:
             if selected_tile_size_q >= 64:
                 profile = keeps_mma_ab_forced_persistent_profile(
@@ -1448,8 +1711,15 @@ def make_throughput_latency_mla_config(
     explicit_split_kv: int | None = None,
     explicit_persistent: bool | None = None,
     mask_type: MaskType | str = MaskType.CAUSAL,
+    softmax_rescale_threshold_log2: float = 0.0,
+    sparse_profile=None,
 ) -> MlaConfig:
-    """Return throughput-latency 1CTA MLA traits for a concrete profile."""
+    """Return throughput-latency 1CTA MLA traits for a concrete profile.
+
+    ``sparse_profile`` is the already-selected general sparse pipeline. Its
+    presence excludes native D576 reload defaults; it adds no independent
+    tuning or compile-time choice.
+    """
 
     mask_type = normalize_mask_type(mask_type)
 
@@ -1479,7 +1749,15 @@ def make_throughput_latency_mla_config(
         raise ValueError("latent_dim must be positive")
     if rope_dim < 0:
         raise ValueError("rope_dim must be non-negative")
-    if num_tokens_per_page not in SUPPORTED_MLA_PAGE_SIZES:
+    sparse_d576 = (
+        num_tokens_per_page == 1
+        and rope_dim == 64
+        and qkv_dtype == "e4m3"
+        and sparse_profile is None
+    )
+    if num_tokens_per_page not in SUPPORTED_MLA_PAGE_SIZES and not (
+        num_tokens_per_page == 1 and rope_dim in (0, 64)
+    ):
         raise ValueError(
             "num_tokens_per_page must be one of "
             f"{SUPPORTED_MLA_PAGE_SIZES}, got {num_tokens_per_page}"
@@ -1491,7 +1769,13 @@ def make_throughput_latency_mla_config(
             f"num_tokens_per_page={num_tokens_per_page}"
         )
     pages_per_kv_tile = MlaConfig.tile_size_kv // num_tokens_per_page
-    if pages_per_kv_tile > MlaConfig.page_offsets_entries_per_stage:
+    metadata_capacity = (
+        128 if num_tokens_per_page == 1 else MlaConfig.page_offsets_entries_per_stage
+    )
+    page_offsets_stages = MlaConfig.page_offsets_stages
+    if sparse_d576:
+        page_offsets_stages = 4
+    if pages_per_kv_tile > metadata_capacity:
         raise ValueError(
             "page-offset staging capacity is smaller than one KV tile: "
             f"pages_per_kv_tile={pages_per_kv_tile}, "
@@ -1517,7 +1801,9 @@ def make_throughput_latency_mla_config(
         seq_len_kv=seq_len_kv,
         latent_dim=latent_dim,
         rope_dim=rope_dim,
-        num_tokens_per_page=num_tokens_per_page,
+        # Profile enumeration only checks that the page size is a dense one;
+        # the D576 sparse page size of one is validated above.
+        num_tokens_per_page=(16 if sparse_d576 else num_tokens_per_page),
         max_active_clusters=max_active_clusters,
         qkv_dtype=qkv_dtype,
         tile_size_q=tile_size_q,
@@ -1528,6 +1814,14 @@ def make_throughput_latency_mla_config(
         selected_profile,
         explicit_persistent,
     )
+    if selected_profile.use_persistent_scheduler and selected_profile.use_multi_ctas_kv:
+        # Persistent work queues enumerate Q/head-dimension tiles, not KV
+        # splits. Direct MlaProfile callers must obey the same restriction
+        # as persistent_override_profile, or only split zero gets produced.
+        raise ValueError(
+            "1CTA persistent scheduling is not supported with split-KV; "
+            "use split_kv=1 or nonpersistent scheduling"
+        )
     tile_size_q = tile_size_q_for_profile(
         selected_profile, num_heads_q, seq_len_q, tile_size_q
     )
@@ -1594,6 +1888,8 @@ def make_throughput_latency_mla_config(
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
         mask_type=mask_type,
+        # Range-checked by ThroughputLatencyMlaDecodeTs and plan().
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         head_dim_qk=head_dim_qk,
         head_dim_v=latent_dim,
         latent_dim=latent_dim,
@@ -1612,6 +1908,8 @@ def make_throughput_latency_mla_config(
         softmax_regs=softmax_register_budget(tile_size_q),
         correction_regs=correction_register_budget(tile_size_q),
         num_tokens_per_page=num_tokens_per_page,
+        page_offsets_entries_per_stage=metadata_capacity,
+        page_offsets_stages=page_offsets_stages,
         max_num_pages_per_seq_kv=max(1, ceil(seq_len_kv / num_tokens_per_page)),
         tmem_s_cols=tile_size_q,
         tmem_stats_cols=MlaConfig.tmem_stats_cols,
@@ -1627,7 +1925,13 @@ def make_throughput_latency_mla_config(
     )
     config_kwargs.update(dtype_config_kwargs(qkv_dtype, o_dtype))
     if selected_profile.kernel_variant == "keeps_mma_ab":
-        config_kwargs.update(keeps_mma_ab_config_kwargs(selected_profile, qkv_dtype))
+        config_kwargs.update(
+            keeps_mma_ab_config_kwargs(
+                selected_profile,
+                qkv_dtype,
+                sparse_d576=sparse_d576,
+            )
+        )
     cfg = MlaConfig(**config_kwargs)
     validate_explicit_cluster_reduction_config(cfg, reduction_mode=reduction_mode)
     cfg = resolve_auto_cluster_reduction_config(
@@ -1635,3 +1939,267 @@ def make_throughput_latency_mla_config(
         reduction_mode=reduction_mode,
     )
     return cfg
+
+
+def configure_sparse_mla(
+    cfg: MlaConfig,
+    profile,
+    *,
+    finalize_output=False,
+    direct_inputs=False,
+    assume_valid_prefix=False,
+    source_capacities=(0, 0),
+) -> MlaConfig:
+    """Resolve one selected sparse profile without order-dependent overrides.
+
+    Policy selects the schedule. This builder checks its implementation
+    constraints, fixes topology, then assigns buffers and warp/register roles.
+    """
+    keep = cfg.kernel_variant == "keeps_mma_ab"
+    issuers = profile.gather_issue_warps
+    reuse = profile.reuse_kv
+    uniform = profile.uniform_offset_cache
+    single = profile.single_kv_stream
+    whole_nvfp4_kv = profile.whole_kv_tile
+    if whole_nvfp4_kv and not (
+        cfg.has_nvfp4_kv
+        and cfg.is_fp8_qkv()
+        and cfg.rope_dim in (0, 64)
+        and reuse
+        and (keep or single)
+        and issuers == 8
+        and profile.kv_tile_size == 128
+    ):
+        raise ValueError(
+            "whole scaled KV tiles require D512/D576, one KV stream, BK128 and eight converters"
+        )
+    if cfg.num_tokens_per_page != 1 or cfg.rope_dim not in (0, 64):
+        raise ValueError("sparse profiles require native page-size-one MLA")
+    if issuers not in (1, 2, 4, 8):
+        raise ValueError("sparse profiles require one, two, four or eight issuers")
+    if (keep and cfg.tile_size_q != 64) or (
+        not keep and cfg.tile_size_q not in (8, 16, 32)
+    ):
+        raise ValueError("unsupported sparse query tile")
+    if single and (
+        keep
+        or cfg.tile_size_q not in ((8, 16, 32) if whole_nvfp4_kv else (8, 16))
+        or cfg.num_ctas_per_head_dim != 1
+        or issuers != (8 if whole_nvfp4_kv else 4)
+        or cfg.use_cluster_reduction
+        or (cfg.num_ctas_per_seq_kv > 1 and cfg.use_persistent_scheduler)
+    ):
+        raise ValueError(
+            "one-instance Swap-AB requires a supported tile/loader layout, one V owner and no cluster reduction"
+        )
+    if reuse and cfg.num_ctas_per_head_dim != 1:
+        raise ValueError("retained KV requires one V owner")
+    if profile.kv_tile_size not in (64, 128) or (
+        profile.kv_tile_size == 64 and (not keep or cfg.is_fp8_qkv() or not reuse)
+    ):
+        raise ValueError("BK64 requires native BF16 Keep-AB reuse")
+    if uniform and (
+        not reuse
+        or issuers not in (4, 8)
+        or (cfg.is_fp8_qkv() and not keep)
+        or (issuers == 8 and not keep)
+    ):
+        raise ValueError("uniform coordinate caching requires a qualified reuse layout")
+    if profile.balanced_registers and (keep or cfg.tile_size_q not in (8, 16)):
+        raise ValueError("balanced registers require Swap-AB M8/M16")
+    if profile.defer_max_update and cfg.is_fp8_qkv():
+        raise ValueError("deferred maxima require native BF16 probabilities")
+    if profile.paired_correction and not keep:
+        raise ValueError("paired correction requires Keep-AB")
+    if profile.page_pipeline_stages and (profile.page_pipeline_stages < 1 or not keep):
+        raise ValueError("page-stage overrides require positive stages and Keep-AB")
+
+    # Final stream count and tile geometry must precede short-loop eligibility.
+    splits = cfg.num_ctas_per_seq_kv
+    cluster_finish = finalize_output and bool(cfg.use_cluster_reduction)
+    direct_finish = finalize_output and splits == 1
+    separate_finish = finalize_output and splits > 1 and not cluster_finish
+    if cluster_finish and (
+        keep or cfg.tile_size_q not in (16, 32) or not cfg.use_bf16_output
+    ):
+        raise ValueError("cluster finishing requires native Swap-AB M16/M32")
+    if direct_finish and cfg.logical_seq_len_q != 1:
+        raise ValueError("fused output requires one logical query per virtual request")
+    if direct_inputs and (not finalize_output or cfg.qkv_dtype not in ("bf16", "e4m3")):
+        raise ValueError("separate sparse indices require native BF16/FP8 final output")
+    if profile.defer_max_update and cfg.softmax_rescale_threshold_log2 > 0.0:
+        # The sparse fixed-bound deferral takes precedence in update_softmax;
+        # a threshold would then only change the FP8 P scale.
+        raise ValueError(
+            "softmax_rescale_threshold_log2 is not supported with deferred "
+            "sparse max updates"
+        )
+    cfg = dataclass_replace(
+        cfg,
+        num_insts_kv=1 if keep or single else 2,
+        tile_size_kv=profile.kv_tile_size,
+        page_offsets_entries_per_stage=profile.kv_tile_size,
+        sparse_reuse_kv=reuse,
+        cache_uniform_sparse_quads=uniform,
+        paired_sparse_correction=profile.paired_correction,
+        defer_sparse_max_update=profile.defer_max_update,
+        sparse_direct=direct_inputs,
+        sparse_valid_prefix=assume_valid_prefix,
+        sparse_direct_capacities=source_capacities if direct_inputs else (0, 0),
+        fuse_sparse_epilogue=direct_finish,
+        fuse_sparse_cluster_epilogue=cluster_finish,
+        fuse_sparse_reduction=separate_finish,
+        load_num_warps=issuers,
+    )
+    short = cfg.short_merged_softmax
+    if (
+        issuers == 8
+        and not keep
+        and (
+            (cfg.tile_size_q not in (8, 16) and not whole_nvfp4_kv)
+            or cfg.local_kv_tiles(cfg.total_kv_tiles) <= cfg.num_insts_kv
+        )
+    ):
+        raise ValueError("eight Swap-AB issuers require a steady-state loop")
+
+    # Retain complete converted FP8 K tiles through every PV feature pass,
+    # avoiding a second NVFP4 gather/conversion for V. Eight loaders and an
+    # independent raw-prefetch buffer provide room for two complete payloads.
+    retained_nvfp4_kv = (
+        cfg.has_nvfp4_kv and keep and issuers == 8 and reuse
+    ) or whole_nvfp4_kv
+    ws_mma = retained_nvfp4_kv and keep
+    # Four D128 slices make one D512 tile. FP8/BK64 reuse keeps two tiles;
+    # BF16 BK128 retains one, with additional stages used for prefetch.
+    kv_stages = (
+        profile.reuse_kv_stages if reuse and profile.reuse_kv_stages else cfg.kv_stages
+    )
+    if reuse and profile.reuse_kv_stages and not retained_nvfp4_kv:
+        retained_tiles = (
+            2
+            if cfg.is_fp8_qkv() or (cfg.tile_size_kv == 64 and not cfg.rope_dim)
+            else 1
+        )
+        if kv_stages < retained_tiles * cfg.qk_head_dim_stages:
+            raise ValueError("insufficient stages to retain KV through PV")
+    page_stages = cfg.page_offsets_stages
+    if (
+        reuse
+        and profile.reuse_kv_stages
+        and keep
+        and (kv_stages == (12 if cfg.is_fp8_qkv() else 5) or cfg.tile_size_kv == 64)
+    ):
+        page_stages = 1
+    if profile.page_pipeline_stages:
+        page_stages = profile.page_pipeline_stages
+    # Persistent D512 NVFP4 schedules (several work tiles per CTA) use a
+    # two-slot raw record ring with early register snapshots and four
+    # metadata stages, so two gathers stay in flight while PV holds both
+    # retained tiles (GB300 H64 B128 top-k 1024 Sq4: 83.4 -> 78.3 us;
+    # prefill H64 Sq1024: 136.5 -> 130.0 us). Short nonpersistent split
+    # loops keep one raw buffer: there the extra 36 KiB of SMEM costs
+    # ~0.3 us (H128 B1-B4: 13.3 -> 13.6 us) and gains nothing. D576 records
+    # need SM107's SMEM (raw_record_ring_fits); there the ring makes
+    # persistent top-k 2048 decode 5-9% faster (VR200 H12 832 rows: 125.8 ->
+    # 115.6 us; H64: 145.9 -> 132.5 us).
+    raw_record_ring = (
+        2
+        if retained_nvfp4_kv
+        and cfg.raw_record_ring_fits()
+        and cfg.kv_cache_format != "fp8"
+        and cfg.use_persistent_scheduler
+        else 1
+    )
+    if retained_nvfp4_kv:
+        page_stages = 4 if raw_record_ring == 2 else 2
+    if single and reuse and kv_stages >= 6 and not cfg.is_fp8_qkv():
+        page_stages = 1
+
+    # Select the final layout once. Sharing a softmax group in a short split
+    # preserves two numerical streams; the one-instance layout is distinct.
+    if single:
+        roles = dict(
+            threads_per_cta=512,
+            correction_warp_idx=4,
+            mma_warp_idx=8,
+            load_warp_idx=12,
+            page_offsets_warp_idx=10,
+            scheduler_warp_idx=11,
+            softmax_regs=128,
+            correction_regs=160,
+            mma_load_regs=64,
+            scheduler_regs=64,
+            o_stages=1,
+        )
+    elif short:
+        roles = dict(
+            threads_per_cta=512,
+            correction_warp_idx=4,
+            mma_warp_idx=8,
+            load_warp_idx=12,
+            page_offsets_warp_idx=9,
+            scheduler_warp_idx=10,
+            softmax_regs=96,
+            correction_regs=96,
+            mma_load_regs=96,
+            scheduler_regs=96,
+        )
+    elif keep:
+        roles = dict(
+            threads_per_cta=640 if issuers == 8 else 512,
+            load_warp_idx=12,
+            softmax_regs=128 if uniform or issuers == 8 else 192,
+            correction_regs=160 if issuers == 8 else 192,
+            mma_load_regs=96 if uniform and issuers == 4 else 64,
+        )
+    else:
+        balanced = profile.balanced_registers
+        roles = dict(
+            threads_per_cta=768 if issuers == 8 else 640,
+            load_warp_idx=16,
+            softmax_regs=96
+            if balanced
+            else 128
+            if uniform
+            else 144
+            if cfg.tile_size_q == 32
+            else 160,
+            correction_regs=96 if balanced else 192 if uniform else cfg.correction_regs,
+            mma_load_regs=(64 if issuers == 8 else 96)
+            if balanced
+            else 96
+            if uniform
+            else 48,
+            scheduler_regs=(64 if issuers == 8 else 96)
+            if balanced
+            else cfg.scheduler_regs,
+        )
+    if retained_nvfp4_kv:
+        roles.update(
+            threads_per_cta=640,
+            page_offsets_warp_idx=9,
+            page_offsets_num_warps=2,
+            softmax_regs=80 if ws_mma else 96,
+            correction_regs=144 if ws_mma else 128,
+            ws_pv=ws_mma,
+            ws_qk=ws_mma,
+            ws_native_e=ws_mma,
+            q_nope_tmem=ws_mma,
+            q_tma_stage=ws_mma,
+            tmem_s_cols=64 if ws_mma else cfg.tile_size_q,
+            compact_nv_rope=bool(cfg.rope_dim),
+            single_raw_prefetch=True,
+            page_offsets_entries_per_stage=132,
+            whole_kv_tile=True,
+            raw_record_ring=raw_record_ring,
+        )
+        kv_stages = 2
+    return dataclass_replace(
+        cfg,
+        **roles,
+        kv_stages=kv_stages,
+        page_offsets_stages=page_stages,
+        q_stages=1
+        if retained_nvfp4_kv or single or (reuse and profile.reuse_kv_stages)
+        else cfg.q_stages,
+    )

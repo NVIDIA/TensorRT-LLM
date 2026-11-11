@@ -19,7 +19,6 @@
 #include "cacheTransBuffer.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 
 #include <chrono>

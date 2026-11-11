@@ -7,6 +7,7 @@
 # first VR200 run is directly comparable to its GB300 counterpart.
 # Runs on the trtllm-ci VR200-HECATE multi-node chain (partition batch-xdr).
 metadata:
+  architecture: DeepseekV4ForCausalLM
   model_name: deepseek_v4_pro_fp4
   precision: fp4
   model_dir_name: DeepSeek-V4-Pro
@@ -74,7 +75,6 @@ worker_config:
       backend: TRTLLM
       use_low_precision_moe_combine: true
     cache_transceiver_config:
-      max_tokens_in_buffer: 8192
       kv_transfer_timeout_ms: 600000
       backend: NIXL
       transceiver_runtime: PYTHON
@@ -104,7 +104,6 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 8192
       kv_transfer_timeout_ms: 600000
       backend: NIXL
       transceiver_runtime: PYTHON

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,6 +29,7 @@
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
+#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #endif // ENABLE_MULTI_DEVICE
 
@@ -214,6 +215,45 @@ private:
 
 #endif // ENABLE_MULTI_DEVICE
 
+void allgatherIntoTensor(
+    torch::Tensor input, torch::Tensor output, torch::List<int64_t> ranks, torch::optional<std::string> groupName)
+{
+    auto const numRanks = static_cast<int64_t>(ranks.size());
+    TLLM_CHECK_WITH_INFO(input.is_cuda() && output.is_cuda(), "All-gather buffers must be CUDA tensors");
+    TLLM_CHECK_WITH_INFO(input.is_contiguous() && output.is_contiguous(), "All-gather buffers must be contiguous");
+    TLLM_CHECK_WITH_INFO(input.device() == output.device() && input.scalar_type() == output.scalar_type(),
+        "All-gather buffers must have the same device and dtype");
+    TLLM_CHECK_WITH_INFO(
+        numRanks > 0 && output.numel() == input.numel() * numRanks, "All-gather output must hold one input per rank");
+    if (numRanks == 1)
+    {
+        output.view_as(input).copy_(input);
+        return;
+    }
+#if ENABLE_MULTI_DEVICE
+    if (groupName.has_value())
+    {
+        auto pg = c10d::resolve_process_group(groupName.value());
+        TLLM_CHECK_WITH_INFO(pg->getSize() == numRanks, "All-gather process-group size mismatch");
+        PgHelper pgh{pg};
+        auto work = pgh.allgather(input, output, {});
+        PGCHECK_THROW_WITH_INFO(work, "ProcessGroup: allgather into tensor");
+    }
+    else
+    {
+        std::set<int> group(ranks.begin(), ranks.end());
+        TLLM_CHECK_WITH_INFO(group.size() == ranks.size(), "All-gather ranks must be unique");
+        auto comm = getComm(group);
+        auto type = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+        NCCLCHECK_THROW(ncclAllGather(
+            input.data_ptr(), output.mutable_data_ptr(), input.numel(), (*getDtypeMap())[type], *comm, stream));
+    }
+#else
+    TLLM_THROW("Multi-rank all-gather requires ENABLE_MULTI_DEVICE");
+#endif
+}
+
 torch::Tensor allgather(torch::Tensor input, torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group_)
 {
 #if ENABLE_MULTI_DEVICE
@@ -285,26 +325,52 @@ std::vector<torch::Tensor> allgather_list_pg(torch::TensorList input_list, torch
 #endif // ENABLE_MULTI_DEVICE
 }
 
+torch::Tensor allgather_pg_by_name(torch::Tensor input, torch::optional<torch::List<int64_t>> sizes,
+    torch::List<int64_t> group, std::string const& group_name)
+{
+#if ENABLE_MULTI_DEVICE
+    return allgather_pg(std::move(input), std::move(sizes), std::move(group), c10d::resolve_process_group(group_name));
+#else
+    return input;
+#endif
+}
+
+std::vector<torch::Tensor> allgather_list_pg_by_name(torch::TensorList input_list,
+    torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group, std::string const& group_name)
+{
+#if ENABLE_MULTI_DEVICE
+    return allgather_list_pg(input_list, std::move(sizes), std::move(group), c10d::resolve_process_group(group_name));
+#else
+    return input_list.vec();
+#endif
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def("allgather_into_tensor(Tensor input, Tensor(a!) output, int[] group, str? group_name=None) -> ()");
     m.def("allgather(Tensor input, SymInt[]? sizes, int[] group) -> Tensor");
     m.def(
         "allgather_pg(Tensor input, SymInt[]? sizes, int[] group, __torch__.torch.classes.c10d.ProcessGroup "
         "process_group) -> Tensor");
+    m.def("allgather_pg_by_name(Tensor input, SymInt[]? sizes, int[] group, str group_name) -> Tensor");
     m.def("allgather_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -> Tensor[]");
     m.def(
         "allgather_list_pg(Tensor[] input_list, SymInt[]? sizes, int[] group, "
         "__torch__.torch.classes.c10d.ProcessGroup process_group) -> Tensor[]");
+    m.def("allgather_list_pg_by_name(Tensor[] input_list, SymInt[]? sizes, int[] group, str group_name) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("allgather_into_tensor", &tensorrt_llm::torch_ext::allgatherIntoTensor);
     m.impl("allgather", &tensorrt_llm::torch_ext::allgather);
     m.impl("allgather_pg", &tensorrt_llm::torch_ext::allgather_pg);
+    m.impl("allgather_pg_by_name", &tensorrt_llm::torch_ext::allgather_pg_by_name);
     m.impl("allgather_list", &tensorrt_llm::torch_ext::allgather_list);
     m.impl("allgather_list_pg", &tensorrt_llm::torch_ext::allgather_list_pg);
+    m.impl("allgather_list_pg_by_name", &tensorrt_llm::torch_ext::allgather_list_pg_by_name);
 }

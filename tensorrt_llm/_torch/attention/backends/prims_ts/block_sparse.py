@@ -19,10 +19,11 @@
 Q8/Q16/Q32 SWAPAB or Q64/Q128 KeepsAB specialization, and atomically publishes
 an immutable revision. ``run()`` validates compact BSHD Q/K/V and caller-owned
 routing tensors, then enqueues route preparation followed by attention in one
-compiled adapter on the caller's CUDA stream. The one-shot entry point retains
-synchronous canonical-BSR inspection to derive its temporary plan capacity.
-A dense plan (``use_block_sparse=False``) keeps the tile selection but attends
-over the whole K/V sequence without route preparation.
+compiled adapter on the caller's CUDA stream; a Sage plan's run first gathers
+its scales into the plan-owned prepared buffer. The one-shot entry point
+retains synchronous canonical-BSR inspection to derive its temporary plan
+capacity. A dense plan (``use_block_sparse=False``) keeps the tile selection
+but attends over the whole K/V sequence without route preparation.
 
 ``BlockSparsePagedTSWrapper`` shares the same scheduling policy and decode
 kernel, but plans only fixed Q geometry and maximum K/V capacity. Page spans,
@@ -39,6 +40,7 @@ import torch
 
 from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
 
+from ._scales import GlobalScale
 from ._block_sparse.common import (
     _num_sparse_pattern_heads,
     _validate_contiguous_route_mode,
@@ -75,7 +77,8 @@ from .decode import (
     _resolve_kv_dtypes,
     _validate_runtime_device,
 )
-from .sage import SageAttentionConfig, SageAttentionParams
+from .kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
+from .sage.config import SageAttentionConfig, SageAttentionParams
 
 
 class _BlockSparseWrapperBase:
@@ -122,18 +125,21 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
     """Plan and reuse compact-BSHD block-sparse attention launches.
 
     Q is ``[B, Sq, Hq, D]`` and K/V are ``[B, Skv, Hkv, D]``. Sparse rows are
-    owned per batch, KV head, and query block, so every Q head in one grouped
-    KV head consumes the same sparse row. A plan fixes geometry and a per-row
-    capacity; every run supplies either BSR or a packed exact-block bitmask.
-    Proxy-enabled plans additionally consume caller-owned K/V summaries, while
-    an optional token mask applies only to exact routes. Callers must keep those
-    tensors alive and immutable until the queued run or captured graph finishes
-    using them. CUDA Graph capture pins plan-owned state only, so captured
-    routing storage remains the caller's responsibility.
+    owned per batch, pattern head, and query block, so every Q head in one
+    grouped KV head consumes the same sparse row. A block-sparse plan fixes
+    geometry and a per-row capacity; every run supplies either BSR or a packed
+    exact-block bitmask. Proxy-enabled plans additionally consume caller-owned
+    K/V summaries, while an optional token mask applies only to exact routes.
+    A dense plan's run takes Q/K/V alone, and a Sage plan's run of either kind
+    adds its scale tensors. Callers must keep those tensors alive and immutable
+    until the queued run or captured graph finishes using them. CUDA Graph
+    capture pins plan-owned state only, so captured routing storage remains the
+    caller's responsibility.
 
-    One plan revision owns one mutable route workspace. Its runs must be ordered
-    on one stream or externally synchronized; unordered concurrent runs require
-    distinct wrappers.
+    One block-sparse plan revision owns one mutable route workspace, and one
+    Sage plan revision owns its mutable prepared scales. Its runs must be
+    ordered on one stream or externally synchronized; unordered concurrent runs
+    require distinct wrappers.
     """
 
     @_serialize_plan
@@ -145,8 +151,8 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
-        q_block_size: int,
-        kv_block_size: int,
+        q_block_size: int | None = None,
+        kv_block_size: int | None = None,
         *,
         device: torch.device | str | int,
         use_block_sparse: bool = True,
@@ -162,8 +168,18 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
         sage_config: SageAttentionConfig | None = None,
+        softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+        sm_scale: GlobalScale | None = None,
+        output_scale: GlobalScale = 1.0,
     ) -> None:
         """Choose a legal profile and allocate reusable routing capacity.
+
+        Each global scale independently accepts a host float or a contiguous
+        one-element CUDA FP32 tensor on the planned device. ``sm_scale`` defaults
+        to ``1 / sqrt(D)`` and ``output_scale`` to 1. Their types select the compiled
+        signature; :meth:`run` may replace values with the same types. Tensor
+        contents must be finite and positive and remain live until GPU execution
+        finishes. Updating their contents is supported during CUDA graph replay.
 
         The plan owns immutable geometry and a uniform route workspace, not a
         sparse pattern. ``max_blocks_per_row`` bounds each runtime sparse row in
@@ -179,7 +195,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
 
         ``use_block_sparse=False`` plans dense attention over the whole K/V
         sequence with the same Q-tile selection. Its route arguments must keep
-        their defaults, and :meth:`run` takes Q/K/V only.
+        their defaults, and :meth:`run` takes Q/K/V only, plus the scales of a
+        Sage plan. A dense plan may omit ``q_block_size`` and
+        ``kv_block_size``; each then defaults to 128, which selects the
+        Q128/KV128 Keeps tile. A block-sparse plan requires both.
 
         ``share_pattern_across_kv_heads=False`` retains independent per-KV-head
         patterns. True uses a singleton head axis in BSR/bitmask inputs and
@@ -227,6 +246,17 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``v_data_type``), and the output is ``torch.bfloat16`` (default) or
         ``torch.float16``. Every :meth:`run` then supplies the scale tensors as
         :class:`SageAttentionParams`.
+
+        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) applies to the
+        Q64/KV256 and Q128/KV128 profiles of dense and block-sparse plans: a
+        row keeps its softmax exponent anchor while a tile raises the row
+        maximum by at most this many binades, which skips the rescale of the
+        accumulated output. Probabilities then reach ``2**threshold``, so Sage
+        FP8 P is quantized at ``448 * 2**-threshold`` and probabilities far
+        below the anchor lose E4M3 precision; rows whose largest scores come
+        first, such as attention sinks in the first blocks, are the most
+        exposed. 0 rescales on every new row maximum and quantizes FP8 P at
+        448.
         """
 
         if use_block_sparse:
@@ -273,6 +303,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             ),
             sage=sage_config,
             use_block_sparse=use_block_sparse,
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         )
         if use_proxy_routes and static.mask_type != "dense":
             raise ValueError("block-sparse proxy routes require mask_type='dense'")
@@ -289,6 +320,8 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
                 device=device,
                 device_index=device_index,
                 plan_stream=plan_stream,
+                sm_scale=sm_scale,
+                output_scale=output_scale,
                 sparse_format=sparse_format,
                 use_proxy_routes=use_proxy_routes,
             )
@@ -309,7 +342,8 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         k_summary: torch.Tensor | None = None,
         v_summary: torch.Tensor | None = None,
         kv_valid_bits: torch.Tensor | None = None,
-        sm_scale: float | None = None,
+        sm_scale: GlobalScale | None = None,
+        output_scale: GlobalScale | None = None,
         out: torch.Tensor | None = None,
         validate: bool = True,
         sage: SageAttentionParams | None = None,
@@ -329,7 +363,8 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``validate=True`` performs structural and plan-geometry validation
         without reading tensor values; it is the safe public default.
         ``validate=False`` treats every run argument as a trusted binding and
-        performs no explicit wrapper validation. K/V view selection, scale
+        skips Q/K/V and routing validation. Global scale metadata and kinds are
+        still checked. K/V view selection, scale
         forwarding, and optional output allocation are unavoidable in both
         modes.
 
@@ -383,8 +418,12 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         kv_valid_bits : torch.Tensor, optional
             Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
             Supply it exactly when the plan enabled token validity bits.
-        sm_scale : float, optional
-            Softmax scale. Defaults to ``1 / sqrt(D)``.
+        sm_scale : float or torch.Tensor, optional
+            Global softmax multiplier in natural exponential units. Omitted values
+            inherit the planned default (``1 / sqrt(D)`` unless overridden).
+        output_scale : float or torch.Tensor, optional
+            Global output multiplier, including restored Sage V means. Omitted
+            values inherit the planned default (1 unless overridden).
         out : torch.Tensor, optional
             Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
             planned output dtype. Must not overlap any live input or plan-owned
@@ -421,6 +460,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             v_summary=v_summary,
             kv_valid_bits=kv_valid_bits,
             sm_scale=sm_scale,
+            output_scale=output_scale,
             out=out,
             sage=sage,
         )
@@ -435,8 +475,8 @@ def block_sparse_attention(
     v: torch.Tensor,
     block_indptr: torch.Tensor | None,
     block_indices: torch.Tensor | None,
-    q_block_size: int,
-    kv_block_size: int,
+    q_block_size: int | None = None,
+    kv_block_size: int | None = None,
     *,
     exact_block_bits: torch.Tensor | None = None,
     k_summary: torch.Tensor | None = None,
@@ -447,10 +487,12 @@ def block_sparse_attention(
     use_proxy_routes: bool = False,
     mask_type: Literal["dense", "causal"] = "dense",
     share_pattern_across_kv_heads: bool = False,
-    sm_scale: float | None = None,
+    sm_scale: GlobalScale | None = None,
+    output_scale: GlobalScale = 1.0,
     out: torch.Tensor | None = None,
     sage: SageAttentionParams | None = None,
     sage_config: SageAttentionConfig | None = None,
+    softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
 ) -> torch.Tensor:
     """Plan and run one compact-BSHD block-sparse or dense attention launch.
 
@@ -477,13 +519,15 @@ def block_sparse_attention(
     block_indices : torch.Tensor, optional
         Contiguous Int32 semantic KV-block IDs referenced by ``block_indptr``.
         Required in BSR mode.
-    q_block_size : int
+    q_block_size : int, optional
         Positive number of logical query tokens represented by one BSR row.
         The product with ``Hq / Hkv`` must be divisible by 8 so a physical Q
-        tile does not cross row boundaries.
-    kv_block_size : int
+        tile does not cross row boundaries. Required by a block-sparse call;
+        a dense call defaults it to 128.
+    kv_block_size : int, optional
         Number of logical KV tokens represented by one BSR block ID; it must
-        be 8, 16, 32, or a positive multiple of 64.
+        be 8, 16, 32, or a positive multiple of 64. Required by a block-sparse
+        call; a dense call defaults it to 128.
     exact_block_bits : torch.Tensor, optional
         Compact UInt32 exact-block bitmap required in bitmask mode.
     k_summary : torch.Tensor, optional
@@ -502,8 +546,10 @@ def block_sparse_attention(
         currently require dense masking.
     mask_type : {"dense", "causal"}, optional
         Attention mask applied inside each selected sparse block.
-    sm_scale : float, optional
-        Softmax scale. Defaults to ``1 / sqrt(D)``.
+    sm_scale : float or torch.Tensor, optional
+        Global softmax multiplier in natural exponential units, default ``1 / sqrt(D)``.
+    output_scale : float or torch.Tensor, optional
+        Global output multiplier, including restored Sage V means, default 1.
     out : torch.Tensor, optional
         Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
         Must not overlap any live input; storage overlap is not checked.
@@ -514,6 +560,9 @@ def block_sparse_attention(
     sage_config : SageAttentionConfig, optional
         The Sage recipe to plan. Defaults to :class:`SageAttentionConfig` with
         ``v_mean`` set when ``sage.v_mean`` is present.
+    softmax_rescale_threshold_log2 : float, optional
+        Binades a row maximum may rise before the output is rescaled, 0 to 8
+        (default 8); see :meth:`BlockSparseTSWrapper.plan`.
 
     share_pattern_across_kv_heads : bool
         False (default) uses one pattern per KV head. True requires a singleton
@@ -581,7 +630,7 @@ def block_sparse_attention(
             batch_size=static.batch_size,
             seq_len_q=static.seq_len_q,
             seq_len_kv=static.seq_len_kv,
-            num_kv_heads=_num_sparse_pattern_heads(
+            num_pattern_heads=_num_sparse_pattern_heads(
                 static.num_kv_heads, static.share_pattern_across_kv_heads
             ),
             q_block_size=static.q_block_size,
@@ -625,6 +674,9 @@ def block_sparse_attention(
         o_data_type=static.output_dtype,
         share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
         sage_config=sage_config,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        sm_scale=sm_scale,
+        output_scale=output_scale,
     )
     return wrapper.run(
         q,
@@ -637,6 +689,7 @@ def block_sparse_attention(
         v_summary=v_summary,
         kv_valid_bits=kv_valid_bits,
         sm_scale=sm_scale,
+        output_scale=output_scale,
         out=out,
         sage=sage,
     )
@@ -666,8 +719,18 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
+        softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+        sm_scale: GlobalScale | None = None,
+        output_scale: GlobalScale = 1.0,
     ) -> None:
         """Plan fixed-Q geometry and a maximum variable-K capacity.
+
+        Each global scale independently accepts a host float or a contiguous
+        one-element CUDA FP32 tensor on the planned device. ``sm_scale`` defaults
+        to ``1 / sqrt(D)`` and ``output_scale`` to 1. Their types select the compiled
+        signature; :meth:`run` may replace values with the same types. Tensor
+        contents must be finite and positive and remain live until GPU execution
+        finishes. Updating their contents is supported during CUDA graph replay.
 
         ``share_pattern_across_kv_heads=True`` accepts a singleton pattern-head
         axis and prepares each BSR row once for all KV heads. False (default)
@@ -684,6 +747,11 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         every physical Q tile within exactly one logical BSR row.
         ``kv_block_size`` remains restricted to 8, 16, 32, or a positive
         multiple of 64.
+
+        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) is the number of
+        binades a row maximum may rise on the Q64/KV256 and Q128/KV128
+        profiles before the output is rescaled; see
+        :meth:`BlockSparseTSWrapper.plan`.
         """
 
         static = _validate_block_sparse_static_profile(
@@ -703,6 +771,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             kv_dtype=kv_data_type,
             output_dtype=o_data_type,
             max_blocks_per_row=max_blocks_per_row,
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         )
         assert static.page_size is not None
         device, device_index = _resolve_cuda_device(device)
@@ -718,6 +787,8 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
                 device=device,
                 device_index=device_index,
                 plan_stream=plan_stream,
+                sm_scale=sm_scale,
+                output_scale=output_scale,
             )
         self._plan_state = candidate
 
@@ -732,7 +803,8 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         block_indices: torch.Tensor,
         *,
         kv_valid_bits: torch.Tensor | None = None,
-        sm_scale: float | None = None,
+        sm_scale: GlobalScale | None = None,
+        output_scale: GlobalScale | None = None,
         out: torch.Tensor | None = None,
         validate: bool = True,
     ) -> torch.Tensor:
@@ -746,7 +818,8 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         ``validate=True`` performs structural and plan-geometry validation
         without reading tensor values; it is the safe public default.
         ``validate=False`` treats every run argument as a trusted binding and
-        performs no explicit wrapper validation. K/V view selection, scale
+        skips Q/K/V and routing validation. Global scale metadata and kinds are
+        still checked. K/V view selection, scale
         forwarding, and optional output allocation are unavoidable in both
         modes.
 
@@ -801,8 +874,12 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             Contiguous UInt32 logical-token validity bitmap
             ``[B, ceil(max_seq_len_kv / 32)]``. Supply it exactly when the plan
             enabled token validity bits.
-        sm_scale : float, optional
-            Softmax scale. Defaults to ``1 / sqrt(D)``.
+        sm_scale : float or torch.Tensor, optional
+            Global softmax multiplier in natural exponential units. Omitted values
+            inherit the planned default (``1 / sqrt(D)`` unless overridden).
+        output_scale : float or torch.Tensor, optional
+            Global output multiplier, including restored Sage V means. Omitted
+            values inherit the planned default (1 unless overridden).
         out : torch.Tensor, optional
             Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
             planned output dtype. Must not overlap any live input or plan-owned
@@ -838,6 +915,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             block_indices=block_indices,
             kv_valid_bits=kv_valid_bits,
             sm_scale=sm_scale,
+            output_scale=output_scale,
             out=out,
         )
         return self._launch_validated_run(state, run_args, run_stream)
@@ -858,8 +936,10 @@ def block_sparse_attention_with_paged_kv_cache(
     kv_valid_bits: torch.Tensor | None = None,
     mask_type: Literal["dense", "causal"] = "dense",
     share_pattern_across_kv_heads: bool = False,
-    sm_scale: float | None = None,
+    sm_scale: GlobalScale | None = None,
+    output_scale: GlobalScale = 1.0,
     out: torch.Tensor | None = None,
+    softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
 ) -> torch.Tensor:
     """Plan and run one fixed-Q paged block-sparse attention launch.
 
@@ -903,11 +983,16 @@ def block_sparse_attention_with_paged_kv_cache(
         ``[B, ceil(max_seq_len_kv / 32)]``.
     mask_type : {"dense", "causal"}, optional
         Attention mask applied inside each selected sparse block.
-    sm_scale : float, optional
-        Softmax scale. Defaults to ``1 / sqrt(D)``.
+    sm_scale : float or torch.Tensor, optional
+        Global softmax multiplier in natural exponential units, default ``1 / sqrt(D)``.
+    output_scale : float or torch.Tensor, optional
+        Global output multiplier, including restored Sage V means, default 1.
     out : torch.Tensor, optional
         Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
         Must not overlap any live input; storage overlap is not checked.
+    softmax_rescale_threshold_log2 : float, optional
+        Binades a row maximum may rise before the output is rescaled, 0 to 8
+        (default 8); see :meth:`BlockSparseTSWrapper.plan`.
 
     share_pattern_across_kv_heads : bool
         False (default) uses one pattern per KV head. True requires a singleton
@@ -973,7 +1058,7 @@ def block_sparse_attention_with_paged_kv_cache(
         batch_size=static.batch_size,
         seq_len_q=static.seq_len_q,
         seq_len_kv=static.seq_len_kv,
-        num_kv_heads=_num_sparse_pattern_heads(
+        num_pattern_heads=_num_sparse_pattern_heads(
             static.num_kv_heads, static.share_pattern_across_kv_heads
         ),
         q_block_size=static.q_block_size,
@@ -1010,6 +1095,9 @@ def block_sparse_attention_with_paged_kv_cache(
         kv_data_type=static.kv_dtype,
         o_data_type=static.output_dtype,
         share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        sm_scale=sm_scale,
+        output_scale=output_scale,
     )
     return wrapper.run(
         q,
@@ -1020,6 +1108,7 @@ def block_sparse_attention_with_paged_kv_cache(
         block_indices,
         kv_valid_bits=kv_valid_bits,
         sm_scale=sm_scale,
+        output_scale=output_scale,
         out=out,
     )
 

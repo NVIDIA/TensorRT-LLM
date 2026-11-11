@@ -19,14 +19,6 @@
 # replace it. The bootstrap mechanics live in `_bootstrap.py`, which keeps its
 # module scope to the standard library so that importing it here cannot pull in
 # torch ahead of the environment preparation it performs.
-import sys
-
-from ._bootstrap import _init, _prepare_environment
-
-# Phase 1: cache environment, DLL search path, Python-library preload and
-# vendored triton_kernels precedence. Must run before torch and before any
-# TensorRT-LLM shared object.
-_prepare_environment()
 
 # The package's public surface is loaded lazily (PEP 562): importing
 # tensorrt_llm no longer executes the whole product tree (previously ~99% of
@@ -35,12 +27,23 @@ _prepare_environment()
 # what that name needs. The TYPE_CHECKING block keeps the original imports
 # visible to static tooling.
 import importlib
+import sys
 from typing import TYPE_CHECKING
 
-# Need to import torch before tensorrt_llm library, otherwise some shared binary files
-# cannot be found for the public PyTorch, raising errors like:
-# ImportError: libc10.so: cannot open shared object file: No such file or directory
-import torch  # noqa
+from ._bootstrap import _init, _mimalloc_arenas_off_thp, _prepare_environment
+
+# Keeps torch's mimalloc arenas off transparent huge pages; the default it sets
+# must be in place when torch loads, so the torch import stays in this block.
+with _mimalloc_arenas_off_thp():
+    # Phase 1: cache environment, DLL search path, Python-library preload and
+    # vendored triton_kernels precedence. Must run before torch and before any
+    # TensorRT-LLM shared object.
+    _prepare_environment()
+
+    # Need to import torch before tensorrt_llm library, otherwise some shared binary files
+    # cannot be found for the public PyTorch, raising errors like:
+    # ImportError: libc10.so: cannot open shared object file: No such file or directory
+    import torch  # noqa
 
 from .logger import logger
 from .version import __version__
@@ -110,7 +113,17 @@ def __getattr__(name):
     entry = _LAZY_ATTRS.get(name)
     if entry is not None:
         module_name, attr = entry
-        module = importlib.import_module(module_name)
+        try:
+            module = importlib.import_module(module_name)
+        except AttributeError as e:
+            # An AttributeError escaping the module is a bug inside it, not a
+            # missing name here. Raised as is, hasattr() and getattr() with a
+            # default would hide it, and ``from ... import`` would run the
+            # module twice (losing the cause unless the name is a submodule).
+            raise ImportError(
+                f"cannot import {name!r} from {__name__!r}: importing "
+                f"{module_name} raised {e!r}",
+                name=__name__) from e
         value = module if attr is None else getattr(module, attr)
         globals()[name] = value  # cache: subsequent access skips __getattr__
         return value
@@ -126,6 +139,12 @@ def __getattr__(name):
             raise
         raise AttributeError(
             f"module {__name__!r} has no attribute {name!r}") from None
+    except AttributeError as e:
+        # Same as above: a bug inside the submodule, not a missing name.
+        raise ImportError(
+            f"cannot import {name!r} from {__name__!r}: importing "
+            f"{__name__}.{name} raised {e!r}",
+            name=__name__) from e
 
 
 def __dir__():

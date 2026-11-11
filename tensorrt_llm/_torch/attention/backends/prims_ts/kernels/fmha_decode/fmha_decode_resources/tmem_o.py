@@ -359,6 +359,10 @@ class TmemOResource(DecodeGenResourceBase):
             cfg
         )
 
+        if cutlass.const_expr(cfg.use_keeps_mma_ab):
+            # SMEM keeps a complete staging band; MMA/TMEM own only live columns.
+            mma_n = min(mma_n, cfg.headdim - head_dim_stage_idx * cfg.head_dim_kv_stage)
+
         if cutlass.const_expr(cfg.head_dim_per_stage_kv == 0):
             # Full-headDim path: all V columns for this O stage live in one
             # contiguous TMEM stage selected by the TS pipeline stage index.
@@ -505,7 +509,9 @@ class TmemOResource(DecodeGenResourceBase):
                             )
                         else:
                             v_operand = v_operand + Int32(
-                                (cfg.head_dim_kv_stage * 2) if cfg.use_fp8_pv else 128
+                                (min(cfg.head_dim_kv_stage, 128) * 2)
+                                if cfg.use_fp8_pv
+                                else 128
                             )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(

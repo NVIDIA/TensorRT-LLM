@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Deadline arbitration tests; no backend or GPU is needed to advance the clock."""
 
+import re
 import threading
 from functools import partial
 from types import SimpleNamespace
@@ -10,34 +11,49 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base import Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
-from tensorrt_llm._torch.disaggregation.native.bounce import NoBounceTransport
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
+from tensorrt_llm._torch.disaggregation.native.ownership import (
+    PhysicalOperationState,
+    SendOperationOwner,
+)
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 
 pytestmark = pytest.mark.cpu_only
 
 
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
+
+
 @pytest.mark.parametrize("reason", ["cancelled", "failed", "shutdown", "peer lost"])
-def test_first_drain_trigger_cannot_be_extended(reason: str) -> None:
+@pytest.mark.parametrize("grace_s", [None, 2.0, 8.0])
+def test_first_drain_trigger_cannot_be_extended(reason: str, grace_s: float | None) -> None:
     """Repeated notifications do not reset the physical grace period."""
     clock, notify = Mock(return_value=10.0), Mock()
     watchdog = RetirementWatchdog(notify, clock=clock)
-    owner = watchdog.create_owner(4, "receive", 5.0)
+    owner = watchdog.create_owner(4, "receive", 5.0, grace_s=grace_s)
+    deadline = 10.0 + (5.0 if grace_s is None else grace_s)
     claim = object()
     assert owner.expose(claim)
     owner.request_drain(reason)
-    clock.return_value = 14.0
+    clock.return_value = deadline - 1.0
     owner.request_drain("another failure")
     watchdog.progress()
     assert watchdog.fatal is None
-    clock.return_value = 15.0
+    clock.return_value = deadline
     watchdog.progress()
     event = watchdog.fatal
     assert event is not None
-    assert (event.started_at, event.deadline, event.reason) == (10.0, 15.0, reason)
+    assert (event.started_at, event.deadline, event.reason) == (10.0, deadline, reason)
     assert not owner.settle(claim)
     assert not owner.can_retire()
     assert not owner.close()
@@ -45,16 +61,19 @@ def test_first_drain_trigger_cannot_be_extended(reason: str) -> None:
     notify.assert_called_once_with(event)
 
 
-@pytest.mark.parametrize("settle_at,retirable", [(14.999, True), (15.0, False), (15.001, False)])
-def test_settlement_and_deadline_share_one_boundary(settle_at: float, retirable: bool) -> None:
+@pytest.mark.parametrize("offset,retirable", [(-0.001, True), (0.0, False), (0.001, False)])
+@pytest.mark.parametrize("grace_s", [None, 2.0, 8.0])
+def test_settlement_and_deadline_share_one_boundary(
+    offset: float, retirable: bool, grace_s: float | None
+) -> None:
     """Evidence arriving exactly at expiry cannot authorize memory reuse."""
     clock = Mock(return_value=10.0)
     watchdog = RetirementWatchdog(Mock(), clock=clock)
-    owner = watchdog.create_owner(4, "send", 5.0)
+    owner = watchdog.create_owner(4, "send", 5.0, grace_s=grace_s)
     claim = object()
     assert owner.expose(claim)
     owner.request_drain("failed")
-    clock.return_value = settle_at
+    clock.return_value = 10.0 + (5.0 if grace_s is None else grace_s) + offset
     assert owner.settle(claim) is retirable
     assert owner.close() is retirable
     clock.return_value = 100.0
@@ -62,21 +81,29 @@ def test_settlement_and_deadline_share_one_boundary(settle_at: float, retirable:
     assert (watchdog.fatal is None) is retirable
 
 
-def test_request_timeout_starts_grace_without_executor_polling() -> None:
+@pytest.mark.parametrize("grace_s", [None, 2.0, 8.0])
+@pytest.mark.parametrize("pieces_complete", [False, True])
+def test_request_timeout_starts_grace_without_executor_polling(
+    grace_s: float | None, pieces_complete: bool
+) -> None:
     """A stalled backend gets a request timeout followed by exactly one grace window."""
     clock = Mock(return_value=10.0)
     watchdog = RetirementWatchdog(Mock(), clock=clock)
-    owner = watchdog.create_owner(4, "send", 5.0)
+    owner = watchdog.create_owner(4, "send", 5.0, grace_s=grace_s)
     claim = object()
     assert owner.expose(claim)
-    clock.return_value = 19.0
+    if pieces_complete:
+        owner.complete_pieces()
+    deadline = 15.0 + (5.0 if grace_s is None else grace_s)
+    clock.return_value = deadline - 1.0
     watchdog.progress()
     assert watchdog.fatal is None
     assert not owner.expose(object())
-    clock.return_value = 20.0
+    clock.return_value = deadline
     watchdog.progress()
     assert watchdog.fatal is not None
     assert watchdog.fatal.started_at == 15.0
+    assert watchdog.fatal.deadline == deadline
     assert watchdog.fatal.reason == "transfer timeout"
 
 
@@ -116,10 +143,63 @@ def test_unpublished_cancellation_is_retirable_without_fatal() -> None:
     watchdog.stop()
 
 
+def test_unclosed_owner_query_observes_owner_lifecycle_without_progress() -> None:
+    """Observation neither retires an owner nor changes clocks or admission."""
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
+
+    def assert_unclosed(expected: bool) -> None:
+        """Check the snapshot without progressing or stopping the watchdog."""
+        clock.reset_mock()
+        assert watchdog.has_unclosed_owners is expected
+        clock.assert_not_called()
+        notify.assert_not_called()
+        assert not watchdog._stopped.is_set()
+        assert not watchdog.shutdown_requested
+
+    assert_unclosed(False)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    assert_unclosed(True)
+    claim = object()
+    assert owner.expose(claim)
+    assert_unclosed(True)
+    assert owner._claims == {id(claim): claim}
+    assert owner.settle(claim)
+    assert_unclosed(True)
+    assert watchdog.fatal is None
+    assert owner.can_retire()
+    with pytest.raises(RuntimeError, match="retained owners"):
+        watchdog.stop()
+    with pytest.raises(RuntimeError, match="teardown refused"):
+        watchdog.require_retired()
+    assert_unclosed(True)
+    assert watchdog._owners == {owner}
+    assert owner.close()
+    assert_unclosed(False)
+    watchdog.require_retired()
+    watchdog.stop()
+
+
+def test_shutdown_request_closes_admission_without_fatal() -> None:
+    """Requested shutdown blocks new work independently of fatal expiry."""
+    watchdog = RetirementWatchdog(Mock(), clock=Mock(return_value=10.0))
+    owner = watchdog.create_owner(4, "receive", 5.0)
+    assert not watchdog.shutdown_requested
+    watchdog.request_shutdown()
+    assert watchdog.shutdown_requested
+    assert watchdog.fatal is None
+    assert not owner.expose(object())
+    with pytest.raises(RuntimeError, match="admission is closed"):
+        watchdog.create_owner(5, "send", 5.0)
+    assert owner.close()
+    watchdog.stop()
+    assert watchdog.shutdown_requested
+
+
 def test_fatal_closes_all_admission_and_keeps_sibling_roots() -> None:
     """One fatal owner closes the worker, not merely its own next operation."""
-    clock = Mock(return_value=10.0)
-    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
     sender = watchdog.create_owner(4, "send", 5.0)
     receiver = watchdog.create_owner(5, "receive", 5.0)
     source, destination = object(), object()
@@ -128,6 +208,15 @@ def test_fatal_closes_all_admission_and_keeps_sibling_roots() -> None:
     sender.request_drain("failed")
     clock.return_value = 15.0
     watchdog.progress()
+    clock.reset_mock()
+    assert watchdog.has_unclosed_owners
+    assert watchdog.fatal is not None
+    assert not watchdog.shutdown_requested
+    clock.assert_not_called()
+    notify.assert_called_once_with(watchdog.fatal)
+    assert not watchdog._stopped.is_set()
+    assert sender._claims == {id(source): source}
+    assert receiver._claims == {id(destination): destination}
     assert not receiver.settle(destination)
     assert not receiver.expose(object())
     with pytest.raises(RuntimeError, match="admission is closed"):
@@ -151,6 +240,165 @@ def test_callback_failure_is_once_only_and_cannot_erase_fatal() -> None:
     notify.assert_called_once()
     assert watchdog.fatal is not None
     assert not owner.settle(claim)
+
+
+@pytest.mark.parametrize("first_poll", [15.0, 20.0, 21.0])
+def test_timeout_callback_failure_preserves_physical_deadline(first_poll: float) -> None:
+    """Logical notification failure cannot postpone or suppress physical expiry."""
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    claim = object()
+    assert owner.expose(claim)
+    timeout = Mock(side_effect=RuntimeError("logical notification failed"))
+    owner.bind_timeout_outcome(timeout)
+    clock.return_value = first_poll
+    watchdog.progress()
+    if first_poll < 20.0:
+        assert watchdog.fatal is None
+        assert not owner.expose(object())
+        clock.return_value = 20.0
+        watchdog.progress()
+    event = watchdog.fatal
+    assert event is not None
+    assert (event.started_at, event.deadline, event.expired_at) == (
+        15.0,
+        20.0,
+        max(first_poll, 20.0),
+    )
+    watchdog.progress()
+    timeout.assert_called_once_with()
+    notify.assert_called_once_with(event)
+    assert not owner.settle(claim)
+    assert owner._claims == {id(claim): claim}
+
+
+def test_timeout_callback_failure_keeps_watchdog_running() -> None:
+    """Containment still runs without caller-side checks after a callback raises."""
+    clock = Mock(return_value=10.0)
+    timed_out, notified = threading.Event(), threading.Event()
+    notify = Mock(side_effect=lambda _event: notified.set())
+    watchdog = RetirementWatchdog(notify, clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    claim = object()
+    assert owner.expose(claim)
+
+    def fail_timeout() -> None:
+        """Signal callback entry before exercising the failure boundary."""
+        timed_out.set()
+        raise RuntimeError("logical notification failed")
+
+    timeout = Mock(side_effect=fail_timeout)
+    owner.bind_timeout_outcome(timeout)
+    clock.return_value = 15.0
+    watchdog.start()
+    try:
+        assert timed_out.wait(1)
+        with watchdog.lock:
+            assert watchdog.fatal is None
+            clock.return_value = 20.0
+        watchdog.wake.set()
+        assert notified.wait(1)
+        event = watchdog.fatal
+        assert event is not None
+        assert (event.started_at, event.deadline) == (15.0, 20.0)
+        timeout.assert_called_once_with()
+        notify.assert_called_once_with(event)
+        assert owner._claims == {id(claim): claim}
+    finally:
+        # Test-only thread cleanup; no physical claim is released by containment.
+        watchdog._stopped.set()
+        watchdog.wake.set()
+        watchdog._thread.join(timeout=1)
+    assert not watchdog._thread.is_alive()
+
+
+@pytest.mark.parametrize("scan", ["progress", "request_shutdown"])
+def test_timeout_callback_can_close_owner_during_scan(scan: str) -> None:
+    """Removing a settled owner cannot interrupt checks of other tracked owners."""
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    sibling = watchdog.create_owner(5, "receive", 5.0)
+    claim, sibling_claim = object(), object()
+    assert owner.expose(claim)
+    assert owner.settle(claim)
+    assert sibling.expose(sibling_claim)
+    timeout = Mock(side_effect=owner.close)
+    owner.bind_timeout_outcome(timeout)
+    clock.return_value = 15.0
+    getattr(watchdog, scan)()
+    timeout.assert_called_once_with()
+    assert owner._closed
+    assert watchdog._owners == {sibling}
+    assert watchdog.fatal is None
+    clock.return_value = 20.0
+    watchdog.progress()
+    assert watchdog.fatal is not None
+    assert watchdog.fatal.request_id == 5
+    assert sibling._claims == {id(sibling_claim): sibling_claim}
+    notify.assert_called_once_with(watchdog.fatal)
+
+
+@pytest.mark.parametrize("scan", ["progress", "request_shutdown"])
+def test_timeout_callback_owner_registration_obeys_shutdown(scan: str) -> None:
+    """Reentrant registration is tracked normally but rejected during shutdown."""
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    claim = object()
+    assert owner.expose(claim)
+    assert owner.settle(claim)
+    register = Mock(side_effect=lambda: watchdog.create_owner(5, "receive", 5.0))
+    owner.bind_timeout_outcome(register)
+    clock.return_value = 15.0
+    getattr(watchdog, scan)()
+    register.assert_called_once_with()
+    assert owner.close()
+    if scan == "request_shutdown":
+        assert not watchdog._owners
+        assert watchdog.shutdown_requested
+        watchdog.stop()
+        notify.assert_not_called()
+    else:
+        (created,) = watchdog._owners
+        assert created.request_id == 5
+        assert created.expose(claim)
+        clock.return_value = 25.0
+        watchdog.progress()
+        assert watchdog.fatal is not None
+        assert watchdog.fatal.request_id == 5
+        assert created._claims == {id(claim): claim}
+        notify.assert_called_once_with(watchdog.fatal)
+
+
+def test_timeout_callback_reentry_preserves_first_fatal_event() -> None:
+    """The outer expiry check cannot overwrite a fatal decision from reentry."""
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    sibling = watchdog.create_owner(5, "receive", 5.0)
+    claim, sibling_claim = object(), object()
+    assert owner.expose(claim)
+    assert sibling.expose(sibling_claim)
+    first_events = []
+
+    def check_sibling() -> None:
+        """Commit the sibling's fatal event before the outer check resumes."""
+        sibling.check()
+        first_events.append(watchdog.fatal)
+
+    owner.bind_timeout_outcome(check_sibling)
+    clock.return_value = 20.0
+    owner.check()
+    assert len(first_events) == 1
+    assert watchdog.fatal is first_events[0]
+    assert watchdog.fatal.request_id == 5
+    watchdog.progress()
+    watchdog.progress()
+    notify.assert_called_once_with(first_events[0])
+    assert owner._claims == {id(claim): claim}
+    assert sibling._claims == {id(sibling_claim): sibling_claim}
 
 
 def test_watchdog_notifies_outside_arbiter_lock() -> None:
@@ -194,7 +442,7 @@ def test_blocked_backend_cannot_delay_fatal_deadline(blocked_call: str) -> None:
     task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=4))
     task.bind_logical_outcomes(transfer_mod._LogicalOutcomes(retirement))
     assert task.begin_physical_operation(7)
-    request = object()
+    request = _write_request()
     status = Mock(wait=Mock(return_value=True), is_completed=Mock(return_value=True))
 
     def block() -> object:
@@ -209,7 +457,10 @@ def test_blocked_backend_cannot_delay_fatal_deadline(blocked_call: str) -> None:
     sender._enforce_physical_ownership = True
     sender._ownership_poisoned = None
     sender._ownership_poison_lock = watchdog.lock
-    sender._agent = Mock(submit_transfer_requests=Mock(return_value=status))
+    sender._agent = Mock(
+        submit_transfer_requests=Mock(return_value=status),
+        check_remote_descs=Mock(return_value=True),
+    )
     if blocked_call == "query":
         task.begin_backend_submission(7, request)
         task.record_backend_submission(7, status)
@@ -302,12 +553,18 @@ def test_repeated_done_is_idempotent_after_another_owner_becomes_fatal() -> None
     assert not task.resources_drained
 
 
-@pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan")])
-def test_invalid_deadline_is_rejected_before_admission(timeout: float) -> None:
+@pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), -float("inf"), float("nan")])
+@pytest.mark.parametrize("invalid_grace", [False, True])
+def test_invalid_deadline_is_rejected_before_admission(timeout: float, invalid_grace: bool) -> None:
     """Unbounded and non-positive settings cannot activate deadline enforcement."""
     watchdog = RetirementWatchdog(Mock())
     with pytest.raises(ValueError, match="finite positive"):
-        watchdog.create_owner(4, "send", timeout)
+        watchdog.create_owner(
+            4,
+            "send",
+            5.0 if invalid_grace else timeout,
+            grace_s=timeout if invalid_grace else 5.0,
+        )
     assert not watchdog._owners
 
 
@@ -350,7 +607,6 @@ def _receiver(watchdog: RetirementWatchdog) -> transfer_mod.Receiver:
     receiver._shutdown = False
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
-    receiver._bounce = Mock()
     return receiver
 
 
@@ -365,6 +621,11 @@ def _rx_session(receiver: transfer_mod.Receiver) -> transfer_mod.RxSession:
         timeout_s=5.0,
         retirement_watchdog=receiver._retirement_watchdog,
     )
+
+
+def _write_request() -> Mock:
+    """A NIXL WRITE request whose remote descriptors pass the sender preflight."""
+    return Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
 
 
 def _tx_session(watchdog: RetirementWatchdog, *, need_aux: bool = True) -> transfer_mod.TxSession:
@@ -384,6 +645,7 @@ def _tx_session(watchdog: RetirementWatchdog, *, need_aux: bool = True) -> trans
     sender._peer_requests_timestamps = {}
     sender.dispatch_task = Mock()
     sender._agent = Mock()
+    sender._agent.check_remote_descs.return_value = True
     sender._agent.submit_transfer_requests.return_value.wait.return_value = True
     params = DisaggregatedParams(disagg_request_id=4)
     if need_aux:
@@ -396,8 +658,167 @@ def _tx_session(watchdog: RetirementWatchdog, *, need_aux: bool = True) -> trans
 def _submit_piece(session: transfer_mod.TxSession, task: transfer_mod.SendTaskBase) -> None:
     """Drive the real sender's submission, backend-DONE and delivery transitions."""
     assert session._sender._begin_task_operation(task, 7)
-    assert session._sender._submit_transfer(task, 7, object()) == (True, None)
+    assert session._sender._submit_transfer(task, 7, _write_request()) == (True, None)
     task.complete()
+
+
+def test_operation_snapshot_distinguishes_empty_and_retains_state_values() -> None:
+    """Snapshots contain immutable evidence, not live operation objects."""
+    owner = SendOperationOwner()
+    assert owner.try_snapshot_operation_states() == ()
+    assert owner.begin_physical_operation(1)
+    snapshot = owner.try_snapshot_operation_states()
+    assert snapshot == (PhysicalOperationState.ADMITTED,)
+
+    owner.retire_unsubmitted_physical_operation(1)
+
+    assert snapshot == (PhysicalOperationState.ADMITTED,)
+    assert owner.try_snapshot_operation_states() == (PhysicalOperationState.NOT_SUBMITTED,)
+
+
+def test_timeout_progress_reports_mixed_sender_phases_without_advancing_deadlines() -> None:
+    """An observation must neither query a backend nor arbitrate an overdue clock."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    session = _tx_session(watchdog, need_aux=False)
+    session.send(Chunk([], [], TokenRange(0, 16), True))
+    task = session.kv_tasks[0]
+    backend_status = Mock()
+    for peer in range(6):
+        assert task.begin_physical_operation(peer)
+    for peer in (1, 2, 3, 5):
+        task.begin_backend_submission(peer, object())
+    for peer in (2, 3, 5):
+        task.record_backend_submission(peer, backend_status)
+    task.retire_backend_done_physical_operation(3)
+    task.retire_unsubmitted_physical_operation(4)
+    task.mark_physical_operation_in_doubt(5)
+
+    def snapshot_state() -> tuple[object, ...]:
+        return (
+            session._deadline_monotonic_s,
+            session._retirement._request_deadline,
+            session._retirement._drain_started,
+            dict(session._retirement._claims),
+            session._logical_outcomes._terminal,
+            [operation.state for operation in task._physical_operations.values()],
+        )
+
+    before = snapshot_state()
+    clock.return_value = 100.0
+    clock.reset_mock()
+
+    description = session._timeout_progress_description()
+
+    for phase in (
+        "pre_submission",
+        "submitting",
+        "submitted",
+        "not_submitted",
+        "backend_done",
+        "in_doubt",
+    ):
+        assert re.search(rf"(?:\[|,){phase}=1(?:,|\])", description), description
+    assert "source_pieces=1" in description
+    assert "unavailable_tasks=0" in description
+    assert before == snapshot_state()
+    clock.assert_not_called()
+    assert backend_status.mock_calls == []
+
+
+def test_timeout_progress_reports_publication_not_remote_submission() -> None:
+    """GEN's local writer evidence must not be presented as CTX service progress."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    session = _rx_session(_receiver(watchdog))
+    task = session.prepare_receive(Chunk([], [], TokenRange(0, 16), True))
+    assert task is not None
+    task.expected_transfers = 2
+    published: set[int] = set()
+    assert session.try_begin_transfer(
+        0,
+        {"sender"},
+        writer_cohort={1, 2},
+        publish=lambda: published.update((1, 2)),
+        published_writers=published,
+    )
+    owner = task._physical_owner
+    assert owner is not None
+    owner.record_writer_result(1, True)
+    owner.record_writer_in_doubt(2)
+
+    def snapshot_state() -> tuple[object, ...]:
+        return (
+            session._retirement._request_deadline,
+            dict(session._retirement._claims),
+            session._logical_outcomes._terminal,
+            dict(owner._writer_results),
+            set(owner._in_doubt_writers),
+        )
+
+    before = snapshot_state()
+    clock.return_value = 100.0
+    clock.reset_mock()
+
+    description = session._timeout_progress_description()
+
+    assert "ctx_submission=unknown" in description
+    assert "publication_may_have_escaped=True" in description
+    assert "expected_writer_results=4" in description  # KV and AUX each need two writers.
+    assert "received_writer_results=1" in description
+    assert "in_doubt_writers=1" in description
+    assert before == snapshot_state()
+    clock.assert_not_called()
+
+
+@pytest.mark.parametrize("side", ["tx", "rx"])
+@pytest.mark.parametrize("locked", ["session", "owner"])
+def test_timeout_progress_does_not_wait_for_busy_metadata(side: str, locked: str) -> None:
+    """A timeout report must not wait behind a worker or retirement arbiter."""
+    watchdog = RetirementWatchdog(Mock(), clock=lambda: 10.0)
+    if side == "tx":
+        session = _tx_session(watchdog, need_aux=False)
+        session.send(Chunk([], [], TokenRange(0, 16), True))
+    else:
+        session = _rx_session(_receiver(watchdog))
+        session.prepare_receive(Chunk([], [], TokenRange(0, 16), True))
+    results = []
+    lock = session.lock if locked == "session" else watchdog.lock
+    with lock:
+        thread = threading.Thread(
+            target=lambda: results.append(session._timeout_progress_description())
+        )
+        thread.start()
+        thread.join(timeout=1.0)
+        finished_without_unlock = not thread.is_alive()
+    thread.join(timeout=1.0)
+    assert finished_without_unlock
+    assert len(results) == 1
+    expected = (
+        "session_busy"
+        if locked == "session"
+        else ("unavailable_tasks=1" if side == "tx" else "unavailable_owners=2")
+    )
+    assert expected in results[0]
+    if side == "rx":
+        session.cancel_local()
+    assert session.close()
+    watchdog.stop()
+
+
+@pytest.mark.parametrize("side", ["tx", "rx"])
+def test_timeout_progress_keeps_legacy_resource_evidence_unavailable(side: str) -> None:
+    """Native sessions without physical ownership do not invent operation phases."""
+    peer = SimpleNamespace(
+        _enforce_physical_ownership=False, setup_session=Mock(), clear_session=Mock()
+    )
+    session_type = transfer_mod.TxSession if side == "tx" else transfer_mod.RxSession
+    session = session_type(4, DisaggregatedParams(disagg_request_id=4), peer)
+    description = session._timeout_progress_description()
+    assert "unavailable(ownership_disabled)" in description
+    assert "pre_submission=" not in description
+    assert "expected_writer_results=" not in description
+    assert session.close()
 
 
 @pytest.mark.parametrize("piece", ["kv", "aux"])
@@ -423,12 +844,12 @@ def test_idle_session_keeps_original_deadline_for_later_piece(piece: str, submit
     assert session._sender._begin_task_operation(later, 7)
     clock.return_value = submit_at
     if submit_at < 15.0:
-        assert session._sender._submit_transfer(later, 7, object()) == (True, None)
+        assert session._sender._submit_transfer(later, 7, _write_request()) == (True, None)
         later.complete()
         assert session.is_completed()
     else:
         with pytest.raises(transfer_mod._TransferNotSubmittedError):
-            session._sender._submit_transfer(later, 7, object())
+            session._sender._submit_transfer(later, 7, _write_request())
         assert (
             later._physical_operations[7].state
             is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
@@ -501,7 +922,6 @@ def test_final_completion_precedes_delayed_perf_logging(final_piece: str, monkey
     watchdog = RetirementWatchdog(Mock(), clock=clock)
     if final_piece == "receive_kv":
         receiver = _receiver(watchdog)
-        receiver._bounce = NoBounceTransport()
         receiver._registrar = SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
         )
@@ -513,8 +933,14 @@ def test_final_completion_precedes_delayed_perf_logging(final_piece: str, monkey
             0, {"sender"}, {7}, publish=lambda: published.add(7), published_writers=published
         )
         session.process_aux_agent_result(7, transfer_mod.AgentResult.SUCCESS)
+        _publish_report_tokens(session)
         finish = partial(
-            session.process_kv_agent_result, 7, 0, True, transfer_mod.AgentResult.SUCCESS
+            session.process_kv_agent_result,
+            7,
+            0,
+            True,
+            transfer_mod.AgentResult.SUCCESS,
+            _KV_RESULT_REPORT_TOKEN,
         )
     else:
         need_aux = final_piece == "send_aux"
@@ -526,7 +952,6 @@ def test_final_completion_precedes_delayed_perf_logging(final_piece: str, monkey
             task = session.send_aux()
         sender = session._sender
         sender._instance_rank = sender._device_id = 0
-        sender._bounce = NoBounceTransport()
         sender._registrar = SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="sender", instance_rank=0)
         )
@@ -612,7 +1037,6 @@ def test_finished_nonfinal_piece_does_not_complete_session(direction: str, block
         _submit_piece(session, session.kv_tasks[0])
     else:
         receiver = _receiver(watchdog)
-        receiver._bounce = NoBounceTransport()
         receiver._registrar = SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
         )
@@ -626,7 +1050,14 @@ def test_finished_nonfinal_piece_does_not_complete_session(direction: str, block
         task = session.prepare_receive(chunk)
         task.expected_transfers = 1
         assert session.try_begin_transfer(0, {"sender"}, {7})
-        session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.SUCCESS)
+        _publish_report_tokens(session)
+        session.process_kv_agent_result(
+            7,
+            0,
+            True,
+            transfer_mod.AgentResult.SUCCESS,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        )
     assert not session._retirement._claims
     assert not session._retirement.is_complete
     assert not session.is_completed()
@@ -648,7 +1079,7 @@ def test_completion_at_transfer_deadline_cannot_replace_timeout() -> None:
     _submit_piece(session, session.kv_tasks[0])
     task = session.send_aux()
     assert session._sender._begin_task_operation(task, 7)
-    assert session._sender._submit_transfer(task, 7, object()) == (True, None)
+    assert session._sender._submit_transfer(task, 7, _write_request()) == (True, None)
     clock.return_value = 15.0
     task.complete()
     assert task.logical_outcome.status is SessionStatus.ERROR
@@ -671,7 +1102,7 @@ def test_expired_fanout_rejects_queued_peer_but_retains_submitted_sibling() -> N
     assert session._sender._begin_task_operation(task, 8)
     clock.return_value = 15.0
     with pytest.raises(transfer_mod._TransferNotSubmittedError):
-        session._sender._submit_transfer(task, 8, object())
+        session._sender._submit_transfer(task, 8, _write_request())
     session._sender._agent.submit_transfer_requests.assert_not_called()
     assert task._physical_operations[8].state is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
     assert list(session._retirement._claims.values()) == [task._physical_operations[7]]
@@ -687,7 +1118,6 @@ def test_expired_second_receive_preserves_existing_claims(need_aux: bool) -> Non
     clock = Mock(return_value=10.0)
     watchdog = RetirementWatchdog(Mock(), clock=clock)
     receiver = _receiver(watchdog)
-    receiver._bounce = NoBounceTransport()
     receiver._registrar = SimpleNamespace(
         self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
     )
@@ -700,7 +1130,10 @@ def test_expired_second_receive_preserves_existing_claims(need_aux: bool) -> Non
     task = session.prepare_receive(Chunk([], [], TokenRange(0, 16), False))
     task.expected_transfers = 1
     assert session.try_begin_transfer(0, {"sender"}, {7})
-    session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.SUCCESS)
+    _publish_report_tokens(session)
+    session.process_kv_agent_result(
+        7, 0, True, transfer_mod.AgentResult.SUCCESS, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+    )
     second = session.prepare_receive(Chunk([], [], TokenRange(16, 32), True))
     second.expected_transfers = 1
     publish = Mock()
@@ -727,7 +1160,6 @@ def _settled_rx_session(
 ) -> tuple[transfer_mod.RxSession, transfer_mod.KVRecvTask, Mock]:
     """Settle real KV and AUX result handlers before the executor closes the session."""
     receiver = _receiver(watchdog)
-    receiver._bounce = NoBounceTransport()
     receiver._registrar = SimpleNamespace(
         self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
     )
@@ -751,7 +1183,10 @@ def _settled_rx_session(
         0, {"sender"}, {7}, publish=lambda: published.add(7), published_writers=published
     )
     result = transfer_mod.AgentResult.SUCCESS if succeeded else transfer_mod.AgentResult.FAILED
-    session.process_kv_agent_result(7, 0, True, result)
+    _publish_report_tokens(session)
+    session.process_kv_agent_result(
+        7, 0, True, result, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+    )
     session.process_aux_agent_result(7, result)
     assert session.resources_drained()
     assert not session._retirement._claims
@@ -774,7 +1209,13 @@ def test_late_receive_evidence_cannot_escape_retirement_deadline(
         assert session.close()
     clock.return_value = 11.0
     report = (
-        partial(session.process_kv_agent_result, 7, 0, True)
+        partial(
+            session.process_kv_agent_result,
+            7,
+            0,
+            True,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        )
         if payload == "kv"
         else partial(session.process_aux_agent_result, 7)
     )
@@ -826,10 +1267,24 @@ def test_restored_receive_claim_can_settle_safely_before_original_deadline() -> 
     session, task, aux = _settled_rx_session(watchdog)
     original = task.logical_outcome
     clock.return_value = 11.0
-    session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.IN_DOUBT)
+    _publish_report_tokens(session)
+    session.process_kv_agent_result(
+        7,
+        0,
+        True,
+        transfer_mod.AgentResult.IN_DOUBT,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
     assert not session.close()
     clock.return_value = 14.0
-    session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.FAILED_QUIESCED)
+    _publish_report_tokens(session)
+    session.process_kv_agent_result(
+        7,
+        0,
+        True,
+        transfer_mod.AgentResult.FAILED_QUIESCED,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
     assert task.logical_outcome is original
     assert session.close()
     assert session.close()
@@ -848,7 +1303,14 @@ def test_new_ambiguity_after_success_does_not_inherit_expired_request_clock() ->
     original = task.logical_outcome
     assert original.status is SessionStatus.TRANSFERRED
     clock.return_value = 30.0
-    session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.IN_DOUBT)
+    _publish_report_tokens(session)
+    session.process_kv_agent_result(
+        7,
+        0,
+        True,
+        transfer_mod.AgentResult.IN_DOUBT,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
     assert task.logical_outcome is original
     assert not session.close()
     watchdog.progress()
@@ -917,9 +1379,9 @@ def test_receive_reserves_kv_and_aux_atomically_against_cancellation(
     assert published == {7}
     assert session.status is SessionStatus.CANCELLED
     assert not session.resources_drained()
-    task.record_writer_result(7, False, wait_for_local_completion=False)
+    task.record_writer_result(7, False)
     assert not session.resources_drained()
-    session._aux_physical_owner.record_writer_result(7, False, wait_for_local_completion=False)
+    session._aux_physical_owner.record_writer_result(7, False)
     assert session.close()
     watchdog.stop()
 
@@ -1013,7 +1475,6 @@ def test_receiver_deadline_retains_kv_aux_and_registration(trigger: str) -> None
     worker._receiver = receiver
     worker._agent = Mock()
     worker._registered_mem = [object()]
-    worker._bounce = Mock()
     if trigger == "cancel":
         session.cancel_local()
     elif trigger == "failure":
@@ -1029,8 +1490,8 @@ def test_receiver_deadline_retains_kv_aux_and_registration(trigger: str) -> None
     clock.return_value = 20.0 if trigger == "timeout" else 15.0
     watchdog.progress()
     assert watchdog.fatal is not None
-    task.record_writer_result(7, False, wait_for_local_completion=False)
-    session._aux_physical_owner.record_writer_result(7, False, wait_for_local_completion=False)
+    task.record_writer_result(7, False)
+    session._aux_physical_owner.record_writer_result(7, False)
     assert not session.resources_drained()
     assert not session.close()
     assert receiver._sessions[4] is session
@@ -1038,7 +1499,6 @@ def test_receiver_deadline_retains_kv_aux_and_registration(trigger: str) -> None
         worker.shutdown()
     worker._agent.deregister_memory.assert_not_called()
     worker._agent.shutdown.assert_not_called()
-    worker._bounce.close.assert_not_called()
     assert len(worker._registered_mem) == 1
     with pytest.raises(RuntimeError, match="admission is closed"):
         _rx_session(receiver)
@@ -1169,7 +1629,7 @@ def test_receiver_timeout_during_blocking_wait_cannot_report_delivery() -> None:
         """Inject late backend evidence at the external wait boundary."""
         assert timeout == 5.0
         clock.return_value = 15.0
-        task.record_writer_result(7, True, wait_for_local_completion=False)
+        task.record_writer_result(7, True)
         task.complete()
         return True
 

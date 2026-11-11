@@ -1,0 +1,222 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# MiniMax-M3 NVFP4 + EAGLE3-GQA, AgentX agentic trace replay, aggregated (GB300).
+# Ported from the InferenceX AgentX GB300 "agg" recipe (gb300.yaml; its dynamo frontend replaced by trtllm-serve). Three of its
+# points, one server each:
+#   tp4 con1  mtp7   low-latency end
+#   tp2 con20 mtp3   mid
+#   tp2 con45 mtp3   max-concurrency end of the GB300 TP2 sweep
+# Kept from the recipe: worker args, capture ladders, DRAM KV offload
+# (kv_cache_config.host_cache_size) and env. TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS
+# is the InferenceX golden acceptance length for this draft model (thinking on,
+# the AgentX default) minus 1, as its synthetic-acceptance connector sets it:
+#   mtp3 AL 2.78 -> 1.78, mtp7 AL 3.52 -> 2.52.
+# Not carried over: --chat_template / --tool_parser (server CLI flags with no
+# LLM-API equivalent; the checkpoint's own chat template is used) and the
+# recipe's store=false request patch (main's ChatCompletionRequest accepts it).
+metadata:
+  model_name: minimax_m3_fp4
+  precision: fp4
+  model_dir_name: MiniMax-M3-NVFP4
+  supported_gpus:
+  - GB300
+  benchmark_type: agentx
+hardware:
+  gpus_per_node: 4
+server_configs:
+- name: minimax_m3_fp4_tp4_eagle3_mtp7_con1_agentx
+  model_name: minimax_m3_fp4
+  server_env_var: TLLM_LOG_LEVEL=INFO TLLM_PROFILE_LOG_RANKS=0 TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1
+    TRTLLM_ENABLE_PDL=1 NCCL_GRAPH_MIXING_SUPPORT=0 MIMALLOC_PURGE_DELAY=0 PYTHONNOUSERSITE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    MAXSMS=32 TRTLLM_SERVE_ENABLE_MSGSPEC=1 TRTLLM_TORCH_COMPILE_CONTEXT_ONLY=1 OMP_NUM_THREADS=1 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.52
+  gpus: 4
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 1
+  pipeline_parallel_size: 1
+  max_batch_size: 1
+  max_seq_len: 1048576
+  max_num_tokens: 16384
+  trust_remote_code: true
+  enable_attention_dp: false
+  enable_chunked_prefill: true
+  enable_autotuner: true
+  reasoning_parser: minimax_m3
+  stream_interval: 20
+  print_iter_log: true
+  enable_iter_perf_stats: true
+  num_postprocess_workers: 8
+  moe_config:
+    backend: TRTLLM
+    use_low_precision_moe_combine: true
+  sparse_attention_config:
+    algorithm: minimax_m3
+    implementation: msa
+    indexer_kv_dtype: fp8
+    sparse_disable_index_value: true
+    fuse_qkv_index_projection: true
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.94
+    enable_block_reuse: true
+    block_reuse_config:
+      policy: per_conversation
+    tokens_per_block: 128
+    use_kv_cache_manager_v2: true
+    dtype: nvfp4
+    event_buffer_max_size: 0
+    host_cache_size: 171798691840
+  scheduler_config:
+    capacity_scheduler_policy: MAX_UTILIZATION
+  cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1]
+  torch_compile_config:
+    enable_fullgraph: true
+    enable_inductor: false
+    enable_piecewise_cuda_graph: true
+    capture_num_tokens: &id001 [1, 512, 1024, 2048]
+    enable_userbuffers: true
+    max_num_streams: 3
+  speculative_config:
+    decoding_type: Eagle3
+    max_draft_len: 7
+    speculative_model: MiniMax-M3-EAGLE3-GQA
+  client_configs:
+  - name: con1_agentx
+    concurrency: 1
+    iterations: 1
+    backend: openai
+    streaming: true
+    benchmark_client: agentx
+    dataset_file: semianalysis_cc_traces_weka_062126
+    client_env_var: AGENTX_MAX_CTX=1048576 AGENTX_DURATION=3600 AGENTX_WARMUP_PER_LANE=3 AGENTX_TIMEOUT_GRACE=5400
+- name: minimax_m3_fp4_tp2_eagle3_mtp3_con20_agentx
+  model_name: minimax_m3_fp4
+  server_env_var: TLLM_LOG_LEVEL=INFO TLLM_PROFILE_LOG_RANKS=0 TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1
+    TRTLLM_ENABLE_PDL=1 NCCL_GRAPH_MIXING_SUPPORT=0 MIMALLOC_PURGE_DELAY=0 PYTHONNOUSERSITE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    MAXSMS=32 TRTLLM_SERVE_ENABLE_MSGSPEC=1 TRTLLM_TORCH_COMPILE_CONTEXT_ONLY=1 OMP_NUM_THREADS=1 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1.78
+  gpus: 2
+  tensor_parallel_size: 2
+  moe_expert_parallel_size: 1
+  pipeline_parallel_size: 1
+  max_batch_size: 20
+  max_seq_len: 1048576
+  max_num_tokens: 16384
+  trust_remote_code: true
+  enable_attention_dp: false
+  enable_chunked_prefill: true
+  enable_autotuner: true
+  reasoning_parser: minimax_m3
+  stream_interval: 20
+  print_iter_log: true
+  enable_iter_perf_stats: true
+  num_postprocess_workers: 8
+  moe_config:
+    backend: TRTLLM
+    use_low_precision_moe_combine: true
+  sparse_attention_config:
+    algorithm: minimax_m3
+    implementation: msa
+    indexer_kv_dtype: fp8
+    sparse_disable_index_value: true
+    fuse_qkv_index_projection: true
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.94
+    enable_block_reuse: true
+    block_reuse_config:
+      policy: per_conversation
+    tokens_per_block: 128
+    use_kv_cache_manager_v2: true
+    dtype: nvfp4
+    event_buffer_max_size: 0
+    host_cache_size: 171798691840
+  scheduler_config:
+    capacity_scheduler_policy: MAX_UTILIZATION
+  cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  torch_compile_config:
+    enable_fullgraph: true
+    enable_inductor: false
+    enable_piecewise_cuda_graph: true
+    capture_num_tokens: *id001
+    enable_userbuffers: true
+    max_num_streams: 3
+  speculative_config:
+    decoding_type: Eagle3
+    max_draft_len: 3
+    speculative_model: MiniMax-M3-EAGLE3-GQA
+  client_configs:
+  - name: con20_agentx
+    concurrency: 20
+    iterations: 1
+    backend: openai
+    streaming: true
+    benchmark_client: agentx
+    dataset_file: semianalysis_cc_traces_weka_062126
+    client_env_var: AGENTX_MAX_CTX=1048576 AGENTX_DURATION=3600 AGENTX_WARMUP_PER_LANE=3 AGENTX_TIMEOUT_GRACE=5400
+- name: minimax_m3_fp4_tp2_eagle3_mtp3_con45_agentx
+  model_name: minimax_m3_fp4
+  server_env_var: TLLM_LOG_LEVEL=INFO TLLM_PROFILE_LOG_RANKS=0 TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1
+    TRTLLM_ENABLE_PDL=1 NCCL_GRAPH_MIXING_SUPPORT=0 MIMALLOC_PURGE_DELAY=0 PYTHONNOUSERSITE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    MAXSMS=32 TRTLLM_SERVE_ENABLE_MSGSPEC=1 TRTLLM_TORCH_COMPILE_CONTEXT_ONLY=1 OMP_NUM_THREADS=1 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1.78
+  gpus: 2
+  tensor_parallel_size: 2
+  moe_expert_parallel_size: 1
+  pipeline_parallel_size: 1
+  max_batch_size: 45
+  max_seq_len: 1048576
+  max_num_tokens: 16384
+  trust_remote_code: true
+  enable_attention_dp: false
+  enable_chunked_prefill: true
+  enable_autotuner: true
+  reasoning_parser: minimax_m3
+  stream_interval: 20
+  print_iter_log: true
+  enable_iter_perf_stats: true
+  num_postprocess_workers: 8
+  moe_config:
+    backend: TRTLLM
+    use_low_precision_moe_combine: true
+  sparse_attention_config:
+    algorithm: minimax_m3
+    implementation: msa
+    indexer_kv_dtype: fp8
+    sparse_disable_index_value: true
+    fuse_qkv_index_projection: true
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.94
+    enable_block_reuse: true
+    block_reuse_config:
+      policy: per_conversation
+    tokens_per_block: 128
+    use_kv_cache_manager_v2: true
+    dtype: nvfp4
+    event_buffer_max_size: 0
+    host_cache_size: 171798691840
+  scheduler_config:
+    capacity_scheduler_policy: MAX_UTILIZATION
+  cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 17, 20, 23, 26, 29, 32, 35, 40, 45]
+  torch_compile_config:
+    enable_fullgraph: true
+    enable_inductor: false
+    enable_piecewise_cuda_graph: true
+    capture_num_tokens: *id001
+    enable_userbuffers: true
+    max_num_streams: 3
+  speculative_config:
+    decoding_type: Eagle3
+    max_draft_len: 3
+    speculative_model: MiniMax-M3-EAGLE3-GQA
+  client_configs:
+  - name: con45_agentx
+    concurrency: 45
+    iterations: 1
+    backend: openai
+    streaming: true
+    benchmark_client: agentx
+    dataset_file: semianalysis_cc_traces_weka_062126
+    client_env_var: AGENTX_MAX_CTX=1048576 AGENTX_DURATION=3600 AGENTX_WARMUP_PER_LANE=3 AGENTX_TIMEOUT_GRACE=5400

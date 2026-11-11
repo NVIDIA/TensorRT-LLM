@@ -19,6 +19,7 @@
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/utils/math.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -101,6 +102,15 @@ PooledPhysMemAllocator::PooledPhysMemAllocator(size_t physMemSize)
     if (!supported)
     {
         throw std::runtime_error("PooledPhysMemAllocator: no supported physical memory allocation property");
+    }
+    if (!mProp.allocFlags.gpuDirectRDMACapable)
+    {
+        // Otherwise this surfaces only later, as an opaque RDMA registration failure.
+        TLLM_LOG_WARNING(
+            "PooledPhysMemAllocator: device %d refused gpuDirectRDMACapable for KV cache memory with handle type %d, "
+            "so the pools are allocated without it. nvidia_peermem (ibv_reg_mr) cannot register this memory for "
+            "GPUDirect RDMA; dma-buf registration still can.",
+            static_cast<int>(mDeviceId), static_cast<int>(mProp.requestedHandleTypes));
     }
 }
 

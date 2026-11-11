@@ -194,3 +194,40 @@ def test_manager_stats_config_and_api(enable_stats: bool) -> None:
         if cache is not None:
             cache.close()
         manager.shutdown()
+
+
+def test_connector_reuse_is_committed_as_reused() -> None:
+    manager = KVCacheManager(_make_config())
+    cache = None
+    try:
+        cache = manager.create_kv_cache(id=17, expected_prompt_length=16)
+        stream = torch.cuda.Stream()
+        assert cache.resume(stream.cuda_stream)
+        assert cache.resize(12)
+        cache.record_connector_reuse(0, 8)
+
+        request_stats = cache.commit_pending_stats()
+        assert request_stats == KVCacheStatsDelta(
+            alloc_total_blocks=3, alloc_new_blocks=3, reused_blocks=2, missed_blocks=1
+        )
+        assert manager.get_committed_stats() == request_stats
+        (iteration,) = manager.get_and_reset_iteration_stats().values()
+        assert iteration.iter_reused_blocks == 2
+        assert iteration.iter_full_reused_blocks == 2
+        assert iteration.iter_missed_blocks == 1
+        assert list(manager.get_and_reset_iteration_connector_reused_blocks().values()) == [2]
+        assert manager.get_and_reset_iteration_connector_reused_blocks() == {}
+        assert manager.get_and_reset_iteration_connector_cached_tokens() == 8
+        assert manager.get_and_reset_iteration_connector_cached_tokens() == 0
+
+        # Once committed, the allocation is no longer pending and stays a miss. The tokens still
+        # count as connector cached tokens.
+        cache.record_connector_reuse(8, 12)
+        assert cache.commit_pending_stats() == KVCacheStatsDelta()
+        assert manager.get_and_reset_iteration_connector_reused_blocks() == {}
+        assert manager.get_and_reset_iteration_connector_cached_tokens() == 4
+        stream.synchronize()
+    finally:
+        if cache is not None:
+            cache.close()
+        manager.shutdown()

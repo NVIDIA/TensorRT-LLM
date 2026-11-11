@@ -12,6 +12,7 @@ import signal
 import sys
 import time
 import uuid
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -27,12 +28,40 @@ from kv_cache_manager_v2_test_utils import allocate_request, initialize_cache, r
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
+from tensorrt_llm import DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.mapping import MpiTopology as Mapping
+
+
+class _GlooQuotaSync:
+    def __init__(self, group: dist.ProcessGroup) -> None:
+        self.group = group
+
+    def allreduce(self, value: float, op: object) -> float:
+        del op
+        tensor = torch.tensor(value, dtype=torch.float64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=self.group)
+        return tensor.item()
+
+
+def _create_cache_manager(group: dist.ProcessGroup, *args, **kwargs) -> KVCacheManagerV2:
+    """Synchronize the V2 constructor's capacity within this instance's Gloo group."""
+    with patch(
+        "tensorrt_llm._torch.distributed.communicator.Distributed.get",
+        return_value=_GlooQuotaSync(group),
+    ):
+        return KVCacheManagerV2(*args, **kwargs)
+
+
+def _instance_mapping(**kwargs) -> Mapping:
+    """Use explicit instance-local ranks for the ctx/gen Gloo process groups."""
+    mapping = object.__new__(Mapping)
+    Mapping.__init__(mapping, **kwargs)
+    return mapping
 
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
@@ -335,7 +364,7 @@ def worker_fn(
         # Create ctx mapping
         pp_rank = local_rank // ctx_tp
         tp_rank = local_rank % ctx_tp
-        mapping = Mapping(
+        mapping = _instance_mapping(
             world_size=ctx_instance_num,
             rank=local_rank,
             tp_size=ctx_tp,
@@ -350,8 +379,9 @@ def worker_fn(
         ctx_pp_ranks_local = [i * ctx_tp + tp_rank for i in range(ctx_pp)]
 
         # Create KVCacheManager
-        kv_cache_manager = KVCacheManagerV2(
-            KvCacheConfig(max_tokens=2048, enable_block_reuse=False),
+        kv_cache_manager = _create_cache_manager(
+            ctx_group if is_ctx else gen_group,
+            KvCacheConfig(max_tokens=2048, enable_block_reuse=False, host_cache_size=0),
             cache_type,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -361,6 +391,7 @@ def worker_fn(
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
+            vocab_size=32000,
         )
 
         # Initialize with random data
@@ -399,7 +430,7 @@ def worker_fn(
         # Create gen mapping
         pp_rank = local_rank // gen_tp
         tp_rank = local_rank % gen_tp
-        mapping = Mapping(
+        mapping = _instance_mapping(
             world_size=gen_instance_num,
             rank=local_rank,
             tp_size=gen_tp,
@@ -414,8 +445,9 @@ def worker_fn(
         gen_pp_ranks_local = [ctx_instance_num + i * gen_tp + tp_rank for i in range(gen_pp)]
 
         # Create KVCacheManager
-        kv_cache_manager = KVCacheManagerV2(
-            KvCacheConfig(max_tokens=2048, enable_block_reuse=False),
+        kv_cache_manager = _create_cache_manager(
+            ctx_group if is_ctx else gen_group,
+            KvCacheConfig(max_tokens=2048, enable_block_reuse=False, host_cache_size=0),
             cache_type,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -425,6 +457,7 @@ def worker_fn(
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
+            vocab_size=32000,
         )
 
         # Initialize gen with random data (to verify transfer overwrites it)
@@ -800,6 +833,8 @@ def worker_fn(
         print(f"[Rank {rank}] Cleanup completed ({mode_str})")
 
     # Cleanup
+    transceiver.shutdown()
+    kv_cache_manager.shutdown()
     dist.destroy_process_group()
 
 
@@ -1120,9 +1155,14 @@ MP_TEST_CONFIGS = [
     ["ctx_first", "ctx_first_sync", "gen_first1", "gen_first2"],
 )
 def test_v2_transceiver_mp(
-    ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, workflow
+    ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, workflow, monkeypatch
 ):
     """Test KvCacheTransceiverV2 with context-first multi-process configurations."""
+    # Gloo workers own their rank identities and must not inherit the enclosing MPI job.
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    for name in list(os.environ):
+        if name.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "I_MPI_", "HYDRA_", "MPI_")):
+            monkeypatch.delenv(name)
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:

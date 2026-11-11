@@ -46,6 +46,7 @@ from defs.model_express.mx_harness import (
     MxE2ECase,
     MxRunLayout,
     archive_run_artifacts,
+    assert_moe_partition,
     assert_transfer_evidence,
     assert_weight_manifests,
     build_canonical_snapshot,
@@ -54,6 +55,7 @@ from defs.model_express.mx_harness import (
     donor_session,
     load_payload,
     log_tail,
+    moe_worker_args,
     mx_metadata_ports,
     require_mx_environment,
     resolve_model_path,
@@ -350,6 +352,7 @@ def test_mx_receiver_accuracy(
                 stop_file=layout.donor_stop,
                 # The donor must outlive the receiver's whole run.
                 max_serve_seconds=accuracy_timeout_s + 120,
+                extra_args=moe_worker_args(case),
             ),
             environment=worker_environment(
                 donor_gpu_ids,
@@ -369,7 +372,7 @@ def test_mx_receiver_accuracy(
                     tp_size=case.tp_size,
                     output_path=layout.output("receiver"),
                     mx_url=mx_url,
-                    extra_args=eval_spec.to_argv(),
+                    extra_args=(*eval_spec.to_argv(), *moe_worker_args(case)),
                 ),
                 worker_environment(
                     receiver_gpu_ids,
@@ -389,11 +392,9 @@ def test_mx_receiver_accuracy(
 
         assert_transfer_evidence(case, layout.log("receiver"))
         # Same invariants as the smoke test, minus the HF baseline role this test never runs.
-        assert_weight_manifests(
-            case,
-            collect_weight_manifests(layout.manifest_dir, case, roles=MX_ROLES),
-            roles=MX_ROLES,
-        )
+        manifests = collect_weight_manifests(layout.manifest_dir, case, roles=MX_ROLES)
+        assert_weight_manifests(case, manifests, roles=MX_ROLES)
+        assert_moe_partition(case, manifests, model_path, roles=MX_ROLES)
 
         assert receiver_payload["eval_task"] == case.task
         assert receiver_payload["eval_num_samples"] == params.num_samples

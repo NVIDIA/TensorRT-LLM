@@ -54,6 +54,28 @@ void launchFusedDiTQKNormRope(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], i
     int cos_seq_per_batch,               // cos rows per batch for broadcast; 0 = no broadcast
     cudaStream_t stream);
 
+// Out-of-place static-E4M3 variant for FLUX CUTEDSL attention. Reads packed
+// BF16 QKV, applies the same per-head Q/K norm + RoPE math as
+// launchFusedDiTQKNormRope, and writes three dense FP8 tensors. V is scaled
+// and converted directly from the packed BF16 input without norm or RoPE.
+void launchFusedDiTQKNormRopeQuantFp8(void const* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim]
+    void* q_out,                                       // [num_tokens, Hq*head_dim], E4M3
+    void* k_out,                                       // [num_tokens, Hk*head_dim], E4M3
+    void* v_out,                                       // [num_tokens, Hv*head_dim], E4M3
+    int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v,
+    int head_dim,                                      // Must be 64, 128, or 256
+    float eps,
+    void const* q_weight,                              // [head_dim], BF16
+    void const* k_weight,                              // [head_dim], BF16
+    void const* q_add_weight,                          // [head_dim] or nullptr
+    void const* k_add_weight,                          // [head_dim] or nullptr
+    float const* q_dequant_scale,                      // [1], FP32
+    float const* k_dequant_scale,                      // [1], FP32
+    float const* v_dequant_scale,                      // [1], FP32
+    float const* cos_emb,                              // [cos_rows, head_dim], FP32
+    float const* sin_emb,                              // [cos_rows, head_dim], FP32
+    int num_txt_tokens, bool interleave, int tokens_per_batch, int cos_seq_per_batch, cudaStream_t stream);
+
 // Full-dim variant for LTX-2 / WAN: RMSNorm range = num_heads_per_side * head_dim.
 // Requires num_heads_q == num_heads_k. No dual-stream support.
 // per_head_cos=false: cos/sin shape [num_tokens, head_dim] (head broadcast).

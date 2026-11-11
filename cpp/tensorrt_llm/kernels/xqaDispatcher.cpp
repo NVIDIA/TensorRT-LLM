@@ -574,6 +574,7 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mSpecDecodingTargetMaxGenLen = mFixedParams.specDecodingTargetMaxGenLen;
         tllmRunnerParams.mForcePrepareSpecDecTreeMask = params.force_prepare_spec_dec_tree_mask;
         tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
+        tllmRunnerParams.customMaskCapacity = params.spec_decoding_bl_tree_mask_capacity;
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
         tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = params.skip_softmax_threshold_scale_factor;

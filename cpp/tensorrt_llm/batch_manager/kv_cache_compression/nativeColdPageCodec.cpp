@@ -131,27 +131,6 @@ bool NativeColdPageCodec::configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolG
             throw std::invalid_argument("A provider layer is absent from all GPU descriptors");
         }
 
-        // Fail closed until KVCM replaces the batched cuMemcpyBatchAsync copies with kernels: on host
-        // kernels that need chunked pinned-memory registration (Linux 6.11-6.13), the embedded lossless
-        // codec cannot split its copies at registration boundaries when wrapped by this codec.
-        bool hasFallbackLifecycle = false;
-        for (auto const& [lifeCycleId, state] : pendingGroups)
-        {
-            static_cast<void>(lifeCycleId);
-            if (!state.lifecycleIndex)
-            {
-                hasFallbackLifecycle = true;
-                break;
-            }
-        }
-        if (hasFallbackLifecycle && kv::HostMem::shouldUseChunkedRegistration())
-        {
-            throw std::invalid_argument(
-                "Cold-page compression is not supported for models with lossless-fallback lifecycles (SSM/GDN) on "
-                "this host kernel: chunked pinned-memory registration (Linux 6.11-6.13) breaks the fallback codec's "
-                "batched copies. Disable KV cache compression for this model or use a different host kernel.");
-        }
-
         auto const properties = configureProvider(providerLifecycles);
         if (properties.size() != providerLifecycles.size())
         {

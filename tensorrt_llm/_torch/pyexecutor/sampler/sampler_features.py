@@ -21,8 +21,7 @@ Four groups, each self-contained and free of ``TorchSampler`` state:
   buffers the sampler scatters results into.
 * **Stop criteria** -- the ``meet_*`` / ``handle_stop_criteria`` predicates
   deciding when a request is finished.
-* **Logit adjustments** -- embedding bias, d2t remapping and the fused greedy
-  sampling kernel.
+* **Logit adjustments** -- embedding bias and the fused greedy sampling kernel.
 * **Async D2H** -- ``AsyncWorkerMixin`` (used by ``TorchSampler``), its
   private side-stream copier, and the ``SamplerEvent`` that bundles the
   resulting worker futures / CUDA events for callers to await.
@@ -62,7 +61,6 @@ __all__ = [
     "_StepIndexTranslator",
     "_StridedStepIndexTranslator",
     "_UnpackedStepIndexer",
-    "apply_d2t",
     "apply_embedding_bias",
     "check_stop_words_length",
     "fast_greedy_sample_kernel",
@@ -402,16 +400,6 @@ def check_stop_words_length(request: LlmRequest) -> bool:
 # --------------------------------------------------------------------------
 
 
-def apply_d2t(tokens: torch.Tensor, model_outputs: dict[str, Any]) -> None:
-    """Applies draft-to-target token translation table.
-
-    Modifies tokens in-place.
-    """
-    if "d2t" in model_outputs:
-        d2t = model_outputs["d2t"][tokens]
-        tokens += d2t
-
-
 def scatter_new_tokens(
     next_tokens: torch.Tensor,
     new_tokens_cuda: torch.Tensor,
@@ -437,19 +425,14 @@ def fast_greedy_sample_kernel(
     new_tokens_cuda: torch.Tensor,
     batch_dest_indices: torch.Tensor,
     max_beam_width: int,
-    d2t: torch.Tensor | None,
 ) -> torch.Tensor:
     """Applies fast greedy sampling to the logits.
 
-    Performs argmax, applies d2t translation if present, and scatters
-    tokens into the output buffer. All operations are in-place.
+    Performs argmax and scatters tokens into the output buffer. All operations
+    are in-place.
     """
     # Simple argmax for greedy sampling
     next_tokens = torch.argmax(logits_cuda, dim=-1).to(dtype=new_tokens_cuda.dtype)
-
-    # Apply draft-to-target token translation if present (for Eagle3)
-    if d2t is not None:
-        next_tokens += d2t[next_tokens]
 
     # Scatter tokens into output buffer
     scatter_new_tokens(next_tokens, new_tokens_cuda, batch_dest_indices, max_beam_width)

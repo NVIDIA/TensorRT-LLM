@@ -95,6 +95,39 @@ __global__ void ulyssesPostUnscatterKernel(T const* __restrict__ q_in, T const* 
     *out_v4 = *in_v4;
 }
 
+template <typename T>
+__global__ void ulyssesPackedQkvPostUnscatterKernel(T const* __restrict__ qkv_in, T* __restrict__ q_out,
+    T* __restrict__ k_out, T* __restrict__ v_out, int const P, int const B, int const Sp, int const H, int const D,
+    int const vec_per_row)
+{
+    constexpr int VEC = 8;
+
+    int const PSp = P * Sp;
+    int const bx = blockIdx.x;
+    int const qkv_idx = bx / PSp;
+    int const psp = bx - qkv_idx * PSp;
+
+    int const h = threadIdx.x / vec_per_row;
+    int const vec_idx = threadIdx.x - h * vec_per_row;
+
+    int const p = psp / Sp;
+    int const sp = psp - p * Sp;
+    int const b = blockIdx.y;
+
+    // qkv_in[p, b, sp, qkv, h, d]:
+    // (((((p*B + b)*Sp + sp)*3 + qkv)*H + h)*D + vec_idx*VEC)
+    // out[b, p*Sp+sp, h, d]:
+    // (((b*PSp + psp)*H + h)*D + vec_idx*VEC)
+    int64_t const in_base
+        = (((((static_cast<int64_t>(p) * B + b) * Sp + sp) * 3 + qkv_idx) * H + h) * D) + vec_idx * VEC;
+    int64_t const out_base = (((static_cast<int64_t>(b) * PSp + psp) * H + h) * D) + vec_idx * VEC;
+
+    T* out_ptr = qkv_idx == 0 ? q_out : (qkv_idx == 1 ? k_out : v_out);
+    uint4 const* in_v4 = reinterpret_cast<uint4 const*>(qkv_in + in_base);
+    uint4* out_v4 = reinterpret_cast<uint4*>(out_ptr + out_base);
+    *out_v4 = *in_v4;
+}
+
 } // namespace
 
 void launchUlyssesPostUnscatter(void const* q_in, void const* k_in, void const* v_in, void* q_out, void* k_out,
@@ -121,6 +154,28 @@ void launchUlyssesPostUnscatter(void const* q_in, void const* k_in, void const* 
 
     ulyssesPostUnscatterKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(q_in_typed, k_in_typed, v_in_typed,
         q_out_typed, k_out_typed, v_out_typed, P, B, D, vec_per_row, Sp_q, H_q, Sp_k, H_k, Sp_v, H_v);
+}
+
+void launchUlyssesPackedQkvPostUnscatter(
+    void const* qkv_in, void* q_out, void* k_out, void* v_out, int P, int B, int Sp, int H, int D, cudaStream_t stream)
+{
+    constexpr int VEC = 8;
+    TLLM_CHECK_WITH_INFO(D % VEC == 0, "ulyssesPackedQkvPostUnscatter: D must be a multiple of 8, got %d", D);
+    int const vec_per_row = D / VEC;
+    int const threads = H * vec_per_row;
+    TLLM_CHECK_WITH_INFO(threads <= 1024,
+        "ulyssesPackedQkvPostUnscatter: threads/block (H*D/8) must be <= 1024, got H=%d D=%d -> %d", H, D, threads);
+
+    dim3 const grid(3 * P * Sp, B, 1);
+    dim3 const block(threads);
+
+    auto* qkv_in_typed = reinterpret_cast<__nv_bfloat16 const*>(qkv_in);
+    auto* q_out_typed = reinterpret_cast<__nv_bfloat16*>(q_out);
+    auto* k_out_typed = reinterpret_cast<__nv_bfloat16*>(k_out);
+    auto* v_out_typed = reinterpret_cast<__nv_bfloat16*>(v_out);
+
+    ulyssesPackedQkvPostUnscatterKernel<__nv_bfloat16>
+        <<<grid, block, 0, stream>>>(qkv_in_typed, q_out_typed, k_out_typed, v_out_typed, P, B, Sp, H, D, vec_per_row);
 }
 
 } // namespace kernels

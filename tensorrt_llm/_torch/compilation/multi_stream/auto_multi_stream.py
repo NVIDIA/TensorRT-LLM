@@ -206,6 +206,12 @@ class MultiStreamDAG:
         # Nodes that accessed each storage root since its last in-place write.
         accesses_since_write: Dict[Node, List[MultiStreamNode]] = {}
         inplace_map = inplace_info()
+        begin_scope = torch.ops.trtllm.begin_nccl_window_tensor_scope.default
+        end_scope = torch.ops.trtllm.end_nccl_window_tensor_scope.default
+        ordering_barriers = {
+            begin_scope: ("inputs", ),
+            end_scope: ("inputs", "outputs"),
+        }
 
         def flatten_args(args):
             """Recursively flatten nested arguments into a flat list."""
@@ -282,6 +288,11 @@ class MultiStreamDAG:
             self.in_degrees[vertex] = len(in_edges)
             for arg in mutated_args:
                 latest_inplace_stat[arg] = vertex
+            if node.op == "call_function" and node.target in ordering_barriers:
+                for arg_name in ordering_barriers[node.target]:
+                    args = flatten_args([node.kwargs[arg_name]])
+                    for arg in args:
+                        latest_inplace_stat[arg] = vertex
 
             for root in accessed_roots:
                 if root not in mutated_roots:
@@ -330,8 +341,17 @@ class MultiStreamDAG:
             return (-distance) * num_nodes + node_id
 
         streams = [Stream(i) for i in range(max_num_streams)]
+        # Scope boundaries stay on the primary stream; output dependencies make the
+        # end op wait for auxiliary-stream producers before releasing their leases.
+        primary_stream_ops = {
+            torch.ops.trtllm.begin_nccl_window_tensor_scope.default,
+            torch.ops.trtllm.end_nccl_window_tensor_scope.default,
+        }
 
         def pick_stream(start_time, node) -> Stream:
+            if (node.node.op == "call_function"
+                    and node.node.target in primary_stream_ops):
+                return streams[0]
             if node.weight == 0:
                 # This is a symint node or a getitem node.
                 # It always assigns to the stream that produce the node.

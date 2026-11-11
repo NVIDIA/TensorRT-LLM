@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _estimate_full_attn_size_per_token,
     _estimate_swa_cache_size,
     _fill_kv_pages,
+    get_scratch_entry,
 )
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings import DataType
@@ -32,11 +33,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     AttentionLayerConfig,
-    AttentionReusePolicy,
     BufferConfig,
     DataRole,
     LayerId,
     PageIndexMode,
+    ReusePolicy,
 )
 
 from .....configs.deepseek_v41 import decoder_bounded_replay_enabled, encoder_replay_enabled
@@ -228,11 +229,11 @@ class CSA2CacheManager(KVCacheManagerV2):
         )
         self._encoder_replay_enabled = encoder_replay_enabled()
         self._encoder_reuse_policy = (
-            AttentionReusePolicy.PRIVATE
+            ReusePolicy.PRIVATE
             if not kv_cache_config.enable_block_reuse
-            else AttentionReusePolicy.OPTIONAL
+            else ReusePolicy.OPTIONAL
             if self._encoder_replay_enabled
-            else AttentionReusePolicy.REQUIRED
+            else ReusePolicy.REQUIRED
         )
         self._decoder_replay_window = _get_decoder_replay_window(
             self.layout, num_layers, mapping, kv_cache_config, pretrained_config, spec_config
@@ -284,10 +285,8 @@ class CSA2CacheManager(KVCacheManagerV2):
             grouping = self.impl.get_life_cycle_pool_group_indices(level)
             for group, stats in enumerate(self.impl.get_storage_statistics(level)):
                 members = [lc for lc, pg in enumerate(grouping) if pg == group]
-                optional_pages = sum(
-                    policies[lc] == AttentionReusePolicy.OPTIONAL for lc in members
-                )
-                names = sorted({AttentionReusePolicy(policies[lc]).name for lc in members})
+                optional_pages = sum(policies[lc] == ReusePolicy.OPTIONAL for lc in members)
+                names = sorted({ReusePolicy(policies[lc]).name for lc in members})
                 slot_bytes = sum(
                     stats.slot_sizes if hasattr(stats, "slot_sizes") else stats.slot_size
                 )
@@ -297,7 +296,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                     f"checkpoint_capacity_upper_bound={stats.total // optional_pages if optional_pages else 0}"
                 )
 
-    def _derive_reuse_salt(self, cache_salt: str | None) -> int | None:
+    def _derive_reuse_salt(self, cache_salt: str | None) -> str | None:
         if self._encoder_replay_enabled:
             # Preserve None vs empty-string and compose with the user namespace.
             cache_salt = "deepseek-v41-csa2-encoder:approximate:" + repr(cache_salt)
@@ -552,7 +551,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                     self.layout.kv_source_layer_ids
                 )
                 private_config["reuse_policy"] = (
-                    AttentionReusePolicy.PRIVATE if decoder_swa else self._encoder_reuse_policy
+                    ReusePolicy.PRIVATE if decoder_swa else self._encoder_reuse_policy
                 )
             layers.append(
                 AttentionLayerConfig(
@@ -643,7 +642,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             self.impl.init_config.layers[
                 self._cache_layer_id(layer, CSA2CacheRole.SWA)
             ].reuse_policy
-            == AttentionReusePolicy.PRIVATE
+            == ReusePolicy.PRIVATE
             for layer in layers
         )
 
@@ -789,10 +788,12 @@ class CSA2CacheManager(KVCacheManagerV2):
         pool_id = self.layer_to_pool_mapping_dict[layer_id]
         cache = self.kv_cache_map[request_id]
         converter = self._get_page_index_converter(layer_id, role.role)
+        scratch_range, scratch_slots = get_scratch_entry(cache, pool_id) or (None, ())
         return converter(
             cache.get_base_page_indices(pool_id).tolist(),
             role.index_mode,
-            cache.get_scratch_desc(pool_id),
+            scratch_range,
+            scratch_slots,
         )
 
     def compute_batch_page_tables(self, request_ids, num_contexts) -> None:
@@ -856,17 +857,17 @@ class CSA2CacheManager(KVCacheManagerV2):
         if not holders:
             return None
         descs = [
-            (index, row, desc)
+            (index, row, entry)
             for row, cache in holders
             for index, pool in enumerate(self._scratch_pools.tolist())
-            if (desc := cache.get_scratch_desc(pool))
+            if (entry := get_scratch_entry(cache, pool))
         ]
         ranges = np.zeros((len(self._scratch_pools), len(request_ids), 2), dtype=np.int32)
-        width = max((len(desc.slot_ids) for _, _, desc in descs), default=1)
+        width = max((len(slot_ids) for _, _, (_, slot_ids) in descs), default=1)
         slots = np.zeros((len(self._scratch_pools), len(request_ids), width), dtype=np.int32)
-        for index, row, desc in descs:
-            ranges[index, row] = (desc.range.beg, desc.range.end)
-            slots[index, row, : len(desc.slot_ids)] = desc.slot_ids
+        for index, row, (scratch_range, slot_ids) in descs:
+            ranges[index, row] = (scratch_range.beg, scratch_range.end)
+            slots[index, row, : len(slot_ids)] = slot_ids
         return ranges, slots
 
     def batch_page_table(self, spec, width: int) -> torch.Tensor:

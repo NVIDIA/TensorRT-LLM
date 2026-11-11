@@ -52,9 +52,11 @@ def _load_cpp_module():
 
 _cpp = _load_cpp_module()
 
+DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY = _cpp.DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+
 AggregatedPageDesc = _cpp.AggregatedPageDesc
 AttentionLayerConfig = _cpp.AttentionLayerConfig
-AttentionReusePolicy = _cpp.AttentionReusePolicy
+ReusePolicy = _cpp.ReusePolicy
 AttnLifeCycle = _cpp.AttnLifeCycle
 BatchDesc = _cpp.BatchDesc
 # BatchDesc is also consumed via dataclasses.replace(): MambaCacheManager's
@@ -76,16 +78,20 @@ class _BatchDescFieldSpec:
 BatchDesc.__dataclass_fields__ = _BatchDescFieldSpec.__dataclass_fields__
 del _BatchDescFieldSpec, _dataclasses_bd
 BufferConfig = _cpp.BufferConfig
+SparseCacheConfig = _cpp.SparseCacheConfig
 BufferId = _cpp.BufferId
 CoalescedBuffer = _cpp.CoalescedBuffer
 CacheTier = _cpp.CacheTier
 CorruptedError = _cpp.CorruptedError
 CuError = _cpp.CuError
+CuOOMError = _cpp.CuOOMError
 DiskCacheTierConfig = _cpp.DiskCacheTierConfig
+DiskOOMError = _cpp.DiskOOMError
 GpuCacheTierConfig = _cpp.GpuCacheTierConfig
 ExpandedBuffer = _cpp.ExpandedBuffer
 HalfOpenRange = _cpp.HalfOpenRange
 HostCacheTierConfig = _cpp.HostCacheTierConfig
+HostOOMError = _cpp.HostOOMError
 KVCacheDesc = _cpp.KVCacheDesc
 KVCacheCreatedData = _cpp.KVCacheCreatedData
 KVCacheEvent = _cpp.KVCacheEvent
@@ -94,6 +100,7 @@ KVCacheEventManager = _cpp.KVCacheEventManager
 KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
 KVCacheManager = _cpp.KVCacheManager
 KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+StreamingAllBlocksClearedData = _cpp.StreamingAllBlocksClearedData
 StreamingBlockRemovedData = _cpp.StreamingBlockRemovedData
 StreamingBlockStoredData = _cpp.StreamingBlockStoredData
 StreamingEventSink = _cpp.StreamingEventSink
@@ -130,6 +137,8 @@ class _KVCacheManagerConfigFieldSpec:
     text_only: bool = False
     enable_partial_commit: bool = True
     pool_rebalance: object = None
+    cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+    host_sparse_pool_quota: object = None
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
@@ -146,9 +155,6 @@ OutOfPagesError = _cpp.OutOfPagesError
 PageIndexConverter = _cpp.PageIndexConverter
 PageIndexMode = _cpp.PageIndexMode
 PageStatus = _cpp.PageStatus
-PageStorageSnapshot = _cpp.PageStorageSnapshot
-Batch = _cpp.Batch
-BatchDeviceArray = _cpp.BatchDeviceArray
 PlannedDropHandle = _cpp.PlannedDropHandle
 PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
@@ -157,7 +163,8 @@ PoolRebalanceConfig = _cpp.PoolRebalanceConfig
 ReuseGroupStatus = _cpp.ReuseGroupStatus
 ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
-ScratchDesc = _cpp.ScratchDesc
+Batch = _cpp.Batch
+IndexTableSpec = _cpp.IndexTableSpec
 SlotDesc = _cpp.SlotDesc
 SlotDescVariant = _cpp.SlotDescVariant
 SsmLayerConfig = _cpp.SsmLayerConfig
@@ -176,20 +183,23 @@ sequence_to_blockchain_keys = _cpp.sequence_to_blockchain_keys
 take_poison = _cpp.take_poison
 
 BeamIndex = int
+CacheGroupId = int
 CacheLevel = int
 CacheTierConfig = Union[GpuCacheTierConfig, HostCacheTierConfig, DiskCacheTierConfig]
+BatchRow = int
 CudaStream = int
 DataRole = str
 LayerGroupId = int
 LayerId = int
 LifeCycleId = int
 MemAddress = int
+MmItemContext = _cpp.MmItemContext
 PoolGroupIndex = int
 PoolIndex = int
 Priority = int
 SlidingWindowSize = Optional[int]
 TokenId = int
-TokenIdExt = Union[int, bytes]
+TokenIdExt = Union[int, bytes, MmItemContext]
 
 BAD_PAGE_INDEX = -1
 DEFAULT_BEAM_INDEX = 0
@@ -210,19 +220,22 @@ def typed_range(*args: int) -> range:
 __all__ = [
     "AggregatedPageDesc",
     "AttentionLayerConfig",
-    "AttentionReusePolicy",
+    "ReusePolicy",
     "BAD_PAGE_INDEX",
     "CACHE_LEVEL1",
     "BatchDesc",
     "BeamIndex",
     "BufferConfig",
+    "SparseCacheConfig",
     "BufferId",
     "CoalescedBuffer",
+    "CacheGroupId",
     "CacheLevel",
     "CacheTier",
     "CacheTierConfig",
     "CudaStream",
     "DEFAULT_BEAM_INDEX",
+    "DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY",
     "DataRole",
     "DiskCacheTierConfig",
     "ExpandedBuffer",
@@ -244,10 +257,12 @@ __all__ = [
     "KVCacheUpdatedData",
     "KvCacheStatus",
     "LayerGroupId",
+    "BatchRow",
     "LayerId",
     "LifeCycleId",
     "LogicError",
     "MemAddress",
+    "MmItemContext",
     "NDEBUG",
     "OutOfPagesError",
     "PageIndexConverter",
@@ -255,9 +270,6 @@ __all__ = [
     "PoolGroupPeakBlockStats",
     "PageIndexMode",
     "PageStatus",
-    "PageStorageSnapshot",
-    "Batch",
-    "BatchDeviceArray",
     "PoolDesc",
     "PoolGroupDesc",
     "PoolGroupIndex",
@@ -265,7 +277,8 @@ __all__ = [
     "Priority",
     "ReuseGroupStatus",
     "ReuseScope",
-    "ScratchDesc",
+    "Batch",
+    "IndexTableSpec",
     "KVCacheIterationStatsDelta",
     "ReusedBlocksByLevel",
     "KVCacheStatsDelta",
@@ -277,6 +290,7 @@ __all__ = [
     "SsmLayerConfig",
     "StreamingBlockRemovedData",
     "StreamingBlockStoredData",
+    "StreamingAllBlocksClearedData",
     "StreamingEventSink",
     "StreamingEventStats",
     "SwaScratchReuseConfig",
@@ -286,6 +300,9 @@ __all__ = [
     "AttnLifeCycle",
     "CorruptedError",
     "CuError",
+    "CuOOMError",
+    "DiskOOMError",
+    "HostOOMError",
     "OutOfMemoryError",
     "_KVCache",
     "create_default_kv_cache_cold_page_codec",

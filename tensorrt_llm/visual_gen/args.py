@@ -103,6 +103,35 @@ class QuantAttentionConfig(StrictBaseModel):
             "quantized type has to cover. SageAttention only."
         ),
     )
+    smooth_v: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Subtract the per-channel V mean before quantizing V and add it back to the output. "
+            "SageAttention only; applied where the attention runs on the PrimTS kernels, while "
+            "the trtllm-gen kernels quantize V without it."
+        ),
+    )
+    vc_attention: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Run the recipe as VC-Attention on the TRTLLM backend. V is stored as E4M3 residuals "
+            "around 128-token tile means with one scale per channel; fp8 Q/K are Hadamard-rotated "
+            "with one scale per 128 tokens. Requires TLLM_FMHA_LIBS=+prims_ts."
+        ),
+    )
+    vc_repair_budget: float = Field(
+        0.0,
+        ge=0.0,
+        lt=1.0,
+        status="prototype",
+        description=(
+            "Fraction of tokens VC-Attention appends as V repair rows instead of restoring "
+            "tile means; 0 restores the means. 0.005 to 0.02 are the useful range, 0.005 is the "
+            "fastest setting measured at unchanged quality. vc_attention only."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -152,10 +181,12 @@ class AttentionConfig(StrictBaseModel):
                 ("int8", "fp8", (1, 16, 1)),
                 ("fp8", "fp8", (1, 1, 1)),
                 ("fp8", "fp8", (1, 4, 1)),
+                ("fp8", "fp8", (1, 16, 1)),
             },
             103: {
                 ("fp8", "fp8", (1, 1, 1)),
                 ("fp8", "fp8", (1, 4, 1)),
+                ("fp8", "fp8", (1, 16, 1)),
             },
         }
         # PrimTS serves the per-tensor FP8 recipes on Blackwell (TLLM_FMHA_LIBS=+prims_ts).
@@ -169,6 +200,20 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (0, 0, 0)),
             },
         }
+        # VC-Attention stores V as E4M3 residuals around tile means with one scale per channel.
+        # VC-Attention-QK16 keeps Q/K in BF16, VC-Attention-QK8 quantizes the Hadamard-rotated
+        # Q/K to E4M3 with one scale per 128 tokens. The recipe fixes these block sizes, so the
+        # config names only the element formats.
+        VC_ATTENTION_RECIPES = {
+            100: {
+                ("bf16", "fp8"),
+                ("fp8", "fp8"),
+            },
+            103: {
+                ("bf16", "fp8"),
+                ("fp8", "fp8"),
+            },
+        }
         # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
@@ -176,6 +221,7 @@ class AttentionConfig(StrictBaseModel):
         }
         CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
+            ("fp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 1)),
             ("nvfp4", "fp8", (0, 0, 0)),
@@ -191,29 +237,59 @@ class AttentionConfig(StrictBaseModel):
             return self
 
         q_config = self.quant_attention_config
-        recipe = (
-            q_config.qk_dtype,
-            q_config.v_dtype,
-            (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
-        )
+        block_sizes = (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size)
+        recipe = (q_config.qk_dtype, q_config.v_dtype, block_sizes)
         if self.backend == "TRTLLM":
             sm_version = get_sm_version()
-            recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(sm_version, set())
+            if q_config.vc_attention:
+                # The recipe fixes its scaling granularity. QK16 keeps bf16 Q/K with one V
+                # scale per channel, QK8 scales Q and K per 128-token block. The block size
+                # fields take the defaults or exactly those values and are set to them.
+                vc_block_sizes = (0, 0, 1) if q_config.qk_dtype == "bf16" else (128, 128, 1)
+                if block_sizes not in ((0, 0, 0), vc_block_sizes):
+                    raise ValueError(
+                        f"VC-Attention with qk_dtype={q_config.qk_dtype!r} fixes the block sizes "
+                        f"to {vc_block_sizes!r}. Leave them at 0, got {block_sizes!r}."
+                    )
+                q_config.q_block_size, q_config.k_block_size, q_config.v_block_size = vc_block_sizes
+                recipe = (q_config.qk_dtype, q_config.v_dtype)
+                recipes = VC_ATTENTION_RECIPES.get(sm_version, set())
+                family = "VC-Attention"
+            else:
+                recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(
+                    sm_version, set()
+                )
+                family = "SAGE and PrimTS"
             if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE and PrimTS recipes on this device: "
+                    f"for backend='TRTLLM'. Supported {family} recipes on this device: "
                     f"{sorted(recipes)}."
                 )
-            if q_config.smooth_k and q_config.q_block_size == 0:
+            if (q_config.smooth_k or q_config.smooth_v) and (
+                q_config.q_block_size == 0 or q_config.vc_attention
+            ):
                 raise ValueError(
-                    "smooth_k is a SageAttention option and does not apply to the per-tensor "
+                    "smooth_k and smooth_v are SageAttention options and do not apply to the "
                     f"recipe {recipe!r}."
                 )
-        elif q_config.smooth_k:
+            if q_config.smooth_v and sm_version not in (100, 103):
+                raise ValueError(
+                    "smooth_v needs the PrimTS kernels, which add the V mean back to the "
+                    f"attention output and run on SM100 and SM103 only; got SM{sm_version}."
+                )
+            if q_config.vc_repair_budget and not q_config.vc_attention:
+                raise ValueError(
+                    "vc_repair_budget is a VC-Attention option and requires vc_attention=True."
+                )
+        elif q_config.vc_attention or q_config.vc_repair_budget:
             raise ValueError(
-                f"smooth_k is a SageAttention option and requires backend='TRTLLM', got "
-                f"backend='{self.backend}'."
+                f"vc_attention is a TRTLLM backend option, got backend='{self.backend}'."
+            )
+        elif q_config.smooth_k or q_config.smooth_v:
+            raise ValueError(
+                f"smooth_k and smooth_v are SageAttention options and require backend='TRTLLM', "
+                f"got backend='{self.backend}'."
             )
         elif self.backend == "CUTEDSL":
             if recipe not in CUTEDSL_RECIPES:
@@ -276,15 +352,27 @@ class AttentionConfig(StrictBaseModel):
         if self.quant_attention_config is None or self.sparse_attention_config is None:
             return self
 
-        # VSA and SOL replace the dense attention path on every backend that
-        # serves them and never consume quant_attention_config, so accepting a
-        # quantization recipe would silently ignore user configuration.
+        # VSA and SOL replace the dense attention path. On TRTLLM every call
+        # carries the SageAttention recipe to the attention kernels, which either
+        # apply it or reject the call, so the recipe is never silently dropped.
+        # The other backends never consume quant_attention_config on that path,
+        # so accepting a recipe there would silently ignore user configuration.
         # SkipSoftmax is part of the dense path itself and can compose.
+        # VC-Attention is a dense recipe of the PrimTS kernels and is not
+        # composed with any sparse algorithm.
+        if self.quant_attention_config.vc_attention:
+            raise ValueError("vc_attention does not compose with sparse_attention_config.")
+        if self.backend == "TRTLLM":
+            return self
         algorithm = self.sparse_attention_config.algorithm
         if algorithm == "vsa":
-            raise ValueError("VSA and quant_attention_config are mutually exclusive.")
+            raise ValueError(
+                "VSA and quant_attention_config are mutually exclusive except on backend='TRTLLM'."
+            )
         if algorithm == "sol_attn":
-            raise ValueError("SOL and quant_attention_config are mutually exclusive.")
+            raise ValueError(
+                "SOL and quant_attention_config are mutually exclusive except on backend='TRTLLM'."
+            )
         return self
 
 
@@ -388,6 +476,20 @@ class ParallelConfig(StrictBaseModel):
         """True iff ``tp_layout`` is ``'token_sharded'`` (test this, not the field's truthiness)."""
         return self.tp_layout == "token_sharded"
 
+    text_encoder_tp_size: int = Field(
+        1,
+        ge=1,
+        status="prototype",
+        description=(
+            "Text encoder tensor-parallel group size. Currently MiniMax-H3 "
+            "only: text-only prompts shard the Qwen3-VL text encoder across "
+            "ranks [0, text_encoder_tp_size), while Ref2VA or FL2VA requests "
+            "with Qwen vision inputs must use text_encoder_tp_size=1. "
+            "The rank 0 worker broadcasts prompt "
+            "embeddings to the remaining ranks."
+        ),
+    )
+
     @property
     def seq_parallel_size(self) -> int:
         """Parallelism degree over the sequence/context axis.
@@ -453,6 +555,11 @@ class ParallelConfig(StrictBaseModel):
         if self.total_parallel_size > world_size:
             raise ValueError(
                 f"total_parallel_size ({self.total_parallel_size}) "
+                f"exceeds world_size ({world_size})"
+            )
+        if self.text_encoder_tp_size > world_size:
+            raise ValueError(
+                f"text_encoder_tp_size ({self.text_encoder_tp_size}) "
                 f"exceeds world_size ({world_size})"
             )
 

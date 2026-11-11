@@ -40,15 +40,18 @@ def _moe_prefix_kernel(
     num_post_pad_ptr,
     BLOCK_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
+    NUM_EXPERTS_POW2: tl.constexpr,
 ):
     """Compute exclusive offsets from padded expert counts."""
-    e = tl.arange(0, NUM_EXPERTS)
-    counts = tl.load(counts_ptr + e).to(tl.int32)
+    # tl.arange needs a power-of-2 range; lanes >= NUM_EXPERTS load a count of 0 and are not stored.
+    e = tl.arange(0, NUM_EXPERTS_POW2)
+    mask = e < NUM_EXPERTS
+    counts = tl.load(counts_ptr + e, mask=mask, other=0).to(tl.int32)
     padded = ((counts + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
     # Inclusive scan; subtract self for exclusive prefix.
     inc = tl.associative_scan(padded, 0, _int32_add)
     out_off = inc - padded
-    tl.store(out_off_ptr + e, out_off)
+    tl.store(out_off_ptr + e, out_off, mask=mask)
     tl.store(num_post_pad_ptr, tl.sum(padded).to(tl.int32))
 
 
@@ -139,6 +142,7 @@ def moe_align_block_size(
         num_post_pad,
         BLOCK_SIZE=block_size,
         NUM_EXPERTS=num_experts,
+        NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
     )
 
     _moe_expert_ids_kernel[num_experts,](
@@ -431,11 +435,13 @@ def _gated_activation_kernel(
     ic2_ptr,
     M,
     INTER,
+    swiglu_limit,
     BLOCK_M: tl.constexpr,
     BLOCK_I: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    HAS_SWIGLU_LIMIT: tl.constexpr,
 ):
-    """Compute ic2[m, i] = activation(gate) * up."""
+    """Compute ic2[m, i] = activation(clamped gate) * clamped up."""
     pid_m = tl.program_id(0)
     pid_i = tl.program_id(1)
 
@@ -449,6 +455,15 @@ def _gated_activation_kernel(
 
     up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
     gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    if HAS_SWIGLU_LIMIT:
+        # The clamp CUTLASS applies for a SwiGLU limit: ``moeOp.cpp`` promotes a
+        # plain clamped SwiGLU to ``SwigluBias`` with a neutral alpha/beta, and
+        # ``SwigluBiasAdaptor`` (``moe_kernels.cuh``) caps the SiLU input from
+        # above only and the linear half symmetrically. The FP8 block-scale and
+        # trtllm-gen activation kernels spell the same two lines.
+        gate = tl.minimum(gate, swiglu_limit)
+        up = tl.maximum(tl.minimum(up, swiglu_limit), -swiglu_limit)
 
     if ACTIVATION == 0:
         act = gate * (1.0 / (1.0 + tl.exp(-gate)))
@@ -464,6 +479,7 @@ def _invoke_gated_activation_kernel(
     ic1: torch.Tensor,
     ic2: torch.Tensor,
     activation: int,
+    swiglu_limit: float | None = None,
 ) -> None:
     """Launch `_gated_activation_kernel`.
 
@@ -471,6 +487,9 @@ def _invoke_gated_activation_kernel(
         ic1: (M, 2*INTER) bfloat16, contiguous (up half | gate half).
         ic2: (M, INTER)   bfloat16, contiguous (output, may be uninitialized).
         activation: 0 for silu/swiglu, 1 for gelu/geglu (exact).
+        swiglu_limit: SwiGLU clamp, or None for an unclamped layer. Passed as a
+            value with a constexpr flag rather than as an optional pointer, so
+            the unclamped variant carries no extra instruction.
     """
     assert ic1.is_contiguous() and ic2.is_contiguous()
     assert ic1.dtype == torch.bfloat16 and ic2.dtype == torch.bfloat16
@@ -486,9 +505,11 @@ def _invoke_gated_activation_kernel(
         ic2,
         M,
         inter,
+        0.0 if swiglu_limit is None else float(swiglu_limit),
         BLOCK_M=BLOCK_M,
         BLOCK_I=BLOCK_I,
         ACTIVATION=activation,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None,
     )
 
 
@@ -502,6 +523,7 @@ def run_triton_fp8_block_scale_moe(
     w2_scales: torch.Tensor,
     activation_type: int,
     output_dtype: torch.dtype | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """
     Complete MoE forward pass using Triton FP8 block-scale GEMMs.
@@ -520,6 +542,9 @@ def run_triton_fp8_block_scale_moe(
         w2_scales: (E, Nb, Kb) F32 block scales for w2.
         activation_type: ActivationType enum value.
         output_dtype: Optional output dtype.
+        swiglu_limit: SwiGLU clamp applied to both FC1 halves before the gated
+            activation, or None for an unclamped layer. SwiGLU only -- no other
+            kind this kernel runs carries a clamp.
 
     Returns:
         (T, H) output tensor.
@@ -563,11 +588,17 @@ def run_triton_fp8_block_scale_moe(
     else:
         raise ValueError(f"Unsupported activation_type={act_int} in Triton FP8 block-scale MoE")
 
+    if swiglu_limit is not None and activation_id != 0:
+        raise ValueError(
+            f"Triton FP8 block-scale MoE clamps SwiGLU only, got activation_type={act_int}"
+        )
+
     ic2 = torch.empty((num_tokens * top_k, intermediate), dtype=torch.bfloat16, device=device)
     _invoke_gated_activation_kernel(
         ic1.view(num_tokens * top_k, gate_up_size),
         ic2,
         activation_id,
+        swiglu_limit,
     )
 
     # The kernel constexpr `top_k=1` here means each ic2 row is already one

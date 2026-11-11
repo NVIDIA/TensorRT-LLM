@@ -41,10 +41,11 @@ class Reducescatter(OpWrapper):
     every rank; `input` is left untouched.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # deepseek-r1 at dep4 is the only caller and always passes `sizes=None`:
-    # it pads to a common height first. The row counts are the full heights an
+    # deepseek-r1 at dep4 and the gpt-oss default target under attention DP
+    # are the callers, and both always pass `sizes=None`: each pads to a
+    # common height first. The row counts are the full heights an
     # attention-DP step reduces, which is the rank count times a slice.
     CELLS: tuple[Cell, ...] = (
         Cell(

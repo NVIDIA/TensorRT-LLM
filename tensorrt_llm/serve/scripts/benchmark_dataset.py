@@ -1153,14 +1153,12 @@ class VisionArenaDataset(HuggingFaceDataset):
         output_len = (output_len
                       if output_len is not None else self.DEFAULT_OUTPUT_LEN)
 
-        # Collect prompts for batch processing
-        prompts = []
         parser_fn = self.SUPPORTED_DATASET_PATHS.get(self.dataset_path)
         if parser_fn is None:
             raise ValueError(f"Unsupported dataset path: {self.dataset_path}")
         sampled_requests = []
         for item in self.data:
-            if len(prompts) >= num_requests:
+            if len(sampled_requests) >= num_requests:
                 break
             prompt = parser_fn(item)
             mm_content = [process_image(item["images"][0])]

@@ -41,7 +41,7 @@ _flash_attn_combine_import_error = None
 try:
     _install_cutlass_dsl_compatibility()
     from flash_attn.cute.interface import flash_attn_combine as _flash_attn_combine
-except (ImportError, OSError) as e:
+except (AttributeError, ImportError, OSError) as e:
     _flash_attn_combine = None
     _flash_attn_combine_import_error = e
 
@@ -340,6 +340,29 @@ def _ulysses_post_unscatter(q_5d, k_5d, v_5d, *, is_hnd):
     return torch.ops.trtllm.ulysses_post_unscatter_qkv(q_5d, k_5d, v_5d, layout)
 
 
+def _all_to_all_5d_raw(
+    input: torch.Tensor,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Packed QKV A2A without the final Python unscatter.
+
+    Input is [B, S/P, 3, H, D]. Output is the raw receive buffer
+    [P, B, S/P, 3, H/P, D], ready for the native packed post-unscatter op.
+    """
+    world_size = torch.distributed.get_world_size(group=process_group)
+    if world_size == 1:
+        return input.unsqueeze(0)
+
+    batch, seq, qkv_count, heads, head_dim = input.shape
+    sharded_heads = heads // world_size
+    inp = input.reshape(batch, seq, qkv_count, world_size, sharded_heads, head_dim)
+    inp = inp.permute(3, 0, 1, 2, 4, 5).contiguous()
+
+    out_flat = torch.empty_like(inp.flatten())
+    torch.distributed.all_to_all_single(out_flat, inp.flatten(), group=process_group)
+    return out_flat.view_as(inp)
+
+
 class UlyssesAttention(AttentionBackend):
     """
     Ulysses Sequence Parallelism wrapper.
@@ -348,7 +371,9 @@ class UlyssesAttention(AttentionBackend):
     Not a standalone backend -- compose around a real backend (VANILLA/TRTLLM).
     Backend-specific kwargs are forwarded to the inner backend. Sequence
     lengths are updated after all-to-all, and VSA gates are redistributed with
-    the same sequence/head mapping as Q before they are forwarded.
+    the same sequence/head mapping as Q before they are forwarded. A ``kv`` plan
+    (a forward over a K/V cache) is passed through untouched: its token count is
+    the real tokens of all ranks, and rows past it after the exchange are padding.
 
     Architecture:
         Input:  [B, S/P, H, D] (sequence sharded across P processes)
@@ -357,10 +382,16 @@ class UlyssesAttention(AttentionBackend):
         Step 3: All-to-All → [B, S/P, H, D] (restore sequence sharding)
         Output: [B, S/P, H, D] (sequence sharded)
 
-    Two modes (auto-selected via ``inner_backend.support_fused_qkv()``):
-    - Unfused: 3 separate all-to-all for Q/K/V + 1 for output (4 collectives)
-    - Fused: stacks Q/K/V into [B, S/P, 3, H, D], 1 fused 5D all-to-all
-      + 1 for output (2 collectives total)
+    Three modes:
+    - Unfused: 3 separate all-to-all for Q/K/V + 1 for output (4 collectives).
+    - Inner-backend fused QKV: selected via ``inner_backend.support_fused_qkv()``.
+      Stacks Q/K/V into [B, S/P, 3, H, D], uses 1 fused 5D all-to-all, then
+      calls the inner backend with packed QKV.
+    - Packed self-attention: selected after fused QKV is unavailable when Q/K/V
+      have the same BF16 CUDA shape and the post-unscatter kernel constraints
+      are satisfied. It uses 1 fused 5D all-to-all, then a native post-unscatter
+      layout conversion before calling the inner backend with separate Q/K/V.
+    Grouped-query attention and the K/V cache path always use the unfused mode.
     """
 
     # One side stream shared across all UlyssesAttention instances on the
@@ -437,9 +468,56 @@ class UlyssesAttention(AttentionBackend):
                 f"by world_size ({self.world_size})."
             )
 
-        if self.inner_backend.support_fused_qkv():
-            return self._forward_fused(q, k, v, **kwargs)
-        return self._forward_unfused(q, k, v, **kwargs)
+        if kwargs.get("kv") is not None:
+            # The plan counts the real tokens of the whole sequence and rows past it are
+            # padding. Only the upper bound can be checked here: a heavily padded short
+            # chunk is indistinguishable from a shard length.
+            rows = q.shape[1] * self.world_size
+            num_tokens = kwargs["kv"].num_tokens
+            if not 0 < num_tokens <= rows:
+                raise ValueError(
+                    f"the plan's {num_tokens} tokens must count the real tokens of the whole "
+                    f"sequence: at least 1, at most the {rows} rows after the exchange"
+                )
+        # The fused modes stack q/k/v on one axis, which needs equal head counts;
+        # grouped-query models take the per-tensor path, and so does the K/V cache
+        # path, whose backends take q, k, v separately.
+        kv = kwargs.get("kv")
+        if self.inner_backend.support_fused_qkv() and q.shape[2] == k.shape[2] and kv is None:
+            out = self._forward_fused(q, k, v, **kwargs)
+        elif kv is None and self._supports_packed_self_attention(q, k, v, kwargs):
+            out = self._forward_packed_self_attention(q, k, v, **kwargs)
+        else:
+            out = self._forward_unfused(q, k, v, **kwargs)
+        return out
+
+    def _supports_packed_self_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kwargs: Dict,
+    ) -> bool:
+        # self.world_size is the Ulysses process-group size here, not the
+        # global distributed world size.
+        if self.world_size <= 1:
+            return False
+        if self.inner_backend.preferred_layout not in (
+            AttentionTensorLayout.HND,
+            AttentionTensorLayout.NHD,
+        ):
+            return False
+        if q.shape != k.shape or q.shape != v.shape:
+            return False
+        if not q.is_cuda or q.dtype != torch.bfloat16 or q.shape[-1] % 8 != 0:
+            return False
+        if q.shape[2] % self.world_size != 0:
+            return False
+        # ulysses_packed_qkv_post_unscatter launches one block of
+        # H_local * (D / 8) threads.
+        if (q.shape[2] // self.world_size) * (q.shape[-1] // 8) > 1024:
+            return False
+        return kwargs.get("gate_compress") is None and kwargs.get("gate_fine") is None
 
     def _forward_fused(
         self,
@@ -479,6 +557,28 @@ class UlyssesAttention(AttentionBackend):
             kwargs["gate_fine"] = gate_fine
 
         output = self.inner_backend.forward(q=qkv, k=None, v=None, **kwargs)
+
+        return self._output_a2a(output, batch_size, seq_len)
+
+    def _forward_packed_self_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        batch_size = q.shape[0]
+        qkv = torch.stack([q, k, v], dim=2)
+        qkv_5d = _all_to_all_5d_raw(qkv, self.process_group)
+        is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
+        q, k, v = torch.ops.trtllm.ulysses_packed_qkv_post_unscatter(qkv_5d, 0 if is_hnd else 1)
+
+        seq_len = q.shape[2] if is_hnd else q.shape[1]
+        kwargs["batch_size"] = batch_size
+        kwargs["seq_len"] = seq_len
+        kwargs["seq_len_kv"] = seq_len
+
+        output = self.inner_backend.forward(q=q, k=k, v=v, **kwargs)
 
         return self._output_a2a(output, batch_size, seq_len)
 
@@ -689,6 +789,8 @@ class UlyssesAttention(AttentionBackend):
         makes default wait on the last push.
         Post-attention permute / SDPA / reverse A2A run in the caller's outer
         compile region for additional inductor fusion."""
+        if attn_kwargs.get("kv") is not None:
+            raise NotImplementedError("The async Ulysses path does not support a K/V cache.")
         P = self.world_size
 
         # Issue the closures in issue_order. Order is correctness-neutral (_join_async
@@ -723,7 +825,7 @@ class UlyssesAttention(AttentionBackend):
         # only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
-        use_fused_post_unscatter = q_5d.dtype == torch.bfloat16
+        use_fused_post_unscatter = self.world_size > 1 and q_5d.dtype == torch.bfloat16
         if use_fused_post_unscatter:
             q_out, k_out, v_out = _ulysses_post_unscatter(q_5d, k_5d, v_5d, is_hnd=is_hnd)
             B = B_q
@@ -789,6 +891,14 @@ class UlyssesAttention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return True
+
+    def support_kv_cache(self) -> bool:
+        return self.inner_backend.support_kv_cache()
+
+    def support_kv_cache_page_size(
+        self, tokens_per_page: int, dtype: Optional[torch.dtype] = None
+    ) -> bool:
+        return self.inner_backend.support_kv_cache_page_size(tokens_per_page, dtype)
 
 
 class Attention2DAttention(AttentionBackend):
@@ -1269,6 +1379,7 @@ class RingAttention(AttentionBackend):
 
         kv_bufs[0, 0].copy_(k)
         kv_bufs[0, 1].copy_(v)
+        output_dtype = q.dtype
         for step in range(self.world_size):
             cur, nxt = step % 2, 1 - step % 2
             if step < self.world_size - 1:
@@ -1280,6 +1391,7 @@ class RingAttention(AttentionBackend):
                 attention_mask=PredefinedAttentionMask.FULL,
                 **inner_kw,
             )
+            output_dtype = block_out.dtype
             # Inner backend returns LSE as [B, H, S]; merge uses [B, S, H] with out [B, S, H, D].
             block_lse = block_lse_bh.transpose(1, 2).contiguous()
             if step == 0:
@@ -1289,8 +1401,8 @@ class RingAttention(AttentionBackend):
                 self._update_out_and_lse(out, lse, block_out, block_lse)
             if step < self.world_size - 1:
                 self._ring_wait()
-        if out.dtype != q.dtype:
-            return out.to(dtype=q.dtype)
+        if out.dtype != output_dtype:
+            return out.to(dtype=output_dtype)
         return out
 
     @property

@@ -2,112 +2,97 @@
 # SPDX-License-Identifier: Apache-2.0
 """Routing for Qwen4ExpForConditionalGeneration.
 
-`route` compares the facts that fix which code runs against the one deployment the
-target was written for, and raises `NoTarget` stating them otherwise (`auto` falls
-back to the built-in implementation; `require` raises). The checkpoint's published
-architecture name is kept by `load_pretrained_config`, so `_router_index` keys on it.
-All criteria are read off `text_config` / `vision_config`; the composite parent's
-mirrored fields are unreliable.
+Qwen3.8-Flash-Next-NVFP4 on sm103 lands on `qwen3_8_flash_next_nvfp4__sm_103__default` at one
+of the layouts in `_LAYOUTS`, with one-model MTP-Eagle (not at dep2) or no speculative
+decoding. The target's `check_deployment` then declines the checkpoints and engine choices it
+does not run, so `auto` falls back to the built-in implementation instead of failing in the
+build.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
-from ..._router_index import NoTarget
+from ..._router_index import NoTarget, routes
 
-# (layers, hidden, experts, attention heads, linear value heads, vocab). Shape-sniffing
-# also matches fine-tunes; the accuracy gate pins identity.
-_TEXT_SHAPE = (48, 2560, 512, 24, 48, 248320)
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.mapping import Mapping
 
-# (depth, hidden, heads, merge, out_hidden, num_pos, deepstack_indexes, act).
-# `deepstack_visual_indexes == ()` is the key member: a deepstack sibling has a merger
-# list this target lacks.
-_VISION_SHAPE = (27, 1152, 16, 2, 2560, 2304, (), "gelu_pytorch_tanh")
+# The GPU the target is certified on.
+_SM = (10, 3)
+
+# (world size, attention DP, MoE TP, MoE EP) -> the target's layout, each in one node. tp1 holds
+# everything on one rank; tp4 splits the routed experts by intermediate, tep4 and dep4 by
+# expert; dep2 is attention DP with two 256-expert windows. MTP runs at every layout but dep2,
+# where no draft acceptance was measured.
+_LAYOUTS = {
+    (1, False, 1, 1): "tp1",
+    (4, False, 4, 1): "tp4",
+    (4, False, 1, 4): "tep4",
+    (4, True, 1, 4): "dep4",
+    (2, True, 1, 2): "dep2",
+}
 
 
-def route(
-    pretrained_config: Any,
-    mapping: Any,
-    compute_capability: Tuple[int, int],
-    spec_config: Optional[Any],
-) -> type:
-    """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
+def layout(mapping: Mapping) -> Optional[str]:
+    """The layout ``mapping`` describes, or None.
 
-    The target is imported where it is returned, so declining costs no import
-    of modeling code.
+    Attention runs TP over the whole world, or DP with the LM head whole. Pipeline and context
+    parallelism, MoE clusters and a world spanning nodes are other forwards.
     """
-    text = getattr(pretrained_config, "text_config", None)
-    vision = getattr(pretrained_config, "vision_config", None)
-    # Absent means this is not the normalized Qwen4-Exp composite at all, and
-    # nothing below would be readable.
-    if text is None or vision is None:
-        raise NoTarget(
-            f"{type(pretrained_config).__name__} carries no text_config/vision_config; "
-            "the qwen4_exp target reads both halves of the normalized composite"
-        )
-
-    shape = (
-        text.num_hidden_layers,
-        text.hidden_size,
-        text.num_experts,
-        text.num_attention_heads,
-        text.linear_num_value_heads,
-        text.vocab_size,
-    )
-    vshape = (
-        vision.depth,
-        vision.hidden_size,
-        vision.num_heads,
-        vision.spatial_merge_size,
-        vision.out_hidden_size,
-        vision.num_position_embeddings,
-        tuple(getattr(vision, "deepstack_visual_indexes", None) or ()),
-        vision.hidden_act,
-    )
-
-    # The target implements the one-model MTP-Eagle loop over the checkpoint's
-    # single MTP module, and no other draft path. A draft longer than three
-    # needs predicted_tokens_per_seq past the 1..4 thop_attention certifies,
-    # which the target asserts; declining here falls back instead of crashing.
-    # The draft must also be a linear chain over that one module; the target
-    # asserts each of these at construction, so declining here is what lets
-    # ``auto`` fall back instead of crashing.
-    mtp_eagle_or_none = spec_config is None or (
-        isinstance(spec_config, MTPDecodingConfig)
-        and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
-        and getattr(spec_config, "num_nextn_predict_layers", None) in (None, 1)
-        and 1 <= spec_config.max_draft_len <= 3
-        and not getattr(spec_config, "use_dynamic_tree", False)
-        and getattr(spec_config, "eagle_choices", None) is None
-        and spec_config.max_total_draft_tokens == spec_config.max_draft_len
-    )
-
-    # Qwen3.8-Flash-Next-NVFP4 on one GB300 (sm103), MTP-Eagle or no speculation.
+    if mapping.enable_attention_dp:
+        attention_as_built = not mapping.enable_lm_head_tp_in_adp
+    else:
+        attention_as_built = mapping.attn_tp_size == mapping.tp_size
     if (
-        compute_capability == (10, 3)
-        and shape == _TEXT_SHAPE
-        and vshape == _VISION_SHAPE
-        and mapping.world_size == 1
-        and mtp_eagle_or_none
+        not attention_as_built
+        or mapping.tp_size != mapping.world_size
+        or (mapping.pp_size, mapping.cp_size, mapping.moe_cluster_size) != (1, 1, 1)
+        or mapping.is_multi_node()
     ):
-        # One line on purpose: the claims suite reads the routed targets off
-        # `from .<target>.modeling import <Class>` lines.
-        # fmt: off
-        # isort: off
-        from .qwen3_8_flash_next_nvfp4__sm_103__tp1.modeling import ModelingV2Qwen38FlashNextNvfp4Sm103Tp1
-        # isort: on
-        # fmt: on
-
-        return ModelingV2Qwen38FlashNextNvfp4Sm103Tp1
-
-    raise NoTarget(
-        f"compute capability {compute_capability}, text shape {shape}, vision shape "
-        f"{vshape}, {mapping.world_size} ranks, speculative decoding "
-        f"{spec_config.spec_dec_mode.name if spec_config is not None else 'off'}"
-        f"{f' max_draft_len={spec_config.max_draft_len}' if spec_config is not None else ''}; "
-        "the one qwen4_exp target is Qwen3.8-Flash-Next-NVFP4 on sm103, tp1, with "
-        "one-model MTP-Eagle (max_draft_len 1..3) or no speculative decoding"
+        return None
+    return _LAYOUTS.get(
+        (mapping.world_size, mapping.enable_attention_dp, mapping.moe_tp_size, mapping.moe_ep_size)
     )
+
+
+# Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the
+# config loader's composite branch writes the same name back.
+@routes("Qwen4ExpForConditionalGeneration")
+def route(
+    model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
+) -> type:
+    """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits."""
+    mapping, spec = model_config.mapping, model_config.spec_config
+    member = layout(mapping)
+    if compute_capability != _SM or member is None:
+        raise NoTarget(
+            f"compute capability {compute_capability}, world_size={mapping.world_size} "
+            f"(tp={mapping.tp_size}, pp={mapping.pp_size}, cp={mapping.cp_size}, "
+            f"attention_dp={mapping.enable_attention_dp}, moe_tp={mapping.moe_tp_size}, "
+            f"moe_ep={mapping.moe_ep_size}); the qwen4_exp target is Qwen3.8-Flash-Next-NVFP4 "
+            "on sm103 in one node: tp1, tp4 (experts split by intermediate), tep4, dep4 "
+            "(attention DP) or dep2 (attention DP, experts EP2)"
+        )
+    if spec is not None and not (
+        isinstance(spec, MTPDecodingConfig) and spec.spec_dec_mode.is_mtp_eagle_one_model()
+    ):
+        raise NoTarget(
+            f"speculative decoding {spec.spec_dec_mode.name}; the target runs one-model "
+            "MTP-Eagle or no speculative decoding"
+        )
+    if spec is not None and member == "dep2":
+        raise NoTarget(
+            "speculative decoding with attention DP (dep2): no draft acceptance was measured at "
+            "this layout; MTP under attention DP is admitted at dep4"
+        )
+    from .qwen3_8_flash_next_nvfp4__sm_103__default.modeling import (
+        ModelingV2Qwen38FlashNextNvfp4Sm103Default,
+    )
+
+    ModelingV2Qwen38FlashNextNvfp4Sm103Default.check_deployment(model_config, llm_args, member)
+    return ModelingV2Qwen38FlashNextNvfp4Sm103Default

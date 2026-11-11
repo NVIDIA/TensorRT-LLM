@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Local SLURM Launch Scripts
 
 ## Overview
@@ -87,7 +90,7 @@ python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_
 ### Disaggregated Mode
 
 ```bash
-python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX]" \
+python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]" \
     --draft-launch-sh $trtllm/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh \
     --launch-sh $work_dir/slurm_launch.sh \
     --install-sh $trtllm/jenkins/scripts/perf/local/slurm_install.sh \
@@ -113,7 +116,7 @@ the run is judged on duration coverage, not a request count. Example test id
 (`_upload` is stripped for local runs, so nothing reaches OpenSearch):
 
 ```
-perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-<agentx-case-name>]
 ```
 
 ### Environment variables
@@ -150,7 +153,7 @@ client_env_var: 'AGENTX_MAX_CTX=996579 AGENTX_DURATION=3600 AGENTX_WARMUP_PER_LA
 
 ```bash
 python3 submit.py \
-    --test-list "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL]" \
+    --test-list "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-<agentx-case-name>]" \
     --draft-launch-sh $trtllm/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh \
     --launch-sh $work_dir/slurm_launch.sh \
     --install-sh $trtllm/jenkins/scripts/perf/local/slurm_install.sh \

@@ -28,12 +28,15 @@ GPU counts only, not architecture, memory or launch topology.
 Reads Python ASTs without importing tests, pytest, torch or TensorRT-LLM.
 Preserves test-list suffixes, including TIMEOUT, and input order. A selector
 covering multiple GPU buckets is expanded into its methods/parameter IDs.
+Unclassifiable entries are skipped and recorded in ``*_skipped.jsonl``.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import json
+import sys
 from functools import lru_cache
 from itertools import product
 from pathlib import Path
@@ -243,8 +246,9 @@ def _bucket(required: int) -> tuple[int, int]:
 def split_test_list(
     test_list: Path, out_dir: Path, test_base: Path = _TEST_BASE
 ) -> dict[Path, int]:
-    """Write three disjoint txt lists, retaining suffixes and order within each bucket."""
+    """Write three disjoint txt lists and a report of unclassifiable entries."""
     buckets: dict[tuple[int, int], list[str]] = {bounds: [] for bounds in _BUCKETS}
+    skipped = []
     for lineno, original in enumerate(test_list.read_text(encoding="utf-8").splitlines(), start=1):
         line = original.strip()
         if not line or line.startswith("#"):
@@ -253,11 +257,23 @@ def split_test_list(
         selector, suffix = parts[0], parts[1] if len(parts) > 1 else ""
         try:
             cases = _selector_cases(selector, test_base)
-            for case, required in cases:
-                buckets[_bucket(required)].append(f"{case} {suffix}" if suffix else case)
-        except (ValueError, SyntaxError) as error:
-            raise ValueError(f"{test_list}:{lineno}: {selector}: {error}") from error
+            classified = [
+                (_bucket(required), f"{case} {suffix}" if suffix else case)
+                for case, required in cases
+            ]
+        except (TypeError, ValueError, SyntaxError) as error:
+            skipped.append({"line": lineno, "entry": original, "reason": str(error)})
+            print(f"{test_list}:{lineno}: skipped {selector}: {error}", file=sys.stderr)
+            continue
+        for bucket, case in classified:
+            buckets[bucket].append(case)
     out_dir.mkdir(parents=True, exist_ok=True)
+    skipped_path = out_dir / f"{test_list.stem}_skipped.jsonl"
+    skipped_path.write_text(
+        "".join(f"{json.dumps(entry, ensure_ascii=False)}\n" for entry in skipped), encoding="utf-8"
+    )
+    if skipped:
+        print(f"Skipped {len(skipped)} entries; see {skipped_path}", file=sys.stderr)
     counts = {}
     for (lower, upper), lines in buckets.items():
         path = out_dir / f"{test_list.stem}_{lower}to{upper}gpu.txt"

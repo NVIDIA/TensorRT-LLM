@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Plan for phi4-mm model support.
 # (done) step 1: support legacy inference pipeline for phi4-mm model.
 # (done) step 2: refactor the inference pipeline to use AGGREGATE mode (https://github.com/NVIDIA/TensorRT-LLM/pull/5522).
@@ -41,6 +44,7 @@ from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from ..peft.lora.config import LoraConfig
+from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (_is_mm_disagg, find_input_mm_embeds,
                                         fuse_input_embeds,
@@ -952,6 +956,7 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
 class Phi4MMForCausalLM(transformers.PreTrainedModel):
 
     _supports_flash_attn = True
+    lora_owner = DecoderLoraOwner(module_path="language_model")
 
     def __init__(self, model_config: ModelConfig):
         if _is_mm_disagg():
@@ -983,6 +988,10 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         self.model_dtype = getattr(config, "torch_dtype", torch.float16)
         self.post_config()
         self.is_loaded = True
+
+    @property
+    def language_model(self) -> torch.nn.Module:
+        return self.llm
 
     def load_weights(self, weights):
         # Load weights into HFPhi4MultimodalEncoder.

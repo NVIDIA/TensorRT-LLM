@@ -70,6 +70,30 @@ def test_clear_rejects_live_references_and_reservations() -> None:
     assert len(cache) == 0
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("ready", [False, True])
+@pytest.mark.parametrize("retain", [False, True])
+def test_releasable_bytes_counts_only_fully_released_entries(ready: bool, retain: bool) -> None:
+    cache = TensorLRUCache[str](max_bytes=16)
+    cache.acquire("shared", 8, retain_after_release=retain)
+    cache.acquire("shared", 8, retain_after_release=retain)
+    if ready:
+        cache.commit("shared", torch.ones(2))
+    cache.put("unreferenced", torch.ones(1))
+    before = cache.stats()
+
+    assert cache.releasable_bytes([]) == 0
+    assert cache.releasable_bytes(["missing", "unreferenced"]) == 0
+    assert cache.releasable_bytes(["shared"]) == 0
+    assert cache.releasable_bytes(["shared", "shared"]) == 8
+    assert cache.stats() == before
+
+    cache.release("shared")
+    assert cache.releasable_bytes(["shared"]) == 8
+    cache.release("shared")
+    assert cache.releasable_bytes(["shared"]) == 0
+
+
 def test_stats_track_hits_misses_insertions_and_replacements() -> None:
     cache = TensorLRUCache[str](max_bytes=32)
     tensor = torch.ones(2, dtype=torch.float32)

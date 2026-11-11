@@ -36,18 +36,21 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include "tensorrt_llm/thop/allreduceTacticCache.h"
 #include "tensorrt_llm/thop/fp4Quantize.h"
 #include "tensorrt_llm/thop/fp8Op.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/userbuffersTensor.h"
 
 #if ENABLE_MULTI_DEVICE
+
 #include <ATen/cuda/EmptyTensor.h>
 #include <c10/util/irange.h>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
+#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
@@ -60,8 +63,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -70,6 +75,7 @@
 #include <shared_mutex>
 #include <tuple>
 #include <unordered_set>
+#include <vector>
 
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
@@ -516,6 +522,7 @@ private:
 
         torch::Tensor inputTensor = input;
         void* inputPtr = input.data_ptr();
+        bool ownsSymmetricInput = false;
 
         // If buffer is not registered, decide whether to register based on size
         if (!windowBuffer0.isValid())
@@ -552,6 +559,7 @@ private:
                     windowBuffer0 = symmetricBuffer0;
                     inputTensor = symmetricInput; // Swap to window-backed tensor
                     inputPtr = windowBuffer0.ptr;
+                    ownsSymmetricInput = true;
                 }
             }
         }
@@ -563,8 +571,11 @@ private:
             inputPtr = windowBuffer0.ptr;
         }
 
-        // Use window-backed output buffer
-        auto [normOut, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
+        // A window-backed output only pairs with a window-backed input: an unregistered send buffer next to a
+        // registered receive buffer returns wrong sums, so that call gets plain ncclAllReduce buffers.
+        auto [normOut, windowBuffer1] = windowBuffer0.isValid()
+            ? createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type())
+            : std::make_pair(torch::Tensor(), tensorrt_llm::common::nccl_util::NCCLWindowBuffer());
         torch::Tensor outputTensor = windowBuffer1.isValid() ? normOut : torch::empty_like(inputTensor);
         void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
         if (!windowBuffer1.isValid())
@@ -577,13 +588,29 @@ private:
         // Perform allreduce
         NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
 
+        // This operation owns only the temporary used to copy an unregistered input. The collective
+        // is its final consumer, and same-stream release makes it reusable without synchronizing.
+        // A window-backed input is borrowed from the caller and remains owned by its outer scope.
+        if (ownsSymmetricInput)
+        {
+            TLLM_CHECK(allocator.releaseTensorBuffer(comm, inputTensor.storage().unsafeGetStorageImpl(), stream));
+        }
+
         if (mOp == AllReduceFusionOp::NONE)
         {
             return {outputTensor};
         }
 
         // Treat any other patterns as fallback cases.
-        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+        auto outputs = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+
+        // RMS_NORM does not return the all-reduce output, so its internal window is complete after
+        // the fused fallback is enqueued. Other fusion modes return it as their residual output.
+        if (mOp == AllReduceFusionOp::RMS_NORM && windowBuffer1.isValid())
+        {
+            TLLM_CHECK(allocator.releaseTensorBuffer(comm, outputTensor.storage().unsafeGetStorageImpl(), stream));
+        }
+        return outputs;
     }
 
     std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,
@@ -930,6 +957,11 @@ private:
     void initGroupTopology()
     {
         static std::map<std::set<int>, std::tuple<bool, bool, bool>> cache;
+        static std::mutex cacheMutex;
+        // This probe performs ProcessGroup collectives.  Model construction
+        // can reach it concurrently, so avoid racing the cache or issuing
+        // overlapping metadata collectives on the same ProcessGroup.
+        std::lock_guard<std::mutex> lock(cacheMutex);
         if (cache.find(mGroup) != cache.end())
         {
             auto [is_NVLINK_supported, is_P2P_supported, is_MNNVL_supported] = cache[mGroup];
@@ -1481,13 +1513,13 @@ private:
 
 #endif // ENABLE_MULTI_DEVICE
 
-void preallocateNCCLWindowBuffer(
-    torch::Tensor const& input, torch::List<int64_t> const& group, int64_t const buffersPerSize)
+bool preallocateNCCLWindowBufferBytes(torch::Tensor const& input, torch::List<int64_t> const& group,
+    int64_t const buffersPerSize, int64_t const sizeBytes)
 {
 #if ENABLE_MULTI_DEVICE
-    if (buffersPerSize <= 0 || group.size() == 0 || input.numel() == 0 || input.size(0) == 0)
+    if (buffersPerSize <= 0 || sizeBytes <= 0 || group.size() == 0 || input.numel() == 0)
     {
-        return;
+        return false;
     }
 
     std::set<int> groupSet;
@@ -1500,27 +1532,16 @@ void preallocateNCCLWindowBuffer(
     if (!commPtr || *commPtr == nullptr)
     {
         TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffers] NCCL comm is null; skipping preallocation");
-        return;
+        return false;
     }
 
     using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
     auto& allocator = NCCLWindowAllocator::getInstance();
     ncclComm_t const comm = *commPtr;
 
-    int64_t const numTokens = input.size(0);
-    int64_t const elementsPerToken = input.numel() / numTokens;
-    if (elementsPerToken <= 0)
-    {
-        return;
-    }
-    size_t const bufferSize = static_cast<size_t>(numTokens) * static_cast<size_t>(elementsPerToken)
-        * static_cast<size_t>(input.element_size());
-    if (bufferSize == 0)
-    {
-        return;
-    }
-    TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) for tokens=%ld (%zu bytes) comm %p",
-        buffersPerSize, numTokens, bufferSize, static_cast<void*>(comm));
+    size_t const bufferSize = static_cast<size_t>(sizeBytes);
+    TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) of %zu bytes on comm %p", buffersPerSize,
+        bufferSize, static_cast<void*>(comm));
     std::vector<void*> allocatedPtrs;
     allocatedPtrs.reserve(buffersPerSize);
     try
@@ -1544,10 +1565,20 @@ void preallocateNCCLWindowBuffer(
     {
         allocator.releaseBuffer(comm, ptr);
     }
+    return allocatedPtrs.size() == static_cast<size_t>(buffersPerSize);
 #else
+    (void) input;
+    (void) sizeBytes;
     (void) group;
     (void) buffersPerSize;
+    return false;
 #endif
+}
+
+void preallocateNCCLWindowBuffer(
+    torch::Tensor const& input, torch::List<int64_t> const& group, int64_t const buffersPerSize)
+{
+    preallocateNCCLWindowBufferBytes(input, group, buffersPerSize, input.nbytes());
 }
 
 bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& group)
@@ -1591,91 +1622,94 @@ bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& 
 #endif
 }
 
+#if ENABLE_MULTI_DEVICE
 namespace
 {
+using TensorScopeInputs = std::pair<std::vector<c10::StorageImpl const*>, int>;
 
-constexpr std::array<int64_t, 14> kAllReduceTuningBuckets
-    = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192};
-constexpr size_t kAllReduceNumTuningBuckets = kAllReduceTuningBuckets.size();
-constexpr size_t kAllReduceNumInputs = 6;
-
-using AllReduceInputShape = c10::SmallVector<int64_t, 8>;
-using AllReduceInputShapes = std::array<AllReduceInputShape, kAllReduceNumInputs>;
-
-struct AllReduceTacticCacheKey
+TensorScopeInputs getTensorScopeInputs(torch::List<torch::Tensor> const& tensors)
 {
-    std::vector<int64_t> group;
-    AllReduceFusionOp fusionOp;
-    bool inputUsesNcclWindow;
-    c10::ScalarType dtype;
-    AllReduceInputShapes staticInputShapes;
-
-    bool operator<(AllReduceTacticCacheKey const& other) const
+    std::vector<c10::StorageImpl const*> storages;
+    storages.reserve(tensors.size());
+    std::optional<int> device;
+    for (torch::Tensor const& tensor : tensors)
     {
-        return std::tie(group, fusionOp, inputUsesNcclWindow, dtype, staticInputShapes)
-            < std::tie(other.group, other.fusionOp, other.inputUsesNcclWindow, other.dtype, other.staticInputShapes);
+        if (tensor.is_cuda())
+        {
+            storages.push_back(tensor.storage().unsafeGetStorageImpl());
+            if (!device.has_value())
+            {
+                device = tensor.get_device();
+            }
+        }
     }
-};
-
-using AllReduceTacticBuckets = std::array<std::optional<int64_t>, kAllReduceNumTuningBuckets>;
-
-struct AllReduceTacticCache
-{
-    mutable std::shared_mutex mutex;
-    std::map<AllReduceTacticCacheKey, AllReduceTacticBuckets> tactics;
-};
-
-std::optional<size_t> getAllReduceBucketIndex(int64_t bucket)
-{
-    auto const iterator = std::lower_bound(kAllReduceTuningBuckets.begin(), kAllReduceTuningBuckets.end(), bucket);
-    if (iterator == kAllReduceTuningBuckets.end() || *iterator != bucket)
-    {
-        return std::nullopt;
-    }
-    return static_cast<size_t>(iterator - kAllReduceTuningBuckets.begin());
+    TLLM_CHECK_WITH_INFO(device.has_value(), "NCCL window tensor scope requires at least one CUDA tensor");
+    return {std::move(storages), *device};
 }
 
-std::optional<size_t> getAllReduceBucketIndexForTokens(int64_t numTokens)
+std::vector<c10::StorageImpl const*> getTensorStorages(torch::List<torch::Tensor> const& tensors)
 {
-    // Match Python's last_positive_power_of_2: the largest bucket also
-    // represents token counts through the value immediately before its next
-    // power of two.
-    if (numTokens < kAllReduceTuningBuckets.front() || numTokens >= 2 * kAllReduceTuningBuckets.back())
+    std::vector<c10::StorageImpl const*> storages;
+    storages.reserve(tensors.size());
+    for (torch::Tensor const& tensor : tensors)
     {
-        return std::nullopt;
+        if (tensor.is_cuda())
+        {
+            storages.push_back(tensor.storage().unsafeGetStorageImpl());
+        }
     }
-
-    // Use the largest tuned bucket that does not exceed the token count.
-    auto const firstLargerBucket
-        = std::upper_bound(kAllReduceTuningBuckets.begin(), kAllReduceTuningBuckets.end(), numTokens);
-    return static_cast<size_t>(firstLargerBucket - kAllReduceTuningBuckets.begin() - 1);
+    return storages;
 }
+} // namespace
+#endif // ENABLE_MULTI_DEVICE
+
+int64_t beginTrackedNCCLWindowTensorScope(torch::List<torch::Tensor> const& inputs)
+{
+#if ENABLE_MULTI_DEVICE
+    auto [storages, device] = getTensorScopeInputs(inputs);
+    return static_cast<int64_t>(
+        tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().beginTensorLeaseScope(storages, device));
+#else
+    (void) inputs;
+    return 0;
+#endif
+}
+
+void beginNCCLWindowTensorScope(torch::List<torch::Tensor> const& inputs)
+{
+    static_cast<void>(beginTrackedNCCLWindowTensorScope(inputs));
+}
+
+void endTrackedNCCLWindowTensorScope(torch::List<torch::Tensor> const& inputs,
+    torch::List<torch::Tensor> const& outputs, bool failed, int64_t entryDepth)
+{
+#if ENABLE_MULTI_DEVICE
+    auto const device = getTensorScopeInputs(inputs).second;
+    auto outputStorages = getTensorStorages(outputs);
+    tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().endTensorLeaseScope(outputStorages, device,
+        at::cuda::getCurrentCUDAStream(device), failed,
+        entryDepth < 0 ? std::nullopt : std::optional<size_t>{static_cast<size_t>(entryDepth)});
+#else
+    (void) inputs;
+    (void) outputs;
+    (void) failed;
+    (void) entryDepth;
+#endif
+}
+
+void endNCCLWindowTensorScope(
+    torch::List<torch::Tensor> const& inputs, torch::List<torch::Tensor> const& outputs, bool failed)
+{
+    endTrackedNCCLWindowTensorScope(inputs, outputs, failed, -1);
+}
+
+namespace
+{
 
 AllReduceTacticCache& getAllReduceTacticCache()
 {
     static AllReduceTacticCache cache;
     return cache;
-}
-
-void insertAllReduceTactic(AllReduceTacticCacheKey key, size_t bucketIndex, int64_t tactic)
-{
-    TORCH_INTERNAL_ASSERT(bucketIndex < kAllReduceNumTuningBuckets);
-    auto& cache = getAllReduceTacticCache();
-    std::unique_lock lock(cache.mutex);
-    cache.tactics[std::move(key)][bucketIndex] = tactic;
-}
-
-std::optional<int64_t> findAllReduceTactic(AllReduceTacticCacheKey const& key, std::optional<size_t> bucketIndex)
-{
-    if (!bucketIndex.has_value())
-    {
-        return std::nullopt;
-    }
-
-    auto const& cache = getAllReduceTacticCache();
-    std::shared_lock lock(cache.mutex);
-    auto const iterator = cache.tactics.find(key);
-    return iterator == cache.tactics.end() ? std::nullopt : iterator->second[*bucketIndex];
 }
 
 AllReduceInputShapes getAllReduceStaticInputShapes(torch::Tensor const& input,
@@ -1737,31 +1771,30 @@ void registerAllReduceTactic(torch::Tensor const& input, torch::optional<torch::
     torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> const& workspace,
     torch::List<int64_t> const& group, int64_t fusionOp, int64_t bucket, int64_t tactic)
 {
-    auto const bucketIndex = getAllReduceBucketIndex(bucket);
-    TORCH_CHECK(bucketIndex.has_value(), "Invalid AllReduce autotuner bucket: ", bucket);
-    insertAllReduceTactic(getAllReduceTacticCacheKey(input, residual, normWeight, scale, bias, workspace, group,
-                              static_cast<AllReduceFusionOp>(fusionOp), isNCCLWindowBuffer(input, group)),
-        *bucketIndex, tactic);
+    getAllReduceTacticCache().insert(
+        getAllReduceTacticCacheKey(input, residual, normWeight, scale, bias, workspace, group,
+            static_cast<AllReduceFusionOp>(fusionOp), isNCCLWindowBuffer(input, group)),
+        bucket, tactic);
 }
 
-void validateAllReduceTuningBuckets(torch::List<int64_t> const& buckets)
+std::vector<int64_t> configureAllReduceTuningBuckets(int64_t maxNumTokens)
 {
-    TORCH_CHECK(buckets.size() == kAllReduceNumTuningBuckets, "AllReduce autotuner bucket mismatch: Python provided ",
-        buckets.size(), " buckets, but C++ expects ", kAllReduceNumTuningBuckets,
-        ". Rebuild TensorRT-LLM so the Python and C++ sources match.");
-    for (size_t index = 0; index < kAllReduceNumTuningBuckets; ++index)
-    {
-        TORCH_CHECK(buckets[index] == kAllReduceTuningBuckets[index], "AllReduce autotuner bucket mismatch at index ",
-            index, ": Python provided ", buckets[index], ", but C++ expects ", kAllReduceTuningBuckets[index],
-            ". Rebuild TensorRT-LLM so the Python and C++ sources match.");
-    }
+    return getAllReduceTacticCache().configure(maxNumTokens);
+}
+
+std::vector<int64_t> getAllReduceTuningBuckets()
+{
+    return getAllReduceTacticCache().getBuckets();
+}
+
+int64_t mapToAllReduceTuningBucket(int64_t numTokens)
+{
+    return getAllReduceTacticCache().mapToBucket(numTokens);
 }
 
 void clearAllReduceTacticCache()
 {
-    auto& cache = getAllReduceTacticCache();
-    std::unique_lock lock(cache.mutex);
-    cache.tactics.clear();
+    getAllReduceTacticCache().clear();
 }
 
 std::vector<torch::Tensor> allreduce_raw(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
@@ -1796,10 +1829,10 @@ std::vector<torch::Tensor> autotunedAllreduce(torch::Tensor const& input,
 {
     auto key = getAllReduceTacticCacheKey(
         input, residual, normWeight, scale, bias, workspace, group, static_cast<AllReduceFusionOp>(fusionOp), false);
-    auto const bucketIndex = getAllReduceBucketIndexForTokens(input.size(0));
-    auto const defaultTactic = findAllReduceTactic(key, bucketIndex);
+    auto const numTokens = input.size(0);
+    auto const defaultTactic = getAllReduceTacticCache().find(key, numTokens);
     key.inputUsesNcclWindow = true;
-    auto const windowTactic = findAllReduceTactic(key, bucketIndex);
+    auto const windowTactic = getAllReduceTacticCache().find(key, numTokens);
 
     int64_t tactic;
     if (!defaultTactic.has_value() && !windowTactic.has_value())
@@ -1860,6 +1893,58 @@ std::vector<torch::Tensor> allreduce_pg(torch::Tensor const& input, torch::optio
 #else
     return {input};
 #endif // ENABLE_MULTI_DEVICE
+}
+
+std::vector<torch::Tensor> allreduce_pg_by_name(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
+    torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
+    torch::optional<torch::Tensor> const& workspace, torch::List<int64_t> const& group, int64_t rank,
+    std::string const& group_name, int64_t const strategy, int64_t const fusion_op, double const eps,
+    bool const trigger_completion_at_end)
+{
+#if ENABLE_MULTI_DEVICE
+    return allreduce_pg(input, residual, norm_weight, scale, bias, workspace, group, rank,
+        c10d::resolve_process_group(group_name), strategy, fusion_op, eps, trigger_completion_at_end);
+#else
+    return {input};
+#endif
+}
+
+torch::Tensor allreduce_pg_warmup_by_name(
+    torch::Tensor const& token, torch::List<int64_t> const& group_, int64_t rank, std::string const& group_name)
+{
+#if ENABLE_MULTI_DEVICE
+    std::set<int> group;
+    for (int64_t group_rank : group_)
+    {
+        group.insert(static_cast<int>(group_rank));
+    }
+    auto const process_group = c10d::resolve_process_group(group_name);
+    auto const rank_it = group.find(rank);
+    TORCH_CHECK(rank_it != group.end(), "Rank not found in ProcessGroup");
+    TORCH_CHECK(std::distance(group.begin(), rank_it) == process_group->getRank(),
+        "ProcessGroup rank does not match TensorRT-LLM TP rank");
+
+    // Run the ProcessGroup topology metadata exchanges before Dynamo/PCG
+    // capture. The normal named allreduce then reuses this cached topology
+    // and continues through its existing optimized native implementation.
+    AllreduceOp op(group, process_group, tensorrt_llm::DataType::kFLOAT, AllReduceStrategyType::AUTO,
+        AllReduceFusionOp::NONE, 0.0F);
+    op.initialize();
+
+    // ``initialize`` discovers topology but does not launch the c10d NCCL
+    // collective.  The first ProcessGroup::allreduce would otherwise lazily
+    // create that communicator while CUDA graph capture is active.  Exercise
+    // the exact c10d path once, eagerly, with a private one-element tensor.
+    TORCH_CHECK(token.is_cuda() && token.numel() > 0 && token.scalar_type() == torch::kFloat,
+        "allreduce_pg_warmup_by_name requires a non-empty CUDA float32 token");
+    AllreduceOp nccl_warmup(group, process_group, tensorrt_llm::DataType::kFLOAT, AllReduceStrategyType::NCCL,
+        AllReduceFusionOp::NONE, 0.0F);
+    nccl_warmup.initialize();
+    (void) nccl_warmup.run(token, std::nullopt, std::nullopt, std::nullopt, std::nullopt, true, std::nullopt);
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+#endif
+    return token;
 }
 
 // residual [m, hidden_dim]
@@ -2062,7 +2147,8 @@ bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
 
 std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::optional<torch::Tensor> const& gamma,
     torch::optional<torch::Tensor> const& residual_in, torch::optional<double> epsilon, torch::Tensor& comm_buffer,
-    torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_)
+    torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_,
+    bool fp8_payload)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
@@ -2169,6 +2255,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     allreduce_params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
     allreduce_params.input = input.const_data_ptr();
     allreduce_params.pattern = pattern;
+    allreduce_params.fp8Payload = fp8_payload;
     allreduce_params.layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED;
 
     if (fusionOp == AllReduceFusionOp::NONE)
@@ -2197,9 +2284,27 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     allreduce_params.rmsNormFusion = hasRmsNormFusion;
     allreduce_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-    // Threshold to switch between one-shot and two-shot allreduce kernel.
-    // Empirical value from the MNNVL sweep, matching FlashInfer's byte threshold.
-    constexpr size_t kOneShotSizeThreshold = 64 * 1024 * 8 * 2;
+    // Threshold to switch between one-shot and two-shot allreduce kernel, in bytes of the
+    // full message (tokens * hidden * ranks * element size). Default: empirical value from the
+    // MNNVL sweep, matching FlashInfer's byte threshold. TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES
+    // overrides it (the Python workspace sizing in distributed/ops.py reads the same variable).
+    static size_t const kOneShotSizeThreshold = []() -> size_t
+    {
+        char const* env = std::getenv("TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES");
+        if (env != nullptr && *env != '\0')
+        {
+            // Reject anything that is not a plain non-negative integer: strtoull would return 0 for
+            // "1MB" (always two-shot) and wrap a negative value, while the Python side raises on a
+            // non-numeric value, so the two sides must not parse the same string differently.
+            char* end = nullptr;
+            errno = 0;
+            unsigned long long const value = std::strtoull(env, &end, 10);
+            TORCH_CHECK(errno == 0 && end != env && *end == '\0' && *env != '-',
+                "TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES must be a non-negative integer, got '", env, "'");
+            return static_cast<size_t>(value);
+        }
+        return 64 * 1024 * 8 * 2;
+    }();
 
     if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
     {
@@ -2323,9 +2428,14 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
+        // comm_buffer (like buffer_flags and allreduce's workspace) is opaque
+        // communication scratch: it is mutated by the kernel but deliberately
+        // not alias-annotated, since AOT functionalization rejects non-ATen
+        // ops with alias annotations (needed for torch.compile / piecewise
+        // CUDA graphs). Ordering comes from the input/output data deps.
         "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
-        "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
-        "Tensor? scale=None, int fusion_op=0) -> "
+        "float? epsilon, Tensor comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
+        "Tensor? scale=None, int fusion_op=0, bool fp8_payload=False) -> "
         "Tensor[]");
     m.def(
         "allreduce("
@@ -2356,7 +2466,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "register_allreduce_tactic(Tensor input, Tensor? residual, Tensor? norm_weight, Tensor? scale, Tensor? bias, "
         "Tensor? workspace, int[] group, int op, int bucket, int tactic) -> ()");
-    m.def("validate_allreduce_tuning_buckets(int[] buckets) -> ()");
+    m.def("configure_allreduce_tuning_buckets(int max_num_tokens) -> int[]");
+    m.def("get_allreduce_tuning_buckets() -> int[]");
+    m.def("map_to_allreduce_tuning_bucket(int num_tokens) -> int");
     m.def("clear_allreduce_tactic_cache() -> ()");
     m.def(
         "allreduce_pg("
@@ -2373,6 +2485,22 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int op,"
         "float eps,"
         "bool trigger_completion_at_end) -> Tensor[]");
+    m.def(
+        "allreduce_pg_by_name("
+        "Tensor input,"
+        "Tensor? residual,"
+        "Tensor? norm_weight,"
+        "Tensor? scale,"
+        "Tensor? bias,"
+        "Tensor? workspace,"
+        "int[] group,"
+        "int rank,"
+        "str group_name,"
+        "int strategy,"
+        "int op,"
+        "float eps,"
+        "bool trigger_completion_at_end) -> Tensor[]");
+    m.def("allreduce_pg_warmup_by_name(Tensor token, int[] group, int rank, str group_name) -> Tensor");
     m.def(
         "moe_allreduce("
         "Tensor residual,"
@@ -2399,7 +2527,21 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int nranks,"
         "float eps) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
+    m.def("preallocate_nccl_window_buffer.bytes(Tensor input, int[] group, int count, int size_bytes) -> bool");
     m.def("is_nccl_window_buffer(Tensor input, int[] group) -> bool");
+    // Scope boundaries modify host-side allocator ownership but do not mutate their tensors.
+    // Python registers them as ordered effects so AOT preserves their runtime order.
+    m.def("begin_nccl_window_tensor_scope(Tensor[] inputs) -> ()");
+    m.def("end_nccl_window_tensor_scope(Tensor[] inputs, Tensor[] outputs, bool failed) -> ()");
+    // Eager boundaries track depth to unwind compiled scopes interrupted by an exception.
+    m.def("begin_nccl_window_tensor_scope.tracked(Tensor[] inputs) -> int");
+    m.def(
+        "end_nccl_window_tensor_scope.tracked(Tensor[] inputs, Tensor[] outputs, bool failed, int entry_depth) -> ()");
+    m.def("set_nccl_window_graph_owner(int owner) -> ()");
+    m.def("release_nccl_window_graph_owner(int owner) -> ()");
+    m.def("set_nccl_window_allocation_suppressed(bool suppressed) -> bool");
+    m.def("get_nccl_window_buffer_release_epoch() -> int");
+    m.def("promote_nccl_window_buffer_releases(int device, int release_epoch) -> ()");
     m.def(
         "minimax_allreduce_rms("
         "Tensor input,"
@@ -2429,9 +2571,16 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("autotuned_allreduce", &tensorrt_llm::torch_ext::autotunedAllreduce);
     m.impl("register_allreduce_tactic", &tensorrt_llm::torch_ext::registerAllReduceTactic);
     m.impl("allreduce_pg", &tensorrt_llm::torch_ext::allreduce_pg);
+    m.impl("allreduce_pg_by_name", &tensorrt_llm::torch_ext::allreduce_pg_by_name);
+    m.impl("allreduce_pg_warmup_by_name", &tensorrt_llm::torch_ext::allreduce_pg_warmup_by_name);
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);
+    m.impl("preallocate_nccl_window_buffer.bytes", &tensorrt_llm::torch_ext::preallocateNCCLWindowBufferBytes);
+    m.impl("begin_nccl_window_tensor_scope", &tensorrt_llm::torch_ext::beginNCCLWindowTensorScope);
+    m.impl("end_nccl_window_tensor_scope", &tensorrt_llm::torch_ext::endNCCLWindowTensorScope);
+    m.impl("begin_nccl_window_tensor_scope.tracked", &tensorrt_llm::torch_ext::beginTrackedNCCLWindowTensorScope);
+    m.impl("end_nccl_window_tensor_scope.tracked", &tensorrt_llm::torch_ext::endTrackedNCCLWindowTensorScope);
     m.impl("is_nccl_window_buffer", &tensorrt_llm::torch_ext::isNCCLWindowBuffer);
     m.impl("minimax_allreduce_rms", &tensorrt_llm::torch_ext::minimax_allreduce_rms);
     m.impl("minimax_allreduce_rms_qk", &tensorrt_llm::torch_ext::minimax_allreduce_rms_qk);
@@ -2439,8 +2588,49 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
-    m.impl("validate_allreduce_tuning_buckets", &tensorrt_llm::torch_ext::validateAllReduceTuningBuckets);
+    m.impl("configure_allreduce_tuning_buckets", &tensorrt_llm::torch_ext::configureAllReduceTuningBuckets);
+    m.impl("get_allreduce_tuning_buckets", &tensorrt_llm::torch_ext::getAllReduceTuningBuckets);
+    m.impl("map_to_allreduce_tuning_bucket", &tensorrt_llm::torch_ext::mapToAllReduceTuningBucket);
     m.impl("clear_allreduce_tactic_cache", &tensorrt_llm::torch_ext::clearAllReduceTacticCache);
+}
+
+// Graph-owner and synchronization bookkeeping has no Tensor argument, so it cannot select CPU
+// or CUDA dispatch. CatchAll is required for these host-side operations.
+TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
+{
+#if ENABLE_MULTI_DEVICE
+    m.impl("set_nccl_window_graph_owner",
+        [](int64_t owner)
+        { tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().setGraphPoolOwner(owner); });
+    m.impl("release_nccl_window_graph_owner",
+        [](int64_t owner)
+        { tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().releaseGraphPoolOwner(owner); });
+    m.impl("set_nccl_window_allocation_suppressed",
+        [](bool suppressed)
+        {
+            return tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().setWindowAllocationSuppressed(
+                suppressed);
+        });
+    m.impl("get_nccl_window_buffer_release_epoch",
+        []()
+        {
+            return static_cast<int64_t>(
+                tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().getBufferReleaseEpoch());
+        });
+    m.impl("promote_nccl_window_buffer_releases",
+        [](int64_t device, int64_t releaseEpoch)
+        {
+            TLLM_CHECK_WITH_INFO(releaseEpoch >= 0, "NCCL window release epoch must be non-negative");
+            tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().promoteBufferReleases(
+                static_cast<int>(device), static_cast<uint64_t>(releaseEpoch));
+        });
+#else
+    m.impl("set_nccl_window_graph_owner", [](int64_t) {});
+    m.impl("release_nccl_window_graph_owner", [](int64_t) {});
+    m.impl("set_nccl_window_allocation_suppressed", [](bool) { return false; });
+    m.impl("get_nccl_window_buffer_release_epoch", []() { return int64_t{0}; });
+    m.impl("promote_nccl_window_buffer_releases", [](int64_t, int64_t) {});
+#endif
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)
@@ -2453,5 +2643,13 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
             return std::vector<at::Tensor>{};
         });
     m.impl("preallocate_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&, int64_t) { return; });
+    m.impl("preallocate_nccl_window_buffer.bytes",
+        [](at::Tensor const&, torch::List<int64_t> const&, int64_t, int64_t) { return false; });
     m.impl("is_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&) { return false; });
+    m.impl("begin_nccl_window_tensor_scope", [](torch::List<torch::Tensor> const&) { return; });
+    m.impl("begin_nccl_window_tensor_scope.tracked", [](torch::List<torch::Tensor> const&) { return int64_t{0}; });
+    m.impl("end_nccl_window_tensor_scope.tracked",
+        [](torch::List<torch::Tensor> const&, torch::List<torch::Tensor> const&, bool, int64_t) { return; });
+    m.impl("end_nccl_window_tensor_scope",
+        [](torch::List<torch::Tensor> const&, torch::List<torch::Tensor> const&, bool) { return; });
 }

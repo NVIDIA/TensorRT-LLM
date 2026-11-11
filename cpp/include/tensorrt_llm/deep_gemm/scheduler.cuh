@@ -8,7 +8,7 @@
  * https://opensource.org/licenses/MIT
  *
  *
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -379,7 +379,7 @@ struct GroupedMaskedScheduler
     }
 };
 
-// Need to keep the same as the one in tests/unittest/_torch/thop/parallel/deep_gemm_tests.py
+// Need to keep the same as the one in tests/unittest/_torch/kernels/parallel/deep_gemm_tests.py
 template <typename T_offset, typename T_index>
 __host__ __device__ __forceinline__ T_offset compute_padded_offset(T_offset offset, T_index problem_idx)
 {

@@ -861,9 +861,10 @@ def check_call_order_disagreement_corrupts_silently() -> None:
 
     Measured on the certified path (world size 4, bf16, hidden 2560): the rank
     that swapped gets exactly 3/4 of its elements wrong in both results, every
-    other rank exactly 1/4 — the disagreeing rank's block — against floors of
-    0.7 and 0.2 here. Nothing raised and nothing hung, in 20 probe iterations
-    out of 20 and in every run of this test.
+    other rank exactly 1/4 — the disagreeing rank's block. At world size 8 the
+    same split is 7/8 and 1/8. The floors are those fractions less 0.05 (0.7
+    and 0.2 at world 4). Nothing raised and nothing hung, in 20 probe
+    iterations out of 20 and in every run of this test.
 
     Kept last, and it puts the communicator back: a swapped *pair* leaves the
     per-communicator positions aligned once both calls are made, so the final
@@ -883,7 +884,9 @@ def check_call_order_disagreement_corrupts_silently() -> None:
         got_second = allgather(second, None, GROUP)
     torch.cuda.synchronize()
 
-    floor = 0.7 if RANK == 0 else 0.2
+    # The swapping rank pairs with every other rank wrongly; the others pair
+    # wrongly only with the swapping rank's block.
+    floor = ((WORLD - 1) / WORLD if RANK == 0 else 1 / WORLD) - 0.05
     for name, got, ref in (
         ("first", got_first, ref_first),
         ("second", got_second, ref_second),
@@ -932,17 +935,23 @@ CHECKS = (
 )
 
 
-def _run_one_rank() -> int:
+def _run_one_rank(device: Optional[int] = None) -> int:
     """Body of one spawned rank: run every test; a failing rank exits nonzero
     and the launcher kills its siblings."""
     global RANK, WORLD, GROUP, HOST_GROUP, SUBGROUPS, PG_BOXED, allgather, validating, entry
     os.environ.setdefault("TLLM_DISABLE_MPI", "1")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(rank)
+    # Spawned on one node, the rank owns device `rank`. Across nodes (--srun)
+    # the caller passes the node-local index. Never read LOCAL_RANK here: a
+    # spawned rank inherits the launching shell's value, the same on every
+    # rank, and NCCL then refuses the group with "invalid usage".
+    if device is None:
+        device = rank
+    torch.cuda.set_device(device)
     # device_id keeps NCCL communicator teardown off the implicit-device path
     # that measurably wedges a watchdog at exit.
-    dist.init_process_group("nccl", init_method="env://", device_id=torch.device("cuda", rank))
+    dist.init_process_group("nccl", init_method="env://", device_id=torch.device("cuda", device))
 
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allgather as entry
 
@@ -1080,5 +1089,9 @@ def _spawn_ranks() -> None:
 if __name__ == "__main__":
     if _WORKER_FLAG in sys.argv:
         sys.exit(_run_one_rank())
+    if "--srun" in sys.argv:
+        import _rank_job
+
+        sys.exit(_run_one_rank(device=_rank_job.adopt_srun_env()))
     _spawn_ranks()
     print("OK")

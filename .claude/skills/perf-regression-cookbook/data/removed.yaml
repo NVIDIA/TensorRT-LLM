@@ -1,0 +1,208 @@
+# Refuted / withdrawn cases — the "do not re-add" registry.
+#
+# WHY THIS FILE EXISTS, and why these entries are NOT in pending.yaml:
+# pending.yaml is a promote-or-drop worklist of cases whose perf nature is
+# *unconfirmed* ("promote once confirmed; drop if refuted"). The entries below
+# were confirmed and REFUTED — they had full case files, with provenance, and
+# were removed on evidence. Filing a refuted case as "pending" invites the next
+# sweep to re-promote it, which is the exact defect class this registry closes.
+# A bare `git rm` is the other failure mode: the next bug-id-first sweep
+# re-encounters the same bug id, finds a merged fix PR, and re-derives the case
+# from scratch, paying the whole investigation again to reach the same no.
+#
+# So: before adding a case, grep this file for its nvbug ids and PR numbers.
+# If it is here, the burden is to defeat `evidence:` — not merely to notice the
+# fix exists.
+#
+# `file:` PATHS ARE AS-OF REMOVAL AND ARE NOT MAINTAINED. On 2026-08-13
+# `references/` was reorganized from five mechanism families
+# (execution-and-graph, kernel-and-fusion, memory-and-capacity, communication,
+# measurement-and-test) into 18 module directories, so most paths below name a
+# directory that no longer exists. That is deliberate: the field records where
+# the case WAS when it was removed, which is what makes it findable in
+# `git log`. Grep this file by nvbug id / PR number, never by path.
+# Fields: id (the case id as it was), file (path as it was), removed_on,
+# reason (one of: not-a-perf-bug, moved-to-instability-cookbook,
+# maintainer-instruction, restructured), nvbugs, evidence (the finding that
+# decided it, taken from the public fix PR description / diff only),
+# mechanism_kept_at (where the transferable knowledge still lives — every
+# removal left its prose behind), readd_if (the condition that would make it
+# admissible again).
+
+removed:
+  # ---- Removed 2026-08-12 by the per-case evidence audit (6 cases) ----------
+  # All six are genuine defects with merged fixes, and every one of their
+  # mechanisms is still described in data/patterns.yaml. What they lack is
+  # perf evidence in the public fix PR (a stated perf symptom or a perf-motivated
+  # product change), which is this cookbook's admission rule.
+
+  - id: case-eagle3-dynamic-tree-worker-misroute
+    file: references/execution-and-graph/eagle3-dynamic-tree-worker-misroute.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6394425"]
+    commits: ["edf63e818557"]
+    success_prs: [15842]
+    evidence: >
+      PR #15842 describes a numerical divergence: with
+      `dynamic_tree_max_topK=1` the validator promotes `use_dynamic_tree=True`
+      and routes to the dynamic-tree worker, whose step-0 tree mask, KV rewind
+      and tree bookkeeping diverge from the equivalent linear chain and lower
+      acceptance length. The fix gates the dynamic-tree path on topK >= 2. The
+      PR states no throughput/latency symptom, so it is an acceptance /
+      correctness fix, not a perf precedent.
+    mechanism_kept_at: pattern-variant-misroute notes (kept as the pattern's
+      clearest illustration of a normalizer "promoting" a degenerate config
+      onto a slower worker)
+    readd_if: a public PR or issue measures the misroute's throughput cost itself.
+
+  - id: case-helix-cp-warmup-missing
+    file: references/execution-and-graph/helix-cp-warmup-missing.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["5888410"]
+    commits: ["9c2d23c2e56e"]
+    success_prs: [11460]
+    evidence: >
+      PR #11460: without Helix CP warmup, the benchmark's reported median
+      TPOT diverged significantly because the first iteration included the
+      CUDA-graph warmup time — a measurement discrepancy, with nothing extra
+      spent on the steady-state served path. Contrast
+      case-png-encode-on-serving-hot-path, which is kept despite its fix not
+      being framed as a perf change precisely because there the gap is real
+      host work the user waits through. That contrast is the rule: an
+      instrument-disagreement bug is not a perf case; a real-work-spent bug is.
+    mechanism_kept_at: pattern-warmup-coverage-gap notes, shape (a) — read
+      PR #11460 directly when auditing context-parallel warmup.
+    readd_if: a public PR or issue measures the missing CP warmup's cost on the served path.
+
+  - id: case-autodeploy-symm-mem-nccl-fallback
+    file: references/communication/autodeploy-symm-mem-nccl-fallback.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6221450"]
+    commits: ["6ef7b387c6d9"]
+    success_prs: [14667]
+    evidence: >
+      PR #14667 is titled "AutoDeploy: Qwen3.5 400B NVFP4 accuracy regression
+      fix"; its diff changes the sharding config (hint-driven sharding with a
+      shared-expert exclusion), the sparse-MoE expert output ordering and the
+      swiglu fusion, and unwaives the accuracy test. The PR states no perf
+      symptom, so it is an accuracy fix, not a perf precedent.
+    mechanism_kept_at: pattern-fast-path-silent-fallback notes; the identical
+      mechanism with a perf fix behind it is
+      case-nemotronh-mnnvl-nccl-fallback.
+    readd_if: a public PR or issue measures the AutoDeploy fallback's cost.
+
+  - id: case-perf-test-host-bound-concurrency
+    file: references/measurement-and-test/perf-test-host-bound-concurrency.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6192201"]
+    commits: ["e6784d834b8d"]
+    success_prs: [14691]
+    evidence: >
+      PR #14691 only unwaives the llama3.1_8b_fp8 AutoDeploy perf-sanity test
+      and raises its client concurrency from 64 to 256 — a test-config change
+      with no product code touched, so it has no product Fix mechanism to cite.
+    mechanism_kept_at: pattern-optimization-lost-in-port notes — "measure a
+      regime that is not noise-dominated" survives as triage advice there
+      because it cost a real investigation; it just has no product-fix case
+      to cite.
+    readd_if: a product fix (not a test-config change) lands for the host-bound regime itself.
+
+  - id: case-eagle3-draft-kv-overallocation
+    file: references/memory-and-capacity/eagle3-draft-kv-overallocation.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6269778"]
+    commits: ["69ea407eb352"]
+    success_prs: [15017]
+    evidence: >
+      PR #15017: `get_num_spec_layers()` resolved through `num_eagle_layers`,
+      which other logic sets to `max_draft_len`, so EAGLE3 allocated too much
+      draft KV cache. A real capacity-accounting defect, but the PR describes
+      it as a memory over-allocation fix and states no perf symptom.
+    mechanism_kept_at: pattern-capacity-accounting-error notes (draft-length
+      term named explicitly, so an auditor knows the surviving instances cover
+      dtype-size and reuse-budget terms only).
+    readd_if: a public PR or issue measures the throughput cost of the lost capacity.
+
+  - id: case-specdec-host-kv-budget-doublecount
+    file: references/memory-and-capacity/specdec-host-kv-budget-doublecount.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6035425"]
+    commits: ["b857ee871b8d"]
+    success_prs: [13130]
+    evidence: >
+      PR #13130: a regression had doubled KV-cache GPU memory usage with spec
+      decoding enabled (fixed on the GPU side by PR #12188); this PR applies the
+      same fix to the host-side budget when KV-cache offloading is enabled.
+      Same shape as the entry above: a memory-usage fix with no perf symptom
+      stated.
+    mechanism_kept_at: pattern-capacity-accounting-error notes (offload-layout
+      term named explicitly).
+    readd_if: a public PR or issue measures the throughput cost of the lost capacity.
+
+  # ---- Removed 2026-08-12 at maintainer instruction (1 case) ---------------
+  # This one is NOT refuted as a non-perf fix, and the distinction matters: it
+  # is the only entry in this file that a future sweep could legitimately re-add.
+
+  - id: case-disagg-pp-transfer-consensus-rendezvous
+    file: references/communication/disagg-pp-transfer-consensus-rendezvous.md
+    removed_on: 2026-08-12
+    reason: maintainer-instruction
+    nvbugs: ["6448152", "6517760", "6549955"]
+    commits: ["526c1e3229c0"]
+    success_prs: [16634]
+    evidence: >
+      Removed at maintainer instruction. PR #16634 (`526c1e3229c0`, titled for
+      6448152) is merged and is a genuine perf fix: it makes the context-side
+      PP transfer-consensus collective added by PR #15139 asynchronous. But its
+      own description says current-head token throughput is not fully
+      recovered (794.61 output tok/s at the exact head vs 1548.84 on the
+      earlier frozen validation tree), so the case's Fix-mechanism bullet
+      over-claimed a complete fix for all three ids.
+    mechanism_kept_at: >
+      nothing in-tree — the per-iteration PP rendezvous mechanism (an unguarded
+      per-iter allgather added by `57bb6ee57a`, PR #15139) is described only in
+      the removed file's git history and in PR #16634's description.
+    readd_if: >
+      re-add once a merged PR (or a follow-up to #16634) states full throughput
+      recovery, citing only the ids that PR references — per the folding rule
+      in SKILL.md, one root cause and one fix PR.
+
+  # ---- Restructured, not removed (1 file) ----------------------------------
+
+  - id: case-trtllmgen-fmha-jit-warmup-coverage
+    file: references/kernel-and-fusion/trtllmgen-fmha-jit-warmup-coverage.md
+    removed_on: 2026-08-12
+    reason: restructured
+    nvbugs: ["6185446", "6193854", "6248837", "6293823", "6315845"]
+    evidence: >
+      Folded five bug ids and two independent fixes into one case. The ids
+      cover TWO distinct defects fixed a month apart — no warmup (#14851) and
+      then a too-sparse warmup grid (#15305). Folding erased the second fix's failed attempts
+      (#15279, #15472), which are the transferable half.
+    mechanism_kept_at: >
+      split into case-trtllmgen-fmha-jit-warmup (round 1: 6185446 + 6193854,
+      PR #14851) and case-trtllmgen-fmha-densify-grid (round 2: 6293823 +
+      6315845, PR #15305, failed #15279 + #15472), cross-linked. 6248837 is
+      not carried on either case.
+    readd_if: never — do not re-fold. See the folding rule in SKILL.md.
+
+# ---- Excluded bug ids (no case ever existed) -------------------------------
+# Ids a sweep will keep re-encountering because they sit next to real perf
+# bugs in the same PR series. Each was checked and rejected.
+excluded_bug_ids:
+  - id: "6248837"
+    evidence: >
+      Appears in the title of PR #15305 (the trtllm-gen FMHA warmup-grid
+      densification), but is not carried on that case, which is anchored to
+      6293823 / 6315845 (the ids in the titles of its failed attempts #15279 /
+      #15472). No public PR text gives a reason to treat it differently from
+      those ids; it is listed here only so a sweep does not re-fold the
+      round-1 and round-2 cases through it.
+    seen_in: the folded FMHA case above; also removed from the instability
+      cookbook's densify-grid case on the same date.

@@ -31,6 +31,7 @@ ALLOWED_PREFIXES = (
     "ad-",
     "exec-",
     "kernel-",
+    "modeling-",
     "perf-",
     "trtllm-",
 )

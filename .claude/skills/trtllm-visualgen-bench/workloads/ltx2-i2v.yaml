@@ -1,0 +1,28 @@
+# Lightricks/LTX-2  ·  LTX2Pipeline / LTX2TwoStagesPipeline  ·  i2v
+# guidance_scale · max_sequence_length: pipeline defaults.
+backend: openai-videos
+
+common_params:
+  width: 1280
+  height: 768
+  num_frames: 121
+  frame_rate: 24.0
+  num_inference_steps: 40
+  guidance_scale: 4.0
+  max_sequence_length: 1024
+  seed: 42
+
+# Prompt from wan_i2v.py's `main`, which pairs it with this reference, minus its
+# audio clause -- no audio is requested here.
+# The reference is pre-resampled to the shape pinned above: LTX-2 resizes straight to
+# the target without preserving aspect, so an off-shape reference is distorted.
+requests:
+  - prompt: A cat presses the piano keys with its paws
+    image_reference:
+      content: ../media/cat_piano.png
+      format: path
+
+# 9 extra_params, all left at their defaults:
+#   output_type=pt · guidance_rescale=0.0 · image_cond_strength=1.0 · stg_scale=0.0
+#   stg_blocks=None · modality_scale=1.0 · rescale_scale=0.0 · guidance_skip_step=0
+#   enhance_prompt=False

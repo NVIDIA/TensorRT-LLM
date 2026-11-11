@@ -343,7 +343,6 @@ def _make_handler_request(
         py_seq_slot=slot,
         py_return_log_probs=False,
         get_tokens=lambda _beam_idx: tokens,
-        py_is_draft=False,
     )
 
 

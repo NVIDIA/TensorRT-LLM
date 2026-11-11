@@ -105,7 +105,7 @@ Calculate MFU against the GPU's peak FP16 tensor core TFLOP/s.
 Run NCU with --set=full --profile-from-start off --target-processes all.
 If --set=full fails, try --set=detailed. Parse the CSV output for
 sm__throughput.avg.pct_of_peak_sustained_elapsed.
-Save raw NCU output to /workspace/.../ncu_output.txt.
+Save raw NCU output to ncu_output.txt.
 ```
 
 ### Remote Profiling
@@ -115,7 +115,7 @@ When profiling on a remote SLURM cluster, include the
 wrapper for the target cluster. The perf-profiling-specialist will prefix its
 commands (nsys, ncu, nvidia-smi) with this wrapper.
 
-The perf-profiling-specialist does not need the `remote-slurm` skill — the
+The perf-profiling-specialist does not need the `exec-remote-slurm` skill — the
 context block provides everything it needs to execute remotely.
 
 ## Available Specialists
