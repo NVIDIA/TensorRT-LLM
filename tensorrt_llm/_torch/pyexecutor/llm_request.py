@@ -995,6 +995,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Prompt tokens beyond the conversation's previous turn, set by the
         # conversation-aware attention-DP router; None when not estimated.
         self.py_uncached_prefill_tokens: int | None = None
+        # Set once the V2 scheduler has checked that estimate against the prefix cache.
+        self.py_uncached_prefill_probed = False
         self.py_original_end_id = self.py_end_id
         self.py_bad_words = None
         self.py_no_repeat_ngram_size = None

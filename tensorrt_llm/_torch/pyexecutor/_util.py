@@ -5115,6 +5115,8 @@ def create_py_executor_resources(
             max_gen_init_admissions_per_pass=(
                 scheduler_config.max_gen_init_admissions_per_pass
                 if scheduler_config is not None else None),
+            exact_context_demotion=runtime_hooks_of(
+                model_engine.model).exact_context_demotion,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
