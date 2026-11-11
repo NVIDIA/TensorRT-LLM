@@ -472,6 +472,45 @@ def test_selfsampling_topk_varlen_launch_modes(rows, base, step, top_k):
     _run_varlen_case([base + step * i for i in range(rows)], 1, 1, top_k, seed=rows)
 
 
+def test_selfsampling_topk_varlen_main_streaming_short_rows():
+    """Reach GvrMainKernel.kern with a mixed batch, including its short-row path."""
+    top_k, max_seq_len = 512, 16384
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    num_sms = properties.multi_processor_count
+    sm_version = properties.major * 10 + properties.minor
+    rows = 2 * num_sms + 1
+    plan = ss_host.route(rows, max_seq_len, max_seq_len, top_k, num_sms, sm_version)
+    if plan["kernel"] != "main":
+        pytest.skip(f"device profile routes rows={rows} to {plan['kernel']}, not main")
+
+    gen = torch.Generator(device=_DEV).manual_seed(16384)
+    logits = torch.randn((rows, max_seq_len), generator=gen, dtype=torch.float32, device=_DEV)
+    kv_lens = torch.full((rows,), max_seq_len, dtype=torch.int32, device=_DEV)
+    kv_lens[0] = 127
+    kv_lens[1] = top_k
+    logits[0, 127:] = 3e38
+    logits[1, top_k:] = 3e38
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+
+    ss_host.run_varlen(logits, kv_lens, indices, max_seq_len=max_seq_len)
+    torch.cuda.synchronize()
+    key = _varlen_cache_key(rows, max_seq_len, top_k, max_seq_len, 1, 1)
+    assert ss_host._VARLEN_CACHE[key][0] == "main", ss_host._VARLEN_CACHE[key][0]
+
+    assert torch.equal(indices[0, :127], torch.arange(127, dtype=torch.int32, device=_DEV))
+    assert bool((indices[0, 127:] == -1).all())
+    assert torch.equal(indices[1], torch.arange(top_k, dtype=torch.int32, device=_DEV))
+
+    full_indices = indices[2:].to(torch.int64)
+    assert bool((full_indices >= 0).all())
+    assert bool((full_indices < max_seq_len).all())
+    sorted_indices = torch.sort(full_indices, dim=1).values
+    assert bool((sorted_indices[:, 1:] != sorted_indices[:, :-1]).all())
+    got = torch.sort(torch.gather(logits[2:], 1, full_indices), dim=1, descending=True).values
+    expected = torch.sort(torch.topk(logits[2:], top_k, dim=1).values, dim=1, descending=True).values
+    assert torch.equal(got, expected), "main streaming path returned an inexact top-K"
+
+
 def test_selfsampling_topk_varlen_zero_kv_slot():
     """Padded / evicted CUDA-graph request slots can carry kv_len < next_n
     (even 0): the engine must emit the empty short row (all -1), not raise —
