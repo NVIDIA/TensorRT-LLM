@@ -211,19 +211,13 @@ for the wrapper.
 Pyrefly is pinned in `requirements-dev.txt`. Missing imports are reported except for
 PyTorch, generated bindings, and configured third-party libraries.
 
-GitHub Actions runs `pyrefly-diff.yml` on PR updates without a target-branch filter.
-It compares the target branch's current tip with a temporary merge of the PR head,
-using the target's pinned Pyrefly, configuration, and wrapper for both full scans.
-Git operations, dependency installation, and checker execution are explicit workflow
-steps; `.github/scripts/pyrefly_diff.py` only reads source files and reports to compute
-the new diagnostics.
-Diagnostics match by path (including renames), error kind, message, and source line,
-with occurrence counts; line shifts alone do not create new diagnostics.
-`pyrefly-report.yml` updates one file-level review thread: findings reopen it on
-every completed check, and a clean comparison resolves it. Failed comparisons do
-not resolve the thread. The check is advisory and is not a required status check.
-Older target branches need the workflow and Pyrefly configuration before they can
-participate. The publisher runs trusted default-branch code and treats scan artifacts
+GitHub Actions runs `pyrefly-diff.yml` on PR updates for any target branch that has
+the workflow. It reports the diagnostics that a temporary merge of the PR head adds to
+the target branch's current tip; both scans use the target's `requirements-dev.txt`,
+Pyrefly configuration, and wrapper. `pyrefly-report.yml` keeps one review thread per
+PR: findings reopen it on every completed check, a clean comparison resolves it, and
+an incomplete check leaves it as it is. The check is advisory and is not a required
+status check. The publisher runs trusted default-branch code and treats scan artifacts
 as data; do not execute PR code in it.
 
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,

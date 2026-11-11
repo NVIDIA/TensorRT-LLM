@@ -3,24 +3,25 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {MARKER, bodyFor, publish} = require('./pyrefly_report');
+const {MARKER, bodyFor, publish, validate} = require('./pyrefly_report');
 
 const head = 'a'.repeat(40);
 const finding = {path: 'tensorrt_llm/module.py', line: 12, name: 'unknown-name',
-  description: 'Unknown name `example`'};
+  message: 'Unknown name `example`'};
 
-function harness({resolved = false, existing = true, errors = [finding], error = null} = {}) {
+function harness({resolved = false, existing = true, diagnostics = [finding], error = null} = {}) {
   const report = {pr_number: 42, base_ref: 'release/test', base_sha: 'b'.repeat(40),
-    head_sha: head, errors, error};
+    head_sha: head, diagnostics, error};
   const run = {id: 123, run_attempt: 1, event: 'pull_request',
     path: '.github/workflows/pyrefly-diff.yml', head_sha: head, head_branch: 'feature',
     repository: {full_name: 'NVIDIA/TensorRT-LLM'},
     head_repository: {full_name: 'contributor/TensorRT-LLM'}, pull_requests: []};
   const pr = {state: 'open', base: {ref: report.base_ref},
     head: {sha: head, repo: {full_name: run.head_repository.full_name}}};
+  // The author is what the GraphQL API returns for a comment made with the Actions token.
   const thread = {id: 'thread-1', isResolved: resolved, comments: {nodes: [{fullDatabaseId: '99',
-    body: `${MARKER}\nold report`, author: {login: 'github-actions[bot]'}}]}};
-  const state = {report, run, pr, thread, writes: [], existing, queryCount: 0,
+    body: `${MARKER}\nold report`, author: {__typename: 'Bot', login: 'github-actions'}}]}};
+  const state = {report, run, pr, thread, writes: [], existing,
     files: [{filename: 'tensorrt_llm/module.py', status: 'modified'}]};
   const github = {
     rest: {pulls: {
@@ -34,7 +35,6 @@ function harness({resolved = false, existing = true, errors = [finding], error =
         state.writes.push([query.includes('unresolveReviewThread') ? 'unresolve' : 'resolve', variables]);
         return {};
       }
-      state.queryCount++;
       return {repository: {pullRequest: {reviewThreads: {
         nodes: state.existing ? [state.thread] : [], pageInfo: {hasNextPage: false},
       }}}};
@@ -54,8 +54,10 @@ test('fork run with an empty pull_requests list can create one file-level thread
   assert.equal(operation, 'create');
   assert.equal(args.subject_type, 'file');
   assert.equal(args.commit_id, head);
+  assert.equal(args.path, 'tensorrt_llm/module.py');
   assert.ok(args.body.includes('release/test'));
   assert.ok(args.body.includes('unknown-name'));
+  assert.ok(args.body.includes('resolve this conversation'));
 });
 
 test('each check with findings reopens a manually resolved thread', async () => {
@@ -78,44 +80,35 @@ test('64-bit comment IDs are preserved when updating the existing report', async
 });
 
 test('clean comparison updates and resolves an existing thread', async () => {
-  const state = harness({errors: []});
+  const state = harness({diagnostics: []});
   await state.publish();
   assert.deepEqual(state.writes.map(item => item[0]), ['update', 'resolve']);
   assert.ok(state.writes[0][1].body.includes('no new diagnostics'));
+  assert.ok(!state.writes[0][1].body.includes('resolve this conversation'));
 });
 
 test('clean comparison does not create a thread', async () => {
-  const state = harness({existing: false, errors: []});
+  const state = harness({existing: false, diagnostics: []});
   await state.publish();
   assert.deepEqual(state.writes, []);
 });
 
-test('scanner failure never resolves an existing thread', async () => {
-  const state = harness({errors: [], error: 'Scanner failed'});
-  await state.publish();
-  assert.deepEqual(state.writes.map(item => item[0]), ['update']);
-  assert.ok(state.writes[0][1].body.includes('check incomplete'));
+test('incomplete check never changes whether an existing thread is resolved', async () => {
+  for (const resolved of [false, true]) {
+    const state = harness({resolved, diagnostics: [], error: 'Scanner failed'});
+    await state.publish();
+    assert.deepEqual(state.writes.map(item => item[0]), ['update']);
+    assert.ok(state.writes[0][1].body.includes('check incomplete'));
+    assert.ok(state.writes[0][1].body.includes('Scanner failed'));
+  }
 });
 
-test('retry can finish a thread state change after the body was already updated', async () => {
-  const state = harness({resolved: true});
-  state.thread.comments.nodes[0].body += '\n<!-- pyrefly-run:123:1 -->';
-  await state.publish();
-  assert.deepEqual(state.writes.map(item => item[0]), ['update', 'unresolve']);
-});
-
-test('an earlier attempt of the same run cannot overwrite a later attempt', async () => {
-  const state = harness();
-  state.thread.comments.nodes[0].body += '\n<!-- pyrefly-run:123:2 -->';
-  await state.publish();
-  assert.deepEqual(state.writes, []);
-});
-
-test('deletion-only PR anchors a new thread on the left side', async () => {
+test('deletion-only PR still gets a file-level thread', async () => {
   const state = harness({existing: false});
   state.files = [{filename: 'deleted.py', status: 'removed'}];
   await state.publish();
-  assert.equal(state.writes[0][1].side, 'LEFT');
+  assert.equal(state.writes[0][1].path, 'deleted.py');
+  assert.equal(state.writes[0][1].subject_type, 'file');
 });
 
 test('force-push, retargeting, closing, and mismatched head repositories discard old results', async () => {
@@ -145,24 +138,47 @@ test('report cannot claim another source head or workflow', async () => {
   }
 });
 
-test('older completed runs cannot overwrite a newer report for the same head', async () => {
-  const state = harness();
-  state.thread.comments.nodes[0].body += '\n<!-- pyrefly-run:124:1 -->';
-  await state.publish();
-  assert.deepEqual(state.writes, []);
+test('only a marked comment from the Actions bot is reused as the report', async () => {
+  for (const author of [
+    {__typename: 'User', login: 'human'},
+    {__typename: 'User', login: 'github-actions'},
+    {__typename: 'Bot', login: 'another-app'},
+    null,
+  ]) {
+    const state = harness();
+    state.thread.comments.nodes[0].author = author;
+    await state.publish();
+    assert.deepEqual(state.writes.map(item => item[0]), ['create']);
+  }
 });
 
-test('human comments with a copied marker are not edited', async () => {
-  const state = harness();
-  state.thread.comments.nodes[0].author.login = 'human';
-  await state.publish();
-  assert.deepEqual(state.writes.map(item => item[0]), ['create']);
+test('malformed reports are rejected before any API call', async () => {
+  for (const change of [
+    report => {report.pr_number = '42';},
+    report => {report.head_sha = 'main';},
+    report => {report.base_sha = '';},
+    report => {report.error = '';},
+    report => {report.diagnostics = [{...finding, line: 0}];},
+    report => {report.diagnostics = [{...finding, message: undefined}];},
+  ]) {
+    const state = harness();
+    change(state.report);
+    await assert.rejects(state.publish, /Invalid Pyrefly report/);
+    assert.deepEqual(state.writes, []);
+  }
+});
+
+test('incomplete report may lack the target branch SHA', () => {
+  const state = harness({diagnostics: [], error: 'Could not merge'});
+  state.report.base_sha = '';
+  validate(state.report);
+  assert.ok(bodyFor(state.report, state.run, 'https://github.com').includes('(unavailable)'));
 });
 
 test('rendered diagnostics escape markup and keep long reports within the comment limit', () => {
   const state = harness();
-  state.report.errors = Array.from({length: 200}, () => ({...finding,
-    description: '<script>example()</script>\n' + 'x'.repeat(2000)}));
+  state.report.diagnostics = Array.from({length: 200}, () => ({...finding,
+    message: '<script>example()</script>\n' + 'x'.repeat(2000)}));
   const body = bodyFor(state.report, state.run, 'https://github.com');
   assert.ok(body.includes('&lt;script&gt;'));
   assert.ok(!body.includes('<script>'));

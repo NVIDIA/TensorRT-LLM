@@ -1,41 +1,45 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Scans the target branch tip and a temporary merge of the PR head, then uploads the
+# diagnostics the PR adds. This workflow runs PR code, so it holds no write permission;
+# pyrefly-report.yml publishes the result.
 name: Pyrefly diff
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited]  # synchronize for push commit
+    # `edited` is needed for a change of target branch; the job condition drops other edits.
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
 
-concurrency:
-  group: pyrefly-diff-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   check:
-    if: >-
-      github.event.action != 'edited' || github.event.changes.base.ref.from != ''  # for edited event, only accept change-target-branch type
+    if: github.event.action != 'edited' || github.event.changes.base.ref.from != ''
+    # Job level: a run whose job is skipped (a title or description edit) never joins the
+    # group, so it cannot cancel a check in progress.
+    concurrency:
+      group: pyrefly-diff-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
+      # actions/checkout skips LFS only for its own git commands.
+      GIT_LFS_SKIP_SMUDGE: 1
       PYREFLY_BASE_ROOT: ${{ github.workspace }}/../pyrefly-base
       PYREFLY_MERGED_ROOT: ${{ github.workspace }}/../pyrefly-merged
       PYREFLY_REPORT_DIR: ${{ github.workspace }}/../pyrefly-diff
     steps:
       - uses: actions/checkout@v6
         with:
+          # The merge needs full history; file contents are fetched only when used.
           fetch-depth: 0
+          filter: blob:none
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Test Pyrefly automation
-        run: |
-          python3 -m unittest discover -s .github/scripts -p 'test_pyrefly_diff.py'
-          node --test .github/scripts/pyrefly_report.test.js
       - name: Prepare target branch and merged PR
         id: prepare
         continue-on-error: true
@@ -53,19 +57,21 @@ jobs:
             merge --no-commit --no-ff "$HEAD_SHA"
           git -C "$PYREFLY_MERGED_ROOT" diff --cached --name-status --find-renames -z "$base_sha" -- \
             > "$PYREFLY_REPORT_DIR/changes"
-          git -C "$PYREFLY_MERGED_ROOT" restore --source "$base_sha" --worktree -- \
-            pyproject.toml scripts/run_pyrefly.sh scripts/pyrefly_workflow.py scripts/pyrefly_exclusion.py
-      - name: Install Pyrefly
+          # Both scans use the target branch's Pyrefly configuration and wrapper scripts.
+          git -C "$PYREFLY_MERGED_ROOT" restore --source "$base_sha" --worktree -- pyproject.toml scripts
+      - name: Install target branch dependencies
         id: install
         if: steps.prepare.outcome == 'success'
         continue-on-error: true
-        run: |
-          pyrefly_requirement=$(sed -n '/^pyrefly==/p' "$PYREFLY_BASE_ROOT/requirements-dev.txt")
-          test -n "$pyrefly_requirement"
-          python3 -m pip install "$pyrefly_requirement"
+        timeout-minutes: 15
+        working-directory: ${{ env.PYREFLY_BASE_ROOT }}
+        # Without the project dependencies every third-party import is a diagnostic.
+        # requirements-dev.txt also pins Pyrefly. The CUDA wheels are large, so keep no
+        # second copy of them in the pip cache.
+        run: python3 -m pip install --no-cache-dir -r requirements-dev.txt
       - name: Check target branch
         id: base_check
-        if: steps.prepare.outcome == 'success' && steps.install.outcome == 'success'
+        if: steps.install.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 5
         working-directory: ${{ env.PYREFLY_BASE_ROOT }}
@@ -74,7 +80,7 @@ jobs:
         run: bash scripts/run_pyrefly.sh --full-project
       - name: Check merged PR
         id: merged_check
-        if: steps.prepare.outcome == 'success' && steps.install.outcome == 'success'
+        if: steps.install.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 5
         working-directory: ${{ env.PYREFLY_MERGED_ROOT }}
@@ -82,13 +88,12 @@ jobs:
           PYREFLY_REPORT_PATH: ${{ env.PYREFLY_REPORT_DIR }}/merged.json
         run: bash scripts/run_pyrefly.sh --full-project
       - name: Compare diagnostics
-        id: compare
         if: ${{ !cancelled() }}
         env:
           BASE_SHA: ${{ steps.prepare.outputs.base_sha }}
           CHECK_ERROR: >-
-            ${{ steps.prepare.outcome != 'success' && 'Could not prepare the PR merge against the target branch. See workflow logs.' ||
-                steps.install.outcome != 'success' && 'Could not install Pyrefly. See workflow logs.' ||
+            ${{ steps.prepare.outcome != 'success' && 'Could not merge the PR into the current target branch. See workflow logs.' ||
+                steps.install.outcome != 'success' && 'Could not install the target branch dependencies. See workflow logs.' ||
                 steps.base_check.outcome != 'success' && 'The target branch check did not complete. See workflow logs.' ||
                 steps.merged_check.outcome != 'success' && 'The merged PR check did not complete. See workflow logs.' || '' }}
         run: |

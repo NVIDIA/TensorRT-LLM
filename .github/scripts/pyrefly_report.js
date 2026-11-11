@@ -2,48 +2,49 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const MARKER = '<!-- pyrefly-diff-report -->';
-const BOT = 'github-actions[bot]';
+const WORKFLOW = '.github/workflows/pyrefly-diff.yml';
 const escapeHtml = text => String(text).replace(/[&<>]/g,
   character => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[character]));
 
 function validate(report) {
-  if (!Number.isSafeInteger(report.pr_number) || report.pr_number <= 0 ||
-      !/^[a-f0-9]{40}$/.test(report.head_sha) ||
-      !/^(?:[a-f0-9]{40})?$/.test(report.base_sha) ||
-      typeof report.base_ref !== 'string' || !report.base_ref ||
-      !(report.error === null || typeof report.error === 'string') ||
-      !Array.isArray(report.errors) || report.errors.some(error =>
-        !error || typeof error.path !== 'string' || typeof error.name !== 'string' ||
-        !Number.isSafeInteger(error.line) || error.line < 1 ||
-        typeof (error.description ?? error.concise_description) !== 'string')) {
-    throw new Error('Invalid Pyrefly report.');
-  }
-  if (!report.error && !report.base_sha) throw new Error('Missing comparison base SHA.');
+  const isText = value => typeof value === 'string';
+  const isPositive = value => Number.isSafeInteger(value) && value > 0;
+  const isSha = value => /^[a-f0-9]{40}$/.test(value);
+  // An incomplete check may have failed before it could resolve the target branch.
+  const incomplete = isText(report.error) && report.error !== '';
+  const valid = isPositive(report.pr_number) && isSha(report.head_sha) &&
+    isText(report.base_ref) && report.base_ref !== '' &&
+    (isSha(report.base_sha) || incomplete && report.base_sha === '') &&
+    (incomplete || report.error === null) &&
+    Array.isArray(report.diagnostics) && report.diagnostics.every(item =>
+      item && isText(item.path) && isPositive(item.line) && isText(item.name) && isText(item.message));
+  if (!valid) throw new Error('Invalid Pyrefly report.');
 }
 
 function bodyFor(report, run, serverUrl) {
+  const count = report.diagnostics.length;
   const title = report.error ? '⚠️ Pyrefly check incomplete' :
-    report.errors.length ? `⚠️ Pyrefly: ${report.errors.length} new diagnostics` :
-      '✅ Pyrefly: no new diagnostics';
-  const lines = [MARKER, `<!-- pyrefly-run:${run.id}:${run.run_attempt} -->`, `### ${title}`, '',
+    count ? `⚠️ Pyrefly: ${count} new diagnostics` : '✅ Pyrefly: no new diagnostics';
+  const lines = [MARKER, `### ${title}`, '',
     `Target: <code>${escapeHtml(report.base_ref)}</code> ` +
-      `(${report.base_sha.slice(0, 12) || 'unavailable'}). PR head: ${report.head_sha.slice(0, 12)}.`, '',
-    'This check is advisory. Please fix or acknowledge the findings, then resolve this conversation.',
-    'Type errors do not fail the check.', ''];
+      `(${report.base_sha.slice(0, 12) || 'unavailable'}). PR head: ${report.head_sha.slice(0, 12)}.`, ''];
   if (report.error) {
-    lines.push(`<pre>${escapeHtml(report.error.slice(0, 2000))}</pre>`);
-  } else {
+    lines.push('The comparison did not finish, so this is not a clean result.',
+      `<pre>${escapeHtml(report.error.slice(0, 2000))}</pre>`);
+  } else if (count) {
+    lines.push('This check is advisory and does not fail CI. ' +
+      'Please fix these diagnostics or accept them, then resolve this conversation.', '');
     let shown = 0;
-    for (const error of report.errors.slice(0, 50)) {
-      const entry = `<code>${escapeHtml(error.path.slice(0, 500))}:${error.line}</code> ` +
-        `<code>[${escapeHtml(error.name.slice(0, 100))}]</code>\n` +
-        `<pre>${escapeHtml((error.description || error.concise_description).slice(0, 1200))}</pre>`;
+    for (const item of report.diagnostics.slice(0, 50)) {
+      const entry = `<code>${escapeHtml(item.path.slice(0, 500))}:${item.line}</code> ` +
+        `<code>[${escapeHtml(item.name.slice(0, 100))}]</code>\n` +
+        `<pre>${escapeHtml(item.message.slice(0, 1200))}</pre>`;
       if (lines.join('\n').length + entry.length > 48000) break;
       lines.push(entry, '');
       shown++;
     }
-    if (shown < report.errors.length) lines.push(`Showing ${shown} of ${report.errors.length} diagnostics.`);
-    if (shown) lines.push('Locations refer to the temporary merged source tree.');
+    if (shown < count) lines.push(`Showing ${shown} of ${count} diagnostics.`);
+    lines.push('Locations refer to the temporary merged source tree.');
   }
   lines.push('', `[Full reports and workflow logs](${serverUrl}/${run.repository.full_name}/actions/runs/${run.id})`);
   return lines.join('\n');
@@ -56,7 +57,7 @@ async function findThread(github, repo, number) {
       repository(owner: $owner, name: $repo) {
         pullRequest(number: $number) {
           reviewThreads(first: 100, after: $cursor) {
-            nodes { id isResolved comments(first: 1) { nodes { fullDatabaseId body author { login } } } }
+            nodes { id isResolved comments(first: 1) { nodes { fullDatabaseId body author { __typename login } } } }
             pageInfo { hasNextPage endCursor }
           }
         }
@@ -65,7 +66,9 @@ async function findThread(github, repo, number) {
     const threads = result.repository.pullRequest.reviewThreads;
     for (const thread of threads.nodes) {
       const comment = thread.comments.nodes[0];
-      if (comment?.author?.login === BOT && comment.body.includes(MARKER)) {
+      // GraphQL reports the Actions bot as a Bot named `github-actions`; only REST appends `[bot]`.
+      if (comment?.author?.__typename === 'Bot' && comment.author.login === 'github-actions' &&
+          comment.body.includes(MARKER)) {
         return {...thread, comment};
       }
     }
@@ -78,7 +81,7 @@ async function publish({github, context, core, report}) {
   validate(report);
   const run = context.payload.workflow_run;
   const repo = context.repo;
-  if (run.event !== 'pull_request' || run.path !== '.github/workflows/pyrefly-diff.yml' ||
+  if (run.event !== 'pull_request' || run.path !== WORKFLOW ||
       run.repository.full_name !== `${repo.owner}/${repo.repo}` || run.head_sha !== report.head_sha) {
     throw new Error('Report does not match its source workflow run.');
   }
@@ -89,15 +92,11 @@ async function publish({github, context, core, report}) {
     return;
   }
   const thread = await findThread(github, repo, report.pr_number);
-  const previous = thread?.comment.body.match(/<!-- pyrefly-run:(\d+):(\d+) -->/);
-  if (previous && (Number(previous[1]) > run.id ||
-      Number(previous[1]) === run.id && Number(previous[2]) > run.run_attempt)) {
-    core.info('This run was superseded.');
-    return;
-  }
-  if (!thread && !report.error && !report.errors.length) return;
+  const clean = !report.error && !report.diagnostics.length;
+  if (!thread && clean) return;
   const body = bodyFor(report, run, context.serverUrl || 'https://github.com');
   if (!thread) {
+    // Only a review comment gives a conversation that can be resolved; anchor it to a changed file.
     const {data: files} = await github.rest.pulls.listFiles({
       ...repo, pull_number: report.pr_number, per_page: 100,
     });
@@ -107,14 +106,13 @@ async function publish({github, context, core, report}) {
       return;
     }
     await github.rest.pulls.createReviewComment({...repo, pull_number: report.pr_number,
-      commit_id: report.head_sha, path: file.filename, subject_type: 'file',
-      side: file.status === 'removed' ? 'LEFT' : 'RIGHT', body});
+      commit_id: report.head_sha, path: file.filename, subject_type: 'file', body});
     return;
   }
   await github.rest.pulls.updateReviewComment({...repo, comment_id: thread.comment.fullDatabaseId, body});
-  const shouldResolve = report.errors.length === 0;
-  if (!report.error && thread.isResolved !== shouldResolve) {
-    const mutation = shouldResolve ? 'resolveReviewThread' : 'unresolveReviewThread';
+  // An incomplete check says nothing about the findings, so it leaves the thread as it is.
+  if (!report.error && thread.isResolved !== clean) {
+    const mutation = clean ? 'resolveReviewThread' : 'unresolveReviewThread';
     await github.graphql(`mutation($id: ID!) {
       ${mutation}(input: {threadId: $id}) { thread { id } }
     }`, {id: thread.id});

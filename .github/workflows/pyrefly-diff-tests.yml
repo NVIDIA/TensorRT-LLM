@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Pyrefly diff automation tests
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/pyrefly_*'
+      - '.github/scripts/test_pyrefly_*'
+      - '.github/workflows/pyrefly-*.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python3 -m unittest discover -s .github/scripts -p 'test_pyrefly_*.py'
+      - run: node --test .github/scripts/pyrefly_report.test.js
