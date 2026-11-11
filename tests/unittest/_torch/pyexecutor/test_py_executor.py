@@ -15,6 +15,7 @@ to PyExecutor, including:
 import threading
 import time
 import types
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from unittest.mock import MagicMock, Mock, patch
 
@@ -85,6 +86,7 @@ def _forward_step_executor(
         sampler=Mock(get_cache_indirection=Mock(return_value=object())),
         execution_stream=Mock(),
         _loop_on_execution_stream=False,
+        _is_kv_manager_v2=False,
         _iter_adp_dummy_ctx_tokens=0,
         _iter_adp_dummy_gen_tokens=0,
         _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
@@ -683,6 +685,65 @@ def _make_admission_request(request_id: int) -> types.SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize("offload", [False, True], ids=["resident", "offload"])
+@pytest.mark.parametrize(
+    "request_type",
+    [
+        LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+        LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
+    ],
+    ids=["context_only", "context_and_generation"],
+)
+def test_sparse_offload_admission_fails_only_prefill_request(
+    offload: bool, request_type: LlmRequestType
+) -> None:
+    def make_request(request_id: int, kind: LlmRequestType) -> LlmRequest:
+        return LlmRequest(
+            request_id=request_id,
+            max_new_tokens=16,
+            input_tokens=[1, 2, 3],
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+            draft_tokens=None,
+            llm_request_type=kind,
+        )
+
+    generation_only = LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+    requests = [
+        make_request(1, generation_only),
+        make_request(2, request_type),
+        make_request(3, generation_only),
+    ]
+    assert requests[0].is_disagg_generation_init_state
+    assert requests[2].is_disagg_generation_init_state
+    existing = make_request(0, generation_only)
+    existing.state = LlmRequestState.GENERATION_IN_PROGRESS
+    executor = _make_admission_executor(None, requests)
+    executor._decode_only = offload
+    executor.active_requests.append(existing)
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    expected = [requests[0], requests[2]] if offload else requests
+    assert admitted == expected
+    assert executor.active_requests == [existing, *expected]
+    assert [call.args[0] for call in executor.sampler.validate_request.call_args_list] == expected
+    if offload:
+        executor._handle_errors.assert_called_once_with(
+            "Sparse KV offload supports generation-only requests; route prefill to a context worker.",
+            requests=[requests[1]],
+            charge_budget=False,
+        )
+    else:
+        executor._handle_errors.assert_not_called()
+
+    followup = make_request(4, generation_only)
+    executor._fetch_new_requests.return_value = [followup]
+    assert PyExecutor._fetch_and_activate_new_requests(executor) == [followup]
+    assert executor.active_requests == [existing, *expected, followup]
+    assert executor._handle_errors.call_count == int(offload)
+
+
 def test_model_validation_fails_only_the_request_it_rejects() -> None:
     requests = [_make_admission_request(i) for i in range(3)]
 
@@ -918,6 +979,59 @@ def test_free_request_resources_releases_target_and_draft_model_state() -> None:
     target.release_request_state.assert_called_once_with(41)
     draft.release_request_state.assert_called_once_with(41)
     assert not executor._prefetched_request_ids
+
+
+@pytest.mark.parametrize("is_v2", [False, True])
+@pytest.mark.parametrize("forward_fails", [False, True])
+def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fails: bool) -> None:
+    batch = ScheduledRequests()
+    events = []
+    logits = object()
+
+    def forward(*args: object, **kwargs: object) -> object:
+        events.append("forward")
+        if forward_fails:
+            raise RuntimeError("forward failed")
+        return logits
+
+    caller_stream = Mock()
+    caller_stream.wait_event.side_effect = lambda event: events.append("join")
+    kv_cache_manager = Mock()
+
+    def update_forward_resources(
+        scheduled_batch: ScheduledRequests, *, wait_for_input_copy: Callable[[], None]
+    ) -> None:
+        wait_for_input_copy()
+        events.append("history")
+
+    kv_cache_manager.update_forward_resources.side_effect = update_forward_resources
+    executor = _forward_step_executor(types.SimpleNamespace(route_capture=None, forward=forward))
+    executor.kv_cache_manager = kv_cache_manager
+    executor._is_kv_manager_v2 = is_v2
+    executor._wait_for_model_engine_input_copy = Mock(
+        side_effect=lambda: events.append("input_copy")
+    )
+    with (
+        patch("torch.cuda.current_stream", return_value=caller_stream),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
+    ):
+        result = PyExecutor._forward_step(executor, batch)
+    if forward_fails:
+        assert result is None
+        assert events == ["forward"]
+        executor._handle_errors.assert_called_once_with("forward failed")
+    else:
+        assert result is logits
+        assert events == ["forward", "join"] + (["input_copy", "history"] if is_v2 else [])
+        executor._handle_errors.assert_not_called()
+    if is_v2 and not forward_fails:
+        kv_cache_manager.update_forward_resources.assert_called_once_with(
+            batch, wait_for_input_copy=executor._wait_for_model_engine_input_copy
+        )
+    else:
+        kv_cache_manager.update_forward_resources.assert_not_called()
+        executor._wait_for_model_engine_input_copy.assert_not_called()
 
 
 class _InflightRequestIds:

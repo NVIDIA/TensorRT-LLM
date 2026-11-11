@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 version: 0.0.1
 l0_cpu:
 - condition:
@@ -68,6 +70,7 @@ l0_cpu:
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
   - unittest/others/test_http_utils_fail_fast.py
+  - unittest/others/test_sparse_offload_accuracy.py
   # perf-sanity multi-frontend port reservation vs the trtllm-serve launcher probe (sockets only, no GPUs).
   - unittest/others/test_perf_sanity_port_reservation.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
