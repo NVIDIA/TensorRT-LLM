@@ -11,54 +11,15 @@ and the MTP layer, gate as the strided half of the q projection.
 from __future__ import annotations
 
 import torch
-import triton
+
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 # Registered by the module that defines it: after `import
 # tensorrt_llm._torch.custom_ops` alone, torch.ops.trtllm has no
 # `fused_sigmoid_mul_inplace` (measured).
-import tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate as _gate_mod
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
-
-def _launch(attention_output: torch.Tensor, gate: torch.Tensor) -> bool:
-    """The registered op's launch, made here when its preconditions hold: the same kernel,
-    grid, block, warps and PDL policy, without the custom-op dispatch around it. False
-    (nothing launched) when they do not, for the op to refuse loudly."""
-    if attention_output.dim() != 2 or attention_output.stride(-1) != 1 or gate.stride(-1) != 1:
-        return False
-    num_tokens, hidden = attention_output.shape
-    if gate.dim() == 3:
-        if gate.shape[0] != num_tokens or gate.shape[1] * gate.shape[2] != hidden:
-            return False
-        head_dim, gate_stride_head = gate.shape[2], gate.stride(1)
-    elif gate.dim() == 2 and gate.shape == attention_output.shape:
-        head_dim, gate_stride_head = hidden, hidden
-    else:
-        return False
-    if num_tokens == 0:
-        return True
-    block = min(triton.next_power_of_2(hidden), 1024 if num_tokens < 1024 else 2048)
-    pdl = (
-        dict(LAUNCH_WITH_PDL=True, launch_pdl=True)
-        if _gate_mod._sigmoid_mul_pdl(attention_output.device.index)
-        else {}
-    )
-    _gate_mod._fused_sigmoid_mul_kernel[(num_tokens, triton.cdiv(hidden, block))](
-        attention_output,
-        attention_output,
-        gate,
-        attention_output.stride(0),
-        attention_output.stride(0),
-        gate.stride(0),
-        gate_stride_head,
-        hidden_size=hidden,
-        head_dim=head_dim,
-        block_size=block,
-        num_warps=4,
-        **pdl,
-    )
-    return True
-
+from tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate import (
+    launch_fused_sigmoid_mul_inplace,
+)
 
 #: The checkpoint's gated attention: 24 q heads of 256, q projection [T, 24, 512].
 _CKPT = dict(heads=24, head_dim=256, dtype=torch.bfloat16, gate="interleaved")
@@ -176,9 +137,9 @@ class FusedSigmoidMulInplace(OpWrapper):
     the running device at the first call of each (hidden, head_dim, block)
     specialization, no autotuner: grid `(T, cdiv(hidden, block))`,
     `block = min(next_pow2(hidden), 1024 if T < 1024 else 2048)`, 4 warps. The
-    cells ran on sm_103. With `direct_launch=True` (the FP8 target), `_launch` makes
-    that same launch itself where the preconditions below hold and skips only the
-    custom-op dispatch; otherwise the op is called and refuses the call.
+    cells ran on sm_103. With `direct_launch=True` (the FP8 target) the op's own
+    launch `launch_fused_sigmoid_mul_inplace` (the op's body) is called, skipping
+    only the custom-op dispatch: 15 instead of 28 us of host time a call on GB300.
 
     Call sites, each the attention output gate between the attention core and
     o_proj:
@@ -257,7 +218,9 @@ class FusedSigmoidMulInplace(OpWrapper):
     def __call__(
         self, attention_output: torch.Tensor, gate: torch.Tensor, direct_launch: bool = False
     ) -> torch.Tensor:
-        if not (direct_launch and _launch(attention_output, gate)):
+        if direct_launch:
+            launch_fused_sigmoid_mul_inplace(attention_output, gate)
+        else:
             torch.ops.trtllm.fused_sigmoid_mul_inplace(attention_output, gate)
         return attention_output
 
