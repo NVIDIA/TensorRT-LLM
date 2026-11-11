@@ -24,6 +24,9 @@ spec_metadata tensor attributes aren't copied into by replay() at all, so
 TLLM_CUDA_GRAPH_STRICT_BUFFERS checks their data_ptr() stays stable across
 replay() calls, catching a rebind (vs. an in-place update) to stale memory.
 
+TestPrepareEachForward guards that warmup and capture never forward the
+attention metadata twice for one prepare when the caller asks for it.
+
 TestCaptureAllowedGate guards allow_capture(): live capture must stay
 confined to warmup, since capturing outside it could resize shared buffers
 and invalidate addresses already baked into other graphs.
@@ -35,18 +38,58 @@ import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as cuda_graph_runner_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative.interface import (
-    prepare_attn_metadata_for_draft_replay,
-    restore_attn_metadata_after_draft_replay,
-)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 SENTINEL = -12345
+
+
+class _PrepareCountingMetadata:
+    """Attention metadata that records the prepares and forwards it sees."""
+
+    def __init__(self):
+        self.context_requests = ["request"]
+        self.prefill_cuda_graphs = True
+        self.events = []
+
+    def prepare(self, inputs=None, *, context_requests=None, prefill_cuda_graphs=False):
+        assert inputs is None
+        assert context_requests == self.context_requests
+        assert prefill_cuda_graphs is self.prefill_cuda_graphs
+        self.events.append("prepare")
+
+
+class TestPrepareEachForward:
+    def _capture(self, prepare_each_forward):
+        runner = create_mock_cuda_graph_runner(1)
+        key = KeyType(batch_size=1, draft_len=0)
+        num_tokens = runner._get_num_tokens_for_key(key)
+        attn_metadata = _PrepareCountingMetadata()
+
+        def forward_fn(inputs):
+            attn_metadata.events.append("forward")
+            return inputs["input_ids"].clone()
+
+        inputs = {
+            "attn_metadata": attn_metadata,
+            "input_ids": torch.zeros((num_tokens,), device="cuda", dtype=torch.int32),
+            "position_ids": torch.zeros((1, num_tokens), device="cuda", dtype=torch.int32),
+        }
+        runner.capture(key, forward_fn, inputs, prepare_each_forward=prepare_each_forward)
+        return runner, attn_metadata.events
+
+    def test_every_forward_after_the_first_follows_its_own_prepare(self):
+        runner, events = self._capture(prepare_each_forward=True)
+        # The caller prepared the first warmup forward.
+        expected = ["forward"] + ["prepare", "forward"] * runner.WARMUP_STEPS
+        assert events == expected
+
+    def test_no_prepare_without_the_request(self):
+        runner, events = self._capture(prepare_each_forward=False)
+        assert events == ["forward"] * (runner.WARMUP_STEPS + 1)
 
 
 class TestCaptureReplayStaticTensors:
@@ -418,27 +461,6 @@ class _MetadataStub:
         self.some_buf = torch.full((1,), value, device="cuda", dtype=torch.int32)
 
 
-class _DraftReplayMetadataStub(TrtllmAttentionMetadata):
-    """attn_metadata with only the fields the draft-replay helpers swap; skips __init__."""
-
-    def __init__(self, value: int):
-        self.draft_replay_swapped_attrs = {}
-        self.kv_cache_manager = object()
-        self.kv_cache_block_offsets = torch.full((1,), value, device="cuda", dtype=torch.int32)
-        self.host_kv_cache_block_offsets = torch.zeros(1, dtype=torch.int32)
-        self.draft_kv_cache_block_offsets = torch.full(
-            (1,), value + 1000, device="cuda", dtype=torch.int32
-        )
-        self.some_alias = self.kv_cache_block_offsets
-        self.enable_flash_mla = False
-
-    def prepare_for_draft_forward(self):
-        # Mirrors DSA's _fullkv aliases, rebound as a side effect of the swap.
-        self.record_draft_swap("some_alias")
-        self.some_alias = self.kv_cache_block_offsets
-        return None
-
-
 class TestStrictBufferCheck:
     """Graph-visible metadata tensors must keep their data_ptr() from capture to replay."""
 
@@ -513,38 +535,6 @@ class TestStrictBufferCheck:
         assert len(calls) == runner.WARMUP_STEPS
         assert runner.replay(key, inputs).item() == 99
 
-    def test_replay_accepts_swapped_attr_with_unchanged_saved_target(self, monkeypatch):
-        """A swapped attr is validated via its saved target; clearing the swap flags it."""
-        runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
-        runner.capture(key, self._forward_reading_some_buf, inputs)
-
-        # Keep the captured tensor alive so the graph doesn't read freed memory.
-        captured_buf = attn_metadata.some_buf
-        attn_metadata.some_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
-
-        attn_metadata.draft_replay_swapped_attrs = {"some_buf": captured_buf}
-        # The graph still reads the captured buffer (10), not the rebound one (99).
-        assert runner.replay(key, inputs).item() == 10
-
-        attn_metadata.draft_replay_swapped_attrs = {}
-        with pytest.raises(RuntimeError, match="some_buf"):
-            runner.replay(key, inputs)
-        del captured_buf
-
-    def test_draft_replay_swapped_attrs_does_not_mask_other_rebinds(self, monkeypatch):
-        """Exempting one swapped attr still flags a rebind of another attr."""
-        runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
-        attn_metadata.other_buf = torch.full((1,), 1, device="cuda", dtype=torch.int32)
-        runner.capture(key, self._forward_reading_some_buf, inputs)
-
-        captured_buf = attn_metadata.some_buf
-        attn_metadata.some_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
-        attn_metadata.other_buf = torch.full((1,), 2, device="cuda", dtype=torch.int32)
-
-        attn_metadata.draft_replay_swapped_attrs = {"some_buf": captured_buf}
-        with pytest.raises(RuntimeError, match="other_buf"):
-            runner.replay(key, inputs)
-
     def test_replay_skips_graph_temporary(self, monkeypatch):
         """A rebound graph temporary is ignored; other rebinds are still flagged."""
         runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
@@ -565,80 +555,6 @@ class TestStrictBufferCheck:
         with pytest.raises(RuntimeError, match="some_buf"):
             runner.replay(key, inputs)
         del captured_tmp_buf
-
-    def _make_draft_replay_runner_and_inputs(self, monkeypatch, value):
-        runner, key, _, inputs = self._make_runner_and_inputs(monkeypatch, value)
-        attn_metadata = _DraftReplayMetadataStub(value)
-        inputs["attn_metadata"] = attn_metadata
-        draft_kv_cache_manager = SimpleNamespace(
-            host_kv_cache_block_offsets=torch.zeros(1, dtype=torch.int32)
-        )
-        return runner, key, attn_metadata, inputs, draft_kv_cache_manager
-
-    @staticmethod
-    def _forward_reading_block_offsets(fn_inputs):
-        return fn_inputs["input_ids"].clone() + fn_inputs["attn_metadata"].kv_cache_block_offsets
-
-    @pytest.mark.parametrize("attr", ["kv_cache_block_offsets", "some_alias"])
-    @pytest.mark.parametrize("replace_target", [False, True])
-    def test_draft_swap_lifecycle(self, monkeypatch, attr, replace_target):
-        """A valid draft swap replays; a target replaced after capture is flagged."""
-        runner, key, attn_metadata, inputs, draft_mgr = self._make_draft_replay_runner_and_inputs(
-            monkeypatch, value=10
-        )
-        runner.capture(key, self._forward_reading_block_offsets, inputs)
-
-        # Keep the captured tensor alive so the graph doesn't read freed memory.
-        captured_buf = attn_metadata.kv_cache_block_offsets
-        if replace_target:
-            setattr(attn_metadata, attr, torch.full((1,), 99, device="cuda", dtype=torch.int32))
-
-        saved = prepare_attn_metadata_for_draft_replay(attn_metadata, draft_mgr)
-        try:
-            if replace_target:
-                with pytest.raises(RuntimeError, match=attr):
-                    runner.replay(key, inputs)
-            else:
-                assert runner.replay(key, inputs).item() == 10
-        finally:
-            restore_attn_metadata_after_draft_replay(attn_metadata, saved)
-        del captured_buf
-
-    def test_restore_clears_swapped_attrs_and_target_buffer(self, monkeypatch):
-        """Restore leaves no swapped attrs behind and rebinds the target buffer."""
-        _, _, attn_metadata, _, draft_mgr = self._make_draft_replay_runner_and_inputs(
-            monkeypatch, value=10
-        )
-        target_buf = attn_metadata.kv_cache_block_offsets
-
-        saved = prepare_attn_metadata_for_draft_replay(attn_metadata, draft_mgr)
-        assert attn_metadata.draft_replay_swapped_attrs["kv_cache_block_offsets"] is target_buf
-        assert attn_metadata.draft_replay_swapped_attrs["some_alias"] is target_buf
-        assert attn_metadata.kv_cache_block_offsets is attn_metadata.draft_kv_cache_block_offsets
-
-        # A repeated swap keeps the first recorded original.
-        attn_metadata.swap_for_draft("kv_cache_block_offsets", torch.zeros(1, device="cuda"))
-        assert attn_metadata.draft_replay_swapped_attrs["kv_cache_block_offsets"] is target_buf
-
-        restore_attn_metadata_after_draft_replay(attn_metadata, saved)
-
-        assert attn_metadata.draft_replay_swapped_attrs == {}
-        assert attn_metadata.kv_cache_block_offsets is target_buf
-        assert attn_metadata.some_alias is target_buf
-
-    def test_cuda_graph_metadata_copy_has_own_swap_record(self):
-        """A swap restored on a graph copy does not leak into the eager metadata's restore."""
-        eager = TrtllmAttentionMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=None)
-        graph = eager.create_cuda_graph_metadata(1)
-        assert graph.draft_replay_swapped_attrs is not eager.draft_replay_swapped_attrs
-
-        eager_buf = eager.kv_lens_cuda
-        graph.swap_for_draft("kv_lens_cuda", torch.zeros_like(graph.kv_lens_cuda))
-        graph.restore_draft_swaps()
-        eager.swap_for_draft("kv_lens_cuda", torch.zeros_like(eager_buf))
-        eager.restore_draft_swaps()
-
-        assert eager.kv_lens_cuda is eager_buf
 
 
 class TestStrictBufferCheckEnvVar:

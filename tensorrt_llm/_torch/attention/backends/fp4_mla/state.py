@@ -4,22 +4,31 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from dataclasses import MISSING, dataclass, field, fields
+from typing import TYPE_CHECKING, Any
 
 import torch
 
+from ..extensions import MetadataExtension
 from .config import FP4_MLA_KV_GLOBAL_SCALE, FP4_MLA_Q_GLOBAL_SCALE, HP_BLOCK_SIZE
-from .metadata import configure_fp4_mla_device_page_table, populate_fp4_mla_append_metadata
 
 if TYPE_CHECKING:
-    from ....memory_buffer_utils import Buffers
     from ..trtllm import TrtllmAttentionMetadata
     from .fp4_mla_context import _Fp8MlaContextScratch
 
 
-@dataclass
-class Fp4MlaState:
+def find_fp4_mla(metadata: Any) -> Fp4MlaState | None:
+    """The FP4 MLA extension of ``metadata``, or None.
+
+    Accepts the duck-typed metadata views the FP4 MLA helpers take, which may
+    carry no extensions at all.
+    """
+    find_ext = getattr(metadata, "find_ext", None)
+    return find_ext(Fp4MlaState) if find_ext is not None else None
+
+
+@dataclass(eq=False, init=False)
+class Fp4MlaState(MetadataExtension):
     """State shared by RoPE/cache append and all FP4 FMHAs in one batch.
 
     Allocate through the metadata buffer allocator so eager forwards and each
@@ -27,6 +36,55 @@ class Fp4MlaState:
     layer-local: MTP and metadata preparation update it before any FMHA runs.
     """
 
+    fields = frozenset(
+        {
+            "batch_indices",
+            "cache_page_index_scale",
+            "cache_pool_id",
+            "context_repack_max_touched_pages",
+            "device_page_table",
+            "device_page_table_valid",
+            "full_pages_cache",
+            "generation_append_lens",
+            "generation_cache_scattered",
+            "generation_kv_lens",
+            "generation_lengths_capture_recorded",
+            "generation_lengths_num_contexts",
+            "generation_lengths_num_seqs",
+            "generation_lengths_num_tokens",
+            "hp_page_index_scale",
+            "hp_page_indices",
+            "hp_pool",
+            "hp_pool_id",
+            "kv_global_scale",
+            "num_blocks",
+            "num_context_blocks",
+            "num_generation_blocks",
+            "num_sequences",
+            "packed_plan_key",
+            "page_table_stride",
+            "paged_kv_indices",
+            "paged_kv_indptr",
+            "paged_kv_indptr_decode",
+            "positions",
+            "prequantized_q",
+            "prequantized_q_rows_per_seq",
+            "prequantized_q_sf",
+            "q_batch_capacity",
+            "q_global_scale",
+            "v_packed_cache_tags",
+            "v_scale_pool",
+            "workspaces",
+        }
+    )
+    methods = frozenset(
+        {
+            "invalidate_generation_lengths",
+            "populate_append_metadata",
+        }
+    )
+
+    metadata: TrtllmAttentionMetadata | None = None
     hp_pool: torch.Tensor | None = None
     hp_page_indices: torch.Tensor | None = None
     v_scale_pool: torch.Tensor | None = None
@@ -56,7 +114,8 @@ class Fp4MlaState:
     prequantized_q_sf: torch.Tensor | None = None
     q_batch_capacity: int | None = None
     prequantized_q_rows_per_seq: int | None = None
-    fp8_context_state: tuple[_Fp8MlaContextScratch, TrtllmAttentionMetadata] | None = None
+    # The FP8 context view of this step, reused by every local layer.
+    _fp8_context_view: tuple[_Fp8MlaContextScratch, TrtllmAttentionMetadata] | None = None
     _paged_kv_indptr: torch.Tensor | None = None
     paged_kv_indptr_decode: torch.Tensor | None = None
     _paged_kv_indices: torch.Tensor | None = None
@@ -80,8 +139,15 @@ class Fp4MlaState:
             raise RuntimeError("FP4 MLA paged_kv_indptr is not allocated.")
         return self._paged_kv_indptr[: self.num_sequences + 1]
 
-    @classmethod
-    def create(cls, metadata: TrtllmAttentionMetadata, buffers: Buffers | None) -> Fp4MlaState:
+    def __init__(self, metadata, *, source=None, **config) -> None:
+        super().__init__(metadata, source=source, **config)
+        for f in fields(self):
+            if f.name == "metadata":
+                continue
+            default = f.default_factory() if f.default_factory is not MISSING else f.default
+            setattr(self, f.name, default)
+        buffers = metadata.cuda_graph_buffers
+        metadata = self.metadata
         manager = metadata.kv_cache_manager
         hp_ring_size = manager.fp4_mla_hp_pool_size
         if hp_ring_size < HP_BLOCK_SIZE:
@@ -117,7 +183,9 @@ class Fp4MlaState:
                 capture_graph=metadata.is_cuda_graph,
             )
 
-        state = cls(hp_pool=hp_pool, v_scale_pool=manager.get_mla_v_scale_pool())
+        state = self
+        state.hp_pool = hp_pool
+        state.v_scale_pool = manager.get_mla_v_scale_pool()
         tokens = (metadata.max_num_tokens,)
         sequences = (metadata.max_num_sequences,)
         indptr = (metadata.max_num_sequences + 1,)
@@ -134,7 +202,6 @@ class Fp4MlaState:
         state.q_global_scale.fill_(FP4_MLA_Q_GLOBAL_SCALE)
         state.kv_global_scale = allocate("kv_global_scale", (1,), torch.float32)
         state.kv_global_scale.fill_(FP4_MLA_KV_GLOBAL_SCALE)
-        return state
 
     def invalidate_generation_lengths(self) -> None:
         self.generation_lengths_num_tokens = -1
@@ -143,9 +210,21 @@ class Fp4MlaState:
         self.generation_lengths_capture_recorded = False
         self.packed_plan_key = None
 
-    def prepare(self, metadata: TrtllmAttentionMetadata, kv_lens: torch.Tensor) -> None:
+    def prepare(self) -> None:
+        from .metadata import configure_fp4_mla_device_page_table
+
+        metadata = self.metadata
+        num_seqs = metadata.num_seqs
+        # FP4 MLA needs the per-forward append lengths rather than the original
+        # prompt lengths. Context scratch-cache metadata and MTP generation
+        # both consume these runtime views.
+        metadata.substitute_runtime_views(
+            prompt_lens_cuda=metadata.seq_lens_kv_cuda[:num_seqs],
+            prompt_lens_cpu=metadata.seq_lens_kv[:num_seqs],
+        )
+        kv_lens = metadata.kv_lens_runtime
         # All local layers reuse this FP8 view only within the current batch.
-        self.fp8_context_state = None
+        self._fp8_context_view = None
         self.invalidate_generation_lengths()
         if metadata.kv_cache_manager is None or metadata.request_ids is None:
             raise RuntimeError(
@@ -156,35 +235,38 @@ class Fp4MlaState:
                 "FP4 MLA requires fixed-stride device page metadata; the "
                 "current KV-cache manager or batch layout is unsupported."
             )
-        # Graph capture's on_update_kv_lens owns the append kernel. Uniform
-        # generation derives token positions in the fused update instead.
-        if not metadata.is_cuda_graph and metadata.num_tokens > 0 and metadata.num_contexts > 0:
+        # Uniform generation derives token positions in the fused update
+        # instead.
+        if metadata.num_tokens > 0 and metadata.num_contexts > 0:
             self.populate_append_metadata(metadata)
 
-    def on_update_kv_lens(self, metadata: TrtllmAttentionMetadata) -> None:
+    def _refresh_length_state(self) -> None:
+        metadata = self.metadata
         self.device_page_table_valid = False
         if metadata.num_tokens > 0:
             self.invalidate_generation_lengths()
             if metadata.num_contexts > 0:
                 self.populate_append_metadata(metadata)
 
-    def update_for_spec_dec(self, metadata: TrtllmAttentionMetadata) -> None:
+    def refresh_from_draft_lengths(self) -> None:
+        super().refresh_from_draft_lengths()
+        # A draft step's query lengths are this draft's own: the kernels read
+        # them as the prompt lengths.
+        metadata = self.metadata
         num_seqs = metadata.num_seqs
-        metadata.prompt_lens_cuda_runtime = metadata.seq_lens_kv_cuda[:num_seqs]
-        if not torch.cuda.is_current_stream_capturing():
-            metadata.prompt_lens_cpu_runtime = metadata.seq_lens_kv[:num_seqs]
-        self.on_update_kv_lens(metadata)
-
-    def restore_from_spec_dec(self, metadata: TrtllmAttentionMetadata) -> None:
-        # Rebind aliases to the restored stable tensors, never to the temporary
-        # spec-dec clone whose storage may be released after graph capture.
-        num_seqs = metadata.num_seqs
-        metadata.kv_lens_cuda_runtime = metadata.kv_lens_cuda[:num_seqs]
-        metadata.prompt_lens_cuda_runtime = metadata.seq_lens_kv_cuda[:num_seqs]
-        if not torch.cuda.is_current_stream_capturing():
-            metadata.prompt_lens_cpu_runtime = metadata.seq_lens_kv[:num_seqs]
+        metadata.substitute_runtime_views(
+            prompt_lens_cuda=metadata.seq_lens_kv_cuda[:num_seqs],
+            prompt_lens_cpu=(
+                None
+                if torch.cuda.is_current_stream_capturing()
+                else metadata.seq_lens_kv[:num_seqs]
+            ),
+        )
+        self._refresh_length_state()
 
     def populate_append_metadata(self, metadata: TrtllmAttentionMetadata) -> None:
+        from .metadata import populate_fp4_mla_append_metadata
+
         num_seqs = metadata.num_contexts + metadata.num_generations
         if num_seqs == 0 or metadata.num_tokens == 0:
             return

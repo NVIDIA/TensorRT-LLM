@@ -337,9 +337,13 @@ class DraftLoopOps:
         return self.gather_ids, rows
 
     def step_update(
-        self, attn_metadata, step: int, num_accepted_tokens, position_ids, gather_ids
+        self, attn_metadata, step: int, num_accepted_tokens, position_ids, gather_ids, refresh
     ) -> Optional["_draft_step.DraftStepResult"]:
-        """Fused per-step metadata update, or None for the native update."""
+        """Fused per-step metadata update, or None for the native update.
+
+        ``refresh`` refreshes the draft after its lengths changed
+        (``md.refresh_draft()`` of the running draft loop).
+        """
         if not self.step_engaged:
             return None
 
@@ -353,6 +357,7 @@ class DraftLoopOps:
                 num_accepted_tokens,
                 position_ids,
                 gather_ids,
+                refresh,
             )
 
         from ... import dispatch
@@ -364,6 +369,7 @@ class DraftLoopOps:
         if _verify.verify_enabled() and reason is None:
             result = _verify.verified_step_update(
                 run_draft_loop,
+                refresh,
                 attn_metadata,
                 step,
                 self.batch_size,

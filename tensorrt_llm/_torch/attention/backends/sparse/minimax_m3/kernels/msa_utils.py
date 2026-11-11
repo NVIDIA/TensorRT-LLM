@@ -184,7 +184,7 @@ def write_msa_phase_kv(
     write_msa_main_kv(
         metadata.kv_cache_manager,
         attn.layer_idx,
-        metadata.msa_out_cache_loc[token_offset : token_offset + num_tokens],
+        metadata.msa_write_slots()[token_offset : token_offset + num_tokens],
         k,
         v,
         # k and v are this phase's own token slice, so every row owns a slot.

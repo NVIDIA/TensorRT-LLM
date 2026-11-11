@@ -65,9 +65,13 @@ def _metadata(*, declares_max_seq_len):
     manager, no ``max_seq_len`` of its own.
     """
     metadata = MagicMock(
-        spec=["kv_cache_manager", "max_seq_len"] if declares_max_seq_len else ["kv_cache_manager"]
+        spec=["kv_cache_manager", "find", "max_seq_len"]
+        if declares_max_seq_len
+        else ["kv_cache_manager", "find"]
     )
     metadata.kv_cache_manager = MagicMock(max_seq_len=SERVED)
+    # No draft KV block offsets: the drafter stays on its private arena.
+    metadata.find = lambda name, default=None: default
     if declares_max_seq_len:
         metadata.max_seq_len = SERVED
     return metadata

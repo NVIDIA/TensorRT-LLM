@@ -7,17 +7,20 @@ from contextlib import contextmanager
 
 import pytest
 import torch
+from _torch.helpers import refresh_from_lengths
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
-    DeepseekV4TrtllmAttentionMetadata,
+    DeepseekV4TrtllmAttention,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSACacheManagerV2,
-    DSAtrtllmAttentionMetadata,
+    DSAMetadata,
+    DSATrtllmAttention,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import _fused_dsa_meta_enabled
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -37,7 +40,7 @@ def _prepared_metadata(
     *,
     context: bool,
     compressed: bool,
-) -> Iterator[DSAtrtllmAttentionMetadata]:
+) -> Iterator[TrtllmAttentionMetadata]:
     config_cls = DeepSeekV4SparseAttentionConfig if compressed else DeepSeekSparseAttentionConfig
     sparse_config = config_cls(
         index_n_heads=64,
@@ -73,10 +76,8 @@ def _prepared_metadata(
     try:
         kv_lens = [cached + length for cached, length in zip(cached_tokens, seq_lens)]
         assert manager.add_dummy_requests([0, 1], kv_lens, is_gen=not context) is not None
-        metadata_cls = (
-            DeepseekV4TrtllmAttentionMetadata if compressed else DSAtrtllmAttentionMetadata
-        )
-        metadata = metadata_cls(
+        backend_cls = DeepseekV4TrtllmAttention if compressed else DSATrtllmAttention
+        metadata = backend_cls.Metadata(
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
             request_ids=[0, 1],
             max_num_requests=2,
@@ -147,7 +148,7 @@ def test_v4_runtime_maps_gather_physical_cache_bytes(
             metadata.slot_mapping_fp8.fill_(-1)
             metadata.slot_mapping_scale.fill_(-1)
 
-            metadata.on_update_kv_lens()
+            refresh_from_lengths(metadata)
 
             assert getattr(metadata, "_fused_dsa_meta_armed", False) is fused
             for offsets, width in (
@@ -192,6 +193,7 @@ def test_dsa_context_gather_alias_survives_runtime_refresh(
         context=True,
         compressed=False,
     ) as metadata:
+        dsa = metadata.ext(DSAMetadata)
         assert (metadata.slot_mapping_fp8_fullkv is metadata.slot_mapping_fp8) is (not cached)
         assert (metadata.slot_mapping_scale_fullkv is metadata.slot_mapping_scale) is (not cached)
         names = (
@@ -200,11 +202,11 @@ def test_dsa_context_gather_alias_survives_runtime_refresh(
             "slot_mapping_fp8_fullkv",
             "slot_mapping_scale_fullkv",
         )
-        expected = [getattr(metadata, name).clone() for name in names]
+        expected = [getattr(dsa, name).clone() for name in names]
 
-        metadata.on_update_kv_lens()
+        refresh_from_lengths(metadata)
 
         assert (metadata.slot_mapping_fp8_fullkv is metadata.slot_mapping_fp8) is (not cached)
         assert (metadata.slot_mapping_scale_fullkv is metadata.slot_mapping_scale) is (not cached)
         for name, prepared in zip(names, expected):
-            torch.testing.assert_close(getattr(metadata, name), prepared, rtol=0, atol=0)
+            torch.testing.assert_close(getattr(dsa, name), prepared, rtol=0, atol=0)

@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-request split-KV plan of the CuTe DSL MLA decode: policy, kernel vs mirror, kernel output."""
 
+import functools
 import math
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmCoreMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
 
@@ -88,7 +90,13 @@ def test_split_kv_plan_is_launched_once_per_step(monkeypatch) -> None:
     monkeypatch.setattr(
         mod, "launch_mla_split_kv_plan", lambda *args, **kwargs: launches.append(kwargs)
     )
-    meta = SimpleNamespace(max_num_requests=16, _cute_dsl_mla_split_plan_key=None)
+    meta = SimpleNamespace(
+        max_num_requests=16, _cute_dsl_mla_split_plan=None, _cute_dsl_mla_split_plan_key=None
+    )
+    # The plan cache is the core's: run its method over the stub's fields.
+    meta.cute_dsl_mla_split_plan = functools.partial(
+        TrtllmCoreMetadata.cute_dsl_mla_split_plan, meta
+    )
     cache_seqs = torch.full((8,), 14208, dtype=torch.int32, device="cuda")
     first = mod.CuteDslMlaFmha._split_kv_plan(meta, cache_seqs, 8, 8, 96)
     assert first.numel() == 8 and meta._cute_dsl_mla_split_plan.numel() == 16

@@ -120,18 +120,17 @@ def test_prepared_encoder_replay_preserves_live_speculative_endpoints(
             req.py_ced_replay = EncoderReplay(
                 0, id(metadata.kv_cache_manager.kv_cache_map[0]), 256, start
             )
-        metadata.prepare_context_replay([req])
-        metadata.prepare()
+        metadata.prepare(context_requests=[req])
         # Host reservation ends at134; accepting one of five drafts moves the
         # actual six verification rows back to [124,130). The allocator may
         # only have pages covering that live interval.
         metadata.kv_lens_cuda[:2].copy_(torch.tensor([end, 130], device="cuda"))
-        metadata.on_update_kv_lens()
+        metadata._refresh_live_endpoints()
         positions = metadata.csa2_positions.clone()
         swa_slots = {layer: slots.clone() for layer, slots in metadata.csa2_swa_write_slots.items()}
         for _ in range(2):
-            metadata.begin_model_forward()
-            metadata.on_update_kv_lens()
+            metadata.reset_forward_state()
+            metadata._refresh_live_endpoints()
             assert metadata.kv_lens_cuda[:2].tolist() == [end, 130]
             torch.testing.assert_close(metadata.csa2_positions, positions)
             assert metadata.csa2_positions[-6:].tolist() == list(range(124, 130))
@@ -147,13 +146,11 @@ def test_prepared_encoder_replay_preserves_live_speculative_endpoints(
             req.context_current_position = end
             metadata.seq_lens = torch.tensor([1, 6], dtype=torch.int32)
             metadata.kv_cache_params.num_cached_tokens_per_seq = [end, 128]
-            metadata.prepare_context_replay([req])
-            metadata.prepare()
+            metadata.prepare(context_requests=[req])
             assert metadata.csa2_replay_mode is None
             assert metadata.csa2_replay_start_positions.tolist() == [start, 0]
             req.py_ced_replay = None
-            metadata.prepare_context_replay([req])
-            metadata.prepare()
+            metadata.prepare(context_requests=[req])
             assert metadata.csa2_replay_start_positions.tolist() == [0, 0]
 
 

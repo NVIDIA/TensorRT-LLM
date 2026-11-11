@@ -1238,8 +1238,8 @@ def test_deepseek_v4_sparse_ratios_prefer_checkpoint_defaults(tmp_path, monkeypa
 
     assert model_config.sparse_attention_config.compress_ratios == [128, 128, 4, 128, 4, 128, 1, 4]
     # V4 sparse MLA hardcodes window_size==128 (FMHA kernel TileSizeKV; see
-    # the runtime assertion in deepseek_v4.py:DeepseekV4TrtllmAttentionMetadata
-    # __post_init__), so this is the only legal value here.
+    # the runtime assertion in DeepseekV4Metadata.allocate), so this is the
+    # only legal value here.
     assert model_config.sparse_attention_config.window_size == 128
 
 
@@ -1559,7 +1559,7 @@ def test_deepseek_v4_sanity(
         prompt_lens=prompt_lens,
         max_num_tokens=8192,
         mapping=mapping,
-        sparse_attention_config=sparse_attn_config,
+        sparse_metadata_params=sparse_attn_config.to_sparse_metadata_params(),
     )
 
     position_ids = []

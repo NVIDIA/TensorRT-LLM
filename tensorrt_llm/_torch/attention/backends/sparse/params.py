@@ -16,11 +16,12 @@
 
 import os
 from dataclasses import dataclass
-from typing import Literal, Optional, Protocol, runtime_checkable
+from typing import Literal, Optional
 
 import torch
 
 from ..cpp_schema import cpp_field
+from ..extensions import MetadataExtension
 
 _INDEXER_MQA_LOGITS_DEFAULT_ELEM_BUDGET = 1 << 31
 _INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT = 4
@@ -45,22 +46,122 @@ def get_indexer_mqa_logits_workspace_bytes(
     return elem_budget * _INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT
 
 
-@runtime_checkable
-class MTPIndexShareMetadata(Protocol):
-    """Draft-loop state a sparse backend exposes so MTP can share one selection.
+# Buffers of MTPIndexShareExtension that the requiring algorithm allocates.
+_INDEX_SHARE_BUFFERS = frozenset({"block_table", "req_idx_per_token", "shared_topk_indices"})
 
-    The three calls are used together for one draft loop, so a backend that
-    implements only some of them cannot serve the reuse at all.
+
+class MTPIndexShareExtension(MetadataExtension):
+    """Draft-loop state shared by the sparse algorithms that reuse one MTP selection.
+
+    The speculative driver brackets an MTP draft loop through the setters; the
+    algorithm's indexer captures its Top-K selection into ``shared_topk_indices``
+    once and reuses it while ``indexer_skip_topk`` is set. The algorithm that
+    requires this extension (DSA or QSA) also keeps the page tables and the
+    packed-row request map here, so the shared selection and the tables it
+    indexes are one state.
     """
 
+    fields = frozenset(
+        {
+            "block_table",
+            "in_mtp_draft_loop",
+            "indexer_skip_topk",
+            "mtp_num_accepted",
+            "req_idx_per_token",
+            "shared_topk_indices",
+            "shared_topk_captured_slots",
+        }
+    )
+    methods = frozenset(
+        {
+            "bind_buffers",
+            "set_in_mtp_draft_loop",
+            "set_mtp_num_accepted",
+            "set_skip_topk",
+            "reset_mtp_index_share",
+        }
+    )
+
+    def __init__(self, metadata, *, source=None, **config) -> None:
+        super().__init__(metadata, source=source, **config)
+        # Page table of the algorithm's indexer cache; allocated by the
+        # requiring algorithm.
+        self.block_table: Optional[torch.Tensor] = None
+        # Request row of each packed token; allocated by the requiring algorithm.
+        self.req_idx_per_token: Optional[torch.Tensor] = None
+        # Captured selections reused by the draft loop, and the capture slots
+        # that hold a selection captured in the current loop.
+        self.shared_topk_indices: Optional[torch.Tensor] = None
+        self.shared_topk_captured_slots: set[int] = set()
+        self.in_mtp_draft_loop = False
+        self.indexer_skip_topk = False
+        self.mtp_num_accepted: Optional[torch.Tensor] = None
+        # A metadata copy starts outside any draft loop.
+        self.shared_topk_captured_slots = set()
+        self.in_mtp_draft_loop = False
+        self.indexer_skip_topk = False
+        self.mtp_num_accepted = None
+
+    adopts_target_state = True
+    # The draft loop rebuilds the packed-row request map; the captured
+    # selections are the draft loop's own.
+    draft_bound = frozenset(
+        {
+            "block_table",
+            "in_mtp_draft_loop",
+            "indexer_skip_topk",
+            "mtp_num_accepted",
+        }
+    )
+    draft_written = frozenset({"req_idx_per_token"})
+    draft_private = frozenset({"shared_topk_indices", "shared_topk_captured_slots"})
+
+    def bind_buffers(self, **buffers: Optional[torch.Tensor]) -> None:
+        """Bind buffers the requiring algorithm allocated, by field name.
+
+        Accepts ``block_table``, ``req_idx_per_token`` and
+        ``shared_topk_indices``; None unbinds one.
+        """
+        unknown = set(buffers) - _INDEX_SHARE_BUFFERS
+        if unknown:
+            raise TypeError(f"MTPIndexShareExtension has no buffers {sorted(unknown)}")
+        for name, buffer in buffers.items():
+            setattr(self, name, buffer)
+
     def set_in_mtp_draft_loop(self, active: bool) -> None:
-        """Mark whether a draft loop is running."""
+        """Mark whether a draft loop is running.
+
+        Readiness is per capture slot: a layer may reuse only the row it
+        captured itself in this loop, so every transition clears it.
+        """
+        self.in_mtp_draft_loop = active
+        self.shared_topk_captured_slots.clear()
 
     def set_mtp_num_accepted(self, num_accepted: Optional[torch.Tensor]) -> None:
         """Supply the per-request accepted counts used to pick the capture row."""
+        self.mtp_num_accepted = num_accepted
 
     def set_skip_topk(self, skip: bool) -> None:
         """Ask the indexer to reuse its captured selection instead of scoring."""
+        self.indexer_skip_topk = skip
+
+    def reset_mtp_index_share(self) -> None:
+        """Clear the draft-loop state the indexer reads."""
+        self.set_skip_topk(False)
+        self.set_in_mtp_draft_loop(False)
+        self.set_mtp_num_accepted(None)
+
+
+class MTPIndexShareUser(MetadataExtension):
+    """An algorithm whose indexer keeps its tables and draft-loop state in ``MTPIndexShareExtension``."""
+
+    requires = (MTPIndexShareExtension,)
+    fields = frozenset({"index_share"})
+
+    @property
+    def index_share(self) -> MTPIndexShareExtension:
+        """The draft-loop state and tables shared with the MTP driver."""
+        return self.metadata.ext(MTPIndexShareExtension)
 
 
 def use_self_sampling_gvr(
@@ -96,6 +197,15 @@ class SparseParams:
 
 class SparseMetadataParams:
     """Base parameters for sparse attention metadata."""
+
+
+class SparseAlgorithmExtension(MetadataExtension):
+    """Base of a sparse algorithm's metadata state; a metadata carries at most one."""
+
+    fields = frozenset({"sparse_metadata_params"})
+    init_fields = {"sparse_metadata_params": None}
+    #: The algorithm's settings for allocating and updating its state.
+    sparse_metadata_params: Optional[SparseMetadataParams] = None
 
 
 @dataclass(kw_only=True, slots=True)

@@ -172,7 +172,7 @@ def make_msa_metadata(manager) -> MiniMaxM3MsaSparseAttentionMetadata:
 
 
 def make_draft_metadata(manager) -> TrtllmAttentionMetadata:
-    """Drafter metadata over the shared manager's FP8 draft view, the manager the runtime's draft swap installs."""
+    """Drafter metadata over the shared manager's FP8 draft view, the manager a draft metadata runs on."""
     view = manager.get_draft_kv_cache_view()
     assert view is not None and view.dtype == DataType.FP8
     return TrtllmAttentionMetadata(

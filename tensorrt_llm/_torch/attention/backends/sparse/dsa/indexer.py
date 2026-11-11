@@ -82,7 +82,18 @@ _INDEXER_PACKED_LOGITS_ELEM_BUDGET = int(
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
-    from .metadata import DSAtrtllmAttentionMetadata
+    from .metadata import DSAMetadata, DSAtrtllmAttentionMetadata
+
+
+def _dsa_state(metadata: "DSAtrtllmAttentionMetadata") -> "DSAMetadata":
+    """The DSA extension of ``metadata``.
+
+    Imported on use: the metadata module imports this one.
+    """
+    from .metadata import DSAMetadata
+
+    return metadata.ext(DSAMetadata)
+
 
 # Optional import: fast-hadamard-transform causes CI build issues (requires wheel+torch pre-installed)
 try:
@@ -309,31 +320,32 @@ def transform_local_topk_and_prepare_pool_view(
     Uses cached values from attn_metadata._ensure_pool_view_cached()
     to avoid redundant Python/CUDA overhead across layers.
     """
+    dsa = _dsa_state(attn_metadata)
     assert topk_indices.dtype == torch.int32
 
-    attn_metadata._ensure_pool_view_cached()
+    dsa._ensure_pool_view_cached()
     page_index_scale, layer_offset = (
         attn_metadata.kv_cache_manager.get_primary_pool_page_index_params(layer_idx)
     )
 
     if is_generation:
-        block_table = attn_metadata._cached_block_table_gen
-        req_idx = attn_metadata._cached_req_idx_gen
+        block_table = dsa._cached_block_table_gen
+        req_idx = dsa._cached_req_idx_gen
     else:
-        block_table = attn_metadata._cached_block_table_ctx
-        req_idx = attn_metadata._cached_req_idx_ctx
+        block_table = dsa._cached_block_table_ctx
+        req_idx = dsa._cached_req_idx_ctx
 
     global_indices = torch.ops.trtllm.convert_req_index_to_global(
         req_idx,
         block_table,
         topk_indices,
-        attn_metadata._cached_tokens_per_block,
+        dsa._cached_tokens_per_block,
         topk_indices.shape[1],
-        page_index_scale * attn_metadata._cached_tokens_per_block,
+        page_index_scale * dsa._cached_tokens_per_block,
         layer_offset,
     )
 
-    return global_indices, attn_metadata._cached_pool_view
+    return global_indices, dsa._cached_pool_view
 
 
 def transform_local_topk_and_prepare_pool_view_grouped(
@@ -358,24 +370,25 @@ def transform_local_topk_and_prepare_pool_view_grouped(
     is bit-identical to ``transform_local_topk_and_prepare_pool_view`` for the
     member with offset ``layer_ids[z]``. MLA-only path.
     """
+    dsa = _dsa_state(attn_metadata)
     assert topk_indices.dtype == torch.int32
 
-    attn_metadata._ensure_pool_view_cached()
+    dsa._ensure_pool_view_cached()
 
     if is_generation:
-        block_table = attn_metadata._cached_block_table_gen
-        req_idx = attn_metadata._cached_req_idx_gen
+        block_table = dsa._cached_block_table_gen
+        req_idx = dsa._cached_req_idx_gen
     else:
-        block_table = attn_metadata._cached_block_table_ctx
-        req_idx = attn_metadata._cached_req_idx_ctx
+        block_table = dsa._cached_block_table_ctx
+        req_idx = dsa._cached_req_idx_ctx
 
     global_indices = torch.ops.trtllm.convert_req_index_to_global_grouped(
         req_idx,
         block_table,
         topk_indices,
-        attn_metadata._cached_tokens_per_block,
+        dsa._cached_tokens_per_block,
         topk_indices.shape[1],
-        page_index_scale * attn_metadata._cached_tokens_per_block,
+        page_index_scale * dsa._cached_tokens_per_block,
         layer_ids,
     )
 
@@ -1170,6 +1183,7 @@ class Indexer(nn.Module):
 
     @staticmethod
     def build_indexer_params(metadata: DSAtrtllmAttentionMetadata) -> Optional[IndexerParams]:
+        dsa = _dsa_state(metadata)
         kv_cache_manager = metadata.kv_cache_manager
         if kv_cache_manager is None or not hasattr(kv_cache_manager, "index_head_dim"):
             return None
@@ -1187,7 +1201,7 @@ class Indexer(nn.Module):
             num_ctx_tokens=metadata.num_ctx_tokens,
             head_dim=head_dim,
             quant_block_size=metadata.indexer_quant_block_size,
-            tokens_per_block=metadata._tokens_per_block,
+            tokens_per_block=dsa._tokens_per_block,
             compress_ratio=compress_ratio,
             request_ids=metadata.request_ids,
             num_past_tokens=metadata.kv_cache_params.num_cached_tokens_per_seq,
@@ -1430,14 +1444,12 @@ class Indexer(nn.Module):
         """
         Prepare scheduler metadata for the DeepGEMM decode MQA kernel.
         """
+        dsa = _dsa_state(metadata)
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
-        # A full rebuild clears the stale marker.
-        metadata.indexer_schedule_stale = False
-        gen_seq_lens = metadata.get_indexer_kv_lens(
+        gen_seq_lens = dsa.bind_gen_indexer_kv_lens(
             metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
         )
-        metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
         if not metadata.use_expanded_buffers_for_mtp:
             scheduler_context_lens = metadata.update_indexer_kv_lens_2d(gen_seq_lens)
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(

@@ -153,25 +153,10 @@ class KeyType(NamedTuple):
     ragged_verify_bucket: Optional[int] = None
 
 
-def _save_spec_decode_capture_state(
-        attn_metadata: Any, enable_spec_decode: bool) -> Optional[torch.Tensor]:
-    if not enable_spec_decode or not hasattr(attn_metadata, 'kv_lens_cuda'):
-        return None
-    return attn_metadata.kv_lens_cuda[:attn_metadata.num_seqs].clone()
-
-
-def _restore_spec_decode_capture_state(
-        attn_metadata: Any, saved_kv_lens_cuda: Optional[torch.Tensor]) -> None:
-    if saved_kv_lens_cuda is None:
-        return
-    # Speculative decoding updates kv_lens_cuda in-place during every forward.
-    # CUDA graph warmup reuses one dummy request for multiple eager forwards, so
-    # letting those updates accumulate would make later warmups/capture advertise
-    # more KV tokens than the dummy request actually allocated. Restore the
-    # single-step input state outside the graph after each forward instead.
-    batch_size = saved_kv_lens_cuda.shape[0]
-    attn_metadata.kv_lens_cuda[:batch_size].copy_(saved_kv_lens_cuda)
-    attn_metadata.on_update_kv_lens()
+def _prepare_again(attn_metadata: Any) -> None:
+    """Prepare ``attn_metadata`` again from the batch it was last prepared with."""
+    attn_metadata.prepare(context_requests=attn_metadata.context_requests,
+                          prefill_cuda_graphs=attn_metadata.prefill_cuda_graphs)
 
 
 @dataclass
@@ -823,9 +808,15 @@ class CUDAGraphRunner:
                 key: KeyType,
                 forward_fn: Callable,
                 initial_inputs: Dict[str, Any],
-                enable_spec_decode: bool = False,
-                postprocess_fn: Optional[Callable] = None) -> Any:
-        """Warm up and/or capture the forward pass for a graph key."""
+                postprocess_fn: Optional[Callable] = None,
+                prepare_each_forward: bool = False) -> Any:
+        """Warm up and/or capture the forward pass for a graph key.
+
+        The caller prepared ``initial_inputs["attn_metadata"]`` for the first
+        warmup forward. With ``prepare_each_forward`` every later warmup
+        forward and the capture are preceded by a ``prepare`` of the same
+        batch, so none of them starts from the state a previous forward left.
+        """
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -874,8 +865,6 @@ class CUDAGraphRunner:
             capture_inputs[
                 "encoder_hidden_states"] = static_encoder_hidden_states
         attn_metadata = capture_inputs["attn_metadata"]
-        saved_kv_lens_cuda = _save_spec_decode_capture_state(
-            attn_metadata, enable_spec_decode)
 
         self.graph_metadata[key] = {
             "attn_metadata": attn_metadata,
@@ -889,20 +878,20 @@ class CUDAGraphRunner:
             # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
             # This also lets us initialize states in the attn_metadata and
             # resize the shared attention workspace before any graph is captured.
-            def run_warmup():
+            def run_warmup(step):
+                if step > 0 and prepare_each_forward:
+                    _prepare_again(attn_metadata)
                 result = forward_fn(capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
-                _restore_spec_decode_capture_state(attn_metadata,
-                                                   saved_kv_lens_cuda)
                 return result
 
-            for _ in range(self.WARMUP_STEPS):
+            for step in range(self.WARMUP_STEPS):
                 if self.is_warmup_only:
-                    output = run_warmup()
+                    output = run_warmup(step)
                 else:
                     with discard_nccl_window_tensor_outputs(capture_inputs):
-                        run_warmup()
+                        run_warmup(step)
 
             if self.is_warmup_only:
                 return output
@@ -912,6 +901,8 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            if self.WARMUP_STEPS > 0 and prepare_each_forward:
+                _prepare_again(attn_metadata)
             with nccl_window_graph_capture(graph, graph_pool):
                 # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
                 prologue_pack = (None if self._pre_replay_hooks else
@@ -921,8 +912,6 @@ class CUDAGraphRunner:
                 output = forward_fn(capture_inputs)
             # The addresses the graph baked in, for the strict buffer check.
             self._record_strict_buffer_snapshot(key)
-            _restore_spec_decode_capture_state(attn_metadata,
-                                               saved_kv_lens_cuda)
 
         self.graphs[key] = graph
         graph_output = make_weak_ref(output)
@@ -1100,38 +1089,46 @@ class CUDAGraphRunner:
         in; any of them changing before a later replay means the graph would
         read stale (or freed) memory. obj.graph_temporary_attrs are skipped.
         """
-        graph_temporary_attrs = getattr(obj, "graph_temporary_attrs", ())
-        return {
-            name: value.data_ptr()
-            for name, value in vars(obj).items()
-            if isinstance(value, torch.Tensor) and value.is_cuda
-            and name not in graph_temporary_attrs
-        }
+        ptrs = {}
+        for prefix, owner in CUDAGraphRunner._graph_tensor_owners(obj):
+            graph_temporary_attrs = getattr(owner, "graph_temporary_attrs", ())
+            ptrs.update({
+                prefix + name: value.data_ptr()
+                for name, value in vars(owner).items()
+                if isinstance(value, torch.Tensor) and value.is_cuda
+                and name not in graph_temporary_attrs
+            })
+        return ptrs
+
+    @staticmethod
+    def _graph_tensor_owners(obj: Any) -> List[Tuple[str, Any]]:
+        """obj and, for attention metadata, its extensions, with key prefixes."""
+        owners = [("", obj)]
+        attached = obj.__dict__.get("_extensions") if hasattr(
+            obj, "__dict__") else None
+        for extension in attached or ():
+            owners.append((f"{type(extension).__name__}.", extension))
+        return owners
 
     @staticmethod
     def _assert_graph_tensor_ptrs_stable(obj: Any,
                                          expected_ptrs: Dict[str, int]) -> None:
-        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved.
-
-        Attributes in obj.draft_replay_swapped_attrs are deliberately rebound
-        to draft KV cache buffers for the duration of a draft replay, so their
-        live value is not the captured one. The target value saved before the
-        swap is checked in its place.
-        """
-        swapped_attrs = getattr(obj, "draft_replay_swapped_attrs", {})
-        for name, expected_ptr in expected_ptrs.items():
-            value = (swapped_attrs[name] if name in swapped_attrs else getattr(
-                obj, name, None))
+        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved."""
+        owners = dict(CUDAGraphRunner._graph_tensor_owners(obj))
+        for key, expected_ptr in expected_ptrs.items():
+            prefix, _, name = key.rpartition(".")
+            owner = owners.get(f"{prefix}." if prefix else "")
+            value = getattr(owner, name, None)
             if not isinstance(value, torch.Tensor):
                 raise RuntimeError(
                     f"CUDA graph metadata attribute `{type(obj).__name__}."
-                    f"{name}` was a tensor at capture time but is now "
+                    f"{key}` was a tensor at capture time but is now "
                     f"{type(value).__name__}. Graph-visible buffers must be "
                     "updated in place, not rebound.")
             if value.data_ptr() != expected_ptr:
                 raise RuntimeError(
                     f"CUDA graph metadata tensor `{type(obj).__name__}."
-                    f"{name}` was reallocated between capture and replay "
+                    f"{key}` was reallocated between capture and replay "
                     f"(data_ptr 0x{expected_ptr:x} -> 0x{value.data_ptr():x}). "
                     "Graph-visible buffers must be updated in place; "
                     "rebinding invalidates addresses baked into the captured "
@@ -2567,6 +2564,13 @@ class EncoderCUDAGraphRunner:
                 key="encoder_cuda_graph_cross_attention_warning")
             return None, None
 
+        if (self.use_fixed_sequence_slots
+                and not attn_metadata.supports_explicit_offsets):
+            raise ValueError(
+                "Encoder CUDA graphs with fixed sequence slots need an attention "
+                "backend that honors explicit sequence offsets (TRTLLM); "
+                f"{type(attn_metadata).__name__} derives them from seq_lens")
+
         # First sighting of this key: create graph-resident metadata and bind
         # it to stable pinned seq_lens storage for future replays.
         padded_batch_size = len(inputs['seq_lens'])
@@ -2580,26 +2584,24 @@ class EncoderCUDAGraphRunner:
         )
         assert graph_attn_metadata.is_cuda_graph
 
-        # Lock FMHA kernel launch params to the padded max_seq_len so the
-        # cubin + grid dims stay constant across replays for this key.
-        graph_attn_metadata.max_context_q_len_override = padded_max_seq_len
-
         # Bind graph metadata to stable host seq_lens storage. The storage may
         # be pinned or pageable; only captured H2D copies require pinned memory.
-        graph_attn_metadata.bind_encoder_cuda_graph_seq_lens(
-            self.shared_static_tensors_cpu["seq_lens"], padded_batch_size)
+        # The FMHA kernel launch params are locked to the padded max_seq_len
+        # so the cubin + grid dims stay constant across replays for this key.
+        capture_offsets_cuda = None
         if self.use_fixed_sequence_slots:
             # CUDA graph replay keeps each request in its capture-time token
             # slot. Explicit boundaries let attention combine those fixed
-            # offsets with the per-replay logical sequence lengths above.
-            capture_offsets = self._get_capture_sequence_offsets(key)
-            capture_offsets_cuda = torch.tensor(capture_offsets,
-                                                dtype=torch.int32,
-                                                device="cuda")
-            graph_attn_metadata.cu_q_seqlens = capture_offsets_cuda
-            graph_attn_metadata.cu_kv_seqlens = capture_offsets_cuda
-        graph_attn_metadata.max_seq_len = self.config.max_seq_len
-        graph_attn_metadata.request_ids = list(range(padded_batch_size))
+            # offsets with the per-replay logical sequence lengths.
+            capture_offsets_cuda = torch.tensor(
+                self._get_capture_sequence_offsets(key),
+                dtype=torch.int32,
+                device="cuda")
+        graph_attn_metadata.bind_encoder_cuda_graph_seq_lens(
+            self.shared_static_tensors_cpu["seq_lens"],
+            padded_batch_size,
+            max_q_len=padded_max_seq_len,
+            offsets=capture_offsets_cuda)
 
         self.retire_staging()
         return graph_attn_metadata, key

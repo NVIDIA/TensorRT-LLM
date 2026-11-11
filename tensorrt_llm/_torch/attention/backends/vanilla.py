@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-from typing import Optional
+from typing import ClassVar, Optional, Type
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +15,7 @@ try:
 except ImportError:
     AttentionMaskConverter = None
 
+from .core import AttentionCoreMetadata
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask, merge_attention_forward_args)
@@ -61,18 +62,34 @@ def generate_sliding_window_mask(batch_size: int, target_length: int,
     return attention_mask
 
 
-class VanillaAttentionMetadata(AttentionMetadata):
+class VanillaCoreMetadata(AttentionCoreMetadata):
+    """Vanilla attention state: each sequence's cache block IDs."""
 
-    def __post_init__(self) -> None:
-        super().__post_init__()
+    # Block IDs, plus the no-KV-cache sequence bound callers set for
+    # encoder-only use and the page size a sparse algorithm (RocketKV) sets.
+    fields = frozenset({"block_ids_per_seq", "max_seq_len", "page_size"})
+    # The sequence bound of no-KV-cache attention.
+    init_fields = {
+        "max_seq_len": None,
+    }
+
+    def __init__(self, metadata, *, source=None, **config) -> None:
+        super().__init__(metadata, source=source, **config)
+        # Per-step block IDs that derive() creates.
+        self.block_ids_per_seq = None
         self.kv_layout = "NHD"
 
-    def prepare(self) -> None:
-        super().prepare()
+    def derive(self) -> None:
+        md = self.metadata
         # indices of used cache blocks for each sequence
-        assert self.request_ids is not None
-        self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids) if self.kv_cache_manager is not None else None
+        assert md.request_ids is not None
+        self.block_ids_per_seq = md.kv_cache_manager.get_batch_cache_indices(
+            md.request_ids) if md.kv_cache_manager is not None else None
+
+
+class VanillaAttentionMetadata(AttentionMetadata):
+    core_metadata_type: ClassVar[
+        Type[AttentionCoreMetadata]] = VanillaCoreMetadata
 
 
 class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
@@ -794,6 +811,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        if isinstance(metadata, AttentionMetadata):
+            # No forward on lengths changed in place without a refresh.
+            metadata.check_lengths_current()
 
         if metadata.multi_item_part_lens is not None:
             raise ValueError(

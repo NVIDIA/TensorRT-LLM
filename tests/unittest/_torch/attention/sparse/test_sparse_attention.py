@@ -25,8 +25,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from _torch.helpers import bare_extension
 
 from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -312,12 +314,11 @@ def _make_sparse_prediction_forward_metadata() -> TrtllmAttentionMetadata:
     metadata._seq_lens_kv = seq_lens
     metadata._seq_lens_cuda = None
     metadata.kv_cache_manager = None
-    metadata._max_seq_len_storage = 4
+    metadata.core()._max_seq_len_storage = 4
     metadata.use_paged_context_fmha = False
     metadata.cu_q_seqlens = None
     metadata.cu_kv_seqlens = None
-    metadata.enable_flash_mla = False
-    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
+    metadata.replace_ext(bare_extension(SpecDecodingMetadata, metadata))
     metadata.kv_lens_cuda_runtime = torch.tensor([2], dtype=torch.int32)
     metadata.kv_lens_runtime = torch.tensor([2], dtype=torch.int32)
     metadata.prompt_lens_cuda_runtime = torch.tensor([2], dtype=torch.int32)

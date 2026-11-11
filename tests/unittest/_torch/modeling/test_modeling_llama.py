@@ -15,6 +15,8 @@ from utils.llm_data import llm_models_root
 from utils.util import default_dtype, getSMVersion
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import \
+    SpecDecodingConfig
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -546,24 +548,24 @@ class TestLlama(unittest.TestCase):
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             prompt_lens=prompt_lens,
-            is_spec_decoding_enabled=is_spec_decoding_enabled,
-            use_spec_decoding=use_spec_decoding,
-            is_spec_dec_tree=is_spec_dec_tree,
-            is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
             max_num_heads_per_kv=num_heads_per_kv,
+            spec_decoding=SpecDecodingConfig(
+                attention_needs_spec_dec_mode=is_spec_decoding_enabled,
+                is_spec_dec_tree=is_spec_dec_tree,
+                is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
+                max_draft_len=max_total_draft_tokens,
+                max_total_draft_tokens=max_total_draft_tokens,
+                tree_buffer_dim=spec_tree_mgr._internal_buf_dim,
+            ),
         )
         cache = kv_cache_manager.kv_cache_map[request.py_request_id]
         assert cache.resize(input_ids.size(-1) + gen_input_ids_0.size(-1))
         attn_metadata_gen_phase_0.prepare()
         attn_metadata_gen_phase_0.update_spec_dec_param(
             batch_size=batch_size,
-            is_spec_decoding_enabled=is_spec_decoding_enabled,
-            is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
-            is_spec_dec_tree=is_spec_dec_tree,
-            max_draft_len=max_total_draft_tokens,
-            max_total_draft_tokens=max_total_draft_tokens,
             spec_tree_manager=spec_tree_mgr,
         )
+        attn_metadata_gen_phase_0.use_spec_decoding = use_spec_decoding
 
         gen_position_ids_0 = [
             torch.full((gen_input_ids_0.size(-1), ),
@@ -601,16 +603,8 @@ class TestLlama(unittest.TestCase):
         num_cached_tokens_per_seq_1 = [
             input_ids.size(-1) + request.py_num_accepted_draft_tokens + 1
         ]
-        attn_metadata_gen_phase_0.seq_lens = torch.tensor(
-            [gen_input_ids_1.size(-1)], dtype=torch.int)
-        attn_metadata_gen_phase_0.kv_cache_params.num_cached_tokens_per_seq = num_cached_tokens_per_seq_1
-
-        attn_metadata_gen_phase_0.spec_decoding_position_offsets = None
-        attn_metadata_gen_phase_0.spec_decoding_packed_mask = None
-        attn_metadata_gen_phase_0.spec_decoding_generation_lengths = None
         assert cache.resize(num_cached_tokens_per_seq_1[0] +
                             gen_input_ids_1.size(-1))
-        attn_metadata_gen_phase_0.prepare()
         is_tree_phase1 = is_spec_dec_tree if get_sm_version() < 100 else False
         spec_tree_mgr_phase1 = None
         spec_metadata_phase1 = None
@@ -628,13 +622,34 @@ class TestLlama(unittest.TestCase):
                 max_total_draft_tokens=max_draft_1,
                 spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
             )
-        attn_metadata_gen_phase_0.update_spec_dec_param(
+        # The second step's draft settings differ, and spec-dec settings are
+        # creation configuration: it gets a metadata of its own.
+        attn_metadata_gen_phase_1 = metadata_cls(
+            seq_lens=torch.tensor([gen_input_ids_1.size(-1)], dtype=torch.int),
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq_1,
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+            max_num_heads_per_kv=num_heads_per_kv,
+            spec_decoding=SpecDecodingConfig(
+                attention_needs_spec_dec_mode=is_spec_decoding_enabled,
+                is_spec_dec_tree=is_tree_phase1,
+                is_spec_dec_dynamic_tree=is_tree_phase1,
+                max_draft_len=gen_input_ids_1.size(-1) - 1,
+                max_total_draft_tokens=gen_input_ids_1.size(-1) - 1,
+                tree_buffer_dim=(spec_tree_mgr_phase1._internal_buf_dim
+                                 if spec_tree_mgr_phase1 is not None else 0),
+            ),
+        )
+        attn_metadata_gen_phase_1.prepare()
+        attn_metadata_gen_phase_1.update_spec_dec_param(
             batch_size=batch_size,
-            is_spec_decoding_enabled=is_spec_decoding_enabled,
-            is_spec_dec_tree=is_tree_phase1,
-            is_spec_dec_dynamic_tree=is_tree_phase1,
-            max_draft_len=gen_input_ids_1.size(-1) - 1,
-            max_total_draft_tokens=gen_input_ids_1.size(-1) - 1,
             spec_metadata=spec_metadata_phase1,
             spec_tree_manager=spec_tree_mgr_phase1)
 
@@ -649,7 +664,7 @@ class TestLlama(unittest.TestCase):
         with torch.inference_mode():
             gen_logits_1 = run_forward(input_ids=gen_input_ids_1,
                                        position_ids=gen_position_ids_1,
-                                       attn_metadata=attn_metadata_gen_phase_0)
+                                       attn_metadata=attn_metadata_gen_phase_1)
 
         torch.cuda.synchronize()
 
@@ -659,30 +674,6 @@ class TestLlama(unittest.TestCase):
                                          device=device)
         num_cached_tokens_per_seq_ref = [input_ids.size(-1)]
 
-        attn_metadata_ref = metadata_cls(
-            seq_lens=torch.tensor([gen_input_ids_ref.size(-1)],
-                                  dtype=torch.int),
-            num_contexts=0,
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=num_cached_tokens_per_seq_ref,
-            ),
-            max_num_requests=1,
-            max_num_tokens=8192,
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-            is_spec_decoding_enabled=is_spec_decoding_enabled,
-            use_spec_decoding=use_spec_decoding,
-            is_spec_dec_tree=is_spec_dec_tree,
-            is_spec_dec_dynamic_tree=False,
-            max_num_heads_per_kv=num_heads_per_kv,
-        )
-
-        attn_metadata_ref.spec_decoding_position_offsets = None
-        attn_metadata_ref.spec_decoding_packed_mask = None
-        attn_metadata_ref.spec_decoding_generation_lengths = None
-        attn_metadata_ref.prepare()
         is_tree_ref = is_spec_dec_tree if get_sm_version() < 100 else False
         spec_tree_mgr_ref = None
         spec_metadata_ref = None
@@ -700,13 +691,33 @@ class TestLlama(unittest.TestCase):
                 max_total_draft_tokens=max_draft_ref,
                 spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
             )
+        attn_metadata_ref = metadata_cls(
+            seq_lens=torch.tensor([gen_input_ids_ref.size(-1)],
+                                  dtype=torch.int),
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq_ref,
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+            max_num_heads_per_kv=num_heads_per_kv,
+            spec_decoding=SpecDecodingConfig(
+                attention_needs_spec_dec_mode=is_spec_decoding_enabled,
+                is_spec_dec_tree=is_tree_ref,
+                is_spec_dec_dynamic_tree=is_tree_ref,
+                max_draft_len=gen_input_ids_ref.size(-1) - 1,
+                max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
+                tree_buffer_dim=(spec_tree_mgr_ref._internal_buf_dim
+                                 if spec_tree_mgr_ref is not None else 0),
+            ),
+        )
+        attn_metadata_ref.prepare()
         attn_metadata_ref.update_spec_dec_param(
             batch_size=batch_size,
-            is_spec_decoding_enabled=is_spec_decoding_enabled,
-            is_spec_dec_tree=is_tree_ref,
-            is_spec_dec_dynamic_tree=is_tree_ref,
-            max_draft_len=gen_input_ids_ref.size(-1) - 1,
-            max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
             spec_metadata=spec_metadata_ref,
             spec_tree_manager=spec_tree_mgr_ref)
 

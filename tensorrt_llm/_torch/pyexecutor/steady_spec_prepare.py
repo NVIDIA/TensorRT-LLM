@@ -26,7 +26,7 @@ import triton.language as tl
 
 from tensorrt_llm._utils import prefer_pinned
 
-from ..attention.backends.interface import AttentionMetadata
+from ..attention.backends.interface import AttentionMetadata, BatchInputs
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 
@@ -503,7 +503,13 @@ class SteadyMtpPrepare:
             positions=buffers.position_ids_cuda,
             mrope_positions=buffers.mrope_position_ids_cuda if self.use_mrope else None,
             gather_ids=buffers.gather_ids_cuda,
-            kv_lens_cuda=attn_metadata.kv_lens_cuda if rec.attn_steady else None,
+            # The kernel writes the scheduled KV lengths; the steady step that
+            # follows (prepare_steady_decode_step) takes them as derived.
+            kv_lens_cuda=(
+                attn_metadata.lengths_for_kernel_update()["kv_lens_cuda"]
+                if rec.attn_steady
+                else None
+            ),
             static_input_ids=rec.static_ids,
             static_position_ids=rec.static_pos,
             block=self.block,
@@ -515,9 +521,11 @@ class SteadyMtpPrepare:
         event.record()
         return num_cached, kv_lens, n if rec.static_ids is not None else 0
 
-    def prepare_attention(self, attn_metadata: AttentionMetadata, kv_lens: list[int]) -> None:
-        """The attention metadata's prepare() of a staged steady step."""
+    def prepare_attention(
+        self, attn_metadata: AttentionMetadata, inputs: BatchInputs, kv_lens: list[int]
+    ) -> None:
+        """The attention metadata's prepare of a staged steady step from the step's ``inputs``."""
         if self.record.attn_steady:
-            attn_metadata.prepare_steady_decode_step(kv_lens)
+            attn_metadata.prepare_steady_decode_step(inputs, kv_lens)
         else:
-            attn_metadata.prepare()
+            attn_metadata.prepare(inputs)

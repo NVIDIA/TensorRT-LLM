@@ -120,18 +120,26 @@ def _report_at_exit() -> None:
 
 
 def _device_fields(md) -> List[str]:
-    names = []
-    for name, value in vars(md).items():
-        if (
-            isinstance(value, torch.Tensor)
-            and value.is_cuda
-            and 0 < value.numel() <= _MAX_SNAPSHOT_NUMEL
-        ):
-            names.append(name)
+    names = set()
+    owners = [vars(md)]
+    for ext in getattr(md, "_extensions", ()):
+        owners.append(vars(ext))
+    for mapping in owners:
+        for name, value in mapping.items():
+            if (
+                not name.startswith("_")
+                and isinstance(value, torch.Tensor)
+                and value.is_cuda
+                and 0 < value.numel() <= _MAX_SNAPSHOT_NUMEL
+                and hasattr(md, name)
+                and getattr(md, name) is value
+            ):
+                names.add(name)
     return sorted(names)
 
 
 def _native_step_tail(
+    refresh,
     md,
     i,
     batch_size,
@@ -144,37 +152,51 @@ def _native_step_tail(
     """The native per-step tail of ``Eagle3OneModelWorker._forward_linear_draft_loop``."""
     from tensorrt_llm._torch.speculative.mtp import _select_mtp_position_ids
 
+    from .draft_step import GlmTp8DSAMetadata
+
     new_position_ids = None
     if position_ids is not None:
         rows = gather_ids if i == 0 else slice(0, batch_size)
         new_position_ids = _select_mtp_position_ids(position_ids, rows) + 1
-    if i == 0:
-        md._seq_lens[:batch_size].fill_(1)
-        md._seq_lens_cuda[:batch_size].fill_(1)
-        md.on_update()
-        if hasattr(md, "host_request_types"):
-            md.host_request_types[: md.num_contexts].fill_(1)
-        md.num_contexts = 0
-        md.kv_lens_cuda[num_contexts:batch_size] -= (
-            runtime_draft_len - num_accepted_tokens[num_contexts:]
-        )
-        md.kv_lens_cuda[:num_contexts] += 1
-        md.update_for_spec_dec()
-        md.use_spec_decoding = False
-    else:
-        md.kv_lens_cuda[:batch_size] += 1
-        md.update_for_spec_dec()
+    dsa = md.find_ext(GlmTp8DSAMetadata)
+    if dsa is not None:
+        md._force_native_refresh = True
+    try:
+        if i == 0:
+            md.set_seq_lens(slice(0, batch_size), host=1, device=1, update_counts=True)
+            md.as_generation_rows()
+            md.adjust_kv_lens(
+                slice(num_contexts, batch_size),
+                num_accepted_tokens[num_contexts:batch_size] - runtime_draft_len,
+            )
+            md.adjust_kv_lens(slice(0, num_contexts), 1)
+            refresh()
+            md.use_spec_decoding = False
+        else:
+            md.adjust_kv_lens(slice(0, batch_size), 1)
+            refresh()
+    finally:
+        if dsa is not None:
+            md._force_native_refresh = False
     return new_position_ids
 
 
 def verified_step_update(
-    run_draft_loop, md, step, batch_size, draft_len, num_accepted_tokens, position_ids, gather_ids
+    run_draft_loop,
+    refresh,
+    md,
+    step,
+    batch_size,
+    draft_len,
+    num_accepted_tokens,
+    position_ids,
+    gather_ids,
 ):
     """Run the native tail, restore, run ``run_draft_loop()`` and count differences."""
     names = _device_fields(md)
     before = {name: getattr(md, name).clone() for name in names}
     native_pos = _native_step_tail(
-        md, step, batch_size, 0, draft_len, num_accepted_tokens, position_ids, gather_ids
+        refresh, md, step, batch_size, 0, draft_len, num_accepted_tokens, position_ids, gather_ids
     )
     after_native = {name: getattr(md, name).clone() for name in names}
     for name in names:

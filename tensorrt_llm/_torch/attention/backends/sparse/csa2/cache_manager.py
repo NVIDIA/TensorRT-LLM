@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
 from copy import copy
 from dataclasses import replace
 from enum import Enum
@@ -756,15 +755,24 @@ class CSA2CacheManager(KVCacheManagerV2):
             self._page_index_converters[key] = self.impl.get_page_index_converter(layer_id, role)
         return self._page_index_converters[key]
 
-    @contextmanager
-    def _swa_publication_scope(self):
-        token = object()
+    def prepare_batch_tables(self, request_ids, num_contexts) -> None:
+        # A publication opened by an earlier step's block-offset copy and never
+        # consumed must not reach this step's prepare.
         self._swa_publication = None
-        self._swa_publication_token = token
-        try:
-            yield token
-        finally:
-            # A nested prepare cannot resurrect an older publication either.
+        self._swa_publication_token = None
+
+    def consume_swa_publication(self):
+        """The token of the SWA tables the latest block-offset copy published, or None.
+
+        CSA2's prepare consumes it once, reads the published tables through
+        ``_get_swa_publication`` and then closes it with
+        ``close_swa_publication``.
+        """
+        return self._swa_publication_token if self._swa_publication is not None else None
+
+    def close_swa_publication(self, token) -> None:
+        """Close the publication ``token`` names; a later one stays open."""
+        if token is not None and token is self._swa_publication_token:
             self._swa_publication = None
             self._swa_publication_token = None
 
@@ -1027,6 +1035,7 @@ class CSA2CacheManager(KVCacheManagerV2):
     ):
         # Invalidate before any validation/fill/copy can fail.
         self._swa_publication = None
+        self._swa_publication_token = None
         if beam_width != 1:
             raise ValueError("CSA2 supports beam width one")
         # Every per-layer table of the batch is converted at once; the SWA
@@ -1039,14 +1048,20 @@ class CSA2CacheManager(KVCacheManagerV2):
         # Context-only caches keep SWA for a prefix of the layers only.
         swa_layers = sum(self.has_swa_cache(layer) for layer in self.pp_layers)
         dst_tensor[:swa_layers, : len(request_ids), 0, :width].copy_(tables[:swa_layers, :, :width])
-        if self._swa_publication_token is not None:
-            self._swa_publication = (
-                dst_tensor,
-                tuple(request_ids),
-                num_contexts,
-                width,
-                (dst_tensor.data_ptr(), dst_tensor.shape, dst_tensor.stride()),
-            )
+        # Publish the copied SWA tables for this step's CSA2 prepare.
+        self._swa_publication_token = object()
+        self._swa_publication = (
+            dst_tensor,
+            tuple(request_ids),
+            num_contexts,
+            width,
+            (dst_tensor.data_ptr(), dst_tensor.shape, dst_tensor.stride()),
+        )
+
+    @property
+    def decoder_replay_window(self) -> int:
+        """Prompt tokens decoder bounded replay re-runs; 0 without decoder replay."""
+        return self._decoder_replay_window
 
     @property
     def blocks_in_primary_pool(self):

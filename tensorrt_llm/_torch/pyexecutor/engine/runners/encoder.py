@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionBackend,
     AttentionMetadata,
     AttentionRuntimeFeatures,
+    BatchInputs,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
@@ -328,9 +329,8 @@ class EncoderMixin:
             kv_cache_manager=None,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             max_num_heads_per_kv=max_num_heads_per_kv,
+            max_seq_len=self._config.max_seq_len,
         )
-        metadata.block_ids_per_seq = None
-        metadata.kv_block_ids_per_seq = None
         return metadata
 
     def _is_distributed_forward(self) -> bool:
@@ -683,17 +683,20 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
             )
 
         metadata = self._setup_attention_metadata()
-        metadata.seq_lens = torch.tensor(sequence_lengths, dtype=torch.int)
-        metadata.num_contexts = batch_size
-        metadata.max_seq_len = self._config.max_seq_len
-        metadata.request_ids = list(range(batch_size))
         if (
             multi_item_part_lens is not None
             and not self._config.attention_backend.support_multi_item_scoring()
         ):
             raise ValueError("The selected attention backend does not support multi-item scoring.")
-        metadata.multi_item_part_lens = multi_item_part_lens
-        metadata.prepare_encoder_only()
+        metadata.prepare_encoder_only(
+            BatchInputs(
+                seq_lens=torch.tensor(sequence_lengths, dtype=torch.int),
+                num_contexts=batch_size,
+                request_ids=list(range(batch_size)),
+                prompt_lens=list(sequence_lengths),
+                multi_item_part_lens=multi_item_part_lens,
+            )
+        )
 
         self._buffers.input_ids_cuda[:actual_num_tokens].copy_(input_ids_cpu, non_blocking=True)
         self._buffers.position_ids_cuda[:actual_num_tokens].copy_(
@@ -1173,10 +1176,6 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
         *,
         gather_context_logits: bool,
     ) -> dict[str, Any]:
-        metadata = inputs.get("attn_metadata")
-        if metadata is not None:
-            metadata.on_update_kv_lens()
-
         outputs = self._model_caller(
             **inputs,
             return_context_logits=gather_context_logits,

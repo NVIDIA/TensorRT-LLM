@@ -211,9 +211,10 @@ def test_encoder_only_incomplete_graph_config_warns_and_stays_eager() -> None:
 
 def test_encoder_only_attention_metadata_uses_runner_cache_indirection() -> None:
     cache_indirection = object()
+    block_ids, kv_block_ids = object(), object()
     metadata = SimpleNamespace(
-        block_ids_per_seq=object(),
-        kv_block_ids_per_seq=object(),
+        block_ids_per_seq=block_ids,
+        kv_block_ids_per_seq=kv_block_ids,
     )
     runner = object.__new__(EncoderRunner)
     runner._model = SimpleNamespace(model_config=object())
@@ -221,6 +222,7 @@ def test_encoder_only_attention_metadata_uses_runner_cache_indirection() -> None
         max_batch_size=4,
         max_num_tokens=16,
         max_beam_width=2,
+        max_seq_len=8,
         attention_backend=TrtllmAttention,
     )
     runner._attention_runtime_features = AttentionRuntimeFeatures()
@@ -238,8 +240,10 @@ def test_encoder_only_attention_metadata_uses_runner_cache_indirection() -> None
 
     assert actual is metadata
     assert build_metadata.call_args.kwargs["cache_indirection"] is cache_indirection
-    assert metadata.block_ids_per_seq is None
-    assert metadata.kv_block_ids_per_seq is None
+    assert build_metadata.call_args.kwargs["max_seq_len"] == 8
+    # Metadata without a KV cache manager owns its block IDs; the runner leaves them.
+    assert metadata.block_ids_per_seq is block_ids
+    assert metadata.kv_block_ids_per_seq is kv_block_ids
 
 
 def test_encoder_decoder_attention_metadata_omits_decoder_cache_indirection() -> None:
@@ -253,6 +257,7 @@ def test_encoder_decoder_attention_metadata_omits_decoder_cache_indirection() ->
         max_batch_size=4,
         max_num_tokens=16,
         max_beam_width=2,
+        max_seq_len=8,
         attention_backend=TrtllmAttention,
     )
     runner._attention_runtime_features = AttentionRuntimeFeatures()
@@ -418,7 +423,7 @@ def test_encoder_graph_supports_only_trtllm_attention_metadata() -> None:
 
 
 def test_encoder_runner_forwards_eager_model_inputs_and_gathers_logits() -> None:
-    metadata = SimpleNamespace(on_update_kv_lens=Mock())
+    metadata = Mock()
     model_forward = Mock(return_value={"logits": torch.arange(12).reshape(3, 4)})
     runner = object.__new__(EncoderRunner)
     runner._model_caller = model_forward
@@ -436,7 +441,8 @@ def test_encoder_runner_forwards_eager_model_inputs_and_gathers_logits() -> None
     )
 
     torch.testing.assert_close(outputs["logits"], torch.arange(12).reshape(3, 4))
-    metadata.on_update_kv_lens.assert_called_once_with()
+    # The metadata was prepared with the inputs; the forward step leaves it as is.
+    assert metadata.method_calls == []
     model_forward.assert_called_once_with(**inputs, return_context_logits=True)
 
 

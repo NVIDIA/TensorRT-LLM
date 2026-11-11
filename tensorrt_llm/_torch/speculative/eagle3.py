@@ -10,13 +10,16 @@ import torch.nn.functional as F
 from torch import nn
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import \
+    set_use_spec_decoding
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.features import FlashMlaMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
-from ..attention.backends.sparse.params import MTPIndexShareMetadata
+from ..attention.backends.sparse.params import MTPIndexShareExtension
 from ..model_config import ModelConfig
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
@@ -31,13 +34,6 @@ from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
-
-
-def _reset_mtp_index_share(attn_metadata: MTPIndexShareMetadata) -> None:
-    """Clear the draft-loop state a sparse indexer reads."""
-    attn_metadata.set_skip_topk(False)
-    attn_metadata.set_in_mtp_draft_loop(False)
-    attn_metadata.set_mtp_num_accepted(None)
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -488,30 +484,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # MTP Eagle: lazily-resolved flag for Mamba hybrid cache support
         self._is_mamba_hybrid_cache = None
 
-        # Worker-side saved spec-dec params; initialized so that a failure
-        # inside _prepare_attn_metadata_for_spec_dec (e.g. an OOM in the
-        # clone calls) cannot turn the cleanup restore into AttributeError.
-        self._saved_packed_mask = None
-        self._saved_position_offsets = None
-        self._saved_spec_decoding_query_len = None
-        self._saved_generation_lengths = None
-        # Set by set_draft_model: the MTP layer applies the draft loop's
-        # deferred kv_lens increment itself.
-        self._draft_folds_kv_lens_increment = False
         # MXFP8 copy of the LM head for greedy draft tokens (MTP Eagle), set
         # by the model once its weights are loaded.
         self.draft_head = None
         self._samples_sharded_target = (key_exchange is not None
                                         and supports_sharded_target_sampling(
                                             spec_config, mapping))
-
-    def set_draft_model(self, draft_model) -> None:
-        super().set_draft_model(draft_model)
-        # Import here to avoid a circular import.
-        from ..models.modeling_speculative import MTPForCausalLM
-        self._draft_folds_kv_lens_increment = (
-            self.is_mtp_eagle and isinstance(draft_model, MTPForCausalLM)
-            and draft_model.folds_kv_lens_increment)
 
     @property
     def max_draft_len(self) -> int:
@@ -537,54 +515,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 return lm_head(hidden_states, gather_output=False)
         return super().target_logits(hidden_states, lm_head, logits_processor,
                                      attn_metadata, spec_metadata, draft_model)
-
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
-        batch_size = attn_metadata.num_seqs
-
-        # Save spec-dec params that the drafting loop will overwrite.
-        # Without this, CUDA graph warmup's second iteration would run
-        # the target model attention with stale draft-layer masks
-        # instead of the correct target-tree masks.
-        if attn_metadata.spec_decoding_packed_mask is not None:
-            self._saved_packed_mask = attn_metadata.spec_decoding_packed_mask[:
-                                                                              batch_size].clone(
-                                                                              )
-        else:
-            self._saved_packed_mask = None
-        if attn_metadata.spec_decoding_position_offsets is not None:
-            self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone(
-            )
-            self._saved_spec_decoding_query_len = (
-                attn_metadata.spec_decoding_query_len)
-        else:
-            self._saved_position_offsets = None
-            self._saved_spec_decoding_query_len = None
-        if attn_metadata.spec_decoding_generation_lengths is not None:
-            self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[:batch_size].clone(
-            )
-        else:
-            self._saved_generation_lengths = None
-
-    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
-        super()._restore_attn_metadata_from_spec_dec(attn_metadata)
-        if self._saved_packed_mask is not None:
-            batch_size = self._saved_packed_mask.shape[0]
-            attn_metadata.spec_decoding_packed_mask[:batch_size].copy_(
-                self._saved_packed_mask)
-            self._saved_packed_mask = None
-        if self._saved_position_offsets is not None:
-            attn_metadata.spec_decoding_position_offsets.copy_(
-                self._saved_position_offsets)
-            attn_metadata.spec_decoding_query_len = (
-                self._saved_spec_decoding_query_len)
-            self._saved_position_offsets = None
-            self._saved_spec_decoding_query_len = None
-        if self._saved_generation_lengths is not None:
-            batch_size = self._saved_generation_lengths.shape[0]
-            attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
-                self._saved_generation_lengths)
-            self._saved_generation_lengths = None
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
@@ -665,41 +595,39 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     batch_size=batch_size,
                 ))
         else:
-            # The step-0 sequence lengths, before the draft loop rewrites them.
-            pre_draft_seq_lens = attn_metadata._seq_lens_cuda
-            # Save the old attn_metadata and spec_metadata
-            self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+            # The step-0 sequence lengths, before the draft loop changes them:
+            # the target's, which the draft loop never changes when it runs on
+            # the draft metadata.
+            pre_draft_seq_lens = attn_metadata.seq_lens_cuda
+            # The draft forwards run on the draft metadata, which leaves the
+            # target's untouched; without one, the target's state is saved
+            # and restored around the draft loop.
+            with self.draft_loop(attn_metadata) as draft_attn_metadata:
+                # Prepare inputs for the 1st draft model forward
+                position_ids = position_ids.squeeze(0)
+                inputs = self.prepare_1st_drafter_inputs(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    accepted_tokens=accepted_tokens,
+                    attn_metadata=draft_attn_metadata,
+                    spec_metadata=spec_metadata,
+                    draft_model=draft_model)
 
-            # Prepare inputs for the 1st draft model forward
-            position_ids = position_ids.squeeze(0)
-            inputs = self.prepare_1st_drafter_inputs(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                accepted_tokens=accepted_tokens,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                draft_model=draft_model)
+                # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here
+                # so the post-loop restore (below) can put attn_metadata back into a
+                # state the target model expects.
+                original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-            # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here
-            # so the post-loop restore (below) can put attn_metadata back into a
-            # state the target model expects.
-            original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+                # Get the draft KV cache manager if using separate layouts
+                draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+                    resource_manager)
 
-            # Get the draft KV cache manager if using separate layouts
-            draft_kv_cache_manager = self.get_draft_kv_cache_manager(
-                resource_manager)
-
-            next_draft_tokens, next_new_tokens = self._forward_draft_loop(
-                inputs, attn_metadata, spec_metadata, draft_model,
-                draft_kv_cache_manager, num_contexts, num_gens, batch_size,
-                num_accepted_tokens, original_all_rank_num_tokens,
-                resource_manager, accepted_tokens, pre_draft_seq_lens)
-            # restore attn_metadata to support cuda graph
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
-            # restore all_rank_num_tokens for attention DP
-            if original_all_rank_num_tokens is not None:
-                attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+                next_draft_tokens, next_new_tokens = self._forward_draft_loop(
+                    inputs, draft_attn_metadata, spec_metadata, draft_model,
+                    draft_kv_cache_manager, num_contexts, num_gens, batch_size,
+                    num_accepted_tokens, original_all_rank_num_tokens,
+                    resource_manager, accepted_tokens, pre_draft_seq_lens)
 
         # prepare next new tokens to support overlap scheduler; the draft loop
         # may have built them already as a view of its token buffer.
@@ -709,7 +637,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 spec_metadata.batch_indices_cuda, batch_size,
                 num_accepted_tokens)
 
-        attn_metadata.use_spec_decoding = True
+        set_use_spec_decoding(attn_metadata, True)
 
         # Commit model-owned target state only after draft preparation has
         # succeeded; SpecWorkerBase aborts the still-pending snapshots on any
@@ -771,7 +699,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         draft_metadata.update_shared_kv_draft_lengths(attn_metadata,
                                                       num_accepted_tokens,
                                                       num_contexts)
-        draft_metadata.use_spec_decoding = False
+        set_use_spec_decoding(draft_metadata, False)
         draft_metadata.padded_num_tokens = None
         draft_metadata.all_rank_num_tokens = (
             spec_metadata.subseq_all_rank_num_tokens)
@@ -843,8 +771,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                    accepted_tokens=None,
                                    pre_draft_seq_lens=None):
         """Linear draft loop, unified for Eagle3 and MTP Eagle."""
-        from ..attention.backends.sparse.dsa import is_dsa_cache_manager
-
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
         next_draft_tokens = []
@@ -876,36 +802,28 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Sparse backends that can reuse one indexer selection across the draft
         # loop expose this setter; each indexer still decides whether its own
         # config turns the reuse on.
-        uses_mtp_index_share = self.is_mtp_eagle and isinstance(
-            attn_metadata, MTPIndexShareMetadata)
+        index_share = (attn_metadata.find_ext(MTPIndexShareExtension)
+                       if self.is_mtp_eagle else None)
         with contextlib.ExitStack() as draft_scope:
-            if uses_mtp_index_share:
-                attn_metadata.set_in_mtp_draft_loop(True)
+            if index_share is not None:
+                index_share.set_in_mtp_draft_loop(True)
                 # Accepted counts let the indexer stash each gen's last-accepted row.
-                attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
+                index_share.set_mtp_num_accepted(num_accepted_tokens)
                 # The metadata outlives this call, so clear the state even when a
                 # draft step raises: a stale draft-loop flag would make the next
                 # target forward reuse these selections. The loop writes
-                # set_skip_topk on the metadata yielded below, which is this same
-                # object: draft_kv_cache_context swaps buffers in place for every
-                # TrtllmAttentionMetadata, and sparse metadata all derive from it.
-                draft_scope.callback(_reset_mtp_index_share, attn_metadata)
+                # set_skip_topk on the extension of the metadata yielded below,
+                # which is this same object: draft_kv_cache_context yields a
+                # draft metadata as it is.
+                draft_scope.callback(index_share.reset_mtp_index_share)
             draft_attn_metadata = draft_scope.enter_context(
                 self.draft_kv_cache_context(attn_metadata,
                                             draft_kv_cache_manager))
             attn_metadata = draft_attn_metadata
             inputs["attn_metadata"] = draft_attn_metadata
-            if self.is_mtp_eagle and is_dsa_cache_manager(
-                    draft_kv_cache_manager):
-                # Overlap scheduling corrects kv_lens_cuda from the runtime
-                # accepted-token counts inside the captured graph. The target
-                # forward refreshes target slot mappings during that correction;
-                # refresh once more after rebinding so the first draft forward
-                # writes the separate DSA indexer cache at the same positions.
-                attn_metadata.on_update_kv_lens()
             for i in range(runtime_draft_len):
-                if uses_mtp_index_share:
-                    attn_metadata.set_skip_topk(i > 0)
+                if index_share is not None:
+                    index_share.set_skip_topk(i > 0)
                 # Run draft model (mode-specific via helper). The helper
                 # passes ``all_rank_num_tokens`` as a kwarg so the draft model
                 # handles save/restore internally (Eagle3DraftModel.forward
@@ -922,12 +840,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # ``[gather_ids]`` site below takes a slice as readily as an
                 # index tensor.
                 if i == 0 and use_epilogue:
+                    # The epilogue writes the draft's device lengths: the
+                    # buffers come from the core, which marks them changed.
+                    lengths = attn_metadata.lengths_for_kernel_update()
                     step0 = step0_epilogue(pre_draft_seq_lens,
                                            num_accepted_tokens,
                                            hidden_states,
                                            inputs["position_ids"],
-                                           attn_metadata._seq_lens_cuda,
-                                           attn_metadata.kv_lens_cuda,
+                                           lengths["seq_lens_cuda"],
+                                           lengths["kv_lens_cuda"],
                                            num_contexts,
                                            batch_size,
                                            runtime_draft_len,
@@ -1131,46 +1052,43 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
                 # Update attn_metadata for the next iteration.
                 if i == 0:
-                    attn_metadata._seq_lens[:batch_size].fill_(1)
-                    if step0 is None:  # else: done by the step-0 epilogue
-                        attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
-                    attn_metadata.on_update()
+                    # The step-0 epilogue already set the device lengths.
+                    attn_metadata.set_seq_lens(
+                        slice(0, batch_size),
+                        host=1,
+                        device=1 if step0 is None else None,
+                        update_counts=True)
                     has_kv_cache = inputs[
                         "attn_metadata"].kv_cache_manager is not None
-                    if has_kv_cache and hasattr(attn_metadata,
-                                                "host_request_types"):
-                        attn_metadata.host_request_types[:attn_metadata.
-                                                         num_contexts].fill_(1)
                     if has_kv_cache:
-                        attn_metadata.num_contexts = 0
-                    if hasattr(attn_metadata, 'kv_lens_cuda') and step0 is None:
-                        attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                            runtime_draft_len -
-                            num_accepted_tokens[num_contexts:])
-                        attn_metadata.kv_lens_cuda[:num_contexts] += 1
-
+                        # The context requests continue as one-token
+                        # generation rows.
+                        attn_metadata.as_generation_rows()
                     if has_kv_cache:
                         self._prepare_flash_mla_generation_layout(
                             attn_metadata, num_contexts, batch_size)
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        attn_metadata.update_for_spec_dec()
+                        # The step-0 epilogue already corrected the device KV
+                        # lengths.
+                        if step0 is None:
+                            attn_metadata.adjust_kv_lens(
+                                slice(num_contexts, batch_size),
+                                num_accepted_tokens[num_contexts:batch_size] -
+                                runtime_draft_len)
+                            attn_metadata.adjust_kv_lens(
+                                slice(0, num_contexts), 1)
+                        self.refresh_draft()
 
                     # Both Eagle3 and MTP Eagle drafters take ``draft_len + 1``
                     # tokens in the first draft step (attention runs in spec-dec
                     # mode), then 1 token per step in subsequent iterations.
                     # Disable spec_decoding here so the masks/positions stay
                     # correct on subsequent iters.
-                    attn_metadata.use_spec_decoding = False
+                    set_use_spec_decoding(attn_metadata, False)
                 else:
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        if (step0 is not None and i + 1 < runtime_draft_len
-                                and self._draft_folds_kv_lens_increment):
-                            # The next MTP pass applies it (in its fused
-                            # input launch when it takes one).
-                            inputs["kv_lens_increment"] = batch_size
-                        else:
-                            attn_metadata.kv_lens_cuda[:batch_size] += 1
-                        attn_metadata.update_for_spec_dec()
+                        attn_metadata.adjust_kv_lens(slice(0, batch_size), 1)
+                        self.refresh_draft()
         next_new_tokens = None
         if token_buffer is not None:
             next_draft_tokens = token_buffer[1:].t()
@@ -1238,7 +1156,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         With no context rows ``prepare_flash_mla`` already staged this exact
         layout, so the early return merely skips a redundant copy.
         """
-        if num_contexts <= 0 or not attn_metadata.enable_flash_mla:
+        if (num_contexts <= 0
+                or attn_metadata.find_ext(FlashMlaMetadata) is None):
             return
         attn_metadata.block_ids_per_seq[:batch_size].copy_(
             attn_metadata.kv_block_ids_per_seq[:batch_size], non_blocking=True)

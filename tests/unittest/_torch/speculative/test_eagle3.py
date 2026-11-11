@@ -17,7 +17,6 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -30,8 +29,8 @@ from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch.attention.backends.sparse.dsa import (
-    DSACacheManagerV2, DSAtrtllmAttentionMetadata)
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import \
+    SpecDecodingConfig
 from tensorrt_llm._torch.attention.backends.trtllm import \
     TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -54,79 +53,9 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig)
 
 
-def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
-    """Refresh DSA mappings after switching to the draft cache."""
-    events = []
-    state = {}
-    draft_manager = object.__new__(DSACacheManagerV2)
-
-    class _Metadata(DSAtrtllmAttentionMetadata):
-
-        def __init__(self):
-            self._seq_lens_cuda = torch.tensor([1], dtype=torch.int32)
-            self._num_ctx_tokens = 0
-
-        def set_in_mtp_draft_loop(self, active):
-            state["in_mtp_draft_loop"] = active
-
-        def set_mtp_num_accepted(self, value):
-            state["mtp_num_accepted"] = value
-
-        def set_skip_topk(self, value):
-            state["skip_topk"] = value
-
-        def on_update_kv_lens(self):
-            events.append("refresh")
-
-    metadata = _Metadata()
-
-    @contextmanager
-    def draft_context(attn_metadata, manager):
-        assert attn_metadata is metadata
-        assert manager is draft_manager
-        events.append("switch")
-        yield metadata
-
-    class _StopAfterFirstDraftForward(Exception):
-        pass
-
-    def run_draft_forward(*args, **kwargs):
-        events.append("forward")
-        raise _StopAfterFirstDraftForward
-
-    worker = SimpleNamespace(
-        is_mtp_eagle=True,
-        draft_kv_cache_context=draft_context,
-        _run_draft_forward=run_draft_forward,
-    )
-
-    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
-
-    with pytest.raises(_StopAfterFirstDraftForward):
-        Eagle3OneModelWorker._forward_linear_draft_loop(
-            worker,
-            {"position_ids": torch.tensor([0], dtype=torch.int32)},
-            metadata,
-            SimpleNamespace(runtime_draft_len=1),
-            draft_model=object(),
-            draft_kv_cache_manager=draft_manager,
-            num_contexts=0,
-            batch_size=1,
-            num_accepted_tokens=torch.tensor([1], dtype=torch.int32),
-            original_all_rank_num_tokens=None,
-        )
-
-    assert events == ["switch", "refresh", "forward"]
-    # The draft forward raised, so only the ExitStack callback can have cleared
-    # this; a leaked flag would let the next target forward reuse the selections.
-    assert state == {
-        "in_mtp_draft_loop": False,
-        "mtp_num_accepted": None,
-        "skip_topk": False,
-    }
-
-
-def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:
+@pytest.mark.parametrize("dynamic", [True, False])
+def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step(
+        dynamic: bool) -> None:
     metadata = TrtllmAttentionMetadata(
         seq_lens=None,
         seq_lens_kv=None,
@@ -134,22 +63,15 @@ def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:
         max_num_requests=1,
         max_num_tokens=1,
         max_seq_len=1,
+        spec_decoding=SpecDecodingConfig(
+            is_spec_dec_tree=True,
+            is_spec_dec_dynamic_tree=dynamic,
+            max_draft_len=1,
+            max_total_draft_tokens=1,
+        ),
     )
-    common_kwargs = dict(
-        batch_size=0,
-        is_spec_decoding_enabled=False,
-        is_spec_dec_tree=True,
-        max_draft_len=1,
-        max_total_draft_tokens=1,
-    )
-
-    metadata.update_spec_dec_param(is_spec_dec_dynamic_tree=True,
-                                   **common_kwargs)
-    assert metadata.force_prepare_spec_dec_tree_mask
-
-    metadata.update_spec_dec_param(is_spec_dec_dynamic_tree=False,
-                                   **common_kwargs)
-    assert not metadata.force_prepare_spec_dec_tree_mask
+    metadata.update_spec_dec_param(batch_size=0)
+    assert metadata.force_prepare_spec_dec_tree_mask is dynamic
 
 
 def test_mtp_dynamic_tree_relocation_uses_full_attention_window(
@@ -524,7 +446,9 @@ def test_external_shared_target_kv_step_prepares_next_new_tokens() -> None:
                                     spec_resource_manager=None,
                                     batch_indices_cuda=torch.tensor([0]),
                                     sharded_target_logits=False)
-    attn_metadata = SimpleNamespace(num_seqs=1, num_contexts=0)
+    attn_metadata = SimpleNamespace(num_seqs=1,
+                                    num_contexts=0,
+                                    find_ext=lambda extension_type: None)
 
     out = MTPEagleWorker._forward_impl(worker,
                                        torch.tensor([1, 2, 3]),
@@ -649,8 +573,11 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
     )
     mock_draft_manager = None
     if spec_signal == "draft_kv_cache_manager":
+        # A one-model draft over its own KV cache: the draft metadata stages
+        # the whole table of the draft manager; the target is not affected.
         mock_draft_manager = _make_mock_kv_cache_manager(num_seqs)
         metadata_kwargs["draft_kv_cache_manager"] = mock_draft_manager
+        metadata_kwargs["one_model_draft"] = True
 
     attn_metadata = TrtllmAttentionMetadata(**metadata_kwargs)
     if spec_signal == "is_spec_decoding_enabled":
@@ -669,7 +596,7 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
 
     attn_metadata.prepare()
 
-    if spec_signal is None:
+    if spec_signal in (None, "draft_kv_cache_manager"):
         # Non-speculative: capped at ceil(max kv len / tokens_per_block).
         expected_max_blocks = -(-max(prompt_lens) //
                                 mock_kv_cache_manager.tokens_per_block)

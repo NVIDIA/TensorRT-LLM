@@ -12,11 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""decode_prologue: the target decode-metadata prologue and the target embedding in one launch.
+"""decode_prologue: the target decode prologue and the target embedding in one launch.
 
-decode_prologue extends draft_loop (``draft_loop``): its launch reuses draft_loop's DeepGEMM
-schedule reproduction (``draft_loop/draft_step.py``) and draft_loop's embedding semantics
-(``draft_loop/embedding.py``) for the target step instead of the draft steps.
+decode_prologue extends draft_loop (``draft_loop``): its launch reuses draft_loop's embedding
+semantics (``draft_loop/embedding.py``) for the target step instead of the draft steps.
 
 Entry point: :class:`prologue.DecodePrologueHook`, which ``runtime.make_runtime_hooks``
 declares to the engine as the step loop's ``decode_prologue`` and hands to the decode

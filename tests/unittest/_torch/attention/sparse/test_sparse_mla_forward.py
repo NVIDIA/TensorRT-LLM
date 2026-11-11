@@ -1355,7 +1355,7 @@ def populate_gen_dsa_kv_cache(mla: MLA, AttentionCls: AttentionBackend,
                                           num_cached_tokens_per_seq=[0] *
                                           len(gen_with_cache)),
             mapping=mapping,
-            sparse_attention_config=sparse_config,
+            sparse_metadata_params=sparse_config.to_sparse_metadata_params(),
         )
         cached_metadata.prepare()
 
@@ -1554,7 +1554,7 @@ def populate_gen_deepseek_v4_kv_cache(
                 len(gen_with_cache)  # No prior cache
             ),
             mapping=mapping,
-            sparse_attention_config=sparse_config,
+            sparse_metadata_params=sparse_config.to_sparse_metadata_params(),
         )
         cached_metadata.prepare()
         _ = mla_forward_impl_with_deepseek_v4_wo_linear(

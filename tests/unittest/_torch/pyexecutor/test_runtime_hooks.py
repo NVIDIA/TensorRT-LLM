@@ -72,7 +72,8 @@ def test_every_field_defaults_to_off():
                 getattr(value, item.name) in (False, None) for item in dataclasses.fields(value)
             )
         else:
-            assert value in (False, None), field.name
+            # Tuple fields (model metadata extensions and their settings) default to empty.
+            assert value in (False, None, ()), field.name
 
 
 def test_hooks_declared_as_none_mean_the_default():
@@ -563,11 +564,16 @@ def test_the_decode_prologue_call_site_uses_its_protocol():
 
 
 class _AttnMetadata:
-    def __init__(self) -> None:
-        self.kv_lens_updates = 0
+    """Attention metadata that records every method call; preprocess_inputs makes none."""
 
-    def on_update_kv_lens(self) -> None:
-        self.kv_lens_updates += 1
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str):
+        def record(*args, **kwargs) -> None:
+            self.calls.append(name)
+
+        return record
 
 
 def _prologue_preparer(prologue):
@@ -591,7 +597,7 @@ def test_preprocess_inputs_runs_the_native_prologue_without_a_hook():
     assert preparer.preprocess_inputs(inputs, enable_spec_decode=False, runtime_draft_len=0) is (
         inputs
     )
-    assert inputs["attn_metadata"].kv_lens_updates == 1
+    assert inputs["attn_metadata"].calls == []
 
 
 @pytest.mark.parametrize("engaged", [False, True], ids=["declined", "engaged"])
@@ -609,7 +615,7 @@ def test_preprocess_inputs_keeps_the_native_prologue_when_the_hook_declines(enga
         inputs
     )
     assert calls == [(preparer, inputs, False, 3)]
-    assert inputs["attn_metadata"].kv_lens_updates == (0 if engaged else 1)
+    assert inputs["attn_metadata"].calls == []
 
 
 # -- the execution-stream loop --------------------------------------------------------------------

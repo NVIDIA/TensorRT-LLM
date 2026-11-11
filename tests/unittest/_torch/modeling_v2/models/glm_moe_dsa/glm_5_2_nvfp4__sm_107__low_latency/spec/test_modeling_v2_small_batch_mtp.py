@@ -74,6 +74,8 @@ def reference_ops(monkeypatch):
 
 
 class _Metadata:
+    """A draft metadata stub that is its own MTP index-share extension."""
+
     def __init__(self, batch, k=5):
         self._seq_lens = torch.full((batch,), k + 1, dtype=torch.int32)
         self.seq_lens_cuda = self._seq_lens.clone()
@@ -96,10 +98,28 @@ class _Metadata:
     def set_mtp_num_accepted(self, value):
         self.mtp_num_accepted = value
 
-    def on_update(self):
-        self.num_tokens = int(self._seq_lens.sum())
+    def reset_mtp_index_share(self):
+        self.set_skip_topk(False)
+        self.set_in_mtp_draft_loop(False)
+        self.set_mtp_num_accepted(None)
 
-    def update_for_spec_dec(self):
+    def find_ext(self, extension_type):
+        return self
+
+    ext = find_ext
+
+    def set_seq_lens(self, rows, *, host=None, device=None, update_counts=False):
+        if host is not None:
+            self._seq_lens[rows] = host
+        if device is not None:
+            self.seq_lens_cuda[rows] = device
+        if update_counts:
+            self.num_tokens = int(self._seq_lens.sum())
+
+    def lengths_for_kernel_update(self):
+        return {"seq_lens_cuda": self.seq_lens_cuda, "kv_lens_cuda": self.kv_lens_cuda}
+
+    def before_forward(self):
         self.updates.append((self.seq_lens_cuda.clone(), self.kv_lens_cuda.clone()))
 
 
@@ -192,7 +212,10 @@ def _loop_fixture(batch, fail_step=None, eligible=True, tp_size=4, k=None, accep
         return value, None
 
     worker = SimpleNamespace(
-        _drafted_rows=None, draft_kv_cache_context=draft_context, _run_draft_forward=run_forward
+        _drafted_rows=None,
+        draft_kv_cache_context=draft_context,
+        _run_draft_forward=run_forward,
+        refresh_draft=metadata.before_forward,
     )
     return worker, helper, inputs, metadata, spec, counts, calls, preflights
 
@@ -542,7 +565,6 @@ def test_worker_checks_configured_runtime_and_allocated_draft_shape(
 
     rows = batch * (runtime_k + 1)
     meta = _Metadata(batch, runtime_k)
-    monkeypatch.setattr(worker_module, "MTPIndexShareMetadata", _Metadata)
     layer, lm_head = object(), object()
     helper = SimpleNamespace(
         layer=layer,

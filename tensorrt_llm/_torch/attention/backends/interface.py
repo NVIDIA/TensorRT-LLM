@@ -1,47 +1,133 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import contextlib
-import copy
 import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Generic,
+                    List, Optional, Protocol, Sequence, Tuple, Type, TypeVar,
+                    Union)
 
 import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
-    from ...attention.backends.prims_ts.vc_attention.quantization import \
-        VCAttentionOperands
+    from ...attention.backends.prims_ts.vc_attention.quantization import VCAttentionOperands
     from ...model_config import ModelConfig
-    from ...modules.mamba.mamba2_metadata import Mamba2Metadata
-    from ...pyexecutor.kv_cache.mixed_precision_staging import \
-        MixedPrecisionKVStaging
+    from ...pyexecutor.llm_request import LlmRequest
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from ..kernels.sage_quant import SageQuantized
     from .fmha.gqa_decode import KvAppendPlan
 
-from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
+from tensorrt_llm._utils import get_hf_rope_theta
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
                                      RopeEmbeddingUtils, RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ...memory_buffer_utils import Buffers, get_memory_buffers
+from ...host_staging import copy_host_to_device
+from ...memory_buffer_utils import Buffers
 from ...metadata import KVCacheParams
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from ...pyexecutor.resource_manager import KVCacheManager
 from ...pyexecutor.trace_log_utils import log_tensor_size
 from ...utils import get_model_extra_attrs
+from .core import AttentionRuntimeFeatures  # noqa: F401  (public import path)
+from .core import AttentionCoreMetadata
 from .cpp_schema import cpp_field
-from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
-                            SparseRuntimeParams)
+from .extensions import (ExtensionRegistry, MetadataExtension, init_field_owner,
+                         resolve_extension_order)
+from .sparse.params import SparseBackendForwardArgs, SparseRuntimeParams
+
+ExtensionT = TypeVar("ExtensionT", bound=MetadataExtension)
+_NO_EXTENSIONS = ExtensionRegistry()
+_ASSIGNABLE_NAMES: Dict[type, FrozenSet[str]] = {}
+# Composed metadata classes keyed by (core class, attached extension types).
+_COMPOSED_CLASSES: Dict[Tuple[type, Tuple[type, ...]], type] = {}
+
+
+def _forwarded_field(extension_type: type, name: str) -> property:
+    """A property reading and writing ``name`` on the attached ``extension_type``."""
+
+    def get(self):
+        return getattr(self.__dict__["_extensions"]._by_type[extension_type],
+                       name)
+
+    def set(self, value):
+        setattr(self.__dict__["_extensions"]._by_type[extension_type], name,
+                value)
+
+    return property(get, set, doc=f"{extension_type.__name__}.{name}")
+
+
+def _forwarded_method(extension_type: type, name: str) -> property:
+    """A property returning the attached ``extension_type``'s bound ``name``."""
+
+    def get(self):
+        return getattr(self.__dict__["_extensions"]._by_type[extension_type],
+                       name)
+
+    return property(get, doc=f"{extension_type.__name__}.{name}()")
+
+
+def _composed_class(core: type, extension_types: Tuple[type, ...]) -> type:
+    """``core`` with each extension's declared fields and methods forwarded.
+
+    One class per (core, extension types) combination, so ``isinstance``
+    against the core family holds and ``copy.copy`` keeps the forwarding.
+    """
+    key = (core, extension_types)
+    composed = _COMPOSED_CLASSES.get(key)
+    if composed is None:
+        namespace = {"_core_class": core, "__module__": core.__module__}
+        core_names = _assignable_names(core)
+        for extension_type in extension_types:
+            fields = extension_type.declared_fields()
+            methods = extension_type.declared_methods()
+            if extension_type.is_core:
+                # A metadata class that defines one of its core's names itself
+                # (a test double) keeps its own definition.
+                fields = {name for name in fields if not hasattr(core, name)}
+                methods = {name for name in methods if not hasattr(core, name)}
+            else:
+                shadowed = (fields | methods) & core_names
+                if shadowed:
+                    raise ValueError(
+                        f"{extension_type.__name__} declares {sorted(shadowed)}, "
+                        f"which {core.__name__} already defines")
+            for name in fields:
+                namespace[name] = _forwarded_field(extension_type, name)
+            for name in methods:
+                namespace[name] = _forwarded_method(extension_type, name)
+        names = ",".join(t.__name__ for t in extension_types)
+        composed = type(f"{core.__name__}[{names}]", (core, ), namespace)
+        _COMPOSED_CLASSES[key] = composed
+    return composed
+
+
+def _assignable_names(cls: type) -> FrozenSet[str]:
+    """Attribute names an instance of ``cls`` may assign.
+
+    Every name a class in the MRO declares (dataclass fields, annotations,
+    class attributes, properties, methods) plus each class's
+    ``_instance_attrs``.
+    """
+    names = _ASSIGNABLE_NAMES.get(cls)
+    if names is None:
+        collected = set()
+        for klass in cls.__mro__:
+            if klass is object:
+                continue
+            collected.update(vars(klass))
+            collected.update(vars(klass).get("__annotations__", ()))
+            collected.update(vars(klass).get("_instance_attrs", ()))
+        names = _ASSIGNABLE_NAMES[cls] = frozenset(collected)
+    return names
+
 
 try:
     # Transformers v5
@@ -50,17 +136,6 @@ except ImportError:
     # Transformers v4
     from transformers.configuration_utils import \
         ALLOWED_LAYER_TYPES as ALLOWED_ATTENTION_LAYER_TYPES
-
-
-@dataclass
-class AttentionRuntimeFeatures:
-    chunked_prefill: bool = False
-    cache_reuse: bool = False
-    has_speculative_draft_tokens: bool = False
-    # This is the chunk size for MLA chunked prefill, which splits KV cache into chunks.
-    chunk_size: int = 0
-    # The real chunk size for MLA chunked prefill is this value * chunk_size.
-    chunked_prefill_buffer_batch_size: int = 4
 
 
 # The type of requests in qkv passed to attention
@@ -72,437 +147,478 @@ class AttentionInputType(IntEnum):
 
 
 @dataclass(kw_only=True)
-class AttentionMetadata:
+class BatchInputs:
+    """One step's batch description, applied by ``AttentionMetadata.prepare``.
+
+    ``q_offsets`` / ``kv_offsets`` are optional packed-token boundaries
+    ``[num_seqs + 1]`` (int32); None means ``cumsum(seq_lens)``. Explicit
+    offsets may leave gaps between sequences (``offsets[i + 1] - offsets[i] >=
+    seq_lens[i]``); only metadata whose ``supports_explicit_offsets`` is True
+    honors offsets that differ from ``cumsum(seq_lens)``.
     """
-    Metadata for the attention module.
-    """
 
-    # The max number of requests in a single batch.
-    max_num_requests: int
-    # The max number of tokens in all requests in a single batch.
-    max_num_tokens: int
-    # The max number of sequences in a single batch.
-    max_num_sequences: Optional[int] = None
-    # The KV cache manager.
-    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
-    # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
-    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
-    mapping: Optional[Mapping] = None
-    # Sparse settings for metadata allocation/update; dense metadata leaves it None.
-    sparse_metadata_params: Optional[SparseMetadataParams] = None
-    # Paged KV-cache block layout:
-    # NHD: [max_num_pages, 2, page_size, num_kv_heads, head_dim]
-    # HND: [max_num_pages, 2, num_kv_heads, page_size, head_dim]
-    kv_layout: Literal["NHD", "HND"] = "HND"
-
-    enable_flash_mla: bool = False
-    enable_context_mla_with_cached_kv: bool = False
-    # Whether CUDA graph is enabled.
-    is_cuda_graph: bool = field(default=False, repr=False)
-
-    # The length of each sequence in the batch for query.
-    # The shape is (batch_size), and located on CPU memory.
-    # For sub metadata of cross attention, it's automatically
-    # initialized to seq_lens of parent metadata.
-    seq_lens: Optional[torch.Tensor]  # Implemented using property
-
-    # The number of context-phase sequences in the batch.
-    num_contexts: int  # Implemented using property
-
-    # The position of each token in each sequence.
-    # May be None if positional embedding is applied outside the backend.
-    position_ids: Optional[torch.Tensor] = None
-
-    # The number of context-phase sequences in the batch.
-    _num_contexts: int = field(init=False, default=0, repr=False)
-    # The parameters for the KV cache.
+    # Per-sequence query lengths [num_seqs] on the host; None keeps the bound
+    # lengths (CUDA graph metadata, whose lengths the graph runner owns).
+    seq_lens: Optional[torch.Tensor]
+    num_contexts: int
+    request_ids: List[int]
+    prompt_lens: List[int]
     kv_cache_params: Optional[KVCacheParams] = None
+    beam_width: int = 1
+    num_chunked_ctx_requests: int = 0
+    q_offsets: Optional[torch.Tensor] = None
+    kv_offsets: Optional[torch.Tensor] = None
+    # A device copy of ``seq_lens`` to bind as it is instead of staging one,
+    # shared with the metadata that owns it (a cross-attention sub-metadata
+    # shares its decoder's query lengths).
+    seq_lens_cuda: Optional[torch.Tensor] = None
+    # Per-sequence KV lengths on the host when they differ from the query
+    # lengths (cross attention); None keeps the bound ones.
+    seq_lens_kv: Optional[torch.Tensor] = None
+    # The step's inputs of the cross-attention sub-metadata, which prepares
+    # its own state from them.
+    cross: Optional["BatchInputs"] = None
+    # The step's scheduled context requests, which extensions read in their
+    # prepare, and whether context forwards may run in CUDA graphs.
+    context_requests: Optional[List["LlmRequest"]] = None
+    prefill_cuda_graphs: bool = False
+    # Per-sequence corrections [num_seqs] (int32, device) to the KV lengths the
+    # host-side ``kv_cache_params`` imply, known only on device when the step
+    # is prepared: lengths a previous step's forward changed after it was
+    # scheduled (accepted draft tokens, a draft rewind). Only metadata whose
+    # ``supports_kv_lens_offsets`` is True applies them.
+    kv_lens_offsets: Optional[torch.Tensor] = None
+    # Per-token corrections [num_tokens - num_ctx_tokens] (int32, device) to
+    # the positions of the generation tokens the host packed, from the same
+    # source as ``kv_lens_offsets``; Helix derives its rank-local lengths from
+    # the corrected positions.
+    position_id_offsets: Optional[torch.Tensor] = None
+    # Per-request part lengths of multi-item scoring; None when the batch
+    # does not score multiple items per request.
+    multi_item_part_lens: Optional[List[List[int]]] = None
 
-    # The length of each sequence in the batch for key and value.
-    # The shape is (batch_size), and located on CPU memory.
-    # It defaults to seq_lens if not set.
-    # Should only set explicitly for cross attention.
-    seq_lens_kv: Optional[torch.Tensor]  # Implemented using property
 
-    # Actual storage for seq_lens and seq_lens_kv
-    _seq_lens: Optional[torch.Tensor] = field(init=False,
-                                              repr=False,
-                                              default=None)
-    _seq_lens_kv: Optional[torch.Tensor] = field(init=False,
-                                                 repr=False,
-                                                 default=None)
+class AttentionMetadata:
+    """A container of the extensions that hold an attention metadata's state.
 
-    # A copy of seq_lens store on the GPU. Used in the logits
-    # processor. Using 2 copies avoids a lot of extraneous
-    # copies in flashinfer's prepare() implementation.
-    _seq_lens_cuda: Optional[torch.Tensor] = field(init=False,
-                                                   repr=False,
-                                                   default=None)
-    _seq_lens_kv_cuda: Optional[torch.Tensor] = field(init=False,
-                                                      repr=False,
-                                                      default=None)
+    The container holds no state of its own: its family's core
+    (``core_metadata_type``, always attached first) holds the batch layout and
+    the family's buffers, and every feature, sparse algorithm or model adds an
+    extension. The container drives their lifecycle and forwards their
+    declared fields and methods, so ``metadata.seq_lens`` reads the core's.
 
-    # For self attention, this is the sub metadata for cross attention
-    # that works together in one model.
-    # For cross attention, this is automatically inited to self,
-    # and must not be set explicitly.
-    cross: Optional["AttentionMetadata"] = None
+    Assigning a name that neither the container's classes nor an attached
+    extension declares raises ``AttributeError``.
+    """
 
-    # The request ID of each sequence in the batch.
-    # The shape is (batch_size).
-    request_ids: Optional[List[int]] = None
+    # Names a test double defined on a subclass may assign; the families keep
+    # their state in their core.
+    _instance_attrs: ClassVar[FrozenSet[str]] = frozenset()
+    # The core extension holding this family's batch layout and state.
+    core_metadata_type: ClassVar[
+        Type[AttentionCoreMetadata]] = AttentionCoreMetadata
+    # Whether ``prepare`` applies ``BatchInputs.kv_lens_offsets`` to the
+    # device KV lengths before the extensions prepare.
+    supports_kv_lens_offsets: ClassVar[bool] = False
+    # Whether the kernels read ``cu_q_seqlens`` / ``cu_kv_seqlens`` as given,
+    # so they may differ from cumsum(seq_lens). Metadata that derives the
+    # boundaries itself rejects offsets that differ.
+    supports_explicit_offsets: ClassVar[bool] = False
 
-    # The prompt length of each sequence in the batch.
-    # For context-phase sequence, the value is its token number, which is same with `context_lens`.
-    # For generation-phase sequence, the value is the token number of its context phase.
-    # The shape is (batch_size) if provided.
-    prompt_lens: Optional[List[int]] = None
+    # Extensions a backend's metadata class attaches to every instance; set on
+    # the class AttentionBackend derives from its ``metadata_extensions``.
+    backend_extension_types: ClassVar[Tuple[Type[MetadataExtension], ...]] = ()
 
-    # Explicit query/KV sequence boundaries for attention kernels that operate
-    # on packed varlen context inputs. These are sequence/segment boundaries,
-    # not necessarily request boundaries.
-    cu_q_seqlens: Optional[torch.Tensor] = None
-    cu_kv_seqlens: Optional[torch.Tensor] = None
+    # The attached extensions, the core first; see extensions.py.
+    _extensions: ExtensionRegistry
 
-    # These fields indicate whether the runtime can use various features.
-    # The kernels may or may not have different behaviors when these
-    # are enabled.
-    runtime_features: AttentionRuntimeFeatures = field(
-        default_factory=AttentionRuntimeFeatures)
+    def __init__(self,
+                 *,
+                 extension_types: Sequence[Type[MetadataExtension]] = (),
+                 copy_of: Optional["AttentionMetadata"] = None,
+                 **kwargs: Any) -> None:
+        """Construct the core and the extensions, routing each argument to its owner.
 
-    # The number of tokens in each rank.
-    all_rank_num_tokens: Optional[List[int]] = None
+        Every keyword argument is a field some extension takes (its
+        ``init_fields``). The extensions attached are the family's defaults,
+        chosen from the arguments, plus ``extension_types``. An argument whose
+        owner is not attached is an error unless it is None, which means not
+        given; an argument no extension takes is an error.
+
+        Each extension's constructor allocates its buffers, in dependency
+        order and the core first, so it can read the extensions constructed
+        before it. ``copy_of`` makes this metadata a copy of another (see
+        ``constructed_copy``): every extension takes its declared ``shared``
+        attributes from that metadata's.
+        """
+        cls = type(self)
+        core_type = cls.core_metadata_type
+        # The backend's extensions follow the family's, whose state (such as
+        # the speculative-decoding settings) they read when constructed.
+        types = resolve_extension_order([
+            *cls.default_extension_types(kwargs), *cls.backend_extension_types,
+            *extension_types
+        ])
+        # Extensions that need the complete metadata come last.
+        types = ([t for t in types if not t.constructed_last] +
+                 [t for t in types if t.constructed_last])
+        owners: Dict[str, type] = {}
+        for owner in (core_type, *types):
+            for name in owner.declared_init_fields():
+                owners.setdefault(name, owner)
+        routed: Dict[type, Dict[str, Any]] = {}
+        for name, value in kwargs.items():
+            owner = owners.get(name)
+            if owner is not None:
+                routed.setdefault(owner, {})[name] = value
+                continue
+            elsewhere = init_field_owner(name)
+            if elsewhere is None:
+                raise TypeError(f"{cls.__name__}() got an unexpected keyword "
+                                f"argument {name!r}")
+            if value is not None:
+                raise TypeError(
+                    f"{cls.__name__}() got {name!r}, which "
+                    f"{elsewhere.__name__} takes, but does not attach it")
+        missing = [
+            name for name in core_type.required_init_fields
+            if name not in routed.get(core_type, {})
+        ]
+        if missing:
+            raise TypeError(f"{cls.__name__}() missing required keyword "
+                            f"arguments {missing}")
+        sources = ({} if copy_of is None else {
+            type(e): e
+            for e in copy_of._attached_extensions()
+        })
+        registry = ExtensionRegistry(self)
+        self.__dict__["_extensions"] = registry
+        registry.attach_new_core(self, core_type, routed.get(core_type, {}),
+                                 sources.get(core_type))
+        registry.attach(self, types, routed, sources)
+
+    def constructed_copy(self,
+                         *,
+                         share: bool = True,
+                         without: Sequence[Type[MetadataExtension]] = (),
+                         **changes: Any) -> Self:
+        """A new metadata built from this one's configuration, with ``changes``.
+
+        Every extension attached now is attached to the copy, constructed with
+        this metadata's current creation arguments (each extension's
+        ``creation_config``) updated by ``changes``; the copy allocates its own
+        buffers from its pool and, with ``share``, takes the ``shared``
+        attributes from this metadata's extensions. Extensions of the types
+        in ``without`` are left out. For CUDA graph, cross-attention and draft
+        metadata.
+        """
+        config: Dict[str, Any] = {}
+        for extension in self._attached_extensions():
+            if not isinstance(extension, tuple(without)):
+                config.update(extension.creation_config())
+        config.update(changes)
+        types = [
+            extension_type
+            for extension_type in self._attached_extensions().types()
+            if not extension_type.is_core
+            and not issubclass(extension_type, tuple(without))
+        ]
+        return self.core_class()(extension_types=types,
+                                 copy_of=self if share else None,
+                                 **config)
+
+    @classmethod
+    def default_extension_types(
+            cls, settings: Dict[str, Any]) -> List[Type[MetadataExtension]]:
+        """Extensions this family attaches, chosen from the constructor arguments."""
+        from .features import CrossAttentionMetadata, DraftMetadata
+        types: List[Type[MetadataExtension]] = [DraftMetadata]
+        if isinstance(settings.get("kv_cache_manager"), BaseMambaCacheManager):
+            from .features.recurrent import RecurrentMetadata
+            types.append(RecurrentMetadata)
+        if (settings.get("cross") is not None
+                or settings.get("seq_lens_kv") is not None):
+            types.append(CrossAttentionMetadata)
+        return types
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name not in _assignable_names(type(self)):
+            if self._routes_to_core(name):
+                # A metadata built without __init__ (as some tests do) gets
+                # its core first; the composed class then forwards the write.
+                self._ensure_core()
+                setattr(self, name, value)
+                return
+            raise AttributeError(
+                f"{type(self).__name__} declares no attribute {name!r}; keep "
+                "feature or model state in a MetadataExtension")
+        object.__setattr__(self, name, value)
+
+    def __getattr__(self, name: str) -> Any:
+        # Reached only when normal lookup fails: route a core field of a
+        # metadata built without __init__ (as some tests do) to its core.
+        if self._routes_to_core(name):
+            self._ensure_core()
+            return getattr(self, name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def _routes_to_core(self, name: str) -> bool:
+        if name.startswith("__"):
+            return False
+        registry = self.__dict__.get("_extensions")
+        if registry is not None and registry.core() is not None:
+            return False
+        return name in type(self).core_metadata_type.declared_names()
+
+    def __copy__(self) -> Self:
+        """A shallow copy that owns a copy of the core state.
+
+        The other extensions stay shared until the copy binds its own registry
+        (``bound_to``), as with any ``copy.copy`` view of the metadata.
+        """
+        clone = object.__new__(type(self))
+        clone.__dict__.update(self.__dict__)
+        registry = self.__dict__.get("_extensions")
+        if registry is not None:
+            clone.__dict__["_extensions"] = registry.with_core_copied(clone)
+        return clone
+
+    def core(self) -> AttentionCoreMetadata:
+        """This metadata's core: its batch layout and family state."""
+        return self._ensure_core()
+
+    def _ensure_core(self) -> AttentionCoreMetadata:
+        """Bind this metadata's registry and attach its core first, if missing."""
+        registry = self.__dict__.get("_extensions")
+        if registry is None or registry.owner is not self:
+            registry = (registry or _NO_EXTENSIONS).bound_to(self)
+            self.__dict__["_extensions"] = registry
+        core = registry.core()
+        if core is None:
+            # A metadata made without __init__ (as some tests do) gets its
+            # family's core with the default configuration: no capacities.
+            core = registry.attach_new_core(self,
+                                            type(self).core_metadata_type, {},
+                                            None)
+        return core
 
     def get_adp_token_counts(self) -> List[int]:
-        """Local execution-stage counts carried by the input count exchange."""
-        return [self.num_tokens]
+        """Local execution-stage counts carried by the input count exchange.
+
+        The first stage is the input (``num_tokens``, unless an extension
+        declares ``adp_input_token_count``); each extension may append its own.
+        """
+        input_tokens = self.find("adp_input_token_count", None)
+        if input_tokens is None:
+            input_tokens = self.num_tokens
+        return [input_tokens, *(self.find("adp_token_counts", None) or ())]
 
     def set_adp_token_counts(self, counts: List[List[int]]) -> List[int]:
         """Save stage counts and return the input-stage counts for padding."""
+        if len(counts) > 1:
+            self.find("receive_adp_token_counts")(counts[1:], counts[0])
         return counts[0]
 
-    # These fields are set when changing seq_lens and _num_contexts to avoid computation
-    # during execution. If the calculation happens during execution, torch compile treats it
-    # as DDS and fails to compile.
-    _num_generations: int = field(init=False, default=0, repr=False)
-    _num_ctx_tokens: int = field(init=False, default=0, repr=False)
-    _num_tokens: int = field(init=False, default=0, repr=False)
+    def find(self, name: str, default: Any = None) -> Any:
+        """An attached extension's declared field or bound method, or ``default``.
 
-    mamba_metadata: Optional[Any] = None
-    mamba_chunk_size: int = 128
-    mamba_metadata_cls: Optional[Type["Mamba2Metadata"]] = None
-
-    # The number of tokens in the padded sequence.
-    padded_num_tokens: Optional[int] = None
-
-    # This buffer is currently only used for TrtllmAttentionMetadata.
-    cache_indirection: Optional[torch.Tensor] = None
-    cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
-
-    _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
-                                                    default_factory=dict)
-    # Upper bound on query heads per KV head over the target model's layers
-    # (unsharded); sizes the spec-dec tree mask.
-    max_num_heads_per_kv: Optional[int] = 1
-
-    multi_item_part_lens: Optional[list[list[int]]] = None
-    """Additional token layout information for multi-item scoring.
-
-    Aggregates `TokensPrompt.multi_item_part_lens` for all requests in the batch,
-    see `TokensPrompt` for details.
-    """
-
-    # Mixed-precision KV: the staging copy attention reads, created by the
-    # first prepare() on a manager with mixed-precision layers.
-    mixed_precision_staging: Optional["MixedPrecisionKVStaging"] = field(
-        init=False, default=None, repr=False, compare=False)
-    # The same for the MTP layers of a separate draft manager; swapped in for draft forwards.
-    draft_mixed_precision_staging: "MixedPrecisionKVStaging | None" = field(
-        init=False, default=None, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if self.is_cross:
-            assert self.cross is None or self.cross is self, "Cross attention metadata should not have sub metadata"
-            self.cross = self
-            return
-
-        assert self.cross is None or type(self) is type(
-            self.cross
-        ), "Top level and cross attention sub metadata type mismatched"
-
-    def on_update_kv_lens(self):
-        pass
-
-    def on_update(self):
-        if (self._seq_lens is not None
-                and self._seq_lens.shape[0] >= self.num_contexts
-                and self.num_contexts >= 0):
-            self._num_ctx_tokens = self._seq_lens[:self.num_contexts].sum(
-            ).item()
-            self._num_generations = self._seq_lens.shape[0] - self.num_contexts
-        if self._seq_lens_kv is not None:
-            self._num_tokens = self._seq_lens_kv.sum().item()
-        elif self._seq_lens is not None:
-            self._num_tokens = self._seq_lens.sum().item()
-
-    @property
-    def seq_lens(self) -> Optional[torch.Tensor]:
-        return self._seq_lens
-
-    @seq_lens.setter
-    def seq_lens(self, value: Optional[torch.Tensor]):
-        # If value not explicitly given, dataclass tries to initialize using class attribute
-        value = value if value is not AttentionMetadata.seq_lens else None
-        self._seq_lens = value
-        self.on_update()
-
-        # The model executor sets seq_lens to None initially.
-        if self._seq_lens is not None:
-            self._seq_lens = maybe_pin_memory(self._seq_lens)
-
-            if self.is_cuda_graph and self._seq_lens_cuda is not None:
-                # Very important: do not reallocate if we are using CUDA graphs.
-                # This copy is safe because the batch size is guaranteed to not
-                # change in the CUDA graph case. The seqlens can change if we
-                # are doing spec decode.
-                self._seq_lens_cuda.copy_(self._seq_lens, non_blocking=True)
-            else:
-                self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
-
-        if self.has_cross_sub_metadata:
-            self.cross._seq_lens = self._seq_lens
-            self.cross._seq_lens_cuda = self._seq_lens_cuda
-
-    @property
-    def num_contexts(self) -> int:
-        return self._num_contexts
-
-    @num_contexts.setter
-    def num_contexts(self, value: int):
-        value = value if value is not AttentionMetadata.num_contexts else 0
-        self._num_contexts = value
-        self.on_update()
-
-    @property
-    def num_generations(self) -> int:
-        return self._num_generations
-
-    @num_generations.setter
-    def num_generations(self, value: int):
-        value = value if value is not AttentionMetadata.num_generations else 0
-        self._num_generations = value
-        self.on_update()
-
-    @property
-    def seq_lens_cuda(self):
-        return self._seq_lens_cuda
-
-    @property
-    def seq_lens_kv(self) -> Optional[torch.Tensor]:
-        return self._seq_lens_kv if self._seq_lens_kv is not None else self._seq_lens
-
-    @seq_lens_kv.setter
-    def seq_lens_kv(self, value: Optional[torch.Tensor]):
-        value = value if value is not AttentionMetadata.seq_lens_kv else None
-        self._seq_lens_kv = value
-        self.on_update()
-        # The model executor sets seqlens to None initially.
-        if self._seq_lens_kv is not None:
-            self._seq_lens_kv = maybe_pin_memory(self._seq_lens_kv)
-            if self.is_cuda_graph and self._seq_lens_kv_cuda is not None:
-                self._seq_lens_kv_cuda.copy_(self._seq_lens_kv,
-                                             non_blocking=True)
-            else:
-                self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(
-                    non_blocking=True)
-
-    @property
-    def seq_lens_kv_cuda(self):
-        return self._seq_lens_kv_cuda if self._seq_lens_kv_cuda is not None else self._seq_lens_cuda
-
-    @property
-    def context_lens(self) -> torch.Tensor:
+        For values the core or the engine reads from whichever extension
+        provides them, such as ``kv_cache_pools`` or ``full_block_table_width``.
         """
-        The length of each context-phase query sequence in the batch.
-        The shape is (num_contexts), where num_contexts is the number of context-phase sequences in the batch.
+        for extension in self._attached_extensions():
+            declared = type(extension)
+            if name in declared.declared_fields(
+            ) or name in declared.declared_methods():
+                return getattr(extension, name)
+        return default
+
+    @classmethod
+    def core_class(cls) -> type:
+        """The metadata family class, without the forwarding of a composed class."""
+        return cls.__dict__.get("_core_class", cls)
+
+    def _compose(self) -> None:
+        """Switch to the composed class of the attached extensions.
+
+        The composed class forwards each extension's declared fields and
+        methods, so callers read ``metadata.field`` instead of
+        ``metadata.ext(T).field``.
         """
-        return self.seq_lens[:self.num_contexts]
+        extension_types = tuple(self._attached_extensions().types())
+        object.__setattr__(self, "__class__",
+                           _composed_class(self.core_class(), extension_types))
+
+    def own_attribute_names(self) -> FrozenSet[str]:
+        """Names this metadata's family defines; extensions may not shadow them."""
+        return _assignable_names(self.core_class())
+
+    def _attached_extensions(self) -> ExtensionRegistry:
+        # Metadata built without __init__ (as some tests do) has no registry.
+        return self.__dict__.get("_extensions", _NO_EXTENSIONS)
+
+    def ext(self, cls: Type[ExtensionT]) -> ExtensionT:
+        """The attached extension of type ``cls``; raises when none is."""
+        found = self._attached_extensions().find(cls)
+        if found is None:
+            raise LookupError(
+                f"{type(self).__name__} has no {cls.__name__} extension attached."
+            )
+        return found
+
+    def find_ext(self, cls: Type[ExtensionT]) -> Optional[ExtensionT]:
+        """The attached extension of type ``cls``, or None."""
+        return self._attached_extensions().find(cls)
+
+    def add_ext(self, cls: Type[ExtensionT]) -> ExtensionT:
+        """Construct and attach ``cls`` and its requirements if absent; return the extension."""
+        self._ensure_core()
+        self._extensions.attach(self, (cls, ))
+        return self.ext(cls)
+
+    def replace_ext(self, extension: MetadataExtension) -> None:
+        """Attach a built extension in place of any of its type.
+
+        For derived views made by ``copy.copy``: binds this metadata to its own
+        registry first, so the source keeps its extensions.
+        """
+        assert extension.metadata is self, "the extension must be built for this metadata"
+        if not extension.is_core:
+            self._ensure_core()
+        elif self.__dict__.get(
+                "_extensions") is None or self._extensions.owner is not self:
+            self._extensions = self._attached_extensions().bound_to(self)
+        self._extensions.replace(extension)
+        self._compose()
+
+    def remove_ext(self, cls: Type[MetadataExtension]) -> None:
+        """Detach the extension of type ``cls`` from a derived view.
+
+        Like ``replace_ext``, binds this metadata to its own registry first.
+        """
+        self._ensure_core()
+        self._extensions.remove(cls)
+        self._compose()
 
     @property
-    def num_seqs(self) -> int:
-        """
-        The number of sequences in the batch.
-        """
-        return self.seq_lens.shape[0]
+    def extensions(self) -> List[MetadataExtension]:
+        """The attached extensions in dependency order."""
+        return list(self._attached_extensions())
 
-    @property
-    def is_cross(self) -> bool:
+    def get_buffer(self, shape: Sequence[int], dtype: torch.dtype,
+                   name: str) -> torch.Tensor:
+        """A persistent buffer from this metadata's pool, graph-stable under capture."""
+        return self.get_empty(self.cuda_graph_buffers,
+                              list(shape),
+                              dtype=dtype,
+                              cache_name=name,
+                              capture_graph=self.is_cuda_graph)
+
+    def stage_to_device(self, key: Any, destination: torch.Tensor,
+                        value: torch.Tensor) -> None:
+        """Copy a host tensor into ``destination`` through pinned staging."""
+        copy_host_to_device(self.core()._host_staging, key, destination, value)
+
+    def adopts_target_state(self) -> bool:
+        """Whether every attached extension takes a draft's state from its target's."""
+        return all(
+            type(extension).adopts_target_state
+            for extension in self._attached_extensions())
+
+    def check_lengths_current(self) -> None:
+        """Raise when the lengths changed in place without a refresh.
+
+        The attention forward calls it: state derived from the lengths would
+        be stale.
         """
-        Is this metadata for cross attention.
-        """
-        return self.seq_lens is not self.seq_lens_kv
+        if self.lengths_changed:
+            raise RuntimeError(
+                f"{type(self).__name__}'s lengths changed in place since its "
+                "last prepare or draft refresh; refresh the draft before its "
+                "forward")
 
     @property
     def has_cross_sub_metadata(self) -> bool:
-        return self.cross is not None and self.cross is not self
+        """Whether this metadata carries a cross-attention sub-metadata."""
+        from .features import CrossAttentionMetadata
+        cross = self.find_ext(CrossAttentionMetadata)
+        return cross is not None and cross.has_sub_metadata
 
-    @property
-    def num_ctx_tokens(self) -> int:
-        return self._num_ctx_tokens
+    def prepare(self,
+                inputs: Optional[BatchInputs] = None,
+                *,
+                context_requests: Optional[List["LlmRequest"]] = None,
+                prefill_cuda_graphs: bool = False) -> None:
+        """Prepare this step's state before the model forward.
 
-    @property
-    def num_tokens(self) -> int:
-        return self._num_tokens
+        ``inputs`` replaces the batch description; without it the fields
+        already set are used. ``inputs.cross`` prepares the cross-attention
+        sub-metadata after this metadata. ``context_requests`` (or
+        ``inputs.context_requests``) are this step's scheduled context requests,
+        which extensions read in their own ``prepare``.
 
-    def prepare(self):
+        The core derives first; every other extension then prepares in
+        dependency order and may correct the core's state only through core
+        methods.
         """
-        Hook to be called before the forward step of the model.
+        core = self.core()
+        if inputs is not None:
+            if (inputs.kv_lens_offsets is not None
+                    and not self.supports_kv_lens_offsets):
+                raise ValueError(
+                    f"{type(self).__name__} keeps no device KV lengths to "
+                    "apply kv_lens_offsets to")
+            core.apply_batch_inputs(inputs)
+            if context_requests is None:
+                context_requests = inputs.context_requests
+                prefill_cuda_graphs = inputs.prefill_cuda_graphs
+        core.set_context_requests(context_requests, prefill_cuda_graphs)
+        if not self.supports_explicit_offsets:
+            self._check_offsets_match_lengths()
+        self._prepare_core()
+        for extension in self._attached_extensions():
+            if extension is not core:
+                extension.prepare()
+        # Core corrections extensions made in their prepare (Rocket, Helix)
+        # are part of the step's derivation.
+        core.clear_lengths_changed()
+        if inputs is not None and inputs.cross is not None:
+            from .features import CrossAttentionMetadata
+            self.ext(CrossAttentionMetadata).prepare_sub_metadata(inputs.cross)
+
+    def _check_offsets_match_lengths(self) -> None:
+        """Reject explicit boundaries this metadata's kernels would ignore."""
+        for offsets, lengths, name in ((self.cu_q_seqlens, self.seq_lens,
+                                        "cu_q_seqlens"),
+                                       (self.cu_kv_seqlens, self.seq_lens_kv,
+                                        "cu_kv_seqlens")):
+            if offsets is None or lengths is None:
+                continue
+            expected = torch.zeros(lengths.numel() + 1, dtype=torch.int64)
+            torch.cumsum(lengths.to(torch.int64), 0, out=expected[1:])
+            if not torch.equal(offsets.cpu().to(torch.int64)[:expected.numel()],
+                               expected):
+                raise ValueError(
+                    f"{type(self).__name__} derives sequence boundaries from "
+                    f"seq_lens and cannot honor a {name} that differs from "
+                    "their cumulative sum")
+
+    def _prepare_core(self) -> None:
+        """Derive the core's per-step state; ``prepare`` runs the extensions around it."""
+        self.core().derive()
+
+    def prepare_encoder_only(self,
+                             inputs: Optional[BatchInputs] = None) -> None:
+        """Encoder-only (no-KV-cache) forward setup.
+
+        ``inputs`` replaces the batch description; without it the fields
+        already set are used. The core defaults to the full ``prepare()``; a
+        family with a leaner encoder-only path overrides it in its core.
         """
-        self._prepare_mamba_metadata()
-
-    def _has_mixed_precision_staging(self) -> bool:
-        """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
-        # isinstance guards against mocks and against V1 managers, which have
-        # no mixed-precision layers.
-        high_layers = getattr(self.kv_cache_manager,
-                              "mixed_precision_high_layers", None)
-        return isinstance(high_layers, dict) and bool(high_layers)
-
-    def prepare_mixed_precision_kv(self, layout: str,
-                                   tokens_per_block: int) -> None:
-        """Create the staging copies on first use, then refresh them per batch."""
-        self.mixed_precision_staging = self._refresh_mixed_precision_kv(
-            self.mixed_precision_staging, self.kv_cache_manager, "mixed",
-            layout, tokens_per_block)
-        draft = self.draft_kv_cache_manager
-        draft_high_layers = getattr(draft, "mixed_precision_high_layers", None)
-        # A draft view runs on the draft manager itself and has no draft of its own.
-        if (draft is not self.kv_cache_manager
-                and isinstance(draft_high_layers, dict) and draft_high_layers):
-            self.draft_mixed_precision_staging = self._refresh_mixed_precision_kv(
-                self.draft_mixed_precision_staging, draft, "draft_mixed",
-                layout, tokens_per_block)
-
-    def sync_draft_mixed_precision_staging(
-            self) -> "MixedPrecisionKVStaging | None":
-        """Give the draft staging copy the target's lengths at the start of a draft forward.
-
-        A mixed-precision MTP draft manager holds the same tokens as the target manager,
-        and overlap-scheduler corrections may have changed the target's lengths on the
-        device since prepare().
-
-        Returns:
-            The draft staging copy; None without a separate mixed-precision draft manager.
-        """
-        draft = self.draft_mixed_precision_staging
-        if draft is not None:
-            draft.lengths.copy_(self.mixed_precision_staging.lengths)
-        return draft
-
-    def _refresh_mixed_precision_kv(
-            self, view: "MixedPrecisionKVStaging | None",
-            manager: KVCacheManagerV2, name: str, layout: str,
-            tokens_per_block: int) -> "MixedPrecisionKVStaging":
-        from ...pyexecutor.kv_cache.mixed_precision_staging import \
-            MixedPrecisionKVStaging
-
-        if view is None or view.manager is not manager:
-            # Built once per metadata object (eager or CUDA graph copy); the
-            # reserved buffer-pool block is shared, so the staging copy is
-            # allocated and zeroed once per rank and the KV budget profiling
-            # run already accounts for it.
-            buffers = (self.cuda_graph_buffers if self.cuda_graph_buffers
-                       is not None else get_memory_buffers())
-            view = MixedPrecisionKVStaging(manager,
-                                           buffers,
-                                           rows=self.max_num_sequences
-                                           or self.max_num_requests,
-                                           layout=layout,
-                                           pool_layout=self.kv_layout,
-                                           tokens_per_block=tokens_per_block,
-                                           name=name)
-            logger.info_once(
-                f"Mixed-precision KV staging ({name}) on this rank: "
-                f"{view.staging_bytes / (1 << 20):.1f} MiB = {view.rows} "
-                f"requests x {view.max_blocks_per_seq} pages x "
-                f"{view.max_page_bytes} B ({layout}, {tokens_per_block} "
-                "tokens per page)",
-                key=f"{name}_precision_kv_staging")
-        view.update(self.request_ids,
-                    self.kv_cache_params.num_cached_tokens_per_seq,
-                    self.seq_lens.tolist(),
-                    capture_graph=self.is_cuda_graph)
-        self._on_mixed_precision_kv_prepared(view)
-        return view
-
-    def _on_mixed_precision_kv_prepared(
-            self, view: "MixedPrecisionKVStaging") -> None:
-        """Backend hook: refresh backend-specific views of the staging cache."""
-
-    def get_mixed_precision_kv_view(
-            self, layer_idx: int) -> Optional["MixedPrecisionKVStaging"]:
-        """Return the staging cache of a mixed-precision layer, else None."""
-        staging = self.mixed_precision_staging
-        if (staging is None or layer_idx not in staging.pools
-                or staging.manager is not self.kv_cache_manager):
-            # No staging for a layer without a mixed-precision high pool, or of a manager not in use.
-            return None
-        return staging
-
-    @contextlib.contextmanager
-    def mixed_precision_kv_staging(self, layer_idx: int):
-        """Run attention on the staging copy, then write the new tokens back."""
-        view = self.get_mixed_precision_kv_view(layer_idx)
-        if view is None:
-            yield
-            return
-        view.convert(layer_idx)
-        saved = self._swap_mixed_precision_kv(view)
-        try:
-            yield
-        finally:
-            self._restore_mixed_precision_kv(saved)
-        view.convert(layer_idx, writeback=True)
-
-    def _swap_mixed_precision_kv(self,
-                                 view: "MixedPrecisionKVStaging") -> tuple:
-        """Point this metadata at the staging cache; return what to restore."""
-        saved = (self.kv_cache_manager, self.kv_layout)
-        self.kv_cache_manager = view
-        self.kv_layout = view.layout
-        return saved
-
-    def _restore_mixed_precision_kv(self, saved: tuple) -> None:
-        """Undo _swap_mixed_precision_kv."""
-        self.kv_cache_manager, self.kv_layout = saved
-
-    def prepare_encoder_only(self) -> None:
-        """Hook for encoder-only (no-KV-cache) forward setup.
-
-        Defaults to the full ``prepare()``; backends with a leaner encoder-only
-        path override this.
-        """
-        self.prepare()
-
-    def _prepare_mamba_metadata(self):
-        if self.mamba_metadata is False:
-            return
-
-        if self.mamba_metadata is None:
-            if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
-                metadata_cls = self.mamba_metadata_cls
-                if metadata_cls is None:
-                    from ...modules.mamba.mamba2_metadata import Mamba2Metadata
-                    metadata_cls = Mamba2Metadata
-                self.mamba_metadata = metadata_cls(
-                    self.max_num_requests,
-                    self.mamba_chunk_size,
-                    max_num_tokens=self.max_num_tokens)
-            else:
-                self.mamba_metadata = False
-                return
-
-        self.mamba_metadata.prepare(self)
+        if inputs is not None:
+            self.core().apply_batch_inputs(inputs)
+        self.core().prepare_encoder_only()
+        self.core().clear_lengths_changed()
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
@@ -522,98 +638,42 @@ class AttentionMetadata:
         if self.is_cuda_graph:
             return self
 
-        cuda_graph_metadata = copy.copy(self)
-        cuda_graph_metadata.is_cuda_graph = True
-        cuda_graph_metadata.cuda_graph_buffers = buffers
-        if self.has_cross_sub_metadata:
-            cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
-                max_batch_size, True, max_draft_tokens, buffers, encode_only)
-        if not sub_cross_metadata:
-            # Set to None to force the cuda graph metadata to allocate a tensor
-            # with the correct batch size. See seq_lens setter for how this works.
-            cuda_graph_metadata._seq_lens_cuda = None
-            if encode_only:
-                # Encoder: variable seq_lens per batch; the runner in-place
-                # updates them via the seq_lens setter each replay.
-                cuda_graph_metadata.seq_lens = torch.ones((max_batch_size, ),
-                                                          dtype=torch.int)
-            else:
-                cuda_graph_metadata.seq_lens = torch.ones(
-                    (max_batch_size, ),
-                    dtype=torch.int) * (1 + max_draft_tokens)
-        if self.is_cross:
-            cuda_graph_metadata.seq_lens_kv = torch.zeros((max_batch_size, ),
-                                                          dtype=torch.int)
-        if self.enable_flash_mla:
-            if self.kv_cache_manager is not None:
-                cuda_graph_metadata.block_ids_per_seq = torch.zeros(
-                    [
-                        self.kv_cache_manager.max_batch_size,
-                        self.kv_cache_manager.max_blocks_per_seq
-                    ],
-                    dtype=torch.int32,
-                    device='cuda',
-                )
-
-        if not encode_only:
-            # Decoder CUDA graphs are always generation-only (no context
-            # requests). Encoder CUDA graphs are the opposite (all context);
-            # the caller sets num_contexts = padded_batch_size.
-            cuda_graph_metadata.num_contexts = 0
-        cuda_graph_metadata.__post_init__()
+        cuda_graph_metadata = self.constructed_copy(
+            is_cuda_graph=True,
+            cuda_graph_buffers=buffers,
+            **self.core().cuda_graph_copy_changes(max_batch_size,
+                                                  max_draft_tokens))
+        graph_core = cuda_graph_metadata.core()
+        from .features import CrossAttentionMetadata
+        cross = cuda_graph_metadata.find_ext(CrossAttentionMetadata)
+        if cross is not None:
+            cross.copy_sub_metadata_for_cuda_graph(max_batch_size,
+                                                   max_draft_tokens, buffers,
+                                                   encode_only)
+        graph_core.reset_cuda_graph_lengths(
+            max_batch_size,
+            max_draft_tokens=max_draft_tokens,
+            sub_cross_metadata=sub_cross_metadata,
+            encode_only=encode_only)
         return cuda_graph_metadata
-
-    def prepare_for_spec_dec(self, *fields) -> None:
-        assert len(self._saved_tensors) == 0, (
-            "prepare_for_spec_dec called while fields "
-            f"{list(self._saved_tensors)} are still saved; a previous "
-            "forward likely raised between prepare_for_spec_dec and "
-            "restore_from_spec_dec")
-        for f in fields:
-            v = getattr(self, f)
-            assert isinstance(v, torch.Tensor), f"{f} is not a torch.Tensor"
-            self._saved_tensors[f] = v
-            setattr(self, f, v.clone())
-
-    def restore_from_spec_dec(self) -> None:
-        for f, v in self._saved_tensors.items():
-            setattr(self, f, v)
-        self._saved_tensors.clear()
-
-    @property
-    def has_spec_dec_saved_state(self) -> bool:
-        """True when prepare_for_spec_dec state has not been restored yet."""
-        return bool(self._saved_tensors)
 
     def update_spec_dec_param(
             self,
-            batch_size,
-            is_spec_decoding_enabled,
-            is_spec_dec_tree,
-            is_spec_dec_dynamic_tree,
-            max_draft_len,
-            max_total_draft_tokens,
+            batch_size: int,
             spec_metadata: Optional['SpecMetadata'] = None,
             spec_tree_manager: Optional['SpecTreeManager'] = None,
-            num_contexts: int = 0):
-        """
-        Hook to be called when using TRTLLM attention backend in spec-dec mode.
+            num_contexts: int = 0) -> None:
+        """Write one step's draft-token layout; the settings are creation config.
 
         ``num_contexts`` is the number of context (prefill) requests in the
         mixed batch, occupying the leading rows of slot-storage buffers.
         Backends that consume gen-only slots (e.g. dynamic tree) must skip
         these rows to align with the XQA kernel's expected row layout.
+        Metadata without speculative-decoding state ignores it.
         """
-
-    def update_helix_param(
-        self,
-        helix_position_offsets: List[int],
-        helix_is_inactive_rank: List[bool],
-        helix_owned_new_tokens: Optional[List[int]] = None,
-    ) -> None:
-        """
-        Hook to be called when using helix parallelism.
-        """
+        update = self.find("update")
+        if update is not None:
+            update(batch_size, spec_metadata, spec_tree_manager, num_contexts)
 
     def create_cross_metadata(
         self,
@@ -622,129 +682,15 @@ class AttentionMetadata:
                                       None] = None,
         encoder_num_cached_tokens_per_seq: Optional[List[int]] = None,
     ) -> "AttentionMetadata":
-        """Build a sub-metadata instance for cross-attention.
+        """Build a cross-attention sub-metadata; see ``CrossAttentionMetadata``.
 
-        The returned metadata shares Q-side fields (``seq_lens``,
-        ``request_ids``, ``num_contexts``) with ``self`` (the decoder
-        self-attention metadata) and overrides the K/V-side with the encoder
-        lengths so that ``returned.is_cross is True``.
-
-        This is intended to be called by the runtime / unit tests once the
-        encoder lengths and cross-pool KV cache manager are known. The
-        returned object is a *new* metadata instance (not stored on
-        ``self.cross``); callers can attach it to ``self.cross`` if desired.
-
-        Args:
-            encoder_seq_lens: Per-request encoder sequence lengths. On the
-                first decoder context step this is the full encoder length;
-                on generation steps it should be ``0`` (no new K/V tokens to
-                add to the cross pool — the encoder K/V are already cached).
-            cross_kv_cache_manager: KV cache manager for the cross pool.
-                When ``None``, the returned metadata uses the stateless
-                (no-KV-cache) path (suitable for unit tests).
-            encoder_num_cached_tokens_per_seq: Per-request count of encoder
-                K/V tokens already present in the cross pool. ``None``
-                defaults to 0 (context phase, nothing cached yet).
-
-        Returns:
-            A new ``AttentionMetadata`` of the same subclass as ``self``,
-            with ``seq_lens_kv`` set to ``encoder_seq_lens`` so that
-            ``is_cross`` becomes ``True``.
+        Attaches ``CrossAttentionMetadata`` on first use, so only models with
+        cross attention carry it.
         """
-        cross_md = copy.copy(self)
-        cross_md._saved_tensors = {}
-        if self.is_cuda_graph:
-            # Cross-attention has K/V lengths from the encoder, while
-            # self-attention has K/V lengths from the decoder. Keep their
-            # CUDA graph metadata buffers separate so preparing cross metadata
-            # cannot overwrite self-attention sequence lengths.
-            cross_md.cuda_graph_buffers = Buffers()
-        cross_md._seq_lens_kv_cuda = None
-        cross_md.cross = None
-        self._update_cross_metadata(
-            cross_md,
-            encoder_seq_lens,
-            cross_kv_cache_manager,
-            encoder_num_cached_tokens_per_seq,
-            base_kv_cache_params=self.kv_cache_params,
-            block_ids_per_seq=None,
-        )
-        cross_md.__post_init__()
-        return cross_md
-
-    def _update_cross_metadata(
-        self,
-        cross_md: "AttentionMetadata",
-        encoder_seq_lens: List[int],
-        cross_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None],
-        encoder_num_cached_tokens_per_seq: Optional[List[int]],
-        *,
-        base_kv_cache_params: Optional[KVCacheParams],
-        block_ids_per_seq: Optional[List[list]],
-    ) -> "AttentionMetadata":
-        encoder_seq_lens_tensor = torch.tensor(encoder_seq_lens,
-                                               dtype=torch.int)
-        cross_md.kv_cache_manager = cross_kv_cache_manager
-        cross_md._seq_lens = self.seq_lens
-        cross_md._seq_lens_cuda = self.seq_lens_cuda
-        cross_md.seq_lens_kv = encoder_seq_lens_tensor
-
-        # Cross-attention keeps decoder-side prompt lengths for the Q-side
-        # context metadata. Encoder-side lengths are represented by
-        # seq_lens_kv and kv_cache_params.num_cached_tokens_per_seq.
-        cross_md.prompt_lens = self.prompt_lens
-
-        if encoder_num_cached_tokens_per_seq is not None:
-            cross_md.kv_cache_params = KVCacheParams(
-                use_cache=(base_kv_cache_params.use_cache
-                           if base_kv_cache_params is not None else
-                           (cross_kv_cache_manager is not None)),
-                num_cached_tokens_per_seq=list(
-                    encoder_num_cached_tokens_per_seq),
-                block_ids_per_seq=block_ids_per_seq,
-                host_max_attention_window_sizes=(
-                    base_kv_cache_params.host_max_attention_window_sizes
-                    if base_kv_cache_params is not None else None),
-                host_sink_token_length=(
-                    base_kv_cache_params.host_sink_token_length
-                    if base_kv_cache_params is not None else None),
-                num_extra_kv_tokens=(base_kv_cache_params.num_extra_kv_tokens if
-                                     base_kv_cache_params is not None else 0),
-            )
-
-        cross_md.request_ids = self.request_ids
-        cross_md.num_contexts = self.num_contexts
-        return cross_md
-
-    def update_cross_metadata(
-        self,
-        encoder_seq_lens: List[int],
-        cross_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None],
-        encoder_num_cached_tokens_per_seq: Optional[List[int]] = None,
-    ) -> "AttentionMetadata":
-        """Refresh an existing CUDA graph cross-attention sub-metadata."""
-        if not self.has_cross_sub_metadata:
-            raise RuntimeError(
-                "CUDA graph cross-attention metadata has not been initialized.")
-
-        cross_md = self.cross
-        assert cross_md is not None
-        base_kv_cache_params = cross_md.kv_cache_params
-        block_ids_per_seq = (base_kv_cache_params.block_ids_per_seq
-                             if base_kv_cache_params is not None else None)
-        return self._update_cross_metadata(
-            cross_md,
-            encoder_seq_lens,
-            cross_kv_cache_manager,
-            encoder_num_cached_tokens_per_seq,
-            base_kv_cache_params=base_kv_cache_params,
-            block_ids_per_seq=block_ids_per_seq,
-        )
-
-    def update_for_spec_dec(self) -> None:
-        """
-        Hook to be called during forward when using spec-dec one-model mode.
-        """
+        from .features import CrossAttentionMetadata
+        return self.add_ext(CrossAttentionMetadata).create_sub_metadata(
+            encoder_seq_lens, cross_kv_cache_manager,
+            encoder_num_cached_tokens_per_seq)
 
     @staticmethod
     def get_empty(buffers: Buffers,
@@ -1179,6 +1125,32 @@ class AttentionBackend(Generic[TMetadata]):
     Base class for attention backends.
     """
     Metadata: Type[TMetadata] = AttentionMetadata
+    # Extensions every metadata of this backend carries, e.g. a sparse
+    # algorithm's state; see extensions.py.
+    metadata_extensions: Tuple[Type[MetadataExtension], ...] = ()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        extensions = cls.__dict__.get("metadata_extensions")
+        carried = cls.Metadata.backend_extension_types
+        if extensions and not all(
+                any(issubclass(have, wanted) for have in carried)
+                for wanted in extensions):
+            # Metadata built through ``cls.Metadata`` carries the backend's
+            # extensions, as a subclass of the inherited metadata class.
+            base = cls.Metadata
+            cls.Metadata = type(
+                f"{cls.__name__}Metadata", (base, ), {
+                    "__module__":
+                    cls.__module__,
+                    "backend_extension_types":
+                    (*base.backend_extension_types, *extensions),
+                })
+
+    @classmethod
+    def create_metadata(cls, **kwargs) -> TMetadata:
+        """Build this backend's metadata with its extensions attached."""
+        return cls.Metadata(**kwargs)
 
     def __init__(
         self,

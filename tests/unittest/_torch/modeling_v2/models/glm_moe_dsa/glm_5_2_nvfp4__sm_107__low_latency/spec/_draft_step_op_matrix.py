@@ -493,10 +493,17 @@ def check_tp8_worker_feedback_eager_and_graph() -> None:
         meta.set_in_mtp_draft_loop = lambda value, m=meta: setattr(m, "in_mtp_draft_loop", value)
         meta.set_skip_topk = lambda value, m=meta: setattr(m, "indexer_skip_topk", value)
         meta.set_mtp_num_accepted = lambda value, m=meta: setattr(m, "mtp_num_accepted", value)
-        meta.on_update = lambda: None
-        meta.update_for_spec_dec = lambda m=meta, s=seq, k=kv: m.updates.append(
-            (s.clone(), k.clone())
+        meta.reset_mtp_index_share = lambda m=meta: (
+            m.set_skip_topk(False),
+            m.set_in_mtp_draft_loop(False),
+            m.set_mtp_num_accepted(None),
         )
+        # The stub is its own MTP index-share extension.
+        meta.find_ext = meta.ext = lambda extension_type, m=meta: m
+        meta.set_seq_lens = lambda rows, *, host=None, device=None, update_counts=False, m=meta: (
+            m._seq_lens.__setitem__(rows, host) if host is not None else None
+        )
+        meta.before_forward = lambda m=meta, s=seq, k=kv: m.updates.append((s.clone(), k.clone()))
         helper = object.__new__(SmallBatchDraftKernels)
         helper.use_table, helper.hidden_size = True, HIDDEN
         helper.DRAFT_LEN = draft_len

@@ -23,9 +23,9 @@ import contextlib
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareMetadata
+from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareExtension
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
-from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker, _reset_mtp_index_share
+from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
 from tensorrt_llm._torch.speculative.mtp import _select_mtp_position_ids
 
 from . import dispatch
@@ -157,54 +157,51 @@ class GlmMtpWorker(MTPEagleWorker):
                 batch_size=batch_size,
             )
         else:
-            # The step-0 sequence lengths, before the draft loop rewrites them.
+            # The step-0 sequence lengths, before the draft loop changes them: the target's,
+            # which the draft loop never changes when it runs on the draft metadata.
             pre_draft_seq_lens = attn_metadata._seq_lens_cuda
-            # Save the old attn_metadata and spec_metadata
-            self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+            # The draft forwards run on the draft metadata, which leaves the target's
+            # untouched; without one, the target's state is saved and restored around the
+            # draft loop.
+            with self.draft_loop(attn_metadata) as draft_attn_metadata:
+                # Prepare inputs for the 1st draft model forward
+                position_ids = position_ids.squeeze(0)
+                if draft_loop_ops is not None:
+                    inputs = draft_loop_ops.first_drafter_inputs(position_ids, hidden_states)
+                else:
+                    inputs = self.prepare_1st_drafter_inputs(
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        hidden_states=hidden_states,
+                        accepted_tokens=accepted_tokens,
+                        attn_metadata=draft_attn_metadata,
+                        spec_metadata=spec_metadata,
+                        draft_model=draft_model,
+                    )
 
-            # Prepare inputs for the 1st draft model forward
-            position_ids = position_ids.squeeze(0)
-            if draft_loop_ops is not None:
-                inputs = draft_loop_ops.first_drafter_inputs(position_ids, hidden_states)
-            else:
-                inputs = self.prepare_1st_drafter_inputs(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    hidden_states=hidden_states,
-                    accepted_tokens=accepted_tokens,
-                    attn_metadata=attn_metadata,
-                    spec_metadata=spec_metadata,
-                    draft_model=draft_model,
+                # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here
+                # so the post-loop restore (below) can put attn_metadata back into a
+                # state the target model expects.
+                original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+
+                # Get the draft KV cache manager if using separate layouts
+                draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+
+                next_draft_tokens, loop_next_new_tokens = self._forward_draft_loop(
+                    inputs,
+                    draft_attn_metadata,
+                    spec_metadata,
+                    draft_model,
+                    draft_kv_cache_manager,
+                    num_contexts,
+                    num_gens,
+                    batch_size,
+                    num_accepted_tokens,
+                    original_all_rank_num_tokens,
+                    resource_manager,
+                    accepted_tokens,
+                    pre_draft_seq_lens,
                 )
-
-            # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here
-            # so the post-loop restore (below) can put attn_metadata back into a
-            # state the target model expects.
-            original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-
-            # Get the draft KV cache manager if using separate layouts
-            draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
-
-            next_draft_tokens, loop_next_new_tokens = self._forward_draft_loop(
-                inputs,
-                attn_metadata,
-                spec_metadata,
-                draft_model,
-                draft_kv_cache_manager,
-                num_contexts,
-                num_gens,
-                batch_size,
-                num_accepted_tokens,
-                original_all_rank_num_tokens,
-                resource_manager,
-                accepted_tokens,
-                pre_draft_seq_lens,
-            )
-            # restore attn_metadata to support cuda graph
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
-            # restore all_rank_num_tokens for attention DP
-            if original_all_rank_num_tokens is not None:
-                attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # prepare next new tokens to support overlap scheduler
         if draft_loop_ops is not None and draft_loop_ops.next_new_tokens is not None:
@@ -278,8 +275,6 @@ class GlmMtpWorker(MTPEagleWorker):
                 accepted_tokens=accepted_tokens,
                 pre_draft_seq_lens=pre_draft_seq_lens,
             )
-        from tensorrt_llm._torch.attention.backends.sparse.dsa import is_dsa_cache_manager
-
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
         next_draft_tokens = []
@@ -293,9 +288,7 @@ class GlmMtpWorker(MTPEagleWorker):
         # Sparse backends that can reuse one indexer selection across the draft
         # loop expose this setter; each indexer still decides whether its own
         # config turns the reuse on.
-        uses_mtp_index_share = self.is_mtp_eagle and isinstance(
-            attn_metadata, MTPIndexShareMetadata
-        )
+        index_share = attn_metadata.find_ext(MTPIndexShareExtension) if self.is_mtp_eagle else None
         # The draft tail (draft_tail): one launch for the draft LM head, the vocab-shard max
         # and the cross-rank argmax. Decided once per forward, before any device work,
         # identically on every TP rank.
@@ -318,32 +311,25 @@ class GlmMtpWorker(MTPEagleWorker):
                 self, draft_model, spec_metadata, draft_loop_ops
             )
         with contextlib.ExitStack() as draft_scope:
-            if uses_mtp_index_share:
-                attn_metadata.set_in_mtp_draft_loop(True)
+            if index_share is not None:
+                index_share.set_in_mtp_draft_loop(True)
                 # Accepted counts let the indexer stash each gen's last-accepted row.
-                attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
+                index_share.set_mtp_num_accepted(num_accepted_tokens)
                 # The metadata outlives this call, so clear the state even when a
                 # draft step raises: a stale draft-loop flag would make the next
                 # target forward reuse these selections. The loop writes
-                # set_skip_topk on the metadata yielded below, which is this same
-                # object: draft_kv_cache_context swaps buffers in place for every
-                # TrtllmAttentionMetadata, and sparse metadata all derive from it.
-                draft_scope.callback(_reset_mtp_index_share, attn_metadata)
+                # set_skip_topk on the extension of the metadata yielded below,
+                # which is this same object: draft_kv_cache_context yields a
+                # draft metadata as it is.
+                draft_scope.callback(index_share.reset_mtp_index_share)
             draft_attn_metadata = draft_scope.enter_context(
                 self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager)
             )
             attn_metadata = draft_attn_metadata
             inputs["attn_metadata"] = draft_attn_metadata
-            if self.is_mtp_eagle and is_dsa_cache_manager(draft_kv_cache_manager):
-                # Overlap scheduling corrects kv_lens_cuda from the runtime
-                # accepted-token counts inside the captured graph. The target
-                # forward refreshes target slot mappings during that correction;
-                # refresh once more after rebinding so the first draft forward
-                # writes the separate DSA indexer cache at the same positions.
-                attn_metadata.on_update_kv_lens()
             for i in range(runtime_draft_len):
-                if uses_mtp_index_share:
-                    attn_metadata.set_skip_topk(i > 0)
+                if index_share is not None:
+                    index_share.set_skip_topk(i > 0)
                 # Run draft model (mode-specific via helper). The helper
                 # passes ``all_rank_num_tokens`` as a kwarg so the draft model
                 # handles save/restore internally (Eagle3DraftModel.forward
@@ -545,6 +531,7 @@ class GlmMtpWorker(MTPEagleWorker):
                         num_accepted_tokens,
                         inputs["position_ids"] if i + 1 < runtime_draft_len else None,
                         gather_ids if i == 0 else None,
+                        self.refresh_draft,
                     )
                 if i + 1 < runtime_draft_len:
                     if self.is_mtp_eagle:
@@ -569,26 +556,23 @@ class GlmMtpWorker(MTPEagleWorker):
                 if draft_step is not None:
                     pass  # The draft-loop step update updated the metadata above.
                 elif i == 0:
-                    attn_metadata._seq_lens[:batch_size].fill_(1)
-                    attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
-                    attn_metadata.on_update()
+                    attn_metadata.set_seq_lens(
+                        slice(0, batch_size), host=1, device=1, update_counts=True
+                    )
                     has_kv_cache = inputs["attn_metadata"].kv_cache_manager is not None
-                    if has_kv_cache and hasattr(attn_metadata, "host_request_types"):
-                        attn_metadata.host_request_types[: attn_metadata.num_contexts].fill_(1)
                     if has_kv_cache:
-                        attn_metadata.num_contexts = 0
-                    if hasattr(attn_metadata, "kv_lens_cuda"):
-                        attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                            runtime_draft_len - num_accepted_tokens[num_contexts:]
-                        )
-                        attn_metadata.kv_lens_cuda[:num_contexts] += 1
-
-                    if has_kv_cache:
+                        # The context requests continue as one-token generation rows.
+                        attn_metadata.as_generation_rows()
                         self._prepare_flash_mla_generation_layout(
                             attn_metadata, num_contexts, batch_size
                         )
                     if hasattr(attn_metadata, "kv_lens_cuda"):
-                        attn_metadata.update_for_spec_dec()
+                        attn_metadata.adjust_kv_lens(
+                            slice(num_contexts, batch_size),
+                            num_accepted_tokens[num_contexts:batch_size] - runtime_draft_len,
+                        )
+                        attn_metadata.adjust_kv_lens(slice(0, num_contexts), 1)
+                        self.refresh_draft()
 
                     # Both Eagle3 and MTP Eagle drafters take ``draft_len + 1``
                     # tokens in the first draft step (attention runs in spec-dec
@@ -598,8 +582,8 @@ class GlmMtpWorker(MTPEagleWorker):
                     attn_metadata.use_spec_decoding = False
                 else:
                     if hasattr(attn_metadata, "kv_lens_cuda"):
-                        attn_metadata.kv_lens_cuda[:batch_size] += 1
-                        attn_metadata.update_for_spec_dec()
+                        attn_metadata.adjust_kv_lens(slice(0, batch_size), 1)
+                        self.refresh_draft()
         stacked = draft_loop_ops.finalize(next_draft_tokens) if draft_loop_ops is not None else None
         next_draft_tokens = (
             stacked if stacked is not None else torch.stack(next_draft_tokens, dim=1)

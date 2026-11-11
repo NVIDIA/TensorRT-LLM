@@ -13,7 +13,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import MLAParams, PositionalEmbeddingParams
-from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+    DSAMetadata,
+    DSAtrtllmAttentionMetadata,
+)
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
 from tensorrt_llm._torch.attention.backends.sparse.params import (
     get_indexer_mqa_logits_elem_budget,
@@ -35,6 +38,12 @@ from tensorrt_llm.deep_gemm import fp8_mqa_logits, fp8_paged_mqa_logits
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+
+def _dsa_state(metadata: DSAtrtllmAttentionMetadata) -> DSAMetadata:
+    """The DSA extension of ``metadata``, which holds the indexer and pool-view state."""
+    return metadata.ext(DSAMetadata)
+
 
 _INDEXER_MQA_LOGITS_ELEM_BUDGET = get_indexer_mqa_logits_elem_budget()
 
@@ -58,34 +67,35 @@ def transform_local_topk_and_prepare_pool_view(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Convert local topk indices to global pool indices and prepare KV pool.
 
-    Uses cached values from attn_metadata._ensure_pool_view_cached()
+    Uses the pool-view values the DSA metadata caches (DSAMetadata._ensure_pool_view_cached)
     to avoid redundant Python/CUDA overhead across layers.
     """
+    dsa = _dsa_state(attn_metadata)
     assert topk_indices.dtype == torch.int32
 
-    attn_metadata._ensure_pool_view_cached()
+    dsa._ensure_pool_view_cached()
     page_index_scale, layer_offset = (
         attn_metadata.kv_cache_manager.get_primary_pool_page_index_params(layer_idx)
     )
 
     if is_generation:
-        block_table = attn_metadata._cached_block_table_gen
-        req_idx = attn_metadata._cached_req_idx_gen
+        block_table = dsa._cached_block_table_gen
+        req_idx = dsa._cached_req_idx_gen
     else:
-        block_table = attn_metadata._cached_block_table_ctx
-        req_idx = attn_metadata._cached_req_idx_ctx
+        block_table = dsa._cached_block_table_ctx
+        req_idx = dsa._cached_req_idx_ctx
 
     global_indices = torch.ops.trtllm.convert_req_index_to_global(
         req_idx,
         block_table,
         topk_indices,
-        attn_metadata._cached_tokens_per_block,
+        dsa._cached_tokens_per_block,
         topk_indices.shape[1],
-        page_index_scale * attn_metadata._cached_tokens_per_block,
+        page_index_scale * dsa._cached_tokens_per_block,
         layer_offset,
     )
 
-    return global_indices, attn_metadata._cached_pool_view
+    return global_indices, dsa._cached_pool_view
 
 
 def transform_local_topk_and_prepare_pool_view_grouped(
@@ -110,24 +120,25 @@ def transform_local_topk_and_prepare_pool_view_grouped(
     is bit-identical to ``transform_local_topk_and_prepare_pool_view`` for the
     member with offset ``layer_ids[z]``. MLA-only path.
     """
+    dsa = _dsa_state(attn_metadata)
     assert topk_indices.dtype == torch.int32
 
-    attn_metadata._ensure_pool_view_cached()
+    dsa._ensure_pool_view_cached()
 
     if is_generation:
-        block_table = attn_metadata._cached_block_table_gen
-        req_idx = attn_metadata._cached_req_idx_gen
+        block_table = dsa._cached_block_table_gen
+        req_idx = dsa._cached_req_idx_gen
     else:
-        block_table = attn_metadata._cached_block_table_ctx
-        req_idx = attn_metadata._cached_req_idx_ctx
+        block_table = dsa._cached_block_table_ctx
+        req_idx = dsa._cached_req_idx_ctx
 
     global_indices = torch.ops.trtllm.convert_req_index_to_global_grouped(
         req_idx,
         block_table,
         topk_indices,
-        attn_metadata._cached_tokens_per_block,
+        dsa._cached_tokens_per_block,
         topk_indices.shape[1],
-        page_index_scale * attn_metadata._cached_tokens_per_block,
+        page_index_scale * dsa._cached_tokens_per_block,
         layer_ids,
     )
 
@@ -987,9 +998,10 @@ class Glm52Indexer(nn.Module):
             ctx_rows = topk_indices_buffer[ctx_last]
             rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
         if rows is not None:
-            shared_topk_indices = metadata.shared_topk_indices
+            index_share = _dsa_state(metadata).index_share
+            shared_topk_indices = index_share.shared_topk_indices
             if shared_topk_indices is None:
-                metadata.shared_topk_indices = rows.contiguous()
+                index_share.bind_buffers(shared_topk_indices=rows.contiguous())
             else:
                 row_start = num_contexts if is_generation else 0
                 shared_topk_indices[row_start : row_start + rows.shape[0], : rows.shape[1]].copy_(

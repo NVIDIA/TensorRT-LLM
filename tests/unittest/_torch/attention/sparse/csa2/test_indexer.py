@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
 from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import CSA2CompressionBatch
 from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import (
@@ -14,7 +15,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import (
     _ChunkInputs,
     _QueryChunk,
 )
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
     CSA2ForwardState,
     CSA2Layout,
@@ -862,7 +863,7 @@ def test_native_paged_owner_indexer_and_graph(monkeypatch, ratio):
     # One request carries two verification queries; declare that arena width.
     manager.max_total_draft_tokens = 1
     q, _, weights = _projected(3)
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=3)
+    metadata = CSA2TrtllmAttention.Metadata(max_num_requests=2, max_num_tokens=3)
     metadata.kv_cache_manager = manager
     metadata.mapping = Mapping()
     metadata.is_cuda_graph = True
@@ -883,7 +884,7 @@ def test_native_paged_owner_indexer_and_graph(monkeypatch, ratio):
     metadata.csa2_candidates = {}
     metadata.csa2_candidate_blocks = {}
     metadata.csa2_candidate_counts = {}
-    metadata.indexer_max_chunk_size = 16
+    metadata.csa2_indexer_max_chunk_size = 16
     metadata.indexer_q_split_threshold = -1
     state = CSA2ForwardState(
         metadata=metadata,
@@ -990,7 +991,9 @@ def test_multi_rank_candidate_publication_and_reindex(count, chunk_size, mixed, 
         manager = _StridedOwner(layout, keys)
         total = count + int(mixed)
         q, _, weights = _projected(total)
-        metadata = CSA2TrtllmMetadata(max_num_requests=1 + int(mixed), max_num_tokens=total)
+        metadata = CSA2TrtllmAttention.Metadata(
+            max_num_requests=1 + int(mixed), max_num_tokens=total
+        )
         metadata.kv_cache_manager = manager
         metadata.mapping = Mapping(world_size=world_size, rank=mpi_rank(), tp_size=world_size)
         metadata.csa2_kv_sources = {0: 0, 1: 0}
@@ -1020,7 +1023,7 @@ def test_multi_rank_candidate_publication_and_reindex(count, chunk_size, mixed, 
         metadata.csa2_candidates = {}
         metadata.csa2_candidate_blocks = {}
         metadata.csa2_candidate_counts = {}
-        metadata.indexer_max_chunk_size = chunk_size
+        metadata.csa2_indexer_max_chunk_size = chunk_size
         metadata.indexer_q_split_threshold = 0
         state = CSA2ForwardState(
             metadata=metadata,
@@ -1090,7 +1093,7 @@ def _single_request_state(heads=8, two_owners=False):
             1: _index_pages_from_rows(pack_rows(-keys, "index")),
         }
         manager.get_index_pages = lambda layer: manager.owner_buffers[layout.layer(layer).kv_source]
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=1)
+    metadata = CSA2TrtllmAttention.Metadata(max_num_requests=1, max_num_tokens=1)
     metadata.kv_cache_manager = manager
     metadata.mapping = Mapping()
     metadata.csa2_kv_sources = {i: i for i in layout.kv_source_layer_ids}
@@ -1117,7 +1120,7 @@ def _single_request_state(heads=8, two_owners=False):
     metadata.csa2_candidates = {}
     metadata.csa2_candidate_blocks = {}
     metadata.csa2_candidate_counts = {}
-    metadata.indexer_max_chunk_size = 16
+    metadata.csa2_indexer_max_chunk_size = 16
     metadata.indexer_q_split_threshold = -1
     state = CSA2ForwardState(
         metadata=metadata,
@@ -1160,7 +1163,7 @@ def test_gathered_decode_graph_grows_past_warmup_prefix(monkeypatch):
 
     monkeypatch.setattr(manager, "gather_indexer_keys", gather)
     # Exercise the bounded fallback independently of native head coverage.
-    monkeypatch.setattr(metadata, "prepare_indexer", lambda layer: None)
+    monkeypatch.setattr(metadata.ext(CSA2Metadata), "prepare_indexer", lambda layer: None)
     monkeypatch.setattr(
         indexer,
         "_call_paged_mqa_logits",
@@ -1283,7 +1286,7 @@ def test_paged_descriptors_refresh_when_the_manager_changes():
     layout, manager, metadata, state = _single_request_state()
     metadata.is_cuda_graph = True
     metadata.csa2_visible_lengths[0].fill_(96)
-    assert metadata.prepare_indexer(0) is metadata
+    assert metadata.prepare_indexer(0) is metadata.ext(CSA2Metadata)
     assert metadata.csa2_indexer_block_table.tolist() == [[0, 1]]
     keys = torch.ones(512, 128, device="cuda", dtype=torch.bfloat16)
     draft = _StridedOwner(layout, pack_rows(keys, "index"))
@@ -1292,7 +1295,7 @@ def test_paged_descriptors_refresh_when_the_manager_changes():
         torch.tensor([[3, 2]], device="cuda", dtype=torch.int32)
     )
     # Same forward serial, different manager: descriptors must follow the draft.
-    assert metadata.prepare_indexer(0) is metadata
+    assert metadata.prepare_indexer(0) is metadata.ext(CSA2Metadata)
     assert metadata.csa2_indexer_k_cache.data_ptr() == draft.index_pages.data_ptr()
     assert metadata.csa2_indexer_block_table.tolist() == [[3, 2]]
 
@@ -1351,7 +1354,7 @@ def _temporal_gvr_case(monkeypatch, emission, *, page_holes=False, candidate_sou
     )
     manager.epoch = 1
     manager.request_epoch = lambda request: manager.epoch
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=1)
+    metadata = CSA2TrtllmAttention.Metadata(max_num_requests=1, max_num_tokens=1)
     metadata.kv_cache_manager = manager
     metadata.mapping = Mapping()
     metadata.request_ids = [13]
@@ -1377,7 +1380,7 @@ def _temporal_gvr_case(monkeypatch, emission, *, page_holes=False, candidate_sou
     metadata.csa2_candidates = {}
     metadata.csa2_candidate_blocks = {}
     metadata.csa2_candidate_counts = {}
-    metadata.indexer_max_chunk_size = 16
+    metadata.csa2_indexer_max_chunk_size = 16
     metadata.indexer_q_split_threshold = -1
     metadata._csa2_forward_serial = 0
     state = CSA2ForwardState(
@@ -1606,7 +1609,6 @@ def test_live_acceptance_graph_refreshes_native_paged_indexer(monkeypatch, query
     metadata.csa2_request_lengths = [query_width]
     metadata.csa2_request_start_positions = [127]
     device = torch.device("cuda")
-    metadata._csa2_ready_for_kv_update = True
     metadata._csa2_query_base = torch.tensor([127], dtype=torch.int32, device=device)
     metadata._csa2_query_lengths = torch.tensor([query_width], dtype=torch.int32, device=device)
     metadata._csa2_query_offsets = torch.arange(query_width, dtype=torch.int32, device=device)
@@ -1625,7 +1627,11 @@ def test_live_acceptance_graph_refreshes_native_paged_indexer(monkeypatch, query
         for owner in (0, 1)
     }
     metadata._csa2_source_geometry = {
-        owner: (metadata._csa2_query_base, metadata._csa2_query_lengths) for owner in (0, 1)
+        owner: (
+            metadata._csa2_query_base,
+            metadata._csa2_query_lengths,
+        )
+        for owner in (0, 1)
     }
     metadata.csa2_main_write_slots = {
         owner: torch.empty(query_width, dtype=torch.int64, device=device) for owner in (0, 1)
@@ -1661,7 +1667,7 @@ def test_live_acceptance_graph_refreshes_native_paged_indexer(monkeypatch, query
         )
 
     def run():
-        metadata.on_update_kv_lens()
+        metadata._refresh_live_endpoints()
         metadata._ensure_swa_slots()  # As entering the first layer does.
         for owner in (0, 1):
             kept[owner][0].copy_(metadata.csa2_swa_write_slots[owner])
@@ -1842,7 +1848,7 @@ def _publish_manual_candidates(metadata, layer, block_ids, block_size=8):
     ranges = metadata.csa2_request_query_ranges
     decode_start = ranges[contexts][0] if contexts < len(ranges) else count
     rows = (requests[decode_start:] - contexts).int()
-    existing = getattr(metadata, "csa2_decode_row_requests", None)
+    existing = getattr(metadata.ext(CSA2Metadata), "csa2_decode_row_requests", None)
     # Captured graphs read this map by address as well: update it in place.
     if existing is not None and existing.shape == rows.shape:
         existing.copy_(rows)
@@ -1864,7 +1870,9 @@ def _candidate_decode_fixture(*, mixed=False, random=False):
     manager = _StridedOwner(layout, pack_rows(keys, "index"))
     manager.max_total_draft_tokens = 1
     count = 4 if mixed else 3
-    metadata = CSA2TrtllmMetadata(max_num_requests=3 if mixed else 2, max_num_tokens=count)
+    metadata = CSA2TrtllmAttention.Metadata(
+        max_num_requests=3 if mixed else 2, max_num_tokens=count
+    )
     metadata.kv_cache_manager = manager
     metadata.mapping = Mapping()
     metadata.is_cuda_graph = True
@@ -1889,7 +1897,7 @@ def _candidate_decode_fixture(*, mixed=False, random=False):
     metadata.csa2_candidate_blocks = {}
     metadata.csa2_candidate_counts = {}
     _publish_manual_candidates(metadata, 0, _MANUAL_BLOCKS)
-    metadata.indexer_max_chunk_size = 16
+    metadata.csa2_indexer_max_chunk_size = 16
     metadata.indexer_q_split_threshold = -1
     q = torch.zeros(count, 32, 128, dtype=torch.bfloat16, device="cuda")
     q[:, :9, :9] = torch.eye(9, dtype=torch.bfloat16, device="cuda")
@@ -2022,7 +2030,9 @@ def test_candidate_decode_batched_exact_and_mixed(monkeypatch, mixed):
         # Without paged sparse descriptors the decode rows fall back to the
         # per-query candidate gathers without row-offset loss.
         with monkeypatch.context() as context:
-            context.setattr(state.metadata, "prepare_sparse_indexer", lambda *a: None)
+            context.setattr(
+                state.metadata.ext(CSA2Metadata), "prepare_sparse_indexer", lambda *a: None
+            )
             fallback, fallback_scores, fallback_calls = _candidate_decode_run(
                 indexer, state, monkeypatch, old=False
             )
@@ -2098,7 +2108,10 @@ def test_candidate_batched_random_logits(monkeypatch, phase):
     # Existing native selection tests allow only 0.005 absolute cutoff error.
     torch.testing.assert_close(new_scores[valid], scores[valid], atol=0.005, rtol=2**-7)
     _check_candidate_multiset(
-        actual, scores, state.metadata.csa2_candidates[0], 0.005 + _bf16_tolerance(scores)
+        actual,
+        scores,
+        state.metadata.csa2_candidates[0],
+        0.005 + _bf16_tolerance(scores),
     )
     separated = gaps > 2 * difference.abs().amax(1)
     torch.testing.assert_close(actual[separated], old[separated], atol=0, rtol=0)
@@ -2442,7 +2455,7 @@ def test_sparse_candidate_paged_decode_and_graph(monkeypatch):
     manager = _StridedOwner(layout, packed_keys)
     manager.max_total_draft_tokens = 1
     q, _, weights = _projected(3)
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=3)
+    metadata = CSA2TrtllmAttention.Metadata(max_num_requests=2, max_num_tokens=3)
     metadata.kv_cache_manager = manager
     metadata.mapping = Mapping()
     metadata.is_cuda_graph = True
@@ -2463,7 +2476,7 @@ def test_sparse_candidate_paged_decode_and_graph(monkeypatch):
     metadata.csa2_candidates = {}
     metadata.csa2_candidate_blocks = {}
     metadata.csa2_candidate_counts = {}
-    metadata.indexer_max_chunk_size = 16
+    metadata.csa2_indexer_max_chunk_size = 16
     metadata.indexer_q_split_threshold = -1
     state = CSA2ForwardState(
         metadata=metadata,

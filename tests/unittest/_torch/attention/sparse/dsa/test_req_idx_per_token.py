@@ -13,25 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Tests for the token->request map used by DSAtrtllmAttentionMetadata.
+Tests for the token->request map used by the DSA metadata extension.
 
 1. build_req_idx_per_token must match the host repeat_interleave build for
    every layout, so the device and host builders cannot drift.
-2. on_update_kv_lens() must rebuild the map after the MTP draft loop rewrites
+2. before_forward() must rebuild the map after the MTP draft loop rewrites
    seq_lens, or every draft token is misattributed to request 0
    (https://nvbugs/6513132, https://nvbugs/6513093).
-3. on_update_kv_lens() must preserve the base metadata invalidation contract.
+3. before_forward() must preserve the base metadata invalidation contract.
 """
 
 from unittest.mock import Mock
 
 import pytest
 import torch
+from _torch.helpers import bare_extension, refresh_from_lengths
 
-from tensorrt_llm._torch.attention.backends.sparse.dsa import (
-    DSAtrtllmAttentionMetadata,
-    build_req_idx_per_token,
-)
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAMetadata, build_req_idx_per_token
+from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareExtension
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 
 def _host_reference(seq_lens: torch.Tensor) -> torch.Tensor:
@@ -65,44 +65,61 @@ def test_matches_host_repeat_interleave(seq_lens, device):
     assert result.to(torch.int32).tolist() == _host_reference(seq_lens).tolist()
 
 
-def test_on_update_kv_lens_invalidates_base_mla_state() -> None:
-    md = object.__new__(DSAtrtllmAttentionMetadata)
-    md.enable_flash_mla = False
-    md._mla_scheduler_buffers_valid = True
-    md._mla_ctx_cu_seqlens_valid = True
-    md._invalidate_pool_view_cache = Mock()
+def _attach_dsa(md: TrtllmAttentionMetadata) -> DSAMetadata:
+    """A DSA extension built without __init__, bound to ``md``."""
+    dsa = object.__new__(DSAMetadata)
+    dsa.metadata = md
+    dsa.enable_ragged_verification = False
+    dsa.ragged_verify_lens = None
+    md.replace_ext(bare_extension(MTPIndexShareExtension, md))
+    md.replace_ext(dsa)
+    return dsa
+
+
+def test_before_forward_invalidates_base_mla_state() -> None:
+    md = object.__new__(TrtllmAttentionMetadata)
+    md.core()._mla_scheduler_buffers_valid = True
+    md.core()._mla_ctx_cu_seqlens_valid = True
     md._num_tokens = 0
     md._num_generations = 0
     md.kv_cache_manager = None
     md.kv_lens_cuda = torch.empty(0, dtype=torch.int32)
-    md._compute_kv_lens_row_reorder = Mock()
-    md.prepare_dense_topk_indices = Mock()
+    dsa = _attach_dsa(md)
+    dsa._invalidate_pool_view_cache = Mock()
+    dsa._compute_kv_lens_row_reorder = Mock()
+    dsa.prepare_dense_topk_indices = Mock()
 
-    md.on_update_kv_lens()
+    refresh_from_lengths(md)
 
-    assert not md._mla_scheduler_buffers_valid
-    assert not md._mla_ctx_cu_seqlens_valid
+    assert not md.core()._mla_scheduler_buffers_valid
+    assert not md.core()._mla_ctx_cu_seqlens_valid
 
 
-def test_on_update_kv_lens_rebuilds_stale_map() -> None:
-    """on_update_kv_lens() must replace prepare()'s stale map (fails pre-fix)."""
+def test_before_forward_rebuilds_stale_map() -> None:
+    """before_forward() must replace prepare()'s stale map (fails pre-fix)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     device = "cuda"
     max_draft_len = 3
     num_requests = 3
 
-    md = object.__new__(DSAtrtllmAttentionMetadata)
+    md = object.__new__(TrtllmAttentionMetadata)
     md.kv_cache_manager = None
     md._num_generations = 0
+    dsa = _attach_dsa(md)
     # __init__ (bypassed by object.__new__) defaults this to False;
-    # on_update_kv_lens() reads it since #16925.
+    # before_forward() reads it.
     md.in_mtp_draft_loop = False
-    md._group_remap_batched = {}
+    # Same reason: `_invalidate_pool_view_cache` clears this unconditionally, and
+    # unlike the sibling test above we exercise the real method rather than a Mock
+    # (the map rebuild happens downstream of it). A dict, not a Mock, so that a
+    # future attribute added to that method fails loudly here instead of being
+    # absorbed.
+    dsa._group_remap_batched = {}
     # Stub collaborators unrelated to the map rebuild (test_dsa_indexer.py style).
     md.kv_lens_cuda = torch.tensor([100, 200, 300], dtype=torch.int32, device=device)
-    md._compute_kv_lens_row_reorder = Mock()
-    md.prepare_dense_topk_indices = Mock()
+    dsa._compute_kv_lens_row_reorder = Mock()
+    dsa.prepare_dense_topk_indices = Mock()
 
     # prepare()-time state: target forward, 1 + max_draft_len tokens/request.
     target_seq_lens = torch.full((num_requests,), 1 + max_draft_len, dtype=torch.int32)
@@ -119,6 +136,6 @@ def test_on_update_kv_lens_rebuilds_stale_map() -> None:
     md._num_tokens = num_requests
     assert md.req_idx_per_token[:num_requests].tolist() == [0, 0, 0]
 
-    md.on_update_kv_lens()
+    refresh_from_lengths(md)
 
     assert md.req_idx_per_token[:num_requests].tolist() == [0, 1, 2]

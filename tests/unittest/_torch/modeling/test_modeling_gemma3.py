@@ -228,12 +228,15 @@ class TestGemma3(unittest.TestCase):
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
             # Right after forward call with custom mask, plan_params will have non-trivial attention_mask_data.
             # One for global-prefill, other for local-prefill.
-            self.assertEqual(len(attn_metadata._plan_params_to_wrappers), 2)
-            for plan_params in attn_metadata._plan_params_to_wrappers.keys():
+            self.assertEqual(len(attn_metadata.core()._plan_params_to_wrappers),
+                             2)
+            for plan_params in attn_metadata.core(
+            )._plan_params_to_wrappers.keys():
                 assert plan_params.attention_mask_data is not None
             # Prepare should flush the params with non-trivial attention_mask_data.
             attn_metadata.prepare()
-            self.assertEqual(len(attn_metadata._plan_params_to_wrappers), 0)
+            self.assertEqual(len(attn_metadata.core()._plan_params_to_wrappers),
+                             0)
 
     # Allow room for small fraction of elements to fail. This is to mitigate flakiness.
     def _assert_most_elems_close(self, actual_value, ref_value, atol, rtol,

@@ -1324,7 +1324,7 @@ class CSA2Indexer(Indexer):
                 continue
             if not is_prefill and paged is not None:
                 continue
-            chunk_size = metadata.indexer_max_chunk_size
+            chunk_size = metadata.csa2_indexer_max_chunk_size
             for start in range(begin, end, chunk_size):
                 stop = min(start + chunk_size, end)
                 # Decode graphs must continue seeing newly published keys as

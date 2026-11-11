@@ -24,11 +24,16 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 from _torch.attention.sparse.csa2._utils import _FakeMetadata
+from _torch.helpers import bare_extension
 from torch import nn
 from transformers import AutoConfig
 from utils.util import skip_blackwell_geforce, skip_pre_blackwell
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import (
+    CSA2Metadata,
+    CSA2TrtllmMetadata,
+)
 from tensorrt_llm._torch.configs import deepseek_v41 as v41_config
 from tensorrt_llm._torch.configs.deepseek_v41 import (
     DeepseekV41Config,
@@ -1902,13 +1907,19 @@ def test_csa2_subtrees_load_once_before_shared_walk(monkeypatch, case):
 
 
 class _ReplayMetadata(_FakeMetadata):
-    _get_csa2_buffer = CSA2TrtllmMetadata._get_csa2_buffer
-    _copy_host = CSA2TrtllmMetadata._copy_host
-    _copy_csa2_tensor = CSA2TrtllmMetadata._copy_csa2_tensor
-    get_adp_token_counts = CSA2TrtllmMetadata.get_adp_token_counts
-    set_adp_token_counts = CSA2TrtllmMetadata.set_adp_token_counts
+    _get_csa2_buffer = CSA2Metadata._get_csa2_buffer
+    _copy_host = CSA2Metadata._copy_host
+    _copy_csa2_tensor = CSA2Metadata._copy_csa2_tensor
     decoder_replay_plan = None
     padded_num_tokens = None
+    adp_input_token_count = CSA2Metadata.adp_input_token_count
+
+    def get_adp_token_counts(self) -> list[int]:
+        return [self.adp_input_token_count, *CSA2Metadata.adp_token_counts.fget(self)]
+
+    def set_adp_token_counts(self, counts: list[list[int]]) -> list[int]:
+        CSA2Metadata.receive_adp_token_counts(self, counts[1:], counts[0])
+        return counts[0]
 
     def __init__(self, lengths, num_contexts):
         super().__init__(lengths, num_contexts)
@@ -2228,19 +2239,20 @@ def test_final_window_replay_freezes_endpoints_and_preserves_mixed_consumers(ful
 
     metadata = _ReplayMetadata([10, 3, 6], num_contexts=2)
     metadata.kv_cache_params.num_cached_tokens_per_seq = [0, 3, 100]
-    metadata.kv_lens_cuda = torch.tensor([10, 6, 103])  # Live speculative endpoint is corrected.
+    # The live speculative endpoint: the target's prepare applied the overlap correction.
+    metadata.kv_lens_offsets = torch.tensor([0, 0, -3], dtype=torch.int32)
     reqs = [
         SimpleNamespace(prompt_len=50, py_ced_replay=None, py_return_context_logits=full_output),
         SimpleNamespace(prompt_len=6, py_ced_replay=None),
     ]
-    CSA2TrtllmMetadata.prepare_context_replay(metadata, reqs)
+    CSA2Metadata.prepare_context_replay(metadata, reqs)
     reqs[0].prompt_len = 10  # Later scheduling must not change this forward's selection.
     plan = plan_decoder_replay(metadata, 8, reqs, private_decoder=True)
     assert plan.replay_seq_lens.tolist() == ([10, 3, 6] if full_output else [0, 3, 6])
     assert plan.swa_floors == ([0, 0, 0] if full_output else [42, 0, 0])
     assert plan.rows.tolist() == list(range(0 if full_output else 10, 19))
-    enter_decoder_replay(metadata, plan)
-    assert metadata.csa2_positions[-6:].tolist() == list(range(97, 103))
+    replay = enter_decoder_replay(metadata, plan)
+    assert replay.csa2_positions[-6:].tolist() == list(range(97, 103))
     exit_decoder_replay(metadata, plan)
     assert metadata.seq_lens.tolist() == [10, 3, 6]
     assert metadata.kv_cache_params.num_cached_tokens_per_seq == [0, 3, 100]
@@ -2263,18 +2275,23 @@ def test_final_window_zero_queries_still_publish_global_and_restore_outputs(peer
     plan.saved_all_rank_num_tokens = [129, 257]
     plan.replay_all_rank_num_tokens = [0, peer_tokens]
     positions = torch.arange(129)
-    _, _, replay_state = model._enter_bounded_replay(plan, metadata, positions, positions, state)
+    _, _, replay_state, replay = model._enter_bounded_replay(
+        plan, metadata, positions, positions, state
+    )
+    assert replay is metadata.decoder_replay_metadata
     assert replay_state.residual.shape == (0, 4, 64)
     layer.self_attn.prepare_global_cache.assert_called_once()
     assert layer.self_attn.prepare_global_cache.call_args.args[0].shape[0] == 129
-    assert metadata.csa2_precomputed_kv_layers == {20}
-    assert metadata.prepare_calls == 0
-    assert metadata.all_rank_num_tokens == [0, peer_tokens]
+    assert replay.csa2_precomputed_kv_layers == {20}
+    assert metadata.prepare_calls == replay.prepare_calls == 0
+    assert replay.all_rank_num_tokens == [0, peer_tokens]
+    assert replay.num_tokens == 0
     restored = model._exit_bounded_replay(plan, metadata, replay_state.residual[:, 0])
     assert restored.shape == (129, 64)
     assert not restored.count_nonzero()
     assert metadata.csa2_decoder_capture_lens == (0,)
-    assert metadata.all_rank_num_tokens == [129, 257]
+    # The target keeps its own token counts; only the replay metadata had the exchanged ones.
+    assert metadata.all_rank_num_tokens is None
     assert metadata.seq_lens.tolist() == [129]
     assert metadata.kv_cache_params.num_cached_tokens_per_seq == [0]
 
@@ -2286,7 +2303,7 @@ def test_final_window_prefill_graph_capability_keeps_intermediate_history():
 
     metadata = _ReplayMetadata([257], num_contexts=1)
     reqs = [SimpleNamespace(prompt_len=2048, py_ced_replay=None)]
-    CSA2TrtllmMetadata.prepare_context_replay(metadata, reqs, allow_final_window=False)
+    CSA2Metadata.prepare_context_replay(metadata, reqs, allow_final_window=False)
     plan = plan_decoder_replay(metadata, 128, reqs, private_decoder=True)
     assert plan.replay_seq_lens.tolist() == [128]
     assert plan.rows.tolist() == list(range(129, 257))
@@ -2403,11 +2420,12 @@ def test_model_boundary_preserves_full_cache_and_compacts_query_rows(
     assert plan.rows.tolist() == list(range(1, sum(lengths)))
     positions = torch.arange(sum(lengths))
     ids = positions + 100
-    new_positions, new_ids, new_state = model._enter_bounded_replay(
+    new_positions, new_ids, new_state, replay = model._enter_bounded_replay(
         plan, metadata, positions, ids, state
     )
-    assert metadata.csa2_precomputed_kv_layers == {20}
-    assert metadata.csa2_replay_query_rows is plan.rows
+    assert replay is metadata.decoder_replay_metadata
+    assert replay.csa2_precomputed_kv_layers == {20}
+    assert replay.csa2_replay_query_rows is plan.rows
     writer = layer.self_attn.prepare_global_cache
     writer.assert_called_once()
     actual, passed_metadata = writer.call_args.args
@@ -2421,8 +2439,11 @@ def test_model_boundary_preserves_full_cache_and_compacts_query_rows(
     torch.testing.assert_close(new_ids, ids[plan.rows])
     torch.testing.assert_close(new_state.residual, state.residual[plan.rows])
     torch.testing.assert_close(new_state.pre_mix, state.pre_mix[plan.rows])
-    assert metadata.seq_lens.tolist() == [128, 7, 6]
-    assert metadata.kv_cache_params.num_cached_tokens_per_seq == [1, 0, 0]
+    assert replay.seq_lens.tolist() == [128, 7, 6]
+    assert replay.kv_cache_params.num_cached_tokens_per_seq == [1, 0, 0]
+    # The target keeps the encoder pass's batch.
+    assert metadata.seq_lens.tolist() == lengths
+    assert metadata.kv_cache_params.num_cached_tokens_per_seq == [0, 0, 0]
     # A later request must not see the cache-only marker from this forward.
     restored = model._exit_bounded_replay(plan, metadata, new_state.residual)
     assert restored.shape == state.residual.shape
@@ -2477,7 +2498,7 @@ def test_remote_tail_source_reuses_boundary_collapse(
         metadata = _ReplayMetadata(lengths, num_contexts=num_contexts)
         metadata.mapping = model.model_config.mapping
         metadata.csa2_remote_tail_mode = None if context_only else "source"
-        metadata.begin_model_forward = Mock()
+        metadata.reset_forward_state = Mock()
         post_mapping = Mock(return_value=resolved.residual)
         state = resolved
         if deferred:
@@ -2515,7 +2536,7 @@ def test_remote_tail_source_reuses_boundary_collapse(
             assert post_args["post_layer_mix"] is state.post_mix
             assert post_args["comb_res_mix"] is state.comb_mix
         encoder.assert_called_once()
-        metadata.begin_model_forward.assert_called_once()
+        metadata.reset_forward_state.assert_called_once()
         writer = layer.self_attn.prepare_global_cache
         if ced_precompute:
             writer.assert_called_once()
@@ -2608,7 +2629,7 @@ def test_remote_tail_attention_dp_generation_keeps_all_layers(
     metadata.is_cuda_graph = is_cuda_graph
     metadata.csa2_remote_tail_mode = remote_mode
     metadata.csa2_remote_tail_starts = [1024] if remote_mode == "destination" else []
-    metadata.begin_model_forward = Mock()
+    metadata.reset_forward_state = Mock()
     enter_decoder = Mock()
     monkeypatch.setattr(v41, "enter_remote_tail_decoder", enter_decoder)
 
@@ -2625,7 +2646,7 @@ def test_remote_tail_attention_dp_generation_keeps_all_layers(
     assert enter_decoder.call_count == int(remote_mode == "destination")
     assert boundary.self_attn.prepare_global_cache.call_count == int(remote_mode == "destination")
     assert metadata.csa2_replay_query_rows is None
-    metadata.begin_model_forward.assert_called_once()
+    metadata.reset_forward_state.assert_called_once()
 
 
 def test_context_decoder_skipping_requires_bounded_replay(
@@ -2687,8 +2708,9 @@ def test_context_only_forward_routes_warmup_to_source_and_refuses_destination(mo
     nn.Module.__init__(model)
     model.disagg_context_only = True
     metadata = SimpleNamespace(
-        csa2_remote_tail_mode=mode, begin_model_forward=Mock(), all_rank_num_tokens=None
+        csa2_remote_tail_mode=mode, reset_forward_state=Mock(), all_rank_num_tokens=None
     )
+    metadata.find_ext = lambda cls: metadata
     result = object()
 
     def source_forward(self, passed_metadata):
@@ -2703,7 +2725,7 @@ def test_context_only_forward_routes_warmup_to_source_and_refuses_destination(mo
             model.forward(metadata)
     else:
         assert model.forward(metadata) is result
-    metadata.begin_model_forward.assert_called_once()
+    metadata.reset_forward_state.assert_called_once()
 
 
 def test_context_only_model_rejects_speculative_decoding_before_construction(monkeypatch):
@@ -3009,6 +3031,8 @@ def test_model_boundary_resets_routing_and_preserves_layer_guard(monkeypatch):
     from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41Model
 
     metadata = CSA2TrtllmMetadata.__new__(CSA2TrtllmMetadata)
+    metadata.replace_ext(bare_extension(CSA2Metadata, metadata))
+    metadata.replace_ext(bare_extension(SpecDecodingMetadata, metadata))
     metadata.reset_routing()
     layout = CSA2Layout((1, 1), (0,), (0,))
     model = DeepseekV41Model.__new__(DeepseekV41Model)

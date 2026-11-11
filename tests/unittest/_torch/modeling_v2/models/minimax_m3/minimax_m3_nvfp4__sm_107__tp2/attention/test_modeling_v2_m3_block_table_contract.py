@@ -8,7 +8,7 @@ step writes ``MsaMetadata.msa_block_table``: today its one writer is the host-to
 ``_build_msa_fields`` (called from ``prepare()``, before the replay), besides the allocation. This test scans
 ``tensorrt_llm/_torch`` and fails on any other write site, so a new in-graph writer has to revisit the early issue.
 
-(``msa_seq_lens_cuda`` IS patched in-graph by ``on_update_kv_lens``; the scorer reads it before the wait only as a hint
+(``msa_seq_lens_cuda`` IS patched by ``on_update_kv_lens``; the scorer reads it before the wait only as a hint
 and bounds every load and store by the value it reads after the wait.)
 
 CPU only: it parses the sources.

@@ -27,7 +27,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.flashinfer import (
     FI_DECODE_TENSOR_CORES_ENV,
-    FlashInferAttentionMetadata,
+    FlashInferCoreMetadata,
     PlanParams,
     decode_tensor_cores_override,
 )
@@ -59,7 +59,7 @@ def use_tensor_cores(
     use_graph_tensor_cores: bool = False,
 ) -> bool:
     """``_use_tensor_cores`` reads only its arguments, never ``self``."""
-    return FlashInferAttentionMetadata._use_tensor_cores(
+    return FlashInferCoreMetadata._use_tensor_cores(
         None, plan_params, flashinfer_backend, use_graph_tensor_cores
     )
 

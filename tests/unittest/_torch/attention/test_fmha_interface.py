@@ -20,8 +20,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from _torch.helpers import bare_extension
 from fmha_test_utils import FakeAttention
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.registry import FMHA_LIBS
@@ -57,7 +59,9 @@ def test_fallback_support_matches_thop_kv_update_contract(
 ) -> None:
     attn = FakeAttention()
     fmha = FallbackFmha(attn)
-    metadata = SimpleNamespace(is_cross=is_cross, helix_position_offsets=None, num_contexts=0)
+    metadata = SimpleNamespace(
+        is_cross=is_cross, num_contexts=0, find_ext=lambda extension_type: None
+    )
     forward_args = AttentionForwardArgs(is_fused_qkv=True, update_kv_cache=update_kv_cache)
     assert fmha.is_supported(None, None, None, metadata, forward_args) is expected
 
@@ -65,7 +69,7 @@ def test_fallback_support_matches_thop_kv_update_contract(
 def test_fallback_rejects_raw_fp8_input() -> None:
     attn = FakeAttention()
     fmha = FallbackFmha(attn)
-    metadata = SimpleNamespace(is_cross=False, helix_position_offsets=None, num_contexts=0)
+    metadata = SimpleNamespace(is_cross=False, num_contexts=0, find_ext=lambda extension_type: None)
     q = torch.empty((1, 128), dtype=torch.float8_e4m3fn)
     assert not fmha.is_supported(q, None, None, metadata, AttentionForwardArgs(is_fused_qkv=True))
 
@@ -76,13 +80,21 @@ def test_fallback_separate_qkv_support(mode: str) -> None:
     attn.is_mla_enable = mode == "mla"
     fmha = FallbackFmha(attn)
     metadata = SimpleNamespace(
-        is_cross=mode == "cross", helix_position_offsets=None, num_contexts=0
+        is_cross=mode == "cross", num_contexts=0, find_ext=lambda extension_type: None
     )
     forward_args = AttentionForwardArgs(
         is_fused_qkv=False, sage_attn_num_elts_per_blk_q=2 if mode == "sage" else 0
     )
     q = torch.empty((1, 128), dtype=torch.bfloat16)
     assert fmha.is_supported(q, q, q, metadata, forward_args) is (mode != "ordinary")
+
+
+# The metadata family with the core fields it forwards, as a mock spec.
+_METADATA_SPEC = type(
+    "TrtllmAttentionMetadataSpec",
+    (TrtllmAttentionMetadata,),
+    dict.fromkeys(TrtllmAttentionMetadata.core_metadata_type.declared_names()),
+)
 
 
 @pytest.mark.parametrize("initial_fused_qkv", [False, True])
@@ -124,13 +136,13 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     attn._fmha_manager = Mock()
     attn._fmha_manager.select.return_value = fmha
 
-    metadata = Mock(spec=TrtllmAttentionMetadata)
-    metadata.token_major_gen_view.return_value = None
+    metadata = Mock(spec=_METADATA_SPEC)
+    metadata.token_major_view.return_value = None
     metadata.presented_token_major.return_value = nullcontext()
     metadata.is_cross = False
-    metadata.enable_flash_mla = False
-    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
-    metadata.spec_decoding_bl_tree_mask = None
+    extensions = {SpecDecodingMetadata: bare_extension(SpecDecodingMetadata, metadata)}
+    metadata.find_ext.side_effect = extensions.get
+    metadata.ext.side_effect = extensions.__getitem__
     metadata.max_context_q_len_override = None
     metadata.kv_cache_manager = None
     lengths = torch.ones(1, dtype=torch.int32)
@@ -189,7 +201,7 @@ def test_support_forwards_request_and_phase(phase: FmhaPhase | None, supported: 
     attn = cast(TrtllmAttention, FakeAttention())
     fmha = _MinimalFmha(attn)
     q, k, v = (torch.empty((2, 4)) for _ in range(3))
-    metadata = Mock(spec=TrtllmAttentionMetadata)
+    metadata = Mock(spec=_METADATA_SPEC)
     forward_args = AttentionForwardArgs()
 
     with patch.object(fmha, "_is_supported", return_value=supported) as hook:
@@ -203,7 +215,7 @@ def test_default_hooks_accept_requests() -> None:
 
     assert _MinimalFmha.is_available(attn)
     assert fmha.is_supported(
-        torch.empty((2, 4)), None, None, Mock(spec=TrtllmAttentionMetadata), AttentionForwardArgs()
+        torch.empty((2, 4)), None, None, Mock(spec=_METADATA_SPEC), AttentionForwardArgs()
     )
 
 
@@ -257,7 +269,7 @@ def test_support_checks_capabilities_before_implementation(
 
     attn = cast(TrtllmAttention, FakeAttention())
     q, k, v = (torch.empty((2, 4)) for _ in range(3))
-    metadata = Mock(spec=TrtllmAttentionMetadata)
+    metadata = Mock(spec=_METADATA_SPEC)
     forward_args = AttentionForwardArgs(**request_args) if requested else AttentionForwardArgs()
 
     for fmha in (_MinimalFmha(attn), _CapableFmha(attn)):

@@ -7,9 +7,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingConfig
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import (
     set_spec_metadata_all_rank_num_tokens,
+    spec_decoding_config,
     update_spec_metadata,
 )
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
@@ -65,14 +67,18 @@ def test_update_spec_metadata_handles_parallel_draft_and_dynamic_tree() -> None:
     )
     attn_metadata.update_spec_dec_param.assert_called_once_with(
         batch_size=2,
-        is_spec_decoding_enabled=True,
+        spec_metadata=spec_metadata,
+        spec_tree_manager=spec_tree_manager,
+        num_contexts=1,
+    )
+    spec_tree_manager._internal_buf_dim = 8
+    assert spec_decoding_config(config, spec_metadata, spec_tree_manager) == SpecDecodingConfig(
+        attention_needs_spec_dec_mode=True,
         is_spec_dec_tree=True,
         is_spec_dec_dynamic_tree=True,
         max_draft_len=6,
         max_total_draft_tokens=6,
-        spec_metadata=spec_metadata,
-        spec_tree_manager=spec_tree_manager,
-        num_contexts=1,
+        tree_buffer_dim=8,
     )
 
 

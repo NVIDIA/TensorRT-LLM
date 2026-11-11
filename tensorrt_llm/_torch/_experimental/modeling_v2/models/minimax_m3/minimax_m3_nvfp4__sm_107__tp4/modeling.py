@@ -296,7 +296,6 @@ from .ops.spec.m3_draft_step import MAX_TOKENS as DRAFT_STEP_KERNEL_MAX_TOKENS
 from .ops.spec.m3_draft_step import m3_draft_step
 from .ops.spec.m3_force_vec_req import m3_force_vec_req
 from .ops.spec.m3_shard_accept import m3_shard_accept
-from .ops.spec.m3_spec_offsets import m3_spec_offsets
 from .ops.spec.m3_step_prologue import m3_step_prologue
 from .ops.triton_sparse_decode import MERGE_MXFP8, MERGE_MXFP8_MIN_TOKENS
 
@@ -1064,7 +1063,7 @@ STEP_PACK_CPP_PROLOGUE = True
 # block tables, positions, cache slots, the sampled-accept pre-wait parameters) before their grid-dependency wait rely
 # on every writer of them being a host-to-device copy before the replay or a PLAIN launch earlier in the step:
 # msa_kv_update, the step-input prologue (Triton scatter or the C++ op), the spec fold tail (Triton or C++), the pack
-# scatter and any step-head op (the spec step correction, STEP_SPEC_OFFSETS_ONE_LAUNCH). Never give one of them a PDL
+# scatter. Never give one of them a PDL
 # attribute with an early trigger.
 STEP_SKIP_UNCHANGED_H2D = True
 # A changed packed 2-D metadata upload stages only each row's changed column span. On a step where a request crosses
@@ -1072,16 +1071,6 @@ STEP_SKIP_UNCHANGED_H2D = True
 # overflowing the 16 KB in-graph window into an eager upload and scatter between the step graphs (57-69 us at the
 # ~1 in 19 block-crossing steps; TTFT inter-graph scan). Kill: False.
 STEP_H2D_CHANGED_SPAN = True
-# A speculative overlap step re-derives the MSA KV-length metadata once, after the forward's KV-length correction,
-# instead of also before it (RuntimeHooks.kv_lens_update_once): the first pass (a fill, the out_cache_loc tail fill and
-# an msa_kv_update at the head of the decode graph, 2.13 us at TP4) is rewritten in full by the second. Kill: False.
-STEP_KV_LENS_UPDATE_ONCE = True
-# The overlap scheduler's speculative step correction (position_ids += offsets, kv_lens += offsets) runs as this
-# target's one plain launch (RuntimeHooks.spec_offsets_op, ops/spec/m3_spec_offsets) instead of two ATen adds at the
-# head of the decode graph: the same int32 adds. TP8 graph bench (the work is per token, not per rank; 64 steps
-# per graph, a predecessor kernel each): -1.27 us/step at 4 tokens / 1 request, -0.72..-0.78 at 8-32 tokens.
-# Kill: False.
-STEP_SPEC_OFFSETS_ONE_LAUNCH = True
 STEP_LOOP_ON_EXECUTION_STREAM = True
 STEP_MERGE_TUNED_TACTICS = True
 STEP_SKIP_GREEDY_RNG_UPLOAD = True
@@ -2702,7 +2691,9 @@ class PrefillTarget:
             num_tokens=md.num_tokens,
             kv_cache_manager=md.kv_cache_manager,
             msa_idx_k_cache=md.msa_idx_k_cache,
-            msa_out_cache_loc=md.msa_out_cache_loc,
+            msa_out_cache_loc=(
+                md.msa_write_slots() if hasattr(md, "msa_write_slots") else md.msa_out_cache_loc
+            ),
             metadata=md,
         )
 
@@ -3004,11 +2995,13 @@ class DecodeTarget:
             num_seqs=md.num_seqs,
             kv_cache_manager=md.kv_cache_manager,
             msa_idx_k_cache=md.msa_idx_k_cache,
-            msa_out_cache_loc=md.msa_out_cache_loc,
+            msa_out_cache_loc=(
+                md.msa_write_slots() if hasattr(md, "msa_write_slots") else md.msa_out_cache_loc
+            ),
             msa_decode_span=md.msa_decode_span,
             msa_block_table=md.msa_block_table,
             msa_seq_lens_cuda=md.msa_seq_lens_cuda,
-            msa_short_ok=md._msa_short_ok,
+            msa_short_ok=md.msa_short_table_staged,
             msa_short_table=md.msa_short_table,
             msa_proxy_max_score_view=md.msa_proxy_max_score_view,
             msa_worst_case_max_k_tiles=md.msa_worst_case_max_k_tiles,
@@ -4602,50 +4595,46 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 batch_size=batch_size,
             )
         else:
-            # Retain the pre-draft tensor before metadata is replaced, as in the parent worker.
+            # The step-0 sequence lengths of the target, which the draft loop never changes when it runs on
+            # the draft metadata.
             pre_draft_seq_lens = attn_metadata._seq_lens_cuda
-            # Save the old attn_metadata and spec_metadata
-            self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+            # The draft forwards run on the draft metadata, which leaves the target's untouched; without one,
+            # the target's state is saved and restored around the draft loop.
+            with self.draft_loop(attn_metadata) as draft_attn_metadata:
+                # Prepare inputs for the 1st draft model forward
+                position_ids = position_ids.squeeze(0)
+                inputs = self.prepare_1st_drafter_inputs(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    accepted_tokens=accepted_tokens,
+                    attn_metadata=draft_attn_metadata,
+                    spec_metadata=spec_metadata,
+                    draft_model=draft_model,
+                )
 
-            # Prepare inputs for the 1st draft model forward
-            position_ids = position_ids.squeeze(0)
-            inputs = self.prepare_1st_drafter_inputs(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                accepted_tokens=accepted_tokens,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                draft_model=draft_model,
-            )
+                # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here so the post-loop restore (below)
+                # can put attn_metadata back into a state the target model expects.
+                original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-            # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here so the post-loop restore (below)
-            # can put attn_metadata back into a state the target model expects.
-            original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+                # Get the draft KV cache manager if using separate layouts
+                draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
-            # Get the draft KV cache manager if using separate layouts
-            draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
-
-            next_draft_tokens, next_new_tokens = self._forward_draft_loop(
-                inputs,
-                attn_metadata,
-                spec_metadata,
-                draft_model,
-                draft_kv_cache_manager,
-                num_contexts,
-                num_gens,
-                batch_size,
-                num_accepted_tokens,
-                original_all_rank_num_tokens,
-                resource_manager,
-                accepted_tokens,
-                pre_draft_seq_lens,
-            )
-            # restore attn_metadata to support cuda graph
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
-            # restore all_rank_num_tokens for attention DP
-            if original_all_rank_num_tokens is not None:
-                attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+                next_draft_tokens, next_new_tokens = self._forward_draft_loop(
+                    inputs,
+                    draft_attn_metadata,
+                    spec_metadata,
+                    draft_model,
+                    draft_kv_cache_manager,
+                    num_contexts,
+                    num_gens,
+                    batch_size,
+                    num_accepted_tokens,
+                    original_all_rank_num_tokens,
+                    resource_manager,
+                    accepted_tokens,
+                    pre_draft_seq_lens,
+                )
 
         # prepare next new tokens to support overlap scheduler
         if self._m3_next_new_tokens is not None:
@@ -5482,18 +5471,15 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 ids, pos, hidden = ids_next, pos_next, to_save
                 if i == 0:
                     # The draft step set the device sequence lengths to 1 and rolled the KV lengths back.
-                    md._seq_lens[:batch_size].fill_(1)
-                    md.on_update()
-                    has_kv_cache = md.kv_cache_manager is not None
-                    if has_kv_cache and hasattr(md, "host_request_types"):
-                        md.host_request_types[: md.num_contexts].fill_(1)
-                    if has_kv_cache:
-                        md.num_contexts = 0
+                    md.set_seq_lens(slice(0, batch_size), host=1, update_counts=True)
+                    if md.kv_cache_manager is not None:
+                        # The context requests continue as one-token generation rows.
+                        md.as_generation_rows()
                         self._prepare_flash_mla_generation_layout(md, 0, batch_size)
-                    md.update_for_spec_dec()
+                    self.refresh_draft()
                     md.use_spec_decoding = False
                 else:
-                    md.update_for_spec_dec()
+                    self.refresh_draft()
         self._m3_next_new_tokens = next_new
         return draft_tokens
 
@@ -5542,8 +5528,6 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
         pack_prologue_op=m3_step_prologue if STEP_PACK_CPP_PROLOGUE else None,
         skip_unchanged_h2d=STEP_SKIP_UNCHANGED_H2D,
         h2d_changed_span=STEP_H2D_CHANGED_SPAN,
-        kv_lens_update_once=STEP_KV_LENS_UPDATE_ONCE,
-        spec_offsets_op=m3_spec_offsets if STEP_SPEC_OFFSETS_ONE_LAUNCH else None,
         loop_on_execution_stream=STEP_LOOP_ON_EXECUTION_STREAM,
         merge_tuned_tactics_across_ranks=STEP_MERGE_TUNED_TACTICS,
         skip_greedy_rng_upload=STEP_SKIP_GREEDY_RNG_UPLOAD,

@@ -29,6 +29,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from _torch.helpers import give_stub_a_draft
 from torch import nn
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
@@ -137,9 +138,9 @@ def _accept_case():
         num_seqs=NUM_GENS,
         kv_cache_manager=_kda_manager(),
         mamba_metadata=SimpleNamespace(state_indices=torch.zeros(4, dtype=torch.int32)),
-        draft_kv_cache_block_offsets=torch.zeros(1, 4, 2, 3, dtype=torch.int32),
         kv_lens_cuda=torch.zeros(4, dtype=torch.int32),
     )
+    give_stub_a_draft(attn, torch.zeros(1, 4, 2, 3, dtype=torch.int32))
     worker = _worker(
         k3_decode=True,
         mapping=TP4,
@@ -240,7 +241,7 @@ _ACCEPT_DECLINES = {
     ),
     "the private context arena": _set("worker._ctx_block_tables", None),
     "a sliding-window draft pool": _set("worker._ctx_pool_windowed", True),
-    "no draft block offsets": _set("attn.draft_kv_cache_block_offsets", None),
+    "no draft block offsets": _set("attn.draft.kv_cache_block_offsets", None),
     "no KV lengths": _set("attn.kv_lens_cuda", None),
     "a vocab-sharded draft embedding": _set(
         "drafter.draft_model_full.model.embed_tokens.tp_size", 2
@@ -707,13 +708,12 @@ def test_dspark_acceptance_is_kept_only_under_k3_decode(monkeypatch):
     on.sample_and_accept_draft_tokens(None, attn, spec)
     kept = on._k3_acceptance
     assert kept[0] is accepted and kept[1] is num_accepted and kept[2] == 0
-    assert kept[3] is spec and kept[4] is attn
+    assert kept[3] is spec
 
 
-@pytest.mark.parametrize("pending", [True, False], ids=["a pending KV rewind", "no pending rewind"])
-def test_k3_markov_chain_drafts_and_next_new_tokens(monkeypatch, pending):
-    """``k3_markov`` gets this rank's slice and the step's acceptance, folds a pending KV-length rewind, and its
-    tokens and next_new_tokens are the step's drafts and next inputs."""
+def test_k3_markov_chain_drafts_and_next_new_tokens(monkeypatch):
+    """``k3_markov`` gets this rank's slice and the step's acceptance, and its tokens and next_new_tokens are the
+    step's drafts and next inputs. It rewinds no KV lengths: the draft loop advanced the draft metadata's only."""
     worker = _worker(KimiK3DSparkWorker, k3_decode=True, mapping=TP4)
     accepted = torch.zeros(NUM_GENS, K + 1, dtype=torch.int32)
     num_accepted = torch.ones(NUM_GENS, dtype=torch.int32)
@@ -722,9 +722,6 @@ def test_k3_markov_chain_drafts_and_next_new_tokens(monkeypatch, pending):
     )
     attn = SimpleNamespace(num_contexts=0, kv_lens_cuda=torch.zeros(4, dtype=torch.int32))
     worker._on_acceptance(accepted, num_accepted, attn, spec)
-    rewind = torch.zeros(NUM_GENS, dtype=torch.int32)
-    worker._kv_rewind_amount, worker._kv_rewind_pending = rewind, pending
-    worker._kv_rewind_nc, worker._kv_rewind_bs = 0, NUM_GENS
     outputs = (
         torch.zeros(NUM_GENS, K, SHARD),
         torch.zeros(NUM_GENS, K, dtype=torch.int32),
@@ -749,13 +746,7 @@ def test_k3_markov_chain_drafts_and_next_new_tokens(monkeypatch, pending):
     assert torch.equal(args[4], drafter.markov_w2[vocab_slice]) and args[5] == vocab_slice.start
     assert args[6] is accepted and torch.equal(args[7], num_accepted)
     assert torch.equal(args[8], spec.batch_indices_cuda[:NUM_GENS])
-    if pending:
-        assert kwargs["kv_lens"] is attn.kv_lens_cuda and kwargs["rewind"] is rewind
-        assert worker._kv_rewind_amount is None and not worker._kv_rewind_pending
-    else:
-        assert kwargs["kv_lens"] is None and kwargs["rewind"] is None
-        assert worker._kv_rewind_amount is rewind
-    assert kwargs["rewind_first"] == 0
+    assert "kv_lens" not in kwargs and "rewind" not in kwargs
 
     drafts = worker.sample_draft_tokens(corrected, spec, NUM_GENS, num_contexts=0)
     assert drafts is outputs[1]

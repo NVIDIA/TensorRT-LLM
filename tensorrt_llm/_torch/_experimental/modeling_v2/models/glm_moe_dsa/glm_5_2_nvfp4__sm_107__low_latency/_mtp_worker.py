@@ -9,10 +9,9 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareMetadata
+from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareExtension
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.speculative import MTPEagleWorker
-from tensorrt_llm._torch.speculative.eagle3 import _reset_mtp_index_share
 from tensorrt_llm._torch.speculative.interface import (
     _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
     _FORCE_ACCEPT_RNG_POOL_SIZE,
@@ -288,7 +287,7 @@ class MTPDraftWorker(MTPEagleWorker):
             and not spec_metadata.wants_advanced_draft_sampling
             and not spec_metadata.is_ragged_verify
             and not torch.compiler.is_compiling()
-            and isinstance(attn_metadata, MTPIndexShareMetadata)
+            and attn_metadata.find_ext(MTPIndexShareExtension) is not None
             and attn_metadata.num_tokens == rows
             and ids.dtype == torch.int32
             and tuple(ids.shape) == (rows,)
@@ -344,8 +343,6 @@ class MTPDraftWorker(MTPEagleWorker):
         None means only the preflight declined: no draft forward has executed.
         Once the first layer starts, failures propagate without replaying it.
         """
-        from tensorrt_llm._torch.attention.backends.sparse.dsa import is_dsa_cache_manager
-
         draft_len = spec_metadata.runtime_draft_len
         first_rows = batch_size * (draft_len + 1)
         accepted_tokens = inputs["input_ids"].view(batch_size, draft_len + 1)
@@ -354,10 +351,11 @@ class MTPDraftWorker(MTPEagleWorker):
         selector = FirstDraftRowSelect(batch_indices, num_accepted, draft_len + 1)
         # Do not modify the caller's inputs if the rebound-manager preflight declines.
         inputs = dict(inputs)
+        index_share = attn_metadata.ext(MTPIndexShareExtension)
         with contextlib.ExitStack() as scope:
-            attn_metadata.set_in_mtp_draft_loop(True)
-            attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
-            scope.callback(_reset_mtp_index_share, attn_metadata)
+            index_share.set_in_mtp_draft_loop(True)
+            index_share.set_mtp_num_accepted(num_accepted_tokens)
+            scope.callback(index_share.reset_mtp_index_share)
             attn_metadata = scope.enter_context(
                 self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager)
             )
@@ -365,15 +363,13 @@ class MTPDraftWorker(MTPEagleWorker):
             # separately configured draft cache. Validate the actual rebound views.
             if not helper.supports(attn_metadata, first_rows, batch_size):
                 return None
-            if is_dsa_cache_manager(draft_kv_cache_manager):
-                attn_metadata.on_update_kv_lens()
             inputs["attn_metadata"] = attn_metadata
             inputs["owned_draft"] = helper
             inputs["row_select"] = selector
             draft_tokens = accepted_tokens.new_empty((batch_size, draft_len))
             next_new_tokens = None
             for step in range(draft_len):
-                attn_metadata.set_skip_topk(step > 0)
+                index_share.set_skip_topk(step > 0)
                 hidden, _ = self._run_draft_forward(draft_model, inputs, spec_metadata, step)
                 # The layer already selected both hidden and residual BEFORE MoE.
                 # A second gather here would select the wrong request (or go OOB).
@@ -381,9 +377,10 @@ class MTPDraftWorker(MTPEagleWorker):
                     raise RuntimeError("small-batch MTP did not select its first-step rows")
                 logits, hidden_half = helper.head(hidden, next_step=step + 1 < draft_len)
                 if step == 0:
-                    attn_metadata._seq_lens[:batch_size].fill_(1)
-                    attn_metadata.on_update()
-                    attn_metadata.num_contexts = 0
+                    # One row per request from here on, on the host; the step has no
+                    # context requests to turn into generation ones.
+                    attn_metadata.set_seq_lens(slice(0, batch_size), host=1, update_counts=True)
+                lengths = attn_metadata.lengths_for_kernel_update()
                 next_projection, next_positions, next_new_tokens = helper.sample_step(
                     logits,
                     hidden,
@@ -391,16 +388,16 @@ class MTPDraftWorker(MTPEagleWorker):
                     step,
                     inputs["position_ids"],
                     selector.gather_ids if step == 0 else None,
-                    attn_metadata.seq_lens_cuda[:batch_size],
-                    attn_metadata.kv_lens_cuda[:batch_size],
+                    lengths["seq_lens_cuda"][:batch_size],
+                    lengths["kv_lens_cuda"][:batch_size],
                     num_accepted,
                     accepted_tokens,
                     batch_indices,
                     hidden_half=hidden_half,
                 )
-                # The fused op just wrote seq/KV lengths. Main owns derived DSA
-                # slots, schedules and dense selection; update even the final step.
-                attn_metadata.update_for_spec_dec()
+                # The fused op just wrote seq/KV lengths. The metadata re-derives the DSA
+                # slots, schedules and dense selection from them, even after the final step.
+                self.refresh_draft()
                 if step == 0:
                     attn_metadata.use_spec_decoding = False
                 if step + 1 < draft_len:
@@ -483,7 +480,7 @@ class MTPDraftWorker(MTPEagleWorker):
 
         Each step's last kernel writes the next step's sequence and KV lengths in place. The
         steps after the first run no indexer and read nothing else of the DSA decode metadata,
-        so the built-in loop's per-step rebuild of it (``update_for_spec_dec``) is left out;
+        so the built-in loop's per-step rebuild of it (``md.refresh_draft()``) is left out;
         with a context short enough that the metadata skips the indexer, only the next step's
         dense selection is refreshed from the new lengths. The host side of draft step 0's
         switch to one row per request comes before that.
@@ -496,22 +493,23 @@ class MTPDraftWorker(MTPEagleWorker):
         draft_tokens = accepted_tokens.new_empty((batch_size, draft_len))
         positions = inputs["position_ids"]
         eh_proj_output = gather_ids = pool_rows = next_new_tokens = None
-        uses_mtp_index_share = isinstance(attn_metadata, MTPIndexShareMetadata)
+        index_share = attn_metadata.find_ext(MTPIndexShareExtension)
         with contextlib.ExitStack() as draft_scope:
-            if uses_mtp_index_share:
-                attn_metadata.set_in_mtp_draft_loop(True)
-                attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
-                draft_scope.callback(_reset_mtp_index_share, attn_metadata)
+            if index_share is not None:
+                index_share.set_in_mtp_draft_loop(True)
+                index_share.set_mtp_num_accepted(num_accepted_tokens)
+                draft_scope.callback(index_share.reset_mtp_index_share)
             attn_metadata = draft_scope.enter_context(
                 self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager)
             )
-            # The draft loop's copy of the sequence lengths (prepare_for_spec_dec) and the KV
-            # lengths, which the draft-step kernels advance.
-            seq_lens = attn_metadata.seq_lens_cuda[:batch_size]
-            kv_lens = attn_metadata.kv_lens_cuda[:batch_size]
+            # The draft metadata's sequence and KV lengths, which the draft-step kernels advance.
+            lengths = attn_metadata.lengths_for_kernel_update()
+            seq_lens = lengths["seq_lens_cuda"][:batch_size]
+            kv_lens = lengths["kv_lens_cuda"][:batch_size]
+            attn_metadata.clear_lengths_changed()
             for i in range(draft_len):
-                if uses_mtp_index_share:
-                    attn_metadata.set_skip_topk(i > 0)
+                if index_share is not None:
+                    index_share.set_skip_topk(i > 0)
                 if i == 0:
                     hidden_states, gather_ids, pool_rows = decode.draft_first_step(
                         attn_metadata,
@@ -532,8 +530,7 @@ class MTPDraftWorker(MTPEagleWorker):
                 if i == 0:
                     # One row per request from here on, on the host (no context requests to
                     # turn into generation ones); the kernel below fills seq_lens.
-                    attn_metadata._seq_lens[:batch_size].fill_(1)
-                    attn_metadata.on_update()
+                    attn_metadata.set_seq_lens(slice(0, batch_size), host=1, update_counts=True)
                 if last:
                     next_new_tokens = decode.draft_sample_glue(
                         logits,
@@ -562,6 +559,10 @@ class MTPDraftWorker(MTPEagleWorker):
                     attn_metadata.prepare_dense_topk_indices(
                         attn_metadata.kv_lens_cuda, device=True
                     )
+                # A deliberate exception to the full draft refresh: the later
+                # steps read no other length-derived state (see the docstring),
+                # so the dense selection above is the whole refresh.
+                attn_metadata.clear_lengths_changed()
                 if i == 0:
                     attn_metadata.use_spec_decoding = False
         self._drafted_rows = (draft_tokens, next_new_tokens)

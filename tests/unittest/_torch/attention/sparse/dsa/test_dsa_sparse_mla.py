@@ -26,6 +26,8 @@ import torch
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingConfig
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     MLAParams,
@@ -703,7 +705,9 @@ def _run_test_for_backend(
         kv_cache_manager.add_dummy_requests(request_ids, context_sequence_lengths)
         # Both backends use the DSA metadata: the vanilla backend runs the same
         # indexer plumbing and only swaps the selection kernels for torch.
-        metadata_sparse_kwargs = {"sparse_attention_config": sparse_config}
+        metadata_sparse_kwargs = {
+            "sparse_metadata_params": sparse_config.to_sparse_metadata_params()
+        }
 
         ctx_seq_lens = torch.tensor(context_sequence_lengths, dtype=torch.int)
         total_ctx_tokens = sum(context_sequence_lengths)
@@ -750,22 +754,16 @@ def _run_test_for_backend(
                         ],
                     ),
                     mapping=mapping,
-                    enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
+                    extension_types=(FlashMlaMetadata,)
+                    if torch.cuda.get_device_capability() == (9, 0)
+                    else (),
+                    spec_decoding=SpecDecodingConfig(
+                        max_draft_len=generation_seq_len_q - 1,
+                        max_total_draft_tokens=generation_seq_len_q - 1,
+                    ),
                     **metadata_sparse_kwargs,
                 )
-                attn_metadata.update_spec_dec_param(
-                    batch_size=max_num_contexts,
-                    is_spec_decoding_enabled=False,
-                    is_spec_dec_tree=False,
-                    is_spec_dec_dynamic_tree=False,
-                    max_draft_len=generation_seq_len_q - 1,
-                    max_total_draft_tokens=generation_seq_len_q - 1,
-                )
                 attn_metadata.prepare()
-                # The executor refreshes device-side metadata after prepare() on
-                # every step; the CuTe DSL paged-MQA atom split reads its
-                # expanded schedule from this refresh.
-                attn_metadata.on_update_kv_lens()
             for layer_idx in range(num_layers):
                 print(f"---- step {step} layer {layer_idx} start ----")
                 if step == 0:

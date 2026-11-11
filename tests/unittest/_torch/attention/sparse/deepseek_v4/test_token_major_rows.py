@@ -18,11 +18,13 @@ same mistake fails in seconds on one GPU.
 
 import pytest
 import torch
+from _torch.helpers import bare_extension
 
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
-    DeepseekV4TrtllmAttentionMetadata,
-)
-from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.features import DraftMetadata
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import DeepseekV4Metadata
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAMetadata
+from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareExtension
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 
 class _StubCacheManager:
@@ -34,6 +36,17 @@ class _StubCacheManager:
         self.max_blocks_per_seq = max_blocks_per_seq
 
 
+def _stub(extension_type: type = DSAMetadata) -> DSAMetadata:
+    """An extension built through ``__new__`` on a core metadata built the same way."""
+    metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+    extension = extension_type.__new__(extension_type)
+    extension.metadata = metadata
+    metadata.replace_ext(bare_extension(MTPIndexShareExtension, metadata))
+    metadata.replace_ext(bare_extension(DraftMetadata, metadata))
+    metadata.replace_ext(extension)
+    return extension
+
+
 def _metadata(
     *,
     num_pools: int,
@@ -41,8 +54,8 @@ def _metadata(
     max_seqs: int,
     draft: int = 5,
     enable_ragged_verification: bool = True,
-) -> DSAtrtllmAttentionMetadata:
-    """A metadata object with just enough state to build its own buffers.
+) -> DSAMetadata:
+    """A DSA extension with just enough state to build its own buffers.
 
     Constructed through ``__new__`` rather than the real constructor: the real
     one wants a runtime, a resource manager and a model config, none of which
@@ -50,17 +63,17 @@ def _metadata(
     new dependency shows up as a clear AttributeError here instead of being
     silently satisfied by a mock.
     """
-    meta = DSAtrtllmAttentionMetadata.__new__(DSAtrtllmAttentionMetadata)
-    meta.kv_cache_manager = _StubCacheManager(num_pools, max_blocks)
-    meta.max_num_sequences = max_seqs
-    meta.max_num_requests = max_seqs
+    meta = _stub()
+    meta.metadata.kv_cache_manager = _StubCacheManager(num_pools, max_blocks)
+    meta.metadata.max_num_sequences = max_seqs
+    meta.metadata.max_num_requests = max_seqs
     meta.max_draft_tokens = draft
     meta.enable_ragged_verification = enable_ragged_verification
-    meta.cuda_graph_buffers = None
+    meta.metadata.cuda_graph_buffers = None
     meta.num_sms = torch.cuda.get_device_properties(0).multi_processor_count
     meta.runtime_tokens_per_gen_step = 0
     meta.create_expanded_buffers(capture_graph=False)
-    meta.prompt_lens_cpu = torch.zeros(max_seqs, dtype=torch.int32)
+    meta.metadata.prompt_lens_cpu = torch.zeros(max_seqs, dtype=torch.int32)
     return meta
 
 
@@ -81,12 +94,10 @@ def test_feature_off_skips_ragged_row_buffers() -> None:
     assert meta.attn_row_block_offsets is None
 
 
-@pytest.mark.parametrize(
-    "metadata_type", [DSAtrtllmAttentionMetadata, DeepseekV4TrtllmAttentionMetadata]
-)
+@pytest.mark.parametrize("metadata_type", [DSAMetadata, DeepseekV4Metadata])
 def test_feature_off_rejects_ragged_layout(metadata_type) -> None:
     """An unexpected ragged update fails instead of dereferencing absent buffers."""
-    meta = metadata_type.__new__(metadata_type)
+    meta = _stub(metadata_type)
     meta.enable_ragged_verification = False
     meta.ragged_verify_lens = None
     assert not meta.is_ragged_verify
@@ -96,37 +107,35 @@ def test_feature_off_rejects_ragged_layout(metadata_type) -> None:
     assert meta.is_ragged_verify
 
     with pytest.raises(RuntimeError, match="without enabling ragged-verification buffers"):
-        meta.prepare()
+        meta._validate_ragged_verification()
     with pytest.raises(RuntimeError, match="without enabling ragged-verification buffers"):
         meta.apply_device_ragged_layout(
             torch.tensor([2]), torch.tensor([0, 0]), torch.tensor([-1, 0])
         )
 
 
-@pytest.mark.parametrize(
-    "metadata_type", [DSAtrtllmAttentionMetadata, DeepseekV4TrtllmAttentionMetadata]
-)
+@pytest.mark.parametrize("metadata_type", [DSAMetadata, DeepseekV4Metadata])
 def test_device_window_kv_bound_preserves_context_and_input(metadata_type) -> None:
-    meta = metadata_type.__new__(metadata_type)
+    meta = _stub(metadata_type)
     meta.device_windows_mode = True
     meta.ragged_verify_lens = [2, 4]
-    meta._num_contexts = 1
-    meta._seq_lens = torch.tensor([7, 2, 4], dtype=torch.int32)
-    meta._seq_lens_kv = None
+    meta.metadata._num_contexts = 1
+    meta.metadata._seq_lens = torch.tensor([7, 2, 4], dtype=torch.int32)
+    meta.metadata._seq_lens_kv = None
     meta.max_draft_tokens = 5
-    meta.kv_lens = torch.tensor([7, 102, 204], dtype=torch.int32)
-    original = meta.kv_lens.clone()
+    meta.metadata.kv_lens = torch.tensor([7, 102, 204], dtype=torch.int32)
+    original = meta.metadata.kv_lens.clone()
     bounded = meta._prepare_device_window_kv_lens(original)
     assert original.tolist() == [7, 102, 204]
     assert bounded.tolist() == [7, 106, 206]
-    assert meta.kv_lens.tolist() == bounded.tolist()
+    assert meta.metadata.kv_lens.tolist() == bounded.tolist()
 
 
 @pytest.mark.parametrize(
     "device_windows_mode,ragged_lens", [(False, [2]), (True, None), (False, None)]
 )
 def test_native_kv_bound_reuses_storage(device_windows_mode, ragged_lens) -> None:
-    meta = DSAtrtllmAttentionMetadata.__new__(DSAtrtllmAttentionMetadata)
+    meta = _stub()
     meta.device_windows_mode = device_windows_mode
     meta.ragged_verify_lens = ragged_lens
     lengths = torch.tensor([102], dtype=torch.int32)
@@ -134,7 +143,7 @@ def test_native_kv_bound_reuses_storage(device_windows_mode, ragged_lens) -> Non
 
 
 def _expand(
-    meta: DSAtrtllmAttentionMetadata,
+    meta: DSAMetadata,
     *,
     num_contexts: int,
     row_req_idx: list[int],
@@ -143,14 +152,14 @@ def _expand(
 ) -> int:
     """Drive the private expansion with an explicit row->request map."""
     ngt = len(row_req_idx)
-    meta.num_contexts = num_contexts
+    meta.metadata.num_contexts = num_contexts
     meta._ragged_num_rows = ngt
     meta.ragged_verify_lens = [1] * ngt
-    meta.kv_cache_block_offsets = block_offsets
+    meta.metadata.kv_cache_block_offsets = block_offsets
     meta.row_req_idx_host[:ngt].copy_(torch.tensor(row_req_idx, dtype=torch.long))
     meta.row_kv_lens_host[:ngt].fill_(7)
     meta.row_kv_correction_host[:ngt].zero_()
-    meta.prompt_lens_cpu[:num_seqs].fill_(1)
+    meta.metadata.prompt_lens_cpu[:num_seqs].fill_(1)
     meta._prepare_token_major_gen_rows(torch.full((num_seqs,), 7, dtype=torch.int32))
     return meta._attn_num_rows
 
@@ -173,7 +182,7 @@ def test_row_block_table_matches_op_layout(num_pools: int) -> None:
     )
     assert rows == len(row_req_idx)
 
-    got = meta.token_major_gen_view().kv_cache_block_offsets
+    got = meta.metadata.token_major_gen_view().kv_cache_block_offsets
     assert got.dim() == src.dim(), (
         f"expanded table has rank {got.dim()} but the attention op reads rank "
         f"{src.dim()}; substituting it wholesale would misread every axis"
@@ -240,13 +249,13 @@ def test_device_layout_preserves_mixed_context_row_and_token_prefixes() -> None:
     )
     assert rows == 5
 
-    meta.num_generations = 2
-    meta._num_ctx_tokens = 5
-    meta.seq_lens = torch.tensor([2, 3, 1, 2], dtype=torch.int32)
-    meta._seq_lens_cuda = meta.seq_lens.to(device="cuda")
-    meta.req_idx_per_token = torch.full((32,), -1, dtype=torch.int32, device="cuda")
+    meta.metadata.num_generations = 2
+    meta.metadata._num_ctx_tokens = 5
+    meta.metadata.seq_lens = torch.tensor([2, 3, 1, 2], dtype=torch.int32)
+    meta.metadata._seq_lens_cuda = meta.metadata.seq_lens.to(device="cuda")
+    meta.index_share.req_idx_per_token = torch.full((32,), -1, dtype=torch.int32, device="cuda")
     context_token_requests = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32, device="cuda")
-    meta.req_idx_per_token[:5].copy_(context_token_requests)
+    meta.index_share.req_idx_per_token[:5].copy_(context_token_requests)
     context_row_requests = torch.tensor([0, 1], dtype=torch.long, device="cuda")
     context_row_corrections = torch.tensor([10, 20], dtype=torch.int32, device="cuda")
     meta.attn_row_req_idx_cuda[:2].copy_(context_row_requests)
@@ -266,11 +275,61 @@ def test_device_layout_preserves_mixed_context_row_and_token_prefixes() -> None:
         meta.attn_row_kv_correction_cuda[:5],
         torch.tensor([10, 20, -2, -1, 0], dtype=torch.int32, device="cuda"),
     )
-    assert torch.equal(meta.req_idx_per_token[:5], context_token_requests)
+    assert torch.equal(meta.index_share.req_idx_per_token[:5], context_token_requests)
     assert torch.equal(
-        meta.req_idx_per_token[5:8],
+        meta.index_share.req_idx_per_token[5:8],
         torch.tensor([2, 3, 3], dtype=torch.int32, device="cuda"),
     )
+    meta.metadata.check_lengths_current()
+
+
+def test_device_layout_applies_kv_lens_delta_and_clears_lengths_changed(monkeypatch) -> None:
+    """Device-window reranking adjusts kv_lens_cuda, refreshes derived state, and leaves lengths clean."""
+    torch.cuda.init()
+    meta = _metadata(num_pools=1, max_blocks=8, max_seqs=4)
+    block_offsets = torch.arange(1 * 4 * 2 * 8, dtype=torch.int32, device="cuda").reshape(
+        1, 4, 2, 8
+    )
+    rows = _expand(
+        meta,
+        num_contexts=0,
+        row_req_idx=[0, 1, 1],
+        num_seqs=2,
+        block_offsets=block_offsets,
+    )
+    assert rows == 3
+
+    md = meta.metadata
+    core = md.core()
+    core.num_generations = 2
+    core._num_contexts = 0
+    core._num_ctx_tokens = 0
+    core._num_tokens = 3
+    core.seq_lens = torch.tensor([2, 1], dtype=torch.int32)
+    core._seq_lens_cuda = torch.tensor([2, 1], dtype=torch.int32, device="cuda")
+    core.kv_lens = torch.tensor([104, 202], dtype=torch.int32)
+    core.kv_lens_cuda = torch.tensor([104, 202], dtype=torch.int32, device="cuda")
+    meta.index_share.req_idx_per_token = torch.full((32,), -1, dtype=torch.int32, device="cuda")
+    meta.indexer_k_cache_block_offsets = torch.arange(
+        2 * 8, dtype=torch.int32, device="cuda"
+    ).reshape(2, 8)
+    refreshed = []
+    monkeypatch.setattr(meta, "on_update_kv_lens", lambda: refreshed.append(True))
+
+    meta.apply_device_ragged_layout(
+        verify_lens=torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
+        req_idx=torch.tensor([0, 1, 1], dtype=torch.long, device="cuda"),
+        kv_correction=torch.tensor([0, -1, 0], dtype=torch.int32, device="cuda"),
+        kv_lens_delta=torch.tensor([-2, 2], dtype=torch.int32, device="cuda"),
+    )
+
+    assert torch.equal(md.seq_lens_cuda[:2], torch.tensor([1, 2], dtype=torch.int32, device="cuda"))
+    assert torch.equal(
+        md.kv_lens_cuda[:2], torch.tensor([102, 204], dtype=torch.int32, device="cuda")
+    )
+    assert refreshed == [True]
+    assert not md.lengths_changed
+    md.check_lengths_current()
 
 
 def test_every_runtime_view_shares_the_row_count() -> None:
@@ -286,7 +345,7 @@ def test_every_runtime_view_shares_the_row_count() -> None:
     nc = 1
     rows = _expand(meta, num_contexts=nc, row_req_idx=[0, 0, 1], num_seqs=6, block_offsets=src)
 
-    view = meta.token_major_gen_view()
+    view = meta.metadata.token_major_gen_view()
     for name in (
         "sequence_length",
         "host_past_key_value_lengths",

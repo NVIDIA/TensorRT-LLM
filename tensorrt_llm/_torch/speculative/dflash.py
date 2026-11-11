@@ -894,12 +894,6 @@ class DFlashWorker(SpecWorkerBase):
         self._saved_ctx_len_host = None
         self._saved_req_ctx_pos = None
         self._ctx_len_restore_pending = False
-        # Deferred kv_lens_cuda rewind state (see _prepare_kv_for_draft_forward,
-        # _apply_kv_rewind_after_draft, _ensure_spec_dec_state_restored).
-        self._kv_rewind_pending = False
-        self._kv_rewind_amount = None
-        self._kv_rewind_nc = None
-        self._kv_rewind_bs = None
         self._batch_to_slot_buffer = None
         self._max_ctx = 0
         self._ctx_k_buf = None  # [max_batch+1, L, max_ctx+block, nkv, hd]
@@ -1393,17 +1387,22 @@ class DFlashWorker(SpecWorkerBase):
         """
         if self._ctx_block_tables is None or num_seqs <= 0:
             return False
-        offsets_name = (
-            "kv_cache_block_offsets" if self._ctx_unified_cache else "draft_kv_cache_block_offsets"
-        )
-        src = getattr(attn_metadata, offsets_name, None)
+        if self._ctx_unified_cache:
+            # A unified draft KV cache is the target's manager: its block
+            # offsets are the target's.
+            src = getattr(attn_metadata, "kv_cache_block_offsets", None)
+        else:
+            # The draft metadata over the draft KV cache stages its own block
+            # offsets, the whole table, in the target's prepare.
+            draft = attn_metadata.find("draft_or_none", None)
+            src = draft.kv_cache_block_offsets if draft is not None else None
         if src is None:
             # The table is bound but unfillable. Leaving it at zeros would send
             # every request's every layer to pool block 0 -- silently.
             raise RuntimeError(
                 "DFlash: bound to the draft KV pool but "
                 f"{type(attn_metadata).__name__} carries no "
-                f"{offsets_name} this iteration."
+                "draft KV block offsets this iteration."
             )
         # Field 0 of the K/V pair: both name the same block for a kv_factor=2
         # pool, and the drafter addresses blocks, not planes. The block count
@@ -1427,13 +1426,18 @@ class DFlashWorker(SpecWorkerBase):
             draft_kv_cache_manager is not None
             and draft_kv_cache_manager is getattr(attn_metadata, "kv_cache_manager", None)
         )
-        offsets_name = (
-            "kv_cache_block_offsets" if self._ctx_unified_cache else "draft_kv_cache_block_offsets"
-        )
-        if draft_kv_cache_manager is not None and not hasattr(attn_metadata, offsets_name):
+        # Only TrtllmAttentionMetadata has KV block offsets (and its draft
+        # metadata's). Without them the table stays all-zero and every request
+        # would read and write pool block 0 -- silently, at acceptance 1.0.
+        if self._ctx_unified_cache:
+            has_block_offsets = hasattr(attn_metadata, "kv_cache_block_offsets")
+        else:
+            draft = attn_metadata.find("draft_or_none", None)
+            has_block_offsets = draft is not None and hasattr(draft, "kv_cache_block_offsets")
+        if draft_kv_cache_manager is not None and not has_block_offsets:
             if self._ctx_unified_cache:
                 raise NotImplementedError(
-                    f"DFlash unified KV requires {offsets_name} in attention metadata"
+                    "DFlash unified KV requires kv_cache_block_offsets in attention metadata"
                 )
             logger.warning(
                 f"DFlash: {type(attn_metadata).__name__} carries no draft KV block offsets; "
@@ -1924,54 +1928,6 @@ class DFlashWorker(SpecWorkerBase):
                 kv_layout="HND",
             )
 
-    def _prepare_attn_metadata_for_dflash(self, attn_metadata, spec_metadata):
-        """Save attn_metadata fields that DFlash modifies during forward."""
-        is_capturing = torch.cuda.is_current_stream_capturing()
-
-        if spec_metadata.is_cuda_graph and not is_capturing:
-            # Only TRTLLM attention metadata keeps device-side KV lengths; on
-            # other backends (FlashInfer) there is nothing to save.
-            fields = ["_seq_lens", "_seq_lens_cuda"]
-            if hasattr(attn_metadata, "kv_lens_cuda"):
-                fields.append("kv_lens_cuda")
-            attn_metadata.prepare_for_spec_dec(*fields)
-        else:
-            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
-
-    def _prepare_kv_for_draft_forward(
-        self,
-        attn_metadata,
-        num_accepted_tokens: torch.Tensor,
-        num_contexts: int,
-        batch_size: int,
-    ):
-        """Adjust kv_lens_cuda so the draft model sees correct RoPE positions."""
-        if hasattr(attn_metadata, "kv_lens_cuda"):
-            self._kv_rewind_amount = 1 - num_accepted_tokens[num_contexts:batch_size]
-            self._kv_rewind_nc = num_contexts
-            self._kv_rewind_bs = batch_size
-
-            if batch_size > num_contexts:
-                attn_metadata.kv_lens_cuda[num_contexts:batch_size] += 1
-            self._kv_rewind_pending = True
-
-            attn_metadata.update_for_spec_dec()
-
-    def _apply_kv_rewind_after_draft(self, attn_metadata, spec_metadata):
-        """Apply the deferred kv_lens rewind after the draft forward."""
-        self._kv_rewind_pending = False
-        is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
-        if is_warmup:
-            # kv_lens_cuda was saved by prepare_for_spec_dec in this mode and
-            # is restored wholesale, so no rewind is needed.
-            return
-
-        if self._kv_rewind_amount is not None and hasattr(attn_metadata, "kv_lens_cuda"):
-            nc = self._kv_rewind_nc
-            bs = self._kv_rewind_bs
-            attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
-            attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
-
     def _advance_ctx_len(self, slots: torch.Tensor, num_accepted: torch.Tensor) -> None:
         """Add this step's accepted tokens to the context lengths of ``slots``, on the device.
 
@@ -2200,16 +2156,7 @@ class DFlashWorker(SpecWorkerBase):
         self._write_ctx_len(ctx_len_updates, ctx_base_updates)
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
-        # Restore first (in warmup mode kv_lens_cuda was saved and comes back
-        # wholesale), then apply any pending rewind for the other modes so a
-        # failed draft forward does not leave kv_lens_cuda incremented.
         super()._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
-        if (
-            getattr(self, "_kv_rewind_pending", False)
-            and attn_metadata is not None
-            and spec_metadata is not None
-        ):
-            self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
         if (
             getattr(self, "_ctx_len_restore_pending", False)
             and self._ctx_len is not None
@@ -2325,196 +2272,199 @@ class DFlashWorker(SpecWorkerBase):
                 state_indices=attn_metadata.mamba_metadata.state_indices,
             )
 
-        self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
-        self._prepare_kv_for_draft_forward(
-            attn_metadata, num_accepted_tokens, num_contexts, batch_size
-        )
+        # The drafter's inputs set their lengths on the draft metadata, which
+        # leaves the target's untouched; without one, the target's lengths
+        # are saved and restored around the draft. The drafter attends its
+        # own context cache and reads no KV lengths.
+        with self.draft_loop(attn_metadata) as draft_attn_metadata:
+            # Collapse mrope [3, 1, N] to 1D by taking the first (temporal) dimension.
+            # The draft model uses standard 1D RoPE, so only scalar positions are needed.
+            if position_ids.ndim == 3:
+                position_ids = position_ids[0, 0]
+            else:
+                position_ids = position_ids.squeeze(0)
 
-        # Collapse mrope [3, 1, N] to 1D by taking the first (temporal) dimension.
-        # The draft model uses standard 1D RoPE, so only scalar positions are needed.
-        if position_ids.ndim == 3:
-            position_ids = position_ids[0, 0]
-        else:
-            position_ids = position_ids.squeeze(0)
+            # Get total tokens processed by target model (for hidden state extraction)
+            total_target_tokens = input_ids.shape[0]
 
-        # Get total tokens processed by target model (for hidden state extraction)
-        total_target_tokens = input_ids.shape[0]
-
-        # Capture prefill (context) hidden states for future gen steps.
-        # This gives the draft model the full prompt context, not just gen tokens.
-        if num_contexts > 0:
-            self._store_prefill_context(
-                draft_model, spec_metadata, attn_metadata, position_ids, total_target_tokens
-            )
-            # Rebuild batch_to_slot after prefill assigns new slots
-            if self._ctx_buf_inited and spec_metadata.request_ids:
-                self._rebuild_batch_to_slot(spec_metadata.request_ids)
-
-        inputs = self.prepare_1st_drafter_inputs(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            accepted_tokens=accepted_tokens,
-            num_accepted_tokens=num_accepted_tokens,
-            attn_metadata=attn_metadata,
-            spec_metadata=spec_metadata,
-            draft_model=draft_model,
-            total_target_tokens=total_target_tokens,
-        )
-
-        if num_gens > 0:
-            with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-                hidden_states_out = draft_model.dflash_forward(
-                    noise_embedding=inputs["noise_embedding"],
-                    query_positions=inputs["query_positions"],
-                    num_ctx_per_req=inputs["num_ctx_per_req"],
-                    ctx_k_cache=inputs["ctx_k_cache"],
-                    ctx_v_cache=inputs["ctx_v_cache"],
-                    ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
-                    ctx_kv_cache=inputs["ctx_kv_cache"],
-                    ctx_page_table=inputs["ctx_page_table"],
-                    block_placement=inputs["block_placement"],
+            # Capture prefill (context) hidden states for future gen steps.
+            # This gives the draft model the full prompt context, not just gen tokens.
+            if num_contexts > 0:
+                self._store_prefill_context(
+                    draft_model, spec_metadata, attn_metadata, position_ids, total_target_tokens
                 )
+                # Rebuild batch_to_slot after prefill assigns new slots
+                if self._ctx_buf_inited and spec_metadata.request_ids:
+                    self._rebuild_batch_to_slot(spec_metadata.request_ids)
 
-                # Gather K logits per gen request from the block outputs.
-                # hidden_states_out is flat: [num_gens * block_size, hidden_dim].
-                # Which block slots carry them is a drafter-family convention,
-                # resolved through _draft_slot_ids.
-                block_size = self._compute_block_size
-                gen_gather_ids = self._draft_slot_ids(draft_model, num_gens, block_size, K)
-                # Shields only the last request: at block_size == K with
-                # shift_label off, slots run 1..K, so every request reads the
-                # next one's slot 0 and the last overruns. Degrades, never raises.
-                gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
+            inputs = self.prepare_1st_drafter_inputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                attn_metadata=draft_attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_model=draft_model,
+                total_target_tokens=total_target_tokens,
+            )
 
-                gen_hidden_states = hidden_states_out[gen_gather_ids]
-                vocab_parallel = self._vocab_parallel
-                if (
-                    vocab_parallel is not None
-                    and vocab_parallel.draft_tokens is not None
-                    and not spec_metadata.wants_advanced_draft_sampling
-                ):
-                    # Greedy draft tokens straight from this rank's vocab shard
-                    # of the block logits, bit-identical to refining the
-                    # gathered logits and taking the per-position argmax.
-                    local_block = vocab_parallel.head.local_logits(gen_hidden_states)
-                    gen_draft_tokens = vocab_parallel.draft_tokens(
-                        draft_model, local_block.view(num_gens, K, -1), inputs
-                    )
-                    vocab_size = vocab_parallel.head.vocab_size
-                else:
-                    gen_logits = draft_model.logits_processor(
-                        gen_hidden_states, draft_model.lm_head, attn_metadata, True
-                    )
-                    # The drafter shares the target's LM head but not its logits
-                    # processor, so apply the transform its config declares,
-                    # before any refinement: a DSpark Markov bias is added to
-                    # the transformed logits.
-                    gen_logits = draft_model.apply_draft_logit_transform(gen_logits)
-
-                    vocab_size = gen_logits.shape[-1]
-                    gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
-
-                    gen_logits = self._refine_block_logits(
-                        draft_model, gen_logits, inputs, spec_metadata
+            if num_gens > 0:
+                with self.draft_kv_cache_context(
+                    draft_attn_metadata, draft_kv_cache_manager
+                ) as draft_attn_metadata:
+                    # The logits read the metadata the context selects, such as a
+                    # FlashInfer view over a separate draft KV cache.
+                    hidden_states_out = draft_model.dflash_forward(
+                        noise_embedding=inputs["noise_embedding"],
+                        query_positions=inputs["query_positions"],
+                        num_ctx_per_req=inputs["num_ctx_per_req"],
+                        ctx_k_cache=inputs["ctx_k_cache"],
+                        ctx_v_cache=inputs["ctx_v_cache"],
+                        ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
+                        ctx_kv_cache=inputs["ctx_kv_cache"],
+                        ctx_page_table=inputs["ctx_page_table"],
+                        block_placement=inputs["block_placement"],
                     )
 
-                    # DFlash 2: replace the independent per-position picks with
-                    # one coherent path through the block (absent for plain
-                    # DFlash).
-                    if getattr(draft_model, "lilicorr", None) is not None:
-                        gen_logits = self._apply_lilicorr(
-                            draft_model,
-                            gen_logits,
-                            gen_hidden_states.reshape(num_gens, K, -1),
-                            inputs["lilicorr_anchor"],
-                            spec_metadata,
+                    # Gather K logits per gen request from the block outputs.
+                    # hidden_states_out is flat: [num_gens * block_size, hidden_dim].
+                    # Which block slots carry them is a drafter-family convention,
+                    # resolved through _draft_slot_ids.
+                    block_size = self._compute_block_size
+                    gen_gather_ids = self._draft_slot_ids(draft_model, num_gens, block_size, K)
+                    # Shields only the last request: at block_size == K with
+                    # shift_label off, slots run 1..K, so every request reads the
+                    # next one's slot 0 and the last overruns. Degrades, never raises.
+                    gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
+
+                    gen_hidden_states = hidden_states_out[gen_gather_ids]
+                    vocab_parallel = self._vocab_parallel
+                    if (
+                        vocab_parallel is not None
+                        and vocab_parallel.draft_tokens is not None
+                        and not spec_metadata.wants_advanced_draft_sampling
+                    ):
+                        # Greedy draft tokens straight from this rank's vocab shard
+                        # of the block logits, bit-identical to refining the
+                        # gathered logits and taking the per-position argmax.
+                        local_block = vocab_parallel.head.local_logits(gen_hidden_states)
+                        gen_draft_tokens = vocab_parallel.draft_tokens(
+                            draft_model, local_block.view(num_gens, K, -1), inputs
                         )
+                        vocab_size = vocab_parallel.head.vocab_size
+                    else:
+                        gen_logits = draft_model.logits_processor(
+                            gen_hidden_states, draft_model.lm_head, draft_attn_metadata, True
+                        )
+                        # The drafter shares the target's LM head but not its logits
+                        # processor, so apply the transform its config declares,
+                        # before any refinement: a DSpark Markov bias is added to
+                        # the transformed logits.
+                        gen_logits = draft_model.apply_draft_logit_transform(gen_logits)
+
                         vocab_size = gen_logits.shape[-1]
-                    elif getattr(draft_model, "has_candidate_selector", False):
-                        gen_logits = self._apply_dflash2_selector(
-                            draft_model,
+                        gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
+
+                        gen_logits = self._refine_block_logits(
+                            draft_model, gen_logits, inputs, spec_metadata
+                        )
+
+                        # DFlash 2: replace the independent per-position picks with
+                        # one coherent path through the block (absent for plain
+                        # DFlash).
+                        if getattr(draft_model, "lilicorr", None) is not None:
+                            gen_logits = self._apply_lilicorr(
+                                draft_model,
+                                gen_logits,
+                                gen_hidden_states.reshape(num_gens, K, -1),
+                                inputs["lilicorr_anchor"],
+                                spec_metadata,
+                            )
+                            vocab_size = gen_logits.shape[-1]
+                        elif getattr(draft_model, "has_candidate_selector", False):
+                            gen_logits = self._apply_dflash2_selector(
+                                draft_model,
+                                gen_logits,
+                                gen_hidden_states.reshape(num_gens, K, -1),
+                                inputs["first_prev_tokens"],
+                                spec_metadata,
+                            )
+                            vocab_size = gen_logits.shape[-1]
+
+                        gen_draft_tokens = self.sample_draft_tokens(
                             gen_logits,
+                            spec_metadata,
+                            batch_size,
+                            num_contexts=num_contexts,
+                        )
+
+                    # Opt-in confidence-calibration recording (env-gated). The
+                    # confidence values come from an optional provider on the
+                    # recorder (None by default -> no calibration rows collected;
+                    # see accept_stats.py). Guarded off for CUDA-graph batches
+                    # and d2t vocab-mapped drafters.
+                    if (
+                        self._accept_stats is not None
+                        and self._accept_stats.confidence_provider is not None
+                        and not spec_metadata.is_cuda_graph
+                        and not torch.cuda.is_current_stream_capturing()
+                        and spec_metadata.request_ids is not None
+                        and self._d2t is None
+                    ):
+                        self._accept_stats.record_draft_confidence(
+                            spec_metadata.request_ids[num_contexts:batch_size],
+                            draft_model,
                             gen_hidden_states.reshape(num_gens, K, -1),
                             inputs["first_prev_tokens"],
-                            spec_metadata,
+                            gen_draft_tokens,
                         )
-                        vocab_size = gen_logits.shape[-1]
 
-                    gen_draft_tokens = self.sample_draft_tokens(
-                        gen_logits,
-                        spec_metadata,
-                        batch_size,
-                        num_contexts=num_contexts,
-                    )
+            else:
+                gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
 
-                # Opt-in confidence-calibration recording (env-gated). The
-                # confidence values come from an optional provider on the
-                # recorder (None by default -> no calibration rows collected;
-                # see accept_stats.py). Guarded off for CUDA-graph batches
-                # and d2t vocab-mapped drafters.
-                if (
-                    self._accept_stats is not None
-                    and self._accept_stats.confidence_provider is not None
-                    and not spec_metadata.is_cuda_graph
-                    and not torch.cuda.is_current_stream_capturing()
-                    and spec_metadata.request_ids is not None
-                    and self._d2t is None
-                ):
-                    self._accept_stats.record_draft_confidence(
-                        spec_metadata.request_ids[num_contexts:batch_size],
-                        draft_model,
-                        gen_hidden_states.reshape(num_gens, K, -1),
-                        inputs["first_prev_tokens"],
-                        gen_draft_tokens,
-                    )
+            # Context requests are not drafted by the block worker (zero placeholder
+            # token); fill their draft-prob slot rows with a one-hot placeholder so
+            # they are a legal distribution when they become gen requests next iter.
+            gen_vocab = vocab_size if num_gens > 0 else None
+            self.write_context_onehot_draft_probs(
+                spec_metadata, num_contexts, num_gens, K, gen_vocab
+            )
 
-        else:
-            gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
+            if num_contexts > 0 and num_gens > 0:
+                ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
+                next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
+            elif num_contexts > 0:
+                next_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
+            else:
+                next_draft_tokens = gen_draft_tokens
 
-        # Context requests are not drafted by the block worker (zero placeholder
-        # token); fill their draft-prob slot rows with a one-hot placeholder so
-        # they are a legal distribution when they become gen requests next iter.
-        gen_vocab = vocab_size if num_gens > 0 else None
-        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
+            self._rollback_guided_decoder_after_verify(num_accepted_tokens)
 
-        if num_contexts > 0 and num_gens > 0:
-            ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
-            next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
-        elif num_contexts > 0:
-            next_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
-        else:
-            next_draft_tokens = gen_draft_tokens
+            next_new_tokens = self._prepare_next_new_tokens(
+                accepted_tokens,
+                next_draft_tokens,
+                spec_metadata.batch_indices_cuda,
+                batch_size,
+                num_accepted_tokens,
+            )
 
-        self._restore_attn_metadata_from_spec_dec(attn_metadata)
-        self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
+            # Restore context lengths after warmup; real runs keep the updates.
+            if is_warmup:
+                self._restore_ctx_len_device()
+                self._restore_ctx_len_host()
+            self._ctx_len_restore_pending = False
 
-        self._rollback_guided_decoder_after_verify(num_accepted_tokens)
-
-        next_new_tokens = self._prepare_next_new_tokens(
-            accepted_tokens,
-            next_draft_tokens,
-            spec_metadata.batch_indices_cuda,
-            batch_size,
-            num_accepted_tokens,
-        )
-
-        # Restore context lengths after warmup; real runs keep the updates.
-        if is_warmup:
-            self._restore_ctx_len_device()
-            self._restore_ctx_len_host()
-        self._ctx_len_restore_pending = False
-
-        return {
-            # The gathered float32 target logits, or this rank's vocab shard
-            # when the target tokens were selected from it.
-            "logits": raw_logits,
-            "logits_vocab_shard": logits_vocab_shard,
-            "new_tokens": accepted_tokens,
-            "new_tokens_lens": num_accepted_tokens,
-            "next_draft_tokens": next_draft_tokens,
-            "next_new_tokens": next_new_tokens,
-        }
+            return {
+                # The gathered float32 target logits, or this rank's vocab shard
+                # when the target tokens were selected from it.
+                "logits": raw_logits,
+                "logits_vocab_shard": logits_vocab_shard,
+                "new_tokens": accepted_tokens,
+                "new_tokens_lens": num_accepted_tokens,
+                "next_draft_tokens": next_draft_tokens,
+                "next_new_tokens": next_new_tokens,
+            }
 
     def _draft_block_width(self, draft_model) -> int:
         """Block slots the draft forward must compute for K draft tokens.
@@ -2886,10 +2836,12 @@ class DFlashWorker(SpecWorkerBase):
 
             # Update seq_lens for gen requests to K+1 (the number of tokens
             # the target forward actually processed).
-            attn_metadata._seq_lens_cuda[num_contexts : num_contexts + num_gens] = (
-                total_tokens_per_req
+            attn_metadata.set_seq_lens(
+                slice(num_contexts, num_contexts + num_gens),
+                host=total_tokens_per_req,
+                device=total_tokens_per_req,
             )
-            attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = total_tokens_per_req
+            self.refresh_draft()
         else:
             noise_embedding = hidden_states.new_empty(0, 0, hidden_dim)
             query_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
@@ -2975,7 +2927,8 @@ class DFlashWorker(SpecWorkerBase):
             block_size,
             width,
         )
-        attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = width
+        attn_metadata.set_seq_lens(slice(num_contexts, num_contexts + num_gens), host=width)
+        self.refresh_draft()
 
         noise_embedding = dflash_noise_block_embedding(
             draft_model.draft_model_full.model.embed_tokens,

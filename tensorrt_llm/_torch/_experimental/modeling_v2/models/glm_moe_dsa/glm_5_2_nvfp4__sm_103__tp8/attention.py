@@ -30,7 +30,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.backend import DSATrtllmAttention
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
-from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+    DSAMetadata,
+    DSAtrtllmAttentionMetadata,
+)
 from tensorrt_llm._torch.attention.backends.sparse.dsa.module import DSAHooks
 from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV32Attention
@@ -38,6 +41,11 @@ from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
 from . import attention_forward, dispatch
 from .kernels.indexer_topk import region
+
+
+def _dsa_state(metadata: DSAtrtllmAttentionMetadata) -> DSAMetadata:
+    """The DSA extension of ``metadata``, which holds the indexer and pool-view state."""
+    return metadata.ext(DSAMetadata)
 
 
 def reclass(module, builtin: type, cls: type) -> None:
@@ -309,6 +317,7 @@ class GlmDsaBackend(DSATrtllmAttention):
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run the DSA indexer and convert its local TopK to paged indices."""
+        dsa_state = _dsa_state(metadata)
         if dispatch.phase() is not dispatch.Phase.DECODE:
             return super().sparse_attn_predict(
                 q=q, k=k, metadata=metadata, forward_args=forward_args
@@ -360,7 +369,7 @@ class GlmDsaBackend(DSATrtllmAttention):
         local_layer_idx = self.get_local_layer_idx(metadata)
         kv_cache_dtype = getattr(metadata.kv_cache_manager, "dtype", None)
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4 and not is_generation:
-            metadata._ensure_pool_view_cached()
+            dsa_state._ensure_pool_view_cached()
             page_index_scale, layer_offset = (
                 metadata.kv_cache_manager.get_primary_pool_page_index_params(local_layer_idx)
             )
@@ -390,19 +399,19 @@ class GlmDsaBackend(DSATrtllmAttention):
                 metadata.host_kv_cache_pool_pointers,
                 metadata.host_kv_cache_pool_mapping,
                 topk_indices,
-                metadata._cached_req_idx_ctx,
-                metadata._cached_block_table_ctx,
+                dsa_state._cached_req_idx_ctx,
+                dsa_state._cached_block_table_ctx,
                 metadata.ctx_kv_indptr[: metadata.num_contexts + 1],
                 scratch,
                 compact_indices,
                 self._nvfp4_mla_kv_scale_quant_orig,
                 local_layer_idx,
                 total_kv_tokens,
-                metadata._cached_tokens_per_block,
-                page_index_scale * metadata._cached_tokens_per_block,
+                dsa_state._cached_tokens_per_block,
+                page_index_scale * dsa_state._cached_tokens_per_block,
                 layer_offset,
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
-                metadata._cached_num_pool_tokens,
+                dsa_state._cached_num_pool_tokens,
             )
             metadata.nvfp4_mla_context_fp8_scratch = scratch
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
@@ -437,7 +446,7 @@ class GlmDsaBackend(DSATrtllmAttention):
                 self._nvfp4_mla_kv_scale_quant_orig,
                 local_layer_idx,
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
-                metadata._cached_num_pool_tokens,
+                dsa_state._cached_num_pool_tokens,
             )
             # Static sparse MLA treats indices as offsets from kvPtr. Feed it
             # compact offsets and the FP8 scratch base; TRTLLMGen is unchanged.

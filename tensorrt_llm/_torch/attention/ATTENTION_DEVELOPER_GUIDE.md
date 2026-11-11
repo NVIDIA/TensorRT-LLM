@@ -354,17 +354,190 @@ metadata and cache behavior.
 
 ### 3.1 Metadata families
 
-All backend metadata types inherit from `AttentionMetadata`. The base contract
-includes sequence-length and request-level state, KV-cache manager and
-parameters, runtime feature flags, and optional CUDA-graph buffer management.
-Sparse metadata subtypes consume only `SparseMetadataParams`, not
-backend-owned `SparseParams`.
+All backend metadata types inherit from `AttentionMetadata`, a container of
+extensions with no state of its own: it holds the extension registry and the
+lifecycle entry points (`prepare` and CUDA-graph copies). Its constructor routes every keyword argument to the extension that
+takes it (`init_fields`); an argument for an extension that is not attached,
+or that no extension takes, is an error.
+
+The state lives in the family's core, an `AttentionCoreMetadata`
+(`backends/core.py`) extension that is always attached first. The base core
+holds the construction configuration (capacities, mapping, KV cache manager,
+runtime features, CUDA-graph flag and buffer pool, cache indirection) and the
+batch layout and inputs (query/KV lengths, request and token counts, request
+IDs, prompt lengths, offsets, KV-cache parameters, beam width, attention DP
+token counts); `TrtllmCoreMetadata`, `FlashInferCoreMetadata` and
+`VanillaCoreMetadata` add the family's buffers and planner state, allocate them
+in their constructor and derive them per step in `derive()`. A family picks its core
+with `core_metadata_type`, and the constructor routes the core's arguments to
+it. Because the metadata forwards the core's declared fields, `metadata.seq_lens`
+and `metadata.kv_lens_cuda` read the core. `copy.copy` of a metadata copies its
+core, so a view owns its batch state.
+
+Everything a feature, a sparse algorithm or a model adds on top of a core
+family is a `MetadataExtension` (`backends/extensions.py`) attached to the
+metadata, not a metadata subclass. Callers reach one with `metadata.ext(T)`
+(raises when absent) or `metadata.find_ext(T)` (returns None). The metadata
+drives every extension through two required hooks: the constructor on
+creation and on every CUDA-graph, cross-attention or draft copy, and
+`prepare()` once per step after the core derived. The constructor
+`__init__(metadata, *, source=None, **config)` calls `super().__init__` first,
+which sets every creation argument the class declares in `init_fields` (a map
+from name to default) from the routed arguments or the default; it then sets
+the extension's other state and allocates its persistent buffers. State every
+copy shares with its source (declared in `shared`) comes from
+`self.shared_or(name, allocate)`. There is no constructor that skips
+allocation: an extension that is not attached is absent. Two members are
+opt-in and called only by `DraftMetadata` on a draft's extensions:
+`adopt_target_state(source)` and `refresh_from_draft_lengths()`, which
+refreshes the state derived from the draft's lengths after the draft loop
+changed them; an override calls `super()`. Length-derived state an extension
+computes lazily is invalidated by the extension itself in `prepare()` and
+`refresh_from_draft_lengths()`. A model declares the extensions it needs and
+their creation arguments through `RuntimeHooks.metadata_extensions` /
+`metadata_config` (for example MiniMax-M3's `msa_policy`); its per-step state
+lives in a model extension or on the model, never in a module-level table
+keyed by the metadata. Extensions come from three places:
+
+- the core family's own configuration (`default_extension_types()`), such as
+  `HelixMetadata`, `DraftMetadata`, `Fp4MlaState`, `SpecDecodingMetadata`
+  and `RecurrentMetadata`;
+- the backend's `metadata_extensions`, such as a sparse algorithm's
+  `SparseAlgorithmExtension` (at most one per metadata); and
+- the caller's `extension_types`, such as `FlashMlaMetadata`.
+
+The engine describes each step with a `BatchInputs` (sequence lengths,
+context count, request IDs, prompt lengths, KV-cache parameters,
+beam width, optional packed-token offsets, `kv_lens_offsets`,
+`position_id_offsets`, and `cross` for the cross-attention sub-metadata) and
+calls
+`metadata.prepare(inputs, context_requests=...)`. Every forward of a metadata
+follows its own `prepare()`; CUDA-graph warmup and capture prepare again
+before each forward (`CUDAGraphRunner.capture(..., prepare_each_forward=True)`).
+`kv_lens_offsets` carries the overlap scheduler's KV-length correction for
+speculative decoding (the previous step's accepted draft tokens, known only on
+device): the TRTLLM core adds it to the device KV lengths in `prepare()`, so
+the device lengths may be shorter than the host ones, and each extension
+derives its length-dependent device state from the device lengths there.
+`position_id_offsets` carries the same correction per generation token for
+the positions; `HelixMetadata` applies it to its global positions and derives
+the rank-local KV lengths of speculative verify groups on device in its
+`prepare()`, which supersedes the `kv_lens_offsets` correction. Extensions
+prepared after Helix (DSA, FP4 MLA) derive from those lengths.
+
+Write access follows field ownership. Lengths and counts belong to the core; code that changes them after `prepare()` uses the
+core's methods, which keep the graph-stable buffers: `adjust_kv_lens()` /
+`set_kv_lens()` for the device KV lengths, `adjust_seq_lens()` /
+`set_seq_lens()` / `bind_lengths()` / `copy_lengths_from()` for the query
+lengths and counts, and `set_cached_token_counts()` for the host cached-token
+counts a draft forward reads. Each of these sets the core's
+`lengths_changed` and refreshes nothing derived from the lengths; a fused
+kernel that writes lengths takes the buffers from
+`lengths_for_kernel_update()`, which sets it too. A draft loop then calls
+`metadata.refresh_draft()` on the target before the next draft forward: when
+the draft's lengths changed, the draft's core re-derives its eagerly derived
+length state (`resync_length_derived_state()`), every other extension runs
+`refresh_from_draft_lengths()` from the draft's current lengths, and the flag
+is cleared. `prepare()`, the steady decode step and the encoder-graph bind
+clear it as well. Every attention forward calls `check_lengths_current()`,
+which raises while it is set. The KV-cache manager is creation configuration;
+`BatchInputs` carries none. A draft loop that turns the
+context requests into one-token generation rows (Eagle3, MTP-Eagle,
+draft-target) also clears the context cached KV through
+`clear_context_cached_kv()`; MTP's correction of its draft's cached lengths
+keeps the context rows.
+
+One-model speculative decoding runs its draft forwards on the draft metadata
+`metadata.draft` of every family, owned by `DraftMetadata` on the target
+(creation arguments `one_model_draft` and `draft_kv_cache_manager`). The draft
+is built at creation over the draft KV cache manager (or the target's) with
+the target's other extensions; its core holds no reference to the target, and
+a draft over its own KV cache is created with `full_block_table_width`, so it
+stages its manager's whole block table itself (DFlash and Kimi K3 read
+`metadata.draft.kv_cache_block_offsets`). A spec worker runs its draft loop
+inside `with metadata.draft_loop() as draft:` (`SpecWorkerBase.draft_loop`,
+which also makes the draft the model's `attention_metadata` extra attribute
+for MLA custom ops). At its start a draft over the target's KV cache whose
+every extension declares `adopts_target_state` takes the target's prepared
+state (`adopt_target_state` of each extension, by its `draft_bound` /
+`draft_written` / `draft_private` lists, inside the CUDA graph the loop is
+captured in); any other draft was prepared with the target from the step's
+batch (with its own steady decode step after the target's) and takes only the
+target's lengths, token padding and the state of the extensions that declare
+`adopts_target_state_always` (speculative decoding). The draft loop changes
+only the draft; the target is never saved, restored or swapped. FlashInfer's
+external shared-target-KV MTP mode still drafts on a FlashInfer view
+(`get_draft_metadata()`), and FlashInfer applies the overlap correction inside
+the forward (`apply_spec_decode_kv_lens_offsets()`). The DSpark rerank, which
+adjusts the target's ragged query and KV lengths on the device after `prepare()`
+through `apply_device_ragged_layout(..., kv_lens_delta=...)` and refreshes the
+sparse extension's length-derived state, is the one deliberate exception to the
+target's lengths never changing after `prepare()`. DeepSeek-V4.1 decoder replay
+runs the replayed decoder layers on a replay metadata of its own, built by
+`CSA2Metadata` at creation and prepared from the replay plan's batch
+(`prepare_decoder_replay()`).
+
+Two TRTLLM core methods stand in for parts of `prepare()`. A steady
+speculative decode step that runs the previous step's batch one step later
+calls `prepare_steady_decode_step(inputs, kv_lens)` instead, when
+`supports_steady_decode_step` holds (no extension but spec-dec mode and the
+draft, a draft metadata that supports it too, no cached-KV context MLA, no
+mixed-precision staging): it takes the step's `BatchInputs`, adds its
+`kv_lens_offsets` to the device KV lengths the engine staged (through
+`lengths_for_kernel_update()`), updates the host KV lengths, re-copies block
+offsets only when its manager's `batch_block_table_key` changed since
+`key_prepared_block_offsets()` (or since its own last steady step), records
+the step's KV lengths as `steady_decode_kv_lens`, and prepares the other
+extensions; `DraftMetadata` then runs the draft's own steady step. The
+context-only plan that dense layers share within one forward is kept through
+`cache_context_plan()` and dropped by `prepare()`, the runtime views and a
+draft refresh. A mixed-precision KV cache runs attention on a
+staging copy that the core owns: `prepare()` refreshes it and takes the
+corrected device KV lengths, a draft refresh keeps it in step
+with the draft's lengths, a draft over the target's KV cache binds the
+target's copy, and a draft over a separate mixed-precision draft manager
+builds its own under the buffer names `draft_mixed_*`. An extension whose
+kernels read the mixed-precision pools another way declares the field
+`mixed_precision_staging_enabled` as False (DSA).
+
+A cross-attention sub-metadata takes its lengths from its own
+`BatchInputs` (`CrossAttentionMetadata`), never from writes by its decoder. Only metadata with `supports_explicit_offsets`
+(TRTLLM) honors `cu_q_seqlens` / `cu_kv_seqlens` that differ from
+`cumsum(seq_lens)`; Vanilla and FlashInfer reject them. Construction-time
+feature settings, such as `RecurrentConfig`, are passed to `Metadata(...)`.
+
+Metadata attribute assignment is strict: assigning a forwarded field writes
+the extension that declares it, and assigning a name that no class in the
+metadata's MRO or attached extension declares raises `AttributeError`. A family's per-step state is declared in its
+core's `fields`; anything a feature or model adds belongs in an extension.
+
+Sparse algorithm extensions consume only `SparseMetadataParams`, not
+backend-owned `SparseParams`. Algorithms that share one MTP draft-loop
+selection (DSA, DeepSeek-V4, QSA) derive from `MTPIndexShareUser`, which
+requires `MTPIndexShareExtension`: that extension owns the draft-loop flags,
+the shared Top-K selection, the indexer page tables and the packed-row
+request map, and the algorithm reaches them through `index_share`, binding the
+buffers it allocates with `index_share.bind_buffers()`.
+
+A metadata with extensions attached is an instance of a composed subclass
+of its family (one class per family and extension set) that forwards every
+declared field and method, so `metadata.field` reads the attached
+extension's field; `isinstance` against the family still holds, and
+`core_class()` returns the family class. `ext(T)` / `find_ext(T)` remain
+for presence checks and for code that keeps one extension reference.
+
+Every extension declares its public state in `fields` and its public
+methods in `methods`. Names are unique across extension classes outside one
+inheritance line (checked at class definition) and may not shadow the
+metadata's own attributes or another attached extension's names (checked at
+attach time). Lifecycle hooks are reserved names.
 
 **`TrtllmAttentionMetadata`** is the main metadata family. It adds paged-KV
-block information, TRTLLM runtime state, chunked-prefill/speculative-decode/Helix
-state, and MLA-specific state. If a source attention needs paged KV, chunked
-prefill, FlashMLA, speculative decoding, or Helix-aware execution, the fit
-question is mostly a `TrtllmAttentionMetadata` fit question.
+block information, TRTLLM runtime state, and MLA-specific state; its features
+(speculative decoding, Helix, FlashMLA, FP4 MLA, separate draft KV cache) are
+extensions. If a source attention needs paged KV, chunked prefill, FlashMLA,
+speculative decoding, or Helix-aware execution, the fit question is mostly a
+`TrtllmAttentionMetadata` fit question.
 
 **`VanillaAttentionMetadata`** is lighter — base metadata plus simple
 cache-index information. Use it when the `Attention` module boundary fits but
@@ -373,9 +546,9 @@ the fused TRTLLM path is too restrictive.
 **`FlashInferAttentionMetadata`** adds a planning-oriented contract with
 workspace, page-table KV metadata, and prefill/decode wrapper state.
 
-**Sparse metadata** families extend the base backend metadata with
-sparse-specific runtime state (indexer buffers, routing state, side-cache
-state).
+**Sparse metadata** is a `SparseAlgorithmExtension` on a core family that
+holds sparse-specific runtime state (indexer buffers, routing state,
+side-cache state).
 
 `SparseRuntimeParams` is the backend-to-`AttentionOp` carrier only on the
 `TrtllmAttention` path. Its fields are algorithm-specific, not a generic
@@ -399,8 +572,8 @@ All views and that capacity are restored on exit, including exceptional exit;
 
 Preparation initializes both the indexer's per-row causal KV extents and the
 attention row extents on device, so prepare-to-forward callers can consume
-them immediately. `on_update_kv_lens()` refreshes those same buffers in place
-after device-side overlap correction. Device-selected windows must install
+them immediately. With `kv_lens_offsets`, `prepare()` refreshes those same
+buffers in place from the corrected device KV lengths. Device-selected windows must install
 their request map and KV corrections before that refresh/replay. Context
 attention rows start at zero; generation attention rows start at
 `num_contexts`, while generation tokens start at `num_ctx_tokens`.

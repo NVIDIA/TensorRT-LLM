@@ -28,6 +28,7 @@ from _torch.modeling.test_kimi_k3_mla import _assert_matches_reference, _checkpo
 from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.attention.backends.features import HelixMetadata
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures, KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
@@ -236,6 +237,9 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
         # The generation kernel emits CP softmax statistics only when its
         # Helix fields are present. Every rank appends to its full replica in
         # this item 2 fixture; ownership is tested separately in item 3.
+        # A CP mapping attaches Helix state by itself; the unsharded baseline
+        # asks for it.
+        metadata.add_ext(HelixMetadata)
         metadata.update_helix_param([context_length], [False])
         metadata.prepare()
         extra_attrs["attention_metadata"] = weakref.ref(metadata)
@@ -364,6 +368,7 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
             query_lengths[i] if i < num_contexts else lengths[i] for i in range(batch)
         ]
         metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached)
+        metadata.add_ext(HelixMetadata)
         if global_positions is not None:
             metadata.update_helix_param(
                 global_positions,

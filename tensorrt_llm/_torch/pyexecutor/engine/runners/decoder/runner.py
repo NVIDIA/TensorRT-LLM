@@ -34,7 +34,6 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
     DSparkCUDAGraphRunner,
-    KeyType,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
@@ -84,6 +83,7 @@ from .inputs import DecoderInputBuffers, DecoderInputPreparer
 from .metadata import (
     DecoderMetadata,
     get_spec_managers,
+    spec_decoding_config,
     sync_group_all_greedy_sample,
     update_spec_metadata,
     validate_dspark_draft_sampling,
@@ -163,7 +163,6 @@ class DecoderRunner(ScheduledModelRunner):
     _context_graph_promotion_supported = True
     _steady_gen_cache_supported = True
     _eager_workspace_reclaim_supported = True
-    _deferred_decode_outputs_supported = True
 
     def __init__(
         self,
@@ -635,12 +634,18 @@ class DecoderRunner(ScheduledModelRunner):
             self._config.spec_config, resource_manager
         )
 
-        attn_metadata = self._metadata.setup_attention(kv_cache_manager, draft_kv_cache_manager)
+        spec_resource_manager, spec_tree_manager = get_spec_managers(resource_manager)
+        if self._config.spec_config is not None:
+            self._metadata.setup_speculative(spec_resource_manager)
+        attn_metadata = self._metadata.setup_attention(
+            kv_cache_manager,
+            draft_kv_cache_manager,
+            spec_decoding_config(self._config, self._metadata.spec_metadata, spec_tree_manager),
+        )
         if isinstance(attn_metadata, TrtllmAttentionMetadata):
             attn_metadata.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
         if enable_spec_decode:
-            spec_resource_manager, spec_tree_manager = get_spec_managers(resource_manager)
-            spec_metadata = self._metadata.setup_speculative(spec_resource_manager)
+            spec_metadata = self._metadata.spec_metadata
             assert spec_metadata is not None
             update_spec_metadata(
                 spec_metadata,
@@ -772,29 +777,22 @@ class DecoderRunner(ScheduledModelRunner):
                 and not self.cuda_graph_runner.needs_capture(key)
             ):
                 step_inputs.begin()
-            with self._cuda_graph_metadata_prepare_scope(
-                attn_metadata,
-                key,
+            prepared = self._inputs.prepare_inputs(
                 execution_requests,
+                kv_cache_manager,
+                attn_metadata,
+                spec_metadata,
+                new_tensors_device,
+                cache_indirection_buffer,
+                resource_manager,
+                can_run_graph,
                 execution_promoted_context_ids,
+                use_lora_graph=use_lora_graph,
                 enable_spec_decode=enable_spec_decode,
-            ):
-                prepared = self._inputs.prepare_inputs(
-                    execution_requests,
-                    kv_cache_manager,
-                    attn_metadata,
-                    spec_metadata,
-                    new_tensors_device,
-                    cache_indirection_buffer,
-                    resource_manager,
-                    can_run_graph,
-                    execution_promoted_context_ids,
-                    use_lora_graph=use_lora_graph,
-                    enable_spec_decode=enable_spec_decode,
-                    runtime_draft_len=runtime_draft_len,
-                    is_dummy=is_dummy,
-                    gather_context_logits=gather_context_logits,
-                )
+                runtime_draft_len=runtime_draft_len,
+                is_dummy=is_dummy,
+                gather_context_logits=gather_context_logits,
+            )
             inputs = prepared.kwargs
             runtime_draft_len = prepared.runtime_draft_len
             if execution_promoted_context_ids:
@@ -839,9 +837,7 @@ class DecoderRunner(ScheduledModelRunner):
                     run_model,
                     postprocess_inputs,
                     attn_metadata=attn_metadata,
-                    draft_kv_cache_manager=draft_kv_cache_manager,
                     moe_load_balancer=moe_load_balancer,
-                    enable_spec_decode=enable_spec_decode,
                     gather_context_logits=gather_context_logits,
                     static_inputs_staged=prepared.static_inputs_staged,
                     position_id_offsets=(
@@ -1162,39 +1158,6 @@ class DecoderRunner(ScheduledModelRunner):
                         logits_row_offset,
                     )
                 logits_row_offset += row_stride
-
-    def _cuda_graph_metadata_prepare_scope(
-        self,
-        attn_metadata: AttentionMetadata,
-        key: KeyType | None,
-        scheduled_requests: ScheduledRequests,
-        promoted_context_request_ids: frozenset[int],
-        *,
-        enable_spec_decode: bool,
-    ) -> contextlib.AbstractContextManager[Any]:
-        """Allow derived outputs only when this forward owns a decode graph.
-
-        Both capture/warmup and replay execute _preprocess_inputs before model
-        consumers. Non-speculative overlap has the same ordering; speculative
-        acceptance corrections and draft-manager swaps keep full preparation.
-        """
-        defer = getattr(attn_metadata, "defer_cuda_graph_decode_outputs", None)
-        if (
-            defer is not None
-            and isinstance(key, KeyType)
-            and attn_metadata.is_cuda_graph is True
-            and key.num_contexts == 0
-            and key.draft_len == 0
-            and scheduled_requests.num_context_requests == 0
-            and scheduled_requests.num_generation_requests > 0
-            and not promoted_context_request_ids
-            and not enable_spec_decode
-            and not self._use_beam_search
-            and self._deferred_decode_outputs_supported
-            and self._mapping.cp_size == 1
-        ):
-            return defer()
-        return contextlib.nullcontext()
 
     @staticmethod
     def _restore_attention_dp_semantic_outputs(

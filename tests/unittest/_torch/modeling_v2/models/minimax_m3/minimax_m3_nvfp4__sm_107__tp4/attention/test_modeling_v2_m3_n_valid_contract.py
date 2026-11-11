@@ -8,7 +8,8 @@ buffer happens before the step's first layer:
 
 - the allocation (``_alloc_msa_proxy_scratch``);
 - the host-to-device copy in ``prepare()`` (``_build_step_plans``);
-- ``on_update_kv_lens``, which the runner calls before the forward. It writes through the plain
+- ``on_update_kv_lens``, which the metadata's ``prepare()`` and ``before_forward()`` call before
+  the forward. It writes through the plain
   ``<<<>>>`` launch of ``msa_kv_update_kernel`` or through torch copies, so any PDL grid of the step starts only
   after it completes.
 

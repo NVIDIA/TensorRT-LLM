@@ -474,9 +474,6 @@ def forward_sparse_mla_kvcache_bf16(
     2. Load full kv cache from paged memory (with k rope applied)
     3. Call FlashMLA sparse attention kernel for sparse prefill/decode
     """
-    assert isinstance(attn_metadata, DSAtrtllmAttentionMetadata), (
-        "DSA requires DSAtrtllmAttentionMetadata"
-    )
     attention_input_type = (
         AttentionInputType.generation_only if is_generation else AttentionInputType.context_only
     )

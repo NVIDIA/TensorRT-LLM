@@ -18,7 +18,7 @@ from tensorrt_llm._torch.attention.backends import (FlashInferAttention,
 from tensorrt_llm._torch.attention.backends import \
     flashinfer as flashinfer_backend
 from tensorrt_llm._torch.attention.backends.flashinfer import (
-    FlashInferWrappers, PlanParams)
+    FlashInferCoreMetadata, FlashInferWrappers, PlanParams)
 from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -31,19 +31,25 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 
-class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
+class TestingFlashInferCoreMetadata(FlashInferCoreMetadata):
+    """Counts the plans the FlashInfer core makes."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._num_times_planned = defaultdict(int)
-
-    def get_num_plans(self, plan_params) -> int:
-        return self._num_times_planned[plan_params]
+    def __init__(self, metadata, *, source=None, **config):
+        super().__init__(metadata, source=source, **config)
+        self.num_times_planned = defaultdict(int)
 
     def _plan_with_params(self, plan_params, flashinfer_backend: str = "fa2"):
         if self.needs_plan(plan_params):
-            self._num_times_planned[plan_params] += 1
+            self.num_times_planned[plan_params] += 1
         return super()._plan_with_params(plan_params, flashinfer_backend)
+
+
+class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
+
+    core_metadata_type = TestingFlashInferCoreMetadata
+
+    def get_num_plans(self, plan_params) -> int:
+        return self.core().num_times_planned[plan_params]
 
 
 @dataclass(repr=False)
@@ -86,12 +92,14 @@ class TestFlashInferAttention(unittest.TestCase):
 
         sliding_page_indices = torch.tensor([BAD_PAGE_INDEX, 3],
                                             dtype=torch.int32)
-        metadata._sanitize_swa_page_indices(sliding_page_indices, layer_idx=4)
+        metadata.core()._sanitize_swa_page_indices(sliding_page_indices,
+                                                   layer_idx=4)
         torch.testing.assert_close(sliding_page_indices,
                                    torch.tensor([0, 3], dtype=torch.int32))
 
         full_page_indices = torch.tensor([BAD_PAGE_INDEX, 3], dtype=torch.int32)
-        metadata._sanitize_swa_page_indices(full_page_indices, layer_idx=5)
+        metadata.core()._sanitize_swa_page_indices(full_page_indices,
+                                                   layer_idx=5)
         torch.testing.assert_close(
             full_page_indices,
             torch.tensor([BAD_PAGE_INDEX, 3], dtype=torch.int32),
@@ -163,10 +171,9 @@ class TestFlashInferAttention(unittest.TestCase):
             kv_cache_manager=manager,
             request_ids=[7],
             workspace_buffer=torch.empty(1, dtype=torch.uint8, device="cuda"),
-            mamba_metadata=False,
         )
 
-        self.assertEqual(metadata._primary_kv_layer_idx, 20)
+        self.assertEqual(metadata.core()._primary_kv_layer_idx, 20)
         manager.get_buffers.assert_called_once_with(20)
 
         metadata.prepare()
@@ -203,7 +210,7 @@ class TestFlashInferAttention(unittest.TestCase):
             return plan_params
 
         with mock.patch.object(
-                metadata,
+                metadata.core(),
                 "_plan_with_params",
                 side_effect=return_plan_params,
         ):
@@ -227,7 +234,7 @@ class TestFlashInferAttention(unittest.TestCase):
                 flashinfer_backend="trtllm-gen",
             )
             metadata.seq_lens = torch.tensor([1, 1], dtype=torch.int32)
-            metadata._uses_full_generation_page_table = True
+            metadata.core()._uses_full_generation_page_table = True
             full_page_single_token_plan = metadata.plan(
                 num_heads=32,
                 num_kv_heads=4,
@@ -237,8 +244,8 @@ class TestFlashInferAttention(unittest.TestCase):
                 attention_mask_type=AttentionMaskType.causal.value,
                 flashinfer_backend="trtllm-gen",
             )
-            metadata._uses_full_generation_page_table = False
-            metadata._is_shared_kv_draft_view = True
+            metadata.core()._uses_full_generation_page_table = False
+            metadata.core()._is_shared_kv_draft_view = True
             shared_draft_single_token_plan = metadata.plan(
                 num_heads=32,
                 num_kv_heads=4,
@@ -248,7 +255,7 @@ class TestFlashInferAttention(unittest.TestCase):
                 attention_mask_type=AttentionMaskType.causal.value,
                 flashinfer_backend="trtllm-gen",
             )
-            metadata._is_shared_kv_draft_view = False
+            metadata.core()._is_shared_kv_draft_view = False
             metadata.seq_lens = torch.tensor([6, 6], dtype=torch.int32)
             multi_token_plan = metadata.plan(
                 num_heads=32,
@@ -315,7 +322,7 @@ class TestFlashInferAttention(unittest.TestCase):
             attention_mask_type=AttentionMaskType.causal,
         )
         eager_wrappers = FlashInferWrappers(is_planned=True)
-        metadata._plan_params_to_wrappers[plan_params] = eager_wrappers
+        metadata.core()._plan_params_to_wrappers[plan_params] = eager_wrappers
 
         graph_metadata = metadata.create_cuda_graph_metadata(2)
 
@@ -323,10 +330,10 @@ class TestFlashInferAttention(unittest.TestCase):
         # batch size. That partitioning -- not the cache key -- is what keeps a graph wrapper from
         # being reused across batch sizes, so PlanParams need not carry the generation batch size.
         self.assertTrue(graph_metadata.is_cuda_graph)
-        self.assertIsNot(graph_metadata._plan_params_to_wrappers,
-                         metadata._plan_params_to_wrappers)
-        self.assertEqual(graph_metadata._plan_params_to_wrappers, {})
-        self.assertIs(metadata._plan_params_to_wrappers[plan_params],
+        self.assertIsNot(graph_metadata.core()._plan_params_to_wrappers,
+                         metadata.core()._plan_params_to_wrappers)
+        self.assertEqual(graph_metadata.core()._plan_params_to_wrappers, {})
+        self.assertIs(metadata.core()._plan_params_to_wrappers[plan_params],
                       eager_wrappers)
 
     def test_generation_page_table_keeps_logical_positions(self):
@@ -373,11 +380,11 @@ class TestFlashInferAttention(unittest.TestCase):
                 torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
             )
             torch.testing.assert_close(
-                metadata._paged_kv_last_page_len[:1],
+                metadata.core()._paged_kv_last_page_len[:1],
                 torch.tensor([32], dtype=torch.int32, device="cuda"),
             )
             torch.testing.assert_close(
-                metadata._logical_kv_lens[:1],
+                metadata.core()._logical_kv_lens[:1],
                 torch.tensor([32], dtype=torch.int32, device="cuda"),
             )
             torch.testing.assert_close(
@@ -419,14 +426,14 @@ class TestFlashInferAttention(unittest.TestCase):
             positions = torch.tensor([31, 32, 33, 34, 62, 63, 64, 65],
                                      dtype=torch.int32,
                                      device="cuda")
-            metadata._cached_token_lens[:2].copy_(cached_token_lens)
-            metadata._logical_kv_lens[:2].copy_(cached_token_lens + 4)
-            metadata._uses_full_generation_page_table = True
-            metadata._positions[:8].copy_(positions)
+            metadata.core()._cached_token_lens[:2].copy_(cached_token_lens)
+            metadata.core()._logical_kv_lens[:2].copy_(cached_token_lens + 4)
+            metadata.core()._uses_full_generation_page_table = True
+            metadata.core()._positions[:8].copy_(positions)
             kv_lens_buffer = torch.tensor([35, 66],
                                           dtype=torch.int32,
                                           device="cuda")
-            metadata._plan_params_to_wrappers = {
+            metadata.core()._plan_params_to_wrappers = {
                 object():
                 FlashInferWrappers(
                     is_planned=True,
@@ -443,15 +450,15 @@ class TestFlashInferAttention(unittest.TestCase):
             )
 
             torch.testing.assert_close(
-                metadata._cached_token_lens[:2],
+                metadata.core()._cached_token_lens[:2],
                 torch.tensor([28, 61], dtype=torch.int32, device="cuda"),
             )
             torch.testing.assert_close(
-                metadata._logical_kv_lens[:2],
+                metadata.core()._logical_kv_lens[:2],
                 torch.tensor([32, 65], dtype=torch.int32, device="cuda"),
             )
             torch.testing.assert_close(
-                metadata._positions[:8],
+                metadata.core()._positions[:8],
                 torch.tensor([28, 29, 30, 31, 61, 62, 63, 64],
                              dtype=torch.int32,
                              device="cuda"),
@@ -467,11 +474,12 @@ class TestFlashInferAttention(unittest.TestCase):
                 tokens_per_generation=4,
                 restore=True,
             )
-            torch.testing.assert_close(metadata._cached_token_lens[:2],
+            torch.testing.assert_close(metadata.core()._cached_token_lens[:2],
                                        cached_token_lens)
-            torch.testing.assert_close(metadata._logical_kv_lens[:2],
+            torch.testing.assert_close(metadata.core()._logical_kv_lens[:2],
                                        cached_token_lens + 4)
-            torch.testing.assert_close(metadata._positions[:8], positions)
+            torch.testing.assert_close(metadata.core()._positions[:8],
+                                       positions)
             torch.testing.assert_close(
                 kv_lens_buffer,
                 torch.tensor([35, 66], dtype=torch.int32, device="cuda"),
@@ -544,24 +552,26 @@ class TestFlashInferAttention(unittest.TestCase):
             v = torch.randn_like(q)
             self.assertEqual(
                 layer.forward(q, k, v, draft_metadata).shape, q.shape)
-            for wrappers in draft_metadata._plan_params_to_wrappers.values():
+            for wrappers in draft_metadata.core(
+            )._plan_params_to_wrappers.values():
                 torch.testing.assert_close(
                     wrappers.decode_wrapper._kv_lens_buffer[:2],
                     draft_metadata.kv_lens_cuda[:2],
                 )
 
             with mock.patch.object(
-                    draft_metadata,
+                    draft_metadata.core(),
                     "_plan_with_params",
-                    wraps=draft_metadata._plan_with_params,
+                    wraps=draft_metadata.core()._plan_with_params,
             ) as replan, mock.patch.object(
-                    draft_metadata,
+                    draft_metadata.core(),
                     "_build_decode_block_tables",
             ) as refresh_block_tables:
                 metadata.prepare()
             replan.assert_not_called()
-            self.assertEqual(refresh_block_tables.call_count,
-                             len(draft_metadata._plan_params_to_wrappers))
+            self.assertEqual(
+                refresh_block_tables.call_count,
+                len(draft_metadata.core()._plan_params_to_wrappers))
         finally:
             target_manager.shutdown()
             draft_manager.shutdown()
@@ -599,7 +609,7 @@ class TestFlashInferAttention(unittest.TestCase):
                 "BatchPrefillWithRaggedKVCacheWrapper",
                 FakeRaggedWrapper,
         ):
-            metadata._plan_ragged_no_kv(plan_params, wrapper, "cudnn")
+            metadata.core()._plan_ragged_no_kv(plan_params, wrapper, "cudnn")
 
         self.assertIn("kv_indptr", wrapper.plan_kwargs)
         self.assertNotIn("v_indptr", wrapper.plan_kwargs)
@@ -831,15 +841,17 @@ class TestFlashInferAttention(unittest.TestCase):
                 results_1.append(result_1)
                 del cache_buf
 
-            for plan_params in attn_metadata._plan_params_to_wrappers.keys():
+            for plan_params in attn_metadata.core(
+            )._plan_params_to_wrappers.keys():
                 self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
             # prepare() defers re-planning to forward_impl only when multiple
             # wrappers share one workspace_buffer (hybrid attention); for the
             # single-wrapper case it re-plans eagerly so cuda-graph capture works.
             attn_metadata.prepare()
-            defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
-            for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            defer_plan = len(attn_metadata.core()._plan_params_to_wrappers) > 1
+            for wrappers in attn_metadata.core(
+            )._plan_params_to_wrappers.values():
                 self.assertEqual(wrappers.is_planned, not defer_plan)
 
             # [context_1, gen_1]
@@ -880,15 +892,17 @@ class TestFlashInferAttention(unittest.TestCase):
                                  context_sequence_lengths[0] + 1)
                 results_2.append(result_2)
 
-            for plan_params in attn_metadata._plan_params_to_wrappers.keys():
+            for plan_params in attn_metadata.core(
+            )._plan_params_to_wrappers.keys():
                 self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
             # prepare() defers re-planning to forward_impl only when multiple
             # wrappers share one workspace_buffer (hybrid attention); for the
             # single-wrapper case it re-plans eagerly so cuda-graph capture works.
             attn_metadata.prepare()
-            defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
-            for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            defer_plan = len(attn_metadata.core()._plan_params_to_wrappers) > 1
+            for wrappers in attn_metadata.core(
+            )._plan_params_to_wrappers.values():
                 self.assertEqual(wrappers.is_planned, not defer_plan)
 
             # [context_2, gen_2]
@@ -928,15 +942,17 @@ class TestFlashInferAttention(unittest.TestCase):
                                  context_sequence_lengths[1] + 1)
                 results_3.append(result_3)
 
-            for plan_params in attn_metadata._plan_params_to_wrappers.keys():
+            for plan_params in attn_metadata.core(
+            )._plan_params_to_wrappers.keys():
                 self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
             # prepare() defers re-planning to forward_impl only when multiple
             # wrappers share one workspace_buffer (hybrid attention); for the
             # single-wrapper case it re-plans eagerly so cuda-graph capture works.
             attn_metadata.prepare()
-            defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
-            for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            defer_plan = len(attn_metadata.core()._plan_params_to_wrappers) > 1
+            for wrappers in attn_metadata.core(
+            )._plan_params_to_wrappers.values():
                 self.assertEqual(wrappers.is_planned, not defer_plan)
 
             # assert value
@@ -1216,12 +1232,13 @@ class TestFlashInferAttention(unittest.TestCase):
         )
 
         self.assertEqual(attention_output.shape, (total_tokens, hidden_size))
-        self.assertGreaterEqual(len(attn_metadata._plan_params_to_wrappers), 1)
+        self.assertGreaterEqual(
+            len(attn_metadata.core()._plan_params_to_wrappers), 1)
         # FlashInfer stores the chosen implementation on the wrapper (see
         # BatchPrefillWithRaggedKVCacheWrapper.__init__: self._backend = backend).
         # TRT-LLM no-cache ragged path passes backend="cudnn" in flashinfer.py.
-        for flashinfer_wrappers in attn_metadata._plan_params_to_wrappers.values(
-        ):
+        for flashinfer_wrappers in attn_metadata.core(
+        )._plan_params_to_wrappers.values():
             ragged_wrapper = flashinfer_wrappers.ragged_prefill_wrapper
             self.assertIsNotNone(ragged_wrapper)
             self.assertEqual(
@@ -1380,7 +1397,7 @@ class _FakeMetadata:
             self.num_blocks[self.num_contexts:])
         wrappers.is_planned = True
 
-    refresh = FlashInferAttentionMetadata._refresh_fa2_cuda_graph_plans
+    refresh = FlashInferCoreMetadata._refresh_fa2_cuda_graph_plans
 
 
 def _refresh_wrappers(page_tuple):

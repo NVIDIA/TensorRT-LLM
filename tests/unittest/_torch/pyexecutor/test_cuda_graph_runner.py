@@ -23,8 +23,6 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunnerConfig,
     KeyType,
     SampleType,
-    _restore_spec_decode_capture_state,
-    _save_spec_decode_capture_state,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -291,25 +289,6 @@ class GraphKeyTestCase(unittest.TestCase):
             batch, None, None, None, promoted_ids, None, False, None
         )
         self.assertEqual(result, (graph_attn_metadata, graph_spec_metadata, key))
-
-
-class CaptureStateTestCase(unittest.TestCase):
-    def test_spec_decode_capture_restores_kv_lens_between_warmups(self) -> None:
-        attn_metadata = Mock()
-        attn_metadata.num_seqs = 1
-        attn_metadata.kv_lens_cuda = torch.tensor([4095], dtype=torch.int32)
-
-        saved_kv_lens_cuda = _save_spec_decode_capture_state(attn_metadata, enable_spec_decode=True)
-
-        # CUDA graph capture performs two eager warmup forwards. A speculative
-        # draft loop may advance the static attention metadata during each
-        # forward, but the next warmup must start from the original input.
-        for _ in range(2):
-            attn_metadata.kv_lens_cuda.add_(1)
-            _restore_spec_decode_capture_state(attn_metadata, saved_kv_lens_cuda)
-            self.assertEqual(attn_metadata.kv_lens_cuda.tolist(), [4095])
-
-        self.assertEqual(attn_metadata.on_update_kv_lens.call_count, 2)
 
 
 def test_encoder_capture_discards_warmup_and_capture_outputs(

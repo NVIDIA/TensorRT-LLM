@@ -9205,6 +9205,14 @@ class KVCacheManagerV2(BaseResourceManager):
             self._allocated_draft_lens.pop(req.py_request_id, None)
             self.try_commit_generation_blocks(req)
 
+    def prepare_batch_tables(self, request_ids: List[int], num_contexts: int) -> None:
+        """Build the per-batch tables ``copy_batch_block_offsets`` reads.
+
+        The attention metadata calls this once per step before it copies the
+        batch's block offsets. Nothing by default; managers whose offsets are
+        derived per batch (sliding-window tables) override it.
+        """
+
     def copy_batch_block_offsets(
         self,
         dst_tensor: torch.Tensor,

@@ -15,7 +15,7 @@ own deployment; none is a general default.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, Tuple
 
 if TYPE_CHECKING:
     import torch
@@ -205,16 +205,11 @@ class RuntimeHooks:
     # With skip_unchanged_h2d: a changed packed 2-D upload stages only each row's changed column span (a page table that
     # gained a page re-sends a few bytes, not every padded row), so the pack keeps fitting the in-graph window.
     h2d_changed_span: bool = False
-    # A speculative step under the overlap scheduler re-derives its KV-length metadata (on_update_kv_lens) once,
-    # after the forward's KV-length correction, instead of also before it: the first pass's device writes are all
-    # rewritten by the second.
-    kv_lens_update_once: bool = False
-    # The overlap scheduler's speculative step correction (position_ids += position offsets, kv_lens += KV-length
-    # offsets) as the model's one launch, called as ``op(positions, position_offsets, kv_lens, kv_lens_offsets)`` on the
-    # generation rows; it returns False to decline (the two in-tree adds run).
-    spec_offsets_op: Optional[
-        Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], bool]
-    ] = None
+    # Attention-metadata extensions the model's metadata carries, attached at creation (the engine's own choice of
+    # extensions is kept; a subclass of one replaces it), and their creation arguments, each routed by name to the
+    # extension that takes it, as (name, value) pairs.
+    metadata_extensions: Tuple[type, ...] = ()
+    metadata_config: Tuple[Tuple[str, Any], ...] = ()
     # Run the overlap executor loop with the execution stream current, so the
     # loop's own stream work and the forward are ordered on one stream.
     loop_on_execution_stream: bool = False

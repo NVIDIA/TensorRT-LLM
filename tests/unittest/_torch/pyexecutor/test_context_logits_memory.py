@@ -366,7 +366,6 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
         _metadata=SimpleNamespace(setup_attention=lambda *args: metadata, attn_metadata=metadata),
         _moe_load_balancer=None,
         _stage_in_graph_sampling=None,
-        _cuda_graph_metadata_prepare_scope=lambda *args, **kwargs: nullcontext(),
         _start_beam_histories=lambda batch: None,
         _maybe_bypass_torch_compile=bypass,
         _forward_step=forward,

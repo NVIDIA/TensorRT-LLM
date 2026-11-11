@@ -81,14 +81,6 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self.spec_tree_manager = None
         self._d2t = None
 
-        # (all_rank_num_tokens, force_prepare_spec_dec_tree_mask) snapshot taken by
-        # _forward_impl before mutating attn_metadata; None means "not saved / already
-        # restored" (all_rank_num_tokens is legitimately None outside ADP, so we can't
-        # use it directly as a sentinel). Restored by _ensure_spec_dec_state_restored
-        # on the failure path so a tolerated forward exception does not leak state
-        # into subsequent iterations.
-        self._saved_extra_state = None
-
         # Pre-allocated draft-loop buffers (CUDA-graph safe).
         self.draft_tokens_buffer = torch.zeros(
             max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
@@ -177,77 +169,10 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         sm = get_sm_version()
         self._needs_mask_repack = not is_sm_100f(sm)
 
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
-        super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
-
-        batch_size = attn_metadata.num_seqs
-        if hasattr(attn_metadata, "kv_lens_cuda"):
-            # Keep kv_lens_cuda itself alive because TRTLLM attention holds a
-            # runtime view into it.
-            self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:batch_size].clone()
-        else:
-            self._saved_kv_lens_cuda = None
-
-        # Restore verify metadata after the draft loop mutates it.
-        if attn_metadata.spec_decoding_packed_mask is not None:
-            self._saved_packed_mask = attn_metadata.spec_decoding_packed_mask[:batch_size].clone()
-        else:
-            self._saved_packed_mask = None
-        if attn_metadata.spec_decoding_position_offsets is not None:
-            self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone()
-            self._saved_spec_decoding_query_len = attn_metadata.spec_decoding_query_len
-        else:
-            self._saved_position_offsets = None
-            self._saved_spec_decoding_query_len = None
-        if attn_metadata.spec_decoding_generation_lengths is not None:
-            self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[
-                :batch_size
-            ].clone()
-        else:
-            self._saved_generation_lengths = None
-
     def prepare_position_ids_and_last_tokens(self, position_ids, seq_lens_cuda):
         position_ids = position_ids.squeeze(0)
         last_tokens_idx = torch.cumsum(seq_lens_cuda, dim=0, dtype=torch.long) - 1
         return position_ids, last_tokens_idx
-
-    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
-        super()._restore_attn_metadata_from_spec_dec(attn_metadata)
-
-        if self._saved_kv_lens_cuda is not None:
-            batch_size = self._saved_kv_lens_cuda.shape[0]
-            attn_metadata.kv_lens_cuda[:batch_size].copy_(self._saved_kv_lens_cuda)
-            self._saved_kv_lens_cuda = None
-
-        if self._saved_packed_mask is not None:
-            batch_size = self._saved_packed_mask.shape[0]
-            attn_metadata.spec_decoding_packed_mask[:batch_size].copy_(self._saved_packed_mask)
-            self._saved_packed_mask = None
-        if self._saved_position_offsets is not None:
-            attn_metadata.spec_decoding_position_offsets.copy_(self._saved_position_offsets)
-            attn_metadata.spec_decoding_query_len = self._saved_spec_decoding_query_len
-            self._saved_position_offsets = None
-            self._saved_spec_decoding_query_len = None
-        if self._saved_generation_lengths is not None:
-            batch_size = self._saved_generation_lengths.shape[0]
-            attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
-                self._saved_generation_lengths
-            )
-            self._saved_generation_lengths = None
-
-    def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
-        # Base cleanup handles the has_spec_dec_saved_state path. Undo the
-        # dynamic-tree-only mutations (all_rank_num_tokens,
-        # force_prepare_spec_dec_tree_mask) so a tolerated forward failure
-        # does not leak the pre-draft-loop state into later iterations.
-        super()._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
-        if attn_metadata is None or self._saved_extra_state is None:
-            return
-        (
-            attn_metadata.all_rank_num_tokens,
-            attn_metadata.force_prepare_spec_dec_tree_mask,
-        ) = self._saved_extra_state
-        self._saved_extra_state = None
 
     # ------------------------------------------------------------------ #
     # Helpers                                                            #
@@ -710,56 +635,47 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         # Save attn/spec metadata before the draft loop mutates it. Stashed on
         # self so _ensure_spec_dec_state_restored can undo the mutation if the
         # draft loop raises (see SpecWorkerBase.forward try/finally).
-        self._saved_extra_state = (
-            attn_metadata.all_rank_num_tokens,
-            attn_metadata.force_prepare_spec_dec_tree_mask,
-        )
-        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
-        attn_metadata.force_prepare_spec_dec_tree_mask = True
+        # The draft loop runs on the draft metadata, which leaves the target's
+        # untouched; without one, the target's state is saved and restored.
+        with self.draft_loop(attn_metadata) as draft_attn_metadata:
+            draft_attn_metadata.force_prepare_spec_dec_tree_mask = True
 
-        # (c) Run the MTP draft tree loop -> build + store the next tree.
-        draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
-        next_draft_tokens = self._forward_draft_loop(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            accepted_tokens=accepted_tokens,
-            num_accepted_tokens=num_accepted_tokens,
-            attn_metadata=attn_metadata,
-            spec_metadata=spec_metadata,
-            draft_model=draft_model,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-            num_contexts=num_contexts,
-            num_gens=num_gens,
-            batch_size=batch_size,
-        )
+            # (c) Run the MTP draft tree loop -> build + store the next tree.
+            draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+            next_draft_tokens = self._forward_draft_loop(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                attn_metadata=draft_attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_model=draft_model,
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                num_contexts=num_contexts,
+                num_gens=num_gens,
+                batch_size=batch_size,
+            )
 
-        # Restore attn metadata to support cuda graph.
-        self._restore_attn_metadata_from_spec_dec(attn_metadata)
-        (
-            attn_metadata.all_rank_num_tokens,
-            attn_metadata.force_prepare_spec_dec_tree_mask,
-        ) = self._saved_extra_state
-        self._saved_extra_state = None
-        attn_metadata.use_spec_decoding = True
+            attn_metadata.use_spec_decoding = True
 
-        # (d) Prepare next_new_tokens for overlap scheduler.
-        next_new_tokens = self._prepare_next_new_tokens(
-            accepted_tokens,
-            next_draft_tokens,
-            spec_metadata.batch_indices_cuda,
-            batch_size,
-            num_accepted_tokens,
-        )
+            # (d) Prepare next_new_tokens for overlap scheduler.
+            next_new_tokens = self._prepare_next_new_tokens(
+                accepted_tokens,
+                next_draft_tokens,
+                spec_metadata.batch_indices_cuda,
+                batch_size,
+                num_accepted_tokens,
+            )
 
-        return {
-            "logits": raw_logits,
-            "new_tokens": accepted_tokens,
-            "new_tokens_lens": num_accepted_tokens,
-            "next_draft_tokens": next_draft_tokens,
-            "next_new_tokens": next_new_tokens,
-            "accepted_draft_tokens_indices": self._accepted_draft_indices_tensor[:batch_size],
-        }
+            return {
+                "logits": raw_logits,
+                "new_tokens": accepted_tokens,
+                "new_tokens_lens": num_accepted_tokens,
+                "next_draft_tokens": next_draft_tokens,
+                "next_new_tokens": next_new_tokens,
+                "accepted_draft_tokens_indices": self._accepted_draft_indices_tensor[:batch_size],
+            }
 
     # ------------------------------------------------------------------ #
     # Step-0 drafter-input repack (dynamic tree)                          #
@@ -843,9 +759,12 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 dim=0,
             )
 
-            attn_metadata._seq_lens[num_contexts:batch_size].fill_(max_path_len)
-            attn_metadata._seq_lens_cuda[num_contexts:batch_size].fill_(max_path_len)
-            attn_metadata.on_update()
+            attn_metadata.set_seq_lens(
+                slice(num_contexts, batch_size),
+                host=max_path_len,
+                device=max_path_len,
+                update_counts=True,
+            )
         else:
             # Context-only (warmup): no gen tokens to repack.
             input_ids = input_ids_ctx
@@ -914,13 +833,19 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 self._repack_mask_padded_to_packed(packed_mask, num_gens, num_step0_tokens)
         attn_metadata.use_spec_decoding = num_gens > 0
         if num_gens > 0 and hasattr(attn_metadata, "kv_lens_cuda"):
-            attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= self._kv_correction
+            attn_metadata.adjust_kv_lens(slice(num_contexts, batch_size), -self._kv_correction)
         self._refresh_blackwell_tree_mask_metadata(attn_metadata)
+        self.refresh_draft()
         if spec_metadata.all_rank_num_tokens is not None:
             # Keep attention/MoE token counts aligned with step-0 repack.
             attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_tokens
 
-        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+        with self.draft_kv_cache_context(
+            attn_metadata, draft_kv_cache_manager
+        ) as draft_attn_metadata:
+            # Forward on the metadata the context selects, such as a
+            # FlashInfer view over a separate draft KV cache.
+            inputs["attn_metadata"] = draft_attn_metadata
             hidden_states = draft_model.mtp_layers[0](
                 embed_tokens=draft_model.embed_tokens,
                 all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
@@ -933,7 +858,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
 
             step0_hs = hidden_states[gather_ids]
             logits = draft_model.mtp_layers[0].shared_head(
-                step0_hs, draft_model.lm_head, attn_metadata, True
+                step0_hs, draft_model.lm_head, draft_attn_metadata, True
             )
 
             new_draft_tokens, new_draft_scores = self.sample(
@@ -945,12 +870,12 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 new_draft_scores=new_draft_scores,
                 previous_draft_scores=None,
                 batch_size=batch_size,
-                attn_metadata=attn_metadata,
+                attn_metadata=draft_attn_metadata,
             )
             self.update_hidden_states(cur_draft_idx=0, batch_size=batch_size, step0_hs=step0_hs)
             self._prepare_draft_layer_metadata(
                 0,
-                attn_metadata,
+                draft_attn_metadata,
                 batch_size,
                 gather_ids,
                 num_contexts,
@@ -969,7 +894,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                     subseq_all_rank_num_tokens = [
                         n * num_tokens_per_req for n in spec_metadata.all_rank_num_seqs
                     ]
-                    attn_metadata.all_rank_num_tokens = subseq_all_rank_num_tokens
+                    draft_attn_metadata.all_rank_num_tokens = subseq_all_rank_num_tokens
 
                 inp_hs = self._accumulated_hs[:batch_size, :num_tokens_per_req, :].reshape(
                     num_infer_tokens, -1
@@ -980,7 +905,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                     "input_ids": inp_ids,
                     "position_ids": inp_pos,
                     "hidden_states": inp_hs,
-                    "attn_metadata": attn_metadata,
+                    "attn_metadata": draft_attn_metadata,
                 }
                 hidden_states = draft_model.mtp_layers[0](
                     embed_tokens=draft_model.embed_tokens,
@@ -993,7 +918,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 hs_reshaped = hidden_states.reshape(batch_size, num_tokens_per_req, -1)
                 selected_hs = hs_reshaped[:, -self.K :, :].reshape(batch_size * self.K, -1)
                 logits = draft_model.mtp_layers[0].shared_head(
-                    selected_hs, draft_model.lm_head, attn_metadata, True
+                    selected_hs, draft_model.lm_head, draft_attn_metadata, True
                 )
 
                 new_draft_tokens, new_draft_scores = self.sample(
@@ -1008,7 +933,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                     new_draft_scores=new_draft_scores,
                     previous_draft_scores=previous_draft_scores,
                     batch_size=batch_size,
-                    attn_metadata=attn_metadata,
+                    attn_metadata=draft_attn_metadata,
                 )
                 self.update_hidden_states(
                     cur_draft_idx=layer_idx,
@@ -1016,7 +941,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                     hidden_states_to_save=hidden_states,
                     selected_parents=self._last_selected_parents,
                 )
-                self._prepare_draft_layer_metadata(layer_idx, attn_metadata, batch_size)
+                self._prepare_draft_layer_metadata(layer_idx, draft_attn_metadata, batch_size)
 
         # Resample the final tree and build it into slot_storage.
         real_draft_tokens, topk_score_indices = self.resampling_final_draft_tokens(batch_size)
@@ -1058,23 +983,28 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 -1, self.K
             )
 
-            attn_metadata._seq_lens[:batch_size].fill_(self.K)
-            attn_metadata._seq_lens_cuda[:batch_size].fill_(self.K)
-            attn_metadata.on_update()
+            attn_metadata.set_seq_lens(
+                slice(0, batch_size),
+                host=self.K,
+                device=self.K,
+                update_counts=True,
+            )
 
             if inputs["attn_metadata"].kv_cache_manager is not None:
-                attn_metadata.host_request_types[: attn_metadata.num_contexts].fill_(1)
-                attn_metadata.num_contexts = 0
+                # The context requests continue as generation rows.
+                attn_metadata.as_generation_rows()
 
             if hasattr(attn_metadata, "kv_lens_cuda"):
                 # Rewind only unaccepted verify tokens; draft KV is added later.
                 if num_gens > 0:
-                    attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                        self._max_path_len
-                    ) - num_accepted_tokens[num_contexts:batch_size]
-                attn_metadata.kv_lens_cuda[:batch_size] += self.K
+                    attn_metadata.adjust_kv_lens(
+                        slice(num_contexts, batch_size),
+                        num_accepted_tokens[num_contexts:batch_size] - self._max_path_len,
+                    )
+                attn_metadata.adjust_kv_lens(slice(0, batch_size), self.K)
             attn_metadata.use_spec_decoding = True
             self._refresh_blackwell_tree_mask_metadata(attn_metadata)
+            self.refresh_draft()
         else:
             num_tokens_previous_layer = cur_draft_idx * self.K
             num_tokens_current_layer = self.K * (cur_draft_idx + 1)
@@ -1082,12 +1012,16 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             self.position_ids_buffer[
                 :batch_size, num_tokens_previous_layer:num_tokens_current_layer
             ] = prev_pos[:, -self.K :] + 1
-            attn_metadata._seq_lens[:batch_size].fill_(num_tokens_current_layer)
-            attn_metadata._seq_lens_cuda[:batch_size].fill_(num_tokens_current_layer)
-            attn_metadata.on_update()
+            attn_metadata.set_seq_lens(
+                slice(0, batch_size),
+                host=num_tokens_current_layer,
+                device=num_tokens_current_layer,
+                update_counts=True,
+            )
             if hasattr(attn_metadata, "kv_lens_cuda"):
-                attn_metadata.kv_lens_cuda[:batch_size] += self.K
+                attn_metadata.adjust_kv_lens(slice(0, batch_size), self.K)
             self._refresh_blackwell_tree_mask_metadata(attn_metadata)
+            self.refresh_draft()
 
 
 class MTPEagleDynamicTreeResourceManager(BaseResourceManager):

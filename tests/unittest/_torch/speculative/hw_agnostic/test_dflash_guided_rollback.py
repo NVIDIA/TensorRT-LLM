@@ -106,18 +106,14 @@ def test_dflash_worker_rolls_back_after_verification(monkeypatch):
     )
     for stub in (
         "_lazy_init_ctx_buffers",
-        "_prepare_attn_metadata_for_dflash",
-        "_prepare_kv_for_draft_forward",
         "_store_prefill_context",
-        "write_context_onehot_draft_probs",
-        "_restore_attn_metadata_from_spec_dec",
     ):
         monkeypatch.setattr(worker, stub, _noop)
 
     def finish_drafting(*args, **kwargs):
         guided.calls.append(("draft_complete", None))
 
-    monkeypatch.setattr(worker, "_apply_kv_rewind_after_draft", finish_drafting)
+    monkeypatch.setattr(worker, "write_context_onehot_draft_probs", finish_drafting)
     monkeypatch.setattr(worker, "prepare_1st_drafter_inputs", lambda *a, **k: {})
     monkeypatch.setattr(worker, "_prepare_next_new_tokens", lambda *a, **k: next_new)
 

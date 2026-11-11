@@ -406,8 +406,7 @@ def run(
         p + n for p, n in zip(starts[num_contexts:], lengths[num_contexts:])
     ]
     metadata.kv_cache_params.num_cached_tokens_per_seq = list(starts)
-    metadata.prepare_context_replay(reqs[:num_contexts])
-    metadata.prepare()
+    metadata.prepare(context_requests=reqs[:num_contexts])
     positions = torch.cat(
         [torch.arange(p, p + n, device="cuda", dtype=torch.int32) for p, n in zip(starts, lengths)]
     ).view(1, -1)

@@ -28,6 +28,7 @@ from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
+from _torch.helpers import bare_extension
 from safetensors import safe_open
 from torch import nn
 from torch._dynamo.backends.common import aot_autograd
@@ -40,6 +41,7 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_blackwell_geforce, skip_pre_blackwell
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
@@ -54,9 +56,6 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     MiniMaxM3SparseMetadataParams,
     MiniMaxM3SparseParams,
     index_head_range,
-)
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
-    MiniMaxM3MsaSparseAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _group_max_reduce
 from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
@@ -737,11 +736,11 @@ def test_piecewise_captures_horizontal_producer_before_attention(
     scale_cache = torch.empty(8, dtype=torch.uint8) if kv_dtype == "nvfp4" else None
     slots = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
     metadata = Mock(
-        spec_set=MiniMaxM3MsaSparseAttentionMetadata,
         num_tokens=2,
         kv_cache_manager=None,
         msa_layer_cache_tensors={3: (kv_cache, index_cache, scale_cache)},
         msa_out_cache_loc=slots,
+        msa_write_slots=Mock(return_value=slots),
     )
     layer = SimpleNamespace(
         enable_fused_qkv_index_projection=True,
@@ -991,7 +990,6 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
         index_cache.copy_(expected_cache)
     selected_blocks = torch.zeros(2, 1, 16, dtype=torch.int32)
     attn_metadata = Mock(
-        spec_set=MiniMaxM3MsaSparseAttentionMetadata,
         num_tokens=2,
         kv_cache_manager=None,
         msa_decode_span=None,
@@ -999,7 +997,7 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
         msa_write_idx_k=Mock(),
         msa_prefill_proxy_plan=None,
         msa_prefill_n_valid_blocks=None,
-        _msa_prefill_identity=None,
+        msa_prefill_identity=None,
         msa_prefill_proxy_kv_indices=torch.tensor([0, 1], dtype=torch.int32),
         msa_qo_lens_cpu=torch.tensor([2], dtype=torch.int32),
         msa_kv_lens_cpu=torch.tensor([2], dtype=torch.int32),
@@ -2219,9 +2217,9 @@ def test_horizontal_producer_explicit_caches_match_manager(
     manager.get_buffers.return_value = main
     manager.get_block_scale_buffers.return_value = scales
     metadata = Mock(
-        spec_set=MiniMaxM3MsaSparseAttentionMetadata,
         kv_cache_manager=manager,
         msa_out_cache_loc=slots,
+        msa_write_slots=Mock(side_effect=lambda n=None: slots if n is None else slots[:n]),
     )
     metadata.msa_idx_k_cache.return_value = index
 
@@ -3356,9 +3354,7 @@ def test_minimax_m3_dense_backend_library_order(
     metadata.cu_q_seqlens = metadata.cu_kv_seqlens = torch.tensor([0, 2], dtype=torch.int32)
     metadata.num_contexts = 1
     metadata.num_generations = 0
-    metadata.enable_flash_mla = False
-    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
-    metadata.spec_decoding_bl_tree_mask = None
+    metadata.replace_ext(bare_extension(SpecDecodingMetadata, metadata))
     metadata.max_context_q_len_override = None
     metadata.kv_cache_manager = SimpleNamespace(
         dtype=DataType.BF16, max_attention_window_vec=[128], max_seq_len=128
@@ -3840,10 +3836,12 @@ def test_minimax_m3_sdpa_dense_decode_matches_repeat_interleave_reference(num_kv
     )
     attn_metadata = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(get_buffers=lambda layer_idx: kv_pool),
-        minimax_m3={"metadata": m3_meta, "out_cache_loc": out_cache_loc},
+        sparse_metadata=m3_meta,
+        out_cache_loc=out_cache_loc,
         is_cuda_graph=False,
         max_seq_len=max_len,
     )
+    attn_metadata.find_ext = lambda cls: attn_metadata
     output = torch.empty(batch, num_heads * head_dim, device=device, dtype=dtype)
 
     MiniMaxM3Attention._sdpa_dense_attention_core(layer, q, k_new, v_new, attn_metadata, output)

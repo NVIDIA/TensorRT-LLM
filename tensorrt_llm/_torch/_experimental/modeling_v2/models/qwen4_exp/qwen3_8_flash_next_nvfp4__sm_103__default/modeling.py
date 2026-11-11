@@ -1790,8 +1790,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         """Bind the draft layer to the manager its draft step sees: its own index plane, that
         manager's position plane and its paged K/V.
 
-        Under attention TP that is the separate draft KV cache the worker swaps in for the
-        draft loop, whose pools hold the draft layer's pages and none of the trunk's;
+        Under attention TP that is the separate draft KV cache of the draft metadata the
+        draft loop runs on, whose pools hold the draft layer's pages and none of the trunk's;
         otherwise the trunk's manager, which maps the draft layer as well. Keyed on the
         manager like `_bind_cache_manager`, and never first bound under capture: the runner
         runs every captured batch shape eagerly first."""
@@ -1838,9 +1838,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
 
     def _draft_step_bind(self, md) -> tuple[_DraftBound, int]:
         """The draft layer's bind for this draft step's manager, and the layer's pool offset
-        in it (what `thop_attention` addresses), checked on every call: the worker swaps the
-        manager and the page tables in for the draft loop, and a page table still decoding
-        the trunk's offsets would read and write another pool's pages."""
+        in it (what `thop_attention` addresses), checked on every call: with a separate draft
+        KV cache the draft loop runs on a draft metadata over that manager, whose
+        `qsa_block_table` decodes the draft manager's offsets."""
         cm = md.kv_cache_manager
         assert cm is not None, "a paged KV cache is required"
         offsets = cm.layer_offsets
@@ -1857,13 +1857,6 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         )
         if self._draft_bound is None or cm is not self._draft_bound.cm:
             self._bind_draft_cache_manager(md)
-        assert cm is self._bound.cm or md.qsa_block_table is getattr(
-            md, "qsa_draft_block_table", None
-        ), (
-            "the draft step is bound to a separate draft KV cache manager but qsa_block_table "
-            "is not that manager's table: the engine's QSA metadata did not swap its page "
-            "table for the draft forward"
-        )
         return self._draft_bound, layer_idx
 
     # -------------------------------------------------------------- forward ---

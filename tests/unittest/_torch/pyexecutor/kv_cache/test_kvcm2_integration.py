@@ -18,12 +18,14 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
 import numpy as np
 import pytest
 import torch
+from _torch.helpers import give_stub_a_draft
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.pyexecutor._util import _get_num_storage_pool_groups
@@ -2677,6 +2679,14 @@ def _disagg_draft_fixture(
     return draft, occupant, request
 
 
+def _stub_set_seq_lens(metadata, rows, *, host=None, device=None, update_counts=False):
+    """``set_seq_lens`` of a stub metadata: writes the host and device query lengths of ``rows``."""
+    if host is not None:
+        metadata._seq_lens[rows] = host
+    if device is not None:
+        metadata._seq_lens_cuda[rows] = device
+
+
 def _disagg_generation_step(draft: KVCacheManagerV2, request: LlmRequest) -> None:
     """One executor generation step on the draft manager: grow the mirror,
     then the post-forward update_resources (nothing accepted, one token)."""
@@ -2772,13 +2782,14 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
         worker.set_draft_model(draft_model)
         attn_metadata = SimpleNamespace(
             max_seq_len=1 << 17,
-            draft_kv_cache_block_offsets=offsets,
             num_contexts=0,
             num_seqs=1,
             num_ctx_tokens=0,
             _seq_lens_cuda=torch.zeros(1, dtype=torch.int32, device="cuda"),
             _seq_lens=torch.zeros(1, dtype=torch.int32),
         )
+        attn_metadata.set_seq_lens = partial(_stub_set_seq_lens, attn_metadata)
+        give_stub_a_draft(attn_metadata, offsets)
         worker._lazy_init_ctx_buffers(
             draft_model,
             SimpleNamespace(max_num_requests=2),
@@ -2923,7 +2934,7 @@ def test_slot_from_zero_worker_refuses_a_disagg_windowed_draft_pool(
         offsets = torch.zeros(
             (num_pools, 2, 2, draft.max_blocks_per_seq), dtype=torch.int32, device="cuda"
         )
-        attn_metadata = SimpleNamespace(max_seq_len=1 << 17, draft_kv_cache_block_offsets=offsets)
+        attn_metadata = give_stub_a_draft(SimpleNamespace(max_seq_len=1 << 17), offsets)
 
         def bind() -> None:
             """Bind the drafter's ctx cache to the draft pool."""
@@ -2994,13 +3005,14 @@ def test_trailing_drafter_slot_reads_only_pages_its_request_holds(
         worker.set_draft_model(draft_model)
         attn_metadata = SimpleNamespace(
             max_seq_len=1 << 17,
-            draft_kv_cache_block_offsets=offsets,
             num_contexts=0,
             num_seqs=1,
             num_ctx_tokens=0,
             _seq_lens_cuda=torch.zeros(1, dtype=torch.int32, device="cuda"),
             _seq_lens=torch.zeros(1, dtype=torch.int32),
         )
+        attn_metadata.set_seq_lens = partial(_stub_set_seq_lens, attn_metadata)
+        give_stub_a_draft(attn_metadata, offsets)
         worker._lazy_init_ctx_buffers(
             draft_model,
             SimpleNamespace(max_num_requests=2),

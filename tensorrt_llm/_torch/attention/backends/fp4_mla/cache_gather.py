@@ -15,6 +15,7 @@ from .layout import (
     _validate_fp4_mla_kv_storage_shape,
 )
 from .metadata import _materialize_fp4_mla_device_page_table_for_forward
+from .state import find_fp4_mla
 
 
 def load_fp4_mla_chunked_kv_cache(
@@ -30,6 +31,7 @@ def load_fp4_mla_chunked_kv_cache(
     qk_rope_head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather one cached-prefix partition from dense FP4 MLA V2 storage."""
+    fp4_mla_state = find_fp4_mla(metadata)
     if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError(f"FP4 MLA chunk gather does not support output dtype {out_dtype}.")
     if num_ctx_cached_tokens < 0:
@@ -87,11 +89,11 @@ def load_fp4_mla_chunked_kv_cache(
     if num_ctx_cached_tokens == 0:
         return compressed_kv, k_pe
 
-    if not bool(getattr(metadata.fp4_mla_state, "device_page_table", False)):
+    if not bool(getattr(fp4_mla_state, "device_page_table", False)):
         raise RuntimeError("FP4 MLA chunk gather requires fixed-stride device page metadata.")
     _materialize_fp4_mla_device_page_table_for_forward(metadata)
-    page_table_stride = int(metadata.fp4_mla_state.page_table_stride)
-    page_ids = metadata.fp4_mla_state._paged_kv_indices
+    page_table_stride = int(fp4_mla_state.page_table_stride)
+    page_ids = fp4_mla_state._paged_kv_indices
     if (
         page_table_stride <= 0
         or not isinstance(page_ids, torch.Tensor)

@@ -1327,7 +1327,7 @@ class MiniMaxM3DraftKVCacheView:
     dtype, pool pointers and block tables from the metadata's manager; the
     shared manager's are NVFP4, with ``[data, scale]`` pool pointers. This view
     flows wherever a separate draft manager would (``get_draft_kv_cache_manager``
-    and the attention-metadata draft swap), with dtype FP8 and one pool rooted at
+    and the draft metadata built over it), with dtype FP8 and one pool rooted at
     the draft layer's K page: slot ``s`` is K page ``s * scale`` and V page
     ``s * scale + 1`` (see :meth:`MiniMaxM3KVCacheManagerV2.get_kv_subpage_pool`).
     Everything else, block lifecycle included, stays with the shared manager.
