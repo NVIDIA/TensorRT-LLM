@@ -2103,7 +2103,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "decoding give a request several and are out of scope; this is the guard.")
         .def(
             "commit",
-            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
+            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd,
+                bool ssmFromPending)
             {
                 // An empty token list with is_end=True must still stop committing, so we do not
                 // early-return on empty; commit() handles it. beam_search_indices is only
@@ -2122,12 +2123,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         TLLM_CHECK_WITH_INFO(!(self.textOnly() && !knownNoDigest),
                             "commit() received a digest token on a text_only sequence — hashing would be corrupted");
                         nb::gil_scoped_release release;
-                        self.commit(view, isEnd);
+                        self.commit(view, isEnd, ssmFromPending);
                     });
             },
             nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
-            nb::arg("is_end") = false)
+            nb::arg("is_end") = false, nb::arg("ssm_from_pending") = false)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "acquire_ssm_snapshot_slot", &kv::KvCache::acquireSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("pending_ssm_snapshot_slot", &kv::KvCache::pendingSsmSnapshotSlot)
+        .def(
+            "release_ssm_snapshot_slot", &kv::KvCache::releaseSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_base_page_indices",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx)
