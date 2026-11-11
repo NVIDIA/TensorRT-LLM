@@ -371,16 +371,14 @@ class SpecDecodingMetadata(MetadataExtension):
             if num_gens > 0:
                 slot_ids = slot_storage.all_ids_buf[num_contexts:batch_size]
 
-                pos_src = torch.index_select(
-                    slot_storage.spec_decoding_position_offsets, 0, slot_ids
-                )[:, :n_dt]
+                pos_src = torch.index_select(slot_storage.position_offsets, 0, slot_ids)[:, :n_dt]
                 pos_dst = self.spec_decoding_position_offsets[: num_gens * n_dt].view(
                     num_gens, n_dt
                 )
                 pos_dst.copy_(pos_src, non_blocking=True)
 
                 actual_mask_width = math.ceil(n_dt / 32)
-                mask_src = torch.index_select(slot_storage.spec_decoding_packed_mask, 0, slot_ids)[
+                mask_src = torch.index_select(slot_storage.packed_mask, 0, slot_ids)[
                     :, :, :actual_mask_width
                 ]
                 if trtllm_gen:

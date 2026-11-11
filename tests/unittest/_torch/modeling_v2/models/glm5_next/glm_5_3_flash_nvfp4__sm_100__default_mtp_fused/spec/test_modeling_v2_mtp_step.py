@@ -74,6 +74,7 @@ class _Metadata:
         self.spec_decoding_position_offsets = None
         self.spec_decoding_generation_lengths = None
         self.use_spec_decoding = True
+        self.enable_flash_mla = False
         self.on_update()
 
     @property

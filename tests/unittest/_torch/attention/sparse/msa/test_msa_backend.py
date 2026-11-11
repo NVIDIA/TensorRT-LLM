@@ -80,8 +80,8 @@ def test_msa_metadata_clears_padded_cache_slot_tail(
     metadata.msa_block_table = torch.zeros((1, 1), dtype=torch.int32)
     metadata.msa_seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
     metadata.msa_subpage_block_table = None
-    metadata._msa_runs_no_fmha = lambda: True
-    metadata._msa_kv_lens_may_change = lambda: False
+    monkeypatch.setattr(MiniMaxM3MsaMetadata, "_msa_runs_no_fmha", lambda self: True)
+    monkeypatch.setattr(MiniMaxM3MsaMetadata, "_msa_kv_lens_may_change", lambda self: False)
     original_ptr = metadata.msa_out_cache_loc.data_ptr()
 
     for count in (4, 2, 0, 1):
@@ -119,8 +119,7 @@ def test_msa_metadata_stages_query_rows_for_dynamic_kv_lens(
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
 
     monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
-    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
-    metadata = metadata_cls.__new__(metadata_cls)
+    metadata = _msa_metadata()
     metadata._msa_buffers_ready = True
     # One four-token page per request, page id 10 + request id.
     metadata.kv_cache_manager = SimpleNamespace(
@@ -138,8 +137,8 @@ def test_msa_metadata_stages_query_rows_for_dynamic_kv_lens(
     metadata.msa_q_intra = torch.full((max_tokens,), 99, dtype=torch.int32)
     metadata.msa_kv_lens_staged = torch.zeros(max_batch, dtype=torch.int32)
     metadata.msa_subpage_block_table = None
-    metadata._msa_runs_no_fmha = lambda: True
-    metadata._msa_kv_lens_may_change = lambda: True
+    monkeypatch.setattr(MiniMaxM3MsaMetadata, "_msa_runs_no_fmha", lambda self: True)
+    monkeypatch.setattr(MiniMaxM3MsaMetadata, "_msa_kv_lens_may_change", lambda self: True)
 
     # The second step is shorter, so a missed refresh would leave the first step's rows behind.
     for qo_lens in ([3, 0, 1, 2], [1, 2, 0]):

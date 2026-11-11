@@ -2200,6 +2200,7 @@ class Glm5NextMtpStep:
             spec_metadata.batch_indices_cuda[:batch_size], num_accepted_tokens - 1
         ]
         next_new_tokens = torch.cat([last_accepted.unsqueeze(1), next_draft_tokens], dim=1)
+        set_use_spec_decoding(attn_metadata, True)
         return {
             "logits": logits,
             "new_tokens": accepted_tokens,
