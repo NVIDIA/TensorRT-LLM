@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 from typing import Sequence
 
+from ...infra.git import CommitPolicy
 from ...operators.coverage import (
     CATALOG_TESTS_DIR,
     MODELING_V2_PACKAGE,
@@ -39,6 +40,13 @@ CITATION_DISCIPLINE = render_template("common/citation_discipline.md.j2")
 def decision_file_block(agent: str, extra: Sequence[str] = ()) -> str:
     """Render the decision-file protocol; decisions come from the role's ending section."""
     return render_template("common/decision_file.md.j2", agent=agent, extra=extra)
+
+
+def commit_block(policy: CommitPolicy) -> str:
+    """Render the commit rules every committing role's prompt carries."""
+    own = ", ".join(f"`{p}`" for p in policy.own_paths) or "the target's family and its tests"
+    judge = ", ".join(f"`{p}`" for p in policy.judge_paths)
+    return render_template("common/committing.md.j2", own=own, judge=judge)
 
 
 def notes_block(notes: str) -> str:

@@ -1,0 +1,14 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Committing
+
+Commit in your own worktree with plain git, one commit per unit of work so that attribution and revert stay per unit:
+
+```bash
+git -C <your worktree> add <path> [path...]
+git -C <your worktree> commit -s -m "<your commit message>"
+```
+
+Name every file explicitly: no directories, no globs that could match a file you did not write, never `git add -A`. The target's own paths are {{ own }}: a commit that touches any other path is code other models run, lands all the same and is listed in the run's report as `shared` or `mixed`, so keep such a change in a commit of its own and say why in your decision. Never commit a judge path ({{ judge }}): what scores the run is not the run's to change, and a commit that touches one is refused. Never a symlink git does not track (a worktree's link to the native build), never a sandbox placeholder (`.mcp.json`, anything under `.claude/`). The run sets the author and the committer: leave them, sign off with `-s`, and write no `Co-authored-by` line and no AI attribution.
+
+When you finish, every commit on your branch is checked against these rules before it is integrated, and one that breaks them comes back to you to fix. No other git command that writes: never `push`, never a branch operation, never a rebase.

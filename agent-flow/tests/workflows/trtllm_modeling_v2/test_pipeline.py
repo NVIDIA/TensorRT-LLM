@@ -220,6 +220,36 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     assert {role for role, _ in calls} == {"surveyor", "kernel_writer", "assembler"}
 
 
+def test_a_kernel_row_that_is_not_done_is_skipped_and_the_run_goes_on(
+    tmp_path, task_file, monkeypatch
+):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    rows = [
+        {"n": 1, "mode": "onboard", "target": "ops/norm/rms"},
+        {"n": 2, "mode": "onboard", "target": "ops/norm/scale"},
+    ]
+    _write_vocabulary(workspace, rows)
+
+    def kernel_writer(turn, prompt):
+        if _task_id(prompt) == "k1-rms":
+            return {"decision": "BLOCKED", "summary": "no kernel exports it on sm_103"}
+        return {"decision": "LANDED", "summary": "landed", "entry": "x"}
+
+    script = Script(kernel_writer=kernel_writer)
+    calls = _run(tmp_path, _spec(task_file), monkeypatch, script)
+    assert [_task_id(p) for _, p in calls] == [*["k1-rms"] * 3, "k2-scale", "core"]
+    assert _state(tmp_path).onboarded
+    # A later worker sees the row as skipped and is told what to do where it needs the entry.
+    core = _prompts(calls, "core")[0]
+    assert "- `k1-rms` (kernel): skipped BLOCKED. no kernel exports it on sm_103" in core
+    assert "write its wrapper in the target's own `ops/`" in core
+    report = _report(tmp_path)
+    skipped = report.split("## Skipped kernel rows")[1].split("##")[0]
+    assert "- `k1-rms` (queue row 1): it ended BLOCKED: no kernel exports it on sm_103" in skipped
+    assert "k1-rms" not in report.split("## Not done")[1].split("##")[0]
+
+
 def test_a_kernel_row_runs_after_the_rows_it_depends_on_in_the_first_unit_that_needs_it():
     queue = (
         QueueItem(1, "onboard", "ops/a/one", depends_on=(3,)),  # on a later row
@@ -1116,6 +1146,11 @@ def test_the_onboard_record_stands_when_the_accepted_libraries_cannot_be_kept(
     report_mod.record_onboarded(workflow, tree, "abc123")
     record = workflow._state.onboarded
     assert record["commit"] == "abc123" and record["accuracy"] == "unjudged (boot only)"
+    assert record["ref"] == "refs/mv2/s/onboarded"
+    # A ref git refused to write is not claimed.
+    workflow._state.onboarded, workflow._git = {}, lambda *args: None
+    report_mod.record_onboarded(workflow, tree, "abc123")
+    assert workflow._state.onboarded["ref"] == "refs/mv2/s/onboarded (git did not write it)"
     assert record["libraries"] == contract_mod.library_digest(tree)
     assert events[-1][0] == "onboarded" and "were not kept" in events[-1][1]
 

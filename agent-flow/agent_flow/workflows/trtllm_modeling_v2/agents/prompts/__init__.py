@@ -14,9 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ...infra.git import CommitPolicy, commit_instruction
+from ...infra.git import CommitPolicy
 from ..decisions import DECISIONS_BY_AGENT, EXTRA_KEYS_BY_AGENT
-from ._common import decision_file_block, notes_block, scope_block
+from ._common import commit_block, decision_file_block, notes_block, scope_block
 from .worker import role_prompt
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard for type checkers only
@@ -91,7 +91,7 @@ def build_trtllm_modeling_v2_prompts(
     prompts = _for_every_role(prompts, scope_block(scope))
     prompts = _for_every_role(prompts, notes_block(notes))
     if commit_policy is not None:
-        block = commit_instruction(commit_policy)
+        block = commit_block(commit_policy)
         prompts = prompts.with_extensions(kernel_writer=block, assembler=block)
     if environment is None:
         return prompts

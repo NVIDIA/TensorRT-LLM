@@ -166,7 +166,8 @@ def record_onboarded(workflow, tree: Path, commit: str) -> None:
     judged = any(v is not None and not v.unjudged for v in scores)
     libraries = contract_mod.library_digest(tree)
     ref = onboard_ref(state.slug)
-    workflow._git(str(repo), "update-ref", ref, commit)
+    if workflow._git(str(repo), "update-ref", ref, commit) is None:
+        ref += " (git did not write it)"
     state.onboarded = dict(
         commit=commit,
         ref=ref,
@@ -500,7 +501,7 @@ def write_report(workflow, pipeline) -> Path:
         "Skipped kernel rows",
         [f"- `{t.id}` (queue row {t.ref}): {t.note}" for t in spent if t.kind == "kernel"],
     )
-    section("Convention findings left", [f"- {f}" for f in findings_left(w)] if record else [])
+    section("Convention findings left", [f"- {f}" for f in findings_left(w)])
     section("Final pass", [f"- {line.render()}" for line in pipeline.final])
     unchecked = [*NOT_CHECKED, *w._contract.notes]
     section("What the run did not check", [f"- {x}" for x in unchecked] + _uncertified(w.workspace))

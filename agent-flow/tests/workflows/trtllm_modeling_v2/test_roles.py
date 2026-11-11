@@ -40,6 +40,7 @@ from agent_flow.workflows.trtllm_modeling_v2.agents.turns import (
     TurnRequest,
     TurnTimeout,
 )
+from agent_flow.workflows.trtllm_modeling_v2.infra.git import CommitPolicy
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
 from agent_flow.workflows.trtllm_modeling_v2.run import start
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import ROLE_BY_KIND, TAGS_BY_KIND
@@ -430,6 +431,17 @@ def test_all_template_resources_are_declared_as_package_data() -> None:
     for name in loaded:
         assert (resources / name).is_file()
         _render._ENVIRONMENT.get_template(name)
+
+
+def test_the_committing_roles_are_told_the_commit_rules():
+    policy = CommitPolicy(own_paths=("a/fam/",), judge_paths=("tensorrt_llm/evaluate/",))
+    bundle = prompts.build_trtllm_modeling_v2_prompts(commit_policy=policy)
+    for text in (bundle.kernel_writer, bundle.assembler):
+        assert "## Committing" in text and "git -C <your worktree> commit -s -m" in text
+        assert "The target's own paths are `a/fam/`" in text and "never `git add -A`" in text
+        assert "Never commit a judge path (`tensorrt_llm/evaluate/`)" in text
+        assert "listed in the run's report as `shared` or `mixed`" in text
+    assert "## Committing" not in bundle.surveyor
 
 
 def test_the_run_puts_its_own_skills_where_each_backend_reads_them(tmp_path):

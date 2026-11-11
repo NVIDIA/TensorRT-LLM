@@ -4,25 +4,22 @@
 """Git for the run: the questions it asks a checkout, and the rules every commit is held to.
 
 QUESTIONS are asked on this host with an argv, never a shell, and with ``--no-optional-locks``:
-a ``git status`` otherwise refreshes the index under ``index.lock``, and the orchestrator asks one
-(the target's marker) while a task's branch is fast-forwarded into the same checkout, which then
-fails on the lock.
+a ``git status`` otherwise refreshes the index under ``index.lock`` and can fail a fast-forward
+into the same checkout.
 
 COMMIT RULES. Every tree-changing task commits with plain ``git commit -s`` on a branch in its own
-worktree (``run/workspace/integration.py``), as the run's one identity (:meth:`CommitIdentity.env`: the
-repository's configured user). Nothing checks a commit as it is made; before a finished task is
-integrated, :func:`audit_commits` reads every commit on its branch, and one that breaks a rule
-goes back to its worker:
+worktree (``run/integration.py``), as the run's one identity (:meth:`CommitIdentity.env`: the
+repository's configured user). Nothing checks a commit as it is made; before a ready task lands,
+:func:`audit_commits` reads every commit on its branch, and one that breaks a rule goes back to
+its worker:
 
 - a ``Signed-off-by`` carries the author's email, and the author is the run's identity; no
   ``Co-authored-by`` unless the policy allows one;
 - no symlink is added (a worktree links the main checkout's native build, and ``.gitignore``
   names only the directory form), and no sandbox placeholder: a ``.mcp.json``, or anything under
   ``.claude/`` or ``.cc-writes/``;
-- every path lies under the policy's allowed prefixes, and outside the denied ones (the run's own
-  workspace, when it sits inside the repository).
-
-The delivery audits its whole branch by the same rules, less the author and the paths.
+- no path is under the run's own workspace or a judge path (the evaluator, the accuracy
+  references). Any other path lands and is labelled ``target``, ``shared`` or ``mixed``.
 """
 
 from __future__ import annotations
@@ -396,39 +393,6 @@ def resolve_base(repo: str | Path, candidates: Sequence[str]) -> str:
 
 #: Where a branch's commits are counted from when the policy names no base.
 DEFAULT_BASE_REFS: tuple[str, ...] = ("origin/main", "upstream/main", "main")
-
-
-def commit_instruction(policy: CommitPolicy) -> str:
-    """The block every committing role's prompt carries."""
-    own = ", ".join(f"`{p}`" for p in policy.own_paths) or "the target's family and its tests"
-    judge = ", ".join(f"`{p}`" for p in policy.judge_paths)
-    return (
-        "## Committing\n"
-        "\n"
-        "Commit in your own worktree with plain git, one commit per unit of work so that "
-        "attribution and revert stay per unit:\n"
-        "\n"
-        "```bash\n"
-        "git -C <your worktree> add <path> [path...]\n"
-        'git -C <your worktree> commit -s -m "<your commit message>"\n'
-        "```\n"
-        "\n"
-        "Name every file explicitly: no directories, no globs that could match a file you did "
-        f"not write, never `git add -A`. The target's own paths are {own}: a commit that "
-        "touches any other path is code other models run, lands all the same and is listed in "
-        "the run's report as `shared` or `mixed`, so keep such a change in a commit of its "
-        f"own and say why in your decision. Never commit a judge path ({judge}): what scores "
-        "the run is not the run's to change, and a commit that touches one is refused. Never "
-        "a symlink git does not track (a worktree's link to the native build), never a "
-        "sandbox placeholder "
-        "(`.mcp.json`, anything under `.claude/`). The run sets the author and the committer: "
-        "leave them, sign off with `-s`, and write no `Co-authored-by` line and no AI "
-        "attribution.\n"
-        "\n"
-        "When you finish, every commit on your branch is checked against these rules before "
-        "it is integrated, and one that breaks them comes back to you to fix. No other git "
-        "command that writes: never `push`, never a branch operation, never a rebase.\n"
-    )
 
 
 NATIVE_ROOT = "tensorrt_llm"
