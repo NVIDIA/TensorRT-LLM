@@ -25,10 +25,11 @@ import yaml
 
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
+from ..spec.deployments import Deployment
 from ..spec.shorthand import order_members_by_cost
 from ..spec.task_schema import TaskSchemaError, parse_parallel_segment
 from .boot import DEFAULT_BOOT_IMAGE_PROMPT, BootSpec, missing_keywords, resolve_boot_spec
-from .check_config import check_configuration
+from .check_config import check_configuration, deployment_of
 from .check_runtime import (
     BOOT_TIMEOUT_S,
     MODE_REQUIRE,
@@ -113,19 +114,15 @@ def write_serve_options(
     path: str | Path,
     task_data: Mapping[str, Any],
     environment: RunEnvironment,
-    *,
-    unit: str | None,
-    member: str | None,
+    deployment: Deployment,
 ) -> Path:
-    """The unit's LLM-API options as the accuracy gate serves them, as one ``--config`` file.
+    """``deployment``'s LLM-API options as the accuracy gate serves them, as one ``--config`` file.
 
     What :func:`~.accuracy.eval_command` gives ``trtllm-eval``, written in the
     gate's own directory so neither gate rewrites a file the other's job may
     be reading.
     """
-    config = check_configuration(
-        task_data, environment, unit=unit, features=None, max_tokens=64, member=member
-    )
+    config = check_configuration(task_data, deployment, max_tokens=64)
     merged = dict(config["llm"])
     merged.pop("model")
     merged["modeling_v2"] = environment.env.get(MODELING_V2_ENV, MODE_REQUIRE)
@@ -136,25 +133,16 @@ def write_serve_options(
     return target
 
 
-def serve_args(
-    task_data: Mapping[str, Any],
-    environment: RunEnvironment,
-    *,
-    member: str | None,
-    options: str | Path,
-) -> list[str]:
-    """Public config plus accuracy-specific request limits, on one HTTP frontend.
+def serve_args(options: str | Path) -> list[str]:
+    """The deployment's options file, on one HTTP frontend.
 
     The gate asks a handful of requests, which one frontend serves. Several need the
     classic IPC executor proxy, which a one-rank engine on the single-process worker
     does not have (`num_serve_frontends > 1 requires the classic IPC executor proxy`).
+    Every limit the server runs under is in the options file, an attention-DP rank's
+    share of a global batch included.
     """
-    accuracy = task_data.get("accuracy") or {}
-    args = ["--config", str(options), "--num_serve_frontends=1"]
-    for flag in ("max_seq_len", "max_batch_size"):
-        if accuracy.get(flag) is not None:
-            args.append(f"--{flag}={accuracy[flag]}")
-    return args
+    return ["--config", str(options), "--num_serve_frontends=1"]
 
 
 def serve_requests(
@@ -312,8 +300,11 @@ def run_serve_gate(
     member: str | None = None,
     spec: ServeSpec | None = None,
     boot: BootSpec | None = None,
+    deployment: Deployment | None = None,
 ) -> GateResult:
-    """Serve the unit's target with ``trtllm-serve``, ask it, and stop it.
+    """Serve ``deployment`` with ``trtllm-serve``, ask it, and stop it.
+
+    Without ``deployment`` it is the one ``unit`` at ``member`` names.
 
     ``boot`` is the unit's boot workload (default :func:`~.boot.resolve_boot_spec`
     over ``features``).
@@ -328,13 +319,15 @@ def run_serve_gate(
         )
     directory = gate_workdir(workdir)
     tag = f"{unit or 'unit'}.{member or 'member'}"
+    if deployment is None:
+        deployment = deployment_of(task_data, unit, member, env.world_size)
     options = write_serve_options(
-        directory / f"serve.{tag}.llm_api.yaml", task_data, env, unit=unit, member=member
+        directory / f"serve.{tag}.llm_api.yaml", task_data, env, deployment
     )
     requests = serve_requests(task_data, spec, boot)
     driver_spec = {
         "model": str(task_data["checkpoint_path"]),
-        "serve_args": serve_args(task_data, env, member=member, options=options),
+        "serve_args": serve_args(options),
         "world_size": _width(member or "") or env.world_size,
         "server_log": str(directory / f"serve.{tag}.server.log"),
         "boot_timeout": spec.timeout,

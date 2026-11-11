@@ -29,7 +29,6 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from ..infra.files import write_text_atomic
 from .deployments import INPUTS, Benchmark, Deployment, Server, name_for
 from .task_schema import (
     ACCURACY_FIELD,
@@ -43,15 +42,7 @@ from .task_schema import (
     resolve_per_unit,
     widest_world_size,
 )
-from .variants import (
-    ANCHOR_RELATIVE,
-    _deep_merge,
-    anchor_state,
-    base_unit,
-    is_variant,
-    variant_gates,
-    variants,
-)
+from .variants import ANCHOR_RELATIVE, anchor_state, base_unit, is_variant, variant_gates, variants
 
 DEFAULT_BENCHMARK = "gsm8k"
 #: The world size of a shorthand spec that names no member with one.
@@ -356,6 +347,12 @@ def engine_options(
     if conflicts:
         raise ValueError(f"{unit}: conflicting check inputs: " + "; ".join(conflicts))
     options = merge_options(merge_options(_unit_options(task_data, unit), overlay or {}), extra)
+    # `accuracy.max_seq_len` and `accuracy.max_batch_size` are the limits the benchmark and the
+    # server were given: stated, they are the deployment's, so every check runs one engine.
+    limits = task_data.get(ACCURACY_FIELD) or {}
+    for key in ("max_seq_len", "max_batch_size"):
+        if limits.get(key) is not None:
+            options[key] = extra[key] = limits[key]
     for switch, key, default in (
         ("chunked_prefill", "enable_chunked_prefill", False),
         ("overlap_scheduler", "disable_overlap_scheduler", True),
@@ -453,16 +450,14 @@ def variant_spec(
     name: str,
     *,
     world_size: int,
-    options_dir: Path | None = None,
 ) -> dict[str, Any]:
     """The spec a variant's checks run under: the unit's, with the variant's overlay.
 
     Every per-unit lookup the gates make (``resolve_per_unit``, the runtime
     block, ``members``) then answers for the variant's name what it answers
-    for its unit, except where the variant says otherwise. With
-    ``options_dir`` the unit's LLM-API YAML merged with the variant's options
-    is written there; without it (compiling the contract) the options are not
-    resolved.
+    for its unit, except where the variant says otherwise. The variant's
+    ``llm_api_options`` are not merged here: :func:`deployment_for` lays them
+    over the unit's options.
     """
     entry = variants(data)[name]
     unit = base_unit(data, name)
@@ -472,19 +467,6 @@ def variant_spec(
         if isinstance(value, dict) and unit in value:
             value[name] = copy.deepcopy(value[unit])
 
-    if options_dir is not None:
-        base_options = resolve_llm_api_options(accuracy, unit)
-        loaded: dict[str, Any] = {}
-        if base_options and Path(base_options).is_file():
-            loaded = yaml.safe_load(Path(base_options).read_text(encoding="utf-8")) or {}
-        merged = _deep_merge(loaded, entry.get("llm_api_options") or {})
-        options_dir.mkdir(parents=True, exist_ok=True)
-        path = options_dir / f"{name}.llm_api.yaml"
-        # Replaced whole: a gate of another variant may be reading it now.
-        write_text_atomic(path, yaml.safe_dump(merged, sort_keys=False), mode=0o600)
-        accuracy["llm_api_options"] = _per_unit(
-            "llm_api_options", accuracy.get("llm_api_options"), name, str(path)
-        )
     for key, value in (entry.get("accuracy") or {}).items():
         if key == "discriminators" and isinstance(value, Mapping):
             # Over the unit's row: a KV-dtype variant adds `kv_cache_quant_algo` to the
@@ -520,9 +502,17 @@ def variant_spec(
 
 
 def deployment_for(
-    data: Mapping[str, Any], name: str, member: str, world_size: int | None = None
+    data: Mapping[str, Any],
+    name: str | None,
+    member: str | None,
+    world_size: int | None = None,
+    features: Any | None = None,
 ) -> Deployment:
     """The deployment unit or variant ``name`` is at ``member``.
+
+    Unnamed, it is the run's default unit at the spec's ``parallel``. ``features``
+    names the features the target under test implements, where that is not every
+    feature up to the unit.
 
     A unit's is one server on its options. ``disagg`` is a context and a generation
     server, both on the options of the unit before it, judged by the test the spec
@@ -534,18 +524,21 @@ def deployment_for(
     world = world_size or widest_world_size(data, DEFAULT_WORLD_SIZE)
     accuracy = data.get(ACCURACY_FIELD) or {}
     named = accuracy.get("benchmark_members")
+    member = member or str(data["parallel"])
 
     def server(
-        spec: Mapping[str, Any], unit: str, overlay: Any = None
+        spec: Mapping[str, Any], unit: str | None, overlay: Any = None
     ) -> tuple[Server, dict, bool]:
         options, sampling, chat = engine_options(
-            spec, unit=unit, member=member, world_size=world, overlay=overlay
+            spec, unit=unit, member=member, features=features, world_size=world, overlay=overlay
         )
         # The model is the spec's `checkpoint_path`, not an option of a served configuration.
         options.pop("model", None)
         return Server(options=options), sampling, chat
 
-    def benchmarks(spec: Mapping[str, Any], unit: str, at: Sequence[str]) -> tuple[Benchmark, ...]:
+    def benchmarks(
+        spec: Mapping[str, Any], unit: str | None, at: Sequence[str]
+    ) -> tuple[Benchmark, ...]:
         if named in at and member != named:
             return ()
         block = spec.get(ACCURACY_FIELD) or {}
@@ -553,8 +546,8 @@ def deployment_for(
         args = tuple(str(a) for a in resolve_per_unit(block, "benchmark_args", unit) or ())
         return (Benchmark(name=benchmark, args=args),)
 
-    def inputs(unit: str) -> tuple[str, ...]:
-        images = "multimodal" in features_through(data, unit)
+    def inputs(unit: str | None) -> tuple[str, ...]:
+        images = "multimodal" in features_through(data, unit or "core")
         return INPUTS if images and data.get(SCOPE_FIELD) != "text_only" else ("text",)
 
     if is_variant(data, name):
@@ -594,7 +587,7 @@ def deployment_for(
         )
     found, sampling, chat = server(data, name)
     return Deployment(
-        name=name_for(name, member),
+        name=name_for(name or "core", member),
         server=found,
         inputs=inputs(name),
         benchmarks=benchmarks(data, name, members_for(data, name, world)),

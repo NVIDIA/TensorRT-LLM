@@ -132,9 +132,7 @@ def test_tasks_run_one_at_a_time(tmp_path, task_file, monkeypatch):
 def test_the_serve_gate_runs_one_frontend(tmp_path):
     """Defect 4: several frontends need the IPC proxy a one-rank single-process engine lacks."""
     options = tmp_path / "core.llm_api.yaml"
-    task = {"accuracy": {"max_seq_len": 9216}}
-    args = serve_gate.serve_args(task, None, member="tp1", options=options)
-    assert args[:3] == ["--config", str(options), "--num_serve_frontends=1"]
+    assert serve_gate.serve_args(options) == ["--config", str(options), "--num_serve_frontends=1"]
 
 
 def test_a_missing_anchor_row_says_how_to_measure_and_write_one(tmp_path):

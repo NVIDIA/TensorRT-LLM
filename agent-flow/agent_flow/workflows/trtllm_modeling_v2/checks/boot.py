@@ -12,10 +12,11 @@ from typing import Any, Mapping, Sequence
 
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
+from ..spec.deployments import Deployment
 from ..spec.shorthand import resolve_llm_api_options
 from ..spec.task_schema import BOOT_KEYS, GATE_TIMEOUT_KEY, load_prompts_file, resolve_gate_timeout
 from . import check_config, feature_evidence
-from .check_config import EngineLimits, check_configuration, engine_declaration
+from .check_config import EngineLimits, check_configuration, deployment_of, engine_declaration
 from .check_runtime import (
     BOOT_TIMEOUT_S,
     MODE_REQUIRE,
@@ -219,8 +220,12 @@ def run_boot_gate(
     features: Any | None = None,
     unit: str | None = None,
     member: str | None = None,
+    deployment: Deployment | None = None,
 ) -> GateResult:
-    """Cold-start the engine and check it generates, through the engine driver.
+    """Cold-start ``deployment``'s engine and check it generates, through the engine driver.
+
+    Without ``deployment`` it is the one ``unit`` at ``member`` names
+    (:func:`~.check_config.deployment_of`).
 
     ``features`` is the features the target under test implements, not those
     the run will finish with (default the run's). ``spec`` is the workload
@@ -232,14 +237,9 @@ def run_boot_gate(
     env = with_mode(environment, mode)
     gate_name = "boot" if mode == MODE_REQUIRE else f"boot[{mode}]"
     _verdict = verdict_factory(inspect_tree(task_data))
-    config = check_configuration(
-        task_data,
-        environment,
-        unit=unit,
-        features=task_data.get("features") if features is None else features,
-        max_tokens=spec.max_tokens,
-        member=member,
-    )
+    if deployment is None:
+        deployment = deployment_of(task_data, unit, member, environment.world_size, features)
+    config = check_configuration(task_data, deployment, max_tokens=spec.max_tokens)
     requests = spec.requests(task_data.get("trtllm_repo_path"))
     declared_requests = len(requests)
     limits = EngineLimits.from_config(config)

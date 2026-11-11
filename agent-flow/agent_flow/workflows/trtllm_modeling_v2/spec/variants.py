@@ -18,7 +18,7 @@ checks run with the unit's spec overlaid with the variant's switches::
 
 Each check is named by the variant (``kv_fp8:accuracy[gsm8k]@tep4``), so its
 verdicts, per-prompt baselines and findings are its own, never the unit's.
-``checks/check_config.variant_spec`` applies and materializes the overlay.
+``spec/shorthand.deployment_for`` applies the overlay.
 """
 
 from __future__ import annotations
@@ -64,8 +64,6 @@ RUNTIME_OVERLAY_KEYS: tuple[str, ...] = (
     "kv_cache_reuse",
     "extra_flags",
 )
-#: Where a variant's merged LLM-API options are written, under the workspace.
-OPTIONS_DIRNAME = "variants"
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
 
 
@@ -231,7 +229,6 @@ __all__ = [
     "ANCHOR_RECORDED",
     "ANCHOR_RELATIVE",
     "DEFAULT_VARIANT_GATES",
-    "OPTIONS_DIRNAME",
     "VARIANTS_FIELD",
     "VARIANT_GATES",
     "VARIANT_ROW_KEYS",

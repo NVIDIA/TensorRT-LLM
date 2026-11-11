@@ -5,14 +5,16 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import Any, Mapping, Sequence
 
-from ..infra.compute.environment import RunEnvironment
+from ..spec import deployments as deployments_mod
+from ..spec.deployments import Deployment
 from ..spec.shorthand import (
-    engine_options,
+    deployment_for,
     load_llm_api_options,
     merge_options,
     parse_runtime_flags,
@@ -111,7 +113,7 @@ class EngineLimits:
         """The request limits explicitly sent to the public LLM API."""
         options = config["llm"]
         return cls(
-            max_num_tokens=int(options["max_num_tokens"]),
+            max_num_tokens=int(options.get("max_num_tokens") or DEFAULT_MAX_NUM_TOKENS),
             max_seq_len=options.get("max_seq_len"),
             chunked_prefill=bool(options.get("enable_chunked_prefill", False)),
         )
@@ -419,32 +421,54 @@ def engine_declaration(config: Mapping[str, Any], *, mode: str | None) -> dict[s
     return declared_engine(options)
 
 
-def check_configuration(
-    task_data: Mapping[str, Any],
-    environment: RunEnvironment,
-    *,
-    unit: str | None,
-    features: Any | None,
-    max_tokens: int,
-    member: str | None,
-) -> dict[str, Any]:
-    """One public API configuration for request and eval checks.
+#: How every check samples unless a shorthand spec's runtime flags say otherwise: the
+#: check's own protocol, never an option of the engine.
+GREEDY_SAMPLING: dict[str, Any] = {"temperature": 0.0, "top_k": 1}
 
-    Runtime flags are an input spelling only. The complete options mapping
-    (:func:`engine_options`), including nested KV and speculative settings,
-    reaches every check intact.
+
+def check_configuration(
+    task_data: Mapping[str, Any], deployment: Deployment, *, max_tokens: int
+) -> dict[str, Any]:
+    """The public API configuration one in-process check runs ``deployment`` under.
+
+    The deployment's options as they are, with the checkpoint as the model: nothing is
+    defaulted here, so a deployment a spec states itself runs exactly what it states.
+    A disaggregated deployment's in-process engine is its context server's.
     """
-    options, sampling, chat = engine_options(
-        task_data, unit=unit, member=member, features=features, world_size=environment.world_size
-    )
-    sampling.setdefault("temperature", 0.0)
-    sampling.setdefault("top_k", 1)
+    server = deployment.server or deployment.ctx
+    options = copy.deepcopy(dict(server.options))
+    options["model"] = str(task_data["checkpoint_path"])
+    sampling = {**GREEDY_SAMPLING, **deployment.sampling}
     sampling.setdefault("max_tokens", int(max_tokens))
     width = int(options.get("max_beam_width", 1))
     if width > 1:
         sampling.setdefault("n", width)
         sampling["use_beam_search"] = True
-    return {"llm": options, "sampling": sampling, "apply_chat_template": chat}
+    return {"llm": options, "sampling": sampling, "apply_chat_template": deployment.chat_template}
+
+
+def deployment_of(
+    task_data: Mapping[str, Any],
+    unit: str | None,
+    member: str | None,
+    world_size: int | None = None,
+    features: Any | None = None,
+) -> Deployment:
+    """The deployment a check named by ``unit`` and ``member`` runs.
+
+    A spec that states its deployments names them: ``unit`` is the deployment's name
+    (core's when unnamed). A shorthand spec's is expanded for the pair
+    (``spec.shorthand.deployment_for``).
+    """
+    if deployments_mod.is_native(task_data):
+        found = deployments_mod.resolve(task_data)
+        named = {d.name: d for d in found}
+        if unit in (None, "core"):
+            return found[0]
+        if unit not in named:
+            raise KeyError(f"{unit!r} names no deployment of this spec ({', '.join(named)})")
+        return named[unit]
+    return deployment_for(task_data, unit, member, world_size, features)
 
 
 #: The runtime input flag each engine field is set by, as a variant's runtime block names it.
@@ -532,7 +556,9 @@ __all__ = [
     "LaunchCapture",
     "LaunchKvCache",
     "UNKNOWN",
+    "GREEDY_SAMPLING",
     "check_configuration",
+    "deployment_of",
     "declared_engine",
     "engine_declaration",
     "format_batches",

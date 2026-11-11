@@ -17,11 +17,11 @@ import yaml
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
 from ..infra.files import write_text_atomic
-from ..spec import shorthand
+from ..spec.deployments import Deployment
 from ..spec.shorthand import resolve_llm_api_options
 from ..spec.task_schema import resolve_per_unit, resolve_samples
 from . import accuracy_policy, check_config, feature_evidence
-from .check_config import check_configuration, engine_declaration
+from .check_config import check_configuration, deployment_of, engine_declaration
 from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner, gate_workdir, with_mode
 from .runtime_evidence import EVAL_NOT_ATTESTED, attest_engine, engine_failure, engine_records
 from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
@@ -264,8 +264,11 @@ def run_accuracy_gate(
     unit: str | None = None,
     member: str | None = None,
     relative: bool = False,
+    deployment: Deployment | None = None,
 ) -> GateResult:
-    """Run ``trtllm-eval`` and compare against the anchor. One-sided.
+    """Run ``trtllm-eval`` on ``deployment``'s options and compare against the anchor. One-sided.
+
+    Without ``deployment`` it is the one ``unit`` at ``member`` names.
 
     The floor is ``reference - k * SE`` by default (:func:`resolve_floor`), a
     fixed ``reference - tolerance`` under ``accuracy.floor.rule: tolerance``.
@@ -294,16 +297,10 @@ def run_accuracy_gate(
 
     name = f"accuracy[{benchmark}]"
     common = dict(name=name, member=member, reference=reference, tolerance=tolerance)
-    config = check_configuration(
-        task_data, environment, unit=unit, features=None, max_tokens=64, member=member
-    )
+    if deployment is None:
+        deployment = deployment_of(task_data, unit, member, environment.world_size)
+    config = check_configuration(task_data, deployment, max_tokens=64)
     config["llm"]["modeling_v2"] = MODE_REQUIRE
-    for key in ("max_seq_len", "max_batch_size"):
-        if accuracy.get(key) is not None:
-            config["llm"][key] = accuracy[key]
-    if accuracy.get("max_batch_size") is not None:
-        # The benchmark's batch is a global total too: each attention-DP rank serves its share.
-        shorthand.share_batch(config["llm"], member, config["llm"].get("tensor_parallel_size"))
     parts = eval_command(task_data, config, benchmark, unit=unit, member=member, workdir=workdir)
     command = eval_harness_command(env, parts)
 

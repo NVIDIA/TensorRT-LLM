@@ -41,7 +41,7 @@ from ..spec.task_schema import (
 )
 from . import accuracy as accuracy_checks
 from . import boot as boot_checks
-from . import check_runtime, datasets, disagg, serve
+from . import check_config, check_runtime, datasets, disagg, serve
 from . import verdict as check_result
 from .accuracy import resolve_model_key
 from .harness import workload_io
@@ -221,10 +221,7 @@ def run_check(
     workdir = Path(workdir).resolve()
     if variants_mod.is_variant(declared, unit):
         spec = shorthand.variant_spec(
-            declared,
-            unit,
-            world_size=widest_world_size(declared, world or 1),
-            options_dir=workdir / variants_mod.OPTIONS_DIRNAME,
+            declared, unit, world_size=widest_world_size(declared, world or 1)
         )
     if member is None:
         member = shorthand.order_members_by_cost(members_for(spec, unit, world or 1))[0]
@@ -250,12 +247,15 @@ def run_check(
     if runner is None:
         runner = shell_runner_for(select_command_executor(environment))
     runner = watch = _ImportWatch(check_runtime.in_tree(runner, tree), tree)
-    if features is None:
-        features = features_for(spec, unit)
-    features = list(features)
+    stated = features is not None
+    features = list(features) if stated else features_for(spec, unit)
+    # What the check runs: the deployment the unit or variant is at this member.
+    deployment = check_config.deployment_of(
+        declared, unit, member, world, features if stated else None
+    )
     spec = datasets.staged_spec(spec, gate if "[" in gate else name, workspace)
     bound = {"timeout": timeout} if timeout else {}
-    common = dict(task_data=spec, runner=runner, unit=unit, member=member)
+    common = dict(task_data=spec, runner=runner, unit=unit, member=member, deployment=deployment)
 
     def measure() -> check_result.GateResult:
         nonlocal anchor_score, disagg_spec
@@ -288,6 +288,7 @@ def run_check(
                         **common,
                         "task_data": datasets.staged_spec(declared, gate, workspace),
                         "unit": base,
+                        "deployment": check_config.deployment_of(declared, base, member, world),
                     },
                 )
                 if first.infrastructure or first.measured is None:
@@ -325,6 +326,7 @@ def run_check(
             )
         if disagg_spec is not None and timeout:
             disagg_spec = replace(disagg_spec, timeout=timeout)
+        common.pop("deployment")
         return disagg.run_disagg_gate(
             environment, workdir=workdir / unit, spec=disagg_spec, **common
         )

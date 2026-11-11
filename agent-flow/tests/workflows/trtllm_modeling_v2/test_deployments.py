@@ -7,14 +7,19 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import yaml
 
+from agent_flow.workflows.trtllm_modeling_v2.checks import accuracy as accuracy_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
+from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
-from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, shorthand, task_schema
+from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
     TaskSchemaError,
     load_and_validate_task_yaml,
@@ -109,15 +114,6 @@ def _delivered(tmp_path, *, parallel: str, model_key: str, agent: str, disagg: b
     return spec
 
 
-def _check_options(spec: dict, unit: str, member: str) -> dict:
-    """The options today's checks send the engine for ``unit`` at ``member``, less the model."""
-    environment = resolve_environment(spec, devices=(), world_size=1)
-    config = check_config.check_configuration(
-        spec, environment, unit=unit, features=None, max_tokens=32, member=member
-    )
-    return {key: value for key, value in config["llm"].items() if key != "model"}
-
-
 # ------------------------------------------------------------- the delivered specs
 
 
@@ -174,7 +170,7 @@ def test_a_delivered_tp2_spec_with_disagg_is_three_deployments(tmp_path):
     assert kv.relative_to == "tp2" and kv.server.options["kv_cache_config"]["dtype"] == "fp8"
 
 
-def test_a_shorthand_deployment_carries_the_options_the_checks_send_today(tmp_path):
+def test_a_check_runs_its_deployments_options_and_adds_nothing(tmp_path):
     spec = _load(
         tmp_path,
         _delivered(
@@ -186,10 +182,59 @@ def test_a_shorthand_deployment_carries_the_options_the_checks_send_today(tmp_pa
         ),
     )
     core, _, kv = deployments.resolve(spec)
-    assert core.server.options == _check_options(spec, "core", "tp2")
-    # A variant's checks run under the spec `variant_spec` writes, its options file included.
-    variant = shorthand.variant_spec(spec, "kv_fp8", world_size=2, options_dir=tmp_path / "v")
-    assert kv.server.options == _check_options(variant, "kv_fp8", "tp2")
+    for deployment, unit in ((core, "core"), (kv, "kv_fp8")):
+        # The deployment a check named by unit and member finds is the one the spec comes to.
+        assert check_config.deployment_of(spec, unit, "tp2") == replace(deployment, core=False)
+        config = check_config.check_configuration(spec, deployment, max_tokens=32)
+        assert config["llm"] == {**deployment.server.options, "model": spec["checkpoint_path"]}
+        assert config["sampling"] == {"temperature": 0.0, "top_k": 1, "max_tokens": 32}
+        assert config["apply_chat_template"] is False
+    # A deployment the spec states itself: its file, the model, and not one default more.
+    native = _load(tmp_path, _native(tmp_path))
+    dep16 = check_config.deployment_of(native, None, None)
+    config = check_config.check_configuration(native, dep16, max_tokens=8)
+    stated = yaml.safe_load((tmp_path / "engines" / "dep16.yaml").read_text())
+    assert config["llm"] == {**stated, "model": native["checkpoint_path"]}
+    assert config["sampling"] == {"temperature": 0.0, "top_k": 1, "max_tokens": 8}
+    assert check_config.deployment_of(native, "pd", None).kind == deployments.DISAGGREGATED
+    with pytest.raises(KeyError, match="'tp4' names no deployment of this spec"):
+        check_config.deployment_of(native, "tp4", None)
+
+
+def test_shorthand_defaults_and_the_attention_dp_share_are_written_once(tmp_path):
+    spec = _delivered(
+        tmp_path, parallel="dep4", model_key="org/model", agent="claude-test-model", disagg=False
+    )
+    spec["runtime"]["extra_flags"] = ["--max_seq_len=5120", "--temperature=0.5"]
+    spec["variants"] = {}
+    loaded = _load(tmp_path, spec)
+    [dep4] = deployments.resolve(loaded)
+    options = dep4.server.options
+    # What the shorthand implies is in the options, where a reader and the engine both see it.
+    assert options["kv_cache_config"]["enable_block_reuse"] is False
+    assert options["kv_cache_config"]["free_gpu_memory_fraction"] == 0.9
+    assert options["enable_chunked_prefill"] is False
+    assert options["disable_overlap_scheduler"] is False
+    assert (options["max_num_tokens"], options["max_seq_len"]) == (8192, 5120)
+    # 64 is the global batch (`accuracy.max_batch_size`): each of four ranks serves 16, and
+    # its graphs are captured to 16. One division, for the boot, the benchmark and the server.
+    assert options["max_batch_size"] == 16
+    assert options["cuda_graph_config"] == {"enable_padding": True, "max_batch_size": 16}
+    assert dep4.sampling == {"temperature": 0.5}
+    seen: list[str] = []
+
+    def runner(command, env=None, timeout=0):
+        seen.append(command)
+        return CommandResult(returncode=1, stdout="")
+
+    environment = resolve_environment(loaded, devices=(), world_size=4)
+    accuracy_checks.run_accuracy_gate(
+        environment, task_data=loaded, reference=50.0, workdir=tmp_path / "w", runner=runner,
+        unit="core", member="dep4",
+    )  # fmt: skip
+    config = re.search(r"--config=(\S+\.yaml)", seen[0]).group(1)
+    sent = yaml.safe_load(Path(config).read_text())
+    assert sent == {**options, "modeling_v2": "require"}
 
 
 # ------------------------------------------------------------------ shorthand, in general
