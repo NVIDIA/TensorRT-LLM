@@ -559,11 +559,9 @@ class Deepseekv3RoutingImpl:
             score_mask = group_mask.unsqueeze(-1).expand(
                 scores_shape[:-1] +
                 [n_group, scores_shape[-1] // n_group]).reshape(scores_shape)
-            scores_with_bias = torch.where(
-                score_mask.bool(), scores_with_bias,
-                torch.tensor(float('-inf'),
-                             dtype=scores_with_bias.dtype,
-                             device=scores_with_bias.device))
+            # Fill with a Python scalar so no -inf tensor is copied to the GPU.
+            scores_with_bias = scores_with_bias.masked_fill(
+                ~score_mask.bool(), float('-inf'))
             _, topk_idx = torch.topk(scores_with_bias,
                                      k=self.top_k,
                                      dim=-1,
