@@ -126,6 +126,17 @@ For each file under `tests/` in the diff:
    A complete set of direct `test_*.py` importers becomes the anchors; an
    ambiguous, dynamic, transitive, or non-test importer retains the directory
    fallback.
+   ModelingV2 tests also have explicit groups spanning component directories.
+   For the named test and helper inputs, a whole-file fallback selects their
+   group instead of the containing directory; AST function/class anchors remain
+   unchanged. MiniMax-M3 MoE groups pair target tests with their matching family
+   router configuration, while collective-launch helpers select their target
+   scope and that configuration. SM103 communication groups span `comm/` and
+   `ops/comm/`; the GLM GEMM group spans `gemm/` and its router test in
+   `ops/gemm/`. Inputs on both sides of these component boundaries select the
+   same group. YAML block and hardware conditions still determine where each
+   group runs. The shared FP4 helper selects the ModelingV2 test subtree, and
+   the K3 engine helper selects its target subtree.
 3. `lookup_paths_into_block_filters` calls `find_match_for_path`
    (bidirectional pytest-tree lineage) for each anchor; matches feed
    `block_filters`. For non-`test_*.py` paths, the lookup walks up
@@ -398,12 +409,19 @@ name a target.
 
 | Changed file | Selects |
 |---|---|
-| Any file in a target, native code included | Only that target's tests |
+| Any file in a target, native code included | That target's tests |
 | Python family code | Its mirror unit directory under `models/<family>/`, else the family-level unit tests (test files directly in the family's unit directory and its non-target subdirectories); plus the tests of every target that imports it, and every unit test file that imports it |
 | Python family code no target imports (such as `routing.py`) | The whole family: `unittest/_torch/modeling_v2/models/<family>` and `accuracy/modeling_v2/<family>`; plus every unit test file that imports it |
 | Non-Python family file | The whole family |
 | Python file under `catalog/<category>/` | `unittest/_torch/modeling_v2/<category>` plus the tests of every target that imports it and every unit test file that imports it; every modeling_v2 entry if that directory does not exist |
 | Any other file: `catalog/_op.py`, files directly under the subtree, `models/` or `catalog/`, the shared native build | Every modeling_v2 entry |
+
+The MiniMax SM107 TP2, TP4 and TP8 router tests live under their respective
+`models/minimax_m3/minimax_m3_nvfp4__sm_107__tpN/ops/moe/` directories and
+are selected with those targets. Explicit M3 family-source associations also
+retain named communication and MoE cases, as well as checks at the family root
+and in `ops/spec`, even when a mirror unit directory exists. These associations
+add file prefixes rather than the whole family or target.
 
 The rule reads imports from the checkout, which in CI is the PR head: it
 parses every Python file of the subtree and of `tests/unittest/_torch/modeling_v2/`
@@ -434,8 +452,9 @@ several files union.
 
 A covering directory entry is retained when no more specific entry exists,
 unless it ignores that path. Whole-tree unit checks directly under
-`unittest/_torch/modeling_v2/` are always retained. If no modeling_v2 entry
-matches, the rule falls back to baseline.
+`unittest/_torch/modeling_v2/` and the shared FP4 test-helper CPU guard at
+`unittest/_torch/modeling_v2/moe/test_modeling_v2_fp4_test_helpers.py` are always
+retained. If no modeling_v2 entry matches, the rule falls back to baseline.
 
 `.md` exclusion carries more weight here than elsewhere: every catalog
 entry ships a contract document, so roughly a fifth of the subtree is

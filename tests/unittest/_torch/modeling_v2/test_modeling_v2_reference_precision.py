@@ -100,9 +100,9 @@ def test_torch_backend_precision_is_restored(raises: bool) -> None:
 @pytest.mark.parametrize(
     "relative_path",
     [
-        "moe/test_modeling_v2_fp4_block_scale_moe_runner.py",
-        "moe/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py",
-        "models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/moe/test_modeling_v2_fused_moe.py",
+        "moe/ops/test_modeling_v2_fp4_block_scale_moe_runner.py",
+        "moe/ops/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py",
+        "models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/ops/moe/test_modeling_v2_fused_moe.py",
     ],
 )
 def test_moe_collection_does_not_assign_precision(relative_path: str) -> None:
@@ -148,9 +148,9 @@ def test_moe_reference_does_not_override_precision(relative_path: str) -> None:
 @pytest.mark.parametrize(
     "relative_path",
     [
-        "moe/test_modeling_v2_fp4_block_scale_moe_runner.py",
-        "moe/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py",
-        "models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/moe/test_modeling_v2_fused_moe.py",
+        "moe/ops/test_modeling_v2_fp4_block_scale_moe_runner.py",
+        "moe/ops/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py",
+        "models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/ops/moe/test_modeling_v2_fused_moe.py",
         "models/qwen4_exp/ops/moe/test_modeling_v2_fp4_block_scale_moe_renorm_routed.py",
         "models/qwen4_exp/ops/moe/test_modeling_v2_fp4_block_scale_moe_renorm_permuted.py",
         "models/qwen4_exp/ops/moe/test_modeling_v2_fp4_moe_renorm_cute_dsl.py",
