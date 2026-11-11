@@ -285,6 +285,7 @@ l0_cpu:
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_ipc.py
   - unittest/executor/test_rpc.py
+  - unittest/executor/test_rpc_response_registration.py
   - unittest/executor/test_multi_frontend_routing.py
   - unittest/executor/test_proxy_request_sender.py
   - unittest/executor/test_event_loop_error_broadcast.py
