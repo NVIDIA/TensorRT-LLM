@@ -43,10 +43,12 @@ preflight -> tasks, in a fixed order -> certification of the final commit -> ver
    says it finished, its commits are audited (who made them, the sign-off, and that none touches
    the workspace or a judge path), fast-forwarded into the checkout and labelled `target`,
    `shared` or `mixed` by whether their paths are the target's own. **A worker checks its own task**
-   with `trtllm-modeling-v2 gate` and its decision is trusted: no check runs between tasks.
+   with `trtllm-modeling-v2 gate` and its decision is trusted: no check runs between tasks. Each
+   landing is read by the conventions scan (an entry's `CELLS`, `ARCHS` and test, Modeling V1
+   imports, the landing name): its findings are kept for the report and never hold a task.
 3. **Certification**: every check of the contract runs once, on the commit the checkout is at, then
-   the delivery checks (the files on disk, the commit audit, the delivered tests, the CI test
-   lists). One rule decides what counts: **a verdict counts for the commit it measured and for no
+   the delivery checks (the commit audit, the target's own tests; the conventions scan's findings
+   are report lines). One rule decides what counts: **a verdict counts for the commit it measured and for no
    other.** The checkout must be clean and must not move while the checks run.
 4. **Verdict**: `delivered` when all of it passed on that one commit. `delivery_report.md` in the
    workspace says what was certified, on which commit, and what was not.

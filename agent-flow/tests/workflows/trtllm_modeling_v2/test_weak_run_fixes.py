@@ -29,19 +29,15 @@ What each run lost, and the case that holds its fix:
   ``test_the_memory_limit_is_read_from_the_process_own_cgroup``
 - a defect in shared code became a fix task the commit policy refused:
   ``test_a_kernel_writer_guards_a_cell_the_target_never_serves``
-- an entry without ``CELLS`` landed and failed the final round:
-  ``test_an_entry_without_cells_or_this_arch_is_refused_when_its_task_lands`` and
-  ``test_landing_and_delivery_apply_one_entry_rule``
+- an entry without ``CELLS`` landed and failed the final round, a static delivery problem
+  cost a whole certification round, and a valid entry under another file name was refused
+  and renamed: ``test_a_landing_is_read_for_the_conventions_and_no_finding_holds_it``
 - nothing read what the workers left uncertified:
   ``test_the_report_lists_what_the_workers_left_uncertified``
 - a measured small-model anchor was called a placeholder:
   ``test_a_measured_small_anchor_is_not_called_a_placeholder``
 - a large tool result ended a turn at the SDK's 1 MiB message limit:
   ``test_the_claude_backend_reads_stream_messages_past_the_sdk_default``
-- a static delivery problem cost a whole certification round:
-  ``test_a_landed_unit_is_read_with_the_static_delivery_checks``
-- a valid entry under another file name was refused and renamed:
-  ``test_the_landing_check_reads_the_entry_the_decision_names``
 - delivered tests' rank processes imported another checkout:
   ``test_delivered_tests_run_with_the_tree_first_on_pythonpath``
 """
@@ -58,12 +54,12 @@ import yaml
 from agent_flow.backends import claude_code
 from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import _common
 from agent_flow.workflows.trtllm_modeling_v2.agents.prompts.worker import ENDING_EXTRAS
-from agent_flow.workflows.trtllm_modeling_v2.checks import anchors, delivery
+from agent_flow.workflows.trtllm_modeling_v2.checks import anchors, conventions
 from agent_flow.workflows.trtllm_modeling_v2.checks import serve as serve_gate
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
 from agent_flow.workflows.trtllm_modeling_v2.run import certify
 from agent_flow.workflows.trtllm_modeling_v2.run import workflow as workflow_mod
-from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import Pipeline, Task, static_repair_block
+from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import Pipeline, Task
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import advice, agent_probe, preflight
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
@@ -302,12 +298,13 @@ _KERNEL_TASK = Task(id="k1-rms", kind="kernel", unit="core", ref="1")
 
 
 def _landing() -> SimpleNamespace:
-    """What ``Pipeline._entry_problems`` reads of a pipeline: the queue row, the target, the arch."""
+    """What a landing reads of a pipeline: the queue row, the target, the arch."""
     return SimpleNamespace(
         _queue_item=lambda task: QueueItem(1, "onboard", "ops/norm/rms"),
         w=SimpleNamespace(
             _preflight=SimpleNamespace(target_rel=_TARGET),
             task_data={"arch": "sm_103", "trtllm_repo_path": ""},
+            vocabulary_path=Path("/nonexistent/vocabulary.yaml"),
         ),
     )
 
@@ -331,102 +328,43 @@ def _land(tmp_path, *decisions: dict) -> tuple[object, list[str]]:
     pipeline._dispatch = dispatch
     pipeline._prompt = lambda task, block: block
     pipeline._integrate = lambda task, role, tree, block: ""
-    pipeline._static_problems = lambda *a: Pipeline._static_problems(pipeline, *a)
-    pipeline._entry_problems = lambda *a: Pipeline._entry_problems(pipeline, *a)
+    pipeline.w.task_data["trtllm_repo_path"] = str(tmp_path)
+    pipeline._scan = lambda *a: Pipeline._scan(pipeline, *a)
     task = Task(id="k1-rms", kind="kernel", unit="core", ref="1", attempts=1)
     return Pipeline._work(pipeline, task, False), prompts
 
 
-def test_a_landing_reads_the_entry_and_gives_one_turn_to_put_it_right(tmp_path):
-    """Defects 11 and 14 where they act: the turn that says LANDED is held to its entry."""
+def test_a_landing_is_read_for_the_conventions_and_no_finding_holds_it(tmp_path):
+    """Defects 11, 13 and 14 as they are answered now: found at the landing, never a gate.
+
+    An entry without ``CELLS``, driven on another architecture, with no test, or landed
+    under another name than its row's is found when its task lands. The finding is kept
+    for the report and the final fix task; it costs the task no turn and does not fail it.
+    """
     named = f"{_TARGET}/ops/norm/rms__r1.py"
     landed = {"decision": "LANDED", "summary": "landed", "entry": named}
     entry = tmp_path / named
     entry.parent.mkdir(parents=True)
-    # An entry with no CELLS: one short turn names the problem, and the task does not land.
-    entry.write_text(_ENTRY_HEAD + _ENTRY_ARCHS)
-    result, prompts = _land(tmp_path, landed, landed)
-    assert len(prompts) == 2 and "- Rms declares no CELLS: nothing is certified" in prompts[1]
-    assert result.error == "its landed work is not deliverable: Rms declares no CELLS: " + (
-        "nothing is certified"
-    )
-    # The module the decision names is the one read, whatever its name: it lands in one turn.
-    entry.write_text(_ENTRY_HEAD + _ENTRY_CELLS + _ENTRY_ARCHS)
+    entry.write_text(_ENTRY_HEAD + "    ARCHS = frozenset({Arch.SM_100})\n")
     result, prompts = _land(tmp_path, landed)
     assert (result.decision, result.error, len(prompts)) == ("LANDED", "", 1)
-    # A decision that names no entry is held to where the queue row places it.
-    result, prompts = _land(tmp_path, {"decision": "LANDED", "summary": "x"}, landed)
-    assert f"`{_TARGET}/ops/norm/rms.py` is not in your worktree" in prompts[1]
+    tests = "tests/unittest/_torch/modeling_v2/models/fam/tgt/norm"
+    assert conventions.load(tmp_path / "ws") == {
+        f"`{_TARGET}/ops/norm/rms.py` is not in the tree: the entry is not where its row "
+        f"lands it, it is at `{named}`": "k1-rms",
+        f"{named}: Rms declares no CELLS: nothing is certified": "k1-rms",
+        f"{named}: Rms's ARCHS names sm_100, not sm_103": "k1-rms",
+        f"{named}: no test at {tests}/test_modeling_v2_rms__r1.py": "k1-rms",
+    }
+    # Put right, the next landing adds nothing; what was found stays on the record.
+    entry.rename(entry.with_name("rms.py"))
+    (tmp_path / _TARGET / "ops/norm/rms.py").write_text(_ENTRY_HEAD + _ENTRY_CELLS + _ENTRY_ARCHS)
+    test = tmp_path / tests / "test_modeling_v2_rms.py"
+    test.parent.mkdir(parents=True)
+    test.write_text("def test_cells():\n    assert Rms.CELLS\n")
+    result, _ = _land(tmp_path, {"decision": "LANDED", "summary": "x"})
     assert (result.decision, result.error) == ("LANDED", "")
-
-
-def test_an_entry_without_cells_or_this_arch_is_refused_when_its_task_lands(tmp_path):
-    """Defect 11: the entry is read when its kernel task lands, with one short turn to fix it."""
-    entry = tmp_path / _TARGET / "ops/norm/rms.py"
-
-    def problems():
-        return Pipeline._entry_problems(_landing(), _KERNEL_TASK, tmp_path)
-
-    assert problems() == [f"`{_TARGET}/ops/norm/rms.py` is not in your worktree"]
-    entry.parent.mkdir(parents=True)
-    entry.write_text(_ENTRY_HEAD + _ENTRY_ARCHS)
-    assert problems() == ["Rms declares no CELLS: nothing is certified"]
-    entry.write_text(_ENTRY_HEAD + _ENTRY_CELLS + "    ARCHS = frozenset({Arch.SM_100})\n")
-    assert problems() == ["ARCHS names sm_100, not sm_103"]
-    entry.write_text(_ENTRY_HEAD + _ENTRY_CELLS + _ENTRY_ARCHS)
-    assert problems() == []
-    block = static_repair_block(["Rms declares no CELLS: nothing is certified"], entry=True)
-    assert "Do not start the task again" in block and "- Rms declares no CELLS" in block
-    assert "`CELLS` name the cells" in block
-
-
-def test_landing_and_delivery_apply_one_entry_rule(tmp_path):
-    """Review of the runs: a landing and the delivery check hold an entry to the same rule."""
-    entry = tmp_path / _TARGET / "ops/norm/rms.py"
-    entry.parent.mkdir(parents=True)
-    entry.write_text(_ENTRY_HEAD + _ENTRY_CELLS + "    ARCHS = frozenset({Arch.SM_100})\n")
-    landing = Pipeline._entry_problems(_landing(), _KERNEL_TASK, tmp_path)
-    delivered, _ = delivery.entry_problems(entry, "sm_103")
-    assert landing == delivered == ["ARCHS names sm_100, not sm_103"]
-
-
-def test_the_landing_check_reads_the_entry_the_decision_names(tmp_path):
-    """Defect 14: the module the decision names counts, whatever its name (the target imports it)."""
-    named = f"{_TARGET}/ops/norm/rms__r1.py"
-    entry = tmp_path / named
-    entry.parent.mkdir(parents=True)
-    entry.write_text(_ENTRY_HEAD + _ENTRY_CELLS + _ENTRY_ARCHS)
-    landing = _landing()
-    assert Pipeline._entry_problems(landing, _KERNEL_TASK, tmp_path, {"entry": named}) == []
-    assert Pipeline._entry_problems(landing, _KERNEL_TASK, tmp_path, {"entry": "nope.py"}) == [
-        f"neither `nope.py` (your decision's `entry`) nor `{_TARGET}/ops/norm/rms.py` is in your worktree"
-    ]
-
-
-def test_a_landed_unit_is_read_with_the_static_delivery_checks(tmp_path, task_file):
-    """Defect 13: the checks that read files run at a landing, not only at the end."""
-    spec = yaml.safe_load(task_file.read_text())
-    target = (
-        "tensorrt_llm/_torch/_experimental/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1"
-    )
-    workflow = SimpleNamespace(
-        task_data=spec, _preflight=SimpleNamespace(target_rel=target, family="gpt_oss")
-    )
-    tree = tmp_path / "tree"
-    tree.mkdir()
-    failures = certify.static_delivery_failures(workflow, tree)
-    names = {f.split(":", 2)[0] + ":" + f.split(":", 2)[1] for f in failures}
-    # An empty tree misses what the final certification reads: the target and its accuracy row.
-    assert "target:modeling.py" in names
-    assert "accuracy:reference" in names
-    # A run whose first deployment names no benchmark owes no CI files: the same waiver as
-    # the certification's.
-    del spec["accuracy"]
-    waived = certify.static_delivery_failures(workflow, tree)
-    assert not any(f.startswith(("accuracy:reference", "tests:test-db")) for f in waived)
-    assert any(f.startswith("target:modeling.py") for f in waived)
-    unit = static_repair_block(["tests:test-db: not listed"], entry=False)
-    assert "Put the tree right" in unit and "- tests:test-db: not listed" in unit
+    assert len(conventions.load(tmp_path / "ws")) == 4
 
 
 def test_the_report_lists_what_the_workers_left_uncertified(tmp_path):

@@ -62,8 +62,7 @@ from ..agents.prompts.kernel import KernelContext, kernel_prompt
 from ..agents.prompts.survey import capture_lists_block
 from ..agents.prompts.tags import tag_section, task_tags
 from ..agents.turns import TurnTimeout
-from ..checks import gate_cli
-from ..checks.delivery import entry_problems
+from ..checks import conventions, gate_cli
 from ..infra.files import write_text_atomic
 from ..operators.coverage import (
     QueueItem,
@@ -174,24 +173,6 @@ class Plan:
     summary: str = ""
     note: str = ""
     tasks: list[Task] = field(default_factory=list)
-
-
-def static_repair_block(problems: list[str], *, entry: bool) -> str:
-    """What a worker whose landed work the final certification would refuse is told."""
-    listed = "\n".join(f"- {problem}" for problem in problems)
-    what = (
-        "Put the entry right in your worktree (its `CELLS` name the cells you drove and saw "
-        "pass, its `ARCHS` this architecture)"
-        if entry
-        else "Put the tree right in your worktree (each finding names the file or list it reads)"
-    )
-    return (
-        "## Your landed work is not deliverable as committed\n\n"
-        "Read statically, as the final certification reads it:\n\n"
-        f"{listed}\n\n"
-        f"Do not start the task again. {what}, commit with `git commit -s`, and write your "
-        "decision file again."
-    )
 
 
 class Pipeline:
@@ -460,68 +441,37 @@ class Pipeline:
                 result.error = f"vocabulary.yaml does not validate: {exc}"
             return result
         if tree is not None:
-            problems = self._static_problems(task, tree, data)
-            if problems:
-                # The final certification would refuse it: one short turn now, no GPU.
-                said = "; ".join(problems)
-                self.w.journal.event("task", f"{task.id}: not deliverable as landed: {said}")
-                note = static_repair_block(problems, entry=task.kind == "kernel")
-                self._dispatch(task, role, self._prompt(task, f"{block}\n\n{note}"), path)
-                data = read_decision(path, role)
-                if data is None or data["decision"] not in FINISHED:
-                    return TurnResult(
-                        error=f"its landed work is not deliverable ({said}), and the "
-                        "turn asked to put it right did not finish"
-                    )
-                result = TurnResult(str(data["decision"]), data)
-                problems = self._static_problems(task, tree, data)
-                if problems:
-                    result.error = f"its landed work is not deliverable: {'; '.join(problems)}"
-                    return result
-        if tree is not None:
             result.error = self._integrate(task, role, tree, block)
+            if not result.error:
+                self._scan(task, data)
         return result
 
-    def _static_problems(self, task: Task, tree: Path, data: Mapping[str, Any]) -> list[str]:
-        """What the final certification's static checks would refuse in a landed task.
+    def _scan(self, task: Task, data: Mapping[str, Any]) -> None:
+        """Read the checkout a task just landed in for the conventions: reported, never a gate.
 
-        A kernel task's entry by the one entry rule; a deployment's or a fix task's tree by
-        the delivery checks that read files (layout, routing, the anchor row, the accuracy
-        test and its test list, the entries the target imports), not the tests or the
-        commits, which certification and integration check.
+        What it finds is kept for the report and the final `fix` task (`conventions.json`);
+        no finding fails the task or sends it back to its worker.
         """
-        if task.kind == "kernel":
-            return self._entry_problems(task, tree, data)
-        if task.kind in ("assemble", "feature", "fix") and self.w._preflight:
-            return certify_mod.static_delivery_failures(self.w, tree)
-        return []
-
-    def _entry_problems(
-        self, task: Task, tree: Path, data: Mapping[str, Any] | None = None
-    ) -> list[str]:
-        """What the delivery check would refuse in a kernel task's entry, read statically.
-
-        The entry is the module the decision file names (`entry`, which a landing states), else
-        where the queue row places it; the delivery check reads the modules the target imports,
-        whatever their names.
-        """
-        item = self._queue_item(task)
-        if item is None:
-            return []
         target_rel = str(getattr(self.w._preflight, "target_rel", "") or "")
-        paths = entry_paths(item, target_rel, self.w.task_data.get("trtllm_repo_path") or None)
-        if not paths:
-            return []
-        named = str((data or {}).get("entry") or "").strip()
-        stated = Path(tree) / named if named else None
-        module = stated if stated is not None and stated.is_file() else Path(tree) / paths[0]
-        if not module.is_file():
-            if named:
-                return [
-                    f"neither `{named}` (your decision's `entry`) nor `{paths[0]}` is in your worktree"
-                ]
-            return [f"`{paths[0]}` is not in your worktree"]
-        return entry_problems(module, str(self.w.task_data.get("arch") or ""))[0]
+        repo = self.w.task_data.get("trtllm_repo_path")
+        if not (target_rel and repo):
+            return
+        item = self._queue_item(task) if task.kind == "kernel" else None
+        paths = entry_paths(item, target_rel, repo) if item is not None else None
+        try:
+            found = conventions.scan(
+                repo,
+                target_rel,
+                str(self.w.task_data.get("arch") or ""),
+                landing=paths[0] if paths else "",
+                named=str(data.get("entry") or "").strip(),
+            )
+            new = conventions.record(self.workspace, task.id, found)
+        except Exception as exc:  # a scan that cannot read the tree says so, and holds nothing
+            new = [f"the scan could not run: {type(exc).__name__}: {exc}"]
+        if new:
+            said = "; ".join(new)
+            self.w.journal.event("conventions", f"{task.id}: {len(new)} finding(s): {said}")
 
     def _integrate(self, task: Task, role: str, tree: Path, block: str) -> str:
         """Audit and integrate ``task``'s branch; why it did not go in, or ``""``.

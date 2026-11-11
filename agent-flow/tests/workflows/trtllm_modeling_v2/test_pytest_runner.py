@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import pytest
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import pytest_runner
-from agent_flow.workflows.trtllm_modeling_v2.checks.delivery import Check as DeliveryCheck
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import model_ops_tests_dir
 from agent_flow.workflows.trtllm_modeling_v2.run import certify
@@ -68,21 +67,17 @@ class _Delivery:
         )
         return CommandResult(returncode=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
-    def check(self, entry_tests=()):
-        checks = tuple(
-            DeliveryCheck(f"test:{n}", True, str(self.repo / test))
-            for n, test in enumerate(entry_tests)
-        )
-        return certify.tests_check(self, checks, self.head)
+    def check(self):
+        return certify.tests_check(self, self.head)
 
 
 def test_the_delivered_tests_run_once_at_the_commit_and_hold_on_their_passing(tmp_path):
     tests = model_ops_tests_dir(TARGET)
     stage = _Delivery(
         tmp_path,
-        {f"{tests}/test_forward.py": PASSING, "tests/entries/test_modeling_v2_x.py": PASSING},
+        {f"{tests}/test_forward.py": PASSING, f"{tests}/norm/test_modeling_v2_x.py": PASSING},
     )
-    check = stage.check(entry_tests=["tests/entries/test_modeling_v2_x.py"])
+    check = stage.check()
     assert check.passed, check.detail
     assert check.detail.startswith("CLEAN (2 passed, 0 skipped, 0 failing)")
     assert f"2 test file(s) ran at {stage.head[:10]}" in check.detail

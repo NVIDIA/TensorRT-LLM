@@ -5,8 +5,8 @@
 
 While the workers build, nothing here runs: their conclusions are trusted.
 Once the pipeline has no task left, :func:`certify` runs the whole contract
-on the commit the checkout is at, then the delivery checks (the files on
-disk, the commit audit, the delivered tests, the CI test lists). The run is
+on the commit the checkout is at, then the delivery checks (the commit audit,
+the delivered tests; the conventions scan's findings are report lines). The run is
 delivered only when all of it passed on that one commit, with the checkout
 clean and unmoved while it ran.
 
@@ -25,7 +25,7 @@ would be paid for nothing.
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -34,15 +34,19 @@ from rich.markup import escape as escape_markup
 
 from agent_flow.console import print_message, print_rule
 
-from ..checks import anchors, gate_cli, pytest_runner
+from ..checks import anchors, conventions, gate_cli, pytest_runner
 from ..checks import verdict as check_result
-from ..checks.delivery import Check as DeliveryCheck
-from ..checks.delivery import DeliveryReport, accuracy_test_path, verify_delivery
 from ..infra.compute.commands import CommandSpec
 from ..infra.files import write_text_atomic
-from ..operators.coverage import model_ops_tests_dir
-from ..spec import deployments as deployments_mod
-from ..spec.deployments import DEFAULT_BENCHMARK, Benchmark
+from ..infra.git import (
+    DEFAULT_BASE_REFS,
+    CommitPolicy,
+    CommitPolicyError,
+    audit_commits,
+    git_output,
+    resolve_base,
+)
+from ..operators.coverage import CATALOG_TESTS_DIR, MODELING_V2_PACKAGE, model_ops_tests_dir
 from . import contract as contract_mod
 
 #: Under the workspace: one directory per certification round, with its checks' files.
@@ -51,14 +55,39 @@ CERTIFY_DIRNAME = "certify"
 CERTIFICATION_FILENAME = "certification.yaml"
 #: The delivery report: the verdict, the commit, every check, what is covered.
 REPORT_FILENAME = "delivery_report.md"
-#: The delivery checks that set the target up for CI: its accuracy test, the test list that
-#: runs it and its anchor's row. A run whose first deployment names no benchmark owes none.
-CI_DELIVERY_CHECKS = frozenset({"accuracy:reference", "tests:accuracy-file", "tests:test-db"})
 #: The most test modules of its own a target delivers that a reviewer accepts: delivery
 #: warns past it and never fails on it.
 TARGET_TEST_MODULES_MAX = 20
 #: How many times a check the infrastructure ended (no verdict) runs again in one round.
 INFRASTRUCTURE_RERUNS = 1
+
+
+@dataclass(frozen=True)
+class DeliveryCheck:
+    """One delivery check, and what it found."""
+
+    name: str
+    passed: bool
+    detail: str
+
+    def render(self) -> str:
+        return f"[{'ok' if self.passed else 'FAIL'}] {self.name}: {self.detail}"
+
+
+@dataclass(frozen=True)
+class DeliveryReport:
+    checks: tuple[DeliveryCheck, ...]
+
+    @property
+    def passed(self) -> bool:
+        return all(check.passed for check in self.checks)
+
+    @property
+    def failures(self) -> tuple[DeliveryCheck, ...]:
+        return tuple(check for check in self.checks if not check.passed)
+
+    def render(self) -> str:
+        return "\n".join(check.render() for check in self.checks)
 
 
 @dataclass(frozen=True)
@@ -180,21 +209,6 @@ def _relative_score(
     return base.measured if base is not None else None
 
 
-def ci_waiver(task_data) -> str:
-    """Why the run owes no :data:`CI_DELIVERY_CHECKS`; ``""`` when it owes them."""
-    if deployments_mod.named(task_data).benchmarks:
-        return ""
-    return "not owed: the first deployment names no benchmark"
-
-
-def _anchor_row(task_data) -> tuple[str, str]:
-    """The reference file and the row's key the first deployment's first benchmark is anchored by."""
-    listed = deployments_mod.named(task_data).benchmarks
-    benchmark = listed[0] if listed else Benchmark(name=DEFAULT_BENCHMARK)
-    path = benchmark.reference_yaml or f"{anchors.REFERENCES_DIR}/{benchmark.name}.yaml"
-    return path, anchors.model_key(task_data, benchmark)
-
-
 def certify(workflow, round: int, first: Sequence[str] = (), log=None) -> Certification:
     """Run the contract and the delivery checks on the checkout's commit; see the module docstring.
 
@@ -288,65 +302,67 @@ def _record(workflow, certification: Certification) -> None:
 # ------------------------------------------------------------------------ delivery checks
 
 
-def delivery_report(workflow, commit: str, round: int = 0) -> DeliveryReport:
-    """The delivery checks on the checkout at ``commit``: files, commits, test lists, tests.
+def git_checks(repo: Path, policy: CommitPolicy, trees: Sequence[str]) -> list[DeliveryCheck]:
+    """The delivered ``trees`` are in git, and the run's commits meet the commit rules.
 
-    The delivered tests run here (:func:`tests_check`), with no agent turn.
+    No check outside a git work tree: a fixture in a temporary directory is no delivery.
+    The audit runs over every commit since the merge base that touches the target's own
+    paths, by the rules each task's commits were held to when they landed.
+    """
+    if not (repo / ".git").exists():
+        return []
+    dirt = git_output(repo, "status", "--porcelain", "--", *trees)
+    dirty = [line for line in (dirt or "").splitlines() if line.strip()]
+    checks = [
+        DeliveryCheck(
+            "git:target-committed",
+            dirt is not None and not dirty,
+            "git status could not be run"
+            if dirt is None
+            else "uncommitted, so a clone would not have them:\n  " + "\n  ".join(dirty[:12])
+            if dirty
+            else "the delivered trees are clean at HEAD",
+        )
+    ]
+    base = resolve_base(repo, [policy.base_ref] if policy.base_ref else DEFAULT_BASE_REFS)
+    if not base:
+        return checks
+    try:
+        found = audit_commits(repo, f"{base}..HEAD", policy, paths=policy.own_paths)
+    except CommitPolicyError as exc:
+        return [*checks, DeliveryCheck("git:commit-hygiene", False, str(exc))]
+    said = (
+        f"{len(found)} finding(s):\n  " + "\n  ".join(f.render() for f in found[:12])
+        if found
+        else f"every commit since {base[:10]} under {', '.join(policy.own_paths) or 'the repo'} "
+        "is signed off by its author, with no co-author, symlink or placeholder"
+    )
+    return [*checks, DeliveryCheck("git:commit-hygiene", not found, said)]
+
+
+def delivery_report(workflow, commit: str, round: int = 0) -> DeliveryReport:
+    """The delivery checks on the checkout at ``commit``: the commits, the conventions, the tests.
+
+    The conventions scan's findings are report lines and fail nothing. The delivered
+    tests run here (:func:`tests_check`), with no agent turn.
     """
     task = workflow.task_data
-    repo = task["trtllm_repo_path"]
+    repo = Path(str(task["trtllm_repo_path"]))
     target_rel = workflow._preflight.target_rel
-    reference_yaml, model_key = _anchor_row(task)
-    report = verify_delivery(
-        repo_root=repo,
-        target_rel=target_rel,
-        family=workflow._preflight.family,
-        reference_yaml=reference_yaml,
-        model_key=model_key,
-        accuracy_test=accuracy_test_path(repo, workflow._preflight.family, Path(target_rel).name),
-        arch=str(workflow.task_data.get("arch") or ""),
-        commit_policy=workflow._commit_policy(),
-    )
-    checks = list(report.checks)
-    waiver = ci_waiver(task)
-    if waiver:
-        checks = [
-            replace(c, passed=True, waived=waiver)
-            if c.name in CI_DELIVERY_CHECKS and not c.passed
-            else c
-            for c in checks
-        ]
+    trees = (target_rel, MODELING_V2_PACKAGE, CATALOG_TESTS_DIR)
+    checks = git_checks(repo, workflow._commit_policy(), trees)
+    found = conventions.scan(repo, target_rel, str(task.get("arch") or ""))
+    first = conventions.load(workflow.workspace)
+    lines = [f"{line} (first at `{first[line]}`)" if line in first else line for line in found]
+    said = f"{len(found)} finding(s), reported:\n  " + "\n  ".join(lines) if found else "no finding"
+    checks.append(DeliveryCheck("conventions", True, said))
     modules = target_test_modules_check(repo, target_rel)
     if modules is not None:
         checks.append(modules)
-    tested = tests_check(workflow, checks, commit, round)
+    tested = tests_check(workflow, commit, round)
     if tested is not None:
         checks.append(tested)
     return DeliveryReport(checks=tuple(checks))
-
-
-def static_delivery_failures(workflow, tree: str | Path) -> list[str]:
-    """The delivery checks that read files, run on ``tree`` (a task's worktree): what fails.
-
-    The same checks the certification runs, less the commit audit (integration audits a
-    task's commits) and the delivered tests (they run at the certification); a CI waiver
-    applies as it does there.
-    """
-    task = workflow.task_data
-    target_rel = workflow._preflight.target_rel
-    family = workflow._preflight.family
-    reference_yaml, model_key = _anchor_row(task)
-    report = verify_delivery(
-        repo_root=tree,
-        target_rel=target_rel,
-        family=family,
-        reference_yaml=reference_yaml,
-        model_key=model_key,
-        accuracy_test=accuracy_test_path(tree, family, Path(target_rel).name),
-        arch=str(task.get("arch") or ""),
-    )
-    waived = CI_DELIVERY_CHECKS if ci_waiver(task) else ()
-    return [f"{c.name}: {c.detail}" for c in report.checks if not c.passed and c.name not in waived]
 
 
 def target_test_modules_check(repo_root: str | Path, target_rel: str) -> DeliveryCheck | None:
@@ -374,23 +390,14 @@ def target_test_modules_check(repo_root: str | Path, target_rel: str) -> Deliver
     return DeliveryCheck("tests:modules", True, detail)
 
 
-def tests_check(
-    workflow, checks: Sequence[DeliveryCheck], commit: str, round: int = 0
-) -> DeliveryCheck | None:
-    """The delivered tests pass at ``commit``, run now in the checkout.
+def tests_check(workflow, commit: str, round: int = 0) -> DeliveryCheck | None:
+    """The target's own tests pass at ``commit``, run now in the checkout.
 
-    The target's own tests, and the catalog entries' tests it is delivered
-    with (the report's ``test:`` checks). The check holds only on none failing,
-    none left unrun and one at least passed. ``None`` when there is no such test.
+    The check holds only on none failing, none left unrun and one at least passed.
+    ``None`` when the target delivers no test.
     """
     repo = Path(str(workflow.task_data["trtllm_repo_path"]))
     paths = [model_ops_tests_dir(workflow._preflight.target_rel)]
-    for check in checks:
-        if check.name.startswith("test:") and check.passed:
-            try:
-                paths.append(Path(check.detail).resolve().relative_to(repo.resolve()).as_posix())
-            except (OSError, ValueError):
-                continue
     files = pytest_runner.list_test_files(repo, commit, paths) if commit else []
     if not files:
         return None
@@ -517,11 +524,9 @@ def write_report(workflow, verdict: str, certification: Certification | None, ta
 __all__ = [
     "CERTIFICATION_FILENAME",
     "CERTIFY_DIRNAME",
-    "CI_DELIVERY_CHECKS",
     "REPORT_FILENAME",
     "Certification",
     "certify",
-    "ci_waiver",
     "delivery_report",
     "target_test_modules_check",
     "tests_check",

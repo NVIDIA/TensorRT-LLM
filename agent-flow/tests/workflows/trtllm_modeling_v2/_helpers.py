@@ -12,7 +12,7 @@ from pathlib import Path
 
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import delivery
+from agent_flow.workflows.trtllm_modeling_v2.checks import anchors
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import workload_io
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
@@ -134,35 +134,15 @@ def _build_repo(tmp_path: Path, *, modeling: str = _MODELING) -> Path:
         encoding="utf-8",
     )
 
-    refs = root / delivery.ACCURACY_REFERENCES_DIR
+    refs = root / anchors.REFERENCES_DIR
     refs.mkdir(parents=True)
     (refs / "gsm8k.yaml").write_text(
         yaml.safe_dump({"openai/gpt-oss-120b": [{"accuracy": 85.6}]}), encoding="utf-8"
-    )
-    tests_dir = root / delivery.ACCURACY_TESTS_DIR
-    tests_dir.mkdir(parents=True, exist_ok=True)
-    (tests_dir / "test_modeling_v2_gpt_oss.py").write_text("def test(): ...\n", encoding="utf-8")
-    db = root / delivery.TEST_DB_DIR
-    db.mkdir(parents=True)
-    (db / "l0_gb300.yml").write_text(
-        "- condition: {}\n  tests:\n  - accuracy/test_modeling_v2_gpt_oss.py::T::t\n",
-        encoding="utf-8",
     )
     return root
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-
-
-def _verify(root: Path) -> delivery.DeliveryReport:
-    return delivery.verify_delivery(
-        repo_root=root,
-        target_rel=TARGET_REL,
-        family="gpt_oss",
-        reference_yaml=f"{delivery.ACCURACY_REFERENCES_DIR}/gsm8k.yaml",
-        model_key="openai/gpt-oss-120b",
-        accuracy_test="test_modeling_v2_gpt_oss.py",
-    )
 
 
 _STATE = ".trtllm_modeling_v2_state.json"
