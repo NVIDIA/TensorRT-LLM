@@ -3212,14 +3212,13 @@ def _varlen_launcher(
             else 3 * k // 2
         )
         if (
-            not low
-            and not big
+            not big
             and sm_version not in _BLACKWELL_SM_VERSIONS
-            and n_kernel >= 65536
-            and k <= 1024
+            and (k == 1024 and n_kernel >= 131072 if low else k <= 1024 and n_kernel >= 65536)
         ):
             # A retried attempt re-reads the row from DRAM; Hopper's lower bandwidth makes long
-            # rows sample with the full staging headroom (the kernel clamps aim to SCAP / 2).
+            # rows sample with the full staging headroom (the kernel clamps aim to SCAP / 2):
+            # FP32 rows of 64K or more scores at K <= 1024, 16-bit rows of 128K or more at K = 1024.
             aim_base = 4 * k
         if (
             dtype is torch.bfloat16

@@ -967,6 +967,45 @@ def test_selfsampling_bf16_partitioned_rows_cluster_on_blackwell_only(monkeypatc
             assert partitioned[-1]["pcw_cluster"] is clustered, (rows, sm_version, partitioned[-1])
 
 
+def test_selfsampling_hopper_long_rows_sample_with_staging_headroom(monkeypatch) -> None:
+    """Hopper samples the long rows of tall batches with the full staging headroom (aim 4K, which
+    the kernel clamps to SCAP / 2): FP32 rows of 64K or more scores at K <= 1024 and 16-bit rows
+    of 128K or more at K = 1024. Blackwell keeps its sampling targets."""
+    real = ss_host._device()
+
+    class RecordingDevice:
+        def __getattr__(self, name: str):
+            if not name.startswith("get_compiled"):
+                return getattr(real, name)
+            return lambda *args, **kwargs: (lambda *launch_args: None)
+
+    monkeypatch.setattr(ss_host, "_device", RecordingDevice)
+    for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
+        monkeypatch.setattr(ss_host, cache, {})
+
+    def aim(rows, n, k, num_sms, sm_version, dtype):
+        npad = (n + 63) // 64 * 64
+        launcher = ss_host._varlen_launcher(
+            rows, npad, k, n, 1, 4, num_sms, sm_version, dtype=dtype, device_index=0
+        )
+        assert launcher[0] == "main", (rows, n, k, dtype, launcher)
+        return launcher[3][0]
+
+    for rows in (256, 512, 1024):
+        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+            for n in (131075, 262127):
+                assert aim(rows, n, 1024, 132, 90, dtype) == 4096, (rows, n, dtype)
+        assert aim(rows, 65539, 1024, 132, 90, torch.float32) == 4096
+        assert aim(rows, 131075, 512, 132, 90, torch.float32) == 2048
+        for dtype in (torch.bfloat16, torch.float16):
+            assert aim(rows, 65539, 1024, 132, 90, dtype) == 1408, (rows, dtype)
+            assert aim(rows, 131075, 512, 132, 90, dtype) == 768, (rows, dtype)
+    # Blackwell: only BF16 batches beyond two waves (256-thread slabs) raise the K=1024 target
+    for dtype, expected in ((torch.float32, 1408), (torch.bfloat16, 2048), (torch.float16, 1408)):
+        assert aim(512, 131075, 1024, 148, 100, dtype) == expected, dtype
+    assert aim(256, 131075, 1024, 148, 100, torch.bfloat16) == 1408
+
+
 @pytest.mark.skipif(
     getSMVersion() != 90
     or torch.cuda.get_device_properties(0).multi_processor_count != ss_host._HOPPER_CLUSTER_SMS,
