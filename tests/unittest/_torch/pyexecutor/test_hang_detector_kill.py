@@ -298,12 +298,13 @@ def _assert_slept_then_killed(order, grace):
 
 def test_rank_crash_kill_sleeps_grace_before_kill(monkeypatch):
     """The grace must elapse BEFORE the kill so cleaner error paths win the race."""
+    grace = 2.5
     order = []
     monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: order.append("kill"))
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
-    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "2.5")
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, str(grace))
     assert hard_kill_on_rank_crash(world_size=2) is True
-    _assert_slept_then_killed(order, 2.5)
+    _assert_slept_then_killed(order, grace)
 
 
 def test_rank_crash_kill_disabled_by_negative_grace(monkeypatch):
@@ -422,9 +423,11 @@ def test_watchdog_cancel_disarms_this_timer(monkeypatch):
 
 
 def test_watchdog_deadline_is_grace_from_arming(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: 1000.0)
-    watchdog = hang_detector_module.RankCrashKillWatchdog(world_size=2, grace=5.0)
-    assert watchdog.deadline == 1005.0
+    now = 1000.0
+    grace = 5.0
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    watchdog = hang_detector_module.RankCrashKillWatchdog(world_size=2, grace=grace)
+    assert watchdog.deadline == now + grace
 
 
 def test_kill_keeps_original_deadline_on_handover(monkeypatch):
@@ -436,18 +439,18 @@ def test_kill_keeps_original_deadline_on_handover(monkeypatch):
     (with monotonic pinned) rather than on wall-clock, so the margin does not
     depend on scheduling luck on a loaded CI node.
     """
+    now = 1000.0
+    grace = 30.0
+    elapsed = 29.5
+    remaining = grace - elapsed
     order = []
     monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: order.append("kill"))
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
-    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: 1000.0)
-    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "30")
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, str(grace))
 
-    # 29.5s of the 30s grace has already been burned by the watchdog.
-    assert hard_kill_on_rank_crash(world_size=2, deadline=1000.5) is True
-    # Exactly one 0.5s sleep, then exactly one kill -- never a second grace.
-    assert order.count(("sleep", 0.5)) == 1, order
-    assert not any(s == ("sleep", 30.0) for s in order), order
-    _assert_slept_then_killed(order, 0.5)
+    assert hard_kill_on_rank_crash(world_size=2, deadline=now + remaining) is True
+    _assert_slept_then_killed(order, remaining)
 
 
 def test_kill_fires_immediately_when_deadline_already_passed(monkeypatch):
@@ -457,15 +460,16 @@ def test_kill_fires_immediately_when_deadline_already_passed(monkeypatch):
     blanket except, which would return False and silently skip the kill --
     exactly in the case the watchdog exists for (cleanup outlasted the grace).
     """
+    now = 1000.0
+    overdue = 100.0
     order = []
     monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: order.append("kill"))
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "30")
 
-    t0 = time.monotonic()
-    assert hard_kill_on_rank_crash(world_size=2, deadline=t0 - 100.0) is True
+    assert hard_kill_on_rank_crash(world_size=2, deadline=now - overdue) is True
     assert order == ["kill"], order
-    assert not [s for s in order if isinstance(s, tuple) and s[1] < 0], order
 
 
 def test_wait_out_kill_grace_never_sleeps_negative(monkeypatch):
@@ -1026,16 +1030,17 @@ def test_delivery_is_checked_after_the_grace_not_before(monkeypatch: pytest.Monk
     The grace exists so the error can reach the client. Sampling the flag
     before waiting would read it while it is still False and kill anyway.
     """
+    grace = 0.5
     calls = []
     monkeypatch.setattr(
         hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
     )
-    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0.5")
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, str(grace))
 
     delivered = threading.Event()
 
     def deliver_during_grace(remaining: float, cancelled: threading.Event | None) -> bool:
-        assert remaining == 0.5
+        assert remaining == grace
         assert cancelled is None
         assert not delivered.is_set()
         delivered.set()
@@ -1045,7 +1050,7 @@ def test_delivery_is_checked_after_the_grace_not_before(monkeypatch: pytest.Monk
     monkeypatch.setattr(hang_detector_module, "_wait_out_kill_grace", wait)
     fired = hard_kill_on_rank_crash(4, error_delivered=delivered)
 
-    wait.assert_called_once_with(0.5, None)
+    wait.assert_called_once_with(grace, None)
     assert fired is False, "the flag was set during the grace window; the kill must observe it"
     assert calls == []
 
