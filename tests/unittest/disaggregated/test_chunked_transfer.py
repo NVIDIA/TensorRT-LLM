@@ -917,6 +917,8 @@ def test_failed_pipelined_send_retires_without_mutating_request_state():
     session = MagicMock()
     session._enforce_physical_ownership = False
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._profile_send_outcomes = {}
+    transceiver._profile_send_observers = set()
 
     transceiver._close_failed_sessions({42: session}, {42: request}, [42], mark_retired=True)
 
@@ -1285,6 +1287,8 @@ def _make_transfer_state_transceiver(session=None, rid: int = 42):
     transceiver._send_reqs = {rid: MagicMock()} if session is not None else {}
     transceiver._recv_sessions = {}
     transceiver._recv_reqs = {}
+    transceiver._profile_send_outcomes = {}
+    transceiver._profile_send_observers = set()
     return transceiver
 
 

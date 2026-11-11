@@ -13,6 +13,7 @@
 # limitations under the License.
 """Request-scoped, observational KV transfer correlation, independent of transport."""
 
+import threading
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ from types import TracebackType
 from typing import Literal
 
 from tensorrt_llm import _profiler
-from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
+from tensorrt_llm._torch.disaggregation.base.transfer import get_wire_request_id
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     BindKvCacheTransceiver,
     CtxTransferStatus,
@@ -32,7 +33,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm.bindings import LlmRequestState
 
-_Direction = Literal["send", "receive"]
+_Direction = Literal["send", "recv"]
 _OBSERVATION_ERRORS = (AttributeError, LookupError, TypeError, ValueError, RuntimeError, OSError)
 
 
@@ -46,7 +47,7 @@ class _KvTransferRecord:
     role: Literal["context", "generation"]
     direction: _Direction
     state_at_submission: LlmRequestState
-    metadata: str | None = None
+    metadata: dict[str, _profiler.MetadataValue] | None = None
     admission_uncertain: bool = False
 
     def get_request(self) -> LlmRequest | None:
@@ -73,6 +74,7 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         self._transceiver = transceiver
         self._backend = backend
         self._rank = rank
+        self._records_lock = threading.RLock()
         self._records: dict[tuple[int, _Direction], _KvTransferRecord] = {}
         self._records_by_status: dict[
             tuple[_Direction, int], dict[tuple[int, _Direction], _KvTransferRecord]
@@ -115,8 +117,14 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
     def transfer_resource_ownership(self, req: LlmRequest) -> bool | None:
         return self._transceiver.transfer_resource_ownership(req)
 
-    def observe_send_terminal_outcome(self, req: LlmRequest, enabled: bool = True) -> None:
-        self._transceiver.observe_send_terminal_outcome(req, enabled)
+    def status_request_id(self, req: LlmRequest) -> int:
+        return self._transceiver.status_request_id(req)
+
+    def start_send_terminal_outcome_observation(self, req: LlmRequest) -> None:
+        self._transceiver.start_send_terminal_outcome_observation(req)
+
+    def stop_send_terminal_outcome_observation(self, req: LlmRequest) -> None:
+        self._transceiver.stop_send_terminal_outcome_observation(req)
 
     def get_send_terminal_outcome(self, req: LlmRequest) -> SendTerminalOutcome | None:
         return self._transceiver.get_send_terminal_outcome(req)
@@ -141,96 +149,80 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         """Index one observation by request identity, direction, and native
         status ID.
         """
-        request_id = req.request_id
-        params = req.py_disaggregated_params
-        transfer_id = request_id
-        if params is not None:
-            if params.disagg_request_id is not None:
-                transfer_id = params.disagg_request_id
-            elif params.ctx_request_id is not None:
-                transfer_id = params.ctx_request_id
-        # Native status uses mRequestId; V2 uses its disaggregated local handle.
-        # Peer ctx_request_id is metadata, never a substitute for that handle.
-        status_id = (
-            request_id
-            if isinstance(self._transceiver, BindKvCacheTransceiver)
-            else get_unique_rid(req)
-        )
-        if status_id is None:
-            status_id = request_id
-        record = _KvTransferRecord(
-            req,
-            (id(req), direction),
-            request_id,
-            transfer_id,
-            status_id,
-            "context" if direction == "send" else "generation",
-            direction,
-            req.state,
-        )
-        status_key = (direction, status_id)
-        for old in list(self._records_by_status.get(status_key, {}).values()):
-            if old.admission_uncertain:
-                # Numeric status cannot distinguish the uncertain older generation.
-                # Discard only its observation, without terminal or release claims.
-                self._discard(old)
-        if direction == "send":
-            self._transceiver.observe_send_terminal_outcome(req)
-        self._records[record.key] = record
-        self._records_by_status.setdefault(status_key, {})[record.key] = record
-        if direction == "receive" and self.receive_completion_uses_request_state:
-            self._receive_state_records[record.key] = record
-        return record
+        with self._records_lock:
+            request_id = req.request_id
+            transfer_id = get_wire_request_id(req.py_disaggregated_params, request_id)
+            status_id = self.status_request_id(req)
+            record = _KvTransferRecord(
+                req,
+                (id(req), direction),
+                request_id,
+                transfer_id,
+                status_id,
+                "context" if direction == "send" else "generation",
+                direction,
+                req.state,
+            )
+            status_key = (direction, status_id)
+            for old in list(self._records_by_status.get(status_key, {}).values()):
+                if old.admission_uncertain:
+                    # Numeric status cannot distinguish the uncertain older generation.
+                    # Discard only its observation, without terminal or release claims.
+                    self._discard(old)
+            if direction == "send":
+                self._transceiver.start_send_terminal_outcome_observation(req)
+            self._records[record.key] = record
+            self._records_by_status.setdefault(status_key, {})[record.key] = record
+            if direction == "recv" and self.receive_completion_uses_request_state:
+                self._receive_state_records[record.key] = record
+            return record
 
-    def _metadata(self, record: _KvTransferRecord) -> str:
-        """Encode and cache request aliases and transport fields for this
-        observation.
-        """
+    def _metadata(self, record: _KvTransferRecord) -> dict[str, _profiler.MetadataValue]:
+        """Cache request aliases and transport fields for this observation."""
         if record.metadata is None:
             req = record.get_request()
             if req is None:
                 raise RuntimeError("KV observation request expired")
-            record.metadata = _profiler._encode_metadata(
-                "kv",
-                {
-                    "request_id": record.request_id,
-                    "transfer_id": record.transfer_id,
-                    "aliases": {
-                        "request": record.request_id,
-                        "transfer": record.transfer_id,
-                        "status": record.status_id,
-                    },
-                    "role": record.role,
-                    "direction": record.direction,
-                    "backend": self._backend,
-                    "rank": self._rank,
-                    "prompt_tokens": req.prompt_len,
+            record.metadata = {
+                "kv.request_id": record.request_id,
+                "kv.transfer_id": record.transfer_id,
+                "kv.aliases": {
+                    "request": record.request_id,
+                    "transfer": record.transfer_id,
+                    "status": record.status_id,
                 },
-            )
+                "kv.role": record.role,
+                "kv.direction": record.direction,
+                "kv.backend": self._backend,
+                "kv.rank": self._rank,
+                "kv.prompt_tokens": req.prompt_len,
+            }
         return record.metadata
 
     def _discard(self, record: _KvTransferRecord) -> None:
         """Remove observation indexes without changing transfer resource
         ownership.
         """
-        if self._records.get(record.key) is not record:
-            return
-        self._records.pop(record.key)
-        status_key = (record.direction, record.status_id)
-        indexed = self._records_by_status[status_key]
-        indexed.pop(record.key)
-        if not indexed:
-            self._records_by_status.pop(status_key)
-        self._receive_state_records.pop(record.key, None)
-        req = record.get_request()
-        if record.direction == "send" and req is not None:
-            try:
-                self._transceiver.observe_send_terminal_outcome(req, enabled=False)
-            except _OBSERVATION_ERRORS as error:
-                # Only observational cleanup is discarded; native ownership is unchanged.
-                _profiler.warn_profiler_failure(
-                    "trtllm::kv_transfer", "kv", "observation cleanup", error
-                )
+        with self._records_lock:
+            if self._records.get(record.key) is not record:
+                return
+            self._records.pop(record.key, None)
+            status_key = (record.direction, record.status_id)
+            indexed = self._records_by_status.get(status_key)
+            if indexed is not None:
+                indexed.pop(record.key, None)
+                if not indexed:
+                    self._records_by_status.pop(status_key, None)
+            self._receive_state_records.pop(record.key, None)
+            req = record.get_request()
+            if record.direction == "send" and req is not None:
+                try:
+                    self._transceiver.stop_send_terminal_outcome_observation(req)
+                except _OBSERVATION_ERRORS as error:
+                    # Only observational cleanup is discarded; native ownership is unchanged.
+                    _profiler.warn_profiler_failure(
+                        "trtllm::kv_transfer", "kv", "observation cleanup", error
+                    )
 
     def _observation_active(self) -> bool:
         """Drop stale observations when the selected profiling window is
@@ -249,15 +241,16 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         """Emit one terminal observation and remove its indexes even if
         recording fails.
         """
-        if self._records.get(record.key) is not record:
-            return
-        try:
-            with _profiler.record_function_metadata_scope(
-                f"trtllm::kv_transfer_{outcome}", "kv", lambda: self._metadata(record)
-            ):
-                pass
-        finally:
-            self._discard(record)
+        with self._records_lock:
+            if self._records.get(record.key) is not record:
+                return
+            try:
+                with _profiler.record_function_metadata_scope(
+                    f"trtllm::kv_transfer_{outcome}", "kv", lambda: self._metadata(record)
+                ):
+                    pass
+            finally:
+                self._discard(record)
 
     def _submission_failed(self, record: _KvTransferRecord) -> None:
         """Retain observations according to resource ownership after
@@ -330,11 +323,11 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         return self._submit(req, "send", self._transceiver.respond_and_send_async)
 
     def request_and_receive_async(self, req: LlmRequest) -> None:
-        return self._submit(req, "receive", self._transceiver.request_and_receive_async)
+        return self._submit(req, "recv", self._transceiver.request_and_receive_async)
 
     def request_and_receive_sync(self, req: LlmRequest) -> None:
         return self._submit(
-            req, "receive", self._transceiver.request_and_receive_sync, synchronous=True
+            req, "recv", self._transceiver.request_and_receive_sync, synchronous=True
         )
 
     def _observe_request_terminal(
@@ -407,7 +400,7 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
             try:
                 if self._observation_active():
                     for record in list(self._records.values()):
-                        if record.direction == "receive":
+                        if record.direction == "recv":
                             try:
                                 self._observe_request_terminal(record, require_unowned=True)
                             except BaseException:
@@ -420,7 +413,7 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         if not self._observation_active() or not self._records:
             return result
         for req in result.cancelled_requests:
-            record = self._records.get((id(req), "receive"))
+            record = self._records.get((id(req), "recv"))
             if record is not None:
                 self._finish(
                     record,
@@ -431,9 +424,7 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
             (result.error_request_ids, "failed"),
         ):
             for status_id in status_ids:
-                for record in list(
-                    self._records_by_status.get(("receive", status_id), {}).values()
-                ):
+                for record in list(self._records_by_status.get(("recv", status_id), {}).values()):
                     self._finish(record, outcome)
         # Native receive polling returns no ids; request mutation is its only evidence.
         for record in list(self._receive_state_records.values()):
@@ -454,15 +445,14 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
             and self._transceiver.supports_inflight_request_cancellation()
         )
         if cancelled and terminal and self._observation_active():
-            directions: tuple[_Direction, ...] = ("send", "receive")
+            directions: tuple[_Direction, ...] = ("send", "recv")
             for direction in directions:
                 record = self._records.get((id(req), direction))
                 if record is not None:
                     self._finish(
                         record,
                         "failed"
-                        if direction == "receive"
-                        and req.state == LlmRequestState.DISAGG_TRANS_ERROR
+                        if direction == "recv" and req.state == LlmRequestState.DISAGG_TRANS_ERROR
                         else "cancelled",
                     )
         return cancelled
