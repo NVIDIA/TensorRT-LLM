@@ -504,97 +504,13 @@ def _expert_operands(configs, which: str) -> None:
         assert torch.equal(fc1_s.to(torch.bfloat16), torch.cat((up_s, gate_s)))
 
 
-def _shared_segment_hands_over(tmp_path) -> None:
-    """`SharedHostSegment` over a memfd: the first handle owns, a concurrent one attaches on
-    publish, a late one at once, and an owner gone unpublished hands the segment to the waiter."""
-    import ctypes
-
-    HS = WT._host_share
-    nbytes = 1 << 20
-
-    def segment(label="numa0"):
-        backing = HS.MemfdBacking(lambda pointer, nbytes, read_only: lambda: None)
-        return HS.SharedHostSegment("a" * 64, nbytes, label, backing, directory=str(tmp_path))
-
-    owner = segment()
-    assert owner.role == HS.OWNER
-    waiter = segment()
-    assert waiter.role == HS.PENDING and waiter.pointer == 0
-    ctypes.memset(owner.pointer, 0x5A, nbytes)
-    owner.publish()
-    waiter.wait()
-    late = segment()
-    for handle in (waiter, late):
-        assert handle.role == HS.ATTACHED and not handle.private
-        assert ctypes.string_at(handle.pointer + nbytes - 8, 8) == b"Z" * 8
-    other = segment("numa1")  # another scope never meets this one
-    assert other.role == HS.OWNER
-    for handle in (waiter, late, other, owner):
-        handle.close()
-    # Closing the owner withdrew its descriptor: the next handle owns a fresh segment.
-    fresh = segment()
-    assert fresh.role == HS.OWNER
-    waiter = segment()
-    assert waiter.role == HS.PENDING
-    fresh.close()
-    waiter.wait(poll_seconds=0.01)
-    assert waiter.role == HS.OWNER
-    waiter.close()
-
-
-def _shared_ngram_table_is_the_private_one(configs, tmp_path, monkeypatch) -> None:
-    """With `ple_shared_host`, the first core fills the segment and the second attaches without
-    reading the shards; both tables are host memory holding exactly the shards' bytes."""
-    monkeypatch.setenv(WT._host_share.PLE_SHARED_HOST_DIR_ENV, str(tmp_path))
-    HS = WT._host_share
-    d = _dims(configs, "tep2", 0, mtp=False)
-    keys = WT.ngram_shard_keys(d)
-    gen = torch.Generator().manual_seed(12)
-    shards = {key: _random_bytes(gen, 5, d.ple_head_dim).view(WT.PLE_TABLE_DTYPE) for key in keys}
-    device = torch.device("cuda")
-    cores = []
-    for _ in range(2):
-        core = SimpleNamespace(w={"embed": torch.empty(1, device=device)}, ple_shared_host="node")
-        rows_per_shard = WT._declare_ngram_table(core, d, shards)
-        cores.append(core)
-    assert [c._ple_table_host.role for c in cores] == [HS.OWNER, HS.PENDING]
-    sources = WT.ngram_table_sources(d, rows_per_shard)
-    assert WT.MODEL_WEIGHTS._fill_shared_table(cores[0], sources, shards, d) == set(keys)
-
-    class _Untouchable(dict):
-        def __getitem__(self, key):
-            raise AssertionError(f"an attached rank read {key}")
-
-    consumed = WT.MODEL_WEIGHTS._fill_shared_table(cores[1], sources, _Untouchable(), d)
-    assert consumed == set(keys) and cores[1]._ple_table_host.role == HS.ATTACHED
-    expected = torch.cat([shards[k].view(torch.uint8) for k in keys]).to(device)
-    for core in cores:
-        segment = core._ple_table_host
-        assert segment.backing.resident_on_host(segment.pointer), segment.describe()
-        assert torch.equal(core.w["ple_table"].view(torch.uint8), expected)
-    for core in cores:
-        core._ple_table_host.close()
-
-
-_NEEDS_GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="host memory the GPU maps")
-
-
 @pytest.mark.parametrize(
     "case",
     [
         pytest.param("expert-first", marks=pytest.mark.cpu_only),
         pytest.param("expert-last", marks=pytest.mark.cpu_only),
-        pytest.param("shared-segment", marks=pytest.mark.cpu_only),
-        pytest.param("shared-table", marks=_NEEDS_GPU),
     ],
 )
-def test_load_operands(case, request, tmp_path, monkeypatch):
-    """What `load` fills operands from: expert codes and scales, and the shared n-gram table."""
-    if case == "shared-segment":
-        _shared_segment_hands_over(tmp_path)
-    elif case == "shared-table":
-        _shared_ngram_table_is_the_private_one(
-            request.getfixturevalue("configs"), tmp_path, monkeypatch
-        )
-    else:
-        _expert_operands(request.getfixturevalue("configs"), case.split("-")[1])
+def test_load_operands(case, request):
+    """What `load` fills the routed-expert operands from: codes and scales."""
+    _expert_operands(request.getfixturevalue("configs"), case.split("-")[1])

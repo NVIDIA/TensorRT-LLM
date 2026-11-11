@@ -51,16 +51,12 @@ from types import SimpleNamespace
 from typing import Any, Callable, NamedTuple
 
 import torch
-from cuda.bindings import driver as cuda_driver
 from cuda.bindings import runtime as cudart
 from torch import nn
 
-from tensorrt_llm._dlpack_utils import pack_strided_memory
 from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
 from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.logger import logger
-
-from . import host_share as _host_share
 
 ALL_LAYERS = object()
 
@@ -266,207 +262,6 @@ def _device_view(host_pointer: int, rows: int, cols: int, dtype, device) -> torc
     )
     assert table.shape == (rows, cols) and table.dtype == dtype, (table.shape, table.dtype)
     return table
-
-
-#: One host copy of the n-gram table per host (`node`), mapped by every rank there; default off.
-PLE_SHARED_HOST_ENV = _host_share.PLE_SHARED_HOST_ENV
-
-
-def ple_shared_host_scope() -> str | None:
-    """`node` or None, from `PLE_SHARED_HOST_ENV`; read once into `core.ple_shared_host`."""
-    return _host_share.shared_host_scope()
-
-
-def _device_numa_node(device) -> int | None:
-    """NUMA node of `device`'s local CPUs (ignoring this process's affinity), or None."""
-    try:
-        props = torch.cuda.get_device_properties(device)
-        base = (
-            f"/sys/bus/pci/devices/{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
-            f"{props.pci_device_id:02x}.0"
-        )
-        with open(f"{base}/local_cpulist") as fh:
-            cpus = _host_share._parse_cpulist(fh.read())
-    except (OSError, AttributeError, RuntimeError, ValueError):
-        return None
-    return _host_share.numa_node_of_cpus(cpus)
-
-
-def _cu(result):
-    err, *values = result
-    if err != cuda_driver.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"CUDA driver call failed: {err}")
-    return values[0] if len(values) == 1 else tuple(values)
-
-
-class _VmmHostBacking:
-    """`host_share.Backing` on CUDA VMM memory on host NUMA node `node`, shared by POSIX fd.
-
-    Not `cudaHostRegister` on shared memory: device gathers from such pages are over 10x
-    slower than from a private registered buffer.
-    """
-
-    def __init__(self, device_index: int, node: int) -> None:
-        self.device_index = device_index
-        self.node = node
-        self._maps: dict[int, tuple[int, int]] = {}
-
-    def _prop(self):
-        D = cuda_driver
-        prop = D.CUmemAllocationProp()
-        prop.type = D.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        prop.location.type = D.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
-        prop.location.id = self.node
-        prop.requestedHandleTypes = (
-            D.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        )
-        return prop
-
-    def granularity(self) -> int:
-        option = cuda_driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
-        return int(_cu(cuda_driver.cuMemGetAllocationGranularity(self._prop(), option)))
-
-    def _map(self, handle, size: int, read_only: bool) -> int:
-        D = cuda_driver
-        va = _cu(D.cuMemAddressReserve(size, self.granularity(), 0, 0))
-        try:
-            _cu(D.cuMemMap(va, size, 0, handle, 0))
-            desc = D.CUmemAccessDesc()
-            desc.location.type = D.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-            desc.location.id = self.device_index
-            desc.flags = (
-                D.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READ
-                if read_only
-                else D.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-            )
-            _cu(D.cuMemSetAccess(va, size, [desc], 1))
-        except BaseException:
-            D.cuMemUnmap(va, size)
-            D.cuMemAddressFree(va, size)
-            raise
-        self._maps[int(va)] = (handle, size)
-        return int(va)
-
-    def _size(self, nbytes: int) -> int:
-        granularity = self.granularity()
-        return -(-nbytes // granularity) * granularity
-
-    def create(self, nbytes: int) -> tuple[int, int]:
-        D = cuda_driver
-        size = self._size(nbytes)
-        handle = _cu(D.cuMemCreate(size, self._prop(), 0))
-        try:
-            va = self._map(handle, size, read_only=False)
-        except BaseException:
-            D.cuMemRelease(handle)
-            raise
-        try:
-            fd = _cu(
-                D.cuMemExportToShareableHandle(
-                    handle, D.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0
-                )
-            )
-        except BaseException:
-            self.release(va, nbytes)
-            raise
-        return va, int(fd)
-
-    def attach(self, fd: int, nbytes: int) -> int:
-        D = cuda_driver
-        handle = _cu(
-            D.cuMemImportFromShareableHandle(
-                fd, D.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-            )
-        )
-        size = self._size(nbytes)
-        try:
-            # The owner's node, not this device's: under the `node` scope they may differ.
-            self.node = int(_cu(D.cuMemGetAllocationPropertiesFromHandle(handle)).location.id)
-            try:
-                return self._map(handle, size, read_only=True)
-            except RuntimeError:
-                return self._map(handle, size, read_only=False)
-        except BaseException:
-            D.cuMemRelease(handle)
-            raise
-
-    def release(self, address: int, nbytes: int) -> None:
-        handle, size = self._maps.pop(address)
-        D = cuda_driver
-        D.cuMemUnmap(address, size)
-        D.cuMemAddressFree(address, size)
-        D.cuMemRelease(handle)
-
-    def resident_on_host(self, address: int) -> bool:
-        prop = _cu(cuda_driver.cuMemGetAllocationPropertiesFromHandle(self._maps[address][0]))
-        return prop.location.type == cuda_driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
-
-    def describe(self) -> str:
-        return f"vmm host numa {self.node}"
-
-
-def _view_at(pointer: int, rows: int, cols: int, dtype, device) -> torch.Tensor:
-    """`[rows, cols]` view of a VMM mapping via DLPack, which names the device explicitly."""
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    flat = pack_strided_memory(pointer, rows * cols, rows * cols, 1, torch.uint8, index)
-    table = flat.view(rows, cols).view(dtype)
-    assert table.data_ptr() == pointer and table.device == torch.device("cuda", index)
-    return table
-
-
-#: Rows sampled at each shard's head and tail: the shared segment's key and an attacher's check.
-_SAMPLE_ROWS = 2
-
-
-def _ngram_samples(weights, keys, rows_per_shard: int) -> list[tuple[int, bytes]]:
-    samples = []
-    for s, key in enumerate(keys):
-        for local in (0, rows_per_shard - _SAMPLE_ROWS):
-            rows = _read(weights[key], (slice(local, local + _SAMPLE_ROWS),))
-            data = rows.contiguous().view(torch.uint8).cpu().numpy().tobytes()
-            width = len(data) // _SAMPLE_ROWS
-            for i in range(_SAMPLE_ROWS):
-                samples.append((s * rows_per_shard + local + i, data[i * width : (i + 1) * width]))
-    return samples
-
-
-def _shared_host_table(rows: int, cols: int, dtype, device, weights, keys, rows_per_shard):
-    """`(table, segment)` over the scope's `host_share.SharedHostSegment`.
-
-    Owner: mapped, empty until load fills and publishes it. Attached: ready. Pending: a meta
-    placeholder until `_fill_shared_table`. Without VMM host NUMA: `_host_resident_empty`.
-    """
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    node = _device_numa_node(device)
-    backing = _VmmHostBacking(index, 0 if node is None else node)
-    try:
-        backing.granularity()
-    except RuntimeError as error:
-        logger.warning(
-            f"ple shared host: no VMM host NUMA allocation on this device ({error}); "
-            "keeping one copy per rank"
-        )
-        return _host_resident_empty(rows, cols, dtype, device)
-    samples = _ngram_samples(weights, keys, rows_per_shard)
-    key = _host_share.table_key(
-        "qwen4_exp ple n-gram table", rows, cols, dtype, *(b for _, b in samples)
-    )
-    segment = _host_share.SharedHostSegment(key, rows * cols, "host", backing)
-    segment.samples = samples
-    if segment.role == _host_share.PENDING:
-        return torch.empty(rows, cols, dtype=dtype, device="meta"), segment
-    return _view_at(segment.pointer, rows, cols, dtype, device), segment
-
-
-def _check_samples(segment, table: torch.Tensor) -> None:
-    """An attached segment's sampled rows are the checkpoint's: shard order and content."""
-    rows = torch.tensor([row for row, _ in segment.samples], device=table.device)
-    got = table.view(torch.uint8)[rows].cpu()
-    for (row, expected), bytes_ in zip(segment.samples, got):
-        assert bytes(bytes_.numpy()) == expected, (
-            f"the shared n-gram table ({segment.describe()}) differs from the checkpoint at "
-            f"row {row}"
-        )
 
 
 # ------------------------------------------------------------------ the table --
@@ -1461,24 +1256,6 @@ class Qwen4ExpFp8Weights:
             consumed.update(ckpt_key if isinstance(ckpt_key, tuple) else (ckpt_key,))
         return consumed
 
-    def _fill_shared_table(self, core, sources, weights, d: SimpleNamespace) -> set:
-        """Fill (owner), wait for (pending) or check (attached) the shared `ple_table`."""
-        segment = core._ple_table_host
-        table = core.w["ple_table"]
-        rows, cols = table.shape
-        if segment.role == _host_share.PENDING:
-            segment.wait()
-            view = _view_at(segment.pointer, rows, cols, table.dtype, core.w["embed"].device)
-            core.w["ple_table"] = nn.Parameter(view, requires_grad=False)
-            assert core.w["ple_table"].data_ptr() == view.data_ptr()
-        if segment.role == _host_share.OWNER:
-            consumed = self.fill(core.w["ple_table"], sources, weights, d)
-            torch.cuda.synchronize()
-            segment.publish()
-            return consumed
-        _check_samples(segment, core.w["ple_table"])
-        return {ckpt for ckpt, _, _, _ in sources}
-
     def load(self, model, weights) -> None:
         """Fill every declared parameter and assert checkpoint coverage both ways."""
         core = model.model
@@ -1493,12 +1270,8 @@ class Qwen4ExpFp8Weights:
             "manifest/parameter drift",
             set(manifest.keys()) ^ set(core.w.keys()),
         )
-        shared = isinstance(getattr(core, "_ple_table_host", None), _host_share.SharedHostSegment)
         for param_key, sources in manifest.items():
-            if shared and param_key == "ple_table":
-                consumed |= self._fill_shared_table(core, sources, weights, d)
-            else:
-                consumed |= self.fill(core.w[param_key], sources, weights, d)
+            consumed |= self.fill(core.w[param_key], sources, weights, d)
             if param_key.endswith(_RELEASE_AFTER):
                 torch.cuda.empty_cache()
 
@@ -1742,8 +1515,7 @@ def _declare_ngram_table(core, d: SimpleNamespace, weights) -> int:
 
     The shards are contiguous row chunks (global row `r` is shard `r // rows_per_shard`), so
     the flat buffer takes the hash's global rows. On CUDA it is host memory the device
-    addresses (the scope's shared segment with `core.ple_shared_host`); otherwise an ordinary
-    allocation on the weights' device.
+    addresses; otherwise an ordinary allocation on the weights' device.
     """
     keys = ngram_shard_keys(d)
     for key in keys:
@@ -1769,10 +1541,6 @@ def _declare_ngram_table(core, d: SimpleNamespace, weights) -> int:
     if device.type != "cuda":
         table = torch.empty(rows, head_dim, dtype=dtype, device=device)
         core._ple_table_host = None
-    elif getattr(core, "ple_shared_host", None):
-        table, core._ple_table_host = _shared_host_table(
-            rows, head_dim, dtype, device, weights, keys, rows_per_shard
-        )
     else:
         table, core._ple_table_host = _host_resident_empty(rows, head_dim, dtype, device)
     core.w["ple_table"] = nn.Parameter(table, requires_grad=False)
