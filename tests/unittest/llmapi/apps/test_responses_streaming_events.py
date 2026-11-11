@@ -38,21 +38,23 @@ from starlette.requests import ClientDisconnect
 import tensorrt_llm.serve.responses_utils as responses_utils
 from tensorrt_llm.executor import EngineDeadError, RequestError
 from tensorrt_llm.executor.utils import context_length_exceeded_message
-from tensorrt_llm.serve.openai_protocol import ResponsesRequest
-from tensorrt_llm.serve.responses_utils import (
+from tensorrt_llm.serve._base.responses_stream import (
     ClosingStreamingResponse,
-    ResponsesStreamingEventsHelper,
-    ResponsesStreamingProcessor,
-    _create_output_content,
     _format_sse_event,
-    _generate_streaming_event,
     _stamp_sequence_number,
     classify_stream_termination,
     describe_stream_termination,
     guard_responses_stream,
     keep_responses_stream_alive,
-    rejected_responses_stream,
     stream_error_event,
+)
+from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+from tensorrt_llm.serve.responses_utils import (
+    ResponsesStreamingEventsHelper,
+    ResponsesStreamingProcessor,
+    _create_output_content,
+    _generate_streaming_event,
+    rejected_responses_stream,
 )
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every

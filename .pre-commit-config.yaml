@@ -419,6 +419,7 @@ common-files: &common_files |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/_base/latency_logger.py |
         tensorrt_llm/serve/_base/msgspec_route.py |
+        tensorrt_llm/serve/_base/responses_stream.py |
         tensorrt_llm/serve/_base/service_types.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |
@@ -1149,6 +1150,7 @@ legacy-files: &legacy_files |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/_base/latency_logger.py |
         tensorrt_llm/serve/_base/msgspec_route.py |
+        tensorrt_llm/serve/_base/responses_stream.py |
         tensorrt_llm/serve/_base/service_types.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |

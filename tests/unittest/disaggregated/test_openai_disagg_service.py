@@ -44,6 +44,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     MinimalInstances,
     ServerRole,
 )
+from tensorrt_llm.serve._base.responses_stream import _format_sse_event
 from tensorrt_llm.serve.conversation_id import get_request_routing_id
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
@@ -78,7 +79,6 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_response_post_processor,
     completion_response_post_processor,
 )
-from tensorrt_llm.serve.responses_utils import _format_sse_event
 from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
 
 pytestmark = pytest.mark.cpu_only

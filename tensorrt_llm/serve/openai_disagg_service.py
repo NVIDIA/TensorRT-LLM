@@ -23,6 +23,7 @@ from fastapi import HTTPException
 from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve._base.responses_stream import responses_done_generator
 from tensorrt_llm.serve._base.service_types import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
@@ -50,7 +51,6 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.openai_service import OpenAIService
-from tensorrt_llm.serve.responses_utils import responses_done_generator
 from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
 
 # Finish reasons for which a GEN handoff is still pending; any other reason means

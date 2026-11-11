@@ -41,6 +41,7 @@ from pydantic import ValidationError
 from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
 from tensorrt_llm.serve import openai_disagg_server, responses_utils
+from tensorrt_llm.serve._base.responses_stream import responses_done_generator
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_client import _encode_request_body
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
@@ -65,7 +66,6 @@ from tensorrt_llm.serve.responses_utils import (
     ServerArrivalTimeMiddleware,
     create_response_non_store,
     finish_reason_mapping,
-    responses_done_generator,
 )
 from tensorrt_llm.serve.router import Router
 
