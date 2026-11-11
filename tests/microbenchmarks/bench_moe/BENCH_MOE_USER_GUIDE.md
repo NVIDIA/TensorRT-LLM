@@ -664,6 +664,7 @@ includes full requested and observed dispatch/expert matrices.
 | `deepseek_r1` | 256 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `kimi_k2` | 384 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `kimi_k3` | 896 | 16 | 3584 † | 3072 | pass `--quant` | `DEEPSEEK_V3` |
+| `kimi_k3_1_pro` | 896 | 16 | 3584 † | 3072 | pass `--quant` | `DEEPSEEK_V3` |
 | `glm_5` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
@@ -681,6 +682,12 @@ down/up projections sit outside the MoE layer and are not benchmarked.
 score-correction bias, routed scaling factor 1.5, and SwiGLU clamp 10. It benchmarks
 the routed-expert branch; the checkpoint's separate shared expert, vision encoder,
 and DSpark draft experts are outside this preset.
+
+`kimi_k3_1_pro` uses the checkpoint's latent routed-expert width 3584 and
+SiTU gate/linear softcaps 4/25. The benchmark records the actual epilogue;
+backend/quantization paths without SiTU retain the existing SwiGLU proxy.
+Latent projections, outer normalization, and the separate shared expert are
+outside this routed-expert preset.
 
 Custom shapes can be used instead of `--model`:
 
