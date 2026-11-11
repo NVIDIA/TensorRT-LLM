@@ -566,6 +566,7 @@ def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache(cuda_graph_config):
 
 
 @skip_gpu_memory_less_than_40gb
+@skip_ray  # https://nvbugs/5682551
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
 def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(
@@ -583,6 +584,7 @@ def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(
 
 
 @skip_gpu_memory_less_than_40gb
+@skip_ray  # https://nvbugs/5682551
 @pytest.mark.part0
 @test_lora_with_and_without_cuda_graph
 def test_llama_7b_multi_lora_read_from_cache_after_insert(cuda_graph_config):
@@ -597,6 +599,7 @@ def test_llama_7b_multi_lora_read_from_cache_after_insert(cuda_graph_config):
 
 
 @skip_gpu_memory_less_than_40gb
+@skip_ray  # https://nvbugs/5682551
 @pytest.mark.part3
 @test_lora_with_and_without_cuda_graph
 def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(
