@@ -42,39 +42,50 @@ _BF16_QUANT = (None, None)
 _BF16_SM = (10, 0)
 
 # A parallel layout, as (world_size, attention_dp, moe_tp, moe_ep). A layout is
-# admitted only once it has been measured. The BF16 checkpoint is 1.1 TB, so it
-# takes 8 ranks with tensor-parallel attention and mamba: replicating the
-# non-expert weights (attention DP) would put about 63 GiB of them on every rank
-# beside 120 GiB of experts.
+# admitted only once it has been measured. The BF16 checkpoint is 1.1 TB, so on 8
+# ranks it takes tensor-parallel attention and mamba: replicating the non-expert
+# weights (attention DP) would put about 63 GiB of them on every rank beside 120 GiB
+# of experts.
 _BF16_TEP8 = (8, False, 1, 8)  # routed experts in eight 64-expert windows
 # The same 8 ranks with the routed experts in two 256-expert windows, each expert's
 # intermediate width split over the 4 ranks of its window: a different expert layout,
 # hence a different target.
 _BF16_TP8EP2 = (8, False, 4, 2)
+# 16 ranks (four trays) halve the experts to 60 GiB a rank, which leaves room for the
+# replicated 63 GiB: attention data parallel, the routed experts in sixteen 32-expert
+# windows. The layout of the disaggregated serving tiers (context and generation).
+_BF16_DEP16 = (16, True, 1, 16)
 
 # The KV cache algorithms each BF16 layout was gated with (None: the checkpoint's bf16).
 _BF16_KV_ALGOS = {
     _BF16_TEP8: (None,),
     # tp8ep2 also binds an fp8-e4m3 pool at unit kv scales (`kv_cache_config.dtype: fp8`).
     _BF16_TP8EP2: (None, QuantAlgo.FP8),
+    _BF16_DEP16: (None,),
 }
 
-# The MoE backends each BF16 layout stands for. AUTO and CUTLASS run the target's own
-# expert path (fused_moe). tep8 also runs its routed experts in the engine's MoE layer when
-# MEGAMOE_CUTEDSL (CuTe DSL MegaMoE, BF16 Relu2 leaf) or TRTLLM (FlashInfer's TRTLLM-Gen BF16
-# MoE) is asked for by name; a request either leaf declines fails at construction.
+# The MoE backends each BF16 layout stands for. On tep8 and tp8ep2, AUTO and CUTLASS run the
+# target's own expert path (fused_moe); tep8 also runs its routed experts in the engine's MoE
+# layer when MEGAMOE_CUTEDSL (CuTe DSL MegaMoE, BF16 Relu2 leaf) or TRTLLM (FlashInfer's
+# TRTLLM-Gen BF16 MoE) is asked for by name. dep16 runs every request in the engine's MoE layer,
+# whose exchange between ranks it needs: AUTO and CUTLASS on the CUTLASS leaf. A request the leaf
+# declines fails at construction.
 _BF16_MOE_BACKENDS = {
     _BF16_TEP8: frozenset({"AUTO", "CUTLASS", "MEGAMOE_CUTEDSL", "TRTLLM"}),
     _BF16_TP8EP2: frozenset({"AUTO", "CUTLASS"}),
+    _BF16_DEP16: frozenset({"AUTO", "CUTLASS", "MEGAMOE_CUTEDSL", "TRTLLM"}),
 }
 # Why a layout refuses a backend another BF16 layout takes, by backend.
 _BF16_MOE_REFUSALS = {
     _BF16_TP8EP2: {
         "MEGAMOE_CUTEDSL": (
             "MegaMoE is expert-parallel only (moe_tp 1) and tp8ep2 splits each expert over "
-            "moe_tp 4; tep8 (moe_ep 8, moe_tp 1) runs it"
+            "moe_tp 4; tep8 (moe_ep 8, moe_tp 1) and dep16 (moe_ep 16) run it"
         ),
-        "TRTLLM": "tp8ep2 runs its experts on fused_moe only; tep8 (moe_ep 8) runs TRTLLM",
+        "TRTLLM": (
+            "tp8ep2 runs its experts on fused_moe only; tep8 (moe_ep 8) and dep16 (moe_ep 16) "
+            "run TRTLLM"
+        ),
     },
 }
 
@@ -215,14 +226,16 @@ def route(
         raise NoTarget(
             f"parallel layout {split}; the BF16 targets are gated on tp8 with the routed "
             "experts expert-parallel over the 8 ranks (tep8: moe_ep 8) or in two expert-parallel "
-            "windows of four tensor-parallel ranks (tp8ep2: moe_ep 2, moe_tp 4)"
+            "windows of four tensor-parallel ranks (tp8ep2: moe_ep 2, moe_tp 4), and on 16 ranks "
+            "with attention data parallel and the routed experts expert-parallel over them "
+            "(dep16: attention_dp, moe_ep 16)"
         )
-    # Only two GB200 trays (4 GPUs each, one NVLink domain) were measured; an 8-GPU node
-    # runs the intra-node all-reduce path nobody has gated.
+    # Only GB200 trays (4 GPUs each, in one NVLink domain) were measured: two for tp8, four
+    # for dep16. An 8-GPU node runs the intra-node collectives nobody has gated.
     if not nvfp4 and not mapping.is_multi_node():
         raise NoTarget(
             f"parallel layout {split} inside one node of {mapping.gpus_per_node} GPUs; the "
-            "BF16 targets are gated on two GB200 trays of four"
+            "BF16 targets are gated on GB200 trays of four (two for tp8, four for dep16)"
         )
 
     # The engine choices.
@@ -313,6 +326,14 @@ def route(
         )
 
         return ModelingV2Nemotron3UltraNvfp4Sm107Dep4
+
+    # Nemotron-3 Ultra 550B-A55B BF16 on 16 sm_100 GPUs, dep16.
+    if layout == _BF16_DEP16:
+        from .nemotron3_ultra_bf16__sm_100__dep16.modeling import (
+            ModelingV2Nemotron3UltraBf16Sm100Dep16,
+        )
+
+        return ModelingV2Nemotron3UltraBf16Sm100Dep16
 
     # Nemotron-3 Ultra 550B-A55B BF16 on 8 sm_100 GPUs, tep8.
     if layout == _BF16_TEP8:
