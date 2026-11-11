@@ -453,6 +453,33 @@ def test_runtime_rejects_untagged_union_values(owner: str, field: str, value: di
 
 
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("preemption", "valid"),
+    [
+        ({}, True),
+        ({"tpot_budget": 0.1}, True),
+        ({"target_output_tps": 40}, True),
+        ({"tpot_budget": None, "target_output_tps": 40}, True),
+        ({"tpot_budget": 0.1, "target_output_tps": None}, True),
+        ({"tpot_budget": None, "target_output_tps": None}, True),
+        ({"tpot_budget": 0}, False),
+        ({"tpot_budget": -0.1}, False),
+        ({"tpot_budget": 1}, False),
+        ({"target_output_tps": 0}, False),
+        ({"target_output_tps": -1}, False),
+        ({"tpot_budget": 0.1, "target_output_tps": 40}, False),
+        ({"policy": "wait"}, False),
+    ],
+)
+def test_gen_preemption_fields(
+    schemas: dict[str, dict], filename: str, preemption: dict, valid: bool
+) -> None:
+    config = {"scheduler_config": {"gen_preemption": preemption}}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
 @pytest.mark.parametrize("field", ["transfer_timeout_sec", "control_grace_sec"])
 @pytest.mark.parametrize(("value", "valid"), [(0.5, True), (0.0, False), (-1.0, False)])
 def test_connector_timeout_constraints(

@@ -451,7 +451,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
     {
         size_t const coldPageBytes = coldPageBytesByLifeCycle[lifeCycle];
-        auto const policy = reusePolicy(mLifeCycles[lifeCycle]);
+        auto const policy = effectivePoolReusePolicy(mLifeCycles[lifeCycle]);
         auto [it, inserted] = coldGroupByPageBytes.emplace(
             std::make_pair(policy, coldPageBytes), PoolGroupIndex{static_cast<int>(coldSlotDescList.size().value())});
         PoolGroupIndex const coldPgIdx = it->second;

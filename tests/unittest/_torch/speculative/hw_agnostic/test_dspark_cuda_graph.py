@@ -28,9 +28,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_dspark import (
+    _dspark_attention_forward_legacy,
     apply_dspark_rotary,
     apply_dspark_rotary_batched,
-    dspark_attention_forward,
     dspark_attention_forward_batched,
     get_dspark_topk_idxs,
     get_dspark_topk_idxs_batched,
@@ -112,7 +112,7 @@ def _scalar_reference(g):
     """Run the validated scalar attention once per request and stack the outputs."""
     outs = []
     for i, sp in enumerate(g["start_positions"]):
-        out_i = dspark_attention_forward(
+        out_i = _dspark_attention_forward_legacy(
             g["x"][i : i + 1],
             g["main_x"][i : i + 1],
             int(sp),
