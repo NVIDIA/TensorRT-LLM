@@ -2257,6 +2257,41 @@ class TestDefaultADPRouterKVBalance:
         assert router.pop_requests(queue, _states([0, 0], [8, 8]), 4, 8) == ([], {})
         assert router._kv_balance_skipped_rounds == {0: 1, 1: 1}
 
+    def test_model_planner_replaces_the_window_and_the_plan(self):
+        calls = {}
+
+        class Planner:
+            def window(self, max_new_requests, free_slots):
+                calls["window"] = (max_new_requests, free_slots)
+                return 2
+
+            def plan(self, **kwargs):
+                calls["plan"] = kwargs
+                return [(1, 0)]
+
+        router = ADPRouter.create(
+            dist=_mock_dist(tp_size=2),
+            has_seq_slot_headroom=False,
+            attention_dp_config=AttentionDpConfig(enable_kv_balanced_admission=True),
+            kv_balanced_admission_planner=Planner(),
+        )
+        queue = _gen_queue([8000, 300, 400])
+        chosen, placement = router.pop_requests(queue, _states([20000, 21000], [6, 7]), 4, 8)
+        assert (_ids(chosen), placement) == ([1], {1: 0})
+        assert _ids(queue) == [0, 2]
+        assert calls["window"] == (4, 3)
+        assert calls["plan"] == dict(
+            candidate_tokens=[8000, 300],
+            candidate_forced=[False, False],
+            rank_tokens=[20000, 21000],
+            rank_num_requests=[6, 7],
+            max_requests_per_rank=8,
+            max_new_requests=4,
+            candidate_groups=calls["plan"]["candidate_groups"],
+        )
+        assert len(calls["plan"]["candidate_groups"]) == 2
+        assert router._kv_balance_skipped_rounds == {0: 1}
+
     def test_request_passed_over_too_often_is_admitted_next(self):
         router = _kv_router(2)
         router._kv_balance_skipped_rounds = {0: KV_BALANCE_MAX_SKIPPED_ROUNDS}

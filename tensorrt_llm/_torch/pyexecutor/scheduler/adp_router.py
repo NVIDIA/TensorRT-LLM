@@ -242,6 +242,7 @@ class ADPRouter(ABC):
         kv_cache_manager=None,
         attention_dp_config=None,
         async_transfer_manager=None,
+        kv_balanced_admission_planner=None,
     ) -> "ADPRouter":
         """Factory method to create the appropriate ADP router.
 
@@ -314,6 +315,7 @@ class ADPRouter(ABC):
             kv_balanced_admission=(
                 attention_dp_config is not None and attention_dp_config.enable_kv_balanced_admission
             ),
+            kv_balanced_admission_planner=kv_balanced_admission_planner,
         )
 
     @abstractmethod
@@ -542,9 +544,18 @@ class DefaultADPRouter(ADPRouter):
         dist: Distributed,
         has_seq_slot_headroom: bool = False,
         kv_balanced_admission: bool = False,
+        kv_balanced_admission_planner=None,
     ):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self.kv_balanced_admission = kv_balanced_admission
+        # A model's RuntimeHooks.kv_balanced_admission_planner; None: the window
+        # and plan_kv_balanced_admission below.
+        self._kv_balanced_admission_planner = kv_balanced_admission_planner
+        if kv_balanced_admission and kv_balanced_admission_planner is not None:
+            logger.info(
+                "Attention DP: KV-balanced admission uses the model's planner "
+                f"{type(kv_balanced_admission_planner).__name__}"
+            )
         # Request id -> admitting rounds it was passed over in the window.
         self._kv_balance_skipped_rounds: Dict[int, int] = {}
 
@@ -583,8 +594,11 @@ class DefaultADPRouter(ADPRouter):
         free_slots = sum(
             max(0, max_num_active_requests - s.num_active_requests) for s in all_rank_states
         )
+        planner = self._kv_balanced_admission_planner
         window = waiting_queue.peek_requests(
-            max(KV_BALANCE_WINDOW, min(max_new_requests, free_slots))
+            planner.window(max_new_requests, free_slots)
+            if planner is not None
+            else max(KV_BALANCE_WINDOW, min(max_new_requests, free_slots))
         )
         if not window or not all(_is_kv_balanced_request(item) for item in window):
             return super().pop_requests(
@@ -592,7 +606,7 @@ class DefaultADPRouter(ADPRouter):
             )
 
         skipped_rounds = self._kv_balance_skipped_rounds
-        plan = plan_kv_balanced_admission(
+        plan = (planner.plan if planner is not None else plan_kv_balanced_admission)(
             candidate_tokens=[_num_input_tokens(item.request) for item in window],
             candidate_forced=[
                 skipped_rounds.get(item.id, 0) >= KV_BALANCE_MAX_SKIPPED_ROUNDS for item in window

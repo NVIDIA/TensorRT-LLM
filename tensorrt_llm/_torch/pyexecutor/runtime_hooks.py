@@ -180,6 +180,34 @@ class HybridCachePolicy:
     state_index_upload_kernel: bool = False
 
 
+class KvBalancedAdmissionPlanner(Protocol):
+    """Chooses the requests attention-DP KV-balanced admission admits, and their ranks.
+
+    Used by ``DefaultADPRouter`` in place of its own window and planner when
+    ``attention_dp_config.enable_kv_balanced_admission`` is on. Every rank calls it
+    with the same all-gathered inputs, so it must be deterministic.
+    """
+
+    def window(self, max_new_requests: int, free_slots: int) -> int:
+        """Number of requests at the head of the queue to choose among."""
+
+    def plan(
+        self,
+        *,
+        candidate_tokens: list[int],
+        candidate_forced: list[bool],
+        rank_tokens: list[int],
+        rank_num_requests: list[int],
+        max_requests_per_rank: int,
+        max_new_requests: int,
+        candidate_groups: list[int],
+    ) -> list[tuple[int, int]]:
+        """``(candidate_index, rank)`` pairs in admission order.
+
+        The arguments are those of ``adp_router.plan_kv_balanced_admission``.
+        """
+
+
 class DecodePrologue(Protocol):
     """Replaces the decode step's input prologue with one launch.
 
@@ -303,6 +331,9 @@ class RuntimeHooks:
     # remainder, and a request ordered as short whose first preparation shows a long remainder is
     # retried after the rest of the iteration. Without demotion it does nothing.
     exact_context_demotion: bool = False
+    # Replaces the attention-DP KV-balanced admission's window and planner
+    # (attention_dp_config.enable_kv_balanced_admission); None keeps the engine's.
+    kv_balanced_admission_planner: Optional[KvBalancedAdmissionPlanner] = None
 
     @property
     def skips_unchanged_metadata_uploads(self) -> bool:

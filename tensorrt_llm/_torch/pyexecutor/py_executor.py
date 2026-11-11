@@ -1230,12 +1230,19 @@ class PyExecutor:
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
+        router_hook_kwargs = {}
+        kv_balanced_admission_planner = runtime_hooks_of(
+            model_engine.model).kv_balanced_admission_planner
+        if kv_balanced_admission_planner is not None:
+            router_hook_kwargs[
+                "kv_balanced_admission_planner"] = kv_balanced_admission_planner
         self.adp_router: ADPRouter = ADPRouter.create(
             dist=self.dist,
             has_seq_slot_headroom=model_engine.enable_overlap_headroom,
             kv_cache_manager=self.kv_cache_manager,
             attention_dp_config=self.llm_args.attention_dp_config,
             async_transfer_manager=self.async_transfer_manager,
+            **router_hook_kwargs,
         )
         # The router publishes the uncached-prefill estimate only when the
         # scheduler's long-prefill demotion consumes it.
