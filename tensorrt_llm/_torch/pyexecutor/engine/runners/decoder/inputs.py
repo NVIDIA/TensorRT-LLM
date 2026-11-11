@@ -11,7 +11,6 @@ from typing import Any
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch.attention.backends.features import HelixMetadata
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata, BatchInputs
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
@@ -2463,7 +2462,7 @@ class DecoderInputPreparer:
             # arm the spec path for ordinary helix generation and send its
             # consumers to uninitialized buffers.
             helix_spec_active = bool(enable_spec_decode and host.lists.helix_owned_new_tokens)
-            if attn_metadata.find_ext(HelixMetadata) is not None:
+            if attn_metadata.enable_helix:
                 attn_metadata.update_helix_param(
                     helix_position_offsets=host.lists.helix_position_offsets,
                     helix_is_inactive_rank=host.lists.helix_is_inactive_rank,

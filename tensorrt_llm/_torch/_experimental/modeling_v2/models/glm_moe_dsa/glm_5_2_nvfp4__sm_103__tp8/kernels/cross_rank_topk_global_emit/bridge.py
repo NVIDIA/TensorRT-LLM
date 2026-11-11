@@ -55,16 +55,6 @@ __all__ = [
 ]
 
 
-def _dsa_state(metadata):
-    """The DSA extension of ``metadata``, which holds the grouped-remap state.
-
-    Imported on use, as the rest of this module's attention imports.
-    """
-    from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAMetadata
-
-    return metadata.ext(DSAMetadata)
-
-
 class GlobalEmitContractError(RuntimeError):
     """The bridge work cross_rank_topk_global_emit performed at the top-k differs from what the call sites requested."""
 
@@ -75,7 +65,7 @@ class RemapPlan:
 
     ``grouped``: the leader of an active full + shared group remaps the whole
     group (``layer_ids``, ``page_index_scale``) and publishes it in
-    ``_dsa_state(metadata)._group_remap_batched[leader]``; the layer's own rows are
+    ``metadata._group_remap_batched[leader]``; the layer's own rows are
     ``out[slot]``. Otherwise the layer remaps alone (``page_index_scale``,
     ``layer_offset``).
     """
@@ -123,7 +113,7 @@ def predict_remap(metadata, local_layer: int) -> Optional[RemapPlan]:
     from tensorrt_llm._torch.attention.backends.sparse.dsa import backend as dsa_backend
 
     if dsa_backend._GROUP_REMAP and not metadata.in_mtp_draft_loop:
-        struct = _dsa_state(metadata)._ensure_group_remap_struct()
+        struct = metadata._ensure_group_remap_struct()
         leader_of = struct.get("leader_of")
         if leader_of is not None and local_layer < len(leader_of):
             leader = leader_of[local_layer]
@@ -291,6 +281,6 @@ def remap_topk_to_global(backend, topk: torch.Tensor, metadata, packet) -> torch
     packet.plan = None
     _check_plan(plan, backend, topk, metadata, packet)
     if plan.remap.grouped:
-        _dsa_state(metadata)._group_remap_batched[plan.remap.leader] = plan.pool
+        metadata._group_remap_batched[plan.remap.leader] = plan.pool
         return plan.pool[plan.remap.slot]
     return plan.pool

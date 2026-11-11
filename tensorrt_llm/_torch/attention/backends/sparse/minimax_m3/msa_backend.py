@@ -233,6 +233,7 @@ class MiniMaxM3MsaMetadata(SparseAlgorithmExtension):
     )
     methods = frozenset(
         {
+            "on_update_kv_lens",
             "_build_msa_fields",
             "_build_step_plans",
             "_create_msa_buffers",

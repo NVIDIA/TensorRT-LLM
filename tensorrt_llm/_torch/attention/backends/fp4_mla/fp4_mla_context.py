@@ -25,7 +25,7 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
 from .fp4_mla_kernels import _fp8_mla_context_block_table_kernel
-from .state import Fp4MlaState, find_fp4_mla
+from .state import Fp4MlaState
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -354,7 +354,7 @@ def _build_fp8_mla_context_metadata(
         host_total_kv_lens=scratch.host_total_kv_lens,
         kv_lens_cuda=kv_lens_cuda,
         kv_lens=kv_lens_cpu,
-        position_offsets=find_fp4_mla(meta).positions[: meta.num_ctx_tokens],
+        position_offsets=meta.fp4_mla_state.positions[: meta.num_ctx_tokens],
         without=(Fp4MlaState,),
     )
 
@@ -364,12 +364,11 @@ def _get_fp8_mla_context_metadata(
     scratch: _Fp8MlaContextScratch,
 ) -> "TrtllmAttentionMetadata":
     """Prepare and reuse one direct metadata view for all layers in a step."""
-    fp4_mla_state = find_fp4_mla(meta)
-    state = fp4_mla_state._fp8_context_view
+    state = meta.fp4_mla_state._fp8_context_view
     if state is not None and state[0] is scratch:
         return state[1]
 
     scratch.prepare(meta)
     fp8_meta = _build_fp8_mla_context_metadata(meta, scratch)
-    fp4_mla_state._fp8_context_view = (scratch, fp8_meta)
+    meta.fp4_mla_state._fp8_context_view = (scratch, fp8_meta)
     return fp8_meta

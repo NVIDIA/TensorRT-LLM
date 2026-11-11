@@ -72,12 +72,6 @@ class RocketMetadata(SparseAlgorithmExtension):
     def _predicts_on_device(self) -> bool:
         return isinstance(self.metadata, TrtllmAttentionMetadata)
 
-    @property
-    def kt_tokens_per_block(self) -> Optional[int]:
-        """The number of KT tokens per block from the KV cache manager."""
-        kv_cache_manager = self.metadata.kv_cache_manager
-        return kv_cache_manager.kt_tokens_per_block if kv_cache_manager is not None else None
-
     def __init__(self, metadata, *, source=None, **config) -> None:
         super().__init__(metadata, source=source, **config)
         buffers = metadata.cuda_graph_buffers
@@ -188,6 +182,12 @@ class RocketMetadata(SparseAlgorithmExtension):
             elif md.prompt_lens[i] > self.prompt_budget:
                 cached[i] += self.prompt_budget - md.prompt_lens[i]
         return cached
+
+    @property
+    def kt_tokens_per_block(self) -> Optional[int]:
+        """The number of KT tokens per block from the KV cache manager."""
+        kv_cache_manager = self.metadata.kv_cache_manager
+        return kv_cache_manager.kt_tokens_per_block if kv_cache_manager is not None else None
 
     def prepare(self) -> None:
         md = self.metadata

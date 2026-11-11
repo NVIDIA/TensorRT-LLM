@@ -39,7 +39,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
 from tensorrt_llm._torch.attention.backends.features.spec_decoding import set_use_spec_decoding
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
@@ -2383,17 +2382,19 @@ class Glm5NextMtpStep:
             attn_metadata.set_seq_lens(slice(0, batch_size), host=1, device=1, update_counts=True)
             has_kv_cache = attn_metadata.kv_cache_manager is not None
             if has_kv_cache:
-                # The context requests continue as one-token generation rows.
                 attn_metadata.as_generation_rows()
-                if num_contexts > 0 and attn_metadata.find_ext(FlashMlaMetadata) is not None:
-                    attn_metadata.block_ids_per_seq[:batch_size].copy_(
-                        attn_metadata.kv_block_ids_per_seq[:batch_size], non_blocking=True
-                    )
             attn_metadata.adjust_kv_lens(
-                slice(num_contexts, batch_size),
-                num_accepted_tokens[num_contexts:batch_size] - draft_len,
+                slice(num_contexts, batch_size), num_accepted_tokens[num_contexts:] - draft_len
             )
             attn_metadata.adjust_kv_lens(slice(0, num_contexts), 1)
+            if (
+                has_kv_cache
+                and num_contexts > 0
+                and getattr(attn_metadata, "enable_flash_mla", False)
+            ):
+                attn_metadata.block_ids_per_seq[:batch_size].copy_(
+                    attn_metadata.kv_block_ids_per_seq[:batch_size], non_blocking=True
+                )
             target_metadata.refresh_draft()
             set_use_spec_decoding(attn_metadata, False)
         else:

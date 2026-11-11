@@ -38,7 +38,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm.bindings import DataType
 
-from ..fp4_mla.state import find_fp4_mla
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 
@@ -110,7 +109,7 @@ class Fp4MlaFmha(PhasedFmha):
             )
         ):
             raise NotImplementedError("FP4 MLA does not support sparse attention.")
-        state = find_fp4_mla(metadata)
+        state = metadata.fp4_mla_state
         if state is None or state.hp_pool is None:
             raise RuntimeError("FP4 MLA requires prepared high-precision KV state.")
         attention_input_type = forward_args.attention_input_type
@@ -196,7 +195,7 @@ class Fp4MlaFmha(PhasedFmha):
             raise RuntimeError("FP4 MLA context requires an output buffer.")
         if forward_args.latent_cache is None:
             raise RuntimeError("FP4 MLA context requires latent_cache.")
-        if find_fp4_mla(metadata).positions is None:
+        if metadata.fp4_mla_state.positions is None:
             raise RuntimeError("FP4 MLA context requires token positions.")
         if metadata.num_contexts <= 0:
             raise RuntimeError("FP4 MLA context requires context requests.")
@@ -343,7 +342,7 @@ class Fp4MlaFmha(PhasedFmha):
     def run_mla_generation(self, params: FmhaParams) -> None:
         attn = params.attn
         metadata = params.meta
-        fp4_mla_state = find_fp4_mla(metadata)
+        fp4_mla_state = metadata.fp4_mla_state
         forward_args = params.fwd
         q = params.query_input
         output = params.output

@@ -367,6 +367,149 @@ class TrtllmCoreMetadata(AttentionCoreMetadata):
         "num_sparse_topk": 0,
     }
 
+    @property
+    def effective_beam_width(self) -> int:
+        # Only use this for the fallback kernel's beam_width argument.
+        # Cross-attention reads request-scoped encoder K/V that is written once
+        # and reused unchanged by every decoder beam. Metadata preparation still
+        # uses beam_width to expand cross block-offset rows to decoder-sequence
+        # scope, but the fallback kernel should treat the cross K/V cache as
+        # non-beam-packed.
+        return 1 if self.is_cross else self.beam_width
+
+    @property
+    def effective_workspace(self) -> Optional[torch.Tensor]:
+        """Attention-kernel workspace, switching to the CUDA-graph copy under capture."""
+        return self.cuda_graph_workspace if self.is_cuda_graph else self.workspace
+
+    @property
+    def max_context_length(self) -> int:
+        """
+        Upper bound for a single context window.
+        Required max_seq_len for context-only attention cases like visual gen
+        """
+        return min(self.max_seq_len, self.max_num_tokens)
+
+    @property
+    def max_seq_len(self) -> int:
+        """
+        Returns the max sequence length.
+        If the attention uses KV cache, it will return max_seq_len from the KV cache manager.
+        If the attention is no cache, max_seq_len should be set manually by user.
+        """
+        if self.kv_cache_manager is not None:
+            return self.kv_cache_manager.max_seq_len
+        else:
+            assert self._max_seq_len_storage is not None, "max_seq_len should be set for no kv cache attention"
+            return self._max_seq_len_storage
+
+    @max_seq_len.setter
+    def max_seq_len(self, value: int) -> None:
+        """
+        Set the max sequence length for no cache attention.
+        """
+        self._max_seq_len_storage = value
+
+    # Block tables given to a metadata without a KV cache manager; with one,
+    # the core allocates or derives them from the manager.
+    _manager_block_tables = frozenset({
+        "kv_cache_block_offsets",
+        "host_kv_cache_block_offsets",
+        "block_ids_per_seq",
+        "kv_block_ids_per_seq",
+    })
+
+    def creation_value(self, name: str) -> Any:
+        # The value set for no-cache attention; a cache's comes from its manager.
+        if name == "max_seq_len":
+            return self._max_seq_len_storage
+        if name in self._manager_block_tables and self.kv_cache_manager is not None:
+            return None
+        return super().creation_value(name)
+
+    @property
+    def tokens_per_block(self) -> Optional[int]:
+        """
+        Returns the number of tokens per block from the KV cache manager.
+        """
+        pools = self._extension_kv_cache_pools()
+        if pools is not None:
+            return pools[2]
+        return self.kv_cache_manager.tokens_per_block if self.kv_cache_manager is not None else None
+
+    @property
+    def page_size(self) -> int:
+        """
+        Number of tokens per cache page.
+        """
+        page_size_override = getattr(self, '_page_size_override', None)
+        if page_size_override is not None:
+            return page_size_override
+        assert self.kv_cache_manager is not None, "page_size requires a KV cache manager"
+        return self.kv_cache_manager.tokens_per_block
+
+    @page_size.setter
+    def page_size(self, value: int) -> None:
+        self._page_size_override = value
+
+    @property
+    def host_kv_cache_pool_pointers(self) -> Optional[torch.Tensor]:
+        """
+        Returns the host KV cache pool pointers from the KV cache manager if KV cache manager is not None.
+        """
+        pools = self._extension_kv_cache_pools()
+        if pools is not None:
+            return pools[0]
+        return self.kv_cache_manager.kv_cache_pool_pointers if self.kv_cache_manager is not None else None
+
+    @property
+    def host_kv_cache_pool_mapping(self) -> Optional[torch.Tensor]:
+        """
+        Returns the host KV cache pool mapping from the KV cache manager if KV cache manager is not None.
+        """
+        pools = self._extension_kv_cache_pools()
+        if pools is not None:
+            return pools[1]
+        return self.kv_cache_manager.kv_cache_pool_mapping if self.kv_cache_manager is not None else None
+
+    def _extension_kv_cache_pools(
+            self) -> Optional[Tuple[torch.Tensor, torch.Tensor, int]]:
+        # An extension's pools (CSA2 compute tiles) replace the manager's.
+        return self.metadata.find("kv_cache_pools", None)
+
+    def copy_lengths_from(self, source: "AttentionCoreMetadata") -> None:
+        super().copy_lengths_from(source)
+        num_seqs = self.num_seqs
+        self.kv_lens_cuda[:num_seqs].copy_(source.kv_lens_cuda[:num_seqs])
+        if self.host_request_types is not None:
+            self.host_request_types[:num_seqs].copy_(
+                source.host_request_types[:num_seqs])
+
+    def resync_length_derived_state(self) -> None:
+        # A draft step changed the lengths the layer-invariant prefixes derive
+        # from; the next MLA layer rebuilds them, and the next context-only
+        # call plans again.
+        self.context_plan = None
+        self._invalidate_mla_scheduler_buffers()
+        self._sync_mixed_precision_staging_lengths()
+
+    def _sync_mixed_precision_staging_lengths(self) -> None:
+        """Keep the mixed-precision staging lengths in step with kv_lens_cuda.
+
+        The staging copy loads the host lengths in ``prepare_mixed_precision_kv``;
+        the step's device corrections (``kv_lens_offsets``) and a draft loop's
+        length changes reach only kv_lens_cuda, so the staging lengths are
+        taken from it on the device.
+        """
+        view = self.mixed_precision_staging
+        if (view is None or view.lengths is None
+                or view.manager is not self.kv_cache_manager):
+            return
+        lengths = view.lengths
+        n = lengths.shape[1]
+        lengths[1].copy_(self.kv_lens_cuda[:n])
+        torch.sub(lengths[1], self.seq_lens_kv_cuda[:n], out=lengths[0])
+
     def __init__(self, metadata, *, source=None, **config) -> None:
         super().__init__(metadata, source=source, **config)
         self.workspace_reclaimable = True
@@ -579,284 +722,6 @@ class TrtllmCoreMetadata(AttentionCoreMetadata):
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:num_seqs]
         if getattr(source, "host_request_types_runtime", None) is not None:
             self.host_request_types_runtime = self.host_request_types[:num_seqs]
-
-    def derive(self) -> None:
-        md = self.metadata
-        self.context_plan = None
-        # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
-        self._invalidate_mla_scheduler_buffers()
-        self._steady_block_table_key = None
-        self.steady_decode_kv_lens = None
-        self._prepared_full_block_offsets = False
-        extra_attrs = get_model_extra_attrs()
-        # If model extra attrs is set, attention_metadata is setup in executor.
-        if extra_attrs is None:
-            get_global_attrs().attention_metadata = weakref.ref(md)
-        if self.kv_cache_manager is None:
-            # Convert the attention metadata to a TRT-LLM no cache attention metadata.
-            assert self.kv_cache_manager is None, "no cache attention should not have KV cache manager"
-            assert self._max_seq_len_storage is not None, "max_seq_len should be set for no cache attention"
-
-            # setting kv cache params
-            self.kv_cache_params = KVCacheParams(use_cache=False, )
-
-            # trtllm attn metadata prepare() requires this
-            self.prompt_lens = self.context_lens
-
-            self.kv_cache_block_offsets = None
-            self.block_ids_per_seq = None
-
-        prompt_lens = torch.as_tensor(
-            self.prompt_lens,
-            dtype=torch.int,
-            device='cpu',
-        )
-        self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
-                             self.prompt_lens_cpu[:self.num_seqs],
-                             pack=True)
-
-        # number of tokens in the kv cache for each sequence in the batch
-        cached_token_lens = torch.tensor(
-            self.kv_cache_params.num_cached_tokens_per_seq,
-            dtype=torch.int,
-            device='cpu',
-        ) if self.kv_cache_params.use_cache else None
-
-        self._prepare_helix_context_slots(cached_token_lens)
-
-        # number of tokens needed in the kv cache for each sequence after the next pass.
-        kv_lens = cached_token_lens + \
-            self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
-        if kv_lens is self.seq_lens or kv_lens is self.seq_lens_kv:
-            kv_lens = kv_lens.clone()
-
-        # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
-        # the sequence length including the cached tokens and the input tokens.
-        self.kv_lens[:self.num_seqs].copy_(
-            kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        if self.kv_lens_offsets is not None:
-            self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-                kv_lens[:self.num_seqs]),
-                                                    non_blocking=True)
-            # Corrections known only on device; the host copies keep the
-            # scheduled lengths.
-            self.kv_lens_cuda[:self.num_seqs] += self.kv_lens_offsets[:self.
-                                                                      num_seqs]
-        else:
-            # Nothing on the device touches the lengths before the forward, so
-            # the copy may join the step-input pack.
-            step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
-                              maybe_pin_memory(kv_lens[:self.num_seqs]))
-        # total kv lens for context requests and generation requests, without extra tokens
-        self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
-        self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
-                                             num_seqs].sum().item()
-        self.host_request_types[:self.num_contexts].fill_(0)
-        self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
-
-        # prepare for kv cache reuse/chunked context in MLA
-        if self.enable_context_mla_with_cached_kv:
-            self.prepare_context_mla_with_cached_kv(cached_token_lens, kv_lens)
-
-        # kv block offsets
-        assert self.request_ids is not None
-        if self.kv_cache_manager is not None:
-            max_kv_len = int(self.kv_lens[:self.num_seqs].max())
-            assert max_kv_len <= self.kv_cache_manager.max_seq_len, (
-                f"The max KV cache length of input sequences ({max_kv_len}) "
-                f"exceeds the KV cache manager's maximum supported length "
-                f"({self.kv_cache_manager.max_seq_len}).")
-
-            # On the non-speculative path the host kv_lens snapshot bounds
-            # every block-table access, so the staged/H2D width can be capped
-            # at the batch's maximum instead of max_seq_len's worth of
-            # columns. Speculative decoding must stage the full width:
-            # draft/tree sub-steps and the overlap scheduler advance
-            # kv_lens_cuda on device past the host snapshot, and their
-            # kernels dereference block columns a host-derived cap would
-            # leave unstaged (uninitialized in this buffer).
-            spec_active = (md.is_spec_decoding_enabled
-                           or bool(self.kv_cache_params.num_extra_kv_tokens) or
-                           (self.runtime_features is not None and
-                            self.runtime_features.has_speculative_draft_tokens)
-                           or self.full_block_table_width)
-            max_blocks = None
-            if not spec_active and self.kv_cache_manager.tokens_per_block:
-                max_blocks = ceil_div(max_kv_len,
-                                      self.kv_cache_manager.tokens_per_block)
-            self.kv_cache_manager.prepare_batch_tables(self.request_ids,
-                                                       self.num_contexts)
-            self.kv_cache_manager.copy_batch_block_offsets(
-                self.kv_cache_block_offsets,
-                self.request_ids,
-                self.beam_width,
-                self.num_contexts,
-                self.num_seqs,
-                max_blocks=max_blocks)
-            self._prepared_full_block_offsets = max_blocks is None
-
-        # Don't pass self.kv_lens as kv_lens here because it includes extra
-        # tokens. Use the actual KV length (without extra tokens) for
-        # kv_lens_runtime, which becomes host_past_key_value_lengths and
-        # eventually mMaxSeqLenKv.
-        self.bind_runtime_views(
-            kv_lens_cuda=self.kv_lens_cuda[:self.num_seqs],
-            kv_lens=kv_lens[:self.num_seqs],
-            prompt_lens_cuda=self.prompt_lens_cuda[:self.num_seqs],
-            prompt_lens_cpu=self.prompt_lens_cpu[:self.num_seqs],
-            host_request_types=self.host_request_types[:self.num_seqs],
-        )
-
-        if self._has_mixed_precision_staging():
-            # Native BF16 paged-context FMHA reads 32-token pages.
-            self.prepare_mixed_precision_kv(
-                "HND", min(self.kv_cache_manager.tokens_per_block, 32))
-            if self.kv_lens_offsets is not None:
-                self._sync_mixed_precision_staging_lengths()
-
-    @property
-    def effective_beam_width(self) -> int:
-        # Only use this for the fallback kernel's beam_width argument.
-        # Cross-attention reads request-scoped encoder K/V that is written once
-        # and reused unchanged by every decoder beam. Metadata preparation still
-        # uses beam_width to expand cross block-offset rows to decoder-sequence
-        # scope, but the fallback kernel should treat the cross K/V cache as
-        # non-beam-packed.
-        return 1 if self.is_cross else self.beam_width
-
-    @property
-    def effective_workspace(self) -> Optional[torch.Tensor]:
-        """Attention-kernel workspace, switching to the CUDA-graph copy under capture."""
-        return self.cuda_graph_workspace if self.is_cuda_graph else self.workspace
-
-    @property
-    def max_context_length(self) -> int:
-        """
-        Upper bound for a single context window.
-        Required max_seq_len for context-only attention cases like visual gen
-        """
-        return min(self.max_seq_len, self.max_num_tokens)
-
-    @property
-    def max_seq_len(self) -> int:
-        """
-        Returns the max sequence length.
-        If the attention uses KV cache, it will return max_seq_len from the KV cache manager.
-        If the attention is no cache, max_seq_len should be set manually by user.
-        """
-        if self.kv_cache_manager is not None:
-            return self.kv_cache_manager.max_seq_len
-        else:
-            assert self._max_seq_len_storage is not None, "max_seq_len should be set for no kv cache attention"
-            return self._max_seq_len_storage
-
-    # Block tables given to a metadata without a KV cache manager; with one,
-    # the core allocates or derives them from the manager.
-    _manager_block_tables = frozenset({
-        "kv_cache_block_offsets",
-        "host_kv_cache_block_offsets",
-        "block_ids_per_seq",
-        "kv_block_ids_per_seq",
-    })
-
-    def creation_value(self, name: str) -> Any:
-        # The value set for no-cache attention; a cache's comes from its manager.
-        if name == "max_seq_len":
-            return self._max_seq_len_storage
-        if name in self._manager_block_tables and self.kv_cache_manager is not None:
-            return None
-        return super().creation_value(name)
-
-    @max_seq_len.setter
-    def max_seq_len(self, value: int) -> None:
-        """
-        Set the max sequence length for no cache attention.
-        """
-        self._max_seq_len_storage = value
-
-    @property
-    def tokens_per_block(self) -> Optional[int]:
-        """
-        Returns the number of tokens per block from the KV cache manager.
-        """
-        pools = self._extension_kv_cache_pools()
-        if pools is not None:
-            return pools[2]
-        return self.kv_cache_manager.tokens_per_block if self.kv_cache_manager is not None else None
-
-    @property
-    def page_size(self) -> int:
-        """
-        Number of tokens per cache page.
-        """
-        page_size_override = getattr(self, '_page_size_override', None)
-        if page_size_override is not None:
-            return page_size_override
-        assert self.kv_cache_manager is not None, "page_size requires a KV cache manager"
-        return self.kv_cache_manager.tokens_per_block
-
-    @page_size.setter
-    def page_size(self, value: int) -> None:
-        self._page_size_override = value
-
-    @property
-    def host_kv_cache_pool_pointers(self) -> Optional[torch.Tensor]:
-        """
-        Returns the host KV cache pool pointers from the KV cache manager if KV cache manager is not None.
-        """
-        pools = self._extension_kv_cache_pools()
-        if pools is not None:
-            return pools[0]
-        return self.kv_cache_manager.kv_cache_pool_pointers if self.kv_cache_manager is not None else None
-
-    @property
-    def host_kv_cache_pool_mapping(self) -> Optional[torch.Tensor]:
-        """
-        Returns the host KV cache pool mapping from the KV cache manager if KV cache manager is not None.
-        """
-        pools = self._extension_kv_cache_pools()
-        if pools is not None:
-            return pools[1]
-        return self.kv_cache_manager.kv_cache_pool_mapping if self.kv_cache_manager is not None else None
-
-    def _extension_kv_cache_pools(
-            self) -> Optional[Tuple[torch.Tensor, torch.Tensor, int]]:
-        # An extension's pools (CSA2 compute tiles) replace the manager's.
-        return self.metadata.find("kv_cache_pools", None)
-
-    def copy_lengths_from(self, source: "AttentionCoreMetadata") -> None:
-        super().copy_lengths_from(source)
-        num_seqs = self.num_seqs
-        self.kv_lens_cuda[:num_seqs].copy_(source.kv_lens_cuda[:num_seqs])
-        if self.host_request_types is not None:
-            self.host_request_types[:num_seqs].copy_(
-                source.host_request_types[:num_seqs])
-
-    def resync_length_derived_state(self) -> None:
-        # A draft step changed the lengths the layer-invariant prefixes derive
-        # from; the next MLA layer rebuilds them, and the next context-only
-        # call plans again.
-        self.context_plan = None
-        self._invalidate_mla_scheduler_buffers()
-        self._sync_mixed_precision_staging_lengths()
-
-    def _sync_mixed_precision_staging_lengths(self) -> None:
-        """Keep the mixed-precision staging lengths in step with kv_lens_cuda.
-
-        The staging copy loads the host lengths in ``prepare_mixed_precision_kv``;
-        the step's device corrections (``kv_lens_offsets``) and a draft loop's
-        length changes reach only kv_lens_cuda, so the staging lengths are
-        taken from it on the device.
-        """
-        view = self.mixed_precision_staging
-        if (view is None or view.lengths is None
-                or view.manager is not self.kv_cache_manager):
-            return
-        lengths = view.lengths
-        n = lengths.shape[1]
-        lengths[1].copy_(self.kv_lens_cuda[:n])
-        torch.sub(lengths[1], self.seq_lens_kv_cuda[:n], out=lengths[0])
 
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
@@ -1379,6 +1244,141 @@ class TrtllmCoreMetadata(AttentionCoreMetadata):
              self.host_request_types_runtime, self._num_generations,
              self.max_num_sequences) = saved
 
+    def derive(self) -> None:
+        md = self.metadata
+        self.context_plan = None
+        # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
+        self._invalidate_mla_scheduler_buffers()
+        self._steady_block_table_key = None
+        self.steady_decode_kv_lens = None
+        self._prepared_full_block_offsets = False
+        extra_attrs = get_model_extra_attrs()
+        # If model extra attrs is set, attention_metadata is setup in executor.
+        if extra_attrs is None:
+            get_global_attrs().attention_metadata = weakref.ref(md)
+        if self.kv_cache_manager is None:
+            # Convert the attention metadata to a TRT-LLM no cache attention metadata.
+            assert self.kv_cache_manager is None, "no cache attention should not have KV cache manager"
+            assert self._max_seq_len_storage is not None, "max_seq_len should be set for no cache attention"
+
+            # setting kv cache params
+            self.kv_cache_params = KVCacheParams(use_cache=False, )
+
+            # trtllm attn metadata prepare() requires this
+            self.prompt_lens = self.context_lens
+
+            self.kv_cache_block_offsets = None
+            self.block_ids_per_seq = None
+
+        prompt_lens = torch.as_tensor(
+            self.prompt_lens,
+            dtype=torch.int,
+            device='cpu',
+        )
+        self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
+        copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
+                             self.prompt_lens_cpu[:self.num_seqs],
+                             pack=True)
+
+        # number of tokens in the kv cache for each sequence in the batch
+        cached_token_lens = torch.tensor(
+            self.kv_cache_params.num_cached_tokens_per_seq,
+            dtype=torch.int,
+            device='cpu',
+        ) if self.kv_cache_params.use_cache else None
+
+        self._prepare_helix_context_slots(cached_token_lens)
+
+        # number of tokens needed in the kv cache for each sequence after the next pass.
+        kv_lens = cached_token_lens + \
+            self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
+        if kv_lens is self.seq_lens or kv_lens is self.seq_lens_kv:
+            kv_lens = kv_lens.clone()
+
+        # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
+        # the sequence length including the cached tokens and the input tokens.
+        self.kv_lens[:self.num_seqs].copy_(
+            kv_lens + self.kv_cache_params.num_extra_kv_tokens)
+        if self.kv_lens_offsets is not None:
+            self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
+                kv_lens[:self.num_seqs]),
+                                                    non_blocking=True)
+            # Corrections known only on device; the host copies keep the
+            # scheduled lengths.
+            self.kv_lens_cuda[:self.num_seqs] += self.kv_lens_offsets[:self.
+                                                                      num_seqs]
+        else:
+            # Nothing on the device touches the lengths before the forward, so
+            # the copy may join the step-input pack.
+            step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
+                              maybe_pin_memory(kv_lens[:self.num_seqs]))
+        # total kv lens for context requests and generation requests, without extra tokens
+        self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
+        self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
+                                             num_seqs].sum().item()
+        self.host_request_types[:self.num_contexts].fill_(0)
+        self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
+
+        # prepare for kv cache reuse/chunked context in MLA
+        if self.enable_context_mla_with_cached_kv:
+            self.prepare_context_mla_with_cached_kv(cached_token_lens, kv_lens)
+
+        # kv block offsets
+        assert self.request_ids is not None
+        if self.kv_cache_manager is not None:
+            max_kv_len = int(self.kv_lens[:self.num_seqs].max())
+            assert max_kv_len <= self.kv_cache_manager.max_seq_len, (
+                f"The max KV cache length of input sequences ({max_kv_len}) "
+                f"exceeds the KV cache manager's maximum supported length "
+                f"({self.kv_cache_manager.max_seq_len}).")
+
+            # On the non-speculative path the host kv_lens snapshot bounds
+            # every block-table access, so the staged/H2D width can be capped
+            # at the batch's maximum instead of max_seq_len's worth of
+            # columns. Speculative decoding must stage the full width:
+            # draft/tree sub-steps and the overlap scheduler advance
+            # kv_lens_cuda on device past the host snapshot, and their
+            # kernels dereference block columns a host-derived cap would
+            # leave unstaged (uninitialized in this buffer).
+            spec_active = (md.is_spec_decoding_enabled
+                           or bool(self.kv_cache_params.num_extra_kv_tokens) or
+                           (self.runtime_features is not None and
+                            self.runtime_features.has_speculative_draft_tokens)
+                           or self.full_block_table_width)
+            max_blocks = None
+            if not spec_active and self.kv_cache_manager.tokens_per_block:
+                max_blocks = ceil_div(max_kv_len,
+                                      self.kv_cache_manager.tokens_per_block)
+            self.kv_cache_manager.prepare_batch_tables(self.request_ids,
+                                                       self.num_contexts)
+            self.kv_cache_manager.copy_batch_block_offsets(
+                self.kv_cache_block_offsets,
+                self.request_ids,
+                self.beam_width,
+                self.num_contexts,
+                self.num_seqs,
+                max_blocks=max_blocks)
+            self._prepared_full_block_offsets = max_blocks is None
+
+        # Don't pass self.kv_lens as kv_lens here because it includes extra
+        # tokens. Use the actual KV length (without extra tokens) for
+        # kv_lens_runtime, which becomes host_past_key_value_lengths and
+        # eventually mMaxSeqLenKv.
+        self.bind_runtime_views(
+            kv_lens_cuda=self.kv_lens_cuda[:self.num_seqs],
+            kv_lens=kv_lens[:self.num_seqs],
+            prompt_lens_cuda=self.prompt_lens_cuda[:self.num_seqs],
+            prompt_lens_cpu=self.prompt_lens_cpu[:self.num_seqs],
+            host_request_types=self.host_request_types[:self.num_seqs],
+        )
+
+        if self._has_mixed_precision_staging():
+            # Native BF16 paged-context FMHA reads 32-token pages.
+            self.prepare_mixed_precision_kv(
+                "HND", min(self.kv_cache_manager.tokens_per_block, 32))
+            if self.kv_lens_offsets is not None:
+                self._sync_mixed_precision_staging_lengths()
+
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
         batch = len(view.page_counts)
@@ -1444,8 +1444,8 @@ class TrtllmCoreMetadata(AttentionCoreMetadata):
         assert md.find("draft_or_none", None) is None
         assert not md.is_spec_decoding_enabled
         assert self.kv_cache_params.num_extra_kv_tokens == 0
-        assert md.find_ext(FlashMlaMetadata) is None
-        assert md.find_ext(HelixMetadata) is None
+        assert not self.enable_flash_mla
+        assert not self.enable_helix
         assert not self.enable_context_mla_with_cached_kv
         assert self.request_ids is not None
         assert max_kv_len <= self.kv_cache_manager.max_seq_len, (
@@ -2657,8 +2657,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         token_major_view = (metadata.token_major_view()
                             if forward_args.attention_input_type
                             == AttentionInputType.generation_only else None)
-        if (metadata.find_ext(FlashMlaMetadata) is not None
-                and token_major_view is not None):
+        if metadata.enable_flash_mla and token_major_view is not None:
             raise ValueError(
                 "FlashMLA does not support ragged token-major generation; "
                 "disable FlashMLA for this layout.")
@@ -3077,7 +3076,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 or metadata.spec_decoding_bl_tree_mask is not None
                 or metadata.spec_bl_tree_first_sparse_mask_offset_kv is not None
                 or metadata.helix_position_offsets is not None
-                or metadata.find_ext(FlashMlaMetadata) is not None):
+                or metadata.enable_flash_mla):
             return plan
         from .fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
         fmha = self._fmha_manager.select(self, q, None, None, metadata, fwd)
@@ -3354,8 +3353,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not self.uses_fp4_mla_attention or self.mla_params is None:
             raise RuntimeError(
                 "FP4 MLA context append requires dense FP4 MLA attention.")
-        fp4_mla_state = metadata.find_ext(Fp4MlaState)
-        if fp4_mla_state is None or fp4_mla_state.positions is None:
+        if (metadata.fp4_mla_state is None
+                or metadata.fp4_mla_state.positions is None):
             raise RuntimeError(
                 "FP4 MLA context append requires token positions.")
         self._ensure_rope_table_size(metadata.max_seq_len)

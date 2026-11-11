@@ -2001,8 +2001,8 @@ def test_on_update_kv_lens_rederives_lengths_slots_and_counts(nvfp4):
         metadata.msa_cu_kv_lens = torch.tensor([0, 9, 21, -1], dtype=torch.int32)
         metadata.msa_cu_q_lens = torch.tensor([0, 2, 5], dtype=torch.int32)
 
-    metadata.ext(MiniMaxM3MsaMetadata).on_update_kv_lens()
-    metadata.ext(MiniMaxM3MsaMetadata).on_update_kv_lens()  # Corrections must be idempotent.
+    metadata.on_update_kv_lens()
+    metadata.on_update_kv_lens()  # Corrections must be idempotent.
     if nvfp4:
         assert metadata.msa_cu_kv_lens.tolist() == [0, 8, 20, -1]
         assert metadata.msa_cu_q_lens.tolist() == [0, 2, 5]
@@ -2027,7 +2027,7 @@ def test_on_update_kv_lens_clamps_to_the_staged_lens():
         qo_lens=(1, 1), kv_staged=(5, 7), kv_corrected=(9, 7), page_size=4
     )
 
-    metadata.ext(MiniMaxM3MsaMetadata).on_update_kv_lens()
+    metadata.on_update_kv_lens()
 
     assert metadata.msa_seq_lens_cuda.tolist() == [5, 7]
     assert metadata.msa_out_cache_loc[:2].tolist() == [4, 106]
@@ -2048,7 +2048,7 @@ def test_on_update_kv_lens_patches_a_mixed_steps_per_step_counts():
         prefill_counts=True,
     )
 
-    metadata.ext(MiniMaxM3MsaMetadata).on_update_kv_lens()
+    metadata.on_update_kv_lens()
 
     assert metadata.msa_seq_lens_cuda.tolist() == [5, 11]
     # Context row: positions 0..4 -> slots 0..4. Generation row attends 11
@@ -2082,7 +2082,7 @@ def test_on_update_kv_lens_is_a_noop_without_speculative_decoding():
 
     metadata._msa_kv_lens_dynamic = False
 
-    metadata.ext(MiniMaxM3MsaMetadata).on_update_kv_lens()
+    metadata.on_update_kv_lens()
 
     assert metadata.msa_seq_lens_cuda.tolist() == [4, 6]
     assert metadata.msa_out_cache_loc.tolist() == [-1] * 5
@@ -2153,7 +2153,7 @@ def test_a_taken_kv_update_replaces_the_rederivation(prefill_counts):
     kv_update = _RecordingKvUpdate(taken=True)
     metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
 
-    metadata.ext(MiniMaxM3MsaMetadata).on_update_kv_lens()
+    metadata.on_update_kv_lens()
 
     # The hook owns the update: the metadata's own re-derivation does not run.
     assert metadata.msa_seq_lens_cuda.tolist() == [9, 12]
@@ -2183,7 +2183,7 @@ def test_a_declined_kv_update_falls_back_to_the_rederivation():
     kv_update = _RecordingKvUpdate(taken=False)
     metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
 
-    metadata.ext(MiniMaxM3MsaMetadata).on_update_kv_lens()
+    metadata.on_update_kv_lens()
 
     assert len(kv_update.calls) == 1
     assert metadata.msa_seq_lens_cuda.tolist() == [8, 12]
@@ -2199,7 +2199,7 @@ def test_kv_update_is_not_called_without_dynamic_kv_lens():
     kv_update = _RecordingKvUpdate(taken=True)
     metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
 
-    metadata.ext(MiniMaxM3MsaMetadata).on_update_kv_lens()
+    metadata.on_update_kv_lens()
 
     assert kv_update.calls == []
 

@@ -18,7 +18,6 @@ from .config import (
     _fp4_mla_packed_wave_plan_enabled,
 )
 from .layout import _ensure_workspace_tensor
-from .state import find_fp4_mla
 
 _SM_COUNT_CACHE: dict[int, int] = {}
 
@@ -105,14 +104,13 @@ def _fp4_mla_packed_plan_geometry(
     generation lengths (``_fp4_mla_uniform_generation_lengths``). ``key`` is
     None when every request keeps a single task and no plan is needed.
     """
-    fp4_mla_state = find_fp4_mla(metadata)
     rows_per_seq = _fp4_mla_packed_rows_per_seq(num_heads, query_len)
     if rows_per_seq == 0 or num_requests <= 0:
         return None
-    if not fp4_mla_state.device_page_table:
+    if not metadata.fp4_mla_state.device_page_table:
         return None
     # The fixed-stride generation page-table capacity (see _max_generation_pages).
-    max_pages = int(fp4_mla_state.page_table_stride)
+    max_pages = int(metadata.fp4_mla_state.page_table_stride)
     if max_pages <= 0:
         return None
     max_kv_len = max_pages * metadata.page_size
@@ -166,7 +164,7 @@ def _fp4_mla_packed_plan_geometry(
         dtype=torch.int32,
         device=device,
     )
-    kv_lens = fp4_mla_state.generation_kv_lens
+    kv_lens = metadata.fp4_mla_state.generation_kv_lens
     key = (
         num_requests,
         splits,
@@ -232,4 +230,4 @@ def _launch_fp4_mla_packed_plan(
         generation_lengths=generation_lengths,
         wave_plan=_fp4_mla_packed_wave_plan_enabled(),
     )
-    find_fp4_mla(metadata).packed_plan_key = geometry.key
+    metadata.fp4_mla_state.packed_plan_key = geometry.key

@@ -232,6 +232,140 @@ class AttentionMetadata:
     # The attached extensions, the core first; see extensions.py.
     _extensions: ExtensionRegistry
 
+    def get_adp_token_counts(self) -> List[int]:
+        """Local execution-stage counts carried by the input count exchange.
+
+        The first stage is the input (``num_tokens``, unless an extension
+        declares ``adp_input_token_count``); each extension may append its own.
+        """
+        input_tokens = self.find("adp_input_token_count", None)
+        if input_tokens is None:
+            input_tokens = self.num_tokens
+        return [input_tokens, *(self.find("adp_token_counts", None) or ())]
+
+    def set_adp_token_counts(self, counts: List[List[int]]) -> List[int]:
+        """Save stage counts and return the input-stage counts for padding."""
+        if len(counts) > 1:
+            self.find("receive_adp_token_counts")(counts[1:], counts[0])
+        return counts[0]
+
+    def find(self, name: str, default: Any = None) -> Any:
+        """An attached extension's declared field or bound method, or ``default``.
+
+        For values the core or the engine reads from whichever extension
+        provides them, such as ``kv_cache_pools`` or ``full_block_table_width``.
+        """
+        for extension in self._attached_extensions():
+            declared = type(extension)
+            if name in declared.declared_fields(
+            ) or name in declared.declared_methods():
+                return getattr(extension, name)
+        return default
+
+    @classmethod
+    def core_class(cls) -> type:
+        """The metadata family class, without the forwarding of a composed class."""
+        return cls.__dict__.get("_core_class", cls)
+
+    def _compose(self) -> None:
+        """Switch to the composed class of the attached extensions.
+
+        The composed class forwards each extension's declared fields and
+        methods, so callers read ``metadata.field`` instead of
+        ``metadata.ext(T).field``.
+        """
+        extension_types = tuple(self._attached_extensions().types())
+        object.__setattr__(self, "__class__",
+                           _composed_class(self.core_class(), extension_types))
+
+    def own_attribute_names(self) -> FrozenSet[str]:
+        """Names this metadata's family defines; extensions may not shadow them."""
+        return _assignable_names(self.core_class())
+
+    def _attached_extensions(self) -> ExtensionRegistry:
+        # Metadata built without __init__ (as some tests do) has no registry.
+        return self.__dict__.get("_extensions", _NO_EXTENSIONS)
+
+    def ext(self, cls: Type[ExtensionT]) -> ExtensionT:
+        """The attached extension of type ``cls``; raises when none is."""
+        found = self._attached_extensions().find(cls)
+        if found is None:
+            raise LookupError(
+                f"{type(self).__name__} has no {cls.__name__} extension attached."
+            )
+        return found
+
+    def find_ext(self, cls: Type[ExtensionT]) -> Optional[ExtensionT]:
+        """The attached extension of type ``cls``, or None."""
+        return self._attached_extensions().find(cls)
+
+    def add_ext(self, cls: Type[ExtensionT]) -> ExtensionT:
+        """Construct and attach ``cls`` and its requirements if absent; return the extension."""
+        self._ensure_core()
+        self._extensions.attach(self, (cls, ))
+        return self.ext(cls)
+
+    def replace_ext(self, extension: MetadataExtension) -> None:
+        """Attach a built extension in place of any of its type.
+
+        For derived views made by ``copy.copy``: binds this metadata to its own
+        registry first, so the source keeps its extensions.
+        """
+        assert extension.metadata is self, "the extension must be built for this metadata"
+        if not extension.is_core:
+            self._ensure_core()
+        elif self.__dict__.get(
+                "_extensions") is None or self._extensions.owner is not self:
+            self._extensions = self._attached_extensions().bound_to(self)
+        self._extensions.replace(extension)
+        self._compose()
+
+    def remove_ext(self, cls: Type[MetadataExtension]) -> None:
+        """Detach the extension of type ``cls`` from a derived view.
+
+        Like ``replace_ext``, binds this metadata to its own registry first.
+        """
+        self._ensure_core()
+        self._extensions.remove(cls)
+        self._compose()
+
+    @property
+    def extensions(self) -> List[MetadataExtension]:
+        """The attached extensions in dependency order."""
+        return list(self._attached_extensions())
+
+    def get_buffer(self, shape: Sequence[int], dtype: torch.dtype,
+                   name: str) -> torch.Tensor:
+        """A persistent buffer from this metadata's pool, graph-stable under capture."""
+        return self.get_empty(self.cuda_graph_buffers,
+                              list(shape),
+                              dtype=dtype,
+                              cache_name=name,
+                              capture_graph=self.is_cuda_graph)
+
+    def stage_to_device(self, key: Any, destination: torch.Tensor,
+                        value: torch.Tensor) -> None:
+        """Copy a host tensor into ``destination`` through pinned staging."""
+        copy_host_to_device(self.core()._host_staging, key, destination, value)
+
+    def adopts_target_state(self) -> bool:
+        """Whether every attached extension takes a draft's state from its target's."""
+        return all(
+            type(extension).adopts_target_state
+            for extension in self._attached_extensions())
+
+    def check_lengths_current(self) -> None:
+        """Raise when the lengths changed in place without a refresh.
+
+        The attention forward calls it: state derived from the lengths would
+        be stale.
+        """
+        if self.lengths_changed:
+            raise RuntimeError(
+                f"{type(self).__name__}'s lengths changed in place since its "
+                "last prepare or draft refresh; refresh the draft before its "
+                "forward")
+
     def __init__(self,
                  *,
                  extension_types: Sequence[Type[MetadataExtension]] = (),
@@ -402,140 +536,6 @@ class AttentionMetadata:
                                             type(self).core_metadata_type, {},
                                             None)
         return core
-
-    def get_adp_token_counts(self) -> List[int]:
-        """Local execution-stage counts carried by the input count exchange.
-
-        The first stage is the input (``num_tokens``, unless an extension
-        declares ``adp_input_token_count``); each extension may append its own.
-        """
-        input_tokens = self.find("adp_input_token_count", None)
-        if input_tokens is None:
-            input_tokens = self.num_tokens
-        return [input_tokens, *(self.find("adp_token_counts", None) or ())]
-
-    def set_adp_token_counts(self, counts: List[List[int]]) -> List[int]:
-        """Save stage counts and return the input-stage counts for padding."""
-        if len(counts) > 1:
-            self.find("receive_adp_token_counts")(counts[1:], counts[0])
-        return counts[0]
-
-    def find(self, name: str, default: Any = None) -> Any:
-        """An attached extension's declared field or bound method, or ``default``.
-
-        For values the core or the engine reads from whichever extension
-        provides them, such as ``kv_cache_pools`` or ``full_block_table_width``.
-        """
-        for extension in self._attached_extensions():
-            declared = type(extension)
-            if name in declared.declared_fields(
-            ) or name in declared.declared_methods():
-                return getattr(extension, name)
-        return default
-
-    @classmethod
-    def core_class(cls) -> type:
-        """The metadata family class, without the forwarding of a composed class."""
-        return cls.__dict__.get("_core_class", cls)
-
-    def _compose(self) -> None:
-        """Switch to the composed class of the attached extensions.
-
-        The composed class forwards each extension's declared fields and
-        methods, so callers read ``metadata.field`` instead of
-        ``metadata.ext(T).field``.
-        """
-        extension_types = tuple(self._attached_extensions().types())
-        object.__setattr__(self, "__class__",
-                           _composed_class(self.core_class(), extension_types))
-
-    def own_attribute_names(self) -> FrozenSet[str]:
-        """Names this metadata's family defines; extensions may not shadow them."""
-        return _assignable_names(self.core_class())
-
-    def _attached_extensions(self) -> ExtensionRegistry:
-        # Metadata built without __init__ (as some tests do) has no registry.
-        return self.__dict__.get("_extensions", _NO_EXTENSIONS)
-
-    def ext(self, cls: Type[ExtensionT]) -> ExtensionT:
-        """The attached extension of type ``cls``; raises when none is."""
-        found = self._attached_extensions().find(cls)
-        if found is None:
-            raise LookupError(
-                f"{type(self).__name__} has no {cls.__name__} extension attached."
-            )
-        return found
-
-    def find_ext(self, cls: Type[ExtensionT]) -> Optional[ExtensionT]:
-        """The attached extension of type ``cls``, or None."""
-        return self._attached_extensions().find(cls)
-
-    def add_ext(self, cls: Type[ExtensionT]) -> ExtensionT:
-        """Construct and attach ``cls`` and its requirements if absent; return the extension."""
-        self._ensure_core()
-        self._extensions.attach(self, (cls, ))
-        return self.ext(cls)
-
-    def replace_ext(self, extension: MetadataExtension) -> None:
-        """Attach a built extension in place of any of its type.
-
-        For derived views made by ``copy.copy``: binds this metadata to its own
-        registry first, so the source keeps its extensions.
-        """
-        assert extension.metadata is self, "the extension must be built for this metadata"
-        if not extension.is_core:
-            self._ensure_core()
-        elif self.__dict__.get(
-                "_extensions") is None or self._extensions.owner is not self:
-            self._extensions = self._attached_extensions().bound_to(self)
-        self._extensions.replace(extension)
-        self._compose()
-
-    def remove_ext(self, cls: Type[MetadataExtension]) -> None:
-        """Detach the extension of type ``cls`` from a derived view.
-
-        Like ``replace_ext``, binds this metadata to its own registry first.
-        """
-        self._ensure_core()
-        self._extensions.remove(cls)
-        self._compose()
-
-    @property
-    def extensions(self) -> List[MetadataExtension]:
-        """The attached extensions in dependency order."""
-        return list(self._attached_extensions())
-
-    def get_buffer(self, shape: Sequence[int], dtype: torch.dtype,
-                   name: str) -> torch.Tensor:
-        """A persistent buffer from this metadata's pool, graph-stable under capture."""
-        return self.get_empty(self.cuda_graph_buffers,
-                              list(shape),
-                              dtype=dtype,
-                              cache_name=name,
-                              capture_graph=self.is_cuda_graph)
-
-    def stage_to_device(self, key: Any, destination: torch.Tensor,
-                        value: torch.Tensor) -> None:
-        """Copy a host tensor into ``destination`` through pinned staging."""
-        copy_host_to_device(self.core()._host_staging, key, destination, value)
-
-    def adopts_target_state(self) -> bool:
-        """Whether every attached extension takes a draft's state from its target's."""
-        return all(
-            type(extension).adopts_target_state
-            for extension in self._attached_extensions())
-
-    def check_lengths_current(self) -> None:
-        """Raise when the lengths changed in place without a refresh.
-
-        The attention forward calls it: state derived from the lengths would
-        be stale.
-        """
-        if self.lengths_changed:
-            raise RuntimeError(
-                f"{type(self).__name__}'s lengths changed in place since its "
-                "last prepare or draft refresh; refresh the draft before its "
-                "forward")
 
     @property
     def has_cross_sub_metadata(self) -> bool:

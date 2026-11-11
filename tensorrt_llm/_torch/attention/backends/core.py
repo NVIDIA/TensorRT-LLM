@@ -56,6 +56,9 @@ class AttentionCoreMetadata(MetadataExtension):
             "runtime_features",
             "is_cuda_graph",
             "enable_context_mla_with_cached_kv",
+            "enable_flash_mla",
+            "enable_helix",
+            "fp4_mla_state",
             "cache_indirection",
             "cuda_graph_buffers",
             "full_block_table_width",
@@ -396,6 +399,27 @@ class AttentionCoreMetadata(MetadataExtension):
     def num_seqs(self) -> int:
         """The number of sequences in the batch."""
         return self.seq_lens.shape[0]
+
+    @property
+    def enable_flash_mla(self) -> bool:
+        """Whether FlashMLA serves the generation phase (its extension is attached)."""
+        from .features import FlashMlaMetadata
+
+        return self.metadata.find_ext(FlashMlaMetadata) is not None
+
+    @property
+    def enable_helix(self) -> bool:
+        """Whether Helix context parallelism is on (its extension is attached)."""
+        from .features import HelixMetadata
+
+        return self.metadata.find_ext(HelixMetadata) is not None
+
+    @property
+    def fp4_mla_state(self):
+        """The FP4 MLA extension when it is attached, else None."""
+        from .fp4_mla.state import Fp4MlaState
+
+        return self.metadata.find_ext(Fp4MlaState)
 
     @property
     def is_cross(self) -> bool:

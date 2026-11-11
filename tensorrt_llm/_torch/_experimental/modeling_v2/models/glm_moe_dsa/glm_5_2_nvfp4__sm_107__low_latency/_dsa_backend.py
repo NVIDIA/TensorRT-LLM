@@ -15,10 +15,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     MLAParams,
     PositionalEmbeddingParams,
 )
-from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
-    DSAMetadata,
-    DSAtrtllmAttentionMetadata,
-)
+from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -28,12 +25,6 @@ from ._indexer import (
     transform_local_topk_and_prepare_pool_view,
     transform_local_topk_and_prepare_pool_view_grouped,
 )
-
-
-def _dsa_state(metadata: DSAtrtllmAttentionMetadata) -> DSAMetadata:
-    """The DSA extension of ``metadata``, which holds the indexer and pool-view state."""
-    return metadata.ext(DSAMetadata)
-
 
 _GROUP_REMAP = os.environ.get("TRTLLM_DISABLE_DSA_GROUP_REMAP", "0") != "1"
 
@@ -191,8 +182,7 @@ class Glm52DSAAttention(TrtllmAttention):
         that equivalence is covered by unit tests (see
         ``tests/unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py``).
         """
-        dsa_state = _dsa_state(metadata)
-        struct = dsa_state._ensure_group_remap_struct()
+        struct = metadata._ensure_group_remap_struct()
         leader_of = struct.get("leader_of")
         if leader_of is None or local_layer_idx >= len(leader_of):
             return None
@@ -210,7 +200,7 @@ class Glm52DSAAttention(TrtllmAttention):
                 struct["group_scale"][leader],
                 is_generation,
             )
-            dsa_state._group_remap_batched[leader] = batched
+            metadata._group_remap_batched[leader] = batched
         else:
             # Shared layer: read the leader's precomputed batch. The batch is
             # cleared at every step boundary, so a present entry is from this
@@ -218,7 +208,7 @@ class Glm52DSAAttention(TrtllmAttention):
             # top-k shape, and otherwise fall back to the per-layer path. This
             # makes any leader/follower ordering or shape mismatch a safe
             # per-layer fallback rather than a stale/out-of-bounds read.
-            batched = dsa_state._group_remap_batched.get(leader, None)
+            batched = metadata._group_remap_batched.get(leader, None)
             if (
                 batched is None
                 or slot >= batched.shape[0]

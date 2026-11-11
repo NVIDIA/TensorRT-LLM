@@ -49,16 +49,6 @@ _KV_LORA_RANK = 512
 _ROPE_DIM = 64
 
 
-def _dsa_state(metadata):
-    """The DSA extension of ``metadata``, which holds the grouped-remap state.
-
-    Imported on use, as the rest of this module's attention imports.
-    """
-    from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAMetadata
-
-    return metadata.ext(DSAMetadata)
-
-
 @dataclass
 class IndexerKScatter:
     """Deferred native indexer K-cache scatter of one layer and one forward.
@@ -483,7 +473,7 @@ def remap_topk_to_global(
     copy = packet.copy
     local_layer_idx = backend.get_local_layer_idx(metadata)
     if dsa_backend._GROUP_REMAP and not metadata.in_mtp_draft_loop:
-        struct = _dsa_state(metadata)._ensure_group_remap_struct()
+        struct = metadata._ensure_group_remap_struct()
         leader_of = struct.get("leader_of")
         if leader_of is not None and local_layer_idx < len(leader_of):
             leader = leader_of[local_layer_idx]
@@ -504,9 +494,9 @@ def remap_topk_to_global(
                         page_index_scale=struct["group_scale"][leader],
                         copy=copy,
                     )
-                    _dsa_state(metadata)._group_remap_batched[leader] = batched
+                    metadata._group_remap_batched[leader] = batched
                     return batched[slot]
-                batched = _dsa_state(metadata)._group_remap_batched.get(leader, None)
+                batched = metadata._group_remap_batched.get(leader, None)
                 if (
                     copy is None
                     and batched is not None

@@ -17,7 +17,6 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
-from ..attention.backends.features import FlashMlaMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..attention.backends.sparse.params import MTPIndexShareExtension
 from ..model_config import ModelConfig
@@ -1156,8 +1155,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         With no context rows ``prepare_flash_mla`` already staged this exact
         layout, so the early return merely skips a redundant copy.
         """
-        if (num_contexts <= 0
-                or attn_metadata.find_ext(FlashMlaMetadata) is None):
+        if num_contexts <= 0 or not attn_metadata.enable_flash_mla:
             return
         attn_metadata.block_ids_per_seq[:batch_size].copy_(
             attn_metadata.kv_block_ids_per_seq[:batch_size], non_blocking=True)

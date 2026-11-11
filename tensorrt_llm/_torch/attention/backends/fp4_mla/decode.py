@@ -55,7 +55,6 @@ from .packed_plan import (
     _launch_fp4_mla_packed_plan,
     _PackedPlanGeometry,
 )
-from .state import find_fp4_mla
 from .v_cache import (
     _get_cutedsl_persistent_v_packed_cache,
     _get_fp4_mla_v_packed_pool_base,
@@ -167,7 +166,6 @@ def _run_triton_attention_decode(
     ``fp4_mla_triton.py``. Threads through the constexpr assume flags,
     TMA descriptors, occupancy/num-warps launch meta, and pipelined PV loop.
     """
-    fp4_mla_state = find_fp4_mla(metadata)
     from .fp4_mla_triton import (
         _fp4_mla_attention_group_reduce_stats_kernel as _attn_group_reduce_stats_kernel,
     )
@@ -314,7 +312,7 @@ def _run_triton_attention_decode(
         global_scale,
         q_global_scale,
         src_page_ids,
-        fp4_mla_state.paged_kv_indptr_decode,
+        metadata.fp4_mla_state.paged_kv_indptr_decode,
         kv_lens,
         src_page_ids.shape[0],
         kv_cache.shape[0],
@@ -379,8 +377,8 @@ def _run_triton_attention_decode(
     # reduce during capture so we never allocate mid-capture. The single-level
     # reduce is numerically identical (it just launches fewer CTAs).
     if num_reduce_groups > 1 and torch.cuda.is_current_stream_capturing():
-        gmax = fp4_mla_state.workspaces.get("_fp4_mla_attention_group_max_buf")
-        gsum = fp4_mla_state.workspaces.get("_fp4_mla_attention_group_sum_buf")
+        gmax = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_group_max_buf")
+        gsum = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_group_sum_buf")
         groups_ready = (
             gmax is not None
             and gsum is not None
@@ -460,7 +458,7 @@ def _run_triton_attention_decode(
         max_scores,
         denom,
         page_max,
-        fp4_mla_state.paged_kv_indptr_decode,
+        metadata.fp4_mla_state.paged_kv_indptr_decode,
         kv_lens,
         src_page_ids.shape[0],
         max_scores.stride(0),
@@ -530,7 +528,7 @@ def _run_triton_attention_decode(
     # Fall back to the unsplit PV (numerically identical) during capture unless a
     # warmup forward already sized that workspace, so capture never allocates.
     if page_split > 1 and torch.cuda.is_current_stream_capturing():
-        pbuf = fp4_mla_state.workspaces.get("_fp4_mla_attention_pv_partial_buf")
+        pbuf = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_pv_partial_buf")
         partial_ready = (
             pbuf is not None
             and pbuf.shape[0] >= num_queries
@@ -560,7 +558,7 @@ def _run_triton_attention_decode(
                 v_sf,
                 global_scale,
                 src_page_ids,
-                fp4_mla_state.paged_kv_indptr_decode,
+                metadata.fp4_mla_state.paged_kv_indptr_decode,
                 kv_lens,
                 src_page_ids.shape[0],
                 kv_cache.shape[0],
@@ -609,7 +607,7 @@ def _run_triton_attention_decode(
                 v_sf,
                 global_scale,
                 src_page_ids,
-                fp4_mla_state.paged_kv_indptr_decode,
+                metadata.fp4_mla_state.paged_kv_indptr_decode,
                 kv_lens,
                 src_page_ids.shape[0],
                 kv_cache.shape[0],
@@ -683,7 +681,7 @@ def _run_triton_attention_decode(
                 v_sf,
                 global_scale,
                 src_page_ids,
-                fp4_mla_state.paged_kv_indptr_decode,
+                metadata.fp4_mla_state.paged_kv_indptr_decode,
                 kv_lens,
                 src_page_ids.shape[0],
                 kv_cache.shape[0],
@@ -724,7 +722,7 @@ def _run_triton_attention_decode(
                 v_sf,
                 global_scale,
                 src_page_ids,
-                fp4_mla_state.paged_kv_indptr_decode,
+                metadata.fp4_mla_state.paged_kv_indptr_decode,
                 kv_lens,
                 src_page_ids.shape[0],
                 kv_cache.shape[0],
@@ -856,7 +854,7 @@ def _run_cutedsl_packed_decode(
     plan = plan_geometry.plan
     # The first FP4 MLA kernel of the step wrote the plan fused with the
     # generation lengths; a stale key means this call plans on other bounds.
-    if find_fp4_mla(metadata).packed_plan_key != plan_geometry.key:
+    if metadata.fp4_mla_state.packed_plan_key != plan_geometry.key:
         _launch_fp4_mla_packed_plan(plan_geometry, kv_lens, metadata)
     partial = _ensure_workspace_tensor(
         metadata,
@@ -939,7 +937,6 @@ def run_fp4_mla_attention_decode(
     KV workspace is materialized on this path. Callers must supply the packed Q
     and scales produced by the fused generation cache update.
     """
-    fp4_mla_state = find_fp4_mla(metadata)
     head_dim = kv_lora_rank + qk_rope_head_dim
     if qk_rope_head_dim != FP4_MLA_K_RESIDUAL_DIM:
         raise ValueError(
@@ -1013,7 +1010,7 @@ def run_fp4_mla_attention_decode(
                     "same-device int32 tensor covering every query token."
                 )
             helix_kv_bounds = helix_kv_bounds[:num_queries]
-    if getattr(fp4_mla_state, "v_scale_pool", None) is None:
+    if getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
         raise RuntimeError(
             "FP4 MLA attention decode requires the auxiliary V scale pool to be allocated."
         )
@@ -1030,7 +1027,9 @@ def run_fp4_mla_attention_decode(
     capacity = int(q_batch_capacity)
     # The fused generation update records the Q layout it produced; metadata
     # that never went through it (contract tests) carries the legacy layout.
-    recorded_rows_per_seq = getattr(fp4_mla_state, "prequantized_q_rows_per_seq", None)
+    recorded_rows_per_seq = getattr(
+        getattr(metadata, "fp4_mla_state", None), "prequantized_q_rows_per_seq", None
+    )
     packed_rows_per_seq = int(recorded_rows_per_seq or 0)
     if recorded_rows_per_seq is not None and packed_rows_per_seq != _fp4_mla_packed_rows_per_seq(
         num_heads, query_len_per_seq
@@ -1090,7 +1089,7 @@ def run_fp4_mla_attention_decode(
     )
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
 
-    v_sf_pool = fp4_mla_state.v_scale_pool
+    v_sf_pool = metadata.fp4_mla_state.v_scale_pool
     v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[local_layer].view(
         torch.float8_e4m3fn
     )
@@ -1281,7 +1280,7 @@ def run_fp4_mla_attention_decode(
                 global_scale,
                 q_global_scale,
                 src_page_ids,
-                fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
                 kv_lens,
                 output,
                 num_heads=num_heads,
@@ -1312,7 +1311,7 @@ def run_fp4_mla_attention_decode(
                 core_v_sf,
                 global_scale,
                 src_page_ids,
-                fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
                 kv_lens,
                 output,
                 splits=select_split_count(max_pages * metadata.page_size),
@@ -1364,7 +1363,7 @@ def run_fp4_mla_attention_decode(
                 core_v_sf,
                 global_scale,
                 src_page_ids,
-                fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
                 kv_lens,
                 kernel_output,
                 splits=splits,
@@ -1385,7 +1384,7 @@ def run_fp4_mla_attention_decode(
                 core_v_sf,
                 global_scale,
                 src_page_ids,
-                fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
                 kv_lens,
                 kernel_output,
                 max_kv_len=max_pages * metadata.page_size,

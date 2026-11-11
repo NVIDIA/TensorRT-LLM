@@ -13,7 +13,6 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention.backends.features import HelixMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import maybe_compile
@@ -224,6 +223,7 @@ class DSAMetadata(SparseAlgorithmExtension, MTPIndexShareUser):
     )
     methods = frozenset(
         {
+            "bind_gen_indexer_kv_lens",
             "_compute_kv_lens_row_reorder",
             "_create_kv_lens_2d_buffer",
             "_ensure_group_remap_struct",
@@ -405,6 +405,111 @@ class DSAMetadata(SparseAlgorithmExtension, MTPIndexShareUser):
     # staging copy; attention reads the sparse gather's FP8 scratch and
     # overlays the high pool's rows on it.
     mixed_precision_staging_enabled = False
+
+    @property
+    def is_ragged_verify(self) -> bool:
+        return self.ragged_verify_lens is not None
+
+    def set_gen_token_layout(
+        self,
+        *,
+        tokens_per_gen_step: int,
+        ragged_verify_lens: Optional[List[int]],
+        device_windows_mode: bool,
+    ) -> None:
+        """Take this step's generation-token layout; read by the next ``prepare``.
+
+        ``tokens_per_gen_step`` is the uniform query width of a generation
+        request at the step's runtime draft length (0: the static draft-token
+        ceiling); ``ragged_verify_lens`` the per-request widths of a ragged
+        verify step, or None; ``device_windows_mode`` whether those widths are
+        only the captured shape split, the true windows arriving on device
+        through ``apply_device_ragged_layout`` after prepare.
+        """
+        self.runtime_tokens_per_gen_step = tokens_per_gen_step
+        self.ragged_verify_lens = ragged_verify_lens
+        self.device_windows_mode = device_windows_mode
+
+    def set_ragged_verify_lens(self, ragged_verify_lens: Optional[List[int]]) -> None:
+        """Take this step's per-request verify widths (None: a uniform step)."""
+        self.ragged_verify_lens = ragged_verify_lens
+
+    def _validate_ragged_verification(self) -> None:
+        """Reject layouts whose stable buffers were not enabled at allocation."""
+        if self.ragged_verify_lens is not None and not self.enable_ragged_verification:
+            raise RuntimeError(
+                "ragged verification metadata was installed without enabling "
+                "ragged-verification buffers"
+            )
+
+    @property
+    def gen_token_stride(self) -> int:
+        stride = int(self.runtime_tokens_per_gen_step)
+        return stride if stride > 0 else 1 + self.max_draft_tokens
+
+    def update_indexer_kv_lens_2d(self, gen_kv_lens: torch.Tensor) -> torch.Tensor:
+        """Fill and return the active query-width view of persistent storage."""
+        md = self.metadata
+        width = min(self.gen_token_stride, self.kv_lens_cuda_2d.shape[1])
+        context_lens = self.kv_lens_cuda_2d[: md.num_generations, :width]
+        context_lens.copy_(gen_kv_lens.unsqueeze(-1).expand(-1, width))
+        return context_lens
+
+    def mla_scheduler_buffers(self, num_heads: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Precompute prefixes for the same rows presented to MLA generation."""
+        view = self.token_major_gen_view()
+        if view is None:
+            return None
+
+        num_ctx = self.metadata.num_contexts
+        n_gen = view.num_rows - num_ctx
+        if not self._ragged_mla_buffers_valid:
+            # RoPE presents one query token per generation row. The device
+            # extents are causal, pre-extra-KV lengths, just like the
+            # cache_seq_lens scanned by the non-precomputed kernel path.
+            torch.cumsum(
+                view.prompt_lens_cuda[num_ctx:],
+                0,
+                dtype=torch.int32,
+                out=self.ragged_mla_cu_q_rows[1 : n_gen + 1],
+            )
+            self.ragged_mla_cu_q_rows[1 : n_gen + 1] *= num_heads
+            torch.cumsum(
+                view.sequence_length[num_ctx:],
+                0,
+                dtype=torch.int32,
+                out=self.ragged_mla_cu_kv_seqlens[1 : n_gen + 1],
+            )
+            self._ragged_mla_buffers_valid = True
+        return (
+            self.ragged_mla_cu_q_rows[: n_gen + 1],
+            self.ragged_mla_cu_kv_seqlens[: n_gen + 1],
+        )
+
+    def gen_token_repeat_list(self) -> List[int]:
+        md = self.metadata
+        if not self.is_ragged_verify:
+            return [self.gen_token_stride] * md.num_generations
+        return list(self.ragged_verify_lens)
+
+    def gen_token_repeats(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        return torch.tensor(self.gen_token_repeat_list(), dtype=torch.long, device=device)
+
+    def expand_per_gen_token(self, values: torch.Tensor, dim: int = 0) -> Tuple[torch.Tensor, int]:
+        """Repeat request values once per generation query token."""
+        md = self.metadata
+        repeats = self.gen_token_repeat_list()
+        num_tokens = sum(repeats)
+        if not self.is_ragged_verify:
+            return values.repeat_interleave(self.gen_token_stride, dim=dim), num_tokens
+        if values.device == self.gen_token_repeats_cuda.device:
+            repeats_dev = self.gen_token_repeats_cuda[: md.num_generations]
+        else:
+            repeats_dev = torch.tensor(repeats, dtype=torch.long, device=values.device)
+        return (
+            values.repeat_interleave(repeats_dev, dim=dim, output_size=num_tokens),
+            num_tokens,
+        )
 
     def __init__(self, metadata, *, source=None, **config) -> None:
         super().__init__(metadata, source=source, **config)
@@ -588,6 +693,14 @@ class DSAMetadata(SparseAlgorithmExtension, MTPIndexShareUser):
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
         self._init_dsa_sparse_offload_state()
 
+    @property
+    def use_cute_dsl_paged_mqa_logits(self) -> bool:
+        """The Indexer's decision: the config flag gated on SM100 and cutlass-dsl."""
+        md = self.metadata
+        return use_cute_dsl_paged_mqa_logits(
+            md.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
+        )
+
     def _offloads_dsa_latent(self) -> bool:
         """Whether attention reads a DSA cache manager's MLA latent through the offload arena."""
         md = self.metadata
@@ -711,119 +824,6 @@ class DSAMetadata(SparseAlgorithmExtension, MTPIndexShareUser):
             high_layer = next(iter(manager.mixed_precision_high_layers.values()))
             self._fill_mixed_precision_high_block_table(manager, high_layer, high_table)
 
-    @property
-    def is_ragged_verify(self) -> bool:
-        return self.ragged_verify_lens is not None
-
-    def set_gen_token_layout(
-        self,
-        *,
-        tokens_per_gen_step: int,
-        ragged_verify_lens: Optional[List[int]],
-        device_windows_mode: bool,
-    ) -> None:
-        """Take this step's generation-token layout; read by the next ``prepare``.
-
-        ``tokens_per_gen_step`` is the uniform query width of a generation
-        request at the step's runtime draft length (0: the static draft-token
-        ceiling); ``ragged_verify_lens`` the per-request widths of a ragged
-        verify step, or None; ``device_windows_mode`` whether those widths are
-        only the captured shape split, the true windows arriving on device
-        through ``apply_device_ragged_layout`` after prepare.
-        """
-        self.runtime_tokens_per_gen_step = tokens_per_gen_step
-        self.ragged_verify_lens = ragged_verify_lens
-        self.device_windows_mode = device_windows_mode
-
-    def set_ragged_verify_lens(self, ragged_verify_lens: Optional[List[int]]) -> None:
-        """Take this step's per-request verify widths (None: a uniform step)."""
-        self.ragged_verify_lens = ragged_verify_lens
-
-    def _validate_ragged_verification(self) -> None:
-        """Reject layouts whose stable buffers were not enabled at allocation."""
-        if self.ragged_verify_lens is not None and not self.enable_ragged_verification:
-            raise RuntimeError(
-                "ragged verification metadata was installed without enabling "
-                "ragged-verification buffers"
-            )
-
-    @property
-    def gen_token_stride(self) -> int:
-        stride = int(self.runtime_tokens_per_gen_step)
-        return stride if stride > 0 else 1 + self.max_draft_tokens
-
-    def update_indexer_kv_lens_2d(self, gen_kv_lens: torch.Tensor) -> torch.Tensor:
-        """Fill and return the active query-width view of persistent storage."""
-        md = self.metadata
-        width = min(self.gen_token_stride, self.kv_lens_cuda_2d.shape[1])
-        context_lens = self.kv_lens_cuda_2d[: md.num_generations, :width]
-        context_lens.copy_(gen_kv_lens.unsqueeze(-1).expand(-1, width))
-        return context_lens
-
-    def mla_scheduler_buffers(self, num_heads: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Precompute prefixes for the same rows presented to MLA generation."""
-        view = self.token_major_gen_view()
-        if view is None:
-            return None
-
-        num_ctx = self.metadata.num_contexts
-        n_gen = view.num_rows - num_ctx
-        if not self._ragged_mla_buffers_valid:
-            # RoPE presents one query token per generation row. The device
-            # extents are causal, pre-extra-KV lengths, just like the
-            # cache_seq_lens scanned by the non-precomputed kernel path.
-            torch.cumsum(
-                view.prompt_lens_cuda[num_ctx:],
-                0,
-                dtype=torch.int32,
-                out=self.ragged_mla_cu_q_rows[1 : n_gen + 1],
-            )
-            self.ragged_mla_cu_q_rows[1 : n_gen + 1] *= num_heads
-            torch.cumsum(
-                view.sequence_length[num_ctx:],
-                0,
-                dtype=torch.int32,
-                out=self.ragged_mla_cu_kv_seqlens[1 : n_gen + 1],
-            )
-            self._ragged_mla_buffers_valid = True
-        return (
-            self.ragged_mla_cu_q_rows[: n_gen + 1],
-            self.ragged_mla_cu_kv_seqlens[: n_gen + 1],
-        )
-
-    def gen_token_repeat_list(self) -> List[int]:
-        md = self.metadata
-        if not self.is_ragged_verify:
-            return [self.gen_token_stride] * md.num_generations
-        return list(self.ragged_verify_lens)
-
-    def gen_token_repeats(self, device: Optional[torch.device] = None) -> torch.Tensor:
-        return torch.tensor(self.gen_token_repeat_list(), dtype=torch.long, device=device)
-
-    def expand_per_gen_token(self, values: torch.Tensor, dim: int = 0) -> Tuple[torch.Tensor, int]:
-        """Repeat request values once per generation query token."""
-        md = self.metadata
-        repeats = self.gen_token_repeat_list()
-        num_tokens = sum(repeats)
-        if not self.is_ragged_verify:
-            return values.repeat_interleave(self.gen_token_stride, dim=dim), num_tokens
-        if values.device == self.gen_token_repeats_cuda.device:
-            repeats_dev = self.gen_token_repeats_cuda[: md.num_generations]
-        else:
-            repeats_dev = torch.tensor(repeats, dtype=torch.long, device=values.device)
-        return (
-            values.repeat_interleave(repeats_dev, dim=dim, output_size=num_tokens),
-            num_tokens,
-        )
-
-    @property
-    def use_cute_dsl_paged_mqa_logits(self) -> bool:
-        """The Indexer's decision: the config flag gated on SM100 and cutlass-dsl."""
-        md = self.metadata
-        return use_cute_dsl_paged_mqa_logits(
-            md.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
-        )
-
     def prepare(self) -> None:
         md = self.metadata
         self._invalidate_length_prefixes()
@@ -843,12 +843,11 @@ class DSAMetadata(SparseAlgorithmExtension, MTPIndexShareUser):
             dtype=torch.int,
             device="cpu",
         )
-        helix = md.find_ext(HelixMetadata)
-        if helix is not None:
+        if md.enable_helix:
             # For Helix CP, inactive ranks only attend to previously cached
             # tokens (no new token appended), while active ranks add new tokens.
             # This mirrors the kv_lens logic in TrtllmAttentionMetadata.prepare().
-            active_rank = ~helix.helix_is_inactive_rank_cpu[: md.num_seqs]
+            active_rank = ~md.helix_is_inactive_rank_cpu[: md.num_seqs]
             kv_lens = cached_token_lens.clone()
             kv_lens[active_rank] += md.seq_lens_kv[active_rank]
         else:
@@ -880,7 +879,7 @@ class DSAMetadata(SparseAlgorithmExtension, MTPIndexShareUser):
                 self.sparse_offload_state, md.request_ids, beam_width=md.beam_width
             )
 
-        if md.kv_lens_offsets is not None or (helix is not None and md._helix_spec_tokens_valid):
+        if md.kv_lens_offsets is not None or (md.enable_helix and md._helix_spec_tokens_valid):
             # The core's device KV lengths carry corrections the host values
             # above do not (the overlap scheduler's, or Helix's rank-local
             # lengths of speculative verify groups, prepared before this
@@ -2444,9 +2443,8 @@ class DSAMetadata(SparseAlgorithmExtension, MTPIndexShareUser):
             dtype=torch.int,
             device="cpu",
         )
-        helix = md.find_ext(HelixMetadata)
-        if helix is not None:
-            active_rank = ~helix.helix_is_inactive_rank_cpu[: md.num_seqs]
+        if md.enable_helix:
+            active_rank = ~md.helix_is_inactive_rank_cpu[: md.num_seqs]
             kv_lens = cached_token_lens.clone()
             kv_lens[active_rank] += md.seq_lens_kv[active_rank]
         else:
