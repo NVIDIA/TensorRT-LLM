@@ -1967,8 +1967,9 @@ class SpecWorkerBase(nn.Module, ABC):
         without the all-gather and the fp32 cast, and ``forward`` marks the
         returned logits as the shard.
         """
-        if spec_metadata is None or not (self._vocab_parallel_argmax
-                                         or self._samples_sharded_temperature):
+        if (spec_metadata is None or not self.verifies_on_target_shard
+                or not (self._vocab_parallel_argmax
+                        or self._samples_sharded_temperature)):
             # A worker without a shard path never marks the metadata.
             return logits_processor.forward(hidden_states, lm_head,
                                             attn_metadata, True)
