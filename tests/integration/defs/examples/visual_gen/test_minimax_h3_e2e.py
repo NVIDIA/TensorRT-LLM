@@ -241,6 +241,7 @@ def test_minimax_h3_released_transformer_loads_and_runs() -> None:
             [[0, 0, 0], [1, 0, 0], [2, 0, 0], [2, 0, 1], [3, 0, 0]],
             device="cuda",
         )
+        torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
         with torch.inference_mode():
             output = transformer(
