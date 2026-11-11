@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.2 target routing, driven by synthetic configs on CPU."""
 
+import sys
+from types import ModuleType
+
 import pytest
 import torch
 from transformers import PretrainedConfig
@@ -33,6 +36,15 @@ def _qualified(target) -> str:
 @pytest.fixture(autouse=True)
 def _on_sm103(monkeypatch):
     """Route as if this were a GB300, wherever the test actually runs."""
+    # Routing selects a class; these synthetic CPU configs do not construct it.
+    module = ModuleType(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+        "glm_5_2_nvfp4__sm_107__low_latency.modeling"
+    )
+    module.ModelingV2Glm52Nvfp4Sm107LowLatency = type(
+        "ModelingV2Glm52Nvfp4Sm107LowLatency", (), {"__module__": module.__name__}
+    )
+    monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: _SM103)
 

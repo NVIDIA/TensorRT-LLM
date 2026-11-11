@@ -223,7 +223,7 @@ def test_native_common_reuse_and_window_retention(make_manager, policy, reused_t
         assert source.resume(stream) and source.resize(len(tokens))
         source.commit(tokens)
         source.suspend()
-        assert source.resume(stream, is_decoding=True)
+        assert source.resume(stream)
         pages = list(source.get_base_page_indices(high_group))
         assert pages[0] >= 0 and pages[4] >= 0
         assert pages[1:4] == [kv.BAD_PAGE_INDEX] * 3
@@ -365,7 +365,7 @@ def test_cold_page_window_high_pages_cross_the_host_tier_unchanged(make_manager)
             for cache in pressure:
                 cache.close()
         assert encode.call_count > 0 and decode.call_count == 0
-        assert source.resume(stream, is_decoding=True)
+        assert source.resume(stream)
         torch.cuda.synchronize()
         assert _introspection.active_page_stats(source)[0][1] == 0
         assert decode.call_count > 0

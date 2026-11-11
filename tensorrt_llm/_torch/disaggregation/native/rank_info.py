@@ -25,6 +25,34 @@ from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 
+# Native transfer wire-protocol version. Bumped whenever the control-plane
+# frames change so a mismatched peer is rejected at registration instead of
+# failing or hanging per request. Value 3 on main: the request and KV-result
+# frames carry a per-writer report token, and main's frame set already differs
+# from release branches, so the two must not be treated as compatible.
+NATIVE_TRANSFER_PROTOCOL_VERSION = 3
+# A peer whose RankInfo carries no version field predates the versioned frames.
+_LEGACY_PROTOCOL_VERSION = 1
+
+
+def validate_protocol_version(peer_ri: "RankInfo") -> None:
+    """Reject a peer whose native transfer protocol version differs from ours.
+
+    A version mismatch means the request and result frames are not laid out the
+    same way, so no other RankInfo field can be trusted; raise before any of
+    them is used.
+    """
+    _check_protocol_version(peer_ri.protocol_version)
+
+
+def _check_protocol_version(peer_version) -> None:
+    if peer_version != NATIVE_TRANSFER_PROTOCOL_VERSION:
+        raise ValueError(
+            "PeerRegistrar: native transfer protocol version mismatch "
+            f"(local={NATIVE_TRANSFER_PROTOCOL_VERSION}, peer={peer_version}). "
+            "Context and generation servers must run the same TensorRT-LLM release."
+        )
+
 
 @dataclass
 class RankInfo:
@@ -49,6 +77,7 @@ class RankInfo:
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
     bounded_replay_on_generation: bool = False
+    protocol_version: int = NATIVE_TRANSFER_PROTOCOL_VERSION
     context_first_ownership: bool = False
     # Layers a unified KV cache manager owns for the drafter (layer specs with
     # a DRAFT owner). They ride the target's pages, so both peers must agree.
@@ -129,6 +158,10 @@ class RankInfo:
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data, strict_map_key=False)
+        # A peer that predates the versioned frames sends no version field.
+        # Check the version before building the dataclass: a peer on another
+        # version may send fields this release does not define.
+        _check_protocol_version(unpacked.get("protocol_version", _LEGACY_PROTOCOL_VERSION))
         if unpacked.get("attention") is not None:
             unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
         if unpacked.get("page_table") is not None:

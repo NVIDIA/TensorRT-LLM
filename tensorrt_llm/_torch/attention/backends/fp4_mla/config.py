@@ -137,6 +137,12 @@ _FP4_MLA_PACKED_MAX_M = 1024
 _FP4_MLA_PACKED_MAX_SPLITS = 16
 _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT = 2
 _FP4_MLA_SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"
+FP4_MLA_PACKED_WAVE_PLAN_ENV = "TRTLLM_FP4_MLA_PACKED_WAVE_PLAN"
+
+
+def _fp4_mla_packed_wave_plan_enabled() -> bool:
+    """Enable the optional wave simulation only when explicitly requested."""
+    return _env_enabled_default(FP4_MLA_PACKED_WAVE_PLAN_ENV, False)
 
 
 def _fp4_mla_packed_q_enabled() -> bool:

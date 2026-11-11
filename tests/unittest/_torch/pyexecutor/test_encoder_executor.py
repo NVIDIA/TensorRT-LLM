@@ -27,7 +27,7 @@ def test_create_rejects_more_than_one_rank() -> None:
 def test_batch_forward_hands_the_packed_batch_to_the_runner() -> None:
     expected = {"logits": torch.tensor([1.0, 2.0])}
     runner = Mock()
-    runner.forward.return_value = expected
+    runner.forward_packed.return_value = expected
     executor = object.__new__(EncoderExecutor)
     executor._runner = runner
     inputs = {
@@ -46,7 +46,7 @@ def test_batch_forward_hands_the_packed_batch_to_the_runner() -> None:
         "multi_item_part_lens",
         "token_type_ids",
     }
-    runner.forward.assert_called_once_with(
+    runner.forward_packed.assert_called_once_with(
         PackedInputs(
             input_ids=[11, 12, 21, 22, 23],
             sequence_lengths=[2, 3],

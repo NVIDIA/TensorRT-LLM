@@ -12,13 +12,21 @@ import math
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.verify_head_sample import (  # noqa: E501
-    VOCAB_SIZE,
-    VerifyHeadSampleState,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.verify_head_sample import (  # noqa: E501
-    glm_verify_head_sample as op,
-)
+from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency import (
+        native_ops,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.verify_head_sample import (  # noqa: E501
+        VOCAB_SIZE,
+        VerifyHeadSampleState,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.verify_head_sample import (  # noqa: E501
+        glm_verify_head_sample as op,
+    )
+except NoTarget as exc:
+    pytest.skip(str(exc), allow_module_level=True)
 from tensorrt_llm._torch.pyexecutor.sampler.ops import custom as shared
 from tensorrt_llm._utils import get_sm_version
 
@@ -244,7 +252,7 @@ def test_input_contract_and_mutation_schema():
     assert not state.supported(*bad)
     with pytest.raises(ValueError):
         state.sample(*bad)
-    schema = torch.ops.trtllm.glm_verify_head_sample_tokens.default._schema
+    schema = native_ops.glm_verify_head_sample_tokens.default._schema
     writes = {a.name for a in schema.arguments if a.alias_info and a.alias_info.is_write}
     assert writes == {"row_counters", "workspace"}
     with pytest.raises(RuntimeError, match="workspace"):
