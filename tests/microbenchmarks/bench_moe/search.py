@@ -30,6 +30,10 @@ except ImportError:
     from cuda import cuda
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.moe.fused_moe.activation import (
+    SwigluBiasActivation,
+    activation_constant_names,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
@@ -104,6 +108,8 @@ def _check_backend_can_implement(
     dtype_activation: torch.dtype,
     swiglu_gptoss_style: bool,
     activation_type: ActivationType,
+    expert_bias: Optional[bool] = None,
+    activation_constants: frozenset[str] = frozenset(),
 ) -> Tuple[bool, Optional[str]]:
     """Resolve backend_str to its MoE class and ask whether it can serve this.
 
@@ -132,6 +138,8 @@ def _check_backend_can_implement(
         quant=canonical_quant(quant_algo),
         dtype_act=dtype_activation,
         swiglu_gptoss_style=swiglu_gptoss_style,
+        bias=expert_bias,
+        activation_constants=activation_constants,
         # Defaults to SwiGLU when unset, which would make every upstream
         # activation gate evaluate the wrong activation.
         activation=canonical_activation(activation_type),
@@ -246,6 +254,18 @@ def is_candidate_valid(
         act_dtype,
         model.swiglu_gptoss_style,
         model.activation_type_enum,
+        expert_bias=model.expert_bias,
+        activation_constants=(
+            activation_constant_names(
+                SwigluBiasActivation(
+                    gate_sigmoid_scale=model.swiglu_alpha,
+                    linear_offset=model.swiglu_beta,
+                    clamp=model.swiglu_limit,
+                )
+            )
+            if model.swiglu_gptoss_style and model.expert_bias is False
+            else frozenset()
+        ),
     )
     if not ok:
         return False, reason

@@ -87,7 +87,7 @@ def _comm_method_name(moe) -> str:
 
 
 def _epilogue_activation_name(moe) -> str:
-    """Return the epilogue the built module actually runs: ``"situ"`` or ``"swiglu"``.
+    """Return the resolved epilogue kind, including SiTU and custom SwiGLU.
 
     The SiTU request can be dropped for reasons the spec cannot see (wrong
     backend, wrong quant, upstream fallback), so read it back rather than
@@ -101,6 +101,8 @@ def _epilogue_activation_name(moe) -> str:
     activation_type = getattr(backend, "activation_type", None)
     if activation_type is not None and ActivationType(activation_type) == ActivationType.SiTu:
         return "situ"
+    if activation_type is not None and ActivationType(activation_type) == ActivationType.SwigluBias:
+        return "swiglu_bias"
     return "swiglu"
 
 
@@ -299,6 +301,7 @@ def _build_moe_module(
 
     mc = model.to_moe_model_config()
     swiglu_gptoss_style = model.swiglu_gptoss_style
+    expert_bias = swiglu_gptoss_style if model.expert_bias is None else model.expert_bias
     activation_type = model.activation_type_enum
 
     routing_method = _create_routing_method(
@@ -339,7 +342,7 @@ def _build_moe_module(
         intermediate_size=mc.intermediate_size,
         hidden_size=mc.hidden_size,
         quant_config=quant_config,
-        bias=swiglu_gptoss_style,
+        bias=expert_bias,
         swiglu_gptoss_style=swiglu_gptoss_style,
         swiglu_alpha=model.swiglu_alpha if swiglu_gptoss_style else None,
         swiglu_beta=model.swiglu_beta if swiglu_gptoss_style else None,
@@ -374,7 +377,7 @@ def _build_moe_module(
         reduce_results=True,
         model_config=model_config,
         weight_loading_mode=weight_loading_mode,
-        bias=swiglu_gptoss_style,
+        bias=expert_bias,
         activation=activation,
     )
     moe_kwargs.update(_situ_kwargs(model, moe_backend, quant_algo))
