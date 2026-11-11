@@ -40,6 +40,11 @@ Tuning knobs (read once, at load): `TRTLLM_NEMOTRON_ULTRA_DEP16_LOWM_MAX_ROWS` a
 are the engine's (`moe_config.max_num_tokens`, `TRTLLM_FORCE_COMM_METHOD`,
 `MEGAMOE_TACTIC_AUTOTUNE`, `MEGAMOE_COMBINE_FORMAT`).
 
+Block reuse (the disaggregated context tier's prefix reuse) is admitted by routing only
+with `TRTLLM_NEMOTRON_ULTRA_DEP16_BLOCK_REUSE=1`, not gated yet: the cache manager takes
+and restores the prompt-end Mamba snapshots in the state pools, and the prefill seeds the
+scan and the conv window from the slot wherever `has_initial_states` says so.
+
 Each target is self-contained: it holds the per-layer weight views it reads,
 passes every argument to every op at the call site, and shares no code with the
 other targets.

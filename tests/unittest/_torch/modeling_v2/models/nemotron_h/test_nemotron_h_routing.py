@@ -361,6 +361,25 @@ def test_ultra_bf16_dep16_refuses_engine_choices_it_never_ran(llm_kwargs, missed
     _refused(config, missed, **llm_kwargs)
 
 
+def test_ultra_bf16_dep16_block_reuse_is_opt_in(monkeypatch):
+    """The disaggregated context tier reuses prefixes; dep16 admits block reuse only when asked
+    for, since no gate has run it, and no other target admits it at all."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.routing import (
+        BF16_DEP16_BLOCK_REUSE_ENV,
+    )
+
+    # trtllm-llmapi-launch drops MV2_, SLURM_, UCX_ and OMPI_ variables before the ranks start.
+    assert not BF16_DEP16_BLOCK_REUSE_ENV.startswith(("MV2_", "SLURM_", "UCX_", "OMPI_"))
+    reuse = dict(kv_cache_config=_kv(enable_block_reuse=True))
+    dep16 = _model_config(_ultra_bf16_config(), **_DEP16)
+    monkeypatch.delenv(BF16_DEP16_BLOCK_REUSE_ENV, raising=False)
+    _refused(dep16, BF16_DEP16_BLOCK_REUSE_ENV, **reuse)
+    monkeypatch.setenv(BF16_DEP16_BLOCK_REUSE_ENV, "1")
+    resolved = modeling_v2_resolve(dep16, _llm_args("require", **reuse))
+    assert _qualified(resolved) == _ULTRA_BF16_DEP16_TARGET
+    _refused(_model_config(_ultra_bf16_config(), **_TEP8), "enable_block_reuse", **reuse)
+
+
 @pytest.mark.parametrize("backend", ["CUTEDSL", "DEEPGEMM", "MEGAMOE_DEEPGEMM", "TRITON"])
 def test_ultra_bf16_dep16_refuses_another_moe_backend(backend):
     config = replace(_model_config(_ultra_bf16_config(), **_DEP16), moe_backend_requested=backend)
