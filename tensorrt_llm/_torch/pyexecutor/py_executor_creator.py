@@ -943,8 +943,15 @@ def _create_py_executor(
         # A model a KernelBuilder rehearsal reaches is built on dummy weights; its
         # checkpoint loads after the rehearsal below. Not with what takes the
         # weights over as they load (DWDP) or captures graphs on them (the
-        # multimodal encoders' CUDA graphs).
+        # multimodal encoders' CUDA graphs), nor where the KV cache estimation
+        # the rehearsal runs on is off: with TRTLLM_SKIP_KV_CACHE_ESTIMATION=1,
+        # context parallelism or the VANILLA backend (as in
+        # KvCacheCreator.try_prepare_estimation), or on a decode-only worker.
         mm_config = llm_args.multimodal_config
+        kv_cache_estimation_off = (skip_est or "cp_type" in mapping.cp_config
+                                   or llm_args.attn_backend == "VANILLA"
+                                   or is_decode_only(
+                                       llm_args.sparse_attention_config))
         model_engine = ModelEngine(
             model_path=checkpoint_dir,
             llm_args=llm_args,
@@ -958,7 +965,8 @@ def _create_py_executor(
             defer_checkpoint=(dwdp_manager is None
                               and dense_dwdp_manager is None
                               and (mm_config is None
-                                   or not mm_config.encoder_cuda_graph)),
+                                   or not mm_config.encoder_cuda_graph)
+                              and not kv_cache_estimation_off),
         )
 
     is_generation = model_engine.model.model_config.is_generation
