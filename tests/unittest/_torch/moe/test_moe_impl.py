@@ -721,8 +721,10 @@ def test_bf16_leaf_routes_on_the_host_while_its_top_k_is_read(monkeypatch) -> No
     [
         ({"hidden_size": 2112}, MoERejectReason.SHAPE_UNALIGNED),
         ({"top_k": 33}, MoERejectReason.ROUTING_UNSUPPORTED),
+        # The deployment below has 8 slots.
+        ({"top_k": 8}, MoERejectReason.ROUTING_UNSUPPORTED),
     ],
-    ids=["hidden_not_128_aligned", "top_k_above_32"],
+    ids=["hidden_not_128_aligned", "top_k_above_32", "top_k_not_below_slots"],
 )
 def test_bf16_leaf_declines_shapes_no_cubin_or_routing_kernel_runs(shape, reason) -> None:
     """Declined during selection, so the layer falls back instead of failing at warmup."""

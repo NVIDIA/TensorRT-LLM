@@ -162,6 +162,12 @@ class TrtllmTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
                 MoERejectReason.ROUTING_UNSUPPORTED,
                 f"{cls.__name__} routes at most top_k={cls._MAX_ROUTING_TOP_K}, got {p.top_k}",
             )
+        if p.top_k is not None and p.top_k >= d.num_slots:
+            return _reject(
+                MoERejectReason.ROUTING_UNSUPPORTED,
+                f"{cls.__name__} needs more expert slots than top_k, got "
+                f"{d.num_slots} slots for top_k={p.top_k}",
+            )
         return check_intermediate_shard_alignment(cls, p, d, weight_alignment=cls._SHAPE_ALIGNMENT)
 
     def _get_quant_method(self) -> object:
