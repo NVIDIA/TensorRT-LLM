@@ -1,28 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""L2 component tests: Wan 2.2 T2V A14B DiT block x feature.
+"""Wan 2.2 A14B component tests using real block-0 weights and first-step inputs.
 
-Each test builds one real-weight DiT block of the high-noise expert (patch
-embedding, condition embedder, RoPE, block 0 and the output head), runs it on
-the inputs of the first denoising step, and compares it with a reference built
-in the same job. The gate is the relative L2 error
-||candidate - reference|| / ||reference||. Thresholds and the experiments
-behind them are in README.md in this directory.
-
-The inputs are built in every run with the framework's Wan 2.2 A14B defaults:
-the seeded Gaussian latent the pipeline starts from, the checkpoint's UMT5
-embeddings of the prompts and the default negative prompt, and the scheduler's
-first timestep. The seed defaults to 42 and is printed with every result;
-set TLLM_VISUALGEN_L2_SEED to exercise another seed.
-
-- BF16 regression check: TRT-LLM BF16 against the HF diffusers block run in
-  FP32. Catches model-implementation bugs (layout, RoPE positions, dropped
-  branches).
-- Lossless features (torch.compile, CUDA graph, CPU offload, attention
-  backends): the feature on against the same block with it off.
-- Quantization loss budget (FP8, FP8 blockwise, NVFP4, SageAttention) against
-  TRT-LLM BF16. A budget for the intended loss, not a bug check; kernel
-  correctness is tested against dequantized references at the kernel level.
+Compare each feature with a reference computed in the same run; see README.md
+for the methodology. Inputs use seed 42 by default, matching existing Wan tests.
+TLLM_VISUALGEN_COMPONENT_SEED overrides it for reproduction or extra coverage.
 """
 
 import functools
@@ -72,7 +54,7 @@ PROMPTS = (
     "A cat sitting on a sunny windowsill watching birds outside.",  # test_wan22_t2v_pipeline.py
 )
 DEFAULT_SEED = 42
-SEED_ENV = "TLLM_VISUALGEN_L2_SEED"
+SEED_ENV = "TLLM_VISUALGEN_COMPONENT_SEED"
 WAN_TIMESTEP_SCALE = 1000.0
 DEVICE = "cuda"
 
@@ -111,7 +93,7 @@ def _rel_l2(candidate: torch.Tensor, reference: torch.Tensor) -> float:
 
 @functools.cache
 def _input_seed() -> int:
-    """Use the fixed test seed unless TLLM_VISUALGEN_L2_SEED overrides it."""
+    """Use the fixed test seed unless TLLM_VISUALGEN_COMPONENT_SEED overrides it."""
     value = os.environ.get(SEED_ENV)
     return int(value) if value is not None else DEFAULT_SEED
 
@@ -280,8 +262,6 @@ def _assert_within(scores: dict[str, float], threshold: float, label: str) -> No
     assert not failed, f"{label}: rel-L2 above {threshold}: {failed} (inputs: {seed})"
 
 
-@pytest.mark.integration
-@pytest.mark.wan_t2v
 def test_bf16_matches_hf(checkpoint, dit_inputs):
     """BF16 regression check: the TRT-LLM block against the HF diffusers block in FP32.
 
@@ -310,8 +290,6 @@ def _quant_supported(quant_algo: str) -> bool:
     return _capability() >= ((10, 0) if quant_algo == "NVFP4" else (8, 9))
 
 
-@pytest.mark.integration
-@pytest.mark.wan_t2v
 @pytest.mark.parametrize("quant_algo", sorted(QUANT_LOSS_BUDGET))
 def test_quantization_loss_budget(checkpoint, dit_inputs, quant_algo):
     """Dynamic FP8 / FP8 blockwise / NVFP4 against BF16 on the same block and inputs."""
@@ -373,8 +351,6 @@ def _assert_attention_backend(model, backend_name: str, quant_attention_config=N
         )
 
 
-@pytest.mark.integration
-@pytest.mark.wan_t2v
 def test_sage_attention_loss_budget(checkpoint, dit_inputs):
     """SageAttention against dense BF16 attention on the same TRTLLM backend."""
     if _capability() != (10, 0):
@@ -400,8 +376,6 @@ def _attention_backend_supported(backend: str) -> bool:
     return _capability() >= (10, 0) if backend in ("CUTEDSL", "FA4") else True
 
 
-@pytest.mark.integration
-@pytest.mark.wan_t2v
 @pytest.mark.parametrize("backend", ("TRTLLM", "CUTEDSL", "FA4"))
 def test_attention_backend_lossless(checkpoint, dit_inputs, backend):
     """An attention backend against the VANILLA (PyTorch SDPA) backend."""
@@ -478,8 +452,6 @@ LOSSLESS_FEATURES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.wan_t2v
 @pytest.mark.parametrize("feature", sorted(LOSSLESS_FEATURES))
 def test_lossless_feature(checkpoint, dit_inputs, feature):
     """A lossless runtime feature against the same block run eagerly on the GPU."""
