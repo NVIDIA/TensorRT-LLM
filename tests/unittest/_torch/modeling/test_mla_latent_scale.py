@@ -30,10 +30,15 @@ def _checkpoint(layernorm_rms, projection_dtype=torch.bfloat16):
     return weights
 
 
+def _scales(weights, kv=_NVFP4_KV, dsa=True, dequantized=False):
+    """Scales of a DSA model with an NVFP4 KV cache unless a case says otherwise."""
+    return _mla_latent_scales(weights, kv, uses_dsa=dsa, dequantizes_kv_b_proj=dequantized)
+
+
 def test_scales_bring_the_latent_to_unit_rms(monkeypatch):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "auto")
     weights = _checkpoint([0.004, 0.03, 0.2, 0.8])
-    scales = _mla_latent_scales(weights, _NVFP4_KV, uses_dsa=True)
+    scales = _scales(weights)
     assert scales == {
         _PREFIX.format(0): 256.0,
         _PREFIX.format(1): 32.0,
@@ -48,37 +53,43 @@ def test_scales_bring_the_latent_to_unit_rms(monkeypatch):
 def test_default_scales_nvfp4_kv_caches_of_dsa_models_only(monkeypatch):
     monkeypatch.delenv(_MLA_LATENT_SCALE_ENV, raising=False)
     weights = _checkpoint([0.004])
-    assert _mla_latent_scales(weights, _NVFP4_KV, uses_dsa=True) == {_PREFIX.format(0): 256.0}
-    assert _mla_latent_scales(weights, _NVFP4_KV, uses_dsa=False) == {}
-    assert _mla_latent_scales(weights, _FP8_KV, uses_dsa=True) == {}
-    assert _mla_latent_scales(weights, _UNQUANTIZED_KV, uses_dsa=True) == {}
+    assert _scales(weights) == {_PREFIX.format(0): 256.0}
+    assert _scales(weights, dsa=False) == {}
+    assert _scales(weights, kv=_FP8_KV) == {}
+    assert _scales(weights, kv=_UNQUANTIZED_KV) == {}
 
 
 def test_explicit_target_scales_every_quantized_kv_cache(monkeypatch):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "0.25")
     weights = _checkpoint([0.004])
-    assert _mla_latent_scales(weights, _NVFP4_KV, uses_dsa=True) == {_PREFIX.format(0): 64.0}
-    assert _mla_latent_scales(weights, _NVFP4_KV, uses_dsa=False) == {_PREFIX.format(0): 64.0}
-    assert _mla_latent_scales(weights, _FP8_KV, uses_dsa=False) == {_PREFIX.format(0): 64.0}
-    assert _mla_latent_scales(weights, _UNQUANTIZED_KV, uses_dsa=True) == {}
+    assert _scales(weights) == {_PREFIX.format(0): 64.0}
+    assert _scales(weights, dsa=False) == {_PREFIX.format(0): 64.0}
+    assert _scales(weights, kv=_FP8_KV, dsa=False) == {_PREFIX.format(0): 64.0}
+    assert _scales(weights, kv=_UNQUANTIZED_KV) == {}
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "on"])
 def test_rejects_invalid_target(monkeypatch, value):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, value)
     with pytest.raises(ValueError, match=_MLA_LATENT_SCALE_ENV):
-        _mla_latent_scales(_checkpoint([0.004]), _NVFP4_KV, uses_dsa=True)
+        _scales(_checkpoint([0.004]))
 
 
 def test_off_leaves_weights_alone(monkeypatch):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "off")
-    assert _mla_latent_scales(_checkpoint([0.004]), _NVFP4_KV, uses_dsa=True) == {}
+    assert _scales(_checkpoint([0.004])) == {}
 
 
-def test_quantized_projection_is_skipped(monkeypatch):
+def test_projection_that_stays_quantized_is_skipped(monkeypatch):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "auto")
     weights = _checkpoint([0.004], projection_dtype=torch.float8_e4m3fn)
-    assert _mla_latent_scales(weights, _NVFP4_KV, uses_dsa=True) == {}
+    assert _scales(weights) == {}
+
+
+def test_projection_dequantized_by_the_loader_is_scaled(monkeypatch):
+    monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "auto")
+    weights = _checkpoint([0.004], projection_dtype=torch.float8_e4m3fn)
+    assert _scales(weights, dequantized=True) == {_PREFIX.format(0): 256.0}
 
 
 def test_scaled_weights_keep_the_projection_output(monkeypatch):
@@ -86,7 +97,7 @@ def test_scaled_weights_keep_the_projection_output(monkeypatch):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "auto")
     weights = _checkpoint([0.004])
     name = _PREFIX.format(0)
-    scale = _mla_latent_scales(weights, _NVFP4_KV, uses_dsa=True)[name]
+    scale = _scales(weights)[name]
     gamma = weights[f"{name}.kv_a_layernorm.weight"]
     projection = weights[f"{name}.kv_b_proj.weight"]
     x = torch.randn(8, _LATENT_DIM, generator=torch.Generator().manual_seed(1))

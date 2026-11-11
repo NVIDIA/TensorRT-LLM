@@ -87,8 +87,10 @@ For models with DeepSeek sparse attention (DSA) and an NVFP4 KV cache, the PyTor
 backend therefore multiplies `kv_a_layernorm.weight` of each layer by a power of
 two that brings the latent to an RMS of about one, and divides `kv_b_proj` by the
 same factor while loading the weights. The model output is unchanged; only the
-values the cache stores move into the range the quantized formats resolve. Layers
-whose `kv_b_proj` is itself quantized are left as they are. Dense MLA is not
+values the cache stores move into the range the quantized formats resolve. This
+needs a floating-point `kv_b_proj`: a checkpoint whose FP8 `kv_b_proj` is
+dequantized while loading (the DeepSeek FP8 checkpoints) is scaled, and layers
+whose `kv_b_proj` stays quantized in the model are left as they are. Dense MLA is not
 scaled by default: it multiplies the NVFP4 latent as block-scaled operands, which
 a power-of-two scale leaves unchanged.
 
