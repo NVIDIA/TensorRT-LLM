@@ -4,9 +4,8 @@
 """The serve gate: ``trtllm-serve`` starts the deployment's target and answers over HTTP.
 
 The gate starts ``trtllm-serve <checkpoint>`` on the tree under test with the
-accuracy gate's LLM-API options, at the member's topology, waits for
-``/health`` and sends one ``/v1/completions`` request, then the unit's boot
-workload as far as the boot gate judges it. It passes when the server became
+deployment's options, waits for ``/health`` and sends one ``/v1/completions``
+request, then the deployment's boot workload as far as the boot gate judges it. It passes when the server became
 healthy, every answer is HTTP 200 with non-empty text, and the answers hold
 the boot workload's keywords. The job is ``serve_driver.py``, run under the
 tree's interpreter. Owed only when ``accuracy.serve.enabled`` says so.

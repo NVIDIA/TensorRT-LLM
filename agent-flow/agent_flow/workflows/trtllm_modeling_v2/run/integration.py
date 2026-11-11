@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """One worktree per task, integrated into the checkout when the task finishes.
 
-A task that changes the tree (a kernel entry, a unit, a variant, a fix) works
+A task that changes the tree (a kernel entry, a deployment, a fix) works
 on its own branch in its own worktree, cut from the checkout's head when the
 task starts. When its worker finishes, the branch's commits are audited
 against the run's commit rules (``infra/git.py``): who made them, how they are

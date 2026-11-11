@@ -104,9 +104,9 @@ trtllm_repo_path: /path/to/TensorRT-LLM
 #                              # cached tokens
 #   # --max_seq_len, --max_batch_size (a global total: an attention-DP rank gets its share),
 #   # --max_num_tokens, --kv_cache_fraction, --kv_cache_dtype, --tokens_per_block,
-#   # --mamba_ssm_cache_dtype, --attention_backend, --moe_backend, --trust_remote_code,
-#   # --temperature, --top_k, --top_p, --apply_chat_template. Anything else goes in an
-#   # options file. A setting stated here and in `llm_api_options` with two values is refused.
+#   # --mamba_ssm_cache_dtype, --attention_backend, --moe_backend, --trust_remote_code.
+#   # Anything else goes in an options file; a check samples greedily, by its own protocol.
+#   # A setting stated here and in `llm_api_options` with two values is refused.
 #   extra_flags: [--max_seq_len=9216, --max_batch_size=64, --kv_cache_fraction=0.7]
 
 # ------------------------------------------------------------- environment

@@ -870,7 +870,7 @@ class Pipeline:
         return (
             f"Workspace: {self.workspace}\n\n"
             f"Read `{w.task_path}` for the run's spec: the checkpoint, the "
-            f"architecture, the parallel segment, the features and the accuracy anchor.\n\n"
+            f"architecture, the deployments it brings up and the accuracy anchor.\n\n"
             f"{w._surface_block}\n"
             f"{w._prior_art_block}\n"
             f"{capture_lists_block(w.task_data)}\n"

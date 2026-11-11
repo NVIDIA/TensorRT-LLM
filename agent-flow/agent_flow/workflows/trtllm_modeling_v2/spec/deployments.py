@@ -177,11 +177,6 @@ class Deployment:
     tests: tuple[str, ...] = ()
     inputs: tuple[str, ...] = ("text",)
     benchmarks: tuple[Benchmark, ...] = ()
-    #: Request settings a shorthand spec's runtime flags state (``--temperature``, ...) and
-    #: whether its prompts go through the chat template. A deployment a spec states itself
-    #: has neither: its checks sample greedily, as the check's own protocol says.
-    sampling: Mapping[str, Any] = field(default_factory=dict)
-    chat_template: bool = False
 
     @property
     def kind(self) -> str:

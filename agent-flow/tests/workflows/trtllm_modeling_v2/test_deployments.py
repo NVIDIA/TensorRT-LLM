@@ -717,6 +717,9 @@ def test_what_the_table_cannot_state_is_one_line_and_a_missing_key_says_its_fix(
     assert "state deployments: 'members' lists members for ['mtp']" in refused(per_feature)
     flag = shorthand(spec, runtime={"extra_flags": ["--some_new_flag=1"]})
     assert "state deployments: runtime.extra_flags has --some_new_flag" in refused(flag)
+    # How a check samples is its protocol, not a setting of the spec.
+    sampled = shorthand(spec, runtime={"extra_flags": ["--temperature=0.7"]})
+    assert "runtime.extra_flags has --temperature" in refused(sampled)
     twice = shorthand(
         spec,
         runtime={"extra_flags": ["--kv_cache_fraction=0.7"]},

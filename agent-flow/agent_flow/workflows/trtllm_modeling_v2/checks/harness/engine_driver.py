@@ -125,17 +125,6 @@ def run_requests(llm: Any, base: Any, spec: Mapping[str, Any]) -> None:
         raise ValueError("dataset was not normalized before engine launch")
     requests = spec.get("requests") or []
     inputs = [make_input(llm, r, model=str(spec["llm"]["model"])) for r in requests]
-    if spec.get("apply_chat_template"):
-        if any(r.get("images") for r in requests):
-            raise ValueError("apply_chat_template requires text requests; multimodal uses render")
-        inputs = [
-            llm.tokenizer.apply_chat_template(
-                [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
-            )
-            if isinstance(p, str)
-            else p
-            for p in inputs
-        ]
     concurrency = max(1, int(spec.get("concurrency", 1)))
     for start in range(0, len(requests), concurrency):
         window = requests[start : start + concurrency]

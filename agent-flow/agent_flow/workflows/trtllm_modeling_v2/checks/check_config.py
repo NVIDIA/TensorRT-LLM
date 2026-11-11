@@ -10,8 +10,7 @@ from typing import Any, Mapping
 
 from ..spec.deployments import Deployment
 
-#: How every check samples unless a shorthand spec's runtime flags say otherwise: the
-#: check's own protocol, never an option of the engine.
+#: How every check samples: the check's own protocol, never an option of the engine.
 GREEDY_SAMPLING: dict[str, Any] = {"temperature": 0.0, "top_k": 1}
 
 
@@ -27,13 +26,12 @@ def check_configuration(
     server = deployment.server or deployment.ctx
     options = copy.deepcopy(dict(server.options))
     options["model"] = str(task_data["checkpoint_path"])
-    sampling = {**GREEDY_SAMPLING, **deployment.sampling}
-    sampling.setdefault("max_tokens", int(max_tokens))
+    sampling = {**GREEDY_SAMPLING, "max_tokens": int(max_tokens)}
     width = int(options.get("max_beam_width", 1))
     if width > 1:
         sampling.setdefault("n", width)
         sampling["use_beam_search"] = True
-    return {"llm": options, "sampling": sampling, "apply_chat_template": deployment.chat_template}
+    return {"llm": options, "sampling": sampling}
 
 
 __all__ = ["GREEDY_SAMPLING", "check_configuration"]
