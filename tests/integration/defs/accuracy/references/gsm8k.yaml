@@ -192,9 +192,10 @@ deepseek-ai/DeepSeek-V4-Pro:
   - quant_algo: MIXED_PRECISION
     spec_dec_algo: DSpark
     accuracy: 95.9
-  # The same NVFP4 export without a drafter, MTP on its MXFP4 MTP block, DEP4
-  # on MegaMoE CuTe DSL. The reference is the DSpark row's value; this
-  # configuration scored 96.0-96.4 on GB300.
+  # nvidia/DeepSeek-V4-Pro-NVFP4 (a different export from the DSpark one above:
+  # no drafter, MXFP4 MTP block) with MTP, DEP4 on MegaMoE CuTe DSL, the MTP
+  # layer on TRTLLM-Gen. The reference is the DSpark row's value; one GB300
+  # run of TestDeepSeekV4Pro::test_gsm8k_dep4_megamoe_cutedsl_mtp scored 95.94.
   - quant_algo: MIXED_PRECISION
     spec_dec_algo: MTP
     accuracy: 95.9

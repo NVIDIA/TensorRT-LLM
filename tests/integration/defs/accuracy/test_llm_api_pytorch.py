@@ -2417,13 +2417,58 @@ _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
     "or trailing zeros.")
 
 
+def _gsm8k_dep4_megamoe_cutedsl(model_name, model_path, extra_evaluator_kwargs,
+                                spec_config, acceptance_key):
+    """Run GSM8K on a DeepSeek-V4-Pro NVFP4 export, MegaMoE CuTe DSL DEP4.
+
+    One node. DEP4 doubles the per-rank model footprint relative to DEP8, so
+    the serving and the CUDA-graph batch are bounded to what fits without a
+    warmup OOM. The acceptance length is gated as well as the score: a drafter
+    regression costs speed only, which the score cannot see.
+    """
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                    free_gpu_memory_fraction=0.5)
+    # Build the evaluator (dataset and harness) before the LLM claims the GPUs.
+    task = GSM8K(model_name)
+    evaluator = task.create_evaluator(GSM8K.NUM_SAMPLES, extra_evaluator_kwargs)
+    with LLM(model_path,
+             attn_backend="TRTLLM",
+             tensor_parallel_size=4,
+             moe_expert_parallel_size=4,
+             enable_attention_dp=True,
+             moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL"),
+             max_batch_size=64,
+             cuda_graph_config=CudaGraphConfig(max_batch_size=64),
+             max_seq_len=4096,
+             max_num_tokens=4096,
+             kv_cache_config=kv_cache_config,
+             enable_chunked_prefill=False,
+             disable_overlap_scheduler=True,
+             custom_tokenizer="deepseek_v4",
+             max_stats_len=-1,
+             enable_iter_perf_stats=True,
+             speculative_config=spec_config) as llm:
+        acc_params = task.get_hypothesis_testing_params(
+            dtype=llm.args.dtype,
+            quant_algo=llm.args.quant_config.quant_algo,
+            kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+            spec_dec_algo=llm.args.speculative_config.decoding_type)
+        assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+        with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+            task.evaluate(llm, prepared_evaluator=evaluator)
+        acceptance_length = compute_acceptance_length(llm)
+        print(f"[AL] {acceptance_key} "
+              f"acceptance_length = {acceptance_length:.3f}")
+        assert_acceptance_length(acceptance_key, acceptance_length)
+
+
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(140000)
 @skip_pre_blackwell
 class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Pro"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Pro"
-    # NVFP4 export (nvidia/deepseek-v4-pro-nvfp4): NVFP4 routed experts in the
+    # NVFP4 export (nvidia/DeepSeek-V4-Pro-NVFP4): NVFP4 routed experts in the
     # body, the MTP block's experts left in MXFP4.
     NVFP4_MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Pro-nvfp4"
     EXTRA_EVALUATOR_KWARGS = dict(
@@ -2454,47 +2499,15 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_gsm8k_dep4_megamoe_cutedsl_mtp(self):
-        # The body runs on MegaMoE CuTe DSL; the MTP layer's MXFP4 experts are
-        # a format that backend cannot serve, so that layer runs on TRTLLM-Gen.
-        # Same serving bounds as the DSpark DEP4 test of this export.
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        free_gpu_memory_fraction=0.5)
-        task = GSM8K(self.MODEL_NAME)
-        evaluator = task.create_evaluator(GSM8K.NUM_SAMPLES,
-                                          self.EXTRA_EVALUATOR_KWARGS)
-        with LLM(self.NVFP4_MODEL_PATH,
-                 attn_backend="TRTLLM",
-                 tensor_parallel_size=4,
-                 moe_expert_parallel_size=4,
-                 enable_attention_dp=True,
-                 moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL"),
-                 max_batch_size=64,
-                 cuda_graph_config=CudaGraphConfig(max_batch_size=64),
-                 max_seq_len=4096,
-                 max_num_tokens=4096,
-                 kv_cache_config=kv_cache_config,
-                 enable_chunked_prefill=False,
-                 disable_overlap_scheduler=True,
-                 custom_tokenizer="deepseek_v4",
-                 max_stats_len=-1,
-                 enable_iter_perf_stats=True,
-                 speculative_config=MTPDecodingConfig(max_draft_len=3)) as llm:
-            acc_params = task.get_hypothesis_testing_params(
-                dtype=llm.args.dtype,
-                quant_algo=llm.args.quant_config.quant_algo,
-                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
-                spec_dec_algo=llm.args.speculative_config.decoding_type)
-            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
-            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
-                task.evaluate(llm, prepared_evaluator=evaluator)
-            # Gate on acceptance as well as on the score: drafts from wrongly
-            # loaded MTP experts cost speed only, which the score cannot see.
-            acceptance_length = compute_acceptance_length(llm)
-            print(f"[AL] test_gsm8k_dep4_megamoe_cutedsl_mtp "
-                  f"acceptance_length = {acceptance_length:.3f}")
-            assert_acceptance_length(
-                "TestDeepSeekV4Pro::test_gsm8k_dep4_megamoe_cutedsl_mtp",
-                acceptance_length)
+        # The body runs on MegaMoE CuTe DSL. The MTP block's experts are MXFP4,
+        # which that backend cannot serve; moe_backend="AUTO" gives the MTP
+        # layer its own backend, TRTLLM-Gen on Blackwell. Serving bounds of
+        # TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl (a different
+        # checkpoint, whose MTP block is NVFP4).
+        _gsm8k_dep4_megamoe_cutedsl(
+            self.MODEL_NAME, self.NVFP4_MODEL_PATH, self.EXTRA_EVALUATOR_KWARGS,
+            MTPDecodingConfig(max_draft_len=3, moe_backend="AUTO"),
+            "TestDeepSeekV4Pro::test_gsm8k_dep4_megamoe_cutedsl_mtp")
 
 
 @pytest.mark.timeout(14400)
@@ -2556,53 +2569,12 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_gsm8k_dep4_megamoe_cutedsl(self):
-        # MegaMoE CuTe DSL is the backend that serves the NVFP4 export. DEP4
-        # doubles the per-rank model footprint relative to DEP8, so bound both
-        # the serving and the CUDA-graph batch to what fits without a warmup
-        # OOM.
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        free_gpu_memory_fraction=0.5)
-        spec_config = DSparkDecodingConfig(
-            max_draft_len=5, speculative_model=self.NVFP4_MODEL_PATH)
-        # Build the evaluator (dataset and harness) before the LLM claims the
-        # GPUs.
-        task = GSM8K(self.MODEL_NAME)
-        evaluator = task.create_evaluator(GSM8K.NUM_SAMPLES,
-                                          self.EXTRA_EVALUATOR_KWARGS)
-        with LLM(self.NVFP4_MODEL_PATH,
-                 attn_backend="TRTLLM",
-                 tensor_parallel_size=4,
-                 moe_expert_parallel_size=4,
-                 enable_attention_dp=True,
-                 moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL"),
-                 max_batch_size=64,
-                 cuda_graph_config=CudaGraphConfig(max_batch_size=64),
-                 max_seq_len=4096,
-                 max_num_tokens=4096,
-                 kv_cache_config=kv_cache_config,
-                 enable_chunked_prefill=False,
-                 disable_overlap_scheduler=True,
-                 custom_tokenizer="deepseek_v4",
-                 max_stats_len=-1,
-                 enable_iter_perf_stats=True,
-                 speculative_config=spec_config) as llm:
-            acc_params = task.get_hypothesis_testing_params(
-                dtype=llm.args.dtype,
-                quant_algo=llm.args.quant_config.quant_algo,
-                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
-                spec_dec_algo=llm.args.speculative_config.decoding_type)
-            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
-            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
-                task.evaluate(llm, prepared_evaluator=evaluator)
-            # Gate on acceptance as well as on the score: a drafter regression
-            # on this backend costs speed only, which the accuracy gate
-            # cannot see.
-            acceptance_length = compute_acceptance_length(llm)
-            print(f"[AL] test_gsm8k_dep4_megamoe_cutedsl "
-                  f"acceptance_length = {acceptance_length:.3f}")
-            assert_acceptance_length(
-                "TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl",
-                acceptance_length)
+        # MegaMoE CuTe DSL is the backend that serves the NVFP4 export.
+        _gsm8k_dep4_megamoe_cutedsl(
+            self.MODEL_NAME, self.NVFP4_MODEL_PATH, self.EXTRA_EVALUATOR_KWARGS,
+            DSparkDecodingConfig(max_draft_len=5,
+                                 speculative_model=self.NVFP4_MODEL_PATH),
+            "TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl")
 
 
 @pytest.mark.timeout(14400)

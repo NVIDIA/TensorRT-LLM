@@ -403,17 +403,9 @@ def build_moe_deployment(
 # against. They fail with the rejection trail instead.
 NO_FALLBACK_BACKENDS: FrozenSet[str] = frozenset({"VANILLA"})
 
-# Families a request tries, in this order, after its own family and before the
-# Cutlass fallback. MegaMoE CuteDSL serves NVFP4 only, so a layer stored in
-# another format -- such as the MXFP4 MTP experts of an NVFP4 DeepSeek-V4
-# checkpoint -- runs on TRTLLM-Gen.
-DEGRADATION_FAMILIES: Dict[str, Tuple[str, ...]] = {
-    "MEGAMOE_CUTEDSL": ("TRTLLM",),
-}
-
 
 def _candidates_for(backend: str) -> List[MoEImplClass]:
-    """Requested family in priority order, then its degradation families, then fallback."""
+    """Requested family in priority order, then fallback."""
     normalized = backend.upper()
     if normalized == "WIDEEP":
         raise ValueError(WIDEEP_DEPRECATION_MESSAGE)
@@ -421,13 +413,6 @@ def _candidates_for(backend: str) -> List[MoEImplClass]:
     if family is None:
         raise ValueError(f"Unsupported moe backend: {backend}")
     candidates = [impl_cls for impl_cls in IMPL_PRIORITY if impl_cls in family]
-    for degradation_family in DEGRADATION_FAMILIES.get(normalized, ()):
-        members = BACKEND_FAMILY[degradation_family]
-        candidates.extend(
-            impl_cls
-            for impl_cls in IMPL_PRIORITY
-            if impl_cls in members and impl_cls not in candidates
-        )
     # A request for CUTLASS already holds every fallback leaf.
     if family.isdisjoint(FALLBACK_IMPLS) and normalized not in NO_FALLBACK_BACKENDS:
         candidates.extend(FALLBACK_IMPLS)

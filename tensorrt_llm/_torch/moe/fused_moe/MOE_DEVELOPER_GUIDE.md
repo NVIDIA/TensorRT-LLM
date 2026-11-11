@@ -629,12 +629,14 @@ serve the layer is turned down and a substitute runs — production depends on
 this, because an unquantized MTP draft layer in a MIXED_PRECISION checkpoint
 must not take down a model whose other layers are NVFP4.
 
-The substitutes are asked in a fixed order: the requested family's own leaves,
-then the families `DEGRADATION_FAMILIES` names for the request, then the
-Cutlass leaves (`FALLBACK_IMPLS`). `MEGAMOE_CUTEDSL` names `TRTLLM`, so a layer
-the NVFP4-only MegaMoE kernel cannot serve, such as the MXFP4 MTP experts of an
-NVFP4 DeepSeek-V4 checkpoint, runs on the TRTLLM-Gen leaf for its format and
-reaches Cutlass only when TRTLLM-Gen declines it too.
+The substitutes are the Cutlass leaves (`FALLBACK_IMPLS`). A layer that should
+run on another family instead asks for it: the embedded MTP layers of a model
+take their own backend from `speculative_config.moe_backend`. For example, the
+MTP block of an NVFP4 DeepSeek-V4 checkpoint keeps MXFP4 experts, which the
+NVFP4-only `MEGAMOE_CUTEDSL` kernel cannot serve; with `moe_backend: AUTO`,
+which resolves to `TRTLLM` for DeepSeek-V4 on SM100-SM119, that layer runs on
+the TRTLLM-Gen leaf for its format while the other layers stay on MegaMoE.
+Without it, the layer falls back to Cutlass.
 
 What is not allowed is doing it quietly. Every resolution returns a
 `MoEResolutionReport` naming the winner, every rejected candidate, its
