@@ -23,17 +23,25 @@ P is 0, all when R >= P or P does not divide T, else the leading T / P * R.
 
 That rule holds for a launch over all rows of the forward. A MoE layer that splits a
 forward into chunks launches over parts of it, so those launches read a word that keeps
-every row (:func:`part_of_the_forward`).
+every row (:func:`part_of_the_forward`). Under Helix CP with attention DP the attention
+output is reduce-scattered across the CP group and each CP rank's MoE runs on its own
+slice of the forward's rows, so no launch covers the forward: the engine's word is not
+registered there (:func:`engine_word`) and every launch keeps every row.
 """
+
+from __future__ import annotations
 
 import contextlib
 import threading
-from typing import Dict, Iterator, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, Iterator, Optional, Sequence
 
 import torch
 
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping
 
 REQUEST_BITS = 16
 MAX_REQUESTS = (1 << REQUEST_BITS) - 1
@@ -127,6 +135,27 @@ class LiveRowWord:
             if error != driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(f"cuStreamWriteValue32 of the live-row word failed: {error!r}")
         self._value = value
+
+
+def forward_rows_split_across_cp_ranks(mapping: Mapping) -> bool:
+    """Whether each CP rank's token-indexed modules (MoE) run on a slice of the forward's rows.
+
+    The condition under which the attention output projection reduce-scatters across the
+    CP group (``_helix_cp_output_projection`` in ``attention/attention.py``).
+    """
+    return mapping.has_cp_helix() and mapping.enable_attention_dp
+
+
+def engine_word(model: torch.nn.Module, mapping: Mapping) -> LiveRowWord:
+    """A new engine's word, registered in ``model.extra_attrs`` for the kernels to read.
+
+    Where the forward's rows are split across CP ranks the word is not registered, so every
+    launch reads ``all_rows_word`` and the engine's writes never reach a kernel.
+    """
+    word = LiveRowWord()
+    if not forward_rows_split_across_cp_ranks(mapping):
+        model.extra_attrs[MODEL_EXTRA_ATTR] = word
+    return word
 
 
 _ALL_ROWS_WORDS: Dict[Optional[int], LiveRowWord] = {}

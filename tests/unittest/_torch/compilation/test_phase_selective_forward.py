@@ -166,6 +166,7 @@ def test_decoder_runner_validates_compiled_body_at_initialization(
 ) -> None:
     model = object.__new__(DecoderModelForCausalLM)
     torch.nn.Module.__init__(model)
+    model.extra_attrs = {}
     wrapper, _, _ = _create_prefill_compiled_model()
     model.model = wrapper if has_wrapper else torch.nn.Identity()
     config = SimpleNamespace(

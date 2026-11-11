@@ -1227,6 +1227,12 @@ class FusedCommMoEScheduler(MoEScheduler):
     9. No multi-stream chunk overlap.
     10. Reject a backend declaring ``input_requirement.run_moe_reuses_buffers``:
         chunk outputs are kept, never copied, so such a backend would alias.
+    11. A launch that reads the forward's live-row word (``moe/live_rows.py``;
+        only the SM100/SM103 MegaMoE CuteDSL kernel does) must cover the rank's
+        whole forward, rows request-major with padding last: launches over one
+        of several chunks run inside ``live_rows.part_of_the_forward()``, and
+        under Helix CP + attention DP the engine registers no word. EPLB
+        statistics still count the dropped rows.
 
     ``repeat_idx`` advancement is done by ``ConfigurableMoE.forward_impl``
     after this scheduler returns. The scheduler must not rotate

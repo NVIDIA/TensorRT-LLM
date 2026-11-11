@@ -36,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.utils import (
     get_model_extra_attrs,
     is_torch_compiling,
+    model_extra_attrs,
     set_per_request_prefill_cuda_graph_flag,
     torch_compiling,
 )
@@ -54,6 +55,7 @@ def _make_decoder_runner(
     graph_key: KeyType | None,
     runner_enabled: bool = True,
     private_decoder: bool = False,
+    mapping: Mapping | None = None,
     **config_changes: Any,
 ) -> tuple[DecoderRunner, Mock, Mock, Mock, dict[str, object]]:
     config = decoder_config(
@@ -99,7 +101,7 @@ def _make_decoder_runner(
             model,
             config,
             model_caller=Mock(),
-            mapping=Mapping(),
+            mapping=mapping if mapping is not None else Mapping(),
             dist=None,
             moe_load_balancer=None,
             sparse_attention_config=None,
@@ -1010,3 +1012,88 @@ def test_decoder_runner_forward_enters_model_context() -> None:
 
     engine._forward_decoder.assert_called_once_with(inputs, resources, is_dummy=False)
     assert get_model_extra_attrs() is None
+
+
+# A padded decode of one-model MTP with three draft tokens: 8 requests of 4 rows each, the
+# last 3 of them CUDA graph padding, so the forward's word is R/P = 5/8 over 32 rows.
+_LIVE_REAL, _LIVE_REQUESTS, _LIVE_ROWS_PER_REQUEST = 5, 8, 4
+
+
+def _padded_decode(
+    mapping: Mapping | None = None,
+) -> tuple[DecoderRunner, Mock, Mock, ScheduledInputs]:
+    """A runner whose graph batch pads ``_LIVE_REAL`` generation requests to ``_LIVE_REQUESTS``."""
+    key = KeyType(batch_size=_LIVE_REQUESTS, draft_len=0)
+    engine, backend, resources, _, _ = _make_decoder_runner(key, mapping=mapping)
+    requests = [_make_request_stub(i) for i in range(_LIVE_REQUESTS)]
+    for request in requests[_LIVE_REAL:]:
+        request.is_dummy = True
+    padded = ScheduledRequests()
+    padded.generation_requests = requests
+    backend.pad_batch.side_effect = lambda batch, *_args: nullcontext(padded)
+    graph_metadata = backend.maybe_get_cuda_graph.return_value[0]
+    graph_metadata.num_contexts = 0
+    graph_metadata.seq_lens = torch.full(
+        (_LIVE_REQUESTS,), _LIVE_ROWS_PER_REQUEST, dtype=torch.int32
+    )
+    batch = ScheduledRequests()
+    batch.generation_requests = requests[:_LIVE_REAL]
+    return engine, backend, resources, ScheduledInputs(batch=batch)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_dummy", [False, True])
+def test_decoder_writes_the_live_row_word_before_the_graph_runs(is_dummy: bool) -> None:
+    """The padded decode writes R/P once, before the replay; a dummy forward keeps every row."""
+    from tensorrt_llm._torch.moe import live_rows
+
+    engine, backend, resources, inputs = _padded_decode()
+    word = Mock()
+    engine._live_rows = word
+    order = Mock()
+    order.attach_mock(word.write, "write")
+    order.attach_mock(backend.replay, "replay")
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs.torch.cuda.Event",
+        return_value=Mock(),
+    ):
+        engine.forward(inputs, resource_manager=resources, is_dummy=is_dummy)
+    expected = live_rows.ALL_ROWS if is_dummy else live_rows.encode(_LIVE_REAL, _LIVE_REQUESTS)
+    word.write.assert_called_once_with(expected)
+    assert [call[0] for call in order.mock_calls][:2] == ["write", "replay"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("helix", [False, True])
+def test_live_row_word_keeps_every_row_of_a_helix_cp_slice(helix: bool) -> None:
+    """Helix CP + attention DP: each CP rank's MoE runs on its slice of the forward's rows."""
+    from tensorrt_llm._torch.moe import live_rows
+    from tensorrt_llm.mapping import CpType
+
+    if helix:
+        mapping = Mapping(
+            world_size=2,
+            tp_size=1,
+            cp_size=2,
+            cp_config={"cp_type": CpType.HELIX},
+            enable_attention_dp=True,
+        )
+    else:
+        mapping = Mapping(world_size=2, tp_size=2, enable_attention_dp=True)
+    engine, *_ = _make_decoder_runner(None, mapping=mapping)
+    # What the runner writes for the padded decode above.
+    engine._live_rows.write(live_rows.encode(_LIVE_REAL, _LIVE_REQUESTS))
+    with (
+        patch.object(live_rows.LiveRowWord, "tensor", lambda word, device: word),
+        model_extra_attrs(engine._model.extra_attrs),
+    ):
+        word = live_rows.current_word("cuda:0")._value
+    rows = _LIVE_REQUESTS * _LIVE_ROWS_PER_REQUEST
+    if helix:
+        # CP rank 0 launches over rows 0-15 (requests 0-3, all real); read with the forward's
+        # word it would keep 16 / 8 * 5 = 10 of them.
+        assert word == live_rows.ALL_ROWS
+    else:
+        # A launch over the whole forward keeps the 20 rows of the 5 real requests.
+        assert word == live_rows.encode(_LIVE_REAL, _LIVE_REQUESTS)
+        assert rows // _LIVE_REQUESTS * _LIVE_REAL == 20
