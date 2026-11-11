@@ -254,6 +254,7 @@ class KDAReplayRegion:
             disable_overlap_scheduler=kwargs.get("disable_overlap_scheduler", False),
             num_reserved_index_slots=reserved,
             has_guard_page=_read_guard_page_setting()[1] is not None,
+            gen_preemption_headroom=kwargs.get("gen_preemption_headroom", 0),
         )
         return KDAReplayState.replay_slot_count(capacity, max_util_for_resume) * bytes_per_slot
 

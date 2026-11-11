@@ -36,11 +36,21 @@ from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...speculative import SpecMetadata
-from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
-from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
+from ...utils import (
+    EventType,
+    Fp8PerTokenQuantizedTensor,
+    get_model_extra_attrs,
+    is_gdn_replay_enabled,
+    is_torch_compiling,
+)
+from ..linear import FP8QDQLinearMethod, FP8RowwiseLinearMethod, Linear, TensorParallelMode
 from ..low_m_gemm import low_m_gemm_dispatcher
 from ..low_m_mma_gemm import conv_supported, low_m_mma_gemm, warp_mma_supported
 from ..multi_stream_utils import maybe_execute_in_parallel_deferred_join
+from ..rms_norm_fp8_per_token import (
+    rms_norm_gated_fp8_per_token,
+    rms_norm_gated_fp8_per_token_eligible,
+)
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
 from .fuse_elementwise_ops import (
@@ -563,6 +573,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.Attention]}
         self.aux_stream = aux_stream
+        self._out_proj_fp8_per_token = False
 
         self.fused_verify = (
             fused_verify
@@ -580,6 +591,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def cache_derived_state(self) -> None:
         """Attach downstream static quantization state after loading weights."""
         self.norm.fp8_scale = None
+        # The gated norm emits per-token FP8 directly for an FP8 rowwise out_proj.
+        self._out_proj_fp8_per_token = isinstance(
+            self.out_proj.quant_method, FP8RowwiseLinearMethod
+        )
         if isinstance(self.out_proj.quant_method, FP8QDQLinearMethod):
             scale = self.out_proj.quant_method.get_static_input_scale(self.out_proj)
             # detach() strips the Parameter wrapper so nn.Module.__setattr__
@@ -663,7 +678,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
     def _compute_tokenwise_inputs(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | Fp8PerTokenQuantizedTensor,
         h_fp8: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.cuda.Event]]:
         """Project to (mixed_qkv, z, a, b, ba_ready).
@@ -685,8 +700,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             def _compute_projected_states_qkvz():
                 return self.in_proj_qkvz(qkvz_input)
 
+            # The unquantized in_proj_ba reads the BF16 copy of a pre-quantized input.
+            hidden_states_ba = hidden_states
+            if isinstance(hidden_states, Fp8PerTokenQuantizedTensor):
+                hidden_states_ba = hidden_states.unquantized_hidden_states
+
             def _compute_projected_states_ba():
-                return self.in_proj_ba(hidden_states)
+                return self.in_proj_ba(hidden_states_ba)
 
             projected_states_qkvz, projected_states_ba, ba_ready = (
                 maybe_execute_in_parallel_deferred_join(
@@ -725,8 +745,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # output whose (heads, head_dim) block is contiguous per token; the
         # gated norm reads it through its token stride instead of packing a
         # copy.
+        attn_out = attn_out.reshape(-1, self.head_v_dim)
+        if self._out_proj_fp8_per_token and (rms_norm_gated_fp8_per_token_eligible(attn_out, z)):
+            fp8_out, scale = rms_norm_gated_fp8_per_token(
+                attn_out, z, self.norm.weight, self.norm.eps
+            )
+            return self.out_proj(
+                Fp8PerTokenQuantizedTensor(fp8_out, scale), all_reduce_params=all_reduce_params
+            )
         attn_out = rms_norm_gated_token_major(
-            attn_out.reshape(-1, self.head_v_dim),
+            attn_out,
             z,
             self.norm.weight,
             self.norm.eps,

@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
     PrimsTSSparseMlaFmha,
     get_prims_ts_toolchain_unsupported_reason,
 )
+from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 from tensorrt_llm._utils import get_sm_version
 
 from ..test_sparse_mla_forward import HAS_FLASH_MLA
@@ -217,6 +218,50 @@ def test_plans_are_shared_through_the_metadata_cache(monkeypatch) -> None:
     assert len(planned) == 3 and len(cache) == 3
 
 
+@pytest.mark.parametrize(
+    "compress_ratio, offload, has_arena, rejected",
+    [
+        (4, True, True, False),
+        (4, True, False, True),
+        (4, False, False, False),
+        (128, True, False, False),
+    ],
+)
+def test_offloaded_compressed_rows_need_their_arena(
+    compress_ratio, offload, has_arena, rejected
+) -> None:
+    """An offloaded ratio-4 layer is served from its sparse cache arena, so it is
+    rejected only when the offload state has no arena for it. Other layers keep
+    their compress pool whether or not offload is on."""
+
+    class _Attn:
+        pass
+
+    attn = _Attn()
+    attn.compress_ratio = compress_ratio
+    attn.layer_idx = 3
+    library = PrimsTSSparseMlaFmha(attn)
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(swa_pool_ptr=0, get_sparse_compress_buffers=None),
+        sparse_offload_state=(
+            SimpleNamespace(layers={3: object()} if has_arena else {}) if offload else None
+        ),
+        # Rejected by the next check, so a layer that passes the arena check stops there.
+        beam_width=2,
+    )
+    reason = library._unsupported_reason(
+        SimpleNamespace(device=torch.device("cuda"), ndim=2),
+        None,
+        None,
+        metadata,
+        SimpleNamespace(attention_input_type=AttentionInputType.generation_only),
+    )
+    if rejected:
+        assert reason == "the offloaded layer has no sparse cache arena."
+    else:
+        assert reason == "beam search is not supported."
+
+
 @pytest.mark.parametrize("offload, heuristic_topk", [(True, False), (False, True)])
 def test_plan_keeps_the_hole_checking_path(monkeypatch, offload, heuristic_topk) -> None:
     """Offload (pages masked to -1 in place) and the heuristic GVR top-k (pads from its
@@ -287,6 +332,144 @@ def _two_source_case(rows: int, heads: int, topk: int, extra_topk: int, device, 
         extra_indices, extra_lengths = _random_indices(rows, extra_topk, extra_rows, device)
         sets.append((indices, lengths, extra_indices, extra_lengths))
     return pool, extra_pool, query, sets
+
+
+class _OffloadAttn:
+    """A ratio-4 BF16 DeepSeek-V4 layer, as much of it as the adapter's forward reads."""
+
+    num_heads = 16
+    compress_ratio = 4
+    layer_idx = 0
+    qk_nope_head_dim = 448
+    qk_rope_head_dim = ROPE
+    q_scaling = 1.0
+
+    def __init__(self, offload: bool):
+        self.sparse_attention_config = SimpleNamespace(
+            window_size=BLOCK, enable_kv_cache_offload=offload, enable_heuristic_topk=False
+        )
+
+
+class _WeakrefableNamespace(SimpleNamespace):
+    """A manager stand-in; the adapter's pool-view cache holds its owner weakly."""
+
+
+def _run_adapter(attn, manager, query, indices, lengths, extra_lengths, offload_layers):
+    """Run the adapter's forward on one generation-only BF16 batch and return the output."""
+    rows, heads = query.shape[0], attn.num_heads
+    metadata = SimpleNamespace(
+        kv_cache_manager=manager,
+        num_ctx_tokens=0,
+        num_tokens=rows,
+        fmha_plan_caches={},
+        token_positions_cuda=torch.zeros(rows, dtype=torch.int32, device=query.device),
+        sparse_mla_swa_lens=lengths,
+        sparse_mla_extra_lens={attn.compress_ratio: extra_lengths},
+        max_compressed_indices={attn.compress_ratio: indices.shape[1] - BLOCK},
+        sparse_offload_state=(
+            SimpleNamespace(layers=offload_layers) if offload_layers is not None else None
+        ),
+    )
+    output = torch.empty(rows, heads * LATENT, dtype=torch.bfloat16, device=query.device)
+    fwd = SimpleNamespace(
+        sparse_runtime_params=SimpleNamespace(sparse_attn_indices=indices),
+        output=output,
+        enable_dsv4_epilogue_fusion=False,
+        quant_q_buffer=None,
+        attention_sinks=None,
+        output_sf=None,
+        out_scale=None,
+        dsv4_inv_rope_cos_sin_cache=None,
+    )
+    PrimsTSSparseMlaFmha(attn).forward(query, None, None, metadata, fwd)
+    torch.cuda.synchronize()
+    return output
+
+
+def test_offloaded_layer_reads_the_sparse_cache_arena(monkeypatch):
+    """With offload, the compressed slots are rows of the layer's sparse cache arena.
+
+    The same compressed rows are scattered into an arena whose other rows are
+    noise, and the indices are remapped to their arena rows. PrimTS must read the
+    arena through the manager's view and match the same attention over the
+    compress pool. One live arena slot is a -1 hole, which offload produces and
+    the kernel must mask; the reference drops that slot instead.
+    """
+    _skip_unless_toolchain()
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+        DeepseekV4AttentionType,
+    )
+
+    # Request validation and kernel warmup are covered elsewhere; this test
+    # pins down which pool the compressed indices address.
+    monkeypatch.setattr(PrimsTSSparseMlaFmha, "_check_request", lambda *args: None)
+    monkeypatch.setattr(PrimsTSSparseMlaFmha, "_warm_kernel_variants", lambda *a, **k: None)
+
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    rows, extra_topk, pool_rows, arena_rows = 6, 256, 1024, 1536
+    heads = _OffloadAttn.num_heads
+    swa = torch.randn(2048, 1, LATENT, dtype=torch.bfloat16, device=device)
+    compress = torch.randn(pool_rows, 1, LATENT, dtype=torch.bfloat16, device=device)
+    # Noise an order of magnitude larger than the real rows, so reading the
+    # wrong arena row cannot go unnoticed.
+    arena = torch.randn(arena_rows, 1, LATENT, dtype=torch.bfloat16, device=device) * 8
+    arena_row_of = torch.randperm(arena_rows, device=device)[:pool_rows].to(torch.int32)
+    arena[arena_row_of.long()] = compress
+    query = torch.randn(rows, heads * LATENT, dtype=torch.bfloat16, device=device) * 0.5
+
+    swa_indices, lengths = _random_indices(rows, BLOCK, swa.shape[0], device)
+    extra_indices, extra_lengths = _random_indices(rows, extra_topk, pool_rows, device)
+    extra_lengths.clamp_(min=2)
+    extra_indices[:, :2] = torch.randint(0, pool_rows, (rows, 2), dtype=torch.int32, device=device)
+
+    manager = _WeakrefableNamespace(
+        dtype=torch.bfloat16,
+        swa_pool_ptr=swa.data_ptr(),
+        compress_pool_ptrs={4: compress.data_ptr()},
+        pp_layers=[0],
+        _compress_ratios={0: 4},
+        get_buffers=lambda layer, attn_type: (
+            swa if attn_type == DeepseekV4AttentionType.SWA else compress
+        ),
+        get_sparse_compress_buffers=lambda layer: (arena, None),
+    )
+
+    # Arena run: remap every live compressed slot, then punch a hole in slot 0
+    # of row 0, which stays inside its live prefix.
+    arena_extra = torch.where(
+        extra_indices >= 0, arena_row_of[extra_indices.clamp(min=0).long()], extra_indices
+    )
+    arena_extra[0, 0] = -1
+    offload_attn = _OffloadAttn(offload=True)
+    got = _run_adapter(
+        offload_attn,
+        manager,
+        query,
+        torch.cat([swa_indices, arena_extra], dim=1).contiguous(),
+        lengths,
+        extra_lengths,
+        offload_layers={0: object()},
+    )
+
+    # Reference: the compress pool, with row 0's hole removed from its prefix.
+    ref_extra = extra_indices.clone()
+    ref_extra[0, :-1] = extra_indices[0, 1:].clone()
+    ref_extra[0, -1] = -1
+    ref_extra_lengths = extra_lengths.clone()
+    ref_extra_lengths[0] -= 1
+    pool_attn = _OffloadAttn(offload=False)
+    ref = _run_adapter(
+        pool_attn,
+        manager,
+        query,
+        torch.cat([swa_indices, ref_extra], dim=1).contiguous(),
+        lengths,
+        ref_extra_lengths,
+        offload_layers=None,
+    )
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
 
 
 def test_reloaded_kernel_accepts_the_same_launch():
@@ -405,7 +588,9 @@ def test_prepared_launch_matches_the_full_path_per_layer():
     sinks_a = torch.randn(heads, dtype=torch.float32, device=device)
     sinks_b = torch.randn(heads, dtype=torch.float32, device=device)
     wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
-    wrapper.plan(device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, has_sinks=True)
+    wrapper.plan(
+        device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, use_attention_sinks=True
+    )
     prepared_launches = []
     original = wrapper._run_prepared
 
@@ -427,7 +612,7 @@ def test_prepared_launch_matches_the_full_path_per_layer():
             extra_lengths=sets[idx][3],
             softmax_scale=LATENT**-0.5,
             output_scale=1.0,
-            sinks=sinks,
+            attention_sinks=sinks,
             out=out,
             validate=validate,
         )
@@ -453,7 +638,9 @@ def test_prepared_launch_matches_the_full_path_per_layer():
     launch(sinks_a.clone())
     assert len(prepared_launches) == 3 and len(wrapper._prepared) == 4
     # Re-planning drops every prepared launch.
-    wrapper.plan(device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, has_sinks=True)
+    wrapper.plan(
+        device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, use_attention_sinks=True
+    )
     assert not wrapper._prepared
 
 
@@ -649,7 +836,7 @@ def test_fused_output_matches_trtllm_inverse_rope_quant(
     # on the softmax, the KV descale on the output), as the adapter passes them.
     run_scales = dict(softmax_scale=softmax_scale * descale * descale, output_scale=descale)
     sources = dict(extra_indices=extra_indices, extra_lengths=extra_lengths) if extra_topk else {}
-    plan_args = dict(max_topk=topk, max_extra_topk=extra_topk, max_seq_len_q=1, q_data_type=dtype)
+    plan_args = dict(max_topk=topk, max_extra_topk=extra_topk, max_q_len=1, q_dtype=dtype)
 
     reference = BatchSparseMLADecodePagedTSWrapper()
     reference.plan(device, rows, heads, **plan_args)
@@ -801,7 +988,7 @@ def test_speculative_decoding_rows_run_on_prims_ts(monkeypatch, generation_seq_l
     library default and the spy asserts that PrimTS served those steps with one
     row per query token (``rows = sum(generation_lens)``, not one per request),
     which is the per-token-row contract the kernel is planned for
-    (``max_seq_len_q = 1``).
+    (``max_q_len = 1``).
     """
     _skip_unless_toolchain()
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
@@ -1192,7 +1379,7 @@ def test_warm_up_fans_out_only_when_a_variant_is_missing(monkeypatch) -> None:
     payloads, workers = fanned[0]
     assert workers == 2  # capped by the env value, below the three variants
     assert [p["rows"] for p in payloads] == [20, 15, 7]
-    assert payloads[0]["plan_kwargs"]["q_data_type"] == "bfloat16"  # JSON-safe dtype
+    assert payloads[0]["plan_kwargs"]["q_dtype"] == "bfloat16"  # JSON-safe dtype
     assert payloads[0]["plan_kwargs"]["max_extra_topk"] == 32
     assert payloads[0]["device_index"] == 0
     import json
@@ -1301,7 +1488,7 @@ def test_precompile_worker_entry_compiles_its_shard_first_then_the_rest(monkeypa
     monkeypatch.setattr(cc, "expected_cache_meta", lambda: {"probe": "meta"})
     payloads = [
         pp.encode_payload(
-            0, rows, 16, dict(max_topk=128, max_extra_topk=512, q_data_type=torch.bfloat16)
+            0, rows, 16, dict(max_topk=128, max_extra_topk=512, q_dtype=torch.bfloat16)
         )
         for rows in (20, 15, 7, 3)
     ]

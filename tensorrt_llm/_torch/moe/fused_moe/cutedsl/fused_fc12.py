@@ -311,6 +311,13 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     quantize_input = quantize_input_nvfp4
     prequantized_nvfp4_input_scale = prequantized_nvfp4_input_scale
 
+    def _join_pending_x_ready(self) -> None:
+        """Wait for the input-ready event handed to ``run_moe_nvfp4`` (once per forward)."""
+        event = getattr(self, "_pending_x_ready_event", None)
+        if event is not None:
+            event.wait()
+            self._pending_x_ready_event = None
+
     def run_moe(self, ctx: MoERunContext, *, workspace: dict | None = None) -> torch.Tensor:
         del workspace  # the fused kernel allocates its own intermediates
         plan = require_comm_plan(self, ctx)
@@ -322,6 +329,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             moe_output=plan.moe_output,
             enable_alltoall=plan.enable_alltoall,
             weight_view=self._build_local_weight_view(),
+            x_ready_event=ctx.x_ready_event,
             sort_tables=ctx.sort_tables,
         )
 
@@ -336,6 +344,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         moe_output: torch.Tensor | None = None,
         enable_alltoall: bool = False,
         weight_view: NvFp4WeightView | None = None,
+        x_ready_event: torch.cuda.Event | None = None,
         sort_tables: MoESortTables | None = None,
     ) -> torch.Tensor:
         assert self.has_nvfp4
@@ -350,9 +359,13 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             assert moe_output.size() == (token_final_scales.size(0), self.hidden_size)
             assert moe_output.dtype == output_dtype
 
+        # Join before the fused kernel reads x, or before returning an empty batch.
+        self._pending_x_ready_event = x_ready_event
+
         # Empty micro-batches: skip autotuning (synthetic grouped-GEMM inputs
         # require at least one output row).
         if token_selected_experts.size(0) == 0:
+            self._join_pending_x_ready()
             return moe_output
 
         effective_top_k = token_selected_experts.size(-1)
@@ -456,6 +469,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             total_num_padded_tokens,
             num_non_exiting_tiles,
         ) = sort_outputs
+
+        self._join_pending_x_ready()
 
         # One fused op: gather + FC1 GEMM + gated act (SwiGLU or SiTU) + requant
         # + FC2 GEMM + finalize (scatter-add into moe_output = a2a combine

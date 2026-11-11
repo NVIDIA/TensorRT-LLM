@@ -19,10 +19,11 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _torch.helpers import triton_num_compiled
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
-from tensorrt_llm._torch.modules.mamba import replay_metadata
+from tensorrt_llm._torch.modules.mamba import mamba2_metadata, replay_metadata
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     ReplayStateUpdateMetadata,
@@ -246,6 +247,21 @@ def _torch_reference_work_items(
 @skip_no_cuda
 class TestCuSeqlensToChunkIndicesOffsets:
     """Tests for cu_seqlens_to_chunk_indices_offsets_triton function."""
+
+    def test_new_batches_reuse_the_compiled_kernel(self):
+        """Sequence and chunk counts that are and are not multiples of 16."""
+        kernel = mamba2_metadata._cu_seqlens_triton_kernel
+
+        def chunk(seq_lens):
+            cu_seqlens = torch.tensor([0] + seq_lens, device="cuda").cumsum(0).int()
+            cu_seqlens_to_chunk_indices_offsets_triton(cu_seqlens, chunk_size=8)
+
+        batches = ([64, 64], [3] * 16, [5] * 17, [8, 8, 1])
+        chunk(batches[0])
+        compiled = triton_num_compiled(kernel)
+        for seq_lens in batches[1:]:
+            chunk(seq_lens)
+        assert triton_num_compiled(kernel) == compiled
 
     def test_empty_sequence(self):
         """Test with empty cu_seqlens (no sequences)."""

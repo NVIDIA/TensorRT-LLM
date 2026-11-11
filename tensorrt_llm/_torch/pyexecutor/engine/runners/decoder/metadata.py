@@ -152,7 +152,6 @@ class DecoderMetadata:
         kv_cache_manager.configure_decode_shortcuts(
             skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
             reuse_pool_views=msa.reuse_pool_views,
-            block_ids_from_views=msa.block_ids_from_views,
         )
 
     def setup_speculative(
@@ -339,10 +338,14 @@ def create_spec_metadata(
         spec_resource_manager=spec_resource_manager,
         max_seq_len=config.max_seq_len,
         num_seq_slots=config.num_seq_slots,
-        # The decode CUDA graphs then capture the temperature-only variant.
+        # The decode CUDA graphs then capture the temperature-only variant. It draws the
+        # sampled rows on vocabulary-sharded logits without the watermark, so a watermark
+        # configuration keeps the ordinary sampler.
         temperature_only_graphs=config.cuda_graph_config is not None
         and config.spec_decode_fast_paths
+        and config.watermark_config is None
         and supports_sharded_target_sampling(config.spec_config, mapping),
+        watermark_config=config.watermark_config,
     )
 
 

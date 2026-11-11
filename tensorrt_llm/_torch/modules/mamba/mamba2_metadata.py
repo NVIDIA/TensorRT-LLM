@@ -29,7 +29,9 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
 from tensorrt_llm._utils import prefer_pinned
 
 
-@triton.jit
+# num_seqs and N follow the batch; specializing them (on == 1 or % 16) would
+# compile kernel variants mid-serving.
+@triton.jit(do_not_specialize=["num_seqs", "N"])
 def _cu_seqlens_triton_kernel(
     cu_seqlens_ptr,  # [num_seqs + 1]
     chunk_indices_ptr,  # [N] output

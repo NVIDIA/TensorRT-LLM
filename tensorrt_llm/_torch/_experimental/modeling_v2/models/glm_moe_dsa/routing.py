@@ -164,13 +164,8 @@ def route(
         and mtp_eagle_or_none
         and kv_cache_quant_algo == QuantAlgo.FP8
     ):
-        # One line on purpose: the claims suite reads the routed targets off
-        # `from .<target>.modeling import <Class>` lines.
-        # fmt: off
-        # isort: off
         from .glm_5_2_nvfp4__sm_107__low_latency.modeling import ModelingV2Glm52Nvfp4Sm107LowLatency
-        # isort: on
-        # fmt: on
+
         return ModelingV2Glm52Nvfp4Sm107LowLatency
 
     # tep4: the attention heads and the dense MLPs sharded four ways, the experts

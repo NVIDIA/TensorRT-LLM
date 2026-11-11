@@ -41,9 +41,9 @@ from _validating import certifying, validating  # noqa: E402,F401 — certifying
 
 _spec = importlib.util.spec_from_file_location(
     "cached_replay_harness",
-    # The Triton entry's test, in the family tree (tests/unittest/_torch/modeling_v2/models/qwen4_exp/ssm).
+    # The Triton entry's test, in the family tree (tests/unittest/_torch/modeling_v2/models/qwen4_exp/ops/ssm).
     _MV2_TESTS
-    / "models/qwen4_exp/ssm"
+    / "models/qwen4_exp/ops/ssm"
     / "test_modeling_v2_fused_recurrent_gated_delta_rule_cached_replay_update.py",
 )
 trep = importlib.util.module_from_spec(_spec)

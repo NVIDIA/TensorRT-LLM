@@ -1391,7 +1391,13 @@ class MTPForCausalLM(nn.Module):
         # Whether the MTP layer's forward takes the draft loop's deferred
         # ``kv_lens_increment``.
         folds_kv_lens_increment = False
+        # A target model that owns its MTP layer class (a Modeling V2
+        # target, for example) names it, and the drafter builds that class
+        # instead of the built-in one registered for the model type.
+        owned_mtp_layer = getattr(model, "mtp_layer_cls", None)
         match model_type:
+            case _ if owned_mtp_layer is not None:
+                mtp_layer = owned_mtp_layer
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
                 mtp_layer = Glm4MTP
@@ -1599,6 +1605,7 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
+        use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
         # The user's value, NOT the engine's: py_executor_creator raises it past
         # this and never writes back, so drafters read _runtime_position_ceiling.
         # None sizes position tables from max_position_embeddings: 1M for K3.
