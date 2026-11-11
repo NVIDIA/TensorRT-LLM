@@ -4,7 +4,7 @@ Check: `{{ gate }}` starts the `ctx` and `gen` servers and the proxy (`trtllm-se
 
 ### Card: disaggregated serving
 
-**Supported means:** both servers boot with their own options, answers complete through the proxy, every rank of both roles reports the Modeling V2 target and its options, and each benchmark meets its floor. Only GSM8K is scored through the proxy; another benchmark fails as "not judged through the hop": list it under `not_done`.
+**Supported means:** both servers boot with their own options, answers complete through the proxy, and every rank of both roles reports the Modeling V2 target and its options. Only GSM8K is scored through the proxy; another benchmark fails as "not judged through the hop": list it under `not_done`.
 
 - Build no launcher, server or transport: the engine's transceiver moves the state.
 - Both sides' options state `cache_transceiver_config` with a `backend` (`DEFAULT` lets the engine choose; a spec without it is refused at load) and `disable_overlap_scheduler: true`.

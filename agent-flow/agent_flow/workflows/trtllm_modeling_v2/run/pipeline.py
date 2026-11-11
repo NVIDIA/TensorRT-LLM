@@ -588,10 +588,14 @@ class Pipeline:
                 inventory=w._surface_block,
             )
         elif task.kind == "kernel":
-            facts.update(self._row(task, target, repo, work))
+            facts.update(self._row(task, target, repo, work), needs=self._needs(deployment))
         else:
             facts.update(self._unit(task, deployment, found[0].name, target))
             facts["pytest"] = self._pytest(work, facts["tests"])
+            # The boot on the stock path, whole: a worker types what it is shown.
+            facts["control"] = f"{facts['gate']} --mode off".replace(
+                f"<{'|'.join(self._gates(deployment))}>", "boot"
+            )
         return facts
 
     def _gates(self, deployment) -> list[str]:
@@ -636,15 +640,18 @@ class Pipeline:
         python = f"{env.one_gpu_prefix} {env.python}".strip() if env is not None else "python"
         return f"cd {tree} && PYTHONPATH={tree} {python} -m pytest {path} -q"
 
-    def _needs(self) -> str:
-        """Which cells the first deployment needs, as far as its options say: for a kernel row."""
-        first = deployments_mod.resolve(self.w.task_data)[0]
-        options = next(iter(first.servers.values())).options
+    def _needs(self, deployment) -> str:
+        """Which cells a kernel row's own deployment needs, as far as its options say.
+
+        The deployment that owns the row: a row only a later deployment calls is held to
+        that deployment's dtype and limits, not to the first one's.
+        """
+        options = next(iter(deployment.servers.values())).options
         kv = (options.get("kv_cache_config") or {}).get("dtype")
         unstated = "not stated: the checkpoint's own"
         stated = [f"KV cache dtype {kv or unstated}"]
         stated += [f"`{key}: {options[key]}`" for key in _CELL_LIMITS if key in options]
-        return f"`{first.name}` needs (its options: {', '.join(stated)})"
+        return f"`{deployment.name}`'s options serve ({', '.join(stated)})"
 
     def _queue_item(self, task: Task) -> QueueItem | None:
         """The vocabulary queue row a kernel task names."""
@@ -687,7 +694,6 @@ class Pipeline:
             name=item.target.strip("/").split("/")[-1],
             module=landing.replace("/", "."),
             test_command=self._pytest(tree, paths[1]) if len(paths) > 1 else "",
-            needs=self._needs(),
         )
 
     def _make_integration(self) -> Integration | None:

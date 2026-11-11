@@ -2,7 +2,7 @@
 SPDX-License-Identifier: Apache-2.0 -#}
 {% if problem %}## Your receipt is not valid
 
-Your turn ended, but {{ problem }}. Do not do the task again: your work is in your worktree. Write the receipt again as the last section says, with `decision:` on its first line, saying what your earlier turn did.
+Your turn ended, but {{ problem }}. Do not do the task again: your work is in your worktree. Write the receipt again as the last section says, beginning with `decision:`, saying what your earlier turn did.
 {% elif base %}## Your finished work did not integrate
 
 Your task already finished, but rebasing its branch onto the checkout's head `{{ base }}` stopped on conflicts in {{ files }}: another task changed them after your worktree was cut. Do not start the task again. In your worktree, rebase:

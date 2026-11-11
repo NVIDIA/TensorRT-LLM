@@ -21,7 +21,7 @@ Answer in `{{ plan }}` and `{{ vocabulary }}`: can this checkpoint be assembled 
 {{ ladder }}
 
 4. Judge coverage against the options' limits (`max_num_tokens`, `max_batch_size`, the CUDA-graph batch sizes), not the benchmark's shapes.
-5. Before a ceiling, search FlashInfer's installed API and the engine's bindings. A wrong `verify` row costs one task; a wrong ceiling ends the run.
+5. Before a ceiling, search FlashInfer's installed API and the engine's bindings. A wrong `verify` row costs one task; a ceiling ends the run before `core`: a wrong one ends it for nothing.
 
 ### `vocabulary.yaml`
 
@@ -48,21 +48,21 @@ queue:
       surface: "<the value the certified column excludes>",
       cells: [{<spec key>: <measured value>, ...}]}
   - {n: 3, mode: onboard, target: ops/<category>/<name>, depends_on: [],
-      unit: <deployment>}                # only a later deployment needs it
+      deployment: <name>}                # only a later deployment needs it
   - {n: 4, mode: verify,  target: <category>/<name>, depends_on: [],
       surface: "<...>", site: mtp_verify}  # optional: names its local copy
 ceiling: null    # or {step: ..., searched: [...], why: ...}
 ```
 
-Give every `call_sites` item the actual target method and call count. `row_multiple` is how many rows one request brings there; use `gathered: true` after attention-DP gathering and `eager_only: true` only outside captured paths.
+Give every `call_sites` item the actual target method. `row_multiple` is how many rows one request brings there; `gathered: true` after attention-DP gathering, `eager_only: true` only outside captured paths.
 
 Queue rules:
 
 - `target` is `<category>/<name>` (a shared entry) or `ops/<category>/<name>` (the target's own), plain names; one row per entry: all its call sites' shapes go in its `cells`.
 - `depends_on` lists the rows (`n`) whose entry this one calls.
-- A `verify` row needs `surface`; it lists its `cells`, at most {{ max_cells }}. Vary one axis at a time: each dtype, the smallest and largest captured batch, one prefill chunk at `max_num_tokens`.
+- A `verify` row needs `surface`; it lists its `cells`, at most {{ max_cells }}: first those its deployment's options serve (its dtype, its limits), then the optional rest, one axis at a time (another dtype, the smallest and largest captured batch).
 - `site` (lowercase words joined by `_`) names the local copy `<name>__<site>`; without it, `<name>__r<n>`. A target name never contains `__`.
-- `unit` is `core` or a later deployment's name. Rows without it block the first deployment. When unsure, leave it out.
+- A row with no `deployment` key is `core`'s: the first deployment's options call its entry. A row only a later deployment's options call (another dtype, another member, disaggregation) names it and runs after `core`.
 - Not for `not_done`: GPU tests, the boot, GSM8K (later tasks').
 
 ### `plan.md`

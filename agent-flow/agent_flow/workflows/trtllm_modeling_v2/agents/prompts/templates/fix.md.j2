@@ -6,7 +6,7 @@ The final pass ran the done deployments' checks once, on the checkout; after a f
 
 {{ goal }}
 
-1. Failed checks first, then convention findings (an entry without `CELLS` or without `{{ arch }}` in `ARCHS`, a missing test, an entry not where its row lands it), cheapest first. Repair a finding inside the target; one that needs a change outside it is left and listed under `not_done`.
+1. Every failed check first; convention findings (an entry without `CELLS` or without `{{ arch }}` in `ARCHS`, a missing test, an entry not where its row lands it) after them. Repair a finding inside the target; one that needs a change outside it is left and listed under `not_done`.
 2. Reproduce a failed check with the gate, naming its deployment, before you change code. Write down the suspected cause before each rerun.
 3. Make the smallest change that removes the cause. One commit per item.
 4. Rerun that check, then the boot of `{{ first }}`.

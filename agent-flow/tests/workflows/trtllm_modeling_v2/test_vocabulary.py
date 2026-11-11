@@ -32,6 +32,26 @@ def _doc(**overrides):
     return doc
 
 
+def test_a_row_names_the_deployment_that_alone_needs_it_and_the_earlier_key_still_loads():
+    """`deployment` is what a reader calls it; `unit` is the key's earlier name."""
+    rows = [
+        {"n": 1, "mode": "onboard", "target": "ops/kv/quant", "deployment": "kv_fp8"},
+        {"n": 2, "mode": "onboard", "target": "ops/kv/scale", "unit": "kv_fp8"},
+        {"n": 3, "mode": "onboard", "target": "ops/norm/rms"},
+    ]
+    doc = _doc(verdict=vocab.VERDICT_AFTER_ADDITIONS, queue=rows)
+    queue = vocab.parse_vocabulary(doc, units=["core", "kv_fp8"])
+    # With neither key a row is core's: what the first deployment's options call.
+    assert [item.unit for item in queue] == ["kv_fp8", "kv_fp8", "core"]
+    rows[0]["deployment"] = "tep9"
+    with pytest.raises(vocab.VocabularyError) as refused:
+        vocab.parse_vocabulary(doc, units=["core", "kv_fp8"])
+    assert (
+        "queue[0].deployment is 'tep9': a later deployment that alone needs the entry "
+        "(['kv_fp8']); leave the key out for the first deployment's rows" in str(refused.value)
+    )
+
+
 def test_every_problem_is_batched():
     doc = {
         "verdict": "maybe",

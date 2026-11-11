@@ -93,7 +93,7 @@ def render(template: str, /, **facts: Any) -> str:
 
 
 def cards(deployment: Deployment) -> list[str]:
-    """The cards ``deployment`` asks for by what it states; a turn loads the first."""
+    """The cards ``deployment`` asks for by what it states; a turn loads each of them."""
     servers = list(deployment.servers.values())
     caches = [s.options.get("kv_cache_config") or {} for s in servers]
     asked = {
@@ -134,15 +134,11 @@ def dispatch(kind: str, facts: Mapping[str, Any]) -> str:
     }
     said["tier_text"] = TIERS.get(said.get("tier"), "")
     parts = [render("worker_base.md.j2", **said), render(f"{kind}.md.j2", **said)]
-    if named:
-        parts.append(render(f"cards/{named[0]}.md.j2", **said))
-    if named[1:]:
-        others = ", ".join(f"`{name}`" for name in named[1:])
-        parts.append(
-            f"This deployment also asks for what these cards cover: {others}. Read them "
-            f"under `{said['package']}/agents/prompts/templates/cards/` where your work "
-            "touches them."
-        )
+    for index, name in enumerate(named):
+        card = render(f"cards/{name}.md.j2", **said).strip()
+        # Every card the deployment asks for is shown: what it asks for holds together.
+        # The line that says what the gate does for it is the first card's alone.
+        parts.append(card if not index else card.split("\n", 1)[1].strip())
     parts += [render("run.md.j2", **said), render("receipt.md.j2", **said)]
     text = "\n\n".join(part.strip() for part in parts if part.strip())
     return re.sub(r"\n{3,}", "\n\n", text) + "\n"

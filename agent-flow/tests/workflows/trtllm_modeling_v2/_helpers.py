@@ -497,7 +497,9 @@ def facts(**changes) -> dict:
         name="rmsnorm",
         module="ops.norm.rmsnorm__r4",
         test_command="cd /ws/worktrees/k4 && PYTHONPATH=/ws/worktrees/k4 python -m pytest t.py -q",
-        needs="`tp1` needs (its options: KV cache dtype not stated: the checkpoint's own)",
+        needs="`tp1`'s options serve (KV cache dtype not stated: the checkpoint's own)",
+        control="/ws/bin/trtllm-modeling-v2 gate boot --task /ws/task.yaml --deployment kv_fp8 "
+        "--workdir /ws/gates/kv_fp8 --tree /ws/worktrees/kv_fp8 --mode off",
         pytest="cd /ws/worktrees/kv_fp8 && PYTHONPATH=/ws/worktrees/kv_fp8 python -m pytest t -q",
     )
     return {**said, **changes}

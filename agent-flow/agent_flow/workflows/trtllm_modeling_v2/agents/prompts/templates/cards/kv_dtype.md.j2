@@ -4,7 +4,7 @@ Check: `{{ gate }}`: every rank's resolved KV dtype must equal the options', the
 
 ### Card: KV-cache dtype
 
-**Supported means:** the engine boots with `kv_cache_config.dtype` as stated, every rank resolved that dtype (an `nvfp4` request that resolved FP8 is a mismatch), and each benchmark meets its floor.
+**Supported means:** the engine boots with `kv_cache_config.dtype` as stated, and every rank resolved that dtype (an `nvfp4` request that resolved FP8 is a mismatch).
 
 - Read the resolved algorithm from `ModelConfig` (`quant_config.kv_cache_quant_algo`), not from the checkpoint. `auto` keeps the checkpoint's own.
 - The routing raises `NoTarget` for an algorithm the forward does not implement.

@@ -6,8 +6,9 @@ SPDX-License-Identifier: Apache-2.0 -#}
 
 - Step and values: row {{ n }} in `{{ vocabulary }}`.{% if row_note %} Its note: {{ row_note }}{% endif %}
 {% if surface %}- Surface to certify, the value the entry's cells exclude today: {{ surface }}
-{% endif %}{% if cells %}- Cells to certify, each the `spec` of one `Cell`: `{{ cells }}`
-{% endif %}- Sourcing: {% if tier %}tier {{ tier }}: {{ tier_text }}{% else %}no tier is recorded; name the one your `__call__` wraps{% endif %}
+{% endif %}{% if cells %}- Cells the row lists, each the `spec` of one `Cell`: `{{ cells }}`
+{% endif %}- Required cells: those {{ needs }}. The others are optional.
+- Sourcing: {% if tier %}tier {{ tier }}: {{ tier_text }}{% else %}no tier is recorded; name the one your `__call__` wraps{% endif %}
 
 ### Where it lands
 
@@ -22,10 +23,10 @@ Use these exact paths: the report looks for the entry there.
 
 Read "Writing operations" in `{{ mv2_readme }}`, `catalog/_op.py`, and one entry of the same category with its test. For C++/CUDA read `{{ build_guide }}` first.
 
-- `__call__`: one kernel-launching call, every argument explicit; weights, state and configuration are arguments. No silent torch fallback: it certifies nothing; torch ops as the stated implementation (tier 4) say so in `note`.
+- `__call__`: one logical operation, every argument explicit; weights, state and configuration are arguments. No silent torch fallback: it certifies nothing; torch ops as the stated implementation (tier 4) say so in `note`.
 - `reference`: the expected result in plain torch with fp32 accumulation, from the cell's named arguments. It calls neither the kernel nor any entry.
 - `is_valid`: rejects inputs the kernel accepts but computes wrongly: only cases you measured.
-- `CELLS`: what the test runs: every cell listed above, plus one at the largest row the options allow (`max_num_tokens`, `max_batch_size`).
+- `CELLS`: what the test runs: every cell the entry claims, with one at the largest row the options allow (`max_num_tokens`, `max_batch_size`).
 - `ARCHS`: add `{{ arch }}` only after the whole test file passed on this device.
 - `note`: preconditions, limits, measured numbers, where the kernel comes from.
 
@@ -38,7 +39,7 @@ Tiers 1 to 3 wrap an existing callable: `git grep` the op's name for its source.
 - Parametrize over `op.CELLS` with the `certifying` fixture of `_validating.py`: the entry's own `__call__` and `reference` both run.
 - Assert CUDA is available, no skip. Seed randomness.
 - Judge a cell by its output distribution against `reference` (cosine similarity, relative L2, a high percentile of the absolute error); a NaN fails. Never widen a band to pass: one wider than torch's default needs a wrong-variant control that fails.
-- Each `is_valid` refusal: show the unguarded failure, then test it with `validating(op)` and `pytest.raises`; a probe that can crash runs in a subprocess.
+- Each `is_valid` refusal is tested with `validating(op)` and `pytest.raises`; a probe that can crash runs in a subprocess.
 - Only where the entry takes them: index arguments at the reachable 2^31 and fp32 2^24+1 boundaries; pool slots (sized by the cache manager) != batch.
 - A normal cell fits 10 s and 40 GiB; a larger one gets `"large": True` in its `spec` and `pytest.mark.high_cuda_memory`.
 
@@ -50,7 +51,6 @@ After your last edit, run the whole file once, and `tests/unittest/_torch/modeli
 
 ### What lands
 
-- `ready`: the entry and its test are committed and `CELLS` holds the cells that pass; a failing cell is left out and goes under `not_done` with its numbers.
-- `blocked`: the entry does not run, or a cell {{ needs }} fails. A defect in shared code there: fix it as a shared commit, or name the file, the trigger and the committed failing test in `summary`.
-- A cell the options never serve (a cached prefix with block reuse off): reject it in `is_valid`.
+- Required cells first. `ready`: the entry and its test are committed and `CELLS` holds the cells that pass; a failing optional cell is left out and goes under `not_done` with its numbers.
+- `blocked`: the entry does not run, or a required cell fails. A defect in shared code there: fix it as a shared commit, or name the file, the trigger and the committed failing test in `summary`.
 - Not for `not_done`: the boot, GSM8K, CI lists (other tasks'), a probe that does not apply.

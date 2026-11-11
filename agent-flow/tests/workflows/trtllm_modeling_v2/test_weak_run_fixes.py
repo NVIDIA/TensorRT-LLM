@@ -307,15 +307,19 @@ def test_the_decision_is_the_first_line_of_the_decision_file():
 def test_a_kernel_writer_guards_a_cell_the_target_never_serves():
     """Defect 10: a queued cell that fails on shared code and is never served does not stop a landing."""
     said = prompt_texts.dispatch("kernel", facts())
+    # `is_valid` refuses what the kernel computes wrongly, measured: not a cell the options
+    # happen not to serve, which is a valid input. A failing optional cell is left out of
+    # `CELLS` and listed; only a required one blocks.
+    assert "reject it in `is_valid`" not in said
     assert (
-        "- A cell the options never serve (a cached prefix with block reuse off): reject it in `is_valid`."
+        "- `is_valid`: rejects inputs the kernel accepts but computes wrongly: only cases you"
         in said
     )
-    # And a cell that fails does not stop it either: the row lands what it certified.
     assert (
-        "- `ready`: the entry and its test are committed and `CELLS` holds the cells that pass; "
-        "a failing cell is left out and goes under `not_done` with its numbers." in said
+        "`ready`: the entry and its test are committed and `CELLS` holds the cells that pass; a "
+        "failing optional cell is left out and goes under `not_done` with its numbers." in said
     )
+    assert "- `blocked`: the entry does not run, or a required cell fails." in said
 
 
 def test_what_a_weak_run_slipped_without_is_in_the_text_its_worker_reads():

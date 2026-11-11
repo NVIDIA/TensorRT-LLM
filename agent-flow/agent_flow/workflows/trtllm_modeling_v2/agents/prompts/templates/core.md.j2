@@ -32,8 +32,8 @@ Uncommitted files, or a rank that imported another checkout, give no pass. A fai
 5. Import runtime interfaces only: nothing from a sibling target or Modeling V1 model code. Sharing inside the family is allowed.
 6. A kernel call no entry covers: wrap it in the target's own `ops/` and list it under `not_done`.
 7. The engine must stop cleanly: ranks left on a device after a check mean no verdict.
-8. After the gate passes: unit tests in `{{ tests }}`, as the README's "Testing and validation" says, run with `{{ pytest }}`; or list them under `not_done`.
+8. After the gate passes: write and run the unit tests in `{{ tests }}` (the README's "Testing and validation") with `{{ pytest }}`. `not_done` is for tests that cannot run.
 
 ### When accuracy is short
 
-Write down one suspected cause before each rerun. Compare one module with the HuggingFace module on real weights. `gate boot --mode off` runs the same prompts on the stock path, as a control.
+Write down one suspected cause before each rerun. Compare one module with the HuggingFace module on real weights. The same prompts on the stock path, as a control: `{{ control }}`.

@@ -4,7 +4,7 @@ Check: `{{ gate }}`: every rank's resolved state dtype must equal the options', 
 
 ### Card: recurrent (SSM) state dtype
 
-**Supported means:** the engine boots with `kv_cache_config.mamba_ssm_cache_dtype` as stated, every rank resolved it, and each benchmark meets its floor.
+**Supported means:** the engine boots with `kv_cache_config.mamba_ssm_cache_dtype` as stated, and every rank resolved it.
 
 - This tree accepts `auto`, `float16`, `bfloat16`, `float32` only. Another dtype needs a shared-runtime change first: separate commits, general, rebuilt.
 - Recurrent state lives in the manager's recurrent pool, never in tensors the target owns. State held in Python is stale after block reuse, eviction, CUDA-graph replay and a disaggregated transfer.

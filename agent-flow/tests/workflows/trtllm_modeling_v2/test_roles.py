@@ -366,7 +366,15 @@ def test_a_kernel_task_names_its_row_its_landing_and_its_sourcing() -> None:
     said = prompts.dispatch("kernel", facts())
     assert "**verify** the entry `norm/rmsnorm` for `sm_103`." in said
     assert "Surface to certify, the value the entry's cells exclude today: bf16" in said
-    assert "Cells to certify, each the `spec` of one `Cell`: `[{'rows': 2048}]`" in said
+    assert "Cells the row lists, each the `spec` of one `Cell`: `[{'rows': 2048}]`" in said
+    # Required and optional cells are named apart: what its deployment's options serve, the rest.
+    needs = "`tp1`'s options serve (KV cache dtype not stated: the checkpoint's own)"
+    assert f"- Required cells: those {needs}. The others are optional." in said
+    assert (
+        "- `CELLS`: what the test runs: every cell the entry claims, with one at the largest"
+        in said
+    )
+    assert "- `__call__`: one logical operation, every argument explicit;" in said
     assert "Sourcing: tier 3: a kernel of a library the engine pins (FlashInfer)" in said
     assert "the target imports `from .ops.norm.rmsnorm__r4 import rmsnorm`" in said
     assert said.index("rmsnorm__r4.py`") < said.index("test_modeling_v2_rmsnorm__r4.py`")
@@ -383,7 +391,7 @@ def test_a_kernel_task_names_its_row_its_landing_and_its_sourcing() -> None:
     assert "## Worktree and commits" not in survey and "gate <boot|" not in survey
 
 
-def test_a_deployment_loads_the_one_card_its_options_ask_for() -> None:
+def test_a_deployment_loads_every_card_its_options_ask_for() -> None:
     assert prompts.cards(Deployment(name="tp1", server=Server(options={}))) == []
     quantized = {"kv_cache_config": {"dtype": "fp8"}}
     pd = Deployment(
@@ -399,12 +407,21 @@ def test_a_deployment_loads_the_one_card_its_options_ask_for() -> None:
         "drafter",
         "state_dtype",
     ]
+    # Every card it asks for is shown: disaggregated, behind a prefix, with images and
+    # quantized hold together, and a weak worker reads what is in its message. The line that
+    # says what the gate does is the first card's alone.
     said = prompts.dispatch("deployment", facts(cards=prompts.cards(pd)))
-    assert "### Card: disaggregated serving" in said and "### Card: KV-cache dtype" not in said
-    assert "also asks for what these cards cover: `multi_node`, `multimodal`, `kv_dtype`" in said
-    assert "/flow/trtllm_modeling_v2/agents/prompts/templates/cards/" in said
-    assert "- Read the card below before you change code." in said
-    assert "Read the card below" not in prompts.dispatch("deployment", facts())
+    headings = re.findall(r"^### Card: (.+)$", said, re.M)
+    assert headings == [
+        "disaggregated serving",
+        "an engine behind a launch prefix",
+        "image inputs",
+        "KV-cache dtype",
+    ]
+    assert said.count("\nCheck: `") == 1 and said.count("**Supported means:**") == 4
+    assert "also asks for what these cards cover" not in said
+    assert "- Read the cards below before you change code." in said
+    assert "Read the cards below" not in prompts.dispatch("deployment", facts())
     # What the first GPU run of a disaggregated deployment paid for is on its card.
     assert "state `cache_transceiver_config` with a `backend`" in said
     assert "`UCX_TLS=tcp` stops the NIXL backend from starting" in said
@@ -428,6 +445,10 @@ def test_one_turn_loads_about_twelve_hundred_words_and_the_texts_stay_small() ->
     # Counted with the fixture's paths and commands in it, which are not standing text.
     assert max(sizes.values()) <= 1270, sizes
     assert all(size <= 1200 for kind, size in sizes.items() if kind != "kernel"), sizes
+    # A deployment that asks for several cards is shown each of them, the gate's line once:
+    # disaggregated, behind a prefix and quantized is the largest turn there is.
+    three = words("deployment", cards=["disaggregated", "multi_node", "kv_dtype"])
+    assert sizes["disaggregated"] < three <= 1510, three
     # What is maintained: the base, the receipt, the six sections and the six cards; and
     # with them what a message says of the run (its facts, a repair, the host's file).
     root = Path(prompts.__file__).parent / "templates"
@@ -458,7 +479,18 @@ def test_what_a_text_says_of_the_code_is_what_the_code_does() -> None:
         "It checks a row's `mode`, `depends_on`, `tier`, `unit`, `site`, `surface` and how "
         "many `cells`; the workers read the rest." in survey
     )
-    assert "- A `verify` row needs `surface`; it lists its `cells`, at most 64." in survey
+    assert (
+        "- A `verify` row needs `surface`; it lists its `cells`, at most 64: first those its "
+        "deployment's options serve (its dtype, its limits), then the optional rest" in survey
+    )
+    # A doubtful row no longer blocks the first deployment: the rule says whose a row is.
+    assert "When unsure, leave it out" not in survey and "unit" not in survey.split("```yaml")[1]
+    assert (
+        "- A row with no `deployment` key is `core`'s: the first deployment's options call"
+        in survey
+    )
+    assert "names it and runs after `core`." in survey
+    assert "a ceiling ends the run before `core`: a wrong one ends it for nothing." in survey
     row = {"n": 1, "mode": "verify", "target": "norm/rms", "surface": "dtype=bf16"}
 
     def parsed(**changes):
@@ -513,6 +545,18 @@ def test_what_a_text_says_of_the_code_is_what_the_code_does() -> None:
     refused = "- Refused at landing: an added symlink (the build guide's install symlinks stay"
     assert refused in fix and "no sign-off" not in fix
     assert "Landed but listed: `Co-authored-by`, another author." in fix
+    # Sentences a weak reader took two ways, each said one way now.
+    deployment = prompts.dispatch("deployment", facts())
+    unjudged = (
+        "- A score without a verdict (`[NO VERDICT]`) leaves accuracy unjudged: the boot decides."
+    )
+    assert unjudged in deployment and "is not a pass" not in deployment
+    assert "1. Every failed check first; convention findings (" in fix
+    assert ") after them." in fix and "cheapest first" not in fix
+    assert "and the host facts file (append only)." in fix
+    again = prompts.repair(problem="the file has no `decision` key")
+    assert "beginning with `decision:`" in again and "first line" not in again
+    assert "Begin with `decision: ready` or `decision: blocked`" in fix
     # A convention is repaired in the target or left; shared code changes for a check.
     assert "Repair a finding inside the target; one that needs a change outside it is left" in fix
     assert "may change when a check needs it, not for a convention." in fix

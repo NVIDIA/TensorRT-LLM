@@ -4,7 +4,7 @@ Check: `{{ gate }}` starts the server behind this deployment's `launch` prefix, 
 
 ### Card: an engine behind a launch prefix
 
-**Supported means:** the engine boots where the prefix places it, every rank reports the Modeling V2 target, your worktree as import origin and the declared widths (`tensor_parallel_size`, `moe_expert_parallel_size`, `enable_attention_dp`, `pipeline_parallel_size`), and each benchmark meets its floor.
+**Supported means:** the engine boots where the prefix places it, every rank reports the Modeling V2 target, your worktree as import origin and the declared widths (`tensor_parallel_size`, `moe_expert_parallel_size`, `enable_attention_dp`, `pipeline_parallel_size`).
 
 - The gate adds the launch prefix and the ranks' launcher. Write no scheduler or MPI line. Never kill by pattern: ranks left on a device after a stop mean no verdict.
 - Each gate run loads the checkpoint on every node: debug with one-GPU tests first.

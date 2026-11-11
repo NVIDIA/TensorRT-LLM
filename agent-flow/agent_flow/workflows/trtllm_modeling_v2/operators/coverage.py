@@ -109,10 +109,16 @@ def _row(at: str, row: Mapping[str, Any], n: int, bad, units) -> QueueItem:
     if tier not in TIERS:
         bad(f"{at}.tier is {row.get('tier')!r}; expected one of {TIERS}")
         tier = TIERS[0]
-    unit = UNIT_CORE if row.get("unit") is None else row["unit"]
-    unit = unit.strip() if isinstance(unit, str) else unit
+    # `deployment`: the later deployment that alone needs the row; without the key the row
+    # is core's. `unit` is the key's earlier name.
+    unit = row.get("deployment", row.get("unit"))
+    unit = UNIT_CORE if unit is None else unit.strip() if isinstance(unit, str) else unit
     if not (isinstance(unit, str) and unit) or (units is not None and unit not in units):
-        bad(f"{at}.unit is {unit!r}: the first unit that needs the entry, of {list(units or ())}")
+        named = [u for u in units or () if u != UNIT_CORE]
+        bad(
+            f"{at}.deployment is {unit!r}: a later deployment that alone needs the entry "
+            f"({named}); leave the key out for the first deployment's rows"
+        )
         unit = UNIT_CORE
     site = None if row.get("site") is None else str(row["site"]).strip()
     if site is not None and not _SITE.match(site):

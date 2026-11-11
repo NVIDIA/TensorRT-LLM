@@ -4,7 +4,7 @@ Check: `{{ gate }}` with `tests` runs the native tests this deployment names; `b
 
 ### Card: drafter (speculative decoding)
 
-**Supported means:** the engine boots with the options' `speculative_config`, every rank reports that algorithm and draft depth, each benchmark meets its floor, and the named acceptance test passes. With no test named, list "acceptance unverified" under `not_done`.
+**Supported means:** the engine boots with the options' `speculative_config`, every rank reports that algorithm and draft depth, and the named acceptance test passes. With no test named, list "acceptance unverified" under `not_done`.
 
 - Accuracy cannot judge a drafter: rejection sampling keeps the output right when drafts are wrong, only slower. Measure accepted tokens per iteration (`numAcceptedTokens`).
 - MTP: the draft layer is part of your forward, as one more decoder layer.

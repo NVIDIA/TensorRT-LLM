@@ -152,7 +152,7 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
         events.append("turn:survey")
         rows = [
             {"n": 1, "mode": "onboard", "target": "ops/norm/rms"},
-            {"n": 2, "mode": "onboard", "target": "ops/kv/quant", "unit": "kv_fp8"},
+            {"n": 2, "mode": "onboard", "target": "ops/kv/quant", "deployment": "kv_fp8"},
             {"n": 3, "mode": "onboard", "target": "ops/norm/scale", "depends_on": [1]},
         ]
         _write_vocabulary(workspace, rows)
@@ -189,6 +189,11 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
         "check:tep2:boot",
         "check:tep2:accuracy",
     ]
+    # A row is told its own deployment's options, not always the first one's: a row only
+    # `kv_fp8` needs is held to that deployment's dtype.
+    serve = "- Required cells: those `{}`'s options serve (KV cache dtype {}"
+    assert serve.format("tp1", "not stated: the checkpoint's own") in _prompts(calls, "k1-rms")[0]
+    assert serve.format("kv_fp8", "fp8).") in _prompts(calls, "k2-quant")[0]
     stands = {t["id"]: (t["status"], t["attempts"]) for t in _tasks(tmp_path)}
     assert stands == {
         "survey": ("done", 1),
@@ -289,16 +294,24 @@ def test_a_kernel_row_that_is_not_done_is_skipped_and_the_run_goes_on(
     # A row lands what it certified: `blocked` is for an entry that cannot be used, and the
     # row is told which cells the first deployment needs, as far as its options say.
     row = _prompts(calls, "k2-scale")[0]
-    needs = "(its options: KV cache dtype not stated: the checkpoint's own, `max_seq_len: 4096`)"
-    assert f"- `blocked`: the entry does not run, or a cell `tp1` needs {needs} fails." in row
-    assert "`CELLS` holds the cells that pass; a failing cell is left out" in row
+    needs = "(KV cache dtype not stated: the checkpoint's own, `max_seq_len: 4096`)"
+    assert f"- Required cells: those `tp1`'s options serve {needs}. The others are optional." in row
+    assert "- `blocked`: the entry does not run, or a required cell fails." in row
+    assert "`CELLS` holds the cells that pass; a failing optional cell is left out" in row
     # Its check is its entry's test: no model-level gate is put before a kernel task.
     assert " gate <" not in row and " -m pytest " in row
     # Core is shown the gates its deployment has something for (`tests` only where the spec
     # states tests), and the command that runs the target's own unit tests.
     assert " gate <boot|accuracy> --task " in core
+    # The control on the stock path is the whole command, not a flag to fit in somewhere.
+    control = re.search(
+        r"as a control: `(\S+ gate boot --task \S+ --deployment tp1 [^`]+ --mode off)`", core
+    )
+    assert control and "<" not in control.group(1)
     tests = "tests/unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1"
-    assert re.search(rf"run with `cd (\S+) && PYTHONPATH=\1 .*-m pytest {tests} -q`", core)
+    assert re.search(
+        rf"with `cd (\S+) && PYTHONPATH=\1 .*-m pytest {tests} -q`\. `not_done` is for", core
+    )
     report = _report(tmp_path)
     skipped = report.split("## Skipped kernel rows")[1].split("##")[0]
     assert "- `k1-rms` (queue row 1): it ended blocked: no kernel exports it on sm_103" in skipped
