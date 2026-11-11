@@ -644,6 +644,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         draft_layer_specs = kwargs.pop("layer_specs", None) or ()
         kwargs.pop("shared_draft_block_width", None)
         draft_slope = sum(layer.bytes_per_token() for layer in draft_layer_specs)
+        # Every request also reserves room for the drafter's next block in the
+        # target's attention layers and in the draft layers: max_draft_len + 1
+        # tokens, enough for either DSpark slot convention.
+        draft_scratch_tokens = (
+            spec_config.max_draft_len + 1 if draft_layer_specs and spec_config is not None else 0
+        )
         num_reserved_dummy_slots = _get_num_cuda_graph_padding_dummy_slots(
             spec_config, max_batch_size
         ) + int(mapping.enable_attention_dp)
@@ -703,6 +709,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             cap_partial_attention_snapshots=True,
             attention_slope_override=attention_slope_override,
             attention_page_bytes_override=attention_page_bytes_override,
+            draft_scratch_tokens=draft_scratch_tokens,
             **kwargs,
         )
         fixed_region_bytes = cls._estimate_fixed_region_bytes(
@@ -712,6 +719,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             kv_cache_config=kv_cache_config,
             **kwargs,
         )
+        intercept += max_batch_size * draft_scratch_tokens * draft_slope
         return slope + draft_slope, intercept + attention_intercept + fixed_region_bytes
 
     @classmethod
