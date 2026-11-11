@@ -49,9 +49,10 @@ Execution paths retain their CUDA event synchronization responsibilities.
 
 Side-stream prefetch stages a request's encoder inputs, MRoPE positions, and
 embeddings on its own CUDA stream. Input preparation of the first chunk that
-reads them, through its multimodal rows or its MRoPE positions, waits for the
-prefetch event and calls `record_stream` on every CUDA tensor in the request's
-multimodal data. A chunk that reads none leaves the event on the request.
+reads them, through its multimodal rows or its MRoPE positions or delta, waits
+for the prefetch event and calls `record_stream` on every CUDA tensor in the
+request's multimodal data. A chunk that reads none leaves the event on the
+request.
 Later chunks then read them without their own wait, and cleanup may drop them
 while forward-stream reads are still queued.
 

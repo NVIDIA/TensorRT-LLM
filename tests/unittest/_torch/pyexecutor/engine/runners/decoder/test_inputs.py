@@ -1166,6 +1166,15 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
             event.record()
         return staged, event
 
+    @staticmethod
+    def _current_stream_runs_after(event: torch.cuda.Event) -> bool:
+        """Whether work queued on the current stream now runs only after `event`,
+        for an `event` that is still pending."""
+        probe = torch.cuda.Event()
+        probe.record()
+        probe.synchronize()
+        return event.query()
+
     def _prepare_prefetched_mrope_chunk(
         self,
         preparer: DecoderInputPreparer,
@@ -1248,9 +1257,56 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         if not staging_was_pending:
             self.skipTest(_ORDER_NOT_EXERCISED)
 
+    def _order_after_chunk_with_prefetch_staged_mrope_delta(self, delay_cycles: int) -> bool | None:
+        """Prepare a first chunk that has no multimodal rows and carries an MRoPE
+        delta but no positions. Returns whether this stream then runs after the
+        prefetch, or None if the prefetch had already finished."""
+        preparer, kv_cache_manager, attn_metadata = self._setup_mrope_inputs()
+        preparer.model.config.vocab_size = 1000
+        context = self._make_mrope_ctx_request(4, 1, 0, 30)
+        context.context_chunk_size = 2
+        context.py_multimodal_data["multimodal_embed_mask_cumsum"] = torch.tensor([0, 0, 1, 2])
+        mrope_config = context.py_multimodal_data["mrope_config"]
+        del mrope_config["mrope_position_ids"]
+        mrope_config["mrope_position_deltas"], event = self._stage_on_side_stream(
+            mrope_config["mrope_position_deltas"], torch.cuda.Stream(), delay_cycles
+        )
+        context.py_mm_encoder_event = event
+
+        self._prepare_prefetched_mrope_chunk(
+            preparer, kv_cache_manager, attn_metadata, context, last_chunk=False
+        )
+        if event.query():
+            return None
+        return self._current_stream_runs_after(event)
+
+    def test_prefetch_staged_mrope_delta_is_read_in_order_by_a_chunk_without_multimodal_rows(
+        self,
+    ) -> None:
+        """The model forward writes a chunk's MRoPE delta into the seq-slot cache
+        even when the chunk has no multimodal rows and no MRoPE positions."""
+        # The first pass through this path does one-time CUDA setup that blocks the host.
+        self._order_after_chunk_with_prefetch_staged_mrope_delta(0)
+        runs_after_prefetch = self._order_after_chunk_with_prefetch_staged_mrope_delta(
+            _SIDE_STREAM_DELAY_CYCLES
+        )
+
+        if runs_after_prefetch is None:
+            self.skipTest(_ORDER_NOT_EXERCISED)
+        self.assertTrue(runs_after_prefetch)
+
     def _gather_prefetch_staged_embedding(
-        self, delay_cycles: int, *, mrope: bool = True
-    ) -> tuple[list[torch.Tensor], torch.Tensor, torch.cuda.Event, list[torch.cuda.Event | None]]:
+        self, delay_cycles: int, *, mrope: bool = True, probe_first_chunk: bool = False
+    ) -> tuple[
+        list[torch.Tensor],
+        torch.Tensor,
+        torch.cuda.Event,
+        list[torch.cuda.Event | None],
+        bool | None,
+    ]:
+        """With `probe_first_chunk`, the last item says whether this stream ran
+        after the prefetch once the first chunk was prepared, or None if the
+        prefetch had already finished by then."""
         preparer, kv_cache_manager, attn_metadata = self._setup_mrope_inputs()
         preparer.model.config.vocab_size = 1000
         context = self._make_mrope_ctx_request(4, 1, 0, 30)
@@ -1267,11 +1323,14 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
 
         gathered = []
         request_events = []
+        first_chunk_waited = None
         for last_chunk in (False, True):
             result = self._prepare_prefetched_mrope_chunk(
                 preparer, kv_cache_manager, attn_metadata, context, last_chunk=last_chunk
             )
             request_events.append(context.py_mm_encoder_event)
+            if probe_first_chunk and not last_chunk and not event.query():
+                first_chunk_waited = self._current_stream_runs_after(event)
             selected = model.select_multimodal_params(result["multimodal_params"], 1)
             if selected:
                 gathered.append(
@@ -1281,7 +1340,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
                     )[0].clone()
                 )
             context.context_current_position = 2
-        return gathered, embedding, event, request_events
+        return gathered, embedding, event, request_events, first_chunk_waited
 
     def test_prefetch_event_survives_a_first_chunk_without_multimodal_rows(self) -> None:
         """A first chunk with no multimodal rows is dropped before the wait in
@@ -1289,7 +1348,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         has to find the stream already ordered after the prefetch."""
         # The first pass through this path does one-time CUDA setup that blocks the host.
         self._gather_prefetch_staged_embedding(0)
-        gathered, embedding, event, _ = self._gather_prefetch_staged_embedding(
+        gathered, embedding, event, *_ = self._gather_prefetch_staged_embedding(
             _SIDE_STREAM_DELAY_CYCLES
         )
         staging_was_pending = not event.query()
@@ -1304,15 +1363,20 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         nothing the prefetch staged, so it must not wait for the prefetch; the
         event stays on the request for the chunk that reads the embedding."""
         # The first pass through this path does one-time CUDA setup that blocks the host.
-        self._gather_prefetch_staged_embedding(0, mrope=False)
-        gathered, embedding, event, request_events = self._gather_prefetch_staged_embedding(
-            _SIDE_STREAM_DELAY_CYCLES, mrope=False
+        self._gather_prefetch_staged_embedding(0, mrope=False, probe_first_chunk=True)
+        gathered, embedding, event, request_events, first_chunk_waited = (
+            self._gather_prefetch_staged_embedding(
+                _SIDE_STREAM_DELAY_CYCLES, mrope=False, probe_first_chunk=True
+            )
         )
         staging_was_pending = not event.query()
 
         self.assertEqual(request_events, [event, None])
         self.assertEqual(len(gathered), 1)
         torch.testing.assert_close(gathered[0], embedding.cuda(), atol=0, rtol=0)
+        if first_chunk_waited is None:
+            self.skipTest(_ORDER_NOT_EXERCISED)
+        self.assertFalse(first_chunk_waited)
         if not staging_was_pending:
             self.skipTest(_ORDER_NOT_EXERCISED)
 

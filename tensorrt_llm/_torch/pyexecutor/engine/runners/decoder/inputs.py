@@ -126,7 +126,8 @@ def _get_context_prompt_lookahead_token(request: LlmRequest, chunk_end: int) -> 
 
 def _chunk_reads_prefetched_tensors(multimodal_params: MultimodalParams, use_mrope: bool) -> bool:
     """Whether this chunk reads device tensors that a cross-iter prefetch stages: its
-    multimodal rows in the model forward, or its MRoPE positions during preparation.
+    multimodal rows or its MRoPE delta in the model forward, or its MRoPE positions during
+    preparation.
     """
     if not multimodal_params.has_content():
         return False
@@ -134,7 +135,10 @@ def _chunk_reads_prefetched_tensors(multimodal_params: MultimodalParams, use_mro
     if runtime is None or runtime.num_mm_tokens_in_chunk != 0:
         return True
     mrope_config = multimodal_params.multimodal_data.get("mrope_config") or {}
-    return use_mrope and mrope_config.get("mrope_position_ids") is not None
+    return use_mrope and (
+        mrope_config.get("mrope_position_ids") is not None
+        or mrope_config.get("mrope_position_deltas") is not None
+    )
 
 
 def _zero_fill_row_spans(buffer: torch.Tensor, spans: list[tuple[int, int]]) -> None:
