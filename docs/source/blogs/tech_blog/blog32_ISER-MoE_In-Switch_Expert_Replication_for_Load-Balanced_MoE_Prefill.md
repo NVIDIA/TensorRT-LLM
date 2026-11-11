@@ -147,7 +147,7 @@ Multicast lets each byte leave the owner once, but each of the following three w
 
 HALO-Q runs on the GPU once per MoE layer invocation, with no host step, and pursues two objectives in order:
 
-- **Objective 1, balance.** MegaMoE finishes a layer with its most loaded rank, so HALO-Q brings every rank's routed load down to the *water level* $T=\lceil\sum_r L_r/P\rceil$, the mean rank load.
+- **Objective 1, balance.** MegaMoE finishes a layer with its most loaded rank, so HALO-Q uses the *water level* $T=\lceil\sum_r L_r/P\rceil$ (the mean rank load rounded up) as its target.
 - **Objective 2, locality.** A route served off its source rank costs a token sent in dispatch and returned in combine, so among balanced routings HALO-Q calculates as many tokens as possible locally.
 
 It plans in five stages:
