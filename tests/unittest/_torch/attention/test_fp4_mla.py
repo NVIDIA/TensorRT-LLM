@@ -91,6 +91,23 @@ def _is_cutedsl_unavailable() -> bool:
     )
 
 
+def _cutedsl_4x_skip_reason() -> str | None:
+    """Why the tests that must take the 4x kernel cannot run on this machine; None when they can."""
+    if _is_cutedsl_unavailable():
+        return "requires Rubin SM107 and the CTM/CuTeDSL runtime"
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    # the 4x kernel needs the oversized shared-memory mode; a device without it decodes on 2x by design
+    return host_4x.device_unsupported_reason(torch.device("cuda", torch.cuda.current_device()))
+
+
+_CUTEDSL_4X_SKIP_REASON = _cutedsl_4x_skip_reason()
+_requires_cutedsl_4x = pytest.mark.skipif(
+    _CUTEDSL_4X_SKIP_REASON is not None,
+    reason=_CUTEDSL_4X_SKIP_REASON or "the 4x kernel can run here",
+)
+
+
 def test_fp4_mla_request_validation_uses_sparse_runtime_params() -> None:
     metadata = SimpleNamespace(
         num_sparse_topk=0,
@@ -2976,10 +2993,7 @@ def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
     )
 
 
-@pytest.mark.skipif(
-    _is_cutedsl_unavailable(),
-    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
-)
+@_requires_cutedsl_4x
 @pytest.mark.parametrize(
     "query_len_per_seq,seq_lens",
     [
@@ -3025,10 +3039,7 @@ def test_fp4_mla_attention_decode_cutedsl_4x_matches_reference(
     assert calls == ["4x"], calls
 
 
-@pytest.mark.skipif(
-    _is_cutedsl_unavailable(),
-    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
-)
+@_requires_cutedsl_4x
 @pytest.mark.parametrize(
     "query_len_per_seq,seq_lens,forced_r2",
     [
@@ -3088,10 +3099,7 @@ def test_fp4_mla_attention_decode_cutedsl_twostream_matches_reference(
     assert ("4x", len(seq_lens) - forced_r2) in calls and ("2x", forced_r2) in calls, calls
 
 
-@pytest.mark.skipif(
-    _is_cutedsl_unavailable(),
-    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
-)
+@_requires_cutedsl_4x
 def test_fp4_mla_attention_decode_cutedsl_twostream_auto_b128(monkeypatch) -> None:
     """Automatic dispatcher at B128/q4 (5.57 4x waves): 13 requests move to the 2x arm; output matches the reference."""
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
@@ -3135,7 +3143,9 @@ def test_fp4_mla_attention_decode_cutedsl_twostream_auto_b128(monkeypatch) -> No
     reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
 )
 @pytest.mark.parametrize(
-    "forced_path,expect", [("4x", ("4x", 128)), ("2x", ("2x", 128))], ids=["force-4x", "force-2x"]
+    "forced_path,expect",
+    [pytest.param("4x", ("4x", 128), marks=_requires_cutedsl_4x), ("2x", ("2x", 128))],
+    ids=["force-4x", "force-2x"],
 )
 def test_fp4_mla_attention_decode_cutedsl_dispatch_forced_path(
     monkeypatch, forced_path: str, expect
@@ -3240,6 +3250,51 @@ def test_fp4_mla_attention_decode_cutedsl_4x_falls_back_to_packed(
     _is_cutedsl_unavailable(),
     reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
 )
+def test_fp4_mla_attention_decode_cutedsl_4x_unavailable_device_runs_packed(monkeypatch) -> None:
+    """A device that cannot host the 4x kernel keeps a call inside the 4x envelope on the packed 2x path."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    reason = "the 4x kernel declares more shared memory per block than the device allows"
+    calls: list[str] = []
+    asked: list[torch.device] = []
+    recorded: list[str | None] = []
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    def unsupported(device):
+        asked.append(device)
+        return reason
+
+    monkeypatch.setattr(
+        fp4_mla_decode_4x, "_run_cutedsl_4x_decode", lambda *a, **k: calls.append("4x")
+    )
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    monkeypatch.setattr(host_4x, "device_unsupported_reason", unsupported)
+    monkeypatch.setattr(
+        fp4_mla_decode_4x, "_fp4_mla_4x_record", lambda why, *a, **k: recorded.append(why)
+    )
+    # the "h128-q4" case of test_fp4_mla_attention_decode_cutedsl_4x_matches_reference: 4x takes it otherwise
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=128,
+        seq_lens=[131, 512],
+        seed=41,
+        query_len_per_seq=4,
+        packed_queries=True,
+        enable_4x=True,
+    )
+    assert calls == ["2x"], calls
+    # the backend asked about the device of the call, and the host's reason is the dispatcher's
+    assert asked and all(device.type == "cuda" for device in asked), asked
+    assert recorded == [reason], recorded
+
+
+@_requires_cutedsl_4x
 @pytest.mark.parametrize(
     "num_heads,query_len_per_seq,seq_lens,one_wave_min_kv",
     [
