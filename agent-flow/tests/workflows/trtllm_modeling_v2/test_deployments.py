@@ -396,6 +396,7 @@ def test_options_files_are_written_without_mutation(tmp_path, spec):
             ]
         },
         {"deployments": [{"name": "badref", "options": {}, "relative_to": "missing"}]},
+        {"deployments": [{"name": "first", "options": {}}, {"name": "core", "options": {}}]},
         {
             "deployments": [
                 {

@@ -405,6 +405,8 @@ def validate(block: Any, errors: list[str]) -> None:
             at = f"{where}.{name}"
             if name in names:
                 errors.append(f"'{at}' is named twice; each deployment needs its own name")
+            if name == "core" and index:
+                errors.append(f"'{at}': `core` is how the first deployment is addressed")
         sides = [role for role in ROLES if entry.get(role) is not None]
         if sides:
             if len(sides) != len(ROLES):
