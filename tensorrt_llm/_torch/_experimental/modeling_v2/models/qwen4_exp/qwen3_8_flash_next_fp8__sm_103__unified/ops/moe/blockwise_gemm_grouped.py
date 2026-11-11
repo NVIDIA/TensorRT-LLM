@@ -72,10 +72,19 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper, true_fp32_matmul
+
+from .fp8_block_scale_moe_runner import dequantize_block_weight, requantize_1x128
+
+#: Scale block edge: 1x128 SFA, 128x128 SFB.
+BLOCK = 128
 
 
 @dsl_user_op
@@ -1856,3 +1865,212 @@ class Sm100BlockwiseGemmKernel:
             num_tiles=num_tiles,
             c_scale=c_scale,
         )
+
+
+_GEMMS: dict = {}
+
+
+def _gmem_ptr(t: torch.Tensor, dtype, align: int = 16):
+    """A global-memory CuTe pointer at `t`'s data."""
+    return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+
+
+def _grouped_reference(a, w, sfa, sfw, rows, group, ntiles) -> torch.Tensor:
+    """fp32 `[rows, n]`: tile `t < ntiles[0]` of `rows / len(group)` rows times its group's
+    dequantized weight; the rows of skipped tiles NaN (unspecified)."""
+    _, n, k = w.shape
+    m_tile = rows // group.numel()
+    act = (
+        a[:rows].float().reshape(rows, k // BLOCK, BLOCK)
+        * sfa[:, :rows].t().float().reshape(rows, k // BLOCK, 1)
+    ).reshape(rows, k)
+    out = torch.full((rows, n), float("nan"), dtype=torch.float32, device=a.device)
+    with true_fp32_matmul():
+        for t, e in enumerate(group[: int(ntiles[0])].tolist()):
+            r = slice(t * m_tile, (t + 1) * m_tile)
+            out[r] = act[r] @ dequantize_block_weight(w[e], sfw[e]).t()
+    return out
+
+
+class BlockwiseGemmGrouped(OpWrapper):
+    """`c[r, n] = sum_k (sfa * a)[r, k] (sfw * w)[group[r // M_tile], n, k]` over `tiles` M tiles
+    (`M_tile` the tactic's MMA M) of which the first `ntiles[0]` (device scalar) are live: `a`
+    `[tiles * M_tile, k]` e4m3, `sfa` `[k / 128, sf_m]` fp32 (M-major), `w` `[groups, n, k]` e4m3,
+    `sfw` `[groups, n / 128, k / 128]` fp32, `c` `[tiles * M_tile, n]` written in place; `tactic`
+    is `(mma_tiler_mn, cluster_shape_mn)`. Compiled once per `c` dtype and tactic."""
+
+    def __call__(
+        self,
+        a: torch.Tensor,
+        w: torch.Tensor,
+        sfa: torch.Tensor,
+        sfw: torch.Tensor,
+        c: torch.Tensor,
+        group: torch.Tensor,
+        ntiles: torch.Tensor,
+        tiles: int,
+        sf_m: int,
+        tactic: tuple,
+    ) -> None:
+        groups, n, k = w.shape
+        sf_n, sf_k = -(-n // BLOCK), -(-k // BLOCK)
+        tiler, cluster = tactic
+        c3 = c.view(tiles, tiler[0], n).permute(1, 2, 0)
+        key = (c.dtype, tactic)
+        fn = _GEMMS.get(key)
+        if fn is None:
+            gemm = Sm100BlockwiseGemmKernel(mma_tiler_mn=tiler, cluster_shape_mn=cluster)
+            mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
+            fn = cute.compile(
+                gemm.wrapper_grouped,
+                tiles,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
+                groups,
+                _gmem_ptr(a, cutlass.Float8E4M3FN),
+                _gmem_ptr(w, cutlass.Float8E4M3FN),
+                _gmem_ptr(sfa, cutlass.Float32),
+                _gmem_ptr(sfw, cutlass.Float32),
+                from_dlpack(c3).mark_layout_dynamic(leading_dim=1),
+                _gmem_ptr(group, cutlass.Int32, 4),
+                _gmem_ptr(ntiles, cutlass.Int32, 4),
+                max_active_clusters=mac,
+                stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                options="--opt-level 2 --enable-tvm-ffi",
+            )
+            _GEMMS[key] = fn
+        fn(
+            tiles,
+            n,
+            k,
+            sf_m,
+            sf_n,
+            sf_k,
+            groups,
+            a.data_ptr(),
+            w.data_ptr(),
+            sfa.data_ptr(),
+            sfw.data_ptr(),
+            c3,
+            group.data_ptr(),
+            ntiles.data_ptr(),
+        )
+
+    def reference(
+        self,
+        a: torch.Tensor,
+        w: torch.Tensor,
+        sfa: torch.Tensor,
+        sfw: torch.Tensor,
+        c: torch.Tensor,
+        group: torch.Tensor,
+        ntiles: torch.Tensor,
+        tiles: int,
+        sf_m: int,
+        tactic: tuple,
+    ) -> torch.Tensor:
+        """`c` after the call, as a fresh tensor of its dtype (fp32 GEMMs over the dequantized
+        operands, rounded once); the rows of skipped tiles NaN (unspecified). `sf_m` and
+        `tactic` pick a layout and a launch, not a result."""
+        return _grouped_reference(a, w, sfa, sfw, c.shape[0], group[:tiles], ntiles).to(c.dtype)
+
+
+blockwise_gemm_grouped = BlockwiseGemmGrouped()
+
+
+class BlockwiseGemmGroupedQuant(OpWrapper):
+    """`blockwise_gemm_grouped` with the 1x128 e4m3 round trip in the epilogue (`epi_quant`):
+    `cq[r, n]` e4m3 codes and `cs[n // 128, r]` fp32 scales (row-major `[n / 128, sf_m]`)
+    instead of `c`. Compiled once per tactic."""
+
+    def __call__(
+        self,
+        a: torch.Tensor,
+        w: torch.Tensor,
+        sfa: torch.Tensor,
+        sfw: torch.Tensor,
+        cq: torch.Tensor,
+        cs: torch.Tensor,
+        group: torch.Tensor,
+        ntiles: torch.Tensor,
+        tiles: int,
+        sf_m: int,
+        tactic: tuple,
+    ) -> None:
+        groups, n, k = w.shape
+        sf_n, sf_k = -(-n // BLOCK), -(-k // BLOCK)
+        key = ("q", tactic)
+        fn = _GEMMS.get(key)
+        if fn is None:
+            tiler, cluster = tactic
+            gemm = Sm100BlockwiseGemmKernel(
+                mma_tiler_mn=tiler, cluster_shape_mn=cluster, epi_quant=True
+            )
+            mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
+            fn = cute.compile(
+                gemm.wrapper_grouped_quant,
+                tiles,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
+                groups,
+                _gmem_ptr(a, cutlass.Float8E4M3FN),
+                _gmem_ptr(w, cutlass.Float8E4M3FN),
+                _gmem_ptr(sfa, cutlass.Float32),
+                _gmem_ptr(sfw, cutlass.Float32),
+                _gmem_ptr(cq, cutlass.Float8E4M3FN),
+                from_dlpack(cs).mark_layout_dynamic(leading_dim=1),
+                _gmem_ptr(group, cutlass.Int32, 4),
+                _gmem_ptr(ntiles, cutlass.Int32, 4),
+                max_active_clusters=mac,
+                stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                options="--opt-level 2 --enable-tvm-ffi",
+            )
+            _GEMMS[key] = fn
+        fn(
+            tiles,
+            n,
+            k,
+            sf_m,
+            sf_n,
+            sf_k,
+            groups,
+            a.data_ptr(),
+            w.data_ptr(),
+            sfa.data_ptr(),
+            sfw.data_ptr(),
+            cq.data_ptr(),
+            cs,
+            group.data_ptr(),
+            ntiles.data_ptr(),
+        )
+
+    def reference(
+        self,
+        a: torch.Tensor,
+        w: torch.Tensor,
+        sfa: torch.Tensor,
+        sfw: torch.Tensor,
+        cq: torch.Tensor,
+        cs: torch.Tensor,
+        group: torch.Tensor,
+        ntiles: torch.Tensor,
+        tiles: int,
+        sf_m: int,
+        tactic: tuple,
+    ) -> torch.Tensor:
+        """The values the call's codes and scales encode, `cq.float() * cs[n // 128, r]`, as
+        fp32 `[rows, n]`: `blockwise_gemm_grouped.reference`'s fp32 product through the MoE
+        runner's 1x128 e4m3 round trip; the rows of skipped tiles NaN (unspecified). `sf_m` and
+        `tactic` pick a layout and a launch, not a result."""
+        return requantize_1x128(
+            _grouped_reference(a, w, sfa, sfw, cq.shape[0], group[:tiles], ntiles)
+        )
+
+
+blockwise_gemm_grouped_quant = BlockwiseGemmGroupedQuant()

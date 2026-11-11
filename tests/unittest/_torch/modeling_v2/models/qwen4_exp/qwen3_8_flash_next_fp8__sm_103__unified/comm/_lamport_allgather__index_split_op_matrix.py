@@ -16,9 +16,10 @@ assert torch.cuda.is_available(), "the selection gather requires CUDA devices"
 
 DEADLINE_S = 900
 WIDTH = 2051
-#: Requests a step (each rank scores `requests / world` of them): tep2 / tep4 HT batches.
-REQUESTS = (16, 32, 64, 128, 192)
-MAX_ROWS = 3 * max(REQUESTS)
+#: Requests a step (each rank scores `requests / world` of them): the entry's CELLS at this world
+#: (tep2 / tep4 HT batches), set by `_run_one_rank`.
+REQUESTS: tuple = ()
+MAX_ROWS = 0
 _MODELING_V2_TESTS = Path(__file__).resolve().parents[4]
 
 lam = gather = MPI_RANK = None
@@ -156,7 +157,7 @@ CHECKS = (
 
 
 def _run_one_rank() -> int:
-    global lam, gather, MPI_RANK, RANK, WORLD
+    global lam, gather, MPI_RANK, RANK, WORLD, REQUESTS, MAX_ROWS
     os.environ.pop("TLLM_DISABLE_MPI", None)
     os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
     sys.path.insert(0, str(_MODELING_V2_TESTS / "comm"))
@@ -168,11 +169,15 @@ def _run_one_rank() -> int:
         lamport_allgather__index_split as entry,
     )
 
-    # The buffers' handles travel over MPI (the engine passes its TP communicator); the NCCL
-    # reference needs a torch process group.
-    lam = entry.build(RANK, WORLD, MAX_ROWS * WIDTH, MPI_RANK.comm.allgather)
-    _ensure_process_group()
     gather = entry.lamport_allgather
+    cells = [c.spec for c in gather.CELLS if c.spec["world"] == WORLD]
+    assert cells and all(s["width"] == WIDTH for s in cells), f"no cell at world {WORLD}"
+    REQUESTS = tuple(s["requests"] for s in cells)
+    MAX_ROWS = 3 * max(REQUESTS)
+    # The buffers' handles travel over MPI (the engine's TP communicator); the NCCL reference
+    # needs a torch process group.
+    lam = entry.build(MPI_RANK.mapping, MAX_ROWS * WIDTH)
+    _ensure_process_group()
     code = _lockstep.run_checks(MPI_RANK, list(CHECKS))
     torch.cuda.synchronize()
     sys.stdout.flush()

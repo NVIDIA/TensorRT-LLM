@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/kernels/communicationKernels/lamportComm.cuh"
 #include "tensorrt_llm/modeling_v2/common/namespace.h"
 
 #include <algorithm>
@@ -33,105 +34,19 @@ namespace kernels
 namespace hc_inject
 {
 // This kernel runs on the workspace of the stock one-shot all-reduce `allreduce_fusion_kernel_oneshot_lamport`
-// (communicationKernels/allReduceFusionKernels.cu) between its calls, so LamportComm, the helpers below and the
-// push / clear / poll / update steps must match that file's Lamport protocol:
+// (communicationKernels/allReduceFusionKernels.cu) between its calls, so it takes that file's LamportComm and helpers
+// (communicationKernels/lamportComm.cuh) and its push / clear / poll / update steps match that kernel's:
 //   - workspace[2 * NRanks + r] is rank r's buffer of three sub-buffers of workspace[3 * NRanks + 1][1] bytes; with
 //     flag = workspace[3 * NRanks][2], a call writes and polls sub-buffer flag % 3 and clears its own (flag + 2) % 3.
 //   - workspace[3 * NRanks + 1][0] holds the bytes the previous call wrote, cleared as 16-byte stores of -0.0f.
 //   - A 16-byte slot has arrived once none of its 32-bit words is -0.0f, so senders store -0.0f as +0.0f.
 //   - Every CTA increments workspace[3 * NRanks][0] after reading the flag; once all have, CTA 0 advances the flag to
 //     (flag + 1) % 3, stores the bytes this call wrote and resets the counter.
-template <int NRanks>
-struct LamportComm
-{
-    __device__ __forceinline__ LamportComm(void** workspace, int rank)
-    {
-        counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
-        flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
-        // In bytes whatever the writer's dtype; readers round up to 16-byte stores (some writers store 4-byte words).
-        clear_ptr = &reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[0];
-        flag_value = *flag_ptr;
-        auto comm_size = reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[1];
-        clear_size = *clear_ptr;
-        int data_offset = flag_value % 3;
-        int clear_offset = (flag_value + 2) % 3;
-        for (int r = 0; r < NRanks; ++r)
-        {
-            data_bufs[r] = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) + data_offset * comm_size;
-        }
-        clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
-        __syncthreads();
-        if (threadIdx.x == 0)
-        {
-            atomicAdd(counter_ptr, 1);
-        }
-    }
-
-    __device__ __forceinline__ void update(int64_t new_clear_size)
-    {
-        if (blockIdx.x == 0 && threadIdx.x == 0)
-        {
-            while (*reinterpret_cast<int volatile*>(counter_ptr) != gridDim.x)
-            {
-            }
-            *flag_ptr = (flag_value + 1) % 3;
-            *clear_ptr = new_clear_size;
-            *counter_ptr = 0;
-        }
-    }
-
-    int* counter_ptr;
-    int* flag_ptr;
-    int64_t* clear_ptr;
-    uint8_t* data_bufs[NRanks];
-    uint8_t* clear_buf;
-    int64_t clear_size;
-    int flag_value;
-};
-
-__device__ __forceinline__ bool is_neg_zero(float v)
-{
-    return *reinterpret_cast<uint32_t*>(&v) == 0x80000000;
-}
-
-__device__ __forceinline__ bool is_neg_zero(float4 v)
-{
-    return is_neg_zero(v.x) || is_neg_zero(v.y) || is_neg_zero(v.z) || is_neg_zero(v.w);
-}
-
-__device__ __forceinline__ float4 get_neg_zero()
-{
-    float4 vec;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
-        reinterpret_cast<uint32_t*>(&vec)[i] = 0x80000000;
-    }
-    return vec;
-}
-
-__device__ __forceinline__ float4 ld_global_volatile(float4* addr)
-{
-    float4 val;
-    asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];"
-                 : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
-                 : "l"(addr));
-    return val;
-}
-
-int get_sm_count()
-{
-    static int sm_count = 0;
-    if (sm_count == 0)
-    {
-        int device_id;
-        TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
-        cudaDeviceProp device_prop;
-        cudaGetDeviceProperties(&device_prop, device_id);
-        sm_count = device_prop.multiProcessorCount;
-    }
-    return sm_count;
-}
+using ::tensorrt_llm::kernels::ar_fusion::get_neg_zero;
+using ::tensorrt_llm::kernels::ar_fusion::get_sm_count;
+using ::tensorrt_llm::kernels::ar_fusion::is_neg_zero;
+using ::tensorrt_llm::kernels::ar_fusion::LamportComm;
+using ::tensorrt_llm::kernels::ar_fusion::ld_global_volatile;
 } // namespace hc_inject
 
 // Thread t holds columns [8t, 8t + 8) of a row's block output and of each of its 4 streams. The Triton program runs a

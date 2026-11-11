@@ -34,6 +34,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.jit_variants import (
     compile_only,
     first_time,
+    mark_warmed,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ngram_token_history import (
     DEP4_SLOTS,
@@ -712,29 +713,28 @@ class PleGateConvInjectNorm(OpWrapper):
         )
         # `MAX_P` follows the step's longest sequence (0 past PER_SEQ_MAX_ROWS): every value, and
         # the context-shaped rows kernel, compile at a geometry's first call.
-        if first_time(
-            "ple_gate_conv_inject_norm",
-            (
-                xc.dtype,
-                conv_states.dtype,
-                carry.dtype,
-                state_indices.dtype,
-                query_start_loc.dtype,
-                gated.stride(0),
-                conv_states.stride(0),
-                pad_slot_id,
-                ksize,
-                dilation,
-                state_len,
-                conv_rows,
-                has_carry,
-                log_s,
-                pdl,
-            ),
-        ):
+        warm_key = (
+            xc.dtype,
+            conv_states.dtype,
+            carry.dtype,
+            state_indices.dtype,
+            query_start_loc.dtype,
+            gated.stride(0),
+            conv_states.stride(0),
+            pad_slot_id,
+            ksize,
+            dilation,
+            state_len,
+            conv_rows,
+            has_carry,
+            log_s,
+            pdl,
+        )
+        if first_time("ple_gate_conv_inject_norm", warm_key):
             for max_p in range(PER_SEQ_MAX_ROWS + 1):
                 compile_only(_ple_conv_kernel, conv_args, **{**conv_constexprs, "MAX_P": max_p})
             compile_only(_ple_conv_rows_kernel, rows_args, **rows_constexprs)
+            mark_warmed("ple_gate_conv_inject_norm", warm_key)
         if not per_seq:
             _ple_conv_rows_kernel[(triton.cdiv(rows, _ROWS_BLOCK_T), width // tile_ch)](
                 *rows_args, **rows_constexprs

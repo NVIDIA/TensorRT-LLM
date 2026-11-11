@@ -15,6 +15,11 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
+
+from .blockwise_gemm_grouped import blockwise_gemm_grouped, blockwise_gemm_grouped_quant
+from .fp8_block_scale_moe_runner import fp8_block_scale_moe_runner
+
 HIDDEN = 2560
 INTER = 640
 FC1_ROWS = 2 * INTER
@@ -336,134 +341,6 @@ def _finalize_pipe_kernel(
     tl.store(out_ptr + t * H + lc, acc.to(tl.bfloat16), mask=lc < H)
 
 
-_GEMMS: dict = {}
-
-
-def _grouped_gemm(a, w, sfa, sfw, c, group, ntiles, tiles, sf_m, tactic):
-    """c[r, n] = sum_k a[r, k] w[group(r // M_TILE), n, k] with a's 1x128 (M-major `sfa[kb, r]`)
-    and w's 128x128 fp32 scales, over `tiles` M tiles of which the first `ntiles[0]` are live."""
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack, make_ptr
-
-    from .blockwise_gemm_grouped import Sm100BlockwiseGemmKernel
-
-    groups, n, k = w.shape
-    sf_n, sf_k = -(-n // BLOCK), -(-k // BLOCK)
-    tiler, cluster = tactic
-    c3 = c.view(tiles, M_TILE, n).permute(1, 2, 0)
-    key = (c.dtype, tactic)
-    fn = _GEMMS.get(key)
-    if fn is None:
-        gemm = Sm100BlockwiseGemmKernel(mma_tiler_mn=tiler, cluster_shape_mn=cluster)
-        mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
-
-        def ptr(t, dt, align=16):
-            return make_ptr(dt, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
-
-        fn = cute.compile(
-            gemm.wrapper_grouped,
-            tiles,
-            n,
-            k,
-            sf_m,
-            sf_n,
-            sf_k,
-            groups,
-            ptr(a, cutlass.Float8E4M3FN),
-            ptr(w, cutlass.Float8E4M3FN),
-            ptr(sfa, cutlass.Float32),
-            ptr(sfw, cutlass.Float32),
-            from_dlpack(c3).mark_layout_dynamic(leading_dim=1),
-            ptr(group, cutlass.Int32, 4),
-            ptr(ntiles, cutlass.Int32, 4),
-            max_active_clusters=mac,
-            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--opt-level 2 --enable-tvm-ffi",
-        )
-        _GEMMS[key] = fn
-    fn(
-        tiles,
-        n,
-        k,
-        sf_m,
-        sf_n,
-        sf_k,
-        groups,
-        a.data_ptr(),
-        w.data_ptr(),
-        sfa.data_ptr(),
-        sfw.data_ptr(),
-        c3,
-        group.data_ptr(),
-        ntiles.data_ptr(),
-    )
-
-
-def _grouped_gemm_q(a, w, sfa, sfw, cq, cs, group, ntiles, tiles, sf_m, tactic):
-    """`_grouped_gemm` with the 1x128 e4m3 round trip in the epilogue (`epi_quant`): `cq[r, n]`
-    e4m3 codes, `cs[n // 128, r]` fp32 scales (row-major `[n / 128, sf_m]`)."""
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack, make_ptr
-
-    from .blockwise_gemm_grouped import Sm100BlockwiseGemmKernel
-
-    groups, n, k = w.shape
-    sf_n, sf_k = -(-n // BLOCK), -(-k // BLOCK)
-    key = ("q", tactic)
-    fn = _GEMMS.get(key)
-    if fn is None:
-        tiler, cluster = tactic
-        gemm = Sm100BlockwiseGemmKernel(
-            mma_tiler_mn=tiler, cluster_shape_mn=cluster, epi_quant=True
-        )
-        mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
-
-        def ptr(t, dt, align=16):
-            return make_ptr(dt, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
-
-        fn = cute.compile(
-            gemm.wrapper_grouped_quant,
-            tiles,
-            n,
-            k,
-            sf_m,
-            sf_n,
-            sf_k,
-            groups,
-            ptr(a, cutlass.Float8E4M3FN),
-            ptr(w, cutlass.Float8E4M3FN),
-            ptr(sfa, cutlass.Float32),
-            ptr(sfw, cutlass.Float32),
-            ptr(cq, cutlass.Float8E4M3FN),
-            from_dlpack(cs).mark_layout_dynamic(leading_dim=1),
-            ptr(group, cutlass.Int32, 4),
-            ptr(ntiles, cutlass.Int32, 4),
-            max_active_clusters=mac,
-            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--opt-level 2 --enable-tvm-ffi",
-        )
-        _GEMMS[key] = fn
-    fn(
-        tiles,
-        n,
-        k,
-        sf_m,
-        sf_n,
-        sf_k,
-        groups,
-        a.data_ptr(),
-        w.data_ptr(),
-        sfa.data_ptr(),
-        sfw.data_ptr(),
-        cq.data_ptr(),
-        cs,
-        group.data_ptr(),
-        ntiles.data_ptr(),
-    )
-
-
 def tile_bound(rows: int, local: int, topk: int = TOPK) -> int:
     """M tiles that hold any routing of `rows` rows over a `local`-expert window."""
     return -(-rows * min(topk, local) // M_TILE) + local
@@ -552,7 +429,7 @@ def _plan(xq, xsf, ids, wts, fc1, fc1_scale, fc2, fc2_scale, offset, tactics=Non
 
     def fc1g():
         if epiq:
-            _grouped_gemm_q(
+            blockwise_gemm_grouped_quant(
                 a1,
                 fc1,
                 sfa.view(HIDDEN // BLOCK, m),
@@ -566,7 +443,7 @@ def _plan(xq, xsf, ids, wts, fc1, fc1_scale, fc2, fc2_scale, offset, tactics=Non
                 t1,
             )
         else:
-            _grouped_gemm(
+            blockwise_gemm_grouped(
                 a1, fc1, sfa.view(HIDDEN // BLOCK, m), fc1_scale, c1, group, ntiles, tiles, m, t1
             )
 
@@ -613,7 +490,7 @@ def _plan(xq, xsf, ids, wts, fc1, fc1_scale, fc2, fc2_scale, offset, tactics=Non
             )
 
     def fc2g():
-        _grouped_gemm(
+        blockwise_gemm_grouped(
             a2.view(torch.float8_e4m3fn), fc2, sfa2, fc2_scale, c2, group, ntiles, tiles, m, t2
         )
 
@@ -659,7 +536,7 @@ def _plan(xq, xsf, ids, wts, fc1, fc1_scale, fc2, fc2_scale, offset, tactics=Non
     ]
 
 
-def moe_prefill_grouped(
+def _moe_prefill_grouped(
     xq: torch.Tensor,
     xsf: torch.Tensor,
     ids: torch.Tensor,
@@ -686,6 +563,77 @@ def moe_prefill_grouped(
         if name == "finalize_first" and after_first is not None:
             after_first(out)
     return out
+
+
+class MoePrefillGrouped(OpWrapper):
+    """This window's partial of a prefill chunk's routed experts, pre-routed, `[rows, HIDDEN]`
+    bf16 (see `_moe_prefill_grouped` for the operands). `fin_first = (r0, r1)` (rows at either
+    end) finalizes those rows, calls `after_first(out)`, then finalizes the rest."""
+
+    def __call__(
+        self,
+        xq: torch.Tensor,
+        xsf: torch.Tensor,
+        ids: torch.Tensor,
+        wts: torch.Tensor,
+        fc1: torch.Tensor,
+        fc1_scale: torch.Tensor,
+        fc2: torch.Tensor,
+        fc2_scale: torch.Tensor,
+        offset: int,
+        tactics=None,
+        fin_first=None,
+        after_first=None,
+    ) -> torch.Tensor:
+        return _moe_prefill_grouped(
+            xq, xsf, ids, wts, fc1, fc1_scale, fc2, fc2_scale, offset, tactics, fin_first,
+            after_first,
+        )  # fmt: skip
+
+    def reference(
+        self,
+        xq: torch.Tensor,
+        xsf: torch.Tensor,
+        ids: torch.Tensor,
+        wts: torch.Tensor,
+        fc1: torch.Tensor,
+        fc1_scale: torch.Tensor,
+        fc2: torch.Tensor,
+        fc2_scale: torch.Tensor,
+        offset: int,
+        tactics=None,
+        fin_first=None,
+        after_first=None,
+    ) -> torch.Tensor:
+        """`fp8_block_scale_moe_runner`'s pre-routed reference over the same window. `tactics`
+        and `fin_first` pick launches, not a result; `after_first` is not called."""
+        local = fc1.shape[0]
+        return fp8_block_scale_moe_runner.reference(
+            routing_logits=None,
+            routing_bias=None,
+            hidden_states=xq,
+            hidden_states_scale=xsf,
+            gemm1_weights=fc1,
+            gemm1_weights_scale=fc1_scale,
+            gemm2_weights=fc2,
+            gemm2_weights_scale=fc2_scale,
+            # The routing space only bounds the runner's `is_valid`; the reference reads the window.
+            num_experts=offset + local,
+            top_k=TOPK,
+            num_fused_shared_experts=None,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=INTER,
+            local_expert_offset=offset,
+            local_num_experts=local,
+            routed_scaling_factor=None,
+            routing_method_type=1,
+            topk_weights=wts,
+            topk_ids=ids,
+        )
+
+
+moe_prefill_grouped = MoePrefillGrouped()
 
 
 _READY: set = set()

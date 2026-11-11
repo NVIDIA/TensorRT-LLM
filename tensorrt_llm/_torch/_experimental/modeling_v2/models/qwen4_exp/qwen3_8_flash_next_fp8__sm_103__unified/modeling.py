@@ -24,7 +24,8 @@ one scale per 128x128 weight block); everything else is bf16 (`weights.py`). Per
   128-row FP8 weight block. Under attention TP the plain sum completes the window partials.
   Under attention DP each rank's rows are gathered (`catalog/comm/allgather`, ragged when the
   counts differ), run through the window and reduce-scattered back
-  (`catalog/comm/reducescatter`; `_expert_sum_op`, or an all-to-all with `MOE_ALLTOALL_ENV`).
+  (`catalog/comm/reducescatter`; `_expert_sum_op`, or an all-to-all with
+  `MOE_COMM_METHOD_ENV=NVLINK_ONE_SIDED`).
 * **Replicated:** the router, the bf16 shared expert, the hyper-connections, PLE and the
   embedding run on this rank's rows. `lm_head` is the shell's: vocab-parallel under attention
   TP, whole under attention DP and at tp1.
@@ -88,10 +89,10 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
-import triton
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -186,7 +187,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4
     _PDL_TRIGGER as _HC_INJECT_PDL_TRIGGER,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (
-    _hc_inject_norm_kernel,
     qwen4_exp_hc_inject_norm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_rstd import (
@@ -245,7 +245,6 @@ from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
-from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -683,11 +682,20 @@ _FP8_ROWTILE_MAX_SCRATCH = 1 << 30  # capacity: fixed: bounds a per-call scratch
 #: (`_rowtile_scratch_groups`) instead of the per-row kernel. Off by default because such steps'
 #: outputs then move by rounding. Read once, when the target is built.
 ROWTILE_SCRATCH_GROUPS_ENV = "TRTLLM_MODELING_V2_ROWTILE_SCRATCH_GROUPS"
-#: Opt-in switch (`weights.switch`): under attention DP, the MoE round trip runs as an all-to-all
-#: dispatch / combine (`moe_a2a__dp_dispatch_combine`): a reference path, not a faster one. Needs
-#: MPI, attention DP and MNNVL; `check_deployment` declines it elsewhere. Read once, when the
-#: target is built.
-MOE_ALLTOALL_ENV = "TRTLLM_MODELING_V2_MOE_ALLTOALL"
+#: The stock MoE communication override (`communication_factory`), compared upper-cased like the
+#: stock factory. Under attention DP, `NVLINK_ONE_SIDED` runs the MoE round trip as an all-to-all
+#: dispatch / combine (`moe_a2a__dp_dispatch_combine`): a reference path, not a faster one; it
+#: needs MPI, attention DP and MNNVL. Unset or `ALLGATHER` keeps the all-gather / reduce-scatter
+#: round trip. `check_deployment` declines any other value, and the all-to-all where it cannot
+#: run. Read once, when the target is built.
+MOE_COMM_METHOD_ENV = "TRTLLM_FORCE_COMM_METHOD"
+
+
+def _moe_comm_method() -> str:
+    """`MOE_COMM_METHOD_ENV` upper-cased, `ALLGATHER` when unset."""
+    return os.environ.get(MOE_COMM_METHOD_ENV, "ALLGATHER").upper()
+
+
 # Rows per FP8 runner call over an attention-DP group's gathered rows (`_routed_experts`): one
 # call reads the window's weights once, bitwise the `_MOE_MAX_ROWS`-row calls; the router, its
 # routing and the activation quantization still run per `_MOE_MAX_ROWS` rows.
@@ -1319,8 +1327,9 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         `run(rows)` applies this rank's expert window; `padding` comes from `_dp_pad_rows`.
         Attention TP: every rank holds every row and `tp_sum` completes the partial. Attention
         DP: all-gather the group's rows in rank order, run the window, reduce-scatter; routing
-        gathered rows keeps every rank's routing of a row identical. `MOE_ALLTOALL_ENV` (MPI and
-        MNNVL) swaps in the NVLink all-to-all, with `run` a `_WindowRun`. Unequal per-rank
+        gathered rows keeps every rank's routing of a row identical.
+        `MOE_COMM_METHOD_ENV=NVLINK_ONE_SIDED` (MPI and MNNVL) swaps in the NVLink all-to-all,
+        with `run` a `_WindowRun`. Unequal per-rank
         counts (`padding` set) use the ragged collectives so the window never sees padding
         rows, which would all route to the same experts and stall the group on one window."""
         if self.dp_size == 1:
@@ -1339,14 +1348,15 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             gathered = allgather(x, sizes, group, process_group)
             return reducescatter(run(gathered), sizes, group, process_group)
 
-        if not _weights.switch(MOE_ALLTOALL_ENV):
+        if _moe_comm_method() != "NVLINK_ONE_SIDED":
             return round_trip
         strategy = None if mpi_disabled() else _build_moe_a2a(self.mapping, self.max_num_tokens)
         if strategy is None:
             # `check_deployment` declines this deployment; reached only when routing is bypassed.
             raise RuntimeError(
-                f"{MOE_ALLTOALL_ENV}=1 needs MPI and MNNVL, which this deployment lacks; unset it "
-                "to run the attention-DP MoE as the all-gather / reduce-scatter round trip"
+                f"{MOE_COMM_METHOD_ENV}=NVLINK_ONE_SIDED needs MPI and MNNVL, which this "
+                "deployment lacks; unset it to run the attention-DP MoE as the all-gather / "
+                "reduce-scatter round trip"
             )
         self.moe_a2a = strategy
 
@@ -2743,51 +2753,23 @@ def _hc_mixer(core, normed, first, up, with_inject):
 def _hc_inject_norm_launch(
     hc, block_out, inject, norm, eps, hc_count, shared, gate_logits, num_warps
 ):
-    """Launch `qwen4_exp_hc_inject_norm` (no finalize fold) at `num_warps` warps with PDL.
+    """Run `qwen4_exp_hc_inject_norm` (no finalize fold) at `num_warps` warps with PDL.
 
     The residual is bitwise at any warp count; the normed stream varies only with the fp32
     sum-of-squares order. Programs read nothing before `griddepcontrol.wait`. Returns
     `(hc_out, normed)`; `hc_out` is `hc` itself without `block_out`."""
-    rows, width = hc.shape
-    hidden = width // hc_count
-    has_inject = block_out is not None
-    has_shared = shared is not None
-    normed = torch.empty((rows, width), dtype=hc.dtype, device=hc.device)
-    hc_out = torch.empty((rows, width), dtype=hc.dtype, device=hc.device) if has_inject else hc
-    _hc_inject_norm_kernel[(rows * hc_count,)](
+    return qwen4_exp_hc_inject_norm(
         hc,
-        block_out if has_inject else hc,
-        inject if has_inject else hc,
-        shared if has_shared else hc,
-        gate_logits if has_shared else hc,
-        hc,
-        hc,
+        block_out,
+        inject,
         norm,
-        hc_out,
-        normed,
-        hc.stride(0),
-        block_out.stride(0) if has_inject else 0,
-        inject.stride(0) if has_inject else 0,
-        shared.stride(0) if has_shared else 0,
-        gate_logits.stride(0) if has_shared else 0,
-        0,
-        0,
-        hc_out.stride(0),
-        normed.stride(0),
         eps,
-        HC_COUNT=hc_count,
-        HIDDEN=hidden,
-        BLOCK=triton.next_power_of_2(hidden),
-        HAS_INJECT=has_inject,
-        HAS_SHARED=has_shared,
-        TOPK=0,
-        STREAMS_PER_PROGRAM=1,
-        PDL_TRIGGER=_HC_INJECT_PDL_TRIGGER,
-        PDL_WAIT=_HC_INJECT_PDL_WAIT,
+        hc_count,
+        shared,
+        gate_logits,
         num_warps=num_warps,
-        launch_pdl=_HC_INJECT_PDL_WAIT,
+        pdl_wait=_HC_INJECT_PDL_WAIT,
     )
-    return hc_out, normed
 
 
 def _hc_mixer_rstd(core, hc, rstd, norm, first, up, with_inject):
@@ -3266,12 +3248,7 @@ def _index_split_lamport(core):
         return None
     width = core.token_topk + core.compress_ratio - 1
     rows = min(_INDEX_SPLIT_LAMPORT_ROWS, core.max_num_tokens)
-    return _selection_lamport_build(
-        core.mapping.tp_rank,
-        core.attn_tp_size,
-        rows * width,
-        Distributed.get(core.mapping).tp_allgather,
-    )
+    return _selection_lamport_build(core.mapping, rows * width)
 
 
 def _index_split_rows(split, rows: int, rows_per_seq: int) -> tuple | None:
@@ -5521,18 +5498,15 @@ class PrefillTarget:
                 device=qkv.device,
             )
             for lo, hi, context_rows in parts:
-                scores = qsa_paged_index_scores(
-                    q=q_index[lo:hi],
-                    index_cache=draft.index_cache,
-                    block_table=block_table,
-                    query_positions=logical[lo:hi],
-                    request_indices=req_idx[lo:hi],
-                    tokens_per_block=tokens_per_block,
-                    compress_ratio=core.compress_ratio,
-                    only_visible_blocks=True,
-                    context_rows=context_rows,
-                    prefill_query_tile=True,
-                    wide_split=True,
+                scores = _context_index_scores(
+                    q_index[lo:hi],
+                    draft.index_cache,
+                    block_table,
+                    logical[lo:hi],
+                    req_idx[lo:hi],
+                    tokens_per_block,
+                    core.compress_ratio,
+                    context_rows,
                 )
                 _selection(
                     core,
@@ -6750,7 +6724,13 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
         mapping = model_config.mapping
         _weights.moe_tpb_requested()
         _weights.switch(ROWTILE_SCRATCH_GROUPS_ENV)
-        if _weights.switch(MOE_ALLTOALL_ENV):
+        comm_method = _moe_comm_method()
+        if comm_method not in ("ALLGATHER", "NVLINK_ONE_SIDED"):
+            raise NoTarget(
+                f"{MOE_COMM_METHOD_ENV}={comm_method} at {layout}: the target runs the MoE round "
+                "trip as ALLGATHER (the default) or NVLINK_ONE_SIDED"
+            )
+        if comm_method == "NVLINK_ONE_SIDED":
             from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
                 NVLinkOneSided,
             )
@@ -6761,8 +6741,8 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
                 or not NVLinkOneSided.is_platform_supported()
             ):
                 raise NoTarget(
-                    f"{MOE_ALLTOALL_ENV}=1 at {layout}: the all-to-all MoE round trip needs MPI, "
-                    "attention DP and MNNVL on this node"
+                    f"{MOE_COMM_METHOD_ENV}=NVLINK_ONE_SIDED at {layout}: the all-to-all MoE "
+                    "round trip needs MPI, attention DP and MNNVL on this node"
                 )
         spec = model_config.spec_config
         if spec is not None:

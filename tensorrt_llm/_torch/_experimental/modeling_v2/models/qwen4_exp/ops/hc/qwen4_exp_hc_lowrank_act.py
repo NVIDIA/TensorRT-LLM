@@ -94,22 +94,20 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
             why="default stack-final mixer (no inject): one decode token",
             spec=dict(rows=1, inject=False, logits_width=352),
         ),
-        # The FP8 unified target's HC mixers in its captured decode graph (batches 1..128).
+        # The FP8 unified target's HC mixers in its captured graphs at 641..3071 rows (e.g. the
+        # breakable prefill buckets): fewer rows run `qwen4_exp_hc_decode_tc_first`, more the
+        # rstd form.
         Cell(
-            why="FP8 unified captured HC mixer, batch 2: 352-wide logits",
-            spec=dict(rows=2, logits_width=352, capture=True),
+            why="FP8 unified captured prefill HC mixer, 641 rows: 352-wide logits",
+            spec=dict(rows=641, logits_width=352, capture=True),
         ),
         Cell(
-            why="FP8 unified captured HC mixer, batch 72: 352-wide logits",
-            spec=dict(rows=72, logits_width=352, capture=True),
+            why="FP8 unified captured prefill HC mixer, 1024 rows: 352-wide logits",
+            spec=dict(rows=1024, logits_width=352, capture=True),
         ),
         Cell(
-            why="FP8 unified captured HC mixer, batch 120: 352-wide logits",
-            spec=dict(rows=120, logits_width=352, capture=True),
-        ),
-        Cell(
-            why="FP8 unified captured HC mixer, batch 128 (the largest): 352-wide",
-            spec=dict(rows=128, logits_width=352, capture=True),
+            why="FP8 unified captured prefill HC mixer, 3071 rows (the largest): 352-wide",
+            spec=dict(rows=3071, logits_width=352, capture=True),
         ),
     )
 
@@ -134,7 +132,8 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
 
     Certified: bf16 outputs from fp32 logits 352 wide (the call site) at 1, 32,
     1024 and 8192 rows with the injection and at 1 row without it, and 384 wide
-    at 128 and 8192 rows (without the injection at 8192); graph replay.
+    at 128 and 8192 rows (without the injection at 8192); graph replay, and
+    captured at 641, 1024 and 3071 rows 352 wide.
     Against the float64 reference: bitwise at 1, 32 and 128 rows; at 1024 and
     8192 rows at most 0.99 ulp on a few `low` elements, relative L2 <= 1.6e-5.
 

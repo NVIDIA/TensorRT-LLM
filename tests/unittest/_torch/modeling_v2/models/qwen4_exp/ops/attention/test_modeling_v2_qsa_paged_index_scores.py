@@ -503,6 +503,49 @@ def test_rejects_metadata_shorter_than_the_rows(only_visible_blocks) -> None:
 
 
 @pytest.mark.parametrize(
+    "bad, match",
+    [
+        (dict(tokens_per_block=0), "positive pages"),
+        (dict(compress_ratio=1), "compression ratio"),
+        ("float_positions", "integer storage"),
+        ("cpu_table", "one CUDA device"),
+        ("empty_table", "non-empty block table"),
+    ],
+    ids=["tokens_per_block-0", "compress_ratio-1", "float-positions", "cpu-table", "empty-table"],
+)
+def test_prefill_query_tile_rejects_what_the_engine_rejects(bad, match) -> None:
+    """The query-tiled launch refuses the operands the engine's launcher refuses."""
+    gen = torch.Generator(device=DEV).manual_seed(1703)
+    rows, tpb, cr = _entry._DECODE_ROW_LIMIT + 44, 32, 4
+    cache = (torch.randn(16, tpb, 1, 128, generator=gen, device=DEV) * 0.5).to(torch.bfloat16)
+    q = (torch.randn(rows, 4, 128, generator=gen, device=DEV) * 0.5).to(torch.bfloat16)
+    args = dict(
+        q=q,
+        index_cache=cache,
+        block_table=torch.arange(16, dtype=torch.int32, device=DEV).view(1, 16),
+        query_positions=torch.arange(rows, dtype=torch.int64, device=DEV),
+        request_indices=torch.zeros(rows, dtype=torch.int32, device=DEV),
+        tokens_per_block=tpb,
+        compress_ratio=cr,
+        only_visible_blocks=True,
+        context_rows=True,
+    )
+    assert _entry._takes_prefill_query_tile(q, True, True, False)
+    if bad == "float_positions":
+        args["query_positions"] = args["query_positions"].float()
+    elif bad == "cpu_table":
+        args["block_table"] = args["block_table"].cpu()
+    elif bad == "empty_table":
+        args["block_table"] = args["block_table"][:, :0]
+    else:
+        args.update(bad)
+    with pytest.raises(ValueError, match=match):
+        _entry._qsa_index_scores_prefill_query_tile(
+            **{k: v for k, v in args.items() if k not in ("only_visible_blocks", "context_rows")}
+        )
+
+
+@pytest.mark.parametrize(
     "chunks",
     [((67584, 8190),), ((5000, 300), (20000, 1700)), ((131072, 4093),)],
     ids=["one-request-8190-at-67k", "two-requests", "ragged-4093-at-128k"],

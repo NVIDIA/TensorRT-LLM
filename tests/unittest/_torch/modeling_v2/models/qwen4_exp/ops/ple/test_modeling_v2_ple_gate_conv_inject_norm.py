@@ -296,13 +296,16 @@ def test_pdl_launches_are_the_plain_launches(rows_per_seq) -> None:
     hc_out, normed = op(*args, pdl=True)
     assert torch.equal(hc_out, want[0]) and torch.equal(normed, want[1])
     assert torch.equal(args[7], want[2])
-    fresh = _build(dict(lengths=(rows_per_seq,) * 4), seed=30 + rows_per_seq)
+    # Capture over other inputs, then refill every operand with `want`'s before the replay.
+    fresh = _build(dict(lengths=(rows_per_seq,) * 4), seed=40 + rows_per_seq)
     pool = fresh[7].clone()
     fresh[7] = pool
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         g_out, g_normed = op(*fresh, pdl=True)
-    pool.copy_(_build(dict(lengths=(rows_per_seq,) * 4), seed=30 + rows_per_seq)[7])
+    for dst, src in zip(fresh, _build(dict(lengths=(rows_per_seq,) * 4), seed=30 + rows_per_seq)):
+        if isinstance(dst, torch.Tensor):
+            dst.copy_(src)
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(g_out, want[0]) and torch.equal(g_normed, want[1])

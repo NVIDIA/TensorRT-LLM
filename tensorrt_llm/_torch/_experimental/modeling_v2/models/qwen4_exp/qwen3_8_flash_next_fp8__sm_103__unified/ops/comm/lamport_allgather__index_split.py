@@ -20,11 +20,13 @@ group must make the same sequence of calls (the split depends only on the row co
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
@@ -32,40 +34,26 @@ SLOTS = 3
 SENTINEL = -(2**31)
 _BLOCK = 1024
 _PROGRAMS = 256
+#: Words of one selection row: the target's `token_topk + compress_ratio - 1`.
+_SELECTION_WIDTH = 2051
 
 
-class _IpcBuffers:
-    """This rank's buffer and the peers' opened ones (addresses in rank order); freed and
-    closed with the object."""
-
-    def __init__(self, rank: int, local: int, peers: list):
-        self.rank, self.local, self.peers = rank, local, peers
-
-    def __del__(self):
-        import sys
-
-        if sys.is_finalizing():
-            return
-        from tensorrt_llm._ipc_utils import cudart
-
-        for q, ptr in enumerate(self.peers):
-            if ptr and q != self.rank:
-                cudart.cudaIpcCloseMemHandle(ptr)
-        if self.local:
-            cudart.cudaFree(self.local)
+if TYPE_CHECKING:
+    from tensorrt_llm._ipc_utils import IpcMemory
 
 
 @dataclass(frozen=True)
 class SelectionLamport:
-    """One rank's view of the group's buffers: `buffers` the IPC allocations (kept alive here),
-    `state` the `[4]` int32 slot state (`state[0]` the next call's slot, `state[1]` the
-    previous call's share in words, `state[2]` the ticket counter), `args` the `[8]` int64 the
-    kernel reads: the peers' buffer addresses at [0, world), this rank's own at `rank`."""
+    """One rank's view of the group's buffers: `buffers` the `IpcMemory` (kept alive here; it
+    frees this rank's buffer and closes the peers' with the object), `state` the `[4]` int32
+    slot state (`state[0]` the next call's slot, `state[1]` the previous call's share in words,
+    `state[2]` the ticket counter), `args` the `[8]` int64 the kernel reads: the peers' buffer
+    addresses at [0, world), this rank's own at `rank`."""
 
     rank: int
     world: int
     max_words: int
-    buffers: _IpcBuffers
+    buffers: IpcMemory
     state: torch.Tensor
     args: torch.Tensor
 
@@ -74,49 +62,32 @@ class SelectionLamport:
         return 0 < words <= self.max_words
 
 
-def build(rank: int, world: int, max_words: int, allgather) -> SelectionLamport:
-    """Allocate this rank's buffers and open the peers' (CUDA IPC, one node). `allgather(b)`
-    gathers one `bytes` a rank in rank order (e.g. `Distributed.get(mapping).tp_allgather`): a
-    collective, so every rank calls `build` at the same point, before any CUDA graph capture."""
-    from tensorrt_llm._ipc_utils import (
-        _ipc_mem_handle_from_bytes,
-        _ipc_mem_handle_to_bytes,
-        _raise_if_error,
-        cuda,
-        cudart,
-    )
+def build(mapping, max_words: int) -> SelectionLamport:
+    """Allocate this rank's buffers and open the peers' over `mapping`'s TP group (CUDA IPC,
+    one node, `IpcMemory`). A TP collective: every rank calls `build` at the same point, before
+    any CUDA graph capture."""
+    from tensorrt_llm._ipc_utils import IpcMemory, cuda
+    from tensorrt_llm._torch.distributed.communicator import Distributed
 
+    rank, world = mapping.tp_rank, mapping.tp_size
     assert 2 <= world <= 4, "the kernel addresses 2 to 4 ranks"
-    nbytes = -(-(SLOTS * max_words * 4) // (1 << 21)) * (1 << 21)
-    err, local = cudart.cudaMalloc(nbytes)
-    _raise_if_error(err)
-    (err,) = cuda.cuMemsetD32(local, SENTINEL & 0xFFFFFFFF, nbytes // 4)
-    _raise_if_error(err)
-    err, handle = cudart.cudaIpcGetMemHandle(local)
-    _raise_if_error(err)
-    handles = allgather(_ipc_mem_handle_to_bytes(handle))
-    assert len(handles) == world, (len(handles), world)
-    peers = []
-    for q, h in enumerate(handles):
-        if q == rank:
-            peers.append(int(local))
-            continue
-        err, ptr = cudart.cudaIpcOpenMemHandle(
-            _ipc_mem_handle_from_bytes(h), cudart.cudaIpcMemLazyEnablePeerAccess
-        )
-        _raise_if_error(err)
-        peers.append(int(ptr))
+    ipc = IpcMemory(mapping, SLOTS * max_words * 4, open_ipc=True)
+    assert ipc.open_ipc, "the TP group spans nodes: no CUDA IPC"
+    (err,) = cuda.cuMemsetD32(ipc.local_ptr, SENTINEL & 0xFFFFFFFF, SLOTS * max_words)
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuMemsetD32 of the selection buffers: {err!r}")
     dev = torch.device("cuda", torch.cuda.current_device())
     state = torch.zeros(4, dtype=torch.int32, device=dev)
+    peers = [int(ptr) for ptr in ipc.peer_ptrs]
     args = torch.tensor(peers + [0] * (8 - world), dtype=torch.int64, device=dev)
     torch.cuda.synchronize()
     # every rank's buffer is filled and opened before any rank's first push
-    allgather(b"")
+    Distributed.get(mapping).tp_allgather(b"")
     return SelectionLamport(
         rank=rank,
         world=world,
         max_words=max_words,
-        buffers=_IpcBuffers(rank, int(local), peers),
+        buffers=ipc,
         state=state,
         args=args,
     )
@@ -215,38 +186,74 @@ def _lamport_allgather_kernel(
                 tl.store(out, v, mask=m)
 
 
-def lamport_allgather(
-    src: torch.Tensor, lam: SelectionLamport, dst_rows: torch.Tensor | None = None
-) -> torch.Tensor:
+class LamportAllgather(OpWrapper):
     """`src`'s rows from every rank of `lam`'s group concatenated in rank order (the NCCL
     `allgather` with equal shares): `src` is this rank's contiguous int32 `[rows, width]`
     share. Returns a fresh `[world * rows, width]` int32 tensor. With `dst_rows` (int32
     `[world * rows]`, a permutation, the same on every rank) the gathered row `j` is stored at
-    row `dst_rows[j]` instead (`out[dst_rows] = gathered`), in the same launch."""
-    assert src.dtype == torch.int32 and src.is_contiguous() and src.ndim == 2
-    rows, width = src.shape
-    share = rows * width
-    assert lam.fits(share * lam.world), (share, lam.world, lam.max_words)
-    dst = torch.empty([lam.world * rows, width], dtype=torch.int32, device=src.device)
-    if dst_rows is not None:
-        assert dst_rows.dtype == torch.int32 and dst_rows.is_contiguous()
-        assert dst_rows.numel() == lam.world * rows
-    pdl = get_env_enable_pdl()
-    _lamport_allgather_kernel[(_PROGRAMS,)](
-        src,
-        dst,
-        lam.args,
-        lam.state,
-        share,
-        lam.rank,
-        lam.max_words,
-        dst if dst_rows is None else dst_rows,
-        width,
-        WORLD=lam.world,
-        BLOCK=_BLOCK,
-        ROW_MAP=dst_rows is not None,
-        USE_PDL=pdl,
-        num_warps=4,
-        launch_pdl=pdl,
+    row `dst_rows[j]` instead (`out[dst_rows] = gathered`), in the same launch. `lam` comes from
+    `build`."""
+
+    ARCHS = frozenset({Arch.SM_103})
+    CELLS: tuple[Cell, ...] = tuple(
+        Cell(
+            why=f"tep{world}: a served step of {requests} requests, 12 trunk calls at "
+            f"{3 * requests} rows and 2 draft calls at {requests}",
+            spec=dict(world=world, requests=requests, width=_SELECTION_WIDTH, dtype=torch.int32),
+        )
+        for world in (2, 4)
+        for requests in (16, 32, 64, 128, 192)
     )
-    return dst
+
+    note = """
+    Certified bitwise NCCL's gather over a long mixed sequence of each cell's calls (the three
+    slots rotating), with and without the row map, eagerly and replayed from a CUDA graph.
+    Not certified: groups spanning nodes, world sizes other than 2 and 4, widths other than
+    the target's selection rows.
+    """
+
+    def __call__(
+        self, src: torch.Tensor, lam: SelectionLamport, dst_rows: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        assert src.dtype == torch.int32 and src.is_contiguous() and src.ndim == 2
+        rows, width = src.shape
+        share = rows * width
+        assert lam.fits(share * lam.world), (share, lam.world, lam.max_words)
+        dst = torch.empty([lam.world * rows, width], dtype=torch.int32, device=src.device)
+        if dst_rows is not None:
+            assert dst_rows.dtype == torch.int32 and dst_rows.is_contiguous()
+            assert dst_rows.numel() == lam.world * rows
+        pdl = get_env_enable_pdl()
+        _lamport_allgather_kernel[(_PROGRAMS,)](
+            src,
+            dst,
+            lam.args,
+            lam.state,
+            share,
+            lam.rank,
+            lam.max_words,
+            dst if dst_rows is None else dst_rows,
+            width,
+            WORLD=lam.world,
+            BLOCK=_BLOCK,
+            ROW_MAP=dst_rows is not None,
+            USE_PDL=pdl,
+            num_warps=4,
+            launch_pdl=pdl,
+        )
+        return dst
+
+    def reference(
+        self, srcs_in_rank_order: Sequence[torch.Tensor], dst_rows: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Every rank's `src` concatenated in rank order, its row `j` at row `dst_rows[j]` with
+        `dst_rows`. The documented collective exception to mirroring `__call__`."""
+        gathered = torch.cat(list(srcs_in_rank_order))
+        if dst_rows is None:
+            return gathered
+        out = torch.empty_like(gathered)
+        out[dst_rows.long()] = gathered
+        return out
+
+
+lamport_allgather = LamportAllgather()

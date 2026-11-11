@@ -34,6 +34,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import (
     ngram_hash,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.jit_variants import (
+    warm_variants,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ngram_token_history import (
     DEP4_SLOTS,
     TEP4_SLOTS,
@@ -54,7 +57,9 @@ TP4_SLOTS = TEP4_SLOTS
 #: Above this many rows per sequence (MTP verify carries at most 4) the call
 #: takes the context-shaped path: packed row tiles plus a separate publish.
 PER_SEQ_MAX_ROWS = 4
-_PER_SEQ_BLOCK_P = triton.next_power_of_2(PER_SEQ_MAX_ROWS)
+#: `BLOCK_P` values a per-sequence call can pick (`next_power_of_2` of 1..PER_SEQ_MAX_ROWS),
+#: all compiled at a geometry's first call.
+_PER_SEQ_BLOCK_PS = (1, 2, 4)
 _ROWS_BLOCK_T = 32
 #: The row-to-sequence search covers at least 2^8 sequences, so one compiled
 #: variant serves every batch up to that size.
@@ -511,7 +516,7 @@ class PleNgramEmbed(OpWrapper):
                 num_warps=1,
             )
         elif num_seqs > 0:
-            _ple_ngram_embed_kernel[(num_seqs,)](
+            embed_args = (
                 input_ids,
                 context_pool,
                 state_indices,
@@ -527,18 +532,33 @@ class PleNgramEmbed(OpWrapper):
                 table.stride(0),
                 out.stride(0),
                 eos_token_id,
+            )
+            embed_constexprs = dict(
                 NGRAM=ngram_size,
                 HEADS_PER=heads // (ngram_size - 1),
                 HEADS=heads,
                 BLOCK_H=triton.next_power_of_2(heads),
                 HEAD_DIM=head_dim,
                 BLOCK_D=triton.next_power_of_2(head_dim),
-                # One compiled variant for every per-sequence row count (rows past `length` masked).
-                BLOCK_P=_PER_SEQ_BLOCK_P,
+                BLOCK_P=triton.next_power_of_2(max(max_rows, 1)),
                 BLOCK_C=triton.next_power_of_2(ngram_size - 1),
                 HAS_CARRY=has_initial_states is not None,
                 num_warps=4,
             )
+            # `BLOCK_P` follows the step's longest sequence: every value compiles at a
+            # geometry's first call, so a served step never compiles.
+            warm_variants(
+                _ple_ngram_embed_kernel,
+                (
+                    tuple(t.dtype for t in embed_args[:11]),
+                    embed_args[11:],
+                    tuple(embed_constexprs[k] for k in ("NGRAM", "HEADS", "HEAD_DIM", "HAS_CARRY")),
+                ),
+                embed_args,
+                [{"BLOCK_P": p} for p in _PER_SEQ_BLOCK_PS],
+                **embed_constexprs,
+            )
+            _ple_ngram_embed_kernel[(num_seqs,)](*embed_args, **embed_constexprs)
         return out
 
     def reference(

@@ -18,8 +18,9 @@ DEADLINE_S = 1500
 HC, HIDDEN = 4, 2560
 WIDTH = HC * HIDDEN
 EPS = 1e-6
-#: Decode-site row counts on both sides of the switch to 2-warp programs at 512 rows.
-ROWS = (33, 96, 168, 192, 216, 288, 384, 480, 511, 512, 576, 640, 1024)
+#: Decode-site row counts on both sides of the switch to 2-warp programs at 512 rows: the entry's
+#: CELLS at this world, set by `_run_one_rank`.
+ROWS: tuple = ()
 _MODELING_V2_TESTS = Path(__file__).resolve().parents[4]
 
 modeling = fused_mod = tp_sum = MPI_RANK = WS = None
@@ -175,7 +176,7 @@ CHECKS = (
 
 
 def _run_one_rank() -> int:
-    global modeling, fused_mod, tp_sum, MPI_RANK, RANK, WORLD, WS
+    global modeling, fused_mod, tp_sum, MPI_RANK, RANK, WORLD, WS, ROWS
     os.environ.pop("TLLM_DISABLE_MPI", None)
     os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
     sys.path.insert(0, str(_MODELING_V2_TESTS / "comm"))
@@ -194,6 +195,10 @@ def _run_one_rank() -> int:
     from tensorrt_llm.functional import AllReduceFusionOp
 
     modeling, fused_mod = _modeling, _fused_mod
+    ROWS = tuple(
+        c.spec["rows"] for c in fused_mod.hc_allreduce_inject_norm.CELLS if c.spec["world"] == WORLD
+    )
+    assert ROWS, f"no cell is certified at world size {WORLD}"
     group = entry.allreduce_group_args(MPI_RANK.mapping)
     WS = group["workspace"]
 

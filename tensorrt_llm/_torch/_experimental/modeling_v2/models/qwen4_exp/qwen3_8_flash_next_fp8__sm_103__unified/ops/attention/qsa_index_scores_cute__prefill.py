@@ -24,6 +24,11 @@ from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_index_scores import (
+    qsa_paged_index_scores as _family_index_scores,
+)
+
 try:
     from cutlass.memory import SmemAllocator
 except ImportError:  # DSL releases before the memory namespace split
@@ -897,7 +902,7 @@ def supports(q, index_cache, tokens_per_block, compress_ratio) -> bool:
     )
 
 
-def qsa_index_scores_prefill(
+def _qsa_index_scores_prefill(
     q,
     index_cache,
     block_table,
@@ -944,3 +949,70 @@ def qsa_index_scores_prefill(
         max(1, min(items, sms)),
     )
     return out
+
+
+class QsaIndexScoresPrefill(OpWrapper):
+    """The family's `qsa_paged_index_scores(..., only_visible_blocks=True, context_rows=True)`
+    on context rows `supports` admits: `[rows, max_blocks]` fp32, the same bits over each row's
+    visible columns, the columns at and past them unspecified."""
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        index_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        query_positions: torch.Tensor,
+        request_indices: torch.Tensor,
+        tokens_per_block: int,
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        return _qsa_index_scores_prefill(
+            q,
+            index_cache,
+            block_table,
+            query_positions,
+            request_indices,
+            tokens_per_block,
+            compress_ratio,
+        )
+
+    def reference(
+        self,
+        q: torch.Tensor,
+        index_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        query_positions: torch.Tensor,
+        request_indices: torch.Tensor,
+        tokens_per_block: int,
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        """The family entry's reference over context rows: NaN past each row's visible columns."""
+        return _family_index_scores.reference(
+            q,
+            index_cache,
+            block_table,
+            query_positions,
+            request_indices,
+            tokens_per_block,
+            compress_ratio,
+            only_visible_blocks=True,
+            context_rows=True,
+        )
+
+    def is_valid(
+        self,
+        q: torch.Tensor,
+        index_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        query_positions: torch.Tensor,
+        request_indices: torch.Tensor,
+        tokens_per_block: int,
+        compress_ratio: int,
+    ) -> None:
+        # The kernel is built for this geometry and checks none of it.
+        assert supports(q, index_cache, tokens_per_block, compress_ratio), (
+            "a call outside `supports`"
+        )
+
+
+qsa_index_scores_prefill = QsaIndexScoresPrefill()

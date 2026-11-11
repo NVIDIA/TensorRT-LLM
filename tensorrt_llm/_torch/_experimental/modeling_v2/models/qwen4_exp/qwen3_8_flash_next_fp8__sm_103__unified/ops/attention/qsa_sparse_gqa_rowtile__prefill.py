@@ -1637,6 +1637,11 @@ class QsaSparseGqaRowtile(OpWrapper):
             "groups), [128, 8196] table, trunk pool straddling 2^31",
             spec=_spec([(120000, 8192)], _TP2, shared_scores=True),
         ),
+        Cell(
+            why="tp4/tep4 engine position dtype: int64 query positions with int32 request "
+            "indices, 2049 rows from 9000, 6 q / 1 kv heads",
+            spec=_spec([(9000, 2049)], _TP4, position_dtype=torch.int64),
+        ),
     )
 
     note = """
@@ -1656,7 +1661,7 @@ class QsaSparseGqaRowtile(OpWrapper):
     Calls allocate their plan scratch, so CUDA-graph capture is not certified (the prefill path
     runs eager). Deterministic.
 
-    Not certified: int64 request indices or positions; rows whose selection resolves no token
+    Not certified: int64 request indices; rows whose selection resolves no token
     (all padding, a foreign request, unmapped pages); `rows == 0`.
     """
 

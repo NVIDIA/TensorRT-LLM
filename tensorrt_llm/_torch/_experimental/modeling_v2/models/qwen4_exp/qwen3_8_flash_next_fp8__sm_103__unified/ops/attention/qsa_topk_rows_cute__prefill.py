@@ -18,6 +18,10 @@ import torch
 from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
+    qsa_topk_expand_decode as _family_topk,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
@@ -534,7 +538,7 @@ def supports(scores, topk_indices) -> bool:
     )
 
 
-def qsa_topk_rows(
+def _qsa_topk_rows(
     scores,
     row_ends,
     query_positions,
@@ -610,3 +614,82 @@ def qsa_topk_rows(
         )
     fn(keys, *ptrs, rows)
     return sel
+
+
+class QsaTopkRows(OpWrapper):
+    """The family's `qsa_topk_expand_decode` on tables `supports` admits, the same bits: writes
+    `topk_indices` and returns the token selection `[rows, token_topk + compress_ratio - 1]`
+    int32 (`out` when given)."""
+
+    def __call__(
+        self,
+        scores: torch.Tensor,
+        row_ends: torch.Tensor,
+        query_positions: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        topk_indices: torch.Tensor,
+        compress_ratio: int,
+        token_topk: int,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _qsa_topk_rows(
+            scores,
+            row_ends,
+            query_positions,
+            sequence_lengths,
+            topk_indices,
+            compress_ratio,
+            token_topk,
+            out,
+        )
+
+    def reference(
+        self,
+        scores: torch.Tensor,
+        row_ends: torch.Tensor,
+        query_positions: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        topk_indices: torch.Tensor,
+        compress_ratio: int,
+        token_topk: int,
+        out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The family entry's reference: `(topk_indices_after, selection)`, fresh tensors."""
+        return _family_topk.reference(
+            scores,
+            row_ends,
+            query_positions,
+            sequence_lengths,
+            topk_indices,
+            compress_ratio,
+            token_topk,
+            out=out,
+        )
+
+    def is_valid(
+        self,
+        scores: torch.Tensor,
+        row_ends: torch.Tensor,
+        query_positions: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        topk_indices: torch.Tensor,
+        compress_ratio: int,
+        token_topk: int,
+        out: torch.Tensor | None = None,
+    ) -> None:
+        # The kernel is built for this width and checks none of it; past that, the family
+        # entry's contract and its silent failures are this kernel's.
+        assert supports(scores, topk_indices), "a call outside `supports`"
+        _family_topk.is_valid(
+            scores,
+            row_ends,
+            query_positions,
+            sequence_lengths,
+            topk_indices,
+            compress_ratio,
+            token_topk,
+            out=out,
+        )
+
+
+qsa_topk_rows = QsaTopkRows()

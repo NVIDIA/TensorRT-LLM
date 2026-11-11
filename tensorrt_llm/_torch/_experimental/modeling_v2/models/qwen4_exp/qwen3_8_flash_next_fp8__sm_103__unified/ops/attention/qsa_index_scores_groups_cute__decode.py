@@ -25,6 +25,10 @@ from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_index_scores import (
+    qsa_paged_index_scores as _family_index_scores,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 from .qsa_sparse_gqa_splitk_cute__decode import (
@@ -359,7 +363,7 @@ def serves(q: torch.Tensor, index_cache: torch.Tensor, rows_per_request: int) ->
     )
 
 
-def index_scores_groups(
+def _index_scores_groups(
     q: torch.Tensor,
     index_cache: torch.Tensor,
     block_table: torch.Tensor,
@@ -430,3 +434,79 @@ def index_scores_groups(
         col_progs,
     )
     return out
+
+
+class QsaIndexScoresGroups(OpWrapper):
+    """The family's `qsa_paged_index_scores(..., only_visible_blocks=True, context_rows=False,
+    rows_per_request=...)` on verify rows `serves` admits: `[rows, max_blocks]` fp32 to the last
+    bits over each row's visible columns, the columns at and past them unspecified."""
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        index_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        query_positions: torch.Tensor,
+        request_indices: torch.Tensor,
+        tokens_per_block: int,
+        compress_ratio: int,
+        use_pdl: bool,
+        rows_per_request: int,
+    ) -> torch.Tensor:
+        return _index_scores_groups(
+            q,
+            index_cache,
+            block_table,
+            query_positions,
+            request_indices,
+            tokens_per_block,
+            compress_ratio,
+            use_pdl,
+            rows_per_request,
+        )
+
+    def reference(
+        self,
+        q: torch.Tensor,
+        index_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        query_positions: torch.Tensor,
+        request_indices: torch.Tensor,
+        tokens_per_block: int,
+        compress_ratio: int,
+        use_pdl: bool,
+        rows_per_request: int,
+    ) -> torch.Tensor:
+        """The family entry's reference over verify rows: NaN past each row's visible columns.
+        `use_pdl` picks a launch, not a result."""
+        return _family_index_scores.reference(
+            q,
+            index_cache,
+            block_table,
+            query_positions,
+            request_indices,
+            tokens_per_block,
+            compress_ratio,
+            only_visible_blocks=True,
+            context_rows=False,
+            use_pdl=use_pdl,
+            rows_per_request=rows_per_request,
+        )
+
+    def is_valid(
+        self,
+        q: torch.Tensor,
+        index_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        query_positions: torch.Tensor,
+        request_indices: torch.Tensor,
+        tokens_per_block: int,
+        compress_ratio: int,
+        use_pdl: bool,
+        rows_per_request: int,
+    ) -> None:
+        # The kernel is built for this geometry and checks none of it.
+        assert serves(q, index_cache, rows_per_request), "a call outside `serves`"
+
+
+index_scores_groups = QsaIndexScoresGroups()

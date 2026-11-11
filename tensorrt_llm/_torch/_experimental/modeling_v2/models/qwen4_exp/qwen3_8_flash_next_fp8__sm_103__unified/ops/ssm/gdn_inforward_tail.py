@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
+
 
 # The tail's token, sequence, slot and stage-row lists are scalar-read views.
 @triton.jit(do_not_specialize_on_alignment=["tok_ptr", "cu_ptr", "slot_ptr", "row_ptr"])
@@ -83,7 +85,7 @@ def _gdn_tail_kernel(
     tl.store(dst, state.to(stage_ptr.dtype.element_ty))
 
 
-def gdn_inforward_tail(
+def _gdn_inforward_tail(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -181,7 +183,7 @@ def _conv_swap_kernel(
     tl.store(live, tl.load(x_ptr + rows[None, :] * stride_xt + c[:, None], mask=m), mask=m)
 
 
-def gdn_inforward_conv_swap(
+def _gdn_inforward_conv_swap(
     conv: torch.Tensor,
     stage: torch.Tensor,
     x: torch.Tensor,
@@ -209,3 +211,90 @@ def gdn_inforward_conv_swap(
         conv.stride(0), conv.stride(1), stage.stride(0), stage.stride(1), x.stride(0),
         W=width, BW=triton.next_power_of_2(width), BLOCK=block, num_warps=4,
     )  # fmt: skip
+
+
+class GdnInforwardTail(OpWrapper):
+    """The split requests' tails of gated delta rule, in place (see `_gdn_inforward_tail`)."""
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        tail_tok: torch.Tensor,
+        cu_tail: torch.Tensor,
+        pool: torch.Tensor,
+        tail_slots: torch.Tensor,
+        stage: torch.Tensor,
+        stage_rows: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        _gdn_inforward_tail(
+            q, k, v, g, beta, tail_tok, cu_tail, pool, tail_slots, stage, stage_rows, out
+        )
+
+    def reference(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        tail_tok: torch.Tensor,
+        cu_tail: torch.Tensor,
+        pool: torch.Tensor,
+        tail_slots: torch.Tensor,
+        stage: torch.Tensor,
+        stage_rows: torch.Tensor,
+        out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(stage, out)` after `gdn_inforward_tail_reference` writes copies of them; the inputs
+        are not touched."""
+        expected_stage, expected_out = stage.clone(), out.clone()
+        gdn_inforward_tail_reference(
+            q, k, v, g, beta, tail_tok, cu_tail, pool, tail_slots, expected_stage, stage_rows,
+            expected_out,
+        )  # fmt: skip
+        return expected_stage, expected_out
+
+
+gdn_inforward_tail = GdnInforwardTail()
+
+
+class GdnInforwardConvSwap(OpWrapper):
+    """The split requests' conv windows staged and replaced, in place (see
+    `_gdn_inforward_conv_swap`)."""
+
+    def __call__(
+        self,
+        conv: torch.Tensor,
+        stage: torch.Tensor,
+        x: torch.Tensor,
+        tail_slots: torch.Tensor,
+        stage_rows: torch.Tensor,
+        conv_win: torch.Tensor,
+    ) -> None:
+        _gdn_inforward_conv_swap(conv, stage, x, tail_slots, stage_rows, conv_win)
+
+    def reference(
+        self,
+        conv: torch.Tensor,
+        stage: torch.Tensor,
+        x: torch.Tensor,
+        tail_slots: torch.Tensor,
+        stage_rows: torch.Tensor,
+        conv_win: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(conv, stage)` after the swap, as fresh tensors; the inputs are not touched."""
+        expected_conv, expected_stage = conv.clone(), stage.clone()
+        _, chans, width = conv.shape
+        for j, (slot, row) in enumerate(zip(tail_slots.tolist(), stage_rows.tolist())):
+            expected_stage[row] = conv[slot]
+            rows = conv_win[j * width : (j + 1) * width].long()
+            expected_conv[slot] = x[rows, :chans].t()
+        return expected_conv, expected_stage
+
+
+gdn_inforward_conv_swap = GdnInforwardConvSwap()

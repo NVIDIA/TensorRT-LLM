@@ -19,9 +19,15 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.jit_variants import (
     compile_only,
     first_time,
+    mark_warmed,
+)
+from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
+    triton_qsa_paged_kv_store,
+    triton_qsa_paged_sparse_gqa,
 )
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 from tensorrt_llm._utils import get_sm_version
@@ -166,7 +172,7 @@ def _qsa_kv_store_stable_kernel(
     )
 
 
-def qsa_paged_kv_store(
+def _qsa_paged_kv_store(
     *,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -256,6 +262,65 @@ def qsa_paged_kv_store(
         BLOCK_DIM=block_dim,
         num_warps=_KV_STORE_WARPS,
     )
+
+
+class QsaPagedKvStoreStable(OpWrapper):
+    """`triton_qsa_paged_kv_store` on `_qsa_kv_store_stable_kernel`: every row's K and V into
+    its request's page of the HND pool, in place. The entry `qsa_paged_kv_store` (its own
+    module) calls this and carries the cells."""
+
+    def __call__(
+        self,
+        *,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        request_indices: torch.Tensor,
+        logical_positions: torch.Tensor,
+        block_table: torch.Tensor,
+        tokens_per_block: int,
+    ) -> None:
+        _qsa_paged_kv_store(
+            k=k,
+            v=v,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            request_indices=request_indices,
+            logical_positions=logical_positions,
+            block_table=block_table,
+            tokens_per_block=tokens_per_block,
+        )
+
+    def reference(
+        self,
+        *,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        request_indices: torch.Tensor,
+        logical_positions: torch.Tensor,
+        block_table: torch.Tensor,
+        tokens_per_block: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(k_cache, v_cache)` after the shared launcher's store into copies (the same bits);
+        the inputs are not touched."""
+        expected_k, expected_v = k_cache.clone(), v_cache.clone()
+        triton_qsa_paged_kv_store(
+            k=k,
+            v=v,
+            k_cache=expected_k,
+            v_cache=expected_v,
+            request_indices=request_indices,
+            logical_positions=logical_positions,
+            block_table=block_table,
+            tokens_per_block=tokens_per_block,
+        )
+        return expected_k, expected_v
+
+
+qsa_paged_kv_store = QsaPagedKvStoreStable()
 
 
 @triton.jit(
@@ -709,7 +774,7 @@ def can_fuse_splitk_output_gate(
     return num_splits > 1
 
 
-def qsa_paged_sparse_gqa(
+def _qsa_paged_sparse_gqa(
     *,
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -876,6 +941,74 @@ def qsa_paged_sparse_gqa(
         **_merge_constexprs(num_q_heads, head_dim, num_splits, use_pdl, row_major, output_gate),
     )
     return output
+
+
+class QsaPagedSparseGqaStable(OpWrapper):
+    """`triton_qsa_paged_sparse_gqa` on this module's prefill-pair, split-K and merge kernels:
+    `[rows, Hq, D]` sparse GQA over each row's selected tokens. The entry `qsa_paged_sparse_gqa`
+    (its own module) calls this and carries the cells."""
+
+    def __call__(
+        self,
+        *,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        selected_tokens: torch.Tensor,
+        request_indices: torch.Tensor,
+        tokens_per_block: int,
+        softmax_scale: float,
+        query_positions: torch.Tensor | None = None,
+        compress_ratio: int | None = None,
+        output_gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _qsa_paged_sparse_gqa(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_table=block_table,
+            selected_tokens=selected_tokens,
+            request_indices=request_indices,
+            tokens_per_block=tokens_per_block,
+            softmax_scale=softmax_scale,
+            query_positions=query_positions,
+            compress_ratio=compress_ratio,
+            output_gate=output_gate,
+        )
+
+    def reference(
+        self,
+        *,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        selected_tokens: torch.Tensor,
+        request_indices: torch.Tensor,
+        tokens_per_block: int,
+        softmax_scale: float,
+        query_positions: torch.Tensor | None = None,
+        compress_ratio: int | None = None,
+        output_gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The shared launcher's output on the same arguments (the same bits)."""
+        return triton_qsa_paged_sparse_gqa(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_table=block_table,
+            selected_tokens=selected_tokens,
+            request_indices=request_indices,
+            tokens_per_block=tokens_per_block,
+            softmax_scale=softmax_scale,
+            query_positions=query_positions,
+            compress_ratio=compress_ratio,
+            output_gate=output_gate,
+        )
+
+
+qsa_paged_sparse_gqa = QsaPagedSparseGqaStable()
 
 
 def _pair_args(
@@ -1184,6 +1317,7 @@ def _warm_decode_buckets(
             ),
             **_pair_constexprs(q, k_cache, selected_tokens, group_size, block_m, compress_ratio),
         )
+    mark_warmed("qsa_stable_decode_buckets", key)
 
 
 def warm_decode_buckets(

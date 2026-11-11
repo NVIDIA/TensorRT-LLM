@@ -962,7 +962,12 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
         gate_logits: Optional[torch.Tensor] = None,
         topk_weights: Optional[torch.Tensor] = None,
         topk_rows: Optional[torch.Tensor] = None,
+        num_warps: Optional[int] = None,
+        pdl_wait: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # `num_warps` (None: 8, or 2 from `_FEW_WARPS_MIN_ROWS` rows, at hidden >= 2048; else 4)
+        # and `pdl_wait` (launch with PDL and wait for the predecessor before any read) set the
+        # Triton launch; the finalize fold's CuTe path ignores both.
         rows, width = hyper_input.shape
         hidden = width // hc_count
         normed = torch.empty((rows, width), dtype=hyper_input.dtype, device=hyper_input.device)
@@ -1040,7 +1045,11 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
                 STREAMS_PER_PROGRAM=spp,
                 PDL_TRIGGER=_PDL_TRIGGER,
             )
-            if block >= 2048:
+            if pdl_wait:
+                constexprs.update(PDL_WAIT=True, launch_pdl=True)
+            if num_warps is not None:
+                warps = num_warps
+            elif block >= 2048:
                 # Both warp counts compile at a geometry's first call.
                 warps = 2 if rows >= _FEW_WARPS_MIN_ROWS else 8
                 warm_variants(
@@ -1054,6 +1063,7 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
                         has_shared,
                         top_k,
                         spp,
+                        pdl_wait,
                     ),
                     args,
                     [{"num_warps": 8}, {"num_warps": 2}],
@@ -1076,11 +1086,14 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
         gate_logits: Optional[torch.Tensor] = None,
         topk_weights: Optional[torch.Tensor] = None,
         topk_rows: Optional[torch.Tensor] = None,
+        num_warps: Optional[int] = None,
+        pdl_wait: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """float64 throughout. The finalize (with `topk_rows`) and the combine
         (with `shared`) are each rounded once to `block_out`'s dtype; `hc_out`
         is the float64 accumulate rounded once; `normed` is the float64 norm of
-        that rounded residual, rounded once. No other intermediate rounding."""
+        that rounded residual, rounded once. No other intermediate rounding.
+        `num_warps` and `pdl_wait` (launch options) are ignored."""
         dtype = hyper_input.dtype
         rows, width = hyper_input.shape
         hidden = width // hc_count
@@ -1115,6 +1128,8 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
         gate_logits: Optional[torch.Tensor] = None,
         topk_weights: Optional[torch.Tensor] = None,
         topk_rows: Optional[torch.Tensor] = None,
+        num_warps: Optional[int] = None,
+        pdl_wait: bool = False,
     ) -> None:
         # The kernel indexes with raw row strides and unit column stride, and
         # reads `inject` / `block_out` / `shared` / the gate per row: a broadcast
