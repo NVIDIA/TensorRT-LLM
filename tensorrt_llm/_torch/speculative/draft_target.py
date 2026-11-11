@@ -167,127 +167,164 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         # target's untouched; without one, the target's state is saved and
         # restored around the draft loop.
         with self.draft_loop(attn_metadata) as draft_attn_metadata:
-            # Prepare inputs for the first draft forward
-            position_ids = position_ids.squeeze(0)
-            inputs = self.prepare_1st_drafter_inputs(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                accepted_tokens=accepted_tokens,
-                attn_metadata=draft_attn_metadata,
-                spec_metadata=spec_metadata,
-            )
-
-            next_draft_tokens = []
-            original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-
-            # Get the draft KV cache manager if using separate layouts
-            draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
-
-            with self.draft_kv_cache_context(
-                draft_attn_metadata, draft_kv_cache_manager
-            ) as draft_attn_metadata:
-                inputs["attn_metadata"] = draft_attn_metadata
-                for i in range(runtime_draft_len):
-                    if i == 0:
-                        start_ids_gen = (
-                            spec_metadata.batch_indices_cuda[:num_gens] * (runtime_draft_len + 1)
-                        ).long()
-                        gather_ids_gen = (
-                            start_ids_gen
-                            + num_accepted_tokens[num_contexts:]
-                            - 1
-                            + draft_attn_metadata.num_ctx_tokens
-                        )
-                        gather_ids = torch.concat(
-                            [spec_metadata.gather_ids[:num_contexts], gather_ids_gen], dim=0
-                        )
-                    else:
-                        gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
-
-                    if self.guided_decoder is not None:
-                        new_tokens = inputs["input_ids"][gather_ids]
-                        self.guided_decoder.add_draft_batch(
-                            new_tokens, num_accepted_tokens, draft_step=i
-                        )
-
-                    if original_all_rank_num_tokens is not None:
-                        if i == 0:
-                            draft_attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
-                        elif spec_metadata.all_rank_num_seqs is not None:
-                            draft_attn_metadata.all_rank_num_tokens = (
-                                spec_metadata.all_rank_num_seqs
-                            )
-
-                    hidden_states = draft_model.model(**inputs)
-                    if isinstance(hidden_states, tuple):
-                        hidden_states = hidden_states[0]
-
-                    # Disable spec-dec mode for chained draft steps
-                    set_use_spec_decoding(draft_attn_metadata, False)
-
-                    logits = draft_model.logits_processor(
-                        hidden_states[gather_ids], draft_model.lm_head, draft_attn_metadata, True
-                    )
-                    if self.guided_decoder is not None:
-                        self.guided_decoder.execute_draft_batch(logits, self._d2t, draft_step=i)
-
-                    new_draft_token = self.sample_draft_tokens(
-                        logits,
-                        spec_metadata,
-                        batch_size,
-                        draft_step=i,
-                    )
-                    next_draft_tokens.append(new_draft_token)
-
-                    # Update inputs and metadata for next draft step
-                    position_ids = inputs["position_ids"][gather_ids] + 1
-                    if i == 0:
-                        draft_attn_metadata.set_seq_lens(
-                            slice(0, batch_size),
-                            host=1,
-                            device=1,
-                            update_counts=True,
-                        )
-                        if inputs["attn_metadata"].kv_cache_manager is not None:
-                            # The context requests continue as one-token
-                            # generation rows.
-                            draft_attn_metadata.as_generation_rows()
-                        self._update_kv_after_first_draft_step(
-                            draft_attn_metadata,
-                            num_accepted_tokens,
-                            num_contexts,
-                            batch_size,
-                            runtime_draft_len,
-                        )
-                    else:
-                        self._update_kv_for_chained_draft_step(draft_attn_metadata, batch_size)
-
-                    inputs = {
-                        "input_ids": new_draft_token,
-                        "position_ids": position_ids,
-                        "attn_metadata": draft_attn_metadata,
-                        "spec_metadata": spec_metadata,
-                    }
-
-            next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
-
-            next_new_tokens = self._prepare_next_new_tokens(
-                accepted_tokens,
-                next_draft_tokens,
-                spec_metadata.batch_indices_cuda,
+            return self._draft_target_loop_body(
+                draft_attn_metadata,
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+                resource_manager,
                 batch_size,
+                num_contexts,
+                num_gens,
+                runtime_draft_len,
+                raw_logits,
+                accepted_tokens,
                 num_accepted_tokens,
             )
 
-            set_use_spec_decoding(attn_metadata, True)
+    def _draft_target_loop_body(
+        self,
+        draft_attn_metadata,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+        resource_manager,
+        batch_size,
+        num_contexts,
+        num_gens,
+        runtime_draft_len,
+        raw_logits,
+        accepted_tokens,
+        num_accepted_tokens,
+    ):
+        """The rest of ``_forward_impl``, inside its draft loop."""
+        # Prepare inputs for the first draft forward
+        position_ids = position_ids.squeeze(0)
+        inputs = self.prepare_1st_drafter_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            accepted_tokens=accepted_tokens,
+            attn_metadata=draft_attn_metadata,
+            spec_metadata=spec_metadata,
+        )
 
-            return {
-                "logits": raw_logits,
-                "new_tokens": accepted_tokens,
-                "new_tokens_lens": num_accepted_tokens,
-                "next_draft_tokens": next_draft_tokens,
-                "next_new_tokens": next_new_tokens,
-            }
+        next_draft_tokens = []
+        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+
+        # Get the draft KV cache manager if using separate layouts
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+
+        with self.draft_kv_cache_context(
+            draft_attn_metadata, draft_kv_cache_manager
+        ) as draft_attn_metadata:
+            inputs["attn_metadata"] = draft_attn_metadata
+            for i in range(runtime_draft_len):
+                if i == 0:
+                    start_ids_gen = (
+                        spec_metadata.batch_indices_cuda[:num_gens] * (runtime_draft_len + 1)
+                    ).long()
+                    gather_ids_gen = (
+                        start_ids_gen
+                        + num_accepted_tokens[num_contexts:]
+                        - 1
+                        + draft_attn_metadata.num_ctx_tokens
+                    )
+                    gather_ids = torch.concat(
+                        [spec_metadata.gather_ids[:num_contexts], gather_ids_gen], dim=0
+                    )
+                else:
+                    gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
+
+                if self.guided_decoder is not None:
+                    new_tokens = inputs["input_ids"][gather_ids]
+                    self.guided_decoder.add_draft_batch(
+                        new_tokens, num_accepted_tokens, draft_step=i
+                    )
+
+                if original_all_rank_num_tokens is not None:
+                    if i == 0:
+                        draft_attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+                    elif spec_metadata.all_rank_num_seqs is not None:
+                        draft_attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+
+                hidden_states = draft_model.model(**inputs)
+                if isinstance(hidden_states, tuple):
+                    hidden_states = hidden_states[0]
+
+                # Disable spec-dec mode for chained draft steps
+                set_use_spec_decoding(draft_attn_metadata, False)
+
+                logits = draft_model.logits_processor(
+                    hidden_states[gather_ids], draft_model.lm_head, draft_attn_metadata, True
+                )
+                if self.guided_decoder is not None:
+                    self.guided_decoder.execute_draft_batch(logits, self._d2t, draft_step=i)
+
+                new_draft_token = self.sample_draft_tokens(
+                    logits,
+                    spec_metadata,
+                    batch_size,
+                    draft_step=i,
+                )
+                next_draft_tokens.append(new_draft_token)
+
+                # Update inputs and metadata for next draft step
+                position_ids = inputs["position_ids"][gather_ids] + 1
+                if i == 0:
+                    draft_attn_metadata.set_seq_lens(
+                        slice(0, batch_size),
+                        host=1,
+                        device=1,
+                        update_counts=True,
+                    )
+                    if inputs["attn_metadata"].kv_cache_manager is not None:
+                        # The context requests continue as one-token
+                        # generation rows.
+                        draft_attn_metadata.as_generation_rows()
+                    self._update_kv_after_first_draft_step(
+                        draft_attn_metadata,
+                        num_accepted_tokens,
+                        num_contexts,
+                        batch_size,
+                        runtime_draft_len,
+                    )
+                else:
+                    self._update_kv_for_chained_draft_step(draft_attn_metadata, batch_size)
+
+                inputs = {
+                    "input_ids": new_draft_token,
+                    "position_ids": position_ids,
+                    "attn_metadata": draft_attn_metadata,
+                    "spec_metadata": spec_metadata,
+                }
+
+        next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens,
+            next_draft_tokens,
+            spec_metadata.batch_indices_cuda,
+            batch_size,
+            num_accepted_tokens,
+        )
+
+        set_use_spec_decoding(attn_metadata, True)
+
+        return {
+            "logits": raw_logits,
+            "new_tokens": accepted_tokens,
+            "new_tokens_lens": num_accepted_tokens,
+            "next_draft_tokens": next_draft_tokens,
+            "next_new_tokens": next_new_tokens,
+        }
 
     def prepare_1st_drafter_inputs(
         self,

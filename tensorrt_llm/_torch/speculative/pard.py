@@ -184,131 +184,164 @@ class PARDWorker(SpecWorkerBase):
         # restored around it.
         target_attn_metadata = attn_metadata
         with self.draft_loop(target_attn_metadata) as attn_metadata:
-            self._prepare_kv_for_draft_forward(attn_metadata, num_contexts, batch_size)
-
-            position_ids = position_ids.squeeze(0)
-            inputs = self.prepare_1st_drafter_inputs(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                accepted_tokens=accepted_tokens,
-                num_accepted_tokens=num_accepted_tokens,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                draft_model=draft_model,
-            )
-
-            draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
-
-            if num_gens > 0:
-                with self.draft_kv_cache_context(
-                    attn_metadata, draft_kv_cache_manager
-                ) as draft_attn_metadata:
-                    # Forward on the metadata the context selects, such as a
-                    # FlashInfer view over a separate draft KV cache.
-                    inputs["attn_metadata"] = draft_attn_metadata
-                    hidden_states_out = draft_model.model(**inputs)
-
-                    # Gather K logits per gen request starting at the bonus position.
-                    # Layout: [acc_0..acc_M, masks] (2K total). Positions M..M+K-1
-                    # produce K unique draft predictions (bonus + K-1 masks).
-                    gen_start_idx = draft_attn_metadata.num_ctx_tokens
-
-                    request_bases = (
-                        torch.arange(num_gens, dtype=torch.long, device="cuda") * (2 * K)
-                        + gen_start_idx
-                    )
-
-                    gen_num_accepted = num_accepted_tokens[num_contexts:batch_size].long()
-                    base_offsets = gen_num_accepted - 1  # M = bonus position
-                    offsets = torch.arange(K, dtype=torch.long, device="cuda")
-
-                    gen_gather_ids = (
-                        request_bases.unsqueeze(1)
-                        + base_offsets.unsqueeze(1)
-                        + offsets.unsqueeze(0)
-                    ).flatten()
-                    gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
-
-                    gen_logits = draft_model.logits_processor(
-                        hidden_states_out[gen_gather_ids],
-                        draft_model.lm_head,
-                        draft_attn_metadata,
-                        True,
-                    )
-
-                    vocab_size = gen_logits.shape[-1]
-                    gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
-
-                    gen_draft_tokens = self.sample_draft_tokens(
-                        gen_logits,
-                        spec_metadata,
-                        batch_size,
-                        num_contexts=num_contexts,
-                    )
-
-                    if self.sa_enhancer is not None and sa_manager is not None:
-                        gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
-                            gen_draft_tokens
-                        )
-
-                    # Pad from (num_gens, K) to (num_gens, 2K-1).
-                    if K > 1:
-                        pad = torch.zeros((num_gens, K - 1), dtype=torch.int32, device="cuda")
-                        gen_draft_tokens = torch.cat([gen_draft_tokens, pad], dim=1)
-
-            elif num_contexts > 0 and self.use_separate_draft_kv_cache:
-                # Pure context batch: populate the draft KV cache so it's
-                # ready when generation starts.
-                with self.draft_kv_cache_context(
-                    attn_metadata, draft_kv_cache_manager
-                ) as draft_attn_metadata:
-                    # Forward on the metadata the context selects, such as a
-                    # FlashInfer view over a separate draft KV cache.
-                    inputs["attn_metadata"] = draft_attn_metadata
-                    draft_model.model(**inputs)
-                gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
-
-            else:
-                gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
-
-            # Context requests are not drafted by the block worker (zero placeholder
-            # token); fill their draft-prob slot rows with a one-hot placeholder so
-            # they are a legal distribution when they become gen requests next iter.
-            gen_vocab = vocab_size if num_gens > 0 else None
-            self.write_context_onehot_draft_probs(
-                spec_metadata, num_contexts, num_gens, K, gen_vocab
-            )
-
-            if num_contexts > 0 and num_gens > 0:
-                ctx_draft_tokens = torch.zeros(
-                    (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
-                )
-                next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
-            elif num_contexts > 0:
-                next_draft_tokens = torch.zeros(
-                    (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
-                )
-            else:
-                next_draft_tokens = gen_draft_tokens
-
-            self._rollback_guided_decoder_after_verify(num_accepted_tokens)
-
-            next_new_tokens = self._prepare_next_new_tokens(
-                accepted_tokens,
-                next_draft_tokens,
-                spec_metadata.batch_indices_cuda,
+            return self._pard_draft_loop_body(
+                attn_metadata,
+                input_ids,
+                position_ids,
+                hidden_states,
+                spec_metadata,
+                draft_model,
+                resource_manager,
                 batch_size,
+                num_contexts,
+                num_gens,
+                raw_logits,
+                K,
+                accepted_tokens,
                 num_accepted_tokens,
+                sa_manager,
             )
 
-            return {
-                "logits": raw_logits,
-                "new_tokens": accepted_tokens,
-                "new_tokens_lens": num_accepted_tokens,
-                "next_draft_tokens": next_draft_tokens,
-                "next_new_tokens": next_new_tokens,
-            }
+    def _pard_draft_loop_body(
+        self,
+        attn_metadata,
+        input_ids,
+        position_ids,
+        hidden_states,
+        spec_metadata,
+        draft_model,
+        resource_manager,
+        batch_size,
+        num_contexts,
+        num_gens,
+        raw_logits,
+        K,
+        accepted_tokens,
+        num_accepted_tokens,
+        sa_manager,
+    ):
+        """The rest of ``_forward_impl``, inside its draft loop."""
+        self._prepare_kv_for_draft_forward(attn_metadata, num_contexts, batch_size)
+
+        position_ids = position_ids.squeeze(0)
+        inputs = self.prepare_1st_drafter_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            accepted_tokens=accepted_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=draft_model,
+        )
+
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+
+        if num_gens > 0:
+            with self.draft_kv_cache_context(
+                attn_metadata, draft_kv_cache_manager
+            ) as draft_attn_metadata:
+                # Forward on the metadata the context selects, such as a
+                # FlashInfer view over a separate draft KV cache.
+                inputs["attn_metadata"] = draft_attn_metadata
+                hidden_states_out = draft_model.model(**inputs)
+
+                # Gather K logits per gen request starting at the bonus position.
+                # Layout: [acc_0..acc_M, masks] (2K total). Positions M..M+K-1
+                # produce K unique draft predictions (bonus + K-1 masks).
+                gen_start_idx = draft_attn_metadata.num_ctx_tokens
+
+                request_bases = (
+                    torch.arange(num_gens, dtype=torch.long, device="cuda") * (2 * K)
+                    + gen_start_idx
+                )
+
+                gen_num_accepted = num_accepted_tokens[num_contexts:batch_size].long()
+                base_offsets = gen_num_accepted - 1  # M = bonus position
+                offsets = torch.arange(K, dtype=torch.long, device="cuda")
+
+                gen_gather_ids = (
+                    request_bases.unsqueeze(1) + base_offsets.unsqueeze(1) + offsets.unsqueeze(0)
+                ).flatten()
+                gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
+
+                gen_logits = draft_model.logits_processor(
+                    hidden_states_out[gen_gather_ids],
+                    draft_model.lm_head,
+                    draft_attn_metadata,
+                    True,
+                )
+
+                vocab_size = gen_logits.shape[-1]
+                gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
+
+                gen_draft_tokens = self.sample_draft_tokens(
+                    gen_logits,
+                    spec_metadata,
+                    batch_size,
+                    num_contexts=num_contexts,
+                )
+
+                if self.sa_enhancer is not None and sa_manager is not None:
+                    gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                        gen_draft_tokens
+                    )
+
+                # Pad from (num_gens, K) to (num_gens, 2K-1).
+                if K > 1:
+                    pad = torch.zeros((num_gens, K - 1), dtype=torch.int32, device="cuda")
+                    gen_draft_tokens = torch.cat([gen_draft_tokens, pad], dim=1)
+
+        elif num_contexts > 0 and self.use_separate_draft_kv_cache:
+            # Pure context batch: populate the draft KV cache so it's
+            # ready when generation starts.
+            with self.draft_kv_cache_context(
+                attn_metadata, draft_kv_cache_manager
+            ) as draft_attn_metadata:
+                # Forward on the metadata the context selects, such as a
+                # FlashInfer view over a separate draft KV cache.
+                inputs["attn_metadata"] = draft_attn_metadata
+                draft_model.model(**inputs)
+            gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
+
+        else:
+            gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
+
+        # Context requests are not drafted by the block worker (zero placeholder
+        # token); fill their draft-prob slot rows with a one-hot placeholder so
+        # they are a legal distribution when they become gen requests next iter.
+        gen_vocab = vocab_size if num_gens > 0 else None
+        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
+
+        if num_contexts > 0 and num_gens > 0:
+            ctx_draft_tokens = torch.zeros(
+                (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
+            )
+            next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
+        elif num_contexts > 0:
+            next_draft_tokens = torch.zeros(
+                (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
+            )
+        else:
+            next_draft_tokens = gen_draft_tokens
+
+        self._rollback_guided_decoder_after_verify(num_accepted_tokens)
+
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens,
+            next_draft_tokens,
+            spec_metadata.batch_indices_cuda,
+            batch_size,
+            num_accepted_tokens,
+        )
+
+        return {
+            "logits": raw_logits,
+            "new_tokens": accepted_tokens,
+            "new_tokens_lens": num_accepted_tokens,
+            "next_draft_tokens": next_draft_tokens,
+            "next_new_tokens": next_new_tokens,
+        }
 
     def _reshape_draft_tokens_for_accept(self, spec_metadata, num_gens, device):
         # draft_tokens buffer has (2K-1) entries per gen request; extract the K real drafts.

@@ -1743,7 +1743,7 @@ class FlashInferCoreMetadata(AttentionCoreMetadata):
         assert self.request_ids is not None
 
         # start and end indices of each sequence in the ragged key and value
-        # for md attention it's the same as qo_indptr so avoid computing twice.
+        # for self attention it's the same as qo_indptr so avoid computing twice.
         if self.is_cross:
             # start and end indices of each sequence in the ragged key and value
             torch.cumsum(self.seq_lens_kv_cuda,

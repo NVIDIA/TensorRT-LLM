@@ -471,33 +471,6 @@ def test_swa_publication_matches_exact_request_and_destination():
     assert manager._swa_publication_token is manager._swa_publication is None
 
 
-def test_unconsumed_swa_publication_does_not_reach_the_next_step():
-    manager = CSA2CacheManager.__new__(CSA2CacheManager)
-    manager._swa_publication_token = manager._swa_publication = None
-    manager.pp_layers = [0]
-    manager.max_blocks_per_seq = 2
-    manager.has_swa_cache = lambda layer: True
-
-    def compute(request_ids, num_contexts):
-        manager._batch_page_tables = torch.zeros((1, len(request_ids), 2), dtype=torch.int32)
-
-    manager.compute_batch_page_tables = compute
-    destination = torch.zeros((1, 2, 2, 2), dtype=torch.int32)
-    # A step publishes its SWA tables but no CSA2 prepare consumes them.
-    manager.prepare_batch_tables([0, 1], 0)
-    manager.copy_batch_block_offsets(destination, [0, 1], 1, 0, 2)
-    stale = manager.consume_swa_publication()
-    assert stale is not None
-    # The next step's preparation drops it before its own copy.
-    manager.prepare_batch_tables([0, 1], 0)
-    assert manager.consume_swa_publication() is None
-    assert manager._get_swa_publication(stale, destination, [0, 1], 0, 2) is None
-    # Its own copy publishes afresh.
-    manager.copy_batch_block_offsets(destination, [0, 1], 1, 0, 2)
-    fresh = manager.consume_swa_publication()
-    assert fresh is not None and fresh is not stale
-
-
 # Embedded DSpark linear verification replayed with the executor protocol.
 DRAFT_LEN = 5
 

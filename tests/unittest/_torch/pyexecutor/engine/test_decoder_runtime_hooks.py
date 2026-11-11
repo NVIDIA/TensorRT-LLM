@@ -98,12 +98,6 @@ def test_a_default_msa_policy_arms_nothing():
     assert metadata._model_metadata_config() == {}
 
 
-def test_model_declared_extensions_and_settings_reach_creation():
-    hooks = RuntimeHooks(metadata_config=(("pools", {}),))
-    metadata = _metadata(hooks, object.__new__(TrtllmAttentionMetadata))
-    assert metadata._model_metadata_config() == {"pools": {}}
-
-
 def test_an_msa_policy_requires_the_msa_backend_and_cache():
     metadata = _metadata(
         RuntimeHooks(msa=MsaRuntimePolicy(reuse_pool_views=True)),

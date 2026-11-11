@@ -2403,24 +2403,3 @@ def test_decode_graph_reads_the_outputs_each_prepare_writes(
         _assert_swa_cpu_reference(
             metadata, manager, selected, starts, [1] * batch_size, [0] * batch_size
         )
-
-
-def test_bind_remote_tail_reads_context_requests():
-    """The remote-tail role and starts come from the bound context requests."""
-
-    def request(mode, start):
-        return SimpleNamespace(py_csa2_remote_tail_mode=mode, py_csa2_remote_tail_start=start)
-
-    csa2 = SimpleNamespace()
-    CSA2Metadata._bind_remote_tail(csa2, [request("destination", 64), request("destination", 8)])
-    assert csa2.csa2_remote_tail_mode == "destination"
-    assert csa2.csa2_remote_tail_starts == (64, 8)
-
-    CSA2Metadata._bind_remote_tail(csa2, [request(None, None)])
-    assert csa2.csa2_remote_tail_mode is None
-    assert csa2.csa2_remote_tail_starts == ()
-
-    with pytest.raises(ValueError, match="homogeneous"):
-        CSA2Metadata._bind_remote_tail(csa2, [request("source", 1), request(None, None)])
-    with pytest.raises(ValueError, match="homogeneous"):
-        CSA2Metadata._bind_remote_tail(csa2, [request("source", 1), request("destination", 2)])

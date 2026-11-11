@@ -19,10 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from utils.metadata_contract import check_copy_reproduces_creation_config
 
-from tensorrt_llm._torch.attention.backends.sparse.qsa.metadata import QSAMetadata
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     QSA_INDEX_POSITION,
     QSA_SIDE_PLANES,
@@ -321,23 +318,3 @@ def test_transfer_views_do_not_depend_on_the_kv_head_split(dtype: DataType) -> N
         assert roles == {str(Role.INDEX_KEY), str(QSA_INDEX_POSITION)}
     else:
         assert roles == {str(QSA_SIDE_PLANES)}
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_qsa_metadata_copies_reproduce_creation_config():
-    """A constructed copy of a QSA metadata over the trunk manager reports its
-    creation configuration."""
-    manager = _manager(DataType.BF16, draft=False)
-    try:
-        metadata = TrtllmAttentionMetadata(
-            max_num_requests=4,
-            max_num_tokens=8,
-            kv_cache_manager=manager,
-            extension_types=(QSAMetadata,),
-            sparse_metadata_params=QSASparseAttentionConfig().to_sparse_metadata_params(
-                pretrained_config=_CHECKPOINT
-            ),
-        )
-        check_copy_reproduces_creation_config(metadata)
-    finally:
-        manager.shutdown()

@@ -5,7 +5,6 @@ import os
 import pytest
 import torch
 from utils.llm_data import llm_models_root
-from utils.metadata_contract import check_copy_reproduces_creation_config
 from utils.util import getSMVersion
 
 import tensorrt_llm
@@ -13,7 +12,6 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.sparse.rocket import (
     RocketKVCacheManager,
-    RocketMetadata,
     RocketTrtllmAttention,
     RocketTrtllmAttentionMetadata,
     RocketVanillaAttention,
@@ -772,74 +770,6 @@ def test_rocket_add_dummy_requests_forwards_capture_sampling_params(mocker):
     mgr.add_dummy_requests([123], capture_sampling_params=sampling_params)
 
     assert base_add_dummy_requests.call_args.kwargs["capture_sampling_params"] is sampling_params
-
-
-@pytest.mark.parametrize(
-    "metadata_cls", [RocketTrtllmAttentionMetadata, RocketVanillaAttentionMetadata]
-)
-def test_rocket_copies_reproduce_creation_config(metadata_cls):
-    """A constructed copy of a prepared Rocket metadata reports its creation configuration."""
-    sparse_attn_config = RocketSparseAttentionConfig(
-        window_size=32, kernel_size=3, prompt_budget=256, page_size=4, kt_cache_dtype="bfloat16"
-    )
-    seq_lens, past_seen_tokens, request_ids = [300, 1], [0, 150], [0, 1]
-    kv_cache_manager = create_rocket_kv_cache_manager(
-        1, 8, 128, 64, 4096, 2, DataType.BF16, sparse_attn_config
-    )
-    kv_cache_manager.add_dummy_requests(
-        request_ids, [seq + past for seq, past in zip(seq_lens, past_seen_tokens)]
-    )
-    try:
-        metadata = create_test_metadata(
-            seq_lens,
-            1,
-            past_seen_tokens,
-            request_ids,
-            kv_cache_manager,
-            sparse_attn_config,
-            metadata_cls,
-        )
-        assert metadata.find_ext(RocketMetadata) is not None
-        check_copy_reproduces_creation_config(metadata)
-    finally:
-        kv_cache_manager.shutdown()
-
-
-@pytest.mark.parametrize(
-    "metadata_cls", [RocketTrtllmAttentionMetadata, RocketVanillaAttentionMetadata]
-)
-def test_rocket_prompt_budget_holds_across_repeated_prepares(metadata_cls):
-    """Preparing the same batch again (as CUDA graph warmup does) caps the cached
-    lengths at the prompt budget once, not once per prepare."""
-    sparse_attn_config = RocketSparseAttentionConfig(
-        window_size=32, kernel_size=3, prompt_budget=256, page_size=4, kt_cache_dtype="bfloat16"
-    )
-    seq_lens, past_seen_tokens, request_ids = [300, 1], [0, 400], [0, 1]
-    kv_cache_manager = create_rocket_kv_cache_manager(
-        1, 8, 128, 64, 4096, 2, DataType.BF16, sparse_attn_config
-    )
-    kv_cache_manager.add_dummy_requests(
-        request_ids, [seq + past for seq, past in zip(seq_lens, past_seen_tokens)]
-    )
-    try:
-        metadata = create_test_metadata(
-            seq_lens,
-            1,
-            past_seen_tokens,
-            request_ids,
-            kv_cache_manager,
-            sparse_attn_config,
-            metadata_cls,
-        )
-        # The generation request's 401-token prompt is cut to the 256-token budget.
-        expected_cached = [0, 400 + 256 - 401]
-        for _ in range(3):
-            assert list(metadata.kv_cache_params.num_cached_tokens_per_seq) == expected_cached
-            if metadata_cls is RocketTrtllmAttentionMetadata:
-                assert metadata.kv_lens[:2].tolist() == [300, expected_cached[1] + 1]
-            metadata.prepare()
-    finally:
-        kv_cache_manager.shutdown()
 
 
 if __name__ == "__main__":

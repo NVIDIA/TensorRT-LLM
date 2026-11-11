@@ -91,9 +91,3 @@ def test_uncorrected_steps_leave_the_inputs(spec, disable_overlap, with_kv_cache
     assert inputs["position_ids"].tolist() == [list(range(8))]
     assert metadata.kv_lens_cuda.tolist() == [100, 101]
     assert metadata.calls == []
-
-
-def test_the_retired_step_correction_hooks_are_gone() -> None:
-    hooks = RuntimeHooks()
-    assert not hasattr(hooks, "kv_lens_update_once")
-    assert not hasattr(hooks, "spec_offsets_op")

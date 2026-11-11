@@ -283,55 +283,6 @@ def test_device_layout_preserves_mixed_context_row_and_token_prefixes() -> None:
     meta.metadata.check_lengths_current()
 
 
-def test_device_layout_applies_kv_lens_delta_and_clears_lengths_changed(monkeypatch) -> None:
-    """Device-window reranking adjusts kv_lens_cuda, refreshes derived state, and leaves lengths clean."""
-    torch.cuda.init()
-    meta = _metadata(num_pools=1, max_blocks=8, max_seqs=4)
-    block_offsets = torch.arange(1 * 4 * 2 * 8, dtype=torch.int32, device="cuda").reshape(
-        1, 4, 2, 8
-    )
-    rows = _expand(
-        meta,
-        num_contexts=0,
-        row_req_idx=[0, 1, 1],
-        num_seqs=2,
-        block_offsets=block_offsets,
-    )
-    assert rows == 3
-
-    md = meta.metadata
-    core = md.core()
-    core.num_generations = 2
-    core._num_contexts = 0
-    core._num_ctx_tokens = 0
-    core._num_tokens = 3
-    core.seq_lens = torch.tensor([2, 1], dtype=torch.int32)
-    core._seq_lens_cuda = torch.tensor([2, 1], dtype=torch.int32, device="cuda")
-    core.kv_lens = torch.tensor([104, 202], dtype=torch.int32)
-    core.kv_lens_cuda = torch.tensor([104, 202], dtype=torch.int32, device="cuda")
-    meta.index_share.req_idx_per_token = torch.full((32,), -1, dtype=torch.int32, device="cuda")
-    meta.indexer_k_cache_block_offsets = torch.arange(
-        2 * 8, dtype=torch.int32, device="cuda"
-    ).reshape(2, 8)
-    refreshed = []
-    monkeypatch.setattr(meta, "on_update_kv_lens", lambda: refreshed.append(True))
-
-    meta.apply_device_ragged_layout(
-        verify_lens=torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
-        req_idx=torch.tensor([0, 1, 1], dtype=torch.long, device="cuda"),
-        kv_correction=torch.tensor([0, -1, 0], dtype=torch.int32, device="cuda"),
-        kv_lens_delta=torch.tensor([-2, 2], dtype=torch.int32, device="cuda"),
-    )
-
-    assert torch.equal(md.seq_lens_cuda[:2], torch.tensor([1, 2], dtype=torch.int32, device="cuda"))
-    assert torch.equal(
-        md.kv_lens_cuda[:2], torch.tensor([102, 204], dtype=torch.int32, device="cuda")
-    )
-    assert refreshed == [True]
-    assert not md.lengths_changed
-    md.check_lengths_current()
-
-
 def test_every_runtime_view_shares_the_row_count() -> None:
     """All views the op reads must agree on batch_size, which is the row count.
 

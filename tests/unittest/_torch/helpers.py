@@ -426,14 +426,6 @@ def construct_extension(extension, **config):
     return extension
 
 
-def start_draft_loop(metadata):
-    """Enter ``metadata.draft_loop()`` and return the draft, as a spec worker does.
-
-    The loop stays open for the rest of the test (until the next start).
-    """
-    return metadata.draft_loop().__enter__()
-
-
 def refresh_from_lengths(metadata):
     """Refresh ``metadata``'s length-derived state as a draft refresh does.
 
