@@ -35,7 +35,7 @@ import tempfile
 import traceback
 from contextlib import nullcontext
 from itertools import product
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import cloudpickle
 import pytest
@@ -1277,6 +1277,11 @@ def generate_multi_gpu_test_params(
         List of pytest.param objects for runnable test configurations only
     """
     params: List = []
+    # Only DEP dispatches through the forced comm method. TEP and TTP build no
+    # communication strategy and DTP always uses AllGather + ReduceScatter
+    # (CommunicationFactory.create_strategy), so their variants across
+    # comm_methods run the same case; keep the first one that is not skipped.
+    seen_non_dep = set()
     for parallel_mode, comm_method in product(parallel_modes, comm_methods):
         for (
             swiglu_alpha,
@@ -1383,8 +1388,40 @@ def generate_multi_gpu_test_params(
                         skip_reason = reason
                         break
 
+            # The test body skips these in CI mode anyway; do not collect them.
+            if not skip_reason and IS_CI_MODE:
+                skip_reason = should_skip_to_accelerate_ci(
+                    backend_type=backend_type,
+                    quant_algo=quant_algo,
+                    model_config=model_config,
+                    routing_method_cls=routing_method_cls,
+                    dtype=dtype,
+                    seq_len=seq_len,
+                    swiglu_gptoss_style=swiglu_alpha != 1
+                    or swiglu_beta != 0
+                    or swiglu_limit != float("inf"),
+                    parallel_mode=parallel_mode,
+                )
+
             if skip_reason:
                 continue
+
+            if parallel_mode != "DEP":
+                case_key = (
+                    parallel_mode,
+                    dtype,
+                    backend_type,
+                    quant_algo,
+                    seq_len,
+                    str(model_config),
+                    routing_method_cls,
+                    swiglu_alpha,
+                    swiglu_beta,
+                    swiglu_limit,
+                )
+                if case_key in seen_non_dep:
+                    continue
+                seen_non_dep.add(case_key)
 
             test_id = f"parallel={parallel_mode}-comm={comm_method}-{base_test_id}"
             param_values = (
@@ -1468,6 +1505,18 @@ def _generate_focused_multi_gpu_test_params(
             if not skip_reason:
                 skip_reason = should_skip_multi_gpu(
                     parallel_mode, model_config, world_size=4, comm_method=comm_method
+                )
+
+            if not skip_reason and IS_CI_MODE:
+                skip_reason = should_skip_to_accelerate_ci(
+                    backend_type=backend_type,
+                    quant_algo=quant_algo,
+                    model_config=model_config,
+                    routing_method_cls=routing_method_cls,
+                    dtype=dtype,
+                    seq_len=seq_len,
+                    swiglu_gptoss_style=False,
+                    parallel_mode=parallel_mode,
                 )
 
             if skip_reason:
@@ -1782,14 +1831,157 @@ MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
 )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
-@pytest.mark.parametrize(
-    "parallel_mode,comm_method_type,dtype,moe_backend,quant_algo,seq_len,model_config,"
-    "routing_method_cls,swiglu_alpha,swiglu_beta,swiglu_limit",
-    MULTI_GPU_TEST_PARAMS,
-)
-@pytest.mark.threadleak(enabled=False)  # module-scoped MPIPoolExecutor persists by design
-def test_configurable_moe_multi_gpu(
+# ============================================================================
+# Pre-merge subset of the multi-GPU matrix
+# ============================================================================
+# MULTI_GPU_TEST_PARAMS runs post-merge. Pre-merge runs what only a multi-GPU
+# test can cover, each once across DGX H100 / B200 / B300; kernels, routing,
+# dtypes and shapes are covered by the single-GPU tests.
+#   comm:  DEP x each comm method x each dispatch payload that method handles
+#          differently (DeepEP quantizes before dispatch only for NVFP4,
+#          DeepEP low-latency for NVFP4 / FP8 / W4A8, NVLink for every format),
+#          plus the backends with their own post-dispatch path: TRTLLM runs the
+#          kernel on precomputed top-k, CuteDSL takes DeepEP low-latency's
+#          direct expert metadata.
+#   shard: TTP x one case per quant-method family; the TP split lives in the
+#          quant method's weight and scale loaders, which backends share.
+#   fused: MegaMoE, whose kernels own the cross-rank exchange.
+# What Hopper can run is placed on DGX H100; DGX B300 keeps only the backends
+# with SM103-specific kernels (CUTLASS NVFP4, CuteDSL NVFP4, MegaMoE CuteDSL).
+class _PremergeCase(NamedTuple):
+    tier: str
+    parallel_mode: str
+    comm: Optional[str]  # None for TTP, where the comm method is not used.
+    backend: str
+    quant: str
+    model: str
+    routing: str = "Renormalize"
+    swiglu_alpha: float = 1
+
+
+_E60 = "e60_k4_h2048_i1408"
+_E8 = "e8_k1_h512_i512"
+_ONE_SIDED, _TWO_SIDED = "NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED"
+_DEEPEP, _DEEPEP_LL = "DEEPEP", "DEEPEPLOWLATENCY"
+
+_MULTI_GPU_PREMERGE_CASES = {
+    90: [
+        _PremergeCase("comm", "DEP", _ONE_SIDED, "CUTLASS", "W8A16", _E60),
+        _PremergeCase("comm", "DEP", _ONE_SIDED, "CUTLASS", "FP8", _E60),
+        _PremergeCase("comm", "DEP", _ONE_SIDED, "CUTLASS", "FP8_BLOCK_SCALES", _E60),
+        _PremergeCase("comm", "DEP", _ONE_SIDED, "CUTLASS", "W8A16", _E8),
+        _PremergeCase("comm", "DEP", _TWO_SIDED, "CUTLASS", "W8A16", _E60),
+        _PremergeCase("comm", "DEP", _DEEPEP, "CUTLASS", "W8A16", _E60),
+        _PremergeCase("comm", "DEP", "ALLGATHER", "MARLIN", "NVFP4", _E60),
+        _PremergeCase("shard", "TTP", None, "CUTLASS", "FP8", _E8),
+        _PremergeCase("shard", "TTP", None, "CUTLASS", "FP8_BLOCK_SCALES", _E8),
+        _PremergeCase("shard", "TTP", None, "CUTLASS", "W8A16", _E8),
+        _PremergeCase("shard", "TTP", None, "CUTLASS", "W4A8_AWQ", _E8),
+        _PremergeCase("shard", "TTP", None, "CUTLASS", "W4A16_MXFP4", _E60),
+    ],
+    100: [
+        _PremergeCase("comm", "DEP", _ONE_SIDED, "DEEPGEMM", "FP8_BLOCK_SCALES", _E60),
+        _PremergeCase("comm", "DEP", _ONE_SIDED, "CUTLASS", "NVFP4", _E60),
+        _PremergeCase("comm", "DEP", _ONE_SIDED, "TRTLLM", "NVFP4", _E8),
+        _PremergeCase("comm", "DEP", _ONE_SIDED, "TRTLLM", "W4A8_MXFP4_MXFP8", _E8),
+        _PremergeCase("comm", "DEP", _ONE_SIDED, "TRTLLM", "W4A16_MXFP4", _E60, swiglu_alpha=1.702),
+        _PremergeCase("comm", "DEP", _TWO_SIDED, "CUTLASS", "NVFP4", _E60),
+        _PremergeCase("comm", "DEP", _TWO_SIDED, "TRTLLM", "W4A8_MXFP4_MXFP8", _E8),
+        _PremergeCase("comm", "DEP", _DEEPEP, "CUTLASS", "NVFP4", _E60),
+        _PremergeCase("comm", "DEP", _DEEPEP, "TRTLLM", "NVFP4", _E8),
+        _PremergeCase("comm", "DEP", _DEEPEP_LL, "CUTLASS", "W8A16", _E60),
+        _PremergeCase("comm", "DEP", _DEEPEP_LL, "CUTLASS", "FP8", _E60),
+        _PremergeCase("comm", "DEP", _DEEPEP_LL, "CUTLASS", "NVFP4", _E60),
+        _PremergeCase("comm", "DEP", _DEEPEP_LL, "TRTLLM", "W4A16_MXFP4", _E60),
+        _PremergeCase("comm", "DEP", _DEEPEP_LL, "CUTEDSL", "NVFP4", _E60),
+        _PremergeCase("shard", "TTP", None, "CUTLASS", "NVFP4", _E8),
+        _PremergeCase("shard", "TTP", None, "CUTEDSL", "NVFP4", _E8),
+        _PremergeCase("shard", "TTP", None, "TRTLLM", "NVFP4", _E8),
+        _PremergeCase("shard", "TTP", None, "TRTLLM", "W4A8_NVFP4_FP8", _E8),
+        _PremergeCase("shard", "TTP", None, "CUTLASS", "W4A8_MXFP4_MXFP8", _E60),
+        _PremergeCase("shard", "TTP", None, "TRTLLM", "W4A16_MXFP4", _E60),
+        _PremergeCase("shard", "TTP", None, "CUTLASS", "MXFP8", _E8),
+        _PremergeCase(
+            "fused",
+            "DEP",
+            MEGAMOE_IGNORE_COMM_METHOD,
+            "MEGAMOE_DEEPGEMM",
+            "W4A8_MXFP4_MXFP8",
+            _E8,
+            "DeepSeekV3",
+        ),
+        _PremergeCase(
+            "fused",
+            "DEP",
+            MEGAMOE_IGNORE_COMM_METHOD,
+            "MEGAMOE_CUTEDSL",
+            "NVFP4",
+            _E8,
+            "DeepSeekV3",
+        ),
+        _PremergeCase(
+            "fused",
+            "DEP",
+            MEGAMOE_IGNORE_COMM_METHOD,
+            "MEGAMOE_CUTEDSL",
+            "NVFP4",
+            _E60,
+            "DeepSeekV3",
+        ),
+    ],
+    103: [
+        _PremergeCase("sm103", "DEP", _ONE_SIDED, "CUTLASS", "NVFP4", _E60),
+        _PremergeCase("sm103", "DEP", _DEEPEP, "CUTEDSL", "NVFP4", _E60),
+        _PremergeCase(
+            "sm103",
+            "DEP",
+            MEGAMOE_IGNORE_COMM_METHOD,
+            "MEGAMOE_CUTEDSL",
+            "NVFP4",
+            _E8,
+            "DeepSeekV3",
+        ),
+    ],
+}
+
+
+def _matches_premerge_case(case: _PremergeCase, values) -> bool:
+    parallel_mode, comm, dtype, backend, quant, _, model_config, routing_method_cls = values[:8]
+    swiglu_alpha = values[8]
+    return (
+        parallel_mode == case.parallel_mode
+        and (case.comm is None or comm == case.comm)
+        and dtype == torch.bfloat16
+        and backend == case.backend
+        and str(quant) == case.quant
+        and str(model_config) == case.model
+        and routing_method_cls.__name__ == f"{case.routing}MoeRoutingMethod"
+        and swiglu_alpha == case.swiglu_alpha
+    )
+
+
+def _premerge_multi_gpu_params(sm_version: int) -> List:
+    """The cases of _MULTI_GPU_PREMERGE_CASES for this SM, taken from MULTI_GPU_TEST_PARAMS.
+
+    A listed case that the matrix no longer generates becomes a failing
+    parameter, so a renamed or newly skipped case cannot drop out silently.
+    """
+    params = []
+    for case in _MULTI_GPU_PREMERGE_CASES.get(sm_version, []):
+        match = next(
+            (p for p in MULTI_GPU_TEST_PARAMS if _matches_premerge_case(case, p.values)), None
+        )
+        if match is None:
+            params.append(pytest.param(case, id=f"tier={case.tier}-missing"))
+        else:
+            params.append(
+                pytest.param(match.values, id=f"tier={case.tier}-{match.id}", marks=match.marks)
+            )
+    return params
+
+
+def _run_configurable_moe_multi_gpu(
+    executor,
     parallel_mode,
     comm_method_type,
     dtype,
@@ -1801,7 +1993,6 @@ def test_configurable_moe_multi_gpu(
     swiglu_alpha,
     swiglu_beta,
     swiglu_limit,
-    moe_multi_gpu_executor,
 ):
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     backend_type = MoeBackendType(moe_backend)
@@ -1837,7 +2028,7 @@ def test_configurable_moe_multi_gpu(
 
     world_size = 4
     _test_moe_multi_gpu(
-        moe_multi_gpu_executor,
+        executor,
         comm_method_type,
         moe_backend,
         quant_algo,
@@ -1852,6 +2043,53 @@ def test_configurable_moe_multi_gpu(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
     )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
+@pytest.mark.parametrize(
+    "parallel_mode,comm_method_type,dtype,moe_backend,quant_algo,seq_len,model_config,"
+    "routing_method_cls,swiglu_alpha,swiglu_beta,swiglu_limit",
+    MULTI_GPU_TEST_PARAMS,
+)
+@pytest.mark.threadleak(enabled=False)  # module-scoped MPIPoolExecutor persists by design
+def test_configurable_moe_multi_gpu(
+    parallel_mode,
+    comm_method_type,
+    dtype,
+    moe_backend,
+    quant_algo,
+    seq_len,
+    model_config,
+    routing_method_cls,
+    swiglu_alpha,
+    swiglu_beta,
+    swiglu_limit,
+    moe_multi_gpu_executor,
+):
+    _run_configurable_moe_multi_gpu(
+        moe_multi_gpu_executor,
+        parallel_mode,
+        comm_method_type,
+        dtype,
+        moe_backend,
+        quant_algo,
+        seq_len,
+        model_config,
+        routing_method_cls,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
+@pytest.mark.parametrize("case", _premerge_multi_gpu_params(get_sm_version()))
+@pytest.mark.threadleak(enabled=False)  # module-scoped MPIPoolExecutor persists by design
+def test_moe_multi_gpu_premerge(case, moe_multi_gpu_executor):
+    """The pre-merge cases of test_configurable_moe_multi_gpu, see _MULTI_GPU_PREMERGE_CASES."""
+    if isinstance(case, _PremergeCase):
+        pytest.fail(f"{case} matches no test_configurable_moe_multi_gpu case on this GPU")
+    _run_configurable_moe_multi_gpu(moe_multi_gpu_executor, *case)
 
 
 # ============================================================================

@@ -36,7 +36,6 @@ l0_gb200_multi_gpus:
   - unittest/_torch/attention/sparse/csa2/test_cache_manager.py::test_partial_page_copy_on_write_and_state
   # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
-  - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
