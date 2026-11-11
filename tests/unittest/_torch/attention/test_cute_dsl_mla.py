@@ -220,10 +220,15 @@ def _select_mla_generation_fmha(
         (103, 48, 6, True, True, "cute_dsl_mla"),
         (100, 48, 6, True, True, "cute_dsl_mla"),
         (103, 48, 6, False, True, "cute_dsl_mla"),
+        (103, 24, 6, True, True, "cute_dsl_mla"),
+        (100, 24, 6, True, True, "cute_dsl_mla"),
+        (103, 24, 6, False, True, "cute_dsl_mla"),
         # The same verify shape without Helix keeps the perf gate.
         (103, 48, 6, True, False, "trtllm_gen"),
-        # H=48 page-64 single-token Helix needs the coverage path on SM103.
+        # Single-token Helix decode at 48 heads on 64-token pages has no
+        # fallback kernel on either architecture.
         (103, 48, 1, True, True, "cute_dsl_mla"),
+        (100, 48, 1, True, True, "cute_dsl_mla"),
         # Single-token H=96 is unchanged (measured perf-table entry).
         (103, 96, 1, True, False, "cute_dsl_mla"),
         # Head counts TRTLLM-Gen serves keep the perf gate.
@@ -439,25 +444,32 @@ def test_page_size_exclusive_to_cute_dsl_needs_a_page_size() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "page_size, fp8_kv, helix, sm, kernel_supported, expected",
+    "page_size, fp8_kv, helix, sm, num_heads, kernel_supported, expected",
     [
-        (64, True, True, 103, True, "cute_dsl_mla"),
-        (32, True, True, 103, True, "trtllm_gen"),
-        (128, True, True, 103, True, "trtllm_gen"),
-        (64, False, True, 103, True, "trtllm_gen"),
-        (64, True, False, 103, True, "trtllm_gen"),
-        (64, True, True, 100, True, "trtllm_gen"),
-        (64, True, True, 103, False, "trtllm_gen"),
+        # The fallback pads 33-63 heads to a 64-row Q tile that has kernels
+        # for 32-token pages only.
+        (64, True, True, 103, 48, True, "cute_dsl_mla"),
+        (64, True, True, 100, 48, True, "cute_dsl_mla"),
+        (64, False, True, 103, 48, True, "cute_dsl_mla"),
+        (128, True, True, 103, 48, True, "cute_dsl_mla"),
+        (64, True, True, 103, 40, True, "cute_dsl_mla"),
+        # The fallback serves these, so the perf gate still decides.
+        (32, True, True, 103, 48, True, "trtllm_gen"),
+        (64, True, True, 103, 24, True, "trtllm_gen"),
+        (64, True, True, 103, 64, True, "trtllm_gen"),
+        (64, True, True, 103, 96, True, "trtllm_gen"),
+        (64, True, False, 103, 48, True, "trtllm_gen"),
+        (64, True, True, 103, 48, False, "trtllm_gen"),
     ],
 )
-def test_mla_generation_helix_fp8_page64_coverage(
-    monkeypatch, page_size, fp8_kv, helix, sm, kernel_supported, expected
+def test_mla_generation_helix_decode_without_fallback_kernel(
+    monkeypatch, page_size, fp8_kv, helix, sm, num_heads, kernel_supported, expected
 ) -> None:
     assert (
         _select_mla_generation_fmha(
             monkeypatch,
             sm=sm,
-            num_heads=48,
+            num_heads=num_heads,
             seq_len_q=1,
             fp8_kv=fp8_kv,
             helix=helix,
@@ -476,7 +488,7 @@ def test_mla_generation_helix_fp8_page64_coverage(
         (64, 1, True, True, True, "cute_dsl_mla"),
         (64, 1, True, True, False, "trtllm_gen"),
         (32, 1, True, True, True, "trtllm_gen"),
-        (64, 1, False, True, True, "trtllm_gen"),
+        (64, 1, False, True, True, "cute_dsl_mla"),
         (64, 1, True, False, True, "trtllm_gen"),
         (64, 6, True, True, True, "cute_dsl_mla"),
         (32, 6, True, True, True, "cute_dsl_mla"),
@@ -503,16 +515,22 @@ def test_mla_generation_mixed_helix_coverage(
 
 
 @pytest.mark.cpu_only
-def test_mla_generation_mixed_page_table_offset(monkeypatch) -> None:
+@pytest.mark.parametrize("seq_len_q", [1, 6])
+def test_mla_generation_mixed_page_table_offset(monkeypatch, seq_len_q) -> None:
     page, heads, latent, rope = 64, 48, 512, 64
+    num_tokens = 2 * seq_len_q
     cache = torch.zeros((12, 1, page, 1, latent + rope), dtype=torch.float8_e4m3fn)
     blocks = torch.arange(12).view(1, 4, 1, 3)
     lengths = torch.tensor([999, 888, 5, 7], dtype=torch.int32)
+    # The Helix buffers are generation-relative; the tail stands for entries
+    # past this step's generation tokens.
+    kv_bounds = torch.arange(100, 100 + num_tokens + 4, dtype=torch.int32)
     meta = SimpleNamespace(
         num_contexts=2,
         max_num_requests=4,
-        helix_position_offsets=torch.zeros(2, dtype=torch.int32),
-        _helix_spec_tokens_valid=False,
+        helix_position_offsets=torch.zeros(num_tokens, dtype=torch.int32),
+        helix_kv_bounds=kv_bounds,
+        _helix_spec_tokens_valid=seq_len_q > 1,
         kv_cache_manager=SimpleNamespace(get_buffers=lambda _: cache),
         kv_cache_block_offsets=blocks,
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]]),
@@ -537,7 +555,7 @@ def test_mla_generation_mixed_page_table_offset(monkeypatch) -> None:
             quant_q_buffer=None,
             mla_bmm1_scale=torch.ones(2, dtype=torch.float32),
             mla_bmm2_scale=torch.ones(1, dtype=torch.float32),
-            softmax_stats_tensor=torch.empty((2, heads, 2), dtype=torch.float32),
+            softmax_stats_tensor=torch.empty((num_tokens, heads, 2), dtype=torch.float32),
         ),
     )
     library = CuteDslMlaFmha.__new__(CuteDslMlaFmha)
@@ -551,12 +569,18 @@ def test_mla_generation_mixed_page_table_offset(monkeypatch) -> None:
         raising=False,
     )
     library._run_mla_decode(
-        torch.zeros((2, heads, latent + rope), dtype=torch.bfloat16),
-        torch.empty((2, heads, latent), dtype=torch.bfloat16),
+        torch.zeros((num_tokens, heads, latent + rope), dtype=torch.bfloat16),
+        torch.empty((num_tokens, heads, latent), dtype=torch.bfloat16),
         params,
         torch.float8_e4m3fn,
     )
     assert len(calls) == 1
     torch.testing.assert_close(calls[0][4], blocks[0, 2:, 0].T.to(torch.int32))
     torch.testing.assert_close(calls[0][5], lengths[2:])
+    assert calls[0][9] == seq_len_q
     assert calls[0][14] is params.fwd.softmax_stats_tensor
+    # A verify group passes the bounds of exactly this step's generation tokens.
+    if seq_len_q > 1:
+        torch.testing.assert_close(calls[0][15], kv_bounds[:num_tokens])
+    else:
+        assert calls[0][15] is None
