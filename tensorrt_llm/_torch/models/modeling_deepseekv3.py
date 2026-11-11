@@ -2097,6 +2097,13 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         weight_loader.load_weights(weights)
 
     def setup_aliases(self) -> None:
+        # `DeepseekV3WeightLoader` binds each MLA `v_b_proj` as a view of the V
+        # rows of `kv_b_proj.weight`; restore that alias for modules whose
+        # weights did not come through the loader (staged MX receivers).
+        for module in self.modules():
+            if isinstance(module, MLA):
+                module.alias_v_b_proj_to_kv_b_proj()
+
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

@@ -2573,6 +2573,56 @@ class MLA(nn.Module):
         self.transform_weights()
         self.cache_derived_state()
 
+    def alias_v_b_proj_to_kv_b_proj(self) -> None:
+        """Rebind `v_b_proj` as a view of the V rows of `kv_b_proj.weight`.
+
+        The DeepSeek-V3 weight loader lays `kv_b_proj.weight` out as
+        `[all K-nope rows; all V rows]` per tensor-parallel head split and binds
+        `v_b_proj` to the V rows through `_bind_v_b_proj_weight`. A module whose
+        weights arrive without that loader (a staged post-transform receiver)
+        keeps a separate `v_b_proj` tensor; this rebinds it structurally so its
+        storage and offset match the loaded layout. No data is copied. It needs
+        allocated weights: a module whose `kv_b_proj.weight` is still a meta
+        tensor is left untouched, since a staged receiver runs this after its
+        weights are materialized. It is idempotent and leaves
+        `_weights_transformed` alone.
+
+        Only an unquantized `kv_b_proj` without a locality-domain partition plan
+        and without CP head slicing is eligible; every other layout is left
+        untouched. Call it only for models whose loader lays `kv_b_proj` out as
+        described (`DeepseekV3WeightLoader`), because it assumes that row order.
+        """
+        kv_b_proj = getattr(self, "kv_b_proj", None)
+        v_b_proj = getattr(self, "v_b_proj", None)
+        if kv_b_proj is None or not isinstance(v_b_proj, nn.Parameter):
+            return
+        weight = getattr(kv_b_proj, "weight", None)
+        if (
+            not isinstance(weight, torch.Tensor)
+            or weight.is_meta
+            or weight.dtype != v_b_proj.dtype
+            or not getattr(kv_b_proj, "_weights_created", False)
+            or kv_b_proj.has_any_quant
+            or kv_b_proj.partition_plan.enabled
+        ):
+            return
+        local_heads = self.num_heads_tp
+        if (
+            self.num_heads_tp_cp != local_heads
+            or weight.dim() != 2
+            or not weight.is_contiguous()
+            or weight.shape[0] != local_heads * (self.qk_nope_head_dim + self.v_head_dim)
+            or weight.shape[1] != self.kv_lora_rank
+            or tuple(v_b_proj.shape) != (local_heads, self.v_head_dim, self.kv_lora_rank)
+        ):
+            return
+        v_rows = weight.data[local_heads * self.qk_nope_head_dim :].view(
+            local_heads, self.v_head_dim, self.kv_lora_rank
+        )
+        if v_b_proj.data_ptr() == v_rows.data_ptr() and v_b_proj.shape == v_rows.shape:
+            return
+        self.v_b_proj = nn.Parameter(v_rows, requires_grad=False)
+
     def _bind_v_b_proj_weight(self, weight: torch.Tensor) -> None:
         """Bind the V absorption weight without retaining a released full weight."""
         plan = self.kv_b_proj.partition_plan
