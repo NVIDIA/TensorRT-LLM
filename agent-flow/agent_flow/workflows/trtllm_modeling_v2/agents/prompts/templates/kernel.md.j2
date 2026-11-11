@@ -22,7 +22,7 @@ Use these exact paths: the report looks for the entry there.
 
 Read "Writing operations" in `{{ mv2_readme }}`, `catalog/_op.py`, and one entry of the same category with its test. For C++/CUDA read `{{ build_guide }}` first: sources in `csrc/`, registered with its macros, a matching fake in `fake_ops.py`.
 
-- `__call__`: one kernel-launching call, every argument explicit; weights, state and configuration are arguments. No torch fallback: it certifies nothing.
+- `__call__`: one kernel-launching call, every argument explicit; weights, state and configuration are arguments. No silent torch fallback: it certifies nothing; torch ops as the stated implementation (tier 4) say so in `note`.
 - `reference`: the expected result in plain torch with fp32 accumulation, from the cell's named arguments. It calls neither the kernel nor any entry.
 - `is_valid`: rejects inputs the kernel accepts but computes wrongly: only cases you measured.
 - `CELLS`: what the test runs: every cell listed above, plus one at the largest row the options allow (`max_num_tokens`, `max_batch_size`). Measured values.
@@ -31,7 +31,7 @@ Read "Writing operations" in `{{ mv2_readme }}`, `catalog/_op.py`, and one entry
 
 An entry without `CELLS`, or whose `ARCHS` lacks `{{ arch }}`, is a finding in the report: check both before you commit.
 
-Tiers 1 to 3 wrap an existing callable: `git grep` the op's name for its source. At tiers 4 and 5 you write it, correct before fast, from the closest existing kernel: keep its license header and name its origin. A composition of torch calls, when nothing better exists, says so in `note`.
+Tiers 1 to 3 wrap an existing callable: `git grep` the op's name for its source. At tiers 4 and 5 you write it, correct before fast, from the closest existing kernel: keep its license header and name its origin.
 
 ### The test
 
@@ -41,7 +41,7 @@ Tiers 1 to 3 wrap an existing callable: `git grep` the op's name for its source.
 - Each `is_valid` refusal: show the unguarded failure, then test it with `validating(op)` and `pytest.raises`; a probe that can crash runs in a subprocess.
 - For index arguments, check reachable 2^31-element, 2^31/row-width, and fp32 2^24+1 boundaries.
 - Pool slots are a cell axis sized from the cache manager, not the batch size. Include slots != batch.
-- A normal cell fits 10 s and 40 GiB; a larger one gets `spec.large=True` and `pytest.mark.large`.
+- A normal cell fits 10 s and 40 GiB; a larger one gets `"large": True` in its `spec` and `pytest.mark.high_cuda_memory`.
 
 Run it with your worktree first on `PYTHONPATH`, or it tests another checkout:
 

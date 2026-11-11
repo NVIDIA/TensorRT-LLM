@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
 from agent_flow.workflows.trtllm_modeling_v2.run.contract import compile_contract
 from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, shorthand, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
@@ -313,6 +314,47 @@ def test_each_deployment_owes_its_boot_its_benchmarks_and_its_tests_and_no_serve
     bare = compile_contract({"deployments": [{"name": "only", "options": {}}]})
     assert [c.key for c in bare.checks] == ["only:boot"]
     assert bare.notes == ("only: it names no benchmark, so its boot alone judges it",)
+
+
+def test_the_documents_say_what_the_code_does_where_a_reader_followed_them(tmp_path, capsys):
+    """The second reviewer ran the documents literally; each of these stopped or misled them."""
+    package = Path(task_schema.__file__).resolve().parents[1]
+    readme = (package / "README.md").read_text(encoding="utf-8")
+    intake = (package / "spec" / "INTAKE.md").read_text(encoding="utf-8")
+    templates = package / "agents" / "prompts" / "templates"
+    # Accuracy runs offline, and the README says where the data must be, as the check does.
+    said = "Accuracy runs offline: each benchmark's dataset is under `$LLM_MODELS_ROOT/datasets/` "
+    said += (
+        f"(GSM8K: `{datasets.KNOWN['gsm8k']}`), in the HuggingFace cache, or at its `dataset_path`"
+    )
+    assert said in readme
+    nowhere = {key: str(tmp_path / key) for key in ("LLM_MODELS_ROOT", "HF_HOME", "HF_HUB_CACHE")}
+    nowhere["HF_DATASETS_CACHE"] = str(tmp_path / "prepared")
+    _, why = datasets.find("gsm8k", "", nowhere)
+    assert f"put it under $LLM_MODELS_ROOT/datasets/{datasets.KNOWN['gsm8k']}" in why
+    # After the fix task a failed deployment's checks run whole: the README and the fix
+    # task's own text say the same words.
+    again = "every check of each deployment that had a failure"
+    assert again in readme and again in (templates / "fix.md.j2").read_text(encoding="utf-8")
+    assert "then the failed checks and" not in readme
+    # A disaggregated deployment on several nodes: who must keep the two sides apart.
+    assert "`ctx` and `gen` prefixes place their ranks on different nodes of the allocation" in (
+        readme
+    )
+    assert "the proxy runs on the orchestrator's host" in readme
+    # `derive` names the key it left open, and prints no warning about an anchor it never writes.
+    checkpoint = _checkpoint(tmp_path)
+    (tmp_path / "tree").mkdir()
+    out = tmp_path / "derived"
+    argv = ["derive", "--checkpoint", str(checkpoint), "--repo", str(tmp_path / "tree")]
+    assert derive.main([*argv, "--out", str(out)]) == 0
+    printed = capsys.readouterr().out
+    assert "open: environment.python: no --site was given; name the interpreter" in printed
+    assert "anchor under one percent" not in printed
+    written = yaml.safe_load((out / "task.derived.yaml").read_text())
+    assert "python" not in written["environment"] and "benchmarks" not in written["deployments"][0]
+    assert "`environment.python`, `accuracy.model_key`) and the spec's warnings" in intake
+    assert "never from `derive`, which writes no anchor" in intake
 
 
 def test_the_example_spec_loads_whole_and_so_do_its_smallest_and_its_disaggregated_form(tmp_path):

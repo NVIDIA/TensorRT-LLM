@@ -19,15 +19,15 @@ trtllm-modeling-v2 --task <spec-dir>/task.derived.yaml --workspace <ws> --dry-ru
 trtllm-modeling-v2 --task <spec-dir>/task.derived.yaml --workspace <ws>
 ```
 
-On one host with a simple environment, fill `checkpoint_path`, `trtllm_repo_path`, `arch`, `environment.python`, `agents.defaults` (`backend`, `model`) and one deployment with its options file. [spec/INTAKE.md](spec/INTAKE.md) says how to add deployments and benchmarks; `task.example.yaml` shows every key.
+On one host with a simple environment, fill `checkpoint_path`, `trtllm_repo_path`, `arch`, `environment.python`, `agents.defaults` (`backend`, `model`) and one deployment with its options file. Accuracy runs offline: each benchmark's dataset is under `$LLM_MODELS_ROOT/datasets/` (GSM8K: `openai/gsm8k`), in the HuggingFace cache, or at its `dataset_path`; leave `accuracy` out to onboard on the boot alone. [spec/INTAKE.md](spec/INTAKE.md) says how to add deployments and benchmarks; `task.example.yaml` shows every key.
 
 ## How a run goes
 
-1. **Preflight** probes where `core` runs and stops only on a hard blocker: an unreadable `config.json`, a tree that does not import, an unwritable `TMPDIR` (61 characters at most), too few free devices for `core`, a missing dataset of `core`, an agent CLI that does not answer. A config the tree cannot load adds a `config` task first. A later deployment that does not fit, and a benchmark with no dataset or whose base is not attempted, are recorded `not attempted`.
+1. **Preflight** probes where `core` runs and stops only on a hard blocker: an unreadable `config.json`, a tree that does not import, an unwritable `TMPDIR` (61 characters at most), too few free devices for `core`, a missing dataset of `core`, an agent CLI that does not answer. A config the tree cannot load adds a `config` task first. A later deployment that does not fit, and a benchmark with no dataset or whose base is not attempted, are recorded `not attempted`. A checkout that holds changes or untracked sources no commit has is said at the start: a check that runs in it gives no verdict until they are committed, removed or git-ignored.
 2. **Survey** writes `plan.md` and `vocabulary.yaml` (the operators the checkpoint needs, and the kernel rows to add).
 3. **Core**, after the kernel rows it needs: each task is one agent turn in its own worktree, 3 attempts, a spent kernel row skipped. When the worker says `ready`, code runs `core`'s boot and benchmarks on its commit; only a pass lands it. A `config`, `survey` or `core` task that spends its attempts ends the run `not onboarded`.
 4. **Each further deployment**, in the spec's order. One that spends its attempts is `not done`: nothing of it lands and the run goes on.
-5. **Final pass**, once: every check the done deployments owe, the target's tests, and the convention scan (an entry without `CELLS` or `ARCHS`, a Modeling V1 import; reported, never a gate). What fails goes to one `fix` task, then the failed checks and `core`'s run again.
+5. **Final pass**, once: every check the done deployments owe, the target's tests, and the convention scan (an entry without `CELLS` or `ARCHS`, a Modeling V1 import; reported, never a gate). What fails goes to one `fix` task, then every check of each deployment that had a failure, and `core`'s, run again.
 6. **Report**: `<ws>/delivery_report.md`.
 
 A check is `trtllm-modeling-v2 gate <boot|accuracy|tests> --task <ws>/task.yaml --deployment <name> --tree <tree>`, the same command for the run and for a worker. Its verdict line names the directory of its files.
@@ -49,7 +49,7 @@ A run that is not onboarded says in its first lines where it stopped, the result
 
 Nothing here names a scheduler. A site adds three fields:
 
-- `launch`, on a deployment or on each of `ctx` and `gen`: the prefix that places the server's ranks (allocation and container only; the flow adds the ranks' launcher). It starts one process per rank, which the flow checks before a load; a prefix that starts one process per node and makes the ranks inside it is not supported. It stays in the foreground, sees the same workspace, checkout and checkpoint paths, and gives rank 0 a hostname this host reaches. `environment.launch` is the prefix of one-GPU commands.
+- `launch`, on a deployment or on each of `ctx` and `gen`: the prefix that places the server's ranks (allocation and container only; the flow adds the ranks' launcher). It starts one process per rank, which the flow checks before a load; a prefix that starts one process per node and makes the ranks inside it is not supported. It stays in the foreground, sees the same workspace, checkout and checkpoint paths, and gives rank 0 a hostname this host reaches. `ctx` and `gen` prefixes place their ranks on different nodes of the allocation (two prefixes that each say "four nodes" may name the same four); the proxy runs on the orchestrator's host. `environment.launch` is the prefix of one-GPU commands: an entry's test in a worker's hands, and the target's delivered tests.
 - `stop`, beside `launch`: the site's command that ends what `launch` started. Both receive `MV2FLOW_SERVER=<deployment>[.<role>]`.
 - `env`, on a deployment: what its servers need of the site.
 
@@ -69,7 +69,7 @@ A disaggregated deployment (`ctx` and `gen`) states `cache_transceiver_config` w
 - Commits on the branch that no task of this run landed.
 - Conventions are findings in the report, not gates.
 
-Run on GPUs so far: every check once, standalone, on one node (aggregated and disaggregated, GSM8K). Not yet: a prefix that leaves the host, several ranks per server, `stop`, a restart after a killed process, image prompts, a benchmark other than GSM8K through a proxy.
+Run on GPUs so far: every check once, standalone, on one node (aggregated and disaggregated, GSM8K). Two ranks per server have run (aggregated and disaggregated). Not yet: a prefix that leaves the host, `stop`, a restart after a killed process, image prompts. Through a proxy only GSM8K is scored; another benchmark there is refused, not judged.
 
 ## An agent that operates a run
 

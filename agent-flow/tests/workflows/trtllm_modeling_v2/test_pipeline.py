@@ -226,6 +226,10 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     assert "| PASS | trtllm-eval | `c0ffee1` |" in report
     assert "| `tep2` | `boot` | - | - | PASS | through the endpoint | `c0ffee1` |" in report
     assert "| `kv_fp8` |" not in report.split("## Done")[1].split("##")[0]
+    # The tasks, in a reader's word for what each belongs to: a deployment.
+    tasks = report.split("## Tasks")[1]
+    assert "| task | kind | deployment | status | attempts | grants | decision | summary |" in tasks
+    assert "| `kv_fp8` | deployment | kv_fp8 | not done |" in tasks and "unit" not in tasks
     # With what each check attested of the engine that ran: every rank's options, the target.
     row = next(line for line in report.splitlines() if line.startswith("| `tep2` | `boot` |"))
     assert row.endswith(
@@ -703,6 +707,11 @@ def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_findi
     assert f"- convention: {TARGET_REL}/modeling.py:1 imports Modeling V1 ({v1})" in goal
     assert "(first at `core`)" in goal and "(first at `kv_fp8`)" in goal
     assert "## Task: the final fix" in goal and "Reproduce a failed check with the gate" in goal
+    # The text says what ran and what will run, as the list of checks below has it.
+    assert "after a failed boot, that deployment's other checks did not run" in goal
+    assert "`tp1` passed its checks when it was onboarded, maybe on an earlier commit" in goal
+    again = "Afterwards code runs every check of each deployment that had a failure, and those of"
+    assert f"{again} `tp1`, once more." in goal and "ran every check" not in goal
     # A deployment whose boot failed is not scored: its benchmark would start the same
     # engine to the same end. After the fix, that deployment's checks and core's own run
     # once more, on the new commit (core's benchmark first, as what `kv_fp8` is held to).

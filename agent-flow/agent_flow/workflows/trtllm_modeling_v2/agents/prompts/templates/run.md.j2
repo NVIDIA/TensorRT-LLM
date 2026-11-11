@@ -43,7 +43,7 @@ Build no other launcher. A prefix that does not fit what you must run is a thing
 {% endif %}{% if text_only %}
 ## Scope: text only
 
-This checkpoint is multimodal, and this target is the language model only. Do not port the vision tower or write an entry for it. The weight loader skips the vision tensors rather than failing on them, and the checks send text prompts only.
+This checkpoint is multimodal, and this target is the language model only. Do not port the vision tower or write an entry for it. The weight loader skips the vision tensors rather than failing on them. A check sends an image only to a deployment whose `inputs` name one.
 {% endif %}{% if spec_notes %}
 ## Notes from the spec
 

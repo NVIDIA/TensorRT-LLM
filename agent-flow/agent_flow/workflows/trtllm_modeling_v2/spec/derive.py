@@ -195,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.site is None:
         derivation.questions.append(
-            "environment: no --site was given; replace `{kind: local}` with the cluster's"
+            "environment.python: no --site was given; name the interpreter every Python "
+            "command runs under, and replace `{kind: local}` where the cluster differs"
         )
     path = write_derivation(args.out, derivation)
     print(f"→ {path}")

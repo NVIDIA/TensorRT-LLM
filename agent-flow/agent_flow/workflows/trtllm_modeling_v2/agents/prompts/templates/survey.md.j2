@@ -25,7 +25,7 @@ Answer in `{{ plan }}` and `{{ vocabulary }}`: can this checkpoint be assembled 
 
 ### `vocabulary.yaml`
 
-Code validates it and makes one kernel task per queue row. Keep the keys exactly.
+Code makes one kernel task per queue row. Of a row it checks `mode`, `depends_on`, `tier`, `unit`, `site`, a `verify` row's `surface` and the number of `cells`; the rest the workers read. Keep the keys exactly.
 
 ```yaml
 verdict: assemblable | assemblable_after_additions | ceiling
@@ -60,7 +60,7 @@ Queue rules:
 
 - `target` is `<category>/<name>` (a shared entry) or `ops/<category>/<name>` (the target's own), plain names; one row per entry: all its call sites' shapes go in its `cells`.
 - `depends_on` lists the rows (`n`) whose entry this one calls.
-- A `verify` row needs `surface` and `cells`, at most {{ max_cells }}. Vary one axis at a time: each dtype, the smallest and largest captured batch, one prefill chunk at `max_num_tokens`.
+- A `verify` row needs `surface`; it lists its `cells`, at most {{ max_cells }}. Vary one axis at a time: each dtype, the smallest and largest captured batch, one prefill chunk at `max_num_tokens`.
 - `site` (lowercase words joined by `_`) names the local copy `<name>__<site>`; without it, `<name>__r<n>`. A target name never contains `__`.
 - `unit` is `core` or a later deployment's name. Rows without it block the first deployment. When unsure, leave it out.
 

@@ -2,7 +2,7 @@
 SPDX-License-Identifier: Apache-2.0 -#}
 ## Task: the final fix
 
-The final pass ran every check the done deployments owe, once, on the checkout. You get this one task to repair what it found. The checks of `{{ first }}` passed: keep them passing.
+The final pass ran the done deployments' checks once, on the checkout; after a failed boot, that deployment's other checks did not run. You get this one task to repair what it found. `{{ first }}` passed its checks when it was onboarded, maybe on an earlier commit: keep them passing.
 
 {{ goal }}
 
@@ -12,4 +12,4 @@ The final pass ran every check the done deployments owe, once, on the checkout. 
 4. Rerun that check, then the boot of `{{ first }}`.
 5. Never widen a tolerance, edit an anchor or change an options file.
 
-Afterwards code runs the failed checks and those of `{{ first }}` once more. List under `not_done` every item you did not repair.
+Afterwards code runs every check of each deployment that had a failure, and those of `{{ first }}`, once more. List under `not_done` every item you did not repair.

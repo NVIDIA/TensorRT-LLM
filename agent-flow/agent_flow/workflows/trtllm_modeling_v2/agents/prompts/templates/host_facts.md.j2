@@ -6,7 +6,7 @@ For a failure, read the affected turn's activity log or the job's receipt and lo
 
 ## Facts
 
-- **`pytest` exits 4 on this host even when every test passed.** The venv lives inside the repository root, so a session-final `sys.path` audit fires. Export `TRTLLM_SKIP_SYS_PATH_CHECK=1`, and adjudicate on the summary line (`N passed`), never on the exit code.
+- **`pytest` may exit 4 here though every test passed.** A venv inside the repository root can make the tree's session-final `sys.path` audit fire. Export `TRTLLM_SKIP_SYS_PATH_CHECK=1` and run it again: after that a nonzero exit is a failure, as it is for the run's own test jobs.
 - **`TMPDIR` must be at most {{ max_tmpdir }} characters.** The LLM API's RPC binds a unix socket under it, the path is capped at 107 bytes and the socket basename takes 45. This run's `TMPDIR` is {% if tmpdir %}`{{ tmpdir }}` ({{ tmpdir|length }} characters).{% else %}not set in the spec.{% endif %}
 
 - **`UCX ERROR uct_iface_open(tcp/rdma_vf_rail0)` is noise.** UCX falls back and the run exits 0. Do not chase it; it is not why your job failed.

@@ -36,6 +36,12 @@ from agent_flow.workflows.trtllm_modeling_v2.agents.turns import (
     TurnRequest,
     TurnTimeout,
 )
+from agent_flow.workflows.trtllm_modeling_v2.checks.boot import resolve_boot_spec
+from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import (
+    VERDICT_AFTER_ADDITIONS,
+    VocabularyError,
+    parse_vocabulary,
+)
 from agent_flow.workflows.trtllm_modeling_v2.run import start
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import ROLE_BY_KIND
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe
@@ -430,6 +436,61 @@ def test_one_turn_loads_about_twelve_hundred_words_and_the_texts_stay_small() ->
     assert run_facts <= 1210, run_facts
 
 
+def test_what_a_text_says_of_the_code_is_what_the_code_does() -> None:
+    """A weak model reads each word literally: a sentence about the code is held to the code."""
+    # A nonzero pytest exit is a failure for the run's own test jobs: never "ignore it".
+    host = (Path(prompts.__file__).parent / "templates" / "host_facts.md.j2").read_text()
+    assert "never on the exit code" not in host
+    assert "a nonzero exit is a failure, as it is for the run's own test jobs" in host
+    # `scope: text_only` is about the target; a deployment that states images is sent one.
+    said = prompts.dispatch("core", facts(text_only=True))
+    assert "A check sends an image only to a deployment whose `inputs` name one." in said
+    assert "send text prompts only" not in said
+    sees = Deployment(name="vl", server=Server(options={}), inputs=("text", "image"))
+    reads = Deployment(name="t", server=Server(options={}))
+    scope = {"scope": "text_only"}
+    assert resolve_boot_spec(scope, sees).has_images
+    assert not resolve_boot_spec(scope, reads).has_images
+    # The survey: the keys of a queue row code checks, and that it counts the cells, no more.
+    survey = prompts.dispatch("survey", facts())
+    assert (
+        "Of a row it checks `mode`, `depends_on`, `tier`, `unit`, `site`, a `verify` row's "
+        "`surface` and the number of `cells`; the rest the workers read." in survey
+    )
+    assert "- A `verify` row needs `surface`; it lists its `cells`, at most 64." in survey
+    row = {"n": 1, "mode": "verify", "target": "norm/rms", "surface": "dtype=bf16"}
+
+    def parsed(**changes):
+        document = {"verdict": VERDICT_AFTER_ADDITIONS, "queue": [{**row, **changes}]}
+        return parse_vocabulary(document)
+
+    assert parsed() and parsed(cells=[{"anything": ["a", "worker", "reads"]}] * 64)
+    for wrong, why in (
+        (dict(surface=""), "verify dispatch with no `surface`"),
+        (dict(cells=[{}] * 65), "lists 65 cells, more than 64"),
+        (dict(mode="check"), "mode is 'check'"),
+        (dict(depends_on="1"), "depends_on must be a list"),
+        (dict(tier=9), "tier is 9"),
+        (dict(site="A B"), "site is 'A B'"),
+    ):
+        with pytest.raises(VocabularyError, match=re.escape(why)):
+            parsed(**wrong)
+    # The kernel: one sentence parts a silent fallback from torch ops as the stated tier,
+    # and a large cell is marked with the names the tree has.
+    kernel = prompts.dispatch("kernel", facts())
+    assert (
+        "No silent torch fallback: it certifies nothing; torch ops as the stated "
+        "implementation (tier 4) say so in `note`." in kernel
+    )
+    assert "No torch fallback" not in kernel and "composition of torch" not in kernel
+    assert (
+        'a larger one gets `"large": True` in its `spec` and `pytest.mark.high_cuda_memory`.'
+        in (kernel)
+    )
+    assert "spec.large" not in kernel
+    assert prompts.TIERS[4].startswith("no implementation exists: compose one from torch ops")
+
+
 def test_the_texts_name_only_paths_the_tree_has() -> None:
     """A prompt is a map of paths: one the tree lost sends a worker nowhere."""
     root = Path(__file__).resolve().parents[4]
@@ -443,3 +504,10 @@ def test_the_texts_name_only_paths_the_tree_has() -> None:
             named.add(path)
     missing = sorted(p for p in named if not (root / p).exists())
     assert len(named) > 12 and not missing, f"the texts name paths this tree lacks: {missing}"
+    # A marker a worker is told to use is one the tree's pytest.ini registers, and the key
+    # of a cell's `spec` it is told to set is one the tree's tests read.
+    marks = set(re.findall(r"pytest\.mark\.(\w+)", text))
+    registered = (root / "tests/unittest/pytest.ini").read_text()
+    assert marks == {"high_cuda_memory"} and "\n    high_cuda_memory:" in registered
+    tests = root / "tests/unittest/_torch/modeling_v2"
+    assert any('spec.get("large")' in p.read_text() for p in tests.rglob("test_*.py"))

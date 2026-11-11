@@ -918,7 +918,7 @@ def test_intake_derive_writes_the_smallest_spec_and_prints_its_warnings(tmp_path
     assert [line.split(":")[1].strip() for line in opened] == [
         "arch",
         "agents.defaults.model",
-        "environment",
+        "environment.python",
     ]
     # Once those are answered, what was written loads as it is.
     written["environment"]["python"] = "/opt/venv/bin/python"

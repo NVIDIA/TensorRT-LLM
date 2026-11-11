@@ -499,7 +499,7 @@ class Pipeline:
     def table(self) -> str:
         """Every task and where it stands, as a markdown table."""
         lines = [
-            "| task | kind | unit | status | attempts | grants | decision | summary |",
+            "| task | kind | deployment | status | attempts | grants | decision | summary |",
             "|---|---|---|---|---|---|---|---|",
         ]
         for t in self.tasks:
