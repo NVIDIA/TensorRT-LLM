@@ -17,8 +17,8 @@
 ### :section Customization
 r"""Configure KV cache compression with TensorRT-LLM.
 
-This example shows the two available compression methods. Currently, only one
-KV cache compression method can be enabled for each LLM instance.
+This example shows the available compression methods. Currently, only one KV
+cache compression method can be enabled for each LLM instance.
 
 NVFP4 cold-page quantization
 ----------------------------
@@ -33,6 +33,21 @@ python llm_kv_cache_compression.py \
 
 A short request can remain entirely on the GPU. Use a workload with enough KV
 pressure to trigger offload when validating the cold-page codec path.
+
+TurboQuant cold-page quantization
+---------------------------------
+Like NVFP4 cold pages, Attention KV keeps its runtime dtype on the GPU, and
+KVCacheManagerV2 encodes a Page with TurboQuant only while the Page resides in
+Host or Disk storage. TurboQuant stores 2 to 4 bits per value and runs on GPUs
+with compute capability 8.0 or newer.
+
+```bash
+python llm_kv_cache_compression.py \
+    --compression-method turboquant-cold-page \
+    --model Qwen/Qwen3-8B \
+    --turboquant-bits 3 \
+    --turboquant-mode mse
+```
 
 TriAttention
 ------------
@@ -58,6 +73,7 @@ from tensorrt_llm.llmapi import (
 
 _DEFAULT_MODELS = {
     "nvfp4-cold-page": "Qwen/Qwen3.5-4B",
+    "turboquant-cold-page": "Qwen/Qwen3-8B",
     "triattention": "Qwen/Qwen3-8B",
 }
 
@@ -97,6 +113,25 @@ def run_nvfp4_cold_page(model: str) -> None:
     )
 
 
+def run_turboquant_cold_page(model: str, bits: float, mode: str, seed: int | None) -> None:
+    """Keep active KV unchanged and store Host/Disk Pages with TurboQuant."""
+    seed_option = {} if seed is None else {"turboquant_seed": seed}
+    _generate(
+        model,
+        KvCacheConfig(
+            use_kv_cache_manager_v2=True,
+            dtype="auto",
+            host_cache_size=8 << 30,
+        ),
+        ColdPageQuantizationCompressionConfig(
+            quant="turboquant",
+            turboquant_bits=bits,
+            turboquant_mode=mode,
+            **seed_option,
+        ),
+    )
+
+
 def run_triattention(model: str, calibration_path: str) -> None:
     """Periodically compact decode KV using offline calibration."""
     _generate(
@@ -132,6 +167,26 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="TriAttention calibration .pt produced for the selected model.",
     )
+    parser.add_argument(
+        "--turboquant-bits",
+        type=float,
+        choices=(2.0, 2.5, 3.0, 3.5, 4.0),
+        default=4.0,
+        help="TurboQuant average bits per value; prod mode supports 2, 3, and 4.",
+    )
+    parser.add_argument(
+        "--turboquant-mode",
+        choices=("mse", "prod"),
+        default="mse",
+        help="mse minimizes reconstruction error; prod makes inner products unbiased.",
+    )
+    parser.add_argument(
+        "--turboquant-seed",
+        type=int,
+        default=None,
+        help="Seed of the TurboQuant rotation and QJL projection matrices "
+        "(default: the configuration default).",
+    )
     args = parser.parse_args()
     if args.compression_method == "triattention" and not args.calibration_path:
         parser.error("--calibration-path is required for TriAttention")
@@ -143,6 +198,10 @@ def main() -> None:
     model = args.model or _DEFAULT_MODELS[args.compression_method]
     if args.compression_method == "nvfp4-cold-page":
         run_nvfp4_cold_page(model)
+    elif args.compression_method == "turboquant-cold-page":
+        run_turboquant_cold_page(
+            model, args.turboquant_bits, args.turboquant_mode, args.turboquant_seed
+        )
     else:
         run_triattention(model, args.calibration_path)
 
