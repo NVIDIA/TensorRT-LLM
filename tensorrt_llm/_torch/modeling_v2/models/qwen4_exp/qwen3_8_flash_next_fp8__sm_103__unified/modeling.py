@@ -1107,6 +1107,9 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         self._binds = 0
         # Set by `begin_step`, cleared by `forward`.
         self._step_begun = False
+        # Whether the step `begin_step` saw carries context rows: its draft steps after the
+        # first run eagerly on `DecodeTarget`, at any batch size (`DecodeTarget.mtp_forward`).
+        self._context_step = False
         self._mtp: "_MtpWeights | None" = None
         self._mtp_cos_sin: torch.Tensor | None = None
         # The verify step's side-cache rollback, registered with the spec worker.
@@ -1689,6 +1692,7 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             target.prepare(attn_metadata, input_ids, position_ids, vision, spec_metadata)
         else:
             assert vision is None, "a generation-only step carries vision rows"
+        self._context_step = attn_metadata.num_contexts > 0
         self._step_begun = True
 
     def forward(
@@ -2145,7 +2149,7 @@ def _mtp_front(core, M: _MtpWeights, embed_tokens, input_ids, hidden_states, mm=
     `fc_embedding` of the normalized next-token embedding is added to every stream of
     `fc_hidden` as the trunk site's unit-weight injection; returns `(x, mixed, inject)`. `mm`
     runs dense projections here and in every draft-layer and MoE helper: `cublas_mm` when
-    None, `_decode_projection` from `DecodeTarget`."""
+    None, `_decode_projection` from `DecodeTarget` (except after a step's context rows)."""
     mm = mm or cublas_mm
     rows = hidden_states.shape[0]
     assert rows <= M.unit_inject.shape[0], (
@@ -2195,17 +2199,17 @@ def _mtp_attention_in(core, M: _MtpWeights, mixed, pos3, pos, with_index: bool, 
 
 
 def _mtp_attention_planes(
-    core, M: _MtpWeights, mixed, draft: _DraftBound, qsa, rows_per_request, with_index, sparse
+    core, M: _MtpWeights, mixed, draft: _DraftBound, qsa, rows_per_request, with_index, sparse, mm
 ) -> tuple:
     """Compute a generation-only draft step's attention input and write its planes.
 
-    Returns `(qkv, gate, q_index)`. The K/V append happens here only on the sparse path (the
-    dense op appends itself). The draft-extend step runs everything after the projection as
-    the trunk's one-launch `qwen4_exp_attn_decode_prologue`."""
+    Returns `(qkv, gate, q_index)`; `mm` runs the input projection. The K/V append happens here
+    only on the sparse path (the dense op appends itself). The draft-extend step runs everything
+    after the projection as the trunk's one-launch `qwen4_exp_attn_decode_prologue`."""
     req_idx, logical, block_table, tokens_per_block, pos3, pos, coords = qsa
     if with_index and _decode_prologue(draft.kv, sparse):
         rows = mixed.shape[0]
-        proj = _decode_projection(mixed, M.attn_in)
+        proj = mm(mixed, M.attn_in)
         qkv = torch.empty([rows, core.qkv_width], dtype=mixed.dtype, device=mixed.device)
         index_scratch = torch.empty(
             [rows, core.index_scratch_width], dtype=mixed.dtype, device=mixed.device
@@ -2246,7 +2250,7 @@ def _mtp_attention_planes(
         gate = torch.split(proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1)[1]
         return qkv, gate, q_index
     proj, qkv, gate, k_dst, v_dst, index_scratch = _mtp_attention_in(
-        core, M, mixed, pos3, pos, with_index, mm=_decode_projection
+        core, M, mixed, pos3, pos, with_index, mm=mm
     )
     q_index = None
     if with_index:
@@ -6192,6 +6196,11 @@ class DecodeTarget:
         """One draft step over generation rows only (`p` rows a request on the first step of a
         batch without context, one otherwise), inside the decode graph when the trunk is.
 
+        The steps after the first of a step with context rows (`core._context_step`) run
+        eagerly at any batch size, so their projections take `cublas_mm`: `_decode_projection`'s
+        FlashInfer kernels compile on the first call at each shape, and only captured batch
+        sizes compile before serving.
+
         Under IndexShare the draft-extend step captures each request's selection and later steps
         skip the index branch, rebuilding it with `qsa_mtp_reuse_topk`; the index keys they skip
         lie past the committed length and the next draft-extend step rewrites them."""
@@ -6229,10 +6238,9 @@ class DecodeTarget:
         logical = md.qsa_logical_positions[:rows]
         block_table = md.qsa_block_table
         tokens_per_block = md.tokens_per_block
+        mm = cublas_mm if core._context_step else _decode_projection
 
-        x, mixed, inject = _mtp_front(
-            core, M, embed_tokens, input_ids, hidden_states, mm=_decode_projection
-        )
+        x, mixed, inject = _mtp_front(core, M, embed_tokens, input_ids, hidden_states, mm=mm)
         qkv, gate, q_index = _mtp_attention_planes(
             core,
             M,
@@ -6242,6 +6250,7 @@ class DecodeTarget:
             p,
             not reuse,
             sparse,
+            mm,
         )
         # Rows whose outputs are read: each request's continuing row on draft-extend, else all.
         cont, pre = None, {}
@@ -6359,9 +6368,7 @@ class DecodeTarget:
             )
             fused_sigmoid_mul_inplace(attn, gate, direct_launch=True)
             attn = sel(attn)
-        out = _mtp_tail(
-            core, M, sel(x, "x"), attn, sel(inject, "inject"), pad_rows, mm=_decode_projection
-        )
+        out = _mtp_tail(core, M, sel(x, "x"), attn, sel(inject, "inject"), pad_rows, mm=mm)
         if capture is not None:
             torch.cuda.current_stream().wait_stream(capture)
         if cont is None:
