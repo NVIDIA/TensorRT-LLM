@@ -7672,11 +7672,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
-        "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-4_of_4": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
         // Single-GPU Gemma4 PerfSanity post-merge baseline
-        "DGX_B200-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
+        "DGX_B200-PyTorch-PerfSanity-Post-Merge-1_of_4": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
         // PerfSanity post-merge tests
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 1, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2_of_4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 1, 8, 1, true],
         "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 1],
     ]
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
@@ -7735,14 +7735,27 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
-        // PerfSanity post-merge tests
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 6, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 6, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 6, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 6, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 6, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 6, 6, 4, 1, true, false],
     ]
+    // PerfSanity post-merge stages end in -k_of_N and run on the official post-merge builds whose
+    // BUILD_NUMBER % N == k % N: key models (DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3, GLM-5.3-Flash)
+    // every 2 builds, the other cases every 4. buildStageConfigs gives split k slot k; a stage with a
+    // single split names its slot, chosen to spread the GPU load evenly over the builds.
+    SBSASlurmTestConfigs += buildStageConfigs(
+        "GB300-4_GPUs-PyTorch-PerfSanity-KeyModels-Post-Merge-{split}_of_2",
+        "auto:gb300-x4",
+        "l0_gb300_multi_gpus_perf_sanity_key_models",
+        2,
+        4,
+        1, true
+    )
+    SBSASlurmTestConfigs += buildStageConfigs(
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-{split}_of_4",
+        "auto:gb300-x4",
+        "l0_gb300_multi_gpus_perf_sanity",
+        4,
+        4,
+        1, true
+    )
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
 
@@ -7760,10 +7773,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-8_GPUs-2_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node2_gpu8", 1, 1, 8, 2],
         "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 1, 1, 16, 4],
     ]
+    // PerfSanity post-merge stages: -k_of_N build slots as for the GB300 single-node stages above. A
+    // DeepSeek-V4-Pro e2e stage runs on the builds of the gen_only_no_context stage of its config.
     // PerfSanity post-merge aggregated
     // 4 Nodes: Kimi K3 MXFP4 modeling_v2, TP16 attention on 16 GPUs in one NVLink domain
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-16_GPUs-4_Nodes-PyTorch-PerfSanity-Node4-GPU16-Post-Merge",
+        "GB200-16_GPUs-4_Nodes-PyTorch-PerfSanity-Node4-GPU16-Post-Merge-{split}_of_2",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_node4_gpu16",
         2,
@@ -7773,7 +7788,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // GB300 PerfSanity post-merge disaggregated
     // MiniMax-M3 150k1k con1 and con64: ctx1 (1 node, 2 GPUs) + gen1 tp4 (1 node, 4 GPUs) = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE1-GPU4-Post-Merge",
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE1-GPU4-Post-Merge-{split}_of_2",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node1_gpu4",
         2,
@@ -7782,115 +7797,61 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     )
     // MiniMax-M3 150k1k con128 (gen dep8) and con1 (gen tp8): ctx1 (1 node, 2 GPUs) + gen1 (2 nodes, 8 GPUs) = 12 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8-Post-Merge",
+        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8-Post-Merge-{split}_of_2",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8",
         2,
         12,
         3
     )
-    // Kimi-K3 160k1k con16: ctx16 (16 single-GPU DWDP ctx servers, 4 nodes) + gen1 helix8 (2 nodes, 8 GPUs) = 24 GPUs
+    multiNodesSBSAConfigs += [
+        // Kimi-K3 160k1k con16: ctx16 (16 single-GPU DWDP ctx servers, 4 nodes) + gen1 helix8 (2 nodes, 8 GPUs) = 24 GPUs
+        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX16-NODE4-GPU16-GEN1-NODE2-GPU8-Post-Merge-2_of_2": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx16_node4_gpu16_gen1_node2_gpu8", 1, 1, 24, 6],
+        // Kimi-K3 160k1k con32: ctx16 (16 single-GPU DWDP ctx servers, 4 nodes) + gen1 helix16 (4 nodes, 16 GPUs) = 32 GPUs
+        "GB300-32_GPUs-8_Nodes-PyTorch-Disagg-PerfSanity-CTX16-NODE4-GPU16-GEN1-NODE4-GPU16-Post-Merge-2_of_2": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx16_node4_gpu16_gen1_node4_gpu16", 1, 1, 32, 8],
+        // 9 Nodes: ctx1 (1 node, 4 GPUs) + gen4 (2 nodes, 8 GPUs each) = 36 GPUs
+        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-Post-Merge-2_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8", 1, 1, 36, 9],
+        // 10 Nodes: ctx6 (1 node, 4 GPUs each) + gen1 (4 nodes, 16 GPUs) = 40 GPUs
+        "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX6-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge-4_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx6_node1_gpu4_gen1_node4_gpu16", 1, 1, 40, 10],
+        // 11 Nodes: ctx3 (1 node, 4 GPUs each) + gen1 (8 nodes, 32 GPUs) = 44 GPUs
+        "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge-3_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32", 1, 1, 44, 11],
+        // 14 Nodes: ctx12 (1 node, 4 GPUs each) + gen1 (2 nodes, 8 GPUs) = 56 GPUs
+        "GB300-56_GPUs-14_Nodes-PyTorch-Disagg-PerfSanity-CTX12-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge-1_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8", 1, 1, 56, 14],
+    ]
+    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs; the key-model cases in their own list
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX16-NODE4-GPU16-GEN1-NODE2-GPU8-Post-Merge",
+        "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-KeyModels-Post-Merge-{split}_of_2",
         "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx16_node4_gpu16_gen1_node2_gpu8",
-        1,
-        24,
-        6
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8_key_models",
+        3,
+        8,
+        2
     )
-    // Kimi-K3 160k1k con32: ctx16 (16 single-GPU DWDP ctx servers, 4 nodes) + gen1 helix16 (4 nodes, 16 GPUs) = 32 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-32_GPUs-8_Nodes-PyTorch-Disagg-PerfSanity-CTX16-NODE4-GPU16-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx16_node4_gpu16_gen1_node4_gpu16",
-        1,
-        32,
-        8
-    )
-    // 9 Nodes: ctx1 (1 node, 4 GPUs) + gen4 (2 nodes, 8 GPUs each) = 36 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8",
-        1,
-        36,
-        9
-    )
-    // 10 Nodes: ctx6 (1 node, 4 GPUs each) + gen1 (4 nodes, 16 GPUs) = 40 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX6-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx6_node1_gpu4_gen1_node4_gpu16",
-        1,
-        40,
-        10
-    )
-    // 11 Nodes: ctx3 (1 node, 4 GPUs each) + gen1 (8 nodes, 32 GPUs) = 44 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32",
-        1,
-        44,
-        11
-    )
-    // 14 Nodes: ctx12 (1 node, 4 GPUs each) + gen1 (2 nodes, 8 GPUs) = 56 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-56_GPUs-14_Nodes-PyTorch-Disagg-PerfSanity-CTX12-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8",
-        1,
-        56,
-        14
-    )
-    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
+        "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge-{split}_of_4",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8",
-        5,
-        8,
-        2
-    )
-    // gen_only_no_context: gen1 (4 nodes, 16 GPUs), no ctx fleet = 16 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16",
-        2,
-        16,
-        4
-    )
-    // Kimi-K3 160k1k ctx_only: the DWDP16 ctx side as one 16-GPU attention-DP server on 4 nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-Node4-GPU16-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_node4_gpu16",
-        1,
-        16,
-        4
-    )
-    // gen_only_no_context: gen1 (8 nodes, 32 GPUs), no ctx fleet = 32 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_gen1_node8_gpu32",
-        1,
-        32,
-        8
-    )
-    // Nemotron-Ultra-V3 8k64k con1 and GLM-5.3-Flash FP8 8k1k con16: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
         2,
         8,
         2
     )
+    multiNodesSBSAConfigs += [
+        // gen_only_no_context: gen1 (4 nodes, 16 GPUs), no ctx fleet = 16 GPUs; the key-model cases in their own list
+        "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-KeyModels-Post-Merge-2_of_2": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16_key_models", 1, 1, 16, 4],
+        // gen_only_no_context: gen1 (4 nodes, 16 GPUs), no ctx fleet = 16 GPUs
+        "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge-4_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16", 1, 1, 16, 4],
+        // Kimi-K3 160k1k ctx_only: the DWDP16 ctx side as one 16-GPU attention-DP server on 4 nodes
+        "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-Node4-GPU16-Post-Merge-1_of_2": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_node4_gpu16", 1, 1, 16, 4],
+        // gen_only_no_context: gen1 (8 nodes, 32 GPUs), no ctx fleet = 32 GPUs
+        "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-Post-Merge-3_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_gen1_node8_gpu32", 1, 1, 32, 8],
+        // GLM-5.3-Flash FP8 8k1k con16: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-KeyModels-Post-Merge-1_of_2": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4_key_models", 1, 1, 8, 2],
+        // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge-3_of_4": ["auto:gb300-flex", "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4", 1, 1, 8, 2],
+    ]
     // Nemotron-Ultra-V3 50k2k con12: ctx1 (1 node, 4 GPUs) + gen6 (6 nodes, 4 GPUs each) = 28 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-28_GPUs-7_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN6-NODE1-GPU4-Post-Merge",
+        "GB300-28_GPUs-7_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN6-NODE1-GPU4-Post-Merge-{split}_of_4",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen6_node1_gpu4",
         2,

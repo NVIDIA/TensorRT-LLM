@@ -332,9 +332,9 @@ def buildStageConfigs(stageName, platform, testlist, splitCount, gpuCount, nodeC
 - `splitCount`: number of actual pytest splits and generated stages. For multi-node tests, it must equal the number of **active (uncommented)** tests in the context (one test per stage).
 - `gpuCount`: total GPUs allocated per stage = `total_nodes * gpus_per_node`
 - `nodeCount`: total SLURM nodes per stage
-- `stageName`: a prefix for legacy `Stage-1` names, or a template such as `Stage-{split}_of_8`. Only the actual `splitCount` stages are generated. The `_of_N` suffix encodes the official post-merge cadence; no scheduling fields are added to the job configuration.
+- `stageName`: a prefix for legacy `Stage-1` names, or a template such as `Stage-{split}_of_4`. Only the actual `splitCount` stages are generated. The `_of_N` suffix encodes the official post-merge cadence; no scheduling fields are added to the job configuration.
 
-For three cases that run once every eight builds, use `Stage-{split}_of_8` with `splitCount=3`. This generates only `Stage-1_of_8`, `Stage-2_of_8`, and `Stage-3_of_8`, which run when the parent `BUILD_NUMBER % 8` is 1, 2, or 3 respectively. The other five slots launch no stage for this group. The general rule is `BUILD_NUMBER % N == k % N`, so `-8_of_8` runs at remainder 0 and shard IDs larger than N wrap around. Explicit `--stage-list` / `--extra-stage` selectors bypass the cadence.
+For three cases that run once every four builds, use `Stage-{split}_of_4` with `splitCount=3`. This generates only `Stage-1_of_4`, `Stage-2_of_4`, and `Stage-3_of_4`, which run when the parent `BUILD_NUMBER % 4` is 1, 2, or 3 respectively. The fourth slot launches no stage for this group. The general rule is `BUILD_NUMBER % N == k % N`, so `-4_of_4` runs at remainder 0 and shard IDs larger than N wrap around. A stage with a single test is a literal entry that names its slot instead, e.g. `"Stage-3_of_4": [platform, testlist, 1, 1, gpuCount, nodeCount]`. Explicit `--stage-list` / `--extra-stage` selectors bypass the cadence.
 
 When adding a multi-node test, either increment `splitCount` on an existing entry or add a new `buildStageConfigs` block. Stages are grouped by node count (2 Nodes, 3 Nodes, 4 Nodes, etc.).
 

@@ -451,12 +451,12 @@ A test list is a top-level key of a test-db YAML file, and a Jenkins stage names
 
 | Test Type | File | Test list | Example list |
 |-----------|------|-----------|--------------|
-| Single-node | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_{gpu_type}_multi_gpus_perf_sanity[_{suffix}]` | `l0_gb300_multi_gpus_perf_sanity_glm5` |
-| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count}` | `l0_gb200_multi_nodes_perf_sanity_node2_gpu8` |
-| Multi-node gen_only_no_context | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_gen1_node{node count}_gpu{gpu count}[_{suffix}]` | `l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8_glm5` |
-| Multi-node disaggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_ctx{ctx workers}_node{nodes per ctx worker}_gpu{gpus per ctx worker}_gen{gen workers}_node{nodes per gen worker}_gpu{gpus per gen worker}[_{suffix}]` | `l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8_e2e` |
+| Single-node | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_{gpu_type}_multi_gpus_perf_sanity[_key_models]` | `l0_gb300_multi_gpus_perf_sanity_key_models` |
+| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count}` | `l0_gb200_multi_nodes_perf_sanity_node4_gpu16` |
+| Multi-node gen_only_no_context | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_gen1_node{node count}_gpu{gpu count}[_key_models]` | `l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8_key_models` |
+| Multi-node disaggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_ctx{ctx workers}_node{nodes per ctx worker}_gpu{gpus per ctx worker}_gen{gen workers}_node{nodes per gen worker}_gpu{gpus per gen worker}[_key_models]` | `l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8` |
 
-The optional `{suffix}` (`glm5`, `e2e`) separates cases that share a topology but run at a different post-merge frequency (see below).
+The optional `_key_models` suffix holds the key-model cases of a topology that other cases share, because the two run at different post-merge frequencies (see below).
 
 ### Jenkins Pipeline Configuration
 
@@ -489,13 +489,12 @@ The official post-merge pipeline runs every perf-sanity stage once every N build
 
 | Cases | N |
 |-------|---|
-| Qwen3-235B FP4 and GLM-5 FP4 (all modes) | 8 |
-| DeepSeek-V4-Pro FP4 disaggregated `e2e` | 4 |
-| Every other perf-sanity case | 2 |
+| Key models: DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3 and GLM-5.3-Flash (all modes) | 2 |
+| Every other perf-sanity case | 4 |
 
-The cadence is encoded in the stage name: `Stage-k_of_N` runs when the parent `BUILD_NUMBER % N == k % N`. For example, `-1_of_8` runs at remainder 1, `-2_of_8` at remainder 2, and `-8_of_8` at remainder 0. Stages without this suffix are not filtered by build number. There is no frequency mapping table or offset balancing.
+The cadence is encoded in the stage name: `Stage-k_of_N` runs when the parent `BUILD_NUMBER % N == k % N`. For example, `-1_of_4` runs at remainder 1, `-2_of_4` at remainder 2, and `-4_of_4` at remainder 0. Stages without this suffix are not filtered by build number.
 
-`buildStageConfigs()` accepts a name template such as `Stage-{split}_of_8`. With three actual pytest splits, it generates only `-1_of_8`, `-2_of_8`, and `-3_of_8`; the other five slots launch no stage. Existing larger lists retain their actual split counts, with shard IDs wrapping modulo N when necessary. Each DeepSeek-V4-Pro E2E stage uses `-1_of_4`, so it runs alongside its corresponding `-1_of_2` gen-only stage. Cases with different frequencies stay in separate contexts and stages.
+`buildStageConfigs()` accepts a name template such as `Stage-{split}_of_4`. With three actual pytest splits, it generates only `-1_of_4`, `-2_of_4`, and `-3_of_4`; the fourth slot launches no stage of that list. Shard IDs larger than N wrap modulo N, so `-3_of_2` runs with `-1_of_2`. A stage with a single split is a literal stage entry that names its slot `k`, chosen so that every build carries a similar GPU load; each DeepSeek-V4-Pro `e2e` stage takes the slot of the `gen_only_no_context` stage of the same config. A test list holds cases of one frequency: where key-model and other cases share a topology, the key-model cases are in a `_key_models` list with a `-KeyModels-` stage.
 
 A PR's `/bot run --post-merge` runs no post-merge perf-sanity stage (a stage whose name contains both `PerfSanity` and `Post-Merge`); only the official post-merge pipeline runs them. The pre-merge perf-sanity stages run as in a plain `/bot run`. To run a post-merge perf-sanity stage on a PR, name it with `--stage-list` or `--extra-stage`.
 
@@ -710,7 +709,7 @@ def buildStageConfigs(stageName, platform, testlist, splitCount, gpuCount, nodeC
 GB200-{gpuCount}_GPUs-{nodeCount}_Nodes-PyTorch-Disagg-PerfSanity-CTX{num_ctx}-NODE{nodes_per_ctx}-GPU{ctx_tp}-GEN{num_gen}-NODE{nodes_per_gen}-GPU{gen_tp}-Post-Merge-{split}_of_{N}
 ```
 
-Use N = 2, 4, or 8 from the frequency table; keep `{split}` literal for the generator.
+Use N = 2 for a key model and N = 4 otherwise (see Post-merge Run Frequency); keep `{split}` literal for the generator. A context with a single test can instead be a literal entry that names its build slot, e.g. `"<stage name>-3_of_4": ["auto:gb300-flex", "<testlist>", 1, 1, <gpuCount>, <nodeCount>]`.
 
 **If a `buildStageConfigs` entry already exists** for the test-db file: update `splitCount` to match the new total number of active tests.
 

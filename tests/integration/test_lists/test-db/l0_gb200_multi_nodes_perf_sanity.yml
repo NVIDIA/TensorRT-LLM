@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# One top-level key per test list: a stage names its list (the key) in jenkins/L0_Test.groovy.
 version: 0.0.1
 l0_gb200_multi_nodes_perf_sanity_node4_gpu16:
 - condition:
