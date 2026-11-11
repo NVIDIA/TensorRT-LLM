@@ -36,6 +36,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shlex
 import signal
 import socket
@@ -161,6 +162,11 @@ def engine_lock(workspace: str | Path | None) -> Iterator[None]:
 
 
 # --------------------------------------------------------------------------- what is owned
+
+
+def files_of(workspace: str | Path, deployment: str) -> Path:
+    """Where the servers of ``deployment`` keep their options, addresses and logs."""
+    return Path(workspace) / "deployments" / deployment
 
 
 def load_owned(workspace: str | Path) -> list[Owned]:
@@ -385,13 +391,21 @@ def proxy_config(model: str, ctx_address: str, gen_address: str) -> dict[str, An
     }
 
 
-def _tail(record: Owned, lines: int = 20) -> str:
-    """Where ``record``'s log is, and its last lines: what a start failure shows."""
+#: What a log line that states an error looks like: the cause of a server that died is
+#: one of these, often a hundred lines above the bottom of a backtrace.
+_ERROR_LINE = re.compile(r"Error|Exception|Invalid|Traceback|\bE\d{4} ")
+
+
+def _tail(record: Owned, lines: int = 8, errors: int = 6) -> str:
+    """Where ``record``'s log is, its last lines that state an error, then its last lines."""
     try:
-        text = "\n".join(Path(record.log).read_text(errors="replace").splitlines()[-lines:])
+        text = Path(record.log).read_text(errors="replace").splitlines()
     except OSError:
-        text = ""
-    return f"({record.log}):\n{text}"
+        text = []
+    last = text[-lines:]
+    said = [line for line in text[: len(text) - len(last)] if _ERROR_LINE.search(line)][-errors:]
+    shown = [*said, *(["  ..."] if said else []), *last]
+    return f"({record.log}):\n" + "\n".join(shown)
 
 
 def _await(record: Owned, deadline: float, watched: Sequence[Owned] = (), address: str = "") -> str:
@@ -447,7 +461,7 @@ def start(
     deadline = time.monotonic() + budget
     clean_owned(workspace, budget)
     declared = engine_env({**(env or {}), **deployment.env}, tree=tree, python=python)
-    directory = workspace / "deployments" / deployment.name
+    directory = files_of(workspace, deployment.name)
     directory.mkdir(parents=True, exist_ok=True)
     options = write_options(deployment, directory, {"modeling_v2": MODE_REQUIRE})
     left = list(devices)
@@ -558,6 +572,10 @@ def _post(
     try:
         with _DIRECT.open(request, timeout=timeout) as reply:
             payload = json.loads(reply.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # The body of an error response is the server's own word on what is wrong.
+        body = exc.read().decode("utf-8", errors="replace").strip()[:300]
+        raise ServerError(f"{name} did not answer {path}: {exc}: {body}") from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise ServerError(f"{name} did not answer {path}: {exc}") from exc
     choice = (payload.get("choices") or [None])[0] if isinstance(payload, dict) else None

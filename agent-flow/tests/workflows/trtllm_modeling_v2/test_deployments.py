@@ -25,7 +25,7 @@ from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
     load_and_validate_task_yaml,
 )
 
-from ._helpers import _workflow
+from ._helpers import MOVES, _workflow
 
 
 @pytest.fixture
@@ -116,8 +116,8 @@ def test_native_aggregate_preserves_all_declared_fields(tmp_path, spec):
 
 def test_disaggregated_sides_are_independent_and_relative(tmp_path, spec):
     """D1: asymmetric attention-DP context and TEP generation remain distinct."""
-    ctx = {"tensor_parallel_size": 4, "enable_attention_dp": True}
-    gen = {"tensor_parallel_size": 2, "moe_expert_parallel_size": 2}
+    ctx = {"tensor_parallel_size": 4, "enable_attention_dp": True, **MOVES}
+    gen = {"tensor_parallel_size": 2, "moe_expert_parallel_size": 2, **MOVES}
     value = native(spec)
     value["deployments"].append(
         {
@@ -144,8 +144,8 @@ def test_disaggregated_stop_is_per_server(tmp_path, spec):
         "deployments": [
             {
                 "name": "pd",
-                "ctx": {"options": {}, "launch": "ctx-launch", "stop": "ctx-stop"},
-                "gen": {"options": {}, "launch": "gen-launch", "stop": "gen-stop"},
+                "ctx": {"options": MOVES, "launch": "ctx-launch", "stop": "ctx-stop"},
+                "gen": {"options": MOVES, "launch": "gen-launch", "stop": "gen-stop"},
             }
         ],
     }
@@ -157,7 +157,7 @@ def test_first_disaggregated_deployment_is_core(tmp_path, spec):
     value = {
         **spec,
         "deployments": [
-            {"name": "pd", "ctx": {"options": {}}, "gen": {"options": {}}},
+            {"name": "pd", "ctx": {"options": MOVES}, "gen": {"options": MOVES}},
             {"name": "later", "options": {}},
         ],
     }
@@ -319,7 +319,14 @@ def test_a_variant_and_a_disaggregated_request_are_one_deployment_each_on_the_fi
     # One variant, on the first member, judged against it; what chose members before is ignored.
     assert by_name["kv_fp8"].server.options["tensor_parallel_size"] == 1
     assert all(d.relative_to == "tp1" for d in found[1:]) and found[0].relative_to is None
-    assert by_name["disagg"].ctx.options == by_name["disagg"].gen.options == found[0].server.options
+    # Each side is core's options, and says how the cache moves, as the tree's own test does.
+    moved = {"disable_overlap_scheduler": True, "cache_transceiver_config": {"backend": "DEFAULT"}}
+    assert found[0].server.options["disable_overlap_scheduler"] is False
+    assert (
+        by_name["disagg"].ctx.options
+        == by_name["disagg"].gen.options
+        == {**found[0].server.options, **moved}
+    )
     assert by_name["disagg"].tests == ("tests/test_pd.py::test_hop",)
     assert all([b.name for b in d.benchmarks] == ["gsm8k"] for d in found)
     assert sorted(n.split("'")[1] for n in notices) == [
@@ -332,6 +339,25 @@ def test_a_variant_and_a_disaggregated_request_are_one_deployment_each_on_the_fi
     pd = next(d for d in resolve(tmp_path, value) if d.kind == "disaggregated")
     assert pd.ctx.options["tensor_parallel_size"] == pd.gen.options["tensor_parallel_size"] == 4
     assert pd.ctx.options["enable_attention_dp"] is True
+    # A backend the spec's own options name stands.
+    named = {"cache_transceiver_config": {"backend": "NIXL"}}
+    value["accuracy"]["llm_api_options"] = {"default": named}
+    pd = next(d for d in resolve(tmp_path, value) if d.kind == "disaggregated")
+    assert pd.gen.options["cache_transceiver_config"] == {"backend": "NIXL"}
+
+
+def test_a_stated_disaggregated_side_that_cannot_move_the_cache_is_one_line_at_load(tmp_path, spec):
+    sides = {"ctx": {"options": {"cache_transceiver_config": {}}}, "gen": {"options": MOVES}}
+    with pytest.raises(TaskSchemaError) as raised:
+        load(tmp_path, {**spec, "deployments": [{"name": "pd", **sides}]})
+    lines = [line for line in str(raised.value).splitlines() if "cache_transceiver" in line]
+    assert lines == [
+        "  - missing deployments.pd.ctx options cache_transceiver_config: a disaggregated "
+        "server refuses its first request without a backend to move the cache over; fix: "
+        "`cache_transceiver_config: {backend: DEFAULT}`"
+    ]
+    # An aggregated deployment moves no cache and owes no such key.
+    load(tmp_path, {**spec, "deployments": [{"name": "tp1", "options": {}}]})
 
 
 def test_accuracy_specific_engine_limits_survive_shorthand(tmp_path, spec):
@@ -623,7 +649,16 @@ def test_a_delivered_spec_is_its_member_its_disaggregated_deployment_and_its_kv_
     assert options["cuda_graph_config"] == {"enable_padding": True, "max_batch_size": 64}
     # Disaggregation is a deployment of two servers on core's options, with the spec's test.
     assert pd.kind == deployments.DISAGGREGATED and list(pd.servers) == ["ctx", "gen"]
-    assert pd.ctx.options == pd.gen.options == options
+    # Each side says how the cache moves and runs without the overlap scheduler.
+    assert (
+        pd.ctx.options
+        == pd.gen.options
+        == {
+            **options,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {"backend": "DEFAULT"},
+        }
+    )
     assert pd.tests == (DISAGG_NODE,) and pd.env == {"LLM_MODELS_ROOT": "/models"}
     # The variant is core's options with its own setting, judged against core's score.
     assert kv.relative_to == "tp2" and kv.server.options["kv_cache_config"]["dtype"] == "fp8"
@@ -651,9 +686,9 @@ def _native(tmp_path) -> dict:
         "kv_cache_config": {"dtype": "nvfp4"},
     }
     (engines / "dep16.yaml").write_text(yaml.safe_dump(dep16), encoding="utf-8")
-    (engines / "ctx.yaml").write_text(yaml.safe_dump(dep16), encoding="utf-8")
+    (engines / "ctx.yaml").write_text(yaml.safe_dump({**dep16, **MOVES}), encoding="utf-8")
     (engines / "gen.yaml").write_text(
-        yaml.safe_dump({**dep16, "enable_attention_dp": False}), encoding="utf-8"
+        yaml.safe_dump({**dep16, **MOVES, "enable_attention_dp": False}), encoding="utf-8"
     )
     return {
         "checkpoint_path": checkpoint,

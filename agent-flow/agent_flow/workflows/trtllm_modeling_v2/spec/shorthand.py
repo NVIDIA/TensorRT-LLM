@@ -37,10 +37,12 @@ from .deployments import (
     BENCHMARK_DEFAULTS,
     DEFAULT_BENCHMARK,
     INPUTS,
+    TRANSCEIVER,
     Deployment,
     Server,
     benchmark_of,
     load_options,
+    transceiver_problem,
     validate_env,
     validate_judging,
 )
@@ -306,6 +308,19 @@ def validate(data: Mapping[str, Any], errors: list[str]) -> None:
         errors.append(str(exc))
 
 
+def disaggregated(options: Mapping[str, Any]) -> dict[str, Any]:
+    """What each side of a disaggregated deployment states beyond core's ``options``.
+
+    As the tree's own disaggregated tests do: a worker with no ``cache_transceiver_config``
+    refuses its first request, and the overlap scheduler is off on both sides.
+    """
+    stated = transceiver_problem(options) is None
+    return {
+        "disable_overlap_scheduler": True,
+        TRANSCEIVER: options[TRANSCEIVER] if stated else {"backend": "DEFAULT"},
+    }
+
+
 def expand(data: Mapping[str, Any]) -> tuple[Deployment, ...]:
     """The deployments a spec's shorthand keys ask for, core's first (the module's table)."""
     accuracy = data.get(ACCURACY_FIELD)
@@ -328,6 +343,8 @@ def expand(data: Mapping[str, Any]) -> tuple[Deployment, ...]:
 
     def deployment(name: str, unit: str, member: str, variant=None, **more: Any) -> Deployment:
         server = _server(data, unit, member, variant or {})
+        if name == DISAGG:
+            server = replace(server, options={**server.options, **disaggregated(server.options)})
         sides = {"ctx": server, "gen": server} if name == DISAGG else {"server": server}
         return Deployment(name=name, relative_to=first if name != first else None, **sides, **more)
 

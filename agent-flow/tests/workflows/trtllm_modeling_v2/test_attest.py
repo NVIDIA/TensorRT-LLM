@@ -66,6 +66,40 @@ def test_a_key_the_engine_resolved_otherwise_fails_the_check(resolved, said):
     assert found.status == attest.MISMATCH and said in found.failure()
 
 
+def test_a_value_that_leaves_the_choice_to_the_engine_records_what_each_rank_ran():
+    declared = {
+        "cache_transceiver_config": {"backend": "DEFAULT"},
+        "kv_cache_config": {"dtype": "Auto"},
+        "max_batch_size": 4,
+    }
+    ran = {
+        "cache_transceiver_config": {"backend": "NIXL", "max_tokens_in_buffer": 4096},
+        "kv_cache_config": {"dtype": "fp8"},
+        "max_batch_size": 4,
+    }
+    found = attest.attest(rank_lines(ran), declared)
+    assert found.status == attest.MATCH and found.failure() is None
+    assert found.resolved == (
+        "cache_transceiver_config.backend: declared DEFAULT, ran NIXL",
+        "kv_cache_config.dtype: declared Auto, ran fp8",
+    )
+    assert "target " in attest.describe([found.record()])
+    assert attest.describe([found.record()]).endswith(
+        "; cache_transceiver_config.backend: declared DEFAULT, ran NIXL; "
+        "kv_cache_config.dtype: declared Auto, ran fp8]"
+    )
+    # Every other value is still compared exactly, and a block the engine has off is no choice.
+    assert attest.attest(rank_lines({**ran, "max_batch_size": 8}), declared).status == (
+        attest.MISMATCH
+    )
+    off = attest.attest(rank_lines({**ran, "cache_transceiver_config": None}), declared)
+    assert "cache_transceiver_config.backend is None, declared 'DEFAULT'" in off.failure()
+    named = {**declared, "cache_transceiver_config": {"backend": "UCX"}}
+    assert "is 'NIXL', declared 'UCX'" in attest.attest(rank_lines(ran), named).failure()
+    almost = attest.attest(rank_lines({"backend": "NIXL"}), {"backend": "defaults"})
+    assert almost.status == attest.MISMATCH and not almost.resolved
+
+
 def test_a_missing_rank_or_key_reads_unknown_and_never_passes():
     one_rank = attest.attest(rank_lines(RESOLVED, ranks=1), OPTIONS)
     assert one_rank.status == attest.UNKNOWN

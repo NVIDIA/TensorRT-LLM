@@ -54,6 +54,9 @@ DISAGGREGATED = "disaggregated"
 ROLES: tuple[str, ...] = ("ctx", "gen")
 #: What a deployment may be sent: every deployment takes text.
 INPUTS: tuple[str, ...] = ("text", "image")
+#: The option each side of a disaggregated deployment must state: what moves the cache
+#: from ``ctx`` to ``gen``. ``DEFAULT`` leaves the backend to the engine.
+TRANSCEIVER = "cache_transceiver_config"
 DEFAULT_BENCHMARK = "gsm8k"
 
 #: What one server states: on an aggregated deployment itself, or inside ``ctx`` and ``gen``.
@@ -327,7 +330,20 @@ def validate_judging(block: Mapping[str, Any], errors: list[str], where: str) ->
                 )
 
 
-def _validate_server(holder: Mapping[str, Any], errors: list[str], where: str) -> None:
+def transceiver_problem(options: Mapping[str, Any]) -> str | None:
+    """Why a disaggregated side with ``options`` cannot answer; ``None`` when it can."""
+    block = options.get(TRANSCEIVER)
+    if isinstance(block, Mapping) and block.get("backend"):
+        return None
+    return (
+        f"options {TRANSCEIVER}: a disaggregated server refuses its first request without a "
+        f"backend to move the cache over; fix: `{TRANSCEIVER}: {{backend: DEFAULT}}`"
+    )
+
+
+def _validate_server(
+    holder: Mapping[str, Any], errors: list[str], where: str, side: bool = False
+) -> None:
     """``options`` (required), ``launch`` and ``stop`` of an aggregated deployment or of one side."""
     if holder.get("options") is None:
         errors.append(
@@ -336,7 +352,9 @@ def _validate_server(holder: Mapping[str, Any], errors: list[str], where: str) -
         )
     else:
         try:
-            load_options(holder["options"])
+            options = load_options(holder["options"])
+            if side and transceiver_problem(options):
+                errors.append(f"missing {where} {transceiver_problem(options)}")
         except ValueError as exc:
             errors.append(f"'{where}.options' {exc}")
     launch = holder.get("launch")
@@ -435,7 +453,7 @@ def validate(block: Any, errors: list[str]) -> None:
                     errors.append(f"'{at}.{role}' must be a mapping with `options`")
                     continue
                 reject_unknown_keys(entry[role], SERVER_KEYS, errors, where=f"{at}.{role}")
-                _validate_server(entry[role], errors, f"{at}.{role}")
+                _validate_server(entry[role], errors, f"{at}.{role}", side=True)
         else:
             _validate_server(entry, errors, at)
         validate_env(entry.get("env"), errors, f"{at}.env")

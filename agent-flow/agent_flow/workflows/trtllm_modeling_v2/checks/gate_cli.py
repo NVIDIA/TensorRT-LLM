@@ -14,7 +14,9 @@ options, the environment, the frozen anchors and the engine lock are the same ei
 A deployment with a launch prefix of its own, and every disaggregated one, boots as a
 server the check starts and asks through its endpoint; any other boots in process. An
 aggregated deployment is scored by ``trtllm-eval`` behind its prefix, a disaggregated one
-through its endpoint. The verdict says which path judged.
+through its endpoint. The verdict says which path judged, and the directory its files
+are in: under the run's workspace when the task file is a run's own, else under
+``--workdir``.
 
 Exit status: 0 when the gate passed or measured a score nothing judges (``NO VERDICT``),
 1 when it failed, 2 on a usage or spec error.
@@ -45,6 +47,7 @@ from . import verdict as check_result
 #: The gates this command runs, by the name it takes.
 GATE_NAMES: tuple[str, ...] = ("boot", "accuracy", "serve", "tests")
 IN_PROCESS = "in process"
+TRTLLM_EVAL = "trtllm-eval"
 THROUGH_ENDPOINT = "through the endpoint"
 #: The run's checkpoint file, beside the workspace's ``task.yaml``: it names the claimed devices.
 _STATE_FILENAME = ".trtllm_modeling_v2_state.json"
@@ -135,11 +138,12 @@ def run_check(
     ``tree`` is the TensorRT-LLM tree measured as it is: the checkout (``trtllm_repo_path``)
     by default. Every command runs from inside it with it first on ``PYTHONPATH``.
     ``workspace`` is the run's: its frozen anchors and claimed devices are used when it is
-    given. ``runner`` replaces the environment's own, for tests. A benchmark whose anchor
-    is another deployment's score is judged against ``relative_score``; without one that
-    deployment's benchmark runs here first (``measure_base``), and when there is no such
-    score this one's is reported with no verdict. ``locked``: the caller already holds the
-    workspace's engine lock.
+    given, and the servers a check starts keep their files in it; without one they are
+    under ``workdir`` with everything else. ``runner`` replaces the environment's own, for
+    tests. A benchmark whose anchor is another deployment's score is judged against
+    ``relative_score``; without one that deployment's benchmark runs here first
+    (``measure_base``), and when there is no such score this one's is reported with no
+    verdict. ``locked``: the caller already holds the workspace's engine lock.
     """
     name = gate_name(gate)
     if name not in GATE_NAMES:
@@ -147,7 +151,8 @@ def run_check(
             f"{gate!r} names no gate this workflow runs ({', '.join(GATE_NAMES)})"
         )
     found = deployments_mod.named(task_data, deployment)
-    workdir = Path(workdir).resolve() / found.name
+    root = Path(workdir).resolve()
+    workdir = root / found.name
     repo = Path(str(task_data.get("trtllm_repo_path") or "."))
     tree = Path(tree).resolve() if tree is not None else repo.resolve()
     spec = {**task_data, "trtllm_repo_path": str(tree)}
@@ -168,7 +173,7 @@ def run_check(
     common = dict(task_data=spec, deployment=found)
     served = found.kind != AGGREGATED or found.prefixed
     if workspace is None:
-        workspace = workdir
+        workspace = root
 
     def accuracy() -> check_result.GateResult:
         nonlocal relative_score
@@ -202,7 +207,7 @@ def run_check(
             result = accuracy_checks.run_accuracy_gate(
                 environment, benchmark=benchmark, workdir=workdir, **judge, **common
             )
-            return replace(result, path=IN_PROCESS)
+            return replace(result, path=TRTLLM_EVAL)
         result = endpoint.run_endpoint_accuracy(
             found, benchmark, environment, task_data=spec, workspace=workspace, **judge
         )
@@ -250,16 +255,22 @@ def run_check(
         tests = disagg.run_disagg_gate if found.kind != AGGREGATED else pytest_runner.run_tests
         return tests(environment, workdir=workdir, runner=runner, **bound, **common)
 
+    def named() -> check_result.GateResult:
+        result = measure()
+        started = result.path == THROUGH_ENDPOINT
+        files = servers.files_of(workspace, found.name) if started else workdir
+        return replace(result, files=str(files))
+
     if locked:
-        return measure()
+        return named()
     # One load at a time: the run's checks and a worker's own never share the devices.
     with servers.engine_lock(workspace):
-        return measure()
+        return named()
 
 
 def run_gate(args: argparse.Namespace) -> check_result.GateResult:
     """The ``gate`` command: :func:`run_check` with what the command line names."""
-    task = Path(args.task)
+    task = Path(args.task).resolve()
     notices: list[str] = []
     try:
         task_data = load_and_validate_task_yaml(task, notices)
@@ -272,8 +283,9 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         args.deployment,
         workdir=args.workdir,
         tree=args.tree,
-        # The run's own task.yaml sits in its workspace, beside its anchors and its state.
-        workspace=task.resolve().parent,
+        # A run's own task.yaml sits in its workspace, beside its state, its anchors and
+        # its servers' files. Any other task file stands alone: its files go to --workdir.
+        workspace=task.parent if (task.parent / _STATE_FILENAME).is_file() else None,
         devices=tuple(int(d) for d in args.devices.split(",")) if args.devices else None,
         python=args.python,
         timeout=args.timeout,

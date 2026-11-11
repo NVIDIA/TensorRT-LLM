@@ -211,7 +211,7 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     first = report.splitlines()[0]
     assert first.startswith(f"# onboarded: commit `c0ffee1`, ref `refs/mv2/{SLUG}/onboarded`, 20")
     assert "| `tp1` | `accuracy[gsm8k]` | 90 | reference 85.6 (" in report
-    assert "| PASS | in process | `c0ffee1` |" in report
+    assert "| PASS | trtllm-eval | `c0ffee1` |" in report
     assert "| `tep2` | `boot` | - | - | PASS | in process | `c0ffee1` |" in report
     assert "| `kv_fp8` |" not in report.split("## Done")[1].split("##")[0]
     # With what each check attested of the engine that ran: every rank's options, the target.
@@ -373,7 +373,7 @@ def test_a_first_deployment_nothing_judges_is_onboarded_on_its_boot_and_says_so(
     if stated == "no row":
         # The score is a line of the report, with no verdict: it failed nothing.
         assert "| `tp1` | `accuracy[gsm8k]` | 90 | none (no declared anchor" in report
-        assert "| no verdict | in process |" in report
+        assert "| no verdict | trtllm-eval |" in report
         assert _verdicts(tmp_path)[1]["unjudged"] and _verdicts(tmp_path)[1]["passed"]
     else:
         assert "tp1: it names no benchmark, so its boot alone judges it" in report
@@ -652,7 +652,7 @@ def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_findi
     assert "kv_fp8:accuracy" not in named and "tep2" not in named
     report = _report(tmp_path)
     assert "| `kv_fp8` | `boot` | - | - | PASS | in process | `f1xed00` |" in report
-    assert "| PASS | in process | `f1xed00` |" in report.split("| `kv_fp8` | `accuracy")[1]
+    assert "| PASS | trtllm-eval | `f1xed00` |" in report.split("| `kv_fp8` | `accuracy")[1]
     assert "| `tep2` | `boot` | - | - | PASS | in process | `c0ffee1` |" in report
     # Nothing of the final pass moves the onboard record.
     assert report.startswith("# onboarded: commit `c0ffee1`")

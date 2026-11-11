@@ -113,10 +113,12 @@ def _gsm8k_on_disk(monkeypatch, tmp_path_factory):
 # with. As a real server's ranks do under the rank hook, it prints what each rank runs: the
 # options it was given (FAKE_RANKS=0: nothing; FAKE_DTYPE: another KV dtype than asked),
 # from the directory it was started in. A prompt it has seen resumes from its cache
-# (FAKE_REUSE=0: never). FAKE_SERVE_EXIT: it refuses to start; FAKE_SERVE_HANG: it never
+# (FAKE_REUSE=0: never). FAKE_SERVE_EXIT: it refuses to start, its error line far above
+# the end of a backtrace; FAKE_SERVE_HANG: it never
 # reports an address; FAKE_DIE_AFTER_BIND=<ctx|gen>: that side dies once the proxy is
 # being started;
-# FAKE_NO_IMAGES: it answers no chat completion; FAKE_UNFINISHED: no finish reason.
+# FAKE_NO_IMAGES: it answers a chat completion with a 400 whose body says why;
+# FAKE_UNFINISHED: no finish reason.
 _FAKE_SERVE = """#!{python}
 import http.server, json, os, signal, sys, threading, time
 
@@ -124,6 +126,10 @@ argv = sys.argv[1:]
 report = argv[argv.index("--report_addr") + 1]
 if os.environ.get("FAKE_SERVE_EXIT"):
     print("fake: refused to start")
+    print("E1111 09:00:00.000000 77 nixl.cpp:9] Invalid UCX_TLS=tcp for NIXL UCX backend")
+    print("RuntimeError: Failed to create NIXL backend")
+    for frame in range(40):
+        print("#%d 0x0000ffff in frame" % frame)
     sys.exit(3)
 if os.environ.get("FAKE_SERVE_HANG"):
     signal.pause()
@@ -148,9 +154,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def _send(self, payload):
+    def _send(self, payload, status=200):
         body = json.dumps(payload).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -163,7 +169,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finish = None if os.environ.get("FAKE_UNFINISHED") else "stop"
         if self.path.endswith("/chat/completions"):
             if os.environ.get("FAKE_NO_IMAGES"):
-                return self.send_error(400, "this model takes no image")
+                why = "this model takes no image; " + "set a vision tower; " * 20 + "END"
+                return self._send({{"error": why}}, 400)
             text, image = asked["messages"][0]["content"]
             assert image["image_url"]["url"].startswith("data:image/png;base64,")
             message = {{"role": "assistant", "content": "A lion statue, asked: " + text["text"]}}

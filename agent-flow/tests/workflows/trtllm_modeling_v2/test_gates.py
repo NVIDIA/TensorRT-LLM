@@ -17,12 +17,14 @@ import yaml
 from agent_flow.workflows.trtllm_modeling_v2.checks import accuracy as accuracy_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import gate_cli
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import serve_driver, workload_io
+from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
 from agent_flow.workflows.trtllm_modeling_v2.run.report import test_modules as target_tests
+from agent_flow.workflows.trtllm_modeling_v2.run.state import STATE_FILENAME
 from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
 
-from ._helpers import attested
+from ._helpers import MOVES, attested
 
 
 def test_the_report_counts_the_targets_test_modules_and_warns_past_twenty(tmp_path):
@@ -71,8 +73,8 @@ def _spec(tmp_path, **more) -> dict:
             },
             {
                 "name": "pd",
-                "ctx": {"options": {"tensor_parallel_size": 2}},
-                "gen": {"options": {"tensor_parallel_size": 2}},
+                "ctx": {"options": {"tensor_parallel_size": 2, **MOVES}},
+                "gen": {"options": {"tensor_parallel_size": 2, **MOVES}},
                 "relative_to": "tp1",
                 "env": {"LLM_MODELS_ROOT": "/models"},
                 "tests": [NODE, NODE.replace("auto", "fp8")],
@@ -181,7 +183,7 @@ def test_accuracy_runs_trtllm_eval_behind_the_deployments_own_prefix(tmp_path):
     assert result.summary().startswith(
         "[PASS] remote:accuracy[gsm8k]: measured 91.0000 vs floor 88.3479"
     )
-    assert "anchor: reference" in result.detail and result.path == gate_cli.IN_PROCESS
+    assert "anchor: reference" in result.detail and result.path == gate_cli.TRTLLM_EVAL
     [command] = runner.seen
     # The prefix is the site's and places the ranks: the flow adds the LLM API's launcher
     # for the eight its options ask for, and no device of this host.
@@ -288,6 +290,34 @@ def test_a_score_nothing_judges_is_a_report_line_and_never_a_failure(tmp_path, c
     assert result.unjudged and result.passed and result.measured == 85.0
     assert "a score with no verdict (`tp1` has no score to hold it to)" in result.detail
     assert result.summary().startswith("[NO VERDICT] tep2:accuracy[gsm8k]: measured 85.0000")
+
+
+def test_a_checks_files_are_in_one_place_which_its_verdict_names(tmp_path, capsys, monkeypatch):
+    path = tmp_path / "task.yaml"
+    path.write_text(yaml.safe_dump(_spec(tmp_path)), encoding="utf-8")
+    seen: list[Path] = []
+
+    def served(deployment, *, workspace, **said):
+        seen.append(Path(workspace))
+        return GateResult(name="boot", passed=True, detail="answered", deployment="pd")
+
+    monkeypatch.setattr(gate_cli.endpoint, "run_endpoint_boot", served)
+    argv = ["boot", "--task", str(path), "--deployment", "pd", "--workdir", str(tmp_path / "w")]
+    # A task file that is no run's stands alone: what its servers write is under --workdir.
+    assert gate_cli.main(argv) == 0
+    assert seen == [tmp_path / "w"]
+    assert f"[through the endpoint] [files {tmp_path}/w/deployments/pd]" in capsys.readouterr().out
+    # A run's own task file sits beside its state: the servers' files are the workspace's.
+    (tmp_path / STATE_FILENAME).write_text(json.dumps({"version": 4, "devices": [0, 1, 2, 3]}))
+    assert gate_cli.main(argv) == 0
+    assert seen[1:] == [tmp_path]
+    assert f"[files {tmp_path}/deployments/pd]" in capsys.readouterr().out
+    # A check that starts no server keeps its files under --workdir either way.
+    runner = _engine(_records("Paris", "the process"))
+    boot = gate_cli.run_check(
+        _spec(tmp_path), "boot", "tep2", workdir=tmp_path / "w", runner=runner
+    )
+    assert boot.files == f"{tmp_path}/w/tep2" and (tmp_path / "w" / "tep2").is_dir()
 
 
 def test_native_tests_run_one_job_each_and_a_skip_or_a_bad_exit_is_not_a_pass(tmp_path):

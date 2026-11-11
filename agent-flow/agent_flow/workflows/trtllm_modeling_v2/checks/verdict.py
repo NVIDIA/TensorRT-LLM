@@ -84,6 +84,8 @@ class GateResult:
     #: Which path judged: ``in process`` or ``through the endpoint``; empty for a check
     #: that has one path only.
     path: str = ""
+    #: The directory the check's files are in: its options, logs and outputs.
+    files: str = ""
     #: One record per server the check attested (:meth:`.attest.Attestation.record`):
     #: its options against what every rank's engine ran. Empty for a check that
     #: attested none. Not hashed: the records are mappings.
@@ -94,6 +96,7 @@ class GateResult:
         verdict = "NO VERDICT" if self.unjudged else "PASS" if self.passed else "FAIL"
         label = f"{self.deployment}:{self.name}" if self.deployment else self.name
         tree = f" [tree {self.tree_state}]" + (f" [{self.path}]" if self.path else "")
+        tree += f" [files {self.files}]" if self.files else ""
         breakdown = f" [{self.breakdown}]" if self.breakdown else ""
         breakdown += describe_engine(self.engine)
         if self.warnings:

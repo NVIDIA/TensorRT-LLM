@@ -10,7 +10,7 @@ defaults are not the ``LLM``'s: temperature 0, ``top_k`` 1, the truncation and s
 strings the evaluator asks for.
 
 Runs under the interpreter of the tree being measured: nothing here imports
-``agent_flow``. The evaluator prints its score as it does for ``trtllm-eval``.
+``agent_flow``. The score the evaluator returns is printed as ``trtllm-eval`` logs it.
 """
 
 from __future__ import annotations
@@ -146,9 +146,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     llm = EndpointLLM(args.url, args.model, load_hf_tokenizer(args.model), args.concurrency)
     try:
-        evaluator.evaluate(llm, sampling)
+        score = evaluator.evaluate(llm, sampling)
     finally:
         llm.shutdown()
+    if score is None:
+        print("endpoint-eval: the evaluator returned no score", file=sys.stderr)
+        return 1
+    # The tree logs the score at INFO, which this script does not show: printed here in
+    # the tree's own words, which are what the check reads.
+    task = getattr(evaluator, "task_name", args.benchmark)
+    print(f"lm-eval {task} average accuracy: {float(score):.2f}", flush=True)
     return 0
 
 

@@ -264,6 +264,8 @@ def driver_records(accepted: int = 320, iterations: int = 100, prompts: int = 32
     return "\n".join(lines) + "\n"
 
 
+#: What each side of a stated disaggregated deployment must say: how the cache moves.
+MOVES = {"cache_transceiver_config": {"backend": "DEFAULT"}}
 #: A model class under the Modeling V2 package, as a rank that built a target reports it.
 TARGET_CLASS = "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.model.GptOssModel"
 

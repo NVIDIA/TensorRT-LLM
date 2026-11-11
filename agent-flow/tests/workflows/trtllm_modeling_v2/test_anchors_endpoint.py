@@ -386,6 +386,9 @@ def test_an_answer_counts_once_it_completed_and_an_image_deployment_is_sent_an_i
     monkeypatch.setenv("FAKE_NO_IMAGES", "1")
     blind = boot()
     assert not blind.passed and blind.detail.startswith("image not checked: vl did not answer")
+    # The server's own word on what is wrong is kept: the first 300 characters of the body.
+    assert 'HTTP Error 400: Bad Request: {"error": "this model takes no image; ' in blind.detail
+    assert "END" not in blind.detail
     monkeypatch.delenv("FAKE_NO_IMAGES")
     # An answer cut off before it finished is not an answer.
     monkeypatch.setenv("FAKE_UNFINISHED", "1")
@@ -470,8 +473,11 @@ def test_the_evaluator_is_told_its_stop_strings_and_its_sample_count(monkeypatch
         def __init__(self, **kwargs):
             built.update(kwargs)
 
+        task_name = "gsm8k"
+
         def evaluate(self, llm, sampling):
             built["stop"] = sampling.stop
+            return built.get("score", 41.7)
 
     class SamplingParams:
         def __init__(self, **kwargs):
@@ -493,13 +499,19 @@ def test_the_evaluator_is_told_its_stop_strings_and_its_sample_count(monkeypatch
     # the count is the split's when the command names none, never left to a default.
     assert built["stop_strings"] == ["Question:"] and built["stop"] == ["Question:"]
     assert built["num_samples"] == 1319
-    assert "endpoint-eval: gsm8k on 1319 samples, greedy, stop ['Question:']" in (
-        capsys.readouterr().out
-    )
+    said = capsys.readouterr().out
+    assert "endpoint-eval: gsm8k on 1319 samples, greedy, stop ['Question:']" in said
+    # The score the evaluator returns is printed, and the check's own parser reads it.
+    assert said.splitlines()[-1] == "lm-eval gsm8k average accuracy: 41.70"
+    assert accuracy.parse_eval_score(said) == 41.7
     built.clear()
     assert endpoint_eval.main([*common, "--num_samples", "200"]) == 0
     assert built["num_samples"] == 200 and "stop_strings" not in built
     assert "on 200 samples, greedy, stop the task own" in capsys.readouterr().out
+    # An evaluation that returns nothing is a failed command, never a silent "no score".
+    GSM8K.evaluate = lambda self, llm, sampling: None
+    assert endpoint_eval.main(common) == 1
+    assert "returned no score" in capsys.readouterr().err
 
 
 def test_a_disaggregated_deployments_boot_goes_through_its_endpoint_under_the_lock(

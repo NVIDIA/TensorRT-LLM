@@ -36,6 +36,9 @@ REUSE_PROMPT = " ".join(
     for n in range(1, 25)
 )
 REUSE_ID = "reuse"
+#: Declared values that leave the choice to the engine (any case): what a rank resolved
+#: one to is recorded and shown, and whatever it chose is a match.
+ENGINE_CHOOSES = ("default", "auto")
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,8 @@ class Attestation:
     keys: int = 0
     mismatches: tuple[str, ...] = ()
     unknown: tuple[str, ...] = ()
+    #: What the ranks chose where the options left the choice to the engine.
+    resolved: tuple[str, ...] = ()
     #: The model class the ranks built, and the package they imported.
     target: str = ""
     origin: str = ""
@@ -150,6 +155,7 @@ def attest(
     records = rank_records(output)
     mismatches: list[str] = []
     unknown: list[str] = []
+    resolved: dict[str, None] = {}
     targets: set[str] = set()
     origins: set[str] = set()
     root = Path(tree).resolve() if tree is not None else None
@@ -164,6 +170,8 @@ def attest(
             status, seen = _observed(record["options"], path)
             if status == UNKNOWN:
                 unknown.append(f"{at}: {path} is not in the engine's configuration")
+            elif status == MATCH and isinstance(value, str) and value.lower() in ENGINE_CHOOSES:
+                resolved[f"{path}: declared {value}, ran {seen}"] = None
             elif status == MISMATCH or not _same(value, seen):
                 mismatches.append(f"{at}: {path} is {seen!r}, declared {value!r}")
         built = str(record.get("target") or "")
@@ -186,6 +194,7 @@ def attest(
         keys=len(declared),
         mismatches=tuple(mismatches),
         unknown=tuple(unknown),
+        resolved=tuple(resolved),
         target=", ".join(sorted(t for t in targets if t)),
         origin=", ".join(sorted(o for o in origins if o)),
     )
@@ -229,8 +238,9 @@ def describe(records: Sequence[Mapping[str, Any]]) -> str:
     for record in records:
         who = "" if record.get("role") in (None, "server") else f"{record['role']}: "
         status = record.get("status", UNKNOWN)
+        chosen = "".join(f"; {line}" for line in record.get("resolved") or ())
         said.append(
             f" [engine {who}{status}: {record.get('ranks')} rank(s) x {record.get('keys')} "
-            f"option(s); target {record.get('target') or 'unknown'}]"
+            f"option(s); target {record.get('target') or 'unknown'}{chosen}]"
         )
     return "".join(said)

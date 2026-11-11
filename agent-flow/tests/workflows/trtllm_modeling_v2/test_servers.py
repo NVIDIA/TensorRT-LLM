@@ -151,7 +151,14 @@ def test_a_start_that_fails_names_the_server_and_its_log_and_leaves_nothing(site
         servers.start(_one(), model="/m", workspace=workspace, timeout=30)
     said = str(raised.value)
     assert said.startswith("tp1 exited before tp1 was bound to an address")
-    assert f"({workspace / 'deployments/tp1/tp1.log'})" in said and "fake: refused to start" in said
+    assert f"({workspace / 'deployments/tp1/tp1.log'})" in said
+    # The lines that state an error come first, then the log's end: the cause of a dead
+    # server is often far above the bottom of its backtrace.
+    cause = "E1111 09:00:00.000000 77 nixl.cpp:9] Invalid UCX_TLS=tcp for NIXL UCX backend"
+    lines = said.splitlines()[1:]
+    assert lines[:3] == [cause, "RuntimeError: Failed to create NIXL backend", "  ..."]
+    assert lines[3:] == [f"#{n} 0x0000ffff in frame" for n in range(32, 40)]
+    assert "fake: refused to start" not in said
     assert servers.load_owned(workspace) == []
     monkeypatch.delenv("FAKE_SERVE_EXIT")
     # A worker that dies while the proxy is waited for does not hide behind it.
