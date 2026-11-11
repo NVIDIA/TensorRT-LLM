@@ -35,6 +35,7 @@ def test_default_target_logits_are_the_logits_processors():
     hidden, lm_head, attn_metadata = torch.randn(3, 8), object(), object()
     # A worker without a vocab-parallel path: the metadata is not even read.
     worker = object.__new__(Eagle3OneModelWorker)
+    SpecWorkerBase.__init__(worker)
 
     out = SpecWorkerBase.target_logits(
         worker, hidden, lm_head, processor, attn_metadata, object(), object()
@@ -224,8 +225,10 @@ def test_mtp_eagle_target_logits_are_sharded_for_greedy_batches(
     )
 
     worker = object.__new__(Eagle3OneModelWorker)
+    SpecWorkerBase.__init__(worker)
     worker.key_exchange = SimpleNamespace(MAX_ROWS=8, transport="IPC") if has_exchange else None
     worker._samples_sharded_temperature = has_exchange
+    worker._target_head_mapping = Head.mapping
     worker.guided_decoder = worker._d2t = None
     worker.spec_config = SimpleNamespace(use_relaxed_acceptance_for_thinking=False)
     worker.mapping = Head.mapping

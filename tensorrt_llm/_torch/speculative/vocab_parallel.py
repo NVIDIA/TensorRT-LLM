@@ -82,8 +82,10 @@ _TARGET_PROGRAMS = 256
 _PAIR_LAYOUT_ARGS = ["stride_out", "slot0", "zero_lo", "zero_hi"]
 
 # "0" turns off the vocab-parallel greedy argmax of the stock one-model
-# speculative workers (SpecWorkerBase.enable_vocab_parallel_argmax): their
-# greedy target and draft tokens then come from the gathered logits again.
+# speculative workers (SpecWorkerBase.enable_vocab_parallel_argmax), which
+# restores the behaviour before it: the gathered target logits, except on the
+# models that take the speculative fast paths, whose workers already selected
+# their greedy and temperature-only target tokens from the shard.
 VOCAB_PARALLEL_ARGMAX_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_ARGMAX"
 
 

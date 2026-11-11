@@ -143,7 +143,9 @@ def _worker_for_rank(rank: int, exchange: _PairExchange) -> _Worker:
     worker = _Worker()
     worker._vocab_parallel_argmax = True
     worker._target_pair_exchange = exchange
-    worker.mapping = Mapping(world_size=exchange.tp_size, tp_size=exchange.tp_size, rank=rank)
+    worker._target_head_mapping = Mapping(
+        world_size=exchange.tp_size, tp_size=exchange.tp_size, rank=rank
+    )
     return worker
 
 
@@ -354,6 +356,107 @@ def test_covered_workers():
         assert cls.verifies_on_target_shard, cls.__name__
     for cls in (Eagle3OneModelDynamicTreeWorker, MTPEagleDynamicTreeWorker, DFlashWorker):
         assert not cls.verifies_on_target_shard, cls.__name__
+
+
+def _bare_covered_worker(cls):
+    """A covered worker with the base state and what its acceptance reads."""
+    worker = object.__new__(cls)
+    SpecWorkerBase.__init__(worker)
+    worker.spec_config = SimpleNamespace(use_relaxed_acceptance_for_thinking=False)
+    worker.is_thop = False
+    worker.sa_enhancer = None
+    return worker
+
+
+def _accept(kind, worker, logits, md, attn_metadata):
+    """The covered worker's own strict acceptance of one step."""
+    if kind in ("mtp", "sa"):
+        input_ids = torch.zeros(1, dtype=torch.int32, device=logits.device)
+        if kind == "mtp":
+            return worker.sample_and_accept_draft_tokens(input_ids, logits, md, attn_metadata)
+        return worker._sample_and_accept_draft_tokens(input_ids, logits, md, attn_metadata)
+    if kind in ("eagle3", "mtp_eagle"):
+        input_ids = torch.zeros(1, dtype=torch.int32, device=logits.device)
+        return worker.sample_and_accept_draft_tokens(input_ids, logits, attn_metadata, md)
+    return worker.sample_and_accept_draft_tokens(logits, attn_metadata, md)
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("kind", ["mtp", "eagle3", "mtp_eagle", "draft_target", "pard", "sa"])
+def test_covered_worker_acceptance_on_shard_matches_gathered(kind, tp):
+    """Each covered worker's own acceptance (including PARD's 2K-row layout)
+    accepts the same tokens and counts from the target logits' vocab shard as
+    from the gathered logits, ties included."""
+    from tensorrt_llm._torch.speculative.draft_target import DraftTargetOneModelWorker
+    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker, MTPEagleWorker
+    from tensorrt_llm._torch.speculative.mtp import MTPWorker
+    from tensorrt_llm._torch.speculative.pard import PARDWorker
+    from tensorrt_llm._torch.speculative.sa_worker import SAWorker
+
+    cls = {
+        "mtp": MTPWorker,
+        "eagle3": Eagle3OneModelWorker,
+        "mtp_eagle": MTPEagleWorker,
+        "draft_target": DraftTargetOneModelWorker,
+        "pard": PARDWorker,
+        "sa": SAWorker,
+    }[kind]
+    num_ctx, num_gens, k = 2, 5, 3
+    rows_per_gen = 2 * k if kind == "pard" else k + 1
+    vocab = 512 * tp
+    gen = torch.Generator(device="cuda").manual_seed(tp * 7 + len(kind))
+    full = torch.randint(
+        0, 4, (num_ctx + num_gens * rows_per_gen, vocab), device="cuda", generator=gen
+    )
+    full = _tie_rows(full.to(torch.bfloat16), tp)
+    # The target tokens acceptance compares: per generation request the first
+    # k + 1 of its rows (all of them but PARD's mask positions).
+    target = torch.argmax(full.float(), dim=-1)[num_ctx:].view(num_gens, rows_per_gen)
+    drafts = target[:, :k].clone().to(torch.int32)
+    for g in range(num_gens):  # a different accepted length per request
+        if g < k:
+            drafts[g, g] = (drafts[g, g] + 1) % vocab
+    if kind == "pard":
+        # PARD's draft buffer holds 2K - 1 entries per request, the K drafts first.
+        buffer = torch.zeros(num_gens, 2 * k - 1, dtype=torch.int32, device="cuda")
+        buffer[:, :k] = drafts
+        draft_tokens = buffer.flatten()
+    else:
+        draft_tokens = drafts.flatten()
+    batch = num_ctx + num_gens
+    attn_metadata = SimpleNamespace(num_seqs=batch, num_contexts=num_ctx)
+
+    def metadata(sharded):
+        return _greedy_md(
+            sharded_target_logits=sharded,
+            use_rejection_sampling=False,
+            runtime_draft_len=k,
+            draft_tokens=draft_tokens,
+            mtp_hidden_states_manager=SimpleNamespace(sa_manager=None),
+        )
+
+    def flatten(accepted, num_accepted):
+        return torch.cat(
+            [accepted[:num_ctx, 0], accepted[num_ctx:, : k + 1].flatten(), num_accepted]
+        ).to(torch.int64)
+
+    ref = flatten(
+        *_accept(kind, _bare_covered_worker(cls), full.float(), metadata(False), attn_metadata)
+    )
+
+    def accept_on_rank(rank, exchange):
+        worker = _bare_covered_worker(cls)
+        worker._vocab_parallel_argmax = True
+        worker._target_pair_exchange = exchange
+        worker._target_head_mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+        return flatten(
+            *_accept(kind, worker, _shard(full, tp, rank), metadata(True), attn_metadata)
+        )
+
+    out = _run_ranks(tp, accept_on_rank)
+    assert torch.equal(out, ref)
+    num_accepted = ref[-batch:]
+    assert num_accepted[num_ctx:].tolist() == [1, 2, 3, 4, 4]
 
 
 @pytest.mark.parametrize("relaxed", [False, True])

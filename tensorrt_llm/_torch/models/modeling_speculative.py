@@ -1735,6 +1735,26 @@ def get_draft_model(model_config, draft_config, lm_head, model):
 _FAST_PATH_RUNTIME_HOOKS = RuntimeHooks(loop_on_execution_stream=True)
 
 
+def _key_exchange_max_rows(model_config: ModelConfig) -> int:
+    """Rows the TP key exchange of a one-model speculative worker is sized for.
+
+    The exchange takes the target rows (at most ``tokens_per_gen_step`` per
+    request: one per context request, the verified window per generation
+    request, PARD's 2K) and the draft rows (one per request and draft step, K
+    per request for a block drafter); a launch with more rows takes the NCCL
+    path of the same decision. Bounded by ``max_num_tokens``; without a known
+    batch bound (only Eagle and MTP configs carry ``_max_batch_size``), sized
+    by ``max_num_tokens``.
+    """
+    spec_config = model_config.spec_config
+    max_rows = model_config.max_num_tokens
+    max_batch_size = getattr(spec_config, "_max_batch_size", None)
+    if max_batch_size:
+        max_rows = min(max_rows,
+                       max_batch_size * spec_config.tokens_per_gen_step)
+    return max_rows
+
+
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
 
@@ -1791,7 +1811,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 # only; None elsewhere).
                 from ..distributed import ll_exchange
                 key_exchange = ll_exchange.create_tp_key_exchange(
-                    model_config.mapping, model_config.max_num_tokens)
+                    model_config.mapping, _key_exchange_max_rows(model_config))
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
                 requested_draft_moe_backend = _get_requested_draft_moe_backend(
@@ -1920,7 +1940,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if key_exchange is None:
             from ..distributed import ll_exchange
             key_exchange = ll_exchange.create_tp_key_exchange(
-                mapping, model_config.max_num_tokens)
+                mapping, _key_exchange_max_rows(model_config))
         self.spec_worker.enable_vocab_parallel_argmax(self.lm_head,
                                                       key_exchange)
 

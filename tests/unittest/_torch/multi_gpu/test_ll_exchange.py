@@ -244,7 +244,7 @@ def _gumbel_sample(tp, base_seed=0):
                 raise NotImplementedError
 
         worker = _Worker(key_exchange=ex)
-        worker.mapping = mapping
+        worker._target_head_mapping = mapping
         worker.cache_derived_state()
         md = SimpleNamespace(
             is_all_greedy_sample=False, sharded_target_logits=True, temperatures=temps
@@ -283,6 +283,38 @@ def _group_allgather(tp):
         ex.close()
 
 
+def _create_agreement(tp):
+    """``create_tp_key_exchange`` agrees across the TP group: when the setup fails on one rank only,
+    every rank gets None (so callers take the NCCL path on every rank); otherwise every rank gets one."""
+    from tensorrt_llm._torch.distributed import ll_exchange
+
+    mapping, rank = _mapping(tp)
+    key = (tuple(mapping.tp_group), mapping.tp_rank, torch.cuda.current_device())
+    init = TPKeyExchange.__init__
+
+    def failing_init(self, *args, **kwargs):
+        raise RuntimeError("simulated setup failure on rank 1")
+
+    try:
+        ll_exchange._EXCHANGES.pop(key, None)
+        if rank == 1:
+            TPKeyExchange.__init__ = failing_init
+        ex = ll_exchange.create_tp_key_exchange(mapping, 64)
+        TPKeyExchange.__init__ = init
+        outcomes = MPI.COMM_WORLD.allgather(ex is not None)
+        assert outcomes == [False] * tp, outcomes
+
+        ll_exchange._EXCHANGES.pop(key, None)
+        ex = ll_exchange.create_tp_key_exchange(mapping, 64)
+        outcomes = MPI.COMM_WORLD.allgather(ex is not None)
+        assert outcomes == [True] * tp, outcomes
+        ex.close()
+    finally:
+        TPKeyExchange.__init__ = init
+        ll_exchange._EXCHANGES.pop(key, None)
+        MPI.COMM_WORLD.barrier()
+
+
 def _worker(fn, tp):
     try:
         with torch.inference_mode():
@@ -298,6 +330,7 @@ CASES = {
     "argmax_logits": _argmax_logits,
     "gumbel_sample": _gumbel_sample,
     "group_allgather": _group_allgather,
+    "create_agreement": _create_agreement,
 }
 
 

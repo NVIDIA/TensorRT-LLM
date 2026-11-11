@@ -26,6 +26,7 @@ from packaging.version import Version
 from torch import nn
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from ..._utils import get_sm_version, prefer_pinned
 from ..attention.backends.interface import AttentionMetadata
@@ -1891,20 +1892,10 @@ class SpecWorkerBase(nn.Module, ABC):
     # Whether the worker's acceptance reads the target logits of a greedy
     # batch only through ``_sample_tokens_for_batch``, so that
     # ``target_logits`` may hand it this rank's vocab shard instead (see
-    # ``enable_vocab_parallel_argmax``). Workers whose acceptance reads the
-    # logits otherwise (tree verification, block drafters with their own
-    # selection) leave it False.
+    # ``enable_vocab_parallel_argmax``). The tree workers (their verification
+    # reads every tree node's logits) and DFlash / DSpark (their own
+    # VocabParallelHead selection) leave it False.
     verifies_on_target_shard: ClassVar[bool] = False
-    # Set by enable_vocab_parallel_argmax: greedy target tokens come from
-    # this rank's vocab shard of the target logits, through the key
-    # exchange, or through the NCCL pair exchange where the key exchange
-    # cannot take the rows.
-    _vocab_parallel_argmax: bool = False
-    _target_pair_exchange = None
-    # Whether temperature-only batches also select their target tokens from
-    # the shard (Gumbel-max in the key exchange); only workers that capture
-    # the temperature-only CUDA graph variant set it.
-    _samples_sharded_temperature: bool = False
 
     def __init__(self,
                  use_separate_draft_kv_cache: bool = False,
@@ -1914,6 +1905,21 @@ class SpecWorkerBase(nn.Module, ABC):
         logits, or None (NCCL all-gather)."""
         super().__init__()
         self.key_exchange = key_exchange
+        # Set by enable_vocab_parallel_argmax: greedy target tokens come from
+        # this rank's vocab shard of the target logits, through the key
+        # exchange, or through the NCCL pair exchange where the key exchange
+        # cannot take the rows.
+        self._vocab_parallel_argmax = False
+        self._target_pair_exchange = None
+        # Whether temperature-only batches also select their target tokens
+        # from the shard (Gumbel-max in the key exchange); only workers that
+        # capture the temperature-only CUDA graph variant set it.
+        self._samples_sharded_temperature = False
+        # Mapping of the target LM head whose shard target_logits returns:
+        # its TP rank places the shard in the vocab.
+        self._target_head_mapping: Optional[Mapping] = None
+        # Shard paths already reported in the log (see _log_shard_path_once).
+        self._logged_shard_paths: set = set()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens: float = get_force_num_accepted_tokens_float(
         )
@@ -2046,14 +2052,15 @@ class SpecWorkerBase(nn.Module, ABC):
         if self._selects_target_from_shard(hidden_states.shape[0], lm_head,
                                            logits_processor, spec_metadata):
             spec_metadata.sharded_target_logits = True
-            logger.info_once(
-                f"{type(self).__name__}: target tokens of "
-                f"{'greedy' if spec_metadata.is_all_greedy_sample else 'temperature-only'}"
-                " batches selected vocab-parallel from the LM head shard "
-                f"(tp={lm_head.mapping.tp_size}, "
-                f"exchange={self._shard_exchange_name(hidden_states.shape[0])})",
-                key=("spec_vocab_parallel_target", type(self).__name__,
-                     spec_metadata.is_all_greedy_sample))
+            rows = hidden_states.shape[0]
+            self._log_shard_path_once(
+                ("target", spec_metadata.is_all_greedy_sample,
+                 self._key_exchange_takes(rows)), lambda:
+                (f"target tokens of "
+                 f"{'greedy' if spec_metadata.is_all_greedy_sample else 'temperature-only'}"
+                 " batches selected vocab-parallel from the LM head "
+                 f"shard (tp={lm_head.mapping.tp_size}, "
+                 f"exchange={self._shard_exchange_name(rows)})"))
             return lm_head(hidden_states, gather_output=False)
         return logits_processor.forward(hidden_states, lm_head, attn_metadata,
                                         True)
@@ -2075,9 +2082,7 @@ class SpecWorkerBase(nn.Module, ABC):
             return False
         if self.key_exchange is None:
             self.key_exchange = key_exchange
-        if getattr(self, "mapping", None) is None:
-            # The shard's vocab offset follows the head's TP rank.
-            self.mapping = lm_head.mapping
+        self._target_head_mapping = lm_head.mapping
         # The pairs carry vocab ids as float32 and must sum exactly. NCCL is
         # exact and takes the same path on every rank; the AUTO strategy may
         # pick a one-shot kernel per rank.
@@ -2141,6 +2146,13 @@ class SpecWorkerBase(nn.Module, ABC):
         return self._key_exchange_takes(rows) or (
             rows >= 1 and self._target_pair_exchange is not None)
 
+    def _log_shard_path_once(self, key: tuple, message) -> None:
+        """Log ``message()`` the first time this worker takes the shard path
+        ``key``; later steps cost one set lookup and format nothing."""
+        if key not in self._logged_shard_paths:
+            self._logged_shard_paths.add(key)
+            logger.info(f"{type(self).__name__}: {message()}")
+
     def _key_exchange_takes(self, rows: int) -> bool:
         return (self.key_exchange is not None
                 and 1 <= rows <= self.key_exchange.MAX_ROWS)
@@ -2152,9 +2164,10 @@ class SpecWorkerBase(nn.Module, ABC):
 
     def _sharded_argmax(self, logits: torch.Tensor) -> torch.Tensor:
         """Global greedy tokens (int32) of this rank's vocab shard ``logits``
-        [rows, V / tp], the ids ``torch.argmax`` gives on the gathered logits
-        (equal maxima go to the lowest global id)."""
-        vocab_offset = self.mapping.tp_rank * logits.shape[-1]
+        [rows, V / tp]: for logits without NaN, the ids ``torch.argmax`` gives
+        on the gathered logits (equal maxima go to the lowest global id). The
+        key exchange orders NaN by its bit pattern."""
+        vocab_offset = self._target_head_mapping.tp_rank * logits.shape[-1]
         if self._key_exchange_takes(logits.shape[0]):
             # Local first maximum, key packing and the exchange in one launch.
             return self.key_exchange.argmax_logits(logits,
@@ -3392,10 +3405,12 @@ class SpecWorkerBase(nn.Module, ABC):
                                     max_indices).squeeze(-1).type(torch.int32)
         return draft_tokens
 
-    def greedy_sample_draft_with_tp_gather(self,
-                                           logits: torch.Tensor,
-                                           spec_metadata=None,
-                                           mapping_lm_head_tp=None):
+    def greedy_sample_draft_with_tp_gather(
+            self,
+            logits: torch.Tensor,
+            spec_metadata=None,
+            mapping_lm_head_tp=None,
+            vocab_sharded: Optional[bool] = None):
         """Greedy draft-token sampling with a TP all-gather of the argmax.
 
         When the draft LM head is vocab-sharded under plain tensor parallelism,
@@ -3405,6 +3420,8 @@ class SpecWorkerBase(nn.Module, ABC):
         vocab-sharded (see ``_draft_logits_are_sharded``) -- e.g. a borrowed or
         gathered full-vocab draft head. Returns tokens in draft-vocab space (the
         caller applies d2t). Expects 2D ``[num_tokens, vocab_shard]`` logits.
+        ``vocab_sharded``: whether the caller produced this rank's vocab shard
+        of the draft head (plain TP); None to infer it from the logits width.
 
         Under ADP + LM-head TP (``mapping_lm_head_tp`` given) the logits are the
         LM-head-TP group's row-stacked batch (``tp_size`` segments of
@@ -3426,7 +3443,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                         -1)[mapping_lm_head_tp.tp_rank]
             return self._get_draft_tokens_from_gathered(own_segment)
         mapping = self.mapping
-        sharded = self._draft_logits_are_sharded(logits, spec_metadata)
+        sharded = (self._draft_logits_are_sharded(logits, spec_metadata)
+                   if vocab_sharded is None else vocab_sharded)
         if (sharded and mapping is not None
                 and getattr(mapping, "tp_size", 1) > 1
                 and not mapping.enable_attention_dp):
@@ -3436,12 +3454,11 @@ class SpecWorkerBase(nn.Module, ABC):
             exchange = self.key_exchange
             use_key_exchange = (exchange is not None
                                 and 1 <= logits.shape[0] <= exchange.MAX_ROWS)
-            logger.info_once(
-                f"{type(self).__name__}: greedy draft tokens selected "
-                f"vocab-parallel from the draft LM head shard (exchange="
-                f"{'key exchange' if use_key_exchange else 'NCCL pair all-gather'})",
-                key=("spec_vocab_parallel_draft", type(self).__name__,
-                     use_key_exchange))
+            self._log_shard_path_once(("draft", use_key_exchange), lambda: (
+                "greedy draft tokens selected vocab-parallel from "
+                "the draft LM head shard (exchange="
+                f"{'key exchange' if use_key_exchange else 'NCCL pair all-gather'})"
+            ))
             if use_key_exchange:
                 if logits.stride(-1) == 1:
                     return exchange.argmax_logits(logits,
@@ -3617,7 +3634,8 @@ class SpecWorkerBase(nn.Module, ABC):
                             *,
                             num_contexts=0,
                             draft_step=None,
-                            mapping_lm_head_tp=None):
+                            mapping_lm_head_tp=None,
+                            vocab_sharded: Optional[bool] = None):
         """Unified draft-token production entry for all one-model workers.
 
         Branches by logits rank: 3D ``[num_gens, K, vocab]`` is the block form
@@ -3626,6 +3644,8 @@ class SpecWorkerBase(nn.Module, ABC):
         (autoregressive workers called once per draft step, e.g. MTP/
         DraftTarget). ``draft_step`` applies only to the step form and
         ``num_contexts`` only to the block form. d2t is read from ``self._d2t``.
+        ``vocab_sharded`` (greedy drafts only): the caller projected this
+        rank's vocab shard of the draft head; None infers it from the width.
 
         In a mixed (context + generation) batch the block form receives
         gen-only logits (context requests draft from accepted tokens they do not
@@ -3655,7 +3675,7 @@ class SpecWorkerBase(nn.Module, ABC):
             batch_shape = logits.shape[:-1]
             tokens = self.greedy_sample_draft_with_tp_gather(
                 logits.reshape(-1, logits.shape[-1]), spec_metadata,
-                mapping_lm_head_tp)
+                mapping_lm_head_tp, vocab_sharded)
             if mapping_lm_head_tp is None:
                 tokens = tokens.reshape(batch_shape)
             # else: ADP+LM-head-TP (2D step form only) -- the sampler returned
@@ -3851,7 +3871,7 @@ class SpecWorkerBase(nn.Module, ABC):
         self._gumbel_seed.add_(1)
         return self.key_exchange.argmax_logits(
             logits,
-            vocab_offset=self.mapping.tp_rank * logits.shape[-1],
+            vocab_offset=self._target_head_mapping.tp_rank * logits.shape[-1],
             temperature=temperatures,
             seed=self._gumbel_seed,
             greedy_threshold=GREEDY_TEMPERATURE_THRESHOLD,
