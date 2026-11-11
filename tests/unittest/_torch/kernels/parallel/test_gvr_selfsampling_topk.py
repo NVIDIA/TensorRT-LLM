@@ -1145,6 +1145,38 @@ def test_selfsampling_hopper_fp16_wide_slabs_issue_samples_first(monkeypatch) ->
         assert env_first(256, 131075, k, 148, 100), k
 
 
+def test_selfsampling_hopper_fp16_skips_survivor_rereads(monkeypatch) -> None:
+    """Hopper FP16 avoids re-reading staged survivors' values, which its L2 no longer holds:
+    K = 2048 rows of 64K or more scores in batches beyond two waves take the 512-thread slab
+    (which stages the values), and the 256-thread slabs of 132-SM parts skip the p2 pass. BF16,
+    the H20 (Blackwell's DRAM bandwidth per SM) and Blackwell keep the p2 pass."""
+    for n in (65551, 131087, 163775):
+        npad = (n + 63) // 64 * 64
+        for dtype, num_sms, sm_version, blk in (
+            (torch.float16, 132, 90, 512),
+            (torch.bfloat16, 132, 90, 256),
+            (torch.float16, 148, 100, 256),
+        ):
+            plan = ss_host._route_streaming_16bit(
+                512, n, npad, 2048, True, dtype, num_sms, sm_version
+            )
+            assert plan["tpl"][0] == blk, (n, dtype, sm_version, plan["tpl"])
+    requests = _record_compile_requests(monkeypatch)
+
+    def p2(rows, n, k, num_sms, sm_version):
+        monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
+        requests.clear()
+        _varlen_plan(rows, n, k, num_sms, sm_version, torch.float16)
+        (kwargs,) = [kwargs for name, kwargs in requests if name == "get_compiled"]
+        return kwargs.get("p2", False)
+
+    for k, n in ((512, 32771), (1024, 32771), (2048, 32783)):
+        assert not p2(512, n, k, 132, 90), (k, n)
+        assert p2(512, n, k, 78, 90), (k, n)  # H20: Blackwell's bandwidth per SM
+        assert p2(512, n, k, 148, 100), (k, n)
+    assert p2(512, 65551, 2048, 132, 90)  # 512-thread slab, n x rows <= 48M scores
+
+
 @pytest.mark.skipif(
     getSMVersion() != 90
     or torch.cuda.get_device_properties(0).multi_processor_count

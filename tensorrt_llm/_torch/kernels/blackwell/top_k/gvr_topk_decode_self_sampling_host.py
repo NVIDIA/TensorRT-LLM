@@ -193,26 +193,36 @@ def _regsel_rows(dtype: torch.dtype, num_rows: int, num_sms: int) -> bool:
     return dtype is torch.bfloat16 and num_rows > 4 * num_sms
 
 
-# Shortest row (scores) whose K <= 1024 rows in batches beyond two waves take Hopper's 512-thread
-# slab, by SM count (default 64K): the 78-SM H20 streams 1.4x (H200) to 2x (H100 SXM) the DRAM
-# bytes per SM, and its 256-thread slab stays faster below 128K scores.
-_HOPPER_WIDE_SLAB_MIN_N = {78: 131072}
+# Hopper SM counts whose DRAM bandwidth per SM is close to datacenter Blackwell's: the 78-SM H20
+# streams 1.4x (H200) to 2x (H100 SXM) the DRAM bytes per SM of a 132-SM part. Its 256-thread slab
+# stays faster below 128K scores per row, and re-reading staged survivors costs it little.
+_HOPPER_BLACKWELL_BANDWIDTH_SMS = (78,)
 
 
-def _wide_slab(b: int, n: int, k: int, wave: int, sm_version: int, regsel: bool = False) -> bool:
+def _wide_slab(
+    b: int,
+    n: int,
+    k: int,
+    wave: int,
+    sm_version: int,
+    regsel: bool = False,
+    fp16: bool = False,
+) -> bool:
     """Whether a main slab that is not ``big`` runs 512-thread CTAs (two per SM) rather than 256.
 
     Batches of up to two waves do on every target. Hopper also streams long K <= 1024 rows of
     taller batches with them, whose register prefetch pays off from 64K scores per row (128K on
     the H20); at K = 1024 rows below 128K scores whose survivors are read from registers
-    (``regsel``) stay on 256 threads.
+    (``regsel``) stay on 256 threads. FP16 K = 2048 rows take them as well: the 256-thread slab
+    stages those rows' survivors as indices and re-reads their values, which Hopper's L2 no longer
+    holds, while the 512-thread slab stages the values.
     """
     if b <= 2 * wave:
         return True
     if (
         sm_version in _BLACKWELL_SM_VERSIONS
-        or k > 1024
-        or n < _HOPPER_WIDE_SLAB_MIN_N.get(wave, 65536)
+        or k > (2048 if fp16 else 1024)
+        or n < (131072 if wave in _HOPPER_BLACKWELL_BANDWIDTH_SMS else 65536)
     ):
         return False
     return not (regsel and k == 1024 and n < 131072)
@@ -779,6 +789,7 @@ def route_streaming(
     num_sms: int = 148,
     sm_version: int = 100,
     regsel: bool = False,
+    fp16: bool = False,
 ) -> dict[str, object]:
     """route() restricted to its STREAMING half (main / clus) — the varlen
     capture policy: per-row kernels must be picked from the families that are
@@ -787,7 +798,8 @@ def route_streaming(
     route() itself lands on main/clus this is IDENTICAL to route().
     force_main additionally skips the clus rounding, so the raw
     min(r1, r2) R matches the CUDA else-branch exactly. regsel: the rows read
-    their survivors back from registers (BF16, see ``_regsel_rows``)."""
+    their survivors back from registers (BF16, see ``_regsel_rows``). fp16: FP16
+    logits (their K = 2048 rows take Hopper's 512-thread slab, see ``_wide_slab``)."""
     if b < 1:
         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
     wave = wave_sms(num_sms, sm_version)
@@ -874,7 +886,7 @@ def route_streaming(
             "smem": smc,
             "ws": False,
         }
-    wide_slab = _wide_slab(b, n, k, wave, sm_version, regsel)
+    wide_slab = _wide_slab(b, n, k, wave, sm_version, regsel, fp16)
     smem_main = (scap + 4) * (8 if (R > 1 or wide_slab) else 4) + (cmp_ + 1) * 8
 
     def _main(blk_, minb_, u_, split_):
@@ -1786,7 +1798,9 @@ def _route_streaming_16bit(
     """
     wave = wave_sms(num_sms, sm_version)
     regsel = _regsel_rows(dtype, b, num_sms)
-    plan = route_streaming(b, n, npad, k, force_main, num_sms, sm_version, regsel)
+    plan = route_streaming(
+        b, n, npad, k, force_main, num_sms, sm_version, regsel, dtype is torch.float16
+    )
     if plan["kernel"] in ("main", "clus"):
         tpl = plan["tpl"]
         if (
@@ -3245,8 +3259,14 @@ def _varlen_launcher(
                     ):
                         main_options["staged_k"] = k
                 if dtype is torch.float16 and not tpl[5]:
-                    main_options["p2"] = (
-                        int(tpl[0]) < 512 or n_kernel * num_rows <= 48 * 1024 * 1024
+                    # 256-thread slabs of 132-SM Hopper parts skip the p2 pass, which re-reads
+                    # the staged survivors' values after their L2 has dropped them
+                    rereads_cheap = (
+                        sm_version in _BLACKWELL_SM_VERSIONS
+                        or num_sms in _HOPPER_BLACKWELL_BANDWIDTH_SMS
+                    )
+                    main_options["p2"] = (int(tpl[0]) < 512 and rereads_cheap) or (
+                        int(tpl[0]) >= 512 and n_kernel * num_rows <= 48 * 1024 * 1024
                     )
         else:
             if k == 512 and num_rows > 2 * num_sms and sm_version in _TUNED_SM_VERSIONS:
