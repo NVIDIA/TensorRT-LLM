@@ -11,6 +11,8 @@ import torch
 import triton
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+
 _CUDA_SUPPORTED_HEAD_DIMS = (128, 512)
 
 
@@ -1872,6 +1874,181 @@ try:
     _HAS_POSTPROCESS_SCATTER = hasattr(torch.ops.trtllm, "compressor_postprocess_scatter")
 except Exception:
     _HAS_POSTPROCESS_SCATTER = False
+
+
+@pytest.mark.parametrize(
+    "cache_dtype,residual_dim",
+    [
+        (0, 0),
+        (1, 0),
+        pytest.param(4, 0, marks=skip_pre_blackwell),
+        pytest.param(4, 64, marks=skip_pre_blackwell),
+    ],
+)
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.skipif(not _HAS_POSTPROCESS_SCATTER, reason="Compressor CUDA ops are required")
+def test_sparse_compressor_scatter_matches_paged_rows(cache_dtype, residual_dim, graph):
+    """One-row page adaptation writes paired arena rows and masks inactive requests."""
+    device = "cuda"
+    head_dim, batch = 512, 4
+    dtype = {0: torch.bfloat16, 1: torch.float8_e4m3fn, 4: torch.uint8}[cache_dtype]
+    row_size = (head_dim + residual_dim) // 2 if cache_dtype == 4 else head_dim
+    x = torch.randn(batch, head_dim, device=device, dtype=torch.bfloat16)
+    weights = torch.ones(head_dim, device=device, dtype=torch.bfloat16)
+    cos_sin = torch.randn(32, 2, 32, device=device)
+    positions = torch.arange(batch, device=device, dtype=torch.int32)
+    num_outputs = torch.ones(batch, device=device, dtype=torch.int32)
+    cu = torch.arange(batch + 1, device=device, dtype=torch.int32)
+    mask = torch.tensor([True, True, True, False], device=device)
+    reference = torch.zeros(batch, 1, row_size, dtype=dtype, device=device)
+    arena = torch.zeros(11, 1, row_size, dtype=dtype, device=device)
+    scale_reference = (
+        torch.zeros(
+            batch, 1, (head_dim + residual_dim) // 16, dtype=torch.float8_e4m3fn, device=device
+        )
+        if cache_dtype == 4
+        else None
+    )
+    scale_arena = (
+        torch.zeros(
+            11, 1, (head_dim + residual_dim) // 16, dtype=torch.float8_e4m3fn, device=device
+        )
+        if cache_dtype == 4
+        else None
+    )
+    # Strided columns from a native output whose capacity exceeds this graph's batch.
+    write_mapping = torch.tensor(
+        [[7, 7], [-1, -1], [3, 3], [0, 0], [10, 10], [-1, -1]], dtype=torch.int32, device=device
+    )
+    starts = torch.zeros(batch, dtype=torch.int32, device=device)
+    blocks = torch.arange(batch, dtype=torch.int32, device=device).view(batch, 1)
+
+    def scatter(data, scales, table, counts, storage_positions):
+        torch.ops.trtllm.compressor_postprocess_scatter(
+            x,
+            None,
+            weights,
+            1e-5,
+            cos_sin,
+            positions,
+            448,
+            64,
+            data,
+            scales,
+            counts,
+            cu,
+            storage_positions,
+            table,
+            mask,
+            1,
+            cache_dtype,
+            1.0,
+            residual_dim,
+            True,
+            None,
+            None,
+        )
+
+    scatter(reference, scale_reference, blocks, num_outputs, starts)
+    starts.fill_(1000)  # Sparse writes must not use logical positions as physical addresses.
+    sparse_starts = torch.zeros_like(starts)
+    data_view = convert_to_torch_tensor(TensorWrapper(arena.data_ptr(), dtype, arena.shape))
+    scale_view = (
+        convert_to_torch_tensor(
+            TensorWrapper(scale_arena.data_ptr(), scale_arena.dtype, scale_arena.shape)
+        )
+        if scale_arena is not None
+        else None
+    )
+
+    def sparse_scatter():
+        indices = write_mapping[:batch, 0]
+        scatter(
+            data_view,
+            scale_view,
+            indices.contiguous().view(batch, 1),
+            torch.where(indices >= 0, num_outputs, 0),
+            sparse_starts,
+        )
+
+    sparse_scatter()
+    if graph:
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            sparse_scatter()
+        arena.zero_()
+        if scale_arena is not None:
+            scale_arena.zero_()
+        # Replay changes the physical cells without changing pointer arguments.
+        write_mapping[0] = 8
+        write_mapping[1] = 4
+        write_mapping[2] = -1
+        capture.replay()
+    expected = torch.zeros_like(arena)
+    expected[8 if graph else 7] = reference[0]
+    expected[4 if graph else 3] = reference[1 if graph else 2]
+    torch.testing.assert_close(arena.view(torch.uint8), expected.view(torch.uint8))
+    if scale_arena is not None:
+        expected_scales = torch.zeros_like(scale_arena)
+        expected_scales[8 if graph else 7] = scale_reference[0]
+        expected_scales[4 if graph else 3] = scale_reference[1 if graph else 2]
+        torch.testing.assert_close(scale_arena.view(torch.uint8), expected_scales.view(torch.uint8))
+
+
+@pytest.mark.parametrize("residual_dim", [0, 64])
+@pytest.mark.parametrize("global_scale", [1.0, 0.25])
+@pytest.mark.parametrize("graph", [False, True])
+@skip_pre_blackwell
+def test_sparse_nvfp4_gather_uses_shared_pool_indices(residual_dim, global_scale, graph):
+    """One index addresses both arena pools through the existing dequantization kernel."""
+    head_dim = 512
+    row_bytes = (head_dim + residual_dim) // 2
+    scale_bytes = (head_dim + residual_dim) // 16
+    data = torch.randint(0, 256, (11, row_bytes), dtype=torch.uint8, device="cuda")
+    scales = (torch.rand(11, scale_bytes, device="cuda") + 0.1).to(torch.float8_e4m3fn)
+    data_indices = torch.tensor([[7, 2, -1, 0], [3, 8, 4, 11]], dtype=torch.int32, device="cuda")
+    original_indices = data_indices.clone()
+    data_view = convert_to_torch_tensor(
+        TensorWrapper(data.data_ptr(), data.dtype, (11, 1, row_bytes))
+    )
+    scale_view = convert_to_torch_tensor(
+        TensorWrapper(scales.data_ptr(), scales.dtype, (11, 1, scale_bytes))
+    )
+    out = torch.zeros(2, 4, head_dim, dtype=torch.float8_e4m3fn, device="cuda")
+    scale = torch.tensor([global_scale], device="cuda")
+
+    def gather():
+        torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+            data_view, scale_view, data_indices, out, scale, residual_dim, data_view.shape[0]
+        )
+
+    gather()
+    if graph:
+        data_indices.copy_(original_indices)
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            gather()
+        # The gather leaves rows whose index is out of range untouched, so the
+        # replay's expectation of zeros there only holds from a cleared output.
+        out.zero_()
+        original_indices.copy_(
+            torch.tensor([[10, -1, 1, 4], [2, 11, 5, 0]], dtype=torch.int32, device="cuda")
+        )
+        data_indices.copy_(original_indices)
+        capture.replay()
+    valid = (original_indices >= 0) & (original_indices < data_view.shape[0])
+    safe_indices = torch.where(valid, original_indices, 0).flatten().long()
+    paired_data = data[safe_indices].contiguous()
+    paired_scales = scales.view(torch.uint8)[safe_indices].contiguous().view(torch.float8_e4m3fn)
+    expected_indices = (
+        torch.arange(8, device="cuda", dtype=torch.int32).view(2, 4).masked_fill(~valid, -1)
+    )
+    expected_out = torch.zeros_like(out)
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+        paired_data, paired_scales, expected_indices, expected_out, scale, residual_dim, 8
+    )
+    torch.testing.assert_close(data_indices, expected_indices)
+    torch.testing.assert_close(out.view(torch.uint8), expected_out.view(torch.uint8))
 
 
 def _scatter_reference_to_paged_cache(

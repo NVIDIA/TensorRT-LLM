@@ -45,6 +45,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..params import get_indexer_mqa_logits_elem_budget, use_self_sampling_gvr
+from .kernels import deterministic_indexer_projection
 from .params import DSAParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
@@ -848,6 +849,10 @@ class Indexer(nn.Module):
         self.wq_b = self.wk = self.k_norm = self.weights_proj = self.rotary_emb = None
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
         self._indexer_bf16 = False
+        self._deterministic_projection = (
+            os.environ.get("FORCE_DETERMINISTIC") == "1"
+            or os.environ.get("FORCE_ATTENTION_KERNEL_DETERMINISTIC") == "1"
+        )
         if not projection_free:
             self.wq_b = Linear(
                 self.q_lora_rank,
@@ -2431,6 +2436,18 @@ class Indexer(nn.Module):
         fp8_out, scale = torch.ops.trtllm.fused_cat_fp8(qk_pe, qk_nope, self.scale_fmt == "ue8m0")
         return fp8_out, scale
 
+    def _project_k_and_weights(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project the indexer key and head weights from the same hidden states."""
+        assert self._fused_wk_wp_weight is not None, (
+            "cache_derived_state() must be called before forward()"
+        )
+        if self._deterministic_projection:
+            return deterministic_indexer_projection(hidden_states, self._fused_wk_wp_weight)
+        if self._indexer_bf16:
+            return F.linear(hidden_states, self._fused_wk_wp_weight)
+        with _tf32_matmul_enabled():
+            return F.linear(_to_float(hidden_states), self._fused_wk_wp_weight)
+
     def pre_indexer_proj(
         self, qr: torch.Tensor, hidden_states: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2447,9 +2464,6 @@ class Indexer(nn.Module):
         """
         if self.projection_free:
             raise RuntimeError("Projection-free Indexer requires forward_prepared()")
-        assert self._fused_wk_wp_weight is not None, (
-            "cache_derived_state() must be called before forward()"
-        )
         # When the boundary fusion pre-quantized the next layer's kv_a_proj
         # NVFP4 input, hidden_states is an Fp4QuantizedTensor that also carries
         # the BF16 post-RMSNorm value. Use that BF16 view here -- the indexer
@@ -2462,18 +2476,7 @@ class Indexer(nn.Module):
             hidden_states_bf = hidden_states.unquantized_hidden_states
         else:
             hidden_states_bf = hidden_states
-        if self._indexer_bf16:
-            # hidden_states_bf and _fused_wk_wp_weight are both the model dtype,
-            # so this runs a single native GEMM with no fp32 cast around it.
-            fused_out = F.linear(hidden_states_bf, self._fused_wk_wp_weight)
-        else:
-            with _tf32_matmul_enabled():
-                # F.linear computes input @ weight.T internally; no explicit .t() needed.
-                # _fused_wk_wp_weight is [head_dim + n_heads, hidden_size] (nn.Linear convention).
-                # Goes through PyTorch's cuBLAS handle which respects allow_tf32 and
-                # dispatches CUBLAS_COMPUTE_32F_FAST_TF32, unlike torch.ops.trtllm.cublas_mm
-                # which uses its own handle and always falls back to CUDA-core SGEMM.
-                fused_out = F.linear(_to_float(hidden_states_bf), self._fused_wk_wp_weight)
+        fused_out = self._project_k_and_weights(hidden_states_bf)
         indexer_k, weights = fused_out.split([self.head_dim, self.n_heads], dim=-1)
         # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE,
         # FP8 quantize); a no-op when the projection already ran in the model dtype.
