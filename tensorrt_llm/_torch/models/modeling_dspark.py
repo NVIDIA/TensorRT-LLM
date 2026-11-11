@@ -114,6 +114,7 @@ from ..modules.multi_stream_utils import private_stream
 from ..modules.mxfp8_draft_head import quantize_mxfp8_rows
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
+from ..speculative.dspark_ring_metadata import dspark_ring_metadata
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import DraftBlockPlacement
 from ..speculative.vocab_parallel import markov_chain_logits
@@ -688,6 +689,8 @@ def _dspark_ring_attention_metadata(
     kernel's ``min(128, position)`` bound never truncates ``valid_len``. Capacity
     ``2 * window_size`` keeps the capacity mask from dropping rows.
     """
+    if slots.is_cuda:
+        return dspark_ring_metadata(slots, start_pos, valid_len, window_size)
     slots_i32 = slots.to(torch.int32)
     return (
         torch.stack((slots_i32, slots_i32), dim=1),
