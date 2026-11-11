@@ -89,14 +89,22 @@ def get_unique_rid(request: LlmRequest) -> Optional[int]:
     answers a different question: this one keys local tables, so it has to agree with
     ``py_request_id``; a session's has to be the name the peer can resolve. A request carrying a
     context id but no disaggregated one therefore has two ids, both correct.
-
-    TODO: Six expressions in this tree derive a request id, and only two of them are these.
     """
     if request.py_disaggregated_params:
         rid = request.py_disaggregated_params.disagg_request_id
         if rid is not None:
             return rid
     return request.request_id
+
+
+def get_wire_request_id(params: DisaggregatedParams | None, request_id: int) -> int:
+    """Resolve the wire ID from disaggregated ID, context ID, then local request ID."""
+    if params is not None:
+        if params.disagg_request_id is not None:
+            return params.disagg_request_id
+        if params.ctx_request_id is not None:
+            return params.ctx_request_id
+    return request_id
 
 
 class SenderBase(ABC):

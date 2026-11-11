@@ -16,14 +16,16 @@
 import gc
 import weakref
 from collections.abc import Iterator, ValuesView
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
+from threading import Event, current_thread
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 from fake_kv_cache_transceiver import FakeKvCacheTransceiver
-from profiler_test_utils import decode_profiler_metadata
+from profiler_test_utils import decode_profiler_metadata, select_regions
 
 from tensorrt_llm import _profiler
 from tensorrt_llm._torch.disaggregation import kv_cache_transceiver as factory
@@ -63,8 +65,16 @@ def _request(
     )
 
 
+def _v2_owner() -> KvCacheTransceiverV2:
+    """Skip transport construction while preserving outcome-observation state."""
+    owner = object.__new__(KvCacheTransceiverV2)
+    owner._profile_send_outcomes = {}
+    owner._profile_send_observers = set()
+    return owner
+
+
 def _wrap(backend: KvCacheTransceiver, monkeypatch: pytest.MonkeyPatch) -> KvCacheTransceiver:
-    monkeypatch.setattr(_profiler, "_CUSTOM_REGIONS", frozenset({"kv"}))
+    select_regions(monkeypatch, "kv")
     wrap = getattr(factory, "_maybe_profile_kv_cache_transceiver", None)
     assert callable(wrap), "KV factory lacks opt-in observational wrapping"
     return wrap(backend, "NIXL", SimpleNamespace(rank=3))
@@ -75,7 +85,7 @@ def events(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     captured: list[tuple[str, str]] = []
 
     @contextmanager
-    def record(name: str, args: str) -> Iterator[None]:
+    def record(name: str, args: str = "") -> Iterator[None]:
         captured.append((name, args))
         yield
 
@@ -118,16 +128,14 @@ class _ScriptedTransceiver(FakeKvCacheTransceiver):
     def has_poisoned_transfer_buffer(self) -> bool:
         return True
 
-    def observe_send_terminal_outcome(self, req: SimpleNamespace, enabled: bool = True) -> None:
-        """Track request identities whose scripted send outcomes may be
-        observed.
-        """
-        if enabled:
-            self.observed.add(id(req))
-            self.observed_status_ids[id(req)] = req.py_request_id
-        else:
-            self.observed.discard(id(req))
-            self.observed_status_ids.pop(id(req), None)
+    def start_send_terminal_outcome_observation(self, req: SimpleNamespace) -> None:
+        """Track requests whose scripted send outcomes may be observed."""
+        self.observed.add(id(req))
+        self.observed_status_ids[id(req)] = self.status_request_id(req)
+
+    def stop_send_terminal_outcome_observation(self, req: SimpleNamespace) -> None:
+        self.observed.discard(id(req))
+        self.observed_status_ids.pop(id(req), None)
 
     def get_send_terminal_outcome(self, req: SimpleNamespace) -> str | None:
         return self.send_terminal
@@ -176,7 +184,7 @@ def test_disabled_wrapper_preserves_identity(
     monkeypatch: pytest.MonkeyPatch, regions: frozenset[str]
 ) -> None:
     backend = FakeKvCacheTransceiver()
-    monkeypatch.setattr(_profiler, "_CUSTOM_REGIONS", regions)
+    select_regions(monkeypatch, *regions)
     wrap = getattr(factory, "_maybe_profile_kv_cache_transceiver", None)
     assert callable(wrap), "KV factory lacks disabled identity contract"
     assert wrap(backend, "NIXL", None) is backend
@@ -199,12 +207,12 @@ def test_context_completion_is_correlated_once_and_metadata_cached(
         "trtllm::kv_transfer_submit",
         "trtllm::kv_transfer_complete",
     ]
-    assert events[0][1] is events[1][1]
+    assert events[0][1] == events[1][1]
     region, fields = decode_profiler_metadata(events[0][1])
     assert region == "kv"
-    assert fields["request_id"] == 5 and fields["transfer_id"] == 17
-    assert fields["prompt_tokens"] == 128
-    assert (fields["role"], fields["direction"], fields["backend"], fields["rank"]) == (
+    assert fields["kv.request_id"] == 5 and fields["kv.transfer_id"] == 17
+    assert fields["kv.prompt_tokens"] == 128
+    assert (fields["kv.role"], fields["kv.direction"], fields["kv.backend"], fields["kv.rank"]) == (
         "context",
         "send",
         "NIXL",
@@ -286,7 +294,7 @@ def test_v2_failed_receive_safe_cancellation_preserves_failure(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
     """Verify real V2 cancellation preserves the failed receive outcome once."""
-    owner = object.__new__(KvCacheTransceiverV2)
+    owner = _v2_owner()
     owner._fp4_mla_bridge_enabled = True
     owner._wait_reqs = {}
     owner._send_sessions = {}
@@ -320,7 +328,7 @@ def test_v2_failed_receive_safe_cancellation_preserves_failure(
         "trtllm::kv_transfer_submit",
         "trtllm::kv_transfer_failed",
     ]
-    assert events[0][1] is events[1][1]
+    assert events[0][1] == events[1][1]
     assert not wrapper._records
 
 
@@ -328,7 +336,7 @@ def test_v2_poll_failure_settles_only_already_retired_receive(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:
     """Observe partial V2 retirement without changing the failed poll or its retry."""
-    owner = object.__new__(KvCacheTransceiverV2)
+    owner = _v2_owner()
     owner._ever_had_recv_session = True
     owner._gen_need_sync = owner._gen_idle_agreed = owner._gen_idle_poll_skip = False
     owner._gen_deferred_receives = 0
@@ -381,13 +389,13 @@ def test_v2_poll_failure_settles_only_already_retired_receive(
     assert owner._recv_reqs == {18: second}
     assert wrapper.transfer_resource_ownership(first) is False
     assert wrapper.transfer_resource_ownership(second) is True
-    assert set(wrapper._records) == {(id(second), "receive")}
+    assert set(wrapper._records) == {(id(second), "recv")}
     assert [name for name, _ in events] == [
         "trtllm::kv_transfer_submit",
         "trtllm::kv_transfer_submit",
         "trtllm::kv_transfer_complete",
     ]
-    assert events[2][1] is events[0][1]
+    assert events[2][1] == events[0][1]
     first_session.close.assert_called_once_with()
     second_session.close.assert_called_once_with()
 
@@ -395,7 +403,7 @@ def test_v2_poll_failure_settles_only_already_retired_receive(
     assert wrapper.check_gen_transfer_status(0).completed_request_ids == [18]
     assert wrapper.check_gen_transfer_status(0).completed_request_ids == []
     assert [name for name, _ in events[2:]] == ["trtllm::kv_transfer_complete"] * 2
-    assert events[3][1] is events[1][1]
+    assert events[3][1] == events[1][1]
     assert not wrapper._records and not owner._recv_sessions
     first_session.close.assert_called_once_with()
     assert second_session.close.call_count == 2
@@ -451,7 +459,7 @@ def test_receive_poll_failure_continues_after_an_observation_fails(
     metadata = wrapper._metadata
 
     def failing_first_metadata(record):
-        if record.key == (id(first), "receive"):
+        if record.key == (id(first), "recv"):
             raise KeyboardInterrupt("first observation")
         return metadata(record)
 
@@ -464,7 +472,7 @@ def test_receive_poll_failure_continues_after_an_observation_fails(
         "trtllm::kv_transfer_submit",
         "trtllm::kv_transfer_complete",
     ]
-    assert events[2][1] is events[1][1]
+    assert events[2][1] == events[1][1]
     assert not wrapper._records
     backend.check_gen_transfer_status.assert_called_once_with(0)
     assert backend.transfer_resource_ownership.call_count == 2
@@ -491,7 +499,7 @@ def test_cancelled_receive_status_preserves_existing_failure_once(
         "trtllm::kv_transfer_submit",
         "trtllm::kv_transfer_failed",
     ]
-    assert events[0][1] is events[1][1]
+    assert events[0][1] == events[1][1]
     assert not wrapper._records
 
 
@@ -616,7 +624,7 @@ def test_numeric_alias_domains_and_directions_do_not_overwrite(
     wrapper.check_gen_transfer_status(0)
     assert not wrapper._records
     assert [
-        decode_profiler_metadata(payload)[1]["request_id"]
+        decode_profiler_metadata(payload)[1]["kv.request_id"]
         for name, payload in events
         if name.endswith("complete")
     ] == [5, 17, 5]
@@ -636,7 +644,7 @@ def test_transfer_fallback_does_not_change_status_identity(
     wrapper.respond_and_send_async(req)
     backend.finish_send(req)
     wrapper.check_context_transfer_status(0)
-    assert decode_profiler_metadata(events[0][1])[1]["transfer_id"] == want
+    assert decode_profiler_metadata(events[0][1])[1]["kv.transfer_id"] == want
     assert not wrapper._records
 
 
@@ -762,7 +770,7 @@ def test_inactive_profiler_never_extracts_payload(monkeypatch: pytest.MonkeyPatc
     del req.prompt_len
     monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: False)
     encode = Mock(side_effect=AssertionError("inactive metadata"))
-    monkeypatch.setattr(_profiler, "_encode_metadata", encode)
+    monkeypatch.setattr(_profiler, "encode_metadata", encode)
     wrapper.respond_and_send_async(req)
     assert not wrapper._records
     backend.finish_send(req)
@@ -771,7 +779,7 @@ def test_inactive_profiler_never_extracts_payload(monkeypatch: pytest.MonkeyPatc
     assert not wrapper._records
 
 
-@pytest.mark.parametrize("direction", ["send", "receive"])
+@pytest.mark.parametrize("direction", ["send", "recv"])
 @pytest.mark.parametrize("outcome", ["complete", "failed"])
 def test_native_accepted_inflight_cancel_waits_for_terminal_status(
     monkeypatch: pytest.MonkeyPatch, events: list, direction: str, outcome: str
@@ -824,7 +832,7 @@ def test_factory_profiled_bridge_rejection_releases_coordinator_claim(
     from coordinator_harness import CoordinatorHarness, TransferRequest
 
     harness = CoordinatorHarness(kv_transfer_timeout_ms=1000)
-    owner = object.__new__(KvCacheTransceiverV2)
+    owner = _v2_owner()
     owner._fp4_mla_bridge_enabled = True
     owner._send_sessions = {}
     owner._send_reqs = {}
@@ -832,7 +840,7 @@ def test_factory_profiled_bridge_rejection_releases_coordinator_claim(
     owner._enable_pipelined_transfer = False
     owner.kv_transfer_timeout_ms = 1000
     constructor = Mock(return_value=owner)
-    monkeypatch.setattr(_profiler, "_CUSTOM_REGIONS", frozenset({"kv"}))
+    select_regions(monkeypatch, "kv")
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.KvCacheTransceiverV2", constructor
     )
@@ -918,7 +926,7 @@ def test_profile_window_end_keeps_inactive_calls_constant_time(
     ]
 
 
-@pytest.mark.parametrize("direction", ["send", "receive"])
+@pytest.mark.parametrize("direction", ["send", "recv"])
 def test_pending_python_transfers_are_indexed_without_full_observation_scans(
     monkeypatch: pytest.MonkeyPatch, events: list, direction: str
 ) -> None:
@@ -1016,7 +1024,7 @@ def test_factory_wraps_after_unchanged_runtime_selection(
     """
     backend = FakeKvCacheTransceiver()
     constructor = Mock(return_value=backend)
-    monkeypatch.setattr(_profiler, "_CUSTOM_REGIONS", frozenset({"kv"}) if enabled else frozenset())
+    select_regions(monkeypatch, *("kv",) if enabled else ())
     monkeypatch.setattr(factory, "BindKvCacheTransceiver", constructor)
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.KvCacheTransceiverV2", constructor
@@ -1041,7 +1049,7 @@ def test_factory_wrapper_context_manager_preserves_shutdown_and_body_error(
 ) -> None:
     """Return the factory wrapper and shut down once without suppressing body errors."""
     backend = _ScriptedTransceiver()
-    monkeypatch.setattr(_profiler, "_CUSTOM_REGIONS", frozenset({"kv"}))
+    select_regions(monkeypatch, "kv")
     monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: active)
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.KvCacheTransceiverV2",
@@ -1080,7 +1088,7 @@ def test_v2_outcome_observation_requires_opt_in_and_safe_close() -> None:
     """Verify V2 records terminal outcomes only after opt-in and safe
     closure.
     """
-    owner = object.__new__(KvCacheTransceiverV2)
+    owner = _v2_owner()
     req = _request()
     session = Mock()
     session._enforce_physical_ownership = True
@@ -1090,7 +1098,7 @@ def test_v2_outcome_observation_requires_opt_in_and_safe_close() -> None:
     getter = getattr(owner, "get_send_terminal_outcome", None)
     assert callable(getter), "safe retirement has no precise observational outcome"
     assert getter(req) is None
-    owner.observe_send_terminal_outcome(req)
+    owner.start_send_terminal_outcome_observation(req)
     assert owner.get_send_terminal_outcomes() == {}
     with pytest.raises(RuntimeError, match="physical resources"):
         owner._retire_send_session(17, outcome="cancelled")
@@ -1099,7 +1107,7 @@ def test_v2_outcome_observation_requires_opt_in_and_safe_close() -> None:
     owner._retire_send_session(17, outcome="cancelled")
     assert getter(req) == "cancelled"
     assert owner.get_send_terminal_outcomes() == {17: "cancelled"}
-    owner.observe_send_terminal_outcome(req, enabled=False)
+    owner.stop_send_terminal_outcome_observation(req)
     assert getter(req) is None
     assert owner.get_send_terminal_outcomes() == {}
 
@@ -1108,25 +1116,25 @@ def test_v2_failed_close_reports_failure_not_cancellation() -> None:
     """Verify V2 failed-session closure produces the failure terminal
     outcome.
     """
-    owner = object.__new__(KvCacheTransceiverV2)
+    owner = _v2_owner()
     req = _request()
     getter = getattr(owner, "get_send_terminal_outcome", None)
     assert callable(getter), "failed close has no precise observational outcome"
     session = Mock()
     session._enforce_physical_ownership = False
-    owner.observe_send_terminal_outcome(req)
+    owner.start_send_terminal_outcome_observation(req)
     owner._close_failed_sessions({17: session}, {17: req}, [17], mark_retired=True)
     assert req.py_kv_send_session_retired and getter(req) == "failed"
 
 
 def test_v2_pipeline_retirement_is_visible_before_final_request_registration() -> None:
-    owner = object.__new__(KvCacheTransceiverV2)
+    owner = _v2_owner()
     req = _request()
     session = Mock()
     session._enforce_physical_ownership = False
     owner._send_sessions = {17: session}
     owner._send_reqs = {}
-    owner.observe_send_terminal_outcome(req)
+    owner.start_send_terminal_outcome_observation(req)
     owner._retire_send_session(17, outcome="cancelled")
     assert owner.get_send_terminal_outcome(req) == "cancelled"
 
@@ -1137,7 +1145,7 @@ def test_v2_actual_partial_send_admission_keeps_record_until_safe_retirement(
     """Verify partial real send admission stays observed until safe
     retirement.
     """
-    owner = object.__new__(KvCacheTransceiverV2)
+    owner = _v2_owner()
     req = _request()
     req.set_kv_cache_transfer_start = lambda value: None
     session = Mock()
@@ -1181,7 +1189,7 @@ def test_v2_rejected_receive_admission_cleans_observation(
     """Verify rejected receive admission removes its observation after safe
     cleanup.
     """
-    owner = object.__new__(KvCacheTransceiverV2)
+    owner = _v2_owner()
     req = _request()
     req.set_kv_cache_transfer_start = lambda value: None
     owner._send_sessions = {}
@@ -1201,8 +1209,29 @@ def test_v2_rejected_receive_admission_cleans_observation(
     assert events[-1][0] == "trtllm::kv_transfer_failed"
 
 
+def test_v2_completed_retirement_retains_profiler_outcome_until_observation_stops() -> None:
+    """Bridge completed retirement to the profiler's complete event without ending observation."""
+    owner = _v2_owner()
+    req = _request()
+    session = Mock()
+    session._enforce_physical_ownership = False
+    owner._send_sessions = {17: session}
+    owner._send_reqs = {17: req}
+    owner.start_send_terminal_outcome_observation(req)
+
+    owner._retire_send_session(17, outcome="completed")
+
+    assert req.py_kv_send_session_retired
+    assert not owner._send_sessions and not owner._send_reqs
+    assert owner.get_send_terminal_outcome(req) == "complete"
+    assert owner.get_send_terminal_outcomes() == {17: "complete"}
+    owner.stop_send_terminal_outcome_observation(req)
+    assert owner.get_send_terminal_outcome(req) is None
+    assert owner.get_send_terminal_outcomes() == {}
+
+
 def test_v2_no_opt_in_does_not_retain_terminal_outcomes() -> None:
-    owner = object.__new__(KvCacheTransceiverV2)
+    owner = _v2_owner()
     req = _request()
     session = Mock()
     session._enforce_physical_ownership = False
@@ -1269,7 +1298,7 @@ def test_uncertain_native_generation_cannot_consume_reused_status_id(
         f"trtllm::kv_transfer_{outcome}",
     ]
     fields = [decode_profiler_metadata(payload)[1] for _, payload in events]
-    assert [(field["request_id"], field["transfer_id"]) for field in fields] == [
+    assert [(field["kv.request_id"], field["kv.transfer_id"]) for field in fields] == [
         (5, 17),
         (new_request_id, 23),
         (new_request_id, 23),
@@ -1310,7 +1339,7 @@ def test_uncertain_native_send_does_not_shadow_reused_receive_domain(
         "trtllm::kv_transfer_submit",
         "trtllm::kv_transfer_complete",
     ]
-    assert decode_profiler_metadata(events[-1][1])[1]["direction"] == "receive"
+    assert decode_profiler_metadata(events[-1][1])[1]["kv.direction"] == "recv"
     assert len(wrapper._records) == 1 and old.request_id == 5
 
 
@@ -1355,7 +1384,7 @@ def test_reused_request_after_terminal_gets_a_fresh_observation(
         "trtllm::kv_transfer_submit",
         "trtllm::kv_transfer_failed",
     ]
-    assert decode_profiler_metadata(events[2][1])[1]["prompt_tokens"] == 256
+    assert decode_profiler_metadata(events[2][1])[1]["kv.prompt_tokens"] == 256
 
 
 def test_receive_terminal_state_does_not_override_live_resource_owner(
@@ -1413,3 +1442,122 @@ def test_unknown_admission_cannot_reuse_a_stale_terminal_request_state(
         wrapper.request_and_receive_async(req)
     wrapper.check_gen_transfer_status(0)
     assert wrapper._records and len(events) == 1
+
+
+def test_transceiver_selects_its_status_id_domain(monkeypatch, events) -> None:
+    """Correlate an unfamiliar runtime using its own local status ID rule."""
+    backend = _ScriptedTransceiver()
+    backend.status_request_id = lambda req: 901
+    backend.check_context_transfer_status = lambda bound, mark_complete=False: CtxTransferStatus(
+        [901], []
+    )
+    wrapper = _wrap(backend, monkeypatch)
+    wrapper.respond_and_send_async(_request())
+    wrapper.check_context_transfer_status(0)
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_complete",
+    ]
+    assert decode_profiler_metadata(events[0][1])[1]["kv.aliases"]["status"] == 901
+    assert not wrapper._records and not backend.observed
+
+
+def test_discard_race_cannot_remove_replacement_observation(monkeypatch, events) -> None:
+    """An expiring observation cannot erase a new generation of its identity key."""
+    backend = _ScriptedTransceiver()
+    wrapper = _wrap(backend, monkeypatch)
+    req = _request()
+    wrapper.respond_and_send_async(req)
+    old = next(iter(wrapper._records.values()))
+    entered, replaced = Event(), Event()
+    acquisition_attempted, replacement_blocked = Event(), Event()
+    first_thread = replacement_thread = None
+    records_lock = wrapper._records_lock
+
+    class ObservedLock:
+        def __enter__(self) -> "ObservedLock":
+            acquired = records_lock.acquire(blocking=False)
+            if current_thread() is replacement_thread and not acquisition_attempted.is_set():
+                if not acquired:
+                    replacement_blocked.set()
+                acquisition_attempted.set()
+            if not acquired:
+                records_lock.acquire()
+            return self
+
+        def __exit__(self, _exc_type: object, _exc_value: object, _traceback: object) -> None:
+            records_lock.release()
+
+    class PausedLookup(dict):
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            if current_thread() is first_thread and not entered.is_set():
+                entered.set()
+                assert acquisition_attempted.wait(timeout=5)
+                if not replacement_blocked.is_set():
+                    assert replaced.wait(timeout=5)
+            return value
+
+    wrapper._records_lock = ObservedLock()
+    wrapper._records = PausedLookup(wrapper._records)
+
+    def expire() -> None:
+        nonlocal first_thread
+        first_thread = current_thread()
+        wrapper._discard(old)
+
+    def replace():
+        nonlocal replacement_thread
+        replacement_thread = current_thread()
+        assert entered.wait(timeout=5)
+        wrapper._discard(old)
+        fresh = wrapper._register(req, "send")
+        replaced.set()
+        return fresh
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        expired = pool.submit(expire)
+        replacement = pool.submit(replace)
+        expired.result(timeout=10)
+        fresh = replacement.result(timeout=10)
+    assert wrapper._records == {fresh.key: fresh}
+    assert wrapper._records_by_status == {("send", 17): {fresh.key: fresh}}
+    assert id(req) in backend.observed
+    backend.send_terminal = "complete"
+    wrapper.check_context_transfer_status(0)
+    assert events[-1][0] == "trtllm::kv_transfer_complete"
+    assert not wrapper._records and not backend.observed
+
+
+def test_v2_send_outcome_observation_starts_and_stops_explicitly() -> None:
+    """Stopping observation drops only the tracked send's retired outcome."""
+    owner = _v2_owner()
+    first, second = _request(), _request(6, 18)
+    owner.start_send_terminal_outcome_observation(first)
+    owner.start_send_terminal_outcome_observation(second)
+    owner._record_send_terminal_outcome(17, "complete")
+    owner._record_send_terminal_outcome(18, "failed")
+    owner.stop_send_terminal_outcome_observation(first)
+    assert owner.get_send_terminal_outcomes() == {18: "failed"}
+    assert owner.get_send_terminal_outcome(first) is None
+    assert owner.get_send_terminal_outcome(second) == "failed"
+
+
+@pytest.mark.parametrize(
+    "disagg_id,ctx_id,want", [(17, 23, 17), (None, 23, 23), (None, None, 5), (0, 23, 0)]
+)
+def test_profile_transfer_id_matches_native_session_wire_id(
+    monkeypatch, events, disagg_id, ctx_id, want
+) -> None:
+    """The trace and both session roles resolve the same peer-visible ID."""
+    from tensorrt_llm._torch.disaggregation.native.transfer import RxSession, TxSession
+
+    req = _request(5, disagg_id, ctx_id)
+    wrapper = _wrap(FakeKvCacheTransceiver(), monkeypatch)
+    wrapper.respond_and_send_async(req)
+    for cls in (TxSession, RxSession):
+        session = SimpleNamespace(
+            _base_args=SimpleNamespace(params=req.py_disaggregated_params), request_id=5
+        )
+        assert cls.disagg_request_id.fget(session) == want
+    assert decode_profiler_metadata(events[0][1])[1]["kv.transfer_id"] == want

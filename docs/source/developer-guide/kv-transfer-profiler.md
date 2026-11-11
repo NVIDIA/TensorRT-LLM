@@ -20,7 +20,7 @@ observer and shape recording. An observer alone does not enable custom scopes;
 the metadata fields appear in the execution trace, not the Chrome export. KV profiling
 does not start a profiler or change runtime profiling endpoints. See the
 [shared metadata contract](profiler-metadata.md) for process-start selection,
-supported literal types, `TRTLLM1` framing, and observational error behavior.
+supported metadata types, `TRTLLM1` framing, and observational error behavior.
 
 The current KV transceiver factory wraps its selected Python/NIXL or C++
 runtime only when KV profiling is selected. Configuration validation, backend
@@ -43,19 +43,24 @@ receive scope includes waiting, followed by its observed terminal marker.
 
 ## Identity and metadata
 
-Each locally tracked transfer carries `request_id`, `transfer_id`, `role`
-(`context` or `generation`), `direction` (`send` or `receive`), resolved
-`backend`, instance `rank`, and `prompt_tokens`. `aliases` records separate
+Each locally tracked transfer uses `kv.*` fields: `kv.request_id`, `kv.transfer_id`, `kv.role`
+(`context` or `generation`), `kv.direction` (`send` or `recv`), resolved
+`kv.backend`, instance `kv.rank`, and `kv.prompt_tokens`. `kv.aliases` records separate
 `request`, `transfer`, and `status` numeric domains: identical numbers in
 different domains do not imply the same observation.
 
-`transfer_id` is the disaggregated request ID when present, otherwise the
+`kv.transfer_id` is the disaggregated request ID when present, otherwise the
 peer context request ID, otherwise the local request ID. Zero is valid.
 The status ID follows the existing owner: Python uses its disaggregated
 local handle; C++ uses the native request ID. A peer context ID is not a
 replacement local status ID. Correlate terminal and submit payloads using
 the identity fields together with role, direction, rank and event order;
 request reuse begins a new local observation.
+
+Terminal event names distinguish `complete`, `failed`, and `cancelled`;
+there is no separate outcome field in the payload.
+The transceiver owns its status-ID domain through `status_request_id`;
+new backends supply that method rather than inheriting a type-based guess.
 
 Metadata is encoded lazily only for an active scope, then cached for that
 observation's terminal. Prompt length reflects the first active metadata

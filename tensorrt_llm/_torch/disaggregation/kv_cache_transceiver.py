@@ -318,9 +318,9 @@ class KvCacheTransceiver(ABC):
     of an instance must call them the same number of times with the same
     arguments per iteration; divergence can deadlock the instance.
 
-    Request ids in results are the ids the transceiver tracks: the request's
-    disaggregated unique id when its disaggregated params carry one,
-    otherwise ``request_id``.
+    Request ids in results use the local domain returned by
+    ``status_request_id``: C++ tracks ``request_id`` and V2 tracks the local
+    disaggregated unique id.
     """
 
     # KV-transfer timeout budget in milliseconds, taken from
@@ -348,6 +348,10 @@ class KvCacheTransceiver(ABC):
         """Whether the send session closed before its final slice."""
         return False
 
+    def status_request_id(self, req: LlmRequest) -> int:
+        """Return the request ID this runtime includes in status results."""
+        return req.request_id
+
     def transfer_resource_ownership(self, req: LlmRequest) -> bool | None:
         """Observe admission without changing resource ownership.
 
@@ -357,15 +361,15 @@ class KvCacheTransceiver(ABC):
         """
         return None
 
-    def observe_send_terminal_outcome(self,
-                                      req: LlmRequest,
-                                      enabled: bool = True) -> None:
-        """Opt in/out of bounded outcome observation for one pending send.
+    def start_send_terminal_outcome_observation(self, req: LlmRequest) -> None:
+        """Observe one pending send's safely retired outcome without polling.
 
         Implementations without precise terminal evidence leave this a no-op.
-        Observers must opt out on terminal or rejected admission. This does
-        not start, poll, cancel, or release a transfer.
+        Observers stop observation after terminal or rejected admission.
         """
+
+    def stop_send_terminal_outcome_observation(self, req: LlmRequest) -> None:
+        """Discard outcome observation without changing transfer ownership."""
 
     def get_send_terminal_outcome(
             self, req: LlmRequest) -> SendTerminalOutcome | None:

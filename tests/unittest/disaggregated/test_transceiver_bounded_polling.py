@@ -144,7 +144,7 @@ def _make_transceiver(
     sessions: dict[int, _FakeSession],
     reqs: Optional[dict[int, _FakeRequest]] = None,
 ) -> KvCacheTransceiverV2:
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._send_sessions = sessions
     transceiver._send_reqs = reqs or {rid: _FakeRequest() for rid in sessions}
     transceiver._sender_future_timeout_ms = 123
@@ -173,8 +173,10 @@ def _make_tx_session(
     aux_task: Optional[_FakeTask] = None,
     timeout_s: Optional[float] = 0.25,
     deadline_monotonic_s: Optional[float] = None,
+    request_id: int = 16,
 ) -> TxSession:
     session = object.__new__(TxSession)
+    session.request_id = request_id
     session._logical_outcomes = _LogicalOutcomes()
     session._timeout_s = timeout_s
     session._overall_timeout_s = None
@@ -455,7 +457,7 @@ def test_context_transfer_status_retires_quiesced_cancelled_session() -> None:
 def test_context_transfer_status_skips_consensus_when_never_sent() -> None:
     # A worker that never sends skips the ctx consensus even when TP sync would need it, but still
     # sweeps so nothing leaks.
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ever_had_send_session = False
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_need_pp_sync = False
@@ -475,7 +477,7 @@ def test_context_transfer_status_skips_consensus_when_never_sent() -> None:
 def test_context_transfer_status_never_sent_no_sync_is_a_noop() -> None:
     # With no tp/pp sync (e.g. attention_dp), a never-sent worker skips the consensus and the sweep,
     # unchanged from before -- a true no-op, so the fix can't slow attention_dp workers.
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ever_had_send_session = False
     transceiver._ctx_need_tp_sync = False
     transceiver._ctx_need_pp_sync = False
@@ -490,7 +492,7 @@ def test_context_transfer_status_never_sent_no_sync_is_a_noop() -> None:
 
 
 def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ever_had_recv_session = False
     transceiver._gen_need_sync = True
     transceiver._init_gen_idle_poll(False)
@@ -515,7 +517,7 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
 
 def test_consensus_outcome_uses_single_batched_allgather() -> None:
     # The outcome and quiescence id lists are exchanged with ONE allgather.
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     calls: list = []
 
     def fake_allgather(payload):
@@ -537,7 +539,7 @@ def test_consensus_outcome_uses_single_batched_allgather() -> None:
 
 
 def test_ctx_tp_consensus_does_not_complete_when_peer_times_out() -> None:
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_need_pp_sync = False
     transceiver._dist = SimpleNamespace(
@@ -555,7 +557,7 @@ def test_ctx_tp_consensus_does_not_complete_when_peer_times_out() -> None:
 
 
 def test_ctx_pp_consensus_does_not_complete_when_peer_times_out() -> None:
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ctx_need_tp_sync = False
     transceiver._ctx_need_pp_sync = True
     transceiver._dist = SimpleNamespace(
@@ -590,7 +592,7 @@ def test_ctx_consensus_fastpath_skips_when_idle(monkeypatch) -> None:
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver._CTX_CONSENSUS_FASTPATH", True
     )
-    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver = _make_bare_transceiver()
     transceiver._ever_had_send_session = True
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_need_pp_sync = False
@@ -1251,8 +1253,11 @@ def test_prepare_context_requests_skips_consensus_when_nothing_waiting() -> None
 
 
 def _make_bare_transceiver() -> KvCacheTransceiverV2:
-    """Bare instance; _poll_sessions_for_interval only needs _collect_done."""
-    return object.__new__(KvCacheTransceiverV2)
+    """Skip transport construction while retaining constructor observation state."""
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._profile_send_outcomes = {}
+    transceiver._profile_send_observers = set()
+    return transceiver
 
 
 class _PollFakeSession:
@@ -1443,7 +1448,7 @@ def _make_gen_ranks(world_size: int, fail_fetch: bool = False):
     collective = _GenCollective(world_size)
     ranks = []
     for rank in range(world_size):
-        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver = _make_bare_transceiver()
         transceiver._ever_had_recv_session = True
         transceiver._gen_need_sync = True
         transceiver._gen_allgather = collective.allgather_for(rank)

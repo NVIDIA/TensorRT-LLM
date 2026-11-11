@@ -58,6 +58,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     SessionStatus,
     TxSessionBase,
     WaitResult,
+    get_wire_request_id,
 )
 from tensorrt_llm._torch.disaggregation.lifecycle.retirement import (
     QuiescenceFatalEvent,
@@ -2481,15 +2482,7 @@ class TxSession(TxSessionBase):
 
     @property
     def disagg_request_id(self) -> int:
-        params = self._base_args.params
-        if params.disagg_request_id is not None:
-            return params.disagg_request_id
-        # ctx_request_id is set on gen-side requests to the ctx server's request ID,
-        # which matches the key the ctx TxSession registered under.  Fall back to
-        # the local request_id only when neither field is available.
-        if params.ctx_request_id is not None:
-            return params.ctx_request_id
-        return self.request_id
+        return get_wire_request_id(self._base_args.params, self.request_id)
 
     @property
     def status(self) -> SessionStatus:
@@ -3830,15 +3823,7 @@ class RxSession(RxSessionBase):
 
     @property
     def disagg_request_id(self) -> int:
-        params = self._base_args.params
-        if params.disagg_request_id is not None:
-            return params.disagg_request_id
-        # ctx_request_id is set on gen-side requests to the ctx server's request ID,
-        # which matches the key the ctx TxSession registered under.  Fall back to
-        # the local request_id only when neither field is available.
-        if params.ctx_request_id is not None:
-            return params.ctx_request_id
-        return self.request_id
+        return get_wire_request_id(self._base_args.params, self.request_id)
 
     @contextmanager
     def _ownership_evidence_guard(self) -> Iterator[None]:

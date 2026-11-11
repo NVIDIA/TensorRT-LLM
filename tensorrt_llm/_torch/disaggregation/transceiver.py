@@ -477,6 +477,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs = {}
         self._recv_reqs = {}
         self._cancelled_receive_fences: Dict[int, tuple[torch.cuda.Event, RetirementDeadline]] = {}
+        self._profile_send_outcomes: dict[int, SendTerminalOutcome] = {}
+        self._profile_send_observers: set[int] = set()
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
         try:
@@ -734,10 +736,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_sessions.clear()
         self._recv_reqs.clear()
         self._transfer_worker.shutdown()
-        outcomes = getattr(self, "_profile_send_outcomes", None)
-        if outcomes is not None:
-            outcomes.clear()
-            self._profile_send_observers.clear()
+        self._profile_send_outcomes.clear()
+        self._profile_send_observers.clear()
         self._shutdown_complete = True
 
     def __enter__(self):
@@ -1180,52 +1180,29 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         elif outcome == "cancelled":
             self._record_send_terminal_outcome(rid, "cancelled")
 
-    def observe_send_terminal_outcome(self, req: LlmRequest, enabled: bool = True) -> None:
-        """Register only a profiler-tracked send; opt out after its observation.
+    def start_send_terminal_outcome_observation(self, req: LlmRequest) -> None:
+        """Track one pending send without retaining the request or polling it."""
+        rid = self.status_request_id(req)
+        self._profile_send_observers.add(rid)
 
-        The optional table is bounded by the adapter's pending sends. It has
-        no request references and is never populated by unobserved transfers.
-        """
-        outcomes: dict[int, SendTerminalOutcome] | None = getattr(
-            self, "_profile_send_outcomes", None
-        )
-        rid = get_unique_rid(req)
-        if rid is None:
-            return
-        if enabled:
-            if outcomes is None:
-                outcomes = {}
-                self._profile_send_outcomes = outcomes
-            observers = getattr(self, "_profile_send_observers", None)
-            if observers is None:
-                observers = set()
-                self._profile_send_observers = observers
-            observers.add(rid)
-        elif outcomes is not None:
-            outcomes.pop(rid, None)
-            self._profile_send_observers.discard(rid)
+    def stop_send_terminal_outcome_observation(self, req: LlmRequest) -> None:
+        """Release a send's observation after terminal or rejected admission."""
+        rid = self.status_request_id(req)
+        self._profile_send_outcomes.pop(rid, None)
+        self._profile_send_observers.discard(rid)
 
     def get_send_terminal_outcome(self, req: LlmRequest) -> SendTerminalOutcome | None:
         """Read an opt-in outcome without polling or consuming retirement state."""
-        outcomes: dict[int, SendTerminalOutcome] | None = getattr(
-            self, "_profile_send_outcomes", None
-        )
-        rid = get_unique_rid(req)
-        return outcomes.get(rid) if outcomes is not None and rid is not None else None
+        return self._profile_send_outcomes.get(self.status_request_id(req))
 
     def _record_send_terminal_outcome(self, rid: int, outcome: SendTerminalOutcome) -> None:
-        """Retain a send outcome only while its request has an opted-in
-        observer.
-        """
-        outcomes: dict[int, SendTerminalOutcome] | None = getattr(
-            self, "_profile_send_outcomes", None
-        )
-        if outcomes is not None and rid in self._profile_send_observers:
-            outcomes[rid] = outcome
+        """Retain terminal evidence only for a send with an active observer."""
+        if rid in self._profile_send_observers:
+            self._profile_send_outcomes[rid] = outcome
 
     def get_send_terminal_outcomes(self) -> dict[int, SendTerminalOutcome]:
         """Return only ready observed outcomes, without scanning pending sends."""
-        return dict(getattr(self, "_profile_send_outcomes", {}))
+        return dict(self._profile_send_outcomes)
 
     @staticmethod
     def _ownership_blocks_retirement(session: object) -> bool:
@@ -1390,6 +1367,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def context_transfer_peer_ready_time(self, req: LlmRequest) -> Optional[float]:
         session = self._send_sessions.get(get_unique_rid(req))
         return None if session is None else getattr(session, "peer_ready_time", None)
+
+    def status_request_id(self, req: LlmRequest) -> int:
+        """Use the local disaggregated handle reported by V2 status polling."""
+        return cast(int, get_unique_rid(req))
 
     def transfer_resource_ownership(self, req: LlmRequest) -> bool:
         """Observe the same authoritative ownership predicate used by the executor."""
