@@ -325,7 +325,7 @@ class DecoderWarmup:
             # The MXFP8 methods dispatch as the autotuner warmup will tune them.
             _select_mxfp8_methods(self)
         warmup_configs, _ = _autotuner_warmup_configs(
-            self, resource_manager, generation_only=self.mapping.has_cp_helix()
+            self, resource_manager, generation_only=_generation_only(self)
         )
         from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
 
@@ -515,9 +515,7 @@ class DecoderWarmup:
         # Helix CP and decode-only workers never run a context batch, so every
         # phase below warms up pure-generation shapes only. Both follow from the
         # configuration, so every rank takes the same branch.
-        generation_only = self.mapping.has_cp_helix() or is_decode_only(
-            self.sparse_attention_config
-        )
+        generation_only = _generation_only(self)
         # A capturable guided decoder rules out the general warmup's generation
         # requests only: the autotuner below runs its context step with the
         # decoder installed. Run the context requests anyway, so that the
@@ -1811,3 +1809,11 @@ def _select_mxfp8_methods(warmup: DecoderWarmup) -> tuple[list, list, list]:
         and (not compile_all_batches or method.backend == "flashinfer")
     ]
     return mxfp8_methods, native_mxfp8_methods, flashinfer_mxfp8_methods
+
+
+def _generation_only(warmup: DecoderWarmup) -> bool:
+    """Whether the warmup runs pure-generation shapes only: Helix CP and decode-only workers
+    never run a context batch. Both follow from the configuration, so every rank agrees. A
+    function of the warmup, not a method: tests run the warmup's methods on stand-in objects.
+    """
+    return warmup.mapping.has_cp_helix() or is_decode_only(warmup.sparse_attention_config)
