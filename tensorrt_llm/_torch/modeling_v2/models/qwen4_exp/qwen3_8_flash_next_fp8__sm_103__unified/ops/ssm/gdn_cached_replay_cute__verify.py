@@ -19,7 +19,7 @@ With PDL the state and history (not written by the previous kernel) are read bef
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -2224,30 +2224,43 @@ def _kernel_kw(
 
 
 def precompile(
-    t: int, h: int, hv: int, max_requests: int, *, pdl: bool, partition_from: int
+    t: int,
+    h: int,
+    hv: int,
+    max_requests: int,
+    *,
+    pdl: bool,
+    partition_from: int,
+    min_requests: int = 1,
+    launch: Optional[Callable[[int], tuple]] = None,
+    conv_fold: Optional[Callable[[int], bool]] = None,
 ) -> int:
-    """Compile every kernel a verify step of 1..`max_requests` requests launches through the
-    default mapping, the way a target calls this entry: work items, and with them no in-kernel
-    commit, from `partition_from` requests on; the q/k L2 norm and the gating in-kernel; bf16
-    `a` / `b`; no `config`, `conv_fold` or `gated_norm`. A compile costs 5-10 s, so a target
-    runs this at bind, before any step: the captured decode graphs do not reach every mapping
-    (padded graphs skip 9 to 15 requests, which an eager mixed step carries). Returns the
-    number of distinct kernels."""
+    """Compile every kernel a verify step of `min_requests`..`max_requests` requests launches,
+    the way a target calls this entry: work items, and with them no in-kernel commit, from
+    `partition_from` requests on; the q/k L2 norm and the gating in-kernel; bf16 `a` / `b`; no
+    `gated_norm`. By default the default mapping at `pdl` without `conv_fold`; `launch(n)`
+    instead returns `(pdl, config)` for a batch of `n` requests and `conv_fold(n)` whether it
+    folds the conv. A compile costs 5-10 s, so a target runs this at bind, before any step: the
+    captured decode graphs do not reach every mapping (padded graphs skip 9 to 15 requests,
+    which an eager mixed step carries). Returns the number of distinct kernels."""
     keys = set()
-    for n in range(1, max_requests + 1):
+    for n in range(min_requests, max_requests + 1):
         partitioned = n >= partition_from
+        n_pdl, config = launch(n) if launch is not None else (pdl, None)
         kw = _kernel_kw(
             n,
             t,
             h,
             hv,
             commit=not partitioned,
-            pdl=pdl,
+            pdl=n_pdl,
             l2norm=True,
             gating=True,
             g_f32=False,
             b_f32=False,
             work_items=partitioned,
+            config=config,
+            fold=conv_fold is not None and conv_fold(n),
         )
         key = tuple(sorted(kw.items()))
         if key not in keys:
