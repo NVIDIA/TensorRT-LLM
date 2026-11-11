@@ -45,10 +45,13 @@ else:
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
+    PAGE_PRIORITY_DEFAULT,
+    PAGE_PRIORITY_MIN,
     BlockReusePolicy,
     KVCacheLayerOwner,
     KVCacheLayerSpec,
     KVCacheManagerV2,
+    PagePriorityCallback,
     Role,
     _compute_index_mapper_capacity,
     _read_guard_page_setting,
@@ -161,6 +164,13 @@ def _insert_draft_pool_ratio(
     ratio = [share * (1 - draft_share) for share in target_ratio]
     ratio.insert(draft_life_cycle, draft_share)
     return ratio
+
+
+def _low_priority_recurrent_state(_ordinal: int, life_cycle: object) -> int:
+    """Lowest eviction priority for recurrent-state pages, the default for attention pages."""
+    if isinstance(life_cycle, AttnLifeCycle):
+        return PAGE_PRIORITY_DEFAULT
+    return PAGE_PRIORITY_MIN
 
 
 class InforwardSnapshotEntry(NamedTuple):
@@ -335,6 +345,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._hybrid_cache_policy = (
             hybrid_cache_policy if hybrid_cache_policy is not None else HybridCachePolicy()
         )
+        self._low_priority_snapshot_prompt_len = 0
+        if kv_cache_config.enable_block_reuse and not is_draft:
+            self._low_priority_snapshot_prompt_len = max(
+                0, self._hybrid_cache_policy.low_priority_snapshot_prompt_len
+            )
+            if self._low_priority_snapshot_prompt_len > 0:
+                logger.info(
+                    "Recurrent-state pages of context requests shorter than "
+                    f"{self._low_priority_snapshot_prompt_len} tokens use the "
+                    "lowest eviction priority"
+                )
         self.spec_config = spec_config
         self.gdn_fused_verify = gdn_fused_verify
         self._disagg_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
@@ -1667,6 +1688,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         enable_request_stats: bool = False,
         expected_prompt_length: Optional[int] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+        custom_priority_callback: Optional[PagePriorityCallback] = None,
     ) -> Optional[_KVCache]:
         kv_cache = super()._create_kv_cache(
             request_id,
@@ -1677,6 +1699,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
             kv_cache_retention_config=kv_cache_retention_config,
+            custom_priority_callback=custom_priority_callback,
         )
         if (
             self.mapping.rank == 0
@@ -2144,6 +2167,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if self.enable_block_reuse and self._waiter_snapshot_points:
             for request in requests:
                 self._merge_waiter_snapshot_points(request)
+
+    @override
+    def _context_priority_callback(self, req: LlmRequest) -> Optional[PagePriorityCallback]:
+        """Lowest eviction priority for the recurrent state of short prompts.
+
+        See ``HybridCachePolicy.low_priority_snapshot_prompt_len``.
+        """
+        if (
+            self.local_num_mamba_layers > 0
+            and not req.is_dummy
+            and req.prompt_len < self._low_priority_snapshot_prompt_len
+        ):
+            return _low_priority_recurrent_state
+        return None
 
     @override
     def _can_share_inflight_prefix(self) -> bool:

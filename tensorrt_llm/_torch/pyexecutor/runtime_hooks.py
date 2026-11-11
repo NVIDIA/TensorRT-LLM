@@ -167,6 +167,12 @@ class HybridCachePolicy:
     # the step there, and passes one other snapshot point per step. 0: no mid-chunk
     # snapshots. Read by KimiK3HybridCacheManager.
     kda_midchunk_snapshot_alignment: int = 0
+    # Context requests whose prompt is shorter than this many tokens commit their
+    # recurrent-state pages (live state and snapshots) at the lowest eviction
+    # priority; attention pages keep theirs. A snapshot is reusable only at its exact
+    # token boundary and takes a whole state slot whatever the prompt length, while a
+    # short prompt is cheap to recompute. 0: off. Needs block reuse.
+    low_priority_snapshot_prompt_len: int = 0
 
 
 class DecodePrologue(Protocol):

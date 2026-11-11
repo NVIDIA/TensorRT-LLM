@@ -452,6 +452,15 @@ class KVCacheLayerSpec:
         return 2 if Role.VALUE in self.buffer_roles else 1
 
 
+# Page eviction priorities of the V2 cache backend: [0, 100], default 35. Lower values are
+# evicted first; pages of one priority are evicted least recently used first.
+PAGE_PRIORITY_MIN = 0
+PAGE_PRIORITY_DEFAULT = 35
+
+PagePriorityCallback = Callable[[int, object], int]
+"""Maps (block ordinal, life cycle) to the eviction priority of a page created by one cache."""
+
+
 def _swa_endpoint_priority(
     prompt_length: int, tokens_per_block: int, rewind_tokens: int
 ) -> Callable[[int, object], int]:
@@ -6184,6 +6193,10 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         request.expect_snapshot_points = sorted({*request.expect_snapshot_points, *points})
 
+    def _context_priority_callback(self, req: LlmRequest) -> PagePriorityCallback | None:
+        """Page priority callback for a context request's new cache; None keeps the default."""
+        return None
+
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
 
@@ -6274,6 +6287,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     expected_prompt_length=(
                         req.total_input_len_cp if self._has_cp_helix else req.prompt_len
                     ),
+                    custom_priority_callback=self._context_priority_callback(req),
                 )
                 if kv_cache is None:
                     return None
@@ -9726,7 +9740,14 @@ class KVCacheManagerV2(BaseResourceManager):
         enable_request_stats: bool = False,
         expected_prompt_length: int | None = None,
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
+        custom_priority_callback: PagePriorityCallback | None = None,
     ):
+        """Create the cache of one request.
+
+        ``custom_priority_callback`` sets the eviction priority of the pages
+        this cache creates (see :meth:`_context_priority_callback`); the SWA
+        endpoint priorities still decide the sliding-window attention pages.
+        """
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
         )
@@ -9760,6 +9781,18 @@ class KVCacheManagerV2(BaseResourceManager):
             priority_kwargs["custom_priority_callback"] = _swa_endpoint_priority(
                 expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
             )
+        if custom_priority_callback is not None and not is_dummy:
+            swa_priority = priority_kwargs.get("custom_priority_callback")
+            if swa_priority is None:
+                priority_kwargs["custom_priority_callback"] = custom_priority_callback
+            else:
+
+                def priority(ordinal: int, life_cycle: object) -> int:
+                    if isinstance(life_cycle, AttnLifeCycle):
+                        return swa_priority(ordinal, life_cycle)
+                    return custom_priority_callback(ordinal, life_cycle)
+
+                priority_kwargs["custom_priority_callback"] = priority
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
             input_tokens,
