@@ -3998,6 +3998,19 @@ def _r93_prep_pv(
     if cutlass.const_expr(not is_local):
         _ds_wait(bars.subview(DS_BAR_META_LANDED), phase)
         _fence_async_shared_cta()
+        # The peer prep of a task's last tile runs only in the drain round of the pair whose last tile is a peer tile.
+        # That pair's final wait (bars[11 + (last & 1)], the commit of PV(last)) is a parity wait, so it is exact only
+        # once the previous commit on the same barrier, PV(last - 2), has arrived, and nothing else orders that commit
+        # before the softmax warps get there.  Wait the pair's own PV(local_tile - 1) here always, not only on a
+        # rebase: its previous generation is the own PV(local_tile - 3), which _r93_pack of the last own tile waited,
+        # and PV(local_tile - 2) is issued ahead of it by the same issuer thread, so its commit has arrived as well.
+        if local_tile + ctm.Int32(1) == chunk_tiles:
+            if local_tile > ctm.Int32(0):
+                drain_prev = local_tile - ctm.Int32(1)
+                _ds_wait(
+                    bars.subview(ctm.Int32(11) + (drain_prev & ctm.Int32(1))),
+                    (drain_prev // ctm.Int32(2)) & ctm.Int32(1),
+                )
         # The landed [PSF|META] bank is re-armed (bars[META_LANDED] expect_tx) and released to its producer (remote
         # bars[META_FREE]) by the issuer in _r93_issue_pv: the re-arm after its own bars[META_LANDED] wait, the
         # release by a tcgen05.commit queued behind its PSF tcgen05.cp (_r95_complete_pv is empty).  The TMEM PSF
