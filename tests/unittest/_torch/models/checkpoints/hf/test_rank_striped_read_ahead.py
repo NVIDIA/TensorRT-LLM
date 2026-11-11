@@ -195,14 +195,85 @@ def test_extent_plan_is_complete_disjoint_and_fair(tmp_path, monkeypatch):
     ],
 )
 def test_cgroup_admission_honors_high_ancestors_and_namespaces(monkeypatch, cgroup, expected):
+    _fake_files(monkeypatch, cgroup)
+    assert read_ahead.cgroup_available_host_memory() == expected
+
+
+def _fake_files(monkeypatch, files):
     def read_text(path, *args, **kwargs):
         del args, kwargs
         try:
-            return cgroup[str(path)]
+            return files[str(path)]
         except KeyError as error:
             raise FileNotFoundError(path) from error
 
     monkeypatch.setattr(Path, "read_text", read_text)
+
+
+@pytest.mark.parametrize(
+    ("cgroup", "expected"),
+    [
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": (
+                    "anon 100\nactive_file 150\ninactive_file 200\nshmem 50\n"
+                ),
+                "/sys/fs/cgroup/jobs/memory.current": "800\n",
+                "/sys/fs/cgroup/jobs/memory.max": "900\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 300\ninactive_file 100\n",
+            },
+            500,
+            id="v2-leaf-and-ancestor",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "5:memory:/host/path\n",
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes": "300\n",
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes": "750\n",
+                "/sys/fs/cgroup/memory/memory.stat": (
+                    "active_file 5\ninactive_file 5\ntotal_active_file 40\ntotal_inactive_file 60\n"
+                ),
+            },
+            550,
+            id="v1-hierarchical-totals",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "5:memory:/host/path\n",
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes": "300\n",
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes": "750\n",
+                "/sys/fs/cgroup/memory/memory.stat": "active_file 20\ninactive_file 30\n",
+            },
+            500,
+            id="v1-without-totals",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file x\ninactive_file 100\n",
+            },
+            600,
+            id="malformed-entry-ignored",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file 400\ninactive_file 400\n",
+            },
+            1000,
+            id="usage-never-below-zero",
+        ),
+    ],
+)
+def test_cgroup_admission_counts_reclaimable_file_cache(monkeypatch, cgroup, expected):
+    _fake_files(monkeypatch, cgroup)
     assert read_ahead.cgroup_available_host_memory() == expected
 
 

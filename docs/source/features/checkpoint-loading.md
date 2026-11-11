@@ -119,8 +119,9 @@ checkpoint bytes reach host memory:
   headroom. If admission fails or the memory probe fails, the refresh remains
   pending and the check is retried on later polls. A warning is logged once
   per deferral episode. This is a conservative check, not a memory reservation:
-  resident pages charged to a cgroup can cause deferral even when only a small
-  part of the checkpoint is missing. Normal weight materialization continues
+  memory that is not file-backed page cache, such as process memory, charged
+  to a cgroup can cause deferral even when only a small part of the checkpoint
+  is missing. Normal weight materialization continues
   while refresh is deferred. After every rank finishes
   materialization, speculative read-ahead work that is still queued or active
   can no longer improve first-token latency and is stopped.
@@ -160,7 +161,10 @@ level for `auto` and warn for an explicit `rank_striped_read_ahead` request.
 With a valid node communicator, fallback preserves native prefetch collectives
 on that load group; if communicator setup failed or its size did not match the
 model-load mapping, native loading safely skips prefetch.
-Memory admission reserves cgroup-aware startup headroom. Reader setup failures
+Memory admission reserves cgroup-aware startup headroom. Inside a memory-limited
+cgroup, file-backed page cache charged to it, such as checkpoints that earlier
+loads left cached, counts as available, as it does for host memory, because the
+kernel reclaims it before the cgroup runs out of memory. Reader setup failures
 also clean up and fall back before mapping; mapping, transformation, or H2D
 failure after activation never retries a partially mutated model. A later
 advisory read failure keeps successfully materialized weights.
