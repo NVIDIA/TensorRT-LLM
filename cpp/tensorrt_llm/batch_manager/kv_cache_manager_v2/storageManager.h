@@ -33,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -74,12 +75,23 @@ private:
 // ---------------------------------------------------------------------------
 // StorageStatistics — per-pool-group slot counts.
 // ---------------------------------------------------------------------------
+using MigrationTimingSamples = std::vector<std::tuple<int, int, int, float>>;
+
+struct StorageMovementStatistics
+{
+    int64_t restoredBlocks = 0;
+    int64_t evictedBlocks = 0;
+    int64_t capacityDroppedBlocks = 0;
+    int64_t priorityDroppedBlocks = 0;
+};
+
 struct StorageStatistics
 {
     TypedVec<PoolIndex, size_t> slotSizes;
-    SlotCount total;     // total slots
-    SlotCount free;      // free (unallocated) slots
-    SlotCount evictable; // scheduled for eviction
+    SlotCount total;                      // total slots
+    SlotCount free;                       // free (unallocated) slots
+    SlotCount evictable;                  // scheduled for eviction
+    StorageMovementStatistics movement{}; // cumulative storage-slot movement, never reset
 
     SlotCount available() const noexcept
     {
@@ -130,13 +142,15 @@ public:
         std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
         std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
         std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f,
-        Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority);
+        Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority, bool enableStats = false);
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
     StorageManager& operator=(StorageManager const&) = delete;
 
     void destroy();
+    //! Drain completed samples; leave incomplete samples pending and return a cumulative skipped count.
+    std::pair<MigrationTimingSamples, int64_t> takeMigrationTimings();
 
     // ---- Allocation -------------------------------------------------------
 
@@ -465,6 +479,29 @@ private:
         return level == kHotLevel ? mHotPoolGroupMapping : mColdPoolGroupMapping;
     }
 
+    void recordMigration(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId lifeCycle, size_t numPages);
+    void recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, bool belowPriorityThreshold = false);
+    void recordDroppedPage(Page const& page, bool belowPriorityThreshold = false);
+
+    void submitMigrationBatchImpl(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
+        PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+
+    struct PendingMigrationTiming
+    {
+        int sourceLevel;
+        int destinationLevel;
+        int poolGroup;
+        SimplePool<CUevent_st>::PoolItem start;
+        SimplePool<CUevent_st>::PoolItem stop;
+    };
+
+    SimplePool<CUevent_st> mTimingEvents;
+    std::vector<PendingMigrationTiming> mPendingMigrationTimings;
+    std::map<std::tuple<CacheLevel, CacheLevel, PoolGroupIndex>, int64_t> mMigrationBatches;
+    int64_t mTimingSampleInterval;
+    int64_t mSkippedMigrationTimings = 0;
+    bool mEnableStats;
+    std::map<std::pair<CacheLevel, PoolGroupIndex>, StorageMovementStatistics> mMovementStats;
     LifeCycleRegistry const& mLifeCycles;
     std::shared_ptr<EventSink> mEventSink;
     Priority mColdTierOffloadMinPriority;

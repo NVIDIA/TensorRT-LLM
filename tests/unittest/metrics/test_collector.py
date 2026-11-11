@@ -19,6 +19,11 @@ from typing import Dict
 import pytest
 from prometheus_client import REGISTRY
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
+    KVCacheV2IterationStatsReport,
+    KVCacheV2StorageIterationStats,
+    append_kv_cache_iteration_stats,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MAX_SPEC_DECODE_POSITION_LABELS, MetricsCollector
 from tensorrt_llm.metrics.enums import MetricNames, RequestEventTiming
@@ -1669,3 +1674,191 @@ class TestRequestErrorCounter:
         collector.log_request_error()
         labels = {**collector.labels, "http_code": ""}
         assert _counter_value_with_labels(collector.counter_request_error, labels) == 1
+
+
+class TestTierStoragePressure:
+    def test_serialized_snapshot_keeps_levels_pools_states_and_movement(
+        self, collector: MetricsCollector
+    ) -> None:
+        report = KVCacheV2IterationStatsReport(
+            {},
+            {},
+            cache_level_tiers=["gpu", "gpu", "host", "disk"],
+            storage_stats=[
+                KVCacheV2StorageIterationStats(0, 0, (64, 64), 10, 2, 7, 3, 4, 0, 1),
+                KVCacheV2StorageIterationStats(0, 1, (1024,), 5, 1, 1, 1, 2, 0, 0),
+                KVCacheV2StorageIterationStats(1, 0, (32,), 20, 0, 20, 5, 6, 0, 0),
+                KVCacheV2StorageIterationStats(2, 0, (16,), 100, 30, 60, 7, 8, 9, 0),
+                KVCacheV2StorageIterationStats(3, 0, (16,), 200, 150, 50, 0, 0, 11, 0),
+            ],
+        )
+        stats = {"attentionDpRank": 2}
+        append_kv_cache_iteration_stats(stats, report)
+        collector.log_iteration_stats(stats)
+        collector.log_iteration_stats(stats)  # Snapshots are cumulative, not iteration deltas.
+        for snapshot in report.storage_stats:
+            labels = {
+                **collector.labels,
+                "dp_rank": "2",
+                "cache_level": str(snapshot.cache_level),
+                "cache_tier": report.cache_level_tiers[snapshot.cache_level],
+                "pool_group": str(snapshot.pool_group_id),
+            }
+            for state, blocks in (
+                ("free", snapshot.free_blocks),
+                ("evictable", snapshot.evictable_blocks),
+                (
+                    "unavailable",
+                    snapshot.total_blocks - snapshot.free_blocks - snapshot.evictable_blocks,
+                ),
+            ):
+                state_labels = {**labels, "state": state}
+                assert collector.kv_cache_tier_blocks.labels(**state_labels)._value.get() == blocks
+                assert collector.kv_cache_tier_bytes.labels(
+                    **state_labels
+                )._value.get() == blocks * sum(snapshot.slot_size)
+            for operation, count in (
+                ("restore", snapshot.restored_blocks),
+                ("evict", snapshot.evicted_blocks),
+                ("drop_capacity", snapshot.capacity_dropped_blocks),
+                ("drop_priority", snapshot.priority_dropped_blocks),
+            ):
+                movement_labels = {**labels, "operation": operation}
+                assert (
+                    collector.kv_cache_tier_moved_blocks.labels(**movement_labels)._value.get()
+                    == count
+                )
+                assert collector.kv_cache_tier_moved_bytes.labels(
+                    **movement_labels
+                )._value.get() == count * sum(snapshot.slot_size)
+        # No detailed snapshots are fabricated for another rank or legacy source.
+        collector.log_iteration_stats({"attentionDpRank": 0, "kvCacheStats": {"usedNumBlocks": 1}})
+        assert all(
+            sample.labels["dp_rank"] == "2"
+            for family in collector.kv_cache_tier_blocks.collect()
+            for sample in family.samples
+        )
+
+    def test_idle_full_prefix_cache_and_cumulative_updates(
+        self, collector: MetricsCollector
+    ) -> None:
+        snapshot = {
+            "cacheLevel": 1,
+            "poolGroupId": 0,
+            "slotSize": [64],
+            "totalNumBlocks": 10,
+            "freeNumBlocks": 0,
+            "evictableNumBlocks": 10,
+            "restoredBlocks": 4,
+            "evictedBlocks": 7,
+        }
+        labels = {
+            **collector.labels,
+            "dp_rank": "0",
+            "cache_level": "1",
+            "cache_tier": "host",
+            "pool_group": "0",
+        }
+
+        def log() -> None:
+            collector.log_iteration_stats(
+                {"kvCacheLevelTiers": ["gpu", "host"], "kvCacheStorageStats": [snapshot]}
+            )
+
+        log()
+        assert (
+            collector.kv_cache_tier_blocks.labels(**labels, state="unavailable")._value.get() == 0
+        )
+        assert collector.kv_cache_tier_blocks.labels(**labels, state="evictable")._value.get() == 10
+        snapshot.update(restoredBlocks=8, evictedBlocks=9, freeNumBlocks=10, evictableNumBlocks=0)
+        log()
+        assert (
+            collector.kv_cache_tier_moved_blocks.labels(**labels, operation="restore")._value.get()
+            == 8
+        )
+        assert (
+            collector.kv_cache_tier_moved_blocks.labels(**labels, operation="evict")._value.get()
+            == 9
+        )
+        assert collector.kv_cache_tier_blocks.labels(**labels, state="evictable")._value.get() == 0
+        # Old producers supply occupancy without movement counters; absent is not measured zero.
+        snapshot.pop("restoredBlocks")
+        snapshot.pop("evictedBlocks")
+        log()
+        assert not _has_series(
+            collector.kv_cache_tier_moved_blocks, {**labels, "operation": "drop_capacity"}
+        )
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"totalNumBlocks": -1},
+            {"freeNumBlocks": 9},
+            {"slotSize": []},
+            {"cacheLevel": -1},
+            {"poolGroupId": True},
+        ],
+    )
+    def test_invalid_snapshot_does_not_create_samples(
+        self, collector: MetricsCollector, changes: dict
+    ) -> None:
+        collector.log_iteration_stats(
+            {
+                "kvCacheStorageStats": [
+                    {
+                        "cacheLevel": 0,
+                        "poolGroupId": 0,
+                        "slotSize": [32],
+                        "totalNumBlocks": 10,
+                        "freeNumBlocks": 3,
+                        "evictableNumBlocks": 4,
+                        **changes,
+                    }
+                ]
+            }
+        )
+        assert not [
+            sample
+            for family in collector.kv_cache_tier_blocks.collect()
+            for sample in family.samples
+        ]
+
+    def test_sampled_migration_latency_and_sampling_budget(
+        self, collector: MetricsCollector
+    ) -> None:
+        stats = {
+            "attentionDpRank": 1,
+            "kvCacheLevelTiers": ["gpu", "host", "disk"],
+            "kvCacheMigrationTimingsSkipped": 3,
+            "kvCacheMigrationTimings": [
+                (2, 0, 0, 2.5),
+                (1, 2, 0, 100.0),
+                (2, 0, 0, float("nan")),
+                (2, 0, 0, -1),
+            ],
+        }
+        collector.log_iteration_stats(stats)
+        for level, tier, operation, expected in [
+            (0, "gpu", "restore", 0.0025),
+            (1, "host", "evict", 0.1),
+        ]:
+            labels = {
+                **collector.labels,
+                "dp_rank": "1",
+                "cache_level": str(level),
+                "cache_tier": tier,
+                "pool_group": "0",
+                "operation": operation,
+            }
+            labels.update(
+                source_cache_level="2" if operation == "restore" else "1",
+                source_cache_tier="disk" if operation == "restore" else "host",
+                destination_cache_level="0" if operation == "restore" else "2",
+                destination_cache_tier="gpu" if operation == "restore" else "disk",
+            )
+            histogram = collector.histogram_kv_cache_tier_migration.labels(**labels)
+            assert histogram._sum.get() == pytest.approx(expected)
+            assert sum(bucket.get() for bucket in histogram._buckets) == 1
+        stats["kvCacheMigrationTimings"] = []
+        collector.log_iteration_stats(stats)
+        assert _get_counter_value(collector, "kv_cache_migration_timing_skipped", 1) == 3

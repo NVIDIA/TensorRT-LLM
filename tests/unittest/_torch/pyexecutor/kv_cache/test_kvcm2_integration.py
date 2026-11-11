@@ -4161,12 +4161,20 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata(
     manager._get_and_reset_iteration_peak_block_stats_by_level = lambda num_levels: [
         [None, None] for _ in range(num_levels)
     ]
-    manager._get_storage_statistics = lambda _level: [object(), object()]
+    manager._get_storage_statistics = lambda _level: [
+        SimpleNamespace(slot_sizes=[64], total=10, free=3, evictable=6),
+        SimpleNamespace(slot_sizes=[1024], total=20, free=10, evictable=5),
+    ]
     manager._build_pool_group_iteration_stats = lambda pool_group_id, *_args: pool_group_id
 
     stats = manager.get_iteration_stats()
 
     assert stats.by_pool_group == {0: 0, 1: 1}
+    assert [
+        (s.cache_level, s.pool_group_id, s.total_blocks, s.free_blocks, s.evictable_blocks)
+        for s in stats.storage_stats
+    ] == [(0, 0, 10, 3, 6), (0, 1, 20, 10, 5)]
+    assert all(s.restored_blocks is None for s in stats.storage_stats)
     ssm_stats = stats.by_life_cycle[3]
     assert ssm_stats.kind == "ssm"
     assert ssm_stats.pool_group_id == 1

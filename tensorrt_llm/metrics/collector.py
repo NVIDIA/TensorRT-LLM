@@ -101,6 +101,12 @@ class MetricsCollector:
             trtllm_kv_cache_free_blocks
             trtllm_kv_cache_used_blocks
             trtllm_kv_cache_tokens_per_block
+            trtllm_kv_cache_tier_blocks
+            trtllm_kv_cache_tier_bytes
+            trtllm_kv_cache_tier_moved_blocks_total
+            trtllm_kv_cache_tier_moved_bytes_total
+            trtllm_kv_cache_tier_migration_duration_seconds
+            trtllm_kv_cache_migration_timing_skipped_total
             trtllm_num_context_requests
             trtllm_num_generation_requests
             trtllm_num_paused_requests
@@ -292,6 +298,49 @@ class MetricsCollector:
             documentation=
             "Cumulative number of generation (output) tokens produced.",
             labelnames=self.labels.keys())
+
+        storage_labels = [
+            *iteration_labelnames, self.labelname_cache_level,
+            self.labelname_cache_tier, "pool_group"
+        ]
+        self.kv_cache_tier_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_tier_blocks",
+            documentation=
+            "Storage slots by configured level, pool group and disjoint state",
+            labelnames=[*storage_labels, "state"])
+        self.kv_cache_tier_bytes = Gauge(
+            name=self.metric_prefix + "kv_cache_tier_bytes",
+            documentation=
+            "Logical slot bytes by configured level, pool group and disjoint state",
+            labelnames=[*storage_labels, "state"])
+        self.kv_cache_tier_moved_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_tier_moved_blocks_total",
+            documentation=
+            "Cumulative restored, evicted or dropped storage slots",
+            labelnames=[*storage_labels, "operation"])
+        self.kv_cache_tier_moved_bytes = Counter(
+            name=self.metric_prefix + "kv_cache_tier_moved_bytes_total",
+            documentation=
+            "Cumulative restored, evicted or dropped logical slot bytes",
+            labelnames=[*storage_labels, "operation"])
+        self._prev_tier_movement: dict[tuple[str, int, int, str], int] = {}
+        self.histogram_kv_cache_tier_migration = Histogram(
+            name=self.metric_prefix +
+            "kv_cache_tier_migration_duration_seconds",
+            documentation=
+            "Sampled cross-level migration batch stream duration in seconds",
+            labelnames=[
+                *storage_labels, "operation", "source_cache_level",
+                "source_cache_tier", "destination_cache_level",
+                "destination_cache_tier"
+            ],
+            buckets=[0.00001, 0.0001, 0.001, 0.01, 0.1, 1, 10, 60, 300])
+        self.kv_cache_migration_timing_skipped = Counter(
+            name=self.metric_prefix + "kv_cache_migration_timing_skipped_total",
+            documentation=
+            "Eligible timing samples skipped because the pending-event budget was full",
+            labelnames=iteration_labelnames)
+        self._prev_skipped_migration_timings: dict[str, int] = {}
 
         self.kv_cache_hit_rate = Gauge(name=self.metric_prefix +
                                        "kv_cache_hit_rate",
@@ -719,6 +768,106 @@ class MetricsCollector:
                           documentation="KV cache configuration info",
                           labelnames=info_labels.keys())
             gauge.labels(**info_labels).set(1)
+
+    def _log_storage_stats(self, iteration_stats: dict, rank: str) -> None:
+        """Export measured level/pool snapshots and deltas of cumulative movement counts."""
+        tiers = iteration_stats.get("kvCacheLevelTiers", [])
+        skipped = iteration_stats.get("kvCacheMigrationTimingsSkipped")
+        if isinstance(skipped,
+                      int) and not isinstance(skipped, bool) and skipped >= 0:
+            previous = self._prev_skipped_migration_timings.get(rank, 0)
+            if skipped >= previous:
+                self._log_counter(self.kv_cache_migration_timing_skipped,
+                                  {self.labelname_dp_rank: rank},
+                                  skipped - previous)
+            self._prev_skipped_migration_timings[rank] = skipped
+        for source, destination, pool_group, elapsed_ms in iteration_stats.get(
+                "kvCacheMigrationTimings", []):
+            if (not all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    and value >= 0
+                    for value in (source, destination, pool_group))
+                    or source == destination
+                    or not isinstance(elapsed_ms, (int, float))
+                    or not math.isfinite(elapsed_ms) or elapsed_ms < 0):
+                continue
+            restoring = destination < source
+            level = destination if restoring else source
+            self._log_histogram(
+                self.histogram_kv_cache_tier_migration,
+                elapsed_ms / 1000.0,
+                labels={
+                    self.labelname_dp_rank:
+                    rank,
+                    **self._cache_level_labels(level, tiers),
+                    "pool_group":
+                    str(pool_group),
+                    "operation":
+                    "restore" if restoring else "evict",
+                    "source_cache_level":
+                    str(source),
+                    "source_cache_tier":
+                    tiers[source] if source < len(tiers) else "",
+                    "destination_cache_level":
+                    str(destination),
+                    "destination_cache_tier":
+                    tiers[destination] if destination < len(tiers) else "",
+                })
+        for snapshot in iteration_stats.get("kvCacheStorageStats", []):
+            level = snapshot.get("cacheLevel")
+            pool_group = snapshot.get("poolGroupId")
+            counts = [
+                snapshot.get(key) for key in ("totalNumBlocks", "freeNumBlocks",
+                                              "evictableNumBlocks")
+            ]
+            sizes = snapshot.get("slotSize", [])
+            if (not all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    and value >= 0 for value in [level, pool_group, *counts])
+                    or not sizes or not all(
+                        isinstance(value, int) and not isinstance(value, bool)
+                        and value > 0 for value in sizes)):
+                continue
+            total, free, evictable = counts
+            if free + evictable > total:
+                continue
+            slot_bytes = sum(sizes)
+            labels = {
+                self.labelname_dp_rank:
+                rank,
+                **self._cache_level_labels(level, tiers),
+                "pool_group":
+                str(pool_group),
+            }
+            for state, value in (("free", free), ("evictable", evictable),
+                                 ("unavailable", total - free - evictable)):
+                state_labels = {**labels, "state": state}
+                self._log_gauge(self.kv_cache_tier_blocks,
+                                value,
+                                labels=state_labels)
+                self._log_gauge(self.kv_cache_tier_bytes,
+                                value * slot_bytes,
+                                labels=state_labels)
+            for field, operation in (
+                ("restoredBlocks", "restore"),
+                ("evictedBlocks", "evict"),
+                ("capacityDroppedBlocks", "drop_capacity"),
+                ("priorityDroppedBlocks", "drop_priority"),
+            ):
+                value = snapshot.get(field)
+                if not isinstance(value, int) or isinstance(value,
+                                                            bool) or value < 0:
+                    continue
+                key = (rank, level, pool_group, operation)
+                previous = self._prev_tier_movement.get(key, 0)
+                if value >= previous:
+                    movement_labels = {**labels, "operation": operation}
+                    self._log_counter(self.kv_cache_tier_moved_blocks,
+                                      movement_labels, value - previous)
+                    self._log_counter(self.kv_cache_tier_moved_bytes,
+                                      movement_labels,
+                                      (value - previous) * slot_bytes)
+                self._prev_tier_movement[key] = value
 
     def _label_merge(self, labels: Dict[str, str]) -> Dict[str, str]:
         if labels is None or len(labels) == 0:
@@ -1248,6 +1397,8 @@ class MetricsCollector:
             if total_intra_device_copy_bytes > 0:
                 self._log_counter(self.kv_cache_intra_device_copy_bytes_total,
                                   rank_labels, total_intra_device_copy_bytes)
+
+        self._log_storage_stats(iteration_stats, rank)
 
     def log_request_error(self, http_code: Union[int, str] = "") -> None:
         """Increment the error counter, labeled by HTTP status code."""

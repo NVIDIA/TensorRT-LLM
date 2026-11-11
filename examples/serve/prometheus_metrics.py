@@ -78,6 +78,12 @@ def parse_and_display_metrics(metrics_data: str) -> None:
         f"{METRIC_PREFIX}kv_cache_reused_blocks_total": "KV cache reused blocks (cumulative)",
         f"{METRIC_PREFIX}kv_cache_missed_blocks_total": "KV cache missed blocks (cumulative)",
         f"{METRIC_PREFIX}kv_cache_utilization": "KV cache utilization",
+        f"{METRIC_PREFIX}kv_cache_tier_blocks": "Per-tier storage blocks by occupancy state",
+        f"{METRIC_PREFIX}kv_cache_tier_bytes": "Per-tier storage bytes by occupancy state",
+        f"{METRIC_PREFIX}kv_cache_tier_moved_blocks_total": "Per-tier moved/dropped blocks",
+        f"{METRIC_PREFIX}kv_cache_tier_moved_bytes_total": "Per-tier moved/dropped bytes",
+        f"{METRIC_PREFIX}kv_cache_tier_migration_duration_seconds": "Sampled tier migration latency",
+        f"{METRIC_PREFIX}kv_cache_migration_timing_skipped_total": "Timing samples skipped at capacity",
     }
 
     found_metrics = []
