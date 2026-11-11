@@ -290,6 +290,62 @@ def test_cancellation_false_keeps_observation_until_safe_true(
     assert not wrapper._records and not backend.observed
 
 
+@pytest.mark.parametrize("outcome", ["accepted", "failed", "error"])
+def test_v2_logical_cancellation_preserves_fence_and_pending_observation(
+    monkeypatch: pytest.MonkeyPatch, events: list, outcome: str
+) -> None:
+    """Keep real V2 logical cancellation independent of physical retirement."""
+    owner = _v2_owner()
+    owner._fp4_mla_bridge_enabled = True
+    owner._send_sessions = {}
+    owner._recv_sessions = {}
+    owner._recv_reqs = {}
+    owner._cancelled_receive_fences = {}
+    retained: list[tuple[object, str]] = []
+    retirement = SimpleNamespace(
+        retain_unproven=lambda request, reason: retained.append((request, reason))
+    )
+    error = RuntimeError("receive retirement unavailable")
+
+    def create_retirement(request_id: int) -> SimpleNamespace:
+        assert request_id == 17
+        if outcome == "error":
+            raise error
+        return retirement
+
+    owner._transfer_worker = SimpleNamespace(create_receive_retirement=create_retirement)
+    monkeypatch.setattr(
+        owner,
+        "request_and_receive_async",
+        lambda request: setattr(
+            request, "state", LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        ),
+    )
+    wrapper = _wrap(owner, monkeypatch)
+    req = _request()
+    wrapper.request_and_receive_async(req)
+    record = wrapper._records[(id(req), "recv")]
+    if outcome == "failed":
+        req.state = LlmRequestState.DISAGG_TRANS_ERROR
+    ready = object()
+
+    if outcome == "error":
+        with pytest.raises(RuntimeError) as caught:
+            wrapper.cancel_gen_logically(req, ready)
+        assert caught.value is error
+        assert not owner._cancelled_receive_fences and not owner._recv_reqs
+    else:
+        assert wrapper.cancel_gen_logically(req, ready) is (outcome == "accepted")
+        assert owner._cancelled_receive_fences[17][0] is ready
+        assert owner._cancelled_receive_fences[17][1] is retirement
+        assert owner._recv_reqs[17] is req
+        assert retained == [(req, "cancelled receive admission")]
+        assert wrapper.has_inflight_transfer(req)
+
+    assert wrapper._records[(id(req), "recv")] is record
+    assert [name for name, _ in events] == ["trtllm::kv_transfer_submit"]
+
+
 def test_v2_failed_receive_safe_cancellation_preserves_failure(
     monkeypatch: pytest.MonkeyPatch, events: list
 ) -> None:

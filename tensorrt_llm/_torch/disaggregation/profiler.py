@@ -18,7 +18,7 @@ import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from tensorrt_llm import _profiler
 from tensorrt_llm._torch.disaggregation.base.transfer import get_wire_request_id
@@ -32,6 +32,9 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm.bindings import LlmRequestState
+
+if TYPE_CHECKING:
+    import torch
 
 _Direction = Literal["send", "recv"]
 _OBSERVATION_ERRORS = (AttributeError, LookupError, TypeError, ValueError, RuntimeError, OSError)
@@ -433,6 +436,11 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
 
     def check_gen_transfer_complete(self) -> bool:
         return self._transceiver.check_gen_transfer_complete()
+
+    def cancel_gen_logically(
+        self, req: LlmRequest, ready: "torch.cuda.Event | None" = None
+    ) -> bool:
+        return self._transceiver.cancel_gen_logically(req, ready)
 
     def cancel_request(self, req: LlmRequest) -> bool:
         """Delegate cancellation and settle only proven terminal
