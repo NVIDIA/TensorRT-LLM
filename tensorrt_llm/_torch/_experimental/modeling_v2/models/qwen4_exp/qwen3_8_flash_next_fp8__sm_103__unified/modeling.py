@@ -1542,8 +1542,7 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             # The CuTe replay kernels of the default mapping a verify step launches, compiled
             # here: a compile costs 5-10 s, and the padded decode graphs skip the request counts
             # an eager mixed step carries. PDL up to `_GDN_REPLAY_PDL_MAX_HEAD_ROWS`
-            # (request x value head) pairs; a tp2/tep2 HT batch takes its own mapping, compiled
-            # on its first launch (`_gdn_replay_launch`).
+            # (request x value head) pairs.
             heads = (width, self.num_k_heads, self.num_v_heads)
             partition_from = CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
             requests = md.max_num_requests
@@ -1553,6 +1552,23 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             if get_env_enable_pdl() and pdl_requests > 0:
                 gdn_replay_precompile(*heads, pdl_requests, pdl=True, partition_from=partition_from)
             gdn_replay_precompile(*heads, requests, pdl=False, partition_from=partition_from)
+            if (
+                heads[1:] == _GDN_REPLAY_HT_GEOMETRY
+                and md.max_num_requests >= _GDN_REPLAY_HT_MIN_REQUESTS
+            ):
+                # A tp2/tep2 HT batch takes its own mapping and conv fold (`_gdn_replay_launch`,
+                # `_gdn_verify_folds_conv`). The decode warmup compiles its kernels with the norm
+                # folded (`_gdn_verify_folds_norm`); a mixed step's verify rows
+                # (`PrefillTarget._gdn_core`) launch them without, compiled here.
+                gdn_replay_precompile(
+                    *heads,
+                    md.max_num_requests,
+                    pdl=False,
+                    partition_from=partition_from,
+                    min_requests=_GDN_REPLAY_HT_MIN_REQUESTS,
+                    launch=lambda n: _gdn_replay_launch(self, n),
+                    conv_fold=lambda n: _gdn_verify_folds_conv(self, n),
+                )
         return dict(int_idx=int_idx, int_conv=int_conv, replay=replay)
 
     def _bind_draft_cache_manager(self, md) -> None:
