@@ -61,11 +61,13 @@ from cbts.rules._helpers import iter_diff_changes, strip_noop_diff_lines
 from cbts.rules.agent_flow import AgentFlowRule
 from cbts.rules.base import PRInputs, Rule, RuleResult, format_reason
 from cbts.rules.docs import DocsRule
+from cbts.rules.import_sanity import ImportSanityRule
 from cbts.rules.modeling_v2 import ModelingV2Rule
 from cbts.rules.openengine import OpenEngineRule
 from cbts.rules.out_of_scope import OutOfScopeRule, is_out_of_scope
 from cbts.rules.python_formatting import PythonFormattingRule, is_formatting_only_change
 from cbts.rules.spec_dec import SpecDecRule
+from cbts.rules.test_infrastructure import TestInfrastructureRule
 from cbts.rules.test_list import TestListRule
 from cbts.rules.tests_def import TestsDefRule
 from cbts.rules.visual_gen import VisualGenRule
@@ -79,8 +81,10 @@ COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("**/*.py",)
 # Classes are used for `--list-needed-diffs` (no need to construct).
 RULE_CLASSES: list[type[Rule]] = [
     PythonFormattingRule,
+    ImportSanityRule,
     WaivesRule,
     TestsDefRule,
+    TestInfrastructureRule,
     TestListRule,
     VisualGenRule,
     SpecDecRule,
@@ -99,8 +103,10 @@ def build_rules(
 ) -> list[Rule]:
     return [
         PythonFormattingRule(),
+        ImportSanityRule(yaml_index, stages, repo_root),
         WaivesRule(yaml_index, stages),
         TestsDefRule(yaml_index, stages, repo_root=repo_root),
+        TestInfrastructureRule(yaml_index, stages),
         TestListRule(yaml_index, stages, repo_root=repo_root),
         VisualGenRule(yaml_index, stages),
         SpecDecRule(yaml_index, stages),
@@ -230,6 +236,11 @@ def _rule_reason(rule, r) -> dict:
         "source": rule.name,
         "blocks": len(r.block_filters),
         "stages": len(r.affected_stages),
+        **(
+            {"reason": r.reason, "files": sorted(r.import_sanity_files)}
+            if rule.name == "import_sanity"
+            else {}
+        ),
     }
 
 
@@ -240,6 +251,7 @@ _TESTSONLY_FAMILY: frozenset[str] = frozenset(
         "testsonly",
         "waiveonly",
         "testdefonly",
+        "testinfraonly",
         "testlistonly",
         "visualgenonly",
         "specdeconly",
@@ -451,10 +463,8 @@ def _load_pr_inputs(input_json_path: Path, repo_root: Path) -> PRInputs:
     "--no-data-policy",
     type=click.Choice(NO_DATA_POLICIES),
     default=DEFAULT_NO_DATA_POLICY,
-    help="How to treat a changed function with no rows in the coverage DB: "
-    "'file' force-runs every test entering that file, 'importers' only the "
-    "file's <module> touch set, 'ignore' treats it as impacting nothing "
-    f"(default: {DEFAULT_NO_DATA_POLICY}).",
+    help="Deprecated compatibility option. Symbol lookup does not infer tests for "
+    "missing DB rows; all values behave as 'ignore'.",
 )
 def main(
     input_json,

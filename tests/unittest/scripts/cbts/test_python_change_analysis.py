@@ -950,7 +950,7 @@ def test_unsafe_added_return_annotation_remains_fail_closed(annotation: str) -> 
 
 
 @pytest.mark.parametrize(("old_return", "new_return"), ((" -> int", " -> None"), (" -> int", "")))
-def test_return_annotation_replacement_or_deletion_remains_fail_closed(
+def test_safe_return_annotation_replacement_or_deletion_resolves_body(
     old_return: str, new_return: str
 ) -> None:
     source = f"def helper(value: int){new_return}:\n    return value\n"
@@ -961,7 +961,8 @@ def test_return_annotation_replacement_or_deletion_remains_fail_closed(
 
     analysis = _analyze(source, diff)
 
-    assert analysis.limitation == "class/signature import change"
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper"}
 
 
 @pytest.mark.parametrize("decorator", ("register", "property", "staticmethod"))
@@ -1004,26 +1005,71 @@ def test_unsafe_parameter_addition_remains_fail_closed(new_parameter: str) -> No
     assert analysis.limitation == "class/signature import change"
 
 
-@pytest.mark.parametrize("alias", ("torch", "torch as th"))
-def test_added_function_accepts_canonical_tensor_annotation_load(alias: str) -> None:
-    local = "th" if " as " in alias else "torch"
+@pytest.mark.parametrize(
+    ("module", "local", "attribute"),
+    (
+        ("torch", "torch", "Tensor"),
+        ("torch", "th", "Tensor"),
+        ("tempfile", "tempfile", "TemporaryDirectory"),
+        ("tempfile", "tf", "TemporaryDirectory"),
+    ),
+)
+def test_added_function_annotation_loads(module: str, local: str, attribute: str) -> None:
+    alias = module if local == module else f"{module} as {local}"
     source = (
-        f"import {alias}\ndef helper(value: {local}.Tensor) -> {local}.Tensor:\n    return value\n"
+        f"import {alias}\ndef helper(value: {local}.{attribute}) -> {local}.{attribute}:\n"
+        "    return value\n"
     )
     diff = (
         f"@@ -1 +1,3 @@\n import {alias}\n"
-        f"+def helper(value: {local}.Tensor) -> {local}.Tensor:\n+    return value\n"
+        f"+def helper(value: {local}.{attribute}) -> {local}.{attribute}:\n+    return value\n"
     )
 
     analysis = _analyze(source, diff)
 
-    assert not analysis.limitation
-    assert analysis.binding_consumers == {"helper"}
+    if module == "tempfile":
+        assert analysis.limitation == "class/signature import change"
+    else:
+        assert not analysis.limitation
+        assert analysis.binding_consumers == {"helper"}
 
 
 @pytest.mark.parametrize(
-    "annotation", ("torch.Tensor | None", "torch.Tensor[int]", "torch.Unknown")
+    "setup",
+    (
+        "import custom as tempfile",
+        "import tempfile\ntempfile = other",
+        "import tempfile\ntempfile.TemporaryDirectory = other",
+        "import tempfile\ndel tempfile.TemporaryDirectory",
+        "import tempfile\nfrom custom import *",
+    ),
 )
+def test_temporary_directory_annotation_rejects_shadowed_bindings(setup: str) -> None:
+    before = setup + "\n"
+    source = before + "def helper() -> tempfile.TemporaryDirectory:\n    return None\n"
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    assert _analyze(source, diff).limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    (
+        "tempfile.Unknown",
+        "tempfile.TemporaryDirectory()",
+        "tempfile.TemporaryDirectory[int]",
+        "tempfile.TemporaryDirectory | None",
+    ),
+)
+def test_temporary_directory_annotation_does_not_allow_calls_or_type_operators(
+    annotation: str,
+) -> None:
+    before = "import tempfile\n"
+    source = before + f"def helper() -> {annotation}:\n    return None\n"
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    assert _analyze(source, diff).limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize("annotation", ("torch.Tensor[int]", "torch.Unknown", "torch.dtype | None"))
 def test_tensor_annotation_load_does_not_trust_type_operators_or_other_attributes(
     annotation: str,
 ) -> None:
@@ -1056,6 +1102,121 @@ def test_tensor_annotation_load_rejects_a_changed_module_binding(mutation: str) 
     analysis = _analyze(source, diff)
 
     assert analysis.limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize("alias", ("torch", "torch as th"))
+@pytest.mark.parametrize("expression", ("float | {name}.Tensor", "{name}.Tensor | None"))
+def test_external_tensor_union_annotation_keeps_fallback(alias: str, expression: str) -> None:
+    name = "th" if " as " in alias else "torch"
+    before = f"import {alias}\n"
+    annotation = expression.format(name=name)
+    source = before + f"def helper(value: {annotation}) -> {annotation}:\n    return value\n"
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    analysis = _analyze(source, diff)
+    assert analysis.limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize(
+    "setup",
+    (
+        "import custom as torch",
+        "import torch\ntorch = other",
+        "import torch\ntorch.Tensor = other",
+        "import torch\nfrom custom import *",
+        "import torch\nsetattr(torch, 'Tensor', other)",
+        "import torch\nsetattr(torch, attribute_name, other)",
+    ),
+)
+def test_tensor_union_rejects_shadowed_types(setup: str) -> None:
+    before = setup + "\n"
+    source = before + "def helper() -> float | torch.Tensor:\n    return 1.0\n"
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    assert _analyze(source, diff).limitation
+
+
+@pytest.mark.parametrize(
+    ("import_line", "decorator"),
+    (
+        ("from functools import lru_cache", "lru_cache"),
+        ("from functools import lru_cache", "lru_cache()"),
+        ("from functools import lru_cache", "lru_cache(maxsize=None)"),
+        ("from functools import lru_cache", "lru_cache(maxsize=128, typed=True)"),
+        ("from functools import lru_cache as memo", "memo(maxsize=0)"),
+        ("from functools import cache", "cache"),
+    ),
+)
+def test_new_stdlib_cache_declarations_keep_fallback_without_source_proof(
+    import_line: str, decorator: str
+) -> None:
+    before = import_line + "\ndef caller():\n    return 1\n"
+    source = (
+        import_line + f"\n@{decorator}\ndef helper():\n    return 2\n"
+        "def caller():\n    return helper()\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    analysis = _analyze(source, diff)
+    assert analysis.limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize(
+    ("setup", "decorator"),
+    (
+        ("from custom import lru_cache", "lru_cache(maxsize=None)"),
+        ("from functools import lru_cache\nlru_cache = other", "lru_cache"),
+        ("from functools import lru_cache\ndel lru_cache", "lru_cache"),
+        ("from functools import lru_cache\nfrom custom import *", "lru_cache"),
+        ("from functools import lru_cache\nlru_cache.__code__ = other", "lru_cache"),
+        ("from functools import lru_cache\nsetattr(lru_cache, '__code__', other)", "lru_cache"),
+        ("from functools import lru_cache\nsetattr(lru_cache, name, other)", "lru_cache"),
+        (
+            "import functools as ft\nft.lru_cache = other\nfrom functools import lru_cache",
+            "lru_cache",
+        ),
+        ("from functools import lru_cache\nglobals()['lru_cache'] = other", "lru_cache"),
+        ("from functools import lru_cache", "lru_cache(maxsize=limit)"),
+        ("from functools import lru_cache", "lru_cache(maxsize=factory())"),
+        ("from functools import lru_cache", "lru_cache(**options)"),
+        ("from functools import lru_cache", "lru_cache(128)"),
+        ("from functools import lru_cache", "lru_cache(typed=1)"),
+        ("from functools import lru_cache", "lru_cache(other=True)"),
+        ("from functools import cache", "cache()"),
+        ("import functools", "functools.lru_cache(maxsize=None)"),
+    ),
+)
+def test_unresolved_cache_declarations_stay_fail_closed(setup: str, decorator: str) -> None:
+    before = setup + "\n"
+    source = before + f"@{decorator}\ndef helper():\n    return 2\n"
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    assert _analyze(source, diff).limitation
+
+
+def test_new_cache_decorator_import_is_not_exempted() -> None:
+    before = "def caller():\n    return 1\n"
+    source = (
+        "from functools import lru_cache\n"
+        "@lru_cache(maxsize=None)\ndef helper():\n    return 2\n"
+        "def caller():\n    return helper()\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    assert _analyze(source, diff).limitation
+
+
+@pytest.mark.parametrize(
+    "reflection",
+    (
+        "getattr(__import__(__name__), name)",
+        "getattr(importlib.import_module(__name__), name)",
+        "getattr(sys.modules[__name__], name)",
+        "inspect.getmembers(module)",
+        "module.__dict__[name]",
+    ),
+)
+def test_cached_declarations_reject_unenumerated_reflective_consumers(reflection: str) -> None:
+    prefix = "from functools import lru_cache\nimport sys, importlib, inspect\n"
+    before = prefix + f"def discover(module, name):\n    return {reflection}\n"
+    source = before + "@lru_cache(maxsize=None)\ndef helper():\n    return 1\n"
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    assert _analyze(source, diff).limitation
 
 
 def test_tensor_annotation_load_rejects_a_class_alias_shadow() -> None:

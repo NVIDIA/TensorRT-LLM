@@ -649,9 +649,6 @@ def test_out_of_scope_rule_preserves_non_lint_and_ambiguous_toml_impact(
         "legacy-files.txt",
         "ruff-legacy.toml",
         "ruff-legacy-baseline.json",
-        "scripts/templates/precommit-legacy-files.j2",
-        "scripts/templates/pyproject-format-exclude.j2",
-        "scripts/templates/ruff-legacy.toml.j2",
     ),
 )
 def test_out_of_scope_rule_combines_dedicated_configs_with_core_changes(

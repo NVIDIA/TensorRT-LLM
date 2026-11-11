@@ -36,18 +36,8 @@ from pathlib import Path
 
 import click
 
-from cbts.coverage.selection.python_change_analysis import (
-    analyze_python_changes,
-    import_executed_qualnames,
-    qualnames_for_lines,
-)
 from cbts.coverage.selection.selector import CoverageSelector
-from cbts.coverage.selection.touch_db import TouchDB, canon, stage_family
-from cbts.rules._helpers import (
-    iter_diff_deleted_post_lines,
-    iter_diff_post_line_numbers,
-    reconstruct_diff_pre_image,
-)
+from cbts.coverage.selection.touch_db import TouchDB, stage_family
 
 # jenkins/scripts/cbts/cbts/command/coverage/selection/explain.py -> repo root
 _REPO_ROOT = Path(__file__).resolve().parents[7]
@@ -64,23 +54,6 @@ def _src_at(repo: Path, sha: str, path: str) -> str | None:
         ["git", "show", f"{sha}:{path}"], cwd=str(repo), capture_output=True, text=True, check=False
     )
     return r.stdout if r.returncode == 0 else None
-
-
-def _caller_frontier(db: TouchDB, cf: str, qualname: str, callers, visiting=None):
-    """Return row-bearing local callers only when every branch resolves."""
-    visiting = set() if visiting is None else visiting
-    if qualname in visiting or not callers.get(qualname):
-        return None
-    frontier: set[str] = set()
-    for caller in callers[qualname]:
-        if db.tests_touching_func(cf, caller):
-            frontier.add(caller)
-            continue
-        nested = _caller_frontier(db, cf, caller, callers, visiting | {qualname})
-        if nested is None:
-            return None
-        frontier.update(nested)
-    return frontier or None
 
 
 @click.command("explain", context_settings={"help_option_names": ["-h", "--help"]})
@@ -128,61 +101,20 @@ def _run(args: _Args) -> int:
         print("\nNo case is removable; every stage runs in full.")
         return 0
 
-    # Forward lookup for the per-case justification the selector does not return.
-    impact_funcs: set[tuple[str, str]] = set()
+    # Reuse the selector's exact symbol set, including deleted definitions.
+    impact_funcs = {
+        (path, name)
+        for path, names in res.changed_symbols.items()
+        for name in names
+        if db.tests_touching_func(path, name)
+    }
     impact_files: set[str] = set()
-    changed_files: set[str] = set()
-    caller_bounded = set(res.caller_bounded_funcs)
-    for f in python_files:
-        cf = canon(f)
-        changed_files.add(cf)
-        lines = iter_diff_post_line_numbers(diffs.get(f, ""))
-        src = _src_at(repo, args.sha, f)
-        qns, ok = qualnames_for_lines(src, lines) if (lines and src) else (set(), False)
-        if not ok:
-            impact_files.add(cf)
-            continue
-        dependencies = analyze_python_changes(
-            src,
-            lines,
-            iter_diff_deleted_post_lines(diffs.get(f, "")),
-            pre_source=reconstruct_diff_pre_image(src, diffs.get(f, "")),
-        )
-        import_executed = import_executed_qualnames(src)
-
-        def record_impact(q: str) -> None:
-            if db.tests_touching_func(cf, q):
-                impact_funcs.add((cf, q))
-                return
-            if f"{cf}::{q}" in caller_bounded:
-                frontier = _caller_frontier(db, cf, q, dependencies.callers)
-                if frontier:
-                    impact_funcs.update((cf, caller) for caller in frontier)
-                    return
-            impact_files.add(cf)
-
-        for q in qns:
-            if q in import_executed:
-                for consumer in dependencies.binding_consumers:
-                    record_impact(consumer)
-            else:
-                record_impact(q)
-    no_data = res.no_data_funcs
-
-    print(f"commit {args.sha[:12]} — {len(python_files)} Python file(s), impact set:")
-    for cf, q in sorted(impact_funcs):
-        print(f"  {cf} :: {q}")
-    for cf in sorted(impact_files):
-        print(f"  {cf} :: <file-level>")
-    if no_data:
-        file_bounded = set(no_data) - caller_bounded
-        print(
-            f"  ({len(no_data)} changed function(s) with no DB rows: "
-            f"{len(caller_bounded)} caller-bounded, {len(file_bounded)} file-level fallback)"
-        )
-        for s in sorted(no_data):
-            bound = "caller-bound" if s in caller_bounded else "file-level"
-            print(f"    no-data ({bound}): {s}")
+    changed_files = set(res.changed_symbols)
+    print(f"commit {args.sha[:12]} — {len(python_files)} Python file(s), recorded impact:")
+    for path, name in sorted(impact_funcs):
+        print(f"  {path} :: {name}")
+    for name in res.no_data_funcs:
+        print(f"  no DB rows (no inferred tests): {name}")
     if non_python:
         print(
             f"\n  NOTE: {len(non_python)} non-Python file(s) in this commit are not evaluated here. "
