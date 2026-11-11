@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -116,19 +116,29 @@ def _find_unresolvable_spec(output, specs):
                       output)
     if match:
         names.add(_normalize_name(match.group(1)))
-    indexes = [
-        i for i, spec in enumerate(specs) if _normalize_name(
-            re.match(r"[A-Za-z0-9][A-Za-z0-9_.\-]*", spec).group(0)) in names
-        if re.match(r"[A-Za-z0-9][A-Za-z0-9_.\-]*", spec)
-    ]
+    indexes = []
+    for i, spec in enumerate(specs):
+        match = re.match(r"[A-Za-z0-9][A-Za-z0-9_.\-]*", spec)
+        if match and _normalize_name(match.group(0)) in names:
+            indexes.append(i)
     return max(indexes) if indexes else None
+
+
+def _is_resolution_failure(output):
+    """Whether Poetry's output reports a dependency-resolution failure.
+
+    Only such failures justify skipping a spec. Anything else (network or index
+    errors, auth problems, a Poetry crash) says nothing about the spec itself.
+    """
+    return bool(
+        re.search(
+            r"version solving failed|"
+            r"Could not find a matching version of package", output))
 
 
 def poetry_add(specs, cwd):
     specs = list(specs)
     while specs:
-        # --lock: only resolve and write poetry.lock; installing the packages
-        # into a virtualenv is not needed for the security scan.
         result = subprocess.run(["poetry", "add", "--lock", *specs],
                                 cwd=cwd,
                                 capture_output=True,
@@ -137,16 +147,22 @@ def poetry_add(specs, cwd):
         print(result.stderr, end="", file=sys.stderr)
         if result.returncode == 0:
             return
-        culprit = _find_unresolvable_spec(result.stdout + result.stderr, specs)
+        output = result.stdout + result.stderr
+        if not _is_resolution_failure(output):
+            raise RuntimeError(
+                f"'poetry add' failed in {cwd} (exit code {result.returncode}) "
+                "for a reason other than dependency resolution; refusing to "
+                "produce an incomplete lock file")
+        culprit = _find_unresolvable_spec(output, specs)
         if culprit is None:
             if len(specs) == 1:
-                print(f"Skipping {specs[0]}: 'poetry add' failed")
+                print(f"Skipping {specs[0]}: dependency resolution failed")
                 return
             mid = len(specs) // 2
             poetry_add(specs[:mid], cwd)
             poetry_add(specs[mid:], cwd)
             return
-        print(f"Skipping {specs[culprit]}: 'poetry add' failed")
+        print(f"Skipping {specs[culprit]}: dependency resolution failed")
         del specs[culprit]
 
 

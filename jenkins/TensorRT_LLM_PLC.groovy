@@ -58,12 +58,12 @@ def createKubernetesPodConfig()
                     tty: true
                     resources:
                       requests:
-                        cpu: '4'
-                        memory: 32Gi
+                        cpu: '1'
+                        memory: 12Gi
                         ephemeral-storage: 200Gi
                       limits:
-                        cpu: '4'
-                        memory: 32Gi
+                        cpu: '1'
+                        memory: 12Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                   - name: jnlp
@@ -102,11 +102,11 @@ def createKubernetesPodConfig()
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 12Gi
+                        memory: 5Gi
                         ephemeral-storage: 200Gi
                       limits:
                         cpu: '2'
-                        memory: 12Gi
+                        memory: 5Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                     securityContext:
@@ -118,12 +118,12 @@ def createKubernetesPodConfig()
                     tty: true
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 12Gi
+                        cpu: '1'
+                        memory: 5Gi
                         ephemeral-storage: 200Gi
                       limits:
-                        cpu: '2'
-                        memory: 12Gi
+                        cpu: '1'
+                        memory: 5Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                     securityContext:
