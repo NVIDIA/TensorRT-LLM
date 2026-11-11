@@ -665,6 +665,7 @@ includes full requested and observed dispatch/expert matrices.
 | `kimi_k2` | 384 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `kimi_k3` | 896 | 16 | 3584 † | 3072 | pass `--quant` | `DEEPSEEK_V3` |
 | `kimi_k3_1_pro` | 896 | 16 | 3584 † | 3072 | pass `--quant` | `DEEPSEEK_V3` |
+| `glm_5_3_flash` | 288 | 8 | 4096 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `glm_5` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
@@ -688,6 +689,10 @@ SiTU gate/linear softcaps 4/25. The benchmark records the actual epilogue;
 backend/quantization paths without SiTU retain the existing SwiGLU proxy.
 Latent projections, outer normalization, and the separate shared expert are
 outside this routed-expert preset.
+
+`glm_5_3_flash` measures the routed-expert core with sigmoid DeepSeek routing,
+normalized top-8 weights scaled by 2.5, and plain SwiGLU clamped at 10.
+The separate shared expert and the surrounding transformer block are excluded.
 
 Custom shapes can be used instead of `--model`:
 

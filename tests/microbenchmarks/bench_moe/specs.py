@@ -471,4 +471,17 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         situ_beta=4.0,
         situ_linear_beta=25.0,
     ),
+    "glm_5_3_flash": ModelSpec(
+        name="glm_5_3_flash",
+        num_experts=288,
+        top_k=8,
+        hidden_size=4096,
+        intermediate_size=2048,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
+        swiglu_clamp=10.0,
+        routed_scaling_factor=2.5,
+    ),
 }
