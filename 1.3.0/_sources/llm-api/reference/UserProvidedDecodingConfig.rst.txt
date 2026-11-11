@@ -1,0 +1,11 @@
+UserProvidedDecodingConfig
+==========================
+
+.. autoclass:: tensorrt_llm.llmapi.UserProvidedDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+    :exclude-members: validate,model_rebuild,parse_raw,model_computed_fields,parse_file,dict,json,model_fields_set,parse_obj,schema,model_construct,model_dump_json,model_validate_strings,model_validate,update_forward_refs,copy,model_json_schema,model_copy,model_parametrized_name,model_validate_json,construct,model_fields,model_extra,Config,model_config,model_dump,model_post_init,schema_json,from_orm
