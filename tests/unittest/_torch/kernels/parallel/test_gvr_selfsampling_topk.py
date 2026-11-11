@@ -1691,6 +1691,66 @@ def test_selfsampling_varlen_heterogeneous_lengths_main():
         assert torch.equal(got, ref_v), f"row {r}: value multiset mismatch (n={n_r})"
 
 
+@pytest.mark.parametrize(
+    "batch_size,n_valid,split",
+    [(304, 16387, False), (1, 131075, True)],
+    ids=["single_cta", "split"],
+)
+@pytest.mark.parametrize("distribution", ["equal", "boundary_ties"])
+def test_selfsampling_varlen_main_deterministic_ties(batch_size, n_valid, split, distribution):
+    """Main-family ties select smaller indices and preserve output order on replay."""
+    top_k = 2048
+    npad = (n_valid + 63) // 64 * 64
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    plan = ss_host.route(
+        batch_size,
+        n_valid,
+        npad,
+        top_k,
+        num_sms=properties.multi_processor_count,
+        sm_version=getSMVersion(),
+        det=True,
+    )
+    assert plan["kernel"] == "main"
+    assert plan["tpl"][5] == split
+
+    row_scores = torch.zeros(n_valid, dtype=torch.float32, device=_DEV)
+    if distribution == "boundary_ties":
+        row_scores[::3] = 1.0
+        row_scores[::257] = 2.0
+    logits = torch.full((batch_size, npad), 3e38, dtype=torch.float32, device=_DEV)
+    logits[:, :n_valid] = row_scores
+    kv_lens = torch.full((batch_size,), n_valid, dtype=torch.int32, device=_DEV)
+    indices = torch.full((batch_size, top_k), -7, dtype=torch.int32, device=_DEV)
+    expected = torch.argsort(row_scores, descending=True, stable=True)[:top_k]
+    expected = expected.sort().values.unsqueeze(0).expand(batch_size, -1)
+    ref_vals = torch.topk(row_scores, top_k).values.unsqueeze(0).expand(batch_size, -1)
+
+    ss_host.run_varlen(
+        logits,
+        kv_lens,
+        indices,
+        max_seq_len=n_valid,
+        deterministic=True,
+    )
+    torch.cuda.synchronize()
+    _check_exact(logits, indices, n_valid, ref_vals)
+    assert torch.equal(indices.to(torch.int64).sort(dim=1).values, expected), (
+        "deterministic ties must select the smallest indices at the top-K boundary"
+    )
+    first_indices = indices.clone()
+    indices.fill_(-9)
+    ss_host.run_varlen(
+        logits,
+        kv_lens,
+        indices,
+        max_seq_len=n_valid,
+        deterministic=True,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(indices, first_indices), "deterministic output order changed on replay"
+
+
 def test_selfsampling_varlen_narrow_logits_clamps_envelope_to_row_width() -> None:
     """Logits narrower than k + 1 with kv lengths beyond k: the launch
     envelope must be the physical row width, so every row takes the in-kernel
