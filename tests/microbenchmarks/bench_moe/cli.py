@@ -28,6 +28,7 @@ import torch
 from tensorrt_llm._torch.moe.fused_moe.routing import (
     DeepSeekV3MoeRoutingMethod,
     DeepSeekV4MoeRoutingMethod,
+    MiniMaxM3MoeRoutingMethod,
 )
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -74,11 +75,12 @@ def _resolve_benchmark_context(args: argparse.Namespace) -> _BenchmarkContext:
     base_config = _resolve_base_config_from_args(args)
     search = _resolve_search_from_args(args, base_config)
     act_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    routing_logits_dtype = (
-        torch.float32
-        if model.routing_method_cls in (DeepSeekV3MoeRoutingMethod, DeepSeekV4MoeRoutingMethod)
-        else act_dtype
+    fp32_routing = model.routing_method_cls in (
+        DeepSeekV3MoeRoutingMethod,
+        DeepSeekV4MoeRoutingMethod,
+        MiniMaxM3MoeRoutingMethod,
     )
+    routing_logits_dtype = torch.float32 if fp32_routing else act_dtype
     return _BenchmarkContext(
         model=model,
         workloads=workloads,

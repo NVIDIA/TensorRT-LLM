@@ -47,6 +47,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import (
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod,
+    MiniMaxM3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
     SigmoidRenormMoeRoutingMethod,
@@ -243,6 +244,15 @@ def _create_routing_method(
             callable_e_score_correction_bias=lambda: e_score_correction_bias,
             callable_tid2eid=lambda: None,
             is_hashed=False,
+        )
+
+    if routing_method_cls is MiniMaxM3MoeRoutingMethod:
+        e_score_correction_bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+        return routing_method_cls(
+            top_k=top_k,
+            num_experts=num_experts,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
     if routing_method_cls is MiniMaxM2MoeRoutingMethod:

@@ -32,6 +32,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import (
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod,
+    MiniMaxM3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
     SigmoidRenormMoeRoutingMethod,
@@ -49,6 +50,7 @@ _ROUTING_METHODS: Dict[str, type] = {
     "DEEPSEEK_V3": DeepSeekV3MoeRoutingMethod,
     "DEEPSEEK_V4": DeepSeekV4MoeRoutingMethod,
     "MINIMAX_M2": MiniMaxM2MoeRoutingMethod,
+    "MINIMAX_M3": MiniMaxM3MoeRoutingMethod,
     "SIGMOID_RENORM": SigmoidRenormMoeRoutingMethod,
 }
 
@@ -126,6 +128,8 @@ class ModelSpec:
     swiglu_beta: float = 0.0
     swiglu_limit: float = float("inf")
     activation_type: str = "SWIGLU"
+    # FC1/FC2 linear biases; None follows the custom SwiGLU activation style.
+    expert_bias: Optional[bool] = None
     swiglu_clamp: float | None = None
     routed_scaling_factor: float = 1.0
     # SiTU constants (Kimi-K3: activation_situ_beta / activation_situ_linear_beta).
@@ -135,6 +139,12 @@ class ModelSpec:
     situ_linear_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if (
+            self.swiglu_gptoss_style
+            and self.expert_bias is False
+            and self.activation_type != "SWIGLU"
+        ):
+            raise ValueError("Custom SwiGLU parameters require activation_type=SWIGLU.")
         if self.swiglu_clamp is not None:
             if self.swiglu_clamp <= 0:
                 raise ValueError("swiglu_clamp must be positive.")
@@ -164,6 +174,8 @@ class ModelSpec:
 
     @property
     def activation_type_enum(self) -> ActivationType:
+        if self.swiglu_gptoss_style and self.expert_bias is False:
+            return ActivationType.SwigluBias
         return _ACTIVATIONS[self.activation_type]
 
     @property
@@ -301,7 +313,7 @@ class RunResult:
     actual_backend: Optional[str] = None
     actual_comm_method: Optional[str] = None
     actual_comm_fallback_reason: Optional[str] = None
-    # Epilogue the built module ran ("swiglu" / "situ"), read back rather
+    # Epilogue the built module ran ("swiglu" / "swiglu_bias" / "situ"), read back rather
     # than echoed from the spec.
     actual_epilogue_activation: Optional[str] = None
     scheduler_kind: Optional[str] = None
@@ -483,5 +495,19 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         topk_group=1,
         swiglu_clamp=10.0,
         routed_scaling_factor=2.5,
+    ),
+    "minimax_m3_1_flash": ModelSpec(
+        name="minimax_m3_1_flash",
+        num_experts=128,
+        top_k=4,
+        hidden_size=6144,
+        intermediate_size=3072,
+        quant_algo=None,
+        routing_method="MINIMAX_M3",
+        routed_scaling_factor=2.0,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        swiglu_limit=7.0,
+        expert_bias=False,
     ),
 }
