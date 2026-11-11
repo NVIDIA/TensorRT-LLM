@@ -1,21 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""L2 component tests on two GPUs: Wan 2.2 T2V A14B DiT block x parallelism.
+"""Wan 2.2 A14B component tests on two GPUs.
 
-Same block, inputs and metric as test_wan22_t2v_a14b_l2.py. The test process
-builds the inputs and the single-GPU reference; the parallel candidate runs on
-two spawned ranks that receive the same inputs, and rank 0 returns its output
-for scoring.
-
-- Sequence parallelism (Ulysses, async Ulysses, Ring, Attention2D) and tensor
-  parallelism are lossless: the parallel block against the single-GPU block
-  with the same attention backend.
-- CFG parallelism runs the pipeline's own split / all-gather / guidance step;
-  the reference is the guidance formula on the single-GPU branch outputs.
-- Parallelism x quantization is a loss budget against single-GPU BF16.
-  Dynamic per-tensor scales are computed per rank, so the parallel quantized
-  block is not bitwise comparable with the single-GPU quantized block, but
-  its loss must stay within the same budget.
+Compare parallel execution with the single-GPU component on the same inputs.
+Quantized variants use the single-GPU BF16 reference; CFG uses separately
+computed branch outputs combined with the pipeline's guidance formula.
 """
 
 import os
@@ -27,7 +16,11 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from test_wan22_t2v_a14b_l2 import (
+
+# Reuse the single-GPU component helpers; spawned ranks inherit this import path.
+__extra_import_path__ = [".."]
+
+from test_wan22_t2v_a14b_component import (
     CHECKPOINT,
     DEVICE,
     EXPERT,
@@ -141,8 +134,6 @@ def _run_parallel(parallel: ParallelConfig, **block_kwargs) -> dict:
     return result["outputs"]
 
 
-@pytest.mark.integration
-@pytest.mark.wan_t2v
 @pytest.mark.parametrize("topology", sorted(TOPOLOGIES))
 def test_parallel_lossless(topology):
     """A parallel topology on two GPUs against the same block on one GPU."""
@@ -161,8 +152,6 @@ QUANT_CASES = [
 ] + [(topology, "SAGE") for topology in QUANT_TOPOLOGIES]
 
 
-@pytest.mark.integration
-@pytest.mark.wan_t2v
 @pytest.mark.parametrize("topology,quant", QUANT_CASES)
 def test_parallel_quantization_loss_budget(topology, quant):
     """Parallel x dynamic quantization / SageAttention against single-GPU BF16."""
@@ -213,7 +202,6 @@ def _cfg_worker(rank, port, result, cases):
         pipeline = SimpleNamespace(
             pipeline_config=SimpleNamespace(visual_gen_mapping=mapping),
             rank=rank,
-            _rescale_noise_cfg=BasePipeline._rescale_noise_cfg,
         )
 
         def forward_fn(latents, extra_latents, step_index, timestep, embeds, extra_tensors):
@@ -254,8 +242,6 @@ def _cfg_worker(rank, port, result, cases):
         dist.destroy_process_group()
 
 
-@pytest.mark.integration
-@pytest.mark.wan_t2v
 def test_cfg_parallel_lossless():
     """CFG parallel: one branch per GPU, gathered and guided.
 
