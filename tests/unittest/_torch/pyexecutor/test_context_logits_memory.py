@@ -378,7 +378,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
         forward_pass_callable=None,
         _execute_logit_post_processors=Mock(),
         _restore_attention_dp_semantic_outputs=lambda batch, values: values,
-        _live_rows=live_row_word,
+        _live_row_word=live_row_word,
     )
     forward_inputs = SimpleNamespace(
         batch=batch,

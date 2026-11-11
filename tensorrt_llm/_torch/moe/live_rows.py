@@ -18,8 +18,10 @@ The requests that pad a batch to a captured CUDA graph's size and the placeholde
 request of an idle attention-DP rank follow the real requests, so the real rows
 lead every token-indexed tensor of a forward. The engine writes, before each
 forward, one 32-bit word in device memory: bits 0-15 hold the real requests R,
-bits 16-31 the requests P of the forward. A kernel over T rows keeps none when
-P is 0, all when R >= P or P does not divide T, else the leading T / P * R.
+bits 16-31 the requests P of the forward. A kernel over T rows keeps
+:func:`live_row_count` of them: none when P is 0, all when R >= P or P does not
+divide T, else the leading T / P * R. Only the SM100/SM103 MegaMoE CuteDSL kernel
+reads the word; EPLB statistics still count the rows it drops.
 
 That rule holds for a launch over all rows of the forward. A MoE layer that splits a
 forward into chunks launches over parts of it, so those launches read a word that keeps
@@ -36,19 +38,24 @@ import threading
 from typing import TYPE_CHECKING, Dict, Iterator, Optional, Sequence
 
 import torch
+from cuda.bindings import driver
 
+from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.live_row_layout import (
+    REQUEST_BITS,
+    REQUEST_MASK,
+)
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
-REQUEST_BITS = 16
-MAX_REQUESTS = (1 << REQUEST_BITS) - 1
+# The most requests a word can describe.
+MAX_REQUESTS = REQUEST_MASK
 NO_ROWS = 0
 ALL_ROWS = (1 << REQUEST_BITS) | 1
 # Key of an engine's word in the per-forward model extra attrs.
-MODEL_EXTRA_ATTR = "live_row_word"
+LIVE_ROW_WORD_ATTR = "live_row_word"
 
 
 def encode(real_requests: int, requests: int) -> int:
@@ -58,12 +65,22 @@ def encode(real_requests: int, requests: int) -> int:
     return (requests << REQUEST_BITS) | real_requests
 
 
-def forward_word(
-    requests: Sequence, *, num_contexts: int, sequence_rows: Optional[torch.Tensor]
-) -> int:
+def live_row_count(word: int, rows: int) -> int:
+    """The leading rows of a launch over ``rows`` rows that ``word`` keeps (host reference).
+
+    The kernels compute the same rule (``live_row_count`` in
+    ``kernels/cutedsl_megamoe/helpers/live_rows.py``).
+    """
+    real, requests = word & REQUEST_MASK, (word >> REQUEST_BITS) & REQUEST_MASK
+    if requests == 0:
+        return 0
+    return rows if real >= requests or rows % requests else rows // requests * real
+
+
+def forward_word(requests: Sequence, *, num_contexts: int, seq_lens: Optional[torch.Tensor]) -> int:
     """The word of a forward over ``requests`` in row order, ``is_dummy`` marking padding.
 
-    ``num_contexts`` and ``sequence_rows`` are the forward's attention metadata: its
+    ``num_contexts`` and ``seq_lens`` are the forward's attention metadata: its
     context requests and the rows of each of its sequences. The padding after the last
     real request is dropped only when the forward holds generation requests alone and
     every sequence owns as many rows; a forward of padding only drops all of its rows,
@@ -78,9 +95,9 @@ def forward_word(
         return NO_ROWS
     uniform = (
         num_contexts == 0
-        and sequence_rows is not None
-        and sequence_rows.numel() > 0
-        and bool((sequence_rows == sequence_rows[0]).all())
+        and seq_lens is not None
+        and seq_lens.numel() > 0
+        and bool((seq_lens == seq_lens[0]).all())
     )
     return encode(real, len(requests)) if uniform else ALL_ROWS
 
@@ -93,10 +110,10 @@ class LiveRowWord:
     at ALL_ROWS, so every row is kept.
     """
 
-    def __init__(self, value: int = ALL_ROWS) -> None:
-        self._value = value
+    def __init__(self) -> None:
+        self._value = ALL_ROWS
         self._tensor: Optional[torch.Tensor] = None
-        self._writes = True
+        self._stream_writes_supported = True
 
     @property
     def read_by_kernels(self) -> bool:
@@ -105,30 +122,46 @@ class LiveRowWord:
         Until then a write would only be recorded, and the forward that allocates the word
         keeps every row, so the engine need not compute the word.
         """
-        return self._tensor is not None and self._writes
+        return self._tensor is not None and self._stream_writes_supported
 
     def tensor(self, device: torch.device) -> torch.Tensor:
-        if self._tensor is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "Run a forward eagerly before capturing it: it allocates the live-row word."
+        """The word's int32[1] device tensor on ``device``, allocated on the first call.
+
+        The first call must run outside CUDA graph capture: it allocates the word holding the
+        last value written, synchronizes the current stream so kernels on any stream read it,
+        and allocates ``all_rows_word`` of the device too. Later calls return the same tensor
+        and require the same device.
+        """
+        if self._tensor is not None:
+            if self._tensor.device != torch.device(device):
+                raise ValueError(
+                    f"the live-row word lives on {self._tensor.device}, not on {device}"
                 )
-            self._tensor = torch.full((1,), ALL_ROWS, dtype=torch.int32, device=device)
-            value, self._value = self._value, ALL_ROWS
-            self.write(value)
-            # Kernels on any stream read it from here on.
-            torch.cuda.current_stream(device).synchronize()
-            # The word of launches over part of a forward (part_of_the_forward), allocated with the
-            # engine's word, outside graph capture.
-            all_rows_word(device)
+            return self._tensor
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Run a forward eagerly before capturing it: it allocates the live-row word."
+            )
+        self._tensor = torch.full((1,), ALL_ROWS, dtype=torch.int32, device=device)
+        value, self._value = self._value, ALL_ROWS
+        self.write(value)
+        # Kernels on any stream read it from here on.
+        torch.cuda.current_stream(device).synchronize()
+        # The word of launches over part of a forward (part_of_the_forward), allocated with the
+        # engine's word, outside graph capture.
+        all_rows_word(device)
         return self._tensor
 
     def write(self, value: int) -> None:
-        if value == self._value or not self._writes:
+        """Set the word to ``value`` for the kernels launched next on the current stream.
+
+        A stream memory write, issued only when the value changes; before a kernel has
+        allocated the word it only records the value. Without stream memory operations
+        the word stays at ALL_ROWS.
+        """
+        if value == self._value or not self._stream_writes_supported:
             return
         if self._tensor is not None:
-            from cuda.bindings import driver
-
             (error,) = driver.cuStreamWriteValue32(
                 torch.cuda.current_stream(self._tensor.device).cuda_stream,
                 self._tensor.data_ptr(),
@@ -136,10 +169,13 @@ class LiveRowWord:
                 driver.CUstreamWriteValue_flags.CU_STREAM_WRITE_VALUE_DEFAULT,
             )
             if error == driver.CUresult.CUDA_ERROR_NOT_SUPPORTED:
-                logger.warning(
-                    "No stream memory operations: padding rows are computed like real rows."
+                logger.warning_once(
+                    f"{self._tensor.device} does not support stream memory operations "
+                    "(cuStreamWriteValue32): the MegaMoE kernels compute the rows of padding "
+                    "requests like real rows.",
+                    key="live_row_word_no_stream_writes",
                 )
-                self._writes = False
+                self._stream_writes_supported = False
                 return
             if error != driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(f"cuStreamWriteValue32 of the live-row word failed: {error!r}")
@@ -163,7 +199,7 @@ def engine_word(model: torch.nn.Module, mapping: Mapping) -> LiveRowWord:
     """
     word = LiveRowWord()
     if not forward_rows_split_across_cp_ranks(mapping):
-        model.extra_attrs[MODEL_EXTRA_ATTR] = word
+        model.extra_attrs[LIVE_ROW_WORD_ATTR] = word
     return word
 
 
@@ -185,14 +221,18 @@ def part_of_the_forward() -> Iterator[None]:
 
 def all_rows_word(device: torch.device) -> torch.Tensor:
     """A word of ``device`` that is never written: it keeps every row."""
-    return _ALL_ROWS_WORDS.setdefault(torch.device(device).index, LiveRowWord()).tensor(device)
+    index = torch.device(device).index
+    word = _ALL_ROWS_WORDS.get(index)
+    if word is None:
+        word = _ALL_ROWS_WORDS[index] = LiveRowWord()
+    return word.tensor(device)
 
 
 def current_word(device: torch.device) -> torch.Tensor:
     """The word a kernel launched now on ``device`` reads: the running engine forward's for a launch
     over all of its rows, else ``all_rows_word``."""
     attrs = get_model_extra_attrs()
-    word = attrs.get(MODEL_EXTRA_ATTR) if attrs else None
+    word = attrs.get(LIVE_ROW_WORD_ATTR) if attrs else None
     if word is None or getattr(_PART, "depth", 0):
         return all_rows_word(device)
     return word.tensor(device)

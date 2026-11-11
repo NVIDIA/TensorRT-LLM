@@ -33,11 +33,8 @@ import torch
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
-live_rows = pytest.importorskip("tensorrt_llm._torch.moe.live_rows")
-
-from _torch.moe.test_live_rows import live_rows as reference  # noqa: E402
-
-from tensorrt_llm._utils import get_sm_version, mpi_rank  # noqa: E402
+from tensorrt_llm._torch.moe import live_rows
+from tensorrt_llm._utils import get_sm_version, mpi_rank
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
@@ -61,7 +58,7 @@ _COMBINE_FORMATS = ("bf16", "32e4m3xe8m0", "16e2m1xbf16")
 
 
 @requires_blackwell
-def test_megamoe_cutedsl_live_row_count_matches_host():
+def test_megamoe_cutedsl_live_row_count_matches_host() -> None:
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack, make_ptr
@@ -110,12 +107,14 @@ def test_megamoe_cutedsl_live_row_count_matches_host():
     )
     torch.cuda.synchronize()
     got = out[: len(cases)].tolist()
-    expected = [reference(w, r) for w, r in cases]
+    expected = [live_rows.live_row_count(w, r) for w, r in cases]
     assert got == expected
 
 
 @requires_blackwell
-def test_megamoe_cutedsl_live_row_word_writes_are_stream_ordered(monkeypatch):
+def test_megamoe_cutedsl_live_row_word_writes_are_stream_ordered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from cuda.bindings import driver
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -139,19 +138,20 @@ def test_megamoe_cutedsl_live_row_word_writes_are_stream_ordered(monkeypatch):
     monkeypatch.setattr(
         driver, "cuStreamWriteValue32", lambda *_: (driver.CUresult.CUDA_ERROR_NOT_SUPPORTED,)
     )
-    unsupported = live_rows.LiveRowWord(live_rows.encode(3, 8))
+    unsupported = live_rows.LiveRowWord()
+    unsupported.write(live_rows.encode(3, 8))
     assert int(unsupported.tensor(device).item()) == live_rows.ALL_ROWS
     unsupported.write(live_rows.NO_ROWS)
-    assert int(unsupported.tensor(device).item()) == live_rows.ALL_ROWS and not unsupported._writes
+    assert int(unsupported.tensor(device).item()) == live_rows.ALL_ROWS and not unsupported._stream_writes_supported
 
 
-def _init_worker(custom_paths):
+def _init_worker(custom_paths: list) -> None:
     for custom_path in custom_paths:
         if custom_path.endswith("tests/unittest") and custom_path not in sys.path:
             sys.path.append(custom_path)
 
 
-def _published_counts(fused_moe, rank, rows):
+def _published_counts(fused_moe: torch.nn.Module, rank: int, rows: int) -> torch.Tensor:
     """This rank's per-expert counts as its router published them to every peer (itself too)."""
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
 
@@ -171,7 +171,7 @@ def _published_counts(fused_moe, rank, rows):
     return matrix.view(torch.int32).view(_WORLD, width)[rank, : router.expert_count].cpu().clone()
 
 
-def _drop_worker(real_requests_by_rank, combine_format):
+def _drop_worker(real_requests_by_rank: tuple, combine_format: str) -> None:
     try:
         _drop_worker_impl(real_requests_by_rank, combine_format)
     except Exception:
@@ -179,7 +179,7 @@ def _drop_worker(real_requests_by_rank, combine_format):
         raise
 
 
-def _drop_worker_impl(real_requests_by_rank, combine_format):
+def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str) -> None:
     from _torch.moe.moe_test_utils import MoeBackendType
     from _torch.moe.quantize_utils import get_test_quant_params
     from _torch.moe.test_moe_module import (
@@ -263,9 +263,9 @@ def _drop_worker_impl(real_requests_by_rank, combine_format):
             fused_moe.cuda(f"cuda:{rank}")
 
             word = live_rows.LiveRowWord()
-            attrs = {live_rows.MODEL_EXTRA_ATTR: word}
+            attrs = {live_rows.LIVE_ROW_WORD_ATTR: word}
 
-            def forward(value):
+            def forward(value: int) -> tuple:
                 word.write(value)
                 with torch.inference_mode(), model_extra_attrs(attrs):
                     output = fused_moe.forward(
@@ -279,9 +279,9 @@ def _drop_worker_impl(real_requests_by_rank, combine_format):
             value = live_rows.forward_word(
                 requests,
                 num_contexts=0,
-                sequence_rows=torch.full((_REQUESTS,), _ROWS_PER_REQUEST, dtype=torch.int32),
+                seq_lens=torch.full((_REQUESTS,), _ROWS_PER_REQUEST, dtype=torch.int32),
             )
-            live = reference(value, rows)
+            live = live_rows.live_row_count(value, rows)
             assert live == real * _ROWS_PER_REQUEST
 
             out_all, counts_all = forward(live_rows.ALL_ROWS)
@@ -306,7 +306,7 @@ def _drop_worker_impl(real_requests_by_rank, combine_format):
 @pytest.mark.skipif(torch.cuda.device_count() < _WORLD, reason=f"needs {_WORLD} GPUs")
 @pytest.mark.threadleak(enabled=False)  # the pool's manager thread persists by design
 @pytest.mark.parametrize("combine_format", _COMBINE_FORMATS)
-def test_megamoe_cutedsl_drops_padding_rows(combine_format):
+def test_megamoe_cutedsl_drops_padding_rows(combine_format: str) -> None:
     with MPIPoolExecutor(
         initializer=_init_worker, initargs=(sys.path,), max_workers=_WORLD
     ) as executor:

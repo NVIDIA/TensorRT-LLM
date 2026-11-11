@@ -2975,6 +2975,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 live_row_word = self._live_row_word
                 if live_row_word is None:
                     live_row_word = all_rows_word(activation.device)
+                if (
+                    live_row_word.dtype != torch.int32
+                    or live_row_word.device != activation.device
+                    or live_row_word.numel() < 1
+                ):
+                    raise RuntimeError(
+                        "MegaMoE-CuteDSL: live_row_word must be an int32 tensor of at least one "
+                        f"element on {activation.device}; got {live_row_word.dtype} "
+                        f"numel={live_row_word.numel()} on {live_row_word.device}."
+                    )
                 runtime_kwargs["live_row_word"] = _to_cute_ptr_cached(
                     live_row_word, assumed_align=4
                 )

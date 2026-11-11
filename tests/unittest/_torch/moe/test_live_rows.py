@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host reference of the live-row word (``live_rows``, which the kernels compute too) and the engine's words."""
+"""The live-row word's host reference (``live_row_count``, which the kernels compute too) and the engine's words."""
 
 from types import SimpleNamespace
+from typing import List, Optional
 
 import pytest
 import torch
@@ -25,33 +26,31 @@ from tensorrt_llm._torch.utils import model_extra_attrs
 pytestmark = pytest.mark.cpu_only
 
 
-def live_rows(word: int, rows: int) -> int:
-    """The leading rows of ``rows`` rows that ``word`` keeps."""
-    real, requests = word & lr.MAX_REQUESTS, word >> lr.REQUEST_BITS
-    if requests == 0:
-        return 0
-    return rows if real >= requests or rows % requests else rows // requests * real
-
-
-def _requests(*kinds: str):
+def _requests(*kinds: str) -> List[SimpleNamespace]:
     """Requests in row order: ``r`` real, ``d`` padding."""
     return [SimpleNamespace(is_dummy=kind == "d") for kind in kinds]
 
 
-def _row_owner(requests, rows_per_request):
+def _row_owner(requests: List[SimpleNamespace], rows_per_request: int) -> List[SimpleNamespace]:
     """The request of every row: each request owns ``rows_per_request`` consecutive rows."""
     return [request for request in requests for _ in range(rows_per_request)]
 
 
-def _word(requests, rows_per_request=1, *, num_contexts=0, sequence_rows=None):
+def _word(
+    requests: List[SimpleNamespace],
+    rows_per_request: int = 1,
+    *,
+    num_contexts: int = 0,
+    seq_lens: Optional[torch.Tensor] = None,
+) -> int:
     """The word of a forward whose sequences own ``rows_per_request`` rows each, unless given."""
-    if sequence_rows is None:
-        sequence_rows = torch.full((len(requests),), rows_per_request, dtype=torch.int32)
-    return lr.forward_word(requests, num_contexts=num_contexts, sequence_rows=sequence_rows)
+    if seq_lens is None:
+        seq_lens = torch.full((len(requests),), rows_per_request, dtype=torch.int32)
+    return lr.forward_word(requests, num_contexts=num_contexts, seq_lens=seq_lens)
 
 
-def _kept_rows(requests, rows_per_request):
-    return live_rows(_word(requests, rows_per_request), len(requests) * rows_per_request)
+def _kept_rows(requests: List[SimpleNamespace], rows_per_request: int) -> int:
+    return lr.live_row_count(_word(requests, rows_per_request), len(requests) * rows_per_request)
 
 
 @pytest.mark.parametrize("rows_per_request", [1, 4, 3])
@@ -65,7 +64,7 @@ def _kept_rows(requests, rows_per_request):
         "d",  # an attention-DP placeholder rank running eagerly
     ],
 )
-def test_padding_rows_dropped_and_real_rows_kept(kinds, rows_per_request):
+def test_padding_rows_dropped_and_real_rows_kept(kinds: str, rows_per_request: int) -> None:
     # 1 row per request: no speculation; 4: the target forward of one-model MTP with
     # three draft tokens; 3: an MTP draft layer over the same requests.
     requests = _requests(*kinds)
@@ -74,66 +73,66 @@ def test_padding_rows_dropped_and_real_rows_kept(kinds, rows_per_request):
         assert (row < kept) == (not owner.is_dummy), (kinds, rows_per_request, row)
 
 
-def test_every_launch_of_one_forward_keeps_its_own_rows():
+def test_every_launch_of_one_forward_keeps_its_own_rows() -> None:
     # One word serves launches of different row counts in one forward.
     word = _word(_requests(*"rrrdd"))
     assert word == lr.encode(3, 5)
-    assert [live_rows(word, rows) for rows in (5, 10, 15, 20)] == [3, 6, 9, 12]
+    assert [lr.live_row_count(word, rows) for rows in (5, 10, 15, 20)] == [3, 6, 9, 12]
 
 
-def test_rows_not_split_evenly_into_requests_are_all_kept():
+def test_rows_not_split_evenly_into_requests_are_all_kept() -> None:
     word = lr.encode(3, 5)
-    assert live_rows(word, 7) == 7
-    assert live_rows(word, 0) == 0
+    assert lr.live_row_count(word, 7) == 7
+    assert lr.live_row_count(word, 0) == 0
 
 
-def test_padding_before_a_real_request_is_kept():
+def test_padding_before_a_real_request_is_kept() -> None:
     # Only padding behind the last real request is dropped.
     requests = _requests(*"rdrdd")
     assert _word(requests) == lr.encode(3, 5)
-    assert live_rows(_word(requests), 10) == 6
+    assert lr.live_row_count(_word(requests), 10) == 6
     assert _word(_requests(*"rrdr")) == lr.ALL_ROWS
 
 
-def test_a_forward_with_contexts_or_unequal_rows_keeps_every_row():
+def test_a_forward_with_contexts_or_unequal_rows_keeps_every_row() -> None:
     requests = _requests(*"rrdd")
     assert _word(requests, 4) == lr.encode(2, 4)
     # A context request in the forward (a mixed batch), whatever the rows.
     assert _word(requests, 4, num_contexts=1) == lr.ALL_ROWS
     # Sequences of unequal rows (ragged verification, a one-token context among MTP requests).
     ragged = torch.tensor([4, 2, 4, 4], dtype=torch.int32)
-    assert _word(requests, sequence_rows=ragged) == lr.ALL_ROWS
+    assert _word(requests, seq_lens=ragged) == lr.ALL_ROWS
     # A forward whose metadata holds no rows.
     empty = torch.zeros(0, dtype=torch.int32)
-    assert lr.forward_word(requests, num_contexts=0, sequence_rows=None) == lr.ALL_ROWS
-    assert _word(requests, sequence_rows=empty) == lr.ALL_ROWS
+    assert lr.forward_word(requests, num_contexts=0, seq_lens=None) == lr.ALL_ROWS
+    assert _word(requests, seq_lens=empty) == lr.ALL_ROWS
     # Padding only drops every row, and no requests keep every row.
-    assert _word(_requests(*"dd"), num_contexts=1, sequence_rows=ragged) == lr.NO_ROWS
+    assert _word(_requests(*"dd"), num_contexts=1, seq_lens=ragged) == lr.NO_ROWS
     assert _word([]) == lr.ALL_ROWS
 
 
-def test_word_layout():
+def test_word_layout() -> None:
     assert lr.ALL_ROWS == lr.encode(1, 1)
     assert lr.NO_ROWS == 0
-    assert live_rows(lr.ALL_ROWS, 96) == 96
-    assert live_rows(lr.NO_ROWS, 96) == 0
-    assert live_rows(lr.encode(0, 4), 96) == 0
-    assert live_rows(lr.encode(4, 4), 96) == 96
+    assert lr.live_row_count(lr.ALL_ROWS, 96) == 96
+    assert lr.live_row_count(lr.NO_ROWS, 96) == 0
+    assert lr.live_row_count(lr.encode(0, 4), 96) == 0
+    assert lr.live_row_count(lr.encode(4, 4), 96) == 96
     top = lr.MAX_REQUESTS
-    assert live_rows(lr.encode(top - 1, top), 2 * top) == 2 * (top - 1)
+    assert lr.live_row_count(lr.encode(top - 1, top), 2 * top) == 2 * (top - 1)
     assert lr.encode(top, top) >> lr.REQUEST_BITS == top
     for real, requests in ((1, 0), (2, 1), (-1, 1), (0, top + 1)):
         with pytest.raises(ValueError):
             lr.encode(real, requests)
 
 
-def test_kernels_read_the_word_of_the_running_forward(monkeypatch):
+def test_kernels_read_the_word_of_the_running_forward(monkeypatch: pytest.MonkeyPatch) -> None:
     # Writes before a kernel allocates the word only record the value: no device.
     engine = lr.LiveRowWord()
     engine.write(lr.encode(2, 4))
     assert engine._value == lr.encode(2, 4)
     monkeypatch.setattr(lr.LiveRowWord, "tensor", lambda word, device: word)
-    with model_extra_attrs({lr.MODEL_EXTRA_ATTR: engine}):
+    with model_extra_attrs({lr.LIVE_ROW_WORD_ATTR: engine}):
         assert lr.current_word("cuda:0") is engine
     for attrs in ({}, None):
         with model_extra_attrs(attrs):
@@ -148,23 +147,23 @@ def test_kernels_read_the_word_of_the_running_forward(monkeypatch):
 _CHUNKED_FORWARD = dict(real=400, requests=512, rows=2048, chunk=1024)
 
 
-def test_launches_over_part_of_a_forward_keep_every_row(monkeypatch):
+def test_launches_over_part_of_a_forward_keep_every_row(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = lr.LiveRowWord()
     engine.write(lr.encode(_CHUNKED_FORWARD["real"], _CHUNKED_FORWARD["requests"]))
     monkeypatch.setattr(lr.LiveRowWord, "tensor", lambda word, device: word)
-    with model_extra_attrs({lr.MODEL_EXTRA_ATTR: engine}):
-        assert live_rows(lr.current_word("cuda:0")._value, _CHUNKED_FORWARD["rows"]) == 1600
+    with model_extra_attrs({lr.LIVE_ROW_WORD_ATTR: engine}):
+        assert lr.live_row_count(lr.current_word("cuda:0")._value, _CHUNKED_FORWARD["rows"]) == 1600
         with lr.part_of_the_forward():
             chunk_word = lr.current_word("cuda:0")
         assert lr.current_word("cuda:0") is engine
     assert chunk_word is lr._ALL_ROWS_WORDS[0]
-    assert live_rows(chunk_word._value, _CHUNKED_FORWARD["chunk"]) == _CHUNKED_FORWARD["chunk"]
+    assert lr.live_row_count(chunk_word._value, _CHUNKED_FORWARD["chunk"]) == _CHUNKED_FORWARD["chunk"]
 
 
 @pytest.mark.parametrize("num_chunks", [1, 2])
-def test_a_moe_layer_reads_the_forward_word_only_when_it_runs_in_one_chunk(monkeypatch, num_chunks):
-    import torch
-
+def test_a_moe_layer_reads_the_forward_word_only_when_it_runs_in_one_chunk(
+    monkeypatch: pytest.MonkeyPatch, num_chunks: int
+) -> None:
     from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
 
     class Stop(Exception):
@@ -197,12 +196,12 @@ def test_a_moe_layer_reads_the_forward_word_only_when_it_runs_in_one_chunk(monke
     )
     seen = []
 
-    def run_chunks(x_chunks, *args, **kwargs):
-        seen.extend(live_rows(lr.current_word("cuda:0")._value, c.shape[0]) for c in x_chunks)
+    def run_chunks(x_chunks: List[torch.Tensor], *args: object, **kwargs: object) -> None:
+        seen.extend(lr.live_row_count(lr.current_word("cuda:0")._value, c.shape[0]) for c in x_chunks)
         raise Stop
 
     monkeypatch.setattr(scheduler, "_run_chunks", run_chunks)
-    with model_extra_attrs({lr.MODEL_EXTRA_ATTR: engine}), pytest.raises(Stop):
+    with model_extra_attrs({lr.LIVE_ROW_WORD_ATTR: engine}), pytest.raises(Stop):
         scheduler.forward(
             x,
             logits,

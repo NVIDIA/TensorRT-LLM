@@ -291,7 +291,7 @@ class DecoderRunner(ScheduledModelRunner):
         )
         self._initialize_moe_workspace_reclaimer()
         # Read through the model's extra attrs by the kernels that drop padding rows.
-        self._live_rows = engine_word(model, mapping)
+        self._live_row_word = engine_word(model, mapping)
         self._warmup = DecoderWarmup(
             config=self._config,
             mapping=mapping,
@@ -833,14 +833,14 @@ class DecoderRunner(ScheduledModelRunner):
             graph_key = key if can_run_graph else None
             # Only for a model whose kernels read the word. Warmup and capture keep every row;
             # otherwise the attention metadata says whether the requests own equal rows.
-            if self._live_rows.read_by_kernels:
-                self._live_rows.write(
+            if self._live_row_word.read_by_kernels:
+                self._live_row_word.write(
                     ALL_ROWS
                     if is_dummy
                     else forward_word(
                         execution_requests.all_requests(),
                         num_contexts=attn_metadata.num_contexts,
-                        sequence_rows=attn_metadata.seq_lens,
+                        seq_lens=attn_metadata.seq_lens,
                     )
                 )
             captures_model_body = self._graphs.captures_model_body(graph_key)

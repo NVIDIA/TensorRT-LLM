@@ -1049,7 +1049,7 @@ def test_decoder_writes_the_live_row_word_before_the_graph_runs(is_dummy: bool) 
 
     engine, backend, resources, inputs = _padded_decode()
     word = Mock()
-    engine._live_rows = word
+    engine._live_row_word = word
     order = Mock()
     order.attach_mock(word.write, "write")
     order.attach_mock(backend.replay, "replay")
@@ -1082,7 +1082,7 @@ def test_live_row_word_keeps_every_row_of_a_helix_cp_slice(helix: bool) -> None:
         mapping = Mapping(world_size=2, tp_size=2, enable_attention_dp=True)
     engine, *_ = _make_decoder_runner(None, mapping=mapping)
     # What the runner writes for the padded decode above.
-    engine._live_rows.write(live_rows.encode(_LIVE_REAL, _LIVE_REQUESTS))
+    engine._live_row_word.write(live_rows.encode(_LIVE_REAL, _LIVE_REQUESTS))
     with (
         patch.object(live_rows.LiveRowWord, "tensor", lambda word, device: word),
         model_extra_attrs(engine._model.extra_attrs),
@@ -1092,11 +1092,10 @@ def test_live_row_word_keeps_every_row_of_a_helix_cp_slice(helix: bool) -> None:
     if helix:
         # CP rank 0 launches over rows 0-15 (requests 0-3, all real); read with the forward's
         # word it would keep 16 / 8 * 5 = 10 of them.
-        assert word == live_rows.ALL_ROWS
+        assert live_rows.live_row_count(word, rows // 2) == rows // 2
     else:
         # A launch over the whole forward keeps the 20 rows of the 5 real requests.
-        assert word == live_rows.encode(_LIVE_REAL, _LIVE_REQUESTS)
-        assert rows // _LIVE_REQUESTS * _LIVE_REAL == 20
+        assert live_rows.live_row_count(word, rows) == 20
 
 
 @pytest.mark.cpu_only

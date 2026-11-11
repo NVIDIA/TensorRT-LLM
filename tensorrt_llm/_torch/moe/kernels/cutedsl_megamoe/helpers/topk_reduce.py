@@ -250,7 +250,7 @@ class TopkReduce:
             )
 
     @cute.jit
-    def _store_zero_slice(self, reduced_output: cute.Tensor, token_idx: Int32, hidden_tile_idx: Int32):
+    def _store_zero_slice(self, reduced_output: cute.Tensor, token_idx: Int32, hidden_tile_idx: Int32) -> None:
         hidden_per_thread = self.hidden_per_thread
         out_dtype = reduced_output.element_type
         dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
