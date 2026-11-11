@@ -20,7 +20,7 @@ speculative decoding runs:
 The checkpoint's quantization picks the targets that can apply: the two above
 serve the NVFP4 checkpoint, and ``glm_5_3_flash_fp8__sm_10x__tp4`` serves the
 block-FP8 (``FP8_BLOCK_SCALES``) checkpoint on sm_100 / sm_103 with tensor
-parallelism 4 (see ``_check_fp8``).
+parallelism 4 (see ``_fp8_refused``).
 
 The checkpoint declares the vision-language wrapper, and the language model's
 shape lives in its ``text_config``, so that is what this tree reads. The
@@ -57,9 +57,8 @@ _SHAPE_FIELDS = (
     "linear_num_heads",
 )
 
-# The block-FP8 target's deployment: (layers, hidden, routed experts, q_lora_rank) of the
-# text config on sm_100 (B200, GB200) and sm_103 (B300, GB300).
-_FP8_SHAPE = (45, 4096, 288, 1536)
+# The GPU architectures the block-FP8 target runs on: sm_100 (B200, GB200) and sm_103
+# (B300, GB300). It reads the same config shape as the NVFP4 targets.
 _FP8_SMS = frozenset({(10, 0), (10, 3)})
 
 # Folds the shared expert into the routed experts' weights when set to "1".
@@ -173,8 +172,21 @@ def route(
         None if text_config is None else tuple(_field(text_config, name) for name in _SHAPE_FIELDS)
     )
     quant_algo = _quant_algo(model_config)
+    # The NVFP4 targets compute their weight shapes from the mapping, as the built-in
+    # model does; neither runs pipeline or context parallelism.
+    single_stage = mapping.pp_size == 1 and mapping.cp_size == 1
+    deployment = (
+        f"compute capability {compute_capability}, text_config shape {shape}, "
+        f"quantization {quant_algo.name if quant_algo is not None else 'none'}, "
+        f"pp={mapping.pp_size} cp={mapping.cp_size}"
+    )
     if quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
-        _check_fp8(model_config, llm_args, compute_capability)
+        fp8_refused = _fp8_refused(model_config, llm_args, compute_capability, shape)
+        if fp8_refused:
+            raise NoTarget(
+                f"{deployment}; the block-FP8 glm5_next target does not run "
+                f"{'; '.join(fp8_refused)}"
+            )
         # One line on purpose: the native loader and CI test selection read the routed
         # targets off `from .<target>.modeling import <Class>` and `return <Class>` here.
         # fmt: off
@@ -183,14 +195,6 @@ def route(
         # isort: on
         # fmt: on
         return ModelingV2Glm53FlashFp8Sm10xTp4
-    # Both targets compute their weight shapes from the mapping, as the built-in
-    # model does; neither runs pipeline or context parallelism.
-    single_stage = mapping.pp_size == 1 and mapping.cp_size == 1
-    deployment = (
-        f"compute capability {compute_capability}, text_config shape {shape}, "
-        f"quantization {quant_algo.name if quant_algo is not None else 'none'}, "
-        f"pp={mapping.pp_size} cp={mapping.cp_size}"
-    )
     if not (compute_capability == _SM and shape == _SHAPE and quant_algo == QuantAlgo.NVFP4):
         raise NoTarget(
             f"{deployment}; the glm5_next targets are the NVFP4 GLM-5.3-Flash checkpoint on "
@@ -225,95 +229,85 @@ def route(
     )
 
 
-def _check_fp8(
-    model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
-) -> None:
-    """Raise ``NoTarget`` unless the block-FP8 target fits this deployment."""
-    from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
+def _fp8_speculation_refused(spec_config: Any) -> list[str]:
+    """The speculative features the block-FP8 target does not run; empty when it runs this config.
 
+    It drafts with the checkpoint's own MTP layer, driven by the engine's one-model MTP-Eagle
+    worker at three linear drafts. A separate draft checkpoint, a draft tree, an MXFP8 draft head
+    and a draft MoE backend, none of which it builds, are declined rather than ignored.
+    """
+    if spec_config is None:
+        return []
+    if not isinstance(spec_config, MTPDecodingConfig):
+        return [f"{type(spec_config).__name__} (only MTP)"]
+    refused = {
+        f"{spec_config.spec_dec_mode.name} (only one-model MTP-Eagle)": (
+            not spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+        ),
+        f"max_draft_len={spec_config.max_draft_len} (only 3)": spec_config.max_draft_len != 3,
+        "draft trees": spec_config.max_total_draft_tokens != spec_config.max_draft_len,
+        "a dynamic draft tree": spec_config.use_dynamic_tree,
+        "a separate speculative checkpoint": spec_config.speculative_model is not None,
+        f"draft_lm_head_dtype={spec_config.draft_lm_head_dtype} (only auto)": (
+            spec_config.draft_lm_head_dtype != "auto"
+        ),
+        f"draft MoE backend {spec_config.moe_backend}": spec_config.moe_backend is not None,
+    }
+    return [name for name, present in refused.items() if present]
+
+
+def _fp8_refused(
+    model_config: ModelConfig,
+    llm_args: TorchLlmArgs,
+    compute_capability: Tuple[int, int],
+    shape: Optional[tuple],
+) -> list[str]:
+    """What the block-FP8 target does not run for this deployment; empty when it is admitted.
+
+    The target serves GLM-5.3-Flash's block-FP8 release, text only, on sm_100 / sm_103 with tp4:
+    tensor-parallel attention over the 4 ranks of one node and the routed experts split by
+    intermediate, a weight layout, which is why it selects a target rather than a runtime branch.
+    Its sparse attention reads an FP8 latent cache. Its MoE kernels read the routed experts in the
+    checkpoint's layout, which only the TRTLLM backend keeps (AUTO resolves to it here), and it
+    does no load balancing, DWDP or shared-expert fusion. Each of these is declined rather than
+    ignored.
+    """
     mapping = model_config.mapping
-    spec_config = model_config.spec_config
-    text = unwrap_glm5_next_text_config(model_config.pretrained_config)
-    shape = tuple(
-        _field(text, name)
-        for name in ("num_hidden_layers", "hidden_size", "n_routed_experts", "q_lora_rank")
-    )
-    kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
-
-    # tp4: tensor-parallel attention over the 4 ranks of one node, the routed experts
-    # split by intermediate (moe_tp 4). A weight-layout question, which is why it
-    # selects a target rather than a runtime branch.
-    tp4 = (
-        mapping.world_size == 4
-        and mapping.tp_size == 4
-        and mapping.moe_tp_size == 4
-        and mapping.moe_ep_size == 1
-        and not mapping.enable_attention_dp
-        and mapping.pp_size == 1
-        and mapping.cp_size == 1
-        and mapping.gpus_per_node >= 4
-    )
-    # The checkpoint's MTP layer driven by the one-model MTP-Eagle loop at three linear
-    # drafts, or no speculation. The target builds the drafter from the checkpoint's own
-    # MTP layer, so a separate draft checkpoint, a draft tree, an MXFP8 draft head and a
-    # draft MoE backend, none of which it builds, are declined rather than ignored.
-    mtp3_or_none = spec_config is None or (
-        isinstance(spec_config, MTPDecodingConfig)
-        and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
-        and spec_config.max_draft_len == 3
-        and spec_config.max_total_draft_tokens == spec_config.max_draft_len
-        and not spec_config.use_dynamic_tree
-        and spec_config.speculative_model is None
-        and spec_config.draft_lm_head_dtype == "auto"
-        and spec_config.moe_backend is None
-    )
-    # The target's MoE kernels read the routed experts in the checkpoint's layout, which
-    # only the TRTLLM backend keeps (AUTO resolves to it here). It does no load balancing,
-    # DWDP or shared-expert fusion, so those are declined rather than ignored.
     moe = llm_args.moe_config
-    moe_as_built = (
-        moe.backend in ("AUTO", "TRTLLM")
-        and moe.load_balancer is None
-        and llm_args.dwdp_config is None
-        and os.environ.get(_SHARED_EXPERT_FUSION_ENV) != "1"
+    kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
+    kv_cache = (
+        "bf16"
+        if kv_cache_quant_algo is None
+        else getattr(kv_cache_quant_algo, "name", kv_cache_quant_algo)
     )
-
-    # GLM-5.3-Flash, block-FP8 release, text only, on sm_100 / sm_103, tp4, with an FP8
-    # latent cache: the sparse attention reads FP8 latent rows.
-    if (
-        compute_capability in _FP8_SMS
-        and shape == _FP8_SHAPE
-        and tp4
-        and mtp3_or_none
-        and moe_as_built
-        and kv_cache_quant_algo == QuantAlgo.FP8
-        and llm_args.disable_mm_encoder
-    ):
-        return
-    draft = ""
-    if isinstance(spec_config, MTPDecodingConfig):
-        draft = (
-            f" max_draft_len={spec_config.max_draft_len}"
-            f" max_total_draft_tokens={spec_config.max_total_draft_tokens}"
-            f" use_dynamic_tree={spec_config.use_dynamic_tree}"
-            f" speculative_model={spec_config.speculative_model}"
-            f" draft_lm_head_dtype={spec_config.draft_lm_head_dtype}"
-            f" draft moe_backend={spec_config.moe_backend}"
-        )
-    raise NoTarget(
-        f"compute capability {compute_capability}, config shape {shape}, quantization "
-        f"{QuantAlgo.FP8_BLOCK_SCALES}, world_size={mapping.world_size} tp={mapping.tp_size} "
-        f"moe_tp={mapping.moe_tp_size} moe_ep={mapping.moe_ep_size} "
-        f"attention_dp={mapping.enable_attention_dp} pp={mapping.pp_size} cp={mapping.cp_size}, "
-        f"speculative decoding {spec_config.spec_dec_mode.name if spec_config else 'off'}{draft}, "
-        f"moe backend={moe.backend} load_balancer={moe.load_balancer} "
-        f"dwdp_config={llm_args.dwdp_config} "
-        f"{_SHARED_EXPERT_FUSION_ENV}={os.environ.get(_SHARED_EXPERT_FUSION_ENV)}, KV cache "
-        f"{kv_cache_quant_algo or 'bf16'}, disable_mm_encoder={llm_args.disable_mm_encoder}; "
-        "the block-FP8 glm5_next target is GLM-5.3-Flash on sm100 / sm103, tp4 (4 ranks of "
-        "one node, tensor-parallel attention, experts split by intermediate), with one-model "
-        "MTP-Eagle at max_draft_len=3 (linear drafts from the checkpoint's MTP layer) or no "
-        "speculative decoding, the AUTO or TRTLLM MoE backend without load balancing, DWDP or "
-        "shared-expert fusion, an FP8 latent cache (kv_cache_config.dtype fp8) and the vision "
-        "tower disabled (disable_mm_encoder)"
+    refused = {
+        f"compute capability {compute_capability} (only sm_100 / sm_103)": (
+            compute_capability not in _FP8_SMS
+        ),
+        f"text_config shape {shape} (only {_SHAPE})": shape != _SHAPE,
+        f"world_size={mapping.world_size} tp={mapping.tp_size} (only tp4 over 4 ranks)": not (
+            mapping.world_size == 4 and mapping.tp_size == 4
+        ),
+        f"moe_tp={mapping.moe_tp_size} moe_ep={mapping.moe_ep_size} (only the experts split by "
+        "intermediate, moe_tp=4 moe_ep=1)": not (
+            mapping.moe_tp_size == 4 and mapping.moe_ep_size == 1
+        ),
+        "attention DP": mapping.enable_attention_dp,
+        f"pp={mapping.pp_size} cp={mapping.cp_size} (only one stage)": (
+            mapping.pp_size != 1 or mapping.cp_size != 1
+        ),
+        f"gpus_per_node={mapping.gpus_per_node} (only the 4 ranks of one node)": (
+            mapping.gpus_per_node < 4
+        ),
+        f"KV cache {kv_cache} (only FP8)": kv_cache_quant_algo != QuantAlgo.FP8,
+        "the vision encoder (only disable_mm_encoder)": not llm_args.disable_mm_encoder,
+        f"MoE backend {moe.backend} (only AUTO or TRTLLM)": moe.backend not in ("AUTO", "TRTLLM"),
+        f"a MoE load balancer ({moe.load_balancer})": moe.load_balancer is not None,
+        f"DWDP ({llm_args.dwdp_config})": llm_args.dwdp_config is not None,
+        f"shared-expert fusion ({_SHARED_EXPERT_FUSION_ENV}=1)": (
+            os.environ.get(_SHARED_EXPERT_FUSION_ENV) == "1"
+        ),
+    }
+    return [name for name, present in refused.items() if present] + _fp8_speculation_refused(
+        model_config.spec_config
     )
