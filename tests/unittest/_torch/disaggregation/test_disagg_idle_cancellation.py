@@ -48,7 +48,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.sampler import (
     SampleStateTensorsHostTorch,
     SampleStateTorch,
@@ -141,6 +141,7 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine.gather_all_responses = False
     engine.kv_connector_manager = None
     engine.previous_batch = None
+    engine.capturable_guided_decoder = None
     engine.is_encoder_decoder = False
     engine._mm_encoder_item_scheduling_enabled = False
     engine.dist = SimpleNamespace(
@@ -186,7 +187,6 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
         effects=PyExecutorEffects(engine),
         registry=PyExecutorRequestRegistry(engine),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
     return engine
 
@@ -524,8 +524,8 @@ def test_existing_compute_request_keeps_post_batch_cancellation(
         batch.context_requests_chunking = [request]
     else:
         batch.generation_requests = [request]
-    executor.previous_batch = SimpleNamespace(
-        scheduled_requests=batch, sample_state=SimpleNamespace(requests=[])
+    executor.previous_batch = BatchState(
+        scheduled_requests=batch, sample_state=SampleStateTorch(requests=[])
     )
     executor.active_requests = [request]
     _abort(executor, request)
@@ -627,7 +627,9 @@ def test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary
         batch.context_requests_chunking = [request]
     else:
         batch.generation_requests = [request]
-    executor.previous_batch = SimpleNamespace(scheduled_requests=batch)
+    executor.previous_batch = BatchState(
+        scheduled_requests=batch, sample_state=SampleStateTorch(requests=[])
+    )
     executor._is_kv_manager_v2 = True
     executor.enable_joint_kv_cache_reuse = False
     executor.kv_cache_manager = Mock(spec=["update_resources", "is_preemption_pending"])
@@ -692,7 +694,7 @@ def _prepare_generation_harvest(executor: PyExecutor, requests: list[LlmRequest]
             single_step_greedy=True,
         ),
     )
-    executor.previous_batch = SimpleNamespace(scheduled_requests=batch, sample_state=state)
+    executor.previous_batch = BatchState(scheduled_requests=batch, sample_state=state)
     sampler = object.__new__(TorchSampler)
     sampler.max_seq_len = 1024
     sampler._track_pending_steps = False

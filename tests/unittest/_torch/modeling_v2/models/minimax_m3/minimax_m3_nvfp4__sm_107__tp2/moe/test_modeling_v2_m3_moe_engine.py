@@ -8,10 +8,12 @@ Operands: ``_m3_moe_operands``.
 """
 
 import zlib
+from typing import Literal
 
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
     HIDDEN,
     INTER,
@@ -137,10 +139,15 @@ def test_full_output_is_the_stock_block_bit_for_bit(m, seed) -> None:
     check_full_output(op, _state(m), m, seed=200 + 10 * m + seed)
 
 
-def test_three_token_random_certified_cell_is_the_stock_block_bit_for_bit() -> None:
-    cell = next(candidate for candidate in op.CELLS if candidate.spec["tokens"] == 3)
-    seed = zlib.crc32((cell.why + "random").encode()) % 2**31
-    check_full_output(op, _state(3), 3, seed=seed)
+@pytest.mark.parametrize("case", ("random", "concentrated"))
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_certified_cells_are_the_stock_block_bit_for_bit(
+    cell: Cell, case: Literal["random", "concentrated"]
+) -> None:
+    """Check stock parity on every certified cell's exact input and routing case."""
+    m = cell.spec["tokens"]
+    seed = zlib.crc32((cell.why + case).encode()) % 2**31
+    check_full_output(op, _state(m), m, seed=seed, case=case)
 
 
 def test_layers_on_one_state_do_not_leak_into_each_other() -> None:
