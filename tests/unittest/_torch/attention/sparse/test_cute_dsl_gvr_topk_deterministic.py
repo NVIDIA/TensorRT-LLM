@@ -158,8 +158,7 @@ def test_main_varlen_mtp_mixed_lengths(deterministic):
     ).repeat(num_rows // (next_n * 8))
     row_indices = torch.arange(num_rows)
     effective_lengths = (
-        (lengths[row_indices // next_n] - next_n + row_indices % next_n + 1)
-        // compress_ratio
+        (lengths[row_indices // next_n] - next_n + row_indices % next_n + 1) // compress_ratio
     ).clamp(0, width)
     scores = row.unsqueeze(0).repeat(num_rows, 1)
     scores[torch.arange(width)[None, :] >= effective_lengths[:, None]] = 1e30

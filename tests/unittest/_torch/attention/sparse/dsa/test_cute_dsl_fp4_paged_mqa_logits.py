@@ -329,6 +329,7 @@ def test_cute_dsl_fp4_paged_mqa_logits(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -440,10 +441,10 @@ def test_cute_dsl_fp4_paged_mqa_logits_short_context(context_len, phys_block_kv)
         (num_blocks, phys_block_kv, 1, head_dim), dtype=torch.bfloat16, device=device
     )
     weights = torch.randn((batch_size * next_n, num_heads), device=device)
-    query_packed, query_scales = per_token_cast_to_fp4(
+    query_packed, query_scales = DSAVanillaIndexer.quantize_fp4(
         query.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
     )
-    query_dequantized = cast_back_from_fp4(
+    query_dequantized = DSAVanillaIndexer.dequantize_fp4(
         query_packed, query_scales, gran_k=32, use_packed_ue8m0=True
     ).view(batch_size, next_n, num_heads, head_dim)
     remove_online_sf_transpose = phys_block_kv == 128
@@ -453,10 +454,11 @@ def test_cute_dsl_fp4_paged_mqa_logits_short_context(context_len, phys_block_kv)
     schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
         context_lens.unsqueeze(-1), 64, deep_gemm.get_num_sms()
     )
-    expected = _ref_paged_mqa_logits(
+    expected = paged_mqa_logits(
         query_dequantized.float(),
         kv_dequantized.float(),
         weights,
+        context_lens,
         context_lens,
         block_table,
         max_model_len=max_model_len,
@@ -467,6 +469,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_short_context(context_len, phys_block_kv)
         query_scales.view(torch.int32).view(batch_size, next_n, num_heads),
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -561,6 +564,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_kernel_split(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -722,6 +726,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_block_meta(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -882,6 +887,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -918,6 +924,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -1031,6 +1038,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -1690,6 +1698,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -1724,6 +1733,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
