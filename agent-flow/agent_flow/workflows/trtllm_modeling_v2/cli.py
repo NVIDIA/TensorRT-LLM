@@ -30,69 +30,61 @@ from .spec.task_schema import TaskSchemaError, load_and_validate_task_yaml
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="trtllm-modeling-v2",
-        description=(
-            "Onboard one checkpoint as a modeling_v2 target: preflight, the tasks in a fixed "
-            "order, the onboard check on the first deployment, each further deployment, one "
-            "final pass and the report. Exit status 0 means onboarded: the first deployment's "
-            "boot and benchmarks passed on the commit that landed, whatever else is not done; "
-            "1 anything else the run came to (`delivery_report.md` and the journal say what); "
-            "2 a spec or usage error. The same command against the same workspace goes on "
-            "from where the last start stopped."
-        ),
+        description="Onboard one checkpoint as a modeling_v2 target: preflight, the tasks in a "
+        "fixed order, the onboard check on the first deployment, each further deployment, one "
+        "final pass and the report. Exit status 0 means onboarded: the first deployment's boot "
+        "and benchmarks passed on the commit that landed, whatever else is not done; 1 anything "
+        "else the run came to (`delivery_report.md` and the journal say what); 2 a spec or "
+        "usage error; 3 the workspace is held by another process. The same command against "
+        "the same workspace goes on from where the last start stopped.",
     )
-    parser.add_argument(
+    add = parser.add_argument
+    add(
         "--task",
         type=Path,
         required=True,
-        help="Path to the task YAML file. It is validated before any agent is constructed "
-        "and written, resolved, to `<workspace>/task.yaml`, which every agent reads. "
-        "`trtllm-modeling-v2 intake derive` writes a first one from a checkpoint.",
+        help="The task YAML file. It is validated before any agent is constructed and written, "
+        "resolved, to `<workspace>/task.yaml`, which every agent reads. `trtllm-modeling-v2 "
+        "intake derive` writes a first one from a checkpoint.",
     )
-    parser.add_argument(
+    add(
         "--workspace",
         type=Path,
         default=Path("workspace/trtllm-modeling-v2"),
-        help="Workspace directory for the run's shared state (task.yaml, "
-        "plan.md, vocabulary.yaml, journal.md, turns/). "
+        help="The run's directory (task.yaml, tasks.yaml, journal.md, turns/, the report). "
         "Created on demand.",
     )
-    parser.add_argument(
+    add(
         "--max-attempts",
         type=int,
         default=DEFAULT_MAX_ATTEMPTS,
-        help="How many worker runs one task gets, its first included. A task that spent "
-        "them is not done: the run goes on without it, and the next start gives it fresh "
-        f"ones. Default {DEFAULT_MAX_ATTEMPTS}.",
+        help="How many worker runs one task gets, its first included. A task that spent them "
+        "is not done: the run goes on without it, and the next start gives it fresh ones. "
+        f"Default {DEFAULT_MAX_ATTEMPTS}.",
     )
-    parser.add_argument(
-        "--max-rounds",
-        type=int,
-        default=None,
-        help="Ignored, with a notice: the run has one final pass and no rounds.",
-    )
-    parser.add_argument(
+    add("--max-rounds", type=int, default=None, help="Ignored, with a notice: there are no rounds.")
+    add(
         "--clean",
         action="store_true",
-        help="Wipe the workspace checkpoint and managed files "
-        f"({STATE_FILENAME}, plan.md, vocabulary.yaml, tasks.yaml, the verdicts, "
-        "journal.md) and start fresh. Without this flag the workflow "
-        "resumes from the checkpoint when one is present, and starts fresh "
-        "otherwise.",
+        help=f"Remove what an earlier run left in the workspace ({STATE_FILENAME}, tasks.yaml, "
+        "plan.md, vocabulary.yaml, the verdicts, journal.md) and start over. The frozen "
+        "anchors and the operator's notes stay.",
     )
-    parser.add_argument(
+    add(
         "--dry-run",
         action="store_true",
-        help="Run preflight and stop before the first agent turn: the spec, the checkout, "
-        "the checkpoint, the anchors and the agent probe. It touches no GPU (no device is "
-        "queried or claimed), so it also runs on a host without one.",
+        help="Run preflight and stop before the first agent turn: the spec, the checkout, the "
+        "checkpoint, the anchors and the agent probe. No device is queried or claimed, so it "
+        "also runs on a host without a GPU.",
     )
-    parser.add_argument(
+    bounds = ", ".join(
+        f"{role} {int(s) // 3600}h" for role, s in DEFAULT_ROLE_TURN_TIMEOUTS.items()
+    )
+    add(
         "--agent-turn-timeout",
         type=int,
         default=None,
-        help="Seconds a single role turn may take, for every role. Without it each role has its own bound ("
-        + ", ".join(f"{role} {int(s) // 3600}h" for role, s in DEFAULT_ROLE_TURN_TIMEOUTS.items())
-        + ").",
+        help=f"Seconds one role turn may take, for every role (default: {bounds}).",
     )
     return parser.parse_args(argv)
 
@@ -123,19 +115,13 @@ def _commit_identity(task_data: dict) -> CommitIdentity:
     return identity
 
 
-#: Open file objects whose flock this process holds, kept alive deliberately.
+#: The open files whose flock this process holds. `flock` belongs to the open file
+#: description: a handle that is collected drops its lock, so they are kept here.
 _HELD_LOCKS: list = []
 
 
-def _claim_workspace(workspace: Path):
-    """Take an exclusive lock on the workspace, or refuse to start.
-
-    The handle is kept in a module-level list rather than returned-and-hoped,
-    because `flock` is held by an OPEN FILE DESCRIPTION: let the file object
-    be collected and the lock silently disappears.
-
-    Released when the process exits, which is what a crash should do.
-    """
+def _claim_workspace(workspace: Path) -> None:
+    """Take the workspace's exclusive lock, or exit 3; a process that ends releases it."""
     import fcntl
 
     workspace.mkdir(parents=True, exist_ok=True)
@@ -146,17 +132,15 @@ def _claim_workspace(workspace: Path):
     except OSError:
         handle.close()
         print(
-            f"error: another trtllm-modeling-v2 process already holds {path}.\n"
-            f"       Two orchestrators on one workspace share the checkpoint and the\n"
-            f"       turn records, so they overwrite each other. Stop the other one\n"
-            f"       first, or use a different --workspace.",
+            f"error: another trtllm-modeling-v2 process already holds {path}. Two orchestrators "
+            "on one workspace overwrite each other's task list and turn records: stop the "
+            "other one first, or use a different --workspace.",
             file=sys.stderr,
         )
         sys.exit(3)
     handle.write(f"{os.getpid()}\n")
     handle.flush()
     _HELD_LOCKS.append(handle)
-    return handle
 
 
 def _lazy_main(module: str) -> Callable[[list[str]], int]:
