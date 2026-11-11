@@ -142,6 +142,21 @@ def test_kernels_read_the_word_of_the_running_forward(monkeypatch: pytest.Monkey
     assert lr._ALL_ROWS_WORDS[0]._value == lr.ALL_ROWS
 
 
+@pytest.mark.parametrize("keep", ["0", "1"])
+def test_the_debug_switch_keeps_every_row(monkeypatch: pytest.MonkeyPatch, keep: str) -> None:
+    """With ``TRTLLM_MEGAMOE_KEEP_PADDING_ROWS=1`` the engine registers no word, so kernels read
+    the word that keeps every row."""
+    from tensorrt_llm.mapping import Mapping
+
+    monkeypatch.setenv(lr.KEEP_PADDING_ROWS_ENV, keep)
+    monkeypatch.setattr(lr.LiveRowWord, "tensor", lambda word, device: word)
+    model = SimpleNamespace(extra_attrs={})
+    engine = lr.engine_word(model, Mapping())
+    with model_extra_attrs(model.extra_attrs):
+        read = lr.current_word("cuda:0")
+    assert read is (lr._ALL_ROWS_WORDS[0] if keep == "1" else engine)
+
+
 # A forward of 512 requests of 4 rows each (one-model MTP), the first 400 real: 2048 rows, the
 # first 1600 real. A MoE layer that splits it into two chunks of 1024 rows launches over each
 # chunk; read with the forward's word, the first chunk would keep 1024 / 512 * 400 = 800 rows and

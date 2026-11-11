@@ -28,12 +28,15 @@ forward into chunks launches over parts of it, so those launches read a word tha
 every row (:func:`part_of_the_forward`). Under Helix CP with attention DP the attention
 output is reduce-scattered across the CP group and each CP rank's MoE runs on its own
 slice of the forward's rows, so no launch covers the forward: the engine's word is not
-registered there (:func:`engine_word`) and every launch keeps every row.
+registered there (:func:`engine_word`) and every launch keeps every row. Setting
+``TRTLLM_MEGAMOE_KEEP_PADDING_ROWS=1`` does the same everywhere: a debugging switch that turns
+the drop off without a rebuild.
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 from typing import TYPE_CHECKING, Dict, Iterator, Optional, Sequence
 
@@ -56,6 +59,8 @@ NO_ROWS = 0
 ALL_ROWS = (1 << REQUEST_BITS) | 1
 # Key of an engine's word in the per-forward model extra attrs.
 LIVE_ROW_WORD_ATTR = "live_row_word"
+# Debugging only: "1" registers no engine word, so the kernels keep every row.
+KEEP_PADDING_ROWS_ENV = "TRTLLM_MEGAMOE_KEEP_PADDING_ROWS"
 
 
 def encode(real_requests: int, requests: int) -> int:
@@ -200,11 +205,18 @@ def forward_rows_split_across_cp_ranks(mapping: Mapping) -> bool:
 def engine_word(model: torch.nn.Module, mapping: Mapping) -> LiveRowWord:
     """A new engine's word, registered in ``model.extra_attrs`` for the kernels to read.
 
-    Where the forward's rows are split across CP ranks the word is not registered, so every
-    launch reads ``all_rows_word`` and the engine's writes never reach a kernel.
+    Where the forward's rows are split across CP ranks, or with ``KEEP_PADDING_ROWS_ENV`` set
+    to 1, the word is not registered, so every launch reads ``all_rows_word`` and the engine's
+    writes never reach a kernel.
     """
     word = LiveRowWord()
-    if not forward_rows_split_across_cp_ranks(mapping):
+    if os.environ.get(KEEP_PADDING_ROWS_ENV, "0") == "1":
+        logger.warning_once(
+            f"{KEEP_PADDING_ROWS_ENV}=1: the MegaMoE kernels compute the rows of padding requests "
+            "like real rows (a debugging switch).",
+            key="live_row_word_keep_padding_rows",
+        )
+    elif not forward_rows_split_across_cp_ranks(mapping):
         model.extra_attrs[LIVE_ROW_WORD_ATTR] = word
     return word
 
