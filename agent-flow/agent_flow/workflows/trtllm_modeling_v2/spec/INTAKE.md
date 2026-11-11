@@ -36,17 +36,17 @@ CODEOWNERS entries; owners review shared changes separately from isolated model 
 
 ```bash
 trtllm-modeling-v2 intake derive --checkpoint <ckpt> --repo <trtllm checkout> \
-    --goal "<members> <features> kv=bf16/fp8/nvfp4 isl=<n> osl=<n> concurrency=<a>/<b>/<c>" \
+    --goal "<members> <features> kv=bf16/fp8/nvfp4 isl=<n> osl=<n> max_batch_size=<n>" \
     --out <dir>
 ```
 
-It writes `task.derived.yaml` and `derive.report.md` (every value the goal did not state and where
-it came from), and prints the spec's warnings (section 9). With a `site.yaml` pass
+It writes `task.derived.yaml` with each deployment's options beside it (`engines/<name>.yaml`),
+and prints what it left open and the spec's warnings (section 9). With a `site.yaml` pass
 `--site` instead of `--repo`. Edit the derived spec; copy `task.example.yaml` only for what the
 goal words cannot say.
 
 - A goal that names features gets those: a drafter or vision tower the checkpoint carries and the
-  request does not ask for is left out (`derive.report.md` says so). Name it to build it.
+  request does not ask for is left out. Name it to build it.
 - `kv=` lists the KV dtypes in one word: the first is every gate's, each other one a variant
   (`gates: [accuracy]`) judged against the unit's own score.
 - Derive asks rather than guesses (and stops until the spec answers): `model_key` when
@@ -61,9 +61,9 @@ goal words cannot say.
 | "Y only aggregate / text-only" | Y in `members.default` for core alone; its variant and feature cells in `coverage.accept` | |
 | "<feature> smoke" | the feature in `features`, `profile: {<feature>: smoke}`, its members narrowed | |
 | a KV cache dtype list | base `kv_cache_config.dtype: auto`; one variant per other dtype (`llm_api_options.kv_cache_config.dtype`, `gates: [accuracy]`) | |
-| chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `kv_cache_config.enable_block_reuse: true`, each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined (the lint blocks a cross product unless the notes accept the one the request names) |
+| chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `kv_cache_config.enable_block_reuse: true`, each only when asked, stated in the spec | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined (the lint blocks a cross product unless the notes accept the one the request names) |
 | disagg | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`, configured, set up and launched as they are), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully. Derive sizes it from the checkpoint: **one node** when a context and a generation engine both fit (`accuracy.disagg.devices`, two engines of two on a 4-GPU node), else `accuracy.disagg.nodes` with one engine per node, as the tree's multi-node disaggregated tests place them | boot and accuracy run one aggregated engine and never cross the hop; a multi-node test runs one pytest process per node of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), so the gates session must hold that many nodes |
-| any other feature (MTP, speculative, offload ...) | name it in `--goal`; `derive.report.md` and `task.example.yaml` say what its unit owes | the same one-variant-per-axis rule applies |
+| any other feature (MTP, speculative, offload ...) | name it in `--goal`; `task.example.yaml` says what its unit owes | the same one-variant-per-axis rule applies |
 | workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192) | |
 
 **The smallest contract that covers the request.** Every check loads the model (minutes on a

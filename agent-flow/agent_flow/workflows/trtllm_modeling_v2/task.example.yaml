@@ -3,7 +3,7 @@
 # with `trtllm-modeling-v2 --task task.yaml --workspace W --dry-run`. `trtllm-modeling-v2 intake
 # derive --checkpoint <dir> --repo <checkout> --goal "..." --out D` writes a starting spec. Or derive one:
 # `trtllm-modeling-v2 --checkpoint <dir> --site site.yaml --goal "..." --workspace W` writes
-# W/task.derived.yaml (beside W/derive.report.md) and runs it; spec/derive.py lists goal words.
+# W/task.derived.yaml and runs it; spec/derive.py lists goal words.
 #
 # Every block is CLOSED: an unknown key is an error naming the nearest real key, never a silent
 # default. Commented-out keys are optional, with their default beside them.
