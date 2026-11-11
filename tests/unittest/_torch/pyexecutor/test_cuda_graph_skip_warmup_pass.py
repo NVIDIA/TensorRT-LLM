@@ -131,13 +131,13 @@ def _generate(skip_warmup_pass: bool, move_workspace: bool = False) -> _Run:
         return replay(self, key, *args, **kwargs)
 
     def fetch_prompts_together(
-        self: ExecutorRequestQueue, timeout: datetime.timedelta | None
+        self: ExecutorRequestQueue, timeout: datetime.timedelta | None, **kwargs: bool
     ) -> list[RequestQueueItem]:
         """Schedule every prompt in the first batch, so each run steps through the same batches."""
-        items = get_from_request_queue(self, timeout)
+        items = get_from_request_queue(self, timeout, **kwargs)
         if items and generating and not first_fetch:
             while len(items) < len(PROMPTS) and (
-                more := get_from_request_queue(self, datetime.timedelta(seconds=10))
+                more := get_from_request_queue(self, datetime.timedelta(seconds=10), **kwargs)
             ):
                 items += more
             first_fetch.append(len(items))
