@@ -344,9 +344,7 @@ def test_k3_fused_moe_mixed_m_sequence(routing_cases):
             )
     for num_tokens, case in sequence:
         logits8, x8 = _tokens(case)
-        output = _fused(
-            proc, bias, x8[:num_tokens].contiguous(), logits8[:num_tokens].contiguous()
-        )
+        output = _fused(proc, bias, x8[:num_tokens].contiguous(), logits8[:num_tokens].contiguous())
         assert torch.equal(_bits(output), _bits(alone[num_tokens, case])), (num_tokens, case)
         if case == "none_local":
             assert bool((output == 0).all()), num_tokens

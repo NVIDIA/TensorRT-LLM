@@ -992,9 +992,7 @@ def test_cute_dsl_gvr_topk_decode_phase_values(cluster_size, tie_aware_check):
     )
     compiled = _compile_gvr_direct(kernel)
     out_indices = torch.full((num_rows, top_k), -7, dtype=torch.int32, device="cuda")
-    out_values = torch.full(
-        (num_rows, top_k), float("nan"), dtype=torch.float32, device="cuda"
-    )
+    out_values = torch.full((num_rows, top_k), float("nan"), dtype=torch.float32, device="cuda")
     compiled(logits, pre_idx, seq_lens, out_values, out_indices, None)
     torch.cuda.synchronize()
 
