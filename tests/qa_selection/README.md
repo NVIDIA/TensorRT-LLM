@@ -92,6 +92,11 @@ pytest's own hook. `<machine>.json` records the profile with the run's ladder, t
 `-v` adds node ids. An unknown machine, a rung above the node, or a leftover list of this
 machine's in the output directory is a usage error.
 
+## Any pytest project
+
+The plugin works for any pytest suite whose tests mark what they need. To use it in yours, see
+[ADOPTING.md](ADOPTING.md).
+
 ## Layout
 
 ```text
@@ -105,6 +110,7 @@ qa_selection/
     machine.py       --machine: may the machine's card run a test
     marks.py         what a test asks for, read from its marks
   tests/           the contract tests
+  ADOPTING.md      using the plugin in another pytest project
 ```
 
 ## Tests
