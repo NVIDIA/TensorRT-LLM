@@ -46,6 +46,8 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
+from ._multimodal import check_target_multimodal_contract
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -223,6 +225,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         )
         return None
     if target is not None:
+        check_target_multimodal_contract(arch, target)
         _RESOLVED_MODES[target] = mode
     return target
 

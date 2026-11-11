@@ -109,6 +109,7 @@ def test_already_chunk_local_embeddings_are_not_sliced_twice():
 
 def test_legacy_imports_preserve_runtime_identity():
     assert legacy_model.MultimodalModelMixin is model.MultimodalModelMixin
+    assert legacy_model.MultimodalRuntimeMixin is model.MultimodalRuntimeMixin
     assert legacy_model.PreparedLlmInputs is model.PreparedLlmInputs
     assert legacy_model.EncoderGroup is model.EncoderGroup
 

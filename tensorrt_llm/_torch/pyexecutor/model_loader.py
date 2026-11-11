@@ -61,7 +61,7 @@ from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
 from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..moe.fused_moe.weight_owner import is_moe_weight_owner
-from ..multimodal.model import MultimodalModelMixin
+from ..multimodal.model import MultimodalModelMixin, MultimodalRuntimeMixin
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
@@ -1274,6 +1274,11 @@ class ModelLoader:
 
             validate_lm_head_output_dtype(model,
                                           self.llm_args.lm_head_output_dtype)
+            # A model that runs its own decoder has no composite fallbacks for its declared
+            # embedding row layout, so it must read correctly from the real configuration.
+            if isinstance(model, MultimodalRuntimeMixin) and not isinstance(
+                    model, MultimodalModelMixin):
+                model.check_multimodal_instance_contract()
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)

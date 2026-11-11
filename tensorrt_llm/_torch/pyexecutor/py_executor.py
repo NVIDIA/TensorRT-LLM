@@ -10121,7 +10121,7 @@ class PyExecutor:
         work can overlap current-iteration sampling in the non-overlap loop and
         previous-batch `_update_requests` in the overlap loop. No-op unless
         `multimodal_config.encoder_side_stream_max_ahead` is positive and the
-        model is a `MultimodalModelMixin` subclass.
+        model is a `MultimodalRuntimeMixin` subclass.
 
         Walks `active_requests` for context-init candidates that are NOT
         in the just-scheduled batch (and, in overlap mode, not in the

@@ -51,7 +51,7 @@ from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..modules.dwdp.dense.manager import DenseDwdpManager
-from ..multimodal.model import MultimodalModelMixin
+from ..multimodal.model import MultimodalRuntimeMixin
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
                            get_num_extra_kv_tokens, get_num_spec_layers,
@@ -1550,8 +1550,14 @@ class KvCacheCreator:
         return requests
 
     def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
-        """Build one processed MM encoder batch at its scheduling limits."""
-        if not isinstance(self._model_engine.model, MultimodalModelMixin):
+        """Build one processed MM encoder batch at its scheduling limits.
+
+        Items stay within the model's `max_encoder_tokens_per_item`. When that bound is below
+        the processor's largest item, the batch holds one params object per item, each built
+        under the bound, so the batch still fills the encoder token budget.
+        """
+        model = self._model_engine.model
+        if not isinstance(model, MultimodalRuntimeMixin):
             return []
         if isinstance(
                 self._profiling_stage_data,
@@ -1579,6 +1585,19 @@ class KvCacheCreator:
                     raise ValueError(
                         "Multimodal encoder token counts must be positive; "
                         f"got {num_tokens} for {modality}")
+            # Modality -> per-item token budget under the model's encoder bound.
+            item_token_budgets: dict[str, int] = {}
+            for modality, num_tokens in list(max_tokens_per_item.items()):
+                bound = model.max_encoder_tokens_per_item(modality)
+                if bound is None or num_tokens <= bound:
+                    continue
+                bounded_tokens = input_processor.get_mm_max_tokens_per_item(
+                    max_num_encoder_tokens=bound).get(modality)
+                if bounded_tokens is None or bounded_tokens <= 0:
+                    del max_tokens_per_item[modality]
+                    continue
+                max_tokens_per_item[modality] = bounded_tokens
+                item_token_budgets[modality] = bound
             max_tokens_per_item = {
                 modality: num_tokens
                 for modality, num_tokens in max_tokens_per_item.items()
@@ -1595,23 +1614,37 @@ class KvCacheCreator:
                 self._model_engine.encoder_batch_size,
                 encoder_max_num_tokens // num_tokens_per_item,
             )
-            mm_data = input_processor.get_dummy_mm_data(
-                max_num_encoder_tokens=encoder_max_num_tokens,
-                mm_counts={modality: num_items},
-                dtype=self._model_engine.model.dtype,
-            )
+            if modality in item_token_budgets:
+                mm_data_list = [
+                    input_processor.get_dummy_mm_data(
+                        max_num_encoder_tokens=item_token_budgets[modality],
+                        mm_counts={modality: 1},
+                        dtype=model.dtype,
+                    ) for _ in range(num_items)
+                ]
+            else:
+                mm_data_list = [
+                    input_processor.get_dummy_mm_data(
+                        max_num_encoder_tokens=encoder_max_num_tokens,
+                        mm_counts={modality: num_items},
+                        dtype=model.dtype,
+                    )
+                ]
         except NotImplementedError:
             logger.info("Multimodal memory profiling skipped: "
                         f"{type(input_processor).__name__} does not implement "
                         "get_dummy_mm_data().")
             return []
-        if not mm_data:
+        if not all(mm_data_list):
             return []
-        if not isinstance(mm_data, dict):
+        if not all(isinstance(mm_data, dict) for mm_data in mm_data_list):
             raise ValueError(
                 "get_dummy_mm_data() must return a multimodal_data "
                 "dictionary")
-        return [MultimodalParams(multimodal_data=mm_data)]
+        return [
+            MultimodalParams(multimodal_data=mm_data)
+            for mm_data in mm_data_list
+        ]
 
     def _encode_dummy_inputs(self) -> Optional[torch.Tensor]:
         """Run the full-budget MM encoder and retain equivalent store output."""

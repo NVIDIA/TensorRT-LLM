@@ -93,6 +93,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Opti
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2._multimodal import TextOnlyTarget
 from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
     k3_mla_decode_view,
@@ -3294,7 +3295,7 @@ def _check_construction(model_config: ModelConfig) -> None:
     )
 
 
-class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
+class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM, TextOnlyTarget):
     """The class ``route`` returns: this target's text model (`KimiLinearModel` above) behind its checks.
 
     It inherits the built-in Kimi K3 causal LM for the checkpoint load and the engine hooks (`load_weights` through

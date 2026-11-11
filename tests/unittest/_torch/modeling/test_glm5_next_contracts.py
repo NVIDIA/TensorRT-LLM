@@ -400,6 +400,8 @@ def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
     )
     processor._processor = SimpleNamespace(image_processor=image_processor)
     model = Mock(spec=MultimodalModelMixin, dtype=torch.float16)
+    # The GLM-5 encoder declares no item bound of its own.
+    model.max_encoder_tokens_per_item.return_value = None
     profiler = object.__new__(KvCacheCreator)
     profiler._llm_args = SimpleNamespace(disable_mm_encoder=False)
     profiler._profiling_stage_data = {"enable_mm_reqs": True}

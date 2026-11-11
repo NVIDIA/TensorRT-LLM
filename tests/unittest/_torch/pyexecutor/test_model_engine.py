@@ -27,7 +27,7 @@ from _torch.pyexecutor.engine_test_utils import (
 
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
-from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
+from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin, MultimodalRuntimeMixin
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.engine import model_setup
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
@@ -714,6 +714,28 @@ class ModelEngineTestCase(unittest.TestCase):
 
         self.assertTrue(is_multimodal(engine.model, engine.input_processor))
         engine._validate_breakable_cuda_graph_compatibility()
+
+    def test_breakable_follows_a_runtime_decoder_declaration(self) -> None:
+        """A decoder that runs the multimodal runtime itself decides, even under the
+        `DecoderModelForCausalLM` rule that admits text decoders."""
+        for allows in (False, True):
+            with self.subTest(allows=allows):
+
+                class RuntimeDecoder(DecoderModelForCausalLM, MultimodalRuntimeMixin):
+                    def allows_breakable_prefill_cuda_graph(self, llm_args) -> bool:
+                        return allows
+
+                engine = object.__new__(ModelEngine)
+                engine.model = RuntimeDecoder.__new__(RuntimeDecoder)
+                engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+                engine.llm_args = TorchLlmArgs(
+                    model="dummy", prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE
+                )
+                if allows:
+                    engine._validate_breakable_cuda_graph_compatibility()
+                else:
+                    with self.assertRaisesRegex(ValueError, "inside the captured prefill forward"):
+                        engine._validate_breakable_cuda_graph_compatibility()
 
     def test_restore_after_refit_never_touches_the_kv_cache(self) -> None:
         """The re-wrap hook must not run the warm-up KV-cache cleanup.

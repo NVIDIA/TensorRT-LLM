@@ -33,7 +33,7 @@ from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
-from ..multimodal.model import MultimodalModelMixin
+from ..multimodal.model import MultimodalModelMixin, MultimodalRuntimeMixin
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
 from ..tensor_lru_cache import TensorLRUCache
@@ -59,6 +59,7 @@ from .engine.multimodal import (
     setup_mm_encoder_attn_metadata,
     setup_mm_encoder_cuda_graphs,
     use_mrope,
+    validate_mm_encoder_prefetch_compatibility,
 )
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import make_scheduled_inputs, resolve_mrope_position_deltas_cache
@@ -349,6 +350,7 @@ class ModelEngine:
         # Every MM item-scheduling decision -- policy, capability, feature
         # validation, budget resolution -- lives in engine/multimodal.py; the
         # engine only copies back the three budgets that are external contract.
+        validate_mm_encoder_prefetch_compatibility(self.llm_args, self.model)
         mm_item_scheduler = MultimodalItemScheduler.maybe_create(
             llm_args=self.llm_args,
             model=self.model,
@@ -366,7 +368,7 @@ class ModelEngine:
             self.encoder_max_num_tokens = mm_item_scheduler.encoder_max_num_tokens
             self.mm_encoder_output_budget_bytes = mm_item_scheduler.output_budget_bytes
             self.bytes_per_mm_encoder_embedding = mm_item_scheduler.bytes_per_embedding
-        if isinstance(self.model, MultimodalModelMixin) and self.mapping.is_first_pp_rank():
+        if isinstance(self.model, MultimodalRuntimeMixin) and self.mapping.is_first_pp_rank():
             multimodal_config = self.model.model_config.multimodal_config
             reuse_capacity_bytes = (
                 multimodal_config.encoder_cache_max_bytes if self.model.encoder_cache_active else 0
@@ -889,6 +891,17 @@ class ModelEngine:
         if self.llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
             return
 
+        if isinstance(self.model, MultimodalRuntimeMixin) and not isinstance(
+            self.model, MultimodalModelMixin
+        ):
+            # A model that runs its own decoder states where its encoder runs; composite
+            # models keep the structural check below.
+            if self.model.allows_breakable_prefill_cuda_graph(self.llm_args):
+                return
+            raise ValueError(
+                f"breakable prefill CUDA graph is not supported by {type(self.model).__name__}: "
+                "its multimodal encoder may run inside the captured prefill forward"
+            )
         if isinstance(self.model, DecoderModelForCausalLM):
             return
         decoder_model = getattr(self.model, "llm", None)
@@ -912,7 +925,7 @@ class ModelEngine:
         if not scheduled_items:
             return
         if self._mm_item_scheduler is None:
-            raise TypeError("Item-level MM scheduling requires MultimodalModelMixin")
+            raise TypeError("Item-level MM scheduling requires MultimodalRuntimeMixin")
         self._mm_item_scheduler.forward_items(requests, scheduled_items)
 
     @property
@@ -920,7 +933,7 @@ class ModelEngine:
         """Return the model-owned encoder-output cache used by this engine."""
         # Whole-model torch.compile wraps the model after its cache is created.
         model = getattr(self.model, "_orig_mod", self.model)
-        if not isinstance(model, MultimodalModelMixin):
+        if not isinstance(model, MultimodalRuntimeMixin):
             return None
         if self._mm_item_scheduler is None and not model.encoder_cache_active:
             return None

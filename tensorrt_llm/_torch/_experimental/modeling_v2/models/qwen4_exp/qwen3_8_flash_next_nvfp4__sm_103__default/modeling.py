@@ -438,7 +438,7 @@ from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
     flashinfer_cached_replay_update,
 )
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
-from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
+from tensorrt_llm._torch.multimodal.model import MultimodalRuntimeMixin
 from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
@@ -463,7 +463,6 @@ from .ops.ssm.gdn_cached_replay_cute__verify import gdn_cached_replay_cute
 from .ops.ssm.gdn_cached_replay_cute__verify import precompile as gdn_replay_precompile
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # The GPU architecture this target is certified for; a direct instantiation could
@@ -6762,7 +6761,7 @@ def _text_settings(text) -> dict:
 
 
 class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
-    DecoderModelForCausalLM[Qwen4ExpDefaultModelingV2, PretrainedConfig], MultimodalModelMixin
+    DecoderModelForCausalLM[Qwen4ExpDefaultModelingV2, PretrainedConfig], MultimodalRuntimeMixin
 ):
     """Qwen3.8-Flash-Next-NVFP4 at tp1, tp4, tep4, dep4 or dep2 on sm_103."""
 
@@ -6773,11 +6772,8 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
     spec_decode_fast_paths: bool = False
     runtime_hooks: RuntimeHooks | None = None
     supports_encoder_cache = True
-
-    @property
-    def language_model(self) -> nn.Module:
-        """The integrated decoder shell inspected by runtime capability helpers."""
-        return self
+    # The tower keeps one attention workspace per CUDA stream (`VisionTower._attention_workspace`).
+    supports_concurrent_encoder = True
 
     @property
     def embedding_dim(self) -> int:
@@ -6822,9 +6818,16 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
             grid_key: MultimodalItemPartition(item_axis=0),
         }
 
-    def set_guided_decoder(self, guided_decoder: CapturableGuidedDecoder) -> bool:
-        """This target does not implement guided decoding."""
-        return False
+    def max_encoder_tokens_per_item(self, modality: str) -> int:
+        """The tower runs at most `VISION_CALL_MAX_PATCHES` patch rows per call and cuts a
+        larger image or video between frames; admission refuses a single frame above it. An
+        item of that size therefore bounds the tower's per-call activations."""
+        return _vision.VISION_CALL_MAX_PATCHES
+
+    def allows_breakable_prefill_cuda_graph(self, llm_args: TorchLlmArgs) -> bool:
+        """The shell encodes before the core's captured `forward`, and the prefill target
+        splices the rows through an eager break (`PrefillTarget._splice`)."""
+        return True
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
@@ -7087,6 +7090,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
             input_ids=input_ids,
             multimodal_params=kwargs.get("multimodal_params"),
             num_context_requests=attn_metadata.num_contexts,
+            mm_token_indices=kwargs.get("mm_token_indices"),
             attn_metadata=attn_metadata,
         )
         self.model.begin_step(
@@ -7096,9 +7100,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
             inputs_embeds=inputs_embeds,
             lora_params=lora_params,
             spec_metadata=spec_metadata,
-            vision=_vision.multimodal_embeds(
-                prepared_mm.multimodal_embeddings, kwargs.get("mm_token_indices")
-            ),
+            vision=_vision.multimodal_embeds(prepared_mm),
         )
         if self.spec_worker is None:
             assert spec_metadata is None, (

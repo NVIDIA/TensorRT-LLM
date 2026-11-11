@@ -22,7 +22,7 @@ import tensorrt_llm.bindings.internal.batch_manager as batch_manager
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
 from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
-from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
+from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin, MultimodalRuntimeMixin
 from tensorrt_llm._torch.pyexecutor._util import (
     CacheCost,
     KvCacheCreator,
@@ -378,6 +378,46 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     assert model.forwarded_item_counts == [2]
     assert retained_output.data_ptr() != model.last_output.data_ptr()
     assert creator._dummy_encoder_inputs == []
+
+
+def test_encoder_profiling_builds_items_within_the_model_bound():
+    """Above the model's per-item bound, profiling asks the processor for one item per
+    params object under that bound, and still fills the encoder token budget."""
+
+    class _InputProcessor:
+        def __init__(self):
+            self.calls = []
+
+        def get_mm_max_tokens_per_item(self, max_num_encoder_tokens=None):
+            return {"image": min(4096, max_num_encoder_tokens or 4096), "audio": 512}
+
+        def get_dummy_mm_data(self, *, max_num_encoder_tokens, mm_counts, dtype):
+            self.calls.append((max_num_encoder_tokens, mm_counts, dtype))
+            return {"image": {"item_count": mm_counts["image"]}}
+
+    class _Model(MultimodalRuntimeMixin):
+        dtype = torch.float16
+
+        def max_encoder_tokens_per_item(self, modality):
+            return 1024 if modality == "image" else None
+
+    input_processor = _InputProcessor()
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(
+        model=_Model(),
+        input_processor=input_processor,
+        encoder_batch_size=8,
+        encoder_max_num_tokens=8192,
+    )
+    creator._llm_args = TorchLlmArgs(model="dummy", checkpoint_format="HF")
+    creator._profiling_stage_data = {"enable_mm_reqs": True}
+
+    encoder_inputs = creator._create_dummy_encoder_inputs()
+
+    assert input_processor.calls == [(1024, {"image": 1}, torch.float16)] * 8
+    assert [params.multimodal_data for params in encoder_inputs] == [
+        {"image": {"item_count": 1}}
+    ] * 8
 
 
 def _make_creator(

@@ -77,6 +77,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch._experimental.modeling_v2._multimodal import TextOnlyTarget
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     ModelingV2Mode,
     NoTarget,
@@ -4498,7 +4499,7 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
 
 
 class ModelingV2MiniMaxM3Nvfp4Sm103Tp4(
-    DecoderModelForCausalLM[MiniMaxM3Tp4ModelingV2, PretrainedConfig]
+    DecoderModelForCausalLM[MiniMaxM3Tp4ModelingV2, PretrainedConfig], TextOnlyTarget
 ):
     """MiniMax-M3 NVFP4 / sm_103 / tp4, text only, with one-model Eagle3 or no speculation.
 

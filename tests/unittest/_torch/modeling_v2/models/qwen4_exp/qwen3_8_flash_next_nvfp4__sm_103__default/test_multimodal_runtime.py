@@ -5,6 +5,9 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2._multimodal import (
+    check_target_multimodal_contract,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (
     modeling as M,
 )
@@ -14,7 +17,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 from tensorrt_llm._torch.configs import Qwen4ExpConfig, Qwen4ExpVisionConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
-from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
+from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin, MultimodalRuntimeMixin
 from tensorrt_llm._torch.pyexecutor.model_engine import _spec_decode_fast_paths
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks, runtime_hooks_of
 from tensorrt_llm.inputs.multimodal import (
@@ -121,11 +124,14 @@ def prepare(shell, params):
     count = params.multimodal_runtime.num_mm_tokens_in_chunk
     ids = torch.full((count,), 7, dtype=torch.int32)
     prepared = shell.prepare_multimodal_embeddings(
-        input_ids=ids, multimodal_params=[params], num_context_requests=1
+        input_ids=ids,
+        multimodal_params=[params],
+        num_context_requests=1,
+        mm_token_indices=torch.arange(count),
     )
     assert prepared.input_ids is ids
     assert not prepared.extra_embeds
-    return V.multimodal_embeds(prepared.multimodal_embeddings, torch.arange(count))
+    return V.multimodal_embeds(prepared)
 
 
 def test_chunks_and_repeated_requests_share_encoder_outputs(monkeypatch):
@@ -186,14 +192,28 @@ def test_position_only_params_are_filtered_and_attached_embeddings_are_consumed(
 
 def test_decoder_contracts_and_speculative_hooks_keep_the_integrated_shell(monkeypatch):
     shell, _ = make_shell(monkeypatch)
-    assert isinstance(shell, MultimodalModelMixin)
-    assert shell.language_model is shell
+    assert isinstance(shell, MultimodalRuntimeMixin)
+    assert not isinstance(shell, MultimodalModelMixin)
+    # The runtime mixin delegates nothing to a separate language model.
+    assert not hasattr(shell, "language_model")
+    assert not hasattr(shell, "set_guided_decoder")
     assert Shell.vocab_size_padded is DecoderModelForCausalLM.vocab_size_padded
     assert Shell.infer_max_seq_len is DecoderModelForCausalLM.infer_max_seq_len
-    assert not shell.supports_mm_encoder_item_scheduling
-    assert not shell.set_guided_decoder(None)
+    assert Shell.forward is not MultimodalModelMixin.forward
     assert shell.embedding_dim == 2 and shell.dtype == torch.float32
     shell.spec_decode_fast_paths = True
     shell.runtime_hooks = RuntimeHooks(loop_on_execution_stream=True)
     assert _spec_decode_fast_paths(shell)
     assert runtime_hooks_of(shell).loop_on_execution_stream
+
+
+def test_the_shell_meets_the_multimodal_runtime_contract(monkeypatch):
+    shell, _ = make_shell(monkeypatch)
+    Shell.check_multimodal_class_contract()
+    shell.check_multimodal_instance_contract()
+    check_target_multimodal_contract("Qwen4ExpForConditionalGeneration", Shell)
+    assert Shell.supports_concurrent_encoder
+    assert not Shell.supports_mm_encoder_item_scheduling
+    assert shell.max_encoder_tokens_per_item("image") == V.VISION_CALL_MAX_PATCHES
+    assert shell.max_encoder_tokens_per_item("video") == V.VISION_CALL_MAX_PATCHES
+    assert shell.allows_breakable_prefill_cuda_graph(None)

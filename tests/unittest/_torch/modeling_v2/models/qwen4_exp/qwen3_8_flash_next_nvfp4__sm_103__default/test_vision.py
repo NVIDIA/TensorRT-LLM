@@ -28,6 +28,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 )
 from tensorrt_llm._torch.configs import Qwen4ExpConfig, Qwen4ExpVisionConfig
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.multimodal.model import PreparedMultimodalEmbeddings
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
@@ -315,10 +316,11 @@ def _params(image=None, video=None, order=None, runtime=None, mrope=True):
     return MultimodalParams(multimodal_data=data, multimodal_runtime=runtime)
 
 
-def _splice(tower, params, num_rows, padding=0):
+def _splice(tower, params, num_rows, padding=0, num_placeholders=None):
     """The tower's rows spliced, as the prefill target's break does, over a prompt whose
     tokens 1..num_rows are the placeholders and which `padding` rows follow; returns the rows
-    that landed there, one value per row, or None when the step carries no media."""
+    that landed there, one value per row, or None when the step carries no media.
+    `num_placeholders` overrides the executor's placeholder count."""
     shell = Shell.__new__(Shell)
     torch.nn.Module.__init__(shell)
     shell.model_config = ModelConfig(
@@ -329,14 +331,14 @@ def _splice(tower, params, num_rows, padding=0):
         )
     )
     shell.vision_tower = tower
+    num_placeholders = num_rows if num_placeholders is None else num_placeholders
     prepared = shell.prepare_multimodal_embeddings(
         input_ids=torch.zeros(num_rows + 2, dtype=torch.int32),
         multimodal_params=[params],
         num_context_requests=1,
+        mm_token_indices=torch.arange(1, 1 + num_placeholders, dtype=torch.int64),
     )
-    vision = V.multimodal_embeds(
-        prepared.multimodal_embeddings, torch.arange(1, 1 + num_rows, dtype=torch.int64)
-    )
+    vision = V.multimodal_embeds(prepared)
     if vision is None:
         return None
     total = num_rows + 2
@@ -360,7 +362,7 @@ MIXED_ROWS = [200.0] * 4 + [100.0] * 4 + [201.0] * 8 + [101.0]
 
 
 def test_a_text_step_runs_no_tower():
-    assert V.multimodal_embeds([], None) is None
+    assert V.multimodal_embeds(PreparedMultimodalEmbeddings(input_ids=torch.zeros(1))) is None
     # Position ids alone (a text prompt through a multimodal processor) are not media.
     assert _splice(None, _params(), 0) is None
 
@@ -421,8 +423,16 @@ def test_encoder_inputs_do_not_require_language_model_position_ids():
 
 
 def test_the_placeholder_rows_must_match_the_towers_rows():
-    with pytest.raises(ValueError, match="4 placeholder rows but received 5"):
-        V.multimodal_embeds([torch.zeros(5, HIDDEN)], torch.arange(4))
+    with pytest.raises(ValueError, match="4 multimodal placeholder positions but 5 active"):
+        _splice(_Tower(), _params(image=IMAGES), 5, num_placeholders=4)
+
+
+def test_active_rows_need_the_executors_placeholder_positions():
+    rows = PreparedMultimodalEmbeddings(
+        input_ids=torch.zeros(5), multimodal_embeddings=[torch.zeros(5, HIDDEN)]
+    )
+    with pytest.raises(ValueError, match="require mm_token_indices"):
+        V.multimodal_embeds(rows)
 
 
 def test_the_grids_stay_on_the_host():

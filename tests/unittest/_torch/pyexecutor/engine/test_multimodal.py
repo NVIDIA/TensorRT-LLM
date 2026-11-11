@@ -22,14 +22,17 @@ from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEnc
 from tensorrt_llm._torch.multimodal.model import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
+    MultimodalRuntimeMixin,
     _build_request_multimodal_input,
 )
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
     MultimodalItemScheduler,
+    bound_mm_max_tokens_per_item,
     resolve_bytes_per_mm_encoder_embedding,
     resolve_mm_encoder_output_budget,
     setup_mm_encoder_attn_metadata,
     setup_mm_encoder_cuda_graphs,
+    validate_mm_encoder_prefetch_compatibility,
     validate_mm_encoder_scheduling_compatibility,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -50,6 +53,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MultimodalConfig,
     MultimodalEncoderCudaGraphConfig,
     MultimodalEncoderSchedulingPolicy,
+    TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
 
@@ -463,6 +467,42 @@ def test_side_stream_compatibility_is_checked_only_for_item_scheduled_models() -
 
     with pytest.raises(ValueError, match="side-stream prefetch"):
         validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
+
+
+class _SingleStreamEncoderModel(MultimodalRuntimeMixin):
+    """A runtime model whose encoder keeps state shared across CUDA streams."""
+
+
+class _BoundedEncoderModel(MultimodalRuntimeMixin):
+    def max_encoder_tokens_per_item(self, modality: str) -> int | None:
+        return {"image": 1024}.get(modality)
+
+
+@pytest.mark.parametrize("max_ahead", [0, 1])
+def test_side_stream_prefetch_requires_a_concurrent_encoder(max_ahead: int) -> None:
+    args = TorchLlmArgs(
+        model="dummy", multimodal_config=MultimodalConfig(encoder_side_stream_max_ahead=max_ahead)
+    )
+    # Composite models keep prefetch; models that are not multimodal ignore the setting.
+    validate_mm_encoder_prefetch_compatibility(args, MultimodalModelMixin())
+    validate_mm_encoder_prefetch_compatibility(args, torch.nn.Linear(1, 1))
+    if max_ahead == 0:
+        validate_mm_encoder_prefetch_compatibility(args, _SingleStreamEncoderModel())
+        return
+    with pytest.raises(ValueError, match="supports_concurrent_encoder"):
+        validate_mm_encoder_prefetch_compatibility(args, _SingleStreamEncoderModel())
+
+
+def test_item_sizes_are_bounded_by_the_model_encoder() -> None:
+    processor_sizes = {"image": 4096, "video": 8192, "audio": 512}
+    assert bound_mm_max_tokens_per_item(_BoundedEncoderModel(), processor_sizes) == {
+        "image": 1024,
+        "video": 8192,
+        "audio": 512,
+    }
+    assert bound_mm_max_tokens_per_item(MultimodalModelMixin(), processor_sizes) == (
+        processor_sizes
+    )
 
 
 @pytest.mark.parametrize(

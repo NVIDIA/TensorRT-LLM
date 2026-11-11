@@ -170,23 +170,43 @@ so it is appropriate only when selecting an item requires no payload changes.
 
 ### Encoder Rows and Token Fusion
 
-`MultimodalModelMixin` lives in
+`MultimodalRuntimeMixin` and `MultimodalModelMixin` live in
 [_torch/multimodal/model.py](source:tensorrt_llm/_torch/multimodal/model.py).
-Both Modeling V1 and Modeling V2 use this runtime contract. The previous
+`MultimodalRuntimeMixin` is the executor's multimodal capability contract and
+the encoder runtime: encoding, request-local reuse across prefill chunks, the
+persistent encoder-output cache, side-stream prefetch and item scheduling. A
+model that runs its own decoder, such as a Modeling V2 target, inherits it
+directly. `MultimodalModelMixin` extends it for composite models whose language
+model is a separate module: it delegates to that module and adds a default
+`forward` and the default text embedding fusion. The previous
 `_torch/models/modeling_multimodal_mixin.py` path re-exports the same classes
 for compatibility.
+
+Every `MultimodalRuntimeMixin` subclass implements `encode_multimodal_inputs`,
+`embedding_dim` and `embedding_dtype`. It can also declare its encoder's limits:
+
+* `max_encoder_tokens_per_item` bounds the dummy items that encoder memory
+  profiling builds and the largest atomic item that item scheduling budgets for.
+* `supports_concurrent_encoder` permits side-stream prefetch, which runs the
+  encoder on an auxiliary CUDA stream. The engine rejects
+  `encoder_side_stream_max_ahead > 0` for a model that does not set it.
+  Composite models set it by default.
+* `allows_breakable_prefill_cuda_graph` admits breakable prefill CUDA graphs
+  for a model that encodes outside the captured forward.
 
 `prepare_multimodal_embeddings` performs cache lookup and encoding, waits for
 prefetched results, selects current-chunk rows, and runs both model hooks.
 Its result contains the input token IDs returned by the full-embedding hook,
 active multimodal rows, and any auxiliary embedding tensors returned by the
-active-embedding hook. It does not look up text embeddings. A model with its
-own embedding splice consumes this result directly and retains responsibility
-for matching the rows to the executor's `mm_token_indices`.
+active-embedding hook. It does not look up text embeddings. When the caller
+passes the executor's `mm_token_indices`, the result carries them with the
+rows, after checking that both count the same rows, so a model with its own
+embedding splice gets rows and positions together.
 
-`prepare_multimodal_inputs` uses that same preparation and then applies the
-default text embedding fusion. Model-specific encoder implementations and
-token embedding operations remain in their respective model packages.
+`MultimodalModelMixin.prepare_multimodal_inputs` uses the same preparation and
+then applies the default text embedding fusion. Model-specific encoder
+implementations and token embedding operations remain in their respective
+model packages.
 
 ### Item Boundaries and Model Hooks
 

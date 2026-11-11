@@ -16,8 +16,9 @@
 
 import contextlib
 import copy
+import inspect
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -61,6 +62,10 @@ from .embeddings import (
 
 class MultimodalEncoderContractError(ValueError):
     """A request-local MM encoder input or output contract violation."""
+
+
+class MultimodalModelContractError(TypeError):
+    """A multimodal model class or instance does not implement the encoder runtime contract."""
 
 
 def _assemble_multimodal_encoder_embeddings(
@@ -276,6 +281,8 @@ def encode_multimodal_by_groups(
 
 
 if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
 
@@ -376,6 +383,9 @@ class PreparedMultimodalEmbeddings:
     input_ids: torch.Tensor
     multimodal_embeddings: Sequence[torch.Tensor] = ()
     extra_embeds: Sequence[torch.Tensor] = ()
+    mm_token_indices: Optional[torch.Tensor] = None
+    """Placeholder positions of `multimodal_embeddings` in this forward's packed tokens,
+    when the caller supplied them; same row count as `multimodal_embeddings`."""
 
 
 @dataclass(frozen=True)
@@ -417,11 +427,21 @@ class EncoderCachePartition:
         return bool(self.looked_up) and not self.hits
 
 
-class MultimodalModelMixin:
-    """Template-method mixin for PyTorch multimodal causal LM models.
+class MultimodalRuntimeMixin:
+    """Multimodal encoder runtime and executor capability contract.
 
-    Concrete model forwards can call `prepare_multimodal_inputs` while keeping their explicit
-    language-model delegation.
+    The executor treats every subclass as a multimodal model. The mixin owns encoder execution,
+    request-local reuse across prefill chunks, the persistent encoder-output cache, side-stream
+    prefetch and item scheduling. `prepare_multimodal_embeddings` returns the rows consumed by
+    one forward; the model splices them into its own token embeddings.
+
+    The mixin has no notion of a separate language model and defines nothing that
+    `DecoderModelForCausalLM` defines, so a model that runs its own decoder can inherit both in
+    either order. Composite models whose language model is a separate module inherit
+    `MultimodalModelMixin`.
+
+    Subclasses implement `encode_multimodal_inputs`, `embedding_dim` and `embedding_dtype`.
+    `check_multimodal_class_contract` and `check_multimodal_instance_contract` verify them.
 
     Current limitations:
 
@@ -445,8 +465,85 @@ class MultimodalModelMixin:
     `BaseMultimodalInputProcessor.get_mm_item_metadata`. This is the executor-layer gate for
     item scheduling."""
 
+    supports_concurrent_encoder: ClassVar[bool] = False
+    """Whether `encode_multimodal_inputs` may run on an auxiliary CUDA stream while the main
+    stream runs the model, which side-stream prefetch requires. A model that sets it keeps every
+    piece of mutable encoder state, such as kernel workspaces, separate per CUDA stream."""
+
+    REQUIRED_MULTIMODAL_MEMBERS: ClassVar[Tuple[str, ...]] = (
+        "encode_multimodal_inputs",
+        "embedding_dim",
+        "embedding_dtype",
+    )
+    """Members every subclass overrides; checked by `check_multimodal_class_contract`."""
+
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
+
+    @classmethod
+    def check_multimodal_class_contract(cls) -> None:
+        """Raise `MultimodalModelContractError` if `cls` leaves a required member undefined."""
+        missing = [
+            name
+            for name in cls.REQUIRED_MULTIMODAL_MEMBERS
+            if inspect.getattr_static(cls, name)
+            is inspect.getattr_static(MultimodalRuntimeMixin, name)
+        ]
+        if missing:
+            raise MultimodalModelContractError(
+                f"{cls.__qualname__} inherits MultimodalRuntimeMixin but does not implement "
+                f"{', '.join(missing)}"
+            )
+
+    def check_multimodal_instance_contract(self) -> None:
+        """Read the declared embedding row layout from the constructed model.
+
+        Properties run with the model's real configuration, so a property that reads a field
+        the configuration lacks fails here, naming the property, rather than later inside the
+        executor, where `torch.nn.Module.__getattr__` would replace the error with a generic
+        missing-attribute message.
+        """
+        for name in ("embedding_dim", "embedding_dtype"):
+            descriptor = inspect.getattr_static(type(self), name)
+            try:
+                value = (
+                    descriptor.__get__(self, type(self))
+                    if hasattr(descriptor, "__get__")
+                    else descriptor
+                )
+            except (AttributeError, NotImplementedError, TypeError, ValueError) as error:
+                raise MultimodalModelContractError(
+                    f"{type(self).__qualname__}.{name} failed: {error!r}"
+                ) from error
+            if name == "embedding_dim" and not (isinstance(value, int) and value > 0):
+                raise MultimodalModelContractError(
+                    f"{type(self).__qualname__}.embedding_dim must be a positive int, got {value!r}"
+                )
+            if name == "embedding_dtype" and not isinstance(value, torch.dtype):
+                raise MultimodalModelContractError(
+                    f"{type(self).__qualname__}.embedding_dtype must be a torch.dtype, "
+                    f"got {value!r}"
+                )
+
+    def max_encoder_tokens_per_item(self, modality: str) -> Optional[int]:
+        """Return the largest item, in encoder tokens, the encoder processes in one piece.
+
+        Encoder memory profiling never builds a larger dummy item, and item scheduling never
+        sizes its per-iteration budget for a larger atomic item. A model that splits larger
+        items internally, or refuses them at admission, declares its bound here. `None`, the
+        default, leaves the input processor's limit in place.
+        """
+        return None
+
+    def allows_breakable_prefill_cuda_graph(self, llm_args: "TorchLlmArgs") -> bool:
+        """Whether a breakable prefill CUDA graph may capture this model's prefill forward.
+
+        Encoder work does not fit in a captured graph. The default refuses, which is correct for
+        any model that encodes inside `forward`. A model that encodes before the captured region
+        and splices rows through an eager break, or never encodes under `llm_args`, overrides
+        this. Composite models (`MultimodalModelMixin`) keep the engine's structural check.
+        """
+        return False
 
     @classmethod
     def _cast_multimodal_encoder_dtype(
@@ -645,11 +742,6 @@ class MultimodalModelMixin:
         return None
 
     @property
-    def text_embedding_layer(self):
-        """Return the token embedding layer used by `fuse_input_embeds`."""
-        raise NotImplementedError
-
-    @property
     def embedding_dim(self) -> int:
         """Return the width of each cached multimodal embedding row."""
         raise NotImplementedError
@@ -700,135 +792,6 @@ class MultimodalModelMixin:
                 or param.multimodal_runtime.num_mm_tokens_in_chunk != 0
             )
         ]
-
-    @property
-    def language_model(self) -> torch.nn.Module:
-        """Return the inner language model that receives prepared inputs."""
-        raise NotImplementedError
-
-    @property
-    def runtime_hooks(self) -> RuntimeHooks:
-        """Return the inner language model's step-loop hooks."""
-        try:
-            language_model = self.language_model
-        except NotImplementedError:
-            return DEFAULT_RUNTIME_HOOKS
-        return runtime_hooks_of(language_model)
-
-    @property
-    def vocab_size_padded(self) -> int:
-        """Return the inner language model's padded vocabulary size."""
-        return self.language_model.vocab_size_padded
-
-    def infer_max_seq_len(self) -> int:
-        """Return the inner language model's maximum sequence length."""
-        return self.language_model.infer_max_seq_len()
-
-    def set_guided_decoder(self, guided_decoder: "CapturableGuidedDecoder") -> bool:
-        """Install a guided decoder on the inner language model.
-
-        Returns False when the inner model does not support guided decoding,
-        matching the contract ModelEngine.set_guided_decoder() expects.
-        """
-        inner = self.language_model
-        if not hasattr(inner, "set_guided_decoder"):
-            return False
-        return inner.set_guided_decoder(guided_decoder)
-
-    def get_language_model_extra_forward_kwargs(
-        self,
-        *,
-        attn_metadata: Any,
-        raw_input_ids: Optional[torch.Tensor],
-        position_ids: Optional[torch.Tensor],
-        mm_inputs: PreparedLlmInputs,
-        **forward_kwargs: Any,
-    ) -> dict[str, Any]:
-        """Return model-specific arguments for the inner language-model forward.
-
-        The attention metadata identifies context and generation requests in this batch.
-        """
-        return {}
-
-    def get_language_model_forward_kwargs(
-        self,
-        *,
-        attn_metadata: Any,
-        input_ids: Optional[torch.Tensor],
-        raw_input_ids: Optional[torch.Tensor],
-        position_ids: Optional[torch.Tensor],
-        inputs_embeds: Optional[torch.Tensor],
-        mm_inputs: PreparedLlmInputs,
-        return_context_logits: bool,
-        **forward_kwargs: Any,
-    ) -> dict[str, Any]:
-        """Build common and model-specific inner language-model forward arguments."""
-        llm_kwargs = {
-            "attn_metadata": attn_metadata,
-            "input_ids": input_ids,
-            "position_ids": position_ids,
-            "inputs_embeds": inputs_embeds,
-            "return_context_logits": return_context_logits,
-        }
-        llm_kwargs.update(
-            self.get_language_model_extra_forward_kwargs(
-                attn_metadata=attn_metadata,
-                raw_input_ids=raw_input_ids,
-                position_ids=position_ids,
-                mm_inputs=mm_inputs,
-                **forward_kwargs,
-            )
-        )
-        return llm_kwargs
-
-    @torch.inference_mode()
-    def forward(
-        self,
-        attn_metadata: Any,
-        input_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        return_context_logits: bool = False,
-        spec_metadata: Any = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        """Prepare multimodal inputs and dispatch them to the language model."""
-        multimodal_params = kwargs.pop("multimodal_params", [])
-        mm_inputs = self.prepare_multimodal_inputs(
-            input_ids=input_ids,
-            positions=position_ids,
-            multimodal_params=multimodal_params,
-            num_context_requests=attn_metadata.num_contexts,
-            attn_metadata=attn_metadata,
-            **kwargs,
-        )
-        if inputs_embeds is not None:
-            if mm_inputs.inputs_embeds is not None:
-                raise ValueError(
-                    "MultimodalModelMixin.forward received both caller-supplied inputs_embeds "
-                    "and multimodal-derived inputs_embeds. These paths are mutually exclusive; "
-                    "pass at most one."
-                )
-            mm_inputs = PreparedLlmInputs(
-                input_ids=None,
-                inputs_embeds=inputs_embeds,
-                extra_embeds=mm_inputs.extra_embeds,
-            )
-
-        llm_kwargs = self.get_language_model_forward_kwargs(
-            attn_metadata=attn_metadata,
-            input_ids=mm_inputs.input_ids,
-            raw_input_ids=input_ids,
-            position_ids=position_ids,
-            inputs_embeds=mm_inputs.inputs_embeds,
-            mm_inputs=mm_inputs,
-            return_context_logits=return_context_logits,
-            multimodal_params=multimodal_params,
-            num_generation_requests=attn_metadata.num_generations,
-            spec_metadata=spec_metadata,
-            **kwargs,
-        )
-        return self.language_model.forward(**llm_kwargs)
 
     def after_full_multimodal_embeddings(
         self,
@@ -1046,6 +1009,7 @@ class MultimodalModelMixin:
         input_ids: torch.Tensor,
         multimodal_params: Optional[Sequence[MultimodalParams]],
         num_context_requests: int,
+        mm_token_indices: Optional[torch.Tensor] = None,
         **forward_kwargs: Any,
     ) -> PreparedMultimodalEmbeddings:
         """Prepare active encoder rows for a model-owned fusion operation.
@@ -1054,7 +1018,39 @@ class MultimodalModelMixin:
         active-chunk selection, and both model hooks. Targets with their own
         token embedding or splice can consume these rows without computing
         text embeddings or replacing their original input token IDs.
+
+        `mm_token_indices` are the executor's placeholder positions for this forward, the
+        `mm_token_indices` forward argument. When given, the model hooks receive them as before,
+        and the result pairs them with the rows after checking that both count the same rows.
+        A result without rows carries no indices.
         """
+        if mm_token_indices is not None:
+            forward_kwargs["mm_token_indices"] = mm_token_indices
+        prepared = self._prepare_active_multimodal_embeddings(
+            input_ids=input_ids,
+            multimodal_params=multimodal_params,
+            num_context_requests=num_context_requests,
+            **forward_kwargs,
+        )
+        if mm_token_indices is None or not prepared.multimodal_embeddings:
+            return prepared
+        num_rows = sum(rows.shape[0] for rows in prepared.multimodal_embeddings)
+        if mm_token_indices.shape[0] != num_rows:
+            raise ValueError(
+                f"The batch has {mm_token_indices.shape[0]} multimodal placeholder positions "
+                f"but {num_rows} active multimodal embedding rows"
+            )
+        return replace(prepared, mm_token_indices=mm_token_indices)
+
+    def _prepare_active_multimodal_embeddings(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        multimodal_params: Optional[Sequence[MultimodalParams]],
+        num_context_requests: int,
+        **forward_kwargs: Any,
+    ) -> PreparedMultimodalEmbeddings:
+        """Select, encode or reuse, and post-process the rows of one forward."""
         context_params = list(
             self.select_multimodal_params(
                 multimodal_params or [],
@@ -1083,46 +1079,6 @@ class MultimodalModelMixin:
             input_ids=input_ids,
             multimodal_embeddings=active_embeddings,
             extra_embeds=extra_embeds,
-        )
-
-    def prepare_multimodal_inputs(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        positions: Optional[torch.Tensor],
-        multimodal_params: Optional[Sequence[MultimodalParams]],
-        num_context_requests: int,
-        **forward_kwargs: Any,
-    ) -> PreparedLlmInputs:
-        """Prepare encoder rows and fuse them with the model's text embeddings."""
-        prepared = self.prepare_multimodal_embeddings(
-            input_ids=input_ids,
-            multimodal_params=multimodal_params,
-            num_context_requests=num_context_requests,
-            **forward_kwargs,
-        )
-        if not prepared.multimodal_embeddings and not prepared.extra_embeds:
-            return PreparedLlmInputs(input_ids=prepared.input_ids, inputs_embeds=None)
-
-        fused_input_ids, inputs_embeds, fused_extra_embeds = self._fuse_multimodal_embeddings(
-            input_ids=prepared.input_ids,
-            multimodal_embeddings=list(prepared.multimodal_embeddings),
-            mm_token_ids=self.multimodal_token_ids,
-            embedding_layer=self.text_embedding_layer,
-            extra_embeds=prepared.extra_embeds,
-            # `text_token_indices` / `mm_token_indices` are pre-computed by the
-            # executor (see DecoderInputPreparer.prepare_inputs) and must reach
-            # `fuse_input_embeds` to (a) preserve the active-chunk subset
-            # contract when MM rows are a subset of visible MM tokens and
-            # (b) avoid the torch.where host sync inside
-            # `filter_mm_token_from_input_ids`.
-            text_token_indices=forward_kwargs.get("text_token_indices"),
-            mm_token_indices=forward_kwargs.get("mm_token_indices"),
-        )
-        return PreparedLlmInputs(
-            input_ids=fused_input_ids,
-            inputs_embeds=inputs_embeds,
-            extra_embeds=fused_extra_embeds,
         )
 
     def _get_or_encode_multimodal_embeddings(
@@ -1551,6 +1507,246 @@ class MultimodalModelMixin:
         )
         encoder_cache.log_stats("multimodal encoder cache write.")
 
+    @staticmethod
+    def _validate_embeddings(
+        embeddings: list[torch.Tensor],
+        multimodal_params: Sequence[MultimodalParams],
+        *,
+        current_chunk_only: bool = False,
+    ) -> None:
+        """Validate gathered embeddings' row count against runtime metadata.
+
+        `current_chunk_only` matches the gather layout; it does not change the
+        original per-request runtime counts used for later prefill chunks.
+        Skipped if any param lacks `multimodal_runtime.total_embeds_in_request`, since the contract
+        cannot be evaluated without complete metadata.
+        """
+        if len(embeddings) != 1:
+            raise ValueError(
+                f"MultimodalRuntimeMixin requires a single embedding tensor, got {len(embeddings)} "
+                "tensors."
+            )
+
+        embeddings_tensor = embeddings[0]
+        expected_rows = 0
+        has_runtime_metadata = []
+        for param in multimodal_params:
+            runtime = param.multimodal_runtime
+            has_runtime = runtime is not None and runtime.total_embeds_in_request is not None
+            has_runtime_metadata.append(has_runtime)
+            if has_runtime:
+                expected_rows += (
+                    runtime.num_mm_tokens_in_chunk
+                    if current_chunk_only
+                    else runtime.total_embeds_in_request
+                )
+
+        if any(has_runtime_metadata) and not all(has_runtime_metadata):
+            raise ValueError(
+                "Multimodal runtime metadata must be present for every param or none of them."
+            )
+        if not all(has_runtime_metadata):
+            logger.debug(
+                "Skipping multimodal embedding row-count validation: runtime metadata missing "
+                "for all params."
+            )
+            return
+
+        actual_rows = embeddings_tensor.shape[0]
+        if actual_rows != expected_rows:
+            raise ValueError(
+                f"Multimodal embedding row count mismatch: expected {expected_rows}, got {actual_rows}."
+            )
+
+
+class MultimodalModelMixin(MultimodalRuntimeMixin):
+    """Composite multimodal causal LM: an encoder runtime wrapped around an inner language model.
+
+    Modeling V1 multimodal models keep the language model in a separate module. This class adds
+    the delegation to that module (`language_model`, the step-loop hooks, vocabulary and
+    guided-decoding queries), a default `forward`, and the default text-embedding fusion
+    (`prepare_multimodal_inputs`). Models that run their own decoder, such as Modeling V2
+    targets, inherit `MultimodalRuntimeMixin` directly instead.
+    """
+
+    supports_concurrent_encoder: ClassVar[bool] = True
+    """Composite models run side-stream prefetch; one whose encoder shares mutable state across
+    CUDA streams sets this to False."""
+
+    @property
+    def text_embedding_layer(self):
+        """Return the token embedding layer used by `fuse_input_embeds`."""
+        raise NotImplementedError
+
+    @property
+    def language_model(self) -> torch.nn.Module:
+        """Return the inner language model that receives prepared inputs."""
+        raise NotImplementedError
+
+    @property
+    def runtime_hooks(self) -> RuntimeHooks:
+        """Return the inner language model's step-loop hooks."""
+        try:
+            language_model = self.language_model
+        except NotImplementedError:
+            return DEFAULT_RUNTIME_HOOKS
+        return runtime_hooks_of(language_model)
+
+    @property
+    def vocab_size_padded(self) -> int:
+        """Return the inner language model's padded vocabulary size."""
+        return self.language_model.vocab_size_padded
+
+    def infer_max_seq_len(self) -> int:
+        """Return the inner language model's maximum sequence length."""
+        return self.language_model.infer_max_seq_len()
+
+    def set_guided_decoder(self, guided_decoder: "CapturableGuidedDecoder") -> bool:
+        """Install a guided decoder on the inner language model.
+
+        Returns False when the inner model does not support guided decoding,
+        matching the contract ModelEngine.set_guided_decoder() expects.
+        """
+        inner = self.language_model
+        if not hasattr(inner, "set_guided_decoder"):
+            return False
+        return inner.set_guided_decoder(guided_decoder)
+
+    def get_language_model_extra_forward_kwargs(
+        self,
+        *,
+        attn_metadata: Any,
+        raw_input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        mm_inputs: PreparedLlmInputs,
+        **forward_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Return model-specific arguments for the inner language-model forward.
+
+        The attention metadata identifies context and generation requests in this batch.
+        """
+        return {}
+
+    def get_language_model_forward_kwargs(
+        self,
+        *,
+        attn_metadata: Any,
+        input_ids: Optional[torch.Tensor],
+        raw_input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        inputs_embeds: Optional[torch.Tensor],
+        mm_inputs: PreparedLlmInputs,
+        return_context_logits: bool,
+        **forward_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build common and model-specific inner language-model forward arguments."""
+        llm_kwargs = {
+            "attn_metadata": attn_metadata,
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "inputs_embeds": inputs_embeds,
+            "return_context_logits": return_context_logits,
+        }
+        llm_kwargs.update(
+            self.get_language_model_extra_forward_kwargs(
+                attn_metadata=attn_metadata,
+                raw_input_ids=raw_input_ids,
+                position_ids=position_ids,
+                mm_inputs=mm_inputs,
+                **forward_kwargs,
+            )
+        )
+        return llm_kwargs
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        attn_metadata: Any,
+        input_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Any = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Prepare multimodal inputs and dispatch them to the language model."""
+        multimodal_params = kwargs.pop("multimodal_params", [])
+        mm_inputs = self.prepare_multimodal_inputs(
+            input_ids=input_ids,
+            positions=position_ids,
+            multimodal_params=multimodal_params,
+            num_context_requests=attn_metadata.num_contexts,
+            attn_metadata=attn_metadata,
+            **kwargs,
+        )
+        if inputs_embeds is not None:
+            if mm_inputs.inputs_embeds is not None:
+                raise ValueError(
+                    "MultimodalModelMixin.forward received both caller-supplied inputs_embeds "
+                    "and multimodal-derived inputs_embeds. These paths are mutually exclusive; "
+                    "pass at most one."
+                )
+            mm_inputs = PreparedLlmInputs(
+                input_ids=None,
+                inputs_embeds=inputs_embeds,
+                extra_embeds=mm_inputs.extra_embeds,
+            )
+
+        llm_kwargs = self.get_language_model_forward_kwargs(
+            attn_metadata=attn_metadata,
+            input_ids=mm_inputs.input_ids,
+            raw_input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=mm_inputs.inputs_embeds,
+            mm_inputs=mm_inputs,
+            return_context_logits=return_context_logits,
+            multimodal_params=multimodal_params,
+            num_generation_requests=attn_metadata.num_generations,
+            spec_metadata=spec_metadata,
+            **kwargs,
+        )
+        return self.language_model.forward(**llm_kwargs)
+
+    def prepare_multimodal_inputs(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        positions: Optional[torch.Tensor],
+        multimodal_params: Optional[Sequence[MultimodalParams]],
+        num_context_requests: int,
+        **forward_kwargs: Any,
+    ) -> PreparedLlmInputs:
+        """Prepare encoder rows and fuse them with the model's text embeddings."""
+        prepared = self._prepare_active_multimodal_embeddings(
+            input_ids=input_ids,
+            multimodal_params=multimodal_params,
+            num_context_requests=num_context_requests,
+            **forward_kwargs,
+        )
+        if not prepared.multimodal_embeddings and not prepared.extra_embeds:
+            return PreparedLlmInputs(input_ids=prepared.input_ids, inputs_embeds=None)
+
+        fused_input_ids, inputs_embeds, fused_extra_embeds = self._fuse_multimodal_embeddings(
+            input_ids=prepared.input_ids,
+            multimodal_embeddings=list(prepared.multimodal_embeddings),
+            mm_token_ids=self.multimodal_token_ids,
+            embedding_layer=self.text_embedding_layer,
+            extra_embeds=prepared.extra_embeds,
+            # `text_token_indices` / `mm_token_indices` are pre-computed by the
+            # executor (see DecoderInputPreparer.prepare_inputs) and must reach
+            # `fuse_input_embeds` to (a) preserve the active-chunk subset
+            # contract when MM rows are a subset of visible MM tokens and
+            # (b) avoid the torch.where host sync inside
+            # `filter_mm_token_from_input_ids`.
+            text_token_indices=forward_kwargs.get("text_token_indices"),
+            mm_token_indices=forward_kwargs.get("mm_token_indices"),
+        )
+        return PreparedLlmInputs(
+            input_ids=fused_input_ids,
+            inputs_embeds=inputs_embeds,
+            extra_embeds=fused_extra_embeds,
+        )
+
     def _fuse_multimodal_embeddings(
         self,
         *,
@@ -1589,57 +1785,6 @@ class MultimodalModelMixin:
 
         fused_input_ids, inputs_embeds = result
         return fused_input_ids, inputs_embeds, ()
-
-    @staticmethod
-    def _validate_embeddings(
-        embeddings: list[torch.Tensor],
-        multimodal_params: Sequence[MultimodalParams],
-        *,
-        current_chunk_only: bool = False,
-    ) -> None:
-        """Validate gathered embeddings' row count against runtime metadata.
-
-        `current_chunk_only` matches the gather layout; it does not change the
-        original per-request runtime counts used for later prefill chunks.
-        Skipped if any param lacks `multimodal_runtime.total_embeds_in_request`, since the contract
-        cannot be evaluated without complete metadata.
-        """
-        if len(embeddings) != 1:
-            raise ValueError(
-                f"MultimodalModelMixin requires a single embedding tensor, got {len(embeddings)} "
-                "tensors."
-            )
-
-        embeddings_tensor = embeddings[0]
-        expected_rows = 0
-        has_runtime_metadata = []
-        for param in multimodal_params:
-            runtime = param.multimodal_runtime
-            has_runtime = runtime is not None and runtime.total_embeds_in_request is not None
-            has_runtime_metadata.append(has_runtime)
-            if has_runtime:
-                expected_rows += (
-                    runtime.num_mm_tokens_in_chunk
-                    if current_chunk_only
-                    else runtime.total_embeds_in_request
-                )
-
-        if any(has_runtime_metadata) and not all(has_runtime_metadata):
-            raise ValueError(
-                "Multimodal runtime metadata must be present for every param or none of them."
-            )
-        if not all(has_runtime_metadata):
-            logger.debug(
-                "Skipping multimodal embedding row-count validation: runtime metadata missing "
-                "for all params."
-            )
-            return
-
-        actual_rows = embeddings_tensor.shape[0]
-        if actual_rows != expected_rows:
-            raise ValueError(
-                f"Multimodal embedding row count mismatch: expected {expected_rows}, got {actual_rows}."
-            )
 
 
 def _collect_cross_iter_prefetch_candidates(
@@ -1692,7 +1837,7 @@ def _collect_cross_iter_prefetch_candidates(
 
 
 def _dispatch_cross_iter_prefetch(
-    model: "MultimodalModelMixin",
+    model: "MultimodalRuntimeMixin",
     candidates: Sequence[tuple["LlmRequest", Dict[str, Any], torch.Tensor]],
     aux_stream: "torch.cuda.Stream",
 ) -> None:
@@ -1839,7 +1984,7 @@ def maybe_prefetch_mm_encoder_for_next_iter(
 
     Returns the number of requests for which an encoder kick-off was queued.
     """
-    if not isinstance(model, MultimodalModelMixin):
+    if not isinstance(model, MultimodalRuntimeMixin):
         return 0
     if max_prefetch <= 0:
         return 0

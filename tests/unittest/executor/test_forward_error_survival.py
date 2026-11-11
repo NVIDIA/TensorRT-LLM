@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
+from tensorrt_llm._torch._experimental.modeling_v2._multimodal import TextOnlyTarget
 from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
@@ -200,6 +201,16 @@ def test_validate_request_skips_hook_for_text_only_requests():
     executor = _validating_executor(model)
     PyExecutor._validate_request(executor, _request(mm_data=None))
     model.validate_multimodal_request_data.assert_not_called()
+
+
+def test_validate_request_rejects_media_for_text_only_targets():
+    class _TextOnlyModel(TextOnlyTarget):
+        pass
+
+    executor = _validating_executor(_TextOnlyModel())
+    with pytest.raises(ValueError, match="language model only"):
+        PyExecutor._validate_request(executor, _request(mm_data={"image": object()}))
+    PyExecutor._validate_request(executor, _request(mm_data={"mrope_config": {}}))
 
 
 def test_validate_request_accepts_models_without_the_hook():

@@ -45,6 +45,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.vision.triton_pos_embed_interpolate import (  # noqa: E501
     triton_pos_embed_interpolate,
 )
+from tensorrt_llm._torch.multimodal.model import PreparedMultimodalEmbeddings
 from tensorrt_llm.inputs.multimodal import MultimodalParams, get_multimodal_item_metadata
 
 #: Tower rope base (`vision_config` has no rope field); unrelated to the text 1e7.
@@ -504,20 +505,18 @@ def encode_multimodal_inputs(
 
 
 def multimodal_embeds(
-    embeddings: Sequence[torch.Tensor], mm_token_indices: torch.Tensor | None
+    prepared: PreparedMultimodalEmbeddings,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Pair already-selected encoder rows with the target's splice indices."""
+    """The step's `(rows, mm_token_indices)` for the prefill target's splice, or None when
+    the step has no active encoder rows. The shared runtime checked that both count the same
+    rows."""
+    embeddings = prepared.multimodal_embeddings
     if not embeddings:
         return None
-    rows = embeddings[0] if len(embeddings) == 1 else torch.cat(tuple(embeddings), dim=0)
-    if mm_token_indices is None:
+    if prepared.mm_token_indices is None:
         raise ValueError("Active multimodal embeddings require mm_token_indices")
-    if mm_token_indices.shape[0] != rows.shape[0]:
-        raise ValueError(
-            f"The batch has {mm_token_indices.shape[0]} placeholder rows "
-            f"but received {rows.shape[0]} active embedding rows"
-        )
-    return rows, mm_token_indices
+    rows = embeddings[0] if len(embeddings) == 1 else torch.cat(tuple(embeddings), dim=0)
+    return rows, prepared.mm_token_indices
 
 
 def run_tower(tower, media: dict, pixel_key: str, grid_key: str):

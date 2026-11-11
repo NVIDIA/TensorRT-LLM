@@ -677,7 +677,7 @@ class _MultimodalEncoderStep:
 class MultimodalScheduler(RequestScheduler):
     """Add per-item MM encoder limits and cache lookup to the LLM scheduler.
 
-    The wrapper is constructed only for ``MultimodalModelMixin`` models. It
+    The wrapper is constructed only for ``MultimodalRuntimeMixin`` models. It
     deliberately reuses the wrapped scheduler's capacity and microbatch
     schedulers so MM encoder costs never enter the LLM token budget.
 

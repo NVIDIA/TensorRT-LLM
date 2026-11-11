@@ -196,7 +196,7 @@ def prepare_multimodal_indices(
     input_ids = torch.tensor(input_ids, dtype=torch.int, device="cpu")
     vocab_size = model.config.vocab_size
     # `multimodal_token_ids` is the common wrapper-model contract. Keep the legacy name as a
-    # fallback for models not yet migrated to `MultimodalModelMixin`.
+    # fallback for models not yet migrated to `MultimodalRuntimeMixin`.
     mm_token_ids = getattr(model, "multimodal_token_ids", None)
     if mm_token_ids is None:
         mm_token_ids = getattr(model, "mm_token_ids", None)
