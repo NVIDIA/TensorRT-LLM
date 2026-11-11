@@ -160,6 +160,8 @@ l0_dgx_b200:
   # --- MEGAMOE_DEEPGEMM (W4A8_MXFP4_MXFP8 only) ---
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_DEEPGEMM"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_CUTEDSL"
+  # MegaMoE CuteDSL on four ranks drops padding rows under every combine format.
+  - unittest/_torch/moe/test_megamoe_live_rows_gpu.py::test_megamoe_cutedsl_drops_padding_rows
   # ------------- MoE: test_multi_gpu_eplb ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb -k "not None"
 - condition:
