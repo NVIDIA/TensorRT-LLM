@@ -16,13 +16,13 @@
 
 from collections.abc import Sequence
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, NoReturn, cast, get_args, get_type_hints
+from typing import TYPE_CHECKING, NoReturn, cast
 from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pytest
 import torch
-from profiler_test_utils import decode_profiler_metadata
+from profiler_test_utils import decode_profiler_metadata, select_regions
 
 from tensorrt_llm import _profiler as profiler
 from tensorrt_llm._torch.distributed import communicator
@@ -80,7 +80,7 @@ def active(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, MagicMock, Mock]:
     parent.Get_size.return_value = 8
     parent.Get_group.return_value = _MpiGroup(list(range(8)))
     monkeypatch.setattr(communicator.MPI, "Group", _MpiGroup, raising=False)
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"mpi"}))
+    select_regions(monkeypatch, "mpi")
     monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: True)
     monkeypatch.setattr(torch.profiler, "record_function", record)
     monkeypatch.setattr(communicator, "mpi_comm", lambda: parent)
@@ -106,12 +106,10 @@ def test_inactive_scope_inspects_neither_group_rank_nor_payload(
     rank = Mock(side_effect=AssertionError("rank inspected"))
     payload = MagicMock()
     record = Mock()
-    monkeypatch.setattr(
-        profiler, "_CUSTOM_REGIONS", frozenset({"mpi"}) if selected else frozenset()
-    )
+    select_regions(monkeypatch, *(["mpi"] if selected else []))
     monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: enabled)
     monkeypatch.setattr(torch.profiler, "record_function", record)
-    with profiler.record_mpi_function(
+    with communicator.record_mpi_function(
         "allgather", communicator="world", group=group, rank=rank, payload=payload
     ) as value:
         assert value is None
@@ -172,7 +170,7 @@ def test_payload_description_is_shallow(
     contents.
     """
     record, _, _ = active
-    with profiler.record_mpi_function(
+    with communicator.record_mpi_function(
         "send", communicator="world", group=lambda: [3], rank=3, payload=payload
     ):
         pass
@@ -187,7 +185,7 @@ def test_tensor_metadata_does_not_read_values(active: tuple[Mock, MagicMock, Moc
     """Verify layout and payload descriptors for a noncontiguous tensor."""
     record, _, _ = active
     payload = torch.ones((3, 2)).transpose(0, 1)
-    with profiler.record_mpi_function(
+    with communicator.record_mpi_function(
         "send", communicator="world", group=lambda: [3], rank=3, payload=payload
     ):
         pass
@@ -211,7 +209,7 @@ def test_direct_mpi_scalars_normalize_without_schema_change(
     active: tuple[Mock, MagicMock, Mock],
 ) -> None:
     record, _, _ = active
-    with profiler.record_mpi_function(
+    with communicator.record_mpi_function(
         "allreduce",
         communicator="tp",
         group=lambda: [1, 3],
@@ -305,7 +303,7 @@ def test_group_inspection_failure_does_not_replace_collective_exception(
     subcomm.allgather.assert_called_once_with("x")
     subcomm.Get_group.return_value.free.assert_called_once_with()
     parent.Get_group.return_value.free.assert_called_once_with()
-    record.assert_not_called()
+    record.assert_called_once_with("trtllm::mpi_tp_allgather", args=None)
 
 
 def test_unmapped_cached_group_discards_metadata_not_result(
@@ -318,7 +316,7 @@ def test_unmapped_cached_group_discards_metadata_not_result(
     subcomm.Get_group.return_value = _MpiGroup([1, -32766])
     mpi_dist._tp_comm = subcomm
     assert mpi_dist.tp_allgather("x", small_payload=True) is subcomm.allgather.return_value
-    record.assert_not_called()
+    record.assert_called_once_with("trtllm::mpi_tp_allgather", args=None)
     subcomm.Get_group.return_value.free.assert_called_once_with()
     parent.Get_group.return_value.free.assert_called_once_with()
 
@@ -327,12 +325,12 @@ def test_nested_mpi_scalars_are_not_recursively_normalized(
     active: tuple[Mock, MagicMock, Mock],
 ) -> None:
     record, _, _ = active
-    with profiler.record_mpi_function(
+    with communicator.record_mpi_function(
         "allreduce", communicator="world", group=lambda: [3], rank=3, nested=[np.int64(3)]
     ):
         result = 7
     assert result == 7
-    record.assert_not_called()
+    record.assert_called_once_with("trtllm::mpi_allreduce", args=None)
 
 
 def test_container_payload_never_iterates_nested_tensors(
@@ -347,7 +345,7 @@ def test_container_payload_never_iterates_nested_tensors(
         def __iter__(self) -> NoReturn:
             raise AssertionError("payload iterated")
 
-    with profiler.record_mpi_function(
+    with communicator.record_mpi_function(
         "send",
         communicator="world",
         group=lambda: [3],
@@ -652,7 +650,7 @@ def test_typed_allgather_uses_one_int64_collective(
 def test_inactive_wrapper_does_not_resolve_parent_for_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset())
+    select_regions(monkeypatch)
     parent = Mock(side_effect=AssertionError("parent inspected"))
     monkeypatch.setattr(communicator, "mpi_comm", parent)
     result = object()
@@ -666,9 +664,7 @@ def test_inactive_wrapper_bypasses_scope_setup(
     monkeypatch: pytest.MonkeyPatch, selected: bool, enabled: bool
 ) -> None:
     """Inactive collectives must bypass scope allocation and keep body outcomes."""
-    monkeypatch.setattr(
-        profiler, "_CUSTOM_REGIONS", frozenset({"mpi"}) if selected else frozenset()
-    )
+    select_regions(monkeypatch, *(["mpi"] if selected else []))
     monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: enabled)
 
     def forbidden(*args: object, **kwargs: object) -> NoReturn:
@@ -704,7 +700,7 @@ def test_wrapper_tracks_real_profiler_start_and_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The same MPI wrapper must begin and stop emitting scopes with the profiler."""
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"mpi"}))
+    select_regions(monkeypatch, "mpi")
     parent = Mock()
     parent.Get_rank.return_value = 3
     parent.Get_size.return_value = 8
@@ -755,9 +751,7 @@ def test_nonblocking_send_return_contract_includes_disabled_none(
     operation: str,
     helper: str,
 ) -> None:
-    method = getattr(communicator.MPIDist, operation)
-    assert type(None) in get_args(get_type_hints(method)["return"])
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset())
+    select_regions(monkeypatch)
     monkeypatch.setattr(communicator, helper, Mock(return_value=None))
     assert getattr(_dist(), operation)(np.ones(2, dtype=np.uint8), 1) is None
 
@@ -797,7 +791,7 @@ def test_two_rank_collective_p2p_profiler_smoke(monkeypatch: pytest.MonkeyPatch)
         captured.append(args)
         return real_record(name, args=args)
 
-    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"mpi"}))
+    select_regions(monkeypatch, "mpi")
     monkeypatch.setattr(torch.profiler, "record_function", recording)
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
         assert mpi_dist.tp_allgather(rank, small_payload=True) == [0, 1]
@@ -811,3 +805,41 @@ def test_two_rank_collective_p2p_profiler_smoke(monkeypatch: pytest.MonkeyPatch)
     decoded = [decode_profiler_metadata(value)[1] for value in captured]
     assert len(decoded) == 4
     assert all(fields["mpi.rank"] == rank and fields["mpi.group"] == "0,1" for fields in decoded)
+
+
+@pytest.mark.parametrize("group_name", ["tp", "pp", "cp"])
+def test_owned_subgroup_uses_mapping_without_mpi_group_queries(
+    active: tuple[Mock, MagicMock, Mock], monkeypatch: pytest.MonkeyPatch, group_name: str
+) -> None:
+    """An initialized owned communicator already has parent-relative membership."""
+    _, _, parent = active
+    mpi_dist = _dist()
+    monkeypatch.setattr(mpi_dist, "_validate_world_size", lambda: None)
+    comm = getattr(mpi_dist, group_name + "_comm")
+    expected = list(getattr(mpi_dist.mapping, group_name + "_group"))
+    for _ in range(3):
+        assert mpi_dist._profile_group(group_name) == expected
+    comm.Get_group.assert_not_called()
+    parent.Get_group.assert_not_called()
+
+
+def test_translated_subgroup_cache_is_bound_to_comm_and_parent(
+    active: tuple[Mock, MagicMock, Mock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reuse successful translation, then invalidate it for a different parent."""
+    _, _, parent = active
+    mpi_dist = _dist()
+    comm = Mock()
+    comm.Get_size.return_value = 2
+    group = _MpiGroup([3, 1])
+    comm.Get_group.return_value = group
+    mpi_dist._tp_comm = comm
+    assert mpi_dist._profile_group("tp") == [3, 1]
+    assert mpi_dist._profile_group("tp") == [3, 1]
+    assert group.translate.call_count == 1
+    replacement = Mock()
+    replacement.Get_group.return_value = _MpiGroup([0, 1])
+    monkeypatch.setattr(communicator, "mpi_comm", lambda: replacement)
+    assert mpi_dist._profile_group("tp") == [3, 1]
+    assert group.translate.call_count == 2
+    assert group.translate.call_args.args[2] is replacement.Get_group.return_value
