@@ -34,7 +34,7 @@ from rich.markup import escape as escape_markup
 
 from agent_flow.console import print_message, print_rule
 
-from ..checks import accuracy_policy, gate_cli, test_results
+from ..checks import accuracy_policy, gate_cli, pytest_runner
 from ..checks import verdict as check_result
 from ..checks.accuracy import resolve_model_key
 from ..checks.delivery import Check as DeliveryCheck
@@ -398,7 +398,7 @@ def target_test_modules_check(repo_root: str | Path, target_rel: str) -> Deliver
     tests_dir = model_ops_tests_dir(target_rel)
     root = Path(repo_root) / tests_dir
     files = (
-        sorted(p for p in root.rglob("*.py") if test_results.TEST_FILE.search(p.as_posix()))
+        sorted(p for p in root.rglob("*.py") if pytest_runner.TEST_FILE.search(p.as_posix()))
         if root.is_dir()
         else []
     )
@@ -431,24 +431,24 @@ def tests_check(
                 paths.append(Path(check.detail).resolve().relative_to(repo.resolve()).as_posix())
             except (OSError, ValueError):
                 continue
-    files = test_results.list_test_files(repo, commit, paths) if commit else []
+    files = pytest_runner.list_test_files(repo, commit, paths) if commit else []
     if not files:
         return None
     python = str((workflow.task_data.get("environment") or {}).get("python") or "python3")
-    results, jobs, code, tail = test_results.run_at(
-        commit,
-        files,
-        cache_dir=workflow.workspace / test_results.CACHE_DIRNAME,
-        out=round_dir(workflow.workspace, round) / "tests",
-        tree=repo,
-        run_job=lambda command, tree, timeout_s: _test_job(workflow, command, tree, timeout_s),
-        python=python,
-    )
-    if not results.env_digest:
+    report = round_dir(workflow.workspace, round) / "tests" / f"{commit[:12]}.xml"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.unlink(missing_ok=True)
+    command = pytest_runner.pytest_command(python, repo, files, report, ("--timeout=180",))
+    code, tail = _test_job(workflow, command, repo, pytest_runner.TIMEOUT_S)
+    outcome = pytest_runner.read_report(report)
+    ran = f"; {len(files)} test file(s) ran at {commit[:10]}"
+    if outcome.unread:
         return DeliveryCheck("tests", False, f"INCOMPLETE (exit {code}): {tail}")
-    ran = f"; {jobs} test job(s) ran at {commit[:10]}" if jobs else ""
-    found = test_results.head_results(results, files)
-    return DeliveryCheck("tests", found.verdict == "CLEAN", found.describe() + ran)
+    if code and outcome.verdict() == "CLEAN":
+        return DeliveryCheck(
+            "tests", False, f"INCOMPLETE (pytest exited {code} beside a clean report){ran}: {tail}"
+        )
+    return DeliveryCheck("tests", outcome.verdict() == "CLEAN", outcome.describe() + ran)
 
 
 def test_job_line(command: str, tree: Path) -> str:

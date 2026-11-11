@@ -6,26 +6,19 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import shutil
 import subprocess
-import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import accuracy as accuracy_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
-from agent_flow.workflows.trtllm_modeling_v2.checks import delivery, disagg, gate_cli, test_results
+from agent_flow.workflows.trtllm_modeling_v2.checks import delivery, disagg, gate_cli
 from agent_flow.workflows.trtllm_modeling_v2.checks import serve as sg
-from agent_flow.workflows.trtllm_modeling_v2.checks import test_results as tc
 from agent_flow.workflows.trtllm_modeling_v2.checks import verdict as check_result
-from agent_flow.workflows.trtllm_modeling_v2.checks.delivery import Check as DeliveryCheck
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import serve_driver, workload_io
-from agent_flow.workflows.trtllm_modeling_v2.checks.harness import test_driver as drv
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
     RunEnvironment,
@@ -735,58 +728,6 @@ def test_every_member_under_its_reference_is_a_finding_unless_the_spec_acknowled
     assert certify.shift_findings(task, low) == []
 
 
-class _Delivery:
-    """What the delivered-tests check reads of a workflow."""
-
-    _shell_runner_override = None
-
-    def __init__(self, tmp_path: Path, head: str = "c0ffee1234567890"):
-        self.task_data = {"trtllm_repo_path": str(tmp_path)}
-        self.workspace = tmp_path / "ws"
-        self._preflight = SimpleNamespace(target_rel="pkg/models/fam/target")
-        self._git = lambda repo, *args: head + "\n"
-
-
-def test_delivery_runs_the_delivered_tests_at_the_commit_and_holds_on_their_passing(
-    tmp_path, monkeypatch
-):
-    checks = (DeliveryCheck("test:gemm/x", True, str(tmp_path / "tests/test_modeling_v2_x.py")),)
-    test = "tests/test_modeling_v2_x.py"
-    asked = {}
-
-    def list_test_files(repo, head, paths):
-        asked["paths"] = list(paths)
-        return [test]
-
-    results = test_results.Results("c0ffee1234567890", "env", collected={test: ["test_a"]})
-    monkeypatch.setattr(test_results, "list_test_files", list_test_files)
-    jobs = []
-
-    def run_at(commit, files, **job):
-        jobs.append((commit, list(files), job["tree"], job["python"]))
-        return results, 1, 0, ""
-
-    monkeypatch.setattr(test_results, "run_at", run_at)
-    stage = _Delivery(tmp_path)
-    # Nothing passed yet: an unrun test never holds the check.
-    check = certify.tests_check(stage, checks, "c0ffee1234567890")
-    assert not check.passed and check.detail.startswith("INCOMPLETE")
-    assert asked["paths"][1] == test
-    assert jobs == [("c0ffee1234567890", [test], tmp_path, "python3")]
-    results.tests[f"{test}::test_a"] = {"outcome": "passed"}
-    check = certify.tests_check(stage, checks, "c0ffee1234567890")
-    assert check.passed and "1 test job(s) ran at c0ffee1234" in check.detail
-    results.tests[f"{test}::test_a"] = {"outcome": "failed", "message": "wrong"}
-    check = certify.tests_check(stage, checks, "c0ffee1234567890")
-    assert not check.passed and check.detail.startswith("FAILING")
-    # A probe that could not run leaves no verdict to reuse.
-    monkeypatch.setattr(
-        test_results, "run_at", lambda *a, **k: (test_results.Results("c0ffee"), 0, 1, "no gpu")
-    )
-    check = certify.tests_check(stage, checks, "c0ffee1234567890")
-    assert not check.passed and check.detail == "INCOMPLETE (exit 1): no gpu"
-
-
 def test_delivery_counts_the_targets_test_modules_and_warns_past_twenty(tmp_path):
     """An onboarded target arrived with 35 test modules, past what a reviewer accepts."""
     target = f"{catalog_paths.MODELING_V2_PACKAGE}/models/fam/target"
@@ -804,99 +745,3 @@ def test_delivery_counts_the_targets_test_modules_and_warns_past_twenty(tmp_path
     assert check.detail.startswith("21 test module(s)")
     assert "WARNING: more than the 20 a reviewer accepts" in check.detail
     assert target_tests(tmp_path, f"{catalog_paths.MODELING_V2_PACKAGE}/models/fam/other") is None
-
-
-_requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not available")
-
-
-def _git(repo: Path, *args: str, env: dict | None = None) -> str:
-    done = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True,
-        text=True,
-        check=True,
-        env={**os.environ, **(env or {})},
-    )
-    return done.stdout.strip()
-
-
-def _commit(repo: Path, base: str, changes: dict[str, str], message: str = "change") -> str:
-    """A commit on ``base`` with ``changes``, made without touching the checkout."""
-    index = repo / ".git" / f"index-{abs(hash(message)) % 10**8}"
-    env = {"GIT_INDEX_FILE": str(index)}
-    _git(repo, "read-tree", base, env=env)
-    for path, content in changes.items():
-        blob = subprocess.run(
-            ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
-            input=content,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        _git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", env=env)
-    tree = _git(repo, "write-tree", env=env)
-    index.unlink(missing_ok=True)
-    return _git(repo, "commit-tree", tree, "-p", base, "-m", message)
-
-
-def _run(command: str) -> tuple[int, str]:
-    # pytest-timeout is not a test dependency here.
-    done = subprocess.run(
-        command.replace(" --timeout=180", ""), shell=True, capture_output=True, text=True
-    )
-    return done.returncode, done.stdout + done.stderr
-
-
-@_requires_git
-def test_a_module_that_skips_itself_on_import_has_a_result_not_a_hole(tmp_path):
-    repo = tmp_path / "repo"
-    (repo / "tests").mkdir(parents=True)
-    (repo / "tests" / "test_other_arch.py").write_text(
-        "import pytest\n\npytest.skip('certified on sm_100 only', allow_module_level=True)\n\n\n"
-        "def test_never():\n    assert False\n",
-        encoding="utf-8",
-    )
-    (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    head = _git(repo, "rev-parse", "HEAD")
-    cache = tmp_path / "ws" / tc.CACHE_DIRNAME
-    code, _ = _run(
-        f"{sys.executable} {drv.__file__} run --cache {cache} --repo {repo} "
-        "tests/test_other_arch.py -- -q -p no:cacheprovider"
-    )
-    assert code == 0
-    results = tc.recorded(cache, head)
-    assert results.unrun(["tests/test_other_arch.py"]) == []
-    skip = results.result("tests/test_other_arch.py")
-    assert skip.outcome == "skipped" and "sm_100 only" in skip.message
-    found = tc.head_results(results, ["tests/test_other_arch.py"])
-    assert found.not_run == [] and found.skipped == ["tests/test_other_arch.py"]
-
-    # The same file through the delivered-tests runner: probe, then one job, then nothing left.
-    ran: list[str] = []
-
-    def run_job(command, tree, timeout_s):
-        ran.append(command)
-        return _run(f"cd {tree} && {command}")
-
-    # A cache of its own, so nothing the direct run above recorded is there to reuse.
-    fresh = tmp_path / "ws" / "fresh_cache"
-    job = dict(cache_dir=fresh, out=tmp_path / "out", tree=repo, run_job=run_job)
-    results, jobs, code, _ = tc.run_at(
-        head, ["tests/test_other_arch.py"], python=sys.executable, **job
-    )
-    assert results.env_digest and jobs == 1 and results.unrun(["tests/test_other_arch.py"]) == []
-    again, jobs, _, _ = tc.run_at(head, ["tests/test_other_arch.py"], python=sys.executable, **job)
-    assert jobs == 0 and len(ran) == 3  # the probe alone: its results in this environment stand
-    failed = tc.run_at(
-        head,
-        ["tests/test_other_arch.py"],
-        python=sys.executable,
-        **{**job, "run_job": lambda command, tree, timeout_s: (1, "unavailable")},
-    )
-    assert not failed[0].env_digest and failed[1:3] == (0, 1)
-    assert "environment probe failed" in failed[3]
