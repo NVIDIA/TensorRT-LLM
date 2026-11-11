@@ -138,7 +138,11 @@ def test_mxfp4_expert_is_refused() -> None:
     # The MTP block of an NVFP4 DeepSeek-V4 export: 32-input E8M0 block
     # scales and no global scales, configured as an NVFP4 layer.
     method = _RecordingMethod()
-    with pytest.raises(ValueError, match=r"MoE layer 61: 0\.w1\.weight_scale .* need 4 columns"):
+    with pytest.raises(
+        ValueError,
+        match=r"MoE layer 61: 0\.w1\.weight_scale has shape \(32, 2\); _RecordingMethod expects "
+        r"one scale per 16 inputs, 4 columns for 64 inputs\. The checkpoint stores",
+    ):
         _load_block_scales(method, _module(), _expert(block=32, global_scales=False))
     assert method.loaded == []
 
@@ -146,7 +150,9 @@ def test_mxfp4_expert_is_refused() -> None:
 @pytest.mark.parametrize("key", ["0.w1.weight_scale", "0.w3.weight_scale", "0.w2.weight_scale"])
 def test_missing_block_scale_is_refused(key: str) -> None:
     method = _RecordingMethod()
-    with pytest.raises(ValueError, match=f"has no {key}; an NVFP4 expert needs one block scale"):
+    with pytest.raises(
+        ValueError, match=f"has no {key}; _RecordingMethod needs one block scale per 16 inputs"
+    ):
         _load_block_scales(method, _module(), _expert(drop=(key,)))
     assert method.loaded == []
 
@@ -154,7 +160,7 @@ def test_missing_block_scale_is_refused(key: str) -> None:
 @pytest.mark.parametrize("key", ["0.w1.weight_scale_2", "0.w2.weight_scale_2"])
 def test_missing_global_weight_scale_is_refused(key: str) -> None:
     method = _RecordingMethod()
-    with pytest.raises(ValueError, match=f"has no {key}; an NVFP4 expert needs its global"):
+    with pytest.raises(ValueError, match=f"has no {key}; _RecordingMethod needs the global"):
         _load_block_scales(method, _module(), _expert(drop=(key,)))
     assert method.loaded == []
 
@@ -226,7 +232,7 @@ def test_partial_reload_buckets_load(buckets: tuple[tuple[str, ...], ...]) -> No
 def test_narrow_block_scale_in_a_partial_reload_is_refused() -> None:
     method = _RecordingMethod()
     expert = _expert(block=32, global_scales=False)
-    with pytest.raises(ValueError, match=r"0\.w2\.weight_scale .* need 2 columns"):
+    with pytest.raises(ValueError, match=r"0\.w2\.weight_scale has shape \(64, 1\);"):
         _load_block_scales(
             method, _module(), _bucket(expert, "w2.weight_scale"), require_complete=False
         )
@@ -307,18 +313,50 @@ def test_load_weights_hands_the_partial_flag_to_the_scale_checks(
     assert "allow_partial_loading" in inspect.getfullargspec(method_cls.load_quant_scales).args
 
 
-def test_streamed_expert_with_narrow_block_scale_is_refused() -> None:
-    method = _RecordingMethod()
+def _streaming_module() -> SimpleNamespace:
     module = _module()
     module.expert_size_per_partition = 1
     module.initial_local_expert_ids = [0]
     module._streamed_expert_slots = set()
-    expert = _expert(block=32, global_scales=False)
-    kwargs = {
-        f"{proj}_{kind}": expert.get(f"0.{proj}.{kind}", torch.tensor(1.0))
+    return module
+
+
+def _streaming_kwargs(expert: dict[str, torch.Tensor]) -> dict[str, torch.Tensor | None]:
+    return {
+        f"{proj}_{kind}": expert.get(f"0.{proj}.{kind}")
         for proj in ("w1", "w2", "w3")
         for kind in ("weight", "weight_scale", "weight_scale_2", "input_scale")
     }
-    with pytest.raises(ValueError, match=r"w1_weight_scale has shape \(32, 2\)"):
-        method.load_streaming_nvfp4_expert(module, global_expert_id=0, local_slot_id=0, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "proj, shape", [("w1", (32, 2)), ("w3", (32, 2)), ("w2", (64, 1))], ids=["w1", "w3", "w2"]
+)
+def test_streamed_expert_with_narrow_block_scale_is_refused(
+    proj: str, shape: tuple[int, int]
+) -> None:
+    method = _RecordingMethod()
+    module = _streaming_module()
+    expert = _expert()
+    expert[f"0.{proj}.weight_scale"] = _expert(block=32)[f"0.{proj}.weight_scale"]
+    with pytest.raises(
+        ValueError, match=rf"0\.{proj}\.weight_scale has shape \({shape[0]}, {shape[1]}\);"
+    ):
+        method.load_streaming_nvfp4_expert(
+            module, global_expert_id=0, local_slot_id=0, **_streaming_kwargs(expert)
+        )
+    assert module._streamed_expert_slots == set()
+    assert method.loaded == []
+
+
+def test_streamed_expert_without_global_weight_scale_is_refused() -> None:
+    method = _RecordingMethod()
+    module = _streaming_module()
+    with pytest.raises(ValueError, match=r"has no 0\.w2\.weight_scale_2;"):
+        method.load_streaming_nvfp4_expert(
+            module,
+            global_expert_id=0,
+            local_slot_id=0,
+            **_streaming_kwargs(_expert(drop=("0.w2.weight_scale_2",))),
+        )
     assert module._streamed_expert_slots == set()
