@@ -1046,6 +1046,28 @@ def test_selfsampling_hopper_reads_shape_constants_at_run_time(monkeypatch) -> N
         assert staged_k(rows, n, 1024, 132, 90) == 1024, (rows, n)
 
 
+def test_selfsampling_hopper_fp16_wide_slabs_issue_samples_first(monkeypatch) -> None:
+    """FP16 batches beyond two waves that Hopper streams on 512-thread slabs issue the sample
+    loads before the row prologue (env_first) up to 48M scores per batch, the bound of p2.
+    Blackwell keeps its rungs: 256-thread slabs, and 512-thread slabs of rows of 128K scores."""
+    requests = _record_compile_requests(monkeypatch)
+
+    def env_first(rows, n, k, num_sms, sm_version):
+        monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
+        requests.clear()
+        _varlen_plan(rows, n, k, num_sms, sm_version, torch.float16)
+        (kwargs,) = [kwargs for name, kwargs in requests if name == "get_compiled"]
+        return kwargs.get("env_first", False)
+
+    for k in (512, 1024):
+        assert env_first(512, 65539, k, 132, 90), k
+        assert not env_first(1024, 65539, k, 132, 90), k
+        for rows in (512, 1024):
+            assert not env_first(rows, 131075, k, 132, 90), (rows, k)
+        assert env_first(512, 65539, k, 148, 100), k
+        assert env_first(256, 131075, k, 148, 100), k
+
+
 @pytest.mark.skipif(
     getSMVersion() != 90
     or torch.cuda.get_device_properties(0).multi_processor_count != ss_host._HOPPER_CLUSTER_SMS,

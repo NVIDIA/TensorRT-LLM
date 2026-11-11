@@ -3288,15 +3288,18 @@ def _varlen_launcher(
                 amin,
                 sd_en,
             )
-            if not tpl[5] and (
-                int(tpl[0]) == 256
-                or (
+            if int(tpl[0]) >= 512 and num_rows > 2 * wave:
+                # Hopper's 512-thread slabs of batches beyond two waves (``_wide_slab``) issue
+                # the sample loads first up to the batch size that takes p2
+                env_first = n_kernel * num_rows <= 48 * 1024 * 1024
+            else:
+                env_first = int(tpl[0]) == 256 or (
                     k <= 1024
                     and 131072 < n_kernel <= 131584
                     and num_rows > num_sms
                     and int(tpl[0]) >= 512
                 )
-            ):
+            if not tpl[5] and env_first:
                 main_options["env_first"] = True
             if (
                 not tpl[5]
