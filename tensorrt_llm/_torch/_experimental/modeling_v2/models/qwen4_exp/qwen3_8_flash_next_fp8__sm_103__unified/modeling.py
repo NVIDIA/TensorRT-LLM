@@ -2353,8 +2353,24 @@ def _window_runner(
         out = _window_runner(core, experts, xq, xsf, topk_ids, topk_w, output)
         after_first(out)
         return out
-    return fp8_block_scale_moe_runner(
+    return _window_runner_call(
+        core,
+        experts,
+        xq,
+        xsf,
         routing_logits=None,
+        topk_weights=topk_w,
+        topk_ids=topk_ids,
+        output=output,
+        tune_max_num_tokens=_runner_tune_rows(core),
+    )
+
+
+def _window_runner_call(core, experts: _weights.ExpertWindow, xq, xsf, **routing) -> torch.Tensor:
+    """`fp8_block_scale_moe_runner` over this rank's whole-expert window, renormalized SwiGLU;
+    `routing` is the call's routing (`routing_logits`, or `topk_ids` / `topk_weights`) and
+    any further runner keywords."""
+    return fp8_block_scale_moe_runner(
         routing_bias=None,
         hidden_states=xq,
         hidden_states_scale=xsf,
@@ -2372,12 +2388,9 @@ def _window_runner(
         local_num_experts=experts.count,
         routed_scaling_factor=None,
         routing_method_type=_ROUTING_METHOD_RENORM,
-        topk_weights=topk_w,
-        topk_ids=topk_ids,
         act_type=_ACT_TYPE_SWIGLU,
         gemm1_clamp_limit=None,
-        output=output,
-        tune_max_num_tokens=_runner_tune_rows(core),
+        **routing,
     )
 
 
@@ -2545,29 +2558,8 @@ def _window_runner_front(core, experts: _weights.ExpertWindow, x, logits, before
 
 def _window_runner_logits(core, experts: _weights.ExpertWindow, xq, xsf, logits) -> torch.Tensor:
     """Run the window with the runner routing `logits` itself (bitwise `renorm_moe_routing_op`)."""
-    return fp8_block_scale_moe_runner(
-        routing_logits=logits,
-        routing_bias=None,
-        hidden_states=xq,
-        hidden_states_scale=xsf,
-        gemm1_weights=experts.fc1_w,
-        gemm1_weights_scale=experts.fc1_s,
-        gemm2_weights=experts.fc2_w,
-        gemm2_weights_scale=experts.fc2_s,
-        num_experts=core.num_experts,
-        top_k=core.topk,
-        num_fused_shared_experts=None,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=core.moe_inter,
-        local_expert_offset=experts.offset,
-        local_num_experts=experts.count,
-        routed_scaling_factor=None,
-        routing_method_type=_ROUTING_METHOD_RENORM,
-        topk_weights=None,
-        topk_ids=None,
-        act_type=_ACT_TYPE_SWIGLU,
-        gemm1_clamp_limit=None,
+    return _window_runner_call(
+        core, experts, xq, xsf, routing_logits=logits, topk_weights=None, topk_ids=None
     )
 
 
@@ -2590,30 +2582,7 @@ def _routed_experts_front(
             shared,
         )
     assert shared is None, "the shared-expert fold rides the block launch"
-    return fp8_block_scale_moe_runner(
-        routing_logits=logits,
-        routing_bias=None,
-        hidden_states=xq,
-        hidden_states_scale=xsf,
-        gemm1_weights=experts.fc1_w,
-        gemm1_weights_scale=experts.fc1_s,
-        gemm2_weights=experts.fc2_w,
-        gemm2_weights_scale=experts.fc2_s,
-        num_experts=core.num_experts,
-        top_k=core.topk,
-        num_fused_shared_experts=None,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=core.moe_inter,
-        local_expert_offset=experts.offset,
-        local_num_experts=experts.count,
-        routed_scaling_factor=None,
-        routing_method_type=_ROUTING_METHOD_RENORM,
-        topk_weights=None,
-        topk_ids=None,
-        act_type=_ACT_TYPE_SWIGLU,
-        gemm1_clamp_limit=None,
-    )
+    return _window_runner_logits(core, experts, xq, xsf, logits)
 
 
 class _WindowRun(NamedTuple):
