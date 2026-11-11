@@ -41,13 +41,15 @@ def require_supported_slurm_topology():
         "SLURM_NODELIST",
         "SLURM_NTASKS_PER_NODE",
     )
-    missing_variables = [variable for variable in required_variables if variable not in os.environ]
+    missing_variables = [
+        variable for variable in required_variables
+        if variable not in os.environ
+    ]
     if missing_variables:
         pytest.fail(
             "This test must run directly under a two-node Slurm allocation; "
             "trtllm-llmapi-launch removes the required topology variables. "
-            f"Missing: {', '.join(missing_variables)}"
-        )
+            f"Missing: {', '.join(missing_variables)}")
     if len(NODE_LIST) != 2:
         pytest.skip("This test requires exactly two Slurm nodes")
 
@@ -87,7 +89,8 @@ def env():
     # one matches, overrides this.
     if get_sm_version() == 103 and platform.machine().lower() == "aarch64":
         e["UCX_TLS"] = "cuda_copy,cuda_ipc,sm,self,tcp"
-    cluster_env.apply_ucx_env(e, cluster_name=os.environ.get("SLURM_CLUSTER_NAME"))
+    cluster_env.apply_ucx_env(e,
+                              cluster_name=os.environ.get("SLURM_CLUSTER_NAME"))
     return e
 
 
@@ -106,17 +109,15 @@ def service_discovery(request, disagg_host: str):
     if request.param == "etcd" and is_disagg_node():
         work_dir = tempfile.mkdtemp()
         data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
-        etcd = subprocess.Popen(
-            [
-                "etcd",
-                "--data-dir",
-                data_dir,
-                "--listen-client-urls",
-                "http://0.0.0.0:2379",
-                "--advertise-client-urls",
-                f"http://{disagg_host}:2379",
-            ]
-        )
+        etcd = subprocess.Popen([
+            "etcd",
+            "--data-dir",
+            data_dir,
+            "--listen-client-urls",
+            "http://0.0.0.0:2379",
+            "--advertise-client-urls",
+            f"http://{disagg_host}:2379",
+        ])
         yield etcd, f"etcd://{disagg_host}:2379"
         try:
             etcd.kill()
@@ -143,7 +144,9 @@ def disagg_cluster_config(service_discovery: tuple):
 def worker(model_name: str, disagg_cluster_config: dict):
     extra_config = {
         "disagg_cluster": disagg_cluster_config,
-        "cache_transceiver_config": {"backend": "DEFAULT"},
+        "cache_transceiver_config": {
+            "backend": "DEFAULT"
+        },
         "kv_cache_config": {
             "free_gpu_memory_fraction": 0.8,
             "enable_block_reuse": False,
@@ -163,15 +166,15 @@ def worker(model_name: str, disagg_cluster_config: dict):
         tp_size, pp_size = 1, 1
         args = ["--tp_size", str(tp_size), "--pp_size", str(pp_size)]
         with RemoteOpenAIServer(
-            model_path,
-            port=port,
-            cli_args=args,
-            host="0.0.0.0",
-            env=env(),
-            llmapi_launch=False,
-            rank=0,
-            extra_config=extra_config,
-            role=ServerRole.CONTEXT,
+                model_path,
+                port=port,
+                cli_args=args,
+                host="0.0.0.0",
+                env=env(),
+                llmapi_launch=False,
+                rank=0,
+                extra_config=extra_config,
+                role=ServerRole.CONTEXT,
         ) as server:
             yield server
     elif is_gen_node() and is_worker_task():
@@ -180,15 +183,15 @@ def worker(model_name: str, disagg_cluster_config: dict):
         tp_size, pp_size = 1, 1
         args = ["--tp_size", str(tp_size), "--pp_size", str(pp_size)]
         with RemoteOpenAIServer(
-            model_path,
-            port=port,
-            cli_args=args,
-            host="0.0.0.0",
-            env=env(),
-            llmapi_launch=False,
-            rank=0,
-            extra_config=extra_config,
-            role=ServerRole.GENERATION,
+                model_path,
+                port=port,
+                cli_args=args,
+                host="0.0.0.0",
+                env=env(),
+                llmapi_launch=False,
+                rank=0,
+                extra_config=extra_config,
+                role=ServerRole.GENERATION,
         ) as server:
             yield server
     else:
@@ -208,13 +211,13 @@ def disagg_server(disagg_cluster_config: dict):
         print(f"starting disagg_server for rank {RANK} node rank {NODE_RANK}")
         # ctx/gen servers are unnecessary for service discovery test
         with RemoteDisaggOpenAIServer(
-            ctx_servers=[],
-            gen_servers=[],
-            port=DISAGG_SERVER_PORT,
-            disagg_config=disagg_config,
-            llmapi_launch=False,
-            env=env(),
-            wait_ready=False,  # wait it to be ready in test body
+                ctx_servers=[],
+                gen_servers=[],
+                port=DISAGG_SERVER_PORT,
+                disagg_config=disagg_config,
+                llmapi_launch=False,
+                env=env(),
+                wait_ready=False,  # wait it to be ready in test body
         ) as server:
             yield server
     else:
@@ -240,7 +243,8 @@ def test_completion(
 ):
     disagg_health_url = f"http://{disagg_host}:{DISAGG_SERVER_PORT}/health/"
     if is_worker_task():
-        wait_for_endpoint_ready(disagg_health_url, timeout=DISAGG_SERVER_START_TIMEOUT_S)
+        wait_for_endpoint_ready(disagg_health_url,
+                                timeout=DISAGG_SERVER_START_TIMEOUT_S)
     if is_pytest_node():
         print(f"running test_completion on rank {RANK} node rank {NODE_RANK}")
         prompt = "What is the result of 1+1? Answer in one word: "

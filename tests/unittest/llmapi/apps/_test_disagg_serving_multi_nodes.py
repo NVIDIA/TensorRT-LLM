@@ -48,14 +48,14 @@ def require_supported_slurm_topology():
         "SLURM_NTASKS_PER_NODE",
     )
     missing_variables = [
-        variable for variable in required_variables if variable not in os.environ
+        variable for variable in required_variables
+        if variable not in os.environ
     ]
     if missing_variables:
         pytest.fail(
             "This test must run directly under a two-node Slurm allocation; "
             "trtllm-llmapi-launch removes the required topology variables. "
-            f"Missing: {', '.join(missing_variables)}"
-        )
+            f"Missing: {', '.join(missing_variables)}")
     if len(NODE_LIST) != 2:
         pytest.skip("This test requires exactly two Slurm nodes")
 
@@ -245,9 +245,8 @@ def test_completion(client: openai.OpenAI,
     elif is_gen_node() and is_worker_task():
         # Keep the generation worker alive until the disaggregated server exits.
         url = f"http://{get_the_other_host(0)}:{DISAGG_SERVER_PORT}/health/"
-        wait_for_endpoint_ready(
-            url, timeout=DISAGG_SERVER_START_TIMEOUT_S + 300
-        )
+        wait_for_endpoint_ready(url,
+                                timeout=DISAGG_SERVER_START_TIMEOUT_S + 300)
         wait_for_endpoint_down(url)
         assert True
     else:
