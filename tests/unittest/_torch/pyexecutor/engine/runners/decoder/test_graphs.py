@@ -648,6 +648,7 @@ def test_kv_regime_resolver_resolves_each_graph_shape_once() -> None:
         patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),
         patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=True),
         patch.object(runner, "_decode_sm_count", return_value=212),
+        patch.object(runner, "_fp4_mla_4x_unavailable", return_value=None),
         patch.object(
             fp4_mla_dispatch, "kv_regimes_for_batch", return_value=(12345, 30080)
         ) as regimes,
