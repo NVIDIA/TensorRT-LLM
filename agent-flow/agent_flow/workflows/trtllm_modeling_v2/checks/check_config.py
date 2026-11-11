@@ -32,6 +32,3 @@ def check_configuration(
         sampling.setdefault("n", width)
         sampling["use_beam_search"] = True
     return {"llm": options, "sampling": sampling}
-
-
-__all__ = ["GREEDY_SAMPLING", "check_configuration"]

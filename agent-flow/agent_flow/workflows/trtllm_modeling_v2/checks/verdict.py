@@ -142,14 +142,3 @@ class GateLog:
 
     def render(self) -> str:
         return "\n".join(result.summary() for result in self.results)
-
-
-__all__ = [
-    "GateLog",
-    "GateResult",
-    "UNKNOWN_TREE_STATE",
-    "describe_tree_state",
-    "inspect_tree",
-    "lost_session",
-    "verdict_factory",
-]

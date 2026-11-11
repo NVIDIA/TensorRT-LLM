@@ -275,15 +275,3 @@ def run_accuracy_gate(
     return ran(
         **judged(measured, anchor, benchmark, relative_score=relative_score, output=combined)
     )
-
-
-__all__ = [
-    "ACCURACY_TIMEOUT_S",
-    "eval_command",
-    "judged",
-    "launch_command",
-    "parse_eval_score",
-    "run_accuracy_gate",
-    "score_lines",
-    "unparsed_score_detail",
-]

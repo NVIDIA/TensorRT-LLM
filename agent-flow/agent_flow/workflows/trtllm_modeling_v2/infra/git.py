@@ -476,34 +476,3 @@ def link_native(repo: Path, tree: Path) -> None:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         target.symlink_to(repo / rel)
-
-
-__all__ = [
-    "repo_lock",
-    "native_artifacts",
-    "link_native",
-    "COMMIT_POLICY_FIELD",
-    "COMMIT_POLICY_KEYS",
-    "CommitFinding",
-    "CommitIdentity",
-    "CommitPolicy",
-    "CommitPolicyError",
-    "JUDGE_PATHS",
-    "LABEL_MIXED",
-    "LABEL_SHARED",
-    "LABEL_TARGET",
-    "DEFAULT_BASE_REFS",
-    "ENV_EMAIL",
-    "ENV_NAME",
-    "SANDBOX_PLACEHOLDER_DIRS",
-    "SANDBOX_PLACEHOLDER_NAMES",
-    "audit_commits",
-    "commit_instruction",
-    "git_checked",
-    "git_output",
-    "is_sandbox_placeholder",
-    "resolve_base",
-    "resolve_commit_identity",
-    "trial_commit",
-    "validate_commit_policy_block",
-]

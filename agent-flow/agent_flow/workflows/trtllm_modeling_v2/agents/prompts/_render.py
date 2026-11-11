@@ -18,6 +18,3 @@ _ENVIRONMENT = Environment(
 def render_template(template_name: str, **context: object) -> str:
     """Render a packaged template, failing on missing context instead of omitting it."""
     return _ENVIRONMENT.get_template(template_name).render(**context)
-
-
-__all__ = ["render_template"]

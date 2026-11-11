@@ -145,6 +145,3 @@ class Journal:
 
     def close(self, *, summary: str) -> None:
         self.section("run closed", summary)
-
-
-__all__ = ["Journal", "utc_now"]

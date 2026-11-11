@@ -511,23 +511,3 @@ def write_report(workflow, pipeline) -> Path:
     path = w.workspace / REPORT_FILENAME
     write_text_atomic(path, "\n".join(lines))
     return path
-
-
-__all__ = [
-    "CHECKS_DIRNAME",
-    "LIBRARIES_DIRNAME",
-    "REPORT_FILENAME",
-    "Line",
-    "delivered_tests",
-    "delivery_lines",
-    "final_pass",
-    "findings_left",
-    "git_lines",
-    "measure",
-    "onboard_check",
-    "onboard_ref",
-    "record_onboarded",
-    "test_job_line",
-    "test_modules",
-    "write_report",
-]

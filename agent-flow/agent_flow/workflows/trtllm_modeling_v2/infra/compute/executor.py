@@ -40,6 +40,3 @@ def shell_runner_for(executor: CommandExecutor, *, default_timeout: int = 1800) 
         return executor.execute(CommandSpec(argv=command, env=env, timeout_s=timeout))
 
     return run
-
-
-__all__ = ["select_command_executor", "shell_runner_for"]

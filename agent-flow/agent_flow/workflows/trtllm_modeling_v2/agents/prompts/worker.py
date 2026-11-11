@@ -44,6 +44,3 @@ def worker_prompt(ending: str) -> str:
 def role_prompt(role: str) -> str:
     """The worker's system prompt for a role whose decisions are in the decision table."""
     return worker_prompt(ending_section(role, ENDING_EXTRAS.get(role, "")))
-
-
-__all__ = ["ENDING_EXTRAS", "WORKER_BASE", "role_prompt", "worker_prompt"]

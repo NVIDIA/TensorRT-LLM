@@ -40,6 +40,3 @@ def read_json(path: Path) -> dict | None:
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
-
-
-__all__ = ["read_json", "write_json_atomic", "write_text_atomic"]

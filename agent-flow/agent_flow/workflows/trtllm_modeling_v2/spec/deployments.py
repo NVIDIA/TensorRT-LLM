@@ -604,30 +604,3 @@ def describe(found: tuple[Deployment, ...], anchors: Mapping[str, str] | None = 
             + (f", {', '.join(judged)}" if judged else "")
         )
     return "\n".join(lines)
-
-
-__all__ = [
-    "AGGREGATED",
-    "BENCHMARK_DEFAULTS",
-    "DEFAULT_BENCHMARK",
-    "DEPLOYMENTS_FIELD",
-    "DISAGGREGATED",
-    "INPUTS",
-    "ROLES",
-    "STATED_ACCURACY_KEYS",
-    "Benchmark",
-    "Deployment",
-    "Server",
-    "benchmark_of",
-    "describe",
-    "is_stated",
-    "load_options",
-    "named",
-    "resolve",
-    "resolve_paths",
-    "split_args",
-    "validate",
-    "validate_env",
-    "validate_judging",
-    "write_options",
-]

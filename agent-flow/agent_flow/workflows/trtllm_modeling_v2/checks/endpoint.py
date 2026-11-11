@@ -292,12 +292,3 @@ def run_endpoint_accuracy(
         ),
         **fields,
     )
-
-
-__all__ = [
-    "ENDPOINT_BENCHMARKS",
-    "NOT_JUDGED",
-    "eval_command",
-    "run_endpoint_accuracy",
-    "run_endpoint_boot",
-]

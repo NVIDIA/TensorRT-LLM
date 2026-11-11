@@ -63,6 +63,3 @@ def find(
         f"the dataset of `{benchmark}` ({repo}) is not on this host, and accuracy runs "
         f"offline: put it under $LLM_MODELS_ROOT/datasets/{repo}, or state `dataset_path`"
     )
-
-
-__all__ = ["KNOWN", "find"]

@@ -362,15 +362,3 @@ def missing_keywords(spec: BootSpec, texts: Sequence[str | None]) -> list[str]:
             label = "the image prompt" if item.images else "a prompt"
             missing.append(f"{absent_keyword} (in {label} {item.prompt[:40]!r})")
     return missing
-
-
-__all__ = [
-    "BootPrompt",
-    "BootSpec",
-    "DEFAULT_BOOT_IMAGE",
-    "DEFAULT_BOOT_IMAGE_KEYWORDS",
-    "DEFAULT_BOOT_IMAGE_PROMPT",
-    "missing_keywords",
-    "resolve_boot_spec",
-    "run_boot_gate",
-]

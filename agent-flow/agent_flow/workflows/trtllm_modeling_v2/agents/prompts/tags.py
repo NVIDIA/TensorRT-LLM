@@ -55,11 +55,3 @@ def task_tags(kind: str, tags: Iterable[str] = ()) -> tuple[str, ...]:
 def tag_section(tags: Iterable[str]) -> str:
     """Return dispatch sections in order, or an empty string when none is a worker tag."""
     return "\n".join(TAG_PROMPTS[tag] for tag in tags if tag in TAG_PROMPTS)
-
-
-__all__ = [
-    "IMPLIED",
-    "TAG_PROMPTS",
-    "tag_section",
-    "task_tags",
-]

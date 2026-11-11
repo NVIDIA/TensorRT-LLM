@@ -186,18 +186,3 @@ def main(argv: list[str] | None = None) -> int:
     data = status(cfg)
     print(json.dumps(data, indent=2) if args.json else format_status(data))
     return 0
-
-
-__all__ = [
-    "ORCHESTRATOR_STALE_S",
-    "Event",
-    "MonitorConfig",
-    "MonitorError",
-    "build_parser",
-    "format_status",
-    "load_config",
-    "main",
-    "orchestrator_state",
-    "status",
-    "wait",
-]

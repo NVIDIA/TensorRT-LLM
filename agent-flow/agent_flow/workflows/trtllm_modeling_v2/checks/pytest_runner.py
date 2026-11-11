@@ -231,18 +231,3 @@ def run_tests(
         if outcome.verdict(skips_fail=True) != "CLEAN":
             return ran(passed=False, detail="; ".join(said))
     return ran(passed=True, detail="; ".join(said))
-
-
-__all__ = [
-    "ARTIFACTS_ENV",
-    "PYTEST_ROOT_MARKERS",
-    "TEST_FILE",
-    "TIMEOUT_S",
-    "Outcome",
-    "list_test_files",
-    "pytest_argv",
-    "pytest_command",
-    "pytest_root",
-    "read_report",
-    "run_tests",
-]

@@ -40,6 +40,3 @@ def capture_lists_block(task_data: Mapping[str, Any]) -> str:
                 )
             lines.append(f"- `{who}`: {said}")
     return "\n".join(lines)
-
-
-__all__ = ["CAPTURE_LISTS_HEADING", "capture_lists_block"]

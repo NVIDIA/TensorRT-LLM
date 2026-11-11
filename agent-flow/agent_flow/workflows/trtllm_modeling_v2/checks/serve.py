@@ -314,18 +314,3 @@ def run_serve_gate(
         return _verdict(passed=False, detail=ended_early(result, timeout), **ran)
     passed, detail, warnings = judge(combined, requests, result.returncode, boot)
     return _verdict(passed=passed, detail=detail, warnings=warnings, **ran)
-
-
-__all__ = [
-    "CHAT_COMPLETIONS",
-    "COMPLETIONS",
-    "GATE_NAME",
-    "SERVE_DRIVER",
-    "ServeSpec",
-    "judge",
-    "run_serve_gate",
-    "serve_args",
-    "serve_command",
-    "serve_requests",
-    "write_serve_options",
-]

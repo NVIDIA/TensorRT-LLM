@@ -589,22 +589,3 @@ def load_and_validate_task_yaml(
             for key in spent & set(accuracy):
                 del accuracy[key]
     return data
-
-
-__all__ = [
-    "ACCURACY_FIELD",
-    "BOOT_KEYS",
-    "DEFAULT_PARALLEL",
-    "GATE_TIMEOUT_KEY",
-    "IGNORED_KEYS",
-    "TaskSchemaError",
-    "derive_checkpoint_segment",
-    "derive_family",
-    "derive_slug",
-    "load_and_validate_task_yaml",
-    "load_prompts_file",
-    "missing",
-    "reject_unknown_keys",
-    "resolve_gate_timeout",
-    "routed_family",
-]

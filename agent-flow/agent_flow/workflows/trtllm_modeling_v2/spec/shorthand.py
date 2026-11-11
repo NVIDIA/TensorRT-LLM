@@ -352,17 +352,3 @@ def expand(data: Mapping[str, Any]) -> tuple[Deployment, ...]:
         judged = benchmarks(str(name), unit, own=entry.get("accuracy"))
         out.append(deployment(str(name), unit, first, entry, env=env(entry), benchmarks=judged))
     return tuple(out)
-
-
-__all__ = [
-    "ACCURACY_KEYS",
-    "DISAGG",
-    "DISAGG_KEYS",
-    "DRAFTERS",
-    "FEATURES",
-    "MEMBER",
-    "SHORTHAND_KEYS",
-    "expand",
-    "per",
-    "validate",
-]

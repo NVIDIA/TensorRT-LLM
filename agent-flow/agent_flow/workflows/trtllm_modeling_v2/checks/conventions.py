@@ -162,14 +162,3 @@ def record(workspace: str | Path, task_id: str, findings: list[str]) -> list[str
         Path(workspace).mkdir(parents=True, exist_ok=True)
         write_text_atomic(Path(workspace) / CONVENTIONS_FILENAME, json.dumps(held, indent=1))
     return new
-
-
-__all__ = [
-    "CONVENTIONS_FILENAME",
-    "entry_findings",
-    "load",
-    "record",
-    "scan",
-    "untested",
-    "v1_imports",
-]

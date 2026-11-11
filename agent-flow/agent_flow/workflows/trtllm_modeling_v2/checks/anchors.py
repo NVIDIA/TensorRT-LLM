@@ -363,28 +363,3 @@ def floor(
     scale = 100.0 if anchor.unit == "fraction" else 1.0
     se = binomial_se(reference * scale, samples) * (math.sqrt(2) if relative else 1.0) / scale
     return Floor(reference - FLOOR_K * se, reference, se, samples, relative), source
-
-
-__all__ = [
-    "ANCHORS_FILENAME",
-    "DECLARED",
-    "FLOOR_K",
-    "KNOWN_SAMPLES",
-    "NONE",
-    "REFERENCE",
-    "RELATIVE",
-    "Anchor",
-    "AnchorError",
-    "Floor",
-    "binomial_se",
-    "differences",
-    "floor",
-    "freeze",
-    "frozen",
-    "load",
-    "load_reference_score",
-    "model_key",
-    "resolve",
-    "samples_of",
-    "tags",
-]

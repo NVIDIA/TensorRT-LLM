@@ -337,17 +337,3 @@ def main(argv: list[str] | None = None) -> int:
         if not result.passed and result.stdout_tail.strip():
             print(result.stdout_tail)
     return 0 if result.passed else 1
-
-
-__all__ = [
-    "GATE_NAMES",
-    "IN_PROCESS",
-    "THROUGH_ENDPOINT",
-    "claimed_devices",
-    "gate_name",
-    "install_cli",
-    "invocation",
-    "main",
-    "run_check",
-    "run_gate",
-]

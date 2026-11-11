@@ -53,6 +53,3 @@ def run_disagg_gate(
         "beside the tree's own (the tests that serve through `trtllm-serve disaggregated`) "
         "and name its node id in the deployment's `tests`",
     )
-
-
-__all__ = ["DEFAULT_TIMEOUT_S", "GATE_NAME", "run_disagg_gate"]

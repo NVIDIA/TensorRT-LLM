@@ -234,20 +234,3 @@ def describe(records: Sequence[Mapping[str, Any]]) -> str:
             f"option(s); target {record.get('target') or 'unknown'}]"
         )
     return "".join(said)
-
-
-__all__ = [
-    "MATCH",
-    "MISMATCH",
-    "REUSE_ID",
-    "REUSE_PROMPT",
-    "UNKNOWN",
-    "Attestation",
-    "attest",
-    "describe",
-    "leaves",
-    "rank_records",
-    "reuse_sends",
-    "reuse_shortfall",
-    "reuses",
-]

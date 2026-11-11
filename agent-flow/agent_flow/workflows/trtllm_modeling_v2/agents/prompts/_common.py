@@ -55,19 +55,6 @@ def scope_block(scope: str) -> str:
     return render_template("common/text_only.md.j2")
 
 
-__all__ = [
-    "CITATION_DISCIPLINE",
-    "EVIDENCE_DISCIPLINE",
-    "MODELING_V2_LAYOUT",
-    "MODELING_V2_SWITCH",
-    "SOURCE_BOUNDARY",
-    "decision_file_block",
-    "notes_block",
-    "scope_block",
-    "tidy",
-]
-
-
 #: What each rung means to the agent that has to build it.
 TIER_DESCRIPTION: dict[int, str] = {
     TIER_TRTLLM_OP: "an op the engine already exports as torch.ops.trtllm.*",
