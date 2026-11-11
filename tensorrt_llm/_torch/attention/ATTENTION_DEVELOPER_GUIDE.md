@@ -643,6 +643,15 @@ The FMHA package is split by role:
   PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen);
   it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
   removes it.
+- `fmha/prims_ts_dsa_sparse_mla.py` runs DSA generation on the vendored PrimTS
+  D576 sparse MLA kernel (SM100/SM103), which reads the NVFP4 KV records of the
+  `fp8rope` layout (`TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT=fp8rope`) in place. Its
+  `prims_ts_reads_nvfp4_mla_records()` is the one decision behind both gather
+  skips: `DSATrtllmAttention.sparse_attn_predict` skips the NVFP4-to-FP8 gather
+  and DSA metadata leaves out the gather's FP8 rows. Where it does not hold
+  (Helix, beam search, a layer without the library, e.g. with skip-correction),
+  the layer gathers and TRTLLM-Gen serves generation. It is in the default
+  library set and `TLLM_FMHA_LIBS=-prims_ts_dsa_sparse_mla` removes it.
 - `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
   vendored PrimTS contiguous and paged wrappers. Paged generation passes a
   live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it

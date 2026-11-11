@@ -21,6 +21,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...fmha.prims_ts_dsa_sparse_mla import prims_ts_reads_nvfp4_mla_records
 from ..mixed_precision_high_rows import overlay_mixed_precision_high_rows
 from .cache_manager import NVFP4_MLA_RECORD_LAYOUT, get_nvfp4_mla_kv_cache_layout
 from .indexer import (
@@ -252,9 +253,11 @@ class DSATrtllmAttention(TrtllmAttention):
         topk_indices_global = self._remap_topk_to_global(topk_indices, metadata, is_generation)
 
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4:
-            if self._prims_ts_reads_nvfp4_records(metadata):
+            if prims_ts_reads_nvfp4_mla_records(metadata, self):
                 # PrimTS dequantizes the selected records itself; it takes the global rows.
                 return topk_indices_global, None
+            # Metadata leaves these rows out when it expects PrimTS to read the records.
+            metadata.ensure_nvfp4_mla_generation_buffers()
             scratch = metadata.nvfp4_mla_fp8_scratch
             compact_indices = metadata.nvfp4_mla_compact_indices
             if scratch is None or compact_indices is None:
@@ -293,24 +296,6 @@ class DSATrtllmAttention(TrtllmAttention):
             return compact_indices, None
 
         return topk_indices_global, None
-
-    def _prims_ts_reads_nvfp4_records(self, metadata: DSAtrtllmAttentionMetadata) -> bool:
-        """Whether generation runs on the PrimTS FMHA that reads NVFP4 records in place."""
-        if getattr(metadata.kv_cache_manager, "mla_kv_cache_layout", None) != (
-            NVFP4_MLA_RECORD_LAYOUT
-        ):
-            return False
-        manager = self._fmha_manager
-        cached = getattr(self, "_prims_ts_record_reader", None)
-        if cached is None or cached[0] is not manager:
-            from ...fmha.prims_ts_dsa_sparse_mla import PrimsTSDsaSparseMlaFmha
-
-            reads_records = manager is not None and any(
-                isinstance(fmha, PrimsTSDsaSparseMlaFmha) for fmha in manager.fmha_libs
-            )
-            cached = (manager, reads_records)
-            self._prims_ts_record_reader = cached
-        return cached[1]
 
     def _remap_topk_to_global(
         self,
