@@ -419,6 +419,74 @@ def test_cute_dsl_fp4_paged_mqa_logits(
 
 
 @skip_not_sm100
+@pytest.mark.parametrize("context_len", [3, 129, 257])
+@pytest.mark.parametrize("phys_block_kv", [32, 128])
+def test_cute_dsl_fp4_paged_mqa_logits_short_context(context_len, phys_block_kv):
+    """Check causal valid logits for short contexts and partial KV tiles."""
+    torch.manual_seed(42)
+    batch_size, next_n, num_heads, head_dim = 2, 3, 64, 128
+    max_model_len = 2048
+    device = "cuda"
+    context_lens = torch.tensor([next_n, context_len], dtype=torch.int32, device=device)
+    blocks_per_seq = ceil_div(context_len, phys_block_kv)
+    num_blocks = batch_size * blocks_per_seq
+    block_table = torch.randperm(num_blocks, dtype=torch.int32, device=device).reshape(
+        batch_size, blocks_per_seq
+    )
+    query = torch.randn(
+        (batch_size, next_n, num_heads, head_dim), dtype=torch.bfloat16, device=device
+    )
+    kv_cache = torch.randn(
+        (num_blocks, phys_block_kv, 1, head_dim), dtype=torch.bfloat16, device=device
+    )
+    weights = torch.randn((batch_size * next_n, num_heads), device=device)
+    query_packed, query_scales = per_token_cast_to_fp4(
+        query.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    query_dequantized = cast_back_from_fp4(
+        query_packed, query_scales, gran_k=32, use_packed_ue8m0=True
+    ).view(batch_size, next_n, num_heads, head_dim)
+    remove_online_sf_transpose = phys_block_kv == 128
+    kv_fused, kv_dequantized = kv_cache_cast_to_fp4(
+        kv_cache, remove_online_sf_transpose=remove_online_sf_transpose
+    )
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens.unsqueeze(-1), 64, deep_gemm.get_num_sms()
+    )
+    expected = _ref_paged_mqa_logits(
+        query_dequantized.float(),
+        kv_dequantized.float(),
+        weights,
+        context_lens,
+        block_table,
+        max_model_len=max_model_len,
+    )
+
+    logits = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+        query_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2),
+        query_scales.view(torch.int32).view(batch_size, next_n, num_heads),
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+        epi_dtype=torch.float32,
+        output_dtype=torch.float32,
+        remove_online_sf_transpose=remove_online_sf_transpose,
+    )
+
+    row_indices = torch.arange(batch_size * next_n, device=device)
+    causal_limits = context_lens[row_indices // next_n] - next_n + row_indices % next_n
+    valid = torch.arange(max_model_len, device=device).unsqueeze(0) <= causal_limits.unsqueeze(1)
+    assert logits.shape == expected.shape
+    assert logits.dtype == torch.float32
+    assert torch.isfinite(logits[valid]).all()
+    atol, rtol = ELEM_TOL[(torch.float32, torch.float32)]
+    torch.testing.assert_close(logits[valid], expected[valid], atol=atol, rtol=rtol)
+
+
+@skip_not_sm100
 @pytest.mark.parametrize(
     "next_n,num_next_n_atoms,atom,num_heads",
     [
