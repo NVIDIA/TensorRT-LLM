@@ -34,6 +34,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluBiasActivation,
     activation_constant_names,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEExecutionContractMixin
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
@@ -110,6 +111,7 @@ def _check_backend_can_implement(
     activation_type: ActivationType,
     expert_bias: Optional[bool] = None,
     activation_constants: frozenset[str] = frozenset(),
+    requires_unfinalized_output: bool = False,
 ) -> Tuple[bool, Optional[str]]:
     """Resolve backend_str to its MoE class and ask whether it can serve this.
 
@@ -154,6 +156,15 @@ def _check_backend_can_implement(
     )
     reason = None
     for backend_cls in candidates:
+        unfinalized = getattr(backend_cls, "supports_unfinalized_output", None)
+        if requires_unfinalized_output and (
+            unfinalized is None
+            or unfinalized is MoEExecutionContractMixin.supports_unfinalized_output
+        ):
+            reason = (
+                f"{backend_cls.__name__} declares no unfinalized output for per-expert post-norm"
+            )
+            continue
         try:
             verdict = backend_cls.can_implement(problem, deployment)
         except Exception as exc:
@@ -255,6 +266,7 @@ def is_candidate_valid(
         model.swiglu_gptoss_style,
         model.activation_type_enum,
         expert_bias=model.expert_bias,
+        requires_unfinalized_output=model.post_expert_norm_eps is not None,
         activation_constants=(
             activation_constant_names(
                 SwigluBiasActivation(
@@ -275,6 +287,17 @@ def is_candidate_valid(
         moe_ep, moe_tp, enable_dp = _resolve_mapping_layout(config, world_size)
     except ValueError as exc:
         return False, str(exc)
+
+    if model.post_expert_norm_eps is not None:
+        pure_ep = moe_tp == 1 and moe_ep == world_size
+        pure_tp = moe_ep == 1 and moe_tp == world_size and not enable_dp
+        if not (pure_ep or pure_tp):
+            return False, "MuseSparkOpen requires pure MoE EP or pure MoE TP without attention DP"
+        if moe_ep > 1 and config.comm_method.upper() == "DEEPEPLOWLATENCY":
+            return (
+                False,
+                "DeepEPLowLatency declares no finalize-before-combine for Muse post-expert norm",
+            )
 
     # DenseGEMM only supports TP; any EP configuration (TEP, DEP, custom ep>1) is unsupported.
     if config.backend.upper() == "DENSEGEMM" and moe_ep > 1:

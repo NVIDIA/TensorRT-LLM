@@ -75,7 +75,7 @@ def _resolve_benchmark_context(args: argparse.Namespace) -> _BenchmarkContext:
     base_config = _resolve_base_config_from_args(args)
     search = _resolve_search_from_args(args, base_config)
     act_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    fp32_routing = model.routing_method_cls in (
+    fp32_routing = model.router_fp32 or model.routing_method_cls in (
         DeepSeekV3MoeRoutingMethod,
         DeepSeekV4MoeRoutingMethod,
         MiniMaxM3MoeRoutingMethod,
