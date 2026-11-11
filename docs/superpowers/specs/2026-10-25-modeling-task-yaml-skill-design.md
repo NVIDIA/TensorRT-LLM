@@ -23,6 +23,12 @@
 - 写出文件后，用工作流自己的检查来校验（`modeling-v2-onboard --check`，没有 v2-onboard 时用
   `load_and_validate_task_yaml`），并告诉用户怎样运行。对话中不再重复实现这些检查。
 
+- 只写 `task_schema.py` 的格式，只对应 modeling-v2-onboard（agent-flow 里有它时）和 modeling-bringup。
+  `trtllm-modeling-v2` 是另一个工作流（`arch`/`members`/`environment` sessions/accuracy anchor），
+  不转换成它的格式、不跑它的 intake、不给它的命令。GPU 节点和 reference 分数都由 run 自己解决，
+  启动前不需要额外准备；backend、model 是命令行参数，不写进 YAML。命令不在 PATH 上时不自行建环境安装，
+  先问用户。
+
 ## 非目标
 
 - `modeling-v2-onboard` 特有的内容中，除 `gpu_pool`（节点池）以外的部分：并行拓扑选择、

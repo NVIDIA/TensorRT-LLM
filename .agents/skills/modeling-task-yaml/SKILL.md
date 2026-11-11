@@ -15,6 +15,29 @@ environment — lives in sentences under `completion_criteria` and
 `implements_tips`. Your job is to ask for what the user left out and turn
 the answers into clear, checkable sentences.
 
+## Which workflow
+
+This skill writes the format of
+`agent_flow/workflows/modeling_bringup/task_schema.py`, for two workflows
+only: `modeling-v2-onboard` when the user's agent-flow has
+`agent_flow/workflows/modeling_v2_onboard/`, `modeling-bringup` otherwise.
+
+- `trtllm-modeling-v2` (`agent_flow/workflows/trtllm_modeling_v2/`) is a
+  different workflow with its own spec (`arch`, `members`, `environment`
+  sessions, accuracy anchors) and its own `intake`. Never convert the
+  task.yaml to it, run its intake, or offer its command, even when the
+  user says "v2" or "ModelingV2".
+- When the user asks for modeling-v2-onboard and their agent-flow does not
+  have it, say so and ask whether to write the task for modeling-bringup
+  instead; do not substitute another workflow.
+- Everything the run needs is decided by the run itself: it holds its GPU
+  nodes and measures the reference scores. Nothing has to be prepared
+  before launch beyond what the workflow's check reports. If you find
+  yourself listing other preconditions (sessions to start, scores to
+  record first), you are on the wrong workflow.
+- Run options (backend, model) are command-line flags, never task.yaml
+  fields.
+
 ## Conversation contract
 
 - Language: pick it from the user's first message in this conversation —
@@ -275,8 +298,10 @@ Ask with one multi-select question:
    - otherwise: `python3 .agents/skills/modeling-task-yaml/scripts/validate_task_yaml.py <workspace>/task.yaml`
      (the schema only).
 
-   If the command is not on PATH, install agent-flow first:
-   `pip install -e <trtllm_repo_path>/agent-flow`.
+   If the command is not on PATH, do not install anything or create an
+   environment on your own: tell the user it is missing and ask where to
+   install it (`pip install -e <agent-flow>` into the environment they run
+   it from). Without it, run only the schema check above.
 4. **Slurm with modeling-v2-onboard only:** ask whether to run the runtime
    check now. It submits one short Slurm job that starts the container and
    shows the GPUs, the mounted paths and CUDA PyTorch, but it waits for a
@@ -379,3 +404,6 @@ implements_tips:
 | Asking the user for pool fields Slurm or the environment can answer | Ask only `nodes` and `max_nodes`; infer the rest and confirm it |
 | Checking paths, image or mounts by hand during the conversation | Run the workflow's check at Finish |
 | Running `--smoke` without asking | It waits for a Slurm node; ask first |
+| Rewriting the task for `trtllm-modeling-v2` or running its intake | Write the `task_schema.py` format for modeling-v2-onboard or modeling-bringup only |
+| Telling the user to start GPU sessions or record a reference score before launch | The run holds its nodes and measures the reference itself |
+| Creating a venv or installing agent-flow unasked | Say the command is missing and ask where to install it |
