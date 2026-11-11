@@ -148,7 +148,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 _STATE = ".trtllm_modeling_v2_state.json"
 
 
-_DECISION_PATH = re.compile(r"Write your decision file to exactly this path[^`]*`([^`]+)`")
+_DECISION_PATH = re.compile(
+    r"write your decision file, as YAML, to exactly this path[^`]*`([^`]+)`"
+)
 
 
 class FakeLayer:
@@ -189,20 +191,18 @@ class Script:
         if callable(override):
             return override(turn, prompt)
         if role == "surveyor":
-            return {"decision": "DRAFT_READY", "summary": "drafted"}
+            return {"decision": "ready", "summary": "drafted"}
         if role == "kernel_writer":
             target = _target_from(prompt)
-            return {"decision": "LANDED", "summary": f"landed {target}", "entry": target}
+            return {"decision": "ready", "summary": f"landed {target}", "entry": target}
         if role == "assembler":
-            return {"decision": "UNIT_READY", "summary": "assembled"}
+            return {"decision": "ready", "summary": "assembled"}
         raise AssertionError(f"unscripted role: {role}")
 
 
 def _target_from(prompt: str) -> str:
-    for token in prompt.split("`"):
-        if token and " " not in token and not token.startswith("/"):
-            return token
-    return "unknown"
+    named = re.search(r"the entry `([^`]+)`", prompt)
+    return named.group(1) if named else "unknown"
 
 
 def _install(monkeypatch, workflow, script):
@@ -398,3 +398,72 @@ def _run(tmp_path, task_file, monkeypatch, script, **kwargs):
     with workflow:
         workflow.run(task_file)
     return calls
+
+
+def facts(**changes) -> dict:
+    """Every fact a task's message may name, as the pipeline supplies them; ``changes`` over them."""
+    said = dict(
+        task_id="kv_fp8",
+        goal="repair what the final pass found, every item:\n- check `kv_fp8:boot` failed",
+        attempt=1,
+        attempts=3,
+        note="",
+        worktree="/ws/worktrees/kv_fp8",
+        repo="/repo",
+        head="",
+        behind="",
+        target=TARGET_REL,
+        arch="sm_103",
+        judge="`tensorrt_llm/evaluate/`, `tensorrt_llm/commands/eval.py`",
+        package="/flow/trtllm_modeling_v2",
+        notes="/ws/operator_notes.md",
+        spec="/ws/task.yaml",
+        plan="/ws/plan.md",
+        vocabulary="/ws/vocabulary.yaml",
+        gate="/ws/bin/trtllm-modeling-v2 gate <boot|accuracy|tests> --task /ws/task.yaml "
+        "--deployment kv_fp8 --workdir /ws/gates/kv_fp8 --tree /ws/worktrees/kv_fp8",
+        history=[],
+        earlier=0,
+        tasks="/ws/tasks.yaml",
+        decisions="/ws/decisions",
+        host_facts="/ws/host_facts.md",
+        rebuilt=[],
+        kept="",
+        python="/opt/venv/bin/python",
+        prefix="CUDA_VISIBLE_DEVICES=0 TMPDIR=/scratch/tmp",
+        devices="0",
+        text_only=False,
+        spec_notes="",
+        path="/ws/decisions/kv_fp8-1.yaml",
+        # a deployment
+        deployment="kv_fp8",
+        first="tp1",
+        described="- `kv_fp8`: aggregated, 1 rank(s); judged by its boot, gsm8k",
+        options="`/spec/engines/kv_fp8.yaml`",
+        checks="`kv_fp8:boot`, `kv_fp8:accuracy[gsm8k]`",
+        judged=["`kv_fp8:accuracy[gsm8k]`: relative (the score of `tp1`)"],
+        anchors="/ws/anchors.yaml",
+        relative="tp1",
+        onboarded="c0ffee1",
+        cards=[],
+        models="tensorrt_llm/_torch/_experimental/modeling_v2/models",
+        tests="tests/unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1",
+        # the survey
+        checkpoint="/ckpt/gpt-oss-120b",
+        inventory="## Surface survey\n\n12 entries.",
+        # a kernel row
+        n=4,
+        mode="verify",
+        entry="norm/rmsnorm",
+        onboard=False,
+        row_note="certify rows",
+        surface="bf16",
+        cells=[{"rows": 2048}],
+        tier=3,
+        paths=(f"{TARGET_REL}/ops/norm/rmsnorm__r4.py", "tests/x/test_modeling_v2_rmsnorm__r4.py"),
+        shared="`catalog/norm/rmsnorm.py` and `tests/catalog/norm/test_modeling_v2_rmsnorm.py`",
+        name="rmsnorm",
+        module="ops.norm.rmsnorm__r4",
+        test_command="cd /ws/worktrees/k4 && PYTHONPATH=/ws/worktrees/k4 python -m pytest t.py -q",
+    )
+    return {**said, **changes}

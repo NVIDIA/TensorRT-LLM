@@ -1,0 +1,29 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Task: deployment `{{ deployment }}`
+
+The checkpoint is onboarded{% if onboarded %} at commit `{{ onboarded }}`{% endif %}. Make this further deployment boot and score. The result is reported; it cannot take back "onboarded".
+
+{{ described }}
+
+### What is asked
+
+{{ options }} state what is asked. Every key is compared with what each rank's engine resolved; a value of `DEFAULT` or `auto` leaves the choice to the engine. Do not edit them. Nothing carries over from another deployment: only these options apply.
+
+### How it is judged
+
+- The checks it owes: {{ checks }}. They run once on the checkout after the last task; what fails there goes to one `fix` task. Run them yourself first and copy each result line into `checks`.
+{% if relative %}- A benchmark no reference row fits is judged against the score of `{{ relative }}`, measured on the same commit.
+{% endif %}- A score without a verdict (`[NO VERDICT]`) is not a pass.
+
+### Rules
+
+- First boot `{{ first }}` on your worktree (the gate with `--deployment {{ first }}`). If it fails, end `blocked` with its result line.
+{% if card %}- Read the card below before you change code.
+{% endif %}- With this deployment's options absent, the target runs as it did. If your change touches code `{{ first }}` uses, run its boot again before `ready`.
+- If the routing declines this configuration, extend the routing and the target. Do not weaken the options.
+- A kernel call no entry covers: wrap it in the target's own `ops/`.
+
+### What "not done" means
+
+This is attempt {{ attempt }} of {{ attempts }}. When this one cannot pass, end `blocked`: `summary` gives the failing command and its result line, `not_done` what is missing and how far it got. After the last attempt the run reports the deployment not done, lands nothing of it and goes on. That outcome is accepted.

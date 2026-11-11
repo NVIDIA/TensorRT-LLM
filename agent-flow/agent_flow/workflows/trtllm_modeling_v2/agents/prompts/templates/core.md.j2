@@ -1,0 +1,39 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Task: core, the first deployment `{{ deployment }}`
+
+Make the checkpoint boot and score as {{ options }} state. This defines "onboarded". Do not edit the options.
+
+{{ described }}
+
+### What the onboard check runs after your turn
+
+Code decides, on your last commit:
+
+1. `{{ deployment }}:boot`: the deployment starts with `modeling_v2=require` and is sent the workload's prompts: completed answers holding their keywords. Every rank must report a Modeling V2 target class, your worktree as its import origin, and each stated option as its engine resolved it. A rank that reports nothing reads `unknown`, and unknown is not a pass. With block reuse on, one prompt is sent again and must come back with `cached_tokens`.
+2. Each benchmark against its frozen anchor ({{ anchors }}):
+{% for line in judged %}   - {{ line }}
+{% endfor %}   An aggregated deployment is scored by `trtllm-eval`, a disaggregated one through its endpoint. Without a reference row, a declared anchor and source are required for a verdict: a score nothing judges is reported `[NO VERDICT]`, and the checkpoint is then onboarded on its boot only.
+
+Uncommitted files, or a rank that imported another checkout, give no pass. A failure's result line goes to your next attempt. This is attempt {{ attempt }} of {{ attempts }}; an attempt is one turn that ends without a pass.
+
+### Run the same thing yourself
+
+- Commit first: the onboard check measures your commit.
+- Get `boot` to pass before you spend an accuracy run. The server's log is in the directory the verdict line names.
+- Copy each result line into `checks`.
+
+### Build
+
+1. Read `{{ plan }}`, `{{ vocabulary }}`, "Model lifecycle" and "Routing" in `{{ mv2_readme }}`, and one existing target under `{{ models }}` end to end.
+2. Create `{{ target }}`. The family's routing returns the target's class for what it supports and raises `NoTarget` with the reason otherwise.
+3. `forward`: a readable sequence of entry calls, arguments explicit. No host sync and no Python branch on tensor values: CUDA graphs replay it.
+4. Weight loading accounts for every checkpoint key. A tensor the target does not use (a vision tower) is skipped with its reason, not an error.
+5. Import runtime interfaces only: nothing from a sibling target or Modeling V1 model code. Sharing inside the family is allowed.
+6. A kernel call no entry covers: wrap it in the target's own `ops/` and list it under `not_done`.
+7. The engine must stop cleanly: ranks left on a device after a check mean no verdict.
+8. After the gate passes: unit tests in `{{ tests }}`, as the README's "Testing and validation" says, or list them under `not_done`.
+
+### When accuracy is short
+
+Write down one suspected cause before each rerun. Compare one module with the HuggingFace module on real weights. `gate boot --mode off` runs the same prompts on the stock path, as a control.

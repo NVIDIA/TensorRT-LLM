@@ -1,0 +1,71 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Task: survey
+
+Answer in `{{ plan }}` and `{{ vocabulary }}`: can this checkpoint be assembled from the tree's operators, and what must be added first?
+
+- Checkpoint: `{{ checkpoint }}`. Architecture: `{{ arch }}`. The spec: `{{ spec }}`.
+- The deployments, the first one first; each one's options file states its limits:
+
+{{ described }}
+
+{{ inventory }}
+
+1. Read `config.json`, then the HuggingFace modeling code. Traps: a multimodal checkpoint nests the language model under `text_config`; `layer_types` is not a sliding window; a drafter under `mtp.*` with `dspark_*` keys is DSpark.
+2. List every step that launches a kernel. Layout, movement, allocation and lookup are plain torch: no row. Include the parallel path's collectives: the HuggingFace code has none.
+3. Per step, record this checkpoint's value on every axis, read the entry's `CELLS`, `ARCHS` and `note`, and set `state`:
+   - `OK`: the cells cover the values and `ARCHS` has `{{ arch }}`.
+   - `CERT`: an entry exists but does not cover them: a `verify` row.
+   - `GAP`: no entry: an `onboard` row at the cheapest tier that serves it:
+
+{{ ladder }}
+
+4. Judge coverage against the options' limits (`max_num_tokens`, `max_batch_size`, the CUDA-graph batch sizes), not the benchmark's shapes.
+5. Before a ceiling, search FlashInfer's installed API and the engine's bindings. A wrong `verify` row costs one task; a wrong ceiling ends the run.
+
+### `vocabulary.yaml`
+
+Code validates it and makes one kernel task per queue row. Keep the keys exactly.
+
+```yaml
+verdict: assemblable | assemblable_after_additions | ceiling
+steps:
+  - step: <what this step computes>
+    values: {<axis>: <this checkpoint's value>, ...}
+    state: OK | CERT | GAP
+    entry: catalog/<category>/<name>.py     # OK and CERT rows; or ops/<category>/<name>.py
+    contract_line: "<the cell (why + spec) or note sentence that decides coverage>"
+    tier: 1 | 2 | 3 | 4 | 5                 # GAP rows: the sourcing rung
+    candidate: torch.ops.trtllm.<name>      # GAP rows at tiers 1-3 (tier 3: flashinfer.<module>.<name>)
+    tried: "<why tiers 1-3 do not serve it>"  # GAP rows at tiers 4-5
+    call_sites:                             # where the target calls the entry
+      - {site: "<Target.method, which step>", row_multiple: 1}
+      - {site: "<...>", row_multiple: 6, gathered: true, row_width: 512}
+      - {site: "<...>", eager_only: true}
+queue:
+  - {n: 1, mode: onboard, target: <category>/<name>, depends_on: []}
+  - {n: 2, mode: verify,  target: <category>/<name>, depends_on: [],
+      surface: "<the value the certified column excludes>",
+      cells: [{<spec key>: <measured value>, ...}]}
+  - {n: 3, mode: onboard, target: ops/<category>/<name>, depends_on: [],
+      unit: <deployment>}                # only a later deployment needs it
+  - {n: 4, mode: verify,  target: <category>/<name>, depends_on: [],
+      surface: "<...>", site: mtp_verify}  # optional: names its local copy
+ceiling: null    # or {step: ..., searched: [...], why: ...}
+```
+
+Give every `call_sites` item the actual target method and call count. `row_multiple` is how many rows one request brings there; use `gathered: true` after attention-DP gathering and `eager_only: true` only outside captured paths. Pool slots come from the cache manager, not batch size.
+
+Queue rules:
+
+- `target` is `<category>/<name>` (a shared entry) or `ops/<category>/<name>` (the target's own), plain names; one row per entry: all its call sites' shapes go in its `cells`.
+- `depends_on` lists the rows (`n`) whose entry this one calls.
+- A `verify` row needs `surface` and `cells`, at most {{ max_cells }}. Vary one axis at a time: each dtype, the smallest and largest captured batch, one prefill chunk at `max_num_tokens`.
+- `site` (lowercase words joined by `_`) names the local copy `<name>__<site>`; without it, `<name>__r<n>`. A target name never contains `__`.
+- `unit` is `core` or a later deployment's name. Rows without it block the first deployment. When unsure, leave it out.
+
+### `plan.md`
+
+For the target's builder: the target directory (`{{ target }}`), what the routing checks, the gaps, the benchmark and its reference row. Never invent an anchor: a missing row goes under `## Open risks`.
+
+End `ready` when both files are written; `summary` counts rows by state. End `blocked` when no tier serves a step: fill `ceiling`.

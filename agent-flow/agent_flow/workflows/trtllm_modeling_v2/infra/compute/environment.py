@@ -193,27 +193,6 @@ class RunEnvironment:
             argv = " ".join(shlex.quote(str(part)) for part in argv)
         return self.command(f"{shlex.quote(self.python)} {argv}", single_process=single_process)
 
-    def describe(self) -> str:
-        """The block injected verbatim into every agent's prompt."""
-        device_line = ", ".join(str(d) for d in self.devices) if self.devices else "(none)"
-        return (
-            "## Running GPU work\n"
-            "\n"
-            "Every GPU command in this run is launched exactly one way. Prefix it with:\n"
-            "\n"
-            "```\n"
-            f"{self.prefix}\n"
-            "```\n"
-            "\n"
-            f"The Python interpreter is `{self.python}`. The devices claimed for this run "
-            f"are: {device_line} (world size {self.world_size}).\n"
-            "\n"
-            "**Do not construct a launcher command, do not probe for one, and do not call a "
-            "test-runner skill.** The environment was resolved before you started and it is "
-            "not yours to rediscover. If this prefix does not fit what you need to run, that "
-            "is a **symptom to report in your final message** — not a problem to solve.\n"
-        )
-
 
 def resolve_environment(
     task_data: Mapping[str, Any],

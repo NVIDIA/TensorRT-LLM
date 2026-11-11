@@ -1,0 +1,53 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+{% if repair %}{{ repair }}
+
+{% endif %}{% if note %}## Why this task runs again
+
+Attempt {{ attempt }} of {{ attempts }} of task `{{ task_id }}`. The previous attempt did not finish:
+
+{{ note }}
+
+{% endif %}{% if behind %}## Your branch is behind the checkout
+
+{{ behind }} commit(s) landed on the checkout after your branch was cut; its head is `{{ head }}`. Rebase onto it before anything else:
+
+    git -C {{ worktree }} rebase {{ head }}
+
+Resolve each conflict so that both your change and the landed one stand, then `git -C {{ worktree }} add` the resolved files and `GIT_EDITOR=true git -C {{ worktree }} rebase --continue` until the rebase is done. If the two cannot both stand, `git -C {{ worktree }} rebase --abort` and say why in your receipt.
+
+{% endif %}{% if history %}## What the run did before this task
+
+Each line is a task that ended, with its worker's own summary; its receipt is `{{ decisions }}/<task>-<attempt>.yaml`. A done task's commits are in the checkout: build on them. Nothing of a task not done landed. A kernel row not done was skipped: where the target needs that entry, write its wrapper in the target's own `ops/`.
+
+{% if earlier %}- ({{ earlier }} earlier task(s): `{{ tasks }}`)
+{% endif %}{% for t in history %}- `{{ t.id }}` ({{ t.kind }}): {{ t.state }}{% if t.decision %} {{ t.decision }}{% endif %}.{% if t.said %} {{ t.said }}{% endif %}
+{% endfor %}
+{% endif %}{% if host_facts %}## Host facts
+
+Read `{{ host_facts }}` before you debug anything about this machine: `pytest`'s exit code, the `TMPDIR` bound, the launch rules, which errors are noise. If you learn a new one, append it under `## Learned during this run`.
+
+{% endif %}{% if rebuilt %}## Native libraries
+
+{% for name in rebuilt %}- libraries were changed by `{{ name }}`: rebuild before you boot
+{% endfor %}{% if kept %}
+The ones the onboard check accepted are kept in `{{ kept }}`.
+{% endif %}
+{% endif %}{% if python %}## GPU commands
+
+The gate launches what it measures itself. Any other GPU command (an entry's test) runs under `{{ python }}` with this prefix, on the device(s) the run claimed ({{ devices }}):
+
+    {{ prefix }}
+
+Build no other launcher. A prefix that does not fit what you must run is a thing to say in your receipt.
+{% endif %}{% if text_only %}
+## Scope: text only
+
+This checkpoint is multimodal, and this target is the language model only. Do not port the vision tower or write an entry for it. The weight loader skips the vision tensors rather than failing on them, and the checks send text prompts only.
+{% endif %}{% if spec_notes %}
+## Notes from the spec
+
+The operator wrote these for this run. Follow them where they apply to your task. They do not change the checks or widen your task.
+
+{{ spec_notes }}
+{% endif %}

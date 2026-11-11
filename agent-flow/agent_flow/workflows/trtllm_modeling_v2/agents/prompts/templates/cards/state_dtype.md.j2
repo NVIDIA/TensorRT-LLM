@@ -1,0 +1,15 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+Check: `{{ gate }}`: every rank's resolved state dtype must equal the options', then the benchmarks.
+
+### Card: recurrent (SSM) state dtype
+
+**Supported means:** the engine boots with `kv_cache_config.mamba_ssm_cache_dtype` as stated, every rank resolved it, and each benchmark meets its floor.
+
+- This tree accepts `auto`, `float16`, `bfloat16`, `float32` only. Another dtype needs a shared-runtime change first: separate commits, general, rebuilt.
+- Recurrent state lives in the manager's recurrent pool, never in tensors the target owns. State held in Python is stale after block reuse, eviction, CUDA-graph replay and a disaggregated transfer.
+- State that carries across prefill chunks goes back to manager storage between calls.
+- Hybrid recurrent models use `MambaHybridCacheManagerV2`. It restores state only at the snapshot boundaries of `kv_cache_config.mamba_state_config`. Without that policy the loader turns block reuse off and logs "Disabling KV cache block reuse for the hybrid Mamba model".
+- Across a disaggregated hop the state moves through `tensorrt_llm/_torch/disaggregation/native/mixers/ssm/`, and needs `transceiver_runtime: PYTHON` with `backend: NIXL`.
+- Imitate: `tests/unittest/_torch/pyexecutor/kv_cache/test_mamba_cache_manager.py`, `tests/unittest/disaggregated/test_mamba_transfer.py`.
+- Grep: `mamba_ssm_cache_dtype`, `MambaStateConfig`, `periodic_snapshot_interval`.

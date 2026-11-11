@@ -1,0 +1,16 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+Check: `{{ gate }}`: `boot` sends an image prompt beside the text ones; `accuracy[<benchmark>]` scores the image benchmark this deployment names.
+
+### Card: image inputs
+
+**Supported means:** with `inputs: [text, image]`, an image prompt gets a completed answer holding its keywords, and the image benchmark meets its floor. A benchmark with no reference row and no declared anchor is a score with no verdict. Through a disaggregated hop an image benchmark is not judged.
+
+- The checkpoint's `config.json` nests the language model's geometry under `text_config`.
+- Fuse only the embeddings of the tokens computed in this step. Under chunked prefill or block reuse part of an image is already cached (`find_input_mm_embeds`, `fuse_input_embeds`).
+- The engine owns the input processor (`register_input_processor`), encoder scheduling and media hashing. Do not rebuild them.
+- A text benchmark says nothing about the vision path, and one keyword is weak evidence: run the image benchmark.
+- A text-only deployment of this checkpoint must load with the vision tensors present and unused.
+- Known image: `tests/integration/test_input_files/merlion.png` (git-lfs).
+- Imitate: `tests/unittest/_torch/multimodal/` (`test_multimodal_runtime.py`, `test_fuse_input_embeds.py`).
+- Grep: `MultimodalParams`, `MultimodalRuntimeData`, `multi_modal_uuids`.

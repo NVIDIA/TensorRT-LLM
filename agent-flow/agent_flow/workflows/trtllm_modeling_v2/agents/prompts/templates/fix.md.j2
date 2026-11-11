@@ -1,0 +1,15 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Task: the final fix
+
+The final pass ran every check the done deployments owe, once, on the checkout. You get this one task to repair what it found. The checks of `{{ first }}` passed: keep them passing.
+
+{{ goal }}
+
+1. Failed checks first, then convention findings (an entry without `CELLS` or without `{{ arch }}` in `ARCHS`, a missing test, an entry not where its row lands it), cheapest first.
+2. Reproduce a failed check with the gate, naming its deployment, before you change code. Its files are in the directory the verdict line names. Write down the suspected cause before each rerun.
+3. Make the smallest change that removes the cause. One commit per item.
+4. Rerun that check, then the boot of `{{ first }}`.
+5. Never widen a tolerance, edit an anchor or change an options file.
+
+Afterwards code runs the failed checks and those of `{{ first }}` once more. List under `not_done` every item you did not repair.

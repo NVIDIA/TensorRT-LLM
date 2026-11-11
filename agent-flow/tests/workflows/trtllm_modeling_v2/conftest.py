@@ -77,7 +77,7 @@ def _git_stays_under_the_base_temp(tmp_path_factory, monkeypatch):
     A fixture tree that is not a checkout has to read as not one, even when
     the base temp directory sits inside some other checkout.
     """
-    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path_factory.getbasetemp()))
+    monkeypatch.setenv("GIT_blocked_DIRECTORIES", str(tmp_path_factory.getbasetemp()))
 
 
 @pytest.fixture(autouse=True)

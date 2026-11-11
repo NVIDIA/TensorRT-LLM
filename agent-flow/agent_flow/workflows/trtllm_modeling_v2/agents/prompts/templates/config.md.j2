@@ -1,0 +1,9 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Task: make the tree load the checkpoint's config
+
+Preflight loaded the checkpoint's `config.json` in this tree with `ModelConfig.from_pretrained`, and it failed:
+
+{{ goal }}
+
+Make the smallest general change that lets the tree load it: no branch on this model. Change nothing else. When you end `ready`, code runs the same probe on your commit, and your branch lands only when the config loads there.

@@ -1,61 +1,55 @@
 {# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0 -#}
-Workspace: {{ ctx.workspace }}
-Repository: {{ ctx.repo }}
-Architecture: {{ ctx.arch }}
-{% if ctx.target_rel %}Target: {{ ctx.target_rel }}
-{% endif %}
-Dispatch {{ ctx.item.n }}: **{{ ctx.item.mode }}** the catalog entry `{{ ctx.item.target }}`.
-{% if ctx.note %}
-{{ ctx.note }}
-{% endif %}{% if ctx.goal %}
-## Your task: `{{ ctx.task_id }}` (tags: {{ purpose_tags }})
+## Task: one operator entry (queue row {{ n }})
 
-{{ ctx.goal }}
-{% endif %}{% if row_note %}
-{% if ctx.goal %}Its queue row's note{% else %}The plan's note for this dispatch{% endif %}: {{ row_note }}
-{% endif %}
-{{ tags }}
-{% if local_variant %}
-## Where it lands
+**{{ mode }}** the entry `{{ entry }}` for `{{ arch }}`. One task, one entry.{% if onboard %} No entry wraps this op: write one.{% else %} An entry exists: certify it at the values below, which its cells do not hold.{% endif %}
 
-In this target's own `ops/`, as the local variant `{{ ctx.landing }}`:
+- Step and values: row {{ n }} in `{{ vocabulary }}`.{% if row_note %} Its note: {{ row_note }}{% endif %}
+{% if surface %}- Surface to certify, the value the entry's cells exclude today: {{ surface }}
+{% endif %}{% if cells %}- Cells to certify, each the `spec` of one `Cell`: `{{ cells }}`
+{% endif %}- Sourcing: {% if tier %}tier {{ tier }}: {{ tier_text }}{% else %}no tier is recorded; name the one your `__call__` wraps{% endif %}
 
-{% for path in ctx.paths -%}
-- `{{ path }}`
-{% endfor %}
-{% if onboard -%}
-Write the entry there.
-{% else -%}
-Start the variant as a copy of the entry as it stands, file and test (the
-shared catalog's, or the copy another target keeps in its `ops/`), keeping its
-class and its instance name (`{{ entry_name }}`), and add your cells there.
-{% endif -%}
-Leave {% for path in ctx.shared %}`{{ path }}`{% if not loop.last %} and {% endif %}{% endfor %}
-as they are: the shared catalog entry is not changed by this run. The target imports the variant (`from .{{ variant_module }} import {{ entry_name }}`)
-and is delivered with it.
-{% endif %}
-{% if ctx.item.surface %}The surface to certify: {{ ctx.item.surface }}
-{% endif %}{% if tier is none -%}
-Sourcing: no rung is recorded for this entry. Name the one its `__call__` wraps in your decision file's `tier`.
-{% else -%}
-Sourcing: **tier {{ tier }} — {{ tier_description }}** (recorded in `vocabulary.yaml` queue row {{ ctx.item.n }}).
-{% if writes_implementation -%}
-This entry has no implementation yet — you are writing it, not wrapping one. Correct-and-slow is acceptable; the tuning phase replaces it. Say in the contract what you rejected at the cheaper rungs.
-{% elif kernel_library -%}
-The entry's `__call__` calls the FlashInfer callable directly — no trtllm op wraps it. Find it in the FlashInfer the run's interpreter has installed; certify the callable as the kernel sources below say.
-{% endif -%}
-{% endif %}
-## Where a kernel comes from
+### Where it lands
 
-An op in `torch.ops.trtllm` is registered from Python (a `torch.library.custom_op("trtllm::...")`
-under `tensorrt_llm/_torch/custom_ops/`: the file name is its source) or from C++ (a
-`TORCH_LIBRARY_FRAGMENT(trtllm, ...)` / `TORCH_LIBRARY_IMPL(trtllm, ...)` block), and
-`git grep` for the op's name finds it. A FlashInfer callable no op wraps is tier 3: the entry's `__call__` calls
-`flashinfer.<module>.<name>` itself. What the entry certifies follows the source: a JIT-compiled
-kernel (CuTe DSL, Triton, FlashInfer) states the architecture it compiled for and that the JIT
-path ran; a compiled-in C++ kernel is in the wheel or not. Say which in the entry's `note`.
+Use these exact paths: the report looks for the entry there.
 
-Read `{{ ctx.vocabulary_path }}` for the computation step this entry serves and the values this checkpoint passes it.
+{% for path in paths %}- `{{ path }}`
+{% endfor %}{% if shared %}- The class and its instance keep the name `{{ name }}`; the target imports `from .{{ module }} import {{ name }}`.
+- {% if not onboard %}First copy {{ shared }} to these paths, then add your cells there. {% endif %}Leave the shared files as they are.
+{% endif %}- A new `ops/<category>/` directory needs an `__init__.py` with the copyright header.
 
-{{ decision_reminder }}
+### The entry: an `OpWrapper`
+
+Read "Writing operations" in `{{ mv2_readme }}`, `catalog/_op.py`, and one entry of the same category with its test. For C++/CUDA read `{{ build_guide }}` first: sources in `csrc/`, registered with its macros, a matching fake in `fake_ops.py`.
+
+- `__call__`: one kernel-launching call, every argument explicit; weights, state and configuration are arguments. No torch fallback: it certifies nothing.
+- `reference`: the expected result in plain torch with fp32 accumulation, from the cell's named arguments. It calls neither the kernel nor any entry.
+- `is_valid`: rejects inputs the kernel accepts but computes wrongly: only cases you measured.
+- `CELLS`: what the test runs: every cell listed above, plus one at the largest row the options allow (`max_num_tokens`, `max_batch_size`). Measured values.
+- `ARCHS`: add `{{ arch }}` only after the whole test file passed on this device.
+- `note`: preconditions, limits, measured numbers, where the kernel comes from.
+
+An entry without `CELLS`, or whose `ARCHS` lacks `{{ arch }}`, is a finding in the report: check both before you commit.
+
+Tiers 1 to 3 wrap an existing callable: `git grep` the op's name for its source. At tiers 4 and 5 you write it, correct before fast, from the closest existing kernel: keep its license header and name its origin. A composition of torch calls, when nothing better exists, says so in `note`.
+
+### The test
+
+- Parametrize over `op.CELLS` with the `certifying` fixture of `_validating.py`: the entry's own `__call__` and `reference` both run.
+- Assert CUDA is available, no skip. Seed randomness.
+- Judge a cell by its output distribution against `reference` (cosine similarity, relative L2, a high percentile of the absolute error); a NaN fails. Never widen a band to pass: one wider than torch's default needs a wrong-variant control that fails.
+- Each `is_valid` refusal: show the unguarded failure, then test it with `validating(op)` and `pytest.raises`; a probe that can crash runs in a subprocess.
+- For index arguments, check reachable 2^31-element, 2^31/row-width, and fp32 2^24+1 boundaries.
+- Pool slots are a cell axis sized from the cache manager, not the batch size. Include slots != batch.
+- A normal cell fits 10 s and 40 GiB; a larger one gets `spec.large=True` and `pytest.mark.large`.
+
+Run it with your worktree first on `PYTHONPATH`, or it tests another checkout:
+
+    {{ test_command }}
+
+After your last edit, run the whole file once, and `tests/unittest/_torch/modeling_v2/test_modeling_v2_no_stale_claims.py`.
+
+### When a cell fails
+
+- The options never serve that cell (a cached prefix with block reuse off): reject it in `is_valid`, leave it out of `CELLS`, list it under `not_done`, and land.
+- The defect is in shared code and the checkpoint's own call hits it: fix it as a shared commit, or end `blocked` with the failing test committed and the file, trigger and test in `summary`.

@@ -11,7 +11,6 @@ import re
 import threading
 import time
 import tomllib
-from dataclasses import asdict, replace
 from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,30 +27,26 @@ from agent_flow.types import AgentTextEvent, SessionInitEvent, ThinkingEvent, To
 from agent_flow.workflows.trtllm_modeling_v2.agents import prompts, roles
 from agent_flow.workflows.trtllm_modeling_v2.agents.decisions import (
     decision_path,
-    names,
+    decision_problem,
     read_decision,
 )
-from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import _common, _render, kernel, survey
-from agent_flow.workflows.trtllm_modeling_v2.agents.prompts.tags import TAG_PROMPTS, task_tags
-from agent_flow.workflows.trtllm_modeling_v2.agents.prompts.worker import WORKER_BASE
 from agent_flow.workflows.trtllm_modeling_v2.agents.turns import (
     InProcessTurnExecutor,
     TurnOutcome,
     TurnRequest,
     TurnTimeout,
 )
-from agent_flow.workflows.trtllm_modeling_v2.infra.git import CommitPolicy
-from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
 from agent_flow.workflows.trtllm_modeling_v2.run import start
-from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import ROLE_BY_KIND, TAGS_BY_KIND
+from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import ROLE_BY_KIND
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe
 from agent_flow.workflows.trtllm_modeling_v2.run.startup.agent_probe import AGENT_PROBE_SKIP_ENV
+from agent_flow.workflows.trtllm_modeling_v2.spec.deployments import Deployment, Server
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
     TaskSchemaError,
     load_and_validate_task_yaml,
 )
 
-from ._helpers import _workflow
+from ._helpers import _workflow, facts
 
 
 def test_a_claude_role_keeps_its_stop_hook_and_a_codex_role_gets_none(tmp_path):
@@ -273,144 +268,25 @@ def _primed(tmp_path, monkeypatch, primer):
     return workflow, executor, made
 
 
-def test_missing_context_raises() -> None:
-    assert _render._ENVIRONMENT.undefined is StrictUndefined
-    with pytest.raises(UndefinedError):
-        _render.render_template("common/notes.md.j2")
-
-
-def test_markdown_and_user_notes_are_neither_escaped_nor_rendered_again() -> None:
-    notes = "<tag> & a > b; {{ not_a_variable }} {% not_a_statement %}"
-    assert _render._ENVIRONMENT.autoescape is False
-    for prompt in asdict(prompts.build_trtllm_modeling_v2_prompts(notes=f"  {notes}\n")).values():
-        assert notes in prompt
-        assert "&lt;tag&gt;" not in prompt
-    assert _common.notes_block(" \n ") == ""
-
-
-def test_decision_file_extra_keys_scope_and_role_endings() -> None:
-    plain = _common.decision_file_block("surveyor")
-    extra = _common.decision_file_block("assembler", ("blocked_reason", "uncertified"))
-    assert "<task>-<attempt>.yaml" in plain
-    assert "This role also carries" not in plain
-    assert "This role also carries" in extra
-    assert _common.scope_block("full") == ""
-    assert "ignore the vision tensors" in _common.scope_block("text_only")
-    for role, prompt in asdict(prompts.DEFAULT_PROMPTS).items():
-        for decision in names(role):
-            assert decision in prompt
-        assert "SPDX-License-Identifier" not in prompt
-    assert task_tags("feature", ("fix", "assemble")) == ("assemble", "feature", "fix")
-    # Every kind of task the pipeline runs has a role, and a section for each of its tags.
-    assert set(TAGS_BY_KIND) | {"kernel"} == set(ROLE_BY_KIND)
-    assert {tag for tags in TAGS_BY_KIND.values() for tag in tags} | {"kernel"} == set(TAG_PROMPTS)
-    for tag, text in TAG_PROMPTS.items():
-        assert text.startswith(f"## Tag `{tag}`")
-
-
 def test_each_attempt_of_a_task_has_its_own_decision_file_and_only_a_valid_one_is_read(tmp_path):
     first = decision_path(tmp_path, "core", 1)
     assert first == tmp_path / "decisions" / "core-1.yaml" and first.parent.is_dir()
     assert decision_path(tmp_path, "core", 2) != first
     assert decision_path(tmp_path, "core", 1, turn=2).name == "core-1.2.yaml"
     assert decision_path(tmp_path, "k1/rms norm", 1).name == "k1_rms_norm-1.yaml"
-    assert read_decision(first, "assembler") is None  # no file is no decision
-    first.write_text("summary: s\ndecision: LANDED\n")
-    assert read_decision(first, "assembler") is None  # another role's decision is none
+    assert read_decision(first) is None  # no file is no receipt
+    assert decision_problem(first) == f"there is no file at `{first}`"
+    # One receipt for every worker: ready or blocked, and nothing else.
+    first.write_text("summary: s\ndecision: UNIT_READY\n")
+    assert read_decision(first) is None
+    assert "`decision` is 'UNIT_READY'" in decision_problem(first)
+    assert "it must be `ready` or `blocked`" in decision_problem(first)
     first.write_text("decision: [not, a, mapping")
-    assert read_decision(first, "assembler") is None
-    first.write_text("summary: s\ndecision: ' UNIT_READY '\nchecks: [boot]\n")
-    assert read_decision(first, "assembler") == {
-        "summary": "s",
-        "decision": "UNIT_READY",
-        "checks": ["boot"],
-    }
-
-
-def test_workers_wait_for_results_and_write_decisions_before_ending() -> None:
-    for role in ("surveyor", "kernel_writer", "assembler"):
-        text = getattr(prompts.DEFAULT_PROMPTS, role)
-        assert WORKER_BASE in text
-        assert "nothing wakes you after it" in text
-        assert "While a job your answer needs is queued or running" in text
-        assert "keep\n  polling or waiting in bounded calls" in text
-        assert "write your decision file before ending the turn" in text
-    layout = " ".join(_common.MODELING_V2_LAYOUT.split())
-    assert "static metadata and routing" in layout
-    assert "tests that require a GPU" in layout
-    assert "do not treat that glob as a CPU-only test suite" in layout
-
-
-@pytest.fixture
-def kernel_context() -> kernel.KernelContext:
-    return kernel.KernelContext(
-        item=QueueItem(4, "onboard", "norm/rmsnorm", surface="bf16", note="certify rows"),
-        workspace="/run",
-        repo="/repo",
-        arch="sm_103",
-        target_rel="modeling_v2/models/family/target",
-        vocabulary_path="/run/vocabulary.yaml",
-        note="Finish the previous attempt.",
-        goal="certify norm",
-        task_id="k4-rmsnorm",
-        task_kind="kernel",
-        tags=("fix",),
-        tier=4,
-        landing="ops/norm/rmsnorm__r4",
-        paths=("entry.py", "test.py"),
-        shared=("catalog/norm/rmsnorm.py", "catalog/test_rmsnorm.py"),
-    )
-
-
-def test_kernel_prompt_names_the_task_and_its_landing(
-    kernel_context: kernel.KernelContext,
-) -> None:
-    ctx = kernel_context
-    text = kernel.kernel_prompt(ctx)
-    # Tasks run one at a time: the launch protocol's devices are the dispatch's own.
-    assert "CUDA_VISIBLE_DEVICES=" not in text
-    assert text.index(ctx.note) < text.index("## Your task")
-    assert text.index("## Tag `kernel`") < text.index("## Tag `fix`")
-    assert "from .ops.norm.rmsnorm__r4 import rmsnorm" in text
-    assert text.index("`entry.py`") < text.index("`test.py`")
-    assert "The surface to certify: bf16" in text
-
-
-@pytest.mark.parametrize(
-    ("tier", "mode", "expected", "absent"),
-    [
-        (None, "verify", "no rung is recorded", "no implementation yet"),
-        (1, "onboard", "Sourcing: **tier 1", "no implementation yet"),
-        ("3", "verify", "FlashInfer callable directly", "no implementation yet"),
-        (4, "onboard", "no implementation yet", "FlashInfer callable directly"),
-        (5, "verify", "Sourcing: **tier 5", "no implementation yet"),
-    ],
-)
-def test_kernel_sourcing_and_landing_branches(
-    kernel_context: kernel.KernelContext, tier: object, mode: str, expected: str, absent: str
-) -> None:
-    ctx = replace(kernel_context, tier=tier, item=replace(kernel_context.item, mode=mode))
-    text = kernel.kernel_prompt(ctx)
-    assert expected in text
-    assert absent not in text
-    assert ("Write the entry there" in text) is (mode == "onboard")
-    assert ("Start the variant as a copy" in text) is (mode != "onboard")
-
-
-def test_the_survey_carries_what_each_deployment_states_for_cuda_graphs(tmp_path) -> None:
-    task = {
-        "deployments": [
-            {"name": "tp1", "options": {"cuda_graph_config": {"batch_sizes": [1, 8]}}},
-            {"name": "eager", "options": {"cuda_graph_config": None}},
-            {"name": "pd", "ctx": {"options": {}}, "gen": {"options": {"cuda_graph_config": {}}}},
-        ]
-    }
-    text = survey.capture_lists_block(task)
-    assert text.startswith(survey.CAPTURE_LISTS_HEADING)
-    assert '- `tp1`: `{"batch_sizes": [1, 8]}`' in text
-    assert "- `eager`: no CUDA graphs" in text
-    assert "- `pd.ctx`: not stated: the engine's default" in text
-    assert "- `pd.gen`: `{}` (the engine's default list)" in text
+    assert read_decision(first) is None and "is not valid YAML" in decision_problem(first)
+    first.write_text("summary: s\n")
+    assert "has no `decision` key" in decision_problem(first)
+    first.write_text("summary: s\ndecision: ' blocked '\nnot_done: [boot]\n")
+    assert read_decision(first) == {"summary": "s", "decision": "blocked", "not_done": ["boot"]}
 
 
 def test_all_template_resources_are_declared_as_package_data() -> None:
@@ -424,71 +300,145 @@ def test_all_template_resources_are_declared_as_package_data() -> None:
     assert templates and templates <= declared
     assert any(dep.lower().startswith("jinja2>=") for dep in config["project"]["dependencies"])
     resources = files(prompts) / "templates"
-    loaded = set(_render._ENVIRONMENT.list_templates())
+    loaded = set(prompts._TEMPLATES.list_templates())
     assert loaded == {
         str(path.relative_to(package_root / "agents/prompts/templates")) for path in templates
     }
     for name in loaded:
         assert (resources / name).is_file()
-        _render._ENVIRONMENT.get_template(name)
+        prompts._TEMPLATES.get_template(name)
 
 
-def test_the_committing_roles_are_told_the_commit_rules():
-    policy = CommitPolicy(own_paths=("a/fam/",), judge_paths=("tensorrt_llm/evaluate/",))
-    bundle = prompts.build_trtllm_modeling_v2_prompts(commit_policy=policy)
-    for text in (bundle.kernel_writer, bundle.assembler):
-        assert "## Committing" in text and "git -C <your worktree> commit -s -m" in text
-        assert "The target's own paths are `a/fam/`" in text and "never `git add -A`" in text
-        assert "Never commit a judge path (`tensorrt_llm/evaluate/`)" in text
-        assert "listed in the run's report as `shared` or `mixed`" in text
-    assert "## Committing" not in bundle.surveyor
+# -------------------------------------------------------------------------- the prompts
+
+_SECTIONS = {
+    "config": "## Task: make the tree load the checkpoint's config",
+    "survey": "## Task: survey",
+    "kernel": "## Task: one operator entry (queue row 4)",
+    "core": "## Task: core, the first deployment `kv_fp8`",
+    "deployment": "## Task: deployment `kv_fp8`",
+    "fix": "## Task: the final fix",
+}
+#: What a turn's message holds besides the run's own facts, for the size limits.
+_QUIET = dict(python="", host_facts="", inventory="", history=[], spec_notes="")
+_CARDS = ("disaggregated", "multi_node", "drafter", "multimodal", "kv_dtype", "state_dtype")
 
 
-def test_the_run_puts_its_own_skills_where_each_backend_reads_them(tmp_path):
-    roles.materialize_skills(tmp_path)
-    names = set(roles.packaged_skills())
-    assert names and "trtllm-modeling-v2-entry" in names
-    for directory in roles.SKILL_DIRS:
-        copied = tmp_path / directory
-        assert {p.name for p in copied.iterdir()} == names
-        packaged = roles.PACKAGED_SKILLS_DIR / "trtllm-modeling-v2-entry" / "SKILL.md"
-        assert (
-            copied / "trtllm-modeling-v2-entry" / "SKILL.md"
-        ).read_bytes() == packaged.read_bytes()
-    # A copy that is current is left alone: on a resumed run the directory may be read-only.
-    kept = tmp_path / roles.SKILL_DIRS[0] / "trtllm-modeling-v2-entry"
-    before = kept.stat().st_ino
-    roles.materialize_skills(tmp_path)
-    assert kept.stat().st_ino == before
-    # One that differs is replaced whole.
-    (kept / "SKILL.md").write_text("stale\n")
-    (kept / "left-over.md").write_text("x\n")
-    roles.materialize_skills(tmp_path)
-    assert not (kept / "left-over.md").exists() and (kept / "SKILL.md").read_text() != "stale\n"
+def test_every_kind_of_task_has_a_role_its_section_and_the_one_receipt() -> None:
+    assert set(_SECTIONS) == set(ROLE_BY_KIND)
+    for kind, heading in _SECTIONS.items():
+        said = prompts.dispatch(kind, facts())
+        # The priorities come first, then the task, last the receipt: ready or blocked.
+        assert said.startswith("## Priorities, in this order\n\n1. Onboard: ")
+        assert said.index(heading) < said.index("## The receipt")
+        assert "Line 1 is `decision: ready` or `decision: blocked`." in said
+        assert "```yaml\ndecision: ready\nsummary: |" in said
+        assert "to exactly this path. The run reads nothing else.\n\n`/ws/decisions/" in said
+        assert "list" not in said.split("## Priorities")[0] and "SPDX" not in said
+        assert "Never change an anchor, a tolerance or a check" in said
+        # The prefix of any other GPU command, as the run resolved it.
+        assert "## GPU commands" in said and "under `/opt/venv/bin/python`" in said
+        assert "\n    CUDA_VISIBLE_DEVICES=0 TMPDIR=/scratch/tmp\n" in said
+        assert "{{" not in said and "{%" not in said
+    kernel = prompts.dispatch("kernel", facts())
+    assert "- `entry`: the entry's path as committed" in kernel and "- `tier`: " in kernel
+    assert "- `entry`: " not in prompts.dispatch("core", facts())
+    # A fact a template names and nobody supplied raises: no prompt goes out with a hole.
+    assert prompts._TEMPLATES.undefined is StrictUndefined
+    with pytest.raises(UndefinedError):
+        prompts.dispatch("core", {})
+    # What the operator wrote is sent as written, neither escaped nor rendered again.
+    notes = "<tag> & a > b; {{ not_a_variable }} {% not_a_statement %}"
+    assert notes in prompts.dispatch("core", facts(spec_notes=notes))
+    assert "## Notes from the spec" not in prompts.dispatch("core", facts())
+    scoped = prompts.dispatch("core", facts(text_only=True))
+    assert "## Scope: text only" in scoped and "skips the vision tensors" in scoped
 
 
-def test_the_feature_skill_names_only_paths_the_tree_has():
-    """The skill and the workers' reuse rule are maps of paths: a path the tree lost is stale."""
-    from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import worker
-    from agent_flow.workflows.trtllm_modeling_v2.agents.roles import PACKAGED_SKILLS_DIR
+def test_a_kernel_task_names_its_row_its_landing_and_its_sourcing() -> None:
+    said = prompts.dispatch("kernel", facts())
+    assert "**verify** the entry `norm/rmsnorm` for `sm_103`." in said
+    assert "Surface to certify, the value the entry's cells exclude today: bf16" in said
+    assert "Cells to certify, each the `spec` of one `Cell`: `[{'rows': 2048}]`" in said
+    assert "Sourcing: tier 3: a kernel of a library the engine pins (FlashInfer)" in said
+    assert "the target imports `from .ops.norm.rmsnorm__r4 import rmsnorm`" in said
+    assert said.index("rmsnorm__r4.py`") < said.index("test_modeling_v2_rmsnorm__r4.py`")
+    assert "First copy `catalog/norm/rmsnorm.py` and " in said
+    assert "Leave the shared files as they are." in said
+    assert "cd /ws/worktrees/k4 && PYTHONPATH=/ws/worktrees/k4 python -m pytest" in said
+    new = dict(onboard=True, mode="onboard", tier=None, shared="", surface="", cells="")
+    onboard = prompts.dispatch("kernel", facts(**new))
+    assert "No entry wraps this op: write one." in onboard and "First copy" not in onboard
+    assert "no tier is recorded" in onboard and "Surface to certify" not in onboard
+    survey = prompts.dispatch("survey", facts(worktree="", gate=""))
+    assert all(f"     {tier}. {text}" in survey for tier, text in prompts.TIERS.items())
+    # The survey has no worktree and runs no check: its message says neither.
+    assert "## Worktree and commits" not in survey and "gate <boot|" not in survey
 
+
+def test_a_deployment_loads_the_one_card_its_options_ask_for() -> None:
+    assert prompts.cards(Deployment(name="tp1", server=Server(options={}))) == []
+    quantized = {"kv_cache_config": {"dtype": "fp8"}}
+    pd = Deployment(
+        name="pd",
+        ctx=Server(options={}, launch="srun -N1"),
+        gen=Server(options=quantized),
+        inputs=("text", "image"),
+    )
+    assert prompts.cards(pd) == ["disaggregated", "multi_node", "multimodal", "kv_dtype"]
+    state = {"dtype": "auto", "mamba_ssm_cache_dtype": "float16"}
+    drafted = {"speculative_config": {"decoding_type": "MTP"}, "kv_cache_config": state}
+    assert prompts.cards(Deployment(name="mtp", server=Server(options=drafted))) == [
+        "drafter",
+        "state_dtype",
+    ]
+    said = prompts.dispatch("deployment", facts(cards=prompts.cards(pd)))
+    assert "### Card: disaggregated serving" in said and "### Card: KV-cache dtype" not in said
+    assert "also asks for what these cards cover: `multi_node`, `multimodal`, `kv_dtype`" in said
+    assert "/flow/trtllm_modeling_v2/agents/prompts/templates/cards/" in said
+    assert "- Read the card below before you change code." in said
+    assert "Read the card below" not in prompts.dispatch("deployment", facts())
+    # What the first GPU run of a disaggregated deployment paid for is on its card.
+    assert "state `cache_transceiver_config` with a `backend`" in said
+    assert "`UCX_TLS=tcp` stops the NIXL backend from starting" in said
+    assert '`UCX_TLS: "^ib"` worked on GB300' in said
+    for card in _CARDS:
+        text = prompts.dispatch("deployment", facts(cards=[card]))
+        # A card opens with its check and the command, then says what "supported" means.
+        opening = text.split("### Card: ")[0].rstrip().splitlines()[-1]
+        assert opening.startswith("Check: `/ws/bin/trtllm-modeling-v2 gate <boot|"), card
+        assert "**Supported means:**" in text.split("### Card: ")[1]
+
+
+def test_one_turn_loads_about_twelve_hundred_words_and_the_texts_stay_small() -> None:
+    def words(kind: str, **changes) -> int:
+        return len(prompts.dispatch(kind, facts(**_QUIET, **changes)).split())
+
+    sizes = {kind: words(kind) for kind in _SECTIONS if kind != "survey"}
+    sizes["survey"] = words("survey", worktree="", gate="")  # it has no worktree and no check
+    sizes.update({card: words("deployment", cards=[card]) for card in _CARDS})
+    # Counted with the fixture's paths and commands in it, which are not standing text.
+    assert max(sizes.values()) <= 1260, sizes
+    assert all(size <= 1200 for kind, size in sizes.items() if kind != "kernel"), sizes
+    # What is maintained: the base, the receipt, the six sections and the six cards; and
+    # with them what a message says of the run (its facts, a repair, the host's file).
+    root = Path(prompts.__file__).parent / "templates"
+    texts = {p.name: len(p.read_text().split()) - 13 for p in root.rglob("*.md.j2")}
+    run_facts = sum(texts.pop(name) for name in ("run.md.j2", "repair.md.j2", "host_facts.md.j2"))
+    assert len(texts) == 14 and sum(texts.values()) <= 4300, texts
+    assert run_facts <= 1200, run_facts
+
+
+def test_the_texts_name_only_paths_the_tree_has() -> None:
+    """A prompt is a map of paths: one the tree lost sends a worker nowhere."""
     root = Path(__file__).resolve().parents[4]
     if not (root / "tensorrt_llm").is_dir():
         pytest.skip("not inside a TensorRT-LLM checkout")
-    skill = PACKAGED_SKILLS_DIR / "trtllm-modeling-v2-features"
-    text = "\n".join(
-        [
-            *(p.read_text() for p in skill.rglob("*.md")),
-            Path(worker.__file__).read_text(),
-            Path(_common.__file__).read_text(),
-            *(p.read_text() for p in Path(_common.__file__).parent.rglob("*.j2")),
-        ]
-    )
-    named = set()
-    for found in re.findall(r"`((?:_torch|tensorrt_llm|tests|cpp|examples)/[^`\s]+)`", text):
+    text = "\n".join(p.read_text() for p in Path(prompts.__file__).parent.rglob("*.j2"))
+    named = {prompts.MV2_README, prompts.BUILD_GUIDE}
+    for found in re.findall(r"`((?:tensorrt_llm|tests|cpp|examples)/[^`\s]+)`", text):
         path = found.split("::")[0].rstrip(".,;:)")
-        path = "tensorrt_llm/" + path if path.startswith("_torch/") else path
         if not any(ch in path for ch in "*<{["):
             named.add(path)
     missing = sorted(p for p in named if not (root / p).exists())
-    assert not missing, f"the feature skill names paths this tree lacks: {missing}"
+    assert len(named) > 12 and not missing, f"the texts name paths this tree lacks: {missing}"

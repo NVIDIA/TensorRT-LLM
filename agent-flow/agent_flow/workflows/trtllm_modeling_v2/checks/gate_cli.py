@@ -328,11 +328,13 @@ def install_cli(workspace: str | Path) -> Path:
     return script
 
 
-def invocation(task: str | Path, workdir: str | Path, deployment: str, cli: str = CLI_NAME) -> str:
+def invocation(
+    task: str | Path, workdir: str | Path, deployment: str, cli: str, tree: str | Path
+) -> str:
     """The command a worker runs one of a deployment's checks with, on its own worktree."""
     return (
         f"{cli} gate <{'|'.join(GATE_NAMES)}> --task {task} --deployment {deployment} "
-        f"--workdir {workdir} --tree <your worktree>"
+        f"--workdir {workdir} --tree {tree}"
     )
 
 

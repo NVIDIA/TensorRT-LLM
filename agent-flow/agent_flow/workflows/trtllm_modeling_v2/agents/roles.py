@@ -5,46 +5,9 @@
 
 from __future__ import annotations
 
-import shutil
-from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from agent_flow.agent_runtime import AGENTS_FIELD, AgentConfig, resolve_agent_config
-
-#: The skills this workflow ships, one directory each; the run materializes them.
-PACKAGED_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
-
-
-#: Where the run's skills go under the workspace, each agent session's cwd:
-#: Claude Code reads `.claude/skills`, Codex `.agents/skills`.
-SKILL_DIRS: tuple[str, ...] = (".claude/skills", ".agents/skills")
-
-
-def materialize_skills(workspace: Path) -> None:
-    """Copy the packaged skills into ``workspace``, where every backend finds them."""
-
-    def files(root: Path) -> dict[Path, bytes]:
-        found = (p for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
-        return {p.relative_to(root): p.read_bytes() for p in found}
-
-    skills = sorted(p for p in PACKAGED_SKILLS_DIR.iterdir() if p.is_dir())
-    for destination in (workspace / name for name in SKILL_DIRS):
-        destination.mkdir(parents=True, exist_ok=True)
-        for skill in skills:
-            target = destination / skill.name
-            # A resumed run: the copy is current, and the directory may be read-only to
-            # this process (a sandbox protects `.claude/skills`).
-            if not target.is_dir() or files(skill) != files(target):
-                shutil.rmtree(target, ignore_errors=True)
-                shutil.copytree(skill, target)
-
-
-def packaged_skills() -> tuple[str, ...]:
-    """The names of the skills the run materializes: the only ones its roles load."""
-    if not PACKAGED_SKILLS_DIR.is_dir():
-        return ()
-    return tuple(sorted(p.name for p in PACKAGED_SKILLS_DIR.iterdir() if p.is_dir()))
-
 
 ROLES: tuple[str, ...] = ("surveyor", "kernel_writer", "assembler")
 

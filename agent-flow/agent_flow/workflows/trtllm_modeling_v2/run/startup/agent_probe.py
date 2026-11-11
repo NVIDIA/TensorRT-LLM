@@ -328,14 +328,11 @@ def probe_agents(
         return [future.result() for future in futures]
 
 
-def foreign_skills(
-    outcomes: Sequence[ProbeOutcome], own: Sequence[str]
-) -> dict[str, tuple[str, ...]]:
-    """Backend kind -> the skills its probe session loaded that the run does not ship."""
+def foreign_skills(outcomes: Sequence[ProbeOutcome]) -> dict[str, tuple[str, ...]]:
+    """Backend kind -> the skills its probe session loaded: the user's, which no worker is told of."""
     found: dict[str, set[str]] = {}
     for outcome in outcomes:
-        mine = found.setdefault(outcome.probed.agent.backend, set())
-        mine.update(skill for skill in outcome.skills if skill not in own)
+        found.setdefault(outcome.probed.agent.backend, set()).update(outcome.skills)
     return {backend: tuple(sorted(names)) for backend, names in found.items()}
 
 

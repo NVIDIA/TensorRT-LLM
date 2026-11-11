@@ -14,15 +14,7 @@ See ``README.md`` for usage and architecture, and ``task.example.yaml`` for conf
 
 from typing import Any
 
-from .agents.prompts import DEFAULT_PROMPTS, PromptBundle, build_trtllm_modeling_v2_prompts
-
-__all__ = [
-    "DEFAULT_PROMPTS",
-    "PromptBundle",
-    "TrtllmModelingV2Workflow",
-    "build_trtllm_modeling_v2_prompts",
-    "main",
-]
+__all__ = ["TrtllmModelingV2Workflow", "main"]
 
 
 def __getattr__(name: str) -> Any:

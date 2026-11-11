@@ -4,8 +4,8 @@
 """The start of a run: preflight, then what every turn and every check of the run reads.
 
 Runs on every start: the hard blockers (``startup/preflight.py``), the agent probe, then
-the journal's header, the checks each deployment owes, the survey's inventory, the prompts
-and the host facts. Any failure stops the run before its first turn; the same command
+the journal's header, the checks each deployment owes, the survey's inventory and the
+host facts. Any failure stops the run before its first turn; the same command
 starts it again. A dry run does the same without touching a GPU.
 """
 
@@ -17,11 +17,8 @@ import os
 from rich.markup import escape as escape_markup
 
 from agent_flow.console import print_message, print_rule
-from agent_flow.prompts import dump_prompt_bundle
 
-from ..agents.prompts import PROMPTS_DIRNAME, build_trtllm_modeling_v2_prompts
-from ..agents.prompts._render import render_template
-from ..agents.roles import materialize_skills, packaged_skills
+from ..agents import prompts
 from ..agents.turns import TURNS_DIRNAME
 from ..checks import anchors as anchors_mod
 from ..checks import gate_cli
@@ -90,7 +87,7 @@ def start(workflow, state, log) -> bool:
         agents = agent_probe.distinct_agents(task, resolved=workflow._role_agents())
         repo, head = str(task.get("trtllm_repo_path") or ""), workflow._head()
         outcomes = agent_probe.probe_agents(agents, workflow.workspace, repo=repo, head=head)
-        workflow._foreign_skills = agent_probe.foreign_skills(outcomes, packaged_skills())
+        workflow._foreign_skills = agent_probe.foreign_skills(outcomes)
         if not all(outcome.ok for outcome in outcomes):
             return stop("agent probe failed", agent_probe.format_failures(outcomes))
         proven = "; ".join(o.describe() for o in outcomes)
@@ -104,17 +101,7 @@ def start(workflow, state, log) -> bool:
     workflow.journal.section("surface survey", f"{inventory.headline}\n\nFull survey: `surface.md`")
     print_message(f"survey: {escape_markup(inventory.headline)}", log)
     gate_cli.install_cli(workflow.workspace)
-    # Built now: every role's prompt carries the launch prefix the devices decide.
-    if workflow._prompts_override is None:
-        workflow.prompts = build_trtllm_modeling_v2_prompts(
-            environment=result.environment,
-            scope=str(task.get("scope") or "full"),
-            commit_policy=workflow._commit_policy(),
-            notes=str(task.get("notes") or ""),
-        )
-    dump_prompt_bundle(workflow.prompts, workflow.workspace / PROMPTS_DIRNAME)
     _write_host_facts(workflow, result)
-    materialize_skills(workflow.workspace)
     owed = [f"- `{check.key}`" for check in workflow._contract.checks]
     owed += [f"- note: {note}" for note in workflow._contract.notes]
     workflow.journal.section(f"checks owed: {len(workflow._contract.checks)}", "\n".join(owed))
@@ -134,8 +121,8 @@ def start(workflow, state, log) -> bool:
 def _write_host_facts(workflow, result: PreflightResult) -> None:
     """Seed ``host_facts.md`` from what this run knows; what a role appended below the marker stays."""
     env = result.environment
-    head = render_template(
-        "common/host_facts.md.j2",
+    head = prompts.render(
+        "host_facts.md.j2",
         max_tmpdir=MAX_TMPDIR_LEN,
         tmpdir=str((env.env or {}).get("TMPDIR") or ""),
         ranks=env.ntasks if env.needs_llmapi_launch else 0,

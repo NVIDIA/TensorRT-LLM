@@ -1,0 +1,15 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+Check: `{{ gate }}` with `tests` runs the native tests this deployment names; `boot` and `accuracy` run too.
+
+### Card: drafter (speculative decoding)
+
+**Supported means:** the engine boots with the options' `speculative_config`, every rank reports that algorithm and draft depth, each benchmark meets its floor, and the named acceptance test passes. With no test named, list "acceptance unverified" under `not_done`.
+
+- Accuracy cannot judge a drafter: rejection sampling keeps the output right when drafts are wrong, only slower. Measure accepted tokens per iteration (`numAcceptedTokens`).
+- MTP: the draft layer is part of your forward, as one more decoder layer.
+- Eagle3, DFlash, DSpark read hidden states the target captures at the layers `is_layer_capture` names (`maybe_capture_hidden_states`).
+- A generation step carries the accepted token plus the drafts. Attention then runs the paged-context path: take each sequence's cached length from the metadata (`num_cached_tokens_per_seq`).
+- State written per draft token is committed for the accepted count only (`AuxiliarySpeculativeStateHandler`).
+- The routing admits a `speculative_config` only where acceptance was measured.
+- Imitate: `test_mtp3_acceptance` (`git grep -n "def test_mtp3_acceptance"`); `tests/unittest/_torch/speculative/`.

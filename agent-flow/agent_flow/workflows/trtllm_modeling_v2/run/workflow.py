@@ -14,6 +14,7 @@ what :meth:`TrtllmModelingV2Workflow.run` returns and what the process exits 0 o
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import shutil
 from pathlib import Path
@@ -32,7 +33,7 @@ from agent_flow.agent_runtime import AgentConfig
 from agent_flow.console import print_message
 from agent_flow.logger import get_logger
 
-from ..agents.prompts import PromptBundle, build_trtllm_modeling_v2_prompts
+from ..agents import prompts
 from ..agents.roles import resolve_role_agents
 from ..agents.turns import InProcessTurnExecutor, TurnRequest
 from ..checks import check_runtime, conventions
@@ -83,7 +84,6 @@ class TrtllmModelingV2Workflow:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         clean: bool = False,
         dry_run: bool = False,
-        prompts: PromptBundle | None = None,
         command_runner: Any | None = None,
         shell_runner: Any | None = None,
         git_runner: Any | None = None,
@@ -97,7 +97,6 @@ class TrtllmModelingV2Workflow:
         self.state_path = self.workspace / STATE_FILENAME
         self.max_attempts = max(1, max_attempts)
         self.dry_run = dry_run
-        self._prompts_override = prompts
         # Injected so every stage is testable without a GPU, a cluster or a model: the
         # runner of preflight's probe, the runner of every check (an explicit one always
         # wins over the environment's), and ``(repo, *args) -> stdout | None`` for the
@@ -121,7 +120,6 @@ class TrtllmModelingV2Workflow:
         self.journal = Journal(path=self.workspace / "journal.md")
         self.task_data: dict[str, Any] = {}
         self.environment: RunEnvironment | None = None
-        self.prompts: PromptBundle = prompts or build_trtllm_modeling_v2_prompts()
         self._layers: dict[str, AgentLayer] = {}
         self._agent_configs: dict[str, AgentConfig] | None = None
         # Set at the start of every run (``run/start.py``): the checks each deployment
@@ -134,8 +132,8 @@ class TrtllmModelingV2Workflow:
             "## Surface survey\n\nNot taken for this run: plan on the assumption that "
             "you do not know what exists, and say so in the plan's open items.\n"
         )
-        # Backend kind -> the skills its sessions load besides the run's own (the user's),
-        # which the agent probe reads and every role then runs without.
+        # Backend kind -> the skills its sessions load (the user's), which the agent probe
+        # reads and every role then runs without.
         self._foreign_skills: dict[str, tuple[str, ...]] = {}
 
     def __enter__(self) -> "TrtllmModelingV2Workflow":
@@ -167,9 +165,8 @@ class TrtllmModelingV2Workflow:
             # writes with its own tools, so it gets no hook.
             hooks=require_tool_call_stop_hook(["Write"]) if agent.backend != "codex" else None,
             extra_mcp_servers=agent.extra_mcp_servers,
-            # The workspace is the session cwd, so the run's own materialized skills are
-            # the ones the agent finds. The user's skills and plugins stay out: no role
-            # is briefed on them, and an unattended session should not reach Slack or mail.
+            # The workspace is the session cwd. The user's skills and plugins stay out: no
+            # worker is told of them, and an unattended session should not reach Slack or mail.
             cwd=self.workspace,
             # A task's worktree commits into the checkout's ``.git``.
             writable_roots=(str(root),) if root and Path(root).is_dir() else (),
@@ -189,7 +186,7 @@ class TrtllmModelingV2Workflow:
     def _layer(self, name: str) -> AgentLayer:
         """Build a role's layer on first use and keep it for the run."""
         if name not in self._layers:
-            self._layers[name] = self._make_agent(name, getattr(self.prompts, name))
+            self._layers[name] = self._make_agent(name, prompts.SYSTEM)
         return self._layers[name]
 
     def _run_turn(
@@ -201,7 +198,7 @@ class TrtllmModelingV2Workflow:
             role=role,
             what=what,
             prompt=prompt,
-            system_prompt=getattr(self.prompts, role, "") if self.prompts else "",
+            system_prompt=prompts.SYSTEM,
             backend=agent.backend,
             model=agent.model,
             reasoning_effort=agent.reasoning_effort,
@@ -259,7 +256,7 @@ class TrtllmModelingV2Workflow:
         By content (``contract.tree_id``), with the environment the checks run in as the
         run resolved it: the interpreter, the exported variables, the devices, the prefix.
         """
-        described = self.environment.describe() if self.environment is not None else ""
+        described = repr(dataclasses.astuple(self.environment)) if self.environment else ""
         environment = hashlib.sha256(described.encode("utf-8")).hexdigest()[:12]
         repo = str(tree or self.task_data.get("trtllm_repo_path") or "")
         return contract_mod.tree_id(repo, commit, self.task_data, environment, self._git)

@@ -335,7 +335,6 @@ def final_pass(pipeline) -> None:
     w.journal.event("final pass", f"on {commit[:12]}: {', '.join(done) or 'no deployment done'}")
     failed = _measure_owed(pipeline, commit)
     lines = delivery_lines(w, commit)
-    cli = gate_cli.invocation(w.task_path, w.workspace / CHECKS_DIRNAME / "fix", "<name>")
     problems = [f"check `{v.key}` failed at {commit[:12]}: {v.summary or v.detail}" for v in failed]
     problems += [
         f"{line.name} at {commit[:12]}: {line.detail}" for line in lines if not line.passed
@@ -343,7 +342,7 @@ def final_pass(pipeline) -> None:
     findings = findings_left(w)
     if problems or findings:
         said = [*problems, *(f"convention: {finding}" for finding in findings)]
-        fix = pipeline.fix(said, f"A check runs again with `{cli}`.")
+        fix = pipeline.fix(said)
         if fix.status == pipeline.DONE:
             # Once more on what the fix left: the deployments that had a failure, whole, and
             # core's own checks, which nothing of this takes the onboard record from.
@@ -387,8 +386,8 @@ def _stopped(workflow, pipeline) -> list[str]:
     return lines
 
 
-def _uncertified(workspace: Path) -> list[str]:
-    """Each task's `uncertified` list from its last decision file, one line per item."""
+def _not_done(workspace: Path) -> list[str]:
+    """Each task's `not_done` list from its last receipt, one line per item."""
 
     def order(path: Path) -> tuple[str, list[int]]:
         task, _, token = path.stem.rpartition("-")
@@ -403,9 +402,9 @@ def _uncertified(workspace: Path) -> list[str]:
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         except (OSError, UnicodeError, yaml.YAMLError):
             continue
-        items = data.get("uncertified") if isinstance(data, dict) else None
+        items = data.get("not_done") if isinstance(data, dict) else None
         items = [x for x in items.splitlines() if x.strip()] if isinstance(items, str) else items
-        lines += [f"- `{task}` left uncertified: {str(item).strip()}" for item in items or ()]
+        lines += [f"- `{task}` left not done: {str(item).strip()}" for item in items or ()]
     return lines
 
 
@@ -508,7 +507,7 @@ def write_report(workflow, pipeline) -> Path:
     section("Convention findings left", [f"- {f}" for f in findings_left(w)])
     section("Final pass", [f"- {line.render()}" for line in pipeline.final])
     unchecked = [*NOT_CHECKED, *w._contract.notes]
-    section("What the run did not check", [f"- {x}" for x in unchecked] + _uncertified(w.workspace))
+    section("What the run did not check", [f"- {x}" for x in unchecked] + _not_done(w.workspace))
     section(
         "Models per role",
         [

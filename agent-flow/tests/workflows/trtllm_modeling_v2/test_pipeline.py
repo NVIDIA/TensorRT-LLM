@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
+from agent_flow.workflows.trtllm_modeling_v2.agents import prompts
 from agent_flow.workflows.trtllm_modeling_v2.agents.turns import TurnTimeout
 from agent_flow.workflows.trtllm_modeling_v2.checks import gate_cli
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
@@ -26,9 +27,9 @@ from agent_flow.workflows.trtllm_modeling_v2.run import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run import report as report_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.integration import (
     Integration,
+    behind,
     load_labels,
     own_paths,
-    worktree_block,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import NOTES_FILENAME
 from agent_flow.workflows.trtllm_modeling_v2.run.state import (
@@ -49,6 +50,7 @@ from ._helpers import (
     _tasks,
     _workflow,
     _write_vocabulary,
+    facts,
     healthy_smi,
     passing_shell,
 )
@@ -57,8 +59,8 @@ FAMILY = str(Path(TARGET_REL).parent)
 SLUG = "gpt-oss-120b-sm_103-tp1"
 KV_FP8 = {"name": "kv_fp8", "options": {"kv_cache_config": {"dtype": "fp8"}}, "relative_to": "tp1"}
 TEP2 = {"name": "tep2", "options": {"tensor_parallel_size": 2}}
-BLOCKED = {"decision": "BLOCKED", "blocked_reason": "environment", "summary": "no route to it"}
-READY = {"decision": "UNIT_READY", "summary": "assembled"}
+BLOCKED = {"decision": "blocked", "summary": "no route to it"}
+READY = {"decision": "ready", "summary": "assembled"}
 
 
 def _spec(task_file, *later: dict, **more) -> Path:
@@ -145,11 +147,11 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
             {"n": 3, "mode": "onboard", "target": "ops/norm/scale", "depends_on": [1]},
         ]
         _write_vocabulary(workspace, rows)
-        return {"decision": "DRAFT_READY", "summary": "three rows"}
+        return {"decision": "ready", "summary": "three rows"}
 
     def kernel_writer(turn, prompt):
         events.append(f"turn:{_task_id(prompt)}")
-        return {"decision": "LANDED", "summary": "landed", "entry": "x"}
+        return {"decision": "ready", "summary": "landed", "entry": "x"}
 
     shell = _checks(events=events)
     script = Script(
@@ -194,18 +196,20 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     # A failed attempt runs again with its result line as its note.
     again = _prompts(calls, "kv_fp8")[1]
     assert "## Why this task runs again" in again and "Attempt 2 of 3" in again
-    assert "it ended BLOCKED: blocked_reason: environment; no route to it" in again
+    assert "it ended blocked: no route to it" in again
     # What a later worker is told of the tasks before it, and of its own checks.
     last = _prompts(calls, "tep2")[0]
-    assert "`kv_fp8` (deployment): not done BLOCKED" in last
-    assert "`core` (core): done UNIT_READY" in last and "Nothing of a task not done landed" in last
-    assert "## The checks `tep2` owes" in last and "`tep2:boot`, `tep2:accuracy[gsm8k]`" in last
+    assert "`kv_fp8` (deployment): not done blocked" in last
+    assert "`core` (core): done ready" in last and "Nothing of a task not done landed" in last
+    assert "The checks it owes: `tep2:boot`, `tep2:accuracy[gsm8k]`." in last
     assert "gate <boot|accuracy|serve|tests>" in last and "--deployment tep2" in last
     script = workspace / "bin" / "trtllm-modeling-v2"
-    assert os.access(script, os.X_OK) and f"    {script} gate <boot|" in last
-    assert "the run runs each of them once on the checkout" in last
+    assert os.access(script, os.X_OK) and f"      {script} gate <boot|" in last
+    assert "They run once on the checkout after the last task" in last
     core = _prompts(calls, "core")[0]
-    assert "the run itself boots and scores this deployment on your committed worktree" in core
+    assert "### What the onboard check runs after your turn" in core
+    assert "Code decides, on your last commit" in core and "attempt 1 of 3" in core
+    assert "`tp1:accuracy[gsm8k]`: reference 85.6 (" in core
     # The report: its first line, then every deployment where it stands.
     report = _report(tmp_path)
     first = report.splitlines()[0]
@@ -222,10 +226,12 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     )
     assert _verdicts(tmp_path)[0]["attested"].startswith("[engine match: 1 rank(s) x 2 option(s);")
     survey = _prompts(calls, "survey")[0]
-    assert "## Tag `survey`" in survey and "## Surface survey" in survey
-    assert f"Write `{workspace}/plan.md` and `{workspace}/vocabulary.yaml`" in survey
+    assert "## Task: survey" in survey and "## Surface survey" in survey
+    assert f"Answer in `{workspace}/plan.md` and `{workspace}/vocabulary.yaml`" in survey
+    # The survey has no worktree and runs no check: its message says neither.
+    assert "## Worktree and commits" not in survey and " gate <boot|" not in survey
     not_done = report.split("## Not done")[1].split("##")[0]
-    assert "- `kv_fp8` (deployment): it ended BLOCKED: blocked_reason: environment" in not_done
+    assert "- `kv_fp8` (deployment): it ended blocked: no route to it" in not_done
     assert f"evidence: `{workspace}/decisions/kv_fp8-3.yaml`" in not_done
     assert "- native libraries: the head's are the onboarded ones" in report
     unchecked = report.split("## What the run did not check")[1].split("##")[0]
@@ -245,30 +251,28 @@ def test_a_kernel_row_that_is_not_done_is_skipped_and_the_run_goes_on(
     ]
     _write_vocabulary(workspace, rows)
 
-    defect = {"affects": "tensorrt_llm/x.py:f", "trigger": "rows above 2^31", "proposal": ""}
-
     def kernel_writer(turn, prompt):
         if _task_id(prompt) == "k1-rms" and turn == 1:
-            return {"decision": "FAILED_RECEIPT", "summary": "overflow", "engine_defect": defect}
+            return {"decision": "blocked", "summary": "tensorrt_llm/x.py:f overflows above 2^31"}
         if _task_id(prompt) == "k1-rms":
-            return {"decision": "BLOCKED", "summary": "no kernel exports it on sm_103"}
-        return {"decision": "LANDED", "summary": "landed", "entry": "x"}
+            return {"decision": "blocked", "summary": "no kernel exports it on sm_103"}
+        return {"decision": "ready", "summary": "landed", "entry": "x"}
 
     script = Script(kernel_writer=kernel_writer)
     calls = _run(tmp_path, _spec(task_file), monkeypatch, script)
     assert [_task_id(p) for _, p in calls] == [*["k1-rms"] * 3, "k2-scale", "core"]
     assert _state(tmp_path).onboarded
-    # A kernel task's next attempt is told why the last one ended, the defect it named included.
+    # A kernel task's next attempt is told why the last one ended, in its worker's words.
     again = _prompts(calls, "k1-rms")[1]
-    assert "it ended FAILED_RECEIPT: engine_defect: affects tensorrt_llm/x.py:f; " in again
-    assert "trigger rows above 2^31; overflow" in again and "Attempt 2 of 3" in again
+    assert "it ended blocked: tensorrt_llm/x.py:f overflows above 2^31" in again
+    assert "Attempt 2 of 3 of task `k1-rms`" in again
     # A later worker sees the row as skipped and is told what to do where it needs the entry.
     core = _prompts(calls, "core")[0]
-    assert "- `k1-rms` (kernel): skipped BLOCKED. no kernel exports it on sm_103" in core
+    assert "- `k1-rms` (kernel): skipped blocked. no kernel exports it on sm_103" in core
     assert "write its wrapper in the target's own `ops/`" in core
     report = _report(tmp_path)
     skipped = report.split("## Skipped kernel rows")[1].split("##")[0]
-    assert "- `k1-rms` (queue row 1): it ended BLOCKED: no kernel exports it on sm_103" in skipped
+    assert "- `k1-rms` (queue row 1): it ended blocked: no kernel exports it on sm_103" in skipped
     assert "k1-rms" not in report.split("## Not done")[1].split("##")[0]
 
 
@@ -307,8 +311,8 @@ def test_a_dispatch_lists_the_newest_ended_tasks_and_says_where_the_rest_are(
     core = _prompts(calls, "core")[0]
     # Thirty-four ended before core (the survey and 33 rows): the newest thirty are listed.
     assert f"- (4 earlier task(s): `{workspace}/tasks.yaml`)" in core
-    assert "`k3-op3` (kernel)" not in core and "- `k4-op4` (kernel): done LANDED" in core
-    assert core.count("(kernel): done LANDED") == 30
+    assert "`k3-op3` (kernel)" not in core and "- `k4-op4` (kernel): done ready" in core
+    assert core.count("(kernel): done ready") == 30
 
 
 def test_a_kernel_row_runs_after_the_rows_it_depends_on_in_the_first_unit_that_needs_it():
@@ -437,7 +441,7 @@ def test_a_worker_that_never_gets_core_ready_stops_the_run_with_its_own_reason(
         assert workflow.run(_spec(task_file)) is False
     report = _report(tmp_path)
     assert report.startswith("# not onboarded: stopped at `core`, not done after 3 attempt(s)")
-    assert "- result: it ended BLOCKED: blocked_reason: environment; no route to it" in report
+    assert "- result: it ended blocked: no route to it" in report
     # What ended it is the worker's own word, not the check an earlier attempt failed.
     decisions = tmp_path / "ws" / "decisions"
     assert (
@@ -464,7 +468,7 @@ def test_the_config_task_runs_first_and_lands_only_when_the_tree_loads_the_confi
 
     def surveyor(turn, prompt):
         _write_vocabulary(tmp_path / "ws", [])
-        return {"decision": "DRAFT_READY", "summary": "no rows"}
+        return {"decision": "ready", "summary": "no rows"}
 
     script = Script(surveyor=surveyor, assembler=_by_task({"config": config}))
     calls = _run(tmp_path, _spec(task_file), monkeypatch, script, command_runner=runner)
@@ -520,8 +524,9 @@ def test_what_preflight_left_out_gets_no_task_and_a_score_nothing_judges_gives_n
     assert "| no verdict | trtllm-eval |" in report.split("| `wide` | `accuracy[mmlu]` |")[1]
     assert "`wide:accuracy[mmlu]`" in _prompts(calls, "wide")[0]
     # Each deployment's dispatch names its options: a file, or where the spec states them.
-    assert f"Its options: `{tmp_path}/engines/wide.yaml`." in _prompts(calls, "wide")[0]
-    assert "Its options: `deployments.kv_fp8` in the spec." in _prompts(calls, "kv_fp8")[0]
+    assert f"`{tmp_path}/engines/wide.yaml` state what is asked." in _prompts(calls, "wide")[0]
+    asked = "`deployments.kv_fp8` in the spec state what is asked."
+    assert asked in _prompts(calls, "kv_fp8")[0]
     assert "| `kv_fp8` | `accuracy[gsm8k]` | 90 | relative (the score of `mid`) | no verdict |" in (
         report
     )
@@ -635,7 +640,7 @@ def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_findi
     assert "- check `kv_fp8:boot` failed at c0ffee1: [FAIL] kv_fp8:boot: " in goal
     assert f"- convention: {TARGET_REL}/modeling.py:1 imports Modeling V1 ({v1})" in goal
     assert "(first at `core`)" in goal and "(first at `kv_fp8`)" in goal
-    assert "## Tag `fix`" in goal and "A check runs again with `" in goal
+    assert "## Task: the final fix" in goal and "Reproduce a failed check with the gate" in goal
     # A deployment whose boot failed is not scored: its benchmark would start the same
     # engine to the same end. After the fix, that deployment's checks and core's own run
     # once more, on the new commit (core's benchmark first, as what `kv_fp8` is held to).
@@ -707,7 +712,7 @@ def test_the_survey_is_held_to_its_schema_and_spent_it_ends_the_run(
             _write_vocabulary(workspace, [])
         else:
             (workspace / "vocabulary.yaml").write_text("queue: [{n: 1}]\n")
-        return {"decision": "DRAFT_READY", "summary": "drafted"}
+        return {"decision": "ready", "summary": "drafted"}
 
     workflow = _workflow(tmp_path)
     calls = _install(monkeypatch, workflow, Script(surveyor=surveyor))
@@ -792,7 +797,7 @@ def test_a_decision_left_by_a_stopped_process_is_taken_not_asked_for_again(
     tmp_path, task_file, monkeypatch
 ):
     def stops_after_answering(self, role, what, prompt, *, decision_file=None):
-        decision_file.write_text(yaml.safe_dump({"decision": "UNIT_READY", "summary": "written"}))
+        decision_file.write_text(yaml.safe_dump({"decision": "ready", "summary": "written"}))
         raise KeyboardInterrupt
 
     with monkeypatch.context() as patched:
@@ -875,7 +880,7 @@ def test_a_new_start_reopens_what_was_not_done_within_its_grants(tmp_path, task_
     # left is not taken for this one's when its worker writes none.
     silent = Script(assembler=_by_task({"kv_fp8": lambda attempt, prompt: None}))
     assert turns(silent) == 6  # each attempt: its turn, then the one asked to write the file
-    assert "wrote no valid decision file" in _tasks(tmp_path)[2]["note"]
+    assert "wrote no valid receipt" in _tasks(tmp_path)[2]["note"]
     assert turns() == 0
     stands = {t["id"]: t for t in _tasks(tmp_path)}
     assert (stands["kv_fp8"]["status"], stands["kv_fp8"]["grants"]) == ("not done", 2)
@@ -986,7 +991,7 @@ def test_every_dispatch_says_to_read_the_operators_notes_and_feedback_appends_to
 
     def surveyor(turn, prompt):
         _write_vocabulary(workspace, [{"n": 1, "mode": "onboard", "target": "ops/norm/rms"}])
-        return {"decision": "DRAFT_READY", "summary": "one row"}
+        return {"decision": "ready", "summary": "one row"}
 
     def kv(attempt, prompt):
         return None if attempt == 1 else READY  # no decision file: one short turn to write it
@@ -1001,11 +1006,11 @@ def test_every_dispatch_says_to_read_the_operators_notes_and_feedback_appends_to
         "assembler",
     ]
     for _, prompt in calls:
-        said = prompt.split("## The operator's notes")[1].split("##")[0]
+        said = prompt.split("## Notes file")[1].split("##")[0]
         assert f"Read `{workspace / NOTES_FILENAME}` first" in said
-        assert "read it again before you write your decision" in said
-        assert "never a reason to change an anchor or a check" in said
-    assert "## Your decision file is not valid" in calls[-1][1]
+        assert "Read it again before you write your receipt" in said
+        assert "It never permits changing an anchor, a tolerance or a check" in said
+    assert "## Your receipt is not valid" in calls[-1][1]
     assert _tasks(tmp_path)[-1]["attempts"] == 1  # the repair turn is no new attempt
     # Each turn's prompt and answer are kept with its activity, one set of files a turn.
     kept = {path.read_text() for path in (workspace / "turns").glob("*.prompt.md")}
@@ -1133,22 +1138,23 @@ def test_a_worker_whose_branch_is_behind_the_checkout_is_told_to_rebase_first(tm
     repo = _checkout(tmp_path)
     integration = _integration(repo, tmp_path)
     tree = integration.open("kv_fp8")
-    assert "## Your branch is behind the checkout" not in worktree_block(tree, repo)
+    assert behind(tree, repo) == (_git(repo, "rev-parse", "HEAD"), "")
     # An earlier attempt left a commit of its own; other tasks have landed since.
     (tree / FAMILY / "a.py").write_text("A = 2\n")
     _git(tree, "commit", "-q", "-am", f"kv{_SIGNED}")
     (repo / "shared.py").write_text("S = 2\n")
     _git(repo, "commit", "-q", "-am", f"other{_SIGNED}")
     head = _git(repo, "rev-parse", "HEAD")
-    said = worktree_block(integration.open("kv_fp8"), repo)
-    assert f"You work in `{tree}`" in said and "## Your branch is behind the checkout" in said
+    assert behind(integration.open("kv_fp8"), repo) == (head, "1")
+    said = prompts.dispatch("deployment", facts(worktree=tree, head=head, behind="1"))
+    assert f"Edit only in `{tree}`" in said and "## Your branch is behind the checkout" in said
     assert "1 commit(s) landed on the checkout after your branch was cut" in said
     assert f"    git -C {tree} rebase {head}" in said
     # A branch with nothing of its own is simply moved to the head: nothing to rebase.
     fresh = integration.open("tep2")
     (repo / "shared.py").write_text("S = 3\n")
     _git(repo, "commit", "-q", "-am", f"another{_SIGNED}")
-    assert "is behind the checkout" not in worktree_block(integration.open("tep2"), repo)
+    assert behind(integration.open("tep2"), repo)[1] == ""
     assert _git(fresh, "rev-parse", "HEAD") == _git(repo, "rev-parse", "HEAD")
     # Unless an earlier attempt left edits it did not commit: they stay where they are.
     (fresh / "shared.py").write_text("S = 'mine'\n")
@@ -1340,7 +1346,7 @@ def test_on_a_real_checkout_core_lands_only_the_commit_the_onboard_check_passed(
         return shell(command, env, timeout)
 
     def tree_of(prompt: str) -> Path:
-        return Path(re.search(r"You work in `([^`]+)`", prompt).group(1))
+        return Path(re.search(r"Edit only in `([^`]+)`", prompt).group(1))
 
     def core(turn, prompt):
         tree = tree_of(prompt)
@@ -1480,7 +1486,7 @@ def test_a_worker_that_commits_nothing_is_still_held_to_the_onboard_check(
     # failure is the attempt's result line, word for word, with no turn to "put it right".
     assert shell.ran == ["tp1:boot", "tp1:boot", "tp1:accuracy"]
     journal = (tmp_path / "ws" / "journal.md").read_text()
-    assert "core (attempt 1 of 3): pending UNIT_READY: [FAIL] tp1:boot: " in journal
+    assert "core (attempt 1 of 3): pending ready: [FAIL] tp1:boot: " in journal
     assert _state(tmp_path).onboarded["commit"] == base == _git(repo, "rev-parse", "HEAD")
     assert _tasks(tmp_path)[1]["attempts"] == 2
 
@@ -1498,7 +1504,7 @@ def test_a_run_that_is_not_onboarded_says_what_to_run_where_and_the_last_commit_
     commits: list[str] = []
 
     def core(attempt, prompt):
-        tree = Path(re.search(r"You work in `([^`]+)`", prompt).group(1))
+        tree = Path(re.search(r"Edit only in `([^`]+)`", prompt).group(1))
         (tree / FAMILY / "a.py").write_text(f"A = {len(commits)}\n")
         _git(tree, "add", f"{FAMILY}/a.py")
         _git(tree, "commit", "-q", "-m", f"core {len(commits)}{_SIGNED}")
@@ -1551,7 +1557,7 @@ def test_a_process_that_died_after_the_commit_landed_goes_on_without_checking_ag
     _git(repo, "commit", "-q", "-m", f"base{_SIGNED}")
 
     def core(attempt, prompt):
-        tree = Path(re.search(r"You work in `([^`]+)`", prompt).group(1))
+        tree = Path(re.search(r"Edit only in `([^`]+)`", prompt).group(1))
         (tree / FAMILY / "a.py").write_text("A = 1\n")
         _git(tree, "add", f"{FAMILY}/a.py")
         _git(tree, "commit", "-q", "-m", f"core{_SIGNED}")

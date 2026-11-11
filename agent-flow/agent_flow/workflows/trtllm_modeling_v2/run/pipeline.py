@@ -36,36 +36,33 @@ from rich.markup import escape as escape_markup
 
 from agent_flow.console import print_message, print_rule
 
-from ..agents import decisions as decision_table
+from ..agents import prompts
 from ..agents.decisions import (
-    DECISION_REMINDER,
+    DECISIONS_DIRNAME,
+    READY,
     clip,
-    decision_file_instruction,
     decision_path,
     decision_problem,
-    decision_repair_block,
     first_paragraph,
     read_decision,
 )
-from ..agents.prompts._common import tidy
-from ..agents.prompts._render import render_template
-from ..agents.prompts.kernel import KernelContext, kernel_prompt
-from ..agents.prompts.survey import capture_lists_block
-from ..agents.prompts.tags import tag_section, task_tags
+from ..checks import anchors as anchors_mod
 from ..checks import conventions, gate_cli
 from ..infra.files import write_text_atomic
 from ..operators.coverage import (
+    MODELING_V2_PACKAGE,
     QueueItem,
     VocabularyError,
     entry_paths,
     load_vocabulary,
+    model_ops_tests_dir,
     rows_by_unit,
     shared_entry_paths,
 )
 from ..spec import deployments as deployments_mod
 from . import report as report_mod
 from .contract import library_digest
-from .integration import REPAIR_TURNS, Integration, repair_block, worktree_block
+from .integration import REPAIR_TURNS, Integration, behind
 from .startup import preflight as preflight_mod
 from .state import StateError
 
@@ -73,20 +70,16 @@ TASKS_FILENAME = "tasks.yaml"
 #: What the operator's `feedback` command appends to; every dispatch says to read it.
 NOTES_FILENAME = "operator_notes.md"
 CONFIG_ID, SURVEY_ID = "config", "survey"
-#: Each task kind: the role its turn runs as, and the tag sections its dispatch carries.
-KINDS: dict[str, tuple[str, tuple[str, ...]]] = {
-    "config": ("assembler", ("assemble", "fix")),
-    "survey": ("surveyor", ("survey",)),
-    "kernel": ("kernel_writer", ()),
-    "core": ("assembler", ("assemble",)),
-    "deployment": ("assembler", ("feature",)),
-    "fix": ("assembler", ("assemble", "fix")),
+#: Each task kind's role: the backend, model and effort the spec states for its turns.
+ROLE_BY_KIND: dict[str, str] = {
+    "config": "assembler",
+    "survey": "surveyor",
+    "kernel": "kernel_writer",
+    "core": "assembler",
+    "deployment": "assembler",
+    "fix": "assembler",
 }
-ROLE_BY_KIND = {kind: role for kind, (role, _) in KINDS.items()}
-TAGS_BY_KIND = {kind: tags for kind, (_, tags) in KINDS.items() if tags}
 PENDING, RUNNING, DONE, NOT_DONE, SKIPPED = "pending", "running", "done", "not done", "skipped"
-#: Decisions that mean the worker did what the task asked.
-FINISHED = decision_table.finishing()
 #: How many worker runs one task gets, its first included: the CLI's --max-attempts default.
 DEFAULT_MAX_ATTEMPTS = 3
 #: How many times an attempt a stopped process cut restarts without being spent.
@@ -134,7 +127,7 @@ class Task:
 
 @dataclass
 class TurnResult:
-    """What one attempt came to: a decision the role may give, or why there is none."""
+    """What one attempt came to: the receipt's decision, or why there is none."""
 
     decision: str = ""
     data: dict[str, Any] = field(default_factory=dict)
@@ -144,7 +137,7 @@ class TurnResult:
 
     @property
     def finished(self) -> bool:
-        return self.decision in FINISHED and not self.error
+        return self.decision == READY and not self.error
 
 
 class Pipeline:
@@ -287,14 +280,14 @@ class Pipeline:
         while (task := self._next()) is not None:
             self._attempt(task)
 
-    def fix(self, problems: list[str], how: str) -> Task:
+    def fix(self, problems: list[str]) -> Task:
         """The final pass's one `fix` task of this entry, run to its end the first time."""
         task = self.by_id(f"fix-{self.entry}")
         if task is None:
             goal = "repair what the final pass found, every item:\n" + "\n".join(
                 f"- {problem}" for problem in problems
             )
-            task = Task(f"fix-{self.entry}", "fix", unit=self.units[0], goal=f"{goal}\n{how}")
+            task = Task(f"fix-{self.entry}", "fix", unit=self.units[0], goal=goal)
             self.tasks.append(task)
             self._save()
         while task.status in (PENDING, RUNNING):
@@ -307,7 +300,7 @@ class Pipeline:
         # A turn that had answered when the process stopped was not cut: only what follows
         # the answer (the landing, its check) starts again, as often as it takes.
         path = decision_path(self.workspace, task.id, max(task.attempts, 1))
-        cut = resumed and read_decision(path, ROLE_BY_KIND[task.kind]) is None
+        cut = resumed and read_decision(path) is None
         if cut and task.cuts >= FREE_RESTARTS:
             result = TurnResult(error=f"its turn was cut {task.cuts + 1} times before it ended")
         else:
@@ -338,35 +331,37 @@ class Pipeline:
     def _work(self, task: Task, resumed: bool) -> TurnResult:
         role = ROLE_BY_KIND[task.kind]
         repo = Path(str(self.w.task_data.get("trtllm_repo_path") or ""))
-        tree, block = None, ""
+        tree = None
         if self.integration is not None and task.kind != "survey":
             tree = self.integration.open(task.id)
-            block = worktree_block(tree, self.integration.repo)
         if not task.lib_start:
             # The task's start, not this attempt's: what an earlier attempt rebuilt counts.
             task.lib_start = library_digest(tree or repo)
         path = decision_path(self.workspace, task.id, task.attempts)
-        data = read_decision(path, role) if resumed else None
+        data = read_decision(path) if resumed else None
+        facts: dict[str, Any] = {}
         if data is not None:
             # The process stopped after the worker answered: its answer stands.
-            self.w.journal.event("task", f"{task.id}: resuming with the decision at {path}")
+            self.w.journal.event("task", f"{task.id}: resuming with the receipt at {path}")
         else:
             path.unlink(missing_ok=True)
-            self._dispatch(task, role, block, path)
-            data = read_decision(path, role)
-            problem = decision_problem(path, role) if data is None else ""
+            facts = self._facts(task, tree)
+            self._dispatch(task, role, facts, path)
+            data = read_decision(path)
+            problem = decision_problem(path) if data is None else ""
             if problem:
                 # The work may be done though the file is wrong: one short turn to say so.
-                self.w.journal.event("task", f"{task.id}: decision file not valid: {problem}")
-                self._dispatch(task, role, f"{block}\n\n{decision_repair_block(problem)}", path)
-                data = read_decision(path, role)
+                self.w.journal.event("task", f"{task.id}: receipt not valid: {problem}")
+                self._dispatch(
+                    task, role, {**facts, "repair": prompts.repair(problem=problem)}, path
+                )
+                data = read_decision(path)
         task.lib_end = library_digest(tree or repo)
         if data is None:
-            names = ", ".join(decision_table.names(role))
-            said = f"its turn wrote no valid decision file at {path} (one of {names})"
+            said = f"its turn wrote no valid receipt at {path} (`decision: ready` or `blocked`)"
             return TurnResult(error=said)
         result = TurnResult(str(data["decision"]), data)
-        if result.decision not in FINISHED:
+        if result.decision != READY:
             return result
         if task.kind == "survey":
             try:
@@ -374,7 +369,7 @@ class Pipeline:
             except VocabularyError as exc:
                 result.error = f"vocabulary.yaml does not validate: {exc}"
             return result
-        result.error = self._land(task, role, tree, block)
+        result.error = self._land(task, role, tree, facts or self._facts(task, tree))
         if not result.error:
             self._scan(task, data)
         return result
@@ -396,7 +391,7 @@ class Pipeline:
 
         return loads
 
-    def _land(self, task: Task, role: str, tree: Path | None, block: str) -> str:
+    def _land(self, task: Task, role: str, tree: Path | None, facts: Mapping[str, Any]) -> str:
         """Audit, check and land ``task``'s branch; why it did not go in, or ``""``.
 
         A branch that does not integrate as it stands (commits that break the rules,
@@ -426,12 +421,13 @@ class Pipeline:
                 return outcome.detail
             if not (outcome.base or outcome.repairable) or turn > REPAIR_TURNS + 1:
                 return f"its branch did not integrate: {outcome.detail}"
-            note = repair_block(outcome, tree)
+            files = ", ".join(f"`{f}`" for f in outcome.conflicts) or "files git did not name"
+            note = prompts.repair(base=outcome.base, files=files, detail=outcome.detail, tree=tree)
             path = decision_path(self.workspace, task.id, task.attempts, turn)
             path.unlink(missing_ok=True)
-            self._dispatch(task, role, f"{block}\n\n{note}", path)
-            data = read_decision(path, role)
-            if data is None or data["decision"] not in FINISHED:
+            self._dispatch(task, role, {**facts, "repair": note}, path)
+            data = read_decision(path)
+            if data is None or data["decision"] != READY:
                 return (
                     f"its branch did not integrate ({outcome.detail}), and the turn asked to "
                     "put it right did not finish"
@@ -462,10 +458,9 @@ class Pipeline:
             said = f"{task.id}: {len(new)} finding(s): {'; '.join(new)}"
             self.w.journal.event("conventions", said)
 
-    def _dispatch(self, task: Task, role: str, block: str, path: Path) -> None:
-        """One turn of ``role`` for ``task``, told to write its decision at ``path``."""
-        parts = (self._prompt(task, block), self._context(task), decision_file_instruction(path))
-        prompt = "\n\n".join(part.strip() for part in parts if part.strip())
+    def _dispatch(self, task: Task, role: str, facts: Mapping[str, Any], path: Path) -> None:
+        """One turn of ``role`` for ``task``, told to write its receipt at ``path``."""
+        prompt = prompts.dispatch(task.kind, {**facts, "path": path})
         self.w.journal.event(f"dispatch: {role}", f"{task.id}, to write {path}")
         self.w._run_turn(role, task.id, prompt, decision_file=path)
 
@@ -483,95 +478,111 @@ class Pipeline:
             )
         return "\n".join(lines)
 
-    # ---------------------------------------------------------------------- the prompts
-    def _context(self, task: Task) -> str:
-        """What every dispatch carries after its task: the operator's notes, the host, the libraries."""
+    # ------------------------------------------------- the facts a task's message is built from
+    def cli(self) -> str:
+        """The workflow's CLI as an agent calls it: by path, when preflight installed it."""
+        script = self.workspace / "bin" / gate_cli.CLI_NAME
+        return str(script) if script.is_file() else gate_cli.CLI_NAME
+
+    def _facts(self, task: Task, tree: Path | None) -> dict[str, Any]:
+        """What ``task``'s message is built from (``agents/prompts``): no prose, only what the run knows."""
+        w = self.w
+        repo = str(w.task_data.get("trtllm_repo_path") or "")
+        found = deployments_mod.resolve(w.task_data)
+        deployment = found[self.units.index(task.unit)] if task.unit in self.units else found[0]
+        target = str(getattr(w._preflight, "target_rel", "") or "")
+        ended = [t for t in self.tasks if t is not task and t.status in (DONE, NOT_DONE, SKIPPED)]
         kept = self.workspace / report_mod.LIBRARIES_DIRNAME
-        return render_template(
-            "dispatch/context.md.j2",
-            notes=self.workspace / NOTES_FILENAME,
-            host_facts=self.w.host_facts_path if self.w.host_facts_path.is_file() else "",
+        head, lacks = behind(tree, self.integration.repo) if tree is not None else ("", "")
+        work = str(tree or repo) if task.kind != "survey" else ""
+        gates = self.workspace / "gates" / deployment.name
+        facts: dict[str, Any] = dict(
+            task_id=task.id,
+            goal=task.goal,
+            attempt=task.attempts,
+            attempts=self.max_attempts,
+            note=task.note,
+            worktree=work,
+            repo=repo,
+            head=head,
+            behind=lacks,
+            target=target,
+            arch=str(w.task_data.get("arch") or ""),
+            judge=", ".join(f"`{path}`" for path in w._commit_policy().judge_paths),
             package=Path(__file__).resolve().parents[1],
+            notes=self.workspace / NOTES_FILENAME,
+            spec=w.task_path,
+            plan=w.plan_path,
+            vocabulary=w.vocabulary_path,
+            gate=work
+            and gate_cli.invocation(w.task_path, gates, deployment.name, self.cli(), work),
+            history=[
+                dict(
+                    id=t.id,
+                    kind=t.kind,
+                    state="skipped" if t.kind == "kernel" and t.status == NOT_DONE else t.status,
+                    decision=t.decision,
+                    said=clip((t.summary or t.note).replace("\n", " "), 300),
+                )
+                for t in ended[-HISTORY_TASKS:]
+            ],
+            earlier=max(0, len(ended) - HISTORY_TASKS),
+            tasks=self.path,
+            decisions=self.workspace / DECISIONS_DIRNAME,
+            host_facts=w.host_facts_path if w.host_facts_path.is_file() else "",
             rebuilt=[
                 t.id
                 for t in self.tasks
                 if t is not task and t.lib_end not in ("", t.lib_start, task.lib_start)
             ],
             kept=kept if kept.is_dir() else "",
+            python=w.environment.python if w.environment is not None else "",
+            prefix=w.environment.prefix if w.environment is not None else "",
+            devices=", ".join(map(str, self.state.devices)) or "none",
+            text_only=w.task_data.get("scope") == "text_only",
+            spec_notes=str(w.task_data.get("notes") or "").strip(),
         )
-
-    def _prompt(self, task: Task, block: str) -> str:
-        """``task``'s dispatch: its goal, why it runs again, what came before, its section, its worktree."""
-        w, note = self.w, ""
-        if task.note:
-            note = (
-                f"Attempt {task.attempts} of {self.max_attempts} of task `{task.id}`. The "
-                f"previous attempt did not finish:\n\n{task.note}"
-            )
-        ended = [t for t in self.tasks if t is not task and t.status in (DONE, NOT_DONE, SKIPPED)]
-        lines = []
-        for t in ended[-HISTORY_TASKS:]:
-            state = "skipped" if t.kind == "kernel" and t.status == NOT_DONE else t.status
-            said = clip((t.summary or t.note).replace("\n", " "), 300)
-            lines.append(f"- `{t.id}` ({t.kind}): {state} {t.decision}. {said}".rstrip())
-        history = ended and render_template(
-            "dispatch/history.md.j2",
-            decisions=self.workspace / decision_table.DECISIONS_DIRNAME,
-            earlier=max(0, len(ended) - HISTORY_TASKS),
-            tasks=self.path,
-            lines=lines,
-        )
-        if task.kind == "kernel":
-            return tidy("\n\n".join((self._kernel_prompt(task, note), history or "", block)))
-        facts: dict[str, Any] = dict(survey="")
         if task.kind == "survey":
-            facts["survey"] = f"{w._surface_block}\n{capture_lists_block(w.task_data)}"
+            facts.update(
+                checkpoint=w.task_data.get("checkpoint_path"),
+                described=deployments_mod.describe(found),
+                inventory=w._surface_block,
+            )
+        elif task.kind == "kernel":
+            facts.update(self._row(task, target, repo, work))
         else:
-            facts.update(self._unit(task))
-        tags = task_tags(TAGS_BY_KIND[task.kind][0], TAGS_BY_KIND[task.kind][1:])
-        head = render_template(
-            "dispatch/task.md.j2",
-            task=task,
-            note=note,
-            history=history or "",
-            tags=tag_section(tags),
-            workspace=self.workspace,
-            task_path=w.task_path,
-            plan_path=w.plan_path,
-            vocabulary_path=w.vocabulary_path,
-            reminder=DECISION_REMINDER,
-            **facts,
-        )
-        return tidy(f"{head}\n\n{block}")
+            facts.update(self._unit(task, deployment, found[0].name, target))
+        return facts
 
-    def cli(self) -> str:
-        """The workflow's CLI as an agent calls it: by path, when preflight installed it."""
-        script = self.workspace / "bin" / gate_cli.CLI_NAME
-        return str(script) if script.is_file() else gate_cli.CLI_NAME
-
-    def _unit(self, task: Task) -> dict[str, Any]:
-        """What an assembler's dispatch says of its deployment: its options, its checks, their command."""
-        w = self.w
-        deployment = deployments_mod.resolve(w.task_data)[self.units.index(task.unit)]
-        name, repair = deployment.name, task.kind in ("fix", CONFIG_ID)
+    def _unit(self, task: Task, deployment, first: str, target: str) -> dict[str, Any]:
+        """What a task on a deployment is told of it: its options, the checks it owes, what judges them."""
+        w, name = self.w, deployment.name
         skipped = getattr(w._preflight, "not_attempted", ())
         left = {r["check"] for r in skipped if r["deployment"] == name}
-        owed = [c.key for c in w._contract.of(name) if c.gate not in left and not repair]
+        owed = [c for c in w._contract.of(name) if c.gate not in left]
+        frozen = getattr(w, "_anchors", None) or {}
+        judged = []
+        for check in owed:
+            anchor = frozen.get(f"{name}:{check.gate.partition('[')[2].rstrip(']')}")
+            if anchor is not None:
+                value = f" {anchor.value:g}" if anchor.value is not None else ""
+                judged.append(f"`{check.key}`: {anchor.kind}{value} ({anchor.source})")
+            elif check.gate != "boot":
+                judged.append(f"`{check.key}`")
         files = [f"`{s.options_path}`" for s in deployment.servers.values() if s.options_path]
-        files = files or [f"`deployments.{name}` in the spec"]
         return dict(
-            repo=w.task_data["trtllm_repo_path"],
-            target=w._preflight.target_rel,
-            unit=task.unit,
             deployment=name,
+            first=first,
             described=deployments_mod.describe((deployment,)),
-            options=", ".join(files),
-            repair=repair,
-            core=deployment.core,
-            checks=", ".join(f"`{key}`" for key in owed),
-            command=gate_cli.invocation(
-                w.task_path, self.workspace / "gates" / name, name, self.cli()
-            ),
+            options=", ".join(files) or f"`deployments.{name}` in the spec",
+            checks=", ".join(f"`{check.key}`" for check in owed),
+            judged=judged,
+            anchors=self.workspace / anchors_mod.ANCHORS_FILENAME,
+            relative=deployment.relative_to or "",
+            onboarded=str((self.state.onboarded or {}).get("commit") or "")[:12],
+            cards=prompts.cards(deployment) if task.kind in ("core", "deployment") else [],
+            models=f"{MODELING_V2_PACKAGE}/models",
+            tests=model_ops_tests_dir(target) if target else "",
         )
 
     def _queue_item(self, task: Task) -> QueueItem | None:
@@ -582,15 +593,12 @@ class Pipeline:
             return None
         return next((q for q in queue if str(q.n) == task.ref), None)
 
-    def _kernel_prompt(self, task: Task, note: str) -> str:
+    def _row(self, task: Task, target: str, repo: str, tree: str) -> dict[str, Any]:
+        """What a kernel task is told of its queue row: the entry, where it lands, how it is tested."""
         w = self.w
         item = self._queue_item(task)
         if item is None:
             raise RuntimeError(f"kernel task {task.id} names no queue row ({task.ref!r})")
-        target_rel = str(getattr(w._preflight, "target_rel", "") or "")
-        repo = w.task_data.get("trtllm_repo_path") or None
-        # A shared entry lands as its local variant in the target's own ops/.
-        landing = str(item.variant) if item.variant is not None and target_rel else item.target
         try:
             rows = (yaml.safe_load(w.vocabulary_path.read_text(encoding="utf-8")) or {}).get(
                 "queue"
@@ -600,24 +608,28 @@ class Pipeline:
         row = next(
             (r for r in rows or () if isinstance(r, dict) and str(r.get("n")) == str(item.n)), {}
         )
-        return kernel_prompt(
-            KernelContext(
-                item=item,
-                workspace=str(self.workspace),
-                repo=str(w.task_data["trtllm_repo_path"]),
-                arch=str(w.task_data["arch"]),
-                target_rel=target_rel,
-                vocabulary_path=str(w.vocabulary_path),
-                note=note,
-                goal=(task.goal or "").strip(),
-                task_id=task.id,
-                task_kind="kernel",
-                tags=(),
-                tier=row.get("tier"),
-                landing=landing,
-                paths=entry_paths(item, target_rel, repo),
-                shared=tuple(shared_entry_paths(item.target)) if landing != item.target else (),
-            )
+        # A shared entry lands as its local variant in the target's own ops/.
+        local = item.variant is not None and bool(target)
+        landing = str(item.variant) if local else item.target
+        paths = entry_paths(item, target, repo or None) or ()
+        env = w.environment
+        python = f"{env.prefix} {env.python}".strip() if env is not None else "python"
+        return dict(
+            n=item.n,
+            mode=item.mode,
+            entry=item.target,
+            onboard=item.mode == "onboard",
+            row_note=(item.note or "").strip(),
+            surface=item.surface or "",
+            cells=row.get("cells") or "",
+            tier=int(row["tier"]) if str(row.get("tier")).strip().isdigit() else None,
+            paths=paths,
+            shared=" and ".join(f"`{p}`" for p in shared_entry_paths(item.target)) if local else "",
+            name=item.target.strip("/").split("/")[-1],
+            module=landing.replace("/", "."),
+            test_command=f"cd {tree} && PYTHONPATH={tree} {python} -m pytest {paths[1]} -q"
+            if len(paths) > 1
+            else "",
         )
 
     def _make_integration(self) -> Integration | None:
@@ -647,13 +659,5 @@ def _failure_note(result: TurnResult) -> str:
     if result.error:
         return result.error
     raw = result.data
-    said = [f"{key}: {raw[key]}" for key in ("blocked_reason", "missing_entry") if raw.get(key)]
-    defect = raw.get("engine_defect")
-    if isinstance(defect, Mapping):
-        said.append(
-            "engine_defect: "
-            + "; ".join(f"{k} {' '.join(str(v).split())}" for k, v in defect.items() if v)
-        )
-    if raw.get("summary"):
-        said.append(clip(str(raw["summary"]), 800))
-    return f"it ended {result.decision}" + (": " + "; ".join(said) if said else "")
+    said = clip(str(raw.get("summary") or ""), 800)
+    return f"it ended {result.decision}" + (f": {said}" if said else "")

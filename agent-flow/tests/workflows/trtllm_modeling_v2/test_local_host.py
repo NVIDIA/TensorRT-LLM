@@ -109,7 +109,6 @@ def test_the_launch_prefix_preserves_shell_quotes():
         text=True,
     )
     assert found.stdout == "a b'$c\n"
-    assert f"```\n{env.prefix}\n```" in env.describe()
 
 
 def test_hung_gpu_inspection_returns_unknown_instead_of_blocking_teardown(monkeypatch):

@@ -1,9 +1,0 @@
-{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: Apache-2.0 -#}
-## What the run did before this task
-
-Each line is a task that ended, with its worker's own summary; its decision file is `{{ decisions }}/<task>-<attempt>.yaml`. A done task's commits are in the checkout: build on them. Nothing of a task not done landed. A kernel row not done was skipped: where the target needs that entry, write its wrapper in the target's own `ops/`.
-
-{% if earlier %}- ({{ earlier }} earlier task(s): `{{ tasks }}`)
-{% endif %}{% for line in lines %}{{ line }}
-{% endfor %}

@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from ..agents.prompts._render import render_template
 from ..infra.files import write_text_atomic
 from ..infra.git import (
     LABEL_TARGET,
@@ -357,22 +356,14 @@ def _checked_out(tree: Path) -> bool:
     return bool(gitdir) and Path(gitdir, "index").exists()
 
 
-def worktree_block(tree: Path, repo: Path) -> str:
-    """What a worker in its own worktree is told; first, to rebase when its branch lacks the head."""
+def behind(tree: Path, repo: Path) -> tuple[str, str]:
+    """``(head, count)``: the checkout's head, and how many of its commits ``tree``'s branch lacks.
+
+    The count is ``""`` when the branch holds the head: a worker is told to rebase only
+    when there is something to rebase onto.
+    """
     head = (git_output(repo, "rev-parse", "HEAD") or "").strip()
-    behind = ""
+    lacks = ""
     if head and git_output(tree, "merge-base", "--is-ancestor", head, "HEAD") is None:
-        behind = (git_output(tree, "rev-list", "--count", f"HEAD..{head}") or "").strip()
-    behind = behind if behind.isdigit() and behind != "0" else ""
-    said = render_template(
-        "dispatch/worktree.md.j2", tree=tree, repo=repo, head=head, behind=behind
-    )
-    return said.strip()
-
-
-def repair_block(outcome: Outcome, tree: Path) -> str:
-    """What a worker whose finished branch did not go in is told: a conflict, or a worktree to put right."""
-    files = ", ".join(f"`{f}`" for f in outcome.conflicts) or "files git did not name"
-    return render_template(
-        "dispatch/repair.md.j2", base=outcome.base, files=files, tree=tree, detail=outcome.detail
-    ).strip()
+        lacks = (git_output(tree, "rev-list", "--count", f"HEAD..{head}") or "").strip()
+    return head, lacks if lacks.isdigit() and lacks != "0" else ""
