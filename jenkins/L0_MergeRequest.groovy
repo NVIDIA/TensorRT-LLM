@@ -3357,7 +3357,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             // every release behind a multi-hour GPU job. Inert on
                             // x86_64 (no promoted bundle) and whenever the wheel is
                             // built from source rather than downloaded.
-                            'boltOptimizeWheel': true,
+                            // Skipped for the bot-triggered NGC-Container-Scanning stage:
+                            // the PR build's wheel is not guaranteed to be BOLT-compatible
+                            // and the scan does not need optimized binaries.
+                            'boltOptimizeWheel': !(runContainerScanning && runMode != "nightly_release"),
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
