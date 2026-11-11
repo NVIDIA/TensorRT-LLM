@@ -69,7 +69,7 @@ trtllmGenMoe::MoE::Runner& moeRunner(int64_t tileN)
     if (runner == nullptr)
     {
         runner = std::make_unique<trtllmGenMoe::MoE::Runner>(
-            btg::Dtype::E4m3, /* useDeepSeekFp8 */ true, static_cast<int32_t>(tileN));
+            /*dtypeElt=*/btg::Dtype::E4m3, /*useDeepSeekFp8=*/true, /*tileTokensDim=*/static_cast<int32_t>(tileN));
     }
     return *runner;
 }
@@ -89,8 +89,8 @@ void checkOperands(at::Tensor const& routing_logits, std::optional<at::Tensor> c
         "routing_logits and hidden_states must have the same number of tokens.");
     TORCH_CHECK(routing_logits.device() == hidden_states.device(),
         "routing_logits and hidden_states must be on the same device");
-    auto const routingMethod = static_cast<RoutingMethodType>(routing_method_type);
-    TORCH_CHECK(routingMethod == RoutingMethodType::Renormalize || routingMethod == RoutingMethodType::RenormalizeNaive,
+    // The kernel computes Renormalize (softmax over the top-k logits), so RenormalizeNaive is not taken.
+    TORCH_CHECK(static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize,
         "fp8_block_scale_moe_front: logits-routed Renormalize without bias or fused shared experts only");
     TORCH_CHECK(top_k <= 32 && top_k > 0,
         "Current routing kernel (no groups, renormalize) only supports top_k<=32 && top_k>0.");

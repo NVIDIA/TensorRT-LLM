@@ -40,18 +40,18 @@ namespace cg = cooperative_groups;
 namespace routing = ::moe::dev::routing;
 using routing::WarpSize;
 
-constexpr int NumThreads = 256;
-constexpr int NumWarps = NumThreads / WarpSize;
-constexpr int VecSize = MaxNumExperts / WarpSize;
-constexpr int ScanItemsPerThread = MaxNumExperts / NumThreads;
-static_assert(MaxNumExperts % NumThreads == 0);
+constexpr int kNumThreads = 256;
+constexpr int kNumWarps = kNumThreads / WarpSize;
+constexpr int kVecSize = kMaxNumExperts / WarpSize;
+constexpr int kScanItemsPerThread = kMaxNumExperts / kNumThreads;
+static_assert(kMaxNumExperts % kNumThreads == 0);
 
 // Per-device state, zeroed at allocation: two banks of per-local-expert counters (a launch counts in bank
 // generation % 2 and zeroes the other), then the grid barrier's arrival count and generation flag.
-constexpr int CounterInts = 2 * MaxNumExperts + 64;
-constexpr int BarrierCount = 2 * MaxNumExperts;
-constexpr int BarrierFlag = 2 * MaxNumExperts + 32;
-constexpr int QuantIters = QuantHidden / 256; // two 1x128 groups a warp iteration
+constexpr int kCounterInts = 2 * kMaxNumExperts + 64;
+constexpr int kBarrierCount = 2 * kMaxNumExperts;
+constexpr int kBarrierFlag = 2 * kMaxNumExperts + 32;
+constexpr int kQuantIters = kQuantHidden / 256; // two 1x128 groups a warp iteration
 
 __device__ __forceinline__ int32_t ldAcquire(int32_t const* p)
 {
@@ -88,14 +88,14 @@ __device__ __forceinline__ void quantizeGroup(uint4 in, __nv_fp8_e4m3* out, floa
     {
         laneAmax = __hmax(laneAmax, __habs(x.v[i]));
     }
-    float groupAmax = float(laneAmax);
+    float groupAmax = static_cast<float>(laneAmax);
 #pragma unroll
     for (int mask = 8; mask > 0; mask /= 2)
     {
         groupAmax = std::max(groupAmax, __shfl_xor_sync(0xFFFFFFFF, groupAmax, mask));
     }
     __nv_bfloat16 amax = ::tensorrt_llm::common::cuda_max(__nv_bfloat16(groupAmax), __nv_bfloat16(1e-10f));
-    float quantScale = 448.f / float(amax);
+    float quantScale = 448.f / static_cast<float>(amax);
     float dequantScale = 1.f / quantScale;
     if (laneInGroup == 0)
     {
@@ -111,7 +111,7 @@ __device__ __forceinline__ void quantizeGroup(uint4 in, __nv_fp8_e4m3* out, floa
 #pragma unroll
     for (int i = 0; i < 8; i++)
     {
-        y.v[i] = __nv_fp8_e4m3(float(x.v[i]) * quantScale);
+        y.v[i] = __nv_fp8_e4m3(static_cast<float>(x.v[i]) * quantScale);
     }
     *reinterpret_cast<uint2*>(out) = y.pack;
 }
@@ -119,51 +119,51 @@ __device__ __forceinline__ void quantizeGroup(uint4 in, __nv_fp8_e4m3* out, floa
 // One warp a token selects its experts with the trtllm-gen routing device functions and takes each slot's offset in
 // its local expert from a global atomic counter. After a grid barrier of the routing CTAs, every CTA scans the counts
 // into expert offsets and writes its own slots' permutation; CTA 0 writes the grouped-GEMM launch tables.
-__global__ void __launch_bounds__(NumThreads) moeFrontKernel(Data params, int32_t* state)
+__global__ void __launch_bounds__(kNumThreads) moeFrontKernel(Data params, int32_t* state)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     using InputT = __nv_bfloat16;
     using BaseType = __nv_bfloat16;
     using TypePacked = routing::PackedScoreIdx<BaseType>;
-    using Scan = cub::BlockScan<int32_t, NumThreads, cub::BLOCK_SCAN_WARP_SCANS>;
+    using Scan = cub::BlockScan<int32_t, kNumThreads, cub::BLOCK_SCAN_WARP_SCANS>;
 
     __shared__ typename Scan::TempStorage tempStorage;
-    __shared__ int32_t smemExpertOffset[MaxNumExperts];
+    __shared__ int32_t smemExpertOffset[kMaxNumExperts];
 
     int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
     int32_t const laneIdx = threadIdx.x % WarpSize;
-    int32_t const tokenIdx = blockIdx.x * NumWarps + warpIdx;
+    int32_t const tokenIdx = blockIdx.x * kNumWarps + warpIdx;
     bool const validToken = tokenIdx < params.numTokens;
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<WarpSize>(block);
-    int32_t* barrierCount = state + BarrierCount;
-    int32_t* barrierFlag = state + BarrierFlag;
+    int32_t* barrierCount = state + kBarrierCount;
+    int32_t* barrierFlag = state + kBarrierFlag;
 
     if (params.usePdl)
     {
         cudaGridDependencySynchronize();
     }
 
-    int32_t const routeCtas = (params.numTokens + NumWarps - 1) / NumWarps;
+    int32_t const routeCtas = (params.numTokens + kNumWarps - 1) / kNumWarps;
     if (static_cast<int32_t>(blockIdx.x) >= routeCtas)
     {
         // Quantization CTAs, outside the routing CTAs' barrier: half a hidden row a warp.
-        int32_t const half = (blockIdx.x - routeCtas) * NumWarps + warpIdx;
+        int32_t const half = (blockIdx.x - routeCtas) * kNumWarps + warpIdx;
         int32_t const tokenQ = half / 2;
         if (tokenQ < params.numTokens)
         {
-            int32_t const it0 = (half % 2) * (QuantIters / 2);
+            int32_t const it0 = (half % 2) * (kQuantIters / 2);
             auto const* in
-                = static_cast<__nv_bfloat16 const*>(params.ptrHiddenBf16) + static_cast<int64_t>(tokenQ) * QuantHidden;
-            uint4 part[QuantIters / 2];
+                = static_cast<__nv_bfloat16 const*>(params.ptrHiddenBf16) + static_cast<int64_t>(tokenQ) * kQuantHidden;
+            uint4 part[kQuantIters / 2];
 #pragma unroll
-            for (int it = 0; it < QuantIters / 2; it++)
+            for (int it = 0; it < kQuantIters / 2; it++)
             {
                 part[it] = *reinterpret_cast<uint4 const*>(in + (it0 + it) * 256 + laneIdx * 8);
             }
-            auto* out = static_cast<__nv_fp8_e4m3*>(params.ptrHiddenFp8) + static_cast<int64_t>(tokenQ) * QuantHidden;
+            auto* out = static_cast<__nv_fp8_e4m3*>(params.ptrHiddenFp8) + static_cast<int64_t>(tokenQ) * kQuantHidden;
 #pragma unroll
-            for (int it = 0; it < QuantIters / 2; it++)
+            for (int it = 0; it < kQuantIters / 2; it++)
             {
                 int32_t const group = 2 * (it0 + it) + laneIdx / 16;
                 quantizeGroup(part[it], out + (it0 + it) * 256 + laneIdx * 8,
@@ -179,13 +179,13 @@ __global__ void __launch_bounds__(NumThreads) moeFrontKernel(Data params, int32_
     }
 
     BaseType const minScore = BaseType{-INFINITY};
-    BaseType score[VecSize];
-    int32_t idx[VecSize];
+    BaseType score[kVecSize];
+    int32_t idx[kVecSize];
     if (validToken)
     {
         InputT const* scores = static_cast<InputT const*>(params.ptrScores) + tokenIdx * params.numExperts;
 #pragma unroll
-        for (int i = 0; i < VecSize; i++)
+        for (int i = 0; i < kVecSize; i++)
         {
             auto expertIdx = i * WarpSize + laneIdx;
             score[i] = expertIdx < params.numExperts ? static_cast<BaseType>(scores[expertIdx]) : minScore;
@@ -196,12 +196,12 @@ __global__ void __launch_bounds__(NumThreads) moeFrontKernel(Data params, int32_
     // No CTA flips the generation before every CTA, this one included, has arrived; the previous launch flipped it
     // before it completed.
     int32_t const generation = *reinterpret_cast<int32_t volatile*>(barrierFlag);
-    int32_t* counters = state + (generation & 1) * MaxNumExperts;
+    int32_t* counters = state + (generation & 1) * kMaxNumExperts;
     if (blockIdx.x == 0)
     {
         // The other bank is the previous launch's, which is complete (this grid depends on it transitively).
-        int32_t* other = state + ((generation + 1) & 1) * MaxNumExperts;
-        for (int e = threadIdx.x; e < MaxNumExperts; e += NumThreads)
+        int32_t* other = state + ((generation + 1) & 1) * kMaxNumExperts;
+        for (int e = threadIdx.x; e < kMaxNumExperts; e += kNumThreads)
         {
             other[e] = 0;
         }
@@ -211,8 +211,8 @@ __global__ void __launch_bounds__(NumThreads) moeFrontKernel(Data params, int32_
     int32_t slotOffset = 0;
     if (validToken)
     {
-        BaseType warpTopKScore[MaxTopK];
-        int32_t warpTopKExpertIdx[MaxTopK];
+        BaseType warpTopKScore[kMaxTopK];
+        int32_t warpTopKExpertIdx[kMaxTopK];
         routing::topk::reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, score, idx, minScore, params.topK);
         BaseType const softmaxScore = routing::calcSoftmax(
             warp, laneIdx < params.topK ? warpTopKScore[laneIdx] : minScore, laneIdx, params.topK);
@@ -251,26 +251,26 @@ __global__ void __launch_bounds__(NumThreads) moeFrontKernel(Data params, int32_
     __syncthreads();
 
     int32_t const tileN = params.tileTokensDim;
-    int32_t count[ScanItemsPerThread];
-    int32_t numCta[ScanItemsPerThread];
+    int32_t count[kScanItemsPerThread];
+    int32_t numCta[kScanItemsPerThread];
 #pragma unroll
-    for (int e = 0; e < ScanItemsPerThread; e++)
+    for (int e = 0; e < kScanItemsPerThread; e++)
     {
-        int32_t const expert = threadIdx.x * ScanItemsPerThread + e;
+        int32_t const expert = threadIdx.x * kScanItemsPerThread + e;
         count[e] = expert < params.numLocalExperts ? __ldcg(counters + expert) : 0;
     }
 #pragma unroll
-    for (int e = 0; e < ScanItemsPerThread; e++)
+    for (int e = 0; e < kScanItemsPerThread; e++)
     {
         numCta[e] = (count[e] + tileN - 1) / tileN;
     }
-    int32_t ctaOffset[ScanItemsPerThread];
+    int32_t ctaOffset[kScanItemsPerThread];
     int32_t numNonExitingCtas;
     Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
 #pragma unroll
-    for (int e = 0; e < ScanItemsPerThread; e++)
+    for (int e = 0; e < kScanItemsPerThread; e++)
     {
-        int32_t const expert = threadIdx.x * ScanItemsPerThread + e;
+        int32_t const expert = threadIdx.x * kScanItemsPerThread + e;
         smemExpertOffset[expert] = ctaOffset[e] * tileN;
         if (blockIdx.x == 0 && expert < params.numLocalExperts)
         {
@@ -326,10 +326,10 @@ int32_t* deviceCounters(int device)
         cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
         TLLM_CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
         int32_t* ptr = nullptr;
-        TLLM_CUDA_CHECK(cudaMalloc(&ptr, CounterInts * sizeof(int32_t)));
+        TLLM_CUDA_CHECK(cudaMalloc(&ptr, kCounterInts * sizeof(int32_t)));
         cudaStream_t side;
         TLLM_CUDA_CHECK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
-        TLLM_CUDA_CHECK(cudaMemsetAsync(ptr, 0, CounterInts * sizeof(int32_t), side));
+        TLLM_CUDA_CHECK(cudaMemsetAsync(ptr, 0, kCounterInts * sizeof(int32_t), side));
         TLLM_CUDA_CHECK(cudaStreamSynchronize(side));
         TLLM_CUDA_CHECK(cudaStreamDestroy(side));
         TLLM_CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
@@ -342,8 +342,8 @@ int32_t* deviceCounters(int device)
 
 bool supports(int32_t numTokens, int32_t numExperts, int32_t topK, int32_t numLocalExperts, int32_t hiddenDim)
 {
-    return numTokens > 0 && numTokens <= MaxNumTokens && numExperts > 0 && numExperts <= MaxNumExperts && topK > 0
-        && topK <= MaxTopK && numLocalExperts > 0 && numLocalExperts <= MaxNumExperts && hiddenDim % 128 == 0;
+    return numTokens > 0 && numTokens <= kMaxNumTokens && numExperts > 0 && numExperts <= kMaxNumExperts && topK > 0
+        && topK <= kMaxTopK && numLocalExperts > 0 && numLocalExperts <= kMaxNumExperts && hiddenDim % 128 == 0;
 }
 
 void run(Data const& data, cudaStream_t stream)
@@ -352,22 +352,22 @@ void run(Data const& data, cudaStream_t stream)
         "fp8_block_scale_moe_front: unsupported problem (tokens %d, experts %d, topK %d, local %d, hidden %d)",
         data.numTokens, data.numExperts, data.topK, data.numLocalExperts, data.hiddenDim);
     TLLM_CHECK_WITH_INFO(data.ptrHiddenBf16 == nullptr
-            || (data.ptrHiddenFp8 != nullptr && data.ptrHiddenScale != nullptr && data.hiddenDim == QuantHidden),
-        "fp8_block_scale_moe_front: quantization needs both outputs and hidden %d", QuantHidden);
+            || (data.ptrHiddenFp8 != nullptr && data.ptrHiddenScale != nullptr && data.hiddenDim == kQuantHidden),
+        "fp8_block_scale_moe_front: quantization needs both outputs and hidden %d", kQuantHidden);
     int device = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
     int32_t* counters = deviceCounters(device);
 
     cudaLaunchConfig_t config{};
-    int32_t const routeCtas = (data.numTokens + NumWarps - 1) / NumWarps;
-    int32_t const quantCtas = data.ptrHiddenBf16 != nullptr ? (2 * data.numTokens + NumWarps - 1) / NumWarps : 0;
+    int32_t const routeCtas = (data.numTokens + kNumWarps - 1) / kNumWarps;
+    int32_t const quantCtas = data.ptrHiddenBf16 != nullptr ? (2 * data.numTokens + kNumWarps - 1) / kNumWarps : 0;
     config.gridDim = routeCtas + quantCtas;
-    config.blockDim = NumThreads;
+    config.blockDim = kNumThreads;
     config.dynamicSmemBytes = 0;
     config.stream = stream;
     cudaLaunchAttribute attributes[1] = {};
     attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attributes[0].val.programmaticStreamSerializationAllowed = int(data.usePdl);
+    attributes[0].val.programmaticStreamSerializationAllowed = static_cast<int>(data.usePdl);
     config.attrs = attributes;
     config.numAttrs = 1;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, moeFrontKernel, data, counters));
