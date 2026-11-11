@@ -116,22 +116,56 @@ def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monk
         ex._stop_worker_thread()
 
 
-@pytest.mark.parametrize("error", [RuntimeError("cleanup failed"), SystemExit("cancelled")])
-def test_phase_failure_is_visible_before_rebind_can_restart(executor, monkeypatch, error):
+@pytest.mark.parametrize(
+    "loop_error,cleanup_error",
+    [
+        (SystemExit("cancelled"), None),
+        (KeyboardInterrupt("cancelled"), None),
+        (None, RuntimeError("cleanup failed")),
+        (SystemExit("cancelled"), RuntimeError("cleanup failed")),
+        (RuntimeError("loop failed"), RuntimeError("cleanup failed")),
+    ],
+)
+def test_phase_failure_is_visible_before_rebind_can_restart(
+    executor, monkeypatch, loop_error, cleanup_error
+):
     ex, _events = executor
     _enable_real_worker(ex, monkeypatch)
+    ex.garbage_collection_gen0_threshold = None
+    ex._event_loop_error_delivered = threading.Event()
+    monkeypatch.setattr(executor_module, "host_profiler_context", lambda enable: nullcontext())
+    monkeypatch.setattr(
+        executor_module, "customized_gc_thresholds", lambda threshold: nullcontext()
+    )
+    watchdog = Mock(return_value=None)
+    kill = Mock()
+    monkeypatch.setattr(executor_module, "start_rank_crash_kill_watchdog", watchdog)
+    monkeypatch.setattr(executor_module, "hard_kill_on_rank_crash", kill)
     uncaught = []
     monkeypatch.setattr(threading, "excepthook", lambda args: uncaught.append(args.exc_value))
+    cleanup_errors = []
 
-    def fail():
-        raise error
+    def event_loop():
+        if loop_error is not None:
+            raise loop_error
+        ex._event_loop_completed = True
 
-    ex._event_loop_wrapper = fail
+    def cleanup():
+        cleanup_errors.append(ex._event_loop_error)
+        ex.shutdown_event.set()
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    ex.event_loop = event_loop
+    ex._executor_loop_cleanup = cleanup
     ex.start_worker()
     assert ex._worker_phase_done.wait(5)
-    assert ex._event_loop_error is error
+    assert cleanup_errors == [loop_error]
+    assert ex._event_loop_error is (loop_error if loop_error is not None else cleanup_error)
     ex._stop_worker_thread()
-    assert uncaught == [error]
+    assert uncaught == [cleanup_error if cleanup_error is not None else loop_error]
+    assert watchdog.called == isinstance(loop_error, Exception)
+    assert kill.called == isinstance(loop_error, Exception)
     ex._resources_released = True
     with pytest.raises(RuntimeError, match="execution failure"):
         ex.rebind_resources(Mock())

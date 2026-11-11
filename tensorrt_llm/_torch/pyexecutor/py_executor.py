@@ -2011,15 +2011,11 @@ class PyExecutor:
             # _executor_loop_cleanup is enough to wake local waiters.
             self._event_loop_error = e
             raise e
-        except BaseException:
-            # SystemExit / KeyboardInterrupt are NOT Exception, so they reach
-            # here rather than the handler above. Peers are just as stranded,
-            # but these are deliberate teardown signals -- the launcher is
-            # already tearing the job down -- and arming an MPI_Abort on top
-            # would turn a clean Ctrl-C into exit 137. Left unarmed on
-            # purpose; `crashed` stays False. Stated explicitly because the
-            # comment above describes the invariant the *Exception* path
-            # enforces, not this one.
+        except BaseException as error:
+            # Publish SystemExit / KeyboardInterrupt before cleanup wakes local
+            # waiters. Keep `crashed` False: the launcher is already tearing the
+            # job down, and MPI_Abort would turn a clean Ctrl-C into exit 137.
+            self._event_loop_error = error
             raise
         finally:
             # Armed BEFORE cleanup: cleanup can block without bound on a
@@ -2121,8 +2117,9 @@ class PyExecutor:
             try:
                 self._event_loop_wrapper()
             except BaseException as error:
-                # Publish failure before waking teardown: the thread can
-                # still appear alive while unwinding and cannot be reused.
+                # The wrapper records loop errors before cleanup. Also retain
+                # failures from its finally block before teardown can rebind;
+                # the thread can still appear alive while unwinding.
                 if self._event_loop_error is None:
                     self._event_loop_error = error
                 raise
@@ -2144,10 +2141,8 @@ class PyExecutor:
             if self._event_loop_error is not None or self._fatal_error is not None:
                 raise RuntimeError("Cannot restart a failed executor")
             if not self.worker_started:
-                if self.worker_thread is not None and not self.worker_thread.is_alive(
-                ):
-                    raise RuntimeError(
-                        "Cannot restart an exited executor thread")
+                assert self.worker_thread is None or self.worker_thread.is_alive(
+                ), "Executor thread exited without a recorded failure"
                 # Model/KV-cache/transceiver construction can create threads
                 # after configure_cpu_affinity(). Refresh the existing-thread
                 # snapshot immediately before launching executor threads.
@@ -2526,7 +2521,8 @@ class PyExecutor:
 
         Call collectively after consuming profiling responses. Graph destruction
         precedes workspace release, and transfer registrations precede cache
-        release. Model engines, weights and the execution stream remain valid.
+        release. Model engines, weights and the execution stream remain valid,
+        as do the worker thread and its thread-local CUDA library state.
         """
         if self._closed or self._resources_released:
             raise RuntimeError("Executor resources are already released")

@@ -2969,16 +2969,18 @@ class TestAwaitSingleResponseShutdown:
         result = stub._await_single_response(id=7, timeout=1.0)
         assert result == ["resp"]
 
-    def test_raises_on_shutdown_with_event_loop_error(self):
+    @pytest.mark.parametrize("error_type", [RuntimeError, SystemExit, KeyboardInterrupt])
+    def test_raises_on_shutdown_with_event_loop_error(self, error_type):
         """When the event loop crashed, _await_single_response surfaces the
         original error as RuntimeError instead of hanging."""
         stub = _ResponseStub()
         stub.is_shutdown = True
-        stub._event_loop_error = RuntimeError("KV cache OOM")
+        stub._event_loop_error = error_type("event loop stopped")
 
-        with pytest.raises(RuntimeError, match="Event loop terminated"):
+        with pytest.raises(RuntimeError, match="Event loop terminated") as error:
             stub._await_single_response(id=42, timeout=1.0)
 
+        assert error.value.__cause__ is stub._event_loop_error
         # The caller now holds the original error, so the rank-crash kill must
         # stand down: this is the signal it waits out its grace for.
         assert stub._event_loop_error_delivered.is_set()
