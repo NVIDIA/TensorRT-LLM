@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 pytestmark = pytest.mark.threadleak(enabled=False)
+_WORKER_TIMEOUT = 120
 
 
 def _events(path: Path) -> list[dict[str, "MetadataValue"]]:
@@ -86,7 +87,6 @@ def _profile(
             operation()
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
-    MPI.COMM_WORLD.Barrier()
     with tempfile.TemporaryDirectory(prefix="nccl-profiler-") as directory:
         path = Path(directory) / "execution.json"
         with execution_trace_observer(path) as observer:
@@ -372,7 +372,10 @@ def test_raw_nccl_events(
     graph: bool,
 ) -> None:
     """Validate raw operations and graph replay with the real MPI-backed fixture."""
-    assert list(mpi_pool_executor.map(_run_collective, [case] * 2, [graph] * 2)) == [True, True]
+    results = mpi_pool_executor.map(
+        _run_collective, [case] * 2, [graph] * 2, timeout=_WORKER_TIMEOUT
+    )
+    assert list(results) == [True, True]
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two real CUDA devices")
@@ -393,4 +396,4 @@ def test_nccl_owner_boundaries(
         else mpi_pool_executor.submit(_run_point_to_point, graph, expected)
         for _ in range(2)
     ]
-    assert [future.result() for future in futures] == [True, True]
+    assert [future.result(timeout=_WORKER_TIMEOUT) for future in futures] == [True, True]
