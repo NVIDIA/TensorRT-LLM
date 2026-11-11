@@ -7194,37 +7194,38 @@ def ensureStageResultNotUploaded(stageName) {
 // TODO: Update existing functions to use runInDockerOnNodeMultiStage and get rid of runInDockerOnNode
 def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, needToDeleteDir=true)
 {
-    return { runner ->
-        // Include agent allocation and setup in the budget, leaving 10 minutes for cleanup.
-        timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
-            node(label) {
-                try {
-                    if (needToDeleteDir) {
-                        deleteDir()
+    return {
+        runner -> node(label) {
+            try {
+                if (needToDeleteDir) {
+                    deleteDir()
+                }
+                stage('Pull Docker Image') {
+                    withCredentials([usernamePassword(
+                        credentialsId: ARTIFACTORY_CREDENTIALS_ID,
+                        usernameVariable: 'USERNAME',
+                        passwordVariable: 'PASSWORD'
+                    )]) {
+                        sh """
+                            set +x
+                            echo "\$PASSWORD" | docker login ${ARTIFACTORY_DOCKER_HOST} -u "\$USERNAME" --password-stdin
+                        """
                     }
-                    stage('Pull Docker Image') {
-                        withCredentials([usernamePassword(
-                            credentialsId: ARTIFACTORY_CREDENTIALS_ID,
-                            usernameVariable: 'USERNAME',
-                            passwordVariable: 'PASSWORD'
-                        )]) {
-                            sh """
-                                set +x
-                                echo "\$PASSWORD" | docker login ${ARTIFACTORY_DOCKER_HOST} -u "\$USERNAME" --password-stdin
-                            """
-                        }
-                        docker.image(image).pull()
-                    }
+                    docker.image(image).pull()
+                }
+                // We submit the Slurm job with the Slurm partition's time spec.
+                // Minus 10 minutes to avoid the Slurm job being stopped earlier.
+                timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                     docker.image(image).inside(dockerArgs) {
                         trtllm_utils.setupGithubFetchAuth()
                         runner()
                     }
-                } catch (Exception e) {
-                    if (e.getMessage()?.contains("Failed to kill container")) {
-                        echo "Known benign error ignored: ${e.getMessage()}"
-                    } else {
-                        throw e // Re-throw if it's a different Exception
-                    }
+                }
+            } catch (Exception e) {
+                if (e.getMessage()?.contains("Failed to kill container")) {
+                    echo "Known benign error ignored: ${e.getMessage()}"
+                } else {
+                    throw e // Re-throw if it's a different Exception
                 }
             }
         }
@@ -7233,11 +7234,12 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
 
 def runInEnrootOnNode(label, partitionTimeout)
 {
-    return { runner ->
-        // Include agent allocation and setup in the budget, leaving 10 minutes for cleanup.
-        timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
-            node(label) {
-                trtllm_utils.setupGithubFetchAuth()
+    return {
+        runner -> node(label) {
+            trtllm_utils.setupGithubFetchAuth()
+            // We submit the Slurm job with the Slurm partition's time spec.
+            // Minus 10 minutes to avoid the Slurm job being stopped earlier.
+            timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                 runner()
             }
         }
