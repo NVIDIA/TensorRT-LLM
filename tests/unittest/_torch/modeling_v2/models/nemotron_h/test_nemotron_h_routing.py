@@ -291,6 +291,93 @@ def test_ultra_bf16_tp8ep2_refuses_an_nvfp4_kv_cache():
     _refused(config, "KV cache", kv_cache_config=_kv(dtype="nvfp4"))
 
 
+# --- BF16 dep16: attention DP over four GB200 trays -------------------------------
+
+_ULTRA_BF16_DEP16_TARGET = (
+    "models.nemotron_h.nemotron3_ultra_bf16__sm_100__dep16.modeling."
+    "ModelingV2Nemotron3UltraBf16Sm100Dep16"
+)
+# Four GB200 trays of four: the disaggregated serving tiers' layout (ctx DEP16, gen DEP16).
+_DEP16 = dict(
+    world_size=16,
+    tp_size=16,
+    moe_ep_size=16,
+    moe_tp_size=1,
+    enable_attention_dp=True,
+    gpus_per_node=4,
+)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_ultra_bf16_dep16_matches(mode):
+    """Attention DP over 16 ranks with the experts in sixteen windows selects dep16."""
+    config = _model_config(_ultra_bf16_config(), **_DEP16)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _ULTRA_BF16_DEP16_TARGET
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("backend", ["AUTO", "CUTLASS", "MEGAMOE_CUTEDSL", "TRTLLM"])
+def test_ultra_bf16_dep16_takes_its_moe_backends(backend, mode):
+    """Every request runs in the engine's MoE layer; the target checks the leaf it builds."""
+    config = replace(_model_config(_ultra_bf16_config(), **_DEP16), moe_backend_requested=backend)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _ULTRA_BF16_DEP16_TARGET
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs, missed",
+    [
+        # 16 ranks of tensor-parallel attention: a layout no target was built for
+        (dict(_DEP16, enable_attention_dp=False), "attention_dp=False"),
+        # the experts in eight windows split two ways
+        (dict(_DEP16, moe_ep_size=8, moe_tp_size=2), "moe_ep=8"),
+        # attention DP over 8 ranks: the replicated non-expert weights would not fit
+        (dict(_DEP16, world_size=8, tp_size=8, moe_ep_size=8), "world_size=8"),
+        # one 16-GPU node: only GB200 trays of four were gated
+        (dict(_DEP16, gpus_per_node=16), "inside one node"),
+        # a vocab-parallel lm_head under attention DP
+        (dict(_DEP16, enable_lm_head_tp_in_adp=True), "enable_lm_head_tp_in_adp"),
+    ],
+    ids=["tp16", "moe-ep8-tp2", "dep8", "single-node", "lm-head-tp"],
+)
+def test_ultra_bf16_dep16_near_misses_do_not_match(mapping_kwargs, missed):
+    config = _model_config(_ultra_bf16_config(), **mapping_kwargs)
+    _refused(config, missed)
+
+
+@pytest.mark.parametrize(
+    "llm_kwargs, missed",
+    [
+        # SWE accuracy needs the bf16 KV cache and the fp32 state
+        (dict(kv_cache_config=_kv(dtype="fp8")), "KV cache"),
+        (dict(kv_cache_config=_kv(mamba_ssm_cache_dtype="float16")), "recurrent-state"),
+        (dict(kv_cache_config=_kv(enable_block_reuse=True)), "enable_block_reuse"),
+        (dict(moe_config=MoeConfig(load_balancer={"num_slots": 512})), "EPLB"),
+        (dict(prefill_cuda_graph_backend="piecewise"), "piecewise"),
+    ],
+    ids=["fp8-kv", "fp16-state", "block-reuse", "eplb", "piecewise"],
+)
+def test_ultra_bf16_dep16_refuses_engine_choices_it_never_ran(llm_kwargs, missed):
+    config = _model_config(_ultra_bf16_config(), **_DEP16)
+    _refused(config, missed, **llm_kwargs)
+
+
+@pytest.mark.parametrize("backend", ["CUTEDSL", "DEEPGEMM", "MEGAMOE_DEEPGEMM", "TRITON"])
+def test_ultra_bf16_dep16_refuses_another_moe_backend(backend):
+    config = replace(_model_config(_ultra_bf16_config(), **_DEP16), moe_backend_requested=backend)
+    _refused(config, "moe_config.backend")
+
+
+def test_ultra_bf16_dep16_with_speculative_decoding_does_not_match():
+    config = _model_config(_ultra_bf16_config(), spec_config=_NGRAM, **_DEP16)
+    _refused(config, "speculative decoding")
+
+
+def test_ultra_nvfp4_does_not_route_to_dep16():
+    """The NVFP4 release on 16 sm_100 ranks with attention DP falls back."""
+    config = _model_config(_ultra_config(), **_DEP16)
+    _refused(config, r"MIXED_PRECISION")
+
+
 # --- NVFP4 on sm_107 -------------------------------------------------------------
 
 _ULTRA_NVFP4_TEP4_TARGET = (
