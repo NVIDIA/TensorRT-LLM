@@ -168,7 +168,7 @@ In the original arena, the default [helper-slot mode](#51-configuration), `per_l
 
 Each rank holds its $H$ home experts in slots $[0,H)$ and $S$ helper slots after them, allocated in peer-accessible CUDA fabric-handle memory; a *broadcast* installs an expert's weights and block scales (its *bundle*) in one helper slot on every member of an aligned group.
 
-**Symmetric helper slots.** A multicast store lands at the same offset on every member, so a broadcast needs one helper index free on all members. For power-of-two EP, at most $S$ broadcast memberships per rank suffice to assign common indices within $S$ slots; [Section 6.1](#61-lower-bound-analysis-of-hierarchical-and-free-slot-usage) gives the proof and compares free placement.
+**Symmetric helper slots.** A multicast store lands at the same offset on every member, so a broadcast needs one helper index free on all members. For power-of-two EP, aligned groups are nested or disjoint: coarse-to-fine coloring needs at most as many indices as the maximum number of broadcasts containing any rank. [Section 6.1](#61-lower-bound-analysis-of-hierarchical-and-free-slot-usage) compares the achievable load-balance bounds under Hierarchical and Free usage.
 
 ### 3.3 TMA Weight Replication and SAMI Multi-Port Broadcast
 
@@ -347,45 +347,34 @@ Here `eplb_per_layer_dynamic.yaml` is a file you create in that directory with t
 
 ### 6.1 Lower-Bound Analysis of Hierarchical and Free Slot Usage
 
-Hierarchical placement replaces independent receiver choices with one multicast group per exported expert. For a load-only comparison, fix the same integer expert-token counts and owner placement on $P$ ranks, where $P$ is a power of two. Each rank may export at most $S$ distinct home experts and use $S$ helper slots. Sending one expert to several receivers counts as one export. Both rules prohibit relaying load: a rank may export its own experts or process other owners' tokens, but not both.
+**Hierarchical and Free slot usage have nearly the same algorithmic load-balancing limit in the tested Zipf workloads.** Across EP8–EP512 and one to four helper slots per rank, the largest difference in the **64-layer mean optimal imbalance ratio is below 0.0041 in R**, or **0.41 percentage points of mean rank load**, at EP8 with one slot (Figure 13). This measures the best achievable balance under each placement rule, independently of the HALO-Q heuristic.
 
-| Slot rule | Replica destinations | Helper-slot charge |
-| :--- | :--- | :--- |
-| Free | Any subset of non-owner ranks | One slot per receiver |
-| Hierarchical | One aligned group per exported expert | One slot per member, including an owner or a member assigned no tokens |
-
-Here Hierarchical includes aligned groups of size $2,4,\ldots,P$, matching the placement family supported by the pair extension. The synthetic model counts logical placement-group slots: a transport team may include an external owner with dummy storage without consuming that owner's helper slot. **The attainable imbalance ratios satisfy**
+**Optimization problem.** For $m\in\{\mathrm{Free},\mathrm{Hierarchical}\}$, given expert-token counts $w_e$ and their owner ranks, choose binary replica placements $x$ and token assignments $a_{er}\in\mathbb Z_{\ge0}$ to minimize the largest final rank load $T$. With $\bar L=\sum_e w_e/P$, the objective and load constraints are
 
 $$
-R_{\mathrm{free}}^*\le R_{\mathrm{hier}}^*,
+R_m^*=\min_{T,a,x}\frac{T}{\bar L},\qquad
+\sum_r a_{er}=w_e,\qquad
+\sum_e a_{er}\le T.
 $$
 
-where each optimum minimizes the maximum rank load divided by the unchanged mean $\bar L$. **Proof:** take any hierarchical plan and keep the same token assignments, but retain a free-slot replica only on non-owner members that process tokens for that expert. Loads are unchanged, export and slot counts cannot increase, and no relay is introduced. Free placement therefore realizes every hierarchical load vector.
+Tokens may execute only on an expert's owner or a rank holding its replica. Each rank may export at most $S$ distinct experts and hold at most $S$ helper replicas; no rank both exports home-expert load and processes other owners' tokens. The placement constraints distinguish the two models:
 
-**A common lower bound.** Let $w_{r,(j)}$ be rank $r$'s home-expert token counts in descending order and $H=E/P$. Every rule obeys
+- **Free:** each exported expert may use any subset of receiver ranks.
+- **Hierarchical:** each exported expert uses one aligned group of size $2,4,\ldots,P$. Every group member consumes one helper slot, including an owner inside the group or a member assigned zero tokens.
 
-$$
-R^*\ge\frac{B}{\bar L},\qquad
-B=\max\left\{\left\lceil\bar L\right\rceil,\ \max_r\left[L_r-\sum_{j=1}^{\min(S,H)}w_{r,(j)}\right]\right\}.
-$$
-
-Token conservation gives the first term. A rank exports at most $S$ experts, so it cannot remove more tokens than its $\min(S,H)$ heaviest experts contain, giving the second. **A validated hierarchical plan with maximum load $B$ proves equality with the free optimum:** its upper bound meets this common lower bound.
-
-**Symmetric slot numbering adds no further capacity cost for fixed aligned groups.** Let $D$ be the maximum number of broadcasts containing any rank. At least $D$ indices are needed. Assign indices from coarse groups to fine ones: every already assigned group intersecting the current group contains it, so at most $D-1$ indices are occupied across its members. One of $D$ indices is therefore free throughout the group. This proves that membership capacity suffices; it does not prove that restricting destinations is free.
+Every Hierarchical plan is also feasible under Free placement after removing unused replicas, so $R_{\mathrm{free}}^*\le R_{\mathrm{hier}}^*$. Figure 12 illustrates the slot constraints on a constructed instance; the small average gap above is specific to the tested workloads.
 
 ![Slot-occupancy matrices and final rank loads for Free and Hierarchical; hatched zero-token replicas still consume a slot.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_slot_usage.svg)
 
-*Figure 12. Helper-slot occupancy for the same eight-rank instance (P = 8, H = 1, S = 1, no load relay). Rows identify candidate experts and owners; columns are receiver ranks 4–7, each with one slot. Filled cells route one token; hatched cells occupy a slot but route none; blank cells contain no replica. Lower bars show final loads and the common lower bound B = 2 (dashed). The panels show optimal plans with R = 1 and 1.5.*
+*Figure 12. Placement constraints with eight ranks and one helper slot per rank. Filled cells serve one token; hatched cells hold a replica but serve none. Columns are receiver slots. The lower bars show optimal plans for this constructed example; the dashed line marks the mean-load lower bound of two.*
 
-Here the original loads are $(3,3,3,3,1,1,1,1)$, with mean two. Free placement sends one token from each hot rank to one cold rank, achieving $R^*=1$. To reach maximum load two under hierarchy, all four hot ranks must export and cannot receive others' tokens. Four broadcasts with $S=1$ must occupy four disjoint aligned pairs; two pairs contain only hot ranks and cannot receive the required transfers. Thus load two is impossible, while load three is feasible, proving $R_{\mathrm{hier}}^*=1.5$.
-
-**Synthetic optimality study.** A separate simulation used 1,536 experts, top-16 routing, 131,072 tokens per step ($N=2,097,152$ routed assignments), a random expert permutation followed by contiguous ownership, and 64 independent layers per EP size from one fixed seed. The expert-popularity vector had coefficient of variation two. For Zipf popularity $p_k\propto k^{-0.668}$, Figure 13 compares bounds on the mean optimal imbalance ratio across EP8–EP512 with one, two, three and four helper slots per rank.
+**Solving the bound.** Mixed-integer linear programming gives lower bounds on $R_m^*$, and validated integral plans give feasible upper bounds. Equal bounds certify the optimum; unresolved cases retain an interval. Figure 13 uses 1,536 experts, top-16 routing, 131,072 tokens per step, random contiguous ownership, and Zipf popularity calibrated to a coefficient of variation of two.
 
 ![Free and Hierarchical mean optimal-load bounds across EP8–EP512, with one through four helper slots per rank.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_slot_bounds.svg)
 
-*Figure 13. Helper-slot budget and bounds on mean optimal imbalance R for Zipf popularity with coefficient of variation two (64 layers per EP). Free and Hierarchical use S = 1, 2, 3 and 4. Markers and lines show feasible upper bounds; shaded bands span the lower and upper bounds. Coincident bounds certify optima; a dagger (†) marks unresolved layers. Each panel uses its own y-axis scale.*
+*Figure 13. Mean optimal imbalance bounds over 64 layers per EP for S = 1, 2, 3 and 4. Lines and markers show feasible upper bounds; shading spans lower to upper bounds, and † marks unresolved cases. Each panel has its own y-axis scale.*
 
-Mixed-integer linear programming supplies lower bounds and validated integral plans supply feasible upper bounds; unresolved configurations are shown as intervals in Figure 13. Across the tested EP8–64 configurations, the mean penalty of Hierarchical over Free was at most 0.41 percentage points of mean rank load for Zipf and 0.50 for the shifted power law $p_k\propto(k+3.04)^{-0.8}$, calibrated to the same popularity variation. These small average differences are empirical, not universal bounds. Some configurations retain solver gaps, and independent exact rechecks remain incomplete. The study excludes copy time, slot memory and GEMM efficiency; its optima also differ from the plans the HALO-Q heuristic finds.
+These are load-only optimization bounds: they exclude copy time and GEMM efficiency, and do not imply that a runtime planner attains the optimum.
 
 ### 6.2 Limitations
 
