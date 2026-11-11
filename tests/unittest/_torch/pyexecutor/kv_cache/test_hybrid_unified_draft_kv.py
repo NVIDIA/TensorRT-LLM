@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.mode import QuantMode
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -191,6 +192,48 @@ def test_plain_target_still_gets_target_and_draft_specs():
         == [KVCacheLayerOwner.TARGET] * _NUM_TARGET_LAYERS
         + [KVCacheLayerOwner.DRAFT] * _NUM_DRAFT_LAYERS
     )
+
+
+def _declaring_creator(draft_kv_dtype):
+    """A creator whose drafter config inherits the target's NVFP4 KV algo."""
+    creator = _creator()
+    del creator._get_draft_kv_model_config  # the real resolution
+    creator._draft_config = SimpleNamespace(
+        pretrained_config=creator._draft_config.pretrained_config,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
+    )
+    if draft_kv_dtype is not None:
+        creator._model_engine.model.draft_model.draft_kv_dtype = draft_kv_dtype
+    return creator
+
+
+@pytest.mark.parametrize(
+    ("draft_kv_dtype", "expected"),
+    [(torch.float8_e4m3fn, DataType.FP8), (None, DataType.BF16), (torch.bfloat16, DataType.BF16)],
+)
+def test_drafter_declared_kv_dtype_sets_the_draft_pool_dtype(draft_kv_dtype, expected):
+    """The drafter's draft_kv_dtype wins over the KV algo the target stamps on
+    its config; without a declaration the pool keeps the drafter's weights dtype."""
+    creator = _declaring_creator(draft_kv_dtype)
+
+    config = creator._get_draft_kv_model_config()
+
+    assert creator._layer_spec_dtype(config, torch.bfloat16) == expected
+    # The loaded drafter's own config is not modified.
+    assert creator._draft_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+    specs = creator._build_unified_dflash_layer_specs(SimpleNamespace(max_attention_window=None))
+    assert {spec.dtype for spec in specs} == {expected}
+    # One MLA latent row per token and layer: 576 bytes in FP8.
+    assert {(spec.num_kv_heads, spec.head_dim, tuple(spec.buffer_roles)) for spec in specs} == {
+        (1, 576, (Role.KEY,))
+    }
+
+
+def test_unsupported_declared_draft_kv_dtype_is_rejected():
+    creator = _declaring_creator(torch.float32)
+
+    with pytest.raises(ValueError, match="Unsupported draft_kv_dtype"):
+        creator._get_draft_kv_model_config()
 
 
 def test_k3_like_drafter_shares_the_hybrid_manager_in_disagg():
