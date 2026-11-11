@@ -248,9 +248,16 @@ Ask with one multi-select question:
 ## Finish
 
 1. Show the complete YAML and ask for changes.
-2. Ask for the workspace directory; write `<workspace>/task.yaml`. If the
-   directory does not exist, say so and create it once the user agrees. If
-   the file exists, ask before overwriting.
+2. Propose a new workspace directory, as a full path, for the user to
+   confirm or replace: `<trtllm_repo_path>/agent-flow/workspace/<name>`
+   (agent-flow's `.gitignore` excludes `workspace/`). `<name>` is the
+   checkpoint directory's name in lower case plus `-v2-onboard` when the
+   user's agent-flow has `agent_flow/workflows/modeling_v2_onboard/`,
+   `-bringup` otherwise; if that directory already exists, append `-2`,
+   `-3`, ... until it does not. Once the user confirms, create the
+   directory and write `<workspace>/task.yaml`. If the user gives an
+   existing directory that already holds a task.yaml, ask before
+   overwriting.
 3. Check it with the workflow's own check, take each problem back to the
    user, fix, and re-run until it passes:
    - when the user's agent-flow has `agent_flow/workflows/modeling_v2_onboard/`:
