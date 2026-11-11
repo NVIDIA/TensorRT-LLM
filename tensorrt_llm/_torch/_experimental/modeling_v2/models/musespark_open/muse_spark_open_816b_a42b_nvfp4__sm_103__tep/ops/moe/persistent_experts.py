@@ -36,6 +36,7 @@ not enter it. An expert's rows do not depend on the window it is read from.
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Dict, Optional, Tuple
 
@@ -45,6 +46,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWr
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     _E2M1_VALUES,
 )
+from tensorrt_llm.logger import logger
 
 HIDDEN = 4096
 INTER = 4096
@@ -90,6 +92,24 @@ OPTIONS: Dict[str, int] = {
 #: What each supported device compute capability changes in ``OPTIONS``.
 OPTIONS_BY_SM: Dict[Tuple[int, int], Dict[str, int]] = {
     (10, 3): {},
+}
+
+#: ``MUSESPARK_OPEN_PERSISTENT_EXPERTS_OPTIONS="order=0,balance=0"`` overrides the tactic
+#: fields of ``OPTIONS`` (after ``OPTIONS_BY_SM``); unset or empty, ``OPTIONS`` applies
+#: unchanged. The 8-row build only; the wide build keeps ``WIDE_OPTIONS``'s ``num_stages``.
+#: Ranges: a weight stage is 18 KiB of shared memory next to 72 KiB of activation stages, so
+#: nine do not fit in 227 KiB; the accumulator stages are TMEM columns (``acc_stages * ntok
+#: <= 64``, ntok 16 for the wide build). Every field is meant only to reorder or retime work:
+#: each output tile keeps one accumulator over K ascending, so the results are intended to
+#: match the default.
+OPTIONS_ENV = "MUSESPARK_OPEN_PERSISTENT_EXPERTS_OPTIONS"
+TACTIC_RANGES: Dict[str, Tuple[int, int]] = {
+    "num_stages": (1, 8),
+    "acc_stages": (1, 4),
+    "balance": (0, 1),
+    "order": (0, 1),
+    "publish": (0, 1),
+    "handoff": (0, 1),
 }
 
 _LOCK = threading.Lock()
@@ -140,13 +160,40 @@ def _resident_sms(device: torch.device) -> int:
     return sms
 
 
-def _device_options(device: torch.device) -> Dict[str, int]:
-    """``OPTIONS`` with ``device``'s compute-capability changes (``OPTIONS_BY_SM``) applied.
-
-    The capability is read once per device.
+def _env_options(environ=os.environ) -> Dict[str, int]:
+    """The ``OPTIONS_ENV`` overrides (``"key=value,..."``, ``TACTIC_RANGES`` keys).
 
     Raises:
-        ValueError: on a device of another compute capability.
+        ValueError: on an unknown or repeated key, a non-integer value or one out of range.
+    """
+    out: Dict[str, int] = {}
+    for item in (i.strip() for i in environ.get(OPTIONS_ENV, "").split(",")):
+        if not item:
+            continue
+        key, _, text = item.partition("=")
+        key = key.strip()
+        if key not in TACTIC_RANGES or key in out:
+            raise ValueError(f"{OPTIONS_ENV}: {item!r} is not a new key of {sorted(TACTIC_RANGES)}")
+        low, high = TACTIC_RANGES[key]
+        try:
+            value = int(text)
+        except ValueError:
+            value = low - 1
+        if not low <= value <= high:
+            raise ValueError(f"{OPTIONS_ENV}: {item!r} needs an integer in [{low}, {high}]")
+        out[key] = value
+    return out
+
+
+def _device_options(device: torch.device) -> Dict[str, int]:
+    """``OPTIONS`` with ``device``'s compute-capability changes (``OPTIONS_BY_SM``) and the
+    ``OPTIONS_ENV`` overrides applied.
+
+    The capability and the environment are read once per device; the overrides, when there
+    are any, are logged then.
+
+    Raises:
+        ValueError: on a device of another compute capability, or an illegal override.
     """
     index = _device_index(device)
     changes = _DEVICE_OPTIONS.get(index)
@@ -158,6 +205,13 @@ def _device_options(device: torch.device) -> Dict[str, int]:
                 f"persistent_experts: no kernel options for SM {capability} "
                 f"(supported: {sorted(OPTIONS_BY_SM)})"
             )
+        overrides = _env_options()
+        if overrides:
+            logger.info(
+                f"[musespark_open] persistent_experts: {OPTIONS_ENV} overrides {overrides} "
+                f"(kernel options { ({**OPTIONS, **changes, **overrides}) }, SM {capability})"
+            )
+        changes = {**changes, **overrides}
         _DEVICE_OPTIONS[index] = changes
     return {**OPTIONS, **changes}
 
