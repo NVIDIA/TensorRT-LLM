@@ -112,5 +112,39 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     )
 
 
+def test_qwen3_vl_attached_embeddings_are_hashed_by_content():
+    hidden_size = 8
+    config = _make_qwen3_vl_config(hidden_size)
+    embedding_width = hidden_size * (
+        1 + len(config.vision_config.deepstack_visual_indexes))
+    tokenizer = _make_tokenizer([
+        7,
+        config.vision_start_token_id,
+        config.image_token_id,
+        config.vision_end_token_id,
+        8,
+    ])
+    processor = _make_qwen3_vl_processor(config, tokenizer)
+
+    def attach(image_embedding):
+        _, extra_processed_inputs = processor.attach_multimodal_embeddings(
+            {"prompt": "Describe this image."},
+            {"image": [image_embedding]},
+            SamplingParams(),
+        )
+        return extra_processed_inputs["multimodal_input"]
+
+    image_embedding = torch.arange(4 * embedding_width, dtype=torch.bfloat16)
+    image_embedding = image_embedding.reshape(4, embedding_width)
+    multimodal_input = attach(image_embedding)
+    hashes = multimodal_input.multimodal_hashes
+
+    # Block reuse keys the image tokens, after <vision_start>, by these hashes.
+    assert multimodal_input.multimodal_positions == [1]
+    assert multimodal_input.multimodal_lengths == [5]
+    assert attach(image_embedding.clone()).multimodal_hashes == hashes
+    assert attach(image_embedding + 1).multimodal_hashes != hashes
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
