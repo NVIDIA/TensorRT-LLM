@@ -3,7 +3,7 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0 -->
 <title>ISER-MoE in one MoE layer</title>
-<desc>(a) Per-layer schedule on one rank: a high-priority COPY stream runs the HALO-Q scheduler and the in-switch weight replication beside the shared expert, and only MegaMoE's helper tiles wait at the READY gate; (b) HALO-Q's two objectives, balance and locality; (c) SAMI, multi-port in-switch broadcast in two pipelined steps; (d) multi-level symmetric multicast groups.</desc>
+<desc>(a) Per-layer schedule on one rank: a high-priority COPY stream runs the HALO-Q scheduler and the in-switch weight replication beside the shared expert, and only MegaMoE's helper tiles wait at the READY gate; (b) HALO-Q's two objectives, balance and locality; (c) SAMI, multi-port in-switch broadcast in two pipelined steps; (d) the original 16/8/4-rank reference levels; PR #21373 adds aligned pairs, illustrated separately in Figure 12.</desc>
 <rect x="-24" y="-24" width="552.468" height="398.899" fill="#ffffff"/>
 <defs>
 <g>
