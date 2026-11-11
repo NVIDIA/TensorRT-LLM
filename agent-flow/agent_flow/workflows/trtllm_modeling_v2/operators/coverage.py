@@ -29,7 +29,6 @@ CATALOG_TESTS_DIR = "tests/unittest/_torch/modeling_v2"
 MODEL_OPS_DIRNAME = "ops"
 #: Where a target's CI accuracy test and its test list entry live.
 INTEGRATION_TESTS_DIR = "tests/integration"
-STATE_OK, STATE_CERT, STATE_GAP = STATES = ("OK", "CERT", "GAP")
 MODE_ONBOARD, MODE_VERIFY = MODES = ("onboard", "verify")
 VERDICTS = ("assemblable", "assemblable_after_additions", "ceiling")
 VERDICT_ASSEMBLABLE, VERDICT_AFTER_ADDITIONS, VERDICT_CEILING = VERDICTS
@@ -44,9 +43,6 @@ UNIT_CORE = "core"
 MAX_ROW_CELLS = 64
 #: Where a GAP's implementation may come from, cheapest first (``agents/prompts`` says each).
 TIERS = (1, 2, 3, 4, 5)
-TIER_TRTLLM_OP, TIER_INTREE_CALLABLE, TIER_KERNEL_LIBRARY, TIER_NATIVE_TORCH, TIER_TRITON = TIERS
-#: A tier above this is work this run writes rather than wraps.
-HIGHEST_REUSING_TIER = TIER_KERNEL_LIBRARY
 
 
 class VocabularyError(ValueError):
@@ -70,7 +66,7 @@ class QueueItem:
     surface: str | None = None
     note: str = ""
     #: Which rung of the sourcing ladder supplies this entry.
-    tier: int = TIER_TRTLLM_OP
+    tier: int = TIERS[0]
     #: The first unit of work that needs this entry: what a failed dispatch blocks.
     unit: str = UNIT_CORE
     #: The call site a shared entry's local variant is named for; ``r<n>`` when none is named.
@@ -108,11 +104,11 @@ def _row(at: str, row: Mapping[str, Any], n: int, bad, units) -> QueueItem:
             f"dtype, each call site's rows at the smallest and largest captured batch, per-rank "
             f"sizes, one chunk at max_num_tokens) from a base cell, not their product"
         )
-    tier = row.get("tier", TIER_TRTLLM_OP)
+    tier = row.get("tier", TIERS[0])
     tier = int(tier) if str(tier).strip().isdigit() else 0
     if tier not in TIERS:
         bad(f"{at}.tier is {row.get('tier')!r}; expected one of {TIERS}")
-        tier = TIER_TRTLLM_OP
+        tier = TIERS[0]
     unit = UNIT_CORE if row.get("unit") is None else row["unit"]
     unit = unit.strip() if isinstance(unit, str) else unit
     if not (isinstance(unit, str) and unit) or (units is not None and unit not in units):

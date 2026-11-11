@@ -14,7 +14,7 @@ def _ok_step(**overrides):
     step = {
         "step": "rmsnorm_q",
         "values": {"dtype": "bf16", "head_dim": 128},
-        "state": vocab.STATE_OK,
+        "state": "OK",
         "entry": "catalog/norm/flashinfer_rmsnorm.py",
         "contract_line": "certified: sm_103, bf16, head_dim in {64, 128}",
     }
@@ -55,7 +55,7 @@ def test_a_row_covers_each_axis_not_their_product():
         }
         return _doc(
             verdict=vocab.VERDICT_AFTER_ADDITIONS,
-            steps=[_ok_step(state=vocab.STATE_CERT)],
+            steps=[_ok_step(state="CERT")],
             queue=[row],
         )
 
@@ -68,7 +68,7 @@ def test_a_row_covers_each_axis_not_their_product():
 def test_bad_queue_tiers_are_batched_as_vocabulary_errors(tier):
     doc = _doc(
         verdict=vocab.VERDICT_AFTER_ADDITIONS,
-        steps=[_ok_step(state=vocab.STATE_CERT)],
+        steps=[_ok_step(state="CERT")],
         queue=[
             {"n": 1, "mode": "verify", "target": "gemm/cublas_mm", "surface": "k=64", "tier": tier}
         ],

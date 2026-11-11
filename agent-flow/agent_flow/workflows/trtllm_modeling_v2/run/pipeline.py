@@ -50,6 +50,7 @@ from ..checks import anchors as anchors_mod
 from ..checks import conventions, gate_cli
 from ..infra.files import write_text_atomic
 from ..operators.coverage import (
+    MODE_ONBOARD,
     MODELING_V2_PACKAGE,
     QueueItem,
     VocabularyError,
@@ -618,7 +619,7 @@ class Pipeline:
             n=item.n,
             mode=item.mode,
             entry=item.target,
-            onboard=item.mode == "onboard",
+            onboard=item.mode == MODE_ONBOARD,
             row_note=(item.note or "").strip(),
             surface=item.surface or "",
             cells=row.get("cells") or "",

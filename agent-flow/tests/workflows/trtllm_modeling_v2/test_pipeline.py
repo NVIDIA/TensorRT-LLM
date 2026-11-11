@@ -21,7 +21,11 @@ from agent_flow.workflows.trtllm_modeling_v2.agents import prompts
 from agent_flow.workflows.trtllm_modeling_v2.agents.turns import TurnTimeout
 from agent_flow.workflows.trtllm_modeling_v2.checks import gate_cli
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
-from agent_flow.workflows.trtllm_modeling_v2.infra.git import CommitIdentity, CommitPolicy
+from agent_flow.workflows.trtllm_modeling_v2.infra.git import (
+    CommitIdentity,
+    CommitPolicy,
+    audit_commits,
+)
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem, rows_by_unit
 from agent_flow.workflows.trtllm_modeling_v2.run import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run import report as report_mod
@@ -1249,6 +1253,38 @@ def test_a_commit_lands_labelled_by_its_paths_and_only_a_judge_path_is_refused(t
     assert named.path_problem("refs/mtp.yaml") and named.path_problem("r/x.yaml")
     assert named.path_problem("tests/integration/defs/accuracy/references/gsm8k.yaml")
     assert not named.path_problem("tests/integration/defs/accuracy/test_llm_api_pytorch.py")
+
+
+def test_the_audit_finds_every_kind_of_commit_the_rules_refuse(tmp_path):
+    """On a real repository on purpose: the audit reads what git wrote."""
+    repo = _checkout(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+
+    def commit(message: str, path: str, link: str = "") -> str:
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).symlink_to(link) if link else (repo / path).write_text("x\n")
+        _git(repo, "add", path)
+        _git(repo, "commit", "-q", "-m", message)
+        return _git(repo, "rev-parse", "HEAD")
+
+    good = commit(f"good{_SIGNED}", "good.py")
+    unsigned = commit("unsigned", "unsigned.py")
+    other = commit("mismatch\n\nSigned-off-by: Operator <op@example.invalid>", "mismatch.py")
+    # Trailers are one block: the co-author sits right above the sign-off.
+    shared = commit(f"co\n\nCo-authored-by: Bot <b@example.invalid>\n{_SIGNED.strip()}", "co.py")
+    link = commit(f"link{_SIGNED}", "link", link="good.py")
+    placeholder = commit(f"ph{_SIGNED}", "pkg/.mcp.json")
+    findings = audit_commits(repo, f"{base}..HEAD")
+    by_sha: dict[str, list[str]] = {}
+    for finding in findings:
+        by_sha.setdefault(finding.sha, []).append(finding.problem)
+    assert good not in by_sha
+    assert by_sha[unsigned] == ["no Signed-off-by"]
+    assert "no sign-off carries the author email" in by_sha[other][0]
+    assert by_sha[shared] == ["carries Co-authored-by"]
+    assert by_sha[link] == ["adds a symlink: link"]
+    assert by_sha[placeholder] == ["adds a sandbox placeholder: pkg/.mcp.json"]
+    assert audit_commits(repo, f"{base}..HEAD", CommitPolicy(allow_co_authors=True)) != findings
 
 
 def test_the_judge_is_guarded_by_path_as_git_knows_it_and_by_what_lands(tmp_path):

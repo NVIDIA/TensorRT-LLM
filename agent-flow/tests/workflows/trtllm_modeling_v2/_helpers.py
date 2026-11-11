@@ -347,7 +347,7 @@ def _write_vocabulary(workspace: Path, queue):
         "steps": [
             {
                 "step": "norm",
-                "state": vocab.STATE_OK,
+                "state": "OK",
                 "entry": "catalog/norm/flashinfer_rmsnorm.py",
                 "contract_line": "certified sm_103 bf16",
             }
