@@ -22,11 +22,14 @@ Serves the generation phase of DSA layers (512 + 64 latent, e.g. GLM-5) whose la
 values with the E4M3 block scales in its loader, and runs FP8 QK/PV MMAs. Generation therefore needs
 neither the NVFP4-to-FP8 gather nor its scratch rows.
 
-``DSATrtllmAttention.sparse_attn_predict`` skips that gather when this library is in the layer's
-FMHA list and passes the layer's global top-k rows, which address the records relative to the
-primary pool base. The query is the E4M3 ``quant_q_buffer`` written by the MLA RoPE kernel with a
-unit scale; the records carry real-valued block scales, so the kernel needs no descale. The context
-phase keeps the gather and the TRTLLM-Gen kernels.
+``DSATrtllmAttention.sparse_attn_predict`` skips that gather when
+:func:`prims_ts_reads_nvfp4_mla_records` holds for the layer and passes the layer's global top-k
+rows, which address the records relative to the primary pool base. DSA metadata asks the same
+function before it leaves out the gather's FP8 rows. Where it does not hold (Helix, beam search, a
+layer whose FMHA list lacks this library, e.g. with skip-correction), the layer gathers and
+TRTLLM-Gen serves generation. The query is the E4M3 ``quant_q_buffer`` written by the MLA RoPE
+kernel with a unit scale; the records carry real-valued block scales, so the kernel needs no
+descale. The context phase keeps the gather and the TRTLLM-Gen kernels.
 """
 
 from __future__ import annotations
@@ -87,13 +90,54 @@ def uses_nvfp4_mla_record_cache(attn: "TrtllmAttention") -> bool:
     return get_nvfp4_mla_kv_cache_layout() == NVFP4_MLA_RECORD_LAYOUT
 
 
-def prims_ts_reads_nvfp4_mla_records() -> bool:
-    """Whether DSA generation over NVFP4 records runs on :class:`PrimsTSDsaSparseMlaFmha` here.
+def _metadata_unsupported_reason(metadata) -> Optional[str]:
+    """Why no generation with this metadata can read NVFP4 records in place, if so."""
+    from ..sparse.dsa.cache_manager import NVFP4_MLA_RECORD_LAYOUT
 
-    The process-wide half of its availability check: the library is enabled, and the GPU and the
-    CuTe DSL toolchain can run it. Every layer the record layout admits (DSA with a 512 + 64
-    latent) passes the per-layer half, so DSA metadata can skip the gather's FP8 rows.
+    manager = getattr(metadata, "kv_cache_manager", None)
+    if getattr(manager, "mla_kv_cache_layout", None) != NVFP4_MLA_RECORD_LAYOUT:
+        return f"the KV cache manager does not use the {NVFP4_MLA_RECORD_LAYOUT!r} layout."
+    if getattr(metadata, "beam_width", 1) != 1:
+        return "beam search is not supported."
+    mapping = getattr(metadata, "mapping", None)
+    if (mapping is not None and mapping.has_cp_helix()) or getattr(
+        metadata, "helix_position_offsets", None
+    ) is not None:
+        return "Helix parallelism is not supported."
+    return None
+
+
+def _layer_lists_library(attn: "TrtllmAttention") -> bool:
+    """Whether the layer's FMHA list holds :class:`PrimsTSDsaSparseMlaFmha` (cached per list)."""
+    manager = getattr(attn, "_fmha_manager", None)
+    cached = getattr(attn, "_prims_ts_record_reader", None)
+    if cached is None or cached[0] is not manager:
+        listed = manager is not None and any(
+            isinstance(fmha, PrimsTSDsaSparseMlaFmha) for fmha in manager.fmha_libs
+        )
+        cached = (manager, listed)
+        attn._prims_ts_record_reader = cached
+    return cached[1]
+
+
+def prims_ts_reads_nvfp4_mla_records(metadata, attn: Optional["TrtllmAttention"] = None) -> bool:
+    """Whether DSA generation reads the NVFP4 records in place on :class:`PrimsTSDsaSparseMlaFmha`.
+
+    The one decision behind both gather skips, so they agree with each other and with what the
+    library serves. ``DSATrtllmAttention.sparse_attn_predict`` passes its layer and skips the
+    gather when this holds. DSA metadata asks without a layer, before the layers are known to
+    it, and then leaves out the gather's FP8 rows; a layer that gathers nevertheless (its FMHA
+    list lacks the library: skip-correction, an unsupported head count) has them allocated by
+    ``DSAtrtllmAttentionMetadata.ensure_nvfp4_mla_generation_buffers``.
+
+    Without a layer: the cache holds records, the metadata rules out neither beam search nor
+    Helix, the library is enabled, and the GPU and the CuTe DSL toolchain can run it. With a
+    layer: the same metadata conditions, and the layer's FMHA list holds the library.
     """
+    if _metadata_unsupported_reason(metadata) is not None:
+        return False
+    if attn is not None:
+        return _layer_lists_library(attn)
     from .registry import get_enabled_fmha_lib_classes
 
     if PrimsTSDsaSparseMlaFmha not in get_enabled_fmha_lib_classes():
@@ -185,21 +229,17 @@ class PrimsTSDsaSparseMlaFmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         fwd: AttentionForwardArgs,
     ) -> Optional[str]:
-        from ..sparse.dsa.cache_manager import NVFP4_MLA_RECORD_LAYOUT
-
         attn = self.attn
         if k is not None or v is not None:
             return "MLA generation takes a fused query only."
         if q.device.type != "cuda" or q.ndim != 2:
             return "the query must be a rank-2 CUDA tensor."
-        manager = metadata.kv_cache_manager
-        if getattr(manager, "mla_kv_cache_layout", None) != NVFP4_MLA_RECORD_LAYOUT:
-            return f"the KV cache manager does not use the {NVFP4_MLA_RECORD_LAYOUT!r} layout."
-        if metadata.beam_width != 1:
-            return "beam search is not supported."
+        reason = _metadata_unsupported_reason(metadata)
+        if reason is not None:
+            return reason
         if fwd.attention_mask_data is not None or fwd.relative_attention_bias is not None:
             return "custom masks and relative bias are not supported."
-        if metadata.helix_position_offsets is not None or fwd.softmax_stats_tensor is not None:
+        if fwd.softmax_stats_tensor is not None:
             return "Helix parallelism is not supported."
         if fwd.attention_sinks is not None:
             return "attention sinks are not supported."
