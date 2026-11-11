@@ -507,7 +507,9 @@ def test_selfsampling_topk_varlen_main_streaming_short_rows():
     sorted_indices = torch.sort(full_indices, dim=1).values
     assert bool((sorted_indices[:, 1:] != sorted_indices[:, :-1]).all())
     got = torch.sort(torch.gather(logits[2:], 1, full_indices), dim=1, descending=True).values
-    expected = torch.sort(torch.topk(logits[2:], top_k, dim=1).values, dim=1, descending=True).values
+    expected = torch.sort(
+        torch.topk(logits[2:], top_k, dim=1).values, dim=1, descending=True
+    ).values
     assert torch.equal(got, expected), "main streaming path returned an inexact top-K"
 
 
