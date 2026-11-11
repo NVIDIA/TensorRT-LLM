@@ -5391,7 +5391,16 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
     return num_experts
 
 
-def _adjust_torch_mem_fraction():
+_DEFAULT_TORCH_MEM_SAFETY_MARGIN = 1024**3
+
+
+def _adjust_torch_mem_fraction(safety_margin: Optional[int] = None):
+    """Cap PyTorch at the memory free at setup plus its reserve, minus a safety margin.
+
+    ``safety_margin`` is the model's declared margin in bytes
+    (``RuntimeHooks.torch_mem_safety_margin``); None uses 1 GiB. Either is
+    clamped to the memory free at this point.
+    """
     # If true, adjust PyTorch CUDA memory fraction to correspond to the
     # total GPU memory minus the statically allocated engine memory.
     # If false, set the PyTorch CUDA memory fraction to 1.0.
@@ -5432,7 +5441,9 @@ def _adjust_torch_mem_fraction():
     # Keep room outside the PyTorch cap for driver allocations made after setup
     # (streams, events, copy launches in the KV cache manager and transfer agents),
     # up to the free memory, so the cap never drops below what PyTorch holds.
-    safety_margin = min(1024**3, mem_free)
+    if safety_margin is None:
+        safety_margin = _DEFAULT_TORCH_MEM_SAFETY_MARGIN
+    safety_margin = min(safety_margin, mem_free)
     mem_torch_max = mem_free + mem_reserved - safety_margin
     mem_torch_fraction = mem_torch_max / mem_total
     logger.info(

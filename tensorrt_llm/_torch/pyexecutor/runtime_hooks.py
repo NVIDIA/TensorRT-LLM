@@ -7,9 +7,13 @@ attribute). Every field defaults to off, and a model that declares nothing gets
 ``RuntimeHooks()``: the step loop, the samplers and the attention metadata then
 run exactly as they do without this module.
 
-The hooks change *where* and *how* the step loop moves data, never what a
-forward computes. Each one is armed only by a model that has measured it on its
-own deployment; none is a general default.
+The hooks change *where* and *how* the step loop moves data, or how the engine
+sizes and manages its resources (device memory, cache pages, scheduling), never
+what a forward computes. Each one is armed only by a model that has measured it
+on its own deployment; none is a general default.
+
+A modeling-v2 target declares them on the registered (outer) model class, the
+class the loader resolves and the engine holds as ``model_engine.model``.
 """
 
 from __future__ import annotations
@@ -255,6 +259,11 @@ class RuntimeHooks:
     iteration_timing_one_event: bool = False
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
+    # Device memory, in bytes, the executor leaves outside the PyTorch cap for driver allocations made after
+    # setup (streams, events, copy launches of the KV cache manager and transfer agents, CUDA IPC mappings of
+    # peer buffers, kernel attribute and module loads), up to the memory free at that point. None keeps the
+    # engine's default margin (1 GiB). The KV cache budget does not change.
+    torch_mem_safety_margin: Optional[int] = None
 
     @property
     def skips_unchanged_metadata_uploads(self) -> bool:

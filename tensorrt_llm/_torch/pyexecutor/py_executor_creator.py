@@ -67,6 +67,7 @@ from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .runtime_hooks import runtime_hooks_of
 from .scheduler import gen_preemption
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
@@ -1505,7 +1506,8 @@ def _create_py_executor(
             py_executor.shutdown()
             raise
 
-    _adjust_torch_mem_fraction()
+    _adjust_torch_mem_fraction(
+        runtime_hooks_of(model_engine.model).torch_mem_safety_margin)
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
