@@ -249,8 +249,15 @@ Ask with one multi-select question:
 
 1. Show the complete YAML and ask for changes.
 2. Propose a new workspace directory, as a full path, for the user to
-   confirm or replace: `<trtllm_repo_path>/agent-flow/workspace/<name>`
-   (agent-flow's `.gitignore` excludes `workspace/`). `<name>` is the
+   confirm or replace: `<agent-flow>/workspace/<name>`, where
+   `<agent-flow>` is the agent-flow directory the user's workflow command
+   is installed from (the parent of the `agent_flow` package that the
+   command's Python imports; `workspace/` is in agent-flow's `.gitignore`).
+   When that directory is inside `trtllm_repo_path`, or no agent-flow is
+   installed yet, use the directory beside the checkout,
+   `<parent of trtllm_repo_path>/<name>`, and say why:
+   modeling-v2-onboard refuses a workspace inside the checkout, because its
+   final task commits everything untracked there. `<name>` is the
    checkpoint directory's name in lower case plus `-v2-onboard` when the
    user's agent-flow has `agent_flow/workflows/modeling_v2_onboard/`,
    `-bringup` otherwise; if that directory already exists, append `-2`,
@@ -276,10 +283,23 @@ Ask with one multi-select question:
    node. Skipping it starts the run sooner: the run's environment task makes
    the same checks once the planner has started. If the user wants it, add
    `--smoke` to the check command and report its result.
-5. Give the run command:
-   `modeling-bringup --task <workspace>/task.yaml --workspace <workspace>`.
-   Mention `modeling-v2-onboard` (same arguments) only when the user's
-   agent-flow has `agent_flow/workflows/modeling_v2_onboard/`.
+5. Run command.
+   - **modeling-v2-onboard** (when the user's agent-flow has
+     `agent_flow/workflows/modeling_v2_onboard/`): ask which backend the
+     run's planner and workers use, Claude Code (the default) or Codex,
+     then give the command:
+     `modeling-v2-onboard --task <workspace>/task.yaml --workspace <workspace>`,
+     with `--backend codex` added for Codex.
+   - **Otherwise:** give
+     `modeling-bringup --task <workspace>/task.yaml --workspace <workspace>`;
+     its roles' backends are set by the workflow, so there is nothing to
+     choose.
+
+   Then ask whether to start the run now from this session. If yes, start
+   it detached, so it outlives this conversation:
+   `setsid nohup <command> > <workspace>/launch.log 2>&1 &`. Report its
+   PID and the log path, and say that rerunning the same command resumes
+   the run. If no, the user runs the command themselves.
 
 ## Sentence library
 
