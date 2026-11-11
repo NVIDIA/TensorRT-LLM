@@ -83,17 +83,19 @@ below one in a few layers: GLM-5.3 has an RMS of 0.003 to 0.01 in its first eigh
 layers. Such values fall under the smallest normal E4M3 number (2^-6), so an FP8
 latent, and the block scales of an NVFP4 latent, keep almost no precision there.
 
-When the KV cache is NVFP4, the PyTorch backend therefore multiplies
-`kv_a_layernorm.weight` of each layer by a power of two that brings the latent to
-an RMS of about one, and divides `kv_b_proj` by the same factor while loading the
-weights. The model output is unchanged; only the values the cache stores move
-into the range the quantized formats resolve. Layers whose `kv_b_proj` is itself
-quantized are left as they are.
+For models with DeepSeek sparse attention (DSA) and an NVFP4 KV cache, the PyTorch
+backend therefore multiplies `kv_a_layernorm.weight` of each layer by a power of
+two that brings the latent to an RMS of about one, and divides `kv_b_proj` by the
+same factor while loading the weights. The model output is unchanged; only the
+values the cache stores move into the range the quantized formats resolve. Layers
+whose `kv_b_proj` is itself quantized are left as they are. Dense MLA is not
+scaled by default: it multiplies the NVFP4 latent as block-scaled operands, which
+a power-of-two scale leaves unchanged.
 
 `TRTLLM_MLA_LATENT_SCALE` controls this: `auto` (default) brings the latent of an
-NVFP4 KV cache to an RMS of 1.0, a positive number brings the latent of any
-quantized KV cache (FP8 included) to that RMS, and `off` loads the weights
-unchanged.
+NVFP4 KV cache of a DSA model to an RMS of 1.0, a positive number brings the
+latent of any quantized KV cache (FP8 and dense MLA included) to that RMS, and
+`off` loads the weights unchanged.
 The setting changes the values stored in the KV cache, so servers that exchange
 KV caches, such as the context and generation servers of a disaggregated
 deployment, must use the same one.

@@ -167,7 +167,8 @@ _MLA_LATENT_SCALE_ENV = "TRTLLM_MLA_LATENT_SCALE"
 _MLA_LATENT_SCALE_DEFAULT = "auto"
 
 
-def _mla_latent_scales(weights, quant_mode: QuantMode) -> Dict[str, float]:
+def _mla_latent_scales(weights, quant_mode: QuantMode,
+                       uses_dsa: bool) -> Dict[str, float]:
     """Per attention module, a power of two for its NoPE latent.
 
     ``kv_a_layernorm.weight`` sets the magnitude of the latent that the KV
@@ -177,18 +178,23 @@ def _mla_latent_scales(weights, quant_mode: QuantMode) -> Dict[str, float]:
     output unchanged and moves the latent into the range a quantized KV cache
     resolves.
 
+    DeepSeek sparse attention (DSA) hands the cached NVFP4 latent to its
+    attention kernels as E4M3 values, which is where a small latent loses
+    precision. Dense MLA multiplies the NVFP4 latent as block-scaled operands,
+    which a power-of-two scale leaves unchanged.
+
     ``TRTLLM_MLA_LATENT_SCALE`` selects which KV caches are scaled and to
-    which RMS: ``auto`` (default) brings the latent of an NVFP4 KV cache to
-    1.0, a number brings the latent of any quantized KV cache to that RMS, and
-    ``off`` scales nothing. Modules whose ``kv_b_proj`` is quantized itself
-    are left alone.
+    which RMS: ``auto`` (default) brings the latent of an NVFP4 KV cache of a
+    DSA model to 1.0, a number brings the latent of any quantized KV cache to
+    that RMS, and ``off`` scales nothing. Modules whose ``kv_b_proj`` is
+    quantized itself are left alone.
     """
     mode = os.environ.get(_MLA_LATENT_SCALE_ENV, _MLA_LATENT_SCALE_DEFAULT)
     if mode == "off":
         return {}
     if mode == "auto":
         target = 1.0
-        scaled = quant_mode.has_fp4_kv_cache()
+        scaled = uses_dsa and quant_mode.has_fp4_kv_cache()
     else:
         try:
             target = float(mode)
@@ -426,8 +432,12 @@ class DeepseekV3WeightLoader:
             return model_nextn > (ckpt_num_nextn_predict_layers or 0) > 0
 
         has_shared_mtp_weights = detect_shared_mtp_weights()
+        sparse_attention_config = self.model_config.sparse_attention_config
         latent_scales = _mla_latent_scales(
-            weights, self.model_config.quant_config.layer_quant_mode)
+            weights,
+            self.model_config.quant_config.layer_quant_mode,
+            uses_dsa=getattr(sparse_attention_config, "algorithm",
+                             None) == "dsa")
         if any(scale != 1.0 for scale in latent_scales.values()):
             logger.info("MLA latent scales: " + ", ".join(
                 f"{name}:{scale:g}"
