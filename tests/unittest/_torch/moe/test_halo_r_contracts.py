@@ -580,8 +580,11 @@ def test_each_launch_takes_the_spin_bound_of_its_moment(
         spin_bound=SimpleNamespace(cycles=lambda: bound.cycles(), warmup_cycles=warmup_cycles),
     )
     bound = SchedulerSpinBound(
-        warmup_seconds=guard.budgets().warmup_seconds, is_tuning=lambda: tuning[0]
+        warmup_seconds=guard.budgets().warmup_seconds,
+        is_tuning=lambda: tuning[0],
+        planner_name="HALO-R",
     )
+    assert bound.name == "per-layer dynamic EPLB HALO-R"
     assert bound.warmup_cycles == warmup_cycles
     guard.register(bound)
 

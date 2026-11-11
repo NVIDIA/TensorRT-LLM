@@ -51,15 +51,18 @@ class SchedulerSpinBound:
     Args:
         warmup_seconds: The MoE communication warmup timeout.
         is_tuning: Returns whether kernels are being profiled.
+        planner_name: The planner whose scheduler waits, such as "HALO-Q"; it
+            names the bound in the timeout logs.
     """
 
-    name = "per-layer dynamic EPLB HALO-Q"
-
-    def __init__(self, *, warmup_seconds: int, is_tuning: Callable[[], bool]) -> None:
+    def __init__(
+        self, *, warmup_seconds: int, is_tuning: Callable[[], bool], planner_name: str
+    ) -> None:
         from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler.runtime import (
             spin_cycles_for_timeout,
         )
 
+        self.name = f"per-layer dynamic EPLB {planner_name}"
         self._spin_cycles_for_timeout = spin_cycles_for_timeout
         self._is_tuning = is_tuning
         self.warmup_cycles = spin_cycles_for_timeout(warmup_seconds)
@@ -104,13 +107,18 @@ class _LiveBankLeaseProvider:
             or group._scheduled_generation != generation + 1
             or group.scheduler_stream is not group.copy_stream
         ):
-            raise RuntimeError("Live-bank reuse lacks the consumer/HALO-Q ordering chain")
+            raise RuntimeError(
+                f"Live-bank reuse lacks the consumer/{group.planner_name} ordering chain"
+            )
         self.bound_copy_module.mark_collective_reuse_safe(self, generation)
         self.proved_generation = generation
 
 
 class RebalanceSlotSchedulerGroup:
     """One layer's scheduler, copy endpoint, and paired consumer generations."""
+
+    # Names the planner in this group's errors.
+    planner_name = "HALO-Q"
 
     def __init__(
         self,
@@ -355,7 +363,9 @@ class RebalanceSlotSchedulerGroup:
             raise RuntimeError("Previous rebalance plan has no paired finish")
         if self._routes_in_flight is not None:
             # Only a failed submission leaves routes that MAIN never waited for.
-            raise RuntimeError("Routes of an earlier HALO-Q launch were never ordered on MAIN")
+            raise RuntimeError(
+                f"Routes of an earlier {self.planner_name} launch were never ordered on MAIN"
+            )
         if (
             not isinstance(logical_expert_ids, torch.Tensor)
             or logical_expert_ids.ndim != 2
@@ -386,7 +396,7 @@ class RebalanceSlotSchedulerGroup:
             spin_cycles=self._spin_bound.cycles(),
         )
         if generation != self._scheduled_generation:
-            raise RuntimeError("TMA and HALO-Q generation mismatch")
+            raise RuntimeError(f"Copy endpoint and {self.planner_name} generation mismatch")
         self._route_target = route_target
         self._generation = generation
         part = (outputs, num_tokens)

@@ -1543,7 +1543,12 @@ def test_scheduler_spin_bound_follows_warmup_transitions_and_autotuning(
         {"Callable": Any, "Optional": Optional},
     )
     tuning = [False]
-    bound = bound_cls(warmup_seconds=guard.budgets().warmup_seconds, is_tuning=lambda: tuning[0])
+    bound = bound_cls(
+        warmup_seconds=guard.budgets().warmup_seconds,
+        is_tuning=lambda: tuning[0],
+        planner_name="HALO-Q",
+    )
+    assert bound.name == "per-layer dynamic EPLB HALO-Q"
     guard.register(bound)
 
     # The engine starts in serving; its warmup transitions switch the bound.

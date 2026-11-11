@@ -152,7 +152,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         return self._ep_comm
 
     def get_scheduler_spin_bound(self) -> Any:
-        """Return the HALO-Q spin bound shared by this model's layers.
+        """Return the spin bound of this model's planner, shared by its layers.
 
         It is registered with the MoE communication timeout guard, which
         lengthens it while the engine warms up.
@@ -168,6 +168,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
             spin_bound = SchedulerSpinBound(
                 warmup_seconds=get_moe_comm_timeout_budgets().warmup_seconds,
                 is_tuning=lambda: AutoTuner.get().is_tuning_mode,
+                planner_name=self.planner.upper().replace("_", "-"),
             )
             register_moe_comm_timeout_proxy(spin_bound)
             self._scheduler_spin_bound = spin_bound

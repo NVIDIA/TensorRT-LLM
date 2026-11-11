@@ -439,6 +439,8 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
     It adds ``forget_helper_residency`` for weight reloads.
     """
 
+    planner_name = "HALO-R"
+
     def forget_helper_residency(self) -> None:
         """Forget which expert each helper slot holds after the expert weights were rewritten.
 
