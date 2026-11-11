@@ -22,10 +22,10 @@
 #include "kv_cache_manager_v2/evictionController.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/storagePolicy.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
-#include "kv_cache_manager_v2/utils/smallVector.h"
 
 #include <chrono>
 #include <functional>
@@ -223,9 +223,7 @@ public:
     // Append a finish event, merging when count exceeds 32 to prevent unbounded growth.
     void notifyFinish(CachedCudaEvent event);
 
-    // Inline room for a request-private page's finish events; only shared prefix pages spill to
-    // the heap.
-    using FinishEvents = SmallVector<CachedCudaEvent, 2>;
+    using FinishEvents = FinishEventVec<CachedCudaEvent>;
 
     SharedPtr<PageHolder> holder;
     FinishEvents finishEvents;

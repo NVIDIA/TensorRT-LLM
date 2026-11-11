@@ -28,7 +28,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+namespace tensorrt_llm::common
 {
 
 //! A move-only vector holding up to N elements inline and moving to the heap beyond that.
@@ -324,4 +324,4 @@ private:
     uint32_t mCapacity = N;
 };
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+} // namespace tensorrt_llm::common

@@ -25,9 +25,9 @@
 #include "kv_cache_manager_v2/pendingStats.h"
 #include "kv_cache_manager_v2/sparseCache.h"
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
+#include "kv_cache_manager_v2/storagePolicy.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
-#include "kv_cache_manager_v2/utils/smallVector.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -157,10 +157,8 @@ private:
 // pages[beamIdx][lcId] tracks who holds/locks each page.
 // treeBlock: non-null only for committed blocks (strong ref in rare cases).
 // ---------------------------------------------------------------------------
-// Held inside the block for up to four life cycles and one beam, so that walking a request's
-// blocks stays local in memory; more life cycles or beams spill to the heap.
-using LifeCycleBlockPages = TypedVec<LifeCycleId, BlockPage, SmallVector<BlockPage, 4>>;
-using BeamBlockPages = TypedVec<BeamIndex, LifeCycleBlockPages, SmallVector<LifeCycleBlockPages, 1>>;
+using LifeCycleBlockPages = LifeCycleVec<BlockPage>;
+using BeamBlockPages = BeamVec<LifeCycleBlockPages>;
 
 struct SeqBlock
 {
