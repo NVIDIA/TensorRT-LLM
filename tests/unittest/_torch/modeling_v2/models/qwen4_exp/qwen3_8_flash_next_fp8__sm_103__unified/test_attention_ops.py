@@ -1979,7 +1979,9 @@ def _prl_site(monkeypatch, built, prologue, site):
                 position_cache=position,
             )
             vectors = (qsa[0], qsa[1], qsa[6], qsa[7], qsa[8], qsa[9], qsa[10])
-            qkv, gate, iq = M._mtp_attention_planes(core, L, x, draft, vectors, p, True, True)
+            qkv, gate, iq = M._mtp_attention_planes(
+                core, L, x, draft, vectors, p, True, True, M._decode_projection
+            )
     torch.cuda.synchronize()
     if site == "trunk":
         got = dict(out=out, qkv=qkv, iq=M._index_query(core, scratch).clone())
