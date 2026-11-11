@@ -157,10 +157,16 @@ def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> 
     request.py_logprobs_simple_format = enabled
     request.py_return_routed_experts = enabled
     request.py_original_end_id = original_end_id
+    request.py_context_logits_explicit = enabled
+    request.py_prompt_logprobs = 3 if enabled else 0
+    request.py_prompt_logprobs_simple_format = enabled
     request.py_arrival_time = 123.0
 
     restored = _broadcast_round_trip(request)
     for attribute in (
+        "py_context_logits_explicit",
+        "py_prompt_logprobs",
+        "py_prompt_logprobs_simple_format",
         "py_logprobs_mode",
         "py_logprobs_simple_format",
         "py_return_routed_experts",
@@ -172,6 +178,9 @@ def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> 
         )
 
     translated = executor_request_to_llm_request(42, restored, [], False)
+    assert translated.py_context_logits_explicit is enabled
+    assert translated.py_prompt_logprobs == request.py_prompt_logprobs
+    assert translated.py_prompt_logprobs_simple_format is enabled
     assert translated.py_logprobs_mode == request.py_logprobs_mode
     assert translated.py_logprobs_simple_format is enabled
     assert translated.py_return_routed_experts is enabled
