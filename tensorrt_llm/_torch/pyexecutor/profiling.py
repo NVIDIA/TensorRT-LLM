@@ -751,7 +751,6 @@ class PyExecutorProfileManager:
                         # pending" and reject a legitimate restart.
                         if executor._runtime_profile_pending_stop_iter == executor.iter_counter:
                             executor._runtime_profile_pending_stop_iter = None
-                active_enable_torch_trace = False
 
             # Capture per-loop timing whenever stats or the iter log
             # are enabled. The reading of the OTHER parity's event
