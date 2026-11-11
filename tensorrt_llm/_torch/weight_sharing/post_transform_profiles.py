@@ -87,6 +87,20 @@ QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3_5-dense-vl-complet
 # expert layouts differ per MoE implementation, so another implementation
 # needs its own ID.
 QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-moe-cutlass-target-layout-v1"
+# Stable contract for the unquantized DeepSeek-V3 MLA + MoE root: per layer the
+# MLA `kv_a_proj_with_mqa`, `q_proj` (or `q_a_proj`/`q_b_proj`), and
+# `kv_a_layernorm` as loaded; `kv_b_proj` re-laid out per tensor-parallel head
+# split as `[all K-nope rows; all V rows]`; the `k_b_proj_trans`
+# `[heads, kv_lora_rank, qk_nope_head_dim]` absorption weight; `v_b_proj` as a
+# view of the V rows of `kv_b_proj.weight`; a dense gated MLP in the first
+# layer; and, in every later layer, an fp32 `e_score_correction_bias` on the
+# replicated router, a fused gate-up shared-expert MLP, and CUTLASS routed
+# experts (`w3_w1_weight` with the up projection before the gate projection,
+# and `w2_weight`) partitioned by MoE TP or EP, plus target-only receiver
+# finalization. The shared experts stay separate from the routed experts.
+DEEPSEEK_V3_MLA_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1 = (
+    "trtllm-deepseek-v3-mla-cutlass-target-layout-v1"
+)
 _MISSING = object()
 
 
