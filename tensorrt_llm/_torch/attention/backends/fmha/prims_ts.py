@@ -38,11 +38,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
-from .utils import (
-    get_kv_page_offset,
-    get_multi_processor_count_for_device,
-    has_uniform_generation_query_lengths,
-)
+from .utils import get_kv_page_offset, get_multi_processor_count_for_device
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.context import (
@@ -61,6 +57,27 @@ if TYPE_CHECKING:
 
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _WORKSPACE_ALIGNMENT = 32
+
+
+def _has_uniform_generation_query_lengths(
+    metadata: "TrtllmAttentionMetadata", num_gen_tokens: int
+) -> bool:
+    """Check the fixed-query MLA caller contract using only host metadata."""
+    num_generations = metadata.num_generations
+    query_lens = metadata.seq_lens
+    if (
+        num_generations <= 0
+        or num_gen_tokens <= 0
+        or num_gen_tokens % num_generations
+        or query_lens is None
+        or query_lens.device.type != "cpu"
+        or query_lens.ndim != 1
+        or query_lens.numel() < metadata.num_contexts + num_generations
+    ):
+        return False
+    # Original prompt lengths do not describe this step's verification rows.
+    query_lens = query_lens[metadata.num_contexts : metadata.num_contexts + num_generations]
+    return bool((query_lens == num_gen_tokens // num_generations).all())
 
 
 def _mla_context_capacities(
@@ -561,8 +578,12 @@ class PrimsTSFmha(PhasedFmha):
             if seq_len_q > 1:
                 if mask_type != AttentionMaskType.causal:
                     return False, "MLA multi-token generation requires a causal mask."
-                if not has_uniform_generation_query_lengths(meta, num_gen_tokens):
-                    return False, "MLA generation requires uniform per-request query lengths."
+                # Selection-cache hits rely on the caller preserving fixed-width Q.
+                if not _has_uniform_generation_query_lengths(meta, num_gen_tokens):
+                    raise ValueError(
+                        "The fixed-query PrimTS MLA generation adapter requires uniform "
+                        "per-request query lengths."
+                    )
             stats = fwd.softmax_stats_tensor
             if is_helix and stats is None:
                 return False, "Helix MLA generation requires softmax statistics."

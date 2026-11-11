@@ -77,7 +77,7 @@ class _RemoteWorkers:
 
 
 @pytest.mark.parametrize("failure", [None, "constructor", "evaluation"])
-@pytest.mark.parametrize("variant", ["dspark", "bf16-kv", "fp8-kv"])
+@pytest.mark.parametrize("variant", ["dspark", "fp8-kv"])
 def test_strict_selection_reaches_existing_workers_and_is_restored(
     monkeypatch: pytest.MonkeyPatch, failure: str | None, variant: str
 ) -> None:
@@ -101,7 +101,7 @@ def test_strict_selection_reaches_existing_workers_and_is_restored(
             assert kwargs["tensor_parallel_size"] == n_workers
             kv_dtype = getattr(kwargs["kv_cache_config"], "dtype", "auto")
             if self.strict:
-                assert kv_dtype == ("auto" if variant == "bf16-kv" else "fp8")
+                assert kv_dtype == "fp8"
             overrides = kwargs.get("env_overrides") or {}
             # worker_main receives only the serialized LLM args, not the
             # pytest process's current environment.
@@ -169,7 +169,7 @@ def test_strict_selection_reaches_existing_workers_and_is_restored(
         if variant == "dspark":
             case.test_prims_ts_fp8_tep8(strict_patch)
         else:
-            case.test_prims_ts(variant == "fp8-kv", strict_patch)
+            case.test_prims_ts(strict_patch)
 
     run_baseline()
     strict_run = True

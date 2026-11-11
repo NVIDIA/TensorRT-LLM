@@ -16,7 +16,7 @@
 import gc
 import weakref
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -26,7 +26,6 @@ from tensorrt_llm._torch.attention.backends.fmha import manager as fmha_manager
 from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
-from tensorrt_llm._torch.attention.backends.fmha.utils import has_uniform_generation_query_lengths
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -56,7 +55,6 @@ def _make_metadata(
     num_ctx_tokens: int = 0,
     use_spec_decoding: bool = False,
     num_sparse_topk: int = 0,
-    seq_lens: torch.Tensor | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         num_contexts=num_contexts,
@@ -64,7 +62,6 @@ def _make_metadata(
         num_ctx_tokens=num_ctx_tokens,
         use_spec_decoding=use_spec_decoding,
         num_sparse_topk=num_sparse_topk,
-        seq_lens=seq_lens,
     )
 
 
@@ -233,103 +230,6 @@ def test_select_non_mla_fmha_preserves_registry_order() -> None:
 
     assert selected is non_phased_fmha
     assert events == [("support", "non-phased", None)]
-
-
-@pytest.mark.parametrize("uniform_first", [False, True])
-@pytest.mark.parametrize(
-    "input_type", [AttentionInputType.generation_only, AttentionInputType.mixed]
-)
-def test_fmha_cache_separates_uniform_and_ragged_generation(
-    uniform_first: bool, input_type: AttentionInputType
-) -> None:
-    events: list[tuple] = []
-    attn, manager = _make_manager()
-    attn.is_mla_enable = input_type == AttentionInputType.generation_only
-    num_tokens = 12 if attn.is_mla_enable else 15
-    uniform_only = FakeFmha(
-        attn,
-        "uniform-only",
-        events,
-        request_support_predicate=lambda q, metadata: has_uniform_generation_query_lengths(
-            metadata, q.shape[0] if attn.is_mla_enable else q.shape[0] - metadata.num_ctx_tokens
-        ),
-    )
-    fallback = FakeFmha(attn, "fallback", events)
-    manager.fmha_libs = [uniform_only, fallback]
-    metadata = _make_metadata(
-        num_contexts=1,
-        num_generations=2,
-        num_ctx_tokens=3,
-        seq_lens=torch.tensor([3, 6, 6], dtype=torch.int32),
-    )
-    q = torch.empty((num_tokens, 4))
-    forward_args = AttentionForwardArgs(attention_input_type=input_type)
-    order = (True, False) if uniform_first else (False, True)
-    selected = {}
-    keys = {}
-    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
-        for uniform in order + order:
-            metadata.seq_lens[1:].copy_(torch.tensor([6, 6] if uniform else [5, 7]))
-            keys[uniform] = manager._make_cache_key(q, metadata, forward_args)
-            selected[uniform] = manager.select(attn, q, None, None, metadata, forward_args)
-    assert selected == {True: uniform_only, False: fallback}
-    assert keys[True]._replace(generation_query_is_uniform=False) == keys[False]
-    assert len(manager._cache) == 2
-    assert events.count(("support", "uniform-only", None)) == 2
-    assert events.count(("support", "fallback", None)) == 1
-
-
-def test_context_cache_key_does_not_inspect_generation_query_lengths() -> None:
-    attn, manager = _make_manager()
-    attn.is_mla_enable = True
-    metadata = _make_metadata(num_contexts=1, num_generations=2, num_ctx_tokens=3)
-    q = torch.empty((3, 4))
-    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.context_only)
-    with patch.object(
-        fmha_manager,
-        "has_uniform_generation_query_lengths",
-        side_effect=AssertionError("context-only must not inspect generation rows"),
-    ):
-        metadata.seq_lens = torch.tensor([3, 6, 6])
-        uniform = manager._make_cache_key(q, metadata, forward_args)
-        metadata.seq_lens = torch.tensor([3, 5, 7])
-        ragged = manager._make_cache_key(q, metadata, forward_args)
-    assert uniform == ragged
-    assert uniform.generation_seq_len_q == 0
-
-
-@pytest.mark.parametrize(
-    "query_lens,num_gen_tokens,expected",
-    [
-        (torch.tensor([3, 6, 6]), 12, True),
-        (torch.tensor([3, 5, 7]), 12, False),
-        (torch.tensor([3, 6, 6]), 11, False),
-        (torch.tensor([3, 6, 6]), 0, False),
-        (torch.tensor([3, 6]), 12, False),
-        (torch.tensor([[3, 6, 6]]), 12, False),
-        (torch.empty(3, device="meta", dtype=torch.int32), 12, False),
-        (None, 12, False),
-    ],
-)
-def test_generation_query_uniformity_uses_only_cpu_metadata(
-    query_lens: torch.Tensor | None,
-    num_gen_tokens: int,
-    expected: bool,
-) -> None:
-    metadata = _make_metadata(
-        num_contexts=1,
-        num_generations=2,
-        num_ctx_tokens=3,
-        seq_lens=query_lens,
-    )
-    device_read = Mock(side_effect=AssertionError("unexpected device read"))
-    with (
-        patch.object(torch.Tensor, "cpu", device_read),
-        patch.object(torch.Tensor, "item", device_read),
-        patch.object(torch.Tensor, "to", device_read),
-    ):
-        assert has_uniform_generation_query_lengths(metadata, num_gen_tokens) is expected
-    device_read.assert_not_called()
 
 
 @pytest.mark.parametrize(("lower_q_length", "upper_q_length"), [(3, 4), (7, 8)])

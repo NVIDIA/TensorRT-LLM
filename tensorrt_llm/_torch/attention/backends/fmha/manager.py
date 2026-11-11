@@ -39,7 +39,6 @@ from .combined import CombinedFmha
 from .interface import Fmha, FmhaPhase, FmhaPrewarmConfig
 from .phased import PhasedFmha
 from .registry import get_enabled_fmha_lib_classes
-from .utils import has_uniform_generation_query_lengths
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -133,7 +132,6 @@ class _FmhaCacheKey(NamedTuple):
     context_batch_size: int
     generation_batch_size: int
     generation_seq_len_q: int
-    generation_query_is_uniform: bool
     attention_mask_type: AttentionMaskType
     has_variable_window: bool
     use_spec_decoding: bool
@@ -394,10 +392,8 @@ class FmhaManager:
         Batch size and generation Q length use ceiling grid buckets based on
         TRTLLM-Gen JIT warmup candidates. Each candidate and its predecessor
         are separate grid points so a support boundary at the candidate cannot
-        alias with the interval below it. Eager speculative batches may have
-        ragged generation rows with the same total Q extent as uniform rows.
-        Keep their support decisions separate using the host query lengths;
-        CUDA-graph batches retain their padded uniform widths.
+        alias with the interval below it. Generation Q lengths are uniform in
+        the executor, including padded speculative-decoding batches.
 
         The batch fields describe the complete source scheduler batch, even
         when ``q`` contains only one compacted phase. Ordinary attention
@@ -428,14 +424,10 @@ class FmhaManager:
             metadata.num_generations, _FMHA_CACHE_BATCH_SIZE_GRID
         )
         generation_seq_len_q = 0
-        generation_query_is_uniform = True
         if attention_input_type != AttentionInputType.context_only and metadata.num_generations > 0:
             generation_num_tokens = q.shape[0]
             if attention_input_type == AttentionInputType.mixed:
                 generation_num_tokens -= metadata.num_ctx_tokens
-            generation_query_is_uniform = has_uniform_generation_query_lengths(
-                metadata, generation_num_tokens
-            )
             generation_seq_len_q = generation_num_tokens // metadata.num_generations
             generation_seq_len_q = _normalize_fmha_cache_grid_value(
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID
@@ -446,7 +438,6 @@ class FmhaManager:
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
-            generation_query_is_uniform=generation_query_is_uniform,
             attention_mask_type=attention_mask_type,
             has_variable_window=forward_args.variable_window_token_starts is not None,
             use_spec_decoding=metadata.use_spec_decoding,

@@ -31,27 +31,6 @@ if TYPE_CHECKING:
     )
 
 
-def has_uniform_generation_query_lengths(
-    metadata: "TrtllmAttentionMetadata", num_gen_tokens: int
-) -> bool:
-    """Check active generation query widths using only host sequence metadata."""
-    num_generations = metadata.num_generations
-    query_lens = metadata.seq_lens
-    if (
-        num_generations <= 0
-        or num_gen_tokens <= 0
-        or num_gen_tokens % num_generations
-        or query_lens is None
-        or query_lens.device.type != "cpu"
-        or query_lens.ndim != 1
-        or query_lens.numel() < metadata.num_contexts + num_generations
-    ):
-        return False
-    # Original prompt lengths do not describe this step's verification rows.
-    query_lens = query_lens[metadata.num_contexts : metadata.num_contexts + num_generations]
-    return bool((query_lens == num_gen_tokens // num_generations).all())
-
-
 def get_kv_page_offset(
     attn: "TrtllmAttention",
     metadata: "TrtllmAttentionMetadata",
