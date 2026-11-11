@@ -30,6 +30,7 @@ from defs.model_express.mx_harness import (
     assert_moe_partition,
     assert_probe_payload,
     assert_transfer_evidence,
+    assert_transfer_within_manifests,
     assert_weight_manifests,
     build_canonical_snapshot,
     build_metadata_only_snapshot,
@@ -131,6 +132,26 @@ _MX_CASES = (
         ),
         id="qwen3-fp8-block-tp2",
         marks=[pytest.mark.skip_less_device(4), skip_no_hopper],
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_TIED_MODEL",
+            default_model_subdir="Qwen3/Qwen3-4B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-tied-tp1",
+            tp_size=1,
+        ),
+        id="qwen3-tied-bf16-tp1",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_TIED_MODEL",
+            default_model_subdir="Qwen3/Qwen3-4B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-tied-tp2",
+            tp_size=2,
+        ),
+        id="qwen3-tied-bf16-tp2",
+        marks=pytest.mark.skip_less_device(4),
     ),
     pytest.param(
         MxE2ECase(
@@ -236,16 +257,19 @@ _MX_CASES = (
 def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request) -> None:
     """Compare HF, MX donor, and no-weight-shards MX receiver outputs and weight manifests.
 
-    Three checks stack up: exact greedy token equality across the roles (the
+    Four checks stack up: exact greedy token equality across the roles (the
     behavioral probe), the receiver's per-rank RDMA completion records proving
-    its bytes arrived through P2P, and byte-exact weight manifests at the
-    transfer boundary and after finalization. For a MoE row, the final
-    manifests must also show the row's MoE partition in every routed-expert
-    tensor shape, so the comparisons cannot pass on an unrequested
-    partition that all roles share. The timing report and the
-    artifact archive are produced from the cleanup path, so `timing.json` and
-    everything under `output_dir` (when pytest runs with `--output-dir`, always
-    in CI) survive a failure with whatever the finished roles produced.
+    its bytes arrived through P2P, byte-exact weight manifests at the transfer
+    boundary and after finalization, and a bound on each RDMA record: it may
+    move no more than the distinct parameter views of its rank's transfer
+    manifest, so a storage shared by several parameters, such as a tied LM
+    head, crosses the wire once. For a MoE row, the final manifests must also
+    show the row's MoE partition in every routed-expert tensor shape, so the
+    comparisons cannot pass on an unrequested partition that all roles share.
+    The timing report and the artifact archive are produced from the cleanup
+    path, so `timing.json` and everything under `output_dir` (when pytest runs
+    with `--output-dir`, always in CI) survive a failure with whatever the
+    finished roles produced.
     """
     required_gpus = case.tp_size * 2
     mx_url, gpu_ids = require_mx_environment(required_gpus)
@@ -343,6 +367,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
         manifests = collect_weight_manifests(layout.manifest_dir, case)
         assert_weight_manifests(case, manifests)
         assert_moe_partition(case, manifests, model_path)
+        assert_transfer_within_manifests(case, layout.log("receiver"), manifests)
     finally:
         # Best-effort timing first so `timing.json` exists even after a worker
         # or assertion failure; then archive everything the run left behind.

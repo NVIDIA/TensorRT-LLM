@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import ast
+import concurrent.futures
 import contextlib
 import copy
 import enum
@@ -39,7 +40,8 @@ from tensorrt_llm._torch.nccl_window_graph import (
     nccl_window_graph_capture, release_nccl_window_graph_owner)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     nccl_window_tensor_scope
-from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
+from tensorrt_llm._utils import (confidential_compute_enabled, local_mpi_size,
+                                 mpi_disabled, nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
 from tensorrt_llm.logger import logger
@@ -73,6 +75,9 @@ class DynamicTensorSpec:
         dim_idx: The index of the dimension to tune.
         gen_tuning_buckets: A tuple of values to try or a function generating values.
         map_to_tuning_buckets: A function to map dimensions to tuning buckets during inference.
+            A negative result indicates the input is outside the supported tuning range.
+            Such inputs miss the cache. In skip-sweep mode, a negative mapping
+            for any required dimension suppresses profiling of the entire operation.
     """
     input_idx: int
     dim_idx: int
@@ -147,6 +152,15 @@ class TuningConfig:
         exclude_from_cache (bool): Skip disk persistence of tuning results for this op.
             Use for JIT-driven ops where caching the tactic across processes would skip
             the JIT warmup. In-process cache still works.
+        parallel_jit_warmup (int): Before profiling, run every not-yet-tuned profile once
+            on this many threads. For runners whose first call per shape JIT-compiles a
+            kernel and releases the GIL while compiling (DeepGEMM), those compiles then
+            overlap, and the profiling loop that follows finds them built. Opted-in
+            runners must be thread-safe and must not use NCCL windows. 0 disables; -1 uses
+            the CPUs this rank may run on, divided by the ranks on the node unless the
+            rank is pinned to a subset, up to 32: neighbouring sweep points often select
+            the same kernel and compile it twice, so more threads keep paying off.
+            TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -156,6 +170,7 @@ class TuningConfig:
     use_cuda_graph: bool = True
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
     exclude_from_cache: bool = False
+    parallel_jit_warmup: int = 0
 
 
 @dataclass(unsafe_hash=True)
@@ -289,9 +304,11 @@ def autotune(tune_mode: bool = True,
         tune_mode: Whether to enable tuning mode
         cache_path: Path to save/load cache files
         skip_dynamic_tuning_buckets: When True, suppress bucket generation in
-            _optimization_profiles() so only actual input shapes from warmup
-            are profiled. Useful for workloads (e.g. diffusion) where the
-            LLM-oriented M-bucket sweep is unnecessary.
+            _optimization_profiles() and profile the encountered shapes and
+            their mapped buckets, subject to tune_max_num_tokens. Inputs with
+            no mapped bucket use the fallback without profiling. Useful for
+            workloads (e.g. diffusion) where the LLM-oriented M-bucket sweep
+            is unnecessary.
         post_tune_merge_dist: Optional ``Distributed``. When set, tactics are
             tuned per-rank independently and merged across ranks in one
             collective at context exit (before the cache is saved) — for
@@ -932,6 +949,28 @@ def _spec_in_bounds(spec, shapes_list) -> bool:
     return True
 
 
+def _default_parallel_jit_warmup_threads() -> int:
+    """Threads for ``parallel_jit_warmup=-1``: this rank's CPUs, up to 32.
+
+    The compilers the warmup starts inherit this process's CPU affinity. A rank
+    pinned to a subset of the host's CPUs has that subset to itself; unpinned
+    ranks share all of them, so each takes its share by the ranks on the node.
+    """
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:  # no affinity API (non-Linux)
+        cpus = os.cpu_count() or 1
+    if cpus >= (os.cpu_count() or cpus):
+        local_ranks = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+        if not mpi_disabled():
+            try:
+                local_ranks = local_mpi_size()
+            except Exception:  # noqa: BLE001 - MPI cannot split by node here
+                pass
+        cpus //= max(1, local_ranks)
+    return min(32, cpus)
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT LLM operations.
 
@@ -957,6 +996,9 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
+        # Cache keys whose runner ran in this process (so any JIT it drives
+        # has happened here), as opposed to keys loaded from disk or peers.
+        self._keys_profiled_in_process: set[Tuple] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
@@ -1173,18 +1215,25 @@ class AutoTuner:
         # was populated by this process's own warmup.
         if tuning_config.exclude_from_cache:
             self.profiling_cache.add_excluded_op(custom_op)
-        if tuning_config.exclude_from_cache and self.is_tuning_mode:
+        is_cache_hit, best_runner_id, best_tactic, min_time = (
+            self.profiling_cache.search_cache(custom_op,
+                                              runners,
+                                              input_shapes,
+                                              tuning_config,
+                                              apply_map_to_tuning_buckets=True))
+        if (tuning_config.exclude_from_cache and self.is_tuning_mode
+                and is_cache_hit and self.profiling_cache.get_cache_key(
+                    custom_op,
+                    runners[best_runner_id],
+                    input_shapes,
+                    tuning_config,
+                    apply_map_to_tuning_buckets=True)
+                not in self._keys_profiled_in_process):
+            # Only an entry this process profiled proves its JIT side
+            # effects already ran here; re-profile anything else.
             is_cache_hit = False
             best_runner_id, best_tactic, min_time = (
                 self.profiling_cache.fallback_entry())
-        else:
-            is_cache_hit, best_runner_id, best_tactic, min_time = (
-                self.profiling_cache.search_cache(
-                    custom_op,
-                    runners,
-                    input_shapes,
-                    tuning_config,
-                    apply_map_to_tuning_buckets=True))
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
@@ -1235,9 +1284,10 @@ class AutoTuner:
         # Synchronize ranks before profiling
         if self._should_current_rank_tune(
                 tuning_config.distributed_tuning_strategy):
+            self._parallel_jit_warmup(custom_op, runners, profiles, inputs,
+                                      tuning_config, **kwargs)
             with self._shared_profile_graph_pool():
                 for p in profiles:
-                    tensors = self._prepare_input_tensors(p, inputs)
                     is_cache_hit, *_ = self.profiling_cache.search_cache(
                         custom_op,
                         runners,
@@ -1246,6 +1296,7 @@ class AutoTuner:
                         apply_map_to_tuning_buckets=False,
                     )
                     if not is_cache_hit:
+                        tensors = self._prepare_input_tensors(p, inputs)
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         with nvtx_range(
                                 f"{custom_op}, shape {p.get_opt_shapes()}"):
@@ -1558,6 +1609,7 @@ class AutoTuner:
             # TODO: use named tuple to make it more readable
             self.profiling_cache[cache_key] = (best_runner_id, best_tactic,
                                                min_time)
+            self._keys_profiled_in_process.add(cache_key)
 
             self.stats.tuned_op_profiled_configs[custom_op] += 1
         elif local_pairs == 0 and total_pairs > 0:
@@ -1576,6 +1628,74 @@ class AutoTuner:
             )
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
+
+    def _parallel_jit_warmup(self, custom_op: str, runners: List[TunableRunner],
+                             profiles: List[OptimizationProfile],
+                             inputs: List[torch.Tensor],
+                             tuning_config: TuningConfig, **kwargs) -> None:
+        """Run each not-yet-tuned profile once on a thread pool to drive its JIT.
+
+        See ``TuningConfig.parallel_jit_warmup``. Purely a warmup: results are
+        discarded, and a failure here is left to the profiling loop, which
+        runs every profile again and handles errors as usual.
+        """
+        num_threads = int(
+            os.environ.get("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP",
+                           tuning_config.parallel_jit_warmup))
+        if num_threads < 0:
+            num_threads = _default_parallel_jit_warmup_threads()
+        if num_threads < 2:
+            return
+        pending = [
+            p for p in profiles if not self.profiling_cache.search_cache(
+                custom_op,
+                runners,
+                p.get_opt_shapes(),
+                tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )[0]
+        ]
+        num_threads = min(num_threads, len(pending))
+        if num_threads < 2:
+            return
+        # Interleave contiguous blocks of the sweep, so the calls in flight
+        # come from far-apart shapes and mostly select different kernels
+        # rather than several threads compiling the same one.
+        size = -(-len(pending) // num_threads)
+        blocks = [pending[i * size:(i + 1) * size] for i in range(num_threads)]
+        order = [b[j] for j in range(size) for b in blocks if j < len(b)]
+        device = torch.cuda.current_device()
+        # One stream for all workers: the allocator caches their blocks where
+        # the profiling loop below allocates, and GPU time is not the cost here.
+        stream = torch.cuda.current_stream()
+        failures = []
+
+        def warm(profile: OptimizationProfile) -> None:
+            torch.cuda.set_device(device)
+            try:
+                with torch.cuda.stream(stream):
+                    tensors = self._prepare_input_tensors(profile, inputs)
+                    if tuning_config.inputs_pre_hook is not None:
+                        tensors = tuning_config.inputs_pre_hook(tensors)
+                    for runner in runners:
+                        for tactic in runner.get_valid_tactics(
+                                tensors, profile, **kwargs):
+                            runner(tensors, tactic=tactic, **kwargs)
+                    stream.synchronize()
+            except Exception as e:  # noqa: BLE001 - the profiling loop reports it
+                failures.append(e)
+
+        start = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=num_threads,
+                thread_name_prefix="autotuner_jit_warmup") as pool:
+            list(pool.map(warm, order))
+        logger.info(f"[Autotuner] {custom_op}: ran {len(order)} profiles on "
+                    f"{num_threads} threads to drive their JIT in "
+                    f"{time.perf_counter() - start:.1f}s" +
+                    (f"; {len(failures)} failed and are left to profiling "
+                     f"({type(failures[0]).__name__}: {failures[0]})"
+                     if failures else ""))
 
     @staticmethod
     def _run_profile_runner(runner: TunableRunner, inputs: List[torch.Tensor],
@@ -1821,7 +1941,12 @@ class AutoTuner:
                     # used during inference (bucketed via map_to_tuning_buckets).
                     actual_val = base_profile.shapes[spec.input_idx][
                         spec.dim_idx].val
-                    opt_shapes = (spec.map_to_tuning_buckets(actual_val), )
+                    mapped_val = spec.map_to_tuning_buckets(actual_val)
+                    if mapped_val < 0:
+                        # Lookup cannot use a measured winner for this input.
+                        # Leave it as a cache miss so choose_one uses fallback.
+                        return []
+                    opt_shapes = (mapped_val, )
                 else:
                     opt_shapes = ()
             elif callable(spec.gen_tuning_buckets):
@@ -2033,6 +2158,7 @@ class AutoTuner:
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
+        self._keys_profiled_in_process.clear()
         if hasattr(torch.ops.trtllm, "clear_allreduce_tactic_cache"):
             torch.ops.trtllm.clear_allreduce_tactic_cache()
 
