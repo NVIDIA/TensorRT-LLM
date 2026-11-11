@@ -7,7 +7,7 @@ Check: `{{ gate }}` starts the `ctx` and `gen` servers and the proxy (`trtllm-se
 **Supported means:** both servers boot with their own options, answers complete through the proxy, every rank of both roles reports the Modeling V2 target and its options, and each benchmark meets its floor. Only GSM8K is scored through the proxy; another benchmark fails as "not judged through the hop": list it under `not_done`.
 
 - Build no launcher, server or transport: the engine's transceiver moves the state.
-- Both sides' options state `cache_transceiver_config` with a `backend` (`DEFAULT` lets the engine choose) and `disable_overlap_scheduler: true`; without the block a worker refuses its first request (HTTP 400). The spec is refused at load when it is missing.
+- Both sides' options state `cache_transceiver_config` with a `backend` (`DEFAULT` lets the engine choose; a spec without it is refused at load) and `disable_overlap_scheduler: true`.
 - The deployment's `env` states the site's UCX transports. A container's `UCX_TLS=tcp` stops the NIXL backend from starting; `UCX_TLS: "^ib"` worked on GB300. The env and the options are the operator's: when they are wrong, end `blocked` naming the key.
 - All per-sequence state sits in pools the cache manager declares to the transceiver (`get_disagg_role_mapper_kinds`, `get_disagg_role_layouts`). State in target-owned tensors does not cross: generation then decodes from wrong state, fluently.
 - The generation engine's first forward is a generation step whose cached length is the prompt length. It needs nothing the context forward computed without storing.

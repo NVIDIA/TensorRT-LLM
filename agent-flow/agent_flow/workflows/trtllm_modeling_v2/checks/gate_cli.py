@@ -353,11 +353,21 @@ def install_cli(workspace: str | Path) -> Path:
 
 
 def invocation(
-    task: str | Path, workdir: str | Path, deployment: str, cli: str, tree: str | Path
+    task: str | Path,
+    workdir: str | Path,
+    deployment: str,
+    cli: str,
+    tree: str | Path,
+    gates: Sequence[str] = GATE_NAMES,
 ) -> str:
-    """The command a worker runs one of a deployment's checks with, on its own worktree."""
+    """The command a worker runs one of a deployment's checks with, on its own worktree.
+
+    ``gates``: the ones the deployment has something for. `tests` is named only where the
+    spec states tests: without any there is nothing to run, and a worker takes the line
+    for a failed check.
+    """
     return (
-        f"{cli} gate <{'|'.join(GATE_NAMES)}> --task {task} --deployment {deployment} "
+        f"{cli} gate <{'|'.join(gates)}> --task {task} --deployment {deployment} "
         f"--workdir {workdir} --tree {tree}"
     )
 

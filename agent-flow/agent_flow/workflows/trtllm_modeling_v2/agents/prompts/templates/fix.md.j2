@@ -2,12 +2,12 @@
 SPDX-License-Identifier: Apache-2.0 -#}
 ## Task: the final fix
 
-The final pass ran the done deployments' checks once, on the checkout; after a failed boot, that deployment's other checks did not run. You get this one task to repair what it found. `{{ first }}` passed its checks when it was onboarded, maybe on an earlier commit: keep them passing.
+The final pass ran the done deployments' checks once, on the checkout; after a failed boot, that deployment's other checks did not run. This one task repairs what it found. `{{ first }}` passed its checks when it was onboarded, maybe on an earlier commit: keep them passing.
 
 {{ goal }}
 
-1. Failed checks first, then convention findings (an entry without `CELLS` or without `{{ arch }}` in `ARCHS`, a missing test, an entry not where its row lands it), cheapest first.
-2. Reproduce a failed check with the gate, naming its deployment, before you change code. Its files are in the directory the verdict line names. Write down the suspected cause before each rerun.
+1. Failed checks first, then convention findings (an entry without `CELLS` or without `{{ arch }}` in `ARCHS`, a missing test, an entry not where its row lands it), cheapest first. Repair a finding inside the target; one that needs a change outside it is left and listed under `not_done`.
+2. Reproduce a failed check with the gate, naming its deployment, before you change code. Write down the suspected cause before each rerun.
 3. Make the smallest change that removes the cause. One commit per item.
 4. Rerun that check, then the boot of `{{ first }}`.
 5. Never widen a tolerance, edit an anchor or change an options file.

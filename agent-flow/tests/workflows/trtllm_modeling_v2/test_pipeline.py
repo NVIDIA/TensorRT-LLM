@@ -210,7 +210,8 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     assert "`kv_fp8` (deployment): not done blocked" in last
     assert "`core` (core): done ready" in last and "Nothing of a task not done landed" in last
     assert "The checks it owes: `tep2:boot`, `tep2:accuracy[gsm8k]`." in last
-    assert "gate <boot|accuracy|tests>" in last and "--deployment tep2" in last
+    # The gates a deployment has something for: `tests` only where the spec states tests.
+    assert "gate <boot|accuracy> --task" in last and "--deployment tep2" in last
     script = workspace / "bin" / "trtllm-modeling-v2"
     assert os.access(script, os.X_OK) and f"      {script} gate <boot|" in last
     assert "They run once on the checkout after the last task" in last
@@ -284,6 +285,19 @@ def test_a_kernel_row_that_is_not_done_is_skipped_and_the_run_goes_on(
     core = _prompts(calls, "core")[0]
     assert "- `k1-rms` (kernel): skipped blocked. no kernel exports it on sm_103" in core
     assert "write its wrapper in the target's own `ops/`" in core
+    # A row lands what it certified: `blocked` is for an entry that cannot be used, and the
+    # row is told which cells the first deployment needs, as far as its options say.
+    row = _prompts(calls, "k2-scale")[0]
+    needs = "(its options: KV cache dtype not stated: the checkpoint's own, `max_seq_len: 4096`)"
+    assert f"- `blocked`: the entry does not run, or a cell `tp1` needs {needs} fails." in row
+    assert "`CELLS` holds the cells that pass; a failing cell is left out" in row
+    # Its check is its entry's test: no model-level gate is put before a kernel task.
+    assert " gate <" not in row and " -m pytest " in row
+    # Core is shown the gates its deployment has something for (`tests` only where the spec
+    # states tests), and the command that runs the target's own unit tests.
+    assert " gate <boot|accuracy> --task " in core
+    tests = "tests/unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1"
+    assert re.search(rf"run with `cd (\S+) && PYTHONPATH=\1 .*-m pytest {tests} -q`", core)
     report = _report(tmp_path)
     skipped = report.split("## Skipped kernel rows")[1].split("##")[0]
     assert "- `k1-rms` (queue row 1): it ended blocked: no kernel exports it on sm_103" in skipped
@@ -707,6 +721,12 @@ def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_findi
     assert "repair what the final pass found, every item:" in goal
     assert "- check `kv_fp8:boot` failed at c0ffee1: [FAIL] kv_fp8:boot: " in goal
     assert f"- convention: {TARGET_REL}/modeling.py:1 imports Modeling V1 model code ({v1})" in goal
+    # A finding is repaired inside the target or left: shared code changes for a check only.
+    assert (
+        "Repair a finding inside the target; one that needs a change outside it is left and "
+        "listed under `not_done`." in goal
+    )
+    assert "may change when a check needs it, not for a convention." in goal
     assert "(first at `core`)" in goal and "(first at `kv_fp8`)" in goal
     assert "## Task: the final fix" in goal and "Reproduce a failed check with the gate" in goal
     # The text says what ran and what will run, as the list of checks below has it.

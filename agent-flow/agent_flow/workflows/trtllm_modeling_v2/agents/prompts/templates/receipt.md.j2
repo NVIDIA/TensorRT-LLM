@@ -8,10 +8,10 @@ Your last action: write your decision file, as YAML, to exactly this path. The r
 
 Begin with `decision: ready` or `decision: blocked`: without that key the file is no receipt. Every key starts at column 0.
 
-- `ready`: the work is committed, and `checks` holds the final result of each check your task requires. Never write `ready` over a check you saw fail.
+- `ready`: the work is committed, and `checks` holds the final result of each check your task requires. Never report a failed check as passed; one the task can leave out goes under `not_done`.
 - `blocked`: you cannot finish. `summary` names what stops you, the command and its result line.
 - `summary`: text: what you did. Copy numbers from tool output.
-- `not_done`: a list: what you skipped or could not certify, each with its reason; `[]` when nothing.
+- `not_done`: a list, each item with its reason; `[]` when nothing.
 - `checks`: a list: each check you ran: command, commit, result line.
 {% for key, what in extra %}- `{{ key }}`: {{ what }}
 {% endfor %}
@@ -20,7 +20,7 @@ decision: ready
 summary: |
   Target boots at tp2. GSM8K 40.52, floor 39.05.
 not_done:
-  - "accuracy test not in a CI test list: no attempt left"
+  - "the fp8 cell at 8192 rows: cosine 0.9994, gate 0.9999"
 checks:
   - "<gate command> @ 1a2b3c4: [PASS] tp2:boot ..."
 ```

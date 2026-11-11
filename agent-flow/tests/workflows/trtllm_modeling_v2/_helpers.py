@@ -497,5 +497,7 @@ def facts(**changes) -> dict:
         name="rmsnorm",
         module="ops.norm.rmsnorm__r4",
         test_command="cd /ws/worktrees/k4 && PYTHONPATH=/ws/worktrees/k4 python -m pytest t.py -q",
+        needs="`tp1` needs (its options: KV cache dtype not stated: the checkpoint's own)",
+        pytest="cd /ws/worktrees/kv_fp8 && PYTHONPATH=/ws/worktrees/kv_fp8 python -m pytest t -q",
     )
     return {**said, **changes}

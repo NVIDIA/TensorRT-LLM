@@ -421,8 +421,9 @@ def test_one_turn_loads_about_twelve_hundred_words_and_the_texts_stay_small() ->
     def words(kind: str, **changes) -> int:
         return len(prompts.dispatch(kind, facts(**_QUIET, **changes)).split())
 
-    sizes = {kind: words(kind) for kind in _SECTIONS if kind != "survey"}
+    sizes = {kind: words(kind) for kind in _SECTIONS if kind not in ("survey", "kernel")}
     sizes["survey"] = words("survey", worktree="", gate="")  # it has no worktree and no check
+    sizes["kernel"] = words("kernel", gate="")  # its check is its entry's test, not the gate
     sizes.update({card: words("deployment", cards=[card]) for card in _CARDS})
     # Counted with the fixture's paths and commands in it, which are not standing text.
     assert max(sizes.values()) <= 1270, sizes
@@ -454,8 +455,8 @@ def test_what_a_text_says_of_the_code_is_what_the_code_does() -> None:
     # The survey: the keys of a queue row code checks, and that it counts the cells, no more.
     survey = prompts.dispatch("survey", facts())
     assert (
-        "Of a row it checks `mode`, `depends_on`, `tier`, `unit`, `site`, a `verify` row's "
-        "`surface` and the number of `cells`; the rest the workers read." in survey
+        "It checks a row's `mode`, `depends_on`, `tier`, `unit`, `site`, `surface` and how "
+        "many `cells`; the workers read the rest." in survey
     )
     assert "- A `verify` row needs `surface`; it lists its `cells`, at most 64." in survey
     row = {"n": 1, "mode": "verify", "target": "norm/rms", "surface": "dtype=bf16"}
@@ -489,6 +490,28 @@ def test_what_a_text_says_of_the_code_is_what_the_code_does() -> None:
     )
     assert "spec.large" not in kernel
     assert prompts.TIERS[4].startswith("no implementation exists: compose one from torch ops")
+    # What the first whole runs showed. A failed check is never reported as passed, and one
+    # a task can leave out is left out: the old sentence made a kernel row with 17 of 20
+    # cells certified say `blocked`.
+    for kind in _SECTIONS:
+        said = prompts.dispatch(kind, facts())
+        assert (
+            "Never report a failed check as passed; one the task can leave out goes under "
+            "`not_done`." in said
+        )
+        assert "Never write `ready` over" not in said and "CI test list" not in said
+        assert "What your task asked and you did not do goes under `not_done`" in said
+    # `not_done` is the task's own: every kernel receipt of the first run listed the boot,
+    # GSM8K and the CI lists, which are other tasks'.
+    assert (
+        "- Not for `not_done`: the boot, GSM8K, CI lists (other tasks'), a probe that does not apply."
+        in kernel
+    )
+    assert "- Not for `not_done`: GPU tests, the boot, GSM8K (later tasks')." in survey
+    # A convention is repaired in the target or left; shared code changes for a check.
+    fix = prompts.dispatch("fix", facts())
+    assert "Repair a finding inside the target; one that needs a change outside it is left" in fix
+    assert "may change when a check needs it, not for a convention." in fix
 
 
 def test_the_texts_name_only_paths_the_tree_has() -> None:

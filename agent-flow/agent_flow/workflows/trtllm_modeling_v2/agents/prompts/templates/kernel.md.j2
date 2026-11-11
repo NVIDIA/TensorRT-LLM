@@ -20,12 +20,12 @@ Use these exact paths: the report looks for the entry there.
 
 ### The entry: an `OpWrapper`
 
-Read "Writing operations" in `{{ mv2_readme }}`, `catalog/_op.py`, and one entry of the same category with its test. For C++/CUDA read `{{ build_guide }}` first: sources in `csrc/`, registered with its macros, a matching fake in `fake_ops.py`.
+Read "Writing operations" in `{{ mv2_readme }}`, `catalog/_op.py`, and one entry of the same category with its test. For C++/CUDA read `{{ build_guide }}` first.
 
 - `__call__`: one kernel-launching call, every argument explicit; weights, state and configuration are arguments. No silent torch fallback: it certifies nothing; torch ops as the stated implementation (tier 4) say so in `note`.
 - `reference`: the expected result in plain torch with fp32 accumulation, from the cell's named arguments. It calls neither the kernel nor any entry.
 - `is_valid`: rejects inputs the kernel accepts but computes wrongly: only cases you measured.
-- `CELLS`: what the test runs: every cell listed above, plus one at the largest row the options allow (`max_num_tokens`, `max_batch_size`). Measured values.
+- `CELLS`: what the test runs: every cell listed above, plus one at the largest row the options allow (`max_num_tokens`, `max_batch_size`).
 - `ARCHS`: add `{{ arch }}` only after the whole test file passed on this device.
 - `note`: preconditions, limits, measured numbers, where the kernel comes from.
 
@@ -39,8 +39,7 @@ Tiers 1 to 3 wrap an existing callable: `git grep` the op's name for its source.
 - Assert CUDA is available, no skip. Seed randomness.
 - Judge a cell by its output distribution against `reference` (cosine similarity, relative L2, a high percentile of the absolute error); a NaN fails. Never widen a band to pass: one wider than torch's default needs a wrong-variant control that fails.
 - Each `is_valid` refusal: show the unguarded failure, then test it with `validating(op)` and `pytest.raises`; a probe that can crash runs in a subprocess.
-- For index arguments, check reachable 2^31-element, 2^31/row-width, and fp32 2^24+1 boundaries.
-- Pool slots are a cell axis sized from the cache manager, not the batch size. Include slots != batch.
+- Only where the entry takes them: index arguments at the reachable 2^31 and fp32 2^24+1 boundaries; pool slots (sized by the cache manager) != batch.
 - A normal cell fits 10 s and 40 GiB; a larger one gets `"large": True` in its `spec` and `pytest.mark.high_cuda_memory`.
 
 Run it with your worktree first on `PYTHONPATH`, or it tests another checkout:
@@ -49,7 +48,9 @@ Run it with your worktree first on `PYTHONPATH`, or it tests another checkout:
 
 After your last edit, run the whole file once, and `tests/unittest/_torch/modeling_v2/test_modeling_v2_no_stale_claims.py`.
 
-### When a cell fails
+### What lands
 
-- The options never serve that cell (a cached prefix with block reuse off): reject it in `is_valid`, leave it out of `CELLS`, list it under `not_done`, and land.
-- The defect is in shared code and the checkpoint's own call hits it: fix it as a shared commit, or end `blocked` with the failing test committed and the file, trigger and test in `summary`.
+- `ready`: the entry and its test are committed and `CELLS` holds the cells that pass; a failing cell is left out and goes under `not_done` with its numbers.
+- `blocked`: the entry does not run, or a cell {{ needs }} fails. A defect in shared code there: fix it as a shared commit, or name the file, the trigger and the committed failing test in `summary`.
+- A cell the options never serve (a cached prefix with block reuse off): reject it in `is_valid`.
+- Not for `not_done`: the boot, GSM8K, CI lists (other tasks'), a probe that does not apply.

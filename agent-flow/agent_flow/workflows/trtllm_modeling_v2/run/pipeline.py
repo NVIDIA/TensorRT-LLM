@@ -92,6 +92,8 @@ GATING = ("config", "survey", "core")
 #: Why a task the spec or preflight dropped is skipped; it is open again once they ask for it.
 _DROPPED = "the spec or preflight no longer asks for it"
 GRANTS = (4, 2)
+#: The options that bound the rows and the lengths a cell of the first deployment can have.
+_CELL_LIMITS = ("max_seq_len", "max_num_tokens", "max_batch_size")
 #: How many ended tasks a dispatch lists, the newest; the file has every one.
 HISTORY_TASKS = 30
 
@@ -545,8 +547,12 @@ class Pipeline:
             spec=w.task_path,
             plan=w.plan_path,
             vocabulary=w.vocabulary_path,
+            # A kernel task's check is its entry's test: the model's checks are not its work.
             gate=work
-            and gate_cli.invocation(w.task_path, gates, deployment.name, self.cli(), work),
+            and task.kind != "kernel"
+            and gate_cli.invocation(
+                w.task_path, gates, deployment.name, self.cli(), work, self._gates(deployment)
+            ),
             history=[
                 dict(
                     id=t.id,
@@ -585,7 +591,13 @@ class Pipeline:
             facts.update(self._row(task, target, repo, work))
         else:
             facts.update(self._unit(task, deployment, found[0].name, target))
+            facts["pytest"] = self._pytest(work, facts["tests"])
         return facts
+
+    def _gates(self, deployment) -> list[str]:
+        """The gates ``deployment`` has something for: its boot, and what the spec states."""
+        has = (("accuracy", deployment.benchmarks), ("tests", deployment.tests))
+        return ["boot", *(name for name, stated in has if stated)]
 
     def _unit(self, task: Task, deployment, first: str, target: str) -> dict[str, Any]:
         """What a task on a deployment is told of it: its options, the checks it owes, what judges them."""
@@ -618,6 +630,22 @@ class Pipeline:
             tests=model_ops_tests_dir(target) if target else "",
         )
 
+    def _pytest(self, tree: str, path: str) -> str:
+        """The one-GPU pytest line for ``path`` on ``tree``, as a worker types it."""
+        env = self.w.environment
+        python = f"{env.one_gpu_prefix} {env.python}".strip() if env is not None else "python"
+        return f"cd {tree} && PYTHONPATH={tree} {python} -m pytest {path} -q"
+
+    def _needs(self) -> str:
+        """Which cells the first deployment needs, as far as its options say: for a kernel row."""
+        first = deployments_mod.resolve(self.w.task_data)[0]
+        options = next(iter(first.servers.values())).options
+        kv = (options.get("kv_cache_config") or {}).get("dtype")
+        unstated = "not stated: the checkpoint's own"
+        stated = [f"KV cache dtype {kv or unstated}"]
+        stated += [f"`{key}: {options[key]}`" for key in _CELL_LIMITS if key in options]
+        return f"`{first.name}` needs (its options: {', '.join(stated)})"
+
     def _queue_item(self, task: Task) -> QueueItem | None:
         """The vocabulary queue row a kernel task names."""
         try:
@@ -645,8 +673,6 @@ class Pipeline:
         local = item.variant is not None and bool(target)
         landing = str(item.variant) if local else item.target
         paths = entry_paths(item, target, repo or None) or ()
-        env = w.environment
-        python = f"{env.one_gpu_prefix} {env.python}".strip() if env is not None else "python"
         return dict(
             n=item.n,
             mode=item.mode,
@@ -660,9 +686,8 @@ class Pipeline:
             shared=" and ".join(f"`{p}`" for p in shared_entry_paths(item.target)) if local else "",
             name=item.target.strip("/").split("/")[-1],
             module=landing.replace("/", "."),
-            test_command=f"cd {tree} && PYTHONPATH={tree} {python} -m pytest {paths[1]} -q"
-            if len(paths) > 1
-            else "",
+            test_command=self._pytest(tree, paths[1]) if len(paths) > 1 else "",
+            needs=self._needs(),
         )
 
     def _make_integration(self) -> Integration | None:

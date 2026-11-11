@@ -25,7 +25,7 @@ Answer in `{{ plan }}` and `{{ vocabulary }}`: can this checkpoint be assembled 
 
 ### `vocabulary.yaml`
 
-Code makes one kernel task per queue row. Of a row it checks `mode`, `depends_on`, `tier`, `unit`, `site`, a `verify` row's `surface` and the number of `cells`; the rest the workers read. Keep the keys exactly.
+Code makes one kernel task per queue row. It checks a row's `mode`, `depends_on`, `tier`, `unit`, `site`, `surface` and how many `cells`; the workers read the rest. Keep the keys exactly.
 
 ```yaml
 verdict: assemblable | assemblable_after_additions | ceiling
@@ -54,7 +54,7 @@ queue:
 ceiling: null    # or {step: ..., searched: [...], why: ...}
 ```
 
-Give every `call_sites` item the actual target method and call count. `row_multiple` is how many rows one request brings there; use `gathered: true` after attention-DP gathering and `eager_only: true` only outside captured paths. Pool slots come from the cache manager, not batch size.
+Give every `call_sites` item the actual target method and call count. `row_multiple` is how many rows one request brings there; use `gathered: true` after attention-DP gathering and `eager_only: true` only outside captured paths.
 
 Queue rules:
 
@@ -63,6 +63,7 @@ Queue rules:
 - A `verify` row needs `surface`; it lists its `cells`, at most {{ max_cells }}. Vary one axis at a time: each dtype, the smallest and largest captured batch, one prefill chunk at `max_num_tokens`.
 - `site` (lowercase words joined by `_`) names the local copy `<name>__<site>`; without it, `<name>__r<n>`. A target name never contains `__`.
 - `unit` is `core` or a later deployment's name. Rows without it block the first deployment. When unsure, leave it out.
+- Not for `not_done`: GPU tests, the boot, GSM8K (later tasks').
 
 ### `plan.md`
 

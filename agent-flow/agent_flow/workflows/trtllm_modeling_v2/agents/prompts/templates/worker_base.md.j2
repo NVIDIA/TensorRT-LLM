@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0 -#}
 2. The Modeling V2 conventions (`{{ mv2_readme }}`), where you can meet them.
 3. Everything else your task asks, where you can.
 
-What you skip or cannot finish goes under `not_done` in your receipt: the report is built from it. Never change an anchor, a tolerance or a check to make a result pass. A commit that touches a judge path ({{ judge }}) is refused.
+What your task asked and you did not do goes under `not_done` in your receipt: the report prints it. Never change an anchor, a tolerance or a check to make a result pass. A commit that touches a judge path ({{ judge }}) is refused.
 
 You own one task of this run, `{{ task_id }}`: do that task only.
 {% if worktree %}
@@ -19,7 +19,7 @@ You own one task of this run, `{{ task_id }}`: do that task only.
 {% if worktree %}
 ## Shared code
 
-Code outside `{{ target }}` and its tests may change when the target needs it.
+Code outside `{{ target }}` and its tests may change when a check needs it, not for a convention.
 
 - One commit per shared change, with no target file in it; its message says why.
 - Make it general: no branch on this model. State in your receipt that other models were not retested.
