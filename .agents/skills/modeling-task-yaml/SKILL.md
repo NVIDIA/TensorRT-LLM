@@ -73,12 +73,15 @@ Part 1 and Part 2 each get one form: a single message asking for every item
 of that part as a numbered list the user answers in one reply. Part 2's form
 is sent only after Part 1 is confirmed.
 
-Before each form, look at what is at hand: the user's messages,
-`nvidia-smi`, the current checkout, the checkpoint directory (e.g. a
-`modeling_*.py` in it). Pre-fill each value you found, written out in full
-with its source (e.g. "from your message", "from nvidia-smi", "found in the
-checkpoint directory"); leave the rest blank. In Part 2's form, the Slurm
-fields are answered only if the user answers yes to "use Slurm?".
+Look before you ask. Before each form, try every source the part lists
+(Part 1: the user's messages, `nvidia-smi`, the current checkout, the
+checkpoint directory, e.g. a `modeling_*.py` in it; Part 2: the sources in
+its table) and pre-fill each value you found, written out in full with its
+source (e.g. "from your message", "from nvidia-smi", "from sacctmgr").
+The user's job is to confirm or correct proposals, not to fill in a blank
+form. Leave a field blank only when no source answers it, and then say what
+you looked at. In Part 2's form, the Slurm fields are answered only if the
+user answers yes to "use Slurm?"; pre-fill them anyway.
 
 When the reply arrives (and, in Part 1, after the checkpoint inspection),
 send one recap: a table of every field, its value and its source (Part 1
@@ -117,11 +120,23 @@ these facts.
 Whether the run uses Slurm:
 
 - **No:** omit `slurm-environment` entirely.
-- **Yes:** ask for `slurm_partition` and `docker_image` (both required,
+- **Yes:** propose `slurm_partition` and `docker_image` (both required,
   under `slurm-environment`), and — only when the user's agent-flow has
-  `agent_flow/workflows/modeling_v2_onboard/` — whether the run uses a
+  `agent_flow/workflows/modeling_v2_onboard/` — ask whether the run uses a
   **GPU pool**: a set of whole nodes the run holds from its start and
   shares among its workers, instead of each worker submitting its own jobs.
+
+Where each proposal comes from (an earlier task.yaml the user names, or
+your memory of this user, takes precedence over the defaults below):
+
+| Field | Source |
+|---|---|
+| use Slurm? | propose yes when `sinfo` is on PATH |
+| `slurm_partition` | `sinfo` partitions with GPUs; propose the default one (marked `*`) and list the others |
+| `docker_image` | the CI image in `<trtllm_repo_path>/jenkins/current_image_tags.properties`: `LLM_SBSA_DOCKER_IMAGE` for a Grace-based target GPU (GH200, GB200, GB300), `LLM_DOCKER_IMAGE` otherwise; a local `.sqsh` the user names replaces it |
+| `account` | `sacctmgr show assoc user=$USER`; propose the only account, or list them when there are several |
+| `qos` | the same association's default QOS; when it has none, list its QOS values or propose omitting the field |
+| `container_mounts` | as in the tables below |
 
 **Without a pool**, these optional fields also go directly under
 `slurm-environment`; the agents read them:
@@ -135,9 +150,8 @@ Whether the run uses Slurm:
 **With a pool**, they go under `slurm-environment.gpu_pool` instead, never
 in both places. The user gives only `nodes` (holder jobs submitted at the
 start) and `max_nodes` (the most the planner may grow it to; omit for the
-worker count). Fill in the rest yourself from this environment, Slurm
-(`sacctmgr`, `sinfo`), an earlier task.yaml or your memory, and show each
-with its source for confirmation:
+worker count). Fill in the rest yourself from the sources above, and show
+each with its source for confirmation:
 
 | Field | Value |
 |---|---|
@@ -325,6 +339,7 @@ implements_tips:
 | Folding disagg into the `trtllm-eval` feature criterion | Disagg gets its own criterion |
 | "Agent measures the HF reference" for an NVFP4 / oversized checkpoint | Require a score or another baseline |
 | Account / qos / mounts both under `slurm-environment` and under `gpu_pool` | Under `gpu_pool` with a pool, directly under `slurm-environment` without |
+| A form of blank fields ("slurm_partition: to fill in") | Pre-fill every field a source answers; leave blank only what none does, and say what you looked at |
 | Asking the user for pool fields Slurm or the environment can answer | Ask only `nodes` and `max_nodes`; infer the rest and confirm it |
 | Checking paths, image or mounts by hand during the conversation | Run the workflow's check at Finish |
 | Running `--smoke` without asking | It waits for a Slurm node; ask first |
