@@ -1448,7 +1448,8 @@ def test_selfsampling_varlen_regclus_parity_and_oracle():
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
     key = _varlen_cache_key(rows, npad, k, msl_c, nn, cr)
-    assert ss_host._VARLEN_CACHE[key][0] == "reg_clus", ss_host._VARLEN_CACHE[key][0]
+    if _routes_as_picked():
+        assert ss_host._VARLEN_CACHE[key][0] == "reg_clus", ss_host._VARLEN_CACHE[key][0]
     torch.cuda.synchronize()
     ref = _reference_varlen_indices(lg, kv, nn, cr, k)
     for r in range(rows):
@@ -1544,7 +1545,8 @@ def test_selfsampling_varlen_regclus_k2048_exact(b: int, n: int, pattern: str) -
     out = torch.full((b, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, max_seq_len=n)
     torch.cuda.synchronize()
-    assert ss_host._VARLEN_CACHE[key][0] == "reg_clus"
+    if _routes_as_picked():
+        assert ss_host._VARLEN_CACHE[key][0] == "reg_clus"
     _check_exact(lg, out, n, torch.topk(lg[:, :n], k, dim=1).values)
 
 
@@ -1799,7 +1801,8 @@ def test_selfsampling_varlen_clus_parity_and_oracle():
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
         key = _varlen_cache_key(rows, npad, k, msl_c, nn, cr)
-        assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
+        if _routes_as_picked():
+            assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
         torch.cuda.synchronize()
         ref = _reference_varlen_indices(lg, kv, nn, cr, k)
         for r in range(rows):
@@ -2831,6 +2834,14 @@ def _check_low_varlen_exact(
             assert bool((output_values[row, count:] == torch.finfo(torch.float32).min).all())
 
 
+def _routes_as_picked() -> bool:
+    """Whether this GPU routes the fixed test shapes as the GPUs they were picked on (datacenter
+    Blackwell and 132-SM Hopper). A smaller Hopper part such as the 78-SM H20 routes some of them
+    to another kernel family; the tests still check the results there."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.major * 10 + props.minor != 90 or props.multi_processor_count == 132
+
+
 def _launcher_family(
     dtype: torch.dtype,
     logits: torch.Tensor,
@@ -2942,7 +2953,7 @@ def test_selfsampling_topk_varlen_16bit_edge_patterns(
         max_seq_len=ncols * compress_ratio,
     )
     torch.cuda.synchronize()
-    if family is not None:
+    if family is not None and _routes_as_picked():
         assert _launcher_family(dtype, logits, top_k, ncols, 1, compress_ratio) == family
     _check_low_varlen_exact(logits, indices, lengths, values)
 
@@ -2989,7 +3000,8 @@ def test_selfsampling_topk_varlen_fp16_main_clus_smoke(
     key = _varlen_cache_key(
         rows, ncols, top_k, ncols, 1, compress_ratio, torch.cuda.current_device()
     )
-    assert ss_host._VARLEN_CACHE_FP16[key][0] == family
+    if _routes_as_picked():
+        assert ss_host._VARLEN_CACHE_FP16[key][0] == family
     _check_low_varlen_exact(logits, indices, lengths, values)
 
 
@@ -3248,7 +3260,8 @@ def test_selfsampling_topk_varlen_fp16_dense_window_exactness(
     ss_host.run_varlen(logits, kv_lens, indices, values=values, max_seq_len=ncols)
     torch.cuda.synchronize()
     key = _varlen_cache_key(rows, stride, top_k, ncols, 1, 1, torch.cuda.current_device())
-    assert ss_host._VARLEN_CACHE_FP16[key][0] == "main"
+    if _routes_as_picked():
+        assert ss_host._VARLEN_CACHE_FP16[key][0] == "main"
     _check_low_varlen_exact(logits, indices, lengths, values)
 
 
@@ -3404,7 +3417,8 @@ def test_selfsampling_topk_varlen_fp16_regclus_exactness(
     key = _varlen_cache_key(
         rows, npad, top_k, ncols, next_n, compress_ratio, torch.cuda.current_device()
     )
-    assert ss_host._VARLEN_CACHE_FP16[key][0] == "reg_clus"
+    if _routes_as_picked():
+        assert ss_host._VARLEN_CACHE_FP16[key][0] == "reg_clus"
     _check_low_varlen_exact(logits, indices, lengths, values)
 
 
