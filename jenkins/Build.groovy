@@ -1106,14 +1106,18 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
     }]}
 
     if (cpu_arch == X86_64_TRIPLE) {
-        def key = "Build With Build Type Debug"
+        def key = "Build With Profiling Enabled"
         def tarName = "profiling-TensorRT-LLM.tar.gz"
         parallelJobs += [
         (key): {
             script {
                 // This test-only artifact must also exist when normal builds are reused.
                 buildOrCache(pipeline, key, null, [(tarName): tarName], LLM_DOCKER_IMAGE, k8s_cpu, {
-                    buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "-a '90' -b Debug --micro_benchmarks -D ENABLE_NANOBIND_PROFILING=ON -D ENABLE_NCCL_PROFILING=ON", true, tarName)
+                    // Profiling replaces the former full Debug build: release Torch's
+                    // RecordFunction ABI requires NDEBUG; retain symbols with RelWithDebInfo.
+                    buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "-a '90' -b RelWithDebInfo --micro_benchmarks -D ENABLE_NANOBIND_PROFILING=ON -D ENABLE_NCCL_PROFILING=ON --extra-make-targets profilerTest", true, tarName)
+                    sh "cd ${LLM_ROOT} && ./cpp/build_RelWithDebInfo/tests/unit_tests/common/profilerTest --gtest_output=xml:profiler-test-results.xml"
+                    sh """python3 -c 'import xml.etree.ElementTree as ET; cases = ET.parse("${LLM_ROOT}/profiler-test-results.xml").findall(".//testcase"); assert len(cases) == 13, "profiling build must run all 13 native cases"; assert all(case.get("status") == "run" and all(case.find(kind) is None for kind in ("skipped", "failure", "error")) for case in cases), "native profiler cases must pass without skips"'"""
                 })
             }
         }]

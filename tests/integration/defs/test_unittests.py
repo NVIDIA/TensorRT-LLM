@@ -583,7 +583,7 @@ def test_mpi_profiler(llm_root: str, llm_venv: "PythonVenvRunnerImpl",
 def test_nccl_profiler_build_contract(llm_root: str,
                                       llm_venv: "PythonVenvRunnerImpl",
                                       output_dir: str, enabled: bool) -> None:
-    """Require the requested native build and run all NCCL contracts without skips."""
+    """Require both native probe flags and run NCCL and binding contracts without skips."""
     import xml.etree.ElementTree as ET
 
     from defs.common import venv_check_call
@@ -595,21 +595,25 @@ def test_nccl_profiler_build_contract(llm_root: str,
     if os.path.exists(report_path):
         os.remove(report_path)
     test_root = os.path.join(llm_root, "tests", "unittest")
-    case = os.path.join(test_root, "_torch", "distributed",
-                        "test_nccl_profiler.py")
+    contracts = [
+        os.path.join(test_root, "_torch", "distributed",
+                     "test_nccl_profiler.py"),
+        os.path.join(test_root, "bindings", "test_nanobind_profiler.py"),
+    ]
     launcher = (
         "import sys, pytest; from tensorrt_llm.bindings import BuildInfo; "
         "from tensorrt_llm import _profiler; "
-        "assert BuildInfo.ENABLE_NCCL_PROFILING is (sys.argv[1] == 'on'), "
-        "'NCCL profiling build does not match the required CI mode'; "
+        "assert all(getattr(BuildInfo, name) is (sys.argv[1] == 'on') "
+        "for name in ('ENABLE_NCCL_PROFILING', 'ENABLE_NANOBIND_PROFILING')), "
+        "'Native profiling flags do not match the required CI mode'; "
         "assert _profiler.custom_region_enabled('nccl'), "
         "'CI must select nccl before importing the product'; "
         "raise SystemExit(pytest.main(sys.argv[2:]))")
     venv_check_call(
         llm_venv,
         [
-            "-c", launcher, mode, case, "-v", "--tb=short", "--timeout=300",
-            f"--junitxml={report_path}"
+            "-c", launcher, mode, *contracts, "-v", "--tb=short",
+            "--timeout=300", f"--junitxml={report_path}"
         ],
         env={
             "PYTHONPATH":
@@ -621,7 +625,16 @@ def test_nccl_profiler_build_contract(llm_root: str,
         timeout=900,
     )
     cases = ET.parse(report_path).findall(".//testcase")
-    assert cases, "NCCL profiler collected no tests"
+    assert cases, "Native profiler contracts collected no tests"
+    selector_cases = [
+        case.get("name", "") for case in cases
+        if case.get("name", "").startswith(
+            "test_nanobind_results_errors_and_selection[")
+    ]
+    assert len(selector_cases) == 4 and set(selector_cases) == {
+        f"test_nanobind_results_errors_and_selection[{selector}]"
+        for selector in ("None", "nanobind", "none", "mpi")
+    }, "Binding profiler must run all four batched selector cases"
     p2p_cases = [
         case for case in cases if case.get("name", "").startswith(
             "test_nccl_owner_boundaries[point-to-point")
@@ -635,4 +648,4 @@ def test_nccl_profiler_build_contract(llm_root: str,
     for case_result in cases:
         for status in ("skipped", "failure", "error"):
             assert case_result.find(status) is None, (
-                f"NCCL profiler {case_result.get('name')} reported {status}")
+                f"Native profiler {case_result.get('name')} reported {status}")

@@ -35,16 +35,13 @@ diff --git a/include/nanobind/nb_class.h b/include/nanobind/nb_class.h
                                      is_method(), detail::filter_setter(extra)...);
  
          detail::property_install(m_ptr, name_, get_p.ptr(), set_p.ptr());
-@@ -670,12 +676,19 @@
-         object get_p, set_p;
+@@ -671,11 +677,17 @@
  
          if constexpr (!std::is_same_v<Getter, std::nullptr_t>)
--            get_p = cpp_function((detail::forward_t<Getter>) getter, is_getter(),
-+            get_p = cpp_function((detail::forward_t<Getter>) getter,
+             get_p = cpp_function((detail::forward_t<Getter>) getter, is_getter(),
 +#if TRTLLM_ENABLE_NANOBIND_PROFILING
 +                                 name(name_),
 +#endif
-+                                 is_getter(),
                                   rv_policy::reference,
                                   detail::filter_getter(extra)...);
  
@@ -56,7 +53,7 @@ diff --git a/include/nanobind/nb_class.h b/include/nanobind/nb_class.h
                                   detail::filter_setter(extra)...);
  
          detail::property_install_static(m_ptr, name_, get_p.ptr(), set_p.ptr());
-@@ -815,12 +828,18 @@
+@@ -815,12 +827,18 @@
  
          if constexpr (!std::is_same_v<Getter, std::nullptr_t>)
              get_p = cpp_function<T>((detail::forward_t<Getter>) getter,
@@ -82,8 +79,8 @@ diff --git a/src/common.cpp b/src/common.cpp
  #include <nanobind/nanobind.h>
  #include <complex>
  #include "nb_internals.h"
-+
 +#if TRTLLM_ENABLE_NANOBIND_PROFILING
++
 +#  include "tensorrt_llm/common/profiler.h"
 +#  include <cstdlib>
 +#  include <cstring>
@@ -147,8 +144,8 @@ diff --git a/src/common.cpp b/src/common.cpp
 +            "non-standard exception naming a nanobind property");
 +    }
 +}
-+#endif
 +
++#endif
  static void property_install_impl(PyTypeObject *tp, PyObject *scope,
                                    const char *name, PyObject *getter,
                                    PyObject *setter) {
@@ -165,8 +162,8 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
      All rights reserved. Use of this source code is governed by a
      BSD-style license that can be found in the LICENSE file.
  */
-+
 +#if TRTLLM_ENABLE_NANOBIND_PROFILING
++
 +#  include "trtllm_pytorch_tensor_adapter.h"
 +#  include "tensorrt_llm/common/profiler.h"
 +#  include <optional>
@@ -176,28 +173,14 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
  
  #include "nb_internals.h"
  #include "buffer.h"
-@@ -28,6 +36,121 @@
+@@ -28,6 +36,103 @@
  
  // Forward/external declarations
  extern Buffer buf;
-+
 +#if TRTLLM_ENABLE_NANOBIND_PROFILING
-+// Observational Python work must not replace a pending operation exception.
-+class nb_func_profiler_error_state {
-+public:
-+    nb_func_profiler_error_state() noexcept {
-+        PyErr_Fetch(&type, &value, &traceback);
-+    }
-+    ~nb_func_profiler_error_state() noexcept {
-+        PyErr_Clear();
-+        PyErr_Restore(type, value, traceback);
-+    }
-+    nb_func_profiler_error_state(const nb_func_profiler_error_state &) = delete;
-+    nb_func_profiler_error_state &operator=(const nb_func_profiler_error_state &) = delete;
 +
-+private:
-+    PyObject *type = nullptr, *value = nullptr, *traceback = nullptr;
-+};
++static PyObject *nb_func_get_module(PyObject *self);
++static PyObject *nb_func_get_qualname(PyObject *self);
 +
 +static std::string nb_func_profiler_utf8(PyObject *value) {
 +    if (!value)
@@ -216,21 +199,17 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
 +        name += f->name + strlen(f->name) + 1;
 +        return name;
 +    }
-+    if (f->flags & (uint32_t) func_flags::has_scope) {
-+        const bool module_scope = PyModule_Check(f->scope);
-+        object module = steal<object>(PyObject_GetAttrString(
-+            f->scope, module_scope ? "__name__" : "__module__"));
++    object module = steal<object>(nb_func_get_module(self));
++    object qualname = steal<object>(nb_func_get_qualname(self));
++    if (!module.is_valid() || !qualname.is_valid())
++        throw std::runtime_error("nanobind profiler qualified name unavailable");
++    if (!module.is_none()) {
 +        name += nb_func_profiler_utf8(module.ptr());
 +        name += '.';
-+        if (!module_scope) {
-+            object qualname = steal<object>(
-+                PyObject_GetAttrString(f->scope, "__qualname__"));
-+            name += nb_func_profiler_utf8(qualname.ptr());
-+            name += '.';
-+        }
 +    }
-+    name += (f->flags & (uint32_t) func_flags::has_name)
-+                ? f->name : "<anonymous>";
++    name += qualname.is_none()
++                ? ((f->flags & (uint32_t) func_flags::has_name) ? f->name : "<anonymous>")
++                : nb_func_profiler_utf8(qualname.ptr());
 +    return name;
 +}
 +
@@ -247,7 +226,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
 +            record.reset();
 +            return;
 +        }
-+        nb_func_profiler_error_state error_state;
++        error_scope error_state;
 +        try {
 +            record->startWithLazyName(
 +                [&]() { return nb_func_profiler_name(self); },
@@ -285,7 +264,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
 +    ~nb_func_record_scope() noexcept {
 +        if (!record || !record->isActive())
 +            return;
-+        nb_func_profiler_error_state error_state;
++        error_scope error_state;
 +        record.reset();
 +    }
 +    nb_func_record_scope(const nb_func_record_scope &) = delete;
@@ -298,50 +277,60 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
  
  static PyObject *nb_func_vectorcall_simple_0(PyObject *, PyObject *const *,
                                               size_t, PyObject *) noexcept;
-@@ -610,6 +733,10 @@
+@@ -610,6 +715,10 @@
  
      func_data *fr = nb_func_data(self);
  
 +#if TRTLLM_ENABLE_NANOBIND_PROFILING
 +    nb_func_record_scope record_scope(self, args_in, nargs_in, kwargs_in);
-+#endif
 +
++#endif
      const bool is_method      = fr->flags & (uint32_t) func_flags::is_method,
                 is_constructor = fr->flags & (uint32_t) func_flags::is_constructor;
  
-@@ -888,6 +1015,10 @@
+@@ -888,6 +997,10 @@
      const size_t count         = (size_t) Py_SIZE(self),
                   nargs_in      = (size_t) NB_VECTORCALL_NARGS(nargsf);
  
 +#if TRTLLM_ENABLE_NANOBIND_PROFILING
 +    nb_func_record_scope record_scope(self, args_in, nargs_in, kwargs_in);
-+#endif
 +
++#endif
      const bool is_method      = fr->flags & (uint32_t) func_flags::is_method,
                 is_constructor = fr->flags & (uint32_t) func_flags::is_constructor;
  
-@@ -977,6 +1108,10 @@
+@@ -977,6 +1090,10 @@
                                               PyObject *kwargs_in) noexcept {
      func_data *fr = nb_func_data(self);
      const size_t nargs_in = (size_t) NB_VECTORCALL_NARGS(nargsf);
-+
 +#if TRTLLM_ENABLE_NANOBIND_PROFILING
++
 +    nb_func_record_scope record_scope(self, args_in, nargs_in, kwargs_in);
 +#endif
  
      // Handler routine that will be invoked in case of an error condition
      PyObject *(*error_handler)(PyObject *, PyObject *const *, size_t,
-@@ -1017,6 +1152,10 @@
+@@ -1017,6 +1134,10 @@
                                               PyObject *kwargs_in) noexcept {
      func_data *fr = nb_func_data(self);
      const size_t nargs_in = (size_t) NB_VECTORCALL_NARGS(nargsf);
-+
 +#if TRTLLM_ENABLE_NANOBIND_PROFILING
++
 +    nb_func_record_scope record_scope(self, args_in, nargs_in, kwargs_in);
 +#endif
      bool is_constructor = fr->flags & (uint32_t) func_flags::is_constructor;
  
      // Handler routine that will be invoked in case of an error condition
+@@ -1362,6 +1483,9 @@
+         (f->flags & (uint32_t) func_flags::has_name)) {
+         PyObject *scope_name = PyObject_GetAttrString(f->scope, "__qualname__");
+         if (scope_name) {
++#if TRTLLM_ENABLE_NANOBIND_PROFILING
++            object scope_name_owner = steal<object>(scope_name);
++#endif
+             return PyUnicode_FromFormat("%U.%s", scope_name, f->name);
+         } else {
+             PyErr_Clear();
 diff --git a/src/trtllm_pytorch_tensor_adapter.h b/src/trtllm_pytorch_tensor_adapter.h
 new file mode 100644
 --- /dev/null
@@ -367,8 +356,8 @@ new file mode 100644
 +
 +#include <torch/version.h>
 +
-+#if TORCH_VERSION_MAJOR != 2 || TORCH_VERSION_MINOR != 14
-+#  error "TRTLLM_ENABLE_NANOBIND_PROFILING requires the validated PyTorch 2.14 private Tensor API"
++#if TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 14)
++#  error "TRTLLM_ENABLE_NANOBIND_PROFILING requires PyTorch 2.14 or newer for the private Tensor API"
 +#endif
 +#if defined(Py_LIMITED_API) || defined(NB_FREE_THREADED)
 +#  error "TRTLLM_ENABLE_NANOBIND_PROFILING requires the CPython GIL and full Python API"
