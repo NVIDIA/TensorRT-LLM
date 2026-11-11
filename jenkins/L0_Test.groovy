@@ -704,28 +704,16 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             """
         }
 
-        // Always re-tar the local stage directory and upload it directly, rather
-        // than trusting the last checkpoint uploaded by the checkpoint branch to
-        // still match it (the superseded-file rename above, or other
-        // post-snapshot writes, can leave it stale). Use --transform so tar
-        // contents carry the postTag filename without touching on-disk
-        // results*.xml files.
-        ensureStageResultNotUploaded("${stageName}${postTag}")
-        def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
-        uploadTestResult("results-${stageName}${postTag}.tar.gz", "test-results", attemptTargets(stageName, postTag))
-        deleteProgressArtifact(pipeline, stageName, postTag)
-
-        // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
+        // Collect coverage before packaging results.
         if (isCbtsStage(stageName)) {
-            CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
-                def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
-                def cbtsLocalDir = "${stageName}/cbts"
-                def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
-                sh "mkdir -p ${cbtsLocalDir}"
-                try {
+            try {
+                CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+                    def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+                    def cbtsLocalDir = "${stageName}/cbts${postTag}"
+                    def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
+                    sh "mkdir -p ${cbtsLocalDir}"
                     timeout(time: 5, unit: 'MINUTES') {
-                        // Freeze writers, then pack on the login node; an archive with no member is dropped.
+                        // Pack remote coverage and discard empty archives.
                         Utils.exec(
                             pipeline,
                             script: Utils.sshUserCmd(
@@ -744,16 +732,25 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                             numRetries: 3,
                         ) == 0
                         if (gotArchive) {
-                            sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
+                            // Aggregation flattens directories; tag retry filenames too.
+                            def coverageTransformOpt = postTag ? "--transform 's|[.]sqlite\$|${postTag}.sqlite|'" : ""
+                            sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} ${coverageTransformOpt} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
                         } else {
                             echo "CBTS: no coverage archive retrieved for ${stageName} (no coverage data or transfer skipped)."
                         }
                     }
-                } catch (Exception e) {
-                    echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
                 }
+            } catch (Exception e) {
+                echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
             }
         }
+
+        // Archive current results, tagging XML members without renaming local files.
+        ensureStageResultNotUploaded("${stageName}${postTag}")
+        def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+        uploadTestResult("results-${stageName}${postTag}.tar.gz", "test-results", attemptTargets(stageName, postTag))
+        deleteProgressArtifact(pipeline, stageName, postTag)
     }
 
     if (localResultDirectoryMissing) {
@@ -811,10 +808,10 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         isolateTestCmdLine += ["--periodic-junit-xmlpath=${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
 
         try {
-            sh """
+            sh(label: "Run pytest (isolated_${i})", script: """
                 cd ${llmSrc}/tests/integration/defs && \
                 ${isolateTestCmdLine.join(" ")}
-            """
+            """)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -835,8 +832,14 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                 def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
                 // conftest.py prefixes nodeids with --test-prefix=${stageName}; match in
                 // Groovy, not a shell grep, so a quote in a parametrized id can't break it.
+                // A unittest entry is recorded as its wrapper,
+                // "${stageName}/test_unittests.py::test_unittests_v2[unittest/...]".
+                def unfinishedNames = [
+                    "${stageName}/${bareTestName}".toString(),
+                    "${stageName}/test_unittests.py::test_unittests_v2[${bareTestName}]".toString(),
+                ]
                 def isTestUnfinished = fileExists(unfinishedTestFile) &&
-                    readFile(unfinishedTestFile).readLines().collect { it.trim() }.contains("${stageName}/${bareTestName}".toString())
+                    readFile(unfinishedTestFile).readLines().collect { it.trim() }.any { it in unfinishedNames }
                 if (isTestUnfinished) {
                     // Record this crash as a JUnit <testcase> like the regular-test
                     // path does. hasUnrerunFailure stays untouched here: it drives
@@ -851,12 +854,12 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                     if (classified instanceof InfraFailure) {
                         unrerunInfraFailure = classified
                     }
-                    // Same duration/no-signature gap as the regular-test path: this
-                    // finished but failed, and was never actually rerun, so
+                    // Same gap as the regular-test path: this finished but failed, and
+                    // the stage's rerun policy did not rerun it, so
                     // results_isolated_${i}.xml still carries the original
                     // <failure> with nothing here to flag it.
                     catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun (duration > 10 min, no matching failure signature)"
+                        error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun under this stage's rerun policy (the rerun list log says why)"
                     }
                     hasUnrerunFailure = true
                 }
@@ -5515,33 +5518,44 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
     def rerunDir = "${WORKSPACE}/${stageName}/rerun/${testType}"
     sh "mkdir -p ${rerunDir}"
 
-    // Generate rerun test lists
+    // Generate rerun test lists. The stage's rule in jenkins/config/rerun_policy.yml
+    // decides which tests are rerun and how often; tests it does not rerun go to
+    // rerun_0.txt, and the log above says why for each.
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
     def testListCmd = testCmdLine.find { it.contains("--test-list=") }
     def testListArg = testListCmd ? "--test-list=${testListCmd.split('=', 2)[1]}" : ""
     def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
     def unfinishedTestArg = fileExists(unfinishedTestFile) ? "--unfinished-test-file=${unfinishedTestFile}" : ""
-    sh """
+    // ${llmSrc} comes from the build artifact, so with reuse_build its test_rerun.py can
+    // be older than this pipeline and not accept --stage-name. Pass it only when the
+    // script does; an older script then applies its own built-in rerun rules.
+    def stageNameSupported = sh(
+        script: "python3 ${llmSrc}/jenkins/scripts/test_rerun.py generate_rerun_tests_list --help 2>/dev/null | grep -q -- '--stage-name'",
+        returnStatus: true
+    ) == 0
+    if (!stageNameSupported) {
+        echo "test_rerun.py in ${llmSrc} does not support --stage-name; generating rerun lists without the stage's rerun policy"
+    }
+    def stageNameArg = stageNameSupported ? "--stage-name='${stageName}'" : ""
+    sh(label: "Generate rerun test lists (${testType})", script: """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
         --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
         --fail-signatures='${failSignaturesList}' \
+        ${stageNameArg} \
         ${testListArg} \
         ${unfinishedTestArg}
-    """
+    """)
 
-    // If the stage has more than 5 failed tests, skip the rerun step
-    def validLineCount = 0
     for (times in [1, 2]) {
         def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
         if (fileExists(currentRerunTestList)) {
-            count = sh(
+            def count = sh(
                 script: "grep -v '^[[:space:]]*\$' ${currentRerunTestList} | wc -l",
                 returnStdout: true
             ).trim().toInteger()
             echo "Found ${count} ${testType} tests to rerun ${times} time(s)"
-            validLineCount += count
         }
     }
 
@@ -5585,10 +5599,10 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
         retainUnfinishedTimeoutEvidence(stageName, llmSrc)
         try {
             runWithCheckpoints(pipeline, checkpoint) {
-                sh """
+                sh(label: "Rerun pytest (${testType}, rerun ${times})", script: """
                     cd ${llmSrc}/tests/integration/defs && \\
                     ${newTestCmdLine.join(" ")}
-                """
+                """)
             }
         } catch(InterruptedException e) {
             throw e
@@ -6580,11 +6594,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 finalSnapshotRequires: "${WORKSPACE}/${stageName}/results.xml",
                             ]
                             runWithCheckpoints(pipeline, checkpoint) {
-                                sh """
+                                sh(label: "Run pytest (regular)", script: """
                                     rm -rf '${stageName}/'
                                     cd '${llmSrc}/tests/integration/defs'
                                     ${pytestCommand.join(" ")}
-                                """
+                                """)
                             }
                         } else {
                             echo "No regular tests to run for stage ${stageName}"
@@ -6629,13 +6643,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             if (classified instanceof InfraFailure) {
                                 unrerunInfraFailure = classified
                             }
-                            // Failures that finished (not a timeout) but were never
-                            // rerun because duration > 10 min and no known failure
-                            // signature matched: results.xml still carries their
-                            // original <failure>, but neither branch above fires for
-                            // them, so without this the stage silently reports green.
+                            // Failures that finished (not a timeout) but that the stage's
+                            // rerun policy did not rerun (for example duration over its
+                            // limit with no known failure signature, or too many
+                            // failures): results.xml still carries their original
+                            // <failure>, but neither branch above fires for them, so
+                            // without this the stage silently reports green.
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+                                error "Some tests failed and were not eligible for rerun under this stage's rerun policy (the rerun list log says why), please check the test report."
                             }
                             hasUnrerunFailure = true
                         }
@@ -6705,7 +6720,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             if (unrerunInfraFailure != null) {
                 throw unrerunInfraFailure
             }
-            error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+            error "Some tests failed and were not eligible for rerun under this stage's rerun policy (the rerun list log says why), please check the test report."
         }
     }
 
@@ -7562,7 +7577,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
-        "DGX_H200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200_perf_sanity", 1, 1, 8],
         // Disable RTXPro6000 stages due to nodes will be offline temporarily.
         // [TODO] Split tests between RTXPro6000 and RTXPro6000D and move reasonable mount of tests to pre-merge.
         // "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
@@ -7708,14 +7722,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
         // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 7, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 7, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 7, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 7, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 7, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 6, 7, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 7, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 6, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 6, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 6, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 6, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 6, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 6, 6, 4, 1, true, false],
     ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
@@ -7735,68 +7747,58 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 1, 1, 16, 4],
     ]
     // PerfSanity post-merge aggregated
-    // 2 Nodes
+    // 4 Nodes: Kimi K3 MXFP4 modeling_v2, TP16 attention on 16 GPUs in one NVLink domain
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
+        "GB200-16_GPUs-4_Nodes-PyTorch-PerfSanity-Node4-GPU16-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
+        "l0_gb200_multi_nodes_perf_sanity_node4_gpu16",
         2,
-        8,
-        2
-    )
-    // PerfSanity post-merge disaggregated
-    // 2 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
-        2,
-        8,
-        2
-    )
-    // 3 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8",
-        2,
-        12,
-        3
-    )
-    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_gen1_node2_gpu8",
-        1,
-        8,
-        2
+        16,
+        4
     )
     // GB300 PerfSanity post-merge disaggregated
-    // GLM-5 (ctx DEP2): 3 Nodes
+    // MiniMax-M3 150k1k con1 and con64: ctx1 (1 node, 2 GPUs) + gen1 tp4 (1 node, 4 GPUs) = 8 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE1-GPU4-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node1_gpu4",
+        2,
+        8,
+        2
+    )
+    // MiniMax-M3 150k1k con128 (gen dep8) and con1 (gen tp8): ctx1 (1 node, 2 GPUs) + gen1 (2 nodes, 8 GPUs) = 12 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8",
-        3,
+        2,
         12,
         3
     )
-    // 9 Nodes
+    // Kimi-K3 160k1k con16: ctx16 (16 single-GPU DWDP ctx servers, 4 nodes) + gen1 helix8 (2 nodes, 8 GPUs) = 24 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE8-GPU32-Post-Merge",
+        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX16-NODE4-GPU16-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32",
+        "l0_gb300_multi_nodes_perf_sanity_ctx16_node4_gpu16_gen1_node2_gpu8",
         1,
-        36,
-        9
+        24,
+        6
+    )
+    // Kimi-K3 160k1k con32: ctx16 (16 single-GPU DWDP ctx servers, 4 nodes) + gen1 helix16 (4 nodes, 16 GPUs) = 32 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-32_GPUs-8_Nodes-PyTorch-Disagg-PerfSanity-CTX16-NODE4-GPU16-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx16_node4_gpu16_gen1_node4_gpu16",
+        1,
+        32,
+        8
     )
     // 9 Nodes: ctx1 (1 node, 4 GPUs) + gen4 (2 nodes, 8 GPUs each) = 36 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8",
-        2,
+        1,
         36,
         9
     )
@@ -7805,7 +7807,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX6-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx6_node1_gpu4_gen1_node4_gpu16",
-        2,
+        1,
         40,
         10
     )
@@ -7814,7 +7816,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32",
-        2,
+        1,
         44,
         11
     )
@@ -7823,7 +7825,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-56_GPUs-14_Nodes-PyTorch-Disagg-PerfSanity-CTX12-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8",
-        2,
+        1,
         56,
         14
     )
@@ -7832,7 +7834,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8",
-        6,
+        5,
         8,
         2
     )
@@ -7845,12 +7847,21 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         16,
         4
     )
+    // Kimi-K3 160k1k ctx_only: the DWDP16 ctx side as one 16-GPU attention-DP server on 4 nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-Node4-GPU16-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_node4_gpu16",
+        1,
+        16,
+        4
+    )
     // gen_only_no_context: gen1 (8 nodes, 32 GPUs), no ctx fleet = 32 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node8_gpu32",
-        2,
+        1,
         32,
         8
     )
