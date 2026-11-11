@@ -1869,6 +1869,33 @@ def test_peer_registrar_requires_matching_unified_draft_layers(
     assert reg.get_peer_rank_info("peer", 1) == peer_ri
 
 
+@pytest.mark.parametrize(("local_dtype", "peer_dtype"), [("FP8", "FP8"), ("FP8", "BF16")])
+def test_peer_registrar_requires_matching_unified_draft_kv_dtype(
+    local_dtype: str, peer_dtype: str
+) -> None:
+    self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.num_draft_layers = 1
+    self_rankinfo.draft_kv_dtype = local_dtype
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    peer_ri.num_draft_layers = 1
+    peer_ri.draft_kv_dtype = peer_dtype
+    if local_dtype != peer_dtype:
+        with pytest.raises(
+            ValueError, match=f"draft KV dtype differs.*local={local_dtype}, peer={peer_dtype}"
+        ):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        return
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info("peer", 1) == peer_ri
+
+
 @pytest.mark.parametrize(
     ("self_kwargs", "peer_kwargs", "compatible"),
     [

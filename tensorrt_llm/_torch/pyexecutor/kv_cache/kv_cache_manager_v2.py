@@ -5374,9 +5374,11 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_layer_dtype(self, global_layer_id: int) -> DataType:
         if self.layer_specs is None:
-            if global_layer_id not in self.layer_offsets:
+            local_layer_id = self.layer_offsets.get(global_layer_id)
+            if local_layer_id is None:
                 raise KeyError(f"global layer {global_layer_id} is not local to this rank")
-            return self.dtype
+            appended = self._appended_draft_layer_specs.get(local_layer_id)
+            return appended.dtype if appended is not None else self.dtype
         return self.get_layer_cache_spec(global_layer_id).dtype
 
     def get_layer_buffer_roles(self, global_layer_id: int) -> tuple[DataRole, ...]:

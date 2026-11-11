@@ -41,6 +41,7 @@ from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
                                                    supports_native_fp8_lora)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
@@ -117,6 +118,38 @@ _STANDALONE_DRAFT_TOKENS_PER_BLOCK = 32
 # Aggregated helix skips memory profiling, so its default KV fraction leaves
 # room for prefill activations. TODO(TRTLLM-17127): remove once helix profiles.
 _HELIX_AGG_FREE_GPU_MEMORY_FRACTION = 0.6
+
+
+def _cuda_tensor_attributes(obj) -> List[torch.Tensor]:
+    """CUDA tensors stored directly as attributes of ``obj``.
+
+    For an ``nn.Module`` these are the tensors it keeps outside its registered
+    parameters and buffers, e.g. tables derived from its weights.
+    """
+    return [
+        value for value in vars(obj).values()
+        if isinstance(value, torch.Tensor) and value.is_cuda
+    ]
+
+
+def _unique_cuda_storage_bytes(tensors: List[torch.Tensor],
+                               exclude: set[int]) -> int:
+    """Bytes of the distinct CUDA storages behind ``tensors``.
+
+    Views of one storage count once; storages whose data pointer is in
+    ``exclude`` do not count.
+    """
+    seen = set(exclude)
+    total = 0
+    for tensor in tensors:
+        if not tensor.is_cuda:
+            continue
+        storage = tensor.untyped_storage()
+        if storage.data_ptr() in seen:
+            continue
+        seen.add(storage.data_ptr())
+        total += storage.nbytes()
+    return total
 
 
 def _get_num_reserved_index_slots(spec_config: Optional[SpeculativeConfig],
@@ -2066,6 +2099,15 @@ class KvCacheCreator:
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
+        drafter_reserve = self._get_context_kv_only_drafter_reserve(fraction)
+        if drafter_reserve > 0:
+            budget_before = kv_cache_max_memory
+            kv_cache_max_memory = int(budget_before - drafter_reserve)
+            logger.info(
+                f"Reserving {drafter_reserve / GB:.2f} GiB of PyTorch headroom for the "
+                f"context-KV-only drafter's resident tensors: KV cache budget "
+                f"{budget_before / GB:.2f} -> {kv_cache_max_memory / GB:.2f} GiB."
+            )
 
         # Estimation uses inferred pool sizing; the final manager uses the
         # user-provided configuration.
@@ -2764,6 +2806,20 @@ class KvCacheCreator:
         spec_dec_mode = self._speculative_config.spec_dec_mode
         if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
             return effective_draft_config
+        declared_dtype = self._declared_draft_kv_dtype()
+        if declared_dtype == torch.float8_e4m3fn:
+            logger.info_once(
+                "External drafter declares an FP8 E4M3 KV pool "
+                "(draft_kv_dtype); the draft layers are allocated in FP8.",
+                key="draft_kv_dtype_fp8")
+            return self._get_kv_quantized_model_config(effective_draft_config,
+                                                       QuantAlgo.FP8)
+        if declared_dtype is not None and declared_dtype not in (
+                torch.float16, torch.bfloat16):
+            raise ValueError(
+                f"Unsupported draft_kv_dtype {declared_dtype} declared by the "
+                "drafter; expected torch.float8_e4m3fn, torch.bfloat16 or "
+                "torch.float16.")
         quant_config = getattr(effective_draft_config, "quant_config", None)
         if quant_config is None or not quant_config.quant_mode.has_kv_cache_quant(
         ):
@@ -2772,6 +2828,88 @@ class KvCacheCreator:
             "External drafter KV pool keeps the drafter dtype; dropping "
             "the KV quantization inherited from the target.")
         return self._get_unquantized_kv_model_config(effective_draft_config)
+
+    def _get_context_kv_only_drafter_reserve(self, fraction: float) -> int:
+        """KV budget that keeps a context-KV-only drafter out of PyTorch's headroom.
+
+        A drafter that declares ``context_kv_only`` (it only computes the
+        prompt's draft KV, on a context server) is a resident cost of that
+        server. Its weights, derived tables and capture buffers are allocated
+        by the profiling forward, so they are in the measured peak, and
+        ``fraction`` of the memory left after the peak goes to the KV cache.
+        Each resident byte therefore costs the KV cache only ``fraction`` of a
+        byte and the PyTorch cap (set from what the KV cache leaves) the rest,
+        so the headroom above the resident tensors shrinks by ``1 - fraction``
+        of the drafter. A context server's activation peak is not what the
+        profile measured (attention over long reused prefixes), and that
+        headroom is what absorbs it, so the remainder comes out of the KV
+        budget as well: the drafter then costs the headroom nothing.
+
+        Returns:
+            ``(1 - fraction)`` times the bytes of the CUDA tensors held by the
+            draft model (minus storage shared with the target) and the
+            speculative metadata; 0 unless the drafter declares
+            ``context_kv_only``.
+        """
+        model = self._model_engine.model
+        draft_model = getattr(model, "draft_model", None)
+        if getattr(draft_model, "context_kv_only", False) is not True:
+            return 0
+        tensors = [*draft_model.parameters(), *draft_model.buffers()]
+        for module in draft_model.modules():
+            tensors.extend(_cuda_tensor_attributes(module))
+        spec_metadata = getattr(self._model_engine, "spec_metadata", None)
+        if spec_metadata is not None:
+            tensors.extend(_cuda_tensor_attributes(spec_metadata))
+        # Storage the target also holds (tied embeddings, say) is the
+        # target's cost. The drafter's own tensors are those under the paths
+        # it is registered at inside the model.
+        draft_prefixes = tuple(
+            f"{name}."
+            for name, module in model.named_modules(remove_duplicate=False)
+            if module is draft_model)
+        shared = {
+            tensor.untyped_storage().data_ptr()
+            for name, tensor in (
+                *model.named_parameters(remove_duplicate=False),
+                *model.named_buffers(remove_duplicate=False),
+            ) if tensor.is_cuda and not name.startswith(draft_prefixes)
+        }
+        resident = _unique_cuda_storage_bytes(tensors, exclude=shared)
+        logger.info(
+            f"Context-KV-only drafter: {resident / GB:.2f} GiB of resident CUDA tensors."
+        )
+        return int((1.0 - fraction) * resident)
+
+    def _declared_draft_kv_dtype(self) -> Optional[torch.dtype]:
+        """KV pool dtype the loaded drafter declares (``draft_kv_dtype``), or None.
+
+        A drafter without the declaration stores its pool in its weights
+        dtype. The declaration belongs to the drafter class, so the context
+        and generation servers of one model agree on it.
+        """
+        draft_model = getattr(self._model_engine.model, "draft_model", None)
+        declared = getattr(draft_model, "draft_kv_dtype", None)
+        return declared if isinstance(declared, torch.dtype) else None
+
+    @staticmethod
+    def _get_kv_quantized_model_config(model_config: ModelConfig,
+                                       kv_cache_quant_algo) -> ModelConfig:
+        """Describe a KV pool in ``kv_cache_quant_algo`` without changing the model config."""
+        quant_config = model_config.quant_config
+        if (quant_config is not None
+                and quant_config.kv_cache_quant_algo == kv_cache_quant_algo):
+            return model_config
+        quant = (copy.copy(quant_config)
+                 if quant_config is not None else QuantConfig())
+        quant.kv_cache_quant_algo = kv_cache_quant_algo
+        # Drop the cached properties the copy carries, see
+        # _get_unquantized_kv_model_config.
+        quant.__dict__.pop("quant_mode", None)
+        quant.__dict__.pop("layer_quant_mode", None)
+        model_config = copy.copy(model_config)
+        model_config.quant_config = quant
+        return model_config
 
     @staticmethod
     def _get_unquantized_kv_model_config(
