@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 import tensorrt_llm.bindings
-from tensorrt_llm import logger
+from tensorrt_llm import _profiler, logger
 from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.agent import use_pure_python_transfer_agent
@@ -1178,7 +1178,24 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if outcome == "completed":
             self._record_send_terminal_outcome(rid, "complete")
         elif outcome == "cancelled":
-            self._record_send_terminal_outcome(rid, "cancelled")
+            observed_outcome: SendTerminalOutcome = "cancelled"
+            if session is not None and rid in self._profile_send_observers:
+                try:
+                    # Retirement preserves an earlier failure even after cancel().
+                    if session.status == SessionStatus.ERROR:
+                        observed_outcome = "failed"
+                except (
+                    AttributeError,
+                    LookupError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                    OSError,
+                ) as error:
+                    _profiler.warn_profiler_failure(
+                        "trtllm::kv_transfer", "kv", "send retirement outcome", error
+                    )
+            self._record_send_terminal_outcome(rid, observed_outcome)
 
     def start_send_terminal_outcome_observation(self, req: LlmRequest) -> None:
         """Track one pending send without retaining the request or polling it."""
