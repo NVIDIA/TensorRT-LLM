@@ -11,7 +11,9 @@ import os
 import pickle
 import sys
 import weakref
+from contextlib import ExitStack
 from dataclasses import dataclass
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import _torch.attention.multi_gpu.helix_test_utils as helix_utils
@@ -27,6 +29,7 @@ from _torch.modeling.kimi_k3_mla_reference import KimiMLAAttention
 from _torch.modeling.test_kimi_k3_checkpoint import load_mla_checkpoint
 from _torch.modeling.test_kimi_k3_mla import _assert_matches_reference, _checkpoint_weights
 from mpi4py import MPI
+from transformers import Qwen3Config
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
@@ -123,11 +126,37 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
         spec_config=DSparkDecodingConfig(
             max_draft_len=scenario.generation_query_width - 1,
             block_size=scenario.generation_query_width - 1,
+            mask_token_id=0,
+            target_layer_ids=[0],
         )
         if scenario.generation_query_width > 1
         else None,
     )
-    with torch.device("cuda"):
+    with ExitStack() as setup, torch.device("cuda"):
+        if model_config.spec_config is not None:
+            # The target wrapper constructs its standalone drafter even though
+            # this attention test never executes it or loads draft weights.
+            draft_dir = setup.enter_context(TemporaryDirectory(prefix="helix-mla-draft-"))
+            Qwen3Config.from_dict(
+                {
+                    "architectures": ["Qwen3ForCausalLM"],
+                    "vocab_size": config.vocab_size,
+                    "hidden_size": config.hidden_size,
+                    "intermediate_size": config.intermediate_size,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 64,
+                    "dtype": "bfloat16",
+                    "max_position_embeddings": config.max_position_embeddings,
+                    "dflash_config": {
+                        "mask_token_id": 0,
+                        "target_layer_ids": [0],
+                        "block_size": scenario.generation_query_width - 1,
+                    },
+                }
+            ).save_pretrained(draft_dir)
+            model_config.spec_config.speculative_model = draft_dir
         model = KimiLinearForCausalLM(model_config).eval()
     projections = {
         f"{name}.{suffix}": value
