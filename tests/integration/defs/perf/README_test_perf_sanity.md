@@ -489,7 +489,7 @@ The official post-merge pipeline runs every perf-sanity stage once every N build
 
 | Cases | N |
 |-------|---|
-| Key models: DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3 and GLM-5.3-Flash (all modes) | 2 |
+| Key models: DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3, GLM-5.3-Flash and Mistral Large 4 (all modes) | 2 |
 | Every other perf-sanity case | 4 |
 
 The cadence is encoded in the stage name: `Stage-k_of_N` runs when the parent `BUILD_NUMBER % N == k % N`. For example, `-1_of_4` runs at remainder 1, `-2_of_4` at remainder 2, and `-4_of_4` at remainder 0. Stages without this suffix are not filtered by build number.

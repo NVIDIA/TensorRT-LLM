@@ -7734,9 +7734,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
     ]
     // PerfSanity post-merge stages end in -k_of_N and run on the official post-merge builds whose
-    // BUILD_NUMBER % N == k % N: key models (DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3, GLM-5.3-Flash)
-    // every 2 builds, the other cases every 4. buildStageConfigs gives split k slot k; a stage with a
-    // single split names its slot, chosen to spread the GPU load evenly over the builds.
+    // BUILD_NUMBER % N == k % N: key models (DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3, GLM-5.3-Flash,
+    // Mistral Large 4) every 2 builds, the other cases every 4. buildStageConfigs gives split k slot k; a
+    // stage with a single split names its slot, chosen to spread the GPU load evenly over the builds.
     SBSASlurmTestConfigs += buildStageConfigs(
         "GB300-4_GPUs-PyTorch-PerfSanity-KeyModels-Post-Merge-{split}_of_2",
         "auto:gb300-x4",
