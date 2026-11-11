@@ -340,7 +340,9 @@ For configurations that support disabling speculation, set both `acceptance_rate
 ```{warning}
 The cutoff can underestimate acceptance when a batch-size schedule shortens the draft: it can divide the accepted-token count by the larger reserved draft-token count instead of the number actually verified in that iteration. With the schedule above at batch size 5, accepting both verified draft tokens per request can therefore record `2/3`. A window of 1 and a threshold of `0.9` then permanently disable speculation even though every verified draft token was accepted.
 
-Leave the acceptance-rate cutoff disabled when using `draft_len_schedule` or `max_concurrency` in the current implementation.
+Dynamic trees have the same limitation: the recorded denominator can be the total tree-token budget rather than the verified path length. For example, accepting a complete six-token path in a 60-token tree can record `6/60`, causing a threshold above `0.1` to permanently disable speculation.
+
+Leave the acceptance-rate cutoff disabled when using dynamic trees, `draft_len_schedule`, or `max_concurrency` in the current implementation.
 ```
 
 The feature is disabled when the window is unset or zero, or the threshold is unset. Model-specific restrictions still apply; for example, Kimi K3 helix rejects these acceptance-rate options.
