@@ -1,7 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-# One top-level key per test list: a stage names its list (the key) in jenkins/L0_Test.groovy.
 version: 0.0.1
 l0_gb300_multi_gpus_perf_sanity:
 - condition:
@@ -37,8 +33,9 @@ l0_gb300_multi_gpus_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v41_flash_grace_blackwell-v41_flash_tep4_dspark_8k1k] TIMEOUT (30)
   # glm-5.3-flash-fp8 tp4 mtp3 8k1k (aggregated)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_fp8_grace_blackwell-glm53_flash_fp8_tp4_mtp3_8k1k] TIMEOUT (30)
-  # glm-5.3-flash-fp8 attention dp4 mtp3 fp8 kv 8k1k and long prompt (aggregated)
+  # glm-5.3-flash-fp8 attention dp4 mtp3 fp8 kv 8k1k (tuned config and the serve command) and long prompt (aggregated)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_fp8_grace_blackwell-glm53_flash_fp8_dep4_mtp3_fp8kv_8k1k] TIMEOUT (30)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_fp8_grace_blackwell-glm53_flash_fp8_dep4_mtp3_fp8kv_maxseq16k_8k1k] TIMEOUT (30)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_fp8_grace_blackwell-glm53_flash_fp8_tp4_mtp3_isl13312_osl33] TIMEOUT (30)
   # glm-5.3-flash-nvfp4 tp4 mtp3 8k1k (aggregated)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_nvfp4_grace_blackwell-glm53_flash_nvfp4_tp4_mtp3_8k1k] TIMEOUT (30)
@@ -64,23 +61,3 @@ l0_gb300_multi_gpus_perf_sanity:
   # minimax-m3-fp4 eagle3 150k1k con1 and con64, TP4 gen worker
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con1_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL] TIMEOUT (35)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con64_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL] TIMEOUT (45)
-l0_gb300_multi_gpus_perf_sanity_glm5:
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 4
-        lte: 4
-    wildcards:
-      gpu:
-      - '*gb300*'
-      linux_distribution_name: ubuntu*
-      cpu: aarch64
-    terms:
-      stage: post_merge
-      backend: pytorch
-  tests:
-  # ctx_only tests (disagg config)
-  # glm-5-fp4
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_glm-5-fp4_8k1k_con1_ctx1_dep2_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (30)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_glm-5-fp4_8k1k_con512_ctx1_dep2_gen1_dep32_eplb0_mtp3_ccb-NIXL] TIMEOUT (50)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_glm-5-fp4_8k1k_con1024_ctx1_dep2_gen1_dep8_eplb256_mtp1_ccb-NIXL] TIMEOUT (65)

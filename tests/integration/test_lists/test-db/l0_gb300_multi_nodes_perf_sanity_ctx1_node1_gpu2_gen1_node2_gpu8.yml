@@ -1,0 +1,20 @@
+version: 0.0.1
+l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8:
+- condition:
+    ranges:
+      # 1 ctx worker with each 1 node and 2 GPUs
+      # 1 gen worker with each 2 node and 8 GPUs
+      system_gpu_count:
+        gte: 12
+        lte: 12
+    wildcards:
+      gpu:
+      - '*gb300*'
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  # minimax-m3-fp4 eagle3 150k1k con128: TP2 ctx worker, DEP8 gen worker
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_minimax-m3-fp4_150k1k_con128_ctx1_tp2_gen1_dep8_eplb0_eagle3_ccb-NIXL] TIMEOUT (95)
+  # minimax-m3-fp4 eagle3 150k1k con1: TP2 ctx worker, TP8 gen worker (modeling_v2 sm103 tp8 target)
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_minimax-m3-fp4_150k1k_con1_ctx1_tp2_gen1_tp8_eplb0_eagle3_ccb-NIXL] TIMEOUT (45)

@@ -40,6 +40,7 @@ POLL_TIMEOUT = 0.01
 AWAIT_TIMEOUT = 0.05
 THREAD_TIMEOUT = 5.0
 WORKER_TIMEOUT = 2.0
+EXT_WORKER_TEARDOWN_TIMEOUT = 30.0
 WORKER_SPAWN_SHUTDOWN_TIMEOUT = 5.0
 
 # Module-local seams keep lifecycle tests from monkeypatching process-wide
@@ -1502,9 +1503,16 @@ class DiffusionRemoteClient:
                 for process in self.worker_processes:
                     _reap_worker_process(process)
 
-            # External-launch mode: join rank-0 worker thread.
+            # External-launch mode: the other ranks' destroy_process_group waits for rank 0's,
+            # which runs in this daemon thread and dies with the interpreter if not joined.
             if self._ext_worker_thread is not None and self._ext_worker_thread.is_alive():
-                self._ext_worker_thread.join(timeout=WORKER_TIMEOUT)
+                self._ext_worker_thread.join(timeout=EXT_WORKER_TEARDOWN_TIMEOUT)
+                if self._ext_worker_thread.is_alive():
+                    raise RuntimeError(
+                        "Rank 0 worker did not finish its teardown within "
+                        f"{EXT_WORKER_TEARDOWN_TIMEOUT:.0f}s; the other ranks may hang in "
+                        "destroy_process_group"
+                    )
         except BaseException as e:
             if shutdown_error is None:
                 shutdown_error = e

@@ -22,7 +22,8 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
-                              IS_CUTLASS_DSL_RUBIN_AVAILABLE, sm_reserve)
+                              IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+                              reserved_max_active_clusters, sm_reserve)
 from ..locality_domain.autotune import tune_locality_domain_concurrent
 from ..locality_domain.runtime import LocalityDomainRuntime
 from ..locality_domain_utils import (get_current_locality_domain,
@@ -36,6 +37,7 @@ from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
 from .cutedsl_matmul_heuristics import (NVFP4_PRECISION,
                                         nvmmh_enabled_for_nvfp4, nvmmh_fields,
                                         nvmmh_max_tactics, rank_configs)
+from .fast_custom_op import fast_custom_op
 
 try:
     from cuda.bindings import driver as cuda
@@ -561,6 +563,20 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
     IDX_PERMUTED_IDX_TO_EXPANDED_IDX = 7
     IDX_SHAPE_INFER = IDX_PERMUTED_IDX_TO_EXPANDED_IDX
 
+    def infer_shape_locality_domain_output_sf_numel(
+            self,
+            input_shapes: List[torch.Size],
+            scaling_vector_size: int = 16) -> int:
+        """Element count of the shared FC1 output scale-factor buffer.
+
+        Both locality-domain partitions write ``m * full_interm //
+        scaling_vector_size`` scales; each partition's weight width ``n``
+        (input 1) equals ``full_interm``.
+        """
+        n = input_shapes[1][1]
+        return (self.infer_shape_max_num_permuted_tokens(input_shapes) * n //
+                scaling_vector_size)
+
     @staticmethod
     def _resize_locality_domain_outputs(
         m: int,
@@ -701,6 +717,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass.cute as cute
 
     from ..kernels.blackwell import fp8_block_scale_low_m_gemm as fp8_low_m
+    from ..kernels.blackwell import kimi_k3_attn_res
     from ..kernels.blackwell.blockwise_gemm.blockwise_gemm import \
         Sm100BlockwiseGemmKernel
     from ..kernels.blackwell.dense_blockscaled_gemm_act_fusion import \
@@ -721,7 +738,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
     from ..kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
-    from ..kernels.blackwell.utils import make_ptr
+    from ..kernels.blackwell.utils import TRTLLM_ENABLE_PDL, make_ptr
+    from ..moe.kernels.blackwell import kimi_k3_router_logits, kimi_k3_routing
     from ..moe.kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
         BlockScaledContiguousGatherGroupedGemmKernel, validate_activation_type)
     from ..moe.kernels.blackwell.blockscaled_contiguous_grouped_gemm import \
@@ -5621,26 +5639,359 @@ if IS_CUTLASS_DSL_AVAILABLE:
     @torch.library.custom_op("trtllm::fp8_block_scale_low_m_gemm",
                              mutates_args=(),
                              device_types="cuda")
-    def fp8_block_scale_low_m_gemm(input: torch.Tensor, weight: torch.Tensor,
-                                   weight_scale: torch.Tensor) -> torch.Tensor:
+    def fp8_block_scale_low_m_gemm(input: torch.Tensor,
+                                   weight: torch.Tensor,
+                                   weight_scale: torch.Tensor,
+                                   gate: Optional[torch.Tensor] = None,
+                                   sigmoid: bool = False) -> torch.Tensor:
         """FP8 block-scale GEMM for few rows (``fp8_block_scale_low_m_gemm.py``).
 
         Takes the operands of ``fp8_swap_ab_gemm(..., disable_ue8m0_cast=True)``:
         BF16 ``input [M, K]`` with ``1 <= M <= 256``, the UE8M0-resmoothed FP8
         ``weight [N, K]`` and its DeepGEMM-packed UE8M0 ``weight_scale``.
-        Returns BF16 ``[M, N]``.
+        Returns BF16 ``[M, N]``: ``bf16(input * gate) @ weight^T`` with a
+        ``gate``, ``sigmoid`` of the result with ``sigmoid`` (both for M in the
+        low-M kernel's range only).
         """
         fp8_low_m.check_inputs(input, weight, weight_scale)
+        if gate is not None:
+            fp8_low_m.check_gate(input, gate)
         output = torch.empty((input.shape[0], weight.shape[0]),
                              dtype=torch.bfloat16,
                              device=input.device)
-        return fp8_low_m.run_low_m_gemm(input, weight, weight_scale, output)
+        return fp8_low_m.run_low_m_gemm(input,
+                                        weight,
+                                        weight_scale,
+                                        output,
+                                        gate=gate,
+                                        sigmoid=sigmoid,
+                                        use_pdl=TRTLLM_ENABLE_PDL)
 
     @torch.library.register_fake("trtllm::fp8_block_scale_low_m_gemm")
-    def _(input: torch.Tensor, weight: torch.Tensor,
+    def _(input: torch.Tensor,
+          weight: torch.Tensor,
+          weight_scale: torch.Tensor,
+          gate: Optional[torch.Tensor] = None,
+          sigmoid: bool = False) -> torch.Tensor:
+        return input.new_empty((input.shape[0], weight.shape[0]),
+                               dtype=torch.bfloat16)
+
+    @torch.library.custom_op("trtllm::fp8_block_scale_low_m_gemm_prequantized",
+                             mutates_args=(),
+                             device_types="cuda")
+    def fp8_block_scale_low_m_gemm_prequantized(
+            input: torch.Tensor, input_scale: torch.Tensor,
+            weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
+        """``fp8_block_scale_low_m_gemm`` on an MXFP8 activation quantized
+        upstream: E4M3 ``input [M, K]`` (``M`` in the low-M kernel's range)
+        and its UE8M0 1x32 ``input_scale`` in the R128c4 layout. Bitwise the
+        GEMM of the BF16 activation the operand quantizes."""
+        fp8_low_m.check_prequantized_inputs(input, input_scale, weight,
+                                            weight_scale)
+        output = torch.empty((input.shape[0], weight.shape[0]),
+                             dtype=torch.bfloat16,
+                             device=input.device)
+        return fp8_low_m.run_low_m_gemm_prequantized(input,
+                                                     input_scale,
+                                                     weight,
+                                                     weight_scale,
+                                                     output,
+                                                     use_pdl=TRTLLM_ENABLE_PDL)
+
+    @torch.library.register_fake(
+        "trtllm::fp8_block_scale_low_m_gemm_prequantized")
+    def _(input: torch.Tensor, input_scale: torch.Tensor, weight: torch.Tensor,
           weight_scale: torch.Tensor) -> torch.Tensor:
         return input.new_empty((input.shape[0], weight.shape[0]),
                                dtype=torch.bfloat16)
+
+    @torch.library.custom_op("trtllm::fp8_block_scale_low_m_gemm_nvfp4",
+                             mutates_args=(),
+                             device_types="cuda")
+    def fp8_block_scale_low_m_gemm_nvfp4(
+            input: torch.Tensor, weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+            global_sf: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``fp4_quantize`` (``global_sf``, 16-element groups, linear scales)
+        of this GEMM's BF16 output from the low-M / mid-M kernel's NVFP4
+        epilogue, byte for byte at the kernel's tactic: E2M1 codes
+        ``uint8 [M, N / 2]`` and E4M3 scales ``uint8 [M * N / 16]``. Runs the
+        current device's NVFP4 route (``nvfp4_out_tactic``) where it selects
+        this output, the BF16 GEMM's default tactic otherwise. ``1 <= M <=
+        256``, ``N`` a multiple of 128, ``global_sf`` an FP32 one-element
+        tensor (see ``can_run_nvfp4``)."""
+        if not fp8_low_m.can_run_nvfp4(input, weight, weight_scale, global_sf):
+            raise ValueError(
+                "fp8_block_scale_low_m_gemm_nvfp4: unsupported operands "
+                f"(M={input.shape[0]}, N={weight.shape[0]}, K={input.shape[-1]})"
+            )
+        m, n = input.shape[0], weight.shape[0]
+        codes = torch.empty((m, n // 2), dtype=torch.uint8, device=input.device)
+        scales = torch.empty((m * n // 16, ),
+                             dtype=torch.uint8,
+                             device=input.device)
+        return fp8_low_m.run_low_m_gemm_nvfp4(
+            input,
+            weight,
+            weight_scale,
+            global_sf,
+            codes,
+            scales,
+            use_pdl=fp8_low_m.TRTLLM_ENABLE_PDL)
+
+    @torch.library.register_fake("trtllm::fp8_block_scale_low_m_gemm_nvfp4")
+    def _(input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+          global_sf: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        m, n = input.shape[0], weight.shape[0]
+        return (input.new_empty((m, n // 2), dtype=torch.uint8),
+                input.new_empty((m * n // 16, ), dtype=torch.uint8))
+
+    # Kimi-K3 decode attention-residual mix + RMSNorm with a PDL prologue
+    # (``kimi_k3_attn_res.py``). ``layer``/``prefix``/``residual`` and the
+    # addends are BF16 ``[M, H]``, ``block`` BF16 ``[N - 1, M, H]``, the
+    # weights BF16 ``[H]``; inputs as ``kimi_k3_attn_res.can_run`` accepts.
+
+    def _check_kimi_k3_attn_res_inputs(layer: torch.Tensor,
+                                       addends: Tuple[torch.Tensor,
+                                                      ...], block: torch.Tensor,
+                                       *weights: torch.Tensor) -> None:
+        # Host-side checks only: the kernel does not validate its operands.
+        if not kimi_k3_attn_res.can_run(layer, addends, block, *weights):
+            raise ValueError("kimi_k3_attn_res: unsupported inputs (layer "
+                             f"{tuple(layer.shape)} {layer.dtype}, block "
+                             f"{tuple(block.shape)}, addends "
+                             f"{[tuple(a.shape) for a in addends]}); see "
+                             "kimi_k3_attn_res.can_run")
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_rmsnorm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_rmsnorm(
+            layer: torch.Tensor,
+            block: torch.Tensor,
+            res_weight: torch.Tensor,
+            rms_weight: torch.Tensor,
+            out_weight: torch.Tensor,
+            rms_eps: float,
+            out_eps: float,
+            snapshots_after_wait: bool = False) -> torch.Tensor:
+        """Attention-residual mix of ``block`` and ``layer``, then RMSNorm.
+
+        ``snapshots_after_wait``: ``block`` was written by the kernel launched
+        immediately before this op, so the kernel loads it after its PDL wait.
+        """
+        _check_kimi_k3_attn_res_inputs(layer, (), block, res_weight, rms_weight,
+                                       out_weight)
+        output = torch.empty_like(layer)
+        kimi_k3_attn_res.run_attn_res(layer, (),
+                                      block,
+                                      res_weight,
+                                      rms_weight,
+                                      out_weight,
+                                      rms_eps,
+                                      out_eps,
+                                      output,
+                                      None,
+                                      snapshots_after_wait=snapshots_after_wait)
+        return output
+
+    @torch.library.register_fake("trtllm::kimi_k3_attn_res_rmsnorm")
+    def _(layer: torch.Tensor,
+          block: torch.Tensor,
+          res_weight: torch.Tensor,
+          rms_weight: torch.Tensor,
+          out_weight: torch.Tensor,
+          rms_eps: float,
+          out_eps: float,
+          snapshots_after_wait: bool = False) -> torch.Tensor:
+        return torch.empty_like(layer)
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_add_rmsnorm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_add_rmsnorm(
+            prefix: torch.Tensor, addend: torch.Tensor, block: torch.Tensor,
+            res_weight: torch.Tensor, rms_weight: torch.Tensor,
+            out_weight: torch.Tensor, rms_eps: float,
+            out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(bf16(prefix + addend), output)``: the residual add, then the mix
+        and RMSNorm on the updated prefix sum."""
+        _check_kimi_k3_attn_res_inputs(prefix, (addend, ), block, res_weight,
+                                       rms_weight, out_weight)
+        output = torch.empty_like(prefix)
+        updated = torch.empty_like(prefix)
+        kimi_k3_attn_res.run_attn_res(prefix, (addend, ), block, res_weight,
+                                      rms_weight, out_weight, rms_eps, out_eps,
+                                      output, updated)
+        return updated, output
+
+    @torch.library.register_fake("trtllm::kimi_k3_attn_res_add_rmsnorm")
+    def _(prefix: torch.Tensor, addend: torch.Tensor, block: torch.Tensor,
+          res_weight: torch.Tensor, rms_weight: torch.Tensor,
+          out_weight: torch.Tensor, rms_eps: float,
+          out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.empty_like(prefix), torch.empty_like(prefix)
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_moe_add_rmsnorm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_moe_add_rmsnorm(
+            residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
+            block: torch.Tensor, res_weight: torch.Tensor,
+            rms_weight: torch.Tensor, out_weight: torch.Tensor, rms_eps: float,
+            out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(prefix, output)`` with ``prefix = bf16(residual + bf16(routed +
+        shared))``, a MoE layer's residual update, then the mix and RMSNorm on
+        ``prefix``."""
+        _check_kimi_k3_attn_res_inputs(residual, (routed, shared), block,
+                                       res_weight, rms_weight, out_weight)
+        output = torch.empty_like(residual)
+        prefix = torch.empty_like(residual)
+        kimi_k3_attn_res.run_attn_res(residual, (routed, shared), block,
+                                      res_weight, rms_weight, out_weight,
+                                      rms_eps, out_eps, output, prefix)
+        return prefix, output
+
+    @torch.library.register_fake("trtllm::kimi_k3_attn_res_moe_add_rmsnorm")
+    def _(residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
+          block: torch.Tensor, res_weight: torch.Tensor,
+          rms_weight: torch.Tensor, out_weight: torch.Tensor, rms_eps: float,
+          out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.empty_like(residual), torch.empty_like(residual)
+
+    def _kimi_k3_attn_res_mxfp8_outputs(
+            rows: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        xq = torch.empty_like(rows, dtype=torch.float8_e4m3fn)
+        xs = torch.empty(kimi_k3_attn_res.mxfp8_scale_numel(*rows.shape),
+                         dtype=torch.uint8,
+                         device=rows.device)
+        return xq, xs
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_moe_add_rmsnorm_mxfp8",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_moe_add_rmsnorm_mxfp8(
+        residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
+        block: torch.Tensor, res_weight: torch.Tensor, rms_weight: torch.Tensor,
+        out_weight: torch.Tensor, rms_eps: float, out_eps: float
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``kimi_k3_attn_res_moe_add_rmsnorm`` plus the MXFP8 form ``(xq,
+        xs)`` of its output: E4M3 ``[M, H]`` and UE8M0 1x32 scales in the
+        R128c4 layout, the bits the FP8 low-M GEMM's in-kernel quantization
+        makes of the output."""
+        _check_kimi_k3_attn_res_inputs(residual, (routed, shared), block,
+                                       res_weight, rms_weight, out_weight)
+        output = torch.empty_like(residual)
+        prefix = torch.empty_like(residual)
+        xq, xs = _kimi_k3_attn_res_mxfp8_outputs(residual)
+        kimi_k3_attn_res.run_attn_res(residual, (routed, shared),
+                                      block,
+                                      res_weight,
+                                      rms_weight,
+                                      out_weight,
+                                      rms_eps,
+                                      out_eps,
+                                      output,
+                                      prefix,
+                                      mxfp8_out=(xq, xs))
+        return prefix, output, xq, xs
+
+    @torch.library.register_fake(
+        "trtllm::kimi_k3_attn_res_moe_add_rmsnorm_mxfp8")
+    def _(
+        residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
+        block: torch.Tensor, res_weight: torch.Tensor, rms_weight: torch.Tensor,
+        out_weight: torch.Tensor, rms_eps: float, out_eps: float
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (torch.empty_like(residual), torch.empty_like(residual),
+                *_kimi_k3_attn_res_mxfp8_outputs(residual))
+
+    # Ungrouped ``noaux_tc_op`` top-16 + ``moe_sort`` (128-row tiles) of one
+    # expert-parallel rank in one launch (``kimi_k3_routing.py``). Direct callers
+    # that bypass the scheduler cannot read the kernel's limits off a decline,
+    # so the op re-raises ``kimi_k3_routing.can_run``'s rejection.
+    @fast_custom_op("trtllm::noaux_tc_route_sort", mutates_args=())
+    def noaux_tc_route_sort(
+        logits: torch.Tensor, e_score_correction_bias: torch.Tensor,
+        routed_scaling_factor: float, local_expert_offset: int,
+        local_num_experts: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(topk_ids int32 [M, 16], topk_weights fp32 [M, 16], *moe_sort outputs)``.
+
+        Top-k equals ``noaux_tc_op`` (one group) on the same logits bit for bit; the six sort
+        outputs have ``moe_sort``'s shapes and dtypes for ``tile_tokens_dim=128``, only valid
+        entries are written (as in ``moe_sort``), and the rows of an expert are in ascending
+        token order.
+        """
+        if not kimi_k3_routing.can_run(logits, e_score_correction_bias,
+                                       local_expert_offset, local_num_experts):
+            raise ValueError(
+                "noaux_tc_route_sort: unsupported operands (needs contiguous "
+                "16-byte-aligned FP32 logits "
+                f"[1, {kimi_k3_routing.MAX_M}] x a multiple of 128 experts up to "
+                f"{kimi_k3_routing.MAX_EXPERTS} on an SM100/SM103/SM107 CUDA device, and a "
+                "matching FP32 bias on the same device; got "
+                f"shape={tuple(logits.shape)}, dtype={logits.dtype}, "
+                f"device={logits.device})")
+        m = logits.shape[0]
+        topk_ids = torch.empty((m, kimi_k3_routing.TOP_K),
+                               dtype=torch.int32,
+                               device=logits.device)
+        topk_weights = torch.empty((m, kimi_k3_routing.TOP_K),
+                                   dtype=torch.float32,
+                                   device=logits.device)
+        sort_outputs = kimi_k3_routing.sort_outputs(m, local_num_experts,
+                                                    logits.device)
+        kimi_k3_routing.run_route_sort(logits, e_score_correction_bias,
+                                       routed_scaling_factor,
+                                       local_expert_offset, local_num_experts,
+                                       topk_ids, topk_weights, sort_outputs)
+        return (topk_ids, topk_weights, *sort_outputs)
+
+    @torch.library.register_fake("trtllm::noaux_tc_route_sort")
+    def _(logits: torch.Tensor, e_score_correction_bias: torch.Tensor,
+          routed_scaling_factor: float, local_expert_offset: int,
+          local_num_experts: int) -> Tuple[torch.Tensor, ...]:
+        m = logits.shape[0]
+        max_tiles, max_permuted = kimi_k3_routing.sort_buffer_sizes(
+            m, local_num_experts)
+
+        def i32(*shape):
+            return logits.new_empty(shape, dtype=torch.int32)
+
+        return (
+            i32(m, kimi_k3_routing.TOP_K),
+            logits.new_empty((m, kimi_k3_routing.TOP_K), dtype=torch.float32),
+            i32(max_tiles),
+            i32(max_tiles),
+            i32(m, kimi_k3_routing.TOP_K),
+            i32(max_permuted),
+            i32(1),
+            i32(1),
+        )
+
+    # Router logits of ``M <= 16`` BF16 tokens and the 896 x 7168 BF16 router
+    # weight, bit-identical to ``dsv3_router_gemm_op(hidden_states, weight.t())``
+    # (``kimi_k3_router_logits.py``); inputs as ``kimi_k3_router_logits.can_run``
+    # accepts them.
+    @fast_custom_op("trtllm::kimi_k3_router_logits", mutates_args=())
+    def kimi_k3_router_logits_op(hidden_states: torch.Tensor,
+                                 weight: torch.Tensor) -> torch.Tensor:
+        if not kimi_k3_router_logits.can_run(hidden_states, weight):
+            raise ValueError("kimi_k3_router_logits: unsupported router inputs")
+        logits = torch.empty(
+            (hidden_states.shape[0], kimi_k3_router_logits.NUM_EXPERTS),
+            dtype=torch.float32,
+            device=hidden_states.device)
+        kimi_k3_router_logits.run_router_logits(hidden_states, weight, logits)
+        return logits
+
+    @torch.library.register_fake("trtllm::kimi_k3_router_logits")
+    def _(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return hidden_states.new_empty(
+            (hidden_states.shape[0], kimi_k3_router_logits.NUM_EXPERTS),
+            dtype=torch.float32)
 
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)
@@ -15972,6 +16323,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     helper = GatherGroupedGemmInputsHelper(
                         self.num_experts, self.top_k, self.num_local_experts,
                         self.local_expert_offset, self.tile_size)
+                    infer_shape_output_sf_numel = functools.partial(
+                        helper.infer_shape_locality_domain_output_sf_numel,
+                        scaling_vector_size=self.scaling_vector_size)
                     self.__class__.tuning_config_cache[key] = TuningConfig(
                         # Use permuted_idx_to_expanded_idx (IDX_SHAPE_INFER) for tuning
                         dynamic_tensor_specs=(DynamicTensorSpec(
@@ -15985,6 +16339,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                            helper.infer_shape_max_num_tiles),
                             ConstraintSpec(6, 0,
                                            helper.infer_shape_max_num_tiles),
+                            # Inplace outputs of the locality-domain half-GEMM
+                            # (10: output, 11: output_sf) follow input 7's bucket;
+                            # the autotuner skips these specs when they are None.
+                            ConstraintSpec(
+                                10, 0,
+                                helper.infer_shape_max_num_permuted_tokens),
+                            ConstraintSpec(11, 0, infer_shape_output_sf_numel),
                         ),
                         inputs_pre_hook=helper.inputs_pre_hook,
                     )
@@ -18789,6 +19150,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             runs 1-CTA (mma_tiler 128x{128,256}, cluster (1,1)) and
             tile_size=256 runs 2-CTA (mma_tiler 256x{128,256}, cluster (2,1));
             the autotuner picks between them per shape.  scheduler="l2_atomic".
+            ``reserved_sms`` SMs are left without an FC12 CTA (whole clusters fewer,
+            at least one launched): one CTA fills an SM's register file, so kernels
+            another stream issues while FC12 runs otherwise get SMs only as its CTAs
+            exit. FC12 hands tiles out through atomic counters, so fewer CTAs change
+            only which CTA computes a tile.
             """
             kernel_class = Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel
             kernel_cache = dict()
@@ -18807,7 +19173,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     enable_alltoall: bool = False,
                     activation_type: ActivationType = ActivationType.Swiglu,
                     situ_beta: Optional[float] = None,
-                    situ_linear_beta: Optional[float] = None):
+                    situ_linear_beta: Optional[float] = None,
+                    reserved_sms: int = 0):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -18819,6 +19186,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.activation_type = ActivationType(int(activation_type))
                 self.situ_beta = situ_beta
                 self.situ_linear_beta = situ_linear_beta
+                if reserved_sms < 0:
+                    raise ValueError(
+                        f"reserved_sms must be non-negative, got {reserved_sms}"
+                    )
+                self.reserved_sms = reserved_sms
                 # Used only by the in-op output memset (moved here so the memset
                 # is the fused kernel's immediate stream predecessor).
                 self.ep_size = ep_size
@@ -18846,6 +19218,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     int(self.activation_type),
                     self.situ_beta,
                     self.situ_linear_beta,
+                    self.reserved_sms,
                 )
 
             def get_valid_tactics(
@@ -19130,8 +19503,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # runners): avoids re-querying HardwareInfo on every forward
                 # and during CUDA-graph capture. FC12 never runs inside a
                 # locality-domain context, so this is the full-device value.
-                max_active_clusters = get_max_activate_clusters(
-                    cluster_shape_mn[0] * cluster_shape_mn[1])
+                cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+                max_active_clusters = reserved_max_active_clusters(
+                    get_max_activate_clusters(cluster_size), cluster_size,
+                    self.reserved_sms)
 
                 # The fused kernel exposes only ``__call__`` (cute.Tensor args),
                 # no ptr-based wrapper. ``make_ordered_layout`` needs an MLIR
@@ -19399,6 +19774,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: ActivationType = ActivationType.Swiglu,
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            reserved_sms: int = 0,
         ) -> torch.Tensor:
             tuner = AutoTuner.get()
             runner = Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner(
@@ -19414,6 +19790,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 activation_type=ActivationType(activation_type),
                 situ_beta=_canonicalize_situ_beta(situ_beta),
                 situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
+                reserved_sms=reserved_sms,
             )
             # Input order matches Fc12FusedInputsHelper (FC1 prefix 0..9 mirrors
             # GatherGroupedGemmInputsHelper; FC2 tensors 10..14; expanded_idx 15
@@ -19426,6 +19803,37 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 token_final_scales, expanded_idx_to_permuted_idx
             ]
             if precomputed_tactic is None:
+                if tuner.is_tuning_mode and reserved_sms:
+                    # This tuning pass profiles the shrunk grid the captured decode
+                    # graphs launch with; without its no-reserve twin the caches'
+                    # full-grid entry stays empty and every eager FC12 launch --
+                    # context/prefill, mixed batches, decode above the captured
+                    # sizes, deployments without CUDA graphs -- would run the
+                    # fallback tactic for the life of the server (prefill is where
+                    # FC12 does most of its work). The twin's cache entry serves
+                    # those; later repeats of this block hit the cache and return.
+                    twin = Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner(
+                        num_experts,
+                        top_k,
+                        num_local_experts,
+                        local_expert_offset,
+                        tile_size,
+                        scaling_vector_size,
+                        swiglu_limit=swiglu_limit,
+                        ep_size=ep_size,
+                        enable_alltoall=enable_alltoall,
+                        activation_type=ActivationType(activation_type),
+                        situ_beta=_canonicalize_situ_beta(situ_beta),
+                        situ_linear_beta=_canonicalize_situ_beta(
+                            situ_linear_beta),
+                        reserved_sms=0,
+                    )
+                    tuner.choose_one(
+                        tuner_key,
+                        [twin],
+                        twin.get_tuning_config(),
+                        inputs,
+                    )
                 _, best_tactic = tuner.choose_one(
                     tuner_key,
                     [runner],
@@ -19452,7 +19860,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "SymInt scaling_vector_size=16, "
             "str? precomputed_tactic=None, "
             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
-            "float situ_beta=-1.0, float situ_linear_beta=-1.0) -> ()",
+            "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
+            "SymInt reserved_sms=0) -> ()",
             device_types="cuda")
         def cute_dsl_nvfp4_fc12_fused_rubin(
             input: torch.Tensor,
@@ -19484,6 +19893,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            reserved_sms: int = 0,
         ) -> None:
             # In-place: finalize scatter-adds into ``output`` (mutates_args);
             # the op returns nothing so it does not alias its own input.
@@ -19497,7 +19907,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 swiglu_limit, precomputed_tactic, expanded_idx_to_permuted_idx,
                 ep_size, enable_alltoall,
                 "trtllm::cute_dsl_nvfp4_fc12_fused_rubin",
-                ActivationType(activation_type), situ_beta, situ_linear_beta)
+                ActivationType(activation_type), situ_beta, situ_linear_beta,
+                reserved_sms)
 
         @torch.library.register_fake("trtllm::cute_dsl_nvfp4_fc12_fused_rubin")
         def _(
@@ -19530,5 +19941,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            reserved_sms: int = 0,
         ) -> None:
             return None
