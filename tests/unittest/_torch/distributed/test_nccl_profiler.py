@@ -19,7 +19,6 @@ fixture establishes the MPI communicator; torchrun alone is not sufficient.
 Traces describe host launches at capture, never additional launches at replay.
 """
 
-import json
 import os
 import pickle
 import shutil
@@ -36,7 +35,7 @@ import torch
 import torch.distributed as dist
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
-from profiler_test_utils import decode_profiler_metadata
+from profiler_test_utils import decode_node_metadata, execution_trace_observer, profiler_nodes
 
 import tensorrt_llm
 from tensorrt_llm import _profiler as profiler
@@ -52,13 +51,12 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 def _events(path: Path) -> list[dict[str, "MetadataValue"]]:
     """Decode NCCL metadata records from an exported execution-trace file."""
-    trace = json.loads(path.read_text())
     result = []
-    for node in trace["nodes"]:
-        if node["name"] == "trtllm::nccl_metadata":
-            region, fields = decode_profiler_metadata(node["inputs"]["values"][0])
-            assert region == "nccl"
-            result.append(fields)
+    for node in profiler_nodes(path, "trtllm::nccl_send", "trtllm::nccl_recv"):
+        region, fields = decode_node_metadata(node)
+        assert region == "nccl"
+        assert node["name"] == f"trtllm::nccl_{fields['nccl.operation']}"
+        result.append(fields)
     return result
 
 
@@ -91,8 +89,7 @@ def _profile(
     MPI.COMM_WORLD.Barrier()
     with tempfile.TemporaryDirectory(prefix="nccl-profiler-") as directory:
         path = Path(directory) / "execution.json"
-        observer = torch.profiler.ExecutionTraceObserver().register_callback(str(path))
-        try:
+        with execution_trace_observer(path) as observer:
             with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU],
                 record_shapes=True,
@@ -113,12 +110,9 @@ def _profile(
             torch.cuda.synchronize()
             for output, reference in zip(outputs, expected, strict=True):
                 torch.testing.assert_close(output, reference, rtol=0, atol=0)
-        finally:
-            observer.unregister_callback()
         fields = _events(path)
         if dispatcher_name is not None:
-            nodes = json.loads(path.read_text())["nodes"]
-            dispatchers = [node for node in nodes if node["name"] == dispatcher_name]
+            dispatchers = profiler_nodes(path, dispatcher_name)
             assert len(dispatchers) == 1
             attributes = {item["name"]: item["value"] for item in dispatchers[0]["attrs"]}
             assert attributes["scope"] == 0
@@ -127,10 +121,7 @@ def _profile(
         if graph:
             # Replay-only profiling must not invent per-replay host metadata.
             replay_path = Path(directory) / "replay.json"
-            replay_observer = torch.profiler.ExecutionTraceObserver().register_callback(
-                str(replay_path)
-            )
-            try:
+            with execution_trace_observer(replay_path) as replay_observer:
                 with torch.profiler.profile(
                     activities=[torch.profiler.ProfilerActivity.CPU],
                     record_shapes=True,
@@ -143,8 +134,6 @@ def _profile(
                         torch.cuda.synchronize()
                         for output, reference in zip(outputs, expected, strict=True):
                             torch.testing.assert_close(output, reference, rtol=0, atol=0)
-            finally:
-                replay_observer.unregister_callback()
             assert _events(replay_path) == []
         trace_root = os.environ.get("TLLM_NCCL_PROFILER_TEST_TRACE_DIR")
         if trace_root is not None:
@@ -275,10 +264,11 @@ def _run_collective(
     return True
 
 
-def _run_point_to_point(graph: bool) -> bool:
+def _run_point_to_point(graph: bool, expected: tuple[bool, bool]) -> bool:
     """Validate fresh two-rank send/receive payloads and native metadata."""
     import torch
 
+    assert (BuildInfo.ENABLE_NCCL_PROFILING, profiler.custom_region_enabled("nccl")) == expected
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     communicator = torch.classes.trtllm.NcclCommunicatorOp(2, rank)
@@ -396,10 +386,11 @@ def test_nccl_owner_boundaries(
     mpi_pool_executor: MPIPoolExecutor, process_group: bool, graph: bool
 ) -> None:
     """P2P observes actual endpoints; ProcessGroup must not acquire a raw-NCCL label."""
+    expected = (BuildInfo.ENABLE_NCCL_PROFILING, profiler.custom_region_enabled("nccl"))
     futures = [
         mpi_pool_executor.submit(_run_process_group)
         if process_group
-        else mpi_pool_executor.submit(_run_point_to_point, graph)
+        else mpi_pool_executor.submit(_run_point_to_point, graph, expected)
         for _ in range(2)
     ]
     assert [future.result() for future in futures] == [True, True]

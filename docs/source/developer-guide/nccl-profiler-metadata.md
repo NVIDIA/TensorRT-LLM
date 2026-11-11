@@ -12,7 +12,7 @@ PyTorch records TensorRT-LLM's registered `allreduce`, `autotuned_allreduce`,
 Their schemas and inputs provide communicator members, requested strategies,
 split sizes where supplied, and tensor shape, dtype and size information.
 These operations do not require `ENABLE_NCCL_PROFILING` and have no additional
-`trtllm::nccl_metadata` child. ProcessGroup-backed operations likewise use
+NCCL metadata child. ProcessGroup-backed operations likewise use
 PyTorch's existing communication events.
 
 A dispatcher operation is a logical collective, not proof of a particular
@@ -23,7 +23,7 @@ strategy or symmetric-buffer fallback.
 
 ## Raw pipeline point-to-point operations
 
-Configure with `-DENABLE_NCCL_PROFILING=ON` to add `trtllm::nccl_metadata`
+Configure with `-DENABLE_NCCL_PROFILING=ON` to add `trtllm::nccl_send` / `trtllm::nccl_recv`
 PyTorch USER_SCOPE events around `NcclCommunicatorOp.send` and `recv`.
 These raw NCCL calls have no equivalent dispatcher event. The option defaults
 to OFF; `tensorrt_llm.bindings.BuildInfo.ENABLE_NCCL_PROFILING` describes the
