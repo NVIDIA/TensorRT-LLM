@@ -314,6 +314,10 @@ l0_dgx_b200:
   tests:
   # GLM-5.3-Flash modeling_v2 split target without speculation (SM100 only).
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100Default::test_gsm8k
+  # GLM-5.3-Flash FP8 modeling_v2 target: GSM8K without speculation and with MTP-3 (plus its
+  # acceptance length).
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/test_accuracy.py::TestModelingV2Glm53FlashFp8Sm10xTp4::test_gsm8k
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/test_accuracy.py::TestModelingV2Glm53FlashFp8Sm10xTp4::test_gsm8k_mtp3
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=fp8]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=nvfp4]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=False-eval_mode=inferencex-kv_dtype=fp8]

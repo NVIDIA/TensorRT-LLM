@@ -197,6 +197,16 @@ l0_b200:
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_rmsnorm.py
   - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
+  # GLM-5.3-Flash FP8 modeling_v2 target (sm_100): its own operations and the catalog
+  # entries it added (KDA, block-FP8 GEMM / MoE runner, router GEMM, clamped SwiGLU).
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4
+  - unittest/_torch/modeling_v2/ssm
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_rms_norm_gated_token_major.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_fp8_block_scale_moe_runner.py
+  - unittest/_torch/modeling_v2/quantization/test_modeling_v2_fp8_quantize_1x128.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_fp8_blockwise_gemm.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_dsv3_router_gemm.py
+  - unittest/_torch/modeling_v2/activation/test_modeling_v2_silu_and_mul.py
   # KDA runtime state-pool and mixed-batch core coverage.
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py
