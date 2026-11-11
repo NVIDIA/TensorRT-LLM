@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import weakref
+
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     create_py_executor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
@@ -88,15 +91,30 @@ def test_profile_kvcache():
     assert vlm_activation_bytes_with_mm_reqs > vlm_activation_bytes_no_mm_reqs, f"Activation bytes should be higher with mm reqs, but got {vlm_activation_bytes_with_mm_reqs} for mm reqs and {vlm_activation_bytes_no_mm_reqs} without mm reqs"
 
 
-def test_pyexecutor_and_kvcache_share_execution_stream():
+def test_pyexecutor_and_kvcache_share_execution_stream(monkeypatch):
     """Test that PyExecutor and KVCacheManager share the same execution_stream.
 
     The execution_stream is created once in create_py_executor and passed to:
     - KVCacheManager (via KvCacheCreator -> _create_kv_cache_manager)
     - PyExecutor (via create_py_executor_instance)
 
-    Both components must use the same stream for proper synchronization.
+    Both components must use the same stream for proper synchronization. The
+    profiling and serving phases must also retain the same worker thread.
     """
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "0")
+    worker_starts = []
+    start_worker = PyExecutor.start_worker
+
+    def record_worker_start(executor):
+        start_worker(executor)
+        manager = executor.resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        assert manager is not None
+        # Do not keep the profiling KV allocation alive across teardown.
+        worker_starts.append((weakref.ref(manager), executor.worker_thread))
+
+    monkeypatch.setattr(PyExecutor, "start_worker", record_worker_start)
+
     MODEL = "Qwen3/Qwen3-0.6B"
     MODEL_PATH = get_model_path(MODEL)
 
@@ -129,26 +147,35 @@ def test_pyexecutor_and_kvcache_share_execution_stream():
     py_executor = create_py_executor(llm_args=torchllm_args,
                                      checkpoint_dir=MODEL_PATH)
 
-    # Get the KVCacheManager from the resource manager
-    kv_cache_manager = py_executor.resource_manager.get_resource_manager(
-        ResourceManagerType.KV_CACHE_MANAGER)
+    try:
+        kv_cache_manager = py_executor.resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER)
 
-    # Verify both PyExecutor and KVCacheManager have execution_stream
-    assert py_executor.execution_stream is not None, \
-        "PyExecutor should have an execution_stream"
-    assert kv_cache_manager is not None, \
-        "KVCacheManager should exist in resource_manager"
-    assert hasattr(kv_cache_manager, '_stream'), \
-        "KVCacheManager should have _stream attribute"
+        assert py_executor.execution_stream is not None, \
+            "PyExecutor should have an execution_stream"
+        assert kv_cache_manager is not None, \
+            "KVCacheManager should exist in resource_manager"
+        assert hasattr(kv_cache_manager, '_stream'), \
+            "KVCacheManager should have _stream attribute"
+        assert py_executor.execution_stream.cuda_stream == kv_cache_manager._stream.cuda_stream, \
+            f"PyExecutor.execution_stream ({py_executor.execution_stream.cuda_stream}) " \
+            f"should have the same cuda_stream pointer as KVCacheManager._stream ({kv_cache_manager._stream.cuda_stream})"
+        assert py_executor.execution_stream is kv_cache_manager._stream, \
+            "PyExecutor.execution_stream and KVCacheManager._stream should be the exact same stream object"
 
-    # Verify they share the same CUDA stream pointer
-    assert py_executor.execution_stream.cuda_stream == kv_cache_manager._stream.cuda_stream, \
-        f"PyExecutor.execution_stream ({py_executor.execution_stream.cuda_stream}) " \
-        f"should have the same cuda_stream pointer as KVCacheManager._stream ({kv_cache_manager._stream.cuda_stream})"
-
-    # Verify they are the exact same stream object
-    assert py_executor.execution_stream is kv_cache_manager._stream, \
-        "PyExecutor.execution_stream and KVCacheManager._stream should be the exact same stream object"
-
-    py_executor.shutdown()
-    torch.cuda.empty_cache()
+        assert len(worker_starts) >= 2, \
+            "Both profiling and serving must start a worker phase"
+        profiling_manager, profiling_thread = worker_starts[0]
+        assert profiling_manager() is not kv_cache_manager, \
+            "The first worker phase must use the profiling KV cache"
+        assert worker_starts[-1][0]() is kv_cache_manager, \
+            "The last worker phase must use the serving KV cache"
+        assert profiling_thread is not None
+        assert all(thread is profiling_thread for _, thread in worker_starts), \
+            "Profiling and serving must use the same worker Thread object"
+        assert py_executor.worker_thread is profiling_thread
+        assert profiling_thread.is_alive(), \
+            "The shared worker must remain alive until serving shuts down"
+    finally:
+        py_executor.shutdown()
+        torch.cuda.empty_cache()

@@ -842,7 +842,8 @@ class PyExecutor:
         self._closed = False
         self._gen_preemption_settings = gen_preemption
         # Profiling and serving share the thread-local CUDA library state
-        # whose allocations were included in the memory budget.
+        # whose allocations were included in the memory budget. Libraries first
+        # used by serving still initialize lazily.
         self.worker_thread: Optional[threading.Thread] = None
         self._worker_phases: Queue[bool] = Queue()
         self._worker_phase_done = threading.Event()
@@ -2169,9 +2170,9 @@ class PyExecutor:
                     # the executor thread's.
                     assert self._broadcast_mpi_comm is not None
                     assert self._broadcast_mpi_comm is not mpi_comm()
-                    # Fresh Events rather than clear(): an executor may be
-                    # started again after shutdown(), and a flag left set by
-                    # the previous run would disarm the new pump.
+                    # Fresh Events rather than clear(): release_resources()
+                    # and rebind_resources() allow another execution phase;
+                    # a flag left set by the previous phase would disarm its pump.
                     self._pp_mpi_progress_stop = threading.Event()
                     self._pp_mpi_progress_quiesced = threading.Event()
                     self._pp_mpi_progress = make_mpi_progress_pump(
@@ -2220,9 +2221,10 @@ class PyExecutor:
                 if self.dist.pp_size > 1 and not self._disable_mpi:
                     self._start_mpi_progress_thread()
                 if self.worker_thread is None:
-                    self.worker_thread = threading.Thread(
+                    worker_thread = threading.Thread(
                         target=self._run_worker_phases, daemon=True)
-                    self.worker_thread.start()
+                    worker_thread.start()
+                    self.worker_thread = worker_thread
                 self._worker_phase_done.clear()
                 self._worker_phases.put(True)
                 self.worker_started = True
@@ -2522,7 +2524,8 @@ class PyExecutor:
         Call collectively after consuming profiling responses. Graph destruction
         precedes workspace release, and transfer registrations precede cache
         release. Model engines, weights and the execution stream remain valid,
-        as do the worker thread and its thread-local CUDA library state.
+        as do the worker thread and the thread-local CUDA library state used by
+        profiling. Libraries first used by serving still initialize lazily.
         """
         if self._closed or self._resources_released:
             raise RuntimeError("Executor resources are already released")

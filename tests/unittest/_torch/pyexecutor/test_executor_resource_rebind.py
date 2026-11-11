@@ -25,6 +25,23 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 pytestmark = pytest.mark.cpu_only
 
 
+def _run_bounded(action):
+    errors = []
+
+    def run():
+        try:
+            action()
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(10)
+    assert not thread.is_alive(), "Executor lifecycle call did not finish"
+    if errors:
+        raise errors[0]
+
+
 def _enable_real_worker(executor, monkeypatch):
     monkeypatch.setenv("TLLM_NUMA_AWARE_WORKER_AFFINITY", "0")
     executor.worker_started = False
@@ -66,7 +83,7 @@ def test_profiling_worker_and_thread_local_state_survive_resource_rebind(executo
         ex.start_worker()
         assert entered.wait(5)
         worker = ex.worker_thread
-        ex.release_resources()
+        _run_bounded(ex.release_resources)
         assert worker.is_alive()
         assert ex._worker_phase_done.is_set()
 
@@ -74,13 +91,13 @@ def test_profiling_worker_and_thread_local_state_survive_resource_rebind(executo
         ex.start_worker()
         assert entered.wait(5)
         assert phases == [(worker, marker), (worker, marker)]
-        ex.shutdown()
+        _run_bounded(ex.shutdown)
         assert not worker.is_alive()
         with pytest.raises(RuntimeError, match="without bound resources"):
             ex.start_worker()
     finally:
         stop_requested.set()
-        ex._stop_worker_thread()
+        _run_bounded(ex._stop_worker_thread)
 
 
 def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monkeypatch):
@@ -89,6 +106,7 @@ def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monk
     cleanup_started = threading.Event()
     finish_cleanup = threading.Event()
     released = threading.Event()
+    release_errors = []
 
     def event_loop():
         ex.shutdown_event.set()
@@ -96,24 +114,35 @@ def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monk
         assert finish_cleanup.wait(5)
 
     def release():
-        ex.release_resources()
-        released.set()
+        try:
+            ex.release_resources()
+        except BaseException as error:
+            release_errors.append(error)
+        finally:
+            released.set()
 
     ex._event_loop_wrapper = event_loop
-    ex.start_worker()
-    assert cleanup_started.wait(5)
-    releaser = threading.Thread(target=release, daemon=True)
-    releaser.start()
+    releaser = None
     try:
+        ex.start_worker()
+        assert cleanup_started.wait(5)
+        releaser = threading.Thread(target=release, daemon=True)
+        releaser.start()
         assert not released.wait(0.05)
         ex.model_engine.release_executor_resources.assert_not_called()
         finish_cleanup.set()
         assert released.wait(5)
+        if release_errors:
+            raise release_errors[0]
         ex.model_engine.release_executor_resources.assert_called_once()
     finally:
         finish_cleanup.set()
-        releaser.join(5)
-        ex._stop_worker_thread()
+        try:
+            if releaser is not None:
+                releaser.join(10)
+                assert not releaser.is_alive()
+        finally:
+            _run_bounded(ex._stop_worker_thread)
 
 
 @pytest.mark.parametrize(
@@ -158,20 +187,78 @@ def test_phase_failure_is_visible_before_rebind_can_restart(
 
     ex.event_loop = event_loop
     ex._executor_loop_cleanup = cleanup
-    ex.start_worker()
-    assert ex._worker_phase_done.wait(5)
-    assert cleanup_errors == [loop_error]
-    assert ex._event_loop_error is (loop_error if loop_error is not None else cleanup_error)
-    ex._stop_worker_thread()
-    assert uncaught == [cleanup_error if cleanup_error is not None else loop_error]
-    assert watchdog.called == isinstance(loop_error, Exception)
-    assert kill.called == isinstance(loop_error, Exception)
-    ex._resources_released = True
-    with pytest.raises(RuntimeError, match="execution failure"):
-        ex.rebind_resources(Mock())
-    ex._resources_released = False
-    with pytest.raises(RuntimeError, match="failed executor"):
+    try:
         ex.start_worker()
+        assert ex._worker_phase_done.wait(5)
+        assert cleanup_errors == [loop_error]
+        assert ex._event_loop_error is (loop_error if loop_error is not None else cleanup_error)
+        _run_bounded(ex._stop_worker_thread)
+        assert uncaught == [cleanup_error if cleanup_error is not None else loop_error]
+        assert watchdog.called == isinstance(loop_error, Exception)
+        assert kill.called == isinstance(loop_error, Exception)
+        ex._resources_released = True
+        with pytest.raises(RuntimeError, match="execution failure"):
+            ex.rebind_resources(Mock())
+        ex._resources_released = False
+        with pytest.raises(RuntimeError, match="failed executor"):
+            ex.start_worker()
+
+    finally:
+        _run_bounded(ex._stop_worker_thread)
+
+
+def test_worker_start_failure_does_not_publish_an_unstarted_thread(executor, monkeypatch):
+    ex, _events = executor
+    _enable_real_worker(ex, monkeypatch)
+    start_error = RuntimeError("cannot start thread")
+    thread_type = threading.Thread
+
+    def failing_thread(**kwargs):
+        thread = thread_type(**kwargs)
+        thread.start = Mock(side_effect=start_error)
+        return thread
+
+    with monkeypatch.context() as patch:
+        patch.setattr(executor_module.threading, "Thread", failing_thread)
+        with pytest.raises(RuntimeError) as error:
+            ex.start_worker()
+    assert error.value is start_error
+    assert ex.worker_thread is None
+    assert not ex.worker_started
+    _run_bounded(ex.shutdown)
+    assert ex._closed
+
+
+def test_sampler_start_failure_can_shut_down_active_phase(executor, monkeypatch):
+    ex, events = executor
+    _enable_real_worker(ex, monkeypatch)
+    stop_requested = threading.Event()
+    start_error = RuntimeError("sampler startup failed")
+    ex.sampler = Mock(spec=AsyncWorkerMixin)
+    ex.sampler.async_worker_enabled.return_value = True
+    ex.sampler.async_worker_start.side_effect = start_error
+
+    def event_loop():
+        assert stop_requested.wait(5)
+        events.append("loop_cleanup")
+        ex.shutdown_event.set()
+
+    ex._event_loop_wrapper = event_loop
+    ex.executor_request_queue.enqueue_shutdown_request.side_effect = stop_requested.set
+    try:
+        with pytest.raises(RuntimeError) as error:
+            ex.start_worker()
+        assert error.value is start_error
+        assert ex.worker_started
+        worker = ex.worker_thread
+        _run_bounded(ex.shutdown)
+        assert ex._closed
+        assert not worker.is_alive()
+        assert events.index("loop_cleanup") < events.index("graphs")
+        ex.sampler.async_worker_stop.assert_called_once()
+    finally:
+        stop_requested.set()
+        _run_bounded(ex._stop_worker_thread)
 
 
 class _Engine(SimpleNamespace):
@@ -339,7 +426,7 @@ def test_release_before_worker_start_does_not_wait_for_shutdown(executor):
     ex.shutdown_event.clear()
     ex.release_resources()
     assert events == ["graphs", "synchronize", "unregister", "cache"]
-    ex.worker_thread.join.assert_not_called()
+    ex._worker_phase_done.wait.assert_not_called()
 
 
 def test_final_shutdown_after_release_does_not_release_resources_twice(executor):
