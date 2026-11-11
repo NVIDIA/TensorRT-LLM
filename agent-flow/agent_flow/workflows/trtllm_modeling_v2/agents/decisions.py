@@ -127,9 +127,9 @@ def decision_list(role: str) -> str:
     return "\n".join(f"- `{d.name}`: {d.when}. Then {d.then}." for d in DECISIONS[role])
 
 
-def ending_section(role: str, extra: str = "", *, heading: str = "Ending your turn") -> str:
+def ending_section(role: str, extra: str = "") -> str:
     """The prompt section that says how ``role`` ends its turn, ``extra`` after the list."""
-    body = f"## {heading}\n\nYour decision file carries one of:\n\n{decision_list(role)}"
+    body = f"## Ending your turn\n\nYour decision file carries one of:\n\n{decision_list(role)}"
     return f"{body}\n\n{extra.strip()}" if extra.strip() else body
 
 

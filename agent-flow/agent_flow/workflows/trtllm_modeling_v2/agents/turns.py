@@ -96,9 +96,9 @@ class TurnOutcome:
 LayerProvider = Callable[[TurnRequest], Any]
 
 
-def _now_text(epoch: float | None = None) -> str:
-    moment = datetime.fromtimestamp(time.time() if epoch is None else epoch, timezone.utc)
-    return moment.isoformat(timespec="seconds")
+def _clock() -> str:
+    """The time of day in UTC, to the second: an activity entry's stamp."""
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
 def _process() -> dict:
@@ -179,9 +179,7 @@ class TurnRecord:
             cut = len(text) - ACTIVITY_ENTRY_LIMIT
             text = f"{text[:ACTIVITY_ENTRY_LIMIT]} ... ({cut} more characters)"
         first, *rest = text.splitlines() or [""]
-        entry = "".join(
-            [f"{_now_text()[11:19]} {kind}: {first}\n", *(f"    {line}\n" for line in rest)]
-        )
+        entry = "".join([f"{_clock()} {kind}: {first}\n", *(f"    {line}\n" for line in rest)])
         with self._lock:
             try:
                 with self.activity_file.open("a", encoding="utf-8") as handle:
