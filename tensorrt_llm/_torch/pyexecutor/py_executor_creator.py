@@ -18,6 +18,8 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
+from tensorrt_llm._torch.pyexecutor.graph_launch_reset import \
+    maybe_reset_graph_launch_mode
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
@@ -1320,6 +1322,8 @@ def _create_py_executor(
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
+
+    maybe_reset_graph_launch_mode(logger)
 
     with _startup_timer.phase("executor_start_worker",
                               metrics=creation_metrics,
