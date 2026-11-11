@@ -152,8 +152,36 @@ def _read_cgroup_value(path: Path, *, unlimited_threshold: int | None = None) ->
     return parsed
 
 
+def _reclaimable_file_cache(stat_path: Path, unified: bool) -> int:
+    """Return the file-backed page cache that a cgroup's `memory.stat` reports.
+
+    The kernel reclaims these pages before the cgroup runs out of memory, so they are as
+    available as the page cache that host memory accounting counts as available. cgroup v1
+    reports them for the whole subtree, like `memory.usage_in_bytes`, in its `total_*`
+    entries; cgroup v2 entries already cover the subtree.
+    """
+    try:
+        lines = stat_path.read_text().splitlines()
+    except (OSError, UnicodeError):
+        return 0
+    stats = {}
+    for line in lines:
+        name, _, value = line.partition(" ")
+        try:
+            stats[name] = int(value)
+        except ValueError:
+            continue
+    names = ("active_file", "inactive_file")
+    if not unified and all(f"total_{name}" in stats for name in names):
+        names = tuple(f"total_{name}" for name in names)
+    return sum(max(0, stats.get(name, 0)) for name in names)
+
+
 def cgroup_available_host_memory() -> int | None:
-    """Return the tightest remaining cgroup limit, including ancestors."""
+    """Return the tightest remaining cgroup limit, including ancestors.
+
+    Reclaimable file-backed page cache charged to a cgroup counts as available.
+    """
     unified_path, memory_path = _cgroup_paths()
     candidates: list[tuple[Path, Path, bool]] = []
 
@@ -190,7 +218,8 @@ def cgroup_available_host_memory() -> int | None:
                 )
             if current is None:
                 continue
-            available.extend(max(0, limit - current) for limit in limits if limit is not None)
+            in_use = max(0, current - _reclaimable_file_cache(path / "memory.stat", unified))
+            available.extend(max(0, limit - in_use) for limit in limits if limit is not None)
 
     return min(available) if available else None
 

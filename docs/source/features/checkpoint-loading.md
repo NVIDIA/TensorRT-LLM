@@ -374,7 +374,11 @@ options to speed up weight loading via efficient streaming from storage.
   reads each piece into the OS page cache while copying tensors to GPU at the
   same time. This assumes most tensors being copied are from the OS page cache.
   It runs only when the whole checkpoint fits in the available host memory,
-  minus some headroom. Otherwise it falls back to `native`.
+  minus some headroom. Otherwise it falls back to `native`. Inside a
+  memory-limited cgroup, file-backed page cache charged to it, such as
+  checkpoints that earlier loads left cached, counts as available, as it does
+  for host memory, because the kernel reclaims it before the cgroup runs out
+  of memory.
 - `auto` (default): use `rank_striped_read_ahead` when the load supports it,
   and `native` I/O otherwise.
 
@@ -405,9 +409,10 @@ is a refresh.
   headroom. If the check fails, or the reader cannot read the memory status,
   the refresh stays queued and the reader checks again at later polls. A
   warning is logged once each time a refresh starts to wait on memory. This
-  check is conservative and does not reserve memory: pages that are already in
-  memory and charged to a cgroup can defer a refresh even when only a small
-  part of the checkpoint is missing from the page cache.
+  check is conservative and does not reserve memory: memory charged to a
+  cgroup that is not file-backed page cache, such as process memory, can defer
+  a refresh even when only a small part of the checkpoint is missing from the
+  page cache.
 - Tensor copies to GPU continue while a refresh waits.
 
 ### Logs
