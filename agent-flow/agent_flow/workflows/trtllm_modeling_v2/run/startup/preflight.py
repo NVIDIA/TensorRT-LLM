@@ -37,7 +37,7 @@ from ...infra.compute.environment import (
 )
 from ...operators.coverage import MODELING_V2_PACKAGE
 from ...spec import deployments as deployments_mod
-from ...spec.advice import spec_warnings, unfit
+from ...spec.advice import checkpoint_notes, spec_warnings, unfit
 from ...spec.deployments import Deployment
 from ...spec.task_schema import (
     DEFAULT_PARALLEL,
@@ -301,7 +301,7 @@ def run_preflight(
             f"devices: the first {widest} of this host are taken for the deployments that "
             f"start here, unprobed: `{core.name}` was probed behind its prefix"
         )
-    result.notes += spec_warnings(task_data)
+    result.notes += checkpoint_notes(task_data, config) + spec_warnings(task_data)
     result.environment = resolve_environment(
         task_data, devices=result.devices, world_size=result.world_size
     )

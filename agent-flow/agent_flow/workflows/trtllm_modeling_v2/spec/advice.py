@@ -16,6 +16,12 @@ from .deployments import Deployment
 #: The share of a device's memory an engine's weights may take: the rest holds the KV
 #: cache, activations and CUDA graphs.
 ENGINE_WEIGHT_FRACTION = 0.75
+#: Where a config states its multi-token-prediction layers.
+DRAFT_LAYER_KEYS = ("num_nextn_predict_layers", "num_mtp_modules", "mtp_num_hidden_layers")
+#: What marks a config as a hybrid model whose layers keep recurrent state: a key that
+#: configures it, or a per-layer type that names it.
+_RECURRENT_KEYS = ("linear_attn_config", "linear_num_value_heads", "mamba_ssm_cfg", "ssm_cfg")
+_RECURRENT_WORDS = ("mamba", "linear", "ssm", "delta", "recurrent")
 
 
 def checkpoint_weight_bytes(checkpoint: str | Path | None) -> int | None:
@@ -79,6 +85,70 @@ def cgroup_memory_limit(proc_cgroup: str | None = None, root: Path = Path("/sys/
         if text.isdigit() and int(text) < 1 << 60:  # "max", or v1's huge number, is no limit
             limits.append(int(text))
     return min(limits) if limits else None
+
+
+def checkpoint_notes(task_data: Mapping[str, Any], config: Mapping[str, Any]) -> list[str]:
+    """Where the checkpoint's ``config.json`` cannot meet a deployment as stated, one note each.
+
+    A server's ranks split the attention heads, the KV heads and the experts; a deployment
+    that drafts has draft layers; one that takes images has a tower; a quantized format
+    runs on its architecture; block reuse on a hybrid checkpoint needs a snapshot policy.
+    Notes, never a stop: the engine's own load decides, and a boot shows it.
+    """
+    heads = config.get("num_attention_heads")
+    kv_heads = config.get("num_key_value_heads") or heads
+    experts = next(
+        (
+            config[k]
+            for k in ("num_experts", "n_routed_experts", "num_local_experts")
+            if config.get(k)
+        ),
+        None,
+    )
+    drafts = any(config.get(k) for k in DRAFT_LAYER_KEYS) or any(
+        str(k).startswith("dspark") for k in config
+    )
+    text = config.get("text_config") if isinstance(config.get("text_config"), Mapping) else {}
+    layers = [str(t).lower() for block in (config, text) for t in block.get("layer_types") or ()]
+    hybrid = any(block.get(k) for block in (config, text) for k in _RECURRENT_KEYS) or any(
+        word in layer for layer in layers for word in _RECURRENT_WORDS
+    )
+    said: list[str] = []
+    for deployment in deployments_mod.resolve(task_data):
+        for role, server in deployment.servers.items():
+            who = deployment.name if role == "server" else f"{deployment.name}.{role}"
+            options, kv = server.options, server.options.get("kv_cache_config") or {}
+            ranks = int(options.get("tensor_parallel_size") or 1)
+            split = int(options.get("moe_expert_parallel_size") or 1)
+            # Attention DP replicates attention; without it the ranks split its heads.
+            if ranks > 1 and not options.get("enable_attention_dp"):
+                if heads and heads % ranks:
+                    said.append(f"{who}: {heads} attention heads do not split {ranks} ways")
+                if kv_heads and kv_heads % ranks and ranks % kv_heads:
+                    said.append(f"{who}: {kv_heads} KV heads do not split {ranks} ways")
+            if split > 1 and experts and experts % split:
+                said.append(f"{who}: {experts} experts do not split {split} ways")
+            drafter = str((options.get("speculative_config") or {}).get("decoding_type") or "")
+            if drafter.lower() in ("mtp", "dspark") and not drafts:
+                said.append(
+                    f"{who}: it drafts with {drafter}, and config.json states no draft layers"
+                )
+            snapshots = kv.get("mamba_state_cache_interval") or any(
+                (kv.get("mamba_state_config") or {}).values()
+            )
+            if hybrid and kv.get("enable_block_reuse") and not snapshots:
+                said.append(
+                    f"{who}: block reuse on a hybrid checkpoint with no Mamba state snapshot policy: "
+                    f"the engine turns reuse off, and a boot's repeated prompt then resumes nothing; "
+                    f"set `kv_cache_config.mamba_state_config.periodic_snapshot_interval`"
+                )
+        if "image" in deployment.inputs and not {"vision_config", "audio_config"} & set(config):
+            said.append(f"{deployment.name}: it takes images, and the checkpoint has no tower")
+    arch = str(task_data.get("arch", ""))[3:]
+    algo = str((config.get("quantization_config") or {}).get("quant_algo") or "").lower()
+    if "fp4" in algo and arch.isdigit() and int(arch) < 100:
+        said.append(f"the checkpoint's {algo} weights need sm_100 or later")
+    return [f"checkpoint: {line}" for line in dict.fromkeys(said)]
 
 
 def spec_warnings(task_data: Mapping[str, Any]) -> list[str]:

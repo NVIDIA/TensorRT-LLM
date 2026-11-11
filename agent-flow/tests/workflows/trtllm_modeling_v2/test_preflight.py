@@ -188,6 +188,27 @@ def test_a_later_deployment_is_not_attempted_and_a_config_that_does_not_load_is_
     assert (tmp_path / "ws" / "anchors.yaml").is_file() and "scored:mmmu" in result.anchors
 
 
+def test_what_the_checkpoint_cannot_meet_is_a_note_and_stops_nothing(tmp_path):
+    task = _task(tmp_path, parallel="unified", members=["tp1", "tp4", "tep4", "dep4"])
+    task["features"] = ["mtp", "multimodal"]
+    reuse = {"kv_cache_config": {"enable_block_reuse": True}}
+    task["variants"] = {"reuse": {"llm_api_options": reuse}}
+    config = {"architectures": ["X"], "num_attention_heads": 6, "num_experts": 6}
+    config["layer_types"] = ["linear_attention", "full_attention"]
+    (tmp_path / "ckpt" / "config.json").write_text(json.dumps(config))
+    result = preflight.run_preflight(task, runner=None, claim=False)
+    said = [note for note in result.notes if note.startswith("checkpoint: ")]
+    assert "checkpoint: tp4: 6 attention heads do not split 4 ways" in said
+    assert "checkpoint: tep4: 6 experts do not split 4 ways" in said
+    # Attention DP replicates attention: only its experts are split.
+    assert "checkpoint: dep4: 6 experts do not split 4 ways" in said
+    assert not any("dep4: 6 attention heads" in note for note in said)
+    assert "checkpoint: mtp: it drafts with MTP, and config.json states no draft layers" in said
+    assert "checkpoint: multimodal: it takes images, and the checkpoint has no tower" in said
+    assert any(n.startswith("checkpoint: reuse: block reuse on a hybrid checkpoint") for n in said)
+    assert len(said) == 9  # with the KV heads of tp4 and tep4, and the heads of tep4
+
+
 def _files(path: Path) -> Path:
     (path / "main").mkdir(parents=True, exist_ok=True)
     (path / "main" / "test-00000-of-00001.parquet").write_text("rows")

@@ -208,12 +208,15 @@ def test_the_shorthand_is_read_once_at_load_and_a_loaded_spec_states_its_deploym
         "model_key": {"default": "org/toy", "mtp": "org/toy-mtp"},
         "max_seq_len": 4096,
     }
+    asked = shorthand.expand(spec)
     loaded = load_and_validate_task_yaml(_write(tmp_path, spec))
     # Below the loader there is one representation: the shorthand's keys are spent.
     assert not {"members", "features", "variants", "runtime"} & set(loaded)
     assert set(loaded["accuracy"]) == {"benchmark", "reference_yaml"}
     assert [d["name"] for d in loaded["deployments"]] == ["tp1", "tep2", "mtp", "kv_fp8"]
     monkeypatch.setattr(shorthand, "expand", lambda *a: pytest.fail("expanded below the loader"))
+    # What the loaded spec states is what the shorthand asked for, to the last option.
+    assert deployments.resolve(loaded) == asked
     found = {d.name: d for d in deployments.resolve(loaded)}
     assert list(found) == ["tp1", "tep2", "mtp", "kv_fp8"] and found["tp1"].core
     assert found["tp1"].server.options["max_batch_size"] == 32

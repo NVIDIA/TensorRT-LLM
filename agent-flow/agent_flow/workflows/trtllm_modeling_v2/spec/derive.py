@@ -31,6 +31,7 @@ import yaml
 
 from . import deployments as deployments_mod
 from . import shorthand
+from .advice import DRAFT_LAYER_KEYS
 from .shorthand import DISAGG, FEATURES, MEMBER
 from .task_schema import ACCURACY_FIELD
 
@@ -40,8 +41,6 @@ ENGINES_DIRNAME = "engines"
 #: Stated rather than left to the engine, which would size its cache for the checkpoint's
 #: whole ``max_position_embeddings``.
 DEFAULT_WORKLOAD: dict[str, int] = {"isl": 4096, "osl": 1024, "max_batch_size": 64}
-#: Where a config states its multi-token-prediction layers.
-DRAFT_LAYER_KEYS = ("num_nextn_predict_layers", "num_mtp_modules", "mtp_num_hidden_layers")
 #: ``key=value`` words: the workload's, and the ``accuracy`` keys the others set.
 _WORKLOAD = ("isl", "osl", "max_seq_len", "max_batch_size")
 _ACCURACY = {"benchmark": "benchmark", "model_key": "model_key", "reference": "reference_yaml"}
