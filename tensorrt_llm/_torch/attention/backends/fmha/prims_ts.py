@@ -60,6 +60,17 @@ _MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _WORKSPACE_ALIGNMENT = 32
 
 
+def _is_prepared_helix_mla_context(
+    metadata: "TrtllmAttentionMetadata", forward_args: AttentionForwardArgs
+) -> bool:
+    """Whether the MLA caller already applied RoPE and appended owner-local KV."""
+    return (
+        forward_args.attention_input_type == AttentionInputType.context_only
+        and metadata.helix_context_local_slots is not None
+        and forward_args.latent_cache is None
+    )
+
+
 def _has_uniform_generation_query_lengths(
     metadata: "TrtllmAttentionMetadata", num_gen_tokens: int
 ) -> bool:
@@ -387,7 +398,9 @@ class PrimsTSFmha(PhasedFmha):
             is_mla and fwd.attention_input_type == AttentionInputType.generation_only
         )
         feature_reason = get_attention_feature_unsupported_reason(
-            meta, fwd, allow_helix=is_mla_generation
+            meta,
+            fwd,
+            allow_helix=is_mla_generation or (is_mla and _is_prepared_helix_mla_context(meta, fwd)),
         )
         if feature_reason is not None:
             return False, feature_reason
@@ -1391,6 +1404,9 @@ class PrimsTSFmha(PhasedFmha):
     def run_mla_context(self, params: FmhaParams) -> None:
         """Run expanded MLA, including cached-prefix and chunk-merge calls."""
         attn, meta, fwd = params.attn, params.meta, params.fwd
+        assert meta.helix_position_offsets is None or _is_prepared_helix_mla_context(meta, fwd), (
+            "PrimTS Helix MLA context requires owner-prepared Q/K/V with no latent cache."
+        )
         q, k, v = params.query_input, params.key_input, params.value_input
         assert q is not None and k is not None and v is not None
         assert params.output is not None

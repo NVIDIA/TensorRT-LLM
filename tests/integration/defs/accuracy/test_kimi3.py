@@ -478,31 +478,62 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
         with preserve_worker_env(8, "TLLM_FMHA_LIBS"):
             self._run_gsm8k_tep8(fp8_kv=True, env_overrides={"TLLM_FMHA_LIBS": "prims_ts"})
 
-    def _run_gsm8k_tep8(self, *, fp8_kv: bool, env_overrides: dict[str, str] | None = None) -> None:
-        """Run the shared DSpark7 workload and its baseline acceptance gate."""
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.private_mpi_session
+    def test_prims_ts_fp8_helix_cp8(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Qualify strict PrimTS aggregated Helix with FP8 MLA and DSpark7."""
+        env = {"TLLM_FMHA_LIBS": "prims_ts", "TRTLLM_HELIX_AGG_EXPERIMENTAL": "1"}
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        with (
+            preserve_worker_env(8, "TLLM_FMHA_LIBS"),
+            preserve_worker_env(8, "TRTLLM_HELIX_AGG_EXPERIMENTAL"),
+        ):
+            self._run_gsm8k_tep8(fp8_kv=True, helix=True, env_overrides=env)
+
+    def _run_gsm8k_tep8(
+        self,
+        *,
+        fp8_kv: bool,
+        helix: bool = False,
+        env_overrides: dict[str, str] | None = None,
+    ) -> None:
+        """Run the shared DSpark7 accuracy workload, with the TEP8 acceptance gate."""
         kv_cache_config = KvCacheConfig(
             dtype="fp8" if fp8_kv else "auto",
             enable_block_reuse=False,
             free_gpu_memory_fraction=0.20,
-            tokens_per_block=64,
-            mamba_ssm_cache_dtype="float32",
+            tokens_per_block=128 if helix else 64,
+            mamba_ssm_cache_dtype="bfloat16" if helix else "float32",
+            **(
+                dict(
+                    use_kv_cache_manager_v2=True,
+                    enable_kv_pool_rebalance=False,
+                    host_cache_size=0,
+                    disk_cache_size=0,
+                )
+                if helix
+                else {}
+            ),
         )
         spec_config = DSparkDecodingConfig(
             max_draft_len=7, speculative_model=self.DSPARK_MODEL_PATH, attention_backend="TRTLLM"
         )
         with LLM(
             self.MODEL_PATH,
-            tensor_parallel_size=8,
+            tensor_parallel_size=1 if helix else 8,
+            context_parallel_size=8 if helix else 1,
+            cp_config=dict(cp_type="HELIX", tokens_per_block=128, use_nccl_for_alltoall=True)
+            if helix
+            else None,
             moe_expert_parallel_size=8,
             enable_attention_dp=False,
             max_batch_size=8,
             max_num_tokens=4096,
             max_seq_len=8192,
             trust_remote_code=True,
-            # The drafter runs between target steps, and its hidden-state
-            # capture needs a whole-sequence prefill.
             disable_overlap_scheduler=True,
-            enable_chunked_prefill=False,
+            enable_chunked_prefill=helix,
             cuda_graph_config=CudaGraphConfig(max_batch_size=8),
             # Not the TRTLLM backend TestKimiK3 uses: trtllm-gen ships
             # SiTu cubins only for W4A8_MXFP4_MXFP8, so K3's NVFP4 routed
@@ -521,10 +552,13 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             # only the experts are 4-bit.
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             assert llm.args.quant_config.kv_cache_quant_algo == (QuantAlgo.FP8 if fp8_kv else None)
-            assert llm.args.kv_cache_config.mamba_ssm_cache_dtype == "float32"
+            assert llm.args.kv_cache_config.mamba_ssm_cache_dtype == (
+                "bfloat16" if helix else "float32"
+            )
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            assert_acceptance_length_for_llm(
-                "TestKimiK3DSpark::test_gsm8k_tep8",
-                llm,
-            )
+            if not helix:
+                assert_acceptance_length_for_llm(
+                    "TestKimiK3DSpark::test_gsm8k_tep8",
+                    llm,
+                )
