@@ -19,11 +19,13 @@ every token of the request until the state is cleaned up.
 """
 
 import asyncio
+import contextlib
 import json
 from types import SimpleNamespace
 
 import pytest
 from llmapi.apps.render_helpers import use_harmony_vocab
+from starlette.requests import ClientDisconnect
 from test_common.serve.app_factory import AggConfig
 from test_common.serve.fakes import ScriptedOutput, ScriptedStep
 
@@ -66,11 +68,29 @@ def _raw_request():
     return SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
 
 
-async def _read_until(frames, marker):
-    async for frame in frames:
-        if marker in frame:
-            return
-    raise AssertionError(f"the stream ended before {marker!r}")
+async def _serve_to_a_client_that_leaves(response, marker, stream_request_id):
+    """Serve ``response`` until the send of the first frame containing ``marker`` fails.
+
+    Returns whether the stream state existed when the send failed, and whether
+    it still exists once the response returns.
+    """
+    adapter = get_harmony_adapter()
+    existed = []
+
+    async def send(message):
+        body = message.get("body", b"")
+        if message["type"] == "http.response.body" and marker in body.decode():
+            existed.append(adapter.get_stream_state(stream_request_id) is not None)
+            raise OSError("connection reset")
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    # ASGI 2.4: the failed send raises, and Starlette raises ClientDisconnect.
+    scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+    with contextlib.suppress(ClientDisconnect):
+        await asyncio.wait_for(response(scope, receive, send), timeout=30)
+    return existed, adapter.get_stream_state(stream_request_id) is not None
 
 
 @pytest.mark.parametrize("num_postprocess_workers", [0, 1], ids=["frontend", "postprocess_worker"])
@@ -104,17 +124,16 @@ def test_a_responses_client_that_disconnects_releases_the_state(serve_env, encod
     request = ResponsesRequest(model="fake-model", input="hi", stream=True)
     stream_request_id = f"responses-api-{request.request_id}"
 
-    async def disconnect_mid_stream():
+    async def serve():
         response = await server.openai_responses(request, _raw_request())
-        frames = response.body_iterator
-        await asyncio.wait_for(_read_until(frames, "response.output_text.delta"), timeout=30)
-        assert get_harmony_adapter().get_stream_state(stream_request_id) is not None
-        # What ClosingStreamingResponse does when the client goes away.
-        await frames.aclose()
+        return await _serve_to_a_client_that_leaves(
+            response, "response.output_text.delta", stream_request_id
+        )
 
-    asyncio.run(disconnect_mid_stream())
+    existed, still_held = asyncio.run(serve())
 
-    assert get_harmony_adapter().get_stream_state(stream_request_id) is None
+    assert existed == [True]
+    assert not still_held
 
 
 def test_a_chat_client_that_disconnects_releases_the_state(serve_env, encoding):
@@ -124,18 +143,15 @@ def test_a_chat_client_that_disconnects_releases_the_state(serve_env, encoding):
         model="fake-model", messages=[{"role": "user", "content": "hi"}], stream=True
     )
 
-    async def disconnect_mid_stream():
+    async def serve():
         response = await server.chat_harmony(request, _raw_request())
         stream_request_id = str(server.generator.generate_calls[0].result.id)
-        frames = response.body_iterator
-        await asyncio.wait_for(_read_until(frames, '"content":"Done'), timeout=30)
-        assert get_harmony_adapter().get_stream_state(stream_request_id) is not None
-        await frames.aclose()
-        return stream_request_id
+        return await _serve_to_a_client_that_leaves(response, '"content":"Done', stream_request_id)
 
-    stream_request_id = asyncio.run(disconnect_mid_stream())
+    existed, still_held = asyncio.run(serve())
 
-    assert get_harmony_adapter().get_stream_state(stream_request_id) is None
+    assert existed == [True]
+    assert not still_held
 
 
 def test_a_failed_responses_post_processing_releases_the_state(monkeypatch):

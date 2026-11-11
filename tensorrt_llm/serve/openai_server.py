@@ -3337,9 +3337,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
             # Handle streaming
             if request.stream:
-                return StreamingResponse(content=create_streaming_generator(
-                    promise, postproc_params),
-                                         media_type="text/event-stream")
+                return ClosingStreamingResponse(
+                    content=create_streaming_generator(promise,
+                                                       postproc_params),
+                    media_type="text/event-stream")
             else:
                 response = await self._create_chat_response(
                     promise, postproc_params, raw_request, disaggregated_params)
