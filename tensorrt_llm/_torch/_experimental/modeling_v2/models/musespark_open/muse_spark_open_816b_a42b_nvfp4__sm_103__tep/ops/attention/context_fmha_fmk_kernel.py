@@ -132,8 +132,10 @@ role walks the same unit list in the same order with the same per-unit counts):
   grid's own wait returns only after this grid completed and its memory is visible).
 
 Numerics: S = Q K^T in fp32 on the tensor core; online softmax in log2 units with the running
-maximum raised on every increase; P = 2^(s * scale_log2 - max * scale_log2 + 8) rounded to E4M3;
-the row sum of the fp32 P in registers; O accumulated in fp32 on the tensor core and multiplied by
+maximum raised when a tile exceeds it by CR_HEADROOM_LOG2 (``cond_rescale``; every increase
+without it); P = 2^(s * scale_log2 - max * scale_log2 + 8) rounded to E4M3 (three of every four
+exponentials as f16x2 MUFUs with ``f16_exp``); the row sum of P in registers (f32; the f16x2
+pairs' in f16x2 per step); O accumulated in fp32 on the tensor core and multiplied by
 ``scale_output / row_sum``. The scales are read at run time from two device scalars,
 ``scale_log2`` and ``scale_output`` (the context preprocess writes them: its BMM1 scale's second
 entry and its BMM2 scale), so a CUDA-graph replay sees their current values.
@@ -170,6 +172,11 @@ IDS_PER_BATCH = 32
 #: P = 2^(s - max + P_PRESCALE_LOG2) uses E4M3's range (max 448) with the maximum raised on every
 #: increase: floor(log2(448)).
 P_PRESCALE_LOG2 = 8.0
+#: Conditional rescale: log2 headroom above the prescaled P maximum 2^8 (E4M3 max 448 = 2^8.8).
+CR_HEADROOM_LOG2 = 0.75
+#: Exponentials of ``f16_exp`` builds, per group of four P elements, cycling through the pattern:
+#: ``m`` one f16x2 pair (one half-precision MUFU) and one f32 pair, ``h`` two f16x2 pairs.
+F16_EXP_PATTERN = "mh"
 #: Diagnostic trace (``trace=True`` builds): int64 timestamps per work unit, then per-step cycle
 #: counts of the first unit of CTA 0 (see ``PagedContextFmhaFmk``).
 TRACE_FIELDS = 24
@@ -196,6 +203,99 @@ def _cvt_f32x4_to_e4m3x4(a, b, c, d, *, loc=None, ip=None) -> Int32:
     )
 
 
+@dsl_user_op
+def _ex2_f16x2(a, b, *, loc=None, ip=None) -> Int32:
+    """2^a and 2^b as one packed f16x2 word (a in the low half): the f32 pair is rounded to f16x2
+    and one half-precision MUFU ``ex2`` serves both."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip) for x in (a, b)],
+            "{\n\t.reg .b32 h;\n\tcvt.rn.f16x2.f32 h, $2, $1;\n\tex2.approx.f16x2 $0, h;\n\t}\n",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _hadd2(a, b, *, loc=None, ip=None) -> Int32:
+    """Packed f16x2 add."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(x).ir_value(loc=loc, ip=ip) for x in (a, b)],
+            "add.rn.f16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _f16x2_sum_f32(h, *, loc=None, ip=None) -> Float32:
+    """Both halves of a packed f16x2 word added in f32."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(h).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 lo, hi;\n\t.reg .f32 f0, f1;\n\tmov.b32 {lo, hi}, $1;\n\t"
+            "cvt.f32.f16 f0, lo;\n\tcvt.f32.f16 f1, hi;\n\tadd.f32 $0, f0, f1;\n\t}\n",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_e4m3x4_f16x2(h01, h23, *, loc=None, ip=None) -> Int32:
+    """Two packed f16x2 words rounded (satfinite) to four E4M3 in one word, h01's low half lowest."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(x).ir_value(loc=loc, ip=ip) for x in (h01, h23)],
+            "{\n\t.reg .b16 lo, hi;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f16x2 lo, $1;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f16x2 hi, $2;\n\t"
+            "mov.b32 $0, {lo, hi};\n\t}\n",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_e4m3x4_f16x2_f32x2(h01, c, d, *, loc=None, ip=None) -> Int32:
+    """One packed f16x2 word (lowest two bytes) and two f32 values (c below d) rounded
+    (satfinite) to four E4M3 in one word."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int32(h01).ir_value(loc=loc, ip=ip),
+                Float32(c).ir_value(loc=loc, ip=ip),
+                Float32(d).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .b16 lo, hi;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f16x2 lo, $1;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 hi, $3, $2;\n\t"
+            "mov.b32 $0, {lo, hi};\n\t}\n",
+            "=r,r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 class PagedContextFmhaFmk:
     """Compiled per (heads, KV heads, instances, key tile, options); sizes and pointers are runtime
     arguments.
@@ -207,11 +307,21 @@ class PagedContextFmhaFmk:
         TMEM columns.
     :param s_stages: S buffers per instance (1 or 2). With 2, QK_j(t + 1) is issued before P.V_j(t)
         and computes while softmax ``j`` works on S_j(t).
-    :param cache_page: tokens per KV cache block, 32 or 64; ``tile_n`` is a whole number of blocks.
+    :param cache_page: tokens per KV cache block, 32 or 64; ``tile_n`` is a whole number of blocks
+        or a part of one (tile 32 on 64-token blocks reads one of the block's two boxes).
     :param kv_stage: K / V ring slots (one key tile of K or V each).
     :param write_stats: mode-0 units also write the natural-log row max and the row sum.
     :param ablate_mufu: diagnostic build, wrong values: exp2 becomes a multiply (no MUFU), to time
         everything else.
+    :param cond_rescale: keep the running maximum (and so skip the rescale of O and the row sum)
+        until a tile's maximum exceeds it by ``CR_HEADROOM_LOG2`` log2 units: P stays below 2^8.75
+        (E4M3 maximum 448) and the final division by the row sum cancels the reference. A warp
+        takes the rescale path only when one of its rows needs it.
+    :param f16_exp: the exponentials of three of every four f32 pairs of P as f16x2 MUFUs (one
+        half-precision ``ex2`` per pair: the argument is rounded to f16, at most 2^-8 absolute for
+        arguments above -16, i.e. 0.3% on a P that is then rounded to E4M3's 3 mantissa bits). The
+        row sum of those pairs is added in f16x2 (at most 16 terms of at most 448 per accumulator
+        and step) and joins the f32 sum once per step.
     :param trace: diagnostic build: ``stats_ptr`` is an int64 buffer of ``num_units *
         TRACE_FIELDS + TRACE_STEP_WORDS`` words. Unit ``u`` gets ``%globaltimer`` values at
         ``u * TRACE_FIELDS + f``: f 0-3 MMA warp (unit start, Q ready, prologue QKs issued, unit
@@ -236,6 +346,8 @@ class PagedContextFmhaFmk:
         ablate_mufu: bool = False,
         trace: bool = False,
         cache_page: int = PAGE,
+        cond_rescale: bool = True,
+        f16_exp: bool = True,
     ):
         assert num_heads % num_kv_heads == 0
         assert (num_heads // num_kv_heads) % num_inst == 0, "instances must share one KV head"
@@ -249,11 +361,13 @@ class PagedContextFmhaFmk:
         self.ni = num_inst
         self.tile_n = tile_n
         self.cache_page = cache_page
+        self.cond_rescale = cond_rescale
+        self.f16_exp = f16_exp
         # TMA boxes per key tile and per cache block; blocks per key tile.
         self.pages_per_tile = tile_n // PAGE
         self.boxes_per_block = cache_page // PAGE
-        self.blocks_per_tile = tile_n // cache_page
-        self.tiles_per_batch = IDS_PER_BATCH // self.blocks_per_tile
+        # Key tiles per batch of IDS_PER_BATCH block ids (a tile of 32 keys is half a 64-token block).
+        self.tiles_per_batch = IDS_PER_BATCH * self.boxes_per_block // self.pages_per_tile
         self.slot_words = tile_n * D // 4
         self.row_words = D // 4
         self.kv_stage = kv_stage
@@ -715,7 +829,7 @@ class PagedContextFmhaFmk:
                                 self.issue_qk(qk_tiled_mma, tStS[j],
                                               tSrQ[None, None, None, q_base + j],
                                               tSrK[None, None, None, k_slot],
-                                              s_full, s_empty, j, n + 1)  # fmt: skip
+                                              s_full, s_empty, j, n + 1, True)  # fmt: skip
                         if cutlass.const_expr(self.trace):
                             if rec & (lane == 0) & (t - t0 < TRACE_STEPS):
                                 trace[step_base + (12 + j) * TRACE_STEPS + t - t0] = (
@@ -816,11 +930,10 @@ class PagedContextFmhaFmk:
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(kv_full + kv_idx, self.kv_bytes)
         for p in cutlass.range_constexpr(self.pages_per_tile):
-            blk = p // self.boxes_per_block
-            half = p % self.boxes_per_block
-            pid = cute.arch.shuffle_sync(
-                ids, (x % self.tiles_per_batch) * self.blocks_per_tile + blk
-            )
+            g = (x % self.tiles_per_batch) * self.pages_per_tile + p  # box index in the batch
+            blk = g // self.boxes_per_block
+            half = g % self.boxes_per_block
+            pid = cute.arch.shuffle_sync(ids, blk)
             box = cutlass.select_(
                 pid >= 0, (pid * self.num_kv_heads + kvh) * self.boxes_per_block + half, oob_box
             )
@@ -833,12 +946,15 @@ class PagedContextFmhaFmk:
         return self.ring_advance(kv_idx, kv_ph, self.kv_stage)
 
     @cute.jit
-    def issue_qk(self, tiled_mma, tStS_j, tSrQ, tSrK, s_full, s_empty, j: cutlass.Constexpr, n):
+    def issue_qk(self, tiled_mma, tStS_j, tSrQ, tSrK, s_full, s_empty, j: cutlass.Constexpr, n,
+                 skip_empty: cutlass.Constexpr = False):  # fmt: skip
         """S tile ``n`` of instance ``j`` into its S buffer ``n % s_stages``, once softmax ``j``
-        has read that buffer's previous tile; commits ``s_full``."""
+        has read that buffer's previous tile; commits ``s_full``. ``skip_empty``: the caller has
+        waited ``p_full`` of ``j``, which its softmax warps arrive after their ``s_empty``."""
         sb = n % self.s_stages
         idx = j * self.s_stages + sb
-        cute.arch.mbarrier_wait(s_empty + idx, ((n // self.s_stages) & 1) ^ 1)
+        if cutlass.const_expr(not skip_empty):
+            cute.arch.mbarrier_wait(s_empty + idx, ((n // self.s_stages) & 1) ^ 1)
         tS = cute.make_tensor(tStS_j.iterator + sb * self.tile_n, tStS_j.layout)
         self.gemm_qk(tiled_mma, tS, tSrQ, tSrK)
         self.commit(s_full + idx)
@@ -982,6 +1098,10 @@ class PagedContextFmhaFmk:
 
         scale = scales[0][0]
         scale_out = scales[1][0]
+        # Conditional rescale: the raw-score distance a tile maximum must exceed the reference by.
+        thr_raw = Float32(0.0)
+        if cutlass.const_expr(self.cond_rescale):
+            thr_raw = Float32(CR_HEADROOM_LOG2) / scale
         trace, step_base, bidx = tr
         # S tiles of this CTA's earlier units (the MMA warp counts the same); P.V completions
         # waited so far (parity).
@@ -1010,9 +1130,10 @@ class PagedContextFmhaFmk:
             t_mid = cutlass.max(t0, cutlass.min(t1, first_masked))
             row_max = -Float32.inf
             row_sum = Float32(0.0)
+            neg_c = Float32(0.0)
             for t in cutlass.range(t0, t_mid, 1, unroll=1):
-                row_max, row_sum, pe_ph = self.softmax_step(
-                    False, t == t0, t, key_limit, row_max, row_sum, n0 + t - t0, pe_ph, scale,
+                row_max, row_sum, pe_ph, neg_c = self.softmax_step(
+                    False, t == t0, t, key_limit, row_max, row_sum, n0 + t - t0, pe_ph, (scale, thr_raw), neg_c,
                     (s_full_j, s_empty_j, p_full_j, p_empty_j),
                     (tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADcS, tiled_tmem_store,
                      tTMEM_STOREtP, tTMEM_STOREcP, n_chunks, tOtO, pv_thr_mma, row),
@@ -1022,8 +1143,8 @@ class PagedContextFmhaFmk:
                 if row == 0:
                     trace[u * TRACE_FIELDS + 12 + inst] = cute.arch.globaltimer()
             for t in cutlass.range(t_mid, t1, 1, unroll=1):
-                row_max, row_sum, pe_ph = self.softmax_step(
-                    True, t == t0, t, key_limit, row_max, row_sum, n0 + t - t0, pe_ph, scale,
+                row_max, row_sum, pe_ph, neg_c = self.softmax_step(
+                    True, t == t0, t, key_limit, row_max, row_sum, n0 + t - t0, pe_ph, (scale, thr_raw), neg_c,
                     (s_full_j, s_empty_j, p_full_j, p_empty_j),
                     (tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADcS, tiled_tmem_store,
                      tTMEM_STOREtP, tTMEM_STOREcP, n_chunks, tOtO, pv_thr_mma, row),
@@ -1074,7 +1195,8 @@ class PagedContextFmhaFmk:
         row_sum,
         n_step,
         pe_ph,
-        scale,
+        scale_thr,
+        neg_c,
         bars,
         atoms,
         tr,
@@ -1108,31 +1230,84 @@ class PagedContextFmhaFmk:
         else:
             tile_max = rMax.load().reduce(cute.ReductionOp.MAX, -Float32.inf, 0)
         old_max = row_max
-        new_max = cute.arch.fmax(tile_max, row_max)
-        if new_max == -Float32.inf:
-            new_max = Float32(0.0)
-        acc_log2 = scale * (old_max - new_max)
-        neg = (Float32(0.0) - new_max) * scale + Float32(P_PRESCALE_LOG2)
-        half = cute.math.exp2(acc_log2, fastmath=True) * Float32(0.5)
-        sum2 = (row_sum * half, row_sum * half)
+        scale, thr_raw = scale_thr
+        factor = Float32(1.0)
+        any_need = True
+        if cutlass.const_expr(self.cond_rescale):
+            # Conditional rescale: the reference maximum (and with it the factor 2^(scale (old -
+            # new)), 8 - max * scale and the rescale of O and the row sum) changes only when a row
+            # of the warp has a tile maximum more than thr_raw above it.
+            need = tile_max > row_max + thr_raw
+            any_need = cute.arch.vote_ballot_sync(need) != 0
+            new_max = row_max
+            neg = neg_c
+            rs_in = row_sum
+            if any_need:
+                new_max = cutlass.select_(need, tile_max, row_max)
+                if cutlass.const_expr(masked):
+                    if new_max == -Float32.inf:
+                        new_max = Float32(0.0)
+                factor = cute.math.exp2(scale * (old_max - new_max), fastmath=True)
+                neg = (Float32(0.0) - new_max) * scale + Float32(P_PRESCALE_LOG2)
+                rs_in = row_sum * factor
+            sum2 = (rs_in, Float32(0.0))
+        else:
+            new_max = cute.arch.fmax(tile_max, row_max)
+            if new_max == -Float32.inf:
+                new_max = Float32(0.0)
+            neg = (Float32(0.0) - new_max) * scale + Float32(P_PRESCALE_LOG2)
+            factor = cute.math.exp2(scale * (old_max - new_max), fastmath=True)
+            half = factor * Float32(0.5)
+            sum2 = (row_sum * half, row_sum * half)
         rP = cute.make_rmem_tensor(tTMEM_STOREcP.shape, Float32)
         rP_i32 = cute.recast_tensor(rP, Int32)
-        for i in cutlass.range_constexpr(0, cute.size(rS), 4):
-            a0, a1 = cute.arch.fma_packed_f32x2((rS[i], rS[i + 1]), (scale, scale), (neg, neg))
-            a2, a3 = cute.arch.fma_packed_f32x2((rS[i + 2], rS[i + 3]), (scale, scale), (neg, neg))
-            e0 = self.ex2(a0)
-            e1 = self.ex2(a1)
-            e2 = self.ex2(a2)
-            e3 = self.ex2(a3)
-            sum2 = cute.arch.add_packed_f32x2(sum2, (e0, e1))
-            sum2 = cute.arch.add_packed_f32x2(sum2, (e2, e3))
-            rP_i32[i // 4] = _cvt_f32x4_to_e4m3x4(e0, e1, e2, e3)
+        sum_h = Float32(0.0)
+        if cutlass.const_expr(self.f16_exp):
+            acc_a = Int32(0)
+            acc_b = Int32(0)
+            for i in cutlass.range_constexpr(0, cute.size(rS), 4):
+                mode = F16_EXP_PATTERN[(i // 4) % len(F16_EXP_PATTERN)]
+                a0, a1 = cute.arch.fma_packed_f32x2((rS[i], rS[i + 1]), (scale, scale), (neg, neg))
+                a2, a3 = cute.arch.fma_packed_f32x2(
+                    (rS[i + 2], rS[i + 3]), (scale, scale), (neg, neg)
+                )
+                if cutlass.const_expr(mode == "h"):
+                    h01 = _ex2_f16x2(a0, a1)
+                    h23 = _ex2_f16x2(a2, a3)
+                    acc_a = _hadd2(acc_a, h01)
+                    acc_b = _hadd2(acc_b, h23)
+                    rP_i32[i // 4] = _cvt_e4m3x4_f16x2(h01, h23)
+                else:
+                    h01 = _ex2_f16x2(a0, a1)
+                    e2 = self.ex2(a2)
+                    e3 = self.ex2(a3)
+                    acc_a = _hadd2(acc_a, h01)
+                    sum2 = cute.arch.add_packed_f32x2(sum2, (e2, e3))
+                    rP_i32[i // 4] = _cvt_e4m3x4_f16x2_f32x2(h01, e2, e3)
+            sum_h = _f16x2_sum_f32(_hadd2(acc_a, acc_b))
+        else:
+            for i in cutlass.range_constexpr(0, cute.size(rS), 4):
+                a0, a1 = cute.arch.fma_packed_f32x2((rS[i], rS[i + 1]), (scale, scale), (neg, neg))
+                a2, a3 = cute.arch.fma_packed_f32x2(
+                    (rS[i + 2], rS[i + 3]), (scale, scale), (neg, neg)
+                )
+                e0 = self.ex2(a0)
+                e1 = self.ex2(a1)
+                e2 = self.ex2(a2)
+                e3 = self.ex2(a3)
+                sum2 = cute.arch.add_packed_f32x2(sum2, (e0, e1))
+                sum2 = cute.arch.add_packed_f32x2(sum2, (e2, e3))
+                rP_i32[i // 4] = _cvt_f32x4_to_e4m3x4(e0, e1, e2, e3)
         if not is_first:
             # P.V of the previous step has completed: O is stable until this step's P arrives.
             cute.arch.mbarrier_wait(p_empty_j, pe_ph)
             pe_ph ^= 1
-            if cute.arch.vote_ballot_sync(old_max != new_max) != 0:
-                self.rescale_o(pv_thr_mma, tOtO, cute.math.exp2(acc_log2, fastmath=True), row)
+            if cutlass.const_expr(self.cond_rescale):
+                if any_need:
+                    self.rescale_o(pv_thr_mma, tOtO, factor, row)
+            else:
+                if cute.arch.vote_ballot_sync(old_max != new_max) != 0:
+                    self.rescale_o(pv_thr_mma, tOtO, factor, row)
         tP = cute.make_tensor(tTMEM_STOREtP.iterator + sb * n, tTMEM_STOREtP.layout)
         cute.copy(tiled_tmem_store, rP, tP)
         cute.arch.fence_view_async_tmem_store()
@@ -1140,7 +1315,7 @@ class PagedContextFmhaFmk:
         if cutlass.const_expr(self.trace):
             if rec & (step < TRACE_STEPS):
                 trace[step_base + (4 + inst) * TRACE_STEPS + step] = cute.arch.clock64()
-        return new_max, sum2[0] + sum2[1], pe_ph
+        return new_max, sum2[0] + sum2[1] + sum_h, pe_ph, neg
 
     @cute.jit
     def rescale_o(self, thr_mma, tOtO, scale, row):

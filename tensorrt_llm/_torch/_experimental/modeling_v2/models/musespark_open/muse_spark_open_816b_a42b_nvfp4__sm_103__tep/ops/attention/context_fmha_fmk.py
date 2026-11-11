@@ -57,9 +57,12 @@ UNIT_FIELDS = 8
 #: Planner cost of a unit beyond its key tiles, in key tiles: a whole item (BF16 epilogue,
 #: diagonal steps, the next unit's Q wait) and a piece of a cut item (fp32 partial epilogue).
 #: Fitted to per-unit timestamps of the kernel's diagnostic build on Rubin (the overheads matter
-#: for short units; deep units amortise either).
-ITEM_OVERHEAD = 8.0
-PIECE_OVERHEAD = 13.0
+#: for short units; deep units amortise either). Refitted on GB300 for the kernel with
+#: ``cond_rescale`` and ``f16_exp`` (a shorter step makes the fixed per-unit cost count for
+#: more): 16 / 26 and a minimum piece of 32 tiles (was 8 / 13 / 16) gave +1.0% summed on the
+#: eight benchmark shapes.
+ITEM_OVERHEAD = 16.0
+PIECE_OVERHEAD = 26.0
 
 
 @dataclass
@@ -177,7 +180,7 @@ def plan_context_fmha(
     split: bool = True,
     item_overhead: float = ITEM_OVERHEAD,
     piece_overhead: float = PIECE_OVERHEAD,
-    min_piece: int = 16,
+    min_piece: int = 32,
     device: Optional[torch.device] = None,
 ) -> FmkPlan:
     """The work units of one context call; see the module docstring.
@@ -268,6 +271,8 @@ def _compiled_kernel(
     trace: bool = False,
     s_stages: int = 1,
     cache_page: int = PAGE,
+    cond_rescale: bool = True,
+    f16_exp: bool = True,
 ):
     """The compiled kernel of one build on one device (every size is a runtime argument)."""
     import cuda.bindings.driver as cuda
@@ -288,6 +293,8 @@ def _compiled_kernel(
         ablate_mufu=ablate_mufu,
         trace=trace,
         cache_page=cache_page,
+        cond_rescale=cond_rescale,
+        f16_exp=f16_exp,
     )
     gmem = cute.AddressSpace.gmem
     ptrs = [
@@ -441,6 +448,8 @@ def paged_context_fmha_fmk(
     workspace: Optional[FmkWorkspace] = None,
     trace: Optional[torch.Tensor] = None,
     s_stages: int = 1,
+    cond_rescale: bool = True,
+    f16_exp: bool = True,
 ) -> torch.Tensor:
     """Causal (bottom-right) attention of the packed new rows ``q`` over their paged contexts.
 
@@ -453,7 +462,9 @@ def paged_context_fmha_fmk(
     ``[total_q, heads, 2]`` (natural-log row max, row sum). ``plan`` from ``plan_context_fmha`` on
     the same lengths. ``trace`` (diagnostic): an int64 buffer of ``plan.num_units *
     TRACE_FIELDS + TRACE_STEP_WORDS`` words (``context_fmha_fmk_kernel``) selects the trace build.
-    ``s_stages`` 2 (with ``plan.tile_n`` 32) double-buffers S per instance. No host
+    ``s_stages`` 2 (with ``plan.tile_n`` 32) double-buffers S per instance. ``cond_rescale`` and
+    ``f16_exp`` select the softmax builds of ``PagedContextFmhaFmk`` (both on by default; off gives
+    the f32 softmax that rescales on every increase of the maximum). No host
     synchronisation: every input is read on the device, in stream order.
     """
     import cuda.bindings.driver as cuda
@@ -474,6 +485,8 @@ def paged_context_fmha_fmk(
         trace is not None,
         int(s_stages),
         int(cache_page),
+        bool(cond_rescale),
+        bool(f16_exp),
     )
     ws = workspace if workspace is not None else _WORKSPACE
     part_o, part_ml = ws.get(plan.num_slots, plan.num_inst, dev)
