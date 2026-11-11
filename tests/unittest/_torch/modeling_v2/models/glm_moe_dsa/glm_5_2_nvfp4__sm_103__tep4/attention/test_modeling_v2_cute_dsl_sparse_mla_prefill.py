@@ -270,7 +270,10 @@ _PREPARE_ARGS = (
 
 
 @pytest.mark.parametrize("all_sparse_indices_valid", [False, True], ids=["masked", "all_valid"])
-def test_full_topk_validity_specializations(all_sparse_indices_valid, certifying) -> None:
+def test_full_topk_validity_specializations(
+    all_sparse_indices_valid,
+    certifying,  # noqa: F811
+) -> None:
     certifying(op)
     args, rows = _build(dict(new=[2, 3], cached=[TOP_K - 1, TOP_K + 33]), seed=17)
     assert bool((rows >= 0).all())
