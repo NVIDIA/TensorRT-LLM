@@ -130,30 +130,32 @@ IMAGE, VIDEO = 1, 2
 
 
 class _Tower:
-    """Stub `VisionTower`: every row of item `i` of modality `m` holds `100 * m + i`."""
+    """Stub `VisionTower`: a merged row carries its first patch's pixel value (`_media`)."""
 
     merge = MERGE
 
     def __init__(self):
         self.calls = 0
+        self.patches = 0
 
     def __call__(self, pixel_values, grid_thw):
         self.calls += 1
-        modality = int(pixel_values[0, 0])
-        return torch.cat(
-            [
-                torch.full((t * h * w // (MERGE * MERGE), HIDDEN), float(100 * modality + item))
-                for item, (t, h, w) in enumerate(grid_thw.tolist())
-            ]
-        )
+        self.patches += pixel_values.shape[0]
+        assert sum(t * h * w for t, h, w in grid_thw.tolist()) == pixel_values.shape[0]
+        return pixel_values[:: MERGE * MERGE].expand(-1, HIDDEN)
 
 
 def _media(modality, grids):
-    """One `multimodal_data` entry; `pixel_values` only carries the stub's modality."""
-    patches = sum(t * h * w for t, h, w in grids)
+    """One `multimodal_data` entry; every patch row of item `i` holds `100 * modality + i`."""
     key = "pixel_values" if modality == IMAGE else "pixel_values_videos"
     grid_key = "image_grid_thw" if modality == IMAGE else "video_grid_thw"
-    return {key: torch.full((patches, 1), float(modality)), grid_key: torch.tensor(grids)}
+    pixels = torch.cat(
+        [
+            torch.full((t * h * w, 1), float(100 * modality + item))
+            for item, (t, h, w) in enumerate(grids)
+        ]
+    )
+    return {key: pixels, grid_key: torch.tensor(grids)}
 
 
 def _params(image=None, video=None, order=None, runtime=None, mrope=True):
@@ -542,6 +544,33 @@ def _hf_video_in_two_calls(tower, media, references, monkeypatch):
     _check("video in two calls", out, *references["video"])
 
 
+def _hf_video_in_chunks(tower, media, references, monkeypatch):
+    """The video spliced over three chunked-prefill chunks whose boundaries cut its two 96-row
+    frames: each chunk runs only the frames holding its rows, and together they are the one-pass
+    rows bitwise."""
+    px, grid = media["video"]
+    total = int(grid.prod(-1).sum()) // tower.merge**2
+    data = {
+        "mrope_config": {"mrope_position_ids": torch.zeros(3, 1, 8, dtype=torch.int32)},
+        "video": {"pixel_values_videos": px, "video_grid_thw": grid},
+    }
+    chunks = []
+    with torch.inference_mode():
+        whole = tower(px, grid)
+        for start, end in ((0, 50), (50, 150), (150, total)):
+            runtime = SimpleNamespace(
+                num_cached_mm_tokens=start,
+                num_mm_tokens_in_chunk=end - start,
+                total_embeds_in_request=total,
+            )
+            params = MultimodalParams(multimodal_data=data, multimodal_runtime=runtime)
+            kwargs = {"multimodal_params": [params], "mm_token_indices": torch.arange(end - start)}
+            chunks.append(V.multimodal_embeds(tower, kwargs)[0])
+    out = torch.cat(chunks)
+    assert torch.equal(out, whole), _mismatch(out, whole)
+    _check("video in three chunks", out, *references["video"])
+
+
 _HF_CASES = {
     "image0": _hf_single("image0"),
     "image1": _hf_single("image1"),
@@ -549,6 +578,7 @@ _HF_CASES = {
     "image_pair": _hf_pair(),
     "image_pair_two_calls": _hf_pair(cap=1176),
     "video_two_calls": _hf_video_in_two_calls,
+    "video_chunks": _hf_video_in_chunks,
 }
 
 
@@ -748,33 +778,39 @@ def test_admission_serves_what_the_tower_serves(build, refusal, reads_tower):
             Shell.validate_request(shell, build())
 
 
-def _chunk(cached, in_chunk):
+def _chunk(cached, in_chunk, total=len(MIXED_ROWS)):
     return SimpleNamespace(
         num_cached_mm_tokens=cached,
         num_mm_tokens_in_chunk=in_chunk,
-        total_embeds_in_request=len(MIXED_ROWS),
+        total_embeds_in_request=total,
     )
 
 
-#: `(id, _params kwargs, placeholder rows, rows that land there (None: no media), tower calls)`.
-#: The chunked cases take prompt-order rows 3..9 of the mixed request, or none.
+#: `(id, _params kwargs, placeholder rows, rows that land there (None: no media), tower calls,
+#: patch rows the tower runs)`. The mixed chunk takes prompt-order rows 3..9: the second frame of
+#: video 0, image 0 and the first frame of video 1 (40 of the request's 68 patch rows); the video
+#: chunk rows 5..7, inside video 1's first frame.
 _SPLICES = [
-    ("text", dict(), 0, None, 0),
-    ("image", dict(image=IMAGES), 5, [100.0] * 4 + [101.0], 1),
-    ("video", dict(video=VIDEOS), 12, [200.0] * 4 + [201.0] * 8, 1),
-    ("mixed", _MIXED, len(MIXED_ROWS), MIXED_ROWS, 2),
-    ("chunk", dict(_MIXED, runtime=_chunk(3, 6)), 6, MIXED_ROWS[3:9], 2),
-    ("chunk_without_placeholders", dict(_MIXED, runtime=_chunk(len(MIXED_ROWS), 0)), 0, None, 0),
+    ("text", dict(), 0, None, 0, 0),
+    ("image", dict(image=IMAGES), 5, [100.0] * 4 + [101.0], 1, 20),
+    ("video", dict(video=VIDEOS), 12, [200.0] * 4 + [201.0] * 8, 1, 48),
+    ("mixed", _MIXED, len(MIXED_ROWS), MIXED_ROWS, 1, 68),
+    ("chunk", dict(_MIXED, runtime=_chunk(3, 6)), 6, MIXED_ROWS[3:9], 1, 40),
+    ("video_chunk", dict(video=VIDEOS, runtime=_chunk(5, 2, 12)), 2, [201.0] * 2, 1, 16),
+    ("chunk_without_placeholders", dict(_MIXED, runtime=_chunk(len(MIXED_ROWS), 0)), 0, None, 0, 0),
 ]
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "params,num_rows,want,calls", [s[1:] for s in _SPLICES], ids=[s[0] for s in _SPLICES]
+    "params,num_rows,want,calls,patches", [s[1:] for s in _SPLICES], ids=[s[0] for s in _SPLICES]
 )
-def test_the_splice_puts_each_items_rows_on_its_placeholders(params, num_rows, want, calls):
+def test_the_splice_puts_each_items_rows_on_its_placeholders(
+    params, num_rows, want, calls, patches
+):
     """The tower's rows reach `begin_step` with the placeholder indices, and the splice writes them
-    over the placeholders in prompt order and zeroes the padding rows after the step."""
+    over the placeholders in prompt order and zeroes the padding rows after the step. A chunk runs
+    the tower on only the frames that hold its rows."""
     tower = _Tower()
     indices = torch.arange(1, 1 + num_rows, dtype=torch.int64)
     kwargs = {
@@ -783,7 +819,7 @@ def test_the_splice_puts_each_items_rows_on_its_placeholders(params, num_rows, w
         "resource_manager": object(),
     }
     vision = _forward_to_begin_step(tower, kwargs)
-    assert tower.calls == calls
+    assert (tower.calls, tower.patches) == (calls, patches)
     total = num_rows + 2
     h = torch.full((total + 3, HIDDEN), -1.0)
     M.PrefillTarget._splice(

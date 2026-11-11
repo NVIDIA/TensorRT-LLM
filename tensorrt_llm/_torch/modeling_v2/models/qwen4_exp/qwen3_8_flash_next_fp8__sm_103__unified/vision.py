@@ -422,15 +422,15 @@ def multimodal_embeds(tower: VisionTower | None, kwargs: dict):
     `rows` is `[R, hidden]` in packed-batch order, `mm_token_indices` the `[R]` rows they replace.
     The shell calls it: the inherited `DecoderModelForCausalLM.forward` drops `multimodal_params`,
     which covers a subset of the context requests (never zip it positionally).
-    `multimodal_runtime` counts rows over a request's media together, in prompt order."""
+    `multimodal_runtime` counts rows over a request's media together, in prompt order; a chunk
+    runs the tower on only the frames that hold its rows (`_tower_rows`)."""
     mm_params = kwargs.get("multimodal_params") or []
     if not mm_params:
         return None
     rows = []
     for params in mm_params:
         data = getattr(params, "multimodal_data", None) or {}
-        image, video = data.get("image"), data.get("video")
-        if image is None and video is None:
+        if data.get("image") is None and data.get("video") is None:
             continue
         mrope_ids = (data.get("mrope_config") or {}).get("mrope_position_ids")
         assert (
@@ -444,26 +444,21 @@ def multimodal_embeds(tower: VisionTower | None, kwargs: dict):
             # Every placeholder row of this request lies in another chunk.
             continue
         assert tower is not None, "post_load_weights builds the vision tower before any step"
-        towers = {}
-        if image is not None:
-            towers["image"] = run_tower(tower, image, *MEDIA_KEYS["image"])
-        if video is not None:
-            towers["video"] = run_tower(tower, video, *MEDIA_KEYS["video"])
-        embeds = in_prompt_order(tower.merge, params, towers)
+        items = _items_in_prompt_order(params, data)
+        merge_unit = tower.merge * tower.merge
+        total = sum(t * h * w for _, _, (t, h, w) in items) // merge_unit
+        start, count = 0, total
         if runtime is not None:
-            # Chunked prefill or reused prefix: splice only this chunk's slice.
+            # Chunked prefill or reused prefix: only this chunk's slice.
             start = int(runtime.num_cached_mm_tokens)
             count = int(runtime.num_mm_tokens_in_chunk)
-            total = embeds.shape[0]
             assert int(runtime.total_embeds_in_request) == total, (
                 f"the executor counted {runtime.total_embeds_in_request} placeholder rows for "
-                f"this request and the tower produced {total} over its {sorted(towers)}; the "
-                "two are derived from the same grids and a disagreement means the merger's "
-                "row count is wrong"
+                f"this request and its grids describe {total}; the two are derived from the "
+                "same grids and a disagreement means the merger's row count is wrong"
             )
             assert 0 <= start <= start + count <= total, (start, count, total)
-            embeds = embeds[start : start + count]
-        rows.append(embeds)
+        rows.append(_tower_rows(tower, items, start, count))
     if not rows:
         return None
     vision = rows[0] if len(rows) == 1 else torch.cat(rows, 0)
@@ -480,49 +475,86 @@ def multimodal_embeds(tower: VisionTower | None, kwargs: dict):
     return vision, mm_token_indices
 
 
-def run_tower(tower, media: dict, pixel_key: str, grid_key: str):
-    """Run the tower on one modality's payload: `(rows, grid_thw)`, items in processor order."""
-    pixel_values, grid_thw = media.get(pixel_key), media.get(grid_key)
-    assert pixel_values is not None and grid_thw is not None, (
-        f"the multimodal payload carries {sorted(media)}; this target reads {pixel_key!r} and "
-        f"{grid_key!r} from it"
-    )
-    assert not grid_thw.is_cuda, f"{grid_key} must stay on the host; see DEVICE_PATHS"
-    return tower(pixel_values, grid_thw), grid_thw
-
-
-def in_prompt_order(merge: int, params, towers: dict) -> torch.Tensor:
-    """One request's tower rows (`towers`: modality -> `(rows, grid_thw)`) in placeholder order.
+def _items_in_prompt_order(params, data: dict) -> list[tuple[torch.Tensor, int, tuple]]:
+    """One request's media items in placeholder order: `(pixel_values, first patch row, (t, h, w))`.
 
     Two modalities interleave by `item_metadata.item_refs`, the only host-side record of order."""
-    if len(towers) == 1:
-        return next(iter(towers.values()))[0]
-    metadata = params.item_metadata
-    order = metadata.item_refs if metadata is not None else None
-    assert order, (
-        f"a request carrying {sorted(towers)} needs item metadata to splice them in prompt "
-        "order; the payload holds each modality's rows apart"
-    )
-    merge_unit = merge * merge
-    items = {}
-    for modality, (embeds, grid_thw) in towers.items():
-        counts = [t * h * w // merge_unit for t, h, w in grid_thw.tolist()]
-        assert sum(counts) == embeds.shape[0], (
-            f"the {modality} grid describes {sum(counts)} rows and the tower produced "
-            f"{embeds.shape[0]}"
+    media = {}
+    for modality, (pixel_key, grid_key) in MEDIA_KEYS.items():
+        payload = data.get(modality)
+        if payload is None:
+            continue
+        pixel_values, grid_thw = payload.get(pixel_key), payload.get(grid_key)
+        assert pixel_values is not None and grid_thw is not None, (
+            f"the multimodal payload carries {sorted(payload)}; this target reads {pixel_key!r} "
+            f"and {grid_key!r} from it"
         )
-        items[modality] = torch.split(embeds, counts, 0)
-    listed = {modality: [] for modality in items}
-    for modality, index in order:
-        assert modality in items, (
-            f"item_refs lists a {modality!r} item; this request carries {sorted(items)}"
+        assert not grid_thw.is_cuda, f"{grid_key} must stay on the host; see DEVICE_PATHS"
+        grid = [tuple(int(v) for v in row) for row in grid_thw.tolist()]
+        firsts, patches = [], 0
+        for frames, height, width in grid:
+            firsts.append(patches)
+            patches += frames * height * width
+        media[modality] = (pixel_values, grid, firsts)
+    if len(media) == 1:
+        modality, (_, grid, _) = next(iter(media.items()))
+        order = [(modality, index) for index in range(len(grid))]
+    else:
+        metadata = params.item_metadata
+        order = metadata.item_refs if metadata is not None else None
+        assert order, (
+            f"a request carrying {sorted(media)} needs item metadata to splice them in prompt "
+            "order; the payload holds each modality's rows apart"
         )
-        listed[modality].append(int(index))
-    for modality, parts in items.items():
-        assert sorted(listed[modality]) == list(range(len(parts))), (
-            f"item_refs lists {modality} items {listed[modality]}; the payload carries {len(parts)}"
-        )
-    return torch.cat([items[modality][int(index)] for modality, index in order], 0)
+        listed = {modality: [] for modality in media}
+        for modality, index in order:
+            assert modality in media, (
+                f"item_refs lists a {modality!r} item; this request carries {sorted(media)}"
+            )
+            listed[modality].append(int(index))
+        for modality, (_, grid, _) in media.items():
+            assert sorted(listed[modality]) == list(range(len(grid))), (
+                f"item_refs lists {modality} items {listed[modality]}; the payload carries "
+                f"{len(grid)}"
+            )
+    return [
+        (media[modality][0], media[modality][2][int(index)], media[modality][1][int(index)])
+        for modality, index in order
+    ]
+
+
+def _tower_rows(tower: VisionTower, items: list, start: int, count: int) -> torch.Tensor:
+    """Placeholder rows `[start, start + count)` of one request's `items` (prompt order).
+
+    One tower call over only the frames that hold them: a frame's rows depend on its own patches
+    alone (attention is per frame, every other op per row), so a chunk of a long video does not
+    rerun the request's other frames. A frame a chunk boundary cuts runs in both chunks. Adjacent
+    frames of one pixel tensor stay one view; items of two modalities are copied into one tensor."""
+    merge_unit = tower.merge * tower.merge
+    end = start + count
+    spans: list[list] = []  # [pixel_values, first patch row, end patch row]
+    grid: list[tuple[int, int, int]] = []
+    first_row = None
+    row = 0  # the item's first placeholder row
+    for pixel_values, first_patch, (frames, height, width) in items:
+        frame_rows = height * width // merge_unit
+        lo = max(start - row, 0) // frame_rows
+        hi = min(-(-(end - row) // frame_rows), frames)
+        if lo < hi:
+            if first_row is None:
+                first_row = row + lo * frame_rows
+            patch_lo = first_patch + lo * height * width
+            patch_hi = first_patch + hi * height * width
+            if spans and spans[-1][0] is pixel_values and spans[-1][2] == patch_lo:
+                spans[-1][2] = patch_hi
+            else:
+                spans.append([pixel_values, patch_lo, patch_hi])
+            grid.append((hi - lo, height, width))
+        row += frames * frame_rows
+    assert first_row is not None, (start, count, row)
+    parts = [pixel_values[lo:hi] for pixel_values, lo, hi in spans]
+    out = tower(parts[0] if len(parts) == 1 else torch.cat(parts, 0), torch.tensor(grid))
+    return out[start - first_row : end - first_row]
 
 
 def validate_request(tower, request) -> None:
