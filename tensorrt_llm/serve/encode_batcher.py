@@ -124,6 +124,37 @@ class EncodeBatcher:
             raise QueueFullError("Embedding request queue is full; retry later.")
         return await future
 
+    async def submit_many(self, token_ids_list: List[List[int]]) -> List[Any]:
+        """Enqueue a group of inputs (one request) and await their results in order.
+
+        The group is all or nothing: every input is validated and the queue must
+        have room for all of them before any is enqueued, so a request rejected
+        with InputTooLongError (HTTP 400) or QueueFullError (HTTP 429) leaves
+        nothing behind to encode. If one input fails, or the caller is
+        cancelled, the inputs still queued are cancelled and skipped by the
+        worker instead of being encoded for a request that already ended.
+        """
+        for token_ids in token_ids_list:
+            self.validate_input(token_ids)
+        max_queue_size = self._queue.maxsize
+        if max_queue_size > 0 and self._queue.qsize() + len(token_ids_list) > max_queue_size:
+            raise QueueFullError("Embedding request queue is full; retry later.")
+        loop = asyncio.get_running_loop()
+        requests = [
+            _QueuedRequest(token_ids=token_ids, future=loop.create_future())
+            for token_ids in token_ids_list
+        ]
+        for request in requests:
+            # Cannot raise: the capacity check above and these puts run without
+            # yielding to the event loop.
+            self._queue.put_nowait(request)
+        try:
+            return await asyncio.gather(*(request.future for request in requests))
+        finally:
+            for request in requests:
+                if not request.future.done():
+                    request.future.cancel()
+
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
         # A request dequeued but held back because it would overflow the token
@@ -139,10 +170,13 @@ class EncodeBatcher:
         Returns the formed batch plus any request carried over to the next batch
         (an over-budget request that was dequeued but not added).
         """
-        if pending is not None:
-            batch = [pending]
-        else:
-            batch = [await self._queue.get()]
+        # A request whose future is already done was cancelled while queued; it
+        # is dropped here so it takes no batch slot, token budget, or encode work.
+        batch = [pending] if pending is not None and not pending.future.done() else []
+        while not batch:
+            request = await self._queue.get()
+            if not request.future.done():
+                batch = [request]
         num_tokens = len(batch[0].token_ids)
         deadline = loop.time() + self._max_queue_delay
         carry_over: Optional[_QueuedRequest] = None
@@ -154,6 +188,8 @@ class EncodeBatcher:
                 request = await asyncio.wait_for(self._queue.get(), timeout)
             except asyncio.TimeoutError:
                 break
+            if request.future.done():
+                continue
             if (
                 self._max_num_tokens is not None
                 and num_tokens + len(request.token_ids) > self._max_num_tokens
@@ -166,6 +202,10 @@ class EncodeBatcher:
 
     async def _dispatch(self, loop, batch: List[_QueuedRequest]) -> None:
         """Run encode_fn on the batch and resolve each request's future."""
+        # Drop requests cancelled during the hold window.
+        batch = [request for request in batch if not request.future.done()]
+        if not batch:
+            return
         token_ids_batch = [request.token_ids for request in batch]
         try:
             # encode_fn is synchronous and blocking (a GPU forward); run it in the
