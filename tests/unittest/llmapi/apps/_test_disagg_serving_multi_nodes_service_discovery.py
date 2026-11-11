@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import platform
 import shutil
@@ -8,42 +11,67 @@ import uuid
 import openai
 import pytest
 from test_common import cluster_env
+from test_common.http_utils import wait_for_endpoint_down, wait_for_endpoint_ready
 
 from tensorrt_llm._utils import get_free_port, get_sm_version
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
-from .utils import expand_slurm_nodelist, wait_for_endpoint_down, wait_for_endpoint_ready
+from .utils import expand_slurm_nodelist
 
 RANK = int(os.environ.get("SLURM_PROCID", 0))
 NODE_RANK = int(os.environ.get("SLURM_NODEID", 0))
 NODE_LIST = expand_slurm_nodelist(os.environ.get("SLURM_NODELIST", ""))
 SLURM_NTASKS_PER_NODE = int(os.environ.get("SLURM_NTASKS_PER_NODE", 1))
+LOCAL_RANK = int(os.environ.get("SLURM_LOCALID", RANK % SLURM_NTASKS_PER_NODE))
 
 # This a multi-node QA test, use a fixed port instead of finding a free port
 # so that all nodes can have the same disagg server config
 DISAGG_SERVER_PORT = 8000
+DISAGG_SERVER_START_TIMEOUT_S = 1200
 
 
-# This test is supposed to run with 2 nodes or more
+@pytest.fixture(autouse=True)
+def require_supported_slurm_topology():
+    required_variables = (
+        "SLURM_PROCID",
+        "SLURM_NODEID",
+        "SLURM_LOCALID",
+        "SLURM_NODELIST",
+        "SLURM_NTASKS_PER_NODE",
+    )
+    missing_variables = [variable for variable in required_variables if variable not in os.environ]
+    if missing_variables:
+        pytest.fail(
+            "This test must run directly under a two-node Slurm allocation; "
+            "trtllm-llmapi-launch removes the required topology variables. "
+            f"Missing: {', '.join(missing_variables)}"
+        )
+    if len(NODE_LIST) != 2:
+        pytest.skip("This test requires exactly two Slurm nodes")
+
+
+# This test uses exactly two nodes.
 def is_ctx_node():
-    assert len(NODE_LIST) == 2
     return NODE_RANK == 0
 
 
 def is_gen_node():
-    assert len(NODE_LIST) == 2
     return NODE_RANK == 1
 
 
+def is_worker_task():
+    return LOCAL_RANK == 0
+
+
 def is_disagg_node():
-    return NODE_RANK == 0
+    return RANK == 0
 
 
 # The test is run on multinodes but only the first node's output is used for assertion
 def is_pytest_node():
-    return NODE_RANK == 0
+    return RANK == 0
 
 
 def env():
@@ -75,7 +103,7 @@ def disagg_host():
 
 @pytest.fixture(params=["etcd", "http"])
 def service_discovery(request, disagg_host: str):
-    if request.param == "etcd":
+    if request.param == "etcd" and is_disagg_node():
         work_dir = tempfile.mkdtemp()
         data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
         etcd = subprocess.Popen(
@@ -96,8 +124,10 @@ def service_discovery(request, disagg_host: str):
             shutil.rmtree(data_dir)
         except Exception:
             pass
-    else:
+    elif request.param == "http":
         yield None, f"http://{disagg_host}:{DISAGG_SERVER_PORT}"
+    else:
+        yield None, f"etcd://{disagg_host}:2379"
 
 
 @pytest.fixture
@@ -127,7 +157,7 @@ def worker(model_name: str, disagg_cluster_config: dict):
     # start workers on 0.0.0.0:<free_port>, then the workers should be able to
     # report their correct hostname:port to the disagg server
     port = get_free_port()
-    if is_ctx_node():
+    if is_ctx_node() and is_worker_task():
         print(f"starting ctx_server for rank {RANK} node rank {NODE_RANK}")
         model_path = get_model_path(model_name)
         tp_size, pp_size = 1, 1
@@ -139,12 +169,12 @@ def worker(model_name: str, disagg_cluster_config: dict):
             host="0.0.0.0",
             env=env(),
             llmapi_launch=False,
-            rank=RANK % SLURM_NTASKS_PER_NODE,
+            rank=0,
             extra_config=extra_config,
             role=ServerRole.CONTEXT,
         ) as server:
             yield server
-    elif is_gen_node():
+    elif is_gen_node() and is_worker_task():
         print(f"starting gen_server for rank {RANK} node rank {NODE_RANK}")
         model_path = get_model_path(model_name)
         tp_size, pp_size = 1, 1
@@ -156,7 +186,7 @@ def worker(model_name: str, disagg_cluster_config: dict):
             host="0.0.0.0",
             env=env(),
             llmapi_launch=False,
-            rank=RANK % SLURM_NTASKS_PER_NODE,
+            rank=0,
             extra_config=extra_config,
             role=ServerRole.GENERATION,
         ) as server:
@@ -209,7 +239,8 @@ def test_completion(
     model_name: str,
 ):
     disagg_health_url = f"http://{disagg_host}:{DISAGG_SERVER_PORT}/health/"
-    wait_for_endpoint_ready(disagg_health_url)
+    if is_worker_task():
+        wait_for_endpoint_ready(disagg_health_url, timeout=DISAGG_SERVER_START_TIMEOUT_S)
     if is_pytest_node():
         print(f"running test_completion on rank {RANK} node rank {NODE_RANK}")
         prompt = "What is the result of 1+1? Answer in one word: "
@@ -227,7 +258,7 @@ def test_completion(
 
         disagg_server.terminate()
 
-    elif is_gen_node():
+    elif is_gen_node() and is_worker_task():
         # keep gen workers alive until the test ends
         wait_for_endpoint_down(disagg_health_url)
         assert True

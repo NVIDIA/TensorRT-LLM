@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import platform
 import socket
@@ -6,25 +9,24 @@ import time
 import openai
 import pytest
 from test_common import cluster_env
-from test_common.http_utils import (wait_for_endpoint_down,
-                                    wait_for_endpoint_ready)
+from test_common.http_utils import wait_for_endpoint_down, wait_for_endpoint_ready
 
 from tensorrt_llm._utils import get_sm_version
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
-from .utils import (expand_slurm_nodelist, wait_for_endpoint_down,
-                    wait_for_endpoint_ready)
+from .utils import expand_slurm_nodelist
 
 RANK = int(os.environ.get("SLURM_PROCID", 0))
 NODE_RANK = int(os.environ.get("SLURM_NODEID", 0))
 NODE_LIST = expand_slurm_nodelist(os.environ.get("SLURM_NODELIST", ""))
 SLURM_NTASKS_PER_NODE = int(os.environ.get("SLURM_NTASKS_PER_NODE", 1))
+LOCAL_RANK = int(os.environ.get("SLURM_LOCALID", RANK % SLURM_NTASKS_PER_NODE))
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-# This test assumes that there are >2 nodes, we run ctx/disagg-server/client on the first node,
-# and run gen the second node.
+# This test uses exactly two nodes: ctx/disagg-server/client on the first node
+# and gen on the second node.
 # This is a multi-node test, and will not be scheduled to the same node running other tests
 # using fixed ports should be safe.
 CTX_SERVER_PORT = 8001
@@ -34,6 +36,28 @@ DISAGG_SERVER_PORT = 8000
 # server on the other node starts independently and may need longer, so the
 # default 180-second readiness window of the disagg server is too short.
 DISAGG_SERVER_START_TIMEOUT_S = 1200
+
+
+@pytest.fixture(scope="module", autouse=True)
+def require_supported_slurm_topology():
+    required_variables = (
+        "SLURM_PROCID",
+        "SLURM_NODEID",
+        "SLURM_LOCALID",
+        "SLURM_NODELIST",
+        "SLURM_NTASKS_PER_NODE",
+    )
+    missing_variables = [
+        variable for variable in required_variables if variable not in os.environ
+    ]
+    if missing_variables:
+        pytest.fail(
+            "This test must run directly under a two-node Slurm allocation; "
+            "trtllm-llmapi-launch removes the required topology variables. "
+            f"Missing: {', '.join(missing_variables)}"
+        )
+    if len(NODE_LIST) != 2:
+        pytest.skip("This test requires exactly two Slurm nodes")
 
 
 # Exclude the current node from the node list, then return other nodes by idx
@@ -58,6 +82,10 @@ def is_ctx_node():
 
 def is_gen_node():
     return NODE_RANK == 1
+
+
+def is_worker_task():
+    return LOCAL_RANK == 0
 
 
 def is_disagg_node():
@@ -123,18 +151,16 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
             "backend": "DEFAULT"
         },
         "kv_cache_config": {
-            "free_gpu_memory_fraction": 0.3,
+            "free_gpu_memory_fraction": 0.8,
             "enable_block_reuse": False,
-            "avg_seq_len": 128,
         },
         "disable_overlap_scheduler": True,
         # Qwen3.5 reserves recurrent state for max_batch_size * pp_size
-        # sequences up front, while this test sends one request at a time.
-        "max_batch_size": 4,
-        "max_num_tokens": 512,
+        # sequences up front; the defaults do not fit on 80 GB GPUs.
+        "max_batch_size": 128,
         "max_seq_len": 8192,
     }
-    if is_ctx_node():
+    if is_ctx_node() and is_worker_task():
         print(f"starting ctx_server for rank {RANK} node rank {NODE_RANK}")
         model_path = get_model_path(model_name)
         tp_size, pp_size = ctx_tp_pp_size
@@ -145,10 +171,10 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
                                 host="0.0.0.0",
                                 env=env(),
                                 llmapi_launch=False,
-                                rank=RANK % SLURM_NTASKS_PER_NODE,
+                                rank=0,
                                 extra_config=extra_config) as server:
             yield server
-    elif is_gen_node():
+    elif is_gen_node() and is_worker_task():
         print(f"starting gen_server for rank {RANK} node rank {NODE_RANK}")
         model_path = get_model_path(model_name)
         tp_size, pp_size = gen_tp_pp_size
@@ -159,7 +185,7 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
                                 host="0.0.0.0",
                                 env=env(),
                                 llmapi_launch=False,
-                                rank=RANK % SLURM_NTASKS_PER_NODE,
+                                rank=0,
                                 extra_config=extra_config) as server:
             yield server
     else:
@@ -170,7 +196,7 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
 def disagg_server(worker: RemoteOpenAIServer):
     if is_disagg_node():
         print(f"starting disagg_server for rank {RANK} node rank {NODE_RANK}")
-        ctx_url = f"localhost:8001"  # Use localhost since the ctx server is on the same node
+        ctx_url = "localhost:8001"  # Use localhost since the ctx server is on the same node
         # TODO: Hopefully the NODE_LIST is ordered by NODE_RANK, this test is only expected to run with 2 nodes now
         # We need to test with 4 nodes or more in the future, which should be easier with service discovery
         gen_url = f"{get_the_other_host(0)}:8002"
@@ -198,9 +224,6 @@ def client(disagg_server: RemoteDisaggOpenAIServer):
 
 def test_completion(client: openai.OpenAI,
                     disagg_server: RemoteDisaggOpenAIServer, model_name: str):
-    if len(NODE_LIST) != 2:
-        pytest.skip("This test is only expected to run with 2 nodes")
-        return
     if is_pytest_node():
         print(f"running test_completion on rank {RANK} node rank {NODE_RANK}")
         prompt = "What is the result of 1+1? Answer in one word: "
@@ -215,15 +238,16 @@ def test_completion(client: openai.OpenAI,
         message = completion.choices[0].text
         assert message.startswith('2.')
 
-        # sleep 10 seconds to ensure a successful wait_for_endpoint_ready on rank1
+        # Give the generation worker time to observe the router before shutdown.
         time.sleep(10)
         disagg_server.terminate()
 
-    elif is_ctx_node() or is_gen_node():
-        # Keep all workers alive until the disaggregated server exits.
-        host = "localhost" if is_ctx_node() else get_the_other_host(0)
-        url = f"http://{host}:{DISAGG_SERVER_PORT}/health/"
-        wait_for_endpoint_ready(url)
+    elif is_gen_node() and is_worker_task():
+        # Keep the generation worker alive until the disaggregated server exits.
+        url = f"http://{get_the_other_host(0)}:{DISAGG_SERVER_PORT}/health/"
+        wait_for_endpoint_ready(
+            url, timeout=DISAGG_SERVER_START_TIMEOUT_S + 300
+        )
         wait_for_endpoint_down(url)
         assert True
     else:
