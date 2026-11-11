@@ -20,8 +20,9 @@ inputs (one launch for the engine's four). Each kernel takes every size and addr
 compiled once per process, on the first launch, which must happen outside CUDA-graph capture. The kernels are called
 through TVM-FFI: a launch costs a few microseconds of host time.
 
-Callers use them only where ``is_supported()`` holds. A call whose arguments are outside what the kernel covers launches
-nothing and returns False; the caller then does that work itself.
+Callers use ``SlotScatter`` only where ``slot_scatter_supported()`` holds and ``StepInputGather`` only where
+``is_supported()`` holds. A call whose arguments are outside what the kernel covers launches nothing and returns False;
+the caller then does that work itself.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from typing import Any, ClassVar
 
 import torch
 
-from ...._utils import is_blackwell_datacenter
+from ...._utils import get_sm_version, is_blackwell_datacenter
 from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 
@@ -42,6 +43,17 @@ def is_supported() -> bool:
     architecture; other architectures keep the torch path.
     """
     return IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and is_blackwell_datacenter()
+
+
+def slot_scatter_supported() -> bool:
+    """Whether ``SlotScatter`` runs on the current device: where ``is_supported()`` holds, and on SM 10.7.
+
+    On SM 10.7 the sampler's four ``index_copy_`` would otherwise launch every step; the engine's gathers
+    (``StepInputGather``) keep the ``is_supported()`` gating.
+    """
+    return is_supported() or (
+        IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and get_sm_version() == 107
+    )
 
 
 def _is_i32(t: torch.Tensor) -> bool:
