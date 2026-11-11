@@ -17,7 +17,14 @@ the answers into clear, checkable sentences.
 
 ## Conversation contract
 
-- Talk in the user's language; write the YAML sentences in English.
+- Language: pick it from the user's first message in this conversation —
+  Chinese if it is written in Chinese, English otherwise — and use it for
+  every message after that: forms, recaps, questions, choice labels and
+  explanations. Switch only when the user asks you to. Tool output, the
+  system locale and the language of files you read do not change it. The
+  examples in this skill are in English; translate them. Field names,
+  paths, commands and values stay as they are, and the YAML sentences are
+  always written in English.
 - Part 1 and Part 2 are each asked as one form (see below), one part per
   message; Parts 3 and 4 go one question per message. Ask anything with
   fixed choices (the feature checklist, yes/no) as described in
