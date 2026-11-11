@@ -51,6 +51,9 @@ l0_b300:
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
   - unittest/_torch/modeling/test_qsa_runtime_wiring.py
   - unittest/_torch/modeling/test_qwen4_exp_support.py
+  - unittest/_torch/modeling/test_kimi_k3_mla.py::test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface
+  - unittest/_torch/modeling/test_kimi_k3_mla.py::test_k3_mla_fp8_fallback_layer_on_nvfp4_cache_matches_huggingface
+  - unittest/_torch/modeling/test_kimi_k3_mla.py::test_k3_mla_nvfp4_kv_chunked_prefill_with_cached_prefix_matches_huggingface
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel

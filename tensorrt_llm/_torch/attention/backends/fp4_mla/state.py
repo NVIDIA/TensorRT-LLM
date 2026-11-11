@@ -64,10 +64,10 @@ class Fp4MlaState:
     num_blocks: list[int] | None = None
     num_context_blocks: int = 0
     num_generation_blocks: int = 0
-    # Whether every generation sequence fills all of its pages, cached across
-    # the layers of a step. Its key does not include the KV lengths, so it is
-    # reset whenever they change.
-    full_pages_cache: tuple[tuple, bool] | None = None
+    # The KV length every generation sequence of this step shares, from the host
+    # lengths prepare() receives; None when they differ, for CUDA-graph metadata,
+    # and when speculative decoding can advance the device lengths past them.
+    generation_kv_len: int | None = None
     workspaces: dict[str, torch.Tensor] = field(default_factory=dict)
     v_packed_cache_tags: dict[str, tuple] = field(default_factory=dict)
 
@@ -145,7 +145,6 @@ class Fp4MlaState:
         self.generation_lengths_num_contexts = -1
         self.generation_lengths_capture_recorded = False
         self.packed_plan_key = None
-        self.full_pages_cache = None
 
     def prepare(self, metadata: TrtllmAttentionMetadata, kv_lens: torch.Tensor) -> None:
         # All local layers reuse this FP8 view only within the current batch.
@@ -160,6 +159,11 @@ class Fp4MlaState:
                 "FP4 MLA requires fixed-stride device page metadata; the "
                 "current KV-cache manager or batch layout is unsupported."
             )
+        self.generation_kv_len = None
+        if not metadata.is_cuda_graph and not metadata.kv_lens_advance_on_device():
+            generation_kv_lens = kv_lens[metadata.num_contexts : metadata.num_seqs].tolist()
+            if generation_kv_lens and min(generation_kv_lens) == max(generation_kv_lens):
+                self.generation_kv_len = int(generation_kv_lens[0])
         # Graph capture's on_update_kv_lens owns the append kernel. Uniform
         # generation derives token positions in the fused update instead.
         if not metadata.is_cuda_graph and metadata.num_tokens > 0 and metadata.num_contexts > 0:

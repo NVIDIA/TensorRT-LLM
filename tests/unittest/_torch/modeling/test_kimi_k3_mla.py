@@ -309,6 +309,16 @@ def _load_mla_checkpoint_every_layer(
     model.load_weights(weights)
 
 
+def _fp4_mla_unavailable() -> bool:
+    """FP4 MLA runs the triton backend on SM100/SM103 and the CuTe DSL one on SM107."""
+    if not torch.cuda.is_available():
+        return True
+    capability = torch.cuda.get_device_capability()
+    return not (
+        capability in ((10, 0), (10, 3)) or (capability == (10, 7) and _cutedsl_backend_available())
+    )
+
+
 def _k3_mla_nvfp4_kv_errors(
     gate: bool, fp8: bool, num_mla_layers: int = 1, cached_prefix: int = 0
 ) -> tuple[float, float]:
@@ -457,10 +467,8 @@ def _k3_mla_nvfp4_kv_errors(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (10, 7)
-    or not _cutedsl_backend_available(),
-    reason="FP4 MLA requires Rubin SM107 and the CuTe DSL runtime",
+    _fp4_mla_unavailable(),
+    reason="FP4 MLA requires SM100 or SM103, or SM107 with the CuTe DSL runtime",
 )
 @pytest.mark.parametrize("gate", [False, True], ids=["no_gate", "gate"])
 def test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface(
@@ -493,10 +501,8 @@ def test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (10, 7)
-    or not _cutedsl_backend_available(),
-    reason="FP4 MLA requires Rubin SM107 and the CuTe DSL runtime",
+    _fp4_mla_unavailable(),
+    reason="FP4 MLA requires SM100 or SM103, or SM107 with the CuTe DSL runtime",
 )
 def test_k3_mla_fp8_fallback_layer_on_nvfp4_cache_matches_huggingface(
     monkeypatch: pytest.MonkeyPatch,
@@ -518,10 +524,8 @@ def test_k3_mla_fp8_fallback_layer_on_nvfp4_cache_matches_huggingface(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (10, 7)
-    or not _cutedsl_backend_available(),
-    reason="FP4 MLA requires Rubin SM107 and the CuTe DSL runtime",
+    _fp4_mla_unavailable(),
+    reason="FP4 MLA requires SM100 or SM103, or SM107 with the CuTe DSL runtime",
 )
 def test_k3_mla_nvfp4_kv_chunked_prefill_with_cached_prefix_matches_huggingface(
     monkeypatch: pytest.MonkeyPatch,

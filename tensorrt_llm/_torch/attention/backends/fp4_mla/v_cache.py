@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import is_blackwell_datacenter, prefer_pinned
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import DataType
 
 from .config import (
@@ -186,8 +186,8 @@ def _triton_prepack_v_enabled() -> bool:
         return False
     # The prepacked-V buffer spans every page of the FP4 KV pool. Each attention
     # metadata (eager and every CUDA graph) holds its own copy, and the KV-cache
-    # budget does not count it, so SM100/SM103 use it only when opted in.
-    default = _env_enabled_default("TRTLLM_FP4_MLA_PREPACK_V", not is_blackwell_datacenter())
+    # budget does not count it, so the triton backend uses it only when opted in.
+    default = _env_enabled_default("TRTLLM_FP4_MLA_PREPACK_V", False)
     return _env_enabled_default("TRTLLM_FP4_MLA_TRITON_PREPACK_V", default)
 
 

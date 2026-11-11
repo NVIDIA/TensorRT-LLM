@@ -7,7 +7,7 @@ from typing import Any, Optional
 import torch
 import triton
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter
 
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
@@ -102,9 +102,10 @@ def can_fuse_fp4_mla_q_quant(
     """Return whether generation can quantize Q in the fused cache update."""
     num_gen = metadata.num_seqs - metadata.num_contexts
     backend = _fp4_mla_attention_backend()
+    sm_version = get_sm_version()
     return bool(
         backend in _FP4_MLA_K_RESIDUAL_BACKENDS
-        and (get_sm_version() == 107 or (backend == "triton" and get_sm_version() in (100, 103)))
+        and (sm_version == 107 or (backend == "triton" and is_blackwell_datacenter(sm_version)))
         and num_gen > 0
         and getattr(metadata, "kv_cache_manager", None) is not None
         and q.shape[0] > 0

@@ -14,7 +14,9 @@ import tensorrt_llm._torch.attention.backends.fmha.fp4_mla as fp4_mla_fmha_backe
 import tensorrt_llm._torch.attention.backends.fp4_mla as fp4_mla_backend
 import tensorrt_llm._torch.attention.backends.fp4_mla.cache_update as fp4_mla_cache_update
 import tensorrt_llm._torch.attention.backends.fp4_mla.decode as fp4_mla_decode
+import tensorrt_llm._torch.attention.backends.fp4_mla.layout as fp4_mla_layout
 import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
+import tensorrt_llm._torch.attention.backends.fp4_mla.state as fp4_mla_state
 import tensorrt_llm._torch.attention.backends.fp4_mla.v_cache as fp4_mla_v_cache
 import tensorrt_llm._torch.attention.backends.trtllm as trtllm_backend
 from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import Fp4MlaFmha
@@ -51,6 +53,7 @@ from tensorrt_llm._torch.kimi_k3_cache_policy import (
     KIMI_K3_FP8_KV_LAYERS_ENV,
     get_kimi_k3_fp8_kv_layer_ids,
 )
+from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     KVCacheManagerV2,
@@ -2350,8 +2353,9 @@ def test_fp4_mla_helix_generation_writes_hp_ring_at_global_position(monkeypatch)
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
-    reason="requires Rubin SM107",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="requires SM100, SM103 or SM107",
 )
 def test_fp4_mla_chunked_cache_gather_dequantizes_k_residual(monkeypatch) -> None:
     _reset_triton_allocator()
@@ -2920,7 +2924,7 @@ def test_fp4_mla_attention_decode_cutedsl_matches_reference(
 @pytest.mark.parametrize("prepack_v", [False, True], ids=["default", "prepack-v"])
 @pytest.mark.parametrize("query_len_per_seq", [1, 4], ids=["mtp0", "mtp3"])
 def test_fp4_mla_attention_decode_triton_matches_reference(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     query_len_per_seq: int,
     prepack_v: bool,
 ) -> None:
@@ -2943,21 +2947,85 @@ def test_fp4_mla_attention_decode_triton_matches_reference(
 
 
 @pytest.mark.cpu_only
-def test_fp4_mla_full_pages_cache_tracks_updated_kv_lengths() -> None:
+@pytest.mark.parametrize("kv_lens_advance_on_device", [False, True], ids=["eager", "spec-dec"])
+def test_fp4_mla_full_pages_follow_host_kv_lengths_of_each_step(
+    monkeypatch: pytest.MonkeyPatch, kv_lens_advance_on_device: bool
+) -> None:
+    """Each prepare() decides the full-pages fast path from its own host KV lengths."""
+    # The device page table needs CUDA tensors; this test covers the host lengths only.
+    monkeypatch.setattr(
+        fp4_mla_state, "configure_fp4_mla_device_page_table", lambda metadata, kv_lens: True
+    )
     state = Fp4MlaState()
     metadata = SimpleNamespace(
         fp4_mla_state=state,
+        kv_cache_manager=object(),
+        request_ids=[0],
+        is_cuda_graph=False,
         num_contexts=0,
         num_seqs=1,
         num_tokens=1,
-        kv_lens_cuda_runtime=torch.tensor([FP4_MLA_TOKENS_PER_BLOCK], dtype=torch.int32),
+        kv_lens_advance_on_device=lambda: kv_lens_advance_on_device,
+        # A meta tensor holds no data: reading the device lengths would raise.
+        kv_lens_cuda_runtime=torch.empty(1, dtype=torch.int32, device="meta"),
     )
-    assert fp4_mla_metadata._infer_assume_full_pages(metadata, 1, FP4_MLA_TOKENS_PER_BLOCK)
+    kv_lens = torch.tensor([FP4_MLA_TOKENS_PER_BLOCK], dtype=torch.int32)
+    state.prepare(metadata, kv_lens)
+    assert (
+        fp4_mla_metadata._infer_assume_full_pages(metadata, 1, FP4_MLA_TOKENS_PER_BLOCK)
+        is not kv_lens_advance_on_device
+    )
 
-    # Keep the tensor address and batch layout, as in successive eager decode steps.
-    metadata.kv_lens_cuda_runtime.fill_(51)
-    state.on_update_kv_lens(metadata)
+    # The next eager step keeps the batch layout with a shorter KV length.
+    kv_lens.fill_(51)
+    state.prepare(metadata, kv_lens)
     assert not fp4_mla_metadata._infer_assume_full_pages(metadata, 1, FP4_MLA_TOKENS_PER_BLOCK)
+
+
+@pytest.mark.cpu_only
+def test_fp4_mla_triton_prepack_v_is_opt_in_on_sm107(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SM107 runs the triton backend when it is selected or CuTe DSL lacks the kernels."""
+    monkeypatch.setattr(tensorrt_llm._utils, "get_sm_version", lambda: 107)
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.delenv("TRTLLM_FP4_MLA_PREPACK_V", raising=False)
+    monkeypatch.delenv("TRTLLM_FP4_MLA_TRITON_PREPACK_V", raising=False)
+    assert not fp4_mla_v_cache._triton_prepack_v_enabled()
+
+    monkeypatch.setenv("TRTLLM_FP4_MLA_TRITON_PREPACK_V", "1")
+    assert fp4_mla_v_cache._triton_prepack_v_enabled()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA tensors")
+def test_fp4_mla_decode_scratch_is_shared_by_cuda_graphs() -> None:
+    """CUDA graphs replay one at a time, so they share one block of decode scratch."""
+    buffers = Buffers()
+    device = torch.device("cuda")
+
+    def scratch(metadata: SimpleNamespace, num_queries: int) -> torch.Tensor:
+        return fp4_mla_layout._ensure_decode_scratch_tensor(
+            metadata,
+            "_fp4_mla_attention_page_max_buf",
+            (num_queries, 64, 96),
+            dtype=torch.float32,
+            device=device,
+        )
+
+    graphs = [
+        SimpleNamespace(is_cuda_graph=True, cuda_graph_buffers=buffers, fp4_mla_state=Fp4MlaState())
+        for _ in range(2)
+    ]
+    # Graphs are captured from the largest batch size down.
+    large = scratch(graphs[0], 8)
+    small = scratch(graphs[1], 4)
+    assert small.data_ptr() == large.data_ptr()
+    assert not any(graph.fp4_mla_state.workspaces for graph in graphs)
+
+    eager = SimpleNamespace(
+        is_cuda_graph=False, cuda_graph_buffers=None, fp4_mla_state=Fp4MlaState()
+    )
+    eager_scratch = scratch(eager, 4)
+    assert eager_scratch.data_ptr() != large.data_ptr()
+    assert eager.fp4_mla_state.workspaces
 
 
 @pytest.mark.skipif(
@@ -3170,8 +3238,9 @@ def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
-    reason="requires Rubin SM107",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="requires SM100, SM103 or SM107",
 )
 @pytest.mark.parametrize(
     ("seq_len", "expected_slot"),
@@ -3242,8 +3311,9 @@ def test_fp4_mla_context_tail_uses_draft_slack_ring(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
-    reason="requires Rubin SM107",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="requires SM100, SM103 or SM107",
 )
 def test_fp4_mla_context_scatter_fuses_qk_rope(monkeypatch) -> None:
     _reset_triton_allocator()

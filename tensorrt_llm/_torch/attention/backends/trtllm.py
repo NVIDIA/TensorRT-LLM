@@ -1184,17 +1184,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # every block-table access, so the staged/H2D width can be capped
             # at the batch's maximum instead of max_seq_len's worth of
             # columns. Speculative decoding must stage the full width:
-            # draft/tree sub-steps and the overlap scheduler advance
-            # kv_lens_cuda on device past the host snapshot, and their
-            # kernels dereference block columns a host-derived cap would
+            # its kernels dereference block columns a host-derived cap would
             # leave unstaged (uninitialized in this buffer).
-            spec_active = (self.draft_kv_cache_manager is not None
-                           or self.is_spec_decoding_enabled
-                           or bool(self.kv_cache_params.num_extra_kv_tokens) or
-                           (self.runtime_features is not None and
-                            self.runtime_features.has_speculative_draft_tokens))
             max_blocks = None
-            if not spec_active and self.kv_cache_manager.tokens_per_block:
+            if (not self.kv_lens_advance_on_device()
+                    and self.kv_cache_manager.tokens_per_block):
                 max_blocks = ceil_div(max_kv_len,
                                       self.kv_cache_manager.tokens_per_block)
             self.kv_cache_manager.copy_batch_block_offsets(
@@ -1335,6 +1329,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             prompt_lens_cpu=prompt_lens,
             host_request_types=self.host_request_types[:num_seqs],
         )
+
+    def kv_lens_advance_on_device(self) -> bool:
+        """Whether kv_lens_cuda can advance on the device past the host lengths of prepare().
+
+        Speculative decoding does that: draft and tree sub-steps and the overlap
+        scheduler's accepted-token correction rewrite the device lengths.
+        """
+        return (self.draft_kv_cache_manager is not None
+                or self.is_spec_decoding_enabled
+                or bool(self.kv_cache_params.num_extra_kv_tokens)
+                or (self.runtime_features is not None
+                    and self.runtime_features.has_speculative_draft_tokens))
 
     @property
     def supports_steady_decode_step(self) -> bool:

@@ -940,23 +940,11 @@ def _infer_assume_full_pages(metadata: Any, max_pages: int, page_size: int) -> b
     ):
         return False
 
-    kv_lens_cuda = getattr(metadata, "kv_lens_cuda_runtime", None)
-    if isinstance(kv_lens_cuda, torch.Tensor):
-        cache_key = (
-            start,
-            end,
-            max_pages,
-            page_size,
-            tuple(block_counts) if block_counts is not None else None,
-            kv_lens_cuda.data_ptr(),
-        )
-        cache = getattr(metadata.fp4_mla_state, "full_pages_cache", None)
-        if cache is not None and cache[0] == cache_key:
-            return bool(cache[1])
-        kv_lens = [int(item) for item in kv_lens_cuda[start:end].detach().cpu().tolist()]
-        result = bool(kv_lens) and min(kv_lens) == max(kv_lens) == max_pages * page_size
-        setattr(metadata.fp4_mla_state, "full_pages_cache", (cache_key, result))
-        return result
+    if isinstance(getattr(metadata, "kv_lens_cuda_runtime", None), torch.Tensor):
+        # Fp4MlaState.prepare() records the step's generation KV length from its
+        # host lengths, so this never waits on a device-to-host copy.
+        kv_len = metadata.fp4_mla_state.generation_kv_len
+        return kv_len is not None and kv_len == max_pages * page_size
 
     kv_cache_params = getattr(metadata, "kv_cache_params", None)
     cached_token_lens = _host_int_list(
