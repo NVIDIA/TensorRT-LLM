@@ -29,6 +29,7 @@ from typing import Any, Mapping
 from ...checks import anchors as anchors_mod
 from ...checks import datasets
 from ...checks.check_runtime import MODE_REQUIRE, with_mode
+from ...checks.servers import rank_problem
 from ...infra.compute.environment import (
     RunEnvironment,
     env_assignments,
@@ -133,6 +134,15 @@ def _prefix(task_data: Mapping[str, Any], server: Server) -> str:
     return launch or str((task_data.get("environment") or {}).get("launch") or "").strip()
 
 
+def _prefixed(deployment: Deployment) -> list[tuple[str, Server]]:
+    """The servers of ``deployment`` with a launch prefix of their own, by the name each runs under."""
+    return [
+        (deployment.name if role == "server" else f"{deployment.name}.{role}", server)
+        for role, server in deployment.servers.items()
+        if server.launch.strip()
+    ]
+
+
 def _prefixes(task_data: Mapping[str, Any], deployment: Deployment) -> dict[str, int]:
     """Each prefix a server of ``deployment`` starts behind, with the ranks it places there."""
     needs: dict[str, int] = {}
@@ -143,11 +153,16 @@ def _prefixes(task_data: Mapping[str, Any], deployment: Deployment) -> dict[str,
 
 
 def probe(
-    task_data: Mapping[str, Any], deployment: Deployment, runner: Any, launch: str | None = None
+    task_data: Mapping[str, Any],
+    deployment: Deployment,
+    runner: Any,
+    launch: str | None = None,
+    count_only: bool = False,
 ) -> dict[str, Any]:
     """What is seen where a server of ``deployment`` will run, from every host that answered.
 
-    ``launch`` is that server's prefix; unnamed, the first server's.
+    ``launch`` is that server's prefix; unnamed, the first server's. ``processes`` is how
+    many the prefix started (each answers once); ``count_only`` asks nothing else.
 
     ``devices`` is ``(host, index, free MiB, total MiB, arch)`` of each device seen;
     ``tree_error``, ``config_error`` and ``tmp_error`` are the first a host reported;
@@ -157,6 +172,8 @@ def probe(
     env = {**environment.env, **deployment.env}
     environment = with_mode(replace(environment, env=env), MODE_REQUIRE)
     argv = ["-c", PROBE_SOURCE, str(task_data["checkpoint_path"])]
+    if count_only:
+        argv = ["-c", f'print("{PROBE_MARKER}{{}}", flush=True)']
     if launch is None:
         launch = next(iter(_prefixes(task_data, deployment)))
     command = environment.python_command(argv, single_process=True)
@@ -174,7 +191,7 @@ def probe(
                 records.append(json.loads(line[len(PROBE_MARKER) :]))
             except ValueError:
                 continue  # a line a rank tore: no answer of its own
-    found: dict[str, Any] = {"devices": []}
+    found: dict[str, Any] = {"devices": [], "processes": len(records)}
     if not records:
         tail = "\n".join(output.strip().splitlines()[-8:])
         found["error"] = f"it exited {result.returncode} with no answer; its last lines:\n{tail}"
@@ -235,6 +252,11 @@ def _claim(task_data, core: Deployment, runner: Any, result: PreflightResult) ->
         for key, what in blockers:
             if seen.get(key):
                 raise PreflightError(f"{what} {where}: {seen[key]}")
+        for name, server in _prefixed(core):
+            # The prefix places the ranks: one that starts another count dies at engine start.
+            wrong = rank_problem(name, seen["processes"], server.ranks)
+            if server.launch.strip() == prefix and wrong:
+                raise PreflightError(wrong)
         devices = [d for d in seen["devices"] if d[4] == arch]
         if not devices:
             others = sorted({d[4] for d in seen["devices"]}) or seen.get("devices_error") or "none"
@@ -256,6 +278,22 @@ def _claim(task_data, core: Deployment, runner: Any, result: PreflightResult) ->
     if unfit(task_data, core, memory):
         raise PreflightError(unfit(task_data, core, memory))
     return memory, free
+
+
+def _misplaced(task_data, deployment: Deployment, runner: Any, counted: dict[str, int]) -> str:
+    """Why a launch prefix of ``deployment`` cannot place its server's ranks; ``""`` when each can.
+
+    One short step behind each prefix, once: it starts no engine and loads nothing. A
+    prefix that does not answer is the boot's to report, not a count.
+    """
+    for name, server in _prefixed(deployment):
+        prefix = server.launch.strip()
+        if prefix not in counted:
+            seen = probe(task_data, deployment, runner, prefix, count_only=True)
+            counted[prefix] = seen["processes"]
+        if counted[prefix] and rank_problem(name, counted[prefix], server.ranks):
+            return rank_problem(name, counted[prefix], server.ranks)
+    return ""
 
 
 def run_preflight(
@@ -297,6 +335,7 @@ def run_preflight(
     else:
         result.notes.append("dry run: nothing was probed; a real start probes where it runs")
     env, probed, left = dict(result.environment.env), _prefixes(task_data, core), set()
+    counted: dict[str, int] = {}
     for deployment in found:
         # A device's memory is known only where the first deployment was probed.
         same = set(_prefixes(task_data, deployment)) <= set(probed)
@@ -304,6 +343,8 @@ def run_preflight(
         wants = sum(here[deployment.name])
         if not why and free is not None and wants > len(free):
             why = f"`{deployment.name}` needs {wants} free devices on this host; it has {len(free)}"
+        if not why and claim and deployment is not core:
+            why = _misplaced(task_data, deployment, runner, counted)
         if why and deployment is not core:
             result.not_attempted.append(dict(deployment=deployment.name, check="", reason=why))
             left.add(deployment.name)

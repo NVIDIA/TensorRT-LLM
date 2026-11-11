@@ -282,7 +282,10 @@ def healthy_smi(count: int = 1, free: int = 180000, cap: str = "10.3", **said):
 
     def runner(command, env=None, timeout=0):
         seen.append(command)
-        return CommandResult(returncode=0, stdout=f"MV2FLOW_PREFLIGHT {json.dumps(record)}\n")
+        # One answer from each process the launch prefix starts (`-n 16`, `--ntasks=16`).
+        asked = re.search(r"\s(?:-n ?|--ntasks[= ])(\d+)\s", command.rsplit(" -c ", 1)[0] + " ")
+        line = f"MV2FLOW_PREFLIGHT {json.dumps(record)}\n"
+        return CommandResult(returncode=0, stdout=line * (int(asked.group(1)) if asked else 1))
 
     runner.seen = seen  # type: ignore[attr-defined]
     return runner

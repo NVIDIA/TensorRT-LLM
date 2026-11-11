@@ -49,7 +49,7 @@ A run that is not onboarded says in its first lines where it stopped, the result
 
 Nothing here names a scheduler. A site adds three fields:
 
-- `launch`, on a deployment or on each of `ctx` and `gen`: the prefix that places the server's ranks (allocation and container only; the flow adds the ranks' launcher). It stays in the foreground, sees the same workspace, checkout and checkpoint paths, and gives rank 0 a hostname this host reaches. `environment.launch` is the prefix of one-GPU commands.
+- `launch`, on a deployment or on each of `ctx` and `gen`: the prefix that places the server's ranks (allocation and container only; the flow adds the ranks' launcher). It starts one process per rank, which the flow checks before a load. It stays in the foreground, sees the same workspace, checkout and checkpoint paths, and gives rank 0 a hostname this host reaches. `environment.launch` is the prefix of one-GPU commands.
 - `stop`, beside `launch`: the site's command that ends what `launch` started. Both receive `MV2FLOW_SERVER=<deployment>[.<role>]`.
 - `env`, on a deployment: what its servers need of the site.
 

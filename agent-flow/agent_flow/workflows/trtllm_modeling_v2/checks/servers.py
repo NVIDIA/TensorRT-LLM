@@ -81,10 +81,14 @@ UNVERIFIED = "devices not verified free"
 #: Where the engine locks are: on this node whatever ``TMPDIR`` a caller has.
 LOCK_DIRS: tuple[str, ...] = ("/dev/shm", "/var/tmp", "/tmp")  # nosec B108
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+#: Printed once by each process a launch prefix starts: how many it starts is how many
+#: ranks it can place.
+_PROCESS = "MV2FLOW_PROCESS"
 # Each process holding a device, with the host it is on: one prefix may land on several.
 # A host whose devices cannot be listed fails the look; it is not a host with no holder.
 _HOLDERS = (
-    "bash -o pipefail -c 'h=$(hostname); nvidia-smi --query-compute-apps=pid --format=csv,noheader "
+    f"bash -o pipefail -c 'h=$(hostname); echo {_PROCESS}; "
+    "nvidia-smi --query-compute-apps=pid --format=csv,noheader "
     '| while read -r p; do echo "$h $p"; done\''
 )
 
@@ -257,8 +261,31 @@ def _end(owned: Owned, grace_s: float) -> None:
             )
 
 
+def rank_problem(name: str, started: int, ranks: int) -> str:
+    """Why a prefix that starts ``started`` processes cannot place ``ranks`` ranks; ``""`` when it can.
+
+    Behind a prefix the flow adds the ranks' launcher and leaves the ranks to the prefix:
+    one that starts fewer dies at engine start, after the load began.
+    """
+    if started == ranks:
+        return ""
+    return (
+        f"the launch prefix of '{name}' starts {started} process(es); its options need {ranks} "
+        f"ranks: the prefix must start one per rank (for example 'srun -n {ranks} --mpi=pmix' "
+        f"or 'mpirun -n {ranks}')"
+    )
+
+
 def _holders(launch: str, env: Mapping[str, str], timeout: float) -> list[str] | None:
     """``<host> <pid>`` of each process holding a device where ``launch`` lands; ``None`` unknown."""
+    return _look(launch, env, timeout)[0]
+
+
+def _look(launch: str, env: Mapping[str, str], timeout: float) -> tuple[list[str] | None, int]:
+    """``(holders, processes)`` where ``launch`` lands: who holds a device, how many it started.
+
+    ``(None, 0)`` when the look could not be taken.
+    """
     try:
         done = subprocess.run(
             ["bash", "-c", f"{launch} {_HOLDERS}".strip()],
@@ -268,10 +295,11 @@ def _holders(launch: str, env: Mapping[str, str], timeout: float) -> list[str] |
             timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return None, 0
     if done.returncode:
-        return None
-    return sorted({" ".join(line.split()) for line in done.stdout.splitlines() if line.strip()})
+        return None, 0
+    lines = [" ".join(line.split()) for line in done.stdout.splitlines() if line.strip()]
+    return sorted({line for line in lines if line != _PROCESS}), lines.count(_PROCESS)
 
 
 def _released(owned: Owned, release_s: float) -> str:
@@ -496,7 +524,12 @@ def start(
         # The line as it is started, beside the log, for whoever reads a start that failed.
         (directory / f"{name}.launch").write_text(line + "\n", encoding="utf-8")
         look = max(0.1, min(PROBE_TIMEOUT_S, deadline - time.monotonic()))
-        before = _holders(server.launch, process_env, look)
+        before, placed = _look(server.launch, process_env, look)
+        # Before a load: a prefix that starts another count of processes than the server
+        # has ranks would only fail at engine start.
+        if server.launch.strip() and server.options and placed:
+            if rank_problem(name, placed, server.ranks):
+                raise ServerError(rank_problem(name, placed, server.ranks))
         with (directory / f"{name}.log").open("wb") as sink:
             process = subprocess.Popen(
                 ["bash", "-c", line],

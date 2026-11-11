@@ -114,8 +114,8 @@ def test_the_probe_runs_where_the_first_deployments_engine_will(tmp_path):
     # and owes its own ranks there: the generation side too, and here when it has none.
     halves = {
         "name": "pd",
-        "ctx": {"options": {"tensor_parallel_size": 4, **MOVES}, "launch": "srun -w n1"},
-        "gen": {"options": {"tensor_parallel_size": 2, **MOVES}, "launch": "srun -w n2"},
+        "ctx": {"options": {"tensor_parallel_size": 4, **MOVES}, "launch": "srun -w n1 -n 4"},
+        "gen": {"options": {"tensor_parallel_size": 2, **MOVES}, "launch": "srun -w n2 -n 2"},
     }
     seen = []
 
@@ -127,9 +127,38 @@ def test_the_probe_runs_where_the_first_deployments_engine_will(tmp_path):
     with pytest.raises(preflight.PreflightError) as short:
         preflight.run_preflight(split, runner=by_prefix)
     assert seen == ["n1", "n2"]
-    assert "`pd` needs 2 free sm_103 device(s) behind `srun -w n2`; 1 of 1 are free" in (
+    assert "`pd` needs 2 free sm_103 device(s) behind `srun -w n2 -n 2`; 1 of 1 are free" in (
         str(short.value)
     )
+
+
+def test_a_launch_prefix_starts_one_process_for_each_rank_which_is_checked_before_a_load(tmp_path):
+    """The flow adds the ranks' launcher and leaves the ranks to the prefix."""
+    lone = {"name": "tp2", "options": {"tensor_parallel_size": 2}, "launch": "srun -w n1"}
+    said = (
+        "the launch prefix of 'tp2' starts 1 process(es); its options need 2 ranks: the prefix "
+        "must start one per rank (for example 'srun -n 2 --mpi=pmix' or 'mpirun -n 2')"
+    )
+    # The first deployment: the run stops, in one line, before anything is loaded.
+    first = _task(tmp_path, parallel=None, deployments=[lone])
+    with pytest.raises(preflight.PreflightError) as stopped:
+        preflight.run_preflight(first, runner=healthy_smi(2))
+    assert str(stopped.value) == said
+    # A later one is not attempted: one short step behind its prefix, which loads nothing.
+    right = {**lone, "name": "placed", "launch": "srun -w n1 -n 2"}
+    later = _task(
+        tmp_path, parallel=None, deployments=[{"name": "tp1", "options": {}}, lone, right]
+    )
+    runner = healthy_smi(2)
+    result = preflight.run_preflight(later, runner=runner)
+    assert [(r["deployment"], r["check"], r["reason"]) for r in result.not_attempted] == [
+        ("tp2", "", said)
+    ]
+    assert len(runner.seen) == 3 and "import tensorrt_llm" in runner.seen[0]
+    assert all("import tensorrt_llm" not in step for step in runner.seen[1:])
+    assert "srun -w n1 /opt/venv/bin/python -c " in runner.seen[1]
+    # A dry run probes nothing, and so counts nothing.
+    assert preflight.run_preflight(later, runner=None, claim=False).not_attempted == []
     # With no prefix of its own, the spec's prefix for one-GPU commands is where it runs.
     task = _task(tmp_path)
     task["environment"]["launch"] = "srun -N1 --gpus=1"

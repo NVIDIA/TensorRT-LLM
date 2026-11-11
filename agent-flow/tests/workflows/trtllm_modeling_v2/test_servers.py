@@ -103,6 +103,17 @@ def test_the_flow_adds_the_ranks_launcher_and_the_prefix_stays_the_sites(site, m
         "1", "tcp,self", "self", "/hf",
     )  # fmt: skip
     assert env[servers.SERVER_NAME_ENV] == "dep16" and "CUDA_VISIBLE_DEVICES" not in env
+    # A prefix that starts one process cannot place two ranks: said before anything is loaded.
+    lone = Deployment(
+        name="tp2", server=Server(options={"tensor_parallel_size": 2}, launch="env SITE_PREFIX=1")
+    )
+    with pytest.raises(servers.ServerError) as refused:
+        servers.start(lone, model="/m", workspace=workspace)
+    assert str(refused.value).startswith(
+        "the launch prefix of 'tp2' starts 1 process(es); its options need 2 ranks: "
+    )
+    assert not (workspace / "deployments/tp2/address.started.json").exists()
+    assert servers.load_owned(workspace) == []
     # With no prefix: this host's launch. One rank runs its worker in its own process.
     running = servers.start(_one("local"), model="/m", workspace=workspace, devices=(4, 5))
     servers.stop(running)
