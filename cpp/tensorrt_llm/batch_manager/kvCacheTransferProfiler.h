@@ -63,13 +63,15 @@ inline void addKvTransferMetadata(common::ProfilerMetadata& metadata, KvTransfer
     {
         metadata.add("kv.payload_bytes", static_cast<std::int64_t>(bytesPerCopy * copyCount));
     }
+    // Optional metadata must not consume or overwrite an already pending CUDA error.
+    if (cudaPeekAtLastError() != cudaSuccess)
+    {
+        return;
+    }
     unsigned long long streamId{};
     auto const streamError = cudaStreamGetId(stream, &streamId);
-    if (streamError != cudaSuccess)
-    {
-        static_cast<void>(cudaGetLastError());
-    }
-    else if (streamId <= static_cast<unsigned long long>(std::numeric_limits<std::int64_t>::max()))
+    if (streamError == cudaSuccess
+        && streamId <= static_cast<unsigned long long>(std::numeric_limits<std::int64_t>::max()))
     {
         metadata.add("kv.cuda_stream_id", static_cast<std::int64_t>(streamId));
     }
