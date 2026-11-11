@@ -78,7 +78,7 @@ Items and checks:
 Inspect the checkpoint with:
 
 ```bash
-python3 .claude/skills/modeling-task-yaml/scripts/inspect_checkpoint.py <checkpoint_path>
+python3 .agents/skills/modeling-task-yaml/scripts/inspect_checkpoint.py <checkpoint_path>
 ```
 
 Show what it found (architecture, dtype, multimodal, MTP layers,
@@ -210,7 +210,7 @@ Ask with one multi-select question:
      It checks the schema, the checkout, the workspace, the checkpoint, the
      image, the mounts and the GPU pool. It does not create the workspace's
      run state.
-   - otherwise: `python3 .claude/skills/modeling-task-yaml/scripts/validate_task_yaml.py <workspace>/task.yaml`
+   - otherwise: `python3 .agents/skills/modeling-task-yaml/scripts/validate_task_yaml.py <workspace>/task.yaml`
      (the schema only).
 
    If the command is not on PATH, install agent-flow first:

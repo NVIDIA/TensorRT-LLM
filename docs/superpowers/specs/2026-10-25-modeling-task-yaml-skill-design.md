@@ -39,8 +39,9 @@
 
 ## Skill 位置与形式
 
-- 位置：`.claude/skills/modeling-task-yaml/SKILL.md`。名字按 `.claude/README.md` 的
-  `<prefix>-<descriptive-name>` 规则取。（我的决定）
+- 位置：`.agents/skills/modeling-task-yaml/SKILL.md`，Codex 从这里读取；
+  `.claude/skills/modeling-task-yaml` 是指向它的软链接，供 Claude Code 读取。名字按
+  `.claude/README.md` 的 `<prefix>-<descriptive-name>` 规则取。（我的决定）
 - `SKILL.md` 描述对话流程。可以附带一份带注释的模板，或者一份标准句子库，用来存放下文
   要写入的英文句子。
 - schema 校验直接调用 agent-flow 里现有的 `load_and_validate_task_yaml`，不要另写一份
