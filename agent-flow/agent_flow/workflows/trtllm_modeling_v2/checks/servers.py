@@ -50,8 +50,12 @@ from typing import Any, Iterator, Mapping, Sequence
 
 import yaml
 
-from ..infra.compute.environment import LLMAPI_LAUNCH, MPI_SETTINGS_KEPT, SINGLE_PROCESS_WORKER_ENV
-from ..infra.compute.server_runtime import rank_launch
+from ..infra.compute.environment import (
+    LLMAPI_LAUNCH,
+    MPI_SETTINGS_KEPT,
+    SINGLE_PROCESS_WORKER_ENV,
+    rank_launch,
+)
 from ..infra.files import write_text_atomic
 from ..spec.deployments import ROLES, Deployment, Server, write_options
 from .check_runtime import MODE_REQUIRE, engine_env
@@ -343,7 +347,7 @@ def launcher(server: Server) -> list[str]:
     """What the flow puts before a program that runs ``server``'s ranks.
 
     Nothing for one rank. Behind a launch prefix, which has placed the ranks, the LLM
-    API's launcher; on this host, ``mpirun`` and the launcher, as every in-process check
+    API's launcher; on this host, ``mpirun`` and the launcher, as every command of a check
     starts them.
     """
     if server.ranks <= 1:

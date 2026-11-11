@@ -52,8 +52,6 @@ def test_every_problem_is_batched_into_one_message(tmp_path):
     del spec["arch"]
     del spec["environment"]
     spec["checkpoint_path"] = "/definitely/not/here"
-    # A disabled gate's fields are still validated.
-    spec["accuracy"]["serve"] = {"enabled": False, "max_tokens": True, "prompt": " "}
     spec["accuracy"]["score_pattern"] = "accuracy: [0-9.]+"
     with pytest.raises(task_schema.TaskSchemaError) as excinfo:
         task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
@@ -62,8 +60,6 @@ def test_every_problem_is_batched_into_one_message(tmp_path):
         "arch",
         "environment",
         "non-existent path",
-        "accuracy.serve.max_tokens",
-        "accuracy.serve.prompt",
         "'accuracy.score_pattern' needs a group around the score",
     ):
         assert expected in message
@@ -267,7 +263,7 @@ def test_a_key_this_version_no_longer_reads_is_dropped_with_one_notice_each(tmp_
     assert load_and_validate_task_yaml(_write(tmp_path, spec)) == resolved
 
 
-def test_each_deployment_owes_its_boot_its_benchmarks_and_its_tests_and_core_the_serve_gate(
+def test_each_deployment_owes_its_boot_its_benchmarks_and_its_tests_and_no_serve_gate(
     tmp_path,
 ):
     spec = _valid_spec(tmp_path) | {
@@ -285,10 +281,13 @@ def test_each_deployment_owes_its_boot_its_benchmarks_and_its_tests_and_core_the
     }
     spec["accuracy"]["acceptance"] = {"num_prompts": 32, "mtp": {"min_absolute": 1.5}}
     spec["accuracy"]["disagg"] = {"test": "tests/test_pd.py::TestM::test_hop"}
+    # An earlier version's serve gate: every boot serves now, so the key is read no more.
+    spec["accuracy"]["serve"] = {"enabled": True, "max_tokens": 8}
     notices: list[str] = []
     resolved = load_and_validate_task_yaml(_write(tmp_path, spec), notices)
     assert sorted(n.split(" is ignored")[0] for n in notices) == [
         "'accuracy.acceptance'",
+        "'accuracy.serve'",
         "'variants.mtp7.accuracy.acceptance'",
         "'variants.mtp7.gates'",
     ]
@@ -310,10 +309,6 @@ def test_each_deployment_owes_its_boot_its_benchmarks_and_its_tests_and_core_the
     assert any(
         "mtp: its drafter's acceptance is judged by no check here" in n for n in contract.notes
     )
-    # The serve gate is core's, where the spec turns it on.
-    resolved["accuracy"]["serve"] = {"enabled": True}
-    more = {c.key for c in compile_contract(resolved).checks} - {c.key for c in contract.checks}
-    assert more == {"tep4:serve"}
     # A spec with no accuracy block owes boots alone, and says so.
     bare = compile_contract({"deployments": [{"name": "only", "options": {}}]})
     assert [c.key for c in bare.checks] == ["only:boot"]

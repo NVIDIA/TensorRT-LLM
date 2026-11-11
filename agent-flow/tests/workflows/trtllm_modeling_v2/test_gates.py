@@ -16,7 +16,6 @@ import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import accuracy as accuracy_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import gate_cli
-from agent_flow.workflows.trtllm_modeling_v2.checks.harness import serve_driver, workload_io
 from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
@@ -112,65 +111,46 @@ def _engine(*said: str, reports: str | None = None, code: int = 0, **changes):
     return run
 
 
-def _records(*texts):
-    return "".join(
-        f"{workload_io.RECORD_MARKER} {json.dumps({'index': n, 'text': t, 'finish_reason': 'stop'})}\n"
-        for n, t in enumerate(texts)
-    )
-
-
-def test_one_function_runs_a_check_on_the_deployment_it_names(tmp_path):
-    data = _spec(tmp_path)
-    tree = tmp_path / "worktree"
+def test_one_function_runs_a_check_on_the_deployment_it_names(site):
+    data = _spec(site)
+    tree = site / "worktree"
     tree.mkdir()
-    shutil.copy(tmp_path / "repo" / "r.yaml", tree / "r.yaml")
-    common = dict(workdir=tmp_path / "w", tree=tree, devices=(4, 5, 6, 7))
-    runner = _engine(_records("Paris", "the process"))
-    boot = gate_cli.run_check(data, "boot", "tep2", runner=runner, **common)
+    shutil.copy(site / "repo" / "r.yaml", tree / "r.yaml")
+    # The interpreter's directory leads PATH: the stand-in server and launcher are there.
+    common = dict(workdir=site / "w", tree=tree, devices=(4, 5, 6, 7), python=f"{site}/bin/python")
+    files = site / "w" / "deployments"
+    boot = gate_cli.run_check(data, "boot", "tep2", **common)
     assert boot.passed, boot.detail
     # The deployment's ranks, on the first of the run's devices, in the tree that was named.
-    [command] = runner.seen
-    assert command.startswith(f"cd {tree.resolve()} && export PYTHONPATH={tree.resolve()}")
-    assert "CUDA_VISIBLE_DEVICES=4,5 " in command and "mpirun -n 2" in command
-    assert "MV2FLOW_RANK_FACTS=1" in command and "TRTLLM_MODELING_V2=require" in command
-    assert "MY_SWITCH=1" in command  # the deployment's own environment
-    assert boot.summary().startswith("[PASS] tep2:boot: engine cold-started")
-    assert boot.path == gate_cli.IN_PROCESS and "[in process]" in boot.summary()
+    started = json.loads((files / "tep2" / "address.started.json").read_text())["env"]
+    assert started["CUDA_VISIBLE_DEVICES"] == "4,5" and started["MY_SWITCH"] == "1"
+    assert started["MV2FLOW_RANK_FACTS"] == "1" and started["TRTLLM_MODELING_V2"] == "require"
+    assert "mpirun -n 2 " in (files / "tep2" / "tep2.launch").read_text()
+    said = "[PASS] tep2:boot: aggregated deployment `tep2` started and its endpoint answered 2"
+    assert boot.summary().startswith(said)
+    assert boot.path == gate_cli.THROUGH_ENDPOINT and "[through the endpoint]" in boot.summary()
     assert (boot.engine[0]["status"], boot.engine[0]["ranks"]) == ("match", 2)
-    # Unnamed, the check is core's: one rank, no launcher.
-    runner = _engine(_records("Paris", "the process"))
-    core = gate_cli.run_check(data, "boot", runner=runner, **common)
-    assert core.deployment == "tp1" and "mpirun" not in runner.seen[0]
-    assert "CUDA_VISIBLE_DEVICES=4 " in runner.seen[0]
-    # An engine that imported another tree's package did not measure this one.
-    runner = _engine(_records("Paris", "the"), origin="/opt/other/tensorrt_llm/__init__.py")
-    elsewhere = gate_cli.run_check(data, "boot", runner=runner, **common)
-    assert not elsewhere.passed
-    assert "imported tensorrt_llm from /opt/other/tensorrt_llm/__init__.py, not from" in (
-        elsewhere.detail
-    )
+    assert boot.files == str(files / "tep2")
     # The boot runs the workload the spec states, the deployment's own entry over the run's.
-    boot = {"prompts": ["The capital of France is"], "keywords": ["Paris"]}
+    workload = {"prompts": ["The capital of France is"], "keywords": ["Paris"]}
     judged = {"model_key": "org/toy", "reference_yaml": "r.yaml"}
-    stated = _spec(tmp_path, accuracy={**judged, "boot": {**boot, "tep2": {"keywords": ["Lyon"]}}})
-    runner = _engine(_records("Paris"))
-    assert gate_cli.run_check(stated, "boot", runner=runner, **common).passed
-    lyon = gate_cli.run_check(stated, "boot", "tep2", runner=runner, **common)
+    more = {**judged, "boot": {**workload, "tep2": {"keywords": ["Lyon"]}}}
+    stated = _spec(site, accuracy=more)
+    # Unnamed, the check is core's: one rank, no launcher. `serve`, a gate of earlier
+    # versions, is the same boot.
+    core = gate_cli.run_check(stated, "serve", **common)
+    assert core.passed and (core.deployment, core.name) == ("tp1", "boot")
+    assert "mpirun" not in (files / "tp1" / "tp1.launch").read_text()
+    started = json.loads((files / "tp1" / "address.started.json").read_text())["env"]
+    assert started["CUDA_VISIBLE_DEVICES"] == "4"
+    lyon = gate_cli.run_check(stated, "boot", "tep2", **common)
     assert not lyon.passed and "missing 1 expected keyword(s): ['Lyon']" in lyon.detail
-    # An answer that did not complete (no finish reason) is not an answer.
-    cut = f"{workload_io.RECORD_MARKER} {json.dumps({'index': 0, 'text': 'Paris'})}\n"
-    unfinished = gate_cli.run_check(stated, "boot", runner=_engine(cut), **common)
-    assert (
-        not unfinished.passed and "did not complete for b0 (no finish reason)" in unfinished.detail
-    )
     with pytest.raises(task_schema.TaskSchemaError, match="names no gate"):
         gate_cli.run_check(data, "perf", **common)
     with pytest.raises(KeyError, match="'dep4' names no deployment of this spec"):
         gate_cli.run_check(data, "boot", "dep4", **common)
     with pytest.raises(task_schema.TaskSchemaError, match="`pd` names no benchmark"):
         gate_cli.run_check(data, "accuracy", "pd", **common)
-    with pytest.raises(task_schema.TaskSchemaError, match="`pd` is disaggregated: its boot serves"):
-        gate_cli.run_check(data, "serve", "pd", **common)
 
 
 def test_accuracy_runs_trtllm_eval_behind_the_deployments_own_prefix(tmp_path):
@@ -323,9 +303,11 @@ def test_a_checks_files_are_in_one_place_which_its_verdict_names(tmp_path, capsy
     path = tmp_path / "task.yaml"
     path.write_text(yaml.safe_dump(_spec(tmp_path)), encoding="utf-8")
     seen: list[Path] = []
+    modes: list[str] = []
 
-    def served(deployment, *, workspace, **said):
+    def served(deployment, *, workspace, mode, **said):
         seen.append(Path(workspace))
+        modes.append(mode)
         return GateResult(name="boot", passed=True, detail="answered", deployment="pd")
 
     monkeypatch.setattr(gate_cli.endpoint, "run_endpoint_boot", served)
@@ -339,12 +321,21 @@ def test_a_checks_files_are_in_one_place_which_its_verdict_names(tmp_path, capsy
     assert gate_cli.main(argv) == 0
     assert seen[1:] == [tmp_path]
     assert f"[files {tmp_path}/deployments/pd]" in capsys.readouterr().out
+    # `serve`, a gate of earlier versions, is answered by the boot, with one notice.
+    assert gate_cli.main(["serve", *argv[1:]]) == 0 and len(seen) == 3
+    said = capsys.readouterr()
+    assert said.err.count("note: `serve` is answered by the boot") == 1
+    assert said.out.startswith("[PASS] pd:boot: ")
+    # `--mode off` is the same boot on the stock path, a control.
+    assert gate_cli.main([*argv, "--mode", "off"]) == 0
+    assert modes == ["require", "require", "require", "off"]
+    capsys.readouterr()
     # A check that starts no server keeps its files under --workdir either way.
-    runner = _engine(_records("Paris", "the process"))
-    boot = gate_cli.run_check(
-        _spec(tmp_path), "boot", "tep2", workdir=tmp_path / "w", runner=runner
+    runner = _engine("lm-eval gsm8k average accuracy: 91.0\n")
+    scored = gate_cli.run_check(
+        _spec(tmp_path), "accuracy[gsm8k]", "tp1", workdir=tmp_path / "w", runner=runner
     )
-    assert boot.files == f"{tmp_path}/w/tep2" and (tmp_path / "w" / "tep2").is_dir()
+    assert scored.files == f"{tmp_path}/w/tp1" and (tmp_path / "w" / "tp1").is_dir()
 
 
 def test_native_tests_run_one_job_each_and_a_skip_or_a_bad_exit_is_not_a_pass(tmp_path):
@@ -386,18 +377,3 @@ def test_native_tests_run_one_job_each_and_a_skip_or_a_bad_exit_is_not_a_pass(tm
     assert "CUDA_VISIBLE_DEVICES" not in runner.seen[0]
     none = gate_cli.run_check(data, "tests", "tp1", runner=runner, **common)
     assert not none.passed and none.detail == "the deployment names no test"
-
-
-def test_the_serve_gate_reads_its_driver_and_names_the_deployment(tmp_path):
-    data = _spec(tmp_path)
-    answer = {"index": 0, "status": 200, "text": " Paris."}
-    stdout = (
-        f"{workload_io.RECORD_MARKER} {json.dumps(answer)}\n"
-        f"{serve_driver.SERVER_MARKER} {json.dumps({'healthy': True, 'boot_s': 3.0})}\n"
-    )
-    runner = _engine(stdout)
-    result = gate_cli.run_check(data, "serve", "tep2", workdir=tmp_path / "w", runner=runner)
-    assert result.passed, result.detail
-    assert result.summary().startswith("[PASS] tep2:serve: trtllm-serve healthy after 3.0s")
-    spec = json.loads((tmp_path / "w" / "tep2" / "serve.tep2.json").read_text())
-    assert spec["world_size"] == 2 and spec["serve_args"][-1] == "--num_serve_frontends=1"

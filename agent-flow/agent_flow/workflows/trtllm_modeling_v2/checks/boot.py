@@ -1,33 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Cold-start generation and boot workload coverage."""
+"""The boot workload: what a boot sends, and what it must see back.
+
+A boot starts the deployment's servers, sends this workload to the endpoint and holds
+the answers to it (``checks/endpoint.py``).
+"""
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from ..infra.compute.commands import ended_early
-from ..infra.compute.environment import RunEnvironment
 from ..spec.deployments import Deployment
-from ..spec.task_schema import BOOT_KEYS, GATE_TIMEOUT_KEY, load_prompts_file, resolve_gate_timeout
-from . import attest
-from .check_config import check_configuration
-from .check_runtime import (
-    BOOT_TIMEOUT_S,
-    MODE_REQUIRE,
-    ShellRunner,
-    default_shell_runner,
-    engine_driver_command,
-    gate_workdir,
-    parse_driver_records,
-    with_mode,
-    write_driver_spec,
-)
-from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
+from ..spec.task_schema import BOOT_KEYS, GATE_TIMEOUT_KEY, load_prompts_file
 
 #: The image a multimodal unit's boot sends when the task declares none: a
 #: photograph shipped in the repository's own test assets (a git-lfs file),
@@ -38,8 +25,6 @@ DEFAULT_BOOT_IMAGE = "tests/integration/test_input_files/merlion.png"
 #: What the default image prompt asks, and the words any correct description
 #: of that photograph (the Merlion fountain in Singapore) contains one of.
 DEFAULT_BOOT_IMAGE_PROMPT = "Describe this image in one sentence."
-#: The finish reasons of an answer that did not complete.
-UNFINISHED: tuple[str, ...] = ("", "None", "timeout", "cancelled")
 
 
 DEFAULT_BOOT_IMAGE_KEYWORDS: tuple[str, ...] = (
@@ -132,7 +117,7 @@ class BootSpec:
         return any(item.images for item in self.items)
 
     def requests(self, repo_root: str | Path | None) -> list[dict[str, Any]]:
-        """Engine-driver requests: the plain prompts, then the items.
+        """The requests a boot sends: the plain prompts, then the items.
 
         A relative image path is resolved against ``repo_root``, the tree under test.
         """
@@ -198,149 +183,6 @@ def _declares_workload(block: Mapping[str, Any]) -> bool:
         key in BOOT_KEYS or not isinstance(value, Mapping) or bool(value)
         for key, value in block.items()
         if key != GATE_TIMEOUT_KEY
-    )
-
-
-def run_boot_gate(
-    environment: RunEnvironment,
-    *,
-    task_data: Mapping[str, Any],
-    deployment: Deployment,
-    workdir: str | Path,
-    spec: BootSpec | None = None,
-    runner: ShellRunner = default_shell_runner,
-    timeout: int | None = None,
-    mode: str = MODE_REQUIRE,
-) -> GateResult:
-    """Cold-start ``deployment``'s engine in process and check it generates, through the engine driver.
-
-    ``spec`` is the workload (:func:`resolve_boot_spec`). Every rank's engine is held to
-    the deployment's options (``checks/attest.py``); with block reuse on, one more prompt
-    is sent again and must come back with cached tokens. ``mode`` other than ``require``
-    is a control run on the stock implementation, recorded as ``boot[<mode>]``.
-    """
-    spec = spec or BootSpec()
-    # The deployment's own environment is laid over the run's for every command of its checks.
-    env = with_mode(replace(environment, env={**environment.env, **deployment.env}), mode)
-    gate_name = "boot" if mode == MODE_REQUIRE else f"boot[{mode}]"
-    _verdict = verdict_factory(inspect_tree(task_data))
-    config = check_configuration(task_data, deployment, max_tokens=spec.max_tokens)
-    requests = spec.requests(task_data.get("trtllm_repo_path"))
-    declared_requests = len(requests)
-    options = (deployment.server or deployment.ctx).options
-    repeats = attest.reuse_sends(options) if attest.reuses(options) else 0
-    requests += [
-        {"id": f"{attest.REUSE_ID}{n}", "prompt": attest.REUSE_PROMPT, "max_tokens": 1}
-        for n in range(repeats)
-    ]
-    if timeout is None:
-        declared = resolve_gate_timeout(task_data.get("accuracy") or {}, "boot", deployment.name)
-        timeout = declared or BOOT_TIMEOUT_S
-    spec_path = write_driver_spec(
-        gate_workdir(workdir) / f"boot.{deployment.name}.json",
-        config=config,
-        requests=requests,
-        max_tokens=spec.max_tokens,
-    )
-    command = engine_driver_command(env, spec_path)
-
-    started = time.monotonic()
-    result = runner(command, None, timeout)
-    elapsed = time.monotonic() - started
-    combined = result.stdout + result.stderr
-    tail = "\n".join(combined.splitlines()[-40:])
-    ran = dict(
-        name=gate_name,
-        deployment=deployment.name,
-        command=command,
-        duration_s=elapsed,
-        stdout_tail=tail,
-    )
-
-    if result.infrastructure:
-        return _verdict(**lost_session(result), **ran)
-    if result.timed_out and result.stalled:
-        return _verdict(passed=False, detail=ended_early(result, timeout), **ran)
-    if result.timed_out:
-        return _verdict(
-            passed=False,
-            detail=f"timed out after {timeout}s — a boot gate that takes this long is "
-            f"not catching catastrophes any more",
-            **ran,
-        )
-    if not result.ok:
-        return _verdict(passed=False, detail=f"exited {result.returncode}", **ran)
-    attested = attest.attest(
-        combined,
-        {**options, "modeling_v2": mode},
-        tree=task_data.get("trtllm_repo_path"),
-        target=mode == MODE_REQUIRE,
-    )
-    ran["engine"] = (attested.record(),)
-    failure = attested.failure()
-    if failure:
-        return _verdict(passed=False, detail=failure, **ran)
-
-    records = {int(r.get("index", -1)): r for r in parse_driver_records(combined)}
-    texts = [
-        str(records[n].get("text", "")) if n in records else None for n in range(len(requests))
-    ]
-    absent = [requests[n]["id"] for n, text in enumerate(texts) if text is None]
-    if absent:
-        return _verdict(
-            passed=False,
-            detail=f"the engine exited cleanly but returned no record for {len(absent)} of "
-            f"{len(requests)} prompt(s) ({', '.join(absent)})",
-            **ran,
-        )
-    # An answer counts once it completed: one cut off mid-way has no finish reason, and one
-    # the engine gave up on says so.
-    ended = {r["id"]: str(records[n].get("finish_reason") or "") for n, r in enumerate(requests)}
-    cut = [
-        f"{name} ({how or 'no finish reason'})" for name, how in ended.items() if how in UNFINISHED
-    ]
-    if cut:
-        return _verdict(
-            passed=False,
-            detail=f"the engine returned an answer that did not complete for {', '.join(cut)}",
-            **ran,
-        )
-    texts = texts[:declared_requests]
-    empty = [requests[n]["id"] for n, text in enumerate(texts) if not (text or "").strip()]
-    if empty:
-        return _verdict(
-            passed=False,
-            detail=f"the engine exited cleanly but generated nothing for {', '.join(empty)}",
-            **ran,
-        )
-    reused = ""
-    if repeats:
-        cached = [records[n].get("cached_tokens") for n in range(declared_requests, len(requests))]
-        shortfall = attest.reuse_shortfall(cached)
-        if shortfall:
-            return _verdict(passed=False, detail=shortfall, **ran)
-        reused = f"; a repeated prompt resumed {max(c or 0 for c in cached)} cached tokens"
-    missing = missing_keywords(spec, texts)
-    if missing:
-        return _verdict(
-            passed=False,
-            detail=f"the generated texts are missing {len(missing)} expected keyword(s): "
-            f"{missing}. Keywords are matched against generated text only",
-            **ran,
-        )
-    images = sum(len(r.get("images") or ()) for r in requests)
-    checked = (
-        f"{len(spec.keywords) + sum(1 for i in spec.items if i.keywords or i.keywords_any)} "
-        f"keyword check(s) in the generated texts"
-        if spec.keywords or any(i.keywords or i.keywords_any for i in spec.items)
-        else "non-empty generation"
-    )
-    sent = f", {images} image(s) sent" if images else ""
-    return _verdict(
-        passed=True,
-        detail=f"engine cold-started and produced {checked} for {len(texts)} prompt(s)"
-        f"{sent}; workload: {spec.source}{reused}",
-        **ran,
     )
 
 

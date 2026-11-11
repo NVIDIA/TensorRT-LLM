@@ -87,7 +87,6 @@ BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "keywords", "max_tokens
 GATE_TIMEOUT_KEY = "timeout"
 BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "keywords", "keywords_any", "images", "render")
 BOOT_RENDERS: tuple[str, ...] = ("loader", "raw")
-SERVE_KEYS: tuple[str, ...] = ("enabled", "prompt", "max_tokens", "timeout")
 
 #: Keys an earlier version of the spec read and this one does not, by path (``*`` is any
 #: key of a mapping), each with what holds instead. Dropped at load, one notice each.
@@ -103,6 +102,8 @@ IGNORED_KEYS: dict[str, str] = {
     "accuracy.benchmark_members": "every deployment is scored on its benchmarks",
     "accuracy.anchor": "an anchor is declared on a benchmark, read from a reference row, or "
     "another deployment's score (`relative_to`)",
+    "accuracy.serve": "every boot starts the deployment's server and asks its endpoint; "
+    "there is no serve gate beside it",
     "accuracy.disagg.devices": "a disaggregated deployment takes its two servers' ranks",
     "accuracy.disagg.nodes": "where a server runs is its launch prefix's to say",
     "commit_policy.base_ref": "each task's commits are audited as they land; the branch is "
@@ -377,29 +378,13 @@ def resolve_gate_timeout(accuracy: Mapping[str, Any], block: str, name: str | No
 
 
 def _validate_accuracy(block: Any, known: Sequence[str], errors: list[str]) -> None:
-    """The ``accuracy`` block's own keys: ``boot``, ``serve``, ``timeout``, and that every key is known."""
+    """The ``accuracy`` block's own keys: ``boot``, ``timeout``, and that every key is known."""
     if not isinstance(block, dict):
         errors.append(f"'{ACCURACY_FIELD}' must be a mapping, got {type(block).__name__}")
         return
     reject_unknown_keys(block, known, errors, where=ACCURACY_FIELD)
     if block.get("boot") is not None:
         _validate_boot(block["boot"], errors)
-    serve = block.get("serve")
-    if serve is not None:
-        where = f"{ACCURACY_FIELD}.serve"
-        if not isinstance(serve, dict):
-            errors.append(f"'{where}' must be a mapping")
-        else:
-            reject_unknown_keys(serve, SERVE_KEYS, errors, where=where)
-            if serve.get("enabled") is not None and not isinstance(serve["enabled"], bool):
-                errors.append(f"'{where}.enabled' must be true or false")
-            for key in ("max_tokens", "timeout"):
-                if serve.get(key) is not None and not _positive_int(serve[key]):
-                    errors.append(f"'{where}.{key}' must be an integer >= 1")
-            if serve.get("prompt") is not None and not (
-                isinstance(serve["prompt"], str) and serve["prompt"].strip()
-            ):
-                errors.append(f"'{where}.prompt' must be a non-empty string")
     if block.get("timeout") is not None and not _positive_int(block["timeout"]):
         errors.append(f"'{ACCURACY_FIELD}.timeout' must be an integer >= 1")
 
@@ -587,7 +572,7 @@ def load_and_validate_task_yaml(
             data.pop(key, None)
         if isinstance(accuracy, dict):
             # What was stated per deployment is now each benchmark's own.
-            spent = (set(accuracy) - set(flat) - {"boot", "serve"}) | set(shorthand.ACCURACY_KEYS)
+            spent = (set(accuracy) - set(flat) - {"boot"}) | set(shorthand.ACCURACY_KEYS)
             for key in spent & set(accuracy):
                 del accuracy[key]
     return data

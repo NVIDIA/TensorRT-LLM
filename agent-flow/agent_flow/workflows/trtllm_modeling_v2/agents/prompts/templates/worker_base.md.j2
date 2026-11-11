@@ -31,7 +31,7 @@ Read `{{ notes }}` first, if it exists, and use what concerns your task. Read it
 
 ## Engines and long commands
 {% if gate %}
-- Run model-level checks with the gate. It holds the run's device lock, and its verdict line names the directory of its files:
+- Run model-level checks with the gate. It holds the run's device lock, starts and stops the deployment's servers itself, and its verdict line names the directory of their files:
 
       {{ gate }}
 

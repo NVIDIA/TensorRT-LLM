@@ -139,11 +139,15 @@ if "--config" in argv and os.environ.get("FAKE_RANKS", "1") == "1":
     options = yaml.safe_load(open(argv[argv.index("--config") + 1])) or {{}}
     if os.environ.get("FAKE_DTYPE"):
         options.setdefault("kv_cache_config", {{}})["dtype"] = os.environ["FAKE_DTYPE"]
+    # With the switch off the engine builds its stock class, as a control run does.
+    stock = os.environ.get("TRTLLM_MODELING_V2") == "off"
+    package = "models.fake" if stock else "_experimental.modeling_v2.models.fake.model"
+    target = "tensorrt_llm._torch." + package + ".Model"
     for rank in range(int(options.get("tensor_parallel_size") or 1)):
         record = {{
             "rank": rank,
             "options": options,
-            "target": "tensorrt_llm._torch._experimental.modeling_v2.models.fake.model.Model",
+            "target": target,
             "origin": os.path.join(os.getcwd(), "tensorrt_llm", "__init__.py"),
         }}
         print("MV2FLOW_RANK_ENGINE " + json.dumps(record), flush=True)

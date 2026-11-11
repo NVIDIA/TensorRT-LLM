@@ -3,9 +3,8 @@
 
 """The checks each deployment owes, and the ledger of what they measured.
 
-A deployment owes its boot, one accuracy check for each of its benchmarks, its native
-tests when it names any, and, for core where the spec turns it on, the serve gate
-(:func:`compile_contract`). Code runs core's boot and benchmarks when `core` lands (the
+A deployment owes its boot, one accuracy check for each of its benchmarks, and its native
+tests when it names any (:func:`compile_contract`). Code runs core's boot and benchmarks when `core` lands (the
 onboard check) and every other check of a done deployment once, in the final pass
 (``run/report.py``); a worker runs its own deployment's by hand while it builds.
 
@@ -26,11 +25,10 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from ..checks import attest, serve
+from ..checks import attest
 from ..infra.git import git_output
 from ..operators.coverage import MODELING_V2_PACKAGE
 from ..spec import deployments as deployments_mod
-from ..spec.deployments import AGGREGATED
 
 STATUS_FILENAME = "contract_status.jsonl"
 #: Where the native libraries an engine loads are built: inside the checkout, ignored by git.
@@ -65,7 +63,6 @@ class Contract:
 
 def compile_contract(task_data: Mapping[str, Any]) -> Contract:
     """Every check the spec's deployments owe, core's first."""
-    serving = serve.ServeSpec.from_task(task_data).enabled
     checks: list[Check] = []
     notes: list[str] = []
     for deployment in deployments_mod.resolve(task_data):
@@ -76,8 +73,6 @@ def compile_contract(task_data: Mapping[str, Any]) -> Contract:
             notes.append(f"{name}: it names no benchmark, so its boot alone judges it")
         if deployment.tests:
             checks.append(Check(name, "tests"))
-        if serving and deployment.core and deployment.kind == AGGREGATED:
-            checks.append(Check(name, serve.GATE_NAME))
         # Speculative decoding preserves the output distribution by construction, so a
         # draft path that computes the wrong thing passes boot and accuracy and shows only
         # as speed. What detects it is a native test of the drafter.
@@ -220,7 +215,7 @@ class Verdict:
     summary: str = ""
     #: A score nothing judged: reported, neither a pass nor a failure.
     unjudged: bool = False
-    #: Which path judged: in process or through the endpoint.
+    #: Which path judged: ``trtllm-eval`` or through the endpoint.
     path: str = ""
     #: What the check attested of each server's engine (``checks/attest.py``): its options
     #: against what every rank ran, and the target class; empty for a check that attests none.

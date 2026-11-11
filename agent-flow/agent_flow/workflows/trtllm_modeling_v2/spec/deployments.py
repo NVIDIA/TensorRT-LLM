@@ -91,7 +91,6 @@ STATED_ACCURACY_KEYS: tuple[str, ...] = (
     "benchmark",
     *BENCHMARK_DEFAULTS,
     "boot",
-    "serve",
     "timeout",
 )
 

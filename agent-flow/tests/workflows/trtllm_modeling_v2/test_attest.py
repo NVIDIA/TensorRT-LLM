@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import enum
 import json
+import os
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -14,10 +16,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import attest
-from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
-from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
-from agent_flow.workflows.trtllm_modeling_v2.spec.deployments import Deployment, Server
+from agent_flow.workflows.trtllm_modeling_v2.checks import attest, check_runtime
+from agent_flow.workflows.trtllm_modeling_v2.spec.deployments import Server
 
 from ._helpers import TARGET_CLASS, rank_lines
 
@@ -253,77 +253,50 @@ _FAKE_TRTLLM = {
         from tensorrt_llm.executor.base_worker import BaseWorker
 
 
-        class SamplingParams:
-            def __init__(self, **fields):
-                self.__dict__.update(fields)
-
-
-        class Output:
-            def __init__(self, ids, cached):
-                self.prompt_token_ids = ids
-                self.cached_tokens = cached
-                self.outputs = [types.SimpleNamespace(
-                    token_ids=[11, 12], text=" Paris", finish_reason="length")]
-
-            def __iter__(self):
-                yield self
-
-
         class LLM:
-            # Resumes a prompt it has seen (FAKE_REUSE=0: never); FAKE_DTYPE is the KV dtype
-            # its engine resolves whatever was asked; FAKE_WORKER=0 sets no worker up here.
+            # FAKE_DTYPE is the KV dtype its engine resolves whatever was asked; FAKE_WORKER=0
+            # sets no worker up in this process.
 
             def __init__(self, model=None, **options):
                 if os.environ.get("FAKE_DTYPE"):
                     options["kv_cache_config"]["dtype"] = os.environ["FAKE_DTYPE"]
-                self.seen = []
-                self.tokenizer = None
                 if os.environ.get("FAKE_WORKER", "1") == "1":
                     BaseWorker(types.SimpleNamespace(**options)).setup_engine()
-
-            def generate_async(self, inputs, params=None, streaming=False, **kwargs):
-                again = inputs in self.seen and os.environ.get("FAKE_REUSE", "1") == "1"
-                self.seen.append(inputs)
-                return Output(list(range(len(inputs.split()))), 448 if again else 0)
-
-            def shutdown(self):
-                pass
     """,
 }
 
 
-def _real_boot(tmp_path: Path, **env):
-    """A boot through the real engine driver and rank hook, on a stand-in ``tensorrt_llm``."""
+def _real_ranks(tmp_path: Path, **env) -> attest.Attestation:
+    """What a real process says under the rank hook, as a server starts: a stand-in ``tensorrt_llm``."""
     repo = tmp_path / "repo"
     for name, text in _FAKE_TRTLLM.items():
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(textwrap.dedent(text), encoding="utf-8")
+    # A server's options file as a check writes it: the deployment's, and the switch.
     options = {"kv_cache_config": {"dtype": "fp8", "enable_block_reuse": True}}
-    deployment = Deployment(name="tp1", core=True, server=Server(options=options))
-    task = {"checkpoint_path": "/ckpt/model", "trtllm_repo_path": str(repo)}
-    environment = RunEnvironment(
-        kind="local", python=sys.executable, world_size=1, env={"PYTHONPATH": str(repo), **env}
+    options["modeling_v2"] = "require"
+    program = f"import tensorrt_llm; tensorrt_llm.LLM(model='/ckpt/model', **{options!r})"
+    # The environment a check gives every server it starts: the hook, the switch, the tree.
+    declared = check_runtime.engine_env({}, tree=repo)
+    done = subprocess.run(
+        [sys.executable, "-c", program],
+        env={**os.environ, **declared, **env},
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    return boot_checks.run_boot_gate(
-        environment, task_data=task, deployment=deployment, workdir=tmp_path / "gates"
-    )
+    return attest.attest(done.stdout, options, tree=repo)
 
 
-def test_a_real_boot_is_held_to_what_its_rank_printed_and_to_a_cache_that_reused(tmp_path):
-    passed = _real_boot(tmp_path / "ok")
-    assert passed.passed, passed.detail + passed.stdout_tail
-    assert "a repeated prompt resumed 448 cached tokens" in passed.detail
-    assert passed.engine[0]["status"] == attest.MATCH and passed.engine[0]["ranks"] == 1
-    assert "[engine match: 1 rank(s) x" in passed.summary()
-
-    other = _real_boot(tmp_path / "dtype", FAKE_DTYPE="auto")
-    assert not other.passed
-    assert "rank 0: kv_cache_config.dtype is 'auto', declared 'fp8'" in other.detail
-
-    cold = _real_boot(tmp_path / "cold", FAKE_REUSE="0")
-    assert not cold.passed and "the engine reused nothing" in cold.detail
-
+def test_a_real_process_under_the_rank_hook_says_what_its_engine_runs(tmp_path):
+    passed = _real_ranks(tmp_path / "ok")
+    assert passed.status == attest.MATCH and (passed.ranks, passed.keys) == (1, 3)
+    assert passed.target.startswith(attest.TARGET_PACKAGE)
+    assert passed.origin == str(tmp_path / "ok" / "repo" / "tensorrt_llm" / "__init__.py")
+    other = _real_ranks(tmp_path / "dtype", FAKE_DTYPE="auto")
+    assert "rank 0: kv_cache_config.dtype is 'auto', declared 'fp8'" in other.failure()
     # An engine none of whose ranks said what it ran: unknown, not a pass.
-    silent = _real_boot(tmp_path / "silent", FAKE_WORKER="0")
-    assert not silent.passed and "rank 0: it printed no record" in silent.detail
+    silent = _real_ranks(tmp_path / "silent", FAKE_WORKER="0")
+    assert silent.status == attest.UNKNOWN and "rank 0: it printed no record" in silent.failure()

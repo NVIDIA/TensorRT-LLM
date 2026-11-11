@@ -353,8 +353,10 @@ def test_a_boot_through_the_endpoint_has_a_stock_path_control_and_the_specs_own_
     started = json.loads((workspace / "deployments/tp1/address.started.json").read_text())
     assert started["env"]["TRTLLM_MODELING_V2"] == "off"
     assert control.engine[0]["status"] == "match"
+    assert control.engine[0]["target"] == "tensorrt_llm._torch.models.fake.Model"
     # A start is bounded by the spec's own `accuracy.boot.timeout`, the deployment's entry first.
     monkeypatch.setenv("FAKE_SERVE_HANG", "1")
+    monkeypatch.setattr(servers, "START_TIMEOUT_S", 45)  # the default, were the spec's not read
     bounded = {**_task(site), "accuracy": {"boot": {"timeout": 600, "tp1": {"timeout": 1}}}}
     began = time.monotonic()
     late = endpoint.run_endpoint_boot(one, task_data=bounded, workspace=workspace)

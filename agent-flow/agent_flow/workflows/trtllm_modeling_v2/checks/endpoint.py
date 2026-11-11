@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Boot and accuracy of a deployment judged through its endpoint.
 
-A disaggregated deployment has no one engine to drive in process: what serves is a
-context server, a generation server and the proxy between them, so its checks ask the
-proxy. Boot starts the deployment, sends the boot workload's prompts as completions and
+Every deployment boots this way: one server, or a context server, a generation server
+and the proxy between them, started by the check and asked through the endpoint. Boot
+starts the deployment, sends the boot workload's prompts as completions and
 holds the answers to the workload's keywords: an endpoint that is healthy and answers
-nothing has not booted. Accuracy starts it and runs the tree's own evaluator against the
-endpoint (``harness/endpoint_eval.py``), judged like any other score, against the
+nothing has not booted. Accuracy of a disaggregated deployment starts it and runs the
+tree's own evaluator against the endpoint (``harness/endpoint_eval.py``), judged like any other score, against the
 anchor's floor. A benchmark the tree has not driven through an endpoint is not started:
 its verdict says it is not judged through the hop.
 

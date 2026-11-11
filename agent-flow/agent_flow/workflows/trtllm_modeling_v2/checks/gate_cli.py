@@ -11,12 +11,12 @@ options, the environment, the frozen anchors and the engine lock are the same ei
     trtllm-modeling-v2 gate boot --task <workspace>/task.yaml --deployment tp4 \
         --tree <your worktree>
 
-A deployment with a launch prefix of its own, and every disaggregated one, boots as a
-server the check starts and asks through its endpoint; any other boots in process. An
-aggregated deployment is scored by ``trtllm-eval`` behind its prefix, a disaggregated one
-through its endpoint. The verdict says which path judged, and the directory its files
-are in: under the run's workspace when the task file is a run's own, else under
-``--workdir``.
+Every deployment boots as servers the check starts and asks through its endpoint: on
+this host, or behind its launch prefix. An aggregated deployment is scored by
+``trtllm-eval`` (behind its prefix), a disaggregated one through its endpoint; the
+verdict says which, and the directory its files are in: under the run's workspace when
+the task file is a run's own, else under ``--workdir``. ``serve``, a gate of earlier
+versions, is answered by the boot, which serves the deployment.
 
 Exit status: 0 when the gate passed or measured a score nothing judges (``NO VERDICT``),
 1 when it failed, 2 on a usage or spec error.
@@ -40,13 +40,14 @@ from ..spec import deployments as deployments_mod
 from ..spec.deployments import AGGREGATED
 from ..spec.task_schema import TaskSchemaError, load_and_validate_task_yaml
 from . import accuracy as accuracy_checks
-from . import anchors, check_runtime, disagg, endpoint, pytest_runner, serve, servers
+from . import anchors, check_runtime, endpoint, pytest_runner, servers
 from . import boot as boot_checks
 from . import verdict as check_result
 
 #: The gates this command runs, by the name it takes.
-GATE_NAMES: tuple[str, ...] = ("boot", "accuracy", "serve", "tests")
-IN_PROCESS = "in process"
+GATE_NAMES: tuple[str, ...] = ("boot", "accuracy", "tests")
+#: A gate of earlier versions: the boot starts the deployment's server and asks it.
+SERVE = "serve"
 TRTLLM_EVAL = "trtllm-eval"
 THROUGH_ENDPOINT = "through the endpoint"
 #: The run's checkpoint file, beside the workspace's ``task.yaml``: it names the claimed devices.
@@ -59,7 +60,9 @@ def _parse(argv: list[str]) -> argparse.Namespace:
         description="Run one trtllm_modeling_v2 check standalone, as the run itself runs it.",
     )
     parser.add_argument(
-        "name", help=f"the gate to run: one of {', '.join(GATE_NAMES)}, or accuracy[<benchmark>]"
+        "name",
+        help=f"the gate to run: one of {', '.join(GATE_NAMES)}, or accuracy[<benchmark>]; "
+        f"`{SERVE}` is answered by the boot",
     )
     parser.add_argument("--task", type=Path, required=True, help="the run's task.yaml")
     parser.add_argument(
@@ -145,7 +148,7 @@ def run_check(
     (``measure_base``), and when there is no such score this one's is reported with no
     verdict. ``locked``: the caller already holds the workspace's engine lock.
     """
-    name = gate_name(gate)
+    name = "boot" if gate_name(gate) == SERVE else gate_name(gate)
     if name not in GATE_NAMES:
         raise TaskSchemaError(
             f"{gate!r} names no gate this workflow runs ({', '.join(GATE_NAMES)})"
@@ -171,7 +174,6 @@ def run_check(
     runner = check_runtime.in_tree(runner, tree)
     bound = {"timeout": timeout} if timeout else {}
     common = dict(task_data=spec, deployment=found)
-    served = found.kind != AGGREGATED or found.prefixed
     if workspace is None:
         workspace = root
 
@@ -223,7 +225,7 @@ def run_check(
     def measure() -> check_result.GateResult:
         if name == "accuracy":
             return accuracy()
-        if name == "boot" and served:
+        if name == "boot":
             result = endpoint.run_endpoint_boot(
                 found,
                 task_data=spec,
@@ -234,34 +236,9 @@ def run_check(
                 **bound,
             )
             return replace(result, path=THROUGH_ENDPOINT)
-        if name == "boot":
-            workload = boot_checks.resolve_boot_spec(spec, found)
-            result = boot_checks.run_boot_gate(
-                environment,
-                workdir=workdir,
-                spec=workload,
-                runner=runner,
-                mode=mode,
-                **bound,
-                **common,
-            )
-            return replace(result, path=IN_PROCESS)
-        if name == "serve":
-            if found.kind != AGGREGATED:
-                raise TaskSchemaError(
-                    f"`{found.name}` is disaggregated: its boot serves it; the serve gate "
-                    f"starts one server"
-                )
-            serve_spec = serve.ServeSpec.from_task(spec)
-            return serve.run_serve_gate(
-                environment,
-                workdir=workdir,
-                runner=runner,
-                spec=replace(serve_spec, timeout=timeout) if timeout else serve_spec,
-                **common,
-            )
-        tests = disagg.run_disagg_gate if found.kind != AGGREGATED else pytest_runner.run_tests
-        return tests(environment, workdir=workdir, runner=runner, **bound, **common)
+        return pytest_runner.run_tests(
+            environment, workdir=workdir, runner=runner, **bound, **common
+        )
 
     def named() -> check_result.GateResult:
         result = measure()
@@ -285,6 +262,12 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
     finally:
         for notice in notices:
             print(f"note: {notice}", file=sys.stderr)
+    if gate_name(args.name) == SERVE:
+        print(
+            f"note: `{SERVE}` is answered by the boot: it starts the deployment's server "
+            "and asks its endpoint",
+            file=sys.stderr,
+        )
     return run_check(
         task_data,
         args.name,

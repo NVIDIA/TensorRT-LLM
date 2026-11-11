@@ -206,7 +206,7 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     assert "`kv_fp8` (deployment): not done blocked" in last
     assert "`core` (core): done ready" in last and "Nothing of a task not done landed" in last
     assert "The checks it owes: `tep2:boot`, `tep2:accuracy[gsm8k]`." in last
-    assert "gate <boot|accuracy|serve|tests>" in last and "--deployment tep2" in last
+    assert "gate <boot|accuracy|tests>" in last and "--deployment tep2" in last
     script = workspace / "bin" / "trtllm-modeling-v2"
     assert os.access(script, os.X_OK) and f"      {script} gate <boot|" in last
     assert "They run once on the checkout after the last task" in last
@@ -220,7 +220,7 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     assert first.startswith(f"# onboarded: commit `c0ffee1`, ref `refs/mv2/{SLUG}/onboarded`, 20")
     assert "| `tp1` | `accuracy[gsm8k]` | 90 | reference 85.6 (" in report
     assert "| PASS | trtllm-eval | `c0ffee1` |" in report
-    assert "| `tep2` | `boot` | - | - | PASS | in process | `c0ffee1` |" in report
+    assert "| `tep2` | `boot` | - | - | PASS | through the endpoint | `c0ffee1` |" in report
     assert "| `kv_fp8` |" not in report.split("## Done")[1].split("##")[0]
     # With what each check attested of the engine that ran: every rank's options, the target.
     row = next(line for line in report.splitlines() if line.startswith("| `tep2` | `boot` |"))
@@ -663,9 +663,9 @@ def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_findi
     named = goal.split("## What the run did before this task")[0]
     assert "kv_fp8:accuracy" not in named and "tep2" not in named
     report = _report(tmp_path)
-    assert "| `kv_fp8` | `boot` | - | - | PASS | in process | `f1xed00` |" in report
+    assert "| `kv_fp8` | `boot` | - | - | PASS | through the endpoint | `f1xed00` |" in report
     assert "| PASS | trtllm-eval | `f1xed00` |" in report.split("| `kv_fp8` | `accuracy")[1]
-    assert "| `tep2` | `boot` | - | - | PASS | in process | `c0ffee1` |" in report
+    assert "| `tep2` | `boot` | - | - | PASS | through the endpoint | `c0ffee1` |" in report
     # Nothing of the final pass moves the onboard record.
     assert report.startswith("# onboarded: commit `c0ffee1`")
     left = report.split("## Convention findings left")[1].split("##")[0]
@@ -695,7 +695,7 @@ def test_the_fix_task_belongs_to_its_final_pass(tmp_path, task_file, monkeypatch
     assert [_task_id(p) for _, p in calls] == ["fix-1"] * 3
     stands = _tasks(tmp_path)[-1]
     assert (stands["id"], stands["status"], stands["attempts"]) == ("fix-1", "not done", 3)
-    assert "| `kv_fp8` | `boot` | - | - | FAIL | in process |" in _report(tmp_path)
+    assert "| `kv_fp8` | `boot` | - | - | FAIL | through the endpoint |" in _report(tmp_path)
     # The next start's final pass names what fails then, in a task of its own: the old one
     # is not reopened.
     calls = _run(tmp_path, task, monkeypatch, script, shell_runner=shell)
@@ -758,7 +758,7 @@ def test_a_fix_that_breaks_core_is_reported_and_takes_nothing_back(
     # Onboarded on the commit where core's checks passed; what the head does now is a line.
     assert report.startswith("# onboarded: commit `c0ffee1`")
     assert _state(tmp_path).onboarded["commit"] == "c0ffee1"
-    assert "| `tp1` | `boot` | - | - | FAIL | in process | `f1xed00` |" in report
+    assert "| `tp1` | `boot` | - | - | FAIL | through the endpoint | `f1xed00` |" in report
     assert "| `kv_fp8` | `accuracy[gsm8k]` | 90 | relative (the score of `tp1`) | PASS |" in report
     # Core's benchmark ran on the new commit as what `kv_fp8` is held to, then its boot.
     assert shell.ran[-3:] == ["tp1:accuracy", "kv_fp8:accuracy", "tp1:boot"]
@@ -1048,7 +1048,7 @@ def test_a_dry_run_stops_after_preflight_with_no_agent_turn_and_no_engine_comman
         assert workflow.run(task_file) is True
     # No device is queried or claimed, and no agent turn starts.
     assert calls == [] and devices == []
-    assert not any("engine_driver" in c or "trtllm-eval" in c or "trtllm-serve" in c for c in ran)
+    assert not any("/boot." in c or "trtllm-eval" in c or "trtllm-serve" in c for c in ran)
     assert _state(tmp_path).onboarded == {}
     assert "checks owed: 2" in (tmp_path / "ws" / "journal.md").read_text()
     assert not (tmp_path / "ws" / "tasks.yaml").exists()

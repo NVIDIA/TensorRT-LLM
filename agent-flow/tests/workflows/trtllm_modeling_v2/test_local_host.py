@@ -18,17 +18,14 @@ import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
 from agent_flow.workflows.trtllm_modeling_v2.infra import monitor as monitor_mod
-from agent_flow.workflows.trtllm_modeling_v2.infra.compute import executor, server_runtime
+from agent_flow.workflows.trtllm_modeling_v2.infra.compute import executor
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import (
     TIMEOUT_RETURNCODE,
     CommandSpec,
     LocalCommandExecutor,
     ended_early,
 )
-from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
-    MULTI_TASK_SLURM_SCRUB,
-    RunEnvironment,
-)
+from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
 from agent_flow.workflows.trtllm_modeling_v2.infra.files import write_json_atomic
 from agent_flow.workflows.trtllm_modeling_v2.infra.monitor import (
     ORCHESTRATOR_EXIT,
@@ -93,7 +90,7 @@ def test_every_command_scrubs_the_allocations_launcher_environment():
     command = env.command("/p x.py")
     for name in ("SLURM_PROCID", "SLURM_NTASKS", "SLURM_LOCALID", "SLURM_NODEID"):
         assert f"-u {name}" in command, name
-    assert command.index(MULTI_TASK_SLURM_SCRUB) < command.index("mpirun")
+    assert command.index("env -u SLURM_PROCID ") < command.index("mpirun -n 4 ")
     assert command.startswith("CUDA_VISIBLE_DEVICES=0,1,2,3 ")
     single = env.command("/p probe.py", single_process=True)
     assert "${!PMIX@}" in single
@@ -109,15 +106,6 @@ def test_the_launch_prefix_preserves_shell_quotes():
         text=True,
     )
     assert found.stdout == "a b'$c\n"
-
-
-def test_hung_gpu_inspection_returns_unknown_instead_of_blocking_teardown(monkeypatch):
-    def hung(argv, **kwargs):
-        assert kwargs["timeout"] == 30
-        raise subprocess.TimeoutExpired(argv, 30)
-
-    monkeypatch.setattr(server_runtime.subprocess, "run", hung)
-    assert server_runtime.device_holders() == set()
 
 
 def test_monitor_cli_tells_a_busy_orchestrator_from_one_that_has_exited(

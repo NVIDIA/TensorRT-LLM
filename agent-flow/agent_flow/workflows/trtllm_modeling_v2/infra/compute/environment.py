@@ -17,8 +17,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .server_runtime import MULTI_TASK_SLURM_VARS, rank_launch
-
 # Variables whose declared value EXTENDS the inherited one. A plain `PATH: <venv>/bin:/usr/bin`
 # drops `/usr/local/mpi/bin`, and the next launcher line dies `mpirun: command not found` (rc
 # 127). `PYTHONPATH` already holds the gates' rank hook (`checks/check_runtime.RANK_HOOK_DIR`) and the
@@ -99,7 +97,31 @@ def single_task_scrub(keep: Sequence[str] = (), *, rank: bool = True) -> str:
 # allocation runs.
 # Unscrubbed, every rank reads rank 0 of a world of 1 and becomes a `mgmn_leader_node` waiting
 # for workers that never come: no error, no exit, a hang.
-MULTI_TASK_SLURM_SCRUB = "env " + " ".join(f"-u {name}" for name in MULTI_TASK_SLURM_VARS)
+MULTI_TASK_SLURM_VARS = (
+    "SLURM_PROCID",
+    "SLURM_NTASKS",
+    "SLURM_LOCALID",
+    "SLURM_NODEID",
+    "SLURM_STEP_ID",
+    "SLURM_TASK_PID",
+    "SLURM_STEP_NUM_TASKS",
+)
+
+
+def rank_launch(world_size: int, launcher: str = LLMAPI_LAUNCH) -> list[str]:
+    """The argv prefix that creates ``world_size`` ranks for one program, or none for one.
+
+    ``--oversubscribe``: Open MPI takes its slot count from the scheduler, and inside a
+    one-task allocation ``-n 4`` asks for four slots against one and dies before any
+    Python runs.
+    """
+    if world_size <= 1:
+        return []
+    scrub = [arg for name in MULTI_TASK_SLURM_VARS for arg in ("-u", name)]
+    return [
+        "env", *scrub,
+        "mpirun", "-n", str(world_size), "--oversubscribe", "--allow-run-as-root", launcher,
+    ]  # fmt: skip
 
 
 @dataclass(frozen=True)

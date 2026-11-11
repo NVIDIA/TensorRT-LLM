@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
 from agent_flow.workflows.trtllm_modeling_v2.spec import advice, deployments, derive, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
@@ -665,10 +664,6 @@ def test_a_delivered_spec_is_its_member_its_disaggregated_deployment_and_its_kv_
     assert {k: v for k, v in kv.server.options.items() if k != "kv_cache_config"} == {
         k: v for k, v in options.items() if k != "kv_cache_config"
     }
-    # A check runs a deployment's options as they are, with the model and greedy sampling.
-    config = check_config.check_configuration(spec, kv, max_tokens=32)
-    assert config["llm"] == {**kv.server.options, "model": spec["checkpoint_path"]}
-    assert config["sampling"] == {"temperature": 0.0, "top_k": 1, "max_tokens": 32}
     assert deployments.named(spec).name == deployments.named(spec, "core").name == "tp2"
     with pytest.raises(KeyError, match="'tp4' names no deployment of this spec"):
         deployments.named(spec, "tp4")

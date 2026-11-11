@@ -12,13 +12,15 @@ from pathlib import Path
 
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import anchors
+from agent_flow.workflows.trtllm_modeling_v2.checks import anchors, attest, endpoint, servers
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import workload_io
+from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as vocab
 from agent_flow.workflows.trtllm_modeling_v2.run.state import load_state
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
+from agent_flow.workflows.trtllm_modeling_v2.spec.deployments import write_options
 
 TARGET_REL = f"{catalog_paths.MODELING_V2_PACKAGE}/models/gpt_oss/gpt_oss_120b__sm_103__tp1"
 
@@ -212,7 +214,49 @@ def _install(monkeypatch, workflow, script):
         return FakeLayer(name, script, calls)
 
     monkeypatch.setattr(TrtllmModelingV2Workflow, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(endpoint, "run_endpoint_boot", scripted_boot(workflow))
     return calls
+
+
+def scripted_boot(workflow):
+    """A boot that asks the run's scripted shell instead of starting a server.
+
+    It writes the deployment's options where a real start does and holds what the shell
+    prints to them, so a scripted run's verdict carries a real attestation. The command
+    names the check (``.../boot.<deployment>.``), as an accuracy check's names its own.
+    """
+
+    def boot(
+        deployment, *, task_data, workspace, spec=None, timeout=None, devices=(), mode="require"
+    ):
+        directory = servers.files_of(workspace, deployment.name)
+        directory.mkdir(parents=True, exist_ok=True)
+        role, server = next(iter(deployment.servers.items()))
+        options = write_options(deployment, directory, {"modeling_v2": mode})[role]
+        tree = task_data["trtllm_repo_path"]
+        command = (
+            f"cd {tree} && trtllm-serve --config={options} {directory}/boot.{deployment.name}."
+        )
+        result = workflow._shell_runner(command, None, timeout or 0)
+        found = attest.attest(result.stdout, {**server.options, "modeling_v2": mode}, tree=tree)
+        said = dict(name="boot", deployment=deployment.name, command=command)
+        said.update(stdout_tail=result.stdout, engine=(found.record(),))
+        if result.infrastructure:
+            detail = f"did not run to a verdict: {result.infrastructure}"
+            return GateResult(
+                passed=False, detail=detail, infrastructure=result.infrastructure, **said
+            )
+        if result.returncode:
+            return GateResult(
+                passed=False,
+                detail=f"the deployment did not start: exited {result.returncode}",
+                **said,
+            )
+        if found.failure():
+            return GateResult(passed=False, detail=found.failure(), **said)
+        return GateResult(passed=True, detail=f"`{deployment.name}` started and answered", **said)
+
+    return boot
 
 
 def fake_git(*, head: str = "c0ffee1", dirt: str = ""):
@@ -244,26 +288,6 @@ def healthy_smi(count: int = 1, free: int = 180000, cap: str = "10.3", **said):
     return runner
 
 
-def driver_records(accepted: int = 320, iterations: int = 100, prompts: int = 32) -> str:
-    """What the engine driver prints for ``prompts`` prompts accepting alike."""
-    lines = []
-    for n in range(prompts):
-        record = {
-            "index": n,
-            "id": f"d{n}",
-            "prompt_sha": f"p{n}",
-            "tokens": accepted,
-            "iterations": iterations,
-            "token_ids": list(range(accepted)),
-            "text": "Paris is the capital of France",
-            "finish_reason": "stop",
-            # What a repeated prompt resumes from the cache, where the boot sends one.
-            "cached_tokens": 64,
-        }
-        lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
-    return "\n".join(lines) + "\n"
-
-
 #: What each side of a stated disaggregated deployment must say: how the cache moves.
 MOVES = {"cache_transceiver_config": {"backend": "DEFAULT"}}
 #: A model class under the Modeling V2 package, as a rank that built a target reports it.
@@ -291,16 +315,8 @@ def rank_lines(
 def attested(command: str, **changes) -> str:
     """What the ranks of the engine ``command`` starts print: the options it was given, as run."""
     tree = re.match(r"cd (\S+) &&", command)
-    spec = re.search(r"--spec '?([^\s']+)", command)
     config = re.search(r"--config=([^\s']+)", command)
-    if spec and "llm" not in json.loads(Path(spec.group(1)).read_text(encoding="utf-8")):
-        return ""  # a driver that starts no engine in its own process
-    if spec:
-        options = dict(json.loads(Path(spec.group(1)).read_text(encoding="utf-8"))["llm"])
-        options.pop("model", None)
-        mode = re.search(r"TRTLLM_MODELING_V2=(\w+)", command)
-        options["modeling_v2"] = mode.group(1) if mode else "off"
-    elif config:
+    if config:
         options = yaml.safe_load(Path(config.group(1)).read_text(encoding="utf-8"))
     else:
         return ""
@@ -314,12 +330,9 @@ def passing_shell(score: float = 90.0, accepted: int = 320, iterations: int = 10
                 returncode=0,
                 stdout=f"lm-eval gsm8k average accuracy: {score}\n" + attested(command),
             )
-        # The gates that need per-request structure run the engine driver,
-        # which prints one record per prompt.
-        if "engine_driver.py" in command:
-            return CommandResult(
-                returncode=0, stdout=driver_records(accepted, iterations) + attested(command)
-            )
+        # A scripted boot: what the ranks of the server it would start print.
+        if "/boot." in command:
+            return CommandResult(returncode=0, stdout=attested(command))
         return CommandResult(
             returncode=0,
             stdout=(

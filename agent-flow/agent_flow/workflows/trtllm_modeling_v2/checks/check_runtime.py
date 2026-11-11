@@ -1,24 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Controller-side check launch protocol, driver workloads and tuning isolation."""
+"""What every check shares: the Modeling V2 switch, the rank hook, the tree it runs in."""
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping
 
 from ..infra.compute.commands import CommandResult, CommandSpec, LocalCommandExecutor
 from ..infra.compute.environment import RunEnvironment
-from .harness import workload_io
-
-# A boot gate that needs longer than this is an accuracy run with no anchor.
-BOOT_TIMEOUT_S = 1800
-
 
 MODELING_V2_ENV = "TRTLLM_MODELING_V2"
 
@@ -46,7 +40,7 @@ _LOCAL_EXECUTOR = LocalCommandExecutor()
 def default_shell_runner(
     command: str,
     env: Mapping[str, str] | None = None,
-    timeout: int = BOOT_TIMEOUT_S,
+    timeout: int = 1800,
 ) -> CommandResult:
     """Run a shell command on this host, including the task's launch prefix."""
     return _LOCAL_EXECUTOR.execute(CommandSpec(argv=command, env=env, timeout_s=timeout))
@@ -112,15 +106,6 @@ def with_mode(environment: RunEnvironment, mode: str) -> RunEnvironment:
     )
 
 
-# ------------------------------------------------------------ the engine driver
-#
-# The measured interpreter constructs public LLM/SamplingParams from one JSON
-# spec and emits MV2FLOW_RECORD results; rank observations are a separate seam.
-
-#: The driver script, run as a file under the measured tree's interpreter.
-ENGINE_DRIVER = Path(__file__).resolve().parent / "harness" / "engine_driver.py"
-
-
 def gate_workdir(workdir: str | Path) -> Path:
     """``workdir``, made: where a gate writes the files its job reads.
 
@@ -150,40 +135,6 @@ def default_triton_cache(task_data: dict[str, Any], workspace: str | Path) -> No
     if env is None:
         env = block["env"] = {}
     env.setdefault(TRITON_CACHE_DIR_ENV, str(Path(workspace).resolve() / RUN_TRITON_CACHE_DIRNAME))
-
-
-def write_driver_spec(
-    path: str | Path,
-    *,
-    config: Mapping[str, Any],
-    requests: Sequence[Mapping[str, Any]] = (),
-    max_tokens: int = 64,
-) -> Path:
-    """Write the engine's public options and the requests the driver sends, in order."""
-    listed = []
-    for index, entry in enumerate(requests):
-        request = dict(entry)
-        request.setdefault("id", f"r{index}")
-        request.setdefault("max_tokens", int(max_tokens))
-        listed.append(request)
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    spec = {**config, "requests": listed, "max_tokens": int(max_tokens)}
-    target.write_text(json.dumps(spec, indent=1, ensure_ascii=False), encoding="utf-8")
-    return target
-
-
-def engine_driver_command(
-    environment: RunEnvironment, spec_path: str | Path, *, script: Path = ENGINE_DRIVER
-) -> str:
-    """The driver's launch over ``spec_path``, on the environment's ranks."""
-    return environment.python_command([str(script), "--spec", str(spec_path)])
-
-
-def parse_driver_records(output: str) -> list[dict[str, Any]]:
-    """Every ``MV2FLOW_RECORD`` the engine driver printed, in request order."""
-    records = workload_io.parse_marked(output, workload_io.RECORD_MARKER)
-    return sorted(records, key=lambda r: int(r.get("index", 0)))
 
 
 def in_tree(runner: Callable[..., Any], tree: Path | None) -> Callable[..., Any]:

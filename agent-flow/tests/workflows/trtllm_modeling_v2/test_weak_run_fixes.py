@@ -16,8 +16,8 @@ What each run lost, and the case that holds its fix:
   ``test_every_dispatch_names_the_running_package``
 - kernel tasks side by side conflicted on the target's package files:
   ``test_tasks_run_one_at_a_time``
-- the serve gate's default frontends need a proxy a one-rank engine lacks:
-  ``test_the_serve_gate_runs_one_frontend``
+- a server's default frontends need a proxy a one-rank engine lacks:
+  ``test_a_server_a_check_starts_runs_one_frontend``
 - a finished task started over for a decision file without ``decision``:
   ``test_a_decision_file_without_its_decision_gets_one_turn_to_write_it``
 - the decision file's example put a long summary before the decision:
@@ -54,8 +54,7 @@ import yaml
 
 from agent_flow.backends import claude_code
 from agent_flow.workflows.trtllm_modeling_v2.agents import prompts as prompt_texts
-from agent_flow.workflows.trtllm_modeling_v2.checks import anchors, conventions
-from agent_flow.workflows.trtllm_modeling_v2.checks import serve as serve_gate
+from agent_flow.workflows.trtllm_modeling_v2.checks import anchors, conventions, servers
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
 from agent_flow.workflows.trtllm_modeling_v2.run import report as report_mod
 from agent_flow.workflows.trtllm_modeling_v2.run import workflow as workflow_mod
@@ -130,10 +129,11 @@ def test_tasks_run_one_at_a_time(tmp_path, task_file, monkeypatch):
 # ------------------------------------------------------------------------------ the checks
 
 
-def test_the_serve_gate_runs_one_frontend(tmp_path):
+def test_a_server_a_check_starts_runs_one_frontend(tmp_path):
     """Defect 4: several frontends need the IPC proxy a one-rank single-process engine lacks."""
-    options = tmp_path / "core.llm_api.yaml"
-    assert serve_gate.serve_args(options) == ["--config", str(options), "--num_serve_frontends=1"]
+    for role in (None, "ctx", "gen"):
+        argv = servers.serve_argv("/ckpt", tmp_path / "tp1.yaml", tmp_path / "address", role=role)
+        assert "--num_serve_frontends=1" in argv
 
 
 def test_a_missing_anchor_row_says_how_to_measure_and_write_one(tmp_path):

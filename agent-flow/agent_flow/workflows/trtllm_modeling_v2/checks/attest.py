@@ -35,7 +35,6 @@ REUSE_PROMPT = " ".join(
     f"Sack {n} of grain was weighed twice at the mill, once on arrival and once before grinding."
     for n in range(1, 25)
 )
-REUSE_ID = "reuse"
 #: Declared values that leave the choice to the engine (any case): what a rank resolved
 #: one to is recorded and shown, and whatever it chose is a match.
 ENGINE_CHOOSES = ("default", "auto")

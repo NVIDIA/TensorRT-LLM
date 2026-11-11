@@ -81,7 +81,7 @@ class GateResult:
     #: deployment has no score): a report line, neither a pass nor a failure. ``passed``
     #: is true with it, so nothing takes the score for a failed check.
     unjudged: bool = False
-    #: Which path judged: ``in process`` or ``through the endpoint``; empty for a check
+    #: Which path judged: ``trtllm-eval`` or ``through the endpoint``; empty for a check
     #: that has one path only.
     path: str = ""
     #: The directory the check's files are in: its options, logs and outputs.
