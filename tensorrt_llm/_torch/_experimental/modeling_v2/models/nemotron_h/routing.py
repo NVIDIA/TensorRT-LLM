@@ -53,7 +53,8 @@ _BF16_TEP8 = (8, False, 1, 8)  # routed experts in eight 64-expert windows
 _BF16_TP8EP2 = (8, False, 4, 2)
 # 16 ranks (four trays) halve the experts to 60 GiB a rank, which leaves room for the
 # replicated 63 GiB: attention data parallel, the routed experts in sixteen 32-expert
-# windows. The layout of the disaggregated serving tiers (context and generation).
+# windows. The layout of the disaggregated serving tiers (context and generation), measured
+# there with the built-in implementation.
 _BF16_DEP16 = (16, True, 1, 16)
 
 # The KV cache algorithms each BF16 layout was gated with (None: the checkpoint's bf16).
