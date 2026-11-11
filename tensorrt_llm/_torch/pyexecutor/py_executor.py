@@ -84,6 +84,7 @@ from ..speculative.spec_sampler_base import SpecSampler
 from ..speculative.speculation_gate import SpeculationGate
 from ..speculative.utils import get_static_draft_len, update_draft_len
 from .adp_iter_stats import ADPIterStatsBuffer
+from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .cuda_graph_runner import ADPShapeAgreement
@@ -681,6 +682,8 @@ class PyExecutor:
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
+    # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
+    _is_kv_manager_v2 = False
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
 
@@ -959,6 +962,8 @@ class PyExecutor:
         self.runtime_draft_len = (get_static_draft_len(model_engine.spec_config)
                                   if model_engine.is_spec_decode else 0)
         self.llm_args = self.model_engine.llm_args
+        self._decode_only = is_decode_only(
+            getattr(self.llm_args, "sparse_attention_config", None))
         self._kv_connector_config = self.llm_args.kv_connector_config
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
@@ -3967,19 +3972,21 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self._maybe_record_hang_diagnostic_phase(
-                        "preparing_resources", scheduled_batch)
-                    self.resource_manager.prepare_resources(scheduled_batch)
-
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
+                    # Sort before preparing resources, so the resource managers see
+                    # the requests in the order the forward runs them.
                     scheduled_batch.generation_requests = sorted(  # stable sort
                         scheduled_batch.generation_requests,
                         key=lambda req: int(req.py_batch_idx is not None),
                     )
+
+                    self._maybe_record_hang_diagnostic_phase(
+                        "preparing_resources", scheduled_batch)
+                    self.resource_manager.prepare_resources(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
@@ -7339,6 +7346,18 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    # The generation requests that do not have batch_idx
+                    # need to be in front of the batch due to the assumptions
+                    # made in model_engine.py::_forward_step. This is only important
+                    # for disaggregated serving. For non-disaggregated serving,
+                    # the generation requests always have batch_idx.
+                    # Sort before preparing resources, so the resource managers see
+                    # the requests in the order the forward runs them.
+                    scheduled_batch.generation_requests = sorted(  # stable sort
+                        scheduled_batch.generation_requests,
+                        key=lambda req: int(req.py_batch_idx is not None),
+                    )
+
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
@@ -7367,17 +7386,6 @@ class PyExecutor:
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
-
-                    # The generation requests that do not have batch_idx
-                    # need to be in front of the batch due to the assumptions
-                    # made in model_engine.py::_forward_step. This is only important
-                    # for disaggregated serving. For non-disaggregated serving,
-                    # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
-
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
@@ -7740,10 +7748,12 @@ class PyExecutor:
         for resource_type, required_blocks, primary_capacity in (
                 self.resource_manager.get_request_kv_block_budgets(request)):
             if required_blocks > primary_capacity:
+                # The capacity is of the pool the budget checks: the GPU primary
+                # pool, or with sparse KV cache offload the host history pool.
                 raise ValueError(
                     f"{resource_type.value} requires {required_blocks} KV cache "
                     f"blocks to complete the request, which exceeds its "
-                    f"GPU-primary capacity of {primary_capacity} blocks "
+                    f"capacity of {primary_capacity} blocks "
                     f"(prompt_len={request.orig_prompt_len}, "
                     f"max_new_tokens={request.max_new_tokens}, "
                     f"beam_width={request.py_beam_width}).")
@@ -7888,7 +7898,12 @@ class PyExecutor:
         request.py_csa2_remote_tail_start = remote_tail_start
         request.py_csa2_remote_tail_split = split
 
-    def _validate_request(self, request: LlmRequest):
+    def _validate_request(self, request: LlmRequest) -> None:
+        if getattr(self, "_decode_only",
+                   False) and not request.is_generation_only_request:
+            raise ValueError(
+                "Sparse KV offload supports generation-only requests; "
+                "route prefill to a context worker.")
         if getattr(self.model_engine, "_dspark_confidence_enabled", False):
             from ..speculative.dspark import validate_confidence_request
 
@@ -9083,24 +9098,42 @@ class PyExecutor:
                             charge_budget=False)
 
     # ---------------------------------------------------------------
-    # Encoder-decoder support: encoder iteration in the executor loop.
+    # Encoder-decoder handoff.
     #
-    # At a scheduling pass, the scheduler may admit encoder-init requests
-    # alongside decoder-context and generation requests.  It returns them in
-    # disjoint buckets:
+    # An encoder-decoder request starts in ENCODER_INIT. Schedulers return
+    # encoder requests and decoder-context requests in disjoint buckets, so
+    # the two never share a micro-batch; this preserves the cross-KV
+    # lifecycle and the dual-pool budget.
     #
-    #   * encoder requests (``LlmRequestState.ENCODER_INIT``), which run
-    #     through ``ModelEngine.forward_encoder`` on this iteration.
-    #     After scatter, they transition to ``CONTEXT_INIT`` and are
-    #     re-admitted by the *next* iteration's scheduler pass for the
-    #     decoder context step.
+    # 1. Submit: _submit_encoder_step adds the requests to inflight_req_ids
+    #    and runs the encoder on encoder_stream from the encoder-launch
+    #    thread. With TP>1 it waits for the step and publishes it before the
+    #    decoder forward; with TP1 it queues a PendingEncoderStep.
+    #    _run_encoder_step runs and publishes in one call when the iteration
+    #    queues no decoder work.
+    # 2. Publish: _poll_encoder_steps publishes a queued step once its ready
+    #    event has completed, and the step's requests leave inflight_req_ids.
+    #    _scatter_encoder_output gives each request still in ENCODER_INIT its
+    #    view of the packed output, the ready event and
+    #    py_skip_cross_kv_projection=False, and moves it to CONTEXT_INIT; a
+    #    request cancelled or failed meanwhile is skipped.
+    # 3. Admit: schedulers hold a CONTEXT_INIT request until its ready event
+    #    has completed. Its first context step reserves self- and cross-KV;
+    #    encoder admission reserves neither.
+    # 4. Consume: _attach_encoder_output_to_execution_stream records the
+    #    output on execution_stream and drops the event. The first context
+    #    step projects cross-KV, then _mark_cross_kv_projection_consumed
+    #    drops the output and sets py_skip_cross_kv_projection; later chunks,
+    #    decode steps and beams only read cross-KV. The packed output is
+    #    freed once every request of its step has dropped its view.
+    # 5. Recompute: a pause frees both KV pools and returns the request to
+    #    ENCODER_INIT; the next publish clears the skip flag, so cross-KV is
+    #    reserved and projected once per cycle. Schedulers pause only requests
+    #    past their first context chunk, so a scheduler pause never meets an
+    #    output that has not been consumed.
     #
-    #   * decoder-context requests (``CONTEXT_INIT`` and disagg-gen-init),
-    #     which flow through the normal decoder IFB step.
-    #
-    # The invariant is that encoder and decoder context never share one
-    # micro-batch; this preserves the cross-KV lifecycle and the
-    # dual-pool budget.
+    # A failed encoder step fails its requests that have not finished.
+    # Terminating a request drops an output it has not consumed.
     # ---------------------------------------------------------------
     def _warmup_encoder_cuda_graphs_enc_dec(self) -> None:
         """Capture encoder graphs on the worker used for runtime replay."""
@@ -9279,19 +9312,7 @@ class PyExecutor:
         encoder_seq_lens: List[int],
         ready_event: torch.cuda.Event,
     ) -> None:
-        """Slice packed encoder hidden states into per-request tensors.
-
-        Stores the slice for each request in ``req.py_encoder_output``
-        as a temporary GPU buffer (consumed by the first decoder
-        context step), and transitions the request from
-        ``ENCODER_INIT`` to ``CONTEXT_INIT`` so the next scheduler
-        iteration admits it on the decoder side.
-
-        ``py_skip_cross_kv_projection`` is initialized to ``False`` so
-        the *first* decoder context step projects K/V from
-        ``encoder_output`` and writes the cross-KV pool; the decoder
-        step flips it to ``True`` for later steps and chunks.
-        """
+        """Give each request still in ENCODER_INIT its slice of the packed output."""
         if encoder_hidden_states is None:
             raise RuntimeError(
                 "Encoder forward returned None hidden states; cannot "
@@ -9317,26 +9338,12 @@ class PyExecutor:
     @nvtx_range("_attach_encoder_output_to_execution_stream")
     def _attach_encoder_output_to_execution_stream(
             self, scheduled_requests: ScheduledRequests) -> None:
-        """Hand encoder-produced tensors over to the execution stream.
+        """Record encoder outputs on the execution stream and drop their events.
 
-        Per-request encoder output tensors are produced on the dedicated
-        ``encoder_stream`` and consumed by the decoder forward on
-        ``execution_stream``. Cross-stream correctness is guaranteed by
-        the scheduler:
-        ``drop_decoder_context_requests_waiting_for_encoder_output`` excludes
-        any ``CONTEXT_INIT`` request whose ``py_encoder_output_ready_event``
-        has not completed, so by the time a request reaches this point the
-        encoder kernels for that request are already done. No
-        ``wait_event`` is therefore needed on the execution stream.
-
-        Two pieces of bookkeeping remain that this helper performs:
-
-        * ``record_stream`` is called on the encoder-output tensor so the
-          PyTorch caching allocator knows the storage is still in use on
-          the execution stream and must not be reused until the decoder
-          forward releases it.
-        * The spent ``py_encoder_output_ready_event`` is cleared so it
-          cannot be queried again on a later iteration.
+        Schedulers admit a context request only after its ready event has
+        completed, so no ``wait_event`` is needed; ``record_stream`` keeps the
+        caching allocator from reusing the storage before the decoder forward
+        has read it.
         """
         for req in scheduled_requests.context_requests:
             ready_event = getattr(req, "py_encoder_output_ready_event", None)
@@ -10287,6 +10294,11 @@ class PyExecutor:
                 torch.cuda.current_stream().wait_event(
                     self._stream_ordering_events[1])
 
+            if self._is_kv_manager_v2:
+                self.kv_cache_manager.update_forward_resources(
+                    scheduled_requests,
+                    wait_for_input_copy=self._wait_for_model_engine_input_copy)
+
             self._kv_connector_wait_for_save()
             if route_capture is not None:
                 route_capture.finish_forward()  # R3: disarm between forwards
@@ -10864,6 +10876,9 @@ class PyExecutor:
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
         self._release_multimodal_resources(request)
+        if getattr(request, "py_encoder_output", None) is not None:
+            request.py_encoder_output = None
+            request.py_encoder_output_ready_event = None
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
 

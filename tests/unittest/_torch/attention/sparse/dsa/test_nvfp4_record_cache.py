@@ -101,3 +101,11 @@ def test_record_layout_has_no_scale_pool(monkeypatch, layout):
         assert estimate == manager.get_cache_bytes_per_token()
     finally:
         manager.shutdown()
+
+
+def test_record_layout_rejects_kv_cache_offload(monkeypatch):
+    """The offload arena reads NVFP4 latents with a block-scale pool, which records lack."""
+    monkeypatch.setenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, "fp8rope")
+    sparse_config = DeepSeekSparseAttentionConfig(index_head_dim=128, enable_kv_cache_offload=True)
+    with pytest.raises(ValueError, match="KV cache offload"):
+        _make_manager(sparse_config)
