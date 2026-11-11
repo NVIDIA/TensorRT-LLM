@@ -172,6 +172,7 @@ def test_qwen3_vl_attached_embedding_hashes_follow_prompt_order():
     assert multimodal_input.multimodal_positions == [1, 8]
     assert multimodal_input.multimodal_lengths == [5, 5]
     hashes = multimodal_input.multimodal_hashes
+    assert hashes == hash_mm_embeddings([first, second])
     assert hashes[0] != hashes[1]
     assert swapped.multimodal_hashes == hashes[::-1]
 
@@ -183,6 +184,11 @@ def test_hash_mm_embeddings_covers_dtype_and_shape():
     assert hash_mm_embeddings([embedding.clone()]) == digest
     assert hash_mm_embeddings([embedding.view(torch.bfloat16)]) != digest
     assert hash_mm_embeddings([embedding.reshape(4, 2)]) != digest
+
+    transposed = embedding.t()
+    assert not transposed.is_contiguous()
+    assert hash_mm_embeddings([transposed]) == hash_mm_embeddings(
+        [transposed.contiguous()])
 
 
 if __name__ == "__main__":
