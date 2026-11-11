@@ -2580,13 +2580,18 @@ class PyExecutor:
             if not self._release_execution_resources(
                     release_model_owned_graphs=True):
                 return
+            self._stop_worker_thread()
         else:
-            for engine in self._terminal_model_engines:
-                engine.release_executor_resources(
-                    release_model_owned_graphs=True)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-        self._stop_worker_thread()
+            try:
+                for engine in self._terminal_model_engines:
+                    engine.release_executor_resources(
+                        release_model_owned_graphs=True)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            finally:
+                # The released phase has no live transfers or execution work.
+                # Terminal cleanup failure must not leave its idle worker alive.
+                self._stop_worker_thread()
         self._closed = True
         # The snapshot above keeps the model owners reachable for the outer
         # worker's collective terminal cleanup.

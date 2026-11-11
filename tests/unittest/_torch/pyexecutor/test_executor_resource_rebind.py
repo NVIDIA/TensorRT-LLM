@@ -457,6 +457,71 @@ def test_final_shutdown_after_release_does_not_release_resources_twice(executor)
     assert not hasattr(ex, "model_engine")
 
 
+@pytest.mark.parametrize("failure_stage", ["graphs", "synchronize"])
+def test_terminal_release_error_stops_worker_and_allows_shutdown_retry(
+    executor, monkeypatch, failure_stage
+):
+    ex, events = executor
+    _enable_real_worker(ex, monkeypatch)
+    stop_requested = threading.Event()
+    cleanup_error = RuntimeError("terminal cleanup failed")
+
+    def event_loop():
+        assert stop_requested.wait(5)
+        ex.shutdown_event.set()
+
+    ex._event_loop_wrapper = event_loop
+    ex.executor_request_queue.enqueue_shutdown_request.side_effect = stop_requested.set
+    try:
+        ex.start_worker()
+        _run_bounded(ex.release_resources)
+        worker = ex.worker_thread
+        engine = ex.model_engine
+        assert worker.is_alive()
+        assert ex._worker_phase_done.is_set()
+        with monkeypatch.context() as patch:
+            owner, name = (
+                (engine, "release_executor_resources")
+                if failure_stage == "graphs"
+                else (torch.cuda, "synchronize")
+            )
+            patch.setattr(owner, name, Mock(side_effect=cleanup_error))
+            with pytest.raises(RuntimeError) as error:
+                _run_bounded(ex.shutdown)
+        assert error.value is cleanup_error
+        assert not worker.is_alive()
+        assert not ex._closed
+        assert ex.model_engine is engine
+        assert ex._terminal_model_engines == (engine,)
+
+        _run_bounded(ex.shutdown)
+        assert ex._closed
+        assert not hasattr(ex, "model_engine")
+        assert events.count("cache") == 1
+        assert events.count("unregister") == 1
+    finally:
+        stop_requested.set()
+        _run_bounded(ex._stop_worker_thread)
+
+
+@pytest.mark.parametrize("unsafe_state", ["hang", "pending_dma"])
+def test_bound_unsafe_shutdown_retains_worker(executor, monkeypatch, unsafe_state):
+    ex, events = executor
+    ex._stop_worker_thread = Mock()
+    ex._pp_mpi_progress_stop = threading.Event()
+    if unsafe_state == "hang":
+        ex.hang_detector.detected.return_value = True
+    else:
+        monkeypatch.setattr(executor_module, "_failed_kv_connector_executors", {})
+        ex._kv_connector_failed = True
+    ex.shutdown()
+    ex._stop_worker_thread.assert_not_called()
+    assert not ex._closed
+    assert ex.resource_manager is not None
+    assert "graphs" not in events
+    assert "cache" not in events
+
+
 @pytest.mark.parametrize("closed,released", [(False, False), (True, False), (True, True)])
 def test_rebind_requires_released_open_executor(executor, closed, released):
     ex, _ = executor

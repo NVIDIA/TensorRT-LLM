@@ -176,6 +176,12 @@ def test_pyexecutor_and_kvcache_share_execution_stream(monkeypatch):
         assert py_executor.worker_thread is profiling_thread
         assert profiling_thread.is_alive(), \
             "The shared worker must remain alive until serving shuts down"
+        py_executor.release_resources()
+        assert py_executor.worker_thread is profiling_thread
+        assert profiling_thread.is_alive(), \
+            "Resource release must park the shared worker until terminal shutdown"
     finally:
         py_executor.shutdown()
         torch.cuda.empty_cache()
+    assert not profiling_thread.is_alive(), \
+        "Terminal shutdown must stop the parked worker"
