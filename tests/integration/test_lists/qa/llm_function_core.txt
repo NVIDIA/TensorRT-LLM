@@ -792,7 +792,7 @@ test_e2e.py::test_trtllm_multimodal_benchmark_serving
 unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/dsa/test_modeling_v2_hist_topk_op_matrix.py
 unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_draft_ehproj_table.py
 unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_draft_sample_glue.py
-unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/comm/test_modeling_v2_intra_node_reduce_op_matrix.py
+unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/ops/comm/test_modeling_v2_intra_node_reduce_op_matrix.py
 
 # ModelingV2 GLM-5.2: four Rubin GPUs (SM107), TP4/MTP5.
 accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm107LowLatency::test_tp4_mtp5_gsm8k_and_acceptance

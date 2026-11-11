@@ -3,7 +3,7 @@
 """Run this target's collective rank job from pytest, and report what it did.
 
 The same contract as ``tests/unittest/_torch/modeling_v2/comm/_rank_job.py``: the
-launcher beside this file owns the per-device rank processes and the deadline
+launcher selected below owns the per-device rank processes and the deadline
 that kills a wedged collective; this only selects the devices, starts it in a
 fresh interpreter (by file path: this tree is not a package) and turns its exit
 code into an assertion.
@@ -77,6 +77,8 @@ def run(entry: str, world_size: int) -> str:
     its stdout."""
     assert world_size in WORLD_SIZES, world_size
     launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
+    if entry == "m3_mc_allreduce_norm":
+        launcher = (Path(__file__).resolve().parent / "../ops/comm" / launcher.name).resolve()
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=require_world(world_size))
 
     # Match the package resolved by pytest: an unbuilt checkout must not

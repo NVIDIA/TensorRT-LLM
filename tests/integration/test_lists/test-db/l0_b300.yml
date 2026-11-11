@@ -153,7 +153,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/attention TIMEOUT (30)
   - unittest/_torch/modeling_v2/gemm TIMEOUT (30)
   - unittest/_torch/modeling_v2/graph TIMEOUT (30)
-  - unittest/_torch/modeling_v2/moe TIMEOUT (30)
+  - unittest/_torch/modeling_v2/moe/ops TIMEOUT (30)
   - unittest/_torch/modeling_v2/norm TIMEOUT (30)
   - unittest/_torch/modeling_v2/quantization TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default TIMEOUT (30)
@@ -201,8 +201,8 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_mla_attn_vb_out.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_mla_qkv.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3_moe.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_k3_moe_m1.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_k3_moe_m2.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/ops/moe/test_modeling_v2_k3_moe_m1.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/ops/moe/test_modeling_v2_k3_moe_m2.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_native.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3_route_quant.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/activation/test_modeling_v2_k3_situ_mul.py

@@ -583,7 +583,7 @@ KILL_MOE_ENGINE = False
 MOE_ENGINE_MAX_TOKENS = 0 if KILL_MOE_ENGINE else 8
 # The engine's push of its sum into the MoE boundary's multicast all-reduce (prepushed mode 2) on the rows the
 # engine serves, with the multicast boundary (DECODE_PLANS' moe_mc_ar): the boundary reads the pushed words instead
-# of loading and pushing the rows itself. Bit for bit the unpushed boundary (comm/_m3_moe_push_op_matrix.py).
+# of loading and pushing the rows itself. Bit for bit the unpushed boundary (ops/moe/_m3_moe_push_op_matrix.py).
 MOE_PUSH_MAX_TOKENS = MOE_ENGINE_MAX_TOKENS if MC_AR_TP2 else 0
 # When the engine pushes its sum into the boundary all-reduce, every CTA releases the PDL dependents right after its
 # grid dependency wait instead of after the push, so the all-reduce (which polls the pushed tagged words, not the grid)

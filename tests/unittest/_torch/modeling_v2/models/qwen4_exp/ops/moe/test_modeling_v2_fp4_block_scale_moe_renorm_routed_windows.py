@@ -26,7 +26,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.reno
     renorm_moe_routing_op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = ["../../../../moe", "../../../.."]
 from _fp4_moe_test_utils import many_expert_layer  # noqa: E402,F401 — fixture by name
 from _precision import true_fp32_matmul  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
@@ -41,6 +41,7 @@ def _helpers():
     path = (
         Path(__file__).resolve().parents[4]
         / "moe"
+        / "ops"
         / "test_modeling_v2_fp4_block_scale_moe_runner.py"
     )
     spec = importlib.util.spec_from_file_location("_fp4_moe_runner_r4_test_helpers", path)

@@ -19,6 +19,7 @@ import pytest
 pytestmark = pytest.mark.cpu_only
 
 _ROOT = Path(__file__).resolve().parents[4] / "tensorrt_llm/_torch/_experimental/modeling_v2"
+_UNIT_ROOT = Path(__file__).resolve().parent
 
 
 def _entry_files() -> list[Path]:
@@ -150,24 +151,28 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
 
 
 def _target_cells_tests() -> list[Path]:
-    unit_root = Path(__file__).resolve().parent
     return sorted(
-        p for p in unit_root.glob("*/test_modeling_v2_*.py") if "TARGET_CELLS" in p.read_text()
+        p
+        for area in _UNIT_ROOT.iterdir()
+        if area.is_dir() and area.name != "models"
+        for p in area.rglob("test_modeling_v2_*.py")
+        if "TARGET_CELLS" in p.read_text()
     )
 
 
 @pytest.mark.parametrize(
-    "test", _target_cells_tests(), ids=lambda p: str(p.relative_to(p.parents[1]))
+    "test", _target_cells_tests(), ids=lambda p: str(p.relative_to(_UNIT_ROOT))
 )
 def test_target_cells_feed_entries_the_target_calls(test):
     """An entry test's `TARGET_CELLS` hold the shapes each target calls the entry with.
 
-    The test sits at `<area>/test_modeling_v2_<entry>.py`, mirroring
-    `catalog/<area>/<entry>.py`. Each key is a target directory under `models/`,
-    and that target's code imports the entry: a cell for an entry the target
-    never calls certifies nothing it runs.
+    The test sits under `<area>/`, including component subdirectories such as
+    `moe/ops/`, and mirrors `catalog/<area>/<entry>.py`. Each key is a target
+    directory under `models/`, and that target's code imports the entry: a cell
+    for an entry the target never calls certifies nothing it runs.
     """
-    area, entry = test.parent.name, test.stem.removeprefix("test_modeling_v2_")
+    area = test.relative_to(_UNIT_ROOT).parts[0]
+    entry = test.stem.removeprefix("test_modeling_v2_")
     assert (_ROOT / "catalog" / area / f"{entry}.py").is_file(), (
         f"{test.name}: declares TARGET_CELLS but mirrors no catalog/{area}/{entry}.py"
     )

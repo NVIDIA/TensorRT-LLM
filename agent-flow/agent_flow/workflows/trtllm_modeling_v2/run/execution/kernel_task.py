@@ -160,7 +160,11 @@ def _kernel_writer_prompt(
             tier=row.get("tier"),
             landing=landing,
             paths=paths,
-            shared=tuple(shared_entry_paths(item.target)) if landing != item.target else (),
+            shared=(
+                shared_entry_paths(item.target, workflow.task_data["trtllm_repo_path"])
+                if landing != item.target
+                else ()
+            ),
             environment_kind=str(environment.get("kind", "local")),
             devices=int(environment.get("gpus_per_node") or 1),
         )

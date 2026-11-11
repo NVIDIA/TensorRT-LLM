@@ -16,7 +16,12 @@ import pytest
 
 pytestmark = pytest.mark.cpu_only
 _FAMILY = Path(__file__).parent
-_LAUNCHERS = sorted(_FAMILY.glob("minimax_m3_nvfp4__sm_107__tp*/comm/_m3*_op_matrix.py"))
+_LAUNCHERS = sorted(
+    path
+    for target in _FAMILY.glob("minimax_m3_nvfp4__sm_107__tp*")
+    for component in ("comm", "ops/comm", "ops/moe")
+    for path in (target / component).glob("_m3*_op_matrix.py")
+)
 
 
 def _launcher(path):
@@ -54,7 +59,7 @@ def _launcher(path):
 @pytest.mark.parametrize("failure", ["interrupt", "partial_spawn"])
 def test_launcher_reaps_workers_on_exception(monkeypatch, path, failure):
     namespace = _launcher(path)
-    tp = int(path.parents[1].name.rsplit("tp", 1)[1])
+    tp = int(path.relative_to(_FAMILY).parts[0].rsplit("tp", 1)[1])
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(map(str, range(tp))))
     real_popen = subprocess.Popen
     children = []

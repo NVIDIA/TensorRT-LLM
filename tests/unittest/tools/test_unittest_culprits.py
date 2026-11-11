@@ -15,9 +15,14 @@
 """Tests for culprit attribution and parallel-config lookup in the unittest integration wrapper."""
 
 import importlib.util
+import os
+import subprocess
 import sys
 import types
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Callable
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -238,3 +243,203 @@ def test_fail_unittests_prioritizes_and_deduplicates_in_flight_culprits(
 )
 def test_parallel_config_key_strips_only_ignore_arguments(case: str, expected: str) -> None:
     assert _parallel_config_key(case) == expected
+
+
+_GR100_M3_TARGETS = "unittest/_torch/modeling_v2/models/minimax_m3"
+_GR100_M3_REPORT_CASES = (
+    *(
+        f"{_GR100_M3_TARGETS}/minimax_m3_nvfp4__sm_107__tp2/{relative}"
+        for relative in (
+            "ops/m3_moe",
+            "ops/moe/test_modeling_v2_m3_moe_engine.py",
+            "ops/moe/test_modeling_v2_m3_moe_epoch_wrap.py",
+            "ops/moe/test_modeling_v2_m3_moe_triton_finalize.py",
+        )
+    ),
+    *(
+        f"{_GR100_M3_TARGETS}/minimax_m3_nvfp4__sm_107__tp4/{relative}"
+        for relative in ("ops/moe", "ops/m3_moe")
+    ),
+    *(
+        f"{_GR100_M3_TARGETS}/minimax_m3_nvfp4__sm_107__tp{tp}/ops/moe/test_modeling_v2_m3_router_tc.py"
+        for tp in (2,)
+    ),
+)
+_CaptureUnittest = Callable[[str, int, bool], list[list[str]]]
+
+
+def _report_path(command: list[str]) -> Path:
+    prefix = "--periodic-junit-xmlpath="
+    return Path(next(arg.removeprefix(prefix) for arg in command if arg.startswith(prefix)))
+
+
+@pytest.fixture
+def capture_unittest_wrapper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _CaptureUnittest:
+    dataframe = MagicMock()
+    dataframe.__getitem__.return_value = dataframe
+    dataframe.dropna.return_value = dataframe
+    dataframe.unique.return_value = dataframe
+    dataframe.tolist.return_value = ["CPU"]
+    pandas_module = types.ModuleType("pandas")
+    setattr(pandas_module, "read_csv", MagicMock(return_value=dataframe))
+    nvml_module = types.ModuleType("pynvml")
+    setattr(nvml_module, "NVMLError", RuntimeError)
+    setattr(nvml_module, "nvmlInit", MagicMock())
+    setattr(nvml_module, "nvmlDeviceGetHandleByIndex", MagicMock(return_value=0))
+    setattr(nvml_module, "nvmlDeviceGetName", MagicMock(return_value="CPU"))
+    monkeypatch.setitem(sys.modules, "pandas", pandas_module)
+    monkeypatch.setitem(sys.modules, "pynvml", nvml_module)
+
+    def getoption(name: str, default: object | None = None) -> object | None:
+        return default
+
+    request = types.SimpleNamespace(config=types.SimpleNamespace(getoption=getoption))
+    output_dir = tmp_path / "session-output"
+    output_dir.mkdir()
+
+    def capture(case: str, workers: int, retry: bool) -> list[list[str]]:
+        commands: list[list[str]] = []
+        dataframe.iterrows.return_value = [
+            (0, {"gpu": "CPU", "unittest_case_name": case, "parallel_factor": workers})
+        ]
+        monkeypatch.setenv("LLM_TEST_PARALLEL_OVERRIDE", str(workers))
+
+        def run_cmd(command: list[str], *, cwd: str, env: dict[str, str]) -> None:
+            assert cwd == _TEST_UNITTESTS.tests_path()
+            assert env["CBTS_PROCESS_ROLE"] == "inner_pytest"
+            commands.append(list(command))
+            if workers > 1:
+                _report_path(command).write_text(
+                    '<testsuites><testsuite tests="1" failures="0" errors="0" '
+                    'skipped="0" time="0"><testcase classname="probe" '
+                    'name="test_probe" /></testsuite></testsuites>',
+                    encoding="utf-8",
+                )
+            if retry and len(commands) == 1:
+                raise subprocess.CalledProcessError(1, command)
+
+        _TEST_UNITTESTS.test_unittests_v2(
+            str(tmp_path / "llm"),
+            types.SimpleNamespace(run_cmd=run_cmd),
+            case,
+            str(output_dir),
+            request,
+        )
+        return commands
+
+    return capture
+
+
+@pytest.mark.cpu_only
+def test_unittest_reports_distinguish_gr100_selectors(
+    capture_unittest_wrapper: _CaptureUnittest,
+) -> None:
+    paths = [
+        _report_path(capture_unittest_wrapper(case, 1, False)[0]) for case in _GR100_M3_REPORT_CASES
+    ]
+    repeated = [
+        _report_path(capture_unittest_wrapper(case, 1, False)[0]) for case in _GR100_M3_REPORT_CASES
+    ]
+    assert paths == repeated
+    assert len(set(paths)) == len(_GR100_M3_REPORT_CASES) == 7
+    assert len({path.parent for path in paths}) == 1
+    assert all(
+        path.name.startswith("results-sub-unittests-") and path.suffix == ".xml" for path in paths
+    )
+    assert all(len(os.fsencode(path.name)) <= 255 for path in paths)
+
+
+@pytest.mark.cpu_only
+def test_unittest_reports_survive_separate_pytest_processes(
+    tmp_path: Path, capture_unittest_wrapper: _CaptureUnittest
+) -> None:
+    paths = [
+        _report_path(capture_unittest_wrapper(case, 1, False)[0])
+        for case in _GR100_M3_REPORT_CASES[1:3]
+    ]
+    work_dir = tmp_path / "pytest-processes"
+    work_dir.mkdir()
+    config = work_dir / "pytest.ini"
+    config.write_text("[pytest]\n", encoding="utf-8")
+    runner = (
+        "import sys\n"
+        "import pytest\n"
+        "from periodic_junit import PeriodicJUnitXML\n"
+        "raise SystemExit(pytest.main(sys.argv[2:], "
+        "plugins=[PeriodicJUnitXML(xmlpath=sys.argv[1], batch_size=1)]))\n"
+    )
+    env = {
+        **os.environ,
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTEST_ADDOPTS": "",
+        "PYTHONPATH": str(_REPO_ROOT / "tests/integration/defs/utils"),
+    }
+    first_report = b""
+    for index, report_path in enumerate(paths):
+        test_file = work_dir / f"test_process_{index}.py"
+        test_file.write_text(
+            f"def test_process_{index}() -> None:\n    assert True\n", encoding="utf-8"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                runner,
+                str(report_path),
+                "-q",
+                "-c",
+                str(config),
+                f"--confcutdir={work_dir}",
+                "-p",
+                "no:cacheprovider",
+                str(test_file),
+            ],
+            cwd=work_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        if index == 0:
+            first_report = report_path.read_bytes()
+    assert paths[0].read_bytes() == first_report
+    assert paths[0] != paths[1]
+    for index, report_path in enumerate(paths):
+        root = ET.parse(report_path).getroot()
+        assert [case.get("name") for case in root.iter("testcase")] == [f"test_process_{index}"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("retry", [False, True])
+def test_unittest_parallel_and_retry_reports_keep_distinct_paths(
+    capture_unittest_wrapper: _CaptureUnittest, retry: bool
+) -> None:
+    calls = [capture_unittest_wrapper(case, 2, retry) for case in _GR100_M3_REPORT_CASES[1:3]]
+    assert all(len(commands) == (2 if retry else 1) for commands in calls)
+    paths = [_report_path(command) for commands in calls for command in commands]
+    assert len(set(paths)) == len(paths)
+    assert all(path.name.endswith(".xml.intermediate") for path in paths)
+    assert all(
+        _report_path(commands[0]).name.startswith("parallel-sub-results-") for commands in calls
+    )
+    if retry:
+        assert all(
+            _report_path(commands[1]).name.startswith("retry-sub-results-") for commands in calls
+        )
+        assert all("--lf" in commands[1] for commands in calls)
+    final_reports = list(paths[0].parent.glob("results-sub-unittests-*.xml"))
+    assert len(final_reports) == 2
+    assert all(list(ET.parse(path).getroot().iter("testcase")) for path in final_reports)
+
+
+@pytest.mark.cpu_only
+def test_unittest_moe_reports_keep_reporting_exclusion_prefix(
+    capture_unittest_wrapper: _CaptureUnittest,
+) -> None:
+    command = capture_unittest_wrapper("unittest/_torch/moe/test_moe_module.py", 1, False)[0]
+    assert _report_path(command).name.startswith("moe-results-sub-unittests-")
+    unfinished = next(arg for arg in command if arg.startswith("--periodic-unfinished-test-path="))
+    assert Path(unfinished.split("=", 1)[1]).name == (
+        "moe-unfinished-sub-unittests-unittest-_torch-moe-test_moe_module.py.txt"
+    )
