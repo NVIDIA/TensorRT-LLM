@@ -195,6 +195,9 @@ def _shutdown_manager(manager, monkeypatch):
     if isinstance(manager, Qwen4ExpHybridCacheManager):
         manager._ple_conv_states = {42: object()}
         manager._ple_ngram_contexts = {42: object()}
+    if isinstance(manager, KimiK3HybridCacheManager):
+        manager._kda_midchunk_snapshots = {42: object()}
+        manager._kda_midchunk_handed_out = {42}
 
     def check_before_pool_shutdown():
         assert manager.intermediate_state_indices is None
@@ -205,6 +208,8 @@ def _shutdown_manager(manager, monkeypatch):
         assert not manager.all_ssm_states and not manager.all_conv_states
         if isinstance(manager, Qwen4ExpHybridCacheManager):
             assert not manager._ple_conv_states and not manager._ple_ngram_contexts
+        if isinstance(manager, KimiK3HybridCacheManager):
+            assert not manager._kda_midchunk_snapshots and not manager._kda_midchunk_handed_out
 
     pool_shutdown = Mock(side_effect=check_before_pool_shutdown)
     monkeypatch.setattr(KVCacheManagerV2, "shutdown", pool_shutdown)

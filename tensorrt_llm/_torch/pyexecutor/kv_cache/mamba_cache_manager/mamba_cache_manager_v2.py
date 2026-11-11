@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import sys
+import time
 from dataclasses import replace
 from types import MappingProxyType
 from typing import (
@@ -211,6 +212,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = True
+    # With block reuse on, the recurrent snapshot and reuse counters are logged
+    # at INFO at most this often (see _maybe_log_branch_snapshot_counters).
+    _BRANCH_SNAPSHOT_COUNTERS_LOG_INTERVAL_S = 60.0
+    _branch_snapshot_counters_logged_at = float("-inf")
     # Whether the model's recurrent layers implement the in-forward snapshot
     # split (GDN).
     _supports_inforward_snapshot = False
@@ -2087,6 +2092,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Count a recurrent-state snapshot committed at ``point`` of ``request``'s prompt."""
         if self._branch_snapshot_points.get(request.py_request_id) == point:
             self._branch_snapshots_taken_total += 1
+        waiter_points = (self._waiter_snapshot_points or {}).get(request.py_request_id, ())
+        if point in waiter_points:
+            self._inflight_prefix_points_taken_total += 1
 
     def _mark_context_position_as_history(self, request: LlmRequest, kv_cache) -> None:
         """Advance history without making later recurrent state reusable."""
@@ -2225,6 +2233,24 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             )
         request.expect_snapshot_points = aligned
 
+    def _maybe_log_branch_snapshot_counters(self) -> None:
+        """Log the recurrent snapshot and reuse counters at INFO, at most once a minute.
+
+        Called on every context admission of a block-reuse manager, so the line
+        shows whether branch, waiter and mid-chunk snapshots are being taken.
+        """
+        now = time.monotonic()
+        if (
+            now - self._branch_snapshot_counters_logged_at
+            < self._BRANCH_SNAPSHOT_COUNTERS_LOG_INTERVAL_S
+        ):
+            return
+        self._branch_snapshot_counters_logged_at = now
+        logger.info(
+            f"[MambaHybridCacheManagerV2] recurrent snapshot counters "
+            f"{self._format_branch_snapshot_counters()}"
+        )
+
     def _skip_branch_snapshot(self, reason: str) -> None:
         self._branch_snapshots_skipped_total[reason] = (
             self._branch_snapshots_skipped_total.get(reason, 0) + 1
@@ -2235,11 +2261,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
     ) -> None:
         """Snapshot where this request leaves the reuse tree, for its siblings."""
+        if req.is_dummy_request:
+            return
+        self._maybe_log_branch_snapshot_counters()
         if not self.kv_cache_config.block_reuse_config.enable_branch_snapshot:
             return
         # Generation-only requests receive their prompt state from the context
         # worker and never prefill here, so they cannot take a snapshot.
-        if req.is_dummy_request or req.is_disagg_generation_init_state:
+        if req.is_disagg_generation_init_state:
             return
         if num_lookup_tokens is None:
             self._skip_branch_snapshot("no_fresh_match")
@@ -2325,7 +2354,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             f"branch_snapshots_taken={self._branch_snapshots_taken_total} "
             f"branch_snapshots_skipped={sum(skipped.values())} "
             f"branch_snapshots_skipped_by_reason="
-            f"{dict(sorted(skipped.items()))}"
+            f"{dict(sorted(skipped.items()))} "
+            f"{self._format_inflight_prefix_counters()}"
         )
 
     @override

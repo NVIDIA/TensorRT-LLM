@@ -5,6 +5,7 @@
 import contextlib
 import math
 import os
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -4627,7 +4628,9 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
             "snapshot_pruned_tokens=640 page_pruned_tokens=128 "
             "branch_snapshots_taken=3 branch_snapshots_skipped=3 "
             "branch_snapshots_skipped_by_reason="
-            "{'already_reused': 1, 'no_divergence': 2}"
+            "{'already_reused': 1, 'no_divergence': 2} "
+            "inflight_prefix_deferrals=0 inflight_prefix_points_requested=0 "
+            "inflight_prefix_points_taken=0"
         )
 
 
@@ -5017,6 +5020,8 @@ def _branch_snapshot_manager(
     mgr._page_pruned_tokens_total = 0
     mgr._branch_snapshots_taken_total = 0
     mgr._branch_snapshots_skipped_total = {}
+    # Logged just now, so the rate-limited INFO counters stay quiet.
+    mgr._branch_snapshot_counters_logged_at = time.monotonic()
     return mgr
 
 

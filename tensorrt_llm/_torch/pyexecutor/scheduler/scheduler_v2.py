@@ -839,6 +839,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if self._prefix_wait_planner is not None and (pending_ctx or starved_ctx)
                 else {}
             )
+            if prefix_waits:
+                self.kv_cache_manager.count_prefix_waits(len(prefix_waits))
         if self._ctx_demote_exact and prefix_waits:
             # The probe of a waiting request predates the prefix it waits for;
             # it is probed again once it stops waiting.

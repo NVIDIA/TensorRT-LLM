@@ -5392,6 +5392,8 @@ class TestLongContextDemotionExact:
         assert waiting.py_uncached_prefill_tokens == 200
         assert waiting.context_chunk_size == 200
         assert mgr.probe_context_reuse.call_count == 2
+        # Only the pass that kept it waiting counts a prefix wait.
+        mgr.count_prefix_waits.assert_called_once_with(1)
 
 
 class TestLongContextDemotion:
