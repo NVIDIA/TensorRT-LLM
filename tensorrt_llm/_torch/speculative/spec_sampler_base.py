@@ -47,6 +47,7 @@ from ..pyexecutor.sampler import (
 from ..pyexecutor.sampler.penalties import has_occurrence_penalty
 from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
 from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
+from ..pyexecutor.sampler.watermark import request_carries_watermark
 from ..pyexecutor.scheduler import ScheduledRequests
 
 # Rejection messages for the sampling features the one-model speculative path
@@ -215,6 +216,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 "the request, or disable speculative decoding."
             )
 
+        # A greedy request cannot carry a watermark, so it is served normally.
+        reason = getattr(self, "_watermark_unsupported_reason", None)
+        if reason is not None and request_carries_watermark(self._watermark_config, request):
+            raise ValueError(reason)
+
         sampling_config = request.sampling_config
         if sampling_config is None:
             return
@@ -297,6 +303,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         enable_penalty: bool = False,
         penalty_supported: bool = True,
         fused_sampling: bool = False,
+        watermark_unsupported_reason: Optional[str] = None,
     ):
         """
         Initialize the speculative sampler.
@@ -309,9 +316,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             penalty_supported: whether this speculation mode's row layout is one
                 the penalties can map (linear modes yes, tree modes not yet).
             fused_sampling: whether the configured sampler supports min_p.
+            watermark_unsupported_reason: why this speculation mode cannot serve watermarked
+                requests (None when it can). Such requests are rejected at admission.
         """
         self._enable_penalty = enable_penalty
         self._penalty_supported = penalty_supported
+        self._watermark_config = args.watermark_config
+        self._watermark_unsupported_reason = watermark_unsupported_reason
         self._fused_sampling = fused_sampling
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None

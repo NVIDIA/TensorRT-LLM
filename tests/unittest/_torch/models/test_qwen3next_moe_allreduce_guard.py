@@ -58,8 +58,11 @@ def layer_builder(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(m, "_create_mlp", mock.MagicMock(name="_create_mlp"))
 
     if request.param == "linear":
+        # The layer builds its mixer through the ``linear_attn_cls`` hook, bound at class creation.
         monkeypatch.setattr(
-            m, "Qwen3NextGatedDeltaNet", mock.MagicMock(name="Qwen3NextGatedDeltaNet")
+            m.Qwen3NextLinearDecoderLayer,
+            "linear_attn_cls",
+            mock.MagicMock(name="Qwen3NextGatedDeltaNet"),
         )
         layer_cls = m.Qwen3NextLinearDecoderLayer
     else:
