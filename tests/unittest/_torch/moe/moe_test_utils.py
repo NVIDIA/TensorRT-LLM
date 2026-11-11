@@ -505,6 +505,14 @@ def should_skip_trtllm(
                 f"(mismatch ~20-22%). CUTLASS backend with the same config passes."
             )
 
+    # Multi-GPU coverage still has separate DEP/NVLINK accuracy and TP-layout
+    # failures. Keep its existing gate while single-GPU coverage is enabled.
+    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8 and swiglu_gptoss_style and parallel_mode is not None:
+        return (
+            "[NVBUG-6178914] W4A8_MXFP4_FP8 gpt-oss multi-GPU coverage remains "
+            "disabled pending the independent DEP/NVLINK accuracy and TP-layout fixes."
+        )
+
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
     # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_MXFP8) auto-pad to 128 alignment,
     # but other quants (FP8_BLOCK_SCALES, NVFP4, W4A8_NVFP4_FP8) crash:
