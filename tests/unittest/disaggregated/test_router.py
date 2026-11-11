@@ -1946,22 +1946,45 @@ async def test_conversation_router_finish_after_server_readd_keeps_load():
 
 
 @pytest.mark.asyncio
+async def test_conversation_router_readd_keeps_retained_server_requests():
+    """Removing one server keeps the routing entries of the other servers."""
+    router = ConversationRouter(server_role=ServerRole.CONTEXT,
+                                servers=["server1", "server2"])
+    on_removed = _make_request(conversation_id="sess-removed")
+    removed, _ = await router.get_next_server(on_removed)
+    on_retained = _make_request(conversation_id="sess-retained")
+    retained, _ = await router.get_next_server(on_retained,
+                                               exclude_server=removed)
+    assert retained != removed
+
+    await _remove_and_readd(router, removed)
+    assert router._get_content_load(retained) > 0
+    await router.finish_request(on_retained)
+    assert router._get_content_load(retained) == 0
+
+
+@pytest.mark.asyncio
 async def test_conversation_router_finish_by_id_after_server_readd_keeps_load():
     """A coordinator request routed before its server left keeps the new load."""
     router = ConversationRouter(server_role=ServerRole.CONTEXT,
                                 servers=["server1", "server2"])
     server, _, _ = await router.get_next_server_by_key(None, req_id=1)
     other = "server2" if server == "server1" else "server1"
+    assert (await router.get_next_server_by_key(None,
+                                                exclude_server=server,
+                                                req_id=2))[0] == other
 
     await _remove_and_readd(router, server)
     assert (await router.get_next_server_by_key(None,
                                                 exclude_server=other,
-                                                req_id=2))[0] == server
+                                                req_id=3))[0] == server
+    await router.finish_request_by_id(2)
+    assert router._get_content_load(other) == 0
     assert router._get_content_load(server) == 1
     await router.finish_request_by_id(1)
 
     assert router._get_content_load(server) == 1
-    await router.finish_request_by_id(2)
+    await router.finish_request_by_id(3)
     assert router._get_content_load(server) == 0
 
 
