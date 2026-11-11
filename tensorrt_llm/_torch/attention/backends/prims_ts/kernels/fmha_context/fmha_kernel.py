@@ -139,6 +139,7 @@ Entry points:
   - FmhaTs                   -- class with @cute.jit __call__ and kernel
 """
 
+import math
 import warnings
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -846,6 +847,8 @@ def build_context_task_manager(
         ``(TaskManager, tmem_resources, tmem_ptr_alloc, dealloc_mbar_alloc,
         peer_dealloc_mbar_alloc, work_queue, clc_response_alloc)``.
     """
+    if softmax_stats is not None and cfg.corr_skip_threshold_log2 > 0:
+        raise ValueError("softmax statistics require corr_skip_threshold_log2=0")
     if cfg.use_paged_kv:
         if cfg.num_tokens_per_page not in _SUPPORTED_CONTEXT_PAGE_SIZES:
             raise ValueError(
@@ -2655,9 +2658,14 @@ def _causal_domain_kwargs(
     return result
 
 
-def _uses_sm107_dense_mla_runtime_kv_bounds(cfg: FmhaConfig) -> bool:
-    """Bound query-paired SM107 FP8 expanded MLA by each packed KV extent."""
-    if not (
+def _uses_packed_dense_runtime_kv_bounds(cfg: FmhaConfig) -> bool:
+    """Bound ordinary query-paired dense context by each live packed KV extent."""
+    # All task roles share the same paired N/N-1 protocol and int32 offsets.
+    # Uniform packed plans omit live offsets; specialized recipes and other
+    # topologies retain their own domains and tail handling.
+    # These are the public API's paired geometries; symmetric D192/D256 use
+    # one instance, and the public context API does not admit D64.
+    return (
         not cfg.is_causal
         and not cfg.has_variable_window
         and cfg.window_size_left == 0
@@ -2665,18 +2673,18 @@ def _uses_sm107_dense_mla_runtime_kv_bounds(cfg: FmhaConfig) -> bool:
         and not cfg.use_paged_kv
         and cfg.has_varlen
         and not cfg.has_uniform_varlen
+        and cfg.packed_dense_k_mask
         and cfg.num_qkv_instances == 2
         and not cfg.two_cta_umma
-        and cfg.logical_head_dim_qk == 192
+        and cfg.logical_head_dim_qk in (128, 192)
         and cfg.pv_mma_tiler[1] == 128
-        and cfg.q_dtype == cfg.k_dtype == cfg.v_dtype == cutlass.Float8E4M3FN
-        and cfg.o_dtype == cutlass.BFloat16
-    ):
-        return False
-    from cutlass.cutlass_dsl import BaseDSL
-
-    arch = BaseDSL._get_dsl().get_arch_enum()
-    return (arch.major, arch.minor) == (10, 7)
+        and cfg.vc_attention is None
+        and not cfg.use_sage_attention
+        and not cfg.use_mxfp8_qk
+        and cfg.q_dtype == cfg.k_dtype == cfg.v_dtype
+        and cfg.q_dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN)
+        and cfg.o_dtype in (cutlass.Float16, cutlass.BFloat16)
+    )
 
 
 def _select_fmha_domain_policy(
@@ -2861,9 +2869,9 @@ def _select_fmha_domain_policy(
             softmax0_domain_kwargs=softmax0_domain,
             softmax1_domain_kwargs=softmax1_domain,
         )
-    if _uses_sm107_dense_mla_runtime_kv_bounds(cfg):
-        if cum_seqlen_k is None:
-            raise ValueError("Packed dense MLA domains require runtime KV offsets")
+    if _uses_packed_dense_runtime_kv_bounds(cfg):
+        if cum_seqlen_q is None or cum_seqlen_k is None:
+            raise ValueError("Packed dense domains require runtime Q and KV offsets")
         dense_kwargs: DomainKwargs = {
             "task_class": PackedDenseDomainTask,
             "num_kv_tiles": num_kv_tiles,
@@ -3107,7 +3115,13 @@ class FmhaTs:
         Number of GQA head repeats (default: 1). Head-paired mode requires
         grouped-query attention with an even repeat count.
     enable_skip_correction : bool, optional
-        Enable skip-correction for softmax rescaling (default: True).
+        Skip O rescaling when the maximum is unchanged or no prior keys were
+        visible (default: True). Independent of lazy maximum updates below.
+    corr_skip_threshold_log2 : float, optional
+        Defer maximum updates up to this base-2 logit increase, in [0, 8]. Zero
+        keeps exact maxima and is required when exporting softmax statistics.
+        None retains the default threshold of 8 when correction skipping is
+        enabled, or 0 otherwise. VC-Attention requires zero.
     uses_ldtm_stat : bool, optional
         Use ``tcgen05.ld.red.max`` (LDTM.STAT) to fuse the per-chunk row_max
         into the TMEM S load on the non-masked path (default: False). The
@@ -3169,6 +3183,7 @@ class FmhaTs:
         vc_attention: str | None = None,
         use_blackwell_tma_oob_workaround: bool = False,
         sage_scale_layout: _SageScaleLayout | None = None,
+        corr_skip_threshold_log2: float | None = None,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -3288,11 +3303,22 @@ class FmhaTs:
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
-        # VC-Attention skips no correction. The skip keeps a stale row max,
-        # under which a larger score codes past VC_EXPCAST_CODE_BIAS and out of
-        # the E4M3 range. The exact per-tile max keeps every code at or below it.
-        if enable_skip_correction and not cfg.vc_attention:
-            cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
+        # VC-Attention cannot defer maximum updates: a larger score relative
+        # to a stale maximum can code past VC_EXPCAST_CODE_BIAS and out of the
+        # E4M3 range. The exact per-tile max keeps every code at or below it.
+        if corr_skip_threshold_log2 is None:
+            corr_skip_threshold_log2 = (
+                _CORR_SKIP_THRESHOLD_LOG2
+                if enable_skip_correction and not cfg.vc_attention
+                else 0.0
+            )
+        if not math.isfinite(corr_skip_threshold_log2) or not (
+            0 <= corr_skip_threshold_log2 <= _CORR_SKIP_THRESHOLD_LOG2
+        ):
+            raise ValueError("corr_skip_threshold_log2 must be finite and in [0, 8]")
+        if cfg.vc_attention and corr_skip_threshold_log2 > 0:
+            raise ValueError("VC-Attention requires corr_skip_threshold_log2=0")
+        cfg.corr_skip_threshold_log2 = corr_skip_threshold_log2
         cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
         cfg.kv_ring_stages = kv_ring_stages
