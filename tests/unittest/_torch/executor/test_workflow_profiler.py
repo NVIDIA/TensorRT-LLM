@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+from _torch.disaggregation.test_disagg_loop_transcript import _pp_executor
 from profiler_test_utils import (
     decode_node_metadata,
     execution_trace_observer,
@@ -32,6 +33,7 @@ from profiler_test_utils import (
 
 from tensorrt_llm import _profiler as profiler
 from tensorrt_llm._torch.pyexecutor import cuda_graph_runner, py_executor
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import inputs as decoder_inputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as decoder_runner
 from tensorrt_llm.mapping import Mapping
 
@@ -792,6 +794,102 @@ def test_pp_loop_call_propagates_actual_slot(
     fields = decode_node_metadata(node)[1]
     assert fields["workflow.executor.microbatch_slot"] == 3
     assert fields["workflow.executor.iteration"] == 6
+
+
+@pytest.mark.parametrize("last_pp_rank", [False, True])
+def test_executor_pp_loop_passes_consecutive_slots(
+    monkeypatch: pytest.MonkeyPatch, last_pp_rank: bool
+) -> None:
+    """Pass slots zero and one from the real loop to the selected forward owner."""
+    owner = _pp_executor(monkeypatch, [], rank=int(last_pp_rank))
+    owner.num_micro_batches = 2
+    owner.micro_batches = [None, None]
+    owner.send_expected_batch_num_handles = [None, None]
+    owner.kv_cache_transceiver = None
+    owner.guided_decoder = None
+    owner.pp_multi_stream_sample = False
+    owner.disable_overlap_scheduler = True
+    owner.resource_manager = Mock()
+    owner.perf_manager = SimpleNamespace(record_perf_events=lambda *args: nullcontext())
+    owner._step_scope = lambda batch: nullcontext()
+    owner._can_queue = Mock(return_value=(True, True))
+    owner.executed_batch_queue = SimpleNamespace(put=owner.executed_batch_response_queue.put)
+    if last_pp_rank:
+        owner.dist.recv_object = Mock(side_effect=[0, 1])
+    for name in (
+        "_add_inflight_ids",
+        "_prepare_disagg_gen_transmission_complete",
+        "_handle_dynamic_draft_len",
+        "_maybe_record_hang_diagnostic_phase",
+        "_handle_executed_batch",
+        "_handle_guided_decoder_errors",
+        "_update_request_states",
+    ):
+        monkeypatch.setattr(owner, name, Mock())
+
+    batches = [py_executor.ScheduledRequests(), py_executor.ScheduledRequests()]
+    for batch in batches:
+        batch.generation_requests = [_request(py_batch_idx=0)]
+    owner._pp_schedule_and_propagate = lambda slot: (batches[slot], [], 0, False)
+    shutdown = iter([False, False, True])
+
+    def fetch_new_requests() -> list[object]:
+        owner.is_shutdown = next(shutdown)
+        return []
+
+    owner._fetch_and_activate_new_requests = fetch_new_requests
+    sample_state = SimpleNamespace(sampler_event=Mock())
+    owner._sample_async = lambda batch, outputs: sample_state
+    slots: list[int | None] = []
+    forwarded_batches: list[object] = []
+
+    def forward(batch: object, *timing_events: object, microbatch_id: int | None = None) -> object:
+        slots.append(microbatch_id)
+        forwarded_batches.append(batch)
+        return {"logits": object()} if last_pp_rank else sample_state
+
+    def wrong_forward(*args: object, **kwargs: object) -> None:
+        pytest.fail("The loop selected the wrong PP forward owner")
+
+    owner._forward_step = forward if last_pp_rank else wrong_forward
+    owner._forward_step_inter_pp = wrong_forward if last_pp_rank else forward
+    monkeypatch.setattr(torch.cuda.nvtx, "range", lambda *args: nullcontext())
+
+    py_executor.PyExecutor._executor_loop_pp(owner)
+
+    assert slots == [0, 1]
+    assert forwarded_batches == batches
+    assert owner.iter_counter == 2
+    assert owner._event_loop_completed
+
+
+def test_prepare_inputs_owner_scope_preserves_exception_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the real input-preparation boundary visible when its first dependency fails."""
+    select_regions(monkeypatch, "workflow")
+    failure = KeyboardInterrupt("prepare inputs failed")
+
+    def fail_prefill_flag(enabled: bool) -> None:
+        raise failure
+
+    monkeypatch.setattr(
+        decoder_inputs, "set_per_request_prefill_cuda_graph_flag", fail_prefill_flag
+    )
+    preparer = decoder_inputs.DecoderInputPreparer.__new__(decoder_inputs.DecoderInputPreparer)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            preparer.prepare_inputs(
+                scheduled_requests=py_executor.ScheduledRequests(),
+                kv_cache_manager=None,
+                attn_metadata=None,
+                enable_spec_decode=False,
+                runtime_draft_len=0,
+                is_dummy=False,
+            )
+
+    assert caught.value is failure
+    assert [event.name for event in trace.events()].count("trtllm::prepare_inputs") == 1
 
 
 @pytest.mark.parametrize("pp_size,expected", [(1, 0), (2, None)])
