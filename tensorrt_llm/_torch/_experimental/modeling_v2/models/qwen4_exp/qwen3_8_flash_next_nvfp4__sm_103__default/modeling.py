@@ -446,6 +446,7 @@ from tensorrt_llm.functional import AllReduceFusionOp
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .. import ple_host_table as _ple_host
 from . import pool as _pool
 from . import vision as _vision
 from . import weights as _weights
@@ -920,6 +921,18 @@ def _moe_prefill_copy(one_rank: bool, trunk_moe_backend: str, max_num_tokens: in
     )
 
 
+def _ple_window(core):
+    """The n-gram gather's `row_window` for this rank's table (None: the whole table)."""
+    host = core._ple_table_host
+    return None if host is None else host.window
+
+
+def _ple_needs_sum(core) -> bool:
+    """Whether the gathered n-gram rows are this rank's share, summed over attention TP."""
+    host = core._ple_table_host
+    return host is not None and host.needs_sum
+
+
 def _ple_host_offload_enabled() -> bool:
     """Whether the n-gram table is declared in host memory (the default)."""
     return _switch(_PLE_HOST_OFFLOAD_ENV, default=True)
@@ -1209,6 +1222,14 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.eos_token_id = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
         self.ple_table_dtype = _weights.PLE_TABLE_DTYPE
         self.ple_host_offload = _ple_host_offload_enabled()
+        # How the host-resident table is stored (`ple_host_table`).
+        self.ple_host_mode = _ple_host.host_table_mode()
+        if self.ple_host_mode != _ple_host.RANK and not self.ple_host_offload:
+            logger.warning(
+                f"{_ple_host.PLE_HOST_TABLE_ENV}={self.ple_host_mode} applies to the host-resident "
+                f"n-gram table; {_PLE_HOST_OFFLOAD_ENV}=0 keeps one device copy per rank"
+            )
+        self.checkpoint_dir = getattr(composite_config, "_name_or_path", None)
         _check_switches(self.one_rank)
         # CPU allocation behind the offloaded table; the `ple_table` parameter is a
         # device-address view that owns none of those pages.
@@ -1369,7 +1390,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         }
         # Reconcile the table height against the checkpoint's id-space tensors: an index past
         # the end is a device-side assert that poisons the process.
-        table_rows = w["ple_table"].shape[0]
+        # Rows of the whole table: under `server` storage `ple_table` holds only this rank's.
+        host = self._ple_table_host
+        table_rows = host.rows if host is not None else w["ple_table"].shape[0]
         used_rows = int(w["ple_offs"][-1]) + int(w["ple_vocab"][-1])
         assert used_rows <= table_rows, (
             f"the n-gram table has {table_rows} rows but its per-head offsets and vocabulary "
@@ -1591,23 +1614,24 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         output-identical, so the pointer's memory kind read back from the driver is the
         signal that cannot be faked."""
         table = self.w["ple_table"]
-        kind = _weights.memory_kind(table.data_ptr())
-        expected = (
-            _weights.CUDA_MEMORY_TYPE_HOST
-            if self.ple_host_offload
-            else _weights.CUDA_MEMORY_TYPE_DEVICE
-        )
-        assert kind == expected, (
-            f"the n-gram table was declared with {_PLE_HOST_OFFLOAD_ENV}="
-            f"{'1' if self.ple_host_offload else '0'}, but the driver reports cudaMemoryType "
-            f"{kind} for the pointer the forward gathers from"
-        )
+        host = self._ple_table_host
+        if host is not None:
+            assert host.resident_on_host(), (
+                f"the n-gram table ({host.describe()}) was declared in host memory, but the "
+                "driver reports device memory for the pointer the forward gathers from"
+            )
+        else:
+            kind = _weights.memory_kind(table.data_ptr())
+            assert kind == _weights.CUDA_MEMORY_TYPE_DEVICE, (
+                f"the n-gram table was declared with {_PLE_HOST_OFFLOAD_ENV}=0, but the driver "
+                f"reports cudaMemoryType {kind} for the pointer the forward gathers from"
+            )
         mib = 1024.0 * 1024.0
         free, total = torch.cuda.mem_get_info()
         print(
             f"ple n-gram table: {tuple(table.shape)} {table.dtype}, "
             f"{table.numel() * table.element_size() / mib:.1f} MiB, "
-            f"{'HOST-resident (device-addressable)' if self.ple_host_offload else 'DEVICE-resident'}"
+            f"{f'HOST-resident ({host.describe()})' if host is not None else 'DEVICE-resident'}"
             f"; after load: allocated {torch.cuda.memory_allocated() / mib:.1f} MiB, "
             f"driver-used {(total - free) / mib:.1f} MiB of {total / mib:.1f} MiB",
             flush=True,
@@ -4194,7 +4218,10 @@ class PrefillTarget:
             S.ple_offs,
             core.eos_token_id,
             num_tokens,
+            row_window=_ple_window(core),
         )
+        if _ple_needs_sum(core):
+            ngram = core.tp_sum(ngram)
         ple_gate_conv_inject_norm(
             hc[:num_tokens],
             cublas_mm(ngram, S.ple_key),
@@ -5878,7 +5905,10 @@ class DecodeTarget:
             S.ple_offs,
             core.eos_token_id,
             rows,
+            row_window=_ple_window(core),
         )
+        if _ple_needs_sum(core):
+            ngram = core.tp_sum(ngram)
         conv_input = torch.empty_like(hc) if stage else None
         out = ple_gate_conv_inject_norm(
             hc,

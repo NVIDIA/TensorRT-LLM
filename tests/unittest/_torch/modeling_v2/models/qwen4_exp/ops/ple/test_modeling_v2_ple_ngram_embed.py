@@ -242,3 +242,30 @@ def test_per_sequence_rows_compile_at_first_call() -> None:
     for flag in (True, False):
         counts = {seen[(flag, rows)] for rows in (1, 2, 3, 4)}
         assert len(counts) == 1, f"carry={not flag}: variants per row count {seen}"
+
+
+@pytest.mark.parametrize("world", (2, 4))
+@pytest.mark.parametrize("lengths", ((3, 1, 4), (300, 7)), ids=("per-sequence", "rows"))
+def test_row_windows_sum_to_the_whole_table(world, lengths) -> None:
+    """Each rank's `row_window` share matches the reference, from a slice of the table (its own
+    rows, `base = lo`) or from the whole table (`base = 0`); the shares sum to the whole output."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import ple_host_table
+
+    args = _build(dict(lengths=lengths, pool_slots=8), seed=31 + world)
+    table = args[5]
+    rows, cols = table.shape
+    whole = op(*([a.clone() if isinstance(a, torch.Tensor) else a for a in args]))
+    total = torch.zeros_like(whole, dtype=torch.float32)
+    for rank in range(world):
+        lo, hi = ple_host_table.owned_rows(rank, world, rows, cols, align=cols)
+        for view, base in ((table[lo:hi], lo), (table, 0)):
+            # Fresh arguments for each call: the op advances the context pool in place.
+            call, ref_call = (
+                [a.clone() if isinstance(a, torch.Tensor) else a for a in args] for _ in range(2)
+            )
+            call[5] = ref_call[5] = view
+            share = op(*call, row_window=(lo, hi, base))
+            ref, _ = op.reference(*ref_call, row_window=(lo, hi, base))
+            assert torch.equal(share, ref), (rank, base)
+        total += share.float()
+    assert torch.equal(total.to(whole.dtype), whole)
