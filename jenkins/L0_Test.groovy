@@ -7602,7 +7602,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext)
         }]]}
 
         // Add SBSA Slurm jobs

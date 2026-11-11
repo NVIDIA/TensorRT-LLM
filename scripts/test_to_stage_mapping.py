@@ -56,16 +56,16 @@ from typing import List
 
 import yaml
 
-# jenkins/scripts/cbts/blocks.py is a sibling script tree, not an installed
-# package -- add it to sys.path the same way jenkins/scripts/cbts/main.py
-# does for its own sibling imports.
+# The cbts package (jenkins/scripts/cbts/cbts/) is a sibling script tree, not
+# an installed package -- put its parent directory on sys.path.
 sys.path.insert(
     0,
     str(
         Path(__file__).resolve().parent.parent / 'jenkins' / 'scripts' /
         'cbts'))
-from blocks import block_matches_stage  # noqa: E402
-from blocks import Stage, YAMLIndex, derive_mako_from_stage, normalize_test_id
+from cbts.blocks import block_matches_stage  # noqa: E402
+from cbts.blocks import (Stage, YAMLIndex, derive_mako_from_stage,
+                         normalize_test_id)
 
 # Target wall-time per pytest-split shard, and a safety ceiling against a
 # corrupted/stale .test_durations blowing up shard counts.
