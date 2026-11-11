@@ -67,7 +67,7 @@ constexpr float kAmaxFloor = 1.0e-10f;
 // [kMaxClusters][8][2560] at 4096.
 constexpr unsigned long long kStride = 1024;
 constexpr size_t kWsPart = 4096;
-constexpr size_t kWsBytes = kWsPart + size_t(kMaxClusters) * kRows * kH * 4;
+constexpr size_t kWsBytes = kWsPart + static_cast<size_t>(kMaxClusters) * kRows * kH * 4;
 constexpr int kDefaultStages = 4; // as fast as five, and leaves ~40 KB of shared memory an SM to side-stream kernels
 
 struct alignas(16) Smem
@@ -102,17 +102,13 @@ template <bool kSh>
 using SmemT = std::conditional_t<kSh, SmemSh, Smem>;
 
 template <bool kSh>
-constexpr int kStaticBytes = (int(sizeof(SmemT<kSh>)) + 127) / 128 * 128;
+constexpr int kStaticBytes = (static_cast<int>(sizeof(SmemT<kSh>)) + 127) / 128 * 128;
 
 constexpr int kShMark = 1024;       // block-list entries >= this are shared-slice items (kShMark + item)
 constexpr int kShCols = 32;         // intermediate columns of a shared item
 constexpr int kShRowBytes = kH * 2; // one bf16 weight / activation row
 
 #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
-#define FP8_BLOCK_MOE_TPB_DEVICE 1
-#endif
-
-#ifdef FP8_BLOCK_MOE_TPB_DEVICE
 __device__ __forceinline__ uint32_t smemAddr(void const* p)
 {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -323,7 +319,7 @@ __device__ __forceinline__ float siluFast(float x)
 // Row t's top-10 logits (ties to the lower id) and their softmax rounded to bf16; lane l holds experts 16l..16l+15.
 __device__ __forceinline__ void routeRow(TpbParams const& p, int t, int lane, Smem& s)
 {
-    uint8_t const* row = static_cast<uint8_t const*>(p.logits) + size_t(t) * kE * 2 + lane * 32;
+    uint8_t const* row = static_cast<uint8_t const*>(p.logits) + static_cast<size_t>(t) * kE * 2 + lane * 32;
     uint4 r0 = ldcg128(row);
     uint4 r1 = ldcg128(row + 16);
     uint32_t words[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
@@ -333,7 +329,7 @@ __device__ __forceinline__ void routeRow(TpbParams const& p, int t, int lane, Sm
     {
         uint32_t b = (words[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
         uint32_t ord = (b & 0x8000u) ? (~b & 0xffffu) : (b | 0x8000u);
-        key[i] = (ord << 16) | uint32_t(kE - 1 - (lane * 16 + i));
+        key[i] = (ord << 16) | static_cast<uint32_t>(kE - 1 - (lane * 16 + i));
     }
     uint32_t mine = 0;
 #pragma unroll 1
@@ -362,7 +358,7 @@ __device__ __forceinline__ void routeRow(TpbParams const& p, int t, int lane, Sm
         uint32_t ord = mine >> 16;
         uint32_t b = (ord & 0x8000u) ? (ord & 0x7fffu) : (~ord & 0xffffu);
         v = __uint_as_float(b << 16);
-        s.topkId[t][lane] = kE - 1 - int(mine & 0xffffu);
+        s.topkId[t][lane] = kE - 1 - static_cast<int>(mine & 0xffffu);
     }
     float const mx = __shfl_sync(0xffffffffu, v, 0);
     float e = lane < kK ? expf(v - mx) : 0.f;
@@ -394,14 +390,14 @@ struct Ring
     }
 };
 
-#endif // FP8_BLOCK_MOE_TPB_DEVICE
+#endif // !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
 
 // CS: CTAs a cluster (4 or 8); kSh: also fold in this rank's shared-expert slice.
 template <int CS, bool kSh>
 __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
     TpbParams const p, int const numStages, int const xbufOffset, int const ringOffset, int const shXOffset)
 {
-#ifdef FP8_BLOCK_MOE_TPB_DEVICE
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
     static_assert(!kSh || CS == 4, "the shared-expert fold takes 4-CTA clusters");
     constexpr int kCs = CS;
     constexpr int kUpRows = 128 / kCs; // a CTA's up rows (and gate rows) of a block
@@ -418,7 +414,7 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
     int const G = gridDim.x;
     int const cta = blockIdx.x;
     int const nSlots = T * kK;
-    int const crank = int(clusterCtaRank());
+    int const crank = static_cast<int>(clusterCtaRank());
     int const cl = cta / kCs;
     int const NC = G / kCs;
 
@@ -435,8 +431,6 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
         mbarInit(&s.xbar[0], 1); // the local arrive.expect_tx; the peers' copies complete the bytes
         mbarInit(&s.xbar[1], 1);
         fenceBarrierInit();
-        // Read before arriving: the counter is a multiple of kStride plus fewer than all of this call's arrivals.
-        s.barTarget = (ldAcquireGpu64(counter) / kStride + 1) * kStride;
     }
     for (int i = threadIdx.x; i < kMaxSlots * kRows; i += kThreads)
     {
@@ -450,6 +444,12 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
     clusterSync();
 
     gridDepWait();
+    if (threadIdx.x == 0)
+    {
+        // Read past the wait, so the previous call's arrivals have all landed, and before arriving: the counter is a
+        // multiple of kStride plus fewer than all of this call's arrivals.
+        s.barTarget = (ldAcquireGpu64(counter) / kStride + 1) * kStride;
+    }
 
     for (int t = warp; t < T; t += kThreads / 32)
     {
@@ -492,7 +492,7 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
         int const bit = myExpert & 31;
         int const d = s.wordBase[wd] + __popc(s.bitmap[wd] & ((1u << bit) - 1u));
         s.expertOf[d] = myExpert;
-        s.slotOf[d][t] = int8_t(threadIdx.x);
+        s.slotOf[d][t] = static_cast<int8_t>(threadIdx.x);
     }
     __syncthreads();
     int const D = s.numDistinct;
@@ -508,16 +508,16 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
             {
                 int const e = s.expertOf[d];
                 int const b0 = (p.rank - e) & (kTpbRanks - 1);
-                s.blkJ[d] = uint16_t(e);
-                s.blkD[d] = uint8_t(d);
+                s.blkJ[d] = static_cast<uint16_t>(e);
+                s.blkD[d] = static_cast<uint8_t>(d);
                 extra = b0 == 0;
             }
             uint32_t const bal = __ballot_sync(0xffffffffu, extra);
             if (extra)
             {
                 int const pos = D + base + __popc(bal & ((1u << lane) - 1u));
-                s.blkJ[pos] = uint16_t(kE + (s.expertOf[d] >> 2));
-                s.blkD[pos] = uint8_t(d);
+                s.blkJ[pos] = static_cast<uint16_t>(kE + (s.expertOf[d] >> 2));
+                s.blkD[pos] = static_cast<uint8_t>(d);
             }
             base += __popc(bal);
         }
@@ -525,7 +525,7 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
         {
             if (lane < p.shBlocks)
             {
-                s.blkJ[D + base + lane] = uint16_t(kShMark + lane);
+                s.blkJ[D + base + lane] = static_cast<uint16_t>(kShMark + lane);
                 s.blkD[D + base + lane] = 0;
             }
         }
@@ -568,9 +568,10 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
                     {
                         uint8_t* dst = ring + rs.stage * kStageBytes;
                         mbarArriveExpectTx(&s.fullBar[rs.stage], kItemRowBytes);
-                        uint8_t const* src = q < 2
-                            ? static_cast<uint8_t const*>(p.shGu) + (size_t(sb) * 64 + crank * 16 + q * 8) * kShRowBytes
-                            : static_cast<uint8_t const*>(p.shDn) + (size_t(sb) * kH + crank * kFc2Rows) * kShCols * 2;
+                        uint8_t const* src = q < 2 ? static_cast<uint8_t const*>(p.shGu)
+                                + (static_cast<size_t>(sb) * 64 + crank * 16 + q * 8) * kShRowBytes
+                                                   : static_cast<uint8_t const*>(p.shDn)
+                                + (static_cast<size_t>(sb) * kH + crank * kFc2Rows) * kShCols * 2;
                         bulkG2S(dst, src, kItemRowBytes, &s.fullBar[rs.stage]);
                     }
                     __syncwarp();
@@ -589,16 +590,17 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
                     mbarArriveExpectTx(&s.fullBar[rs.stage], kItemRowBytes + kKb * 4);
                     if (kind < 2)
                     {
-                        size_t const row = size_t(j) * kBlkRows + kind * 128 + crank * kUpRows + u * 16;
+                        size_t const row = static_cast<size_t>(j) * kBlkRows + kind * 128 + crank * kUpRows + u * 16;
                         bulkG2S(dst, p.w1 + row * kH, kItemRowBytes, &s.fullBar[rs.stage]);
-                        bulkG2S(
-                            dst + kItemRowBytes, p.s1 + (size_t(j) * 2 + kind) * kKb, kKb * 4, &s.fullBar[rs.stage]);
+                        bulkG2S(dst + kItemRowBytes, p.s1 + (static_cast<size_t>(j) * 2 + kind) * kKb, kKb * 4,
+                            &s.fullBar[rs.stage]);
                     }
                     else
                     {
-                        size_t const row = size_t(j) * kH + crank * kFc2Rows + u * kItemFc2Rows;
+                        size_t const row = static_cast<size_t>(j) * kH + crank * kFc2Rows + u * kItemFc2Rows;
                         bulkG2S(dst, p.w2 + row * 128, kItemRowBytes, &s.fullBar[rs.stage]);
-                        bulkG2S(dst + kItemRowBytes, p.s2 + size_t(j) * kKb, kKb * 4, &s.fullBar[rs.stage]);
+                        bulkG2S(
+                            dst + kItemRowBytes, p.s2 + static_cast<size_t>(j) * kKb, kKb * 4, &s.fullBar[rs.stage]);
                     }
                 }
                 __syncwarp();
@@ -659,6 +661,8 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
                 {
                     bulkWaitRead<2 * kNh>();
                 }
+                // Only the issuing lanes waited; the whole warp overwrites the slots below.
+                __syncwarp();
             }
             float* stg = &s.stage[n & 1][q][0][0];
             if (t0 < T)
@@ -675,9 +679,10 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
             __syncwarp();
             if (lane < kCs)
             {
-                uint32_t const off = uint32_t((n & 1) * T * kBlkRows + ((crank * nq + q) * T) * 16) * 4u;
-                bulkS2Cluster(mapaShared(xbase + off, uint32_t(lane)), stg, uint32_t(T * 16 * 4),
-                    mapaShared(xbarBase + uint32_t(n & 1) * 8u, uint32_t(lane)));
+                uint32_t const off = static_cast<uint32_t>((n & 1) * T * kBlkRows + ((crank * nq + q) * T) * 16) * 4u;
+                bulkS2Cluster(mapaShared(xbase + off, static_cast<uint32_t>(lane)), stg,
+                    static_cast<uint32_t>(T * 16 * 4),
+                    mapaShared(xbarBase + static_cast<uint32_t>(n & 1) * 8u, static_cast<uint32_t>(lane)));
             }
             if (lane < kCs)
             {
@@ -702,7 +707,7 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
             for (int m = 0; m < 2; ++m)
             {
                 int const kpos = kb * 128 + m * 64 + tig * 16;
-                bx[q][m] = g < T ? ldcg128(p.xq + size_t(g) * kH + kpos) : make_uint4(0, 0, 0, 0);
+                bx[q][m] = g < T ? ldcg128(p.xq + static_cast<size_t>(g) * kH + kpos) : make_uint4(0, 0, 0, 0);
             }
             xs[q][0] = 2 * tig < T ? __ldcg(p.xsf + kb * p.xsfStride + 2 * tig) : 0.f;
             xs[q][1] = 2 * tig + 1 < T ? __ldcg(p.xsf + kb * p.xsfStride + 2 * tig + 1) : 0.f;
@@ -727,7 +732,8 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
                     float acc = 0.f;
                     for (int c = lane; c < kH / 8; c += 32)
                     {
-                        uint4 const xv = ldcg128(static_cast<uint8_t const*>(p.shX) + size_t(t) * kShRowBytes + c * 16);
+                        uint4 const xv = ldcg128(
+                            static_cast<uint8_t const*>(p.shX) + static_cast<size_t>(t) * kShRowBytes + c * 16);
                         uint4 const wv = ldcg128(static_cast<uint8_t const*>(p.shGl) + c * 16);
                         __nv_bfloat162 const* xa = reinterpret_cast<__nv_bfloat162 const*>(&xv);
                         __nv_bfloat162 const* wa = reinterpret_cast<__nv_bfloat162 const*>(&wv);
@@ -813,7 +819,7 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
                     }
                     if (warp == 0 && lane == 0)
                     {
-                        mbarArriveExpectTx(&s.xbar[pb], uint32_t(kCs * 2 * T * 16 * 4));
+                        mbarArriveExpectTx(&s.xbar[pb], static_cast<uint32_t>(kCs * 2 * T * 16 * 4));
                     }
                     mbarWaitCluster(&s.xbar[pb], (xphase >> pb) & 1u);
                     xphase ^= 1u << pb;
@@ -912,7 +918,7 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
 
             if (warp == 0 && lane == 0)
             {
-                mbarArriveExpectTx(&s.xbar[pb], uint32_t(kCs * 2 * kNh * T * 16 * 4));
+                mbarArriveExpectTx(&s.xbar[pb], static_cast<uint32_t>(kCs * 2 * kNh * T * 16 * 4));
             }
             mbarWaitCluster(&s.xbar[pb], (xphase >> pb) & 1u);
             xphase ^= 1u << pb;
@@ -1035,7 +1041,7 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
                 for (int mi = 0; mi < kMtPerWarp; ++mi)
                 {
                     int const row = crank * kFc2Rows + u * kItemFc2Rows + (warp + kConsumerWarps * mi) * 16 + g;
-                    float* pp = part + size_t(cl) * kRows * kH + row;
+                    float* pp = part + static_cast<size_t>(cl) * kRows * kH + row;
                     if (t0 < T)
                     {
                         __stcg(pp + t0 * kH, out[u][mi][0]);
@@ -1058,7 +1064,7 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
     {
         // Every CTA arrives, inactive ones too, so past the wait every CTA is past its prologue.
         fenceAcqRelGpu();
-        redAddRelease64(counter, cta == 0 ? kStride - (unsigned long long) (G - 1) : 1ull);
+        redAddRelease64(counter, cta == 0 ? kStride - static_cast<unsigned long long>(G - 1) : 1ull);
         unsigned long long const target = s.barTarget;
         while (ldAcquireGpu64(counter) < target)
         {
@@ -1067,8 +1073,8 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
     __syncthreads();
     {
         int const nUnits = T * (kH / 4);
-        int const u0 = int((long long) cta * nUnits / G);
-        int const u1 = int((long long) (cta + 1) * nUnits / G);
+        int const u0 = static_cast<int>(static_cast<long long>(cta) * nUnits / G);
+        int const u1 = static_cast<int>(static_cast<long long>(cta + 1) * nUnits / G);
         int const grp = threadIdx.x >> 4;
         int const q = threadIdx.x & 15;
         constexpr int kGroups = kThreads / 16;
@@ -1079,13 +1085,13 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
             bool const live = u < u1;
             int const t = live ? u / (kH / 4) : 0;
             int const row = live ? (u % (kH / 4)) * 4 : 0;
-            float const* src = part + size_t(t) * kH + row;
+            float const* src = part + static_cast<size_t>(t) * kH + row;
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
             if (live)
             {
                 for (int k = q; k < NCa; k += 16)
                 {
-                    float4 const x = __ldcg(reinterpret_cast<float4 const*>(src + size_t(k) * kRows * kH));
+                    float4 const x = __ldcg(reinterpret_cast<float4 const*>(src + static_cast<size_t>(k) * kRows * kH));
                     v.x += x.x;
                     v.y += x.y;
                     v.z += x.z;
@@ -1107,11 +1113,11 @@ __global__ void __launch_bounds__(kThreads, 1) fp8BlockMoeTpbKernel(
                 uint2 pk;
                 pk.x = *reinterpret_cast<uint32_t const*>(&lo);
                 pk.y = *reinterpret_cast<uint32_t const*>(&hi);
-                *reinterpret_cast<uint2*>(o + size_t(t) * kH + row) = pk;
+                *reinterpret_cast<uint2*>(o + static_cast<size_t>(t) * kH + row) = pk;
             }
         }
     }
-#endif // FP8_BLOCK_MOE_TPB_DEVICE
+#endif // !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
 }
 
 int smemOptinTpb(int device)
@@ -1141,7 +1147,7 @@ int activeClustersT(int device)
     cudaLaunchConfig_t cfg{};
     cfg.gridDim = dim3(CS * kMaxClusters);
     cfg.blockDim = dim3(kThreads);
-    cfg.dynamicSmemBytes = size_t(maxSmemBytes);
+    cfg.dynamicSmemBytes = static_cast<size_t>(maxSmemBytes);
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeClusterDimension;
     attr[0].val.clusterDim.x = CS;
@@ -1186,7 +1192,7 @@ void launchTpbT(TpbParams const& params, bool pdl, cudaStream_t stream)
     {
         throw std::invalid_argument("fp8_block_moe_tpb: three ring stages do not fit in shared memory");
     }
-    size_t const smem = size_t(ringOffset) + size_t(stages) * kStageBytes;
+    size_t const smem = static_cast<size_t>(ringOffset) + static_cast<size_t>(stages) * kStageBytes;
     cudaLaunchConfig_t cfg{};
     cfg.gridDim = dim3(clusters * CS);
     cfg.blockDim = dim3(kThreads);

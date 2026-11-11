@@ -50,7 +50,7 @@ using ::tensorrt_llm::kernels::ar_fusion::ld_global_volatile;
 } // namespace hc_inject
 
 // Thread t holds columns [8t, 8t + 8) of a row's block output and of each of its 4 streams. The Triton program runs a
-// stream on G = 32 * program_warps threads over a 4096-wide block, its thread u in chunk c holding this CTA's thread
+// stream on G = 32 * programWarps threads over a 4096-wide block, its thread u in chunk c holding this CTA's thread
 // c * G + u. Its sum of squares, reproduced bitwise: per thread and chunk the fp32 pair (fma(x0, x0, x2 * x2) +
 // fma(x4, x4, x6 * x6), fma(x1, x1, x3 * x3) + fma(x5, x5, x7 * x7)), a pairwise tree over chunks (masked ones are
 // zero), low + high, the warp's xor butterfly 16..1, then ((w0 + w2) + (w1 + w3)) at 4 warps or (w0 + w1) at 2.
@@ -60,36 +60,36 @@ static constexpr int kHidden = 2560;
 static constexpr int kStreams = 4;
 static constexpr int kThreads = kHidden / 8;
 
-__device__ __forceinline__ float bf16_lo(uint32_t w)
+__device__ __forceinline__ float bf16Lo(uint32_t w)
 {
     return __uint_as_float(w << 16);
 }
 
-__device__ __forceinline__ float bf16_hi(uint32_t w)
+__device__ __forceinline__ float bf16Hi(uint32_t w)
 {
     return __uint_as_float(w & 0xFFFF0000u);
 }
 
-__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi)
+__device__ __forceinline__ uint32_t packBf16x2(float lo, float hi)
 {
     uint32_t r;
     asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
     return r;
 }
 
-__device__ __forceinline__ float round_bf16(float x)
+__device__ __forceinline__ float roundBf16(float x)
 {
-    return bf16_lo(pack_bf16x2(x, 0.f));
+    return bf16Lo(packBf16x2(x, 0.f));
 }
 
-__device__ __forceinline__ float ld_bf16(void const* base, int64_t elem)
+__device__ __forceinline__ float ldBf16(void const* base, int64_t elem)
 {
     uint16_t v = reinterpret_cast<uint16_t const*>(base)[elem];
     return __uint_as_float(static_cast<uint32_t>(v) << 16);
 }
 
 //! `tl.sigmoid` as the Triton kernel compiles it.
-__device__ __forceinline__ float sigmoid_triton(float x)
+__device__ __forceinline__ float sigmoidTriton(float x)
 {
     float y;
     asm("{ .reg .f32 t; mul.f32 t, %1, 0fBFB8AA3B; ex2.approx.f32 t, t; add.f32 t, t, 0f3F800000; "
@@ -100,7 +100,7 @@ __device__ __forceinline__ float sigmoid_triton(float x)
 }
 
 //! `rsqrt(ss / 2560 + eps)` as the Triton kernel compiles it (`div.full`, `add`, `rsqrt.approx.ftz`).
-__device__ __forceinline__ float rstd_triton(float ss, float eps)
+__device__ __forceinline__ float rstdTriton(float ss, float eps)
 {
     float y;
     asm("{ .reg .f32 t; div.full.f32 t, %1, 0f45200000; add.f32 t, t, %2; rsqrt.approx.ftz.f32 %0, t; }"
@@ -116,7 +116,7 @@ __device__ __forceinline__ float2 add2(float2 a, float2 b)
 
 //! A program thread's sum of squares: the pairwise tree over its unmasked chunk pairs, then low + high.
 template <int G>
-__device__ __forceinline__ float thread_ssq(float2 const* leaves, int u)
+__device__ __forceinline__ float threadSsq(float2 const* leaves, int u)
 {
     if constexpr (G == 128)
     {
@@ -149,12 +149,12 @@ struct HcVariant
 
 template <int NRanks, int G, bool HasShared, bool TriggerCompletionAtEnd, int Var>
 __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
-    hc_allreduce_inject_norm_kernel(HcInjectNormParams params)
+    hcAllreduceInjectNormKernel(HcInjectNormParams params)
 {
     static_assert(kHidden % (8 * G) == 0 || G == 128, "the chunk layout above");
-    __shared__ float2 s_leaf[kStreams][kThreads];
-    __shared__ float s_red[kStreams][G / 32];
-    __shared__ uint4 s_w[kStreams][kThreads];
+    __shared__ float2 sLeaf[kStreams][kThreads];
+    __shared__ float sRed[kStreams][G / 32];
+    __shared__ uint4 sW[kStreams][kThreads];
     int const tid = threadIdx.x;
     int const lane = tid & 31;
 
@@ -162,7 +162,7 @@ __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
 #pragma unroll
     for (int s = 0; s < kStreams; ++s)
     {
-        s_w[s][tid] = reinterpret_cast<uint4 const*>(params.norm_weight)[s * kThreads + tid];
+        sW[s][tid] = reinterpret_cast<uint4 const*>(params.normWeight)[s * kThreads + tid];
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -174,8 +174,8 @@ __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
 #endif
     LamportComm<NRanks> comm(params.workspace, params.rank);
     int const rows = params.rows;
-    int const tot_access = rows * kThreads;
-    int const clear_access = static_cast<int>((comm.clear_size + sizeof(float4) - 1) / sizeof(float4));
+    int const totAccess = rows * kThreads;
+    int const clearAccess = static_cast<int>((comm.clear_size + sizeof(float4) - 1) / sizeof(float4));
 
     // Push this rank's partial rows, -0.0f stored as +0.0f.
     for (int row = blockIdx.x; row < rows; row += gridDim.x)
@@ -195,14 +195,14 @@ __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
 #pragma unroll
         for (int r = 0; r < NRanks; ++r)
         {
-            reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * tot_access + idx]
+            reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * totAccess + idx]
                 = *reinterpret_cast<float4*>(val);
         }
     }
-    float4 const clear_vec = get_neg_zero();
-    for (int idx = blockIdx.x * kThreads + tid; idx < clear_access; idx += gridDim.x * kThreads)
+    float4 const clearVec = get_neg_zero();
+    for (int idx = blockIdx.x * kThreads + tid; idx < clearAccess; idx += gridDim.x * kThreads)
     {
-        reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
+        reinterpret_cast<float4*>(comm.clear_buf)[idx] = clearVec;
     }
 
     for (int row = blockIdx.x; row < rows; row += gridDim.x)
@@ -211,20 +211,20 @@ __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
         // The site's operands (issued before the poll, consumed after it).
         uint4 hcw[kStreams];
         float inj[kStreams];
-        auto const* hc_row = reinterpret_cast<uint8_t const*>(params.hc) + row * params.hc_stride * 2;
+        auto const* hcRow = reinterpret_cast<uint8_t const*>(params.hc) + row * params.hcStride * 2;
 #pragma unroll
         for (int s = 0; s < kStreams; ++s)
         {
-            hcw[s] = reinterpret_cast<uint4 const*>(hc_row + s * kHidden * 2)[tid];
-            inj[s] = ld_bf16(params.inject, row * params.inject_stride + s);
+            hcw[s] = reinterpret_cast<uint4 const*>(hcRow + s * kHidden * 2)[tid];
+            inj[s] = ldBf16(params.inject, row * params.injectStride + s);
         }
         [[maybe_unused]] uint4 shw = make_uint4(0, 0, 0, 0);
         [[maybe_unused]] float gate = 0.f;
         if constexpr (HasShared)
         {
             shw = reinterpret_cast<uint4 const*>(
-                reinterpret_cast<uint8_t const*>(params.shared) + row * params.shared_stride * 2)[tid];
-            gate = ld_bf16(params.gate, row * params.gate_stride);
+                reinterpret_cast<uint8_t const*>(params.shared) + row * params.sharedStride * 2)[tid];
+            gate = ldBf16(params.gate, row * params.gateStride);
         }
 
         float4 vals[NRanks];
@@ -236,7 +236,7 @@ __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
             for (int r = 0; r < NRanks; ++r)
             {
                 vals[r]
-                    = ld_global_volatile(&reinterpret_cast<float4*>(comm.data_bufs[params.rank])[r * tot_access + idx]);
+                    = ld_global_volatile(&reinterpret_cast<float4*>(comm.data_bufs[params.rank])[r * totAccess + idx]);
                 done &= !is_neg_zero(vals[r]);
             }
         }
@@ -251,17 +251,17 @@ __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
             {
                 acc += static_cast<float>(reinterpret_cast<__nv_bfloat16 const*>(&vals[r])[i]);
             }
-            b[i] = round_bf16(acc);
+            b[i] = roundBf16(acc);
         }
         if constexpr (HasShared)
         {
-            float const sg = sigmoid_triton(gate);
+            float const sg = sigmoidTriton(gate);
             uint32_t const* sw = reinterpret_cast<uint32_t const*>(&shw);
 #pragma unroll
             for (int p = 0; p < 4; ++p)
             {
-                b[2 * p] = round_bf16(__fmaf_rn(sg, bf16_lo(sw[p]), b[2 * p]));
-                b[2 * p + 1] = round_bf16(__fmaf_rn(sg, bf16_hi(sw[p]), b[2 * p + 1]));
+                b[2 * p] = roundBf16(__fmaf_rn(sg, bf16Lo(sw[p]), b[2 * p]));
+                b[2 * p + 1] = roundBf16(__fmaf_rn(sg, bf16Hi(sw[p]), b[2 * p + 1]));
             }
         }
         // Injection (rounded once, stored) and the per-thread sum-of-squares pairs.
@@ -274,19 +274,19 @@ __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
 #pragma unroll
             for (int p = 0; p < 4; ++p)
             {
-                ow[s][p] = pack_bf16x2(
-                    __fmaf_rn(inj[s], b[2 * p], bf16_lo(xw[p])), __fmaf_rn(inj[s], b[2 * p + 1], bf16_hi(xw[p])));
-                e[2 * p] = bf16_lo(ow[s][p]);
-                e[2 * p + 1] = bf16_hi(ow[s][p]);
+                ow[s][p] = packBf16x2(
+                    __fmaf_rn(inj[s], b[2 * p], bf16Lo(xw[p])), __fmaf_rn(inj[s], b[2 * p + 1], bf16Hi(xw[p])));
+                e[2 * p] = bf16Lo(ow[s][p]);
+                e[2 * p + 1] = bf16Hi(ow[s][p]);
             }
             reinterpret_cast<uint4*>(
-                reinterpret_cast<uint8_t*>(params.hc_out) + (row * params.hc_out_stride + s * kHidden) * 2)[tid]
+                reinterpret_cast<uint8_t*>(params.hcOut) + (row * params.hcOutStride + s * kHidden) * 2)[tid]
                 = make_uint4(ow[s][0], ow[s][1], ow[s][2], ow[s][3]);
             float const lo
                 = __fadd_rn(__fmaf_rn(e[0], e[0], __fmul_rn(e[2], e[2])), __fmaf_rn(e[4], e[4], __fmul_rn(e[6], e[6])));
             float const hi
                 = __fadd_rn(__fmaf_rn(e[1], e[1], __fmul_rn(e[3], e[3])), __fmaf_rn(e[5], e[5], __fmul_rn(e[7], e[7])));
-            s_leaf[s][tid] = make_float2(lo, hi);
+            sLeaf[s][tid] = make_float2(lo, hi);
         }
         __syncthreads();
         if (tid < G)
@@ -295,7 +295,7 @@ __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
 #pragma unroll
             for (int s = 0; s < kStreams; ++s)
             {
-                v[s] = thread_ssq<G>(s_leaf[s], tid);
+                v[s] = threadSsq<G>(sLeaf[s], tid);
             }
 #pragma unroll
             for (int off = 16; off >= 1; off >>= 1)
@@ -311,7 +311,7 @@ __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
 #pragma unroll
                 for (int s = 0; s < kStreams; ++s)
                 {
-                    s_red[s][tid / 32] = v[s];
+                    sRed[s][tid / 32] = v[s];
                 }
             }
         }
@@ -322,25 +322,25 @@ __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
             float tot;
             if constexpr (G == 128)
             {
-                tot = __fadd_rn(__fadd_rn(s_red[s][0], s_red[s][2]), __fadd_rn(s_red[s][1], s_red[s][3]));
+                tot = __fadd_rn(__fadd_rn(sRed[s][0], sRed[s][2]), __fadd_rn(sRed[s][1], sRed[s][3]));
             }
             else
             {
-                tot = __fadd_rn(s_red[s][0], s_red[s][1]);
+                tot = __fadd_rn(sRed[s][0], sRed[s][1]);
             }
-            float const rstd = rstd_triton(tot, params.eps);
-            uint4 const wq = s_w[s][tid];
+            float const rstd = rstdTriton(tot, params.eps);
+            uint4 const wq = sW[s][tid];
             uint32_t const* ww = reinterpret_cast<uint32_t const*>(&wq);
             uint32_t nw[4];
 #pragma unroll
             for (int p = 0; p < 4; ++p)
             {
-                float const ylo = __fmul_rn(__fmul_rn(bf16_lo(ow[s][p]), rstd), __fadd_rn(1.f, bf16_lo(ww[p])));
-                float const yhi = __fmul_rn(__fmul_rn(bf16_hi(ow[s][p]), rstd), __fadd_rn(1.f, bf16_hi(ww[p])));
-                nw[p] = pack_bf16x2(ylo, yhi);
+                float const ylo = __fmul_rn(__fmul_rn(bf16Lo(ow[s][p]), rstd), __fadd_rn(1.f, bf16Lo(ww[p])));
+                float const yhi = __fmul_rn(__fmul_rn(bf16Hi(ow[s][p]), rstd), __fadd_rn(1.f, bf16Hi(ww[p])));
+                nw[p] = packBf16x2(ylo, yhi);
             }
             reinterpret_cast<uint4*>(
-                reinterpret_cast<uint8_t*>(params.normed) + (row * params.normed_stride + s * kHidden) * 2)[tid]
+                reinterpret_cast<uint8_t*>(params.normed) + (row * params.normedStride + s * kHidden) * 2)[tid]
                 = make_uint4(nw[0], nw[1], nw[2], nw[3]);
         }
     }
@@ -356,26 +356,26 @@ __global__ void __launch_bounds__(kThreads, HcVariant<Var>::kMinBlocks)
 }
 
 template <int NRanks, int G, bool HasShared, bool TriggerCompletionAtEnd, int Var>
-int max_grid()
+int maxGrid()
 {
     static int const grid = []()
     {
-        int per_sm = 0;
+        int perSm = 0;
         TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, hc_allreduce_inject_norm_kernel<NRanks, G, HasShared, TriggerCompletionAtEnd, Var>, kThreads, 0));
-        return std::max(1, per_sm) * get_sm_count();
+            &perSm, hcAllreduceInjectNormKernel<NRanks, G, HasShared, TriggerCompletionAtEnd, Var>, kThreads, 0));
+        return std::max(1, perSm) * get_sm_count();
     }();
     return grid;
 }
 
 template <int NRanks, int G, bool HasShared, bool TriggerCompletionAtEnd, int Var>
-void launch_var(HcInjectNormParams const& params)
+void launchVar(HcInjectNormParams const& params)
 {
-    auto kernel = hc_allreduce_inject_norm_kernel<NRanks, G, HasShared, TriggerCompletionAtEnd, Var>;
-    int const max_grid = hc_inject::max_grid<NRanks, G, HasShared, TriggerCompletionAtEnd, Var>();
+    auto kernel = hcAllreduceInjectNormKernel<NRanks, G, HasShared, TriggerCompletionAtEnd, Var>;
+    int const maxGrid = hc_inject::maxGrid<NRanks, G, HasShared, TriggerCompletionAtEnd, Var>();
     cudaLaunchConfig_t cfg;
     cudaLaunchAttribute attribute[1];
-    cfg.gridDim = std::min(params.rows, max_grid);
+    cfg.gridDim = std::min(params.rows, maxGrid);
     cfg.blockDim = kThreads;
     cfg.dynamicSmemBytes = 0;
     cfg.stream = params.stream;
@@ -389,23 +389,23 @@ void launch_var(HcInjectNormParams const& params)
 template <int NRanks, int G, bool HasShared, bool TriggerCompletionAtEnd>
 void launch(HcInjectNormParams const& params)
 {
-    int const g3 = hc_inject::max_grid<NRanks, G, HasShared, TriggerCompletionAtEnd, 3>();
-    int const g2 = hc_inject::max_grid<NRanks, G, HasShared, TriggerCompletionAtEnd, 2>();
+    int const g3 = hc_inject::maxGrid<NRanks, G, HasShared, TriggerCompletionAtEnd, 3>();
+    int const g2 = hc_inject::maxGrid<NRanks, G, HasShared, TriggerCompletionAtEnd, 2>();
     if (params.rows > g3 && params.rows <= g2)
     {
-        launch_var<NRanks, G, HasShared, TriggerCompletionAtEnd, 2>(params);
+        launchVar<NRanks, G, HasShared, TriggerCompletionAtEnd, 2>(params);
     }
     else
     {
-        launch_var<NRanks, G, HasShared, TriggerCompletionAtEnd, 3>(params);
+        launchVar<NRanks, G, HasShared, TriggerCompletionAtEnd, 3>(params);
     }
 }
 
 template <int NRanks, int G>
-void dispatch_flags(HcInjectNormParams const& params)
+void dispatchFlags(HcInjectNormParams const& params)
 {
     bool const shared = params.shared != nullptr;
-    if (shared && params.trigger_completion_at_end)
+    if (shared && params.triggerCompletionAtEnd)
     {
         launch<NRanks, G, true, true>(params);
     }
@@ -413,7 +413,7 @@ void dispatch_flags(HcInjectNormParams const& params)
     {
         launch<NRanks, G, true, false>(params);
     }
-    else if (params.trigger_completion_at_end)
+    else if (params.triggerCompletionAtEnd)
     {
         launch<NRanks, G, false, true>(params);
     }
@@ -424,25 +424,23 @@ void dispatch_flags(HcInjectNormParams const& params)
 }
 } // namespace hc_inject
 
-void hc_allreduce_inject_norm_op(HcInjectNormParams const& params)
+void launchHcAllreduceInjectNorm(HcInjectNormParams const& params)
 {
-    TLLM_CHECK_WITH_INFO(params.hidden_dim == hc_inject::kHidden && params.hc_count == hc_inject::kStreams,
+    TLLM_CHECK_WITH_INFO(params.hiddenDim == hc_inject::kHidden && params.hcCount == hc_inject::kStreams,
         "hc_allreduce_inject_norm: hidden 2560 and 4 streams only");
     TLLM_CHECK_WITH_INFO(params.rows > 0, "hc_allreduce_inject_norm: no rows");
-    TLLM_CHECK_WITH_INFO(params.program_warps == 4 || params.program_warps == 2,
+    TLLM_CHECK_WITH_INFO(params.programWarps == 4 || params.programWarps == 2,
         "hc_allreduce_inject_norm: the Triton program's warps must be 4 or 2");
     TLLM_CHECK_WITH_INFO((params.shared == nullptr) == (params.gate == nullptr),
         "hc_allreduce_inject_norm: shared and gate come together");
     TLLM_CHECK_WITH_INFO(params.partial != nullptr, "hc_allreduce_inject_norm: no partial");
     if (params.nranks == 2)
     {
-        params.program_warps == 4 ? hc_inject::dispatch_flags<2, 128>(params)
-                                  : hc_inject::dispatch_flags<2, 64>(params);
+        params.programWarps == 4 ? hc_inject::dispatchFlags<2, 128>(params) : hc_inject::dispatchFlags<2, 64>(params);
     }
     else if (params.nranks == 4)
     {
-        params.program_warps == 4 ? hc_inject::dispatch_flags<4, 128>(params)
-                                  : hc_inject::dispatch_flags<4, 64>(params);
+        params.programWarps == 4 ? hc_inject::dispatchFlags<4, 128>(params) : hc_inject::dispatchFlags<4, 64>(params);
     }
     else
     {

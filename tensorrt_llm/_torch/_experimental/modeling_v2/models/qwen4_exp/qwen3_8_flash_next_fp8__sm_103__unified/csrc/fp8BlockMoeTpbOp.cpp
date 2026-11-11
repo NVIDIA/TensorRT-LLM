@@ -84,6 +84,10 @@ at::Tensor fp8BlockMoeTpb(at::Tensor const& logits, at::Tensor const& xq, at::Te
     {
         checkAligned(*t, "operand");
     }
+    for (at::Tensor const* t : std::initializer_list<at::Tensor const*>{&xq, &xsf, &w1, &s1, &w2, &s2, &workspace})
+    {
+        TORCH_CHECK(t->device() == logits.device(), "every operand must be on the logits' CUDA device");
+    }
     c10::cuda::CUDAGuard const guard(logits.device());
     int const device = logits.get_device();
     auto out = at::empty({rows, kd::kHidden}, logits.options());
@@ -116,6 +120,7 @@ at::Tensor fp8BlockMoeTpb(at::Tensor const& logits, at::Tensor const& xq, at::Te
         for (at::Tensor const* t : std::initializer_list<at::Tensor const*>{&*shX, &*shGu, &*shGl, &*shDn})
         {
             checkAligned(*t, "shared operand");
+            TORCH_CHECK(t->device() == logits.device(), "every shared operand must be on the logits' CUDA device");
         }
         p.shX = shX->data_ptr();
         p.shGu = shGu->data_ptr();
