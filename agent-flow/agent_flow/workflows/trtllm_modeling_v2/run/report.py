@@ -459,10 +459,11 @@ def write_report(workflow, pipeline) -> Path:
         f"- repository: `{repo}` at `{w._head() or '(no commit)'}`",
     ]
     if record:
-        now = contract_mod.library_digest(repo)
-        kept = f": the accepted ones are in `{w.workspace / LIBRARIES_DIRNAME}`"
+        now, kept = contract_mod.library_digest(repo), w.workspace / LIBRARIES_DIRNAME
         same = now == record["libraries"]
-        said = "are the onboarded ones" if same else f"({now}) are not the onboarded ones{kept}"
+        said = "are the onboarded ones" if same else f"({now}) are not the onboarded ones"
+        if not same and kept.is_dir():
+            said += f": the accepted ones are in `{kept}`"
         lines.append(f"- native libraries: the head's {said} ({record['libraries']})")
     for t in pipeline.tasks:
         if t.lib_end and t.lib_end != t.lib_start and t.status != pipeline.DONE:

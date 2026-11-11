@@ -250,6 +250,30 @@ def test_a_kernel_row_that_is_not_done_is_skipped_and_the_run_goes_on(
     assert "k1-rms" not in report.split("## Not done")[1].split("##")[0]
 
 
+def test_a_task_that_changed_the_libraries_without_landing_is_named_in_the_report(
+    tmp_path, task_file, repo, monkeypatch
+):
+    def kv(attempt, prompt):
+        if attempt == 1:
+            (repo / "tensorrt_llm" / "libtensorrt_llm.so").write_bytes(b"rebuilt for kv")
+        return BLOCKED
+
+    script = Script(assembler=_by_task({"kv_fp8": kv}))
+    calls = _run(tmp_path, _spec(task_file, KV_FP8, TEP2), monkeypatch, script, max_attempts=2)
+    stands = {t["id"]: t for t in _tasks(tmp_path)}
+    # The hashes are the task's first start and its last end: a later attempt that built
+    # nothing does not hide what the first one did.
+    assert stands["kv_fp8"]["lib_start"] == stands["core"]["lib_end"]
+    assert stands["kv_fp8"]["lib_end"] != stands["kv_fp8"]["lib_start"]
+    report = _report(tmp_path)
+    assert "- native libraries were changed by `kv_fp8`, which did not land" in report
+    # What the head holds now is not what was onboarded; nothing was kept to point at.
+    onboarded = _state(tmp_path).onboarded["libraries"]
+    assert f"are not the onboarded ones ({onboarded})" in report
+    assert "the accepted ones are in" not in report
+    assert "libraries were changed by" not in _prompts(calls, "kv_fp8")[0]
+
+
 def test_a_kernel_row_runs_after_the_rows_it_depends_on_in_the_first_unit_that_needs_it():
     queue = (
         QueueItem(1, "onboard", "ops/a/one", depends_on=(3,)),  # on a later row
@@ -400,7 +424,13 @@ def test_what_preflight_left_out_gets_no_task_and_a_base_with_no_score_gives_no_
     kv = {**KV_FP8, "relative_to": "mid"}
     # Scored on a benchmark nothing anchors: preflight leaves that one check out.
     unanchored = {"name": "mmlu", "reference_yaml": "refs/none.yaml"}
-    wide = {"name": "wide", "options": {}, "benchmarks": [{"name": "gsm8k"}, unanchored]}
+    (tmp_path / "engines").mkdir()
+    (tmp_path / "engines" / "wide.yaml").write_text("max_batch_size: 4\n")
+    wide = {
+        "name": "wide",
+        "options": "engines/wide.yaml",
+        "benchmarks": [{"name": "gsm8k"}, unanchored],
+    }
     task = _spec(task_file, mid, kv, TEP2, wide)
     shell = _checks()
     script = Script(assembler=_by_task({"mid": BLOCKED}))
@@ -424,6 +454,9 @@ def test_what_preflight_left_out_gets_no_task_and_a_base_with_no_score_gives_no_
     ]
     assert "| `wide` | `accuracy[gsm8k]` |" in report and "`accuracy[mmlu]` |" not in report
     assert "`wide:accuracy[mmlu]`" not in _prompts(calls, "wide")[0]
+    # Each deployment's dispatch names its options: a file, or where the spec states them.
+    assert f"Its options: `{tmp_path}/engines/wide.yaml`." in _prompts(calls, "wide")[0]
+    assert "Its options: `deployments.kv_fp8` in the spec." in _prompts(calls, "kv_fp8")[0]
     assert "| `kv_fp8` | `accuracy[gsm8k]` | 90 | relative (the score of `mid`) | no verdict |" in (
         report
     )
@@ -1077,6 +1110,7 @@ def test_on_a_real_checkout_core_lands_only_the_commit_the_onboard_check_passed(
     assert labels == {("core", "target"), ("kv_fp8", "shared")}
     outside = report.split("## Changed outside the target")[1].split("##")[0]
     assert "shared (`kv_fp8`): kv: shared code: shared.py" in outside
+    assert "core: three" not in outside and outside.count("\n- ") == 1
     stands = {t["id"]: t for t in _tasks(tmp_path)}
     assert stands["tep2"]["status"] == "not done" and not stands["tep2"]["commit"]
     assert "tensorrt_llm/evaluate/lm_eval.py is a judge path" in stands["tep2"]["note"]
@@ -1104,13 +1138,21 @@ def test_a_worker_that_commits_nothing_is_still_held_to_the_onboard_check(
     def core(attempt, prompt):
         if attempt == 2:
             shell.fail.clear()
+            # Left uncommitted in the checkout's own target: no check measured it.
+            modeling = repo / TARGET_REL / "modeling.py"
+            modeling.write_text(modeling.read_text() + "# edited in place\n")
         return READY
 
     script = Script(assembler=_by_task({"core": core}))
     workflow = _workflow(tmp_path, git_runner=None, shell_runner=shell)
-    _install(monkeypatch, workflow, script)
+    calls = _install(monkeypatch, workflow, script)
     with workflow:
         assert workflow.run(_spec(task_file)) is True
+    # A line of the final pass that is no deployment's check goes to the one fix task too.
+    assert [_task_id(p) for _, p in calls] == ["core", "core", "fix-1"]
+    goal = _prompts(calls, "fix-1")[0]
+    assert f"- git:target-committed at {base[:12]}: uncommitted, so a clone would not have" in goal
+    assert "[FAIL] git:target-committed at `" in _report(tmp_path)
     # The target was there already: what the check judges is the head as it is. Its
     # failure is the attempt's result line, word for word, with no turn to "put it right".
     assert shell.ran == ["tp1:boot", "tp1:boot", "tp1:accuracy"]

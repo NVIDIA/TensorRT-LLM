@@ -336,7 +336,8 @@ class Pipeline:
         if self.integration is not None and task.kind != "survey":
             tree = self.integration.open(task.id)
             block = worktree_block(tree, self.integration.repo)
-        if not resumed or not task.lib_start:
+        if not task.lib_start:
+            # The task's start, not this attempt's: what an earlier attempt rebuilt counts.
             task.lib_start = library_digest(tree or repo)
         path = decision_path(self.workspace, task.id, task.attempts)
         data = read_decision(path, role) if resumed else None
