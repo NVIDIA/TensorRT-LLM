@@ -401,6 +401,8 @@ class _MetadataPushRouter(KernelComponent):
             raise ValueError("apply_topk_at_fc1 requires router topk_scores.")
         if cutlass.const_expr(self.fc1_activation_per_token_scale != (activation_scales is not None)):
             raise ValueError("The router carries activation_scales iff fc1_activation_per_token_scale is enabled.")
+        if cutlass.const_expr((live_row_word is None) != (token_rows is None)):
+            raise ValueError("The router takes live_row_word and token_rows together.")
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
         self._router_kernel(
             topk_indices,
