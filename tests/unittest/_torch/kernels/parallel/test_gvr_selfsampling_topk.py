@@ -1671,6 +1671,7 @@ def test_selfsampling_varlen_heterogeneous_lengths_main():
     kv[1] = 900  # short (n <= k)
     kv[2] = nn - 1  # zero-window (every row of the request empty)
     kv[3] = k * cr + nn  # just above the short path
+    kv[4] = 0  # negative pre-compression lengths clamp to an empty row
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
