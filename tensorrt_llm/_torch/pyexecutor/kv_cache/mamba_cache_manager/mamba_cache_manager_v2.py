@@ -70,6 +70,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     DataType,
     get_pp_layers,
 )
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import HybridCachePolicy
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
@@ -281,6 +282,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_draft: bool = False,
         conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
         gdn_fused_verify: bool = False,
+        hybrid_cache_policy: Optional[HybridCachePolicy] = None,
         **kwargs,
     ) -> None:
         """See the class docstring.
@@ -288,6 +290,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         Args:
             gdn_fused_verify: Whether the GDN layers verify drafts with the
                 fused kernels (see gdn_replay_partitioned).
+            hybrid_cache_policy: The recurrent-state cache policies the model
+                declares (``RuntimeHooks.hybrid_cache``); None: all off.
             layer_specs: Draft-owned attention layers a standalone drafter
                 keeps in this manager, appended after the target layers that
                 the mask arguments describe (see ``_append_draft_layers``).
@@ -328,6 +332,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         ]
 
         self._mamba_layer_mask = list(mamba_layer_mask)
+        self._hybrid_cache_policy = (
+            hybrid_cache_policy if hybrid_cache_policy is not None else HybridCachePolicy()
+        )
         self.spec_config = spec_config
         self.gdn_fused_verify = gdn_fused_verify
         self._disagg_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
@@ -2046,15 +2053,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 end=commit_end,
             )
             kv_cache.commit(tokens)
-            if (
-                self.local_num_mamba_layers > 0
-                and self._branch_snapshot_points.get(request.py_request_id) == commit_end
-            ):
-                self._branch_snapshots_taken_total += 1
+            if self.local_num_mamba_layers > 0:
+                self._count_snapshot_commit(request, commit_end)
         if request.context_current_position >= commit_limit:
             self._mark_context_position_as_history(request, kv_cache)
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
+
+    def _count_snapshot_commit(self, request: LlmRequest, point: int) -> None:
+        """Count a recurrent-state snapshot committed at ``point`` of ``request``'s prompt."""
+        if self._branch_snapshot_points.get(request.py_request_id) == point:
+            self._branch_snapshots_taken_total += 1
 
     def _mark_context_position_as_history(self, request: LlmRequest, kv_cache) -> None:
         """Advance history without making later recurrent state reusable."""

@@ -4072,6 +4072,10 @@ def _create_kv_cache_manager(
             f"published for {kv_cache_manager_cls.__name__}.")
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
+        if model_engine is not None and not is_draft:
+            # Recurrent-state cache policies the model declares on its class.
+            manager_extra_kwargs["hybrid_cache_policy"] = runtime_hooks_of(
+                model_engine.model).hybrid_cache
 
     if config_utils.is_glm5_next(config) or is_kimi_linear(config):
         # Kimi K3 hybrid: KDA (Kimi Delta Attention) recurrent/conv states on
