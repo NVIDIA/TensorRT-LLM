@@ -14,6 +14,7 @@
 
 import contextlib
 import enum
+import errno
 import itertools
 import json
 import math
@@ -2494,6 +2495,60 @@ def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path, monkeypatch):
     assert builds() == 3
 
 
+def test_deep_gemm_jit_share_builds_here_when_the_directory_fails(
+        tmp_path, monkeypatch):
+    """Where the share directory cannot be used (here its kernels directory is
+    a file), DeepGEMM's compiler wrapper runs the real compiler, as without
+    sharing. A kernel built here that cannot be published (the quota is full)
+    is still this build's result, and is marked failed for the others."""
+    calls = tmp_path / "calls"
+    compiler = tmp_path / "fake_nvcc"
+    compiler.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        f"open({str(calls)!r}, 'a').write(' '.join(args) + '\\n')\n"
+        "out = args[args.index('--output-file') + 1]\n"
+        "open(out, 'wb').write(open(args[0], 'rb').read()[::-1])\n")
+    compiler.chmod(0o755)
+    share = tmp_path / "share"
+    share.mkdir()
+    (share / "kernels").write_text("not a directory")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "kernel.cu").write_text("kernel one")
+    output = work / "kernel.cubin"
+    argv = [str(work / "kernel.cu"), "--cubin", "--output-file", str(output)]
+    env = {
+        k: v
+        for k, v in os.environ.items() if not k.startswith("TLLM_JIT_SHARE_")
+    }
+    env.update({
+        jit_share.SHARE_DIR_ENV: str(share),
+        jit_share._REAL_COMPILER_ENV: str(compiler),
+    })
+    run = subprocess.run([sys.executable, "-I", "-S", jit_share.__file__] +
+                         argv,
+                         env=env,
+                         capture_output=True,
+                         text=True)
+    assert run.returncode == 0, run.stderr
+    assert output.read_text() == "eno lenrek"
+    assert calls.read_text().count("--cubin") == 1
+
+    def quota_full(output: str, cubin: str) -> None:
+        raise OSError(errno.EDQUOT, os.strerror(errno.EDQUOT))
+
+    monkeypatch.setattr(jit_share, "_publish", quota_full)
+    kernels = tmp_path / "kernels"
+    kernels.mkdir()
+    assert jit_share._build(str(compiler), argv, str(output),
+                            str(kernels / "k.cubin"),
+                            str(kernels / "k.failed")) == 0
+    assert (kernels / "k.failed").exists()
+    assert calls.read_text().count("--cubin") == 2
+
+
 def test_jit_share_wrapper_needs_a_private_directory(tmp_path):
     """DeepGEMM runs the compiler wrapper found in its directory, so the wrapper
     is written to and used from a directory only this user can write to: one
@@ -2562,6 +2617,41 @@ def test_jit_share_install_moves_past_an_unusable_wrapper_directory(
     assert jit_share.install()
     assert os.path.dirname(os.environ["DG_JIT_NVCC_COMPILER"]) == good
     assert os.environ[jit_share._REAL_COMPILER_ENV] == str(compiler)
+
+
+def test_jit_share_install_needs_a_directory_other_users_cannot_write(
+        tmp_path, monkeypatch):
+    """Every process runs the kernels it finds in the share directory, so
+    install() shares builds only when the directory, and the ones it holds
+    kernels in, belong to this user and other users cannot write to them."""
+    if os.statvfs(tmp_path).f_flag & os.ST_NOEXEC:
+        pytest.skip("the temporary directory does not allow executing files")
+    monkeypatch.setattr(jit_share, "_wrapper_dirs",
+                        lambda share_dir: [str(tmp_path / "bin")])
+    monkeypatch.setattr(jit_share, "_installed", False)
+    compiler = tmp_path / "nvcc"
+    compiler.write_text("#!/bin/sh\n")
+    compiler.chmod(0o700)
+    # install() sets these; registering them first makes the test restore them.
+    for name in ("DG_JIT_NVCC_COMPILER", "DG_JIT_CACHE_DIR",
+                 jit_share._SALT_ENV, jit_share._PROCESS_ENV):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    share = tmp_path / "share"
+    share.mkdir()
+    share.chmod(0o777)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(share))
+    monkeypatch.setenv(jit_share._REAL_COMPILER_ENV, str(compiler))
+    with pytest.warns(RuntimeWarning, match="other users cannot write"):
+        assert not jit_share.install()
+    assert "DG_JIT_NVCC_COMPILER" not in os.environ
+    share.chmod(0o755)
+    (share / "cute").chmod(0o777)
+    with pytest.warns(RuntimeWarning, match="cute"):
+        assert not jit_share.install()
+    (share / "cute").chmod(0o755)
+    assert jit_share.install()
+    assert os.environ["DG_JIT_CACHE_DIR"] == str(share / "deep_gemm")
 
 
 def test_shared_kernel_cache_exports_and_loads(monkeypatch, tmp_path):
@@ -2649,6 +2739,29 @@ def test_jit_share_waits_end_at_the_deadline(monkeypatch, tmp_path):
     assert jit_share._DEADLINE_ENV not in os.environ
     sweep.done(0)
     assert sweep.wait_done(0)
+
+
+def test_jit_share_builds_here_when_the_directory_fails(monkeypatch, tmp_path):
+    """Where the share directory cannot be used (here the directories in it are
+    files, so that nothing can be created in them), a process builds each
+    kernel itself, as without sharing: a pass starts at the front, a sweep's
+    items are all this process's, and a CuTe DSL lookup is a miss whose store
+    keeps the kernel here."""
+    for name in ("slots", "sweeps", "cute"):
+        (tmp_path / name).write_text("not a directory")
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(jit_share, "_slot", None)
+    monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
+    assert jit_share.start_fraction() == 0.0
+    sweep = jit_share.SharedSweep("sweep")
+    assert sweep.claim(0) and sweep.claim(0)
+    sweep.done(0)
+    assert sweep.wait_done(0)
+    cache = jit_share.SharedKernelCache("Runner")
+    with jit_share.sharing_kernels():
+        assert (1, "tile") not in cache
+        cache[(1, "tile")] = "kernel"  # its export fails
+        assert (1, "tile") in cache and cache[(1, "tile")] == "kernel"
 
 
 def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path):

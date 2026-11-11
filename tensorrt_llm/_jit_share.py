@@ -18,9 +18,12 @@ The ranks of a launch compile the same kernels, each on its own. With
 ``TLLM_JIT_SHARE_DIR`` set to a directory that every process of the launch
 can see (on a multi-node launch, a shared file system; use a fresh directory
 per launch), the first process to claim a kernel builds it and the others
-reuse the result. Every process runs the kernels it finds there, so the
-directory must be one that only trusted users can write to. Two kinds of
-kernels are shared:
+reuse the result. Every process runs the kernels it finds there, so
+:func:`install` shares builds only when the directory, and the ones it holds
+kernels in, belong to this user and other users cannot write to them (group
+members who can write to them must be trusted). Where the directory cannot be
+used (permissions, quota, I/O errors), a process builds each kernel itself, as
+without sharing. Two kinds of kernels are shared:
 
 * DeepGEMM's. DeepGEMM compiles a kernel the first time a shape selects it:
   it writes ``<tmp>/kernel.cu``, runs its compiler (``DG_JIT_NVCC_COMPILER``,
@@ -182,31 +185,54 @@ def start_fraction() -> float:
         share_dir = os.environ.get(SHARE_DIR_ENV)
         if share_dir:
             slots = os.path.join(share_dir, "slots")
-            os.makedirs(slots, exist_ok=True)
-            slot = len(os.listdir(slots))
-            while not _claim(os.path.join(slots, str(slot))):
-                slot += 1
+            try:
+                os.makedirs(slots, exist_ok=True)
+                slot = len(os.listdir(slots))
+                while not _claim(os.path.join(slots, str(slot))):
+                    slot += 1
+            except OSError:
+                slot = 0  # The directory is not usable here: start at the front.
         _slot = slot
     return (_slot * 0.6180339887498949) % 1.0
 
 
 class SharedSweep:
     """Claims on the items of a list of builds that every process walks, such as the
-    profiles of one autotuner sweep. ``name`` must be the same in every process."""
+    profiles of one autotuner sweep. ``name`` must be the same in every process.
+
+    Where the directory is not usable (permissions, quota, I/O errors), this
+    process claims every item, as it would without sharing.
+    """
 
     def __init__(self, name: str):
         self.dir = os.path.join(
             os.environ[SHARE_DIR_ENV], "sweeps", hashlib.sha256(name.encode()).hexdigest()[:24]
         )
-        os.makedirs(self.dir, exist_ok=True)
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+        except OSError:
+            self.dir = None
 
     def claim(self, index: int) -> bool:
         """Claim item ``index``; False if another process claimed it."""
-        return _claim(os.path.join(self.dir, f"{index}.claim"))
+        if self.dir is None:
+            return True
+        try:
+            return _claim(os.path.join(self.dir, f"{index}.claim"))
+        except OSError:
+            self.dir = None
+            return True
 
     def done(self, index: int) -> None:
         """Record that item ``index`` has run, so its builds are published."""
-        os.close(os.open(os.path.join(self.dir, f"{index}.done"), os.O_CREAT | os.O_WRONLY, 0o644))
+        if self.dir is None:
+            return
+        try:
+            os.close(
+                os.open(os.path.join(self.dir, f"{index}.done"), os.O_CREAT | os.O_WRONLY, 0o644)
+            )
+        except OSError:
+            pass  # The others wait for this item until their wait runs out.
 
     def wait_done(self, index: int) -> bool:
         """Wait until the process that claimed item ``index`` has run it, or the wait runs
@@ -219,7 +245,7 @@ class SharedSweep:
         return True
 
     def _is_done(self, index: int) -> bool:
-        return os.path.exists(os.path.join(self.dir, f"{index}.done"))
+        return self.dir is None or os.path.exists(os.path.join(self.dir, f"{index}.done"))
 
 
 class sharing_kernels:
@@ -255,12 +281,17 @@ def _release_unstored_claim() -> str | None:
         return None
     _unstored.claim = None
     claim, failed = pending
+    _mark_failed(failed, "compile raised")
+    return claim
+
+
+def _mark_failed(failed: str, reason: str) -> None:
+    """Write the ``.failed`` file that stops the other processes waiting for a kernel, if the directory allows."""
     try:
         with open(failed, "w") as f:
-            f.write("compile raised\n")
+            f.write(reason + "\n")
     except OSError:
         pass
-    return claim
 
 
 class SharedKernelCache(dict):
@@ -303,10 +334,14 @@ class SharedKernelCache(dict):
         if failed_here == claim:
             return False  # Its compile raised here; the runner compiles it again.
         start = time.time()
-        os.makedirs(os.path.dirname(obj), exist_ok=True)
         action = "cute-loaded"
         if not os.path.exists(obj):
-            if _claim(claim):
+            try:
+                os.makedirs(os.path.dirname(obj), exist_ok=True)
+                claimed = _claim(claim)
+            except OSError:
+                return False  # The directory is not usable here: the runner compiles it.
+            if claimed:
                 _unstored.claim = (claim, failed)
                 return False  # This process compiles it; the store exports it.
             if os.environ.get(_DEFER_ENV) == "1" and not os.path.exists(failed):
@@ -341,8 +376,7 @@ class SharedKernelCache(dict):
         try:
             _export_kernel(kernel, obj, name, meta)
         except Exception as e:  # noqa: BLE001 - the kernel works here; the others compile it
-            with open(failed, "w") as f:
-                f.write(f"{type(e).__name__}: {e}\n")
+            _mark_failed(failed, f"{type(e).__name__}: {e}")
             return
         _log(os.environ[SHARE_DIR_ENV], start, "cute-built", name)
 
@@ -430,9 +464,26 @@ def install() -> bool:
     )
     if not compiler or not os.access(compiler, os.X_OK):
         return False
+    # Every process runs the kernels it finds in these directories.
+    deep_gemm = os.path.join(share_dir, "deep_gemm")
+    code_dirs = [share_dir, os.path.join(share_dir, "kernels"), os.path.join(share_dir, "cute")]
+    if os.environ.get("DG_JIT_CACHE_DIR", deep_gemm) == deep_gemm:
+        code_dirs.append(deep_gemm)
     try:
-        os.makedirs(os.path.join(share_dir, "kernels"), exist_ok=True)
+        for path in code_dirs:
+            os.makedirs(path, mode=0o755, exist_ok=True)
     except OSError:
+        return False
+    untrusted = next((path for path in code_dirs if not _trusted_dir(path)), None)
+    if untrusted is not None:
+        import warnings
+
+        warnings.warn(
+            f"{SHARE_DIR_ENV} is ignored: {untrusted} must be a directory of this user "
+            "that other users cannot write to",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return False
     wrapper = None
     for bin_dir in _wrapper_dirs(share_dir):
@@ -490,6 +541,19 @@ def _wrapper_dirs(share_dir: str) -> list[str]:
     if _private_dir(share_dir):
         dirs.append(os.path.join(share_dir, "bin"))
     return dirs
+
+
+def _trusted_dir(path: str) -> bool:
+    """True for a directory that this user owns and other users cannot write to."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.getuid()
+        and not info.st_mode & stat.S_IWOTH
+    )
 
 
 def _private_dir(path: str) -> bool:
@@ -609,20 +673,27 @@ def _build(compiler: str, argv: list[str], output: str, cubin: str, failed: str)
 
     returncode = subprocess.run([compiler] + argv).returncode
     if returncode == 0 and os.path.isfile(output) and os.path.getsize(output) > 0:
-        _publish(output, cubin)
+        try:
+            _publish(output, cubin)
+        except OSError as e:  # The kernel is built here; the others build it themselves.
+            _mark_failed(failed, f"publish: {e}")
     elif not os.path.exists(cubin):
-        with open(failed, "w") as f:
-            f.write(f"exit code {returncode}\n")
+        _mark_failed(failed, f"exit code {returncode}")
     return returncode
 
 
 def _claim(claim: str) -> bool:
+    """Create ``claim``; False if it exists. Other errors (permissions, quota, I/O) raise OSError."""
     try:
         fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     except FileExistsError:
         return False
-    os.write(fd, f"{os.uname().nodename} {os.getpid()}\n".encode())
-    os.close(fd)
+    try:
+        os.write(fd, f"{os.uname().nodename} {os.getpid()}\n".encode())
+    except OSError:
+        pass  # The claim stands; its text only says who made it.
+    finally:
+        os.close(fd)
     return True
 
 
@@ -657,20 +728,23 @@ def main(argv: list[str]) -> int:
     output = argv[argv.index("--output-file") + 1]
     key = _kernel_key(source, argv)
     kernels = os.path.join(share_dir, "kernels")
-    os.makedirs(kernels, exist_ok=True)
     cubin, claim, failed = (os.path.join(kernels, key + s) for s in (".cubin", ".claim", ".failed"))
-
-    if os.path.exists(cubin):
-        action, returncode = "copied", _copy(cubin, output)
-    elif _claim(claim):
-        action, returncode = "built", _build(compiler, argv, output, cubin, failed)
-    elif os.environ.get(_DEFER_ENV) == "1" and not os.path.exists(failed):
-        print(f"{BUSY_MARK} {key}", flush=True)
-        action, returncode = "busy", BUSY_EXIT_CODE
-    elif _wait(cubin, failed):
-        action, returncode = "waited", _copy(cubin, output)
-    else:
-        action, returncode = "fallback", _build(compiler, argv, output, cubin, failed)
+    try:
+        os.makedirs(kernels, exist_ok=True)
+        if os.path.exists(cubin):
+            action, returncode = "copied", _copy(cubin, output)
+        elif _claim(claim):
+            action, returncode = "built", _build(compiler, argv, output, cubin, failed)
+        elif os.environ.get(_DEFER_ENV) == "1" and not os.path.exists(failed):
+            print(f"{BUSY_MARK} {key}", flush=True)
+            action, returncode = "busy", BUSY_EXIT_CODE
+        elif _wait(cubin, failed):
+            action, returncode = "waited", _copy(cubin, output)
+        else:
+            action, returncode = "fallback", _build(compiler, argv, output, cubin, failed)
+    except OSError:
+        # The directory is not usable here (permissions, quota, I/O): build as without sharing.
+        os.execvp(compiler, [compiler] + argv)  # nosec B606 - becomes the real compiler, same arguments, no shell
     _log(share_dir, start, action, key)
     return returncode
 
