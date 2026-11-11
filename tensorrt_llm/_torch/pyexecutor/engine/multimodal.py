@@ -16,7 +16,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
+from tensorrt_llm._torch.multimodal.embeddings import _join_embeddings
 from tensorrt_llm._torch.multimodal.model import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,

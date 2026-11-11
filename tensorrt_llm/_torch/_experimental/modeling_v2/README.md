@@ -125,6 +125,8 @@ it uses only runtime interfaces, for example:
 
 * `DecoderModel`, `DecoderModelForCausalLM`, `ModelConfig` and `Mapping`.
 * Attention and speculative metadata, and the KV cache managers.
+* `MultimodalModelMixin` from `_torch/multimodal/model.py`, which provides
+  shared encoder execution and caching independently of model implementations.
 
 A target does not import, subclass or call Modeling V1 model code: the model
 classes in `_torch/models/`, the layers in `_torch/modules/`, MLA and the
@@ -133,6 +135,42 @@ This applies to every path in the target: prefill, decode, the shapes a fast
 path does not cover, and weight loading. The
 [DeepSeek R1 target](models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/) is an
 example that uses no Modeling V1 model code.
+
+### Multimodal targets
+
+Inherit `DecoderModelForCausalLM` first and `MultimodalModelMixin` second on
+the target's decoder shell. This preserves the decoder's speculative and
+runtime hooks while letting the executor recognize its multimodal capabilities.
+Implement `encode_multimodal_inputs`, `embedding_dim`, `embedding_dtype`, and
+`language_model`. An integrated decoder may return `self` from `language_model`;
+declare `runtime_hooks` and override delegating methods such as
+`set_guided_decoder` in that case to avoid self-delegation. Expose `dtype` for
+encoder memory profiling.
+
+Before the core's forward, call `prepare_multimodal_embeddings` with the
+engine's context count and request Params. It returns the active encoder rows
+after request-local reuse, persistent cache lookup, stream synchronization,
+chunk selection, and model hooks. Feed those rows to the target's own token
+splice. Keep original token IDs available when other model operations need
+them. Targets that use the default text embedding fusion may instead call
+`prepare_multimodal_inputs` and implement its embedding interface.
+
+Filter position-only Params in `select_multimodal_params` when the processor
+also emits them for text requests. Enable `supports_encoder_cache` only when
+the processor supplies stable item keys and exact output row counts. Declare
+packed input partitions or implement item selection so partial cache hits
+encode only missing items. Encoder outputs and cached tensors are read-only;
+mutable encoder scratch must be independent for concurrent CUDA streams when
+prefetch is enabled.
+
+Item scheduling is a separate capability. Set
+`supports_mm_encoder_item_scheduling` only after the complete cost, selection,
+and memory-profile contracts work for the target's certified encoder shapes.
+The Qwen3.8 Flash Next target uses inline encoding, chunk reuse, persistent
+encoder caching, and prefetch; it leaves item scheduling disabled because the
+processor's maximum atomic image exceeds its certified per-frame patch bound.
+See the [multimodal developer guide](../../../../docs/source/developer-guide/multimodal.md)
+for the shared contracts.
 
 ## Adding a family or a target
 

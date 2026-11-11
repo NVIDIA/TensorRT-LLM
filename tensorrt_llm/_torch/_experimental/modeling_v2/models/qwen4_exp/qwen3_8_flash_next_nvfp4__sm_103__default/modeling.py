@@ -140,6 +140,7 @@ from __future__ import annotations
 import math
 import os
 import re
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -437,12 +438,14 @@ from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
     flashinfer_cached_replay_update,
 )
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.utils import ActivationType, is_gdn_replay_enabled
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp
+from tensorrt_llm.inputs.multimodal import MultimodalItemPartition, MultimodalParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -460,6 +463,7 @@ from .ops.ssm.gdn_cached_replay_cute__verify import gdn_cached_replay_cute
 from .ops.ssm.gdn_cached_replay_cute__verify import precompile as gdn_replay_precompile
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # The GPU architecture this target is certified for; a direct instantiation could
@@ -6758,7 +6762,7 @@ def _text_settings(text) -> dict:
 
 
 class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
-    DecoderModelForCausalLM[Qwen4ExpDefaultModelingV2, PretrainedConfig]
+    DecoderModelForCausalLM[Qwen4ExpDefaultModelingV2, PretrainedConfig], MultimodalModelMixin
 ):
     """Qwen3.8-Flash-Next-NVFP4 at tp1, tp4, tep4, dep4 or dep2 on sm_103."""
 
@@ -6768,6 +6772,59 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
     # decode-step prepare), validated there; off at every other layout.
     spec_decode_fast_paths: bool = False
     runtime_hooks: RuntimeHooks | None = None
+    supports_encoder_cache = True
+
+    @property
+    def language_model(self) -> nn.Module:
+        """The integrated decoder shell inspected by runtime capability helpers."""
+        return self
+
+    @property
+    def embedding_dim(self) -> int:
+        """Width of one merged vision row; the composite config has no top-level width."""
+        return self.model_config.pretrained_config.vision_config.out_hidden_size
+
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        return self.model_config.torch_dtype
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.embedding_dtype
+
+    def select_multimodal_params(
+        self, multimodal_params: Sequence[MultimodalParams], num_context_requests: int
+    ) -> list[MultimodalParams]:
+        context_params = super().select_multimodal_params(multimodal_params, num_context_requests)
+        return [
+            param
+            for param in context_params
+            if any(
+                param.multimodal_data.get(key) is not None
+                for key in ("image", "video", "multimodal_embedding")
+            )
+        ]
+
+    def encode_multimodal_inputs(
+        self, multimodal_params: Sequence[MultimodalParams]
+    ) -> torch.Tensor:
+        return _vision.encode_multimodal_inputs(self.vision_tower, multimodal_params)
+
+    def get_multimodal_item_partitions(
+        self, param: MultimodalParams, modality: str
+    ) -> dict[str, MultimodalItemPartition]:
+        pixel_key, grid_key = _vision.MEDIA_KEYS[modality]
+        grids = param.multimodal_data[modality][grid_key]
+        return {
+            pixel_key: MultimodalItemPartition(
+                item_lengths=tuple(t * h * w for t, h, w in grids.tolist())
+            ),
+            grid_key: MultimodalItemPartition(item_axis=0),
+        }
+
+    def set_guided_decoder(self, guided_decoder: CapturableGuidedDecoder) -> bool:
+        """This target does not implement guided decoding."""
+        return False
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
@@ -7025,6 +7082,13 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
         the sampler verifies, `spec_metadata.gather_ids`) and hands the worker the trunk's
         ungathered stream rows, which the MTP module reads; `position_ids` goes in the
         engine's layout."""
+        assert input_ids is not None, "this target's PLE layer hashes token ids"
+        prepared_mm = self.prepare_multimodal_embeddings(
+            input_ids=input_ids,
+            multimodal_params=kwargs.get("multimodal_params"),
+            num_context_requests=attn_metadata.num_contexts,
+            attn_metadata=attn_metadata,
+        )
         self.model.begin_step(
             attn_metadata,
             input_ids,
@@ -7032,7 +7096,9 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
             inputs_embeds=inputs_embeds,
             lora_params=lora_params,
             spec_metadata=spec_metadata,
-            vision=_vision.multimodal_embeds(self.vision_tower, kwargs),
+            vision=_vision.multimodal_embeds(
+                prepared_mm.multimodal_embeddings, kwargs.get("mm_token_indices")
+            ),
         )
         if self.spec_worker is None:
             assert spec_metadata is None, (

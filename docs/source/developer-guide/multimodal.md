@@ -168,6 +168,26 @@ override selection explicitly; the compatibility selector cannot describe an
 arbitrary model layout. An empty partition dict means every field is shared,
 so it is appropriate only when selecting an item requires no payload changes.
 
+### Encoder Rows and Token Fusion
+
+`MultimodalModelMixin` lives in
+[_torch/multimodal/model.py](source:tensorrt_llm/_torch/multimodal/model.py).
+Both Modeling V1 and Modeling V2 use this runtime contract. The previous
+`_torch/models/modeling_multimodal_mixin.py` path re-exports the same classes
+for compatibility.
+
+`prepare_multimodal_embeddings` performs cache lookup and encoding, waits for
+prefetched results, selects current-chunk rows, and runs both model hooks.
+Its result contains the input token IDs returned by the full-embedding hook,
+active multimodal rows, and any auxiliary embedding tensors returned by the
+active-embedding hook. It does not look up text embeddings. A model with its
+own embedding splice consumes this result directly and retains responsibility
+for matching the rows to the executor's `mm_token_indices`.
+
+`prepare_multimodal_inputs` uses that same preparation and then applies the
+default text embedding fusion. Model-specific encoder implementations and
+token embedding operations remain in their respective model packages.
+
 ### Item Boundaries and Model Hooks
 
 An item is the smallest independently encodable unit, not necessarily one

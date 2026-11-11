@@ -102,6 +102,7 @@ l0_cpu:
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
+  - unittest/_torch/multimodal/test_prepared_multimodal_embeddings.py
   # modeling_v2 routing and routing-table checks: config shapes and a monkeypatched
   # compute capability, no device. The default targets' shard tests: small CPU
   # tensors and the CPU block_scale_interleave. The rest of unittest/_torch/modeling_v2

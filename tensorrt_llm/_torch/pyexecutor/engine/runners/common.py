@@ -11,7 +11,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.models.modeling_multimodal_utils import filter_mm_token_from_input_ids
+from tensorrt_llm._torch.multimodal.embeddings import filter_mm_token_from_input_ids
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
 from tensorrt_llm._utils import maybe_pin_memory

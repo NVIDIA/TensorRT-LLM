@@ -49,14 +49,14 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.logger import logger
 
-from ..models.modeling_multimodal_utils import (
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
+from .embeddings import (
     _store_chunked_prefill_embeddings,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
-from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
-from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
 
 
 class MultimodalEncoderContractError(ValueError):
@@ -362,6 +362,20 @@ def _run_on_aux_stream(aux_stream: torch.cuda.Stream) -> Iterator[torch.cuda.Eve
             # Keep the sync point valid even if the block raises after queuing
             # aux-stream work.
             exit_event.record()
+
+
+@dataclass(frozen=True)
+class PreparedMultimodalEmbeddings:
+    """Active encoder rows before a model's token-embedding fusion.
+
+    ``multimodal_embeddings`` contains request-ordered tensors with only rows
+    consumed by this forward. ``extra_embeds`` carries model-specific features
+    selected by the same hooks as the default fusion path.
+    """
+
+    input_ids: torch.Tensor
+    multimodal_embeddings: Sequence[torch.Tensor] = ()
+    extra_embeds: Sequence[torch.Tensor] = ()
 
 
 @dataclass(frozen=True)
@@ -1026,21 +1040,20 @@ class MultimodalModelMixin:
                 sliced[key] = [value[i] for i in item_indices]
         return sliced
 
-    # A future optional mixin-owned forward can build on the same template method.
-    def prepare_multimodal_inputs(
+    def prepare_multimodal_embeddings(
         self,
         *,
         input_ids: torch.Tensor,
-        positions: Optional[torch.Tensor],
         multimodal_params: Optional[Sequence[MultimodalParams]],
         num_context_requests: int,
         **forward_kwargs: Any,
-    ) -> PreparedLlmInputs:
-        """Prepare multimodal inputs for a concrete model forward.
+    ) -> PreparedMultimodalEmbeddings:
+        """Prepare active encoder rows for a model-owned fusion operation.
 
-        This method owns the common framework sequence around a model-specific
-        encoder hook: retrieve/cache embeddings, select active chunk rows if
-        needed, run optional model hooks, and fuse rows into text embeds.
+        Owns encoder/cache lookup, request-local storage, stream ordering,
+        active-chunk selection, and both model hooks. Targets with their own
+        token embedding or splice can consume these rows without computing
+        text embeddings or replacing their original input token IDs.
         """
         context_params = list(
             self.select_multimodal_params(
@@ -1049,7 +1062,7 @@ class MultimodalModelMixin:
             )
         )
         if not context_params:
-            return PreparedLlmInputs(input_ids=input_ids, inputs_embeds=None)
+            return PreparedMultimodalEmbeddings(input_ids=input_ids)
 
         embeddings = self._get_or_encode_multimodal_embeddings(context_params)
 
@@ -1066,13 +1079,37 @@ class MultimodalModelMixin:
             multimodal_params=context_params,
             **forward_kwargs,
         )
-
-        fused_input_ids, inputs_embeds, fused_extra_embeds = self._fuse_multimodal_embeddings(
+        return PreparedMultimodalEmbeddings(
             input_ids=input_ids,
             multimodal_embeddings=active_embeddings,
+            extra_embeds=extra_embeds,
+        )
+
+    def prepare_multimodal_inputs(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        positions: Optional[torch.Tensor],
+        multimodal_params: Optional[Sequence[MultimodalParams]],
+        num_context_requests: int,
+        **forward_kwargs: Any,
+    ) -> PreparedLlmInputs:
+        """Prepare encoder rows and fuse them with the model's text embeddings."""
+        prepared = self.prepare_multimodal_embeddings(
+            input_ids=input_ids,
+            multimodal_params=multimodal_params,
+            num_context_requests=num_context_requests,
+            **forward_kwargs,
+        )
+        if not prepared.multimodal_embeddings and not prepared.extra_embeds:
+            return PreparedLlmInputs(input_ids=prepared.input_ids, inputs_embeds=None)
+
+        fused_input_ids, inputs_embeds, fused_extra_embeds = self._fuse_multimodal_embeddings(
+            input_ids=prepared.input_ids,
+            multimodal_embeddings=list(prepared.multimodal_embeddings),
             mm_token_ids=self.multimodal_token_ids,
             embedding_layer=self.text_embedding_layer,
-            extra_embeds=extra_embeds,
+            extra_embeds=prepared.extra_embeds,
             # `text_token_indices` / `mm_token_indices` are pre-computed by the
             # executor (see DecoderInputPreparer.prepare_inputs) and must reach
             # `fuse_input_embeds` to (a) preserve the active-chunk subset

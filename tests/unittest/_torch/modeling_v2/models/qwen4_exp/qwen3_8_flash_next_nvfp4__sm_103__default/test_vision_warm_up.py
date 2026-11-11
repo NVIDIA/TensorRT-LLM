@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test of the default target's vision tower warm-up: after `VisionTower.warm_up`, which
-`post_load_weights` runs, a media request of any grid compiles no Triton kernel.
+"""GPU tests of the default target's vision warm-up and concurrent execution.
+
+After `VisionTower.warm_up`, which `post_load_weights` runs, a media request of any grid
+compiles no Triton kernel. Concurrent forwards use independent attention scratch.
 
 The tower is one block deep (the block's kernels are every block's) over random weights at the
 checkpoint's shapes, built from the weight table's own `vis_*` declarations.
@@ -90,6 +92,46 @@ def _variants() -> dict:
             kernel = kernel.fn
         counts[name] = len(kernel.device_caches[device][0])
     return counts
+
+
+def test_attention_workspace_is_owned_by_each_cuda_stream():
+    tower = _tower()
+    device = torch.device("cuda", torch.cuda.current_device())
+    first = torch.cuda.Stream(device=device)
+    second = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(first):
+        first_workspace = tower._attention_workspace(device)
+        first_workspace.resize_(64).fill_(1)
+        assert tower._attention_workspace(device) is first_workspace
+    with torch.cuda.stream(second):
+        second_workspace = tower._attention_workspace(device)
+        second_workspace.resize_(64).fill_(2)
+        assert tower._attention_workspace(device) is second_workspace
+    first.synchronize()
+    second.synchronize()
+    assert first_workspace is not second_workspace
+    assert torch.equal(first_workspace.cpu(), torch.ones(64, dtype=torch.int8))
+    assert torch.equal(second_workspace.cpu(), torch.full((64,), 2, dtype=torch.int8))
+
+
+def test_concurrent_vision_calls_match_serial_outputs():
+    tower = _tower()
+    grids = [torch.tensor([[1, 4, 4]]), torch.tensor([[1, 8, 4]])]
+    pixels = [
+        torch.randn(rows, tower.pixel_width, dtype=tower.dtype, device="cuda") for rows in (16, 32)
+    ]
+    expected = [tower(values, grid) for values, grid in zip(pixels, grids, strict=True)]
+    producer = torch.cuda.current_stream()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    actual = []
+    for stream, values, grid in zip(streams, pixels, grids, strict=True):
+        stream.wait_stream(producer)
+        with torch.cuda.stream(stream):
+            actual.append(tower(values, grid))
+    for stream in streams:
+        stream.synchronize()
+    for output, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(output, reference, rtol=1e-3, atol=1e-4)
 
 
 def test_after_warm_up_no_grid_compiles_a_kernel():
