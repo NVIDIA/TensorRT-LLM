@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+cache_transceiver_config:
+  backend: NIXL
+  kv_transfer_timeout_ms: 600000
+  transceiver_runtime: PYTHON
+cuda_graph_config:
+  batch_sizes:
+  - 1
+  - 2
+  - 4
+  enable_padding: true
+custom_tokenizer: deepseek_v41
+disable_mm_encoder: true
+enable_attention_dp: false
+enable_iter_perf_stats: true
+enable_lm_head_tp_in_adp: false
+iter_perf_stats_interval: 40
+kv_cache_config:
+  avg_seq_len: 160000
+  dtype: fp8
+  enable_block_reuse: false
+  event_buffer_max_size: 0
+  free_gpu_memory_fraction: 0.85
+  host_cache_size: 0
+  tokens_per_block: 128
+max_batch_size: 1
+max_num_tokens: 256
+max_seq_len: 996595
+moe_config:
+  backend: TRTLLM
+  use_low_precision_moe_combine: true
+moe_expert_parallel_size: 2
+num_postprocess_workers: 4
+num_serve_frontends: 4
+pipeline_parallel_size: 1
+print_iter_log: true
+sparse_attention_config:
+  algorithm: csa2
+  enable_heuristic_topk: true
+speculative_config:
+  block_size: 5
+  decoding_type: DSpark
+  max_draft_len: 5
+  speculative_model: <MODEL_PATH>
+stream_interval: 20
+tensor_parallel_size: 8

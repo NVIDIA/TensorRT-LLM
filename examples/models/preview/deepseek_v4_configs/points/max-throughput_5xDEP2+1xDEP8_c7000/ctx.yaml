@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+attention_dp_config:
+  kv_cache_routing_conversation_affinity: true
+  kv_cache_routing_new_conv_placement: least_prefill
+  kv_cache_routing_strict_affinity_max_wait_iters: 2000
+  kv_cache_routing_strict_conversation_affinity: true
+cache_transceiver_config:
+  backend: NIXL
+  kv_transfer_timeout_ms: 600000
+  transceiver_runtime: PYTHON
+cuda_graph_config: null
+custom_tokenizer: deepseek_v41
+disable_mm_encoder: true
+disable_overlap_scheduler: false
+enable_attention_dp: true
+enable_chunked_prefill: true
+enable_iter_perf_stats: true
+internal_request_auth_key: <AUTH_KEY>
+iter_perf_stats_interval: 40
+kv_cache_config:
+  avg_seq_len: 160000
+  block_reuse_config:
+    max_num_turns: 5
+    policy: per_conversation
+  dtype: fp8
+  enable_block_reuse: true
+  event_buffer_max_size: 0
+  fp8_context_mla_kv_len_cap: 8000000
+  free_gpu_memory_fraction: 0.9
+  host_cache_bind_to_gpu_numa_node: true
+  host_cache_size: 134217728000
+  tokens_per_block: 128
+max_batch_size: 256
+max_num_tokens: 32768
+max_seq_len: 990016
+moe_config:
+  backend: CUTEDSL
+moe_expert_parallel_size: 2
+num_serve_frontends: 8
+pipeline_parallel_size: 1
+prefill_cuda_graph_backend: breakable
+print_iter_log: true
+prompt_token_cache_config:
+  max_bytes: 2147483648
+  path: <PTC_DIR>
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+sparse_attention_config:
+  algorithm: csa2
+tensor_parallel_size: 2

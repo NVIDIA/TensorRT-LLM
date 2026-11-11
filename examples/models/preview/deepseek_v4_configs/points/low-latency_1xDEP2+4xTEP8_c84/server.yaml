@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+backend: pytorch
+context_servers:
+  num_instances: 1
+  router:
+    type: conversation
+  urls: <CTX_URLS>
+gen_strip_message_history: true
+gen_tokids_ctxbytes: true
+generation_servers:
+  num_instances: 4
+  router:
+    type: load_balancing
+    use_tokens: false
+  urls: <GEN_URLS>
+hostname: 0.0.0.0
+num_workers: 4
+port: 8333
+server_keep_alive_timeout: 3600
