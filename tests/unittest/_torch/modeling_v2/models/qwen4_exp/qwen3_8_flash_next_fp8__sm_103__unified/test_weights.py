@@ -514,3 +514,200 @@ def _expert_operands(configs, which: str) -> None:
 def test_load_operands(case, request):
     """What `load` fills the routed-expert operands from: codes and scales."""
     _expert_operands(request.getfixturevalue("configs"), case.split("-")[1])
+
+
+# ------------------------------------------------------------ the host n-gram table --
+
+
+def _host_table_module():
+    from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import ple_host_table
+
+    return ple_host_table
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rows, cols", [(320001536, 160), (1000, 160), (37, 4)])
+def test_host_table_chunks_cover_the_rows(rows, cols):
+    """Chunks are whole multiples of the alignment, tile the rows in order, and every server size
+    that divides `CHUNKS` splits them into disjoint contiguous shares."""
+    PH = _host_table_module()
+    align = PH.CHUNK_ALIGN if cols == 160 else cols
+    per = PH.chunk_rows(rows, cols, align)
+    assert (per * cols) % align == 0 and per * PH.CHUNKS >= rows
+    ranges = [PH.chunk_range(k, rows, cols, align) for k in range(PH.CHUNKS)]
+    assert ranges[0][0] == 0 and ranges[-1][1] == rows
+    assert all(a[1] == b[0] for a, b in zip(ranges, ranges[1:]))
+    for world in (1, 2, 4, 8):
+        shares = [PH.owned_rows(r, world, rows, cols, align) for r in range(world)]
+        assert shares[0][0] == 0 and shares[-1][1] == rows
+        assert all(a[1] == b[0] for a, b in zip(shares, shares[1:])), shares
+
+
+def _broker_role(path, key, queue, go, done, die_on_go):
+    """A child process: the broker loaded from its file, without importing tensorrt_llm. An owner
+    publishes (or exits, `die_on_go`) when the test sets `go` and stays until it sets `done`."""
+    import importlib.util
+    import mmap
+    import os
+
+    spec = importlib.util.spec_from_file_location("chunk_broker", path)
+    broker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(broker)
+    queue.put("ready")
+    got = broker.acquire(key, 300)
+    if got[0] == broker.OWNER:
+        queue.put("owner")
+        go.wait(300)
+        if die_on_go:
+            os._exit(0)
+        fd = os.memfd_create("t")
+        os.ftruncate(fd, 4096)
+        mmap.mmap(fd, 4096)[:5] = b"bytes"
+        got[1].publish(fd, {"n": 4096})
+        done.wait(300)
+        got[1].close()
+    else:
+        queue.put(("attached", bytes(mmap.mmap(got[1], 4096)[:5]), got[2]))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("owner_dies", [False, True], ids=["publish", "owner-exits"])
+def test_chunk_broker_hands_over(owner_dies):
+    """The first process owns a key; a waiter that is already waiting attaches to what it
+    publishes (and so does a late one), or owns the key itself when the owner exits before
+    publishing. No files are left."""
+    import multiprocessing
+    import os
+    import time
+    import uuid
+
+    PH = _host_table_module()
+    path = PH._broker.__file__
+    key = uuid.uuid4().hex
+    ctx = multiprocessing.get_context("spawn")
+    go, done = ctx.Event(), ctx.Event()
+    procs = []
+
+    def start(die_on_go=False):
+        queue = ctx.Queue()
+        proc = ctx.Process(target=_broker_role, args=(path, key, queue, go, done, die_on_go))
+        proc.start()
+        procs.append(proc)
+        assert queue.get(timeout=300) == "ready"
+        return queue
+
+    try:
+        assert start(owner_dies).get(timeout=60) == "owner"
+        waiter = start()
+        time.sleep(1.0)  # the waiter is connected and blocked on the owner
+        go.set()
+        if owner_dies:
+            assert waiter.get(timeout=60) == "owner"
+        else:
+            assert waiter.get(timeout=60) == ("attached", b"bytes", {"n": 4096})
+            assert start().get(timeout=60) == ("attached", b"bytes", {"n": 4096})
+    finally:
+        go.set()
+        done.set()
+        for proc in procs:
+            proc.join(60)
+    assert all(proc.exitcode == 0 for proc in procs), [proc.exitcode for proc in procs]
+    assert not [f for f in os.listdir("/dev/shm") if key in f]
+
+
+def _fake_shards(rows_per_shard: int, shards: int, cols: int, seed: int) -> tuple:
+    g = torch.Generator().manual_seed(seed)
+    data = torch.randint(0, 256, (shards * rows_per_shard, cols), generator=g, dtype=torch.uint8)
+    keys = [f"s{i}" for i in range(shards)]
+    weights = {
+        k: data[i * rows_per_shard : (i + 1) * rows_per_shard].view(WT.PLE_TABLE_DTYPE)
+        for i, k in enumerate(keys)
+    }
+    return data, keys, weights
+
+
+def _host_tables(monkeypatch, mode, world, data, keys, weights, rows_per_shard, identity=None):
+    """`world` ranks' tables in one process: threads, so `node` ranks wait on each other, and a
+    barrier in place of the server's collective agreement."""
+    import threading
+
+    PH = _host_table_module()
+    barrier = threading.Barrier(world)
+    votes = []
+
+    def agree(ok):
+        votes.append(ok)
+        barrier.wait()
+        return all(votes)
+
+    monkeypatch.setattr(PH, "_all_agree", agree)
+    rows, cols = data.shape
+    copy, read = PH.shard_rows(weights, keys, rows_per_shard, WT._read)
+    tables = [
+        PH.PleHostTable(
+            mode,
+            rows,
+            cols,
+            WT.PLE_TABLE_DTYPE,
+            torch.device("cuda"),
+            rank=r,
+            world=world,
+            dp=1,
+            private=WT._host_resident_empty,
+            identity=identity,
+        )  # fmt: skip
+        for r in range(world)
+    ]
+    threads = [threading.Thread(target=t.fill, args=(copy, read)) for t in tables]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(300)
+    return tables
+
+
+def _vmm_host_numa() -> bool:
+    PH = _host_table_module()
+    try:
+        PH._VmmChunks(torch.cuda.current_device(), PH.CHUNK_ALIGN, 1, 0).close()
+    except (RuntimeError, AttributeError):
+        return False
+    return True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="host memory the GPU maps")
+@pytest.mark.parametrize("mode", ["rank", "server", "node", "node-fallback"])
+def test_host_table_modes(mode, monkeypatch):
+    """`rank` holds every row, `server` this rank's rows with its window, `node` every row in
+    chunks one rank creates and the other attaches to; `node` without a checkpoint identity runs
+    `server`. Each holds exactly the checkpoint's bytes, in host memory."""
+    import uuid
+
+    PH = _host_table_module()
+    if mode == "node" and not _vmm_host_numa():
+        pytest.skip("no CUDA VMM host NUMA allocation on this platform")
+    rows_per_shard, shards, cols = 40960, 8, 160
+    data, keys, weights = _fake_shards(rows_per_shard, shards, cols, seed=5)
+    rows = data.shape[0]
+    want = {"rank": PH.RANK, "server": PH.SERVER, "node": PH.NODE, "node-fallback": PH.SERVER}
+    requested = PH.NODE if mode.startswith("node") else mode
+    identity = uuid.uuid4().hex if mode == "node" else None
+    tables = _host_tables(monkeypatch, requested, 2, data, keys, weights, rows_per_shard, identity)
+    expected = data.cuda()
+    for rank, t in enumerate(tables):
+        assert t.mode == want[mode], (rank, t.mode, t.describe())
+        assert t.resident_on_host(), t.describe()
+        if t.mode == PH.SERVER:
+            lo, hi, base = t.window
+            assert (lo, hi) == PH.owned_rows(rank, 2, rows, cols)
+            got = t.table[lo - base : hi - base]
+            assert torch.equal(got.view(torch.uint8), expected[lo:hi])
+            assert t.needs_sum
+        else:
+            assert t.window is None and not t.needs_sum
+            assert torch.equal(t.table.view(torch.uint8), expected)
+    if mode == "node":
+        created = sorted(len(t._segments) for t in tables)
+        assert created == [PH.CHUNKS // 2, PH.CHUNKS // 2], [t.describe() for t in tables]
+    for t in tables:
+        t.close()
