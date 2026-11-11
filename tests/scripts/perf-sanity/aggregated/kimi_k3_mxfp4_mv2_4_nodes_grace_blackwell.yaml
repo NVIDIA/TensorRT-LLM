@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kimi K3 (MXFP4) modeling_v2 low-latency decode on 16 GB200 GPUs (4 nodes, one
+# NVLink domain), 1k1k. Two cases, one per kimi_k3_vl modeling_v2 target:
+# TP16 attention with MoE TP4xEP4 and DSpark 7 drafts (6 accepted, forced), and
+# TP16 attention with MoE TP16xEP1 without speculation.
+#
+# modeling_v2: require makes the server fail if the Kimi K3 targets are not
+# picked. tokens_per_block: 64 is what the targets' DSpark drafter kernels need.
+# The drafter is RadixArk-Kimi-K3-DSpark, the DSpark checkpoint the targets'
+# drafter path is written for.
+metadata:
+  model_name: kimi_k3_mxfp4
+  supported_gpus:
+  - GB200
+hardware:
+  gpus_per_node: 4
+server_configs:
+  # Low-latency decode, TP16 attention, MoE TP4xEP4, DSpark 7 drafts (forced 6 accepted)
+  - name: "kimi_k3_tp16_moetp4ep4_dspark7_1k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=6"
+    model_name: "kimi_k3_mxfp4"
+    tensor_parallel_size: 16
+    moe_tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 8
+    max_num_tokens: 8192
+    enable_attention_dp: false
+    enable_chunked_prefill: true
+    trust_remote_code: true
+    modeling_v2: require
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 8
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.25
+      tokens_per_block: 64
+    speculative_config:
+      decoding_type: 'DSpark'
+      max_draft_len: 7
+      speculative_model: RadixArk-Kimi-K3-DSpark
+    client_configs:
+      - name: "con1_iter10_1k1k"
+        concurrency: 1
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        dataset_file: <dataset_file>
+      - name: "con4_iter10_1k1k"
+        concurrency: 4
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        dataset_file: <dataset_file>
+      - name: "con8_iter10_1k1k"
+        concurrency: 8
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        dataset_file: <dataset_file>
+
+  # Low-latency decode without speculation, TP16 attention, MoE TP16xEP1
+  - name: "kimi_k3_tp16_moetp16ep1_nospec_1k1k"
+    model_name: "kimi_k3_mxfp4"
+    tensor_parallel_size: 16
+    moe_tensor_parallel_size: 16
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    max_batch_size: 2
+    max_num_tokens: 8192
+    enable_attention_dp: false
+    enable_chunked_prefill: true
+    trust_remote_code: true
+    modeling_v2: require
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 2
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.25
+      tokens_per_block: 64
+    client_configs:
+      - name: "con1_iter10_1k1k"
+        concurrency: 1
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        dataset_file: <dataset_file>
+      - name: "con2_iter10_1k1k"
+        concurrency: 2
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        dataset_file: <dataset_file>

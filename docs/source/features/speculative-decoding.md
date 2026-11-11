@@ -296,7 +296,7 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 * `MTP`
 * `Eagle3`
 * `NGram` (deprecated; use `SA` instead)
-* `DraftTarget`
+* `Draft_Target`
 * `PARD`
 * `DFlash`
 * `SA`
@@ -351,3 +351,20 @@ The field name `speculative_model_dir` can also be used as an alias for `specula
       max_draft_len: 4
       speculative_model_dir: /path/to/draft/model
 ```
+
+### DSpark attention projection precision
+
+`TRTLLM_DSPARK_LINEAR_BACKEND=bf16|fp8` selects the attention projection
+precision of the embedded DeepSeek-V4 DSpark drafter. When unset, projections
+use FP8 on Rubin SM107 with TP=1 or attention DP, and BF16 otherwise. Set
+bf16 to use dequantized BF16 draft weights. An explicit fp8 selection
+requires TP=1 or attention DP; unsupported tensor-parallel mappings are
+rejected during initialization. Non-Rubin FP8 is opt-in and requires workload
+accuracy and acceptance-length validation.
+
+### Packed FP4 MLA wave planning
+
+`TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=1` enables the optional wave-simulation
+planner for packed FP4 MLA decode. The default is disabled (0); the
+rule-based split plan remains active. Validate end-to-end latency on the
+serving workload before enabling wave simulation.
