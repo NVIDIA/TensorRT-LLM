@@ -60,15 +60,18 @@ def _moe_prefix_kernel(
     num_post_pad_ptr,
     BLOCK_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
+    NUM_EXPERTS_POW2: tl.constexpr,
 ):
     """Compute exclusive offsets from padded expert counts."""
-    e = tl.arange(0, NUM_EXPERTS)
-    counts = tl.load(counts_ptr + e).to(tl.int32)
+    # tl.arange needs a power-of-2 range; lanes >= NUM_EXPERTS load a count of 0 and are not stored.
+    e = tl.arange(0, NUM_EXPERTS_POW2)
+    mask = e < NUM_EXPERTS
+    counts = tl.load(counts_ptr + e, mask=mask, other=0).to(tl.int32)
     padded = ((counts + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
     # Inclusive scan; subtract self for exclusive prefix.
     inc = tl.associative_scan(padded, 0, _int32_add)
     out_off = inc - padded
-    tl.store(out_off_ptr + e, out_off)
+    tl.store(out_off_ptr + e, out_off, mask=mask)
     tl.store(num_post_pad_ptr, tl.sum(padded).to(tl.int32))
 
 
@@ -159,6 +162,7 @@ def moe_align_block_size(
         num_post_pad,
         BLOCK_SIZE=block_size,
         NUM_EXPERTS=num_experts,
+        NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
     )
 
     _moe_expert_ids_kernel[num_experts,](

@@ -44,6 +44,7 @@ from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
+from tensorrt_llm._errors import ConfigInputError
 from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.commands._config_overrides import (ConfigOverride,
@@ -68,6 +69,7 @@ from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
+from tensorrt_llm.llmapi.startup_checks import no_visible_gpu_error
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
@@ -87,6 +89,7 @@ from tensorrt_llm.usage import config as _telemetry_config
 from tensorrt_llm.usage import (get_observed_signal,
                                 record_termination_observation,
                                 set_lifecycle_phase, set_usage_context)
+from tensorrt_llm.usage.usage_lib import _mark_visual_gen
 
 if TYPE_CHECKING:
     # Type-only: the visual_gen tree is imported lazily inside the VisualGen
@@ -291,7 +294,7 @@ def get_llm_args(
     if gpus_per_node is None:
         gpus_per_node = device_count()
         if gpus_per_node == 0:
-            raise ValueError("No GPU devices found on the node")
+            raise no_visible_gpu_error()
 
     # TODO: This manual cp_type conversion can be removed once cp_config
     # is refactored to a typed Pydantic model with enum coercion
@@ -977,6 +980,48 @@ _EMBEDDING_ARCH_MAP = {
 }
 
 
+def _is_pplx_decider_checkpoint(model: str,
+                                revision: Optional[str] = None) -> bool:
+    """Return whether a checkpoint has the pplx-decider decision contract."""
+    try:
+        if os.path.isdir(model):
+            decision_config_file = os.path.join(model, "decision_config.json")
+            if not os.path.isfile(decision_config_file):
+                return False
+        else:
+            from transformers.utils.hub import cached_file
+            decision_config_file = cached_file(
+                model,
+                "decision_config.json",
+                revision=revision,
+                _raise_exceptions_for_missing_entries=False,
+                _raise_exceptions_for_connection_errors=False,
+            )
+            if decision_config_file is None:
+                return False
+
+        with open(decision_config_file) as config_file:
+            decision_config = json.load(config_file)
+    except (OSError, ValueError) as e:
+        logger.warning(
+            f"Could not read decision config for embedding routing ({model}): {e}"
+        )
+        return False
+
+    if not isinstance(decision_config, dict):
+        return False
+    from tensorrt_llm._torch.models.modeling_pplx_decider import \
+        PPLX_DECIDER_NUM_LABELS
+    codes = decision_config.get("codes")
+    token_ids = decision_config.get("token_ids")
+    return (decision_config.get("attention_mode") == "noncausal_full_attention"
+            and decision_config.get("pooling") == "last"
+            and isinstance(codes, list)
+            and len(codes) == PPLX_DECIDER_NUM_LABELS
+            and isinstance(token_ids, list)
+            and len(token_ids) == PPLX_DECIDER_NUM_LABELS)
+
+
 def _resolve_embedding_architecture_override(
         model: str,
         trust_remote_code: bool,
@@ -1001,14 +1046,19 @@ def _resolve_embedding_architecture_override(
 
     if not architectures:
         return None
-    target = _EMBEDDING_ARCH_MAP.get(architectures[0])
+    architecture = architectures[0]
+    if architecture == "Qwen3_5Model" and _is_pplx_decider_checkpoint(
+            model, revision):
+        target = "PplxDeciderForDecision"
+    else:
+        target = _EMBEDDING_ARCH_MAP.get(architecture)
     if target is None:
         return None
 
     # Best-effort sanity check on a local checkpoint: warn (don't fail) if the
     # sentence-transformers pooling layout is absent. The subcommand is explicit
     # embedding intent, so we still proceed with last-token pooling + L2 norm.
-    if os.path.isdir(model):
+    if target == "Qwen3ForTextEmbedding" and os.path.isdir(model):
         pooling_cfg = os.path.join(model, "1_Pooling", "config.json")
         if not os.path.isfile(pooling_cfg):
             logger.warning(
@@ -1016,7 +1066,7 @@ def _resolve_embedding_architecture_override(
                 "proceeding with last-token pooling + L2 normalize.")
 
     logger.info(f"Embedding routing: overriding architecture "
-                f"{architectures[0]} -> {target}")
+                f"{architecture} -> {target}")
     return {"architectures": [target]}
 
 
@@ -1617,6 +1667,10 @@ def serve(
 
     MODEL: model name or Hugging Face checkpoint path
     """
+    is_visual_gen = enable_visual_gen or visual_gen_args is not None
+    if is_visual_gen:
+        # VisualGen reports no startup error category or startup state.
+        _mark_visual_gen()
     logger.set_level(log_level)
     if enable_sleep_mode and backend != "pytorch":
         raise click.UsageError(
@@ -1700,8 +1754,9 @@ def serve(
     explicit_cli_keys = collect_explicit_cli_keys(
         exclude=("extra_llm_api_options", "config", "config_overrides"))
 
-    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
-                     or get_is_diffusion_only_model(model))
+    if not is_visual_gen and get_is_diffusion_only_model(model):
+        is_visual_gen = True
+        _mark_visual_gen()
     # Honor YAML telemetry opt-out before --set parsing can raise an error.
     raw_llm_args_extra_dict = {}
     if not is_visual_gen and extra_llm_api_options is not None:
@@ -1710,7 +1765,7 @@ def serve(
         if raw_llm_args_extra_dict is None:
             raw_llm_args_extra_dict = {}
         elif not isinstance(raw_llm_args_extra_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
     if not is_visual_gen:
         _command_telemetry.apply_raw_config_telemetry_opt_out(
             raw_llm_args_extra_dict,
@@ -1879,13 +1934,13 @@ def serve(
             }
             for name, value in unsupported_args.items():
                 if value is not None:
-                    raise ValueError(
+                    raise ConfigInputError(
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
             if grpc_protocol == "smg":
                 if find_spec("smg_grpc_proto") is None:
-                    raise ValueError(
+                    raise ConfigInputError(
                         "gRPC serving with the SMG protocol requires the optional "
                         "'smg-grpc-proto' package. Install it with: "
                         'pip install "tensorrt_llm[grpc-smg]"')
@@ -2113,7 +2168,7 @@ def serve_encoder(
         if encoder_args_extra_dict is None:
             encoder_args_extra_dict = {}
         elif not isinstance(encoder_args_extra_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
     _command_telemetry.apply_raw_config_telemetry_opt_out(
         encoder_args_extra_dict,
         usage_context=_telemetry_config.UsageContext.CLI_SERVE,
@@ -2246,7 +2301,7 @@ def serve_embedding(
         if extra_dict is None:
             extra_dict = {}
         elif not isinstance(extra_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
     _command_telemetry.apply_raw_config_telemetry_opt_out(
         extra_dict,
         usage_context=_telemetry_config.UsageContext.CLI_SERVE,
@@ -2581,6 +2636,30 @@ def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                 process.terminate()
 
 
+_COORDINATOR_UDS_NAME = "coordinator.sock"
+# Linux's sun_path holds 108 bytes, including the terminating NUL.
+_MAX_UDS_PATH_BYTES = 107
+
+
+def _make_coordinator_uds_dir(public_port: int) -> tempfile.TemporaryDirectory:
+    """Create a new directory for the coordinator's Unix socket.
+
+    The directory is created with mode 0o700, so only this user can reach the
+    socket inside it. It is made in the temporary directory, or in /tmp when
+    the socket path there would not fit in a Unix socket address.
+    """
+    prefix = f"trtllm_disagg_coord_{public_port}_"
+    uds_dir = tempfile.TemporaryDirectory(prefix=prefix)
+    uds_path = os.path.join(uds_dir.name, _COORDINATOR_UDS_NAME)
+    if len(os.fsencode(uds_path)) <= _MAX_UDS_PATH_BYTES:
+        return uds_dir
+    uds_dir.cleanup()
+    logger.warning(f"Coordinator socket path {uds_path} is longer than "
+                   f"{_MAX_UDS_PATH_BYTES} bytes; creating its directory in "
+                   f"/tmp instead.")
+    return tempfile.TemporaryDirectory(prefix=prefix, dir="/tmp")  # nosec B108
+
+
 def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                                  metadata_server_config_file,
                                  metadata_server_cfg, request_timeout,
@@ -2603,97 +2682,109 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     # that dominated per-request latency). Opt-out via the UDS env = "0".
     use_uds = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS,
                              "1") == "1"
-    coord_uds = (
-        f"/tmp/trtllm_disagg_coord_{public_port}.sock"  # nosec B108
-        if use_uds else None)
-    # Fleet points at the UDS when enabled; the TCP port stays up for health.
-    coord_url = f"unix:{coord_uds}" if coord_uds else \
-        f"http://{public_host}:{coord_port}"
-
-    # Bind the coordinator's TCP socket here rather than letting uvicorn bind the
-    # hostname, so this listener starts the same way as the standalone server and
-    # the fleet workers. uvicorn would resolve the name itself, and a hostname
-    # whose AAAA record is link-local resolves to fe80:: with scope id 0 -- which
-    # the kernel always rejects with "invalid argument", because the scope id can
-    # only be derived from an interface name. Binding AF_INET here also surfaces a
-    # port conflict with the same diagnostics as the other two listeners.
-    coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Set before the try so that its finally also cleans up after a failed
+    # startup.
+    coord_socket = None
+    fleet = []
+    # The socket lives in a new directory that only this user can enter; the
+    # permissions uvicorn sets on the socket file itself do not widen that.
+    coord_uds_dir = _make_coordinator_uds_dir(public_port) if use_uds else None
     try:
-        coord_socket.bind((public_host, coord_port))
-    except OSError as e:
-        coord_socket.close()
-        raise _bind_failure("coordinator", public_host, coord_port, e) from e
+        coord_uds = (os.path.join(coord_uds_dir.name, _COORDINATOR_UDS_NAME)
+                     if coord_uds_dir is not None else None)
+        # Fleet points at the UDS when enabled; the TCP port stays up for health.
+        coord_url = f"unix:{coord_uds}" if coord_uds else \
+            f"http://{public_host}:{coord_port}"
 
-    # 1. Launch the delegating fleet pointed at the implicit coordinator we start
-    #    below (port-1 for TCP; UDS for the hot path). Workers hold
-    #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
-    fleet = _launch_disagg_fleet(disagg_cfg, config_file,
-                                 metadata_server_config_file, request_timeout,
-                                 server_start_timeout, num_workers, coord_url)
+        # Bind the coordinator's TCP socket here rather than letting uvicorn bind the
+        # hostname, so this listener starts the same way as the standalone server and
+        # the fleet workers. uvicorn would resolve the name itself, and a hostname
+        # whose AAAA record is link-local resolves to fe80:: with scope id 0 -- which
+        # the kernel always rejects with "invalid argument", because the scope id can
+        # only be derived from an interface name. Binding AF_INET here also surfaces a
+        # port conflict with the same diagnostics as the other two listeners.
+        coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            coord_socket.bind((public_host, coord_port))
+        except OSError as e:
+            coord_socket.close()
+            raise _bind_failure("coordinator", public_host, coord_port,
+                                e) from e
 
-    # 2. Build + serve the coordinator in this process. It OWNS routing state and
-    #    builds the owner routers itself (single shared namespace-aware core + ONE
-    #    ZMQ ingest server, started once here).
-    def _client_factory(router, role, max_retries=1):
-        from tensorrt_llm.serve.openai_client import OpenAIHttpClient
-        return OpenAIHttpClient(
-            router,
-            role,
-            request_timeout,
-            max_retries,
-            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key,
-            frontend_affinity=disagg_cfg.ctx_frontend_affinity)
+        # 1. Launch the delegating fleet pointed at the implicit coordinator we start
+        #    below (port-1 for TCP; UDS for the hot path). Workers hold
+        #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
+        fleet = _launch_disagg_fleet(disagg_cfg, config_file,
+                                     metadata_server_config_file,
+                                     request_timeout, server_start_timeout,
+                                     num_workers, coord_url)
 
-    coordinator = DisaggCoordinatorService(
-        disagg_cfg,
-        _client_factory,
-        metadata_config=metadata_server_cfg,
-        server_start_timeout_secs=server_start_timeout,
-        request_timeout_secs=request_timeout)
-    logger.info(f"Coordinator serving on {public_host}:{coord_port} "
-                f"(uds={coord_uds}) (fleet on public port {public_port})")
-    set_lifecycle_phase("serving")
+        # 2. Build + serve the coordinator in this process. It OWNS routing state and
+        #    builds the owner routers itself (single shared namespace-aware core + ONE
+        #    ZMQ ingest server, started once here).
+        def _client_factory(router, role, max_retries=1):
+            from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+            return OpenAIHttpClient(
+                router,
+                role,
+                request_timeout,
+                max_retries,
+                internal_disagg_auth_key=disagg_cfg.internal_request_auth_key,
+                frontend_affinity=disagg_cfg.ctx_frontend_affinity)
 
-    async def _serve_and_monitor():
-        server_task = asyncio.create_task(
-            CoordinatorServer(coordinator)(
-                public_host,
-                coord_port,
-                uds=coord_uds,
-                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
-                sockets=[coord_socket]))
+        coordinator = DisaggCoordinatorService(
+            disagg_cfg,
+            _client_factory,
+            metadata_config=metadata_server_cfg,
+            server_start_timeout_secs=server_start_timeout,
+            request_timeout_secs=request_timeout)
+        logger.info(f"Coordinator serving on {public_host}:{coord_port} "
+                    f"(uds={coord_uds}) (fleet on public port {public_port})")
+        set_lifecycle_phase("serving")
 
-        async def _monitor_fleet():
-            while True:
-                for i, process in enumerate(fleet):
-                    return_code = process.poll()
-                    if return_code is not None:
-                        if return_code != 0:
-                            _report_observed_child_failure(
-                                return_code, "disagg_worker", "serving")
-                            raise RuntimeError(
-                                f"Disagg fleet worker {i} (pid={process.pid}) "
-                                f"exited with code {return_code}")
-                        return
-                await asyncio.sleep(1)
+        async def _serve_and_monitor():
+            server_task = asyncio.create_task(
+                CoordinatorServer(coordinator)(
+                    public_host,
+                    coord_port,
+                    uds=coord_uds,
+                    keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
+                    sockets=[coord_socket]))
 
-        monitor_task = asyncio.create_task(_monitor_fleet())
-        done, pending = await asyncio.wait((server_task, monitor_task),
-                                           return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            task.result()
+            async def _monitor_fleet():
+                while True:
+                    for i, process in enumerate(fleet):
+                        return_code = process.poll()
+                        if return_code is not None:
+                            if return_code != 0:
+                                _report_observed_child_failure(
+                                    return_code, "disagg_worker", "serving")
+                                raise RuntimeError(
+                                    f"Disagg fleet worker {i} (pid={process.pid}) "
+                                    f"exited with code {return_code}")
+                            return
+                    await asyncio.sleep(1)
 
-    try:
+            monitor_task = asyncio.create_task(_monitor_fleet())
+            done, pending = await asyncio.wait(
+                (server_task, monitor_task),
+                return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                task.result()
+
         asyncio.run(_serve_and_monitor())
     finally:
-        coord_socket.close()
+        if coord_socket is not None:
+            coord_socket.close()
         for process in fleet:
             if process.poll() is None:
                 process.terminate()
+        if coord_uds_dir is not None:
+            coord_uds_dir.cleanup()
 
 
 def _init_fleet_worker_process():
@@ -3153,14 +3244,31 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
         )
 
 
+def _visual_gen_requested(args: Sequence[str]) -> bool:
+    """Detect the explicit VisualGen flags of ``serve`` before Click parses them."""
+    for arg in args:
+        if arg == "--":
+            break
+        if arg.split("=", 1)[0] in ("--enable_visual_gen", "--visual_gen_args"):
+            return True
+    return False
+
+
 class DefaultGroup(_command_telemetry.TelemetryGroup):
     """Custom Click group to allow default command behavior"""
 
     def resolve_command(self, ctx, args):
         # If the first argument is not a recognized subcommand, assume "serve"
         if args and args[0] not in self.commands:
-            return "serve", self.commands["serve"], args
-        return super().resolve_command(ctx, args)
+            result = "serve", self.commands["serve"], args
+        else:
+            result = super().resolve_command(ctx, args)
+        if result[0] == "serve" and _visual_gen_requested(result[2]):
+            # Marked before Click parses the serve options, so a VisualGen
+            # launch rejected by Click also reports no startup error category
+            # or startup state.
+            _mark_visual_gen()
+        return result
 
 
 main = DefaultGroup(

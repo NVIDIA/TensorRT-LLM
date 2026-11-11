@@ -42,9 +42,8 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
-from ..fmha_decode_constants import (
-    INT32_SCORE_BIAS,
-)
+from ....sage.int32_scores import INT32_SCORE_BIAS
+from ....sage.modes import SageScoreScaling
 from ...placeholder_helpers import _placeholder_smem_array
 from .helpers_common import (
     _route_is_proxy,
@@ -461,11 +460,13 @@ class SmemPResource(DecodeGenResourceBase):
         # returns dequantized scores (one scale per score) scales by
         # ``c * sfQ`` alone and carries no bias; any other loads the tile's
         # words in place, a fragment ahead like the scores.
-        dequantized: Constexpr[bool] = cfg.sage_scores_dequantized()
+        dequantized: Constexpr[bool] = (
+            cfg.sage_score_scaling() is SageScoreScaling.DEQUANTIZED
+        )
         uses_words: Constexpr[bool] = cfg.use_sage_attention and not dequantized
         groups: Constexpr[int] = cfg.sage_k_groups_per_fragment()
         # A mixed plan's proxy tile comes back from the max pass dequantized
-        # (``FmhaDecodeConfig.sage_scores_dequantized``), so its multipliers
+        # (``FmhaDecodeConfig.sage_score_scaling``), so its multipliers
         # are ``c * sfQ`` alone, with no INT32 bias, in place of the exact
         # words.
         replaces_proxy_words: Constexpr[bool] = uses_words and cfg.sage_mixed_k_geometry
@@ -744,7 +745,7 @@ class SmemPResource(DecodeGenResourceBase):
             p1 = Float32(s_arr[value_idx + 1])
             if cutlass.const_expr(
                 _pair_uses_ex2_emulation(
-                    pair_idx, pairs_per_fragment, self.cfg.ex2_emulated_pairs
+                    pair_idx, pairs_per_fragment, self.cfg.fragment_ex2_emulated_pairs
                 )
             ):
                 p0, p1 = _ex2_emulation_packed_f32x2(p0, p1)
@@ -782,6 +783,7 @@ class SmemPResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
         route_is_proxy: cutlass.Boolean,
+        sage_q_scale: Float32 | None = None,
     ) -> None:
         """Materialize one complete-row Keeps probability tile.
 
@@ -789,7 +791,9 @@ class SmemPResource(DecodeGenResourceBase):
         gives paired lanes the low/high 64-column halves of one row. Each lane
         writes disjoint packed blocks into the TMEM or SMEM layout consumed by
         BMM2. Streamed profiles, including every block-sparse Keeps profile,
-        produce P through the rolled fragment loop instead.
+        produce P through the rolled fragment loop instead. A Sage row arrives
+        dequantized without ``sfQ`` (``TmemSResource._dequantize_sage_keeps_row``),
+        so its exponent multiplier is ``c * sfQ``.
         """
         cfg = self.cfg
         # Every block-sparse Keeps profile streams P; only dense complete rows
@@ -812,6 +816,9 @@ class SmemPResource(DecodeGenResourceBase):
             )
 
         exponent_addend = self._exponent_addend(new_max_arr[0], route_is_proxy)
+        exp_scale = self.scale_softmax_log2
+        if cutlass.const_expr(cfg.use_sage_attention):
+            exp_scale = self.scale_softmax_log2 * sage_q_scale
 
         # Preserve four independent modulo-4 sum chains as two packed pairs,
         # without keeping a second 16-value P array live beside the S row.
@@ -832,7 +839,7 @@ class SmemPResource(DecodeGenResourceBase):
                             s_arr[s_base + val_base],
                             s_arr[s_base + val_base + 1],
                         ),
-                        (self.scale_softmax_log2, self.scale_softmax_log2),
+                        (exp_scale, exp_scale),
                         (exponent_addend, exponent_addend),
                     )
                     p_pair_01 = (
@@ -845,7 +852,7 @@ class SmemPResource(DecodeGenResourceBase):
                             s_arr[s_base + val_base + 2],
                             s_arr[s_base + val_base + 3],
                         ),
-                        (self.scale_softmax_log2, self.scale_softmax_log2),
+                        (exp_scale, exp_scale),
                         (exponent_addend, exponent_addend),
                     )
                     p_pair_23 = (
@@ -869,7 +876,7 @@ class SmemPResource(DecodeGenResourceBase):
                             s_arr[s_base + val_base],
                             s_arr[s_base + val_base + 1],
                         ),
-                        (self.scale_softmax_log2, self.scale_softmax_log2),
+                        (exp_scale, exp_scale),
                         (exponent_addend, exponent_addend),
                     )
                     p_pair = (
@@ -1276,6 +1283,7 @@ class SmemPResource(DecodeGenResourceBase):
             )
             if cutlass.const_expr(
                 not self.use_variable_seqlens_kv
+                and cfg.fixed_seqlen
                 and not cfg.uses_runtime_q_kv_union
                 and not cfg.use_split_kv
                 and cfg.has_odd_kv_tail
@@ -1442,6 +1450,27 @@ class SmemPResource(DecodeGenResourceBase):
             new_max_arr=new_max_arr,
             s_arr=s_arr,
             route_is_proxy=cutlass.Boolean(False),
+        )
+
+    @producer_work
+    @cute.jit
+    def compute_sage_p(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+        sage_q_scale: Float32,
+    ) -> None:
+        """Compute a complete-row Sage P tile from the max pass's dequantized row."""
+
+        assert self.cfg.use_sage_attention and self.cfg.stages_q128_p_in_smem
+        self._compute_keeps_p(
+            stage_info,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            route_is_proxy=cutlass.Boolean(False),
+            sage_q_scale=sage_q_scale,
         )
 
     @producer_work

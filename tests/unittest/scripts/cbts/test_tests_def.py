@@ -435,18 +435,152 @@ def test_deleted_yaml_body_without_visible_key_falls_back() -> None:
         ("def test_other():\n    pass\n", []),
     ),
 )
+@pytest.mark.parametrize("test_path", ("test_models.py", "modeling_v2/test_models.py"))
 def test_deleted_accuracy_key_requires_absence_from_test_sources(
     tmp_path: Path,
     source: str,
     expected: list[str],
+    test_path: str,
 ) -> None:
+    """Deleted reference sections remain relevant while a nested test still reads them."""
     git_path = f"{ACCURACY_REFS_PREFIX}gsm8k.yaml"
     yaml_path = "accuracy/references/gsm8k.yaml"
     reference = tmp_path / git_path
     reference.parent.mkdir(parents=True)
     reference.write_text("Other:\n  - expected: 2\n", encoding="utf-8")
-    accuracy_test = tmp_path / ACCURACY_DIR / "test_models.py"
+    accuracy_test = tmp_path / ACCURACY_DIR / test_path
+    accuracy_test.parent.mkdir(parents=True, exist_ok=True)
     accuracy_test.write_text(source, encoding="utf-8")
     diff = "@@ -1,4 +1,2 @@\n-GPT-OSS/20B-MXFP4:\n-  - expected: 1\n Other:\n   - expected: 2\n"
 
     assert _make_rule(tmp_path)._compute_anchors(git_path, yaml_path, diff) == expected
+
+
+@pytest.mark.parametrize(
+    ("source", "key", "expected"),
+    (
+        (
+            'class TestTarget:\n    MODEL_NAME = "provider/model"\n',
+            "provider/model",
+            ["accuracy/modeling_v2/test_target.py::TestTarget"],
+        ),
+        (
+            "class TestTarget:\n    def test_accuracy(self):\n        pass\n",
+            "TestTarget::test_accuracy",
+            ["accuracy/modeling_v2/test_target.py::TestTarget::test_accuracy"],
+        ),
+        (
+            'class TestTarget:\n    KEY = "TestTarget::mtp3"\n'
+            "    def test_accuracy(self):\n        pass\n",
+            "TestTarget::mtp3",
+            ["accuracy/modeling_v2/test_target.py::TestTarget"],
+        ),
+        (
+            "class TestTarget(BaseTest):\n    pass\n",
+            "TestTarget::test_inherited",
+            ["accuracy/modeling_v2/test_target.py::TestTarget"],
+        ),
+        (
+            'class TestTarget:\n    KEY = ("ModelingV2Target::" "mtp3")\n',
+            "ModelingV2Target::mtp3",
+            ["accuracy/modeling_v2/test_target.py::TestTarget"],
+        ),
+        (
+            'class TestTarget:\n    KEY = "ModelingV2Target::mtp3"\n    KV_KEY = KEY + "_fp8_kv"\n',
+            "ModelingV2Target::mtp3_fp8_kv",
+            ["accuracy/modeling_v2/test_target.py::TestTarget"],
+        ),
+        (
+            'KEY = "ModelingV2Target::mtp3"\nclass TestTarget:\n    pass\n',
+            "ModelingV2Target::mtp3",
+            ["accuracy/modeling_v2/test_target.py"],
+        ),
+        (
+            'def read_reference():\n    return "ModelingV2Target::mtp3"\n',
+            "ModelingV2Target::mtp3",
+            ["accuracy/modeling_v2/test_target.py"],
+        ),
+        (
+            'class TestTarget:\n    KEY = f"ModelingV2Target::{VARIANT}"\n',
+            "ModelingV2Target::mtp3",
+            ["accuracy/modeling_v2/test_target.py::TestTarget"],
+        ),
+        (
+            'class TestTarget:\n    KEY = "ModelingV2Other::mtp3"\n',
+            "ModelingV2Target::mtp3",
+            ["accuracy/references/acceptance_length.yaml"],
+        ),
+    ),
+)
+def test_nested_accuracy_reference_anchors(
+    tmp_path: Path, source: str, key: str, expected: list[str]
+) -> None:
+    """Resolve nested model, method and variant keys without inventing method anchors."""
+    _write_defs_file(tmp_path, "accuracy/modeling_v2/test_target.py", source)
+    _write_defs_file(tmp_path, "accuracy/test_other.py", "class TestOther:\n    pass\n")
+    yaml_path = "accuracy/references/acceptance_length.yaml"
+    _write_defs_file(tmp_path, yaml_path, f"{key}:\n  min_al: 2.5\n")
+    diff = f"@@ -0,0 +1,2 @@\n+{key}:\n+  min_al: 2.5\n"
+
+    assert (
+        _make_rule(tmp_path)._compute_anchors(f"{DEFS_GIT_PREFIX}{yaml_path}", yaml_path, diff)
+        == expected
+    )
+
+
+@pytest.mark.parametrize("namespace", ("ModelingV2Target", "TestTarget"))
+def test_acceptance_reference_only_selects_consuming_classes(
+    tmp_path: Path, namespace: str
+) -> None:
+    """A variant reference keeps listed test methods through their consuming class."""
+    key = f"{namespace}::mtp3"
+    yaml_path = "accuracy/references/acceptance_length.yaml"
+    _write_defs_file(tmp_path, yaml_path, f"{key}:\n  min_al: 2.5\n")
+    for module in ("modeling_v2", "other"):
+        _write_defs_file(
+            tmp_path,
+            f"accuracy/{module}/test_target.py",
+            f'class TestTarget:\n    KEY = "{key}"\n',
+        )
+    test_db = tmp_path / "test-db"
+    test_db.mkdir()
+    (test_db / "l0_target.yml").write_text(
+        "l0_target:\n- tests:\n"
+        "  - accuracy/modeling_v2/test_target.py::TestTarget::test_accuracy\n"
+        "  - accuracy/modeling_v2/test_target.py::TestUnrelated::test_accuracy\n"
+        "  - accuracy/other/test_target.py::TestTarget::test_accuracy\n"
+        "- tests:\n  - accuracy/test_unrelated.py::TestUnrelated::test_accuracy\n",
+        encoding="utf-8",
+    )
+    rule = CbtsTestsDefRule(YAMLIndex.load(test_db), {}, tmp_path)
+    result = rule.apply(
+        PRInputs(
+            changed_files=[f"{DEFS_GIT_PREFIX}{yaml_path}"],
+            diffs={f"{DEFS_GIT_PREFIX}{yaml_path}": f"@@ -0,0 +1,2 @@\n+{key}:\n+  min_al: 2.5\n"},
+        )
+    )
+
+    assert result is not None
+    assert result.scope == "testdefonly"
+    assert set(result.block_filters) == {("l0_target", 0)}
+    assert set(result.block_filters[("l0_target", 0)]) == {
+        "accuracy/modeling_v2/test_target.py::TestTarget",
+        "accuracy/other/test_target.py::TestTarget",
+    }
+
+
+def test_mixed_known_and_unknown_reference_keys_keep_fallback(tmp_path: Path) -> None:
+    """One unresolved namespace prevents narrowing a mixed reference change."""
+    _write_defs_file(
+        tmp_path,
+        "accuracy/modeling_v2/test_target.py",
+        'class TestTarget:\n    KEY = "ModelingV2Target::mtp3"\n',
+    )
+    yaml_path = "accuracy/references/acceptance_length.yaml"
+    content = "ModelingV2Target::mtp3:\n  min_al: 2.5\nUnknown::variant:\n  min_al: 1.5\n"
+    _write_defs_file(tmp_path, yaml_path, content)
+    diff = "@@ -0,0 +1,4 @@\n" + "".join(f"+{line}\n" for line in content.splitlines())
+
+    assert _make_rule(tmp_path)._compute_anchors(
+        f"{DEFS_GIT_PREFIX}{yaml_path}", yaml_path, diff
+    ) == [yaml_path]
