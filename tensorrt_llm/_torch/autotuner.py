@@ -38,7 +38,7 @@ from cuda.bindings import driver
 import tensorrt_llm
 from tensorrt_llm import _jit_share as jit_share
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.kernel_builder import KernelBuilder
+from tensorrt_llm._torch.kernel_builder import KernelBuilder, worker_stream
 from tensorrt_llm._torch.nccl_window_graph import (
     abandon_nccl_window_graph_owner, nccl_window_allocation_suppressed,
     nccl_window_graph_capture, release_nccl_window_graph_owner)
@@ -1029,17 +1029,6 @@ def _interleaved(profiles: List[OptimizationProfile],
     return [b[j] for j in range(size) for b in blocks if j < len(b)]
 
 
-_build_streams = threading.local()
-
-
-def _thread_build_stream() -> torch.cuda.Stream:
-    """The calling thread's own stream for builds, made on first use."""
-    stream = getattr(_build_streams, "stream", None)
-    if stream is None:
-        stream = _build_streams.stream = torch.cuda.Stream()
-    return stream
-
-
 def _default_parallel_jit_warmup_threads() -> int:
     """Threads for ``parallel_jit_warmup=-1``: this rank's CPUs, up to 32.
 
@@ -1977,19 +1966,21 @@ class AutoTuner:
         # queued so far, which produced them.
         ready = torch.cuda.Event()
         ready.record()
-        queued = sum(
-            builder.submit(
-                BUILD_OP_PREFIX + custom_op, (runner_ids, p.get_opt_shapes()),
-                partial(self._build_profile,
-                        custom_op,
-                        runners,
-                        p,
-                        inputs,
-                        tuning_config,
-                        None,
-                        kwargs,
-                        ready=ready))
-            for p in _interleaved(profiles, builder.threads))
+        queued = 0
+        for p in _interleaved(profiles, builder.threads):
+            build = partial(self._build_profile,
+                            custom_op,
+                            runners,
+                            p,
+                            inputs,
+                            tuning_config,
+                            None,
+                            kwargs,
+                            ready=ready)
+            queued += builder.submit(BUILD_OP_PREFIX + custom_op,
+                                     (runner_ids, p.get_opt_shapes()),
+                                     build,
+                                     uses_gpu=True)
         logger.info(f"[Autotuner] {custom_op}: {queued} of {len(profiles)} "
                     "profiles queued to build")
 
@@ -2009,7 +2000,7 @@ class AutoTuner:
         the calling thread's own, after ``ready``, and returns whether anything
         was built.
         """
-        stream = stream if stream is not None else _thread_build_stream()
+        stream = stream if stream is not None else worker_stream()
         if ready is not None:
             stream.wait_event(ready)
         built = False

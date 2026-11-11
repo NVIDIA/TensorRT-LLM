@@ -215,10 +215,11 @@ serving runs the tuned tactic.
 For a model with such an op, the engine first loads dummy weights and runs the autotuner
 warmup's two forwards on them (a context batch at the maximum token count and one
 generation request) in the build state, then loads the checkpoint while the kernels build.
-The startup log shows these as the `rehearsal`, `checkpoint` and `autotuner_builds` phases,
-which `model_engine_creation_seconds` then does not include; `autotuner_builds` waits for
-the autotuned ops' builds. Supported ops: MiniMax-M3's MSA attention (`fmha_sm100`), and in
-the build state, DeepGEMM's FP8 block-scale GEMMs on Blackwell and FlashInfer's MXFP8 GEMM.
+The startup log shows these as the `rehearsal`, `checkpoint` and `gpu_builds` phases,
+which `model_engine_creation_seconds` then does not include; `gpu_builds` waits for the
+builds that run kernels on the GPU. Supported ops: MiniMax-M3's MSA attention
+(`fmha_sm100`), and in the build state, DeepGEMM's FP8 block-scale GEMMs on Blackwell and
+FlashInfer's MXFP8 GEMM.
 
 | Environment variable | Default | Effect |
 |----------------------|---------|--------|

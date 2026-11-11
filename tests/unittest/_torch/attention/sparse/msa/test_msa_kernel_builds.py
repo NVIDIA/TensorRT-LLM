@@ -95,7 +95,9 @@ def test_the_indexer_maximum_score_pass_also_lists_its_split_variants(fmha_sm100
 def test_a_rehearsal_run_lists_and_launches_nothing(fmha_sm100, no_compile, monkeypatch):
     builder = kernel_builder.KernelBuilder.get()
     submitted = []
-    monkeypatch.setattr(builder, "submit", lambda op, key, build: submitted.append(key) or True)
+    monkeypatch.setattr(
+        builder, "submit", lambda op, key, build, uses_gpu=False: submitted.append(key) or True
+    )
     page_size = head_dim = 128
     num_heads, num_kv_heads, qo_len = 8, 1, 100
     q = torch.ones(qo_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)

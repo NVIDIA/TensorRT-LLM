@@ -11,6 +11,11 @@ those its call signature has not listed yet. Worker threads then build them in p
 The op's own later call finds a kernel built, or waits on the op's own lock for a build
 that is still running.
 
+An op whose kernels compile inside its own run, and that may run on several threads at
+once, needs no list of its own: ``builds_by_running`` has each of its calls in a rehearsal
+queue one run of the op for every shape its ``BuildConfig`` sweeps, on the call's own
+arguments cut or tiled to that shape.
+
 An op that goes through the autotuner builds through it instead: in the autotuner's
 build state (``autotuner.build_kernels``), ``choose_one`` queues here the builds of every
 shape, runner and tactic the op's tuning will time.
@@ -32,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import importlib
 import itertools
 import os
@@ -48,6 +54,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Tuple,
     Union,
 )
@@ -56,7 +63,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-__all__ = ["BuildConfig", "DynamicSpec", "KernelBuilder"]
+__all__ = ["BuildConfig", "DynamicSpec", "KernelBuilder", "builds_by_running", "worker_stream"]
 
 _ENV = "TLLM_KERNEL_BUILDER"
 _REHEARSAL_ENV = "TLLM_KERNEL_BUILDER_REHEARSAL"
@@ -76,6 +83,8 @@ _FAMILIES = {
 
 # A build returns True when it compiled the kernel, False when the kernel was already there.
 Build = Callable[[], bool]
+# Where a dimension sits in an op's arguments: (positional index or keyword, tensor dimension).
+Position = Tuple[Union[int, str], int]
 
 _QUEUED, _DONE, _FAILED = "queued", "done", "failed"
 
@@ -171,14 +180,14 @@ class KernelBuilder:
         self.threads = max(1, threads)
         self._lock = threading.Lock()
         self._idle = threading.Condition(self._lock)
-        self._queue: "queue.Queue[Tuple[str, Hashable, Build]]" = queue.Queue()
+        self._queue: "queue.Queue[Tuple[str, Hashable, Build, bool]]" = queue.Queue()
         self._workers: List[threading.Thread] = []
         self._device: Optional[int] = None
         self._passes = 0
         self._rehearsals = 0
         self._pending = 0
-        # Queued and running builds per op.
-        self._pending_by_op: Dict[str, int] = {}
+        # Queued and running builds that use the GPU (submit's uses_gpu).
+        self._pending_gpu = 0
         # The shapes listed so far for each (op, call signature).
         self._listed: Dict[Tuple[str, Hashable], set] = {}
         self._states: Dict[Tuple[str, Hashable], str] = {}
@@ -268,12 +277,13 @@ class KernelBuilder:
         config: BuildConfig,
         observed: Mapping[str, int],
         list_builds: Callable[[List[Dict[str, int]]], Iterable[Tuple[Hashable, Build]]],
+        uses_gpu: bool = False,
     ) -> None:
         """In a build pass, submit every build ``list_builds(shapes)`` returns as
         ``(key, build)``, where ``shapes`` are those ``config`` sweeps for a call that has
         ``observed`` and that no earlier call of ``(op, signature)`` swept.
 
-        A failure to list leaves the kernels to the op.
+        A failure to list leaves the kernels to the op. ``uses_gpu`` as for ``submit``.
         """
         if not self.active():
             return
@@ -295,7 +305,9 @@ class KernelBuilder:
             )
             return
         list_s = time.perf_counter() - t0
-        queued = sum(self.submit(op, key, build) for key, build in self._rotated(builds))
+        queued = sum(
+            self.submit(op, key, build, uses_gpu=uses_gpu) for key, build in self._rotated(builds)
+        )
         with self._lock:
             stats = self._op_stats(op)
             stats.signatures += new_signature
@@ -306,8 +318,12 @@ class KernelBuilder:
             f"({list_s:.1f}s to list)"
         )
 
-    def submit(self, op: str, key: Hashable, build: Build) -> bool:
-        """Queue one build; False when ``(op, key)`` was already queued or built."""
+    def submit(self, op: str, key: Hashable, build: Build, uses_gpu: bool = False) -> bool:
+        """Queue one build; False when ``(op, key)`` was already queued or built.
+
+        ``uses_gpu``: the build runs kernels on tensors of its own, so it holds GPU memory
+        while it runs (``join(gpu_only=True)`` waits for these).
+        """
         if not self.enabled:
             return False
         with self._lock:
@@ -316,9 +332,9 @@ class KernelBuilder:
             self._states[(op, key)] = _QUEUED
             self._op_stats(op).submitted += 1
             self._pending += 1
-            self._pending_by_op[op] = self._pending_by_op.get(op, 0) + 1
+            self._pending_gpu += uses_gpu
             self._start_workers()
-        self._queue.put((op, key, build))
+        self._queue.put((op, key, build, uses_gpu))
         return True
 
     def state(self, op: str, key: Hashable) -> Optional[str]:
@@ -353,12 +369,12 @@ class KernelBuilder:
 
     # Waiting and reporting.
 
-    def join(self, timeout: Optional[float] = None, prefix: Optional[str] = None) -> float:
-        """Wait for every queued build, or for those of the ops whose name starts with
-        ``prefix``; returns the seconds waited."""
+    def join(self, timeout: Optional[float] = None, gpu_only: bool = False) -> float:
+        """Wait for every queued build, or only for those that use the GPU; returns the
+        seconds waited."""
         t0 = last = time.perf_counter()
         with self._idle:
-            while (pending := self._pending_for(prefix)) > 0:
+            while (pending := self._pending_gpu if gpu_only else self._pending) > 0:
                 now = time.perf_counter()
                 if timeout is not None and now - t0 >= timeout:
                     break
@@ -367,11 +383,6 @@ class KernelBuilder:
                     last = now
                 self._idle.wait(timeout=1.0)
         return time.perf_counter() - t0
-
-    def _pending_for(self, prefix: Optional[str]) -> int:
-        if prefix is None:
-            return self._pending
-        return sum(n for op, n in self._pending_by_op.items() if op.startswith(prefix))
 
     def report(self, name: str, waited: float = 0.0) -> List[str]:
         with self._lock:
@@ -412,7 +423,7 @@ class KernelBuilder:
     def _work(self) -> None:
         device_set = False
         while True:
-            op, key, build = self._queue.get()
+            op, key, build, uses_gpu = self._queue.get()
             t0 = time.perf_counter()
             state = _DONE
             # Every item is settled, whatever it raises: an unsettled one would hang join().
@@ -441,6 +452,157 @@ class KernelBuilder:
                 else:
                     stats.present += 1
                 self._pending -= 1
-                self._pending_by_op[op] -= 1
-                # Waits by op prefix end as an op's builds finish, not only at idle.
+                self._pending_gpu -= uses_gpu
+                # A wait for the GPU builds can end before the others do.
                 self._idle.notify_all()
+
+
+# Builds that run kernels.
+
+_worker_streams = threading.local()
+
+
+def worker_stream() -> Optional["torch.cuda.Stream"]:
+    """The calling thread's own CUDA stream, made on first use; None without CUDA."""
+    if not torch.cuda.is_available():
+        return None
+    stream = getattr(_worker_streams, "stream", None)
+    if stream is None:
+        stream = _worker_streams.stream = torch.cuda.Stream()
+    return stream
+
+
+def builds_by_running(
+    config: BuildConfig,
+    dims: Mapping[str, Sequence[Position]],
+    output: Optional[Callable[..., Any]] = None,
+    name: Optional[str] = None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Decorates an op whose kernels compile inside its own run, so that it needs no list
+    of its own.
+
+    In a rehearsal, each call queues on KernelBuilder's workers one run of the op for every
+    shape ``config`` sweeps from the call's that no earlier call of its signature queued.
+    ``dims`` gives, for each of ``config``'s dimensions, where it sits in the arguments; a
+    run takes the call's arguments with those tensors cut or tiled to its shape. The call
+    itself then returns ``output(*args, **kwargs)``, the op's output filled with zeros,
+    when given, and runs otherwise. Outside a rehearsal the op runs as it is.
+
+    The op must be safe to run on several threads at once and must not use NCCL windows.
+    Its runs use the GPU (``KernelBuilder.join(gpu_only=True)``).
+
+    Args:
+        config: The dimensions the op's kernels depend on.
+        dims: Each dimension's (positional index or keyword, tensor dimension) positions;
+            the call's value is read at the first one.
+        output: The op's output for the call's arguments, filled with zeros.
+        name: The op's name in KernelBuilder's log; the function's name by default.
+    """
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        op = name or fn.__qualname__
+
+        @functools.wraps(fn)
+        def call(*args, **kwargs):
+            builder = KernelBuilder.get()
+            if not builder.rehearsing():
+                return fn(*args, **kwargs)
+            observed = {
+                dim: _argument(args, kwargs, positions[0][0]).shape[positions[0][1]]
+                for dim, positions in dims.items()
+            }
+            builder.prebuild(
+                op,
+                _signature(args, kwargs, dims),
+                config,
+                observed,
+                functools.partial(_runs, fn, args, kwargs, dims, _ready_event()),
+                uses_gpu=True,
+            )
+            if output is not None:
+                return output(*args, **kwargs)
+            return fn(*args, **kwargs)
+
+        return call
+
+    return decorate
+
+
+def _argument(args: Sequence[Any], kwargs: Mapping[str, Any], where: Union[int, str]) -> Any:
+    return args[where] if isinstance(where, int) else kwargs[where]
+
+
+def _signature(args: Sequence[Any], kwargs: Mapping[str, Any], dims) -> Hashable:
+    """What a call has but its swept dimensions: each tensor's dtype, device and shape with
+    those dimensions left out, and every other argument."""
+    swept = {position for positions in dims.values() for position in positions}
+
+    def tag(where: Union[int, str], value: Any) -> Hashable:
+        if isinstance(value, torch.Tensor):
+            shape = tuple(-1 if (where, d) in swept else n for d, n in enumerate(value.shape))
+            return (value.dtype, value.device.type, shape)
+        try:
+            hash(value)
+            return value
+        except TypeError:
+            return type(value).__name__
+
+    return (
+        tuple(tag(i, value) for i, value in enumerate(args)),
+        tuple(sorted((key, tag(key, value)) for key, value in kwargs.items())),
+    )
+
+
+def _ready_event() -> Optional["torch.cuda.Event"]:
+    """Marks the work queued so far, which produced the call's arguments."""
+    if not torch.cuda.is_available():
+        return None
+    event = torch.cuda.Event()
+    event.record()
+    return event
+
+
+def _runs(fn, args, kwargs, dims, ready, shapes) -> List[Tuple[Hashable, Build]]:
+    return [
+        (
+            tuple(sorted(shape.items())),
+            functools.partial(_run, fn, args, kwargs, dims, shape, ready),
+        )
+        for shape in shapes
+    ]
+
+
+def _run(fn, args, kwargs, dims, shape, ready) -> bool:
+    """Run ``fn`` once, on the worker's own stream after ``ready``, with the tensors at
+    ``dims`` cut or tiled to ``shape``; its output is discarded."""
+    stream = worker_stream()
+    if stream is not None and ready is not None:
+        stream.wait_event(ready)
+    args, kwargs = list(args), dict(kwargs)
+    on_stream = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+    with torch.inference_mode(), on_stream:
+        for dim, positions in dims.items():
+            for where, axis in positions:
+                resized = _resized(_argument(args, kwargs, where), axis, shape[dim])
+                if isinstance(where, int):
+                    args[where] = resized
+                else:
+                    kwargs[where] = resized
+        fn(*args, **kwargs)
+        if stream is not None:
+            stream.synchronize()
+    return True
+
+
+def _resized(tensor: torch.Tensor, axis: int, size: int) -> torch.Tensor:
+    """A copy of ``tensor`` with ``size`` entries along ``axis``: its leading ones, repeated
+    as many times as it takes. Copying keeps index values valid."""
+    if tensor.shape[axis] == 0:
+        shape = list(tensor.shape)
+        shape[axis] = size
+        return tensor.new_zeros(shape)
+    if size > tensor.shape[axis]:
+        repeats = [1] * tensor.dim()
+        repeats[axis] = -(-size // tensor.shape[axis])
+        tensor = tensor.repeat(*repeats)
+    return tensor.narrow(axis, 0, size).clone(memory_format=torch.contiguous_format)

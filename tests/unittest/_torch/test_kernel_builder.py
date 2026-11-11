@@ -7,9 +7,15 @@ import threading
 import types
 
 import pytest
+import torch
 
 from tensorrt_llm._torch import kernel_builder
-from tensorrt_llm._torch.kernel_builder import BuildConfig, DynamicSpec, KernelBuilder
+from tensorrt_llm._torch.kernel_builder import (
+    BuildConfig,
+    DynamicSpec,
+    KernelBuilder,
+    builds_by_running,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -180,17 +186,54 @@ def test_the_rehearsal_runs_for_a_model_an_op_family_reaches(monkeypatch):
     assert not KernelBuilder(threads=1, enabled=False).wants_rehearsal("msa")
 
 
-def test_join_waits_for_the_builds_of_the_ops_a_prefix_names():
+def test_join_can_wait_only_for_the_builds_that_use_the_gpu():
     builder = KernelBuilder(threads=2, enabled=True)
     release = threading.Event()
-    builder.submit("other", "k", lambda: release.wait(timeout=30))
-    builder.submit("autotuner:op", "k", lambda: True)
-    assert builder.join(timeout=30, prefix="autotuner:") < 30
-    assert builder.state("autotuner:op", "k") == "done"
-    assert builder.state("other", "k") == "queued"
+    builder.submit("compile", "k", lambda: release.wait(timeout=30))
+    builder.submit("run", "k", lambda: True, uses_gpu=True)
+    assert builder.join(timeout=30, gpu_only=True) < 30
+    assert builder.state("run", "k") == "done"
+    assert builder.state("compile", "k") == "queued"
     release.set()
     builder.join(timeout=30)
-    assert builder.state("other", "k") == "done"
+    assert builder.state("compile", "k") == "done"
+
+
+def test_an_op_built_by_running_runs_once_per_swept_shape_in_a_rehearsal(monkeypatch):
+    builder = KernelBuilder(threads=2, enabled=True)
+    monkeypatch.setattr(KernelBuilder, "_instance", builder)
+    runs = []
+
+    @builds_by_running(
+        BuildConfig((DynamicSpec("m", (1, 8)),)),
+        dims={"m": [(0, 0), ("out", 0)]},
+        output=lambda x, w, out: torch.zeros(x.shape[0], w.shape[1]),
+        name="op",
+    )
+    def op(x, w, out):
+        runs.append(
+            (x.clone(), out.shape[0], threading.get_ident(), torch.is_inference_mode_enabled())
+        )
+        return x @ w
+
+    x = torch.arange(12.0).reshape(6, 2)
+    w = torch.ones(2, 3)
+    # Outside a rehearsal the op runs as it is.
+    assert torch.equal(op(x, w, out=torch.empty(6, 3)), x @ w)
+    runs.clear()
+    with builder.rehearsal():
+        assert torch.equal(op(x, w, out=torch.empty(6, 3)), torch.zeros(6, 3))
+        # A call of the same signature at a swept size queues nothing new.
+        op(x[:1], w, out=torch.empty(1, 3))
+    builder.join(timeout=30)
+    # The call's own size and the swept ones, each run once, off the calling thread.
+    assert sorted(run[0].shape[0] for run in runs) == [1, 6, 8]
+    assert all(run[1] == run[0].shape[0] for run in runs)
+    assert all(run[2] != threading.get_ident() and run[3] for run in runs)
+    # A larger size repeats the call's rows.
+    tiled = next(run[0] for run in runs if run[0].shape[0] == 8)
+    assert torch.equal(tiled, torch.cat([x, x[:2]]))
+    assert builder.stats("op").submitted == 3
 
 
 def test_disabled():

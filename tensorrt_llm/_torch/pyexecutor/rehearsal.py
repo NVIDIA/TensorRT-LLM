@@ -6,8 +6,8 @@ For a model a KernelBuilder op family reaches, the model engine is built on dumm
 (``ModelEngine(defer_checkpoint=True)``). ``rehearse`` then runs the autotuner warmup's
 forwards on throwaway KV cache managers inside a KernelBuilder rehearsal, in the
 autotuner's build state: the ops list their kernels, and the kernels build on worker
-threads while the checkpoint loads. ``join_autotuner_builds`` then waits for the builds
-the autotuned ops queued.
+threads while the checkpoint loads. ``join_gpu_builds`` then waits for the builds that run
+kernels on the GPU.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from ..autotuner import BUILD_OP_PREFIX
 from ..kernel_builder import KernelBuilder
 from ..speculative import get_spec_resource_manager
 from .resource_manager import ResourceManager, ResourceManagerType
@@ -60,14 +59,13 @@ def rehearse(model_engine: ModelEngine, kv_cache_creator: KvCacheCreator) -> Non
         torch.cuda.empty_cache()
 
 
-def join_autotuner_builds() -> None:
-    """Wait for the builds the rehearsal's autotuned ops queued, then free their memory.
+def join_gpu_builds() -> None:
+    """Wait for the rehearsal's builds that run kernels on the GPU, then free their memory.
 
-    They run their kernels on inputs of their own, so they end before the KV cache
-    estimation measures free memory. Builds that only compile keep running. Every rank
-    calls it.
+    They run on inputs of their own, so they end before the KV cache estimation measures
+    free memory. Builds that only compile keep running. Every rank calls it.
     """
-    waited = KernelBuilder.get().join(prefix=BUILD_OP_PREFIX)
+    waited = KernelBuilder.get().join(gpu_only=True)
     torch.cuda.empty_cache()
     if waited >= 0.1:
-        logger.info(f"[KernelBuilder] waited {waited:.1f}s for the autotuner's builds")
+        logger.info(f"[KernelBuilder] waited {waited:.1f}s for the builds that run kernels")
