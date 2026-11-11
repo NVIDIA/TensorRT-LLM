@@ -29,9 +29,15 @@ the delivered target.
 preflight -> tasks, in a fixed order -> certification of the final commit -> verdict and report
 ```
 
-1. **Preflight** (Python, plus one probe turn per agent configuration): the spec, the checkout, the
-   checkpoint, the accuracy anchors, the devices, the agent backends. It compiles the contract. Any
-   failure stops the run before a worker starts; the same command resumes once it is fixed.
+1. **Preflight** (Python, plus one probe turn per agent configuration). It stops the run before
+   a worker starts only on a hard blocker: the checkpoint cannot be read, the tree does not import,
+   the first deployment's devices are missing, busy or too small for its weights, its temporary
+   directory is not writable, a benchmark it is scored on has no dataset, an agent does not answer.
+   The tree, the devices and the temporary directory are probed where the first deployment runs
+   (behind its launch prefix). Everything else it sees is a note; a later deployment that cannot be
+   attempted, and a checkpoint config the tree cannot load yet, are recorded in `preflight.json`.
+   It freezes the accuracy anchors (`anchors.yaml`) and compiles the contract. The same command
+   resumes once a blocker is fixed.
 2. **Tasks**, in this order, which no agent chooses:
    - the survey: `plan.md` and `vocabulary.yaml`, the checkpoint mapped onto the catalog;
    - for each unit, core first, then each feature of the spec: one kernel task per vocabulary
@@ -155,6 +161,6 @@ round goes on from the verdicts it recorded for the same commit. `--clean` start
 | `run/pipeline.py` | The fixed order of tasks, the planner's four decisions |
 | `run/integration.py` | One worktree per task, the commit audit, rebase and fast-forward |
 | `run/contract.py`, `run/certify.py` | The contract and its verdicts; the certification, the delivery checks, the report |
-| `run/startup/` | Preflight and the agent probe |
+| `run/startup/`, `run/start.py` | Preflight's hard blockers and the agent probe; what a run starts from |
 | `checks/`, `checks/harness/` | The gates and their evidence; `gate_cli.run_check` runs one for a worker and for the certification alike |
 | `infra/` | Command execution on this host, Git operations, the heartbeat and `monitor` |
