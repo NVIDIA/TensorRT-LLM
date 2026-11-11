@@ -323,7 +323,7 @@ def main(argv: list[str] | None = None) -> None:
     ) as workflow:
         try:
             delivered = workflow.run(args.task)
-        except AgentConfigError as exc:
+        except (AgentConfigError, TaskSchemaError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(2)
         except KeyboardInterrupt:

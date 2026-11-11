@@ -36,6 +36,7 @@ from ...operators.inventory import (
     surface_names,
     write_surface_file,
 )
+from ...spec import deployments as deployments_mod
 from ...spec.task_schema import assembly_units
 from .. import contract as contract_mod
 from .. import requirements as requirements_mod
@@ -256,7 +257,22 @@ def _write_contract(workflow) -> None:
     workflow.journal.section(
         "coverage: what the contract proves of the request", workflow._coverage.render()
     )
+    _write_deployments(workflow)
     _write_intake_lint(workflow)
+
+
+def _write_deployments(workflow) -> None:
+    """Journal the deployments the spec comes to, core's first.
+
+    The checks still read the shorthand they are expanded from, and preflight reports a
+    shorthand that asks two values of one setting, so a failure here only says so.
+    """
+    try:
+        found = deployments_mod.resolve(workflow.task_data, workflow._gate_env().world_size)
+    except Exception as exc:
+        workflow.journal.section("deployments: not expanded", f"{type(exc).__name__}: {exc}")
+        return
+    workflow.journal.section(f"deployments: {len(found)}", deployments_mod.describe(found))
 
 
 def _write_intake_lint(workflow) -> None:

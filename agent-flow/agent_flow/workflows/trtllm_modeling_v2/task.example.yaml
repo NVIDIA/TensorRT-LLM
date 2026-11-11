@@ -26,6 +26,29 @@ parallel: tp1
 # members declare, else 4. A list, or per unit over `default`:
 # members: {default: [tp4, tep4, dep4], multimodal: [tep4]}
 
+# `parallel`, `members`, `features`, `variants`, `runtime` and `accuracy.llm_api_options` are
+# shorthand: each unit and each variant at each of its members is one deployment, whose native
+# options are what these keys come to (the run journals them; `core` at the first member listed
+# is the first). A spec may state its deployments itself instead, and then states none of the
+# shorthand keys; a run reads them once its checks do, until then it validates them and stops:
+# deployments:
+#   - name: dep16                     # the first is core's
+#     options: engines/dep16.yaml     # a native LLM-API options file (`trtllm-serve --config`),
+#                                     # beside this file, or the options as a mapping
+#     launch: "<site prefix>"         # empty: this host
+#     timeout: 5400
+#     inputs: [text, image]           # default [text]
+#     benchmarks:                     # each a `trtllm-eval` subcommand
+#       - name: gsm8k                 # judged against the reference row of accuracy.model_key
+#       - {name: aa_lcr, anchor: 0.62, source: "<where it was measured>", env: {NS_JUDGE_MODEL: m}}
+#     tests: []                       # native pytest node ids that also judge it
+#   - name: pd                        # disaggregated: a context and a generation server
+#     env: {UCX_TLS: "tcp,self,sm,cuda_copy,cuda_ipc"}
+#     ctx: {options: engines/ctx.yaml, launch: "<nodes 1 to 4>"}
+#     gen: {options: engines/gen.yaml, launch: "<nodes 5 to 8>"}
+#     relative_to: dep16              # judged against dep16's own score
+# With `deployments`, `accuracy` is optional and keeps `model_key`, `boot` and `dataset_path`.
+
 # Feature units, built after core in the order listed: mtp, eagle3, dflash, dspark, multimodal,
 # host_offload, disagg, kv_quant, decoder_replay, encoder_replay. Speculators get the acceptance
 # gate. disagg owes its disaggregated-serving test alone (`accuracy.disagg`, below), once, at the
@@ -105,9 +128,13 @@ trtllm_repo_path: /path/to/TensorRT-LLM
 # REQUIRED: how GPU work is launched, resolved once into the command prefix every prompt carries.
 
 environment:
-  # REQUIRED. `local`, the one kind: every command runs on the orchestrator's own host, on the
-  # devices preflight claims. On a cluster, start the orchestrator inside the allocation.
+  # `local`, the one kind and the default: every command runs on the orchestrator's own host, on
+  # the devices preflight claims. On a cluster, start the orchestrator inside the allocation.
   kind: local
+
+  # The site's prefix for a one-GPU command; a deployment carries its own `launch`. Validated
+  # here; the run's commands do not go through it yet.
+  # launch: "<site prefix>"
 
   # REQUIRED: the interpreter every Python command runs under, the editable install to measure.
   # It must exist at launch (`intake lint` checks a path visible from this host).

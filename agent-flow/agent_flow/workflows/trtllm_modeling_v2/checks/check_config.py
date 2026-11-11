@@ -325,10 +325,15 @@ def checkpoint_remote_code(checkpoint: str | Path | None) -> bool:
     return False
 
 
-def launch_conflicts(task_data: Mapping[str, Any], unit: str | None) -> list[str]:
-    """Refuse conflicting input spellings before a check constructs its public options."""
+def launch_conflicts(
+    task_data: Mapping[str, Any], unit: str | None, overlay: Mapping[str, Any] | None = None
+) -> list[str]:
+    """Refuse conflicting input spellings before a check constructs its public options.
+
+    ``overlay`` is merged over the unit's options file first, as a variant's options are.
+    """
     flags, _, _ = parse_runtime_flags(resolve_runtime(task_data, unit).get("extra_flags") or ())
-    options = _unit_options(task_data, unit)
+    options = merge_options(_unit_options(task_data, unit), overlay or {})
 
     def differences(left: Mapping[str, Any], right: Mapping[str, Any], path: str = "") -> list[str]:
         errors = []
@@ -695,26 +700,28 @@ def engine_declaration(config: Mapping[str, Any], *, mode: str | None) -> dict[s
     return declared_engine(options)
 
 
-def check_configuration(
+def engine_options(
     task_data: Mapping[str, Any],
-    environment: RunEnvironment,
     *,
     unit: str | None,
-    features: Any | None,
-    max_tokens: int,
     member: str | None,
-) -> dict[str, Any]:
-    """One public API configuration for request and eval checks.
+    features: Any | None = None,
+    world_size: int | None = None,
+    overlay: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    """The public LLM-API options ``unit`` runs under at ``member``, from the spec's shorthand.
 
-    Runtime flags are an input spelling only. The complete options mapping,
-    including nested KV and speculative settings, reaches every check intact.
+    The runtime switches and flags, the unit's options file (``overlay`` merged over it, as
+    a variant's options are), the member's topology and the unit's speculator become one
+    options mapping; the sampling keys and the chat-template switch the flags state come
+    beside it. ``world_size`` is the member's when its segment names none.
     """
     runtime = resolve_runtime(task_data, unit)
     extra, sampling, chat = parse_runtime_flags(runtime.get("extra_flags") or ())
-    conflicts = launch_conflicts(task_data, unit)
+    conflicts = launch_conflicts(task_data, unit, overlay)
     if conflicts:
         raise ValueError(f"{unit}: conflicting check inputs: " + "; ".join(conflicts))
-    options = merge_options(_unit_options(task_data, unit), extra)
+    options = merge_options(merge_options(_unit_options(task_data, unit), overlay or {}), extra)
     for switch, key, default in (
         ("chunked_prefill", "enable_chunked_prefill", False),
         ("overlap_scheduler", "disable_overlap_scheduler", True),
@@ -743,7 +750,7 @@ def check_configuration(
     if checkpoint_remote_code(task_data.get("checkpoint_path")):
         options.setdefault("trust_remote_code", True)
     kind, size = parse_parallel_segment(member or str(task_data["parallel"]))
-    size = size or environment.world_size
+    size = size or world_size or 1
     options.update(
         model=str(task_data["checkpoint_path"]),
         tensor_parallel_size=size,
@@ -777,6 +784,27 @@ def check_configuration(
             speculative.setdefault("speculative_model", str(task_data["checkpoint_path"]))
     else:
         options["speculative_config"] = None
+    return options, sampling, chat
+
+
+def check_configuration(
+    task_data: Mapping[str, Any],
+    environment: RunEnvironment,
+    *,
+    unit: str | None,
+    features: Any | None,
+    max_tokens: int,
+    member: str | None,
+) -> dict[str, Any]:
+    """One public API configuration for request and eval checks.
+
+    Runtime flags are an input spelling only. The complete options mapping
+    (:func:`engine_options`), including nested KV and speculative settings,
+    reaches every check intact.
+    """
+    options, sampling, chat = engine_options(
+        task_data, unit=unit, member=member, features=features, world_size=environment.world_size
+    )
     sampling.setdefault("temperature", 0.0)
     sampling.setdefault("top_k", 1)
     sampling.setdefault("max_tokens", int(max_tokens))
@@ -979,6 +1007,7 @@ __all__ = [
     "checkpoint_remote_code",
     "declared_engine",
     "engine_declaration",
+    "engine_options",
     "format_batches",
     "has_snapshot_policy",
     "launch_captures",

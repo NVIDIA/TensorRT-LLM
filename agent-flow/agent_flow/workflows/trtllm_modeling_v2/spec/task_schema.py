@@ -13,6 +13,7 @@ into the workspace is fully explicit.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -25,6 +26,7 @@ from ..agents.roles import ROLES
 from ..checks import accuracy_policy
 from ..infra.compute.environment import EnvironmentError, check_tmpdir
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
+from ..operators.coverage import MODELING_V2_PACKAGE
 from .schema_keys import reject_unknown_keys
 from .variants import ANCHOR_RECORDED, ANCHOR_RELATIVE, VARIANTS_FIELD, validate_variants
 
@@ -180,6 +182,10 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     VARIANTS_FIELD,
     "coverage",
     "profile",
+    # What the run brings up, stated as native options (spec/deployments.py). The keys
+    # above it that say the same (`members`, `features`, `variants`, `runtime`, ...) are
+    # shorthand, expanded into deployments when the spec is read.
+    "deployments",
 )
 #: ``coverage.accept``: the requested feature@member cells the contract may leave uncovered.
 COVERAGE_FIELD = "coverage"
@@ -291,6 +297,9 @@ FLOOR_KEYS: tuple[str, ...] = ("rule", "k", "shift_min_members", "acknowledge")
 ENVIRONMENT_KEYS: tuple[str, ...] = (
     "kind",
     "python",
+    # The site's prefix for a one-GPU command (a kernel entry's test); a deployment
+    # carries its own. Empty: the orchestrator's host.
+    "launch",
     "env",
     # The image the GPU jobs run in, if any, and how host paths appear inside it
     # (`host:inside`): the intake lint checks the run's paths through them.
@@ -313,7 +322,7 @@ REMOVED_ENVIRONMENT_KEYS: tuple[str, ...] = (
     "session_wait",
     "substrate_checkpoint",
 )
-ENVIRONMENT_REQUIRED_FIELDS: tuple[str, ...] = ("kind", "python")
+ENVIRONMENT_REQUIRED_FIELDS: tuple[str, ...] = ("python",)
 
 # Accuracy tolerance, in benchmark points, under `accuracy.floor.rule:
 # tolerance` only.
@@ -404,9 +413,41 @@ def derive_slug(data: Mapping[str, Any]) -> str:
     return f"{checkpoint}-{data[ARCH_FIELD]}-{data[PARALLEL_FIELD]}"
 
 
+def routed_family(repo: str | Path, architecture: str) -> str | None:
+    """The family whose ``routing.py`` declares ``@routes(architecture)``; ``None`` when none does.
+
+    The tree's own registry of which family serves an ``architectures[0]``, read from the
+    source without importing it: the orchestrator's interpreter need not have TensorRT-LLM.
+    """
+    models = Path(repo) / MODELING_V2_PACKAGE / "models"
+    for routing in sorted(models.glob("*/routing.py")):
+        try:
+            tree = ast.parse(routing.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    continue
+                called = decorator.func
+                if getattr(called, "id", getattr(called, "attr", "")) != "routes":
+                    continue
+                if any(
+                    isinstance(a, ast.Constant) and a.value == architecture for a in decorator.args
+                ):
+                    return routing.parent.name
+    return None
+
+
 def derive_family(architecture: str) -> str:
-    """``GptOssForCausalLM`` -> ``gpt_oss``: the modeling_v2 family directory."""
-    name = re.sub(r"For(Causal|Conditional|Seq2Seq|Sequence)?LM$", "", architecture)
+    """``GptOssForCausalLM`` -> ``gpt_oss``: the family directory of an architecture nothing routes yet.
+
+    The class name without its head suffix (``ForCausalLM``, ``ForConditionalGeneration``, ...),
+    in snake case. A family the tree already routes is read from it (:func:`routed_family`).
+    """
+    name = re.sub(r"For[A-Z][A-Za-z0-9]*$", "", architecture)
     name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
     name = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", name)
     return re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
@@ -604,11 +645,14 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
         if not isinstance(value, str) or not value.strip():
             errors.append(f"'{ENVIRONMENT_FIELD}.{name}' must be a non-empty string")
 
-    kind = block.get("kind")
-    if isinstance(kind, str) and kind not in (*ENVIRONMENT_KINDS, "session_spool"):
+    kind = block.setdefault("kind", ENVIRONMENT_KINDS[0])
+    if kind not in (*ENVIRONMENT_KINDS, "session_spool"):
         errors.append(
             f"'{ENVIRONMENT_FIELD}.kind' must be one of {ENVIRONMENT_KINDS}; got {kind!r}"
         )
+    launch = block.get("launch")
+    if launch is not None and not isinstance(launch, str):
+        errors.append(f"'{ENVIRONMENT_FIELD}.launch' must be a string: the site's launch prefix")
 
     env = block.get("env")
     if env is None:
@@ -1448,97 +1492,12 @@ def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
                     ]
 
 
-def drop_ignored_keys(data: dict[str, Any], notices: list[str] | None) -> None:
-    """Take the keys this version no longer reads out of ``data``, one notice for each."""
-    accuracy = data.get(ACCURACY_FIELD)
-    if not isinstance(accuracy, dict):
-        return
-    for key, why in IGNORED_ACCURACY_KEYS.items():
-        if key in accuracy:
-            del accuracy[key]
-            if notices is not None:
-                notices.append(f"'{ACCURACY_FIELD}.{key}' is ignored: {why}; drop the key")
+def _validate_shorthand(data: dict[str, Any], errors: list[str]) -> None:
+    """Validate the keys that state a run as units, members and variants, filling their defaults.
 
-
-def load_and_validate_task_yaml(
-    path: str | Path, notices: list[str] | None = None
-) -> dict[str, Any]:
-    """Parse ``path`` as YAML, validate it, and fill in the workflow's defaults.
-
-    Returns the resolved mapping. Raises :class:`TaskSchemaError` with
-    **every** detected problem batched into a single message. A key this
-    version no longer reads (:data:`IGNORED_ACCURACY_KEYS`) is dropped, and
-    ``notices``, when given, gains one line saying so.
+    They are shorthand for deployments (``spec/deployments.py``), and the checks and
+    the run still read them as written.
     """
-    task_path = Path(path)
-    if not task_path.is_file():
-        raise TaskSchemaError(f"task file not found: {task_path}")
-
-    text = task_path.read_text(encoding="utf-8")
-    try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise TaskSchemaError(f"{task_path} is not valid YAML: {exc}") from exc
-
-    if data is None:
-        data = {}
-    if not isinstance(data, dict):
-        raise TaskSchemaError(
-            f"{task_path} must be a YAML mapping at the top level, got {type(data).__name__}"
-        )
-
-    drop_ignored_keys(data, notices)
-    # BEFORE validation, deliberately. `accuracy.llm_api_options` has an
-    # existence check, and that check is a *consumer* of the resolved path.
-    _resolve_spec_relative_paths(data, task_path.resolve().parent)
-    # After the paths, before validation: what it derives is validated like
-    # what the spec says.
-    derive_gate_defaults(data, task_path.resolve().parent)
-
-    errors: list[str] = []
-
-    validate_commit_policy_block(data.get(COMMIT_POLICY_FIELD), errors)
-
-    if "perf" in data:
-        errors.append(
-            "'perf' is not read: the flow has no tuning stage, and performance work runs "
-            "outside it on the delivered target; drop the block"
-        )
-    reject_unknown_keys({k: v for k, v in data.items() if k != "perf"}, TOP_LEVEL_KEYS, errors)
-    errors.extend(validate_agents(data, ROLES))
-
-    for name in REQUIRED_PATH_FIELDS:
-        if name not in data:
-            errors.append(f"missing required field '{name}'")
-            continue
-        value = data[name]
-        if not isinstance(value, str) or not value.strip():
-            errors.append(f"'{name}' must be a non-empty string, got {type(value).__name__}")
-            continue
-        if not Path(value).exists():
-            errors.append(f"'{name}' points to a non-existent path: {value}")
-
-    arch = data.get(ARCH_FIELD)
-    if arch is None:
-        errors.append(
-            f"missing required field '{ARCH_FIELD}'. It is never inferred: catalog "
-            f"receipts are per-architecture, so the wrong value gates this target "
-            f"against another machine's certification."
-        )
-    elif not isinstance(arch, str) or not ARCH_PATTERN.match(arch):
-        errors.append(f"'{ARCH_FIELD}' must look like 'sm_100' / 'sm_103'; got {arch!r}")
-
-    parallel = data.get(PARALLEL_FIELD)
-    if parallel is None:
-        data[PARALLEL_FIELD] = DEFAULT_PARALLEL
-    elif not isinstance(parallel, str):
-        errors.append(f"'{PARALLEL_FIELD}' must be a string, got {type(parallel).__name__}")
-    else:
-        try:
-            parse_parallel_segment(parallel)
-        except TaskSchemaError as exc:
-            errors.append(str(exc))
-
     # After `parallel` has been defaulted, since legality depends on it.
     if MEMBERS_FIELD in data:
         environment = data.get(ENVIRONMENT_FIELD)
@@ -1587,6 +1546,143 @@ def load_and_validate_task_yaml(
     _validate_coverage(data.get(COVERAGE_FIELD), errors)
     _validate_profile(data, errors)
 
+    if RUNTIME_FIELD not in data:
+        data[RUNTIME_FIELD] = dict(RUNTIME_SWITCHES) | {"extra_flags": []}
+    else:
+        try:
+            _validate_runtime(data[RUNTIME_FIELD], errors)
+        except TaskSchemaError as exc:
+            errors.append(str(exc))
+
+    scope = data.get(SCOPE_FIELD)
+    if scope is None:
+        data[SCOPE_FIELD] = DEFAULT_SCOPE
+    elif scope not in SCOPES:
+        errors.append(f"'{SCOPE_FIELD}' must be one of {SCOPES}; got {scope!r}")
+
+    if ACCURACY_FIELD not in data:
+        errors.append(
+            f"missing required field '{ACCURACY_FIELD}'. The accuracy gate is the release "
+            f"criterion, and its anchor comes from a written source — never from the run."
+        )
+    else:
+        try:
+            _validate_accuracy(data[ACCURACY_FIELD], errors)
+        except TaskSchemaError as exc:
+            errors.append(str(exc))
+        _require_disagg_test(data, errors)
+        _require_relative_on_variants(data, errors)
+
+
+def drop_ignored_keys(data: dict[str, Any], notices: list[str] | None) -> None:
+    """Take the keys this version no longer reads out of ``data``, one notice for each."""
+    accuracy = data.get(ACCURACY_FIELD)
+    if not isinstance(accuracy, dict):
+        return
+    for key, why in IGNORED_ACCURACY_KEYS.items():
+        if key in accuracy:
+            del accuracy[key]
+            if notices is not None:
+                notices.append(f"'{ACCURACY_FIELD}.{key}' is ignored: {why}; drop the key")
+
+
+def load_and_validate_task_yaml(
+    path: str | Path, notices: list[str] | None = None
+) -> dict[str, Any]:
+    """Parse ``path`` as YAML, validate it, and fill in the workflow's defaults.
+
+    Returns the resolved mapping. Raises :class:`TaskSchemaError` with
+    **every** detected problem batched into a single message. A spec states what
+    the run brings up either as ``deployments`` or through the shorthand keys;
+    ``spec.deployments.resolve`` reads both from the mapping returned here. A key this
+    version no longer reads (:data:`IGNORED_ACCURACY_KEYS`) is dropped, and
+    ``notices``, when given, gains one line saying so.
+    """
+    task_path = Path(path)
+    if not task_path.is_file():
+        raise TaskSchemaError(f"task file not found: {task_path}")
+
+    text = task_path.read_text(encoding="utf-8")
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise TaskSchemaError(f"{task_path} is not valid YAML: {exc}") from exc
+
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise TaskSchemaError(
+            f"{task_path} must be a YAML mapping at the top level, got {type(data).__name__}"
+        )
+
+    # Imported here: that module reads this one's shorthand helpers.
+    from . import deployments as deployments_mod
+
+    native = deployments_mod.is_native(data)
+    spec_dir = task_path.resolve().parent
+    drop_ignored_keys(data, notices)
+    # BEFORE validation, deliberately. `accuracy.llm_api_options` and a deployment's
+    # `options` have an existence check, and that check is a *consumer* of the resolved path.
+    _resolve_spec_relative_paths(data, spec_dir)
+    if native:
+        deployments_mod.resolve_paths(data, spec_dir)
+    else:
+        # After the paths, before validation: what it derives is validated like
+        # what the spec says.
+        derive_gate_defaults(data, spec_dir)
+
+    errors: list[str] = []
+
+    validate_commit_policy_block(data.get(COMMIT_POLICY_FIELD), errors)
+
+    if "perf" in data:
+        errors.append(
+            "'perf' is not read: the flow has no tuning stage, and performance work runs "
+            "outside it on the delivered target; drop the block"
+        )
+    reject_unknown_keys({k: v for k, v in data.items() if k != "perf"}, TOP_LEVEL_KEYS, errors)
+    errors.extend(validate_agents(data, ROLES))
+
+    for name in REQUIRED_PATH_FIELDS:
+        if name not in data:
+            errors.append(f"missing required field '{name}'")
+            continue
+        value = data[name]
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"'{name}' must be a non-empty string, got {type(value).__name__}")
+            continue
+        if not Path(value).exists():
+            errors.append(f"'{name}' points to a non-existent path: {value}")
+
+    arch = data.get(ARCH_FIELD)
+    if arch is None:
+        errors.append(
+            f"missing required field '{ARCH_FIELD}'. It is never inferred: catalog "
+            f"receipts are per-architecture, so the wrong value gates this target "
+            f"against another machine's certification."
+        )
+    elif not isinstance(arch, str) or not ARCH_PATTERN.match(arch):
+        errors.append(f"'{ARCH_FIELD}' must look like 'sm_100' / 'sm_103'; got {arch!r}")
+
+    parallel = data.get(PARALLEL_FIELD)
+    if parallel is None:
+        data[PARALLEL_FIELD] = DEFAULT_PARALLEL
+    elif not isinstance(parallel, str):
+        errors.append(f"'{PARALLEL_FIELD}' must be a string, got {type(parallel).__name__}")
+    else:
+        try:
+            parse_parallel_segment(parallel)
+        except TaskSchemaError as exc:
+            errors.append(str(exc))
+
+    if native:
+        deployments_mod.validate_native_spec(data, errors)
+        accuracy = data.get(ACCURACY_FIELD)
+        if isinstance(accuracy, dict) and accuracy.get("boot") is not None:
+            _validate_boot(accuracy["boot"], errors)
+    else:
+        _validate_shorthand(data, errors)
+
     if ENVIRONMENT_FIELD not in data:
         errors.append(
             f"missing required field '{ENVIRONMENT_FIELD}'. It declares how GPU work is "
@@ -1607,36 +1703,9 @@ def load_and_validate_task_yaml(
         except TaskSchemaError as exc:
             errors.append(str(exc))
 
-    if RUNTIME_FIELD not in data:
-        data[RUNTIME_FIELD] = dict(RUNTIME_SWITCHES) | {"extra_flags": []}
-    else:
-        try:
-            _validate_runtime(data[RUNTIME_FIELD], errors)
-        except TaskSchemaError as exc:
-            errors.append(str(exc))
-
     notes = data.get(NOTES_FIELD)
     if notes is not None and (not isinstance(notes, str) or not notes.strip()):
         errors.append(f"'{NOTES_FIELD}' must be a non-empty string")
-
-    scope = data.get(SCOPE_FIELD)
-    if scope is None:
-        data[SCOPE_FIELD] = DEFAULT_SCOPE
-    elif scope not in SCOPES:
-        errors.append(f"'{SCOPE_FIELD}' must be one of {SCOPES}; got {scope!r}")
-
-    if ACCURACY_FIELD not in data:
-        errors.append(
-            f"missing required field '{ACCURACY_FIELD}'. The accuracy gate is the release "
-            f"criterion, and its anchor comes from a written source — never from the run."
-        )
-    else:
-        try:
-            _validate_accuracy(data[ACCURACY_FIELD], errors)
-        except TaskSchemaError as exc:
-            errors.append(str(exc))
-        _require_disagg_test(data, errors)
-        _require_relative_on_variants(data, errors)
 
     if errors:
         bullet = "\n  - "
@@ -1724,5 +1793,6 @@ __all__ = [
     "load_prompts_file",
     "members_for",
     "parse_parallel_segment",
+    "routed_family",
     "widest_world_size",
 ]

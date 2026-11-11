@@ -45,7 +45,8 @@ from ..infra.compute.commands import CommandExecutor
 from ..infra.compute.environment import RunEnvironment
 from ..infra.git import CommitPolicy, git_output
 from ..operators.coverage import own_paths
-from ..spec.task_schema import load_and_validate_task_yaml
+from ..spec import deployments as deployments_mod
+from ..spec.task_schema import TaskSchemaError, load_and_validate_task_yaml
 from . import certify as certify_mod
 from . import contract as contract_mod
 from . import pipeline as pipeline_mod
@@ -383,6 +384,15 @@ class TrtllmModelingV2Workflow:
         for notice in notices:
             print_message(f"[yellow]note: {notice}[/yellow]", log)
             self.journal.event("spec key ignored", notice)
+        if deployments_mod.is_native(self.task_data):
+            found = deployments_mod.resolve(self.task_data)
+            raise TaskSchemaError(
+                f"{source} is valid and states {len(found)} deployment(s):\n"
+                f"{deployments_mod.describe(found)}\n"
+                f"The run and its checks still read a spec's shorthand keys (`parallel`, "
+                f"`members`, `features`, `variants`), so a spec that states `deployments` "
+                f"itself is validated here and not yet run."
+            )
         check_runtime.default_triton_cache(self.task_data, self.workspace)
 
         if self.resume:

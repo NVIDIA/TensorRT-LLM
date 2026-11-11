@@ -48,6 +48,7 @@ from ...spec.task_schema import (
     members_for,
     parse_parallel_segment,
     resolve_per_unit,
+    routed_family,
     widest_world_size,
 )
 from ...spec.variants import ANCHOR_RELATIVE, anchor_state, base_unit, variant_gates
@@ -969,7 +970,8 @@ def resolve_target_identity(
 
     The family and the checkpoint segment are derived and overridable through
     ``task.yaml``'s ``target`` block. The family comes from the checkpoint's
-    own ``architectures[0]``, which is the same string routing keys on.
+    own ``architectures[0]``, which is the same string routing keys on: the
+    family whose ``routing.py`` in the checkout declares it, else its name.
     """
     override = dict(task_data.get("target") or {})
 
@@ -979,7 +981,11 @@ def resolve_target_identity(
             "the checkpoint's config.json declares no `architectures`, so the "
             "modeling_v2 family cannot be derived. Set `target.family` in task.yaml."
         )
-    family = override.get("family") or derive_family(str(architectures[0]))
+    family = (
+        override.get("family")
+        or routed_family(task_data["trtllm_repo_path"], str(architectures[0]))
+        or derive_family(str(architectures[0]))
+    )
     segment = override.get("checkpoint_segment") or derive_checkpoint_segment(
         task_data["checkpoint_path"]
     )
