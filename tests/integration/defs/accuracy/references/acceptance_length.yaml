@@ -280,3 +280,22 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_long_context:
   # 2.5% below ref_al, as for tp1_mtp3_long_context, whose deliberately wrong
   # reused selection scores 3.760.
   min_al: 3.9
+# Read by TestModelingV2Qwen38FlashNextFp8Sm103Unified (the qwen4_exp FP8 target's
+# test_accuracy.py): three drafts of the checkpoint's single MTP module, so acceptance length
+# lives in [1.0, 4.0]. modeling_v2's own readings on GB300 (TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1),
+# min_al 95% of each.
+# test_mtp3_gsm8k[dep4] and [dep4_alltoall], over gsm8k: bf16 KV under attention DP; dep4 read
+# 3.394 and dep4_alltoall 3.375.
+ModelingV2Qwen38FlashNextFp8Sm103Unified::mtp3:
+  ref_al: 3.394
+  min_al: 3.224
+# test_mtp3_gsm8k[tep4_fp8_kv_breakable], over gsm8k: an FP8 KV pool with the breakable prefill
+# graph.
+ModelingV2Qwen38FlashNextFp8Sm103Unified::mtp3_fp8_kv:
+  ref_al: 3.274
+  min_al: 3.110
+# test_mtp3_long_context, over the 3k-6k-token pass keys at tep4 (the sparse attention path):
+# IndexShare on, bf16 KV. Every draft of a pass-key answer is accepted.
+ModelingV2Qwen38FlashNextFp8Sm103Unified::mtp3_long_context:
+  ref_al: 4.000
+  min_al: 3.800
