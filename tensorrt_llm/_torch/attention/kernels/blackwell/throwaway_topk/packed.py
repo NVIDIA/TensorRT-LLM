@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """TensorSSA packed FP32 FMA adapter for the indexer's four-element epilogue.
 
 The installed CuTe arch wrapper accepts a Python two-tuple. Iterating a

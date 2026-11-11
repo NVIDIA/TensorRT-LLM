@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Copyright (c) 2026 by FlashInfer team.
+# Licensed under the Apache License, Version 2.0.
 """Shape contracts for automatic selective policy selection."""
 
 MODEL_CONFIGS = {
