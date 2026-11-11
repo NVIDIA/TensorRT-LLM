@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Contracts for switching a stopped executor from profiling to serving resources."""
 
+import gc
 import threading
+import weakref
 from contextlib import nullcontext
 from dataclasses import fields
 from queue import Queue
@@ -44,7 +46,7 @@ def _run_bounded(action):
 
 def _stop_worker(executor):
     if executor.worker_thread is not None:
-        executor._worker_phases.put(False)
+        executor._worker_phases.put(None)
         _run_bounded(executor._join_worker_thread)
 
 
@@ -59,7 +61,10 @@ def _enable_real_worker(executor, monkeypatch):
     executor.dist = SimpleNamespace(pp_size=1, world_size=1)
 
 
-def test_profiling_worker_and_thread_local_state_survive_resource_rebind(executor, monkeypatch):
+@pytest.mark.parametrize("start_serving", [False, True])
+def test_profiling_worker_and_thread_local_state_survive_resource_rebind(
+    executor, monkeypatch, start_serving
+):
     ex, _events = executor
     _enable_real_worker(ex, monkeypatch)
     local_state = threading.local()
@@ -94,9 +99,10 @@ def test_profiling_worker_and_thread_local_state_survive_resource_rebind(executo
         assert ex._worker_phase_done.is_set()
 
         ex.rebind_resources(Mock())
-        ex.start_worker()
-        assert entered.wait(5)
-        assert phases == [(worker, marker), (worker, marker)]
+        if start_serving:
+            ex.start_worker()
+            assert entered.wait(5)
+        assert phases == [(worker, marker)] * (2 if start_serving else 1)
         _run_bounded(ex.shutdown)
         assert not worker.is_alive()
         with pytest.raises(RuntimeError, match="without bound resources"):
@@ -104,6 +110,69 @@ def test_profiling_worker_and_thread_local_state_survive_resource_rebind(executo
     finally:
         stop_requested.set()
         _stop_worker(ex)
+
+
+@pytest.mark.parametrize("drop_during", ["queued", "active", "parked"])
+def test_worker_owns_queued_and_active_phases_but_not_parked_executor(monkeypatch, drop_during):
+    ex = object.__new__(PyExecutor)
+    _enable_real_worker(ex, monkeypatch)
+    ex._closed = False
+    ex._resources_released = False
+    ex._event_loop_error = None
+    ex._fatal_error = None
+    ex.sampler = object()
+    entered = threading.Event()
+    finish = threading.Event()
+    consumer_waiting = threading.Event()
+    consume = threading.Event()
+    run_worker = PyExecutor._run_worker_phases
+
+    def delayed_consumer(*args):
+        consumer_waiting.set()
+        assert consume.wait(5)
+        run_worker(*args)
+
+    if drop_during == "queued":
+        monkeypatch.setattr(PyExecutor, "_run_worker_phases", staticmethod(delayed_consumer))
+
+    def event_loop():
+        entered.set()
+        assert finish.wait(5)
+
+    ex._event_loop_wrapper = event_loop
+    executor_ref = weakref.ref(ex)
+    phase_done = ex._worker_phase_done
+    commands = ex._worker_phases
+    ex.start_worker()
+    worker = ex.worker_thread
+    try:
+        if drop_during == "queued":
+            assert consumer_waiting.wait(5)
+            assert not entered.is_set()
+        else:
+            assert entered.wait(5)
+        if drop_during == "parked":
+            finish.set()
+            assert phase_done.wait(5)
+            assert worker.is_alive()
+        del ex
+        gc.collect()
+        if drop_during != "parked":
+            assert executor_ref() is not None
+            consume.set()
+            assert entered.wait(5)
+            finish.set()
+            assert phase_done.wait(5)
+            gc.collect()
+        worker.join(10)
+        assert executor_ref() is None
+        assert not worker.is_alive()
+    finally:
+        consume.set()
+        finish.set()
+        commands.put(None)
+        worker.join(10)
+        assert not worker.is_alive()
 
 
 @pytest.mark.parametrize("terminal", [False, True])
@@ -193,7 +262,15 @@ def test_phase_failure_is_visible_before_rebind_can_restart(
     monkeypatch.setattr(executor_module, "start_rank_crash_kill_watchdog", watchdog)
     monkeypatch.setattr(executor_module, "hard_kill_on_rank_crash", kill)
     uncaught = []
-    monkeypatch.setattr(threading, "excepthook", lambda args: uncaught.append(args.exc_value))
+    original_hook = threading.excepthook
+
+    def record_worker_error(args):
+        if args.thread is ex.worker_thread:
+            uncaught.append(args.exc_value)
+        else:
+            original_hook(args)
+
+    monkeypatch.setattr(threading, "excepthook", record_worker_error)
     cleanup_errors = []
 
     def event_loop():

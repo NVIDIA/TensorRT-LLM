@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import traceback
+import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from enum import IntEnum
@@ -841,11 +842,11 @@ class PyExecutor:
         self._resources_released = False
         self._closed = False
         self._gen_preemption_settings = gen_preemption
-        # Profiling and serving share the thread-local CUDA library state
-        # whose allocations were included in the memory budget. Libraries first
-        # used by serving still initialize lazily.
+        # Retain CUDA library state the LLM profiling forward creates on this
+        # worker. The multimodal encoder dummy runs on the startup thread;
+        # libraries first used by a serving thread still initialize lazily.
         self.worker_thread: Optional[threading.Thread] = None
-        self._worker_phases: Queue[bool] = Queue()
+        self._worker_phases: Queue[Optional["PyExecutor"]] = Queue()
         self._worker_phase_done = threading.Event()
         self._worker_phase_done.set()
         self._initialize_execution(
@@ -1630,7 +1631,7 @@ class PyExecutor:
         self._validate_moe_a2a_checkpoint_support()
 
     def rebind_resources(self, resources: PyExecutorResources) -> None:
-        """Bind fresh resources after release_resources(), without starting workers.
+        """Bind fresh resources after release_resources(), without starting a phase.
 
         Call collectively on the startup thread. The previous phase must have
         exited cleanly; failed and finally closed executors cannot be reused.
@@ -2113,27 +2114,40 @@ class PyExecutor:
                 ". "
                 "Remove sleep_config to keep the current configuration.")
 
-    def _run_worker_phases(self) -> None:
-        while self._worker_phases.get():
+    @staticmethod
+    def _run_worker_phases(phases: Queue[Optional["PyExecutor"]],
+                           phase_done: threading.Event) -> None:
+        while True:
+            executor = phases.get()
+            if executor is None:
+                return
             try:
-                self._event_loop_wrapper()
+                executor._event_loop_wrapper()
             except BaseException as error:
                 # The wrapper records loop errors before cleanup. Also retain
                 # failures from its finally block before teardown can rebind;
                 # the thread can still appear alive while unwinding.
-                if self._event_loop_error is None:
-                    self._event_loop_error = error
+                if executor._event_loop_error is None:
+                    executor._event_loop_error = error
                 raise
             finally:
                 # Resource teardown must wait for the wrapper's cleanup,
                 # including on an exceptional exit, before rebinding.
-                self._worker_phase_done.set()
+                # RPC followers may finish without an explicit shutdown. The
+                # parked thread must not keep their executor/model alive.
+                del executor
+                phase_done.set()
 
     def _join_worker_thread(self) -> None:
         if self.worker_thread is not None:
             self.worker_thread.join()
 
     def start_worker(self):
+        """Start one execution phase, creating the persistent thread on first use.
+
+        Raises RuntimeError for closed or released executors, or a recorded
+        event-loop or fatal error. Repeated calls during a phase are idempotent.
+        """
         with self.worker_lock:
             if self._closed or self._resources_released:
                 raise RuntimeError(
@@ -2198,8 +2212,8 @@ class PyExecutor:
                     self.broadcast_sample_state_handler.start()
                 # Duplicate the communicator on the main thread for
                 # sleep/wakeup control messages.  MPI_Comm_dup is collective
-                # across all ranks and must run before any worker thread
-                # starts to avoid racing with the worker's MPI traffic.
+                # across all ranks and must run before the next execution
+                # phase starts to avoid racing with the worker's MPI traffic.
                 # Only needed when multi-rank sleep/wakeup is actually
                 # possible, i.e. MPI executor path (not Ray), sleep_config
                 # enabled, and more than one rank participating.
@@ -2221,11 +2235,17 @@ class PyExecutor:
                     self._start_mpi_progress_thread()
                 if self.worker_thread is None:
                     worker_thread = threading.Thread(
-                        target=self._run_worker_phases, daemon=True)
+                        target=PyExecutor._run_worker_phases,
+                        args=(self._worker_phases, self._worker_phase_done),
+                        daemon=True)
                     worker_thread.start()
+                    # Only the queue is retained by the finalizer, not self.
+                    weakref.finalize(self, self._worker_phases.put, None)
                     self.worker_thread = worker_thread
                 self._worker_phase_done.clear()
-                self._worker_phases.put(True)
+                # The queued phase owns the executor until the thread takes it;
+                # RPC followers may return immediately after this handoff.
+                self._worker_phases.put(self)
                 self.worker_started = True
             # Start the sampler's async worker, if it is enabled
             if (isinstance(self.sampler, AsyncWorkerMixin)
@@ -2523,8 +2543,9 @@ class PyExecutor:
         Call collectively after consuming profiling responses. Graph destruction
         precedes workspace release, and transfer registrations precede cache
         release. Model engines, weights and the execution stream remain valid,
-        as do the worker thread and the thread-local CUDA library state used by
-        profiling. Libraries first used by serving still initialize lazily.
+        as do the worker thread and CUDA library state the LLM profiling
+        forward creates on it. The multimodal encoder dummy runs on the startup
+        thread; libraries first used by a serving thread still initialize lazily.
         """
         if self._closed or self._resources_released:
             raise RuntimeError("Executor resources are already released")
@@ -2564,13 +2585,18 @@ class PyExecutor:
         self._resources_released = True
 
     def shutdown(self) -> None:
-        """Finally close the executor; closed executors cannot be rebound."""
+        """Request terminal worker exit and close the executor without rebinding.
+
+        The current execution phase finishes before the thread is joined and
+        resources are released. A detected hang returns without joining;
+        pending-DMA resources retain their existing owners.
+        """
         if self._closed:
             return
         if self.worker_thread is not None:
             # Terminal shutdown never starts another phase, even if cleanup
             # raises. The current wrapper and its finally still run to completion.
-            self._worker_phases.put(False)
+            self._worker_phases.put(None)
         # Capture model owners before any rank-local shutdown step can fail;
         # outer workers still need them for an all-rank unsafe preflight.
         terminal_engines = list(getattr(self, "_terminal_model_engines", ()))

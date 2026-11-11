@@ -20,6 +20,7 @@ import weakref
 from contextlib import contextmanager
 from queue import Queue
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -933,6 +934,7 @@ def test_final_startup_failure_closes_parked_profiling_worker(monkeypatch, failu
     workers = []
     executors = []
     events = []
+    original_adjust = py_executor_creator._adjust_torch_mem_fraction
 
     def fail(*args, **kwargs):
         raise startup_error
@@ -959,7 +961,7 @@ def test_final_startup_failure_closes_parked_profiling_worker(monkeypatch, failu
             workers.append(executor.worker)
             executors.append(weakref.ref(executor))
             if failure_stage == "adjust":
-                monkeypatch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", fail)
+                creation_patch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", fail)
 
         def teardown_managers(self, resources):
             resources.pop(ResourceManagerType.KV_CACHE_MANAGER)
@@ -1005,6 +1007,7 @@ def test_final_startup_failure_closes_parked_profiling_worker(monkeypatch, failu
                     kv_cache_quant_algo=QuantAlgo.NO_QUANT,
                     kv_cache_creator_cls=EstimatingCacheCreator,
                 )
+        assert py_executor_creator._adjust_torch_mem_fraction is original_adjust
         assert error.value is startup_error
         assert events == ["shutdown"]
         assert len(workers) == 1 and not workers[0].is_alive()
@@ -1038,8 +1041,13 @@ def test_startup_cleanup_failure_preserves_original_error(monkeypatch):
 
     monkeypatch.setattr(_DummyPyExecutor, "start_worker", start)
     monkeypatch.setattr(_DummyPyExecutor, "shutdown", shutdown)
-    # Exercise the actual logger API on the cleanup failure path.
+    log_error = Mock(wraps=py_executor_creator.logger.error)
+    monkeypatch.setattr(py_executor_creator.logger, "error", log_error)
     with pytest.raises(RuntimeError) as error:
         _run_create_py_executor(monkeypatch, sm_version=100, kv_cache_quant_algo=QuantAlgo.NO_QUANT)
     assert error.value is startup_error
     assert len(shutdown_calls) == 1
+    log_error.assert_called_once()
+    message = log_error.call_args.args[0]
+    assert "Failed to shut down executor after startup failure" in message
+    assert "shutdown failed" in message
