@@ -1083,6 +1083,8 @@ def _normalize_file_uri(uri: str) -> str:
 # inside it. Unset (the default) refuses every local reference. The offline
 # Python API does not go through this check.
 _MEDIA_ALLOWED_INPUT_DIR_ENV = "TRTLLM_MEDIA_ALLOWED_INPUT_DIR"
+# The variable's former name, no longer read; see `log_allowed_local_media_path`.
+_FORMER_MEDIA_ALLOWED_INPUT_DIR_ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
 
 # Flags for the single open of a request-supplied local file. Each is left
 # out on a platform that lacks it; the fstat checks on the open descriptor
@@ -1227,8 +1229,15 @@ def log_allowed_local_media_path() -> None:
     Unset ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` is the default and is not
     logged. A value that is not a directory is reported here, since every
     request naming a local file would otherwise fail with a generic error
-    while the operator sees nothing at startup.
+    while the operator sees nothing at startup. So is a set
+    ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH``, which is not read.
     """
+    if os.environ.get(_FORMER_MEDIA_ALLOWED_INPUT_DIR_ENV):
+        logger.warning(
+            "%s is no longer read; set %s instead.",
+            _FORMER_MEDIA_ALLOWED_INPUT_DIR_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
+        )
     allowed_root = os.environ.get(_MEDIA_ALLOWED_INPUT_DIR_ENV, "")
     if not allowed_root:
         return
