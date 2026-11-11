@@ -370,6 +370,7 @@ def test_no_exc_info_passed_to_trtllm_logger():
     """The TRT-LLM logger takes no exc_info: passing it raises TypeError."""
     import ast
     import pathlib
+    import re
 
     import tensorrt_llm
 
@@ -380,8 +381,8 @@ def test_no_exc_info_passed_to_trtllm_logger():
         source = path.read_text(encoding="utf-8", errors="replace")
         if "exc_info" not in source or "logger" not in source:
             continue
-        # stdlib loggers accept exc_info
-        if "logging.getLogger" in source:
+        # A module whose `logger` is a stdlib logger may pass exc_info to it.
+        if re.search(r"^\s*logger\s*=\s*logging\.getLogger", source, re.MULTILINE):
             continue
         for node in ast.walk(ast.parse(source)):
             if (
