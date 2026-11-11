@@ -26,7 +26,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from ..checks import serve
+from ..checks import attest, serve
 from ..infra.git import git_output
 from ..operators.coverage import MODELING_V2_PACKAGE
 from ..spec import deployments as deployments_mod
@@ -222,6 +222,9 @@ class Verdict:
     unjudged: bool = False
     #: Which path judged: in process or through the endpoint.
     path: str = ""
+    #: What the check attested of each server's engine (``checks/attest.py``): its options
+    #: against what every rank ran, and the target class; empty for a check that attests none.
+    attested: str = ""
 
     @property
     def key(self) -> str:
@@ -282,6 +285,7 @@ class ContractStatus:
             summary=str(result.summary())[:1000] if hasattr(result, "summary") else "",
             unjudged=bool(getattr(result, "unjudged", False)) and not infrastructure,
             path=str(getattr(result, "path", "") or ""),
+            attested=attest.describe(getattr(result, "engine", ())).strip(),
         )
         self.verdicts.append(verdict)
         self.path.parent.mkdir(parents=True, exist_ok=True)

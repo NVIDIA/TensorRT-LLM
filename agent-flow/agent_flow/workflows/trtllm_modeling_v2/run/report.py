@@ -21,7 +21,8 @@ reused (``run/contract.py``); deployments not done or not attempted are skipped.
 
 **The report** (:func:`write_report`), ``delivery_report.md``, is what the run delivers.
 Its first line says ``onboarded`` or ``not onboarded``; the process exits 0 on the first,
-whatever else failed.
+whatever else failed. Each check's line names the commit it was measured on, which path
+judged it and what it attested of the engine that ran.
 """
 
 from __future__ import annotations
@@ -460,9 +461,11 @@ def _done_rows(workflow, pipeline) -> list[str]:
             score = "-" if v is None or v.measured is None else f"{v.measured:g}"
             cells = (score, anchor, v.said if v else "not run", (v.path if v else "") or "-")
             commit = (v.commit if v else "")[:12] or "-"
-            rows.append(f"| `{name}` | `{check.gate}` | {' | '.join(cells)} | `{commit}` |")
-    head = ["| deployment | check | score | anchor | verdict | judged | commit |", "|---|" * 7]
-    return [head[0], head[1].replace("||", "|"), *rows] if rows else []
+            attested = (v.attested if v else "").replace("|", "/") or "-"
+            row = f"| `{name}` | `{check.gate}` | {' | '.join(cells)} | `{commit}` | {attested} |"
+            rows.append(row)
+    head = "| deployment | check | score | anchor | verdict | judged | commit | engine attested |"
+    return [head, "|---" * 8 + "|", *rows] if rows else []
 
 
 def write_report(workflow, pipeline) -> Path:

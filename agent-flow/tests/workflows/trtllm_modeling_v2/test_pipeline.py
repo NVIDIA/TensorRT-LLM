@@ -214,6 +214,13 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     assert "| PASS | in process | `c0ffee1` |" in report
     assert "| `tep2` | `boot` | - | - | PASS | in process | `c0ffee1` |" in report
     assert "| `kv_fp8` |" not in report.split("## Done")[1].split("##")[0]
+    # With what each check attested of the engine that ran: every rank's options, the target.
+    row = next(line for line in report.splitlines() if line.startswith("| `tep2` | `boot` |"))
+    assert row.endswith(
+        "| `c0ffee1` | [engine match: 2 rank(s) x 2 option(s); target "
+        "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.model.GptOssModel] |"
+    )
+    assert _verdicts(tmp_path)[0]["attested"].startswith("[engine match: 1 rank(s) x 2 option(s);")
     survey = _prompts(calls, "survey")[0]
     assert "## Tag `survey`" in survey and "## Surface survey" in survey
     assert f"Write `{workspace}/plan.md` and `{workspace}/vocabulary.yaml`" in survey
@@ -1417,15 +1424,18 @@ def test_a_run_that_is_not_onboarded_says_what_to_run_where_and_the_last_commit_
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", f"base{_SIGNED}")
     base = _git(repo, "rev-parse", "HEAD")
-    shell = _checks(fail={"tp1:accuracy"})
+    shell = _checks(fail={"tp1:boot"})
     commits: list[str] = []
 
     def core(attempt, prompt):
         tree = Path(re.search(r"You work in `([^`]+)`", prompt).group(1))
-        (tree / FAMILY / "a.py").write_text(f"A = {attempt}\n")
+        (tree / FAMILY / "a.py").write_text(f"A = {len(commits)}\n")
         _git(tree, "add", f"{FAMILY}/a.py")
-        _git(tree, "commit", "-q", "-m", f"core {attempt}{_SIGNED}")
+        _git(tree, "commit", "-q", "-m", f"core {len(commits)}{_SIGNED}")
         commits.append(_git(tree, "rev-parse", "HEAD"))
+        if len(commits) == 2:
+            shell.fail.clear()
+            shell.fail.add("tp1:accuracy")  # the second commit boots, and scores too low
         return READY
 
     script = Script(assembler=_by_task({"core": core}))
@@ -1433,8 +1443,9 @@ def test_a_run_that_is_not_onboarded_says_what_to_run_where_and_the_last_commit_
     _install(monkeypatch, workflow, script)
     with workflow:
         assert workflow.run(_spec(task_file, KV_FP8)) is False
-    # The boot passed on each attempt's commit; the benchmark failed on both. Nothing landed.
-    assert shell.ran == ["tp1:boot", "tp1:accuracy", "tp1:boot", "tp1:accuracy"]
+    # The first commit did not boot; the second booted and failed its benchmark, which is
+    # what ended the task: the report names that check, not the older failure. Nothing landed.
+    assert shell.ran == ["tp1:boot", "tp1:boot", "tp1:accuracy"]
     assert _git(repo, "rev-parse", "HEAD") == base and _state(tmp_path).onboarded == {}
     workspace = tmp_path / "ws"
     report = _report(tmp_path).splitlines()
@@ -1445,7 +1456,7 @@ def test_a_run_that_is_not_onboarded_says_what_to_run_where_and_the_last_commit_
         f"{workspace}/task.yaml --deployment tp1 --tree {workspace}/worktrees/core`"
     )
     assert report[4] == "- last commit where `tp1:accuracy[gsm8k]` passed: `none`"
-    # A later start: the benchmark passes on the first new commit, then the boot breaks.
+    # A later start, whose commit does not boot: the boot last passed on the second commit.
     shell.fail.clear()
     shell.fail.add("tp1:boot")
     workflow = _workflow(tmp_path, git_runner=None, shell_runner=shell, max_attempts=1)
