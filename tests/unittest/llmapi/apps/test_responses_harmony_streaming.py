@@ -53,10 +53,18 @@ _OUTPUTS = {
 }
 
 
-def _stream(text, tokens_per_response):
-    """Stream one Harmony output; returns the event payloads of each response."""
+def _stream(text, tokens_per_response, empty_responses=False):
+    """Stream one Harmony output; returns the event payloads of each response.
+
+    With empty_responses, a response without new tokens follows every response.
+    """
     adapter = get_harmony_adapter()
     tokens = adapter.encoding.encode(text, allowed_special="all")
+    chunks = []
+    for start in range(0, len(tokens), tokens_per_response):
+        chunks.append(tokens[start : start + tokens_per_response])
+        if empty_responses:
+            chunks.append([])
     request = ResponsesRequest(model="gpt-oss", input="Where is my order?", stream=True)
     processor = ResponsesStreamingProcessor(
         request=request,
@@ -68,10 +76,10 @@ def _stream(text, tokens_per_response):
     output = result.outputs[0]
     responses = []
     try:
-        for start in range(0, len(tokens), tokens_per_response):
+        for i, chunk in enumerate(chunks):
             output._last_token_ids_len = len(output.token_ids)
-            output.token_ids.extend(tokens[start : start + tokens_per_response])
-            result._done = start + tokens_per_response >= len(tokens)
+            output.token_ids.extend(chunk)
+            result._done = i == len(chunks) - 1
             frames = processor.process_single_output(result)
             responses.append([json.loads(frame.split("data: ", 1)[1]) for frame in frames])
     finally:
@@ -124,6 +132,29 @@ def test_a_response_sends_one_delta_per_content_part(harmony_vocab):
     for events in responses:
         parts = [(e["type"], e["output_index"]) for e in events if e["type"].endswith(".delta")]
         assert len(parts) == len(set(parts))
+
+
+@pytest.mark.parametrize("tokens_per_response", [1, 20])
+@pytest.mark.parametrize("output", sorted(_OUTPUTS))
+def test_item_events_carry_the_item_output_index(harmony_vocab, output, tokens_per_response):
+    """Every event of an item, from output_item.added to output_item.done, has the item's index."""
+    added = []
+    for events in _stream(_OUTPUTS[output], tokens_per_response):
+        for event in events:
+            if event["type"] == "response.output_item.added":
+                added.append(event["output_index"])
+            elif "output_index" in event:
+                assert event["output_index"] == added[-1], event["type"]
+    assert added == sorted(set(added))
+
+
+@pytest.mark.parametrize("output", sorted(_OUTPUTS))
+def test_a_response_without_new_tokens_sends_no_events(harmony_vocab, output):
+    """E.g. the last response, when its only token was a stop token removed from the output."""
+    responses = _stream(_OUTPUTS[output], 1, empty_responses=True)
+
+    assert all(events == [] for events in responses[1::2])
+    assert _client_view(responses) == _client_view(_stream(_OUTPUTS[output], 1))
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 5])

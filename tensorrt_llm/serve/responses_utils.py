@@ -3120,9 +3120,6 @@ def _generate_harmony_token_events(
     # channel is open the parser is still inside that message.
     if (parser.current_channel is None
             and parser.state == StreamState.EXPECT_START):
-        streaming_events_helper.output_index_increment()
-        streaming_events_helper.is_output_item_added_sent = False
-
         if len(messages) > 0:
             previous_item = messages[-1]
             if previous_item.recipient is not None:
@@ -3167,6 +3164,10 @@ def _generate_harmony_token_events(
                     text_content)
                 yield streaming_events_helper.get_output_item_done_event(
                     text_item)
+
+        # The done events above carry the index of the item they close.
+        streaming_events_helper.output_index_increment()
+        streaming_events_helper.is_output_item_added_sent = False
 
     if parser.last_content_delta:
         if (parser.current_channel == "final"
