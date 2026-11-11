@@ -512,14 +512,25 @@ def test_kill_switch(value, enabled, monkeypatch):
     )
     lm_head = _lm_head()
     model = SimpleNamespace(spec_worker=worker, lm_head=lm_head)
-    model_config = SimpleNamespace(mapping=lm_head.mapping, max_num_tokens=8192)
+    # Sized by the batch bound: 16 requests x (1 + 3 drafts) rows.
+    spec_config = SimpleNamespace(_max_batch_size=16, tokens_per_gen_step=4)
+    model_config = SimpleNamespace(
+        mapping=lm_head.mapping, max_num_tokens=8192, spec_config=spec_config
+    )
     SpecDecOneEngineForCausalLM._enable_vocab_parallel_argmax(model, model_config, None)
-    assert created == ([8192] if enabled else [])
+    assert created == ([64] if enabled else [])
     assert enabled_with == (["key exchange"] if enabled else [])
+    if enabled:
+        # Without a batch bound in the spec config, by max_num_tokens.
+        created.clear()
+        model_config.spec_config = SimpleNamespace(tokens_per_gen_step=4)
+        SpecDecOneEngineForCausalLM._enable_vocab_parallel_argmax(model, model_config, None)
+        assert created == [8192]
 
     # A key exchange the fast paths already built is reused.
     created.clear()
     enabled_with.clear()
+    model_config.spec_config = spec_config
     SpecDecOneEngineForCausalLM._enable_vocab_parallel_argmax(model, model_config, "fast path")
     assert created == []
     assert enabled_with == (["fast path"] if enabled else [])
