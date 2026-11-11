@@ -209,6 +209,63 @@ def test_narrow_block_scale_in_a_partial_reload_is_refused():
     assert method.loaded == []
 
 
+class _ScalesOnlyMethod(_RecordingMethod):
+    """Runs FusedMoEMethodBase.load_weights with the weight layout stubbed out."""
+
+    def load_expert_weights_to_dst(
+        self,
+        module,
+        weights,
+        weight_loading_mode,
+        load_expert_ids,
+        dst_w3_w1_weights_tensor,
+        dst_w2_weights_tensor,
+        dst_w3_w1_bias_tensor,
+        dst_w2_bias_tensor,
+        allow_partial_loading=False,
+    ):
+        pass
+
+
+def _loadable_module():
+    module = _module()
+    module.num_experts = 1
+    module.initial_local_expert_ids = [0]
+    module.bias = False
+    module.layer_load_balancer = None
+    module.w3_w1_weight = torch.empty(1, 2 * INTERMEDIATE, HIDDEN // 2, dtype=torch.uint8)
+    module.w2_weight = torch.empty(1, HIDDEN, INTERMEDIATE // 2, dtype=torch.uint8)
+    module.w3_w1_weight_scale = torch.empty(1, 2 * INTERMEDIATE, HIDDEN // 16, dtype=torch.uint8)
+    module.w2_weight_scale = torch.empty(1, HIDDEN, INTERMEDIATE // 16, dtype=torch.uint8)
+    return module
+
+
+@pytest.mark.parametrize(
+    "bucket_suffixes",
+    [
+        (_PROJECTION_KEYS["w1"] + _PROJECTION_KEYS["w3"], _PROJECTION_KEYS["w2"]),
+        tuple((f"{proj}.{kind}",) for kind in ("weight", "weight_scale", "weight_scale_2")
+              for proj in ("w1", "w3", "w2")),
+    ],
+    ids=["w3w1_then_w2", "per_tensor_kind"],
+)
+def test_partial_update_weights_buckets_pass_load_weights(bucket_suffixes):
+    # The path of a partial update_weights: every bucket goes through load_weights
+    # with allow_partial_loading=True, and a bucket may hold a weight without its scales.
+    method = _ScalesOnlyMethod()
+    module = _loadable_module()
+    expert = _expert()
+    for suffixes in bucket_suffixes:
+        method.load_weights(
+            module,
+            _bucket(expert, *suffixes),
+            MoEWeightLoadingMode.VANILLA,
+            allow_partial_loading=True,
+        )
+    assert {entry[0] for entry in method.loaded} == {"w3_w1", "w2"}
+    assert sorted(module.tmp_weight_scale_2[0]) == ["w1", "w2", "w3"]
+
+
 @pytest.mark.parametrize(
     "method_cls",
     [NVFP4CutlassFusedMoEMethod, NVFP4PlusCuteDslFusedMoEMethod, NVFP4TRTLLMGenFusedMoEMethod],
