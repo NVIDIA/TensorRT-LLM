@@ -155,7 +155,10 @@
 ### 收尾
 
 1. 展示完整的 task.yaml 草稿，请用户确认或修改。
-2. 问 workspace 路径，把 `task.yaml` 写进去。如果目标文件已经存在，先问用户，不能直接覆盖。
+2. 直接给出一个新的 workspace 完整路径请用户确认或替换：`<trtllm_repo_path>/agent-flow/workspace/<name>`
+   （agent-flow 的 `.gitignore` 忽略 `workspace/`），`<name>` 是 checkpoint 目录名的小写加
+   `-v2-onboard` 或 `-bringup`，目录已存在就加 `-2`、`-3`。确认后创建目录并写入 `task.yaml`；
+   用户换成的目录里已有 task.yaml 时，先问再覆盖。
 3. 用 `modeling-v2-onboard --check` 校验（schema、checkout、workspace、checkpoint、镜像、mounts、
    GPU pool）；没有 v2-onboard 时用 `load_and_validate_task_yaml`。失败时把问题告诉用户，改完再校验。
 4. Slurm + v2-onboard 时，问用户要不要现在跑运行时检查（`--check --smoke`：提交一个短 Slurm 作业，
