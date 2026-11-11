@@ -44,12 +44,26 @@ def createKubernetesPodConfig()
                     tty: true
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 12Gi
+                        cpu: '1'
+                        memory: 5Gi
                         ephemeral-storage: 200Gi
                       limits:
-                        cpu: '2'
-                        memory: 12Gi
+                        cpu: '1'
+                        memory: 5Gi
+                        ephemeral-storage: 200Gi
+                    imagePullPolicy: Always
+                  - name: sonarqube
+                    image: ${image}
+                    command: ['cat']
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: '4'
+                        memory: 32Gi
+                        ephemeral-storage: 200Gi
+                      limits:
+                        cpu: '4'
+                        memory: 32Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                   - name: jnlp
@@ -58,11 +72,11 @@ def createKubernetesPodConfig()
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 5Gi
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 5Gi
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                   - name: pulse-malware-scanner
                     image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-malware-scanner-cli:stable
@@ -70,12 +84,12 @@ def createKubernetesPodConfig()
                     tty: true
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 8Gi
+                        cpu: '1'
+                        memory: 2Gi
                         ephemeral-storage: 200Gi
                       limits:
-                        cpu: '2'
-                        memory: 8Gi
+                        cpu: '1'
+                        memory: 2Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                     securityContext:
@@ -88,11 +102,11 @@ def createKubernetesPodConfig()
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 16Gi
+                        memory: 12Gi
                         ephemeral-storage: 200Gi
                       limits:
                         cpu: '2'
-                        memory: 16Gi
+                        memory: 12Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                     securityContext:
@@ -105,11 +119,11 @@ def createKubernetesPodConfig()
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 16Gi
+                        memory: 12Gi
                         ephemeral-storage: 200Gi
                       limits:
                         cpu: '2'
-                        memory: 16Gi
+                        memory: 12Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                     securityContext:
@@ -283,7 +297,12 @@ def generateLockFiles(llmRepo, ref)
 
 def sonarScan()
 {
-    container("cpu") {
+    container("sonarqube") {
+        // This container is a bare ubuntu image; the tools installed by installTools()
+        // live in the "cpu" container's filesystem, not here.
+        sh "apt update"
+        sh "apt install -y --no-install-recommends git wget unzip openjdk-17-jre-headless ca-certificates"
+        sh "git config --global --add safe.directory ${env.WORKSPACE}"
         def sonarScannerCliVer = "8.0.0.6341"
         // Expected SHA-256 of the scanner zip; update it together with sonarScannerCliVer.
         def sonarScannerCliSha256 = "c55773294e951dcba23ebe7084616f33721b0ce0d199401c7e07d3a6cdfafdb1"

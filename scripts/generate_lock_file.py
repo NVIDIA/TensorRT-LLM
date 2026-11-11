@@ -56,7 +56,7 @@ project_constraints = {
 }
 
 target_env = {
-    "python_version": 310,
+    "python_version": 312,
     "platform_system": "",
     "platform_machine": "x86_64",
     "sys_platform": "linux",
@@ -87,6 +87,67 @@ def get_project_info(path: str):
             else:
                 name = matches.group(2)
     return {"name": name, "version": version}
+
+
+def _normalize_name(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _find_unresolvable_spec(output, specs):
+    """Return the index of the spec that Poetry blames for a failed resolution.
+
+    Poetry ends a failed resolution with
+    "So, because <project> depends on <pkg> (<constraint>), version solving
+    failed." (or "... on both <a> (..) and <b> (..)", or "Could not find a
+    matching version of package <pkg>"). When several packages are named, the
+    one listed last in `specs` is blamed, so that earlier entries win, as when
+    adding one by one. Returns None if no listed package can be identified.
+    """
+    names = set()
+    match = re.search(
+        r"So, because .*? depends on (.*?), version solving failed", output,
+        re.S)
+    if match:
+        names.update(
+            _normalize_name(n) for n in re.findall(
+                r"([A-Za-z0-9][A-Za-z0-9_.\-]*)(?:\[[^\]]*\])? \(",
+                match.group(1)))
+    match = re.search(r"Could not find a matching version of package (\S+)",
+                      output)
+    if match:
+        names.add(_normalize_name(match.group(1)))
+    indexes = [
+        i for i, spec in enumerate(specs) if _normalize_name(
+            re.match(r"[A-Za-z0-9][A-Za-z0-9_.\-]*", spec).group(0)) in names
+        if re.match(r"[A-Za-z0-9][A-Za-z0-9_.\-]*", spec)
+    ]
+    return max(indexes) if indexes else None
+
+
+def poetry_add(specs, cwd):
+    specs = list(specs)
+    while specs:
+        # --lock: only resolve and write poetry.lock; installing the packages
+        # into a virtualenv is not needed for the security scan.
+        result = subprocess.run(["poetry", "add", "--lock", *specs],
+                                cwd=cwd,
+                                capture_output=True,
+                                text=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode == 0:
+            return
+        culprit = _find_unresolvable_spec(result.stdout + result.stderr, specs)
+        if culprit is None:
+            if len(specs) == 1:
+                print(f"Skipping {specs[0]}: 'poetry add' failed")
+                return
+            mid = len(specs) // 2
+            poetry_add(specs[:mid], cwd)
+            poetry_add(specs[mid:], cwd)
+            return
+        print(f"Skipping {specs[culprit]}: 'poetry add' failed")
+        del specs[culprit]
 
 
 def generate_metadata_json():
@@ -158,11 +219,10 @@ if __name__ == "__main__":
                                 shell=True,
                                 capture_output=True,
                                 text=True).stdout
-        for constraint in project_constraints.get(
-                str(Path(file_path).relative_to(curr_path)), []):
-            subprocess.run(f"poetry add '{constraint}'",
-                           shell=True,
-                           cwd=save_path)
+        # Constraints go first so they steer the resolver for the whole batch.
+        specs = list(
+            project_constraints.get(str(Path(file_path).relative_to(curr_path)),
+                                    []))
         packages = output.split('\n')
 
         if packages[-1] == '':  # last entry is newline
@@ -174,7 +234,7 @@ if __name__ == "__main__":
             if not package or \
                 package.startswith('#') or \
                 '-f' in package or \
-                package.startswith('--'):
+                package.startswith('-'):
                 continue
 
             curr_env = None
@@ -201,7 +261,6 @@ if __name__ == "__main__":
                 package_name = data[0].replace(" ", "")
                 if (not package_name.startswith("tensorrt_llm")
                         and not package_name.startswith("3rdparty")):
-                    poetry_cmd = f"poetry add '{package_name}'"
-                    if package_name in url_mapping:
-                        poetry_cmd = f"poetry add '{url_mapping[package_name]}'"
-                    subprocess.run(poetry_cmd, shell=True, cwd=save_path)
+                    specs.append(url_mapping.get(package_name, package_name))
+
+        poetry_add(list(dict.fromkeys(specs)), save_path)
