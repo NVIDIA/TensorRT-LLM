@@ -1644,9 +1644,13 @@ void FmhaV2Fmha<AttentionVariant>::initGeneration(AttentionVariant const& op)
         fmhaParams.tpSize = 1;
         fmhaParams.tpRank = 0;
         mGenerationRunner = std::make_unique<FusedMHARunnerV2>(fmhaParams);
-        // Only deepseek must using fmha in the generation phase when flash mla is not enabled.
-        TLLM_CHECK_WITH_INFO(
-            mGenerationRunner->isFmhaSupported(), "Deepseek should be supported by fmha in generation part.");
+        if (!mGenerationRunner->isFmhaSupported())
+        {
+            // FlashMLA serves the generation configs FMHA-v2 has no kernel for.
+            TLLM_CHECK_WITH_INFO(
+                FlashMlaFmha::isAvailable(op), "Deepseek should be supported by fmha in generation part.");
+            mGenerationRunner.reset();
+        }
     }
 }
 
