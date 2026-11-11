@@ -296,9 +296,38 @@
       "path": "dwdp_config.contention_opt"
     },
     {
+      "allowed_values": [
+        "per_slice",
+        "batched",
+        "gather"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "dwdp_config.copy_mode"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.dwdp_size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_dense"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_experts"
+    },
+    {
+      "allowed_values": [
+        "register",
+        "tma"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "dwdp_config.gather_kernel"
     },
     {
       "capture_policy": "int",
@@ -1461,6 +1490,16 @@
       "path": "scheduler_config.enable_prefix_aware_scheduling"
     },
     {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "scheduler_config.gen_preemption.target_output_tps"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "scheduler_config.gen_preemption.tpot_budget"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "scheduler_config.use_python_scheduler"
@@ -1478,6 +1517,11 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "serve_frontend_affinity_port_stride"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "serve_graceful_shutdown_timeout_s"
     },
     {
       "capture_policy": "bool",

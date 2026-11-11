@@ -8,9 +8,9 @@ from typing import Sequence, Tuple
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ... import native_ops
 from ._mnnvl_workspace import NUM_LAMPORT_BUFFERS
 
 
@@ -78,7 +78,7 @@ class GlmMnnvlHop(OpWrapper):
         buffer_flags: torch.Tensor,
         shard_published: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        norm_out, residual_out = torch.ops.trtllm.glm_mnnvl_hop(
+        norm_out, residual_out = native_ops.glm_mnnvl_hop(
             input, residual, gamma, epsilon, comm_buffer, buffer_flags, shard_published
         )
         return norm_out, residual_out

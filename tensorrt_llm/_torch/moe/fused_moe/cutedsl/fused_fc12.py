@@ -47,6 +47,7 @@ from ..impl_contract import (
     MoEProblem,
     MoERejectReason,
     MoERunContext,
+    MoESortTables,
     MoEStaticCapability,
     require_comm_plan,
 )
@@ -56,7 +57,12 @@ from ..interface import MoESchedulerKind, _reject
 from ..quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from ..routing import BaseMoeRoutingMethod
 from .identity import KERNEL_FUSED_FC12, PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL
-from .kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
+from .kernel_inputs import (
+    NvFp4WeightView,
+    finalize_routing_scales,
+    prequantized_nvfp4_input_scale,
+    quantize_input_nvfp4,
+)
 from .runners import CuteDslFusedMoENvfp4Runner
 
 
@@ -74,6 +80,12 @@ class CuteDslFc12FusedMoENvfp4Runner(CuteDslFusedMoENvfp4Runner):
     @staticmethod
     def _tile_sizes() -> list[int]:
         return [128, 256]
+
+
+# The most SMs the fused FC12 grid keeps free beside it (the measured R200
+# split); the model's per-forward ``reserve_sms_for_concurrent_kernels``
+# request, bounded by this ceiling, is applied at every launch.
+_SM_RESERVE_CEILING = 16
 
 
 @register_moe_impl
@@ -221,6 +233,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             self.aux_stream_dict = {}
         self.event_dict = {EventType.Main: torch.cuda.Event()}
         self.scaling_vector_size = 16
+        # SMs the fused kernel leaves free (``reserve_sms_for_concurrent_kernels``).
+        self._concurrent_sm_reserve = 0
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -247,6 +261,26 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         # all-to-all combine workspace.
         return True
 
+    def sm_reserve_ceiling(self) -> int:
+        """Whole clusters fewer, at least one launched (one CTA holds an SM's
+        register file): the 16-SM split measured on a VR200. Per-launch the model
+        hands the reserve of ``reserve_sms_for_concurrent_kernels`` over, bounded
+        by this ceiling."""
+        return _SM_RESERVE_CEILING
+
+    def reserve_sms_for_concurrent_kernels(self, num_sms: int) -> int:
+        """The fused kernel's persistent grid launches enough whole clusters fewer to leave
+        ``num_sms`` SMs without an FC12 CTA (``reserved_sms`` of the op)."""
+        if num_sms < 0:
+            raise ValueError(f"num_sms must be non-negative, got {num_sms}")
+        self._concurrent_sm_reserve = num_sms
+        return num_sms
+
+    def consumes_sort_tables(self) -> bool:
+        """``run_moe_nvfp4`` runs on the routing kernel's tables when they match
+        the tuned tile; not with a slot remap."""
+        return self.num_slots == self.num_experts
+
     def load_weights(self, weights: list[dict], allow_partial_loading: bool = False) -> None:
         super().load_weights(weights, allow_partial_loading=allow_partial_loading)
         # DWDP registers the freshly loaded expert weights with its handle
@@ -272,7 +306,17 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     # ------------------------------------------------------------------
     # Input quantization and dispatch (NVFP4 only)
     # ------------------------------------------------------------------
+    # Shared NVFP4 input handling: the passthrough rule and its prequant
+    # exception live once in kernel_inputs.py, bound like quantize_input.
     quantize_input = quantize_input_nvfp4
+    prequantized_nvfp4_input_scale = prequantized_nvfp4_input_scale
+
+    def _join_pending_x_ready(self) -> None:
+        """Wait for the input-ready event handed to ``run_moe_nvfp4`` (once per forward)."""
+        event = getattr(self, "_pending_x_ready_event", None)
+        if event is not None:
+            event.wait()
+            self._pending_x_ready_event = None
 
     def run_moe(self, ctx: MoERunContext, *, workspace: dict | None = None) -> torch.Tensor:
         del workspace  # the fused kernel allocates its own intermediates
@@ -285,6 +329,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             moe_output=plan.moe_output,
             enable_alltoall=plan.enable_alltoall,
             weight_view=self._build_local_weight_view(),
+            x_ready_event=ctx.x_ready_event,
+            sort_tables=ctx.sort_tables,
         )
 
     # Fused-kernel dispatch, with its own autotuner key and outer runner so
@@ -298,6 +344,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         moe_output: torch.Tensor | None = None,
         enable_alltoall: bool = False,
         weight_view: NvFp4WeightView | None = None,
+        x_ready_event: torch.cuda.Event | None = None,
+        sort_tables: MoESortTables | None = None,
     ) -> torch.Tensor:
         assert self.has_nvfp4
         assert weight_view is not None
@@ -311,9 +359,13 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             assert moe_output.size() == (token_final_scales.size(0), self.hidden_size)
             assert moe_output.dtype == output_dtype
 
+        # Join before the fused kernel reads x, or before returning an empty batch.
+        self._pending_x_ready_event = x_ready_event
+
         # Empty micro-batches: skip autotuning (synthetic grouped-GEMM inputs
         # require at least one output row).
         if token_selected_experts.size(0) == 0:
+            self._join_pending_x_ready()
             return moe_output
 
         effective_top_k = token_selected_experts.size(-1)
@@ -337,6 +389,15 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             runner.get_tuning_config(),
             inputs,
         )
+        # Tables the routing produced (``try_route_with_sort``) replace
+        # ``moe_sort`` when they are at the tuned tile.
+        if sort_tables is not None and runner.tile_size_of(best_tactic) == sort_tables.tile_size:
+            return self.run_moe_nvfp4_impl(
+                *inputs,
+                enable_alltoall=enable_alltoall,
+                tile_size=sort_tables.tile_size,
+                sort_tables=sort_tables,
+            )
         return runner(inputs, tactic=best_tactic)
 
     def _situ_betas(self) -> tuple[float, float]:
@@ -366,8 +427,12 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         recv_expert_count: torch.Tensor | None = None,
         deep_ep_expert_capacity: int | None = None,
         use_count_native_expert_metadata: bool = False,
+        sort_tables: MoESortTables | None = None,
     ) -> torch.Tensor:
-        """Single fused FC1+FC2 op."""
+        """Single fused FC1+FC2 op.
+
+        ``sort_tables`` (at ``tile_size``) replace this rank's ``moe_sort``.
+        """
         # The shared CuteDslFusedMoENvfp4Runner.forward always forwards the
         # DeepEP direct-metadata knobs. This backend never enables that path
         # (can_use_deep_ep_direct_metadata() stays False), so they must arrive
@@ -383,6 +448,19 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         situ_beta, situ_linear_beta = self._situ_betas()
         slot_start = weight_view.slot_start
 
+        if sort_tables is not None:
+            assert sort_tables.tile_size == tile_size
+            sort_outputs = sort_tables.outputs
+        else:
+            sort_outputs = torch.ops.trtllm.moe_sort(
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                num_experts=self.num_slots,
+                top_k=effective_top_k,
+                local_expert_offset=slot_start,
+                local_num_experts=esp,
+                tile_tokens_dim=tile_size,
+            )
         (
             tile_idx_to_expert_idx,
             tile_idx_to_mn_limit,
@@ -390,15 +468,9 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             permuted_idx_to_expanded_idx,
             total_num_padded_tokens,
             num_non_exiting_tiles,
-        ) = torch.ops.trtllm.moe_sort(
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            num_experts=self.num_slots,
-            top_k=effective_top_k,
-            local_expert_offset=slot_start,
-            local_num_experts=esp,
-            tile_tokens_dim=tile_size,
-        )
+        ) = sort_outputs
+
+        self._join_pending_x_ready()
 
         # One fused op: gather + FC1 GEMM + gated act (SwiGLU or SiTU) + requant
         # + FC2 GEMM + finalize (scatter-add into moe_output = a2a combine
@@ -439,5 +511,6 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             activation_type=int(self.activation_type),
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            reserved_sms=self._concurrent_sm_reserve,
         )
         return moe_output

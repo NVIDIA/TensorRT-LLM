@@ -138,6 +138,9 @@ def delivery_failures(workflow) -> list[str]:
 #: runs it and its anchor's row. A run whose every unit is ``smoke`` or ``bringup`` owes none.
 CI_DELIVERY_CHECKS = frozenset({"accuracy:reference", "tests:accuracy-file", "tests:test-db"})
 _NO_CI_PROFILES = (PROFILE_SMOKE, PROFILE_BRINGUP)
+#: The most test modules of its own a target delivers that a reviewer accepts (10-15,
+#: consolidated by domain, is the aim): delivery warns past it and never fails on it.
+TARGET_TEST_MODULES_MAX = 20
 
 
 def ci_waiver(task_data) -> str:
@@ -175,7 +178,9 @@ def delivery_report(workflow, *, run_tests: bool = False) -> DeliveryReport:
         ),
         model_key=resolve_model_key(workflow.task_data),
         accuracy_test=accuracy_test_path(
-            workflow.task_data["trtllm_repo_path"], workflow._preflight.family
+            workflow.task_data["trtllm_repo_path"],
+            workflow._preflight.family,
+            Path(workflow._preflight.target_rel).name,
         ),
         commit_policy=CommitPolicy.from_task(workflow.task_data, workspace=workflow.workspace),
     )
@@ -189,11 +194,41 @@ def delivery_report(workflow, *, run_tests: bool = False) -> DeliveryReport:
                 for c in report.checks
             )
         )
+    modules = target_test_modules_check(
+        workflow.task_data["trtllm_repo_path"], workflow._preflight.target_rel
+    )
+    if modules is not None:
+        report = DeliveryReport(checks=(*report.checks, modules))
     tested = tests_check(workflow, report, run=run_tests)
     if run_tests:
         report = delivery_report(workflow)
         report = DeliveryReport(checks=tuple(c for c in report.checks if c.name != "tests"))
     return DeliveryReport(checks=(*report.checks, *((tested,) if tested else ())))
+
+
+def target_test_modules_check(repo_root: str | Path, target_rel: str) -> DeliveryCheck | None:
+    """How many test modules the target delivers under its tests' directory, and their lines.
+
+    Never fails delivery: past :data:`TARGET_TEST_MODULES_MAX` it says so as a
+    warning. ``None`` when the target has no test there.
+    """
+    tests_dir = model_ops_tests_dir(target_rel)
+    root = Path(repo_root) / tests_dir
+    files = (
+        sorted(p for p in root.rglob("*.py") if test_results.TEST_FILE.search(p.as_posix()))
+        if root.is_dir()
+        else []
+    )
+    if not files:
+        return None
+    lines = sum(len(p.read_text(encoding="utf-8", errors="replace").splitlines()) for p in files)
+    detail = f"{len(files)} test module(s), {lines} lines, under {tests_dir}"
+    if len(files) > TARGET_TEST_MODULES_MAX:
+        detail += (
+            f"; WARNING: more than the {TARGET_TEST_MODULES_MAX} a reviewer accepts: consolidate "
+            "them by domain to 10-15 modules, with one copy of each helper"
+        )
+    return DeliveryCheck("tests:modules", True, detail)
 
 
 def tests_check(workflow, report: DeliveryReport, *, run: bool = False) -> DeliveryCheck | None:

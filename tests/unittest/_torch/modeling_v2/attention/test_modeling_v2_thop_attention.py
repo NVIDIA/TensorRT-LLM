@@ -7550,7 +7550,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
         Cell(
             why="qwen4_exp prefill: GQA 24q/2kv d256, bf16 pool, paged context; "
             "a fresh 70-row sequence beside 33 rows over a 48-token cached prefix",

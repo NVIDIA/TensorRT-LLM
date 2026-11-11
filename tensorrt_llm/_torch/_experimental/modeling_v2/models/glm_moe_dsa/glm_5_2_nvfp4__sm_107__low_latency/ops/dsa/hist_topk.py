@@ -8,9 +8,9 @@ from typing import Sequence
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ... import native_ops
 from ._hist_topk import MAX_SHARD, TOPK, shard_size
 
 _TOKEN_BITS = 21
@@ -114,9 +114,7 @@ class GlmHistTopk(OpWrapper):
         next_n: int,
         group_size: int,
     ) -> torch.Tensor:
-        torch.ops.trtllm.glm_dsa_hist_topk(
-            logits, kv_lens, out, comm_buffer, state, next_n, group_size
-        )
+        native_ops.glm_dsa_hist_topk(logits, kv_lens, out, comm_buffer, state, next_n, group_size)
         return out
 
     def reference(

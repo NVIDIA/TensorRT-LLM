@@ -14,10 +14,10 @@ from typing import Sequence
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm.mapping import Mapping
 
+from ... import native_ops
 from ._ipc_workspace import (
     IpcWorkspace,
     bind_ipc_workspace,
@@ -52,7 +52,7 @@ class GlmIntraNodeReduce(OpWrapper):
         buffer_bytes,
         trigger_completion_at_end,
     ):
-        return torch.ops.trtllm.glm_intra_node_reduce(
+        return native_ops.glm_intra_node_reduce(
             input,
             residual,
             gamma,

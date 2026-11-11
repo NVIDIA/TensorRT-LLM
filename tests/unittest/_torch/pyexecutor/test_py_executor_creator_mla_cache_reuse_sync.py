@@ -228,6 +228,7 @@ def _make_llm_args():
         ),
     )
     scheduler_config = SimpleNamespace(
+        gen_preemption=None,
         context_chunking_policy=None,
         capacity_scheduler_policy=None,
     )
