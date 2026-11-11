@@ -35,6 +35,14 @@ tests:
     launch:
       mode: mpi
       world_size: 8
+  - case: accuracy/modeling_v2/nemotron_h/nemotron3_ultra_bf16__sm_100__tep8/test_accuracy.py::TestModelingV2Nemotron3UltraBf16Sm100Tep8::test_gsm8k_megamoe_cutedsl
+    launch:
+      mode: mpi
+      world_size: 8
+  - case: accuracy/modeling_v2/nemotron_h/nemotron3_ultra_bf16__sm_100__tep8/test_accuracy.py::TestModelingV2Nemotron3UltraBf16Sm100Tep8::test_gsm8k_trtllm_moe
+    launch:
+      mode: mpi
+      world_size: 8
   - case: accuracy/modeling_v2/nemotron_h/nemotron3_ultra_bf16__sm_100__tp8ep2/test_accuracy.py::TestModelingV2Nemotron3UltraBf16Sm100Tp8ep2::test_gsm8k
     launch:
       mode: mpi

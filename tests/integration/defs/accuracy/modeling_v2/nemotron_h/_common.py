@@ -32,7 +32,7 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
 
 from ....conftest import check_device_contain, llm_models_root
 from ...accuracy_core import GSM8K, LlmapiAccuracyTestHarness
@@ -67,7 +67,12 @@ class NemotronHBf16Target(LlmapiAccuracyTestHarness):
     MODEL_PATH = BF16_MODEL_PATH
     MOE_EP = 8
 
-    def _gsm8k(self, max_batch_size: int, kv_cache_dtype: str = "auto") -> None:
+    def _gsm8k(
+        self, max_batch_size: int, kv_cache_dtype: str = "auto", moe_backend: str | None = None
+    ) -> None:
+        # `moe_backend` asks for the routed experts' backend by name; None leaves the LLM
+        # API's default (AUTO), which runs the target's own fused_moe.
+        moe_kwargs = {} if moe_backend is None else dict(moe_config=MoeConfig(backend=moe_backend))
         # 1.1 TB of weights: 8 ranks, about 128 GiB of them on each 185 GiB GPU, and the
         # fraction applies to what is left. The batch ceiling is the serving envelope the
         # targets were gated at: decode graphs up to that many rows, and a recurrent-state
@@ -92,6 +97,7 @@ class NemotronHBf16Target(LlmapiAccuracyTestHarness):
                 cuda_graph_config=CudaGraphConfig(
                     max_batch_size=max_batch_size, enable_padding=True
                 ),
+                **moe_kwargs,
             ) as llm,
         ):
             task = GSM8K(self.MODEL_NAME)

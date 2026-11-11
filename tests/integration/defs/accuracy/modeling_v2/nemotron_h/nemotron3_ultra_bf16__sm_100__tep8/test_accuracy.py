@@ -31,3 +31,12 @@ class TestModelingV2Nemotron3UltraBf16Sm100Tep8(NemotronHBf16Target):
 
     def test_gsm8k(self):
         self._gsm8k(max_batch_size=256)
+
+    def test_gsm8k_megamoe_cutedsl(self):
+        # The routed experts on the engine's CuTe DSL MegaMoE BF16 leaf (Relu2, top-22). Built-in
+        # implementation, same layout: 94.85 with MegaMoE, 95.11 with CUTLASS.
+        self._gsm8k(max_batch_size=256, moe_backend="MEGAMOE_CUTEDSL")
+
+    def test_gsm8k_trtllm_moe(self):
+        # The routed experts on the engine's TRTLLM-Gen BF16 MoE (FlashInfer, Relu2, top-22).
+        self._gsm8k(max_batch_size=256, moe_backend="TRTLLM")

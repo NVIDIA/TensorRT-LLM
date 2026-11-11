@@ -109,6 +109,7 @@ l0_cpu:
   # Nemotron-H routing and the BF16 targets' weight-table and cache-bind tests: synthetic configs,
   # meta tensors and stand-in managers, no device.
   - unittest/_torch/modeling_v2/models/nemotron_h/test_nemotron_h_routing.py
+  - unittest/_torch/modeling_v2/models/nemotron_h/test_nemotron_h_uncertified_generic_calls.py
   - unittest/_torch/modeling_v2/models/nemotron_h/nemotron3_ultra_bf16__sm_100__tep8
   - unittest/_torch/modeling_v2/models/nemotron_h/nemotron3_ultra_bf16__sm_100__tp8ep2
   # The qwen4_exp default target's cpu_only tests (its routing among them); this stage runs

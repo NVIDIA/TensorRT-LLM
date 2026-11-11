@@ -217,9 +217,19 @@ def test_ultra_bf16_tep8_refuses_engine_choices_it_never_ran(llm_kwargs, missed)
     _refused(config, missed, **llm_kwargs)
 
 
-def test_ultra_bf16_refuses_another_moe_backend():
-    config = replace(_model_config(_ultra_bf16_config(), **_TEP8), moe_backend_requested="TRTLLM")
+@pytest.mark.parametrize("backend", ["CUTEDSL", "DEEPGEMM", "MEGAMOE_DEEPGEMM", "TRITON"])
+def test_ultra_bf16_refuses_another_moe_backend(backend):
+    config = replace(_model_config(_ultra_bf16_config(), **_TEP8), moe_backend_requested=backend)
     _refused(config, "moe_config.backend")
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("backend", ["AUTO", "CUTLASS", "MEGAMOE_CUTEDSL", "TRTLLM"])
+def test_ultra_bf16_tep8_takes_its_moe_backends(backend, mode):
+    """fused_moe by default (AUTO, CUTLASS); the engine's MegaMoE or TRTLLM-Gen BF16 MoE layer
+    when asked for by name. The target, not routing, checks that the leaf serves the layer."""
+    config = replace(_model_config(_ultra_bf16_config(), **_TEP8), moe_backend_requested=backend)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _ULTRA_BF16_TARGET
 
 
 def test_ultra_bf16_refuses_an_fp16_engine():
@@ -260,6 +270,20 @@ def test_ultra_bf16_tp8ep2_matches_over_an_fp8_kv_cache(mode):
     config = _model_config(_ultra_bf16_config(), **_TP8EP2)
     resolved = modeling_v2_resolve(config, _llm_args(mode, kv_cache_config=_kv(dtype="fp8")))
     assert _qualified(resolved) == _ULTRA_BF16_TP8EP2_TARGET
+
+
+@pytest.mark.parametrize(
+    "backend, missed",
+    [
+        # EP-only: tp8ep2 splits every expert over the 4 ranks of its window
+        ("MEGAMOE_CUTEDSL", "expert-parallel only"),
+        ("TRTLLM", "fused_moe only"),
+        ("CUTEDSL", "moe_config.backend"),
+    ],
+)
+def test_ultra_bf16_tp8ep2_refuses_the_engine_moe_backends(backend, missed):
+    config = replace(_model_config(_ultra_bf16_config(), **_TP8EP2), moe_backend_requested=backend)
+    _refused(config, missed)
 
 
 def test_ultra_bf16_tp8ep2_refuses_an_nvfp4_kv_cache():
