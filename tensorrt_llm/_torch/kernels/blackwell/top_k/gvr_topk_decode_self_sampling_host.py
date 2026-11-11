@@ -3252,9 +3252,12 @@ def _varlen_launcher(
             tsh_en = 1 if tpl[5] else 0
         else:
             split_aim = 2 * k
-            split_sfac = 32 if r_const == 2 else 48 if k > 1024 else 16
+            # Rows above K = 1024 sample with the same factor at every split; two parts (32-row
+            # K=2048 batches on the 78-SM H20) took the K <= 1024 factor and some rows retried
+            # for up to 9x the time
+            split_sfac = 48 if k > 1024 else 32 if r_const == 2 else 16
             unsplit_aim = 4 * k if k >= 1024 else 2 * k
-            amin = 3 * k if r_const == 2 else 7 * k // 2
+            amin = 3 * k if r_const == 2 and k <= 1024 else 7 * k // 2
             # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
             # num_rows > 15 would strand small batches in SPLIT-main without the
             # staged floor (a distribution-dependent tail regression); the kernel

@@ -1033,6 +1033,22 @@ def test_selfsampling_hopper_long_rows_sample_with_staging_headroom(monkeypatch)
     assert slab(1024, 65539, torch.bfloat16, 148, 100) == slab(1024, 65539, torch.float16, 148, 100)
 
 
+def test_selfsampling_split_k2048_rows_sample_with_one_factor(monkeypatch) -> None:
+    """FP32 rows above K = 1024 split over CTAs sample with the same factor at every split: 32-row
+    K=2048 batches split each row in two on the 78-SM H20 and in four on 132- and 148-SM GPUs."""
+    _record_compile_requests(monkeypatch)
+
+    def split_and_sfac(n, num_sms, sm_version):
+        launcher = _varlen_plan(32, n, 2048, num_sms, sm_version, torch.float32)
+        assert launcher[0] == "main", (n, num_sms, launcher)
+        return launcher[2][5], launcher[3][1]
+
+    for n in (32783, 65551, 131087, 163775):
+        assert split_and_sfac(n, 78, 90) == (2, 48), n
+    for n in (65551, 131087, 163775):
+        assert split_and_sfac(n, 132, 90) == split_and_sfac(n, 148, 100) == (4, 48), n
+
+
 def test_selfsampling_hopper_reads_shape_constants_at_run_time(monkeypatch) -> None:
     """Kernels that compile a shape constant in keep it at run time on Hopper where that is
     faster: the row stride of FP32 K=1024 register kernels in batches beyond two waves of rows
