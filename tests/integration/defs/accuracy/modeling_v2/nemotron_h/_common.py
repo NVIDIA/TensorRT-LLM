@@ -22,9 +22,10 @@ checks its step contract on the first forward; the switch travels to the ranks a
 
 The NVFP4 targets run the NVFP4 release on 4 Rubin GPUs (sm_107) with its FP8 KV cache
 and an fp16 recurrent state. The BF16 targets run the deployment their route admits: the BF16 release over 8
-GB200 GPUs (two trays of four), tensor-parallel attention and mamba, the recurrent
-state in the checkpoint's fp32, block reuse off. GSM8K runs with thinking off, the
-protocol the built-in TestNemotronV3Ultra gates this model with.
+GB200 GPUs (two trays of four) with tensor-parallel attention and mamba, or over 16 (four trays)
+with attention data parallel (dep16), the recurrent state in the checkpoint's fp32, block reuse
+off. GSM8K runs with thinking off, the protocol the built-in TestNemotronV3Ultra gates this model
+with.
 """
 
 import pytest
@@ -61,23 +62,39 @@ _EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(enable_thinking=False))
 
 
 class NemotronHBf16Target(LlmapiAccuracyTestHarness):
-    """One BF16 target: the subclass sets the MoE expert-parallel size its layout uses."""
+    """One BF16 target: the subclass sets the ranks, the MoE expert-parallel size and whether
+    attention is data parallel, as its layout uses them."""
 
     MODEL_NAME = MODEL_NAME
     MODEL_PATH = BF16_MODEL_PATH
+    WORLD = 8
     MOE_EP = 8
+    ATTENTION_DP = False
+    # The engine's max_num_tokens (per rank under attention DP); None leaves the LLM API's.
+    MAX_NUM_TOKENS: int | None = None
 
     def _gsm8k(
-        self, max_batch_size: int, kv_cache_dtype: str = "auto", moe_backend: str | None = None
+        self,
+        max_batch_size: int,
+        kv_cache_dtype: str = "auto",
+        moe_backend: str | None = None,
+        moe_max_num_tokens: int | None = None,
     ) -> None:
         # `moe_backend` asks for the routed experts' backend by name; None leaves the LLM
-        # API's default (AUTO), which runs the target's own fused_moe.
-        moe_kwargs = {} if moe_backend is None else dict(moe_config=MoeConfig(backend=moe_backend))
-        # 1.1 TB of weights: 8 ranks, about 128 GiB of them on each 185 GiB GPU, and the
-        # fraction applies to what is left. The batch ceiling is the serving envelope the
-        # targets were gated at: decode graphs up to that many rows, and a recurrent-state
-        # pool deep enough (271 slots at 256) that its last slots lie past 2^31 elements of
-        # the fp32 state.
+        # API's default (AUTO), which runs the tp8 targets' own fused_moe and dep16's CUTLASS
+        # leaf. `moe_max_num_tokens` caps one MoE launch (moe_config.max_num_tokens).
+        moe_fields = dict(backend=moe_backend, max_num_tokens=moe_max_num_tokens)
+        moe_fields = {k: v for k, v in moe_fields.items() if v is not None}
+        moe_kwargs = dict(moe_config=MoeConfig(**moe_fields)) if moe_fields else {}
+        engine_kwargs = {}
+        if self.MAX_NUM_TOKENS is not None:
+            engine_kwargs["max_num_tokens"] = self.MAX_NUM_TOKENS
+        # 1.1 TB of weights: about 128 GiB of them on each 185 GiB GPU at tp8 (123 GiB at
+        # dep16), and the fraction applies to what is left. The batch ceiling (per rank under
+        # attention DP) is the serving envelope the target was gated at: decode graphs up to
+        # that many rows, and a recurrent-state pool deep enough that its last slots lie past
+        # 2^31 elements of the fp32 state (271 slots at tp8 / 256; from slot 22 on at dep16,
+        # whose ranks hold all 256 heads).
         with (
             scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
             LLM(
@@ -91,12 +108,13 @@ class NemotronHBf16Target(LlmapiAccuracyTestHarness):
                     mamba_ssm_cache_dtype="float32",
                 ),
                 max_batch_size=max_batch_size,
-                tensor_parallel_size=8,
+                tensor_parallel_size=self.WORLD,
                 moe_expert_parallel_size=self.MOE_EP,
-                enable_attention_dp=False,
+                enable_attention_dp=self.ATTENTION_DP,
                 cuda_graph_config=CudaGraphConfig(
                     max_batch_size=max_batch_size, enable_padding=True
                 ),
+                **engine_kwargs,
                 **moe_kwargs,
             ) as llm,
         ):
