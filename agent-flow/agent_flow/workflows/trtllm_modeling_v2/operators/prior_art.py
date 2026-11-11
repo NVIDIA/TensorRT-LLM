@@ -10,7 +10,7 @@ Intake reads it from disk only: no engine import, no GPU. Two products:
   ``topk``, ``compress`` ...): other targets' ``ops/``, the shared catalog,
   the attention backends and the custom ops. A match is a lead for the
   survey, not a verdict: the surveyor still reads the entry's cells.
-- :func:`engine_constraints` states what the engine's kernels refuse for this
+- :func:`engine_limits` states what the engine's kernels refuse for this
   geometry, read from the source that refuses it (a head dimension the
   trtllm-gen FMHA has no kernel for, say), with the design it usually implies.
   Each limit is one :data:`ENGINE_RULES` entry.
@@ -20,13 +20,11 @@ the leads that hold into the spec's ``notes``, which every role reads.
 
 Every place read off the tree is an anchor (:mod:`.tree_anchors`): found where
 it was last seen, else by what it defines. One the checkout has nowhere is
-left out and reported (:data:`PRIOR_ART_ANCHORS`), never replaced by a value
-remembered here.
+left out, never replaced by a value remembered here.
 """
 
 from __future__ import annotations
 
-import ast
 import math
 import re
 from dataclasses import dataclass, field
@@ -410,11 +408,6 @@ def engine_limits(config: Mapping[str, Any], repo: str | Path | None = None) -> 
     return [limit for rule in ENGINE_RULES for limit in rule(config, repo)]
 
 
-def engine_constraints(config: Mapping[str, Any], repo: str | Path | None = None) -> list[str]:
-    """What the engine's kernels refuse for this checkpoint's geometry, each with its usual way out."""
-    return [limit.text for limit in engine_limits(config, repo)]
-
-
 def _op_words(name: str) -> set[str]:
     """A listed implementation's words: its category and name, not the directory of its owner."""
     return words(name.split("/ops/", 1)[-1].split(" ->", 1)[0].replace("/", " "))
@@ -469,43 +462,14 @@ def survey_block(found: PriorArt | None, limits: Sequence[EngineLimit], *, limit
     return "\n".join(lines) + "\n"
 
 
-#: The value of the PyTorch loader's list of ``kv_cache_config.dtype`` values.
-_KV_DTYPES = re.compile(r"_VALID_KV_CACHE_DTYPES\s*(?::[^=]*)?=\s*(\([^)]*\)|\[[^\]]*\])")
-
-
-def engine_kv_dtypes(repo: str | Path | None) -> tuple[tuple[str, ...], str] | None:
-    """The KV-cache dtypes the engine accepts and where that was read, or ``None`` when unknown."""
-    found = tree_anchors.read(repo, "kv_cache_dtypes")
-    if found is None:
-        return None
-    text, marker, where = found
-    match = _KV_DTYPES.match(text, marker.start())
-    try:
-        values = tuple(str(v) for v in ast.literal_eval(match.group(1))) if match else ()
-    except (ValueError, SyntaxError):
-        return None
-    return (values, where) if values else None
-
-
-#: The anchors this module reads.
-PRIOR_ART_ANCHORS: tuple[str, ...] = (
-    *(key for key, _ in ENGINE_ANCHORS),
-    "fmha_head_dims",
-    "kv_cache_dtypes",
-)
-
-
 __all__ = [
     "ENGINE_ANCHORS",
     "ENGINE_RULES",
-    "PRIOR_ART_ANCHORS",
     "PRIOR_ART_HEADING",
     "Candidate",
     "EngineLimit",
     "PriorArt",
     "config_words",
-    "engine_constraints",
-    "engine_kv_dtypes",
     "engine_limits",
     "find_prior_art",
     "fmha_head_dims",

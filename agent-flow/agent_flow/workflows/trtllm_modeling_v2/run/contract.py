@@ -26,9 +26,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 
-from ..checks import check_config, disagg, serve
-from ..checks.check_config import order_members_by_cost
+from ..checks import disagg, serve
+from ..spec import shorthand
 from ..spec import variants as variants_mod
+from ..spec.shorthand import order_members_by_cost
 from ..spec.task_schema import (
     DISAGG_FEATURE,
     PROFILE_BRINGUP,
@@ -183,7 +184,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         if level == PROFILE_BRINGUP:
             notes.append(f"{name}: the bringup profile gates no configuration variant")
             continue
-        spec = check_config.variant_spec(task_data, name, world_size=world_size)
+        spec = shorthand.variant_spec(task_data, name, world_size=world_size)
         members = order_members_by_cost(members_for(spec, name, world_size))
         base = variants_mod.base_unit(task_data, name)
         if base == DISAGG_FEATURE:

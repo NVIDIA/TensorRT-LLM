@@ -32,13 +32,15 @@ import yaml
 from ...checks import accuracy as accuracy_checks
 from ...checks import check_config
 from ...checks import disagg as disagg_checks
-from ...checks.check_config import resolve_llm_api_options, speculation_flags
+from ...checks.check_config import speculation_flags
 from ...infra.compute import environment as environment_mod
 from ...infra.compute.commands import CommandResult, CommandSpec, LocalCommandExecutor
 from ...infra.compute.environment import RunEnvironment, resolve_environment
 from ...infra.git import git_output
 from ...operators.coverage import MODELING_V2_PACKAGE
+from ...spec import shorthand
 from ...spec.derive import hybrid_marker
+from ...spec.shorthand import resolve_llm_api_options
 from ...spec.task_schema import (
     assembly_units,
     derive_checkpoint_segment,
@@ -351,11 +353,11 @@ def check_launch_settings(task_data: Mapping[str, Any]) -> list[str]:
     for unit in assembly_units(task_data):
         try:
             problems.extend(
-                f"[{unit}] {line}" for line in check_config.launch_conflicts(task_data, unit)
+                f"[{unit}] {line}" for line in shorthand.launch_conflicts(task_data, unit)
             )
         except ValueError as exc:
             raise PreflightError(f"[{unit}] {exc}") from exc
-    if check_config.checkpoint_remote_code(task_data.get("checkpoint_path")):
+    if shorthand.checkpoint_remote_code(task_data.get("checkpoint_path")):
         notes.append(
             "launch: the checkpoint ships its own code (`auto_map`), so every launcher "
             "trusts it (`--trust_remote_code`, `trust_remote_code: true`)"
@@ -473,7 +475,7 @@ def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list
     """Every configuration variant with an accuracy gate has an anchor its gate can read.
 
     A variant that names a row of its own looks it up under the variant's name,
-    with its own ``accuracy`` overlay (``checks/check_config.variant_spec``). A
+    with its own ``accuracy`` overlay (``spec/shorthand.variant_spec``). A
     relative one (``spec.variants.anchor_state``) is judged against its unit's
     benchmark at the same member, which the contract must owe.
     """
@@ -502,7 +504,7 @@ def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list
                 f"at {', '.join(c.member for c in own) or 'its member'}"
             )
             continue
-        spec = check_config.variant_spec(task_data, name, world_size=world_size)
+        spec = shorthand.variant_spec(task_data, name, world_size=world_size)
         notes.extend(check_accuracy_anchors(spec, [name]))
     return notes
 
@@ -598,7 +600,7 @@ def check_speculation_support(task_data: Mapping[str, Any]) -> list[str]:
             if flag.startswith("--spec_decode_algo="):
                 asked.add(flag.split("=", 1)[1])
         path = resolve_llm_api_options(task_data.get("accuracy") or {}, unit)
-        loaded = check_config.load_llm_api_options(path)
+        loaded = shorthand.load_llm_api_options(path)
         config = loaded.get("speculative_config") or {}
         if config.get("decoding_type"):
             asked.add(str(config["decoding_type"]))

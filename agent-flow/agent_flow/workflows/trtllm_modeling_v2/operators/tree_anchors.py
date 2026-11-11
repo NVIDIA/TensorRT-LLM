@@ -140,16 +140,6 @@ ANCHORS: dict[str, Anchor] = _anchors(
         consequence="the prior-art scan skips the MoE modules",
     ),
     Anchor(
-        "kv_cache_dtypes",
-        "the KV-cache dtypes the PyTorch loader accepts",
-        "tensorrt_llm/_torch/pyexecutor/model_loader.py",
-        FILE,
-        ("tensorrt_llm",),
-        marker=r"_VALID_KV_CACHE_DTYPES\s*(?::[^=\n]*)?=",
-        search="`_VALID_KV_CACHE_DTYPES`",
-        consequence="a KV-cache dtype the engine does not load is not caught before launch",
-    ),
-    Anchor(
         "fmha_head_dims",
         "the head dimensions the trtllm-gen FMHA has kernels for",
         "cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaKernels.h",
@@ -328,11 +318,6 @@ def read(repo: str | Path | None, anchor: Anchor | str) -> tuple[str, re.Match[s
     return (text, match, found.where) if match else None
 
 
-def missing(repo: str | Path | None, keys: Iterable[str]) -> list[Resolution]:
-    """The anchors among ``keys`` this checkout has nowhere."""
-    return [r for r in (resolve(repo, k) for k in keys) if not r.found]
-
-
 def render_map(repo: str | Path | None, found: Sequence[Resolution] | None = None) -> str:
     """``tree_map.md``: where each anchor is in the checkout at ``repo``, and how to find it.
 
@@ -370,7 +355,6 @@ __all__ = [
     "MAX_SEARCH_BYTES",
     "Anchor",
     "Resolution",
-    "missing",
     "read",
     "render_map",
     "resolve",

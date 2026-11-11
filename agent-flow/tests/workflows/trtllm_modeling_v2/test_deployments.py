@@ -14,7 +14,7 @@ import yaml
 from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
-from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, task_schema
+from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, shorthand, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
     TaskSchemaError,
     load_and_validate_task_yaml,
@@ -188,7 +188,7 @@ def test_a_shorthand_deployment_carries_the_options_the_checks_send_today(tmp_pa
     core, _, kv = deployments.resolve(spec)
     assert core.server.options == _check_options(spec, "core", "tp2")
     # A variant's checks run under the spec `variant_spec` writes, its options file included.
-    variant = check_config.variant_spec(spec, "kv_fp8", world_size=2, options_dir=tmp_path / "v")
+    variant = shorthand.variant_spec(spec, "kv_fp8", world_size=2, options_dir=tmp_path / "v")
     assert kv.server.options == _check_options(variant, "kv_fp8", "tp2")
 
 
@@ -313,7 +313,7 @@ def _native(tmp_path) -> dict:
                 "inputs": ["text", "image"],
                 "benchmarks": [
                     {"name": "gsm8k"},
-                    {"name": "mmmu", "args": "--post_process_fn strip_reasoning"},
+                    {"name": "mmmu", "args": "--post_process_fn 'strip reasoning'"},
                     {
                         "name": "aa_lcr",
                         "anchor": 0.62,
@@ -326,7 +326,11 @@ def _native(tmp_path) -> dict:
                 "name": "pd",
                 "env": {"UCX_TLS": "tcp,self,sm,cuda_copy,cuda_ipc"},
                 "ctx": {"options": "engines/ctx.yaml", "launch": "srun --nodelist=n[1-4]"},
-                "gen": {"options": "engines/gen.yaml", "launch": "srun --nodelist=n[5-8]"},
+                "gen": {
+                    "options": "engines/gen.yaml",
+                    "launch": "srun --nodelist=n[5-8]",
+                    "stop": "scancel --name gen",
+                },
                 "relative_to": "dep16",
                 "tests": [DISAGG_NODE],
             },
@@ -351,13 +355,16 @@ def test_a_spec_states_its_deployments_as_native_options(tmp_path):
     assert core.inputs == ("text", "image")
     gsm8k, mmmu, aa_lcr = core.benchmarks
     assert (gsm8k.name, gsm8k.anchor, gsm8k.args) == ("gsm8k", None, ())
-    assert mmmu.args == ("--post_process_fn", "strip_reasoning")
+    assert mmmu.args == ("--post_process_fn", "strip reasoning")  # split as a shell would
     assert (aa_lcr.anchor, aa_lcr.env) == (0.62, {"NS_JUDGE_MODEL": "judge"})
     assert aa_lcr.source.startswith("trtllm-eval aa_lcr")
     # Context and generation are two servers with their own options and prefixes.
     assert (pd.kind, pd.core, pd.relative_to) == (deployments.DISAGGREGATED, False, "dep16")
     assert pd.ctx.options["enable_attention_dp"] and not pd.gen.options["enable_attention_dp"]
-    assert pd.gen.launch == "srun --nodelist=n[5-8]"
+    assert (pd.gen.launch, pd.gen.stop) == ("srun --nodelist=n[5-8]", "scancel --name gen")
+    assert pd.ctx.stop == ""
+    # A deployment that names no benchmark takes the spec's: gsm8k unless `accuracy` says another.
+    assert [b.name for b in pd.benchmarks] == ["gsm8k"]
     assert pd.env == {"UCX_TLS": "tcp,self,sm,cuda_copy,cuda_ipc"} and pd.tests == (DISAGG_NODE,)
     # What it loads is what it states: the resolved spec loads again to the same deployments.
     assert deployments.resolve(_load(tmp_path, spec)) == (core, pd)
@@ -392,7 +399,9 @@ def test_every_problem_with_stated_deployments_is_batched(tmp_path):
     pd["timeout"] = 0
     spec["deployments"].append({"name": "Bad Name", "options": {}, "lanch": "x"})
     spec["features"] = ["mtp"]
-    spec["accuracy"]["benchmark"] = "mmlu"
+    spec["accuracy"]["tolerance"] = 5.0
+    pd["ctx"]["stop"] = "scancel --name ctx"
+    del pd["ctx"]["launch"]
     with pytest.raises(TaskSchemaError) as raised:
         _load(tmp_path, spec)
     message = str(raised.value)
@@ -409,7 +418,8 @@ def test_every_problem_with_stated_deployments_is_batched(tmp_path):
         "'deployments[2].name' must be lowercase letters, digits and '_'",
         "unknown key 'deployments[2].lanch' — did you mean 'deployments[2].launch'?",
         "'features' beside 'deployments': these keys are shorthand for deployments",
-        "'accuracy' carries ['benchmark'] beside 'deployments'",
+        "'accuracy' carries ['tolerance'] beside 'deployments'",
+        "'deployments.dep16.ctx.stop' ends what `launch` started, and there is no `launch`",
     ):
         assert expected in message, expected
 
@@ -538,7 +548,7 @@ def test_a_first_deployment_without_an_anchor_is_warned_of(tmp_path):
     native = _native(tmp_path)
     native["deployments"][0]["benchmarks"] = native["deployments"][0]["benchmarks"][2:]
     assert _warned(tmp_path, native) == []
-    del native["deployments"][0]["benchmarks"]
+    native["deployments"][0]["benchmarks"] = []
     [said] = _warned(tmp_path, native)
     assert said.startswith("no accuracy anchor: `dep16` names no benchmark")
 
@@ -578,4 +588,7 @@ def test_intake_derive_writes_the_spec_and_prints_its_warnings(tmp_path, capsys)
     assert "open: arch: name the GPU architecture" in printed
     assert derive.main(["--help"]) == 0
     assert derive.main(["lint", "--task", "x.yaml"]) == 2
+    said = capsys.readouterr().err
+    assert said.count("\n") == 1 and "`intake lint` is replaced by" in said and "--dry-run" in said
+    assert derive.main(["other"]) == 2
     assert "usage: trtllm-modeling-v2 intake derive" in capsys.readouterr().err

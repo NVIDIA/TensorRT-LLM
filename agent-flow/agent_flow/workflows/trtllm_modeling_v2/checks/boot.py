@@ -12,14 +12,10 @@ from typing import Any, Mapping, Sequence
 
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
+from ..spec.shorthand import resolve_llm_api_options
 from ..spec.task_schema import BOOT_KEYS, GATE_TIMEOUT_KEY, load_prompts_file, resolve_gate_timeout
 from . import check_config, feature_evidence
-from .check_config import (
-    EngineLimits,
-    check_configuration,
-    engine_declaration,
-    resolve_llm_api_options,
-)
+from .check_config import EngineLimits, check_configuration, engine_declaration
 from .check_runtime import (
     BOOT_TIMEOUT_S,
     MODE_REQUIRE,

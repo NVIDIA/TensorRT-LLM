@@ -1051,6 +1051,14 @@ def main(argv: list[str] | None = None) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(USAGE)
         return 0 if argv else 2
+    if argv[0] == "lint":
+        print(
+            "`intake lint` is replaced by `trtllm-modeling-v2 --task <spec> --workspace <W> "
+            "--dry-run`, which validates the spec and journals its warnings; `intake derive` "
+            "prints the same warnings",
+            file=sys.stderr,
+        )
+        return 2
     if argv[0] != "derive":
         print(USAGE, file=sys.stderr)
         return 2

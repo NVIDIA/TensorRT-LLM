@@ -25,9 +25,10 @@ import yaml
 
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
+from ..spec.shorthand import order_members_by_cost
 from ..spec.task_schema import TaskSchemaError, parse_parallel_segment
 from .boot import DEFAULT_BOOT_IMAGE_PROMPT, BootSpec, missing_keywords, resolve_boot_spec
-from .check_config import check_configuration, order_members_by_cost
+from .check_config import check_configuration
 from .check_runtime import (
     BOOT_TIMEOUT_S,
     MODE_REQUIRE,

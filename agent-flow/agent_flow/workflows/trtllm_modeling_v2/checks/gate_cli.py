@@ -29,6 +29,7 @@ from typing import Any, Callable, Mapping, Sequence
 from ..infra.compute.environment import resolve_environment
 from ..infra.compute.executor import select_command_executor, shell_runner_for
 from ..infra.files import read_json
+from ..spec import shorthand
 from ..spec import variants as variants_mod
 from ..spec.task_schema import (
     TaskSchemaError,
@@ -41,7 +42,7 @@ from ..spec.task_schema import (
 from . import acceptance as acceptance_checks
 from . import accuracy as accuracy_checks
 from . import boot as boot_checks
-from . import check_config, check_runtime, datasets, disagg, gate_records, serve
+from . import check_runtime, datasets, disagg, gate_records, serve
 from . import verdict as check_result
 from .accuracy import resolve_model_key
 from .harness import workload_io
@@ -229,14 +230,14 @@ def run_check(
     world = world_size
     workdir = Path(workdir).resolve()
     if variants_mod.is_variant(declared, unit):
-        spec = check_config.variant_spec(
+        spec = shorthand.variant_spec(
             declared,
             unit,
             world_size=widest_world_size(declared, world or 1),
             options_dir=workdir / variants_mod.OPTIONS_DIRNAME,
         )
     if member is None:
-        member = check_config.order_members_by_cost(members_for(spec, unit, world or 1))[0]
+        member = shorthand.order_members_by_cost(members_for(spec, unit, world or 1))[0]
     if world is None:
         world = parse_parallel_segment(member)[1] or 1
     # The disaggregated-serving test starts two engines, so it asks for both.

@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
+from ..spec.shorthand import merge_options, resolve_llm_api_options, resolve_max_draft_len
 from ..spec.task_schema import (
     TaskSchemaError,
     load_prompts_file,
@@ -24,14 +25,7 @@ from ..spec.task_schema import (
     resolve_per_unit,
 )
 from . import stats
-from .check_config import (
-    check_configuration,
-    engine_declaration,
-    merge_options,
-    resolve_llm_api_options,
-    resolve_max_draft_len,
-    speculation_flags,
-)
+from .check_config import check_configuration, engine_declaration, speculation_flags
 from .check_runtime import (
     BOOT_TIMEOUT_S,
     MODE_OFF,

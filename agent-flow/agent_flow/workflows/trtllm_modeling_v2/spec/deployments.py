@@ -33,24 +33,14 @@ Nothing downstream needs to know which form the spec was written in.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field, replace
+import shlex
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
 
-from .task_schema import (
-    ACCURACY_FIELD,
-    DISAGG_FEATURE,
-    SCOPE_FIELD,
-    assembly_units,
-    features_through,
-    members_for,
-    reject_unknown_keys,
-    resolve_per_unit,
-    widest_world_size,
-)
-from .variants import ANCHOR_RELATIVE, anchor_state, base_unit, variant_gates, variants
+from .task_schema import ACCURACY_FIELD, reject_unknown_keys
 
 DEPLOYMENTS_FIELD = "deployments"
 AGGREGATED = "aggregated"
@@ -60,14 +50,11 @@ ROLES: tuple[str, ...] = ("ctx", "gen")
 #: What a deployment may be sent: every deployment takes text.
 INPUTS: tuple[str, ...] = ("text", "image")
 DEFAULT_BENCHMARK = "gsm8k"
-#: The world size of a shorthand spec that names no member with one.
-DEFAULT_WORLD_SIZE = 4
 
 DEPLOYMENT_KEYS: tuple[str, ...] = (
     "name",
     "options",
     "launch",
-    # The site's command that ends what `launch` started, where SIGTERM is not enough.
     "stop",
     "env",
     "timeout",
@@ -77,7 +64,10 @@ DEPLOYMENT_KEYS: tuple[str, ...] = (
     "benchmarks",
     *ROLES,
 )
-SERVER_KEYS: tuple[str, ...] = ("options", "launch")
+#: What one server states: on an aggregated deployment itself, or inside ``ctx`` and ``gen``.
+#: ``stop`` is the site's command that ends what ``launch`` started, where a signal to the
+#: launcher is not enough.
+SERVER_KEYS: tuple[str, ...] = ("options", "launch", "stop")
 BENCHMARK_KEYS: tuple[str, ...] = ("name", "args", "anchor", "source", "env")
 #: Shorthand a spec that states ``deployments`` cannot also state: each says what runs.
 SHORTHAND_KEYS: tuple[str, ...] = (
@@ -89,9 +79,18 @@ SHORTHAND_KEYS: tuple[str, ...] = (
     "profile",
     "coverage",
 )
-#: The ``accuracy`` keys a spec that states ``deployments`` keeps: the reference rows' model,
-#: the boot workload and the dataset's place. Every other one is a deployment's to state.
-NATIVE_ACCURACY_KEYS: tuple[str, ...] = ("model_key", "boot", "dataset_path")
+#: The ``accuracy`` keys a spec that states ``deployments`` keeps, the defaults of every
+#: deployment: the reference rows' model, file and tags, the benchmark of a deployment that
+#: names none, the dataset's place and the boot workload. A deployment's ``benchmarks``
+#: override them per benchmark; an engine setting is in its options.
+NATIVE_ACCURACY_KEYS: tuple[str, ...] = (
+    "model_key",
+    "benchmark",
+    "reference_yaml",
+    "dataset_path",
+    "discriminators",
+    "boot",
+)
 
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -133,11 +132,14 @@ class Server:
     options_path: str = ""
     #: The site's launch prefix; empty means the orchestrator's own host.
     launch: str = ""
+    #: The site's command that ends what ``launch`` started; empty: a signal is enough.
+    stop: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"options": self.options_path or dict(self.options)}
-        if self.launch:
-            out["launch"] = self.launch
+        for key in ("launch", "stop"):
+            if getattr(self, key):
+                out[key] = getattr(self, key)
         return out
 
 
@@ -153,7 +155,6 @@ class Deployment:
     ctx: Server | None = None
     gen: Server | None = None
     env: Mapping[str, str] = field(default_factory=dict)
-    stop: str = ""
     timeout: int | None = None
     #: The deployment whose own score this one is judged against, where no reference row fits.
     relative_to: str | None = None
@@ -161,6 +162,11 @@ class Deployment:
     tests: tuple[str, ...] = ()
     inputs: tuple[str, ...] = ("text",)
     benchmarks: tuple[Benchmark, ...] = ()
+    #: Request settings a shorthand spec's runtime flags state (``--temperature``, ...) and
+    #: whether its prompts go through the chat template. A deployment a spec states itself
+    #: has neither: its checks sample greedily, as the check's own protocol says.
+    sampling: Mapping[str, Any] = field(default_factory=dict)
+    chat_template: bool = False
 
     @property
     def kind(self) -> str:
@@ -180,7 +186,7 @@ class Deployment:
             out.update(self.server.as_dict())
         else:
             out.update({role: server.as_dict() for role, server in self.servers.items()})
-        for key in ("env", "stop", "timeout", "relative_to"):
+        for key in ("env", "timeout", "relative_to"):
             value = getattr(self, key)
             if value:
                 out[key] = dict(value) if isinstance(value, Mapping) else value
@@ -253,7 +259,7 @@ def _validate_env(env: Any, errors: list[str], where: str) -> None:
 
 
 def _validate_server(holder: Mapping[str, Any], errors: list[str], where: str) -> None:
-    """``options`` (required) and ``launch`` of an aggregated deployment or of one side."""
+    """``options`` (required), ``launch`` and ``stop`` of an aggregated deployment or of one side."""
     if holder.get("options") is None:
         errors.append(f"'{where}.options' is required: a native LLM-API options file")
     else:
@@ -264,6 +270,11 @@ def _validate_server(holder: Mapping[str, Any], errors: list[str], where: str) -
     launch = holder.get("launch")
     if launch is not None and not isinstance(launch, str):
         errors.append(f"'{where}.launch' must be a string: the site's launch prefix")
+    stop = holder.get("stop")
+    if stop is not None and (not isinstance(stop, str) or not stop.strip()):
+        errors.append(f"'{where}.stop' must be a command, as a string")
+    elif stop and not launch:
+        errors.append(f"'{where}.stop' ends what `launch` started, and there is no `launch`")
 
 
 def _validate_benchmarks(block: Any, errors: list[str], where: str) -> None:
@@ -329,7 +340,7 @@ def validate(block: Any, errors: list[str]) -> None:
         if sides:
             if len(sides) != len(ROLES):
                 errors.append(f"'{at}' has `{sides[0]}` alone; disaggregated needs `ctx` and `gen`")
-            for key in ("options", "launch"):
+            for key in SERVER_KEYS:
                 if entry.get(key) is not None:
                     errors.append(
                         f"'{at}.{key}' sits beside `ctx` and `gen`: each side states its own"
@@ -343,9 +354,6 @@ def validate(block: Any, errors: list[str]) -> None:
         else:
             _validate_server(entry, errors, at)
         _validate_env(entry.get("env"), errors, f"{at}.env")
-        stop = entry.get("stop")
-        if stop is not None and (not isinstance(stop, str) or not stop.strip()):
-            errors.append(f"'{at}.stop' must be a command, as a string")
         timeout = entry.get("timeout")
         if timeout is not None and (
             isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1
@@ -398,8 +406,21 @@ def validate_native_spec(data: Mapping[str, Any], errors: list[str]) -> None:
     if extra:
         errors.append(
             f"'{ACCURACY_FIELD}' carries {extra} beside '{DEPLOYMENTS_FIELD}': with deployments "
-            f"it keeps {list(NATIVE_ACCURACY_KEYS)} only; a benchmark, its options and its anchor "
-            f"are a deployment's `benchmarks`, and an engine setting is in its options"
+            f"it keeps {list(NATIVE_ACCURACY_KEYS)} only, the defaults of every deployment; a "
+            f"benchmark's options and its anchor are a deployment's `benchmarks`, and an engine "
+            f"setting is in its options"
+        )
+    for key in ("benchmark", "reference_yaml", "dataset_path"):
+        value = accuracy.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            errors.append(f"'{ACCURACY_FIELD}.{key}' must be a non-empty string")
+    tags = accuracy.get("discriminators")
+    if tags is not None and not (
+        isinstance(tags, Mapping)
+        and all(isinstance(v, (str, int, float, bool)) for v in tags.values())
+    ):
+        errors.append(
+            f"'{ACCURACY_FIELD}.discriminators' must map a reference row's tag to a scalar"
         )
     key = accuracy.get("model_key")
     if key is not None and (not isinstance(key, str) or not key.strip()):
@@ -412,20 +433,33 @@ def _server(holder: Mapping[str, Any]) -> Server:
         options=_load_options(source),
         options_path=source if isinstance(source, str) else "",
         launch=str(holder.get("launch") or ""),
+        stop=str(holder.get("stop") or ""),
     )
 
 
 def _args(value: Any) -> tuple[str, ...]:
+    """A benchmark's options: a list of strings, or one string split as a shell would."""
     if isinstance(value, str):
-        return tuple(value.split())
+        return tuple(shlex.split(value))
     return tuple(str(arg) for arg in value or ())
 
 
-def _stated(block: list[Mapping[str, Any]]) -> tuple[Deployment, ...]:
-    """The deployments of a validated ``deployments`` block."""
+def _stated(data: Mapping[str, Any]) -> tuple[Deployment, ...]:
+    """The deployments of a validated spec that states them.
+
+    A deployment that names no ``benchmarks`` takes the spec's: ``accuracy.benchmark``
+    (``gsm8k`` unsaid) when the spec has an ``accuracy`` block, none without one.
+    """
+    accuracy = data.get(ACCURACY_FIELD)
+    default = (
+        [{"name": str(accuracy.get("benchmark") or DEFAULT_BENCHMARK)}]
+        if isinstance(accuracy, Mapping)
+        else []
+    )
     out = []
-    for index, entry in enumerate(block):
+    for index, entry in enumerate(data[DEPLOYMENTS_FIELD]):
         disaggregated = entry.get(ROLES[0]) is not None
+        stated = entry.get("benchmarks")
         benchmarks = tuple(
             Benchmark(
                 name=str(b["name"]),
@@ -434,7 +468,7 @@ def _stated(block: list[Mapping[str, Any]]) -> tuple[Deployment, ...]:
                 source=str(b.get("source") or ""),
                 env={str(k): str(v) for k, v in (b.get("env") or {}).items()},
             )
-            for b in entry.get("benchmarks") or ()
+            for b in (default if stated is None else stated)
         )
         out.append(
             Deployment(
@@ -444,7 +478,6 @@ def _stated(block: list[Mapping[str, Any]]) -> tuple[Deployment, ...]:
                 ctx=_server(entry["ctx"]) if disaggregated else None,
                 gen=_server(entry["gen"]) if disaggregated else None,
                 env={str(k): str(v) for k, v in (entry.get("env") or {}).items()},
-                stop=str(entry.get("stop") or ""),
                 timeout=entry.get("timeout"),
                 relative_to=entry.get("relative_to"),
                 tests=tuple(entry.get("tests") or ()),
@@ -452,108 +485,6 @@ def _stated(block: list[Mapping[str, Any]]) -> tuple[Deployment, ...]:
                 benchmarks=benchmarks,
             )
         )
-    return tuple(out)
-
-
-# ------------------------------------------------------------------------- shorthand
-
-
-def _expanded(data: Mapping[str, Any], world_size: int | None) -> tuple[Deployment, ...]:
-    """The deployments a spec's shorthand keys ask for.
-
-    Each unit is one deployment per member, in the spec's order, so core at its first
-    member comes first. A unit's benchmark is on each of them, or on the one
-    ``accuracy.benchmark_members`` names. ``disagg`` is one disaggregated deployment
-    whose two servers run the options of the unit before it, judged by its test. A
-    variant is one deployment at each member it names, else at one (the benchmark
-    member, else its unit's first), judged against its unit's deployment there unless
-    it names a reference row of its own. ``profile`` and ``coverage`` change what the
-    run checks, not what is deployed, and are not read here.
-
-    The options are what the checks build today from the same keys
-    (``checks.check_config.engine_options``), without the model's path: that is the
-    spec's ``checkpoint_path``, not an option of a served configuration.
-    """
-    from ..checks.check_config import engine_options, variant_spec
-
-    world = world_size or widest_world_size(data, DEFAULT_WORLD_SIZE)
-    accuracy = data.get(ACCURACY_FIELD) or {}
-    named = accuracy.get("benchmark_members")
-
-    def server(spec: Mapping[str, Any], unit: str, member: str, overlay: Any = None) -> Server:
-        options, _, _ = engine_options(
-            spec, unit=unit, member=member, world_size=world, overlay=overlay
-        )
-        options.pop("model", None)
-        return Server(options=options)
-
-    def benchmarks(spec: Mapping[str, Any], unit: str, member: str, at: list[str]):
-        if named in at and member != named:
-            return ()
-        block = spec.get(ACCURACY_FIELD) or {}
-        name = str(resolve_per_unit(block, "benchmark", unit) or DEFAULT_BENCHMARK)
-        return (Benchmark(name=name, args=_args(resolve_per_unit(block, "benchmark_args", unit))),)
-
-    def inputs(unit: str) -> tuple[str, ...]:
-        images = "multimodal" in features_through(data, unit)
-        return INPUTS if images and data.get(SCOPE_FIELD) != "text_only" else ("text",)
-
-    out: list[Deployment] = []
-    units = assembly_units(data)
-    for index, unit in enumerate(units):
-        members = members_for(data, unit, world)
-        if unit == DISAGG_FEATURE:
-            member = named if named in members else members[0]
-            block = accuracy.get("disagg") or {}
-            side = server(data, units[index - 1], member)
-            tests = block.get("tests") or ([block["test"]] if block.get("test") else [])
-            out.append(
-                Deployment(
-                    name=name_for(unit, member),
-                    ctx=side,
-                    gen=side,
-                    env={str(k): str(v) for k, v in (block.get("env") or {}).items()},
-                    timeout=block.get("timeout"),
-                    tests=tuple(str(test) for test in tests),
-                    inputs=inputs(unit),
-                )
-            )
-            continue
-        for member in members:
-            out.append(
-                Deployment(
-                    name=name_for(unit, member),
-                    server=server(data, unit, member),
-                    inputs=inputs(unit),
-                    benchmarks=benchmarks(data, unit, member, members),
-                )
-            )
-    for name, entry in variants(data).items():
-        unit = base_unit(data, name)
-        if unit == DISAGG_FEATURE:
-            continue
-        spec = variant_spec(data, name, world_size=world)
-        unit_members = members_for(data, unit, world)
-        at = [str(m) for m in entry.get("members") or ()] or [
-            named if named in unit_members else unit_members[0]
-        ]
-        scored = "accuracy" in variant_gates(data, name)
-        relative = scored and anchor_state(data, name) == ANCHOR_RELATIVE
-        for member in at:
-            out.append(
-                Deployment(
-                    name=name_for(name, member),
-                    server=server(spec, name, member, entry.get("llm_api_options")),
-                    env={str(k): str(v) for k, v in (entry.get("env") or {}).items()},
-                    relative_to=name_for(unit, member)
-                    if relative and member in unit_members
-                    else None,
-                    inputs=inputs(unit),
-                    benchmarks=benchmarks(spec, name, member, at) if scored else (),
-                )
-            )
-    if out:
-        out[0] = replace(out[0], core=True)
     return tuple(out)
 
 
@@ -565,8 +496,11 @@ def resolve(data: Mapping[str, Any], world_size: int | None = None) -> tuple[Dep
     switches, flags and options file ask for two values of one setting.
     """
     if is_native(data):
-        return _stated(data[DEPLOYMENTS_FIELD])
-    return _expanded(data, world_size)
+        return _stated(data)
+    # Imported here: that module builds this one's types.
+    from .shorthand import expand
+
+    return expand(data, world_size)
 
 
 def write_options(deployment: Deployment, directory: str | Path) -> dict[str, Path]:

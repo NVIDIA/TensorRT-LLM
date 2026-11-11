@@ -22,13 +22,7 @@ import yaml
 from agent_flow.workflows.trtllm_modeling_v2.checks import acceptance as acceptance_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import accuracy as accuracy_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
-from agent_flow.workflows.trtllm_modeling_v2.checks import (
-    check_config,
-    delivery,
-    disagg,
-    gate_cli,
-    test_results,
-)
+from agent_flow.workflows.trtllm_modeling_v2.checks import delivery, disagg, gate_cli, test_results
 from agent_flow.workflows.trtllm_modeling_v2.checks import serve as sg
 from agent_flow.workflows.trtllm_modeling_v2.checks import test_results as tc
 from agent_flow.workflows.trtllm_modeling_v2.checks import verdict as check_result
@@ -54,7 +48,7 @@ from agent_flow.workflows.trtllm_modeling_v2.run import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.certify import (
     target_test_modules_check as target_tests,
 )
-from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
+from agent_flow.workflows.trtllm_modeling_v2.spec import shorthand, task_schema
 
 from ._helpers import _ENTRY, _REPO_ROOT, TARGET_REL, _build_repo, _verify, _write_entry
 
@@ -1147,7 +1141,7 @@ def test_an_attention_dp_rank_serves_its_share_of_the_global_batch():
             "batch_sizes": [1, 2, 4, 8, 16, 24, 32, 64, 128],
         },
     }
-    check_config.share_batch(options, "dep4")
+    shorthand.share_batch(options, "dep4")
     assert options["max_batch_size"] == 32
     assert options["cuda_graph_config"] == {
         "max_batch_size": 32,
