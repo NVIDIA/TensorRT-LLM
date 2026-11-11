@@ -151,6 +151,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     NVFP4TRTLLMGenFusedMoEBaseMethod,
     NVFP4TRTLLMGenFusedMoEMethod,
     UnquantizedFusedMoEMethod,
+    W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
 )
@@ -1658,20 +1659,40 @@ def test_cutedsl_finalize_weights_once_with_the_router_weight_on_the_input(leaf_
 
 
 @pytest.mark.parametrize("post_quant_comm", [True, False])
-@pytest.mark.parametrize("hidden_size", [48, 64])
-@pytest.mark.parametrize("fc2_input_scale", [0.25, 0.5])
-def test_trtllm_gen_mxfp4_fp8_input_quantization(
-    post_quant_comm: bool, hidden_size: int, fc2_input_scale: float
-) -> None:
-    if not torch.cuda.is_available() or get_sm_version() < 89:
-        pytest.skip("Static FP8 input quantization requires CUDA and SM89 or newer")
+@pytest.mark.parametrize("hidden_size", [256, 512])
+def test_trtllm_gen_mxfp4_fp8_input_quantization(post_quant_comm: bool, hidden_size: int) -> None:
+    """Load checkpoint scales before quantizing either dispatch order to FP8."""
+    if not torch.cuda.is_available() or get_sm_version() < 100:
+        pytest.skip("TRTLLM-Gen MXFP4 scale loading requires Blackwell or newer")
 
     fc1_input_scale = 0.25
-    backend = SimpleNamespace(
-        w3_w1_weight=torch.empty(1, 128, 32, device="cuda", dtype=torch.uint8),
-        fc31_input_gate_dequant=torch.tensor([fc1_input_scale], device="cuda"),
-        fc31_input_dequant=torch.tensor([fc1_input_scale / fc2_input_scale], device="cuda"),
-    )
+    backend = torch.nn.Module()
+    backend.num_experts = backend.expert_size_per_partition = 4
+    backend.initial_local_expert_ids = list(range(backend.num_experts))
+    backend.hidden_size = hidden_size
+    backend.intermediate_size = backend.intermediate_size_per_partition = 128
+    backend.tp_size, backend.tp_rank = 1, 0
+    backend.bias = False
+    backend.weight_loading_mode = MoEWeightLoadingMode.VANILLA
+    quant_method = W4A8MXFP4FP8TRTLLMGenFusedMoEMethod()
+    with torch.device("cuda"):
+        quant_method.create_weights(backend)
+        weights = {}
+        for expert_id in range(backend.num_experts):
+            for proj in ("w1", "w3", "w2"):
+                weights[f"{expert_id}.{proj}.input_scale"] = torch.tensor(
+                    0.5 if proj == "w2" else fc1_input_scale
+                )
+                shape = (
+                    backend.w2_weight_scale.shape[1:]
+                    if proj == "w2"
+                    else backend.w3_w1_weight_scale[expert_id].chunk(2)[0].shape
+                )
+                weights[f"{expert_id}.{proj}.weight_scale"] = torch.full(
+                    shape, 127, dtype=torch.uint8
+                )
+        quant_method.load_quant_scales(backend, weights)
+
     x = torch.linspace(-8, 8, 2 * hidden_size, device="cuda", dtype=torch.bfloat16).reshape(
         2, hidden_size
     )
@@ -1680,7 +1701,7 @@ def test_trtllm_gen_mxfp4_fp8_input_quantization(
         backend, x, post_quant_comm=post_quant_comm
     )
 
-    expected = (torch.nn.functional.pad(x, (0, 64 - hidden_size)).float() / fc1_input_scale).to(
+    expected = (torch.nn.functional.pad(x, (0, 512 - hidden_size)).float() / fc1_input_scale).to(
         torch.float8_e4m3fn
     )
     assert scales is None
