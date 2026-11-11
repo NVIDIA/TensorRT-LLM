@@ -289,7 +289,9 @@ Ask with one multi-select question:
      run's planner and workers use, Claude Code (the default) or Codex,
      then give the command:
      `modeling-v2-onboard --task <workspace>/task.yaml --workspace <workspace>`,
-     with `--backend codex` added for Codex.
+     with `--backend codex` added for Codex. The backend is the only
+     question: the model and reasoning effort are the workflow's defaults
+     for that backend, so ask about neither and add no `--model`.
    - **Otherwise:** give
      `modeling-bringup --task <workspace>/task.yaml --workspace <workspace>`;
      its roles' backends are set by the workflow, so there is nothing to

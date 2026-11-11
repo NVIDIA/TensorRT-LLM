@@ -167,7 +167,8 @@
    检查容器、GPU、mounts、CUDA PyTorch；要等节点）。不跑的话，planner 启动后由环境任务做同样的检查，
    并产出 worker 用的 wrapper。
 5. 给出运行命令。modeling-v2-onboard 先问 run 里的 planner 和 worker 用 Claude Code（默认）还是 Codex，
-   Codex 时命令加 `--backend codex`；modeling-bringup 没有统一的后端开关，直接给命令。然后问要不要由当前会话
+   Codex 时命令加 `--backend codex`。只问后端：模型和推理强度用工作流代码里该后端的默认值，不问也不加
+   `--model`；modeling-bringup 没有统一的后端开关，直接给命令。然后问要不要由当前会话
    代为启动：要的话用 `setsid nohup <命令> > <workspace>/launch.log 2>&1 &` 后台启动，报告 PID 和日志路径，
    并说明重跑同一条命令会接着跑；不要就由用户自己运行。
 
