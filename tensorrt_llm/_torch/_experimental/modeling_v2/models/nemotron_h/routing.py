@@ -15,6 +15,7 @@ Super) is declined on its shape before any engine choice is read.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
@@ -56,6 +57,13 @@ _BF16_TP8EP2 = (8, False, 4, 2)
 # windows. The layout of the disaggregated serving tiers (context and generation), measured
 # there with the built-in implementation.
 _BF16_DEP16 = (16, True, 1, 16)
+
+# Block reuse on dep16, opt-in and not gated yet: the disaggregated context tier reuses each
+# conversation's prefix, its Mamba state restored from the prompt-end snapshots the cache
+# manager takes (`kv_cache_config.mamba_state_config`). The manager takes and restores the
+# snapshots in the state pools; the target's prefill seeds the scan and the conv window from
+# the slot wherever `has_initial_states` says so, as Modeling V1's Mamba2 mixer does.
+BF16_DEP16_BLOCK_REUSE_ENV = "TRTLLM_NEMOTRON_ULTRA_DEP16_BLOCK_REUSE"
 
 # The KV cache algorithms each BF16 layout was gated with (None: the checkpoint's bf16).
 _BF16_KV_ALGOS = {
@@ -257,10 +265,16 @@ def route(
             f"use_kv_cache_manager_v2={kv_cache_config.use_kv_cache_manager_v2}; the targets "
             "read the hybrid recurrent-state pools of KV cache manager V2"
         )
-    if kv_cache_config.enable_block_reuse:
+    dep16 = not nvfp4 and layout == _BF16_DEP16
+    if kv_cache_config.enable_block_reuse and not (
+        dep16 and os.environ.get(BF16_DEP16_BLOCK_REUSE_ENV, "0") == "1"
+    ):
+        hint = (
+            f"; dep16 runs it, not gated yet, with {BF16_DEP16_BLOCK_REUSE_ENV}=1" if dep16 else ""
+        )
         raise NoTarget(
             "enable_block_reuse=True: the targets were gated with block reuse off and implement "
-            "no Mamba state snapshots"
+            f"no Mamba state snapshots{hint}"
         )
     if llm_args.moe_config.load_balancer is not None and mapping.moe_ep_size > 1:
         raise NoTarget(
