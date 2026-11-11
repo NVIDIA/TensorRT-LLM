@@ -179,7 +179,10 @@ def test_one_engine_layer_per_moe_block(monkeypatch, requested, comm):
     assert list(layers.keys()) == [str(i) for i in MOE_LAYERS]
     assert [c["layer_idx"] for c in calls] == MOE_LAYERS
     assert all(c["allow_backend_degradation"] is False for c in calls)
-    assert M._exchange(layers["1"]) == (comm or "fused in the kernel")
+    if comm is not None:
+        assert M._exchange(layers["1"]) == comm
+    else:
+        assert M._exchange(layers["1"]).startswith("fused in the kernel")
 
 
 @pytest.mark.parametrize(

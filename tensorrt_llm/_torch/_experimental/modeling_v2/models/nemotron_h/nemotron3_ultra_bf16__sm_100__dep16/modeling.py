@@ -404,7 +404,16 @@ def _routed_experts(model_config: ModelConfig, d, w: nn.ParameterDict) -> nn.Mod
 def _exchange(moe: nn.Module) -> str:
     """How a built MoE layer moves tokens between ranks, for the log."""
     comm = getattr(moe, "comm", None)
-    return "fused in the kernel" if comm is None else type(comm).__name__
+    if comm is not None:
+        return type(comm).__name__
+    # MegaMoE: the settings a sweep varies (MEGAMOE_COMBINE_FORMAT, MEGAMOE_TACTIC_AUTOTUNE and
+    # moe_config.max_num_tokens, which tops its per-launch token buckets).
+    backend = getattr(moe, "backend", None)
+    return (
+        f"fused in the kernel (combine {getattr(backend, 'combine_format', '?')}, tactic "
+        f"autotune {getattr(backend, 'tactic_autotune', '?')}, per-rank token capacity "
+        f"{getattr(backend, 'max_tokens_per_rank_capacity', '?')})"
+    )
 
 
 class NemotronUltraBf16Dep16ModelingV2(DecoderModel):
