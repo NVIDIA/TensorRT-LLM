@@ -906,6 +906,7 @@ def test_draft_load_reads_only_the_shards_holding_draft_keys(
         )
         loader = ModelLoader.__new__(ModelLoader)
         loader._metrics = {}
+        loader._startup_metadata = {}
         loader.spec_config = SimpleNamespace(speculative_model=str(checkpoint_dir))
         loader.mapping = Mapping()
         loader.weight_mapper = object()
