@@ -104,6 +104,60 @@ def test_msa_metadata_clears_padded_cache_slot_tail(
     assert metadata.msa_out_cache_loc.tolist() == [-1] * 4
 
 
+@pytest.mark.cpu_only
+def test_msa_metadata_stages_query_rows_for_dynamic_kv_lens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Speculative steps stage each query token's request row and offset, refreshed every step."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_buffers_ready = True
+    # One four-token page per request, page id 10 + request id.
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=4,
+        get_buffers=lambda layer_idx: torch.empty(1),
+        get_block_ids_per_seq=lambda request_ids: torch.tensor(
+            [[10 + request_id] for request_id in request_ids], dtype=torch.int32
+        ),
+    )
+    max_batch, max_tokens = 4, 8
+    metadata.msa_out_cache_loc = torch.full((max_tokens,), 99, dtype=torch.int32)
+    metadata.msa_block_table = torch.zeros((max_batch, 1), dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.zeros(max_batch, dtype=torch.int32)
+    metadata.msa_q_batch_row = torch.full((max_tokens,), 99, dtype=torch.int32)
+    metadata.msa_q_intra = torch.full((max_tokens,), 99, dtype=torch.int32)
+    metadata.msa_kv_lens_staged = torch.zeros(max_batch, dtype=torch.int32)
+    metadata.msa_subpage_block_table = None
+    metadata._msa_runs_no_fmha = lambda: True
+    metadata._msa_kv_lens_may_change = lambda: True
+
+    # The second step is shorter, so a missed refresh would leave the first step's rows behind.
+    for qo_lens in ([3, 0, 1, 2], [1, 2, 0]):
+        batch = len(qo_lens)
+        total = sum(qo_lens)
+        metadata.request_ids = list(range(batch))
+        metadata._msa_qo_lens_cpu = torch.tensor(qo_lens, dtype=torch.int32)
+        # One cached token ahead of each request's new ones.
+        metadata._msa_kv_lens_cpu = metadata._msa_qo_lens_cpu + 1
+        metadata._msa_qo_offset_cpu = torch.ones(batch, dtype=torch.int32)
+        metadata._num_tokens = total
+        metadata._build_msa_fields()
+
+        expected_rows, expected_offsets = [], []
+        for row, qo_len in enumerate(qo_lens):
+            for offset in range(qo_len):
+                expected_rows.append(row)
+                expected_offsets.append(offset)
+        assert metadata._msa_fields_ready
+        assert metadata._msa_kv_lens_dynamic
+        assert metadata.msa_q_batch_row[:total].tolist() == expected_rows
+        assert metadata.msa_q_intra[:total].tolist() == expected_offsets
+        assert metadata.msa_kv_lens_staged[:batch].tolist() == [n + 1 for n in qo_lens]
+
+
 def test_msa_package_availability_installs_cutlass_compatibility_aliases(monkeypatch):
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
         msa_package_available,

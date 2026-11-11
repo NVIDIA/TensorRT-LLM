@@ -206,6 +206,26 @@ class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
             pytest.skip("FP8 pre-quantized Ministral-8B model not available")
 
 
+class TestApertus8BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "swiss-ai/Apertus-8B-Instruct-2509"
+    MODEL_PATH = f"{llm_models_root()}/Apertus-8B-Instruct-2509"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestApertus1p5_8B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "swiss-ai/Apertus-v1.5-8B"
+    MODEL_PATH = f"{llm_models_root()}/Apertus-v1.5-8B"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 # This class has extensively parameterized test methods, which yield totally 200 test cases.
 # This is because this model requires high test coverage over the feature combinations.
 # Normally we should not parameterize test methods so extensively -- just test on the typical/important feature combinations.
@@ -3069,9 +3089,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    def test_prims_ts_bfloat16(self, mocker):
-        if get_sm_version() not in (100, 103):
-            pytest.skip("PrimTS requires SM100 or SM103")
+    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"],
+                             ids=["bf16-kv", "fp8-kv"])
+    def test_prims_ts_bfloat16(self, mocker, kv_cache_dtype):
+        if get_sm_version() not in (100, 103, 107):
+            pytest.skip("PrimTS requires SM100, SM103, or SM107")
 
         calls = _count_prims_ts_phase_calls(mocker)
         env = {
@@ -3079,6 +3101,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
         }
         kv_cache_config = KvCacheConfig(
+            dtype=kv_cache_dtype,
             free_gpu_memory_fraction=0.75,
             tokens_per_block=32,
             use_kv_cache_manager_v2=True,
@@ -3089,6 +3112,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                      kv_cache_config=kv_cache_config,
                      disable_overlap_scheduler=True,
                      cuda_graph_config=None) as llm:
+                if kv_cache_dtype == "fp8":
+                    assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
                 calls.update({name: 0 for name in calls})
                 task = CnnDailymail(self.MODEL_NAME)
                 task.evaluate(llm)

@@ -1266,7 +1266,7 @@ def test_fp8_runtime_uses_modelopt_nvfp4_scales(tmp_path):
 
 def test_runtime_admission_is_checked_before_manager_creation(monkeypatch) -> None:
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: False)
-    with pytest.raises(RuntimeError, match="requires an SM100-family device"):
+    with pytest.raises(ValueError, match="requires an SM100-family device"):
         util_mod.create_kv_cache_compression_manager(
             ColdPageQuantizationCompressionConfig(),
             model_engine=_factory_model_engine(),
