@@ -1221,8 +1221,9 @@ def test_commit_pending_drafts_matches_the_replay_reference(B, H, M):
     )
 
     data, accept = _round2_inputs(B, H, M)
-    # Every other slot, in reverse order, with its own accepted count (0 included).
+    # Select odd slots in reverse order plus slot 0, whose accepted count is zero.
     slots = torch.arange(B - 1, -1, -2, dtype=torch.int32)
+    slots = torch.cat((slots, slots.new_tensor([0])))
     accepted = accept[slots.long()]
     expected = _replay_drafts_reference(data, slots, accepted).cuda()
 
