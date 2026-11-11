@@ -28,6 +28,7 @@ from typing import Callable
 from ..infra.files import write_text_atomic
 from ..infra.git import (
     LABEL_TARGET,
+    NO_SIGNOFF,
     CommitPolicy,
     audit_change,
     audit_commits,
@@ -244,12 +245,12 @@ class Integration:
             head = git_checked(self.repo, "rev-parse", "HEAD")
             count = ("rev-list", "--count", f"{head}..{branch}")
             ahead = git_checked(tree, *count, check=False).strip() or "0"
-            broken = self._audit(tree, head, branch) if ahead != "0" else ""
+            broken, unsigned = self._audit(tree, head, branch) if ahead != "0" else ("", False)
             if broken:
                 return Outcome(False, broken, repairable=True)
             # With nothing of its own, the branch is brought to the head: what its check
-            # judges is then the head itself.
-            rebased = self._git(tree, "rebase", head)
+            # judges is then the head itself. A commit that lacks its sign-off gets it here.
+            rebased = self._git(tree, "rebase", *(["--signoff"] if unsigned else []), head)
             if rebased.returncode != 0:
                 conflicts = git_checked(
                     tree, "diff", "--name-only", "--diff-filter=U", check=False
@@ -300,6 +301,7 @@ class Integration:
             "--format=%x1e%H%x1f%s%x1f", f"{head}..{branch}", check=False,
         )  # fmt: skip
         rows = load_labels(self.root.parent)
+        listed = audit_commits(self.repo, f"{head}..{branch}", self.policy)
         for record in filter(str.strip, out.split("\x1e")):
             sha, subject, raw = record.split("\x1f", 2)
             paths = [path for _, path in changed_paths(raw)]
@@ -311,31 +313,38 @@ class Integration:
                     subject=subject,
                     label=self.policy.label(paths),
                     outside=outside,
+                    # What its message or author gets wrong: landed, and listed in the report.
+                    rules=[f.problem for f in listed if f.sha == sha],
                 )
             )
         write_text_atomic(self.root.parent / COMMIT_LABELS_FILENAME, json.dumps(rows, indent=1))
 
-    def _audit(self, tree: Path, head: str, branch: str) -> str:
-        """What in the task's own commits breaks the run's commit rules, said for its worker; "" if nothing."""
+    def _audit(self, tree: Path, head: str, branch: str) -> tuple[str, bool]:
+        """``(what the task's commits change that is refused, said for its worker; whether one lacks its sign-off)``.
+
+        Only what a commit changes is refused. What its message or author gets wrong
+        lands: the rebase signs off where that is missing, and the report lists the rest.
+        """
         if self.policy is None:
-            return ""
+            return "", False
         fork = git_checked(tree, "merge-base", head, branch, check=False).strip() or head
-        findings = audit_commits(tree, f"{head}..{branch}", self.policy)
+        found = audit_commits(tree, f"{head}..{branch}", self.policy)
+        findings = [finding for finding in found if not finding.listed]
         said = {finding.problem for finding in findings}
         # What lands is what is audited: the net change too, which a merge commit's own
         # edits are part of and no single commit shows.
         net = audit_change(tree, fork, branch, self.policy)
         findings += [finding for finding in net if finding.problem not in said]
+        unsigned = any(finding.problem == NO_SIGNOFF for finding in found)
         if not findings:
-            return ""
+            return "", unsigned
         return (
-            f"commits on {branch} break the run's commit rules:\n"
+            f"commits on {branch} change what the run refuses:\n"
             + "\n".join(f"  - {f.render()}" for f in findings)
             + f"\nRewrite the commits since {fork[:10]}, for this turn only despite the rule "
-            f"against it: `git -C {tree} rebase --signoff {fork}` signs each one off, and "
-            f"`git -C {tree} reset --soft {fork}` lets you commit again only what belongs to "
-            "the task."
-        )
+            f"against it: `git -C {tree} reset --soft {fork}` lets you commit again only what "
+            "belongs to the task."
+        ), unsigned
 
     def close(self, task_id: str) -> None:
         """Remove an integrated task's worktree; its branch stays as the record."""

@@ -1456,16 +1456,29 @@ def test_uncommitted_work_or_a_commit_that_breaks_the_rules_does_not_land(tmp_pa
     assert not outcome.merged and outcome.repairable
     assert f"files in {tree} that no commit holds" in outcome.detail
     assert f"\n  {FAMILY}/a.py" in outcome.detail
-    _git(tree, "commit", "-q", "-am", "unsigned")
-    outcome = integration.integrate("core")
-    assert not outcome.merged and outcome.repairable
-    assert "no Signed-off-by" in outcome.detail and "rebase --signoff" in outcome.detail
-    assert (repo / FAMILY / "a.py").read_text() == "A = 1\n"
-    _git(tree, "rebase", "-q", "--signoff", _git(repo, "rev-parse", "HEAD"))
+    # What a commit's message or author gets wrong never spends a landing: an agent CLI adds
+    # a trailer by default. A missing sign-off is added by the flow's own rebase; a
+    # co-author line lands as it is, and is listed for the report.
+    _git(tree, "commit", "-q", "-am", "unsigned\n\nCo-authored-by: Bot <b@example.invalid>")
     landed = integration.integrate("core")
     assert landed.merged and landed.commit == _git(repo, "rev-parse", "HEAD")
     assert (repo / FAMILY / "a.py").read_text() == "A = 2\n"
     assert _git(repo, "rev-list", "--merges", "--count", "HEAD") == "0"
+    message = _git(repo, "log", "-1", "--format=%B")
+    assert "Signed-off-by: T <t@example.com>" in message and "Co-authored-by: Bot" in message
+    [row] = load_labels(tmp_path / "ws")
+    assert row["rules"] == ["carries Co-authored-by"] and row["sha"] == landed.commit
+    # What a commit changes is still refused, and goes back to its worker.
+    tree = integration.open("kv")
+    (tree / "pkg").mkdir()
+    (tree / "pkg" / ".mcp.json").write_text("{}")
+    _git(tree, "add", "-f", "pkg/.mcp.json")
+    _git(tree, "commit", "-q", "-m", f"a placeholder{_SIGNED}")
+    refused = integration.integrate("kv")
+    assert not refused.merged and refused.repairable
+    assert "change what the run refuses" in refused.detail
+    assert "adds a sandbox placeholder: pkg/.mcp.json" in refused.detail
+    assert "reset --soft" in refused.detail and "--signoff" not in refused.detail
 
 
 def test_what_lands_is_the_commit_that_was_checked_and_nothing_beside_it(tmp_path):
@@ -1638,6 +1651,9 @@ def test_the_audit_finds_every_kind_of_commit_the_rules_refuse(tmp_path):
     for finding in findings:
         by_sha.setdefault(finding.sha, []).append(finding.problem)
     assert good not in by_sha
+    # What the message or the author gets wrong is listed; what the commit changes, refused.
+    listed = {finding.sha for finding in findings if finding.listed}
+    assert listed == {unsigned, other, shared}
     assert by_sha[unsigned] == ["no Signed-off-by"]
     assert "no sign-off carries the author email" in by_sha[other][0]
     assert by_sha[shared] == ["carries Co-authored-by"]
@@ -1765,7 +1781,14 @@ def test_on_a_real_checkout_core_lands_only_the_commit_the_onboard_check_passed(
     def kv(turn, prompt):
         tree = tree_of(prompt)
         (tree / "shared.py").write_text("S = 2\n")
-        _git(tree, "commit", "-q", "-am", f"kv: shared code{_SIGNED}")
+        # As an agent CLI commits by default: no sign-off, and a trailer of its own.
+        _git(
+            tree,
+            "commit",
+            "-q",
+            "-am",
+            "kv: shared code\n\nCo-authored-by: Bot <b@example.invalid>",
+        )
         return READY
 
     def tep2(turn, prompt):
@@ -1830,6 +1853,15 @@ def test_on_a_real_checkout_core_lands_only_the_commit_the_onboard_check_passed(
     assert labels == {("core", "target"), ("kv_fp8", "shared")}
     outside = report.split("## Changed outside the target")[1].split("##")[0]
     assert "shared (`kv_fp8`): kv: shared code: shared.py" in outside
+    # It landed, signed off by the flow's rebase, and its co-author line is listed with the
+    # convention findings: the commit, what, and how to rewrite it.
+    [landed] = [r for r in load_labels(workspace) if r["task"] == "kv_fp8"]
+    assert "Signed-off-by: " in _git(repo, "log", "-1", "--format=%B", landed["sha"])
+    left = report.split("## Convention findings left")[1].split("##")[0]
+    assert (
+        f"- commit `{landed['sha'][:12]}` (`kv_fp8`): carries Co-authored-by; rewrite it before "
+        "the pull request (`git rebase -i`, then `git commit --amend`)" in left
+    )
     assert "core: three" not in outside and outside.count("\n- ") == 1
     stands = {t["id"]: t for t in _tasks(tmp_path)}
     assert stands["tep2"]["status"] == "not done" and not stands["tep2"]["commit"]

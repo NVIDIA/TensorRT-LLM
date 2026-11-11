@@ -748,7 +748,14 @@ def write_report(workflow, pipeline) -> Path:
         "Skipped kernel rows",
         [f"- `{t.id}` (queue row {t.ref}): {t.note}" for t in spent if t.kind == "kernel"],
     )
-    section("Convention findings left", [f"- {f}" for f in findings_left(w)])
+    # With them, what a landed commit's message or author gets wrong: listed, never refused.
+    rewrite = "rewrite it before the pull request (`git rebase -i`, then `git commit --amend`)"
+    commits = [
+        f"- commit `{row['sha'][:12]}` (`{row['task']}`): {rule}; {rewrite}"
+        for row in load_labels(w.workspace)
+        for rule in row.get("rules") or ()
+    ]
+    section("Convention findings left", [f"- {f}" for f in findings_left(w)] + commits)
     section("Final pass", [f"- {line.render()}" for line in pipeline.final])
     section("What the run did not check", [f"- {x}" for x in (*NOT_CHECKED, *w._contract.notes)])
     section("What the workers left", _not_done(w.workspace))

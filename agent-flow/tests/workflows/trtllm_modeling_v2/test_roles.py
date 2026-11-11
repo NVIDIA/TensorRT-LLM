@@ -508,8 +508,12 @@ def test_what_a_text_says_of_the_code_is_what_the_code_does() -> None:
         in kernel
     )
     assert "- Not for `not_done`: GPU tests, the boot, GSM8K (later tasks')." in survey
-    # A convention is repaired in the target or left; shared code changes for a check.
+    # What a commit changes is refused; what its message or author gets wrong is listed.
     fix = prompts.dispatch("fix", facts())
+    refused = "- Refused at landing: an added symlink (the build guide's install symlinks stay"
+    assert refused in fix and "no sign-off" not in fix
+    assert "Landed but listed: `Co-authored-by`, another author." in fix
+    # A convention is repaired in the target or left; shared code changes for a check.
     assert "Repair a finding inside the target; one that needs a change outside it is left" in fix
     assert "may change when a check needs it, not for a convention." in fix
 

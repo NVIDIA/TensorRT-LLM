@@ -10,11 +10,16 @@ into the same checkout.
 COMMIT RULES. Every tree-changing task commits with plain ``git commit -s`` on a branch in its own
 worktree (``run/integration.py``), as the run's one identity (:meth:`CommitIdentity.env`: the
 repository's configured user). Nothing checks a commit as it is made; before a ready task lands,
-:func:`audit_commits` reads every commit on its branch, and one that breaks a rule goes back to
-its worker:
+:func:`audit_commits` reads every commit on its branch.
 
-- a ``Signed-off-by`` carries the author's email, and the author is the run's identity; no
-  ``Co-authored-by`` unless the policy allows one;
+What a commit's message or author gets wrong never spends an attempt: an agent CLI adds a
+trailer by default, and a landing lost to it is a landing of `core` lost. A missing
+``Signed-off-by`` is added by the flow's own rebase; a sign-off that is not the author's, another
+author than the run's identity, and a ``Co-authored-by`` (unless the policy allows one) land and
+are listed in the report (:attr:`CommitFinding.listed`).
+
+What a commit changes is refused, and goes back to its worker:
+
 - no symlink is added (a worktree links the main checkout's native build, and ``.gitignore``
   names only the directory form), and no sandbox placeholder: a ``.mcp.json``, or anything under
   ``.claude/`` or ``.cc-writes/``;
@@ -312,7 +317,7 @@ def trial_commit(identity: CommitIdentity, *, allow_co_authors: bool = False) ->
             if done.returncode != 0:
                 return [f"git {args[0]} failed (rc {done.returncode}): {done.stderr.strip()}"]
         policy = CommitPolicy(identity=identity, allow_co_authors=allow_co_authors)
-        return [f.problem for f in audit_commits(tmp, "HEAD", policy)]
+        return [f.problem for f in audit_commits(tmp, "HEAD", policy) if not f.listed]
 
 
 @dataclass(frozen=True)
@@ -322,9 +327,16 @@ class CommitFinding:
     sha: str
     subject: str
     problem: str
+    #: About the message or the author, not what the commit changes: it lands, and the
+    #: report lists it.
+    listed: bool = False
 
     def render(self) -> str:
         return f"{self.sha[:10]} {self.subject[:70]}: {self.problem}"
+
+
+#: The one finding the flow repairs itself: its rebase signs the commit off.
+NO_SIGNOFF = "no Signed-off-by"
 
 
 def _email_of(trailer_value: str) -> str:
@@ -364,19 +376,19 @@ def audit_commits(
             continue
         sha, author, author_email, subject, signoffs, coauthors, raw = fields[:7]
 
-        def found(problem: str) -> None:
-            findings.append(CommitFinding(sha, subject, problem))
+        def found(problem: str, listed: bool = False) -> None:
+            findings.append(CommitFinding(sha, subject, problem, listed))
 
         signed = [s for s in signoffs.split("\x1d") if s.strip()]
         if not signed:
-            found("no Signed-off-by")
+            found(NO_SIGNOFF, True)
         elif not any(_email_of(v).lower() == author_email.strip().lower() for v in signed):
             shown = ", ".join(repr(v.strip()) for v in signed)
-            found(f"no sign-off carries the author email <{author_email}> (found {shown})")
+            found(f"no sign-off carries the author email <{author_email}> (found {shown})", True)
         if not policy.allow_co_authors and any(c.strip() for c in coauthors.split("\x1d")):
-            found("carries Co-authored-by")
+            found("carries Co-authored-by", True)
         if policy.identity is not None and author != policy.identity.render():
-            found(f"authored as {author!r}, not the run's {policy.identity.render()!r}")
+            found(f"authored as {author!r}, not the run's {policy.identity.render()!r}", True)
         for problem in _path_problems(policy, raw):
             found(problem)
     return findings
