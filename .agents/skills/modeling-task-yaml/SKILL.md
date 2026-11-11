@@ -19,9 +19,9 @@ the answers into clear, checkable sentences.
 
 - Talk in the user's language; write the YAML sentences in English.
 - Part 1 and Part 2 are each asked as one form (see below), one part per
-  message; Parts 3 and 4 go one question per message. Use AskUserQuestion
-  for anything with fixed choices (the feature checklist, yes/no); without
-  it, list the choices in plain text.
+  message; Parts 3 and 4 go one question per message. Ask anything with
+  fixed choices (the feature checklist, yes/no) as described in
+  "Questions with fixed choices".
 - Show values, not verdicts. Whenever you propose, infer, or recap values,
   list every field with its exact value (full paths, names, numbers) and,
   where you checked it, the check result. "All verified" or "already filled
@@ -39,6 +39,33 @@ the answers into clear, checkable sentences.
 - Check paths and settings once, at Finish, with the workflow's own check;
   do not re-implement its checks in the conversation. A problem it reports
   goes back to the user.
+
+## Questions with fixed choices
+
+Use your harness's question tool when it has one and it fits the question:
+`AskUserQuestion` in Claude Code, `request_user_input` in Codex. A
+single-choice tool cannot ask a multi-select question; ask that one in text.
+Codex lists `request_user_input` in Default mode only when the user started
+it with `--enable default_mode_request_user_input`; when the tool is not in
+your tool list, ask in text.
+
+Otherwise ask in text, in this shape:
+
+```text
+Which features should the accuracy run prove? Reply with numbers separated
+by commas (e.g. 1,2,3), or "default" to keep the marked ones.
+  1. CUDA graph (default)
+  2. overlap scheduler (default)
+  3. chunked prefill (default)
+  4. KV cache reuse
+```
+
+- Number every choice and mark the defaults with `(default)`.
+- Say how to answer: one number, or numbers separated by commas for a
+  multi-select, or "default".
+- A yes/no question is numbered too (`1. yes`, `2. no`).
+- Repeat the parsed answer back before using it; ask again if a number is
+  out of range.
 
 ## Forms for Parts 1 and 2
 
