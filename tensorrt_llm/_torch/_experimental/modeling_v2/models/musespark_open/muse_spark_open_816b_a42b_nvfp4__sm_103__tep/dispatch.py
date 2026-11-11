@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import os
 import pathlib
 from typing import (
     Any,
@@ -432,6 +433,24 @@ def closure(names: Iterable[str]) -> FrozenSet[str]:
         seen.add(name)
         stack.extend(_BY_NAME[name].depends_on)
     return frozenset(seen)
+
+
+def env_paths(
+    name: str, allowed: FrozenSet[str], environ: Optional[Mapping[str, str]] = None
+) -> FrozenSet[str]:
+    """The fast paths the comma-separated environment variable ``name`` lists.
+
+    Empty when the variable is unset or empty (``environ`` defaults to ``os.environ``).
+
+    Raises:
+        ValueError: for a name outside ``allowed``.
+    """
+    environ = os.environ if environ is None else environ
+    names = frozenset(item.strip() for item in environ.get(name, "").split(",") if item.strip())
+    unknown = names - allowed
+    if unknown:
+        raise ValueError(f"{TAG} {name} names {sorted(unknown)}; allowed: {sorted(allowed)}")
+    return names
 
 
 #: GPUs per node: one compute tray of an NVL72 rack, whose GPUs all share one NVLink domain.

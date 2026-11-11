@@ -982,6 +982,28 @@ _SM103_TEP4_PATHS = (
 #: forked at the start of a decode forward.
 _PREFETCH_LEVERS = frozenset({"graph_start_qkv_prefetch"})
 
+#: ``MUSESPARK_OPEN_SM103_TEP4_EXTRA_PATHS`` (comma-separated fast-path names; unset or empty:
+#: nothing changes) adds to the sm103 TEP4 composition fast paths that the sm103 TEP8
+#: composition serves and this one leaves out, so the lever table resolves them (on under
+#: ``auto``, like every served lever without a rule): the early-ids start of the persistent
+#: expert kernel (``early_expert_ids``, which builds on ``moe_prologue``) and the projection
+#: GEMMs writing straight into their consumers' transports (``pool_into_route``,
+#: ``unpool_into_boundary``, ``attention_output_into_hop``). Read once, at import: the
+#: composition is structural, and every rank of the TP group must see the same value (a rank
+#: on another path leaves its peers polling). A name outside the allowed set raises.
+_SM103_TEP4_EXTRA_PATHS_ENV = "MUSESPARK_OPEN_SM103_TEP4_EXTRA_PATHS"
+_SM103_TEP4_EXTRA_PATHS_ALLOWED = frozenset(
+    {
+        "early_expert_ids",
+        "pool_into_route",
+        "unpool_into_boundary",
+        "attention_output_into_hop",
+    }
+)
+_SM103_TEP4_SERVED = _SM103_TEP4_PATHS | _dispatch.env_paths(
+    _SM103_TEP4_EXTRA_PATHS_ENV, _SM103_TEP4_EXTRA_PATHS_ALLOWED
+)
+
 
 #: The compositions, per (SM, tensor-parallel size) (``dispatch.CompositionKey``):
 #: the fast paths and levers served and the GPU topology they were validated on, with
@@ -993,7 +1015,7 @@ TARGET_PATHS = {
         served=_TEP8_PATHS | _PREFETCH_LEVERS, topology=_dispatch.TWO_TRAYS_OF_4
     ),
     (103, 4): _dispatch.TargetPaths(
-        served=_SM103_TEP4_PATHS,
+        served=_SM103_TEP4_SERVED,
         topology=_dispatch.ONE_TRAY_OF_4,
         preconditions=(_dispatch.NO_PREFILL_SEQUENCE_PARALLEL,),
     ),
