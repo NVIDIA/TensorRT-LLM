@@ -32,7 +32,6 @@ import pytest
 import torch
 from _torch.moe.moe_test_utils import MoeBackendType
 
-from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import moe_resolution
 from tensorrt_llm._torch.moe.fused_moe.activation import (
@@ -578,7 +577,7 @@ def test_per_layer_dynamic_eplb_refuses_the_mxfp4_mtp_layer(backend: str) -> Non
     report = _mxfp4_mtp_layer_report(backend, eplb_mode="per_layer_dynamic")
 
     assert report.winner is None
-    with pytest.raises(UnsupportedError, match="no MoE implementation can serve this layer"):
+    with pytest.raises(ValueError, match="no MoE implementation can serve this layer"):
         impl_class_for(report)
 
 
