@@ -60,7 +60,8 @@ from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
 from agent_flow.workflows.trtllm_modeling_v2.run import certify
 from agent_flow.workflows.trtllm_modeling_v2.run import workflow as workflow_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import Pipeline, Task
-from agent_flow.workflows.trtllm_modeling_v2.run.startup import advice, agent_probe, preflight
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe
+from agent_flow.workflows.trtllm_modeling_v2.spec import advice
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
 from ._helpers import Script, _run, _state, _task_id, _tasks, _write_vocabulary
@@ -194,22 +195,22 @@ def test_delivered_tests_run_with_the_tree_first_on_pythonpath(tmp_path):
     ],
 )
 def test_a_memory_limited_host_is_told_to_bound_the_kv_host_tier(
-    tmp_path, task_file, monkeypatch, limit, host_cache_size, warned
+    monkeypatch, limit, host_cache_size, warned
 ):
     """Defect 9: engines pin a KV host tier sized from the node, past a cgroup limit."""
-    spec = yaml.safe_load(task_file.read_text())
-    kv = {"enable_block_reuse": False}
-    if host_cache_size is not None:
-        kv["host_cache_size"] = host_cache_size
-    options = tmp_path / "core.yaml"
-    options.write_text(yaml.safe_dump({"kv_cache_config": kv}), encoding="utf-8")
-    spec["accuracy"]["llm_api_options"] = {"core": str(options)}
-    monkeypatch.setattr(preflight, "memory_limit_and_free", lambda: (limit, 690 << 30))
-    notes = preflight.check_kv_cache_configs(spec, {})
-    said = [n for n in notes if n.startswith("host memory:")]
+    kv = {} if host_cache_size is None else {"host_cache_size": host_cache_size}
+    spec = {"deployments": [{"name": "tp1", "options": {"kv_cache_config": kv}}]}
+    # The node's free memory is stated too: the note must not depend on the host the test runs on.
+    node = {"SC_PAGE_SIZE": 4096, "SC_AVPHYS_PAGES": (690 << 30) // 4096}
+    monkeypatch.setattr(advice.os, "sysconf", node.__getitem__)
+    monkeypatch.setattr(advice, "cgroup_memory_limit", lambda *a, **k: limit)
+    said = [n for n in advice.spec_warnings(spec) if n.startswith("host memory:")]
     assert bool(said) is warned
     if warned:
-        assert "690 GiB" in said[0] and "64 GiB" in said[0] and "host_cache_size" in said[0]
+        assert said[0].startswith("host memory: tp1: set no `kv_cache_config.host_cache_size`")
+        assert (
+            "690 GiB" in said[0] and "this process may use 64 GiB (its cgroup's limit)" in said[0]
+        )
 
 
 def test_the_memory_limit_is_read_from_the_process_own_cgroup(tmp_path):
@@ -221,29 +222,15 @@ def test_the_memory_limit_is_read_from_the_process_own_cgroup(tmp_path):
     (step / "memory.max").write_text(str(280 << 30) + "\n")
     (step.parent / "memory.max").write_text(str(900 << 30) + "\n")
     v2 = "0::/system.slice/slurmstepd.scope/job_7/step_0\n"
-    assert preflight.cgroup_memory_limit(v2, root) == 280 << 30
+    assert advice.cgroup_memory_limit(v2, root) == 280 << 30
     # v1: the memory controller's own hierarchy; a huge number means no limit.
     mem = root / "memory" / "slurm" / "uid_1" / "job_7"
     mem.mkdir(parents=True)
     (mem / "memory.limit_in_bytes").write_text(str(64 << 30))
     (root / "memory" / "memory.limit_in_bytes").write_text("9223372036854771712")
     v1 = "12:cpuset:/slurm/uid_1/job_7\n9:memory:/slurm/uid_1/job_7\n"
-    assert preflight.cgroup_memory_limit(v1, root) == 64 << 30
-    assert preflight.cgroup_memory_limit("0::/\n", tmp_path / "none") is None
-
-
-def test_the_host_memory_note_is_held_to_the_process_own_cgroup_limit(tmp_path, monkeypatch):
-    """Defect 9 at the note itself: the limit preflight warns by is the process's cgroup's."""
-    # The mount's root states no limit; the step this process runs in does. The node's free
-    # memory is stated too: the note must not depend on the host the test runs on.
-    monkeypatch.setattr(preflight, "CGROUP_ROOT", tmp_path / "no-limit-at-the-root")
-    monkeypatch.setattr(preflight, "cgroup_memory_limit", lambda *a, **k: 64 << 30)
-    node = {"SC_PAGE_SIZE": 4096, "SC_AVPHYS_PAGES": (690 << 30) // 4096}
-    monkeypatch.setattr(preflight.os, "sysconf", node.__getitem__)
-    spec = {"deployments": [{"name": "tp1", "options": {}}]}
-    [note] = preflight.check_kv_cache_configs(spec, {})
-    assert note.startswith("host memory: tp1: set no `kv_cache_config.host_cache_size`")
-    assert "690 GiB" in note and "this process may use 64 GiB (its cgroup's limit)" in note
+    assert advice.cgroup_memory_limit(v1, root) == 64 << 30
+    assert advice.cgroup_memory_limit("0::/\n", tmp_path / "none") is None
 
 
 # ------------------------------------------------------------------------ the decision file

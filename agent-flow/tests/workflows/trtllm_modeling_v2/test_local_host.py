@@ -231,15 +231,12 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
     assert "note: 'profile' is ignored: " in said and "unknown key 'feature'" in said
     del spec["profile"], spec["feature"]
 
-    # A spec the checkpoint cannot meet fails preflight: 1, and the journal says why.
+    # A checkpoint that cannot be read fails preflight: 1, and the journal says why.
     spec["agents"] = {"defaults": {"backend": "claude-code", "model": "claude-test-model"}}
-    spec["parallel"] = "tp2"
-    config = Path(spec["checkpoint_path"]) / "config.json"
-    config.write_text(
-        json.dumps({"architectures": ["GptOssForCausalLM"], "num_attention_heads": 3})
-    )
+    (Path(spec["checkpoint_path"]) / "config.json").write_text("{not json")
     task_file.write_text(yaml.safe_dump(spec))
     failed = tmp_path / "ws-no-anchor"
     assert run("--task", str(task_file), "--workspace", str(failed), "--dry-run") == 1
-    assert "preflight failed" in (failed / "journal.md").read_text()
+    journal = (failed / "journal.md").read_text()
+    assert "preflight failed" in journal and "the checkpoint is not readable" in journal
     assert dict(os.environ) == before

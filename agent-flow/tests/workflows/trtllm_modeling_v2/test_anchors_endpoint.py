@@ -23,8 +23,7 @@ from agent_flow.workflows.trtllm_modeling_v2.checks.boot import (
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import endpoint_eval
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
-from agent_flow.workflows.trtllm_modeling_v2.run.startup import advice
-from agent_flow.workflows.trtllm_modeling_v2.spec import deployments
+from agent_flow.workflows.trtllm_modeling_v2.spec import advice, deployments
 from agent_flow.workflows.trtllm_modeling_v2.spec.deployments import Benchmark, Deployment, Server
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import TaskSchemaError
 

@@ -40,6 +40,7 @@ from ._helpers import (
     _tasks,
     _workflow,
     _write_vocabulary,
+    healthy_smi,
     passing_shell,
 )
 
@@ -765,12 +766,12 @@ def test_a_dry_run_stops_after_preflight_with_no_agent_turn_and_no_engine_comman
 
 
 def test_a_failed_preflight_ends_the_run_before_any_agent(tmp_path, task_file, monkeypatch):
-    def busy_device(argv, env=None, timeout=0):
-        return CommandResult(returncode=0, stdout="0, 20000, 183359, 99, 10.3\n")
-
-    calls = _run(tmp_path, task_file, monkeypatch, Script(), command_runner=busy_device)
+    busy = healthy_smi(free=20000)
+    calls = _run(tmp_path, task_file, monkeypatch, Script(), command_runner=busy)
     assert calls == []
-    assert "preflight failed" in (tmp_path / "ws" / "journal.md").read_text()
+    journal = (tmp_path / "ws" / "journal.md").read_text()
+    assert "preflight failed" in journal
+    assert "`tp1` needs 1 free sm_103 device(s) on this host; 0 of 1 are free" in journal
     assert not _state(tmp_path).done
 
 

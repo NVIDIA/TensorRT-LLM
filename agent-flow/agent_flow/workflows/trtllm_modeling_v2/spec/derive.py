@@ -847,8 +847,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     path = write_derivation(args.out, derivation)
     print(f"→ {path}\n→ {args.out / REPORT_FILENAME}")
-    # Imported here: the warnings are the run's startup's, which reads this module.
-    from ..run.startup.advice import spec_warnings
+    from .advice import spec_warnings
 
     written = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     deployments_mod.resolve_paths(written, path.resolve().parent)

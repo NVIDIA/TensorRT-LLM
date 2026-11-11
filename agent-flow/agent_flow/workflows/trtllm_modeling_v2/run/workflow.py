@@ -49,11 +49,11 @@ from ..spec.task_schema import load_and_validate_task_yaml
 from . import certify as certify_mod
 from . import contract as contract_mod
 from . import pipeline as pipeline_mod
+from . import start as start_mod
 from .integration import own_paths
 from .journal import Journal
 from .pipeline import DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ROUNDS, Pipeline
-from .startup import bootstrap
-from .startup.bootstrap import HOST_FACTS_FILENAME, TROUBLESHOOTING_HINT
+from .start import HOST_FACTS_FILENAME
 from .state import (
     STAGE_EXECUTION,
     STAGE_PREFLIGHT,
@@ -332,7 +332,7 @@ class TrtllmModelingV2Workflow:
         leaves the run open: the same command resumes once the host is fixed.
         """
         self._state = state
-        if not bootstrap._run_preflight(self, state, log):
+        if not start_mod.start(self, state, log):
             return False
         if self.dry_run:
             print_message(
@@ -496,6 +496,5 @@ __all__ = [
     "DEFAULT_MAX_ROUNDS",
     "HOST_FACTS_FILENAME",
     "SKILL_DIRS",
-    "TROUBLESHOOTING_HINT",
     "TrtllmModelingV2Workflow",
 ]

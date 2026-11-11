@@ -233,14 +233,17 @@ def fake_git(*, head: str = "c0ffee1", dirt: str = ""):
     return run
 
 
-def healthy_smi(count: int = 1):
-    rows = "\n".join(f"{i}, 180000, 183359, 0, 10.3" for i in range(count))
+def healthy_smi(count: int = 1, free: int = 180000, cap: str = "10.3", **said):
+    """A runner of preflight's probe: ``count`` devices of 183359 MiB, a tree that imports."""
+    devices = [[str(i), str(free), "183359", cap] for i in range(count)]
+    record = {"host": "node-1", "devices": devices, **said}
+    seen: list[str] = []
 
-    def runner(argv, env=None, timeout=0):
-        if argv and argv[0] == "nvidia-smi":
-            return CommandResult(returncode=0, stdout=rows + "\n")
-        return CommandResult(returncode=0, stdout="ok\n")
+    def runner(command, env=None, timeout=0):
+        seen.append(command)
+        return CommandResult(returncode=0, stdout=f"MV2FLOW_PREFLIGHT {json.dumps(record)}\n")
 
+    runner.seen = seen  # type: ignore[attr-defined]
     return runner
 
 

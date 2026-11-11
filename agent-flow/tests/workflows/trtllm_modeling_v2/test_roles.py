@@ -40,8 +40,9 @@ from agent_flow.workflows.trtllm_modeling_v2.agents.turns import (
     TurnTimeout,
 )
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
+from agent_flow.workflows.trtllm_modeling_v2.run import start
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import ROLE_BY_KIND, TAGS_BY_KIND
-from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe, bootstrap
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe
 from agent_flow.workflows.trtllm_modeling_v2.run.startup.agent_probe import AGENT_PROBE_SKIP_ENV
 
 from ._helpers import _workflow
@@ -133,7 +134,7 @@ def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_fil
         tmp_path, shell_runner=lambda command, env=None, timeout=0: shells.append(command)
     )
     log = get_logger().console
-    assert not bootstrap._run_preflight(workflow, workflow._init_state(task_file, log), log)
+    assert not start.start(workflow, workflow._init_state(task_file, log), log)
     journal = (tmp_path / "ws" / "journal.md").read_text(encoding="utf-8")
     assert "agent probe failed" in journal and "srt-mux-9.sock" in journal
     # The file never written fails the probe, whatever the turn said.

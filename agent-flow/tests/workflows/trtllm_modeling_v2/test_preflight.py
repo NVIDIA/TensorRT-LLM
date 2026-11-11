@@ -21,33 +21,7 @@ from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
 
-
-def _smi_rows(*rows: str) -> str:
-    return "\n".join(rows) + "\n"
-
-
-def _healthy_row(index: int, cap: str = "10.3") -> str:
-    return f"{index}, 180000, 183359, 0, {cap}"
-
-
-def make_runner(*, smi: str, probe_ok=lambda index: True):
-    """Build a runner that answers nvidia-smi, the lone probe, and torchrun."""
-
-    def runner(argv, env=None, timeout=0):
-        joined = " ".join(argv)
-        if argv and argv[0] == "nvidia-smi":
-            return CommandResult(returncode=0, stdout=smi)
-        if argv and argv[0] == "torchrun":
-            return CommandResult(returncode=0, stdout="[preflight] OK\n")
-        if "torch.cuda.set_device" in joined:
-            index = int((env or {}).get("CUDA_VISIBLE_DEVICES", "0"))
-            if probe_ok(index):
-                return CommandResult(returncode=0, stdout="ok\n")
-            return CommandResult(returncode=1, stderr="cudaErrorDevicesUnavailable")
-        raise AssertionError(f"unexpected command: {argv}")
-
-    return runner
-
+from ._helpers import healthy_smi
 
 _SCRATCH = "/scratch/mv2flow-run-tmp"
 
@@ -71,80 +45,145 @@ def _task(tmp_path, **overrides):
     return task
 
 
-def test_run_preflight_resolves_identity(tmp_path):
-    task = _task(tmp_path, parallel="dep4")
+def _weights(tmp_path, gib: int) -> None:
+    index = {"metadata": {"total_size": gib << 30}}
+    (tmp_path / "ckpt" / "model.safetensors.index.json").write_text(json.dumps(index))
+
+
+def test_preflight_resolves_identity_and_claims_the_first_deployments_devices(tmp_path):
+    task = _task(tmp_path, parallel="unified", members=["dep4", "tp1"])
     (tmp_path / "ckpt").rename(tmp_path / "Qwen3-30B-A3B")
     task["checkpoint_path"] = str(tmp_path / "Qwen3-30B-A3B")
-    runner = make_runner(smi=_smi_rows(*[_healthy_row(i) for i in range(4)]))
+    runner = healthy_smi(6)
     result = preflight.run_preflight(task, runner=runner)
-    assert result.slug == "qwen3-30b-a3b-sm_103-dep4"
-    assert result.branch == "trtllm-modeling-v2/qwen3-30b-a3b-sm_103-dep4"
-    assert result.devices == (0, 1, 2, 3)
-    assert result.world_size == 4
+    assert result.slug == "qwen3-30b-a3b-sm_103-unified"
+    assert result.branch == "trtllm-modeling-v2/qwen3-30b-a3b-sm_103-unified"
+    assert (result.devices, result.world_size) == ((0, 1, 2, 3), 4)
     assert result.checkpoint_config["architectures"] == ["Qwen3MoeForCausalLM"]
-
-
-def test_preflight_claims_the_devices_the_widest_deployment_on_this_host_takes(tmp_path):
-    """A disaggregated deployment starts two engines; one behind a launch prefix places its own."""
-
-    def claimed(**spec):
-        result = preflight.run_preflight(_task(tmp_path, **spec), claim=False)
-        return result.devices, result.world_size, result.notes
-
-    assert claimed(parallel="unified", members=["tp1", "tep2"])[:2] == ((0, 1), 2)
-    devices, world, notes = claimed(
-        parallel="unified",
-        members={"default": ["tp1", "tep2"], "disagg": ["tep2"]},
-        features=["disagg"],
-    )
-    assert (devices, world) == ((0, 1, 2, 3), 2)
-    assert any(
-        "4 claimed, not 2: a disaggregated deployment starts two engines" in n for n in notes
-    )
-    stated = [{"name": "dep16", "options": {"tensor_parallel_size": 16}, "launch": "srun -N4"}]
-    devices, world, notes = claimed(parallel=None, deployments=stated)
-    assert (devices, world) == ((), 1)
-    assert any("every server starts behind its launch prefix" in n for n in notes)
+    assert result.family == "qwen3_moe" and result.target_rel.endswith("__sm_103__unified")
+    # One probe, in the tree, under the run's interpreter, with no prefix: on this host.
+    [command] = runner.seen
+    assert command.startswith(f"cd {tmp_path} && ") and "/opt/venv/bin/python -c " in command
+    assert "srun" not in command and "TRTLLM_MODELING_V2=require" in command
+    # A dry run probes nothing and takes the first devices.
+    dry = preflight.run_preflight(task, runner=None, claim=False)
+    assert dry.devices == (0, 1, 2, 3) and any(n.startswith("dry run:") for n in dry.notes)
+    # The devices claimed are the widest attempted deployment's: a later one on this host
+    # runs its checks on them, and a disaggregated one starts two engines.
+    wider = _task(tmp_path, parallel="unified", members=["tp1", "tep2"])
+    wider["checkpoint_path"] = task["checkpoint_path"]
+    result = preflight.run_preflight(wider, runner=healthy_smi(6, free=170000))
+    assert (result.devices, result.world_size) == ((0, 1), 2)
+    wider.update(members={"default": ["tp1", "tep2"], "disagg": ["tep2"]}, features=["disagg"])
+    result = preflight.run_preflight(wider, runner=healthy_smi(6))
+    assert (result.devices, result.world_size) == ((0, 1, 2, 3), 2)
     # One side behind a prefix: the other is this host's, and takes its ranks here.
     halves = {
         "name": "pd",
         "ctx": {"options": {"tensor_parallel_size": 4}, "launch": "srun -N1"},
         "gen": {"options": {"tensor_parallel_size": 2}},
     }
-    assert claimed(parallel=None, deployments=[halves])[:2] == ((0, 1), 2)
+    split = _task(tmp_path, parallel=None, deployments=[halves])
+    split["checkpoint_path"] = task["checkpoint_path"]
+    assert preflight.run_preflight(split, runner=None, claim=False).devices == (0, 1)
 
 
-def test_a_spec_the_checkpoint_cannot_meet_is_refused_with_every_reason(tmp_path):
-    task = _task(tmp_path, parallel="unified", members=["tp1", "tp4", "tep4", "dep4"])
-    task["features"] = ["mtp", "multimodal"]
-    config = {"architectures": ["X"], "num_attention_heads": 6, "num_experts": 6}
-    (tmp_path / "ckpt" / "config.json").write_text(json.dumps(config))
-    with pytest.raises(preflight.SpecInconsistencyError) as refused:
-        preflight.run_preflight(task, claim=False)
-    said = str(refused.value)
-    assert "tp4: 6 attention heads do not split 4 ways" in said
-    assert "tep4: 6 experts do not split 4 ways" in said
-    # Attention DP replicates attention: only its experts are split.
-    assert "dep4: 6 experts do not split 4 ways" in said and "dep4: 6 attention heads" not in said
-    assert "mtp: it drafts with MTP, and config.json states no draft layers" in said
-    assert "multimodal: it takes images, and the checkpoint has no tower" in said
+def test_the_probe_runs_where_the_first_deployments_engine_will(tmp_path):
+    stated = [
+        {"name": "dep16", "options": {"tensor_parallel_size": 16}, "launch": "srun -N4 -n16"},
+        {"name": "tp1", "options": {}},
+    ]
+    task = _task(tmp_path, parallel=None, deployments=stated)
+    runner = healthy_smi(4)
+    result = preflight.run_preflight(task, runner=runner)
+    # Behind the prefix, which places the ranks: no device of this host is claimed for it.
+    assert "; srun -N4 -n16 /opt/venv/bin/python -c " in runner.seen[0]
+    assert result.devices == (0,)  # the later deployment's, which starts here
+    assert any(n.startswith("devices: the first 1 of this host are taken") for n in result.notes)
+    alone = _task(tmp_path, parallel=None, deployments=stated[:1])
+    result = preflight.run_preflight(alone, runner=healthy_smi(4))
+    assert result.devices == () and "(none claimed here)" in result.report()
+    # With no prefix of its own, the spec's prefix for one-GPU commands is where it runs.
+    task = _task(tmp_path)
+    task["environment"]["launch"] = "srun -N1 --gpus=1"
+    runner = healthy_smi(1)
+    preflight.run_preflight(task, runner=runner)
+    assert "; srun -N1 --gpus=1 /opt/venv/bin/python -c " in runner.seen[0]
 
 
-def test_multirank_probe_launches_the_run_interpreter_on_claimed_devices():
-    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
+@pytest.mark.parametrize(
+    "seen,said",
+    [
+        (dict(tree_error="ImportError: no tensorrt_llm"), "the tree does not import where `tp1`"),
+        (dict(tmp_error="PermissionError: /scratch"), "the temporary directory is not writable"),
+        (dict(cap="10.0"), "`tp1` needs sm_103 devices; where `tp1` runs (on this host) the"),
+        (dict(free=1000), "`tp1` needs 1 free sm_103 device(s) on this host; 0 of 1 are free"),
+        (
+            dict(count=0, devices_error="nvidia-smi: not found"),
+            "the probe saw nvidia-smi: not found",
+        ),
+    ],
+)
+def test_only_a_hard_blocker_of_the_first_deployment_stops_the_run(tmp_path, seen, said):
+    with pytest.raises(preflight.PreflightError) as stopped:
+        preflight.run_preflight(_task(tmp_path), runner=healthy_smi(**seen))
+    assert said in str(stopped.value)
 
-    seen = []
 
-    def runner(argv, env, timeout):
-        seen.append((argv, env))
-        return CommandResult(0, "[preflight] OK")
+def test_the_other_hard_blockers_are_read_from_files(tmp_path, monkeypatch):
+    task = _task(tmp_path)
+    silent = lambda command, env=None, timeout=0: CommandResult(3, "", "bash: srun: not found")  # noqa: E731
+    with pytest.raises(preflight.PreflightError, match="the probe did not answer where `tp1` runs"):
+        preflight.run_preflight(task, runner=silent)
+    # The first deployment's weights do not fit its devices.
+    _weights(tmp_path, 300)
+    with pytest.raises(preflight.PreflightError, match="`tp1` cannot hold the weights: 300 GiB"):
+        preflight.run_preflight(task, runner=healthy_smi(1))
+    _weights(tmp_path, 30)
+    # A benchmark it is scored on has no dataset on this host.
+    monkeypatch.setenv("LLM_MODELS_ROOT", str(tmp_path / "empty"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "empty"))
+    scored = _task(tmp_path, accuracy={"model_key": "org/toy"})
+    with pytest.raises(preflight.PreflightError, match="`tp1` is scored on `gsm8k`: "):
+        preflight.run_preflight(scored, runner=healthy_smi(1))
+    (tmp_path / "ckpt" / "config.json").write_text("[not, a, config")
+    with pytest.raises(preflight.PreflightError, match="the checkpoint is not readable"):
+        preflight.run_preflight(task, runner=healthy_smi(1))
 
-    preflight.check_multirank_substrate(
-        2, RunEnvironment("local", "/venv/bin/python", devices=(3, 5)), runner=runner
-    )
-    argv, env = seen[0]
-    assert argv[3:6] == ["--no-python", "/venv/bin/python", "-c"]
-    assert env["CUDA_VISIBLE_DEVICES"] == "3,5"
+
+def test_a_later_deployment_is_not_attempted_and_a_config_that_does_not_load_is_recorded(
+    tmp_path,
+):
+    stated = [
+        {"name": "tp4", "options": {"tensor_parallel_size": 4}, "benchmarks": []},
+        {"name": "tp1", "options": {}},
+        {"name": "tp8", "options": {"tensor_parallel_size": 8}},
+        {
+            "name": "scored",
+            "options": {"tensor_parallel_size": 4},
+            "benchmarks": [{"name": "mmmu"}],
+        },
+    ]
+    task = _task(tmp_path, parallel=None, deployments=stated)
+    _weights(tmp_path, 300)
+    runner = healthy_smi(4, config_error="KeyError: 'kimi_k3'")
+    result = preflight.run_preflight(task, runner=runner, workspace=tmp_path / "ws")
+    # The first deployment passed; the others cost the run nothing but a record.
+    assert result.devices == (0, 1, 2, 3)
+    assert [(r["deployment"], r["check"]) for r in result.not_attempted] == [
+        ("tp1", ""),
+        ("tp8", ""),
+        ("scored", "accuracy[mmmu]"),
+    ]
+    reasons = [r["reason"] for r in result.not_attempted]
+    assert reasons[0].startswith("`tp1` cannot hold the weights: 300 GiB on 1 device(s)")
+    assert reasons[1] == "`tp8` needs 8 free devices on this host; it has 4"
+    assert reasons[2].startswith("no declared anchor and no reference row")
+    # The tree cannot load the checkpoint's config yet: recorded, and not a stop.
+    assert result.config_error == "KeyError: 'kimi_k3' (on node-1)"
+    assert "config:      the tree cannot load it yet: KeyError" in result.report()
+    # The anchors were frozen by preflight, once for the workspace.
+    assert (tmp_path / "ws" / "anchors.yaml").is_file() and "scored:mmmu" in result.anchors
 
 
 def _files(path: Path) -> Path:

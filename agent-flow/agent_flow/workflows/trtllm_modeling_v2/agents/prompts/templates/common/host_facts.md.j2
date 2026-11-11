@@ -1,0 +1,35 @@
+# Host facts
+
+What this host does that a generic Linux box does not. **Read this before you debug an environment failure**: every fact here was learned the expensive way by an earlier dispatch on this machine.
+
+For a failure, read the affected turn's activity log or the job's receipt and log. Report the exact error, command, commit and evidence paths.
+
+## Facts
+
+- **`pytest` exits 4 on this host even when every test passed.** The venv lives inside the repository root, so a session-final `sys.path` audit fires. Export `TRTLLM_SKIP_SYS_PATH_CHECK=1`, and adjudicate on the summary line (`N passed`), never on the exit code.
+- **`TMPDIR` must be at most {{ max_tmpdir }} characters.** The LLM API's RPC binds a unix socket under it, the path is capped at 107 bytes and the socket basename takes 45. This run's `TMPDIR` is {% if tmpdir %}`{{ tmpdir }}` ({{ tmpdir|length }} characters).{% else %}not set in the spec.{% endif %}
+
+- **`UCX ERROR uct_iface_open(tcp/rdma_vf_rail0)` is noise.** UCX falls back and the run exits 0. Do not chase it; it is not why your job failed.
+- **`RC=$?` after a pipe is the *pipe's* exit code, not the command's.** `cmd | tee log; RC=$?` reports `tee`. Use `PIPESTATUS[0]`, or drop the pipe.
+- **A venv interpreter created with `--system-site-packages` resolves only inside the container it was created in.** Running it from the host finds an interpreter and none of the packages, which reads as a broken install.
+{% if ranks %}
+- **A {{ ranks }}-rank launch needs the `SLURM_*` scrub and `--oversubscribe`.** Without them every rank reads `mpi_rank=0`, every rank becomes a leader, and the job hangs forever with no error and no traceback. Both are already in the launch prefix you were handed: use it verbatim rather than writing your own `mpirun` line.
+{% endif %}
+{% if container_image %}
+- **The container is `{{ container_image }}`.** An interpreter path in this run's environment block is a path *inside* it.
+{% endif %}
+{% if notes %}
+
+## What preflight measured on this host
+
+{% for note in notes %}
+- {{ note }}
+{% endfor %}
+{% endif %}
+
+## Learned during this run
+
+This section is yours. If you spend more than a few minutes discovering something about this host that the section above would have saved you, append it here as one bullet: the symptom first, then what to do. The orchestrator never rewrites anything below the marker, so it survives every restart and reaches every later dispatch.
+
+{{ marker }}
+
