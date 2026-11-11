@@ -431,6 +431,9 @@ class DecoderCudaGraphs:
         pass does is needed and the ranks can agree."""
         if self.cuda_graph_runner.graphs:
             return "decode CUDA graphs were already captured"
+        # A stage that skips a shape for lack of KV cache leaves its peers waiting at the line-up.
+        if self.mapping.has_pp():
+            return "pipeline parallelism is not supported"
         # One gate per duty of the warmup-only pass in run_cuda_graph_warmup.
         if self._lora.cuda_graph_manager is not None:
             return "LoRA CUDA graphs tune their kernels in the warmup-only pass"
