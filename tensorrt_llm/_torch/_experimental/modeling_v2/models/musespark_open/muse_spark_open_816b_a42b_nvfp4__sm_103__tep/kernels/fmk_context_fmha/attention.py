@@ -153,9 +153,9 @@ class StepPlans:
 
 
 class FmkContextMixin:
-    """Mixin in front of a ``FlashInferTrtllmGenFmha``: the context phase of the mixed steps
-    ``takes_step`` accepts runs the multi-instance context FMHA; every other call is the class
-    behind it. Adds plain attributes only (set by ``install``)."""
+    """Members ``install`` adds to a ``FlashInferTrtllmGenFmha`` (see ``_fmk_class``): the context
+    phase of the mixed steps ``takes_step`` accepts runs the multi-instance context FMHA; every
+    other call is the library's own. Adds plain attributes only (set by ``install``)."""
 
     _fmk_plans: Optional[StepPlans] = None
     _fmk_workspace: Optional[_fmk.FmkWorkspace] = None
@@ -167,7 +167,7 @@ class FmkContextMixin:
     def run_context(self, params: FmhaParams) -> None:
         lo, hi = self._fmk_band
         if not takes_step(params.meta, lo, hi):
-            super().run_context(params)
+            self._fmk_shipped_run_context(params)
             return
         lengths = self._fmk_host_lengths(params)
         reason = self._fmk_decline(params, lengths)
@@ -178,7 +178,7 @@ class FmkContextMixin:
                 f"trtllm-gen context FMHA (layer {self.attn.layer_idx}): {reason}",
                 key=f"musespark_open.fmk_context_fmha.decline.{reason}",
             )
-            super().run_context(params)
+            self._fmk_shipped_run_context(params)
             return
         self._fmk_run(params, *lengths)
         self.fmk_calls += 1
@@ -327,8 +327,19 @@ class FmkContextMixin:
 
 @functools.lru_cache(maxsize=None)
 def _fmk_class(base: type) -> type:
-    """``base`` with ``FmkContextMixin`` in front, one class per base."""
-    return type(f"{base.__name__}FmkContext", (FmkContextMixin, base), {})
+    """A subclass of ``base`` holding ``FmkContextMixin``'s members, one class per base.
+
+    ``_fmk_shipped_run_context`` is the library's own ``run_context``. The class is not
+    ``type(name, (FmkContextMixin, base), {})``: ``lib.__class__ = ...`` refuses it (the instance
+    layout differs, as the ABC base of the library adds the instance dict below the mixin's).
+    """
+    members = {
+        name: member
+        for name, member in vars(FmkContextMixin).items()
+        if name not in ("__dict__", "__weakref__", "__module__", "__doc__")
+    }
+    members["_fmk_shipped_run_context"] = base.run_context
+    return type(f"{base.__name__}FmkContext", (base,), members)
 
 
 def _refusal(attention) -> Optional[str]:
@@ -463,7 +474,7 @@ def install(model: torch.nn.Module) -> int:
     plans = StepPlans(num_ctas, heads, kv_heads)
     for attention in chosen:
         lib = _fi_gen_library(attention.attn)
-        if not isinstance(lib, FmkContextMixin):
+        if not hasattr(lib, "_fmk_shipped_run_context"):
             lib.__class__ = _fmk_class(type(lib))
         lib._fmk_plans = plans
         lib._fmk_workspace = workspace
