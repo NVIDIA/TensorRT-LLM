@@ -224,12 +224,20 @@ def run_check(
                 task_data=spec,
                 workspace=workspace,
                 spec=boot_checks.resolve_boot_spec(spec, found),
+                devices=devices,
                 **bound,
             )
             return replace(result, path=THROUGH_ENDPOINT)
         if name == "boot":
+            workload = boot_checks.resolve_boot_spec(spec, found)
             result = boot_checks.run_boot_gate(
-                environment, workdir=workdir, runner=runner, mode=mode, **bound, **common
+                environment,
+                workdir=workdir,
+                spec=workload,
+                runner=runner,
+                mode=mode,
+                **bound,
+                **common,
             )
             return replace(result, path=IN_PROCESS)
         if name == "serve":

@@ -42,6 +42,8 @@ from typing import Any, Iterator, Mapping, Sequence
 
 import yaml
 
+from ..infra.compute.environment import LLMAPI_LAUNCH, MPI_SETTINGS_KEPT, SINGLE_PROCESS_WORKER_ENV
+from ..infra.compute.server_runtime import rank_launch
 from ..infra.files import write_text_atomic
 from ..spec.deployments import ROLES, Deployment, Server, write_options
 from .check_runtime import MODE_REQUIRE, engine_env
@@ -211,6 +213,31 @@ def launch_env(launch: str, declared: Mapping[str, str]) -> dict[str, str]:
     return env
 
 
+def local_launch(
+    server: Server, devices: Sequence[int], env: Mapping[str, str], declared: Sequence[str]
+) -> tuple[list[str], dict[str, str]]:
+    """How a server with no launch prefix starts on this host: ``(launcher argv, its environment)``.
+
+    Behind a prefix the site places the ranks and the devices. Here the server gets
+    ``devices`` for itself; one rank runs its worker in its own process, with the MPI
+    bootstrap variables this process may have inherited from an allocation taken out
+    (all but those the spec ``declared``); more ranks start under ``mpirun`` and the LLM
+    API's launcher, as every in-process check starts them.
+    """
+    if server.launch.strip():
+        return [], dict(env)
+    env = dict(env)
+    if devices:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in devices)
+    if server.ranks > 1:
+        return rank_launch(server.ranks, LLMAPI_LAUNCH), env
+    kept = {"SLURM_PROCID", "SLURM_LOCALID", *MPI_SETTINGS_KEPT, *declared}
+    bootstrap = ("PMI", "MPI", "OMPI", "SLURM")
+    env = {k: v for k, v in env.items() if k in kept or not k.startswith(bootstrap)}
+    env.setdefault(SINGLE_PROCESS_WORKER_ENV, "1")
+    return [], env
+
+
 def serve_argv(
     model: str, options: str | Path, address_file: str | Path, *, role: str | None = None
 ) -> list[str]:
@@ -253,8 +280,8 @@ def _holders(launch: str, env: Mapping[str, str]) -> list[str] | None:
 def _start_one(
     name: str,
     argv: Sequence[str],
-    server: Server,
     env: Mapping[str, str],
+    server: Server,
     directory: Path,
     address_file: Path,
     workspace: Path,
@@ -265,6 +292,8 @@ def _start_one(
     address_file.unlink(missing_ok=True)
     log = directory / f"{name}.log"
     line = f"{server.launch} {' '.join(shlex.quote(a) for a in argv)}".strip()
+    # The line as it is started, beside the log, for whoever reads a start that failed.
+    (directory / f"{name}.launch").write_text(line + "\n", encoding="utf-8")
     process_env = {**env, SERVER_NAME_ENV: name}
     before = _holders(server.launch, process_env)
     with log.open("wb") as sink:
@@ -333,14 +362,17 @@ def start(
     timeout: int | None = None,
     tree: str | Path | None = None,
     python: str | None = None,
+    devices: Sequence[int] = (),
 ) -> Running:
     """Start ``deployment``'s servers and wait until the one to ask is healthy.
 
     Ends first whatever an earlier process of the run left recorded. ``env`` is the
     spec's environment; the deployment's own is laid over it. Every server runs from
     ``tree`` with the Modeling V2 switch on and the rank hook loaded
-    (``check_runtime.engine_env``), so its ranks say what they run. On any failure
-    everything started here is stopped before the error is raised.
+    (``check_runtime.engine_env``), so its ranks say what they run. A server with no
+    launch prefix takes its ranks' share of ``devices``, in the order the servers start
+    (:func:`local_launch`). On any failure everything started here is stopped before the
+    error is raised.
     """
     workspace = Path(workspace)
     declared = {**(env or {}), **deployment.env}
@@ -350,6 +382,17 @@ def start(
     directory.mkdir(parents=True, exist_ok=True)
     options = write_options(deployment, directory, {"modeling_v2": MODE_REQUIRE})
     cwd = str(tree) if tree is not None else None
+    left = list(devices)
+
+    def launched(server: Server, argv: list[str]) -> tuple[list[str], dict[str, str]]:
+        """``argv`` and the environment ``server`` starts with, here or behind its prefix."""
+        own = [left.pop(0) for _ in range(min(server.ranks, len(left)))]
+        own = [] if server.launch.strip() else own
+        launcher, env = local_launch(
+            server, own, launch_env(server.launch, declared), list(declared)
+        )
+        return [*launcher, *argv], env
+
     deadline = time.monotonic() + (timeout or deployment.timeout or START_TIMEOUT_S)
     owned: list[Owned] = []
     running = Running(deployment, "", owned, workspace)
@@ -358,9 +401,8 @@ def start(
             server = deployment.server
             record = _start_one(
                 deployment.name,
-                serve_argv(model, options["server"], directory / "address"),
+                *launched(server, serve_argv(model, options["server"], directory / "address")),
                 server,
-                launch_env(server.launch, declared),
                 directory,
                 directory / "address",
                 workspace,
@@ -373,11 +415,11 @@ def start(
         addresses = {}
         for role in ROLES:
             server = getattr(deployment, role)
+            argv = serve_argv(model, options[role], directory / f"address.{role}", role=role)
             record = _start_one(
                 f"{deployment.name}.{role}",
-                serve_argv(model, options[role], directory / f"address.{role}", role=role),
+                *launched(server, argv),
                 server,
-                launch_env(server.launch, declared),
                 directory,
                 directory / f"address.{role}",
                 workspace,
@@ -397,8 +439,8 @@ def start(
             ["trtllm-serve", "disaggregated", "-c", str(config)]
             + ["--server_start_timeout", str(remaining), "-r", "360000"]
             + ["--report_addr", str(directory / "address.proxy")],
-            Server(options={}),
             launch_env("", declared),
+            Server(options={}),
             directory,
             directory / "address.proxy",
             workspace,
@@ -497,6 +539,7 @@ __all__ = [
     "complete",
     "engine_lock",
     "launch_env",
+    "local_launch",
     "load_owned",
     "proxy_config",
     "serve_argv",

@@ -73,10 +73,34 @@ def test_a_launch_behind_a_prefix_inherits_no_scheduler_or_mpi_identity(site, mo
         "1", "tcp,self", "self", "/hf",
     )  # fmt: skip
     assert env[servers.SERVER_NAME_ENV] == "dep16"
-    # On the orchestrator's own host nothing is taken away: the local launch rule applies.
-    running = servers.start(_one("local"), model="/m", workspace=workspace)
+
+
+def test_a_server_with_no_prefix_starts_as_this_host_starts_an_engine(site, monkeypatch):
+    """Its own devices, its ranks under the launcher, and no MPI world it did not start."""
+    for name in ("SLURM_JOB_ID", "SLURM_PROCID", "PMIX_RANK", "OMPI_COMM_WORLD_SIZE"):
+        monkeypatch.setenv(name, "7")
+    workspace = site / "ws"
+    # One rank: its worker in its own process, the allocation's bootstrap variables out.
+    running = servers.start(_one("local"), model="/m", workspace=workspace, devices=(4, 5))
     servers.stop(running)
-    assert _started(workspace, "local")["env"]["SLURM_JOB_ID"] == "7"
+    env = _started(workspace, "local")["env"]
+    assert env["CUDA_VISIBLE_DEVICES"] == "4" and env["TLLM_WORKER_USE_SINGLE_PROCESS"] == "1"
+    assert "SLURM_JOB_ID" not in env and "PMIX_RANK" not in env and env["SLURM_PROCID"] == "7"
+    # Two servers of two ranks each: each under mpirun and the launcher, on its own devices.
+    pd = Deployment(
+        name="pd",
+        ctx=Server(options={"tensor_parallel_size": 2}),
+        gen=Server(options={"tensor_parallel_size": 2}),
+    )
+    running = servers.start(pd, model="/m", workspace=workspace, devices=(4, 5, 6, 7))
+    try:
+        [ctx, gen, _] = [o.name for o in servers.load_owned(workspace)]
+        launched = (workspace / "deployments" / "pd" / "pd.ctx.launch").read_text()
+        assert "mpirun -n 2 --oversubscribe --allow-run-as-root trtllm-llmapi-launch" in launched
+    finally:
+        servers.stop(running)
+    assert _started(workspace, "pd", "ctx")["env"]["CUDA_VISIBLE_DEVICES"] == "4,5"
+    assert _started(workspace, "pd", "gen")["env"]["CUDA_VISIBLE_DEVICES"] == "6,7"
 
 
 def test_a_disaggregated_deployment_is_two_servers_and_a_proxy_written_from_their_addresses(site):

@@ -378,6 +378,14 @@ def test_one_function_runs_a_check_on_the_deployment_it_names(tmp_path):
     assert "imported tensorrt_llm from /opt/other/tensorrt_llm/__init__.py, not from" in (
         elsewhere.detail
     )
+    # The boot runs the workload the spec states, the deployment's own entry over the run's.
+    boot = {"prompts": ["The capital of France is"], "keywords": ["Paris"]}
+    judged = {"model_key": "org/toy", "reference_yaml": "r.yaml"}
+    stated = _spec(tmp_path, accuracy={**judged, "boot": {**boot, "tep2": {"keywords": ["Lyon"]}}})
+    runner = _engine(_records("Paris"))
+    assert gate_cli.run_check(stated, "boot", runner=runner, **common).passed
+    lyon = gate_cli.run_check(stated, "boot", "tep2", runner=runner, **common)
+    assert not lyon.passed and "missing 1 expected keyword(s): ['Lyon']" in lyon.detail
     with pytest.raises(task_schema.TaskSchemaError, match="names no gate"):
         gate_cli.run_check(data, "perf", **common)
     with pytest.raises(KeyError, match="'dep4' names no deployment of this spec"):

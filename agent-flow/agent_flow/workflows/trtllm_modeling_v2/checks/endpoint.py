@@ -20,7 +20,7 @@ from __future__ import annotations
 import shlex
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from ..infra.compute.environment import RunEnvironment
 from ..spec.deployments import Benchmark, Deployment, Server
@@ -73,6 +73,7 @@ def run_endpoint_boot(
     workspace: str | Path,
     spec: BootSpec | None = None,
     timeout: int | None = None,
+    devices: Sequence[int] = (),
 ) -> GateResult:
     """Start ``deployment``, hold its endpoint to the boot workload, and stop it.
 
@@ -104,6 +105,7 @@ def run_endpoint_boot(
             timeout=timeout,
             tree=task_data.get("trtllm_repo_path"),
             python=(task_data.get("environment") or {}).get("python"),
+            devices=devices,
         )
     except servers.ServerError as exc:
         return ran(passed=False, detail=f"the deployment did not start: {exc}")
@@ -229,6 +231,7 @@ def run_endpoint_accuracy(
             timeout=deployment.timeout,
             tree=task_data.get("trtllm_repo_path"),
             python=(task_data.get("environment") or {}).get("python"),
+            devices=environment.devices,
         )
     except servers.ServerError as exc:
         return ran(passed=False, detail=f"the deployment did not start: {exc}")

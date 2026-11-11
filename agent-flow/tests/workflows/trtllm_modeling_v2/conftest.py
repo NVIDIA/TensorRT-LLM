@@ -171,6 +171,11 @@ signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
 server.serve_forever()
 """
 _FAKE_SMI = '#!/bin/bash\n[ -f "$FAKE_SMI" ] && cat "$FAKE_SMI"\nexit 0\n'
+# A stand-in for `mpirun`: one process, the command after the LLM API's launcher.
+_FAKE_MPIRUN = (
+    '#!/bin/bash\nwhile [ $# -gt 0 ] && [ "$1" != trtllm-llmapi-launch ]; do shift; done\n'
+    'shift\nexec "$@"\n'
+)
 
 
 @pytest.fixture
@@ -181,6 +186,7 @@ def site(tmp_path, monkeypatch):
     for name, text in (
         ("trtllm-serve", _FAKE_SERVE.format(python=sys.executable)),
         ("nvidia-smi", _FAKE_SMI),
+        ("mpirun", _FAKE_MPIRUN),
     ):
         path = bin_dir / name
         path.write_text(text)
