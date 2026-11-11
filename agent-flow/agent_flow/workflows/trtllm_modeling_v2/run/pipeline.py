@@ -528,7 +528,7 @@ class Pipeline:
         ended = [t for t in self.tasks if t is not task and t.status in (DONE, NOT_DONE, SKIPPED)]
         head, lacks = behind(tree, self.integration.repo) if tree is not None else ("", "")
         work = str(tree or repo) if task.kind != "survey" else ""
-        gates = self.workspace / "gates" / deployment.name
+        gates = self.workspace / report_mod.CHECKS_DIRNAME / deployment.name
         facts: dict[str, Any] = dict(
             task_id=task.id,
             goal=task.goal,

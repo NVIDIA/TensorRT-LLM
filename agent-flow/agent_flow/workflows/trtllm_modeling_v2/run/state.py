@@ -5,7 +5,7 @@
 
 What preflight resolved (the slug, the branch, the claimed devices) and the onboard
 record, written once and never taken back. Where the run stands is in the files the run
-keeps anyway: the task list (``tasks.yaml``), the verdicts (``contract_status.jsonl``) and
+keeps anyway: the task list (``tasks.yaml``), the verdicts (``verdicts.jsonl``) and
 the decision files; the same command against the same workspace goes on from them.
 """
 

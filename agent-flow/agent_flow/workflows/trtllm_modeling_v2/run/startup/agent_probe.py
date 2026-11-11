@@ -9,7 +9,7 @@ SHA-256 and the checkout's ``HEAD`` into a file in the workspace. The file is ju
 the model's words: a model can say anything, and cannot write a hash it never computed. A
 session that ran read-only fails too: every file a role writes would wait on an approval.
 A failure carries the turn's own text, the CLI's stderr and what to do (:func:`hint_for`).
-Each probe turn leaves its prompt, activity and answer under ``gates/agent-probe/<n>/``.
+Each probe turn leaves its prompt, activity and answer under ``checks/agent-probe/<n>/``.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from ...agents.roles import ROLES, resolve_role_agents
 from ...agents.turns import InProcessTurnExecutor, TurnRequest
 
 #: Where the probe's turns and files live, under the workspace.
-AGENT_PROBE_DIR = Path("gates") / "agent-probe"
+AGENT_PROBE_DIR = Path("checks") / "agent-probe"
 #: How long one probe turn may take. A CLI that cannot start fails in seconds.
 AGENT_PROBE_TIMEOUT_S = 600.0
 #: Set to skip the probe, for when the probe itself is what is broken.
@@ -303,7 +303,7 @@ def probe_agents(
     layer_for: LayerFactory | None = None,
     timeout_s: float = AGENT_PROBE_TIMEOUT_S,
 ) -> list[ProbeOutcome]:
-    """Probe every agent at once; one outcome each, in order, under ``gates/agent-probe/<n>/``.
+    """Probe every agent at once; one outcome each, in order, under ``checks/agent-probe/<n>/``.
 
     ``head`` is the checkout's ``HEAD`` as preflight reads it, ``""`` when it could not.
     """

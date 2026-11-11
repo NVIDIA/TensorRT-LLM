@@ -110,7 +110,7 @@ def gate_workdir(workdir: str | Path) -> Path:
     """``workdir``, made: where a gate writes the files its job reads.
 
     On the shared filesystem when the job runs on another host; the workflow
-    passes ``<workspace>/gates/<unit>``.
+    passes ``<workspace>/checks/<deployment>``.
     """
     directory = Path(workdir)
     directory.mkdir(parents=True, exist_ok=True)

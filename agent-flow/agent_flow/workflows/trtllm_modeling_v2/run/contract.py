@@ -8,7 +8,7 @@ tests when it names any (:func:`compile_contract`). Code runs core's boot and be
 onboard check) and every other check of a done deployment once, in the final pass
 (``run/report.py``); a worker runs its own deployment's by hand while it builds.
 
-Every result is appended to ``contract_status.jsonl`` with the commit it was measured on
+Every result is appended to ``verdicts.jsonl`` with the commit it was measured on
 and what it measured by content (:func:`tree_id`: the git tree, the native libraries built
 into it, what the checks read of the spec, this workflow's version, the environment). A
 pass on record for the same content is reused, never re-run; a verdict about any other
@@ -30,7 +30,7 @@ from ..infra.git import git_output
 from ..operators.coverage import MODELING_V2_PACKAGE
 from ..spec import deployments as deployments_mod
 
-STATUS_FILENAME = "contract_status.jsonl"
+STATUS_FILENAME = "verdicts.jsonl"
 #: Where the native libraries an engine loads are built: inside the checkout, ignored by git.
 NATIVE_LIBRARY_DIRS: tuple[str, ...] = ("tensorrt_llm", "tensorrt_llm/libs")
 #: Where a family builds libraries of its own: anywhere under the Modeling V2 package.

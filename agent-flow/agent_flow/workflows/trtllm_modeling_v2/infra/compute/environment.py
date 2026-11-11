@@ -76,6 +76,11 @@ MPI_SETTINGS_KEPT: tuple[str, ...] = (
 )
 #: The prefixes of MPI variables a run's environment may declare and keep through the scrub.
 _DECLARED_MPI_PREFIXES: tuple[str, ...] = ("OMPI_MCA_", "PMIX_MCA_", "OMPI_ALLOW_")
+#: How the variables of an MPI world, and of a scheduler's task, begin (`PMI` holds `PMIX`).
+#: The one list: the shell scrub below and a server's environment (``checks/servers.py``)
+#: take out the same names.
+MPI_PREFIXES: tuple[str, ...] = ("PMI", "MPI", "OMPI", "MV2_")
+SCHEDULER_PREFIXES: tuple[str, ...] = ("SLURM",)
 
 
 def single_task_scrub(keep: Sequence[str] = (), *, rank: bool = True) -> str:
@@ -87,7 +92,8 @@ def single_task_scrub(keep: Sequence[str] = (), *, rank: bool = True) -> str:
     named = ("SLURM_PROCID", "SLURM_LOCALID") if rank else ()
     kept = [*named, *MPI_SETTINGS_KEPT, *sorted(set(keep))]
     tests = " && ".join(f'[ "$v" != {name} ]' for name in dict.fromkeys(kept))
-    return f'for v in ${{!PMI@}} ${{!PMIX@}} ${{!MPI@}} ${{!OMPI@}} ${{!SLURM@}}; do {tests} && unset "$v"; done'
+    names = " ".join(f"${{!{prefix}@}}" for prefix in (*MPI_PREFIXES, *SCHEDULER_PREFIXES))
+    return f'for v in {names}; do {tests} && unset "$v"; done'
 
 
 # Above one task, under `mpirun`, the misleading variables are the Slurm task ones:

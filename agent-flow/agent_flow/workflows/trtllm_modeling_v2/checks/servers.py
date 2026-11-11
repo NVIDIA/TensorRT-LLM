@@ -52,7 +52,9 @@ import yaml
 
 from ..infra.compute.environment import (
     LLMAPI_LAUNCH,
+    MPI_PREFIXES,
     MPI_SETTINGS_KEPT,
+    SCHEDULER_PREFIXES,
     SINGLE_PROCESS_WORKER_ENV,
     rank_launch,
 )
@@ -71,9 +73,6 @@ RELEASE_TIMEOUT_S = 120
 PROBE_TIMEOUT_S = 120
 #: A deployment's start timeout when it states none: a load of a large checkpoint.
 START_TIMEOUT_S = 1800
-#: What a launch must not inherit from the orchestrator: the MPI and scheduler identity
-#: of the process that happens to start it. The prefix brings its own.
-SCRUBBED_PREFIXES: tuple[str, ...] = ("PMI_", "PMIX_", "OMPI_", "MPI_", "SLURM_", "MV2_")
 #: The role names ``trtllm-serve --server_role`` takes for the two sides.
 SERVER_ROLES: dict[str, str] = {"ctx": "context", "gen": "generation"}
 #: What a verdict's line says when the devices could not be looked at after a stop.
@@ -370,11 +369,12 @@ def launch_env(launch: str, declared: Mapping[str, str]) -> dict[str, str]:
     """The environment of a server's command: the process's, the spec's, and no borrowed identity.
 
     Behind a prefix nothing of the orchestrator's MPI or scheduler identity is passed on
-    (:data:`SCRUBBED_PREFIXES`); a variable the spec declares is, whatever its name.
+    (``MPI_PREFIXES``, ``SCHEDULER_PREFIXES``); a variable the spec declares is, whatever its name.
     """
     env = dict(os.environ)
     if launch.strip():
-        env = {k: v for k, v in env.items() if not k.startswith(SCRUBBED_PREFIXES)}
+        borrowed = (*MPI_PREFIXES, *SCHEDULER_PREFIXES)
+        env = {k: v for k, v in env.items() if not k.startswith(borrowed)}
     env.update({str(k): str(v) for k, v in declared.items()})
     return env
 
@@ -410,7 +410,7 @@ def local_env(
     one = server.ranks <= 1
     kept = {*MPI_SETTINGS_KEPT, *declared, *(("SLURM_PROCID", "SLURM_LOCALID") if one else ())}
     # Above one rank the scheduler's variables stay: `mpirun` reads its slots from them.
-    borrowed = ("PMI", "MPI", "OMPI", *(("SLURM",) if one else ()))
+    borrowed = (*MPI_PREFIXES, *(SCHEDULER_PREFIXES if one else ()))
     env = {k: v for k, v in env.items() if k in kept or not k.startswith(borrowed)}
     if one:
         env.setdefault(SINGLE_PROCESS_WORKER_ENV, "1")

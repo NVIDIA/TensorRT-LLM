@@ -62,7 +62,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "is not done: the run goes on without it, and the next start gives it fresh ones. "
         f"Default {DEFAULT_MAX_ATTEMPTS}.",
     )
-    add("--max-rounds", type=int, default=None, help="Ignored, with a notice: there are no rounds.")
     add(
         "--clean",
         action="store_true",
@@ -219,12 +218,6 @@ def main(argv: list[str] | None = None) -> None:
 
     _claim_workspace(Path(args.workspace))
 
-    if args.max_rounds is not None:
-        print(
-            "note: --max-rounds is ignored: the run has one final pass and no rounds; "
-            "drop the flag",
-            file=sys.stderr,
-        )
     # A driver watching the run tells a crashed orchestrator from a busy one by it.
     heartbeat = start_orchestrator_heartbeat(args.workspace, ORCHESTRATOR_HEARTBEAT_S)
 

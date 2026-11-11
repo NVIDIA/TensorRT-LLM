@@ -53,7 +53,7 @@ from .journal import utc_now
 
 REPORT_FILENAME = "delivery_report.md"
 #: Under the workspace: where the run's own checks write, one directory per commit.
-CHECKS_DIRNAME = "gates"
+CHECKS_DIRNAME = "checks"
 #: Under the workspace: the native libraries the onboard check accepted, when the checkout's
 #: are not those.
 LIBRARIES_DIRNAME = "onboarded_libraries"

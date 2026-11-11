@@ -453,7 +453,7 @@ def facts(**changes) -> dict:
         plan="/ws/plan.md",
         vocabulary="/ws/vocabulary.yaml",
         gate="/ws/bin/trtllm-modeling-v2 gate <boot|accuracy|tests> --task /ws/task.yaml "
-        "--deployment kv_fp8 --workdir /ws/gates/kv_fp8 --tree /ws/worktrees/kv_fp8",
+        "--deployment kv_fp8 --workdir /ws/checks/kv_fp8 --tree /ws/worktrees/kv_fp8",
         history=[],
         earlier=0,
         tasks="/ws/tasks.yaml",
@@ -499,7 +499,7 @@ def facts(**changes) -> dict:
         test_command="cd /ws/worktrees/k4 && PYTHONPATH=/ws/worktrees/k4 python -m pytest t.py -q",
         needs="`tp1`'s options serve (KV cache dtype not stated: the checkpoint's own)",
         control="/ws/bin/trtllm-modeling-v2 gate boot --task /ws/task.yaml --deployment kv_fp8 "
-        "--workdir /ws/gates/kv_fp8 --tree /ws/worktrees/kv_fp8 --mode off",
+        "--workdir /ws/checks/kv_fp8 --tree /ws/worktrees/kv_fp8 --mode off",
         pytest="cd /ws/worktrees/kv_fp8 && PYTHONPATH=/ws/worktrees/kv_fp8 python -m pytest t -q",
     )
     return {**said, **changes}

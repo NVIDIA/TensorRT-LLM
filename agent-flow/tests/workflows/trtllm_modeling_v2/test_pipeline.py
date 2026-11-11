@@ -701,7 +701,7 @@ def test_a_check_the_infrastructure_ended_runs_once_more_and_is_no_verdict_of_it
     task = _spec(task_file, KV_FP8)
     (tmp_path / "ws" / ".trtllm_modeling_v2_state.json").unlink()
     (tmp_path / "ws" / "tasks.yaml").unlink()
-    (tmp_path / "ws" / "contract_status.jsonl").unlink()
+    (tmp_path / "ws" / contract_mod.STATUS_FILENAME).unlink()
     calls = _run(tmp_path, task, monkeypatch, Script(), shell_runner=shell, max_attempts=1)
     assert _state(tmp_path).onboarded == {} and len(calls) == 1
     assert "did not run to a verdict: the allocation ended under it" in _tasks(tmp_path)[1]["note"]

@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
+from agent_flow.workflows.trtllm_modeling_v2.checks import servers
 from agent_flow.workflows.trtllm_modeling_v2.infra import monitor as monitor_mod
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute import executor
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import (
@@ -25,13 +26,17 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import (
     LocalCommandExecutor,
     ended_early,
 )
-from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
+from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
+    RunEnvironment,
+    single_task_scrub,
+)
 from agent_flow.workflows.trtllm_modeling_v2.infra.files import write_json_atomic
 from agent_flow.workflows.trtllm_modeling_v2.infra.monitor import (
     ORCHESTRATOR_EXIT,
     ORCHESTRATOR_HEARTBEAT,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run import workflow as workflow_mod
+from agent_flow.workflows.trtllm_modeling_v2.spec.deployments import Server
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
     TaskSchemaError,
     load_and_validate_task_yaml,
@@ -93,8 +98,33 @@ def test_every_command_scrubs_the_allocations_launcher_environment():
     assert command.index("env -u SLURM_PROCID ") < command.index("mpirun -n 4 ")
     assert command.startswith("CUDA_VISIBLE_DEVICES=0,1,2,3 ")
     single = env.command("/p probe.py", single_process=True)
-    assert "${!PMIX@}" in single
     assert "exec /p probe.py" in single
+    # One list of what names an MPI world or a scheduler's task, for the shell scrub and for
+    # a server's environment alike; the settings and the rank's own two names stay.
+    inherited = {
+        "PMIX_RANK": "3",
+        "PMI_FD": "9",
+        "OMPI_COMM_WORLD_SIZE": "4",
+        "MPI_LOCALRANKID": "1",
+        "MV2_COMM_WORLD_RANK": "2",
+        "SLURM_JOB_ID": "7",
+        "SLURM_PROCID": "0",
+        "OMPI_ALLOW_RUN_AS_ROOT": "1",
+    }
+    left = subprocess.run(
+        ["bash", "-c", f"{single_task_scrub()}; env"],
+        env={"PATH": os.environ["PATH"], **inherited},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    kept = {line.split("=")[0] for line in left.splitlines()} & set(inherited)
+    assert kept == {"SLURM_PROCID", "OMPI_ALLOW_RUN_AS_ROOT"}
+    with mock.patch.dict(os.environ, inherited):
+        behind = servers.launch_env("srun -N1", {"OMPI_MCA_btl": "self"})
+        here = servers.local_env(Server(options={}), (), dict(os.environ), [])
+    assert not set(inherited) & set(behind) and behind["OMPI_MCA_btl"] == "self"
+    assert set(inherited) & set(here) == {"SLURM_PROCID", "OMPI_ALLOW_RUN_AS_ROOT"}
 
 
 def test_the_launch_prefix_preserves_shell_quotes():
@@ -203,10 +233,12 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
     assert "--dry-run" in capsys.readouterr().out
     workspace = tmp_path / "ws"
     argv = ["--task", str(task_file), "--workspace", str(workspace), "--dry-run"]
-    assert run(*argv, "--max-rounds", "9") == 0
+    # A flag upstream main never had gets no notice: it is refused as any unknown one.
+    assert run(*argv, "--max-rounds", "9") == 2
+    assert "unrecognized arguments: --max-rounds 9" in capsys.readouterr().err
+    assert run(*argv) == 0
     said = capsys.readouterr()
     assert "--dry-run: preflight passed" in said.out
-    assert "note: --max-rounds is ignored: " in said.err
     assert (workspace / "anchors.yaml").is_file() and not (workspace / "tasks.yaml").exists()
 
     # A spec that states no model for its roles is a spec error: 2, before anything runs.
