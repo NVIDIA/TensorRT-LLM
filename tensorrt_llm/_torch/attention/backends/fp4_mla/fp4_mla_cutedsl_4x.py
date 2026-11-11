@@ -7410,6 +7410,19 @@ def _ds_wait(mbar, phase: ctm.Int32):
 
 
 @cute.jit
+def _ds_seen(mbar, phase: ctm.Int32):
+    # Non-blocking: has the phase with this parity completed?  Issued early so that its latency overlaps compute.
+    return cute.arch.mbarrier_test_wait(mbar.data_ptr(), phase)
+
+
+@cute.jit
+def _ds_wait_unless(seen, mbar, phase: ctm.Int32):
+    # Wait only when the earlier _ds_seen of the same phase had not found it complete.
+    if not seen:
+        _ds_wait(mbar, phase)
+
+
+@cute.jit
 def _ds_pair_sync(
     mbar,
     rank: ctm.Int32,
@@ -8623,6 +8636,10 @@ def _r93_pack(
             running_anchor,
             scale,
         )
+    # earlycheck c: the two P-bank credits of the stores below, tested ahead of the PSF computation.
+    credit_phase = (own_index - ctm.Int32(1)) & ctm.Int32(1)
+    pv_done_seen = _ds_seen(bars.subview(ctm.Int32(11) + (local_tile & ctm.Int32(1))), credit_phase)
+    source_done_seen = _ds_seen(source_done, credit_phase)
     newmax = cute.arch.fmax(running_max, blockmax)
     newanchor, rebase, delta = _select_smem_p4_lazy_anchor_with_validity(
         newmax, ctm.Boolean(newmax != ctm.Float32(-ctm.Float32.inf)), running_anchor, scale
@@ -8695,11 +8712,12 @@ def _r93_pack(
     # P and local TMEM PSF retain the original two-consumer PV/source credit.
     if own_index > ctm.Int32(0):
         # x9: PV(own tile own_index-1) done straight from its commit barrier; bar6 is the peer credit only.
-        _ds_wait(
+        _ds_wait_unless(
+            pv_done_seen,
             bars.subview(ctm.Int32(11) + (local_tile & ctm.Int32(1))),
-            (own_index - ctm.Int32(1)) & ctm.Int32(1),
+            credit_phase,
         )
-        _ds_wait(source_done, (own_index - ctm.Int32(1)) & ctm.Int32(1))
+        _ds_wait_unless(source_done_seen, source_done, credit_phase)
     swizzle = ctm.Swizzle.from_name("s128b")
     # Adjacent N16 groups occupy one contiguous aligned 16-byte segment
     # after the existing s128b swizzle. Preserve byte positions and publish
