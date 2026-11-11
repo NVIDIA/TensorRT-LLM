@@ -373,6 +373,21 @@ def test_the_report_lists_what_the_workers_left_not_done(tmp_path, task_file, mo
         "- `core` left not done: lm_head at M=8192",
         "- `k1-rms` left not done: cached-prefix context (31+33 tokens) fails in shared code",
     ]
+    # The receipt's own example is a mapping to YAML; no form a worker writes stops the report.
+    forms = {
+        "\n  - CI list: no attempt left\n  - plain": ["CI list: no attempt left", "plain"],
+        "\n  tests: no time\n  docs: later": ["tests: no time", "docs: later"],
+        "7": ["7"],
+        "true": ["True"],
+        "none yet": ["none yet"],
+        "[]": [],
+        "0": [],
+        "": [],
+    }
+    for form, lines in forms.items():
+        (decisions / "core-1.2.yaml").write_text(f"decision: ready\nnot_done: {form}\n")
+        said = [line for line in report_mod._not_done(tmp_path) if "`core`" in line]
+        assert said == [f"- `core` left not done: {line}" for line in lines], form
     # In the report a reader opens, not only in the helper that collects them.
     said = {"decision": "ready", "summary": "x", "not_done": ["lm_head at M=8192"]}
     _run(tmp_path, task_file, monkeypatch, Script(assembler=lambda turn, prompt: said))

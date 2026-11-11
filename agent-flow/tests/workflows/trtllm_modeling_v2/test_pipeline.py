@@ -26,6 +26,7 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.git import (
     CommitIdentity,
     CommitPolicy,
     audit_commits,
+    git_output,
 )
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem, rows_by_unit
 from agent_flow.workflows.trtllm_modeling_v2.run import contract as contract_mod
@@ -1996,6 +1997,19 @@ def test_the_onboard_record_is_written_once_and_found_again(tmp_path):
     refs.clear()
     report_mod.reconcile_onboarded(workflow)
     assert workflow._state.onboarded["ref"] == ref and refs == {ref: "abc123"}
+
+
+def test_git_itself_creates_the_onboard_ref_once_and_never_moves_it(tmp_path):
+    """The scripted refs above say what git does with an empty old value; this asks git."""
+    repo, ref = _checkout(tmp_path), "refs/mv2/s/onboarded"
+    workflow, first = SimpleNamespace(_git=git_output), _git(repo, "rev-parse", "HEAD")
+    (repo / "shared.py").write_text("S = 2\n")
+    _git(repo, "commit", "-q", "-am", "next")
+    assert report_mod._pinned(workflow, repo, ref) == ""
+    assert report_mod._pin(workflow, repo, ref, first)
+    assert not report_mod._pin(workflow, repo, ref, _git(repo, "rev-parse", "HEAD"))
+    assert report_mod._pin(workflow, repo, ref, first)
+    assert _git(repo, "rev-parse", ref) == first
 
 
 def test_the_accepted_libraries_are_kept_with_a_manifest_and_the_report_says_which(

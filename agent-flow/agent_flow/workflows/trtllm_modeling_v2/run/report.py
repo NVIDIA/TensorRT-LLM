@@ -589,9 +589,17 @@ def _not_done(workspace: Path) -> list[str]:
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         except (OSError, UnicodeError, yaml.YAMLError):
             continue
+        # Whatever a worker wrote there: a list, a block of lines, a mapping, one word, a number.
         items = data.get("not_done") if isinstance(data, dict) else None
-        items = [x for x in items.splitlines() if x.strip()] if isinstance(items, str) else items
-        lines += [f"- `{task}` left not done: {str(item).strip()}" for item in items or ()]
+        if isinstance(items, dict):
+            items = [{what: why} for what, why in items.items()]
+        elif not isinstance(items, list):
+            items = [x for x in str(items or "").splitlines() if x.strip()]
+        for item in items:
+            # `- what: why` is a mapping to YAML, and one item to its writer.
+            pairs = item.items() if isinstance(item, dict) else ()
+            said = "; ".join(f"{what}: {why}" for what, why in pairs) or str(item)
+            lines.append(f"- `{task}` left not done: {' '.join(said.split())}")
     return lines
 
 
