@@ -251,25 +251,17 @@ class EnvironmentError(ValueError):
     """A declared environment cannot safely run the workload."""
 
 
-def check_tmpdir(env: Mapping[str, str], *, require_set: bool = True) -> None:
-    """Assert ``TMPDIR`` and ``CLAUDE_CODE_TMPDIR`` are set, short, and not ``/tmp``.
+def check_tmpdir(env: Mapping[str, str]) -> None:
+    """Assert that a ``TMPDIR`` or ``CLAUDE_CODE_TMPDIR`` the spec declares is short and not ``/tmp``.
 
-    The length bound (:data:`MAX_TMPDIR_LEN`, a unix socket's path) applies to
-    ``TMPDIR`` alone: ``CLAUDE_CODE_TMPDIR`` binds no socket. ``env`` is the
-    environment **declared in task.yaml**; this check does *not* fall back to
-    the orchestrator's own ``os.environ``. ``require_set=False`` checks only
-    the variables that are set.
+    The length bound (:data:`MAX_TMPDIR_LEN`, a unix socket's path) applies to ``TMPDIR``
+    alone: ``CLAUDE_CODE_TMPDIR`` binds no socket. ``env`` is the environment declared in
+    task.yaml; one it does not declare is the system's, which preflight probes.
     """
     for name in ("TMPDIR", "CLAUDE_CODE_TMPDIR"):
         value = env.get(name)
         if not value:
-            if not require_set:
-                continue
-            raise EnvironmentError(
-                f"{name} is not set. Engine builds and NVRTC scratch default there, and "
-                f"on a shared host the default fills to zero mid-run. Set it in "
-                f"task.yaml's `environment.env`."
-            )
+            continue
         resolved = Path(value).resolve()
         if resolved == Path("/tmp") or Path("/tmp") in resolved.parents:
             raise EnvironmentError(

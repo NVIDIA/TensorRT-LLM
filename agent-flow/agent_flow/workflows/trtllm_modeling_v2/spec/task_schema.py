@@ -279,7 +279,7 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
                     f"'{ENVIRONMENT_FIELD}.env.{key}' must be a scalar the shell can carry"
                 )
         try:
-            check_tmpdir({str(k): str(v) for k, v in env.items()}, require_set=False)
+            check_tmpdir({str(k): str(v) for k, v in env.items()})
         except EnvironmentError as exc:
             errors.append(f"'{ENVIRONMENT_FIELD}.env': {exc}")
     mounts = block.get("mounts")
