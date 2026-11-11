@@ -86,6 +86,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GpuCacheTierConfig,
     HalfOpenRange,
     HostCacheTierConfig,
+    HostMemBackingConfig,
     KVCacheDesc,
     KVCacheEventManager,
     KVCacheIterationStatsDelta,
@@ -2993,13 +2994,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             if kv_cache_config.host_cache_bind_to_gpu_numa_node:
                 host_tier_numa_node = _host_tier_numa_node(int(host_quota), mapping)
-            cache_tiers.append(
-                HostCacheTierConfig(
-                    quota=int(host_quota),
-                    allow_remote_numa_fallback=host_tier_numa_node is None,
-                    numa_node=host_tier_numa_node,
-                )
-            )
+            cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
         disk_cache_size = kv_cache_config.disk_cache_size
         if disk_cache_size is not None and disk_cache_size > 0:
             disk_cache_path = kv_cache_config.disk_cache_path
@@ -3021,6 +3016,13 @@ class KVCacheManagerV2(BaseResourceManager):
             tokens_per_block=tokens_per_block,
             cache_tiers=cache_tiers,
         )
+        if host_tier_numa_node is not None:
+            config = replace(
+                config,
+                host_mem_backing=HostMemBackingConfig(
+                    numa_node=host_tier_numa_node, allow_remote_numa_fallback=False
+                ),
+            )
         config = self._add_mixed_precision_layers(config)
         config = self._lay_out_regions(config)
         arena_bytes = sparse_arena_bytes(config, self.max_batch_size)

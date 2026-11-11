@@ -266,8 +266,8 @@ class GpuCacheTierConfig:
 class HostCacheTierConfig:
     quota: int
     max_quota: int | None = None
+    # Deprecated: set KVCacheManagerConfig.host_mem_backing. False still makes the placement strict.
     allow_remote_numa_fallback: bool = True
-    numa_node: int | None = None
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -517,6 +517,13 @@ class PoolRebalanceConfig:
     ratio_tolerance: float = 0.25
     moving_average_decay: float = 0.9999
 
+# How the manager backs the host cache tier's memory; the tier does not read it.
+@dataclass(slots=True)
+class HostMemBackingConfig:
+    numa_node: int | None = None
+    allow_remote_numa_fallback: bool = True
+    def validate(self) -> None: ...
+
 @dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
@@ -552,6 +559,7 @@ class KVCacheManagerConfig:
     # Regions, each with a life cycle of its own, numbered after every layer life cycle in
     # declaration order. A (layer, role) pair belongs to one layer config or one region.
     regions: list[RegionConfig] = ...
+    host_mem_backing: HostMemBackingConfig = ...
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

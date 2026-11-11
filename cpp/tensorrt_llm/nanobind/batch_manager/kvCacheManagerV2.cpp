@@ -1745,15 +1745,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::GpuCacheTierConfig::validate) DEF_COPY(kv::GpuCacheTierConfig);
 
     nb::class_<kv::HostCacheTierConfig>(m, "HostCacheTierConfig")
-        .def(nb::init<size_t, std::optional<size_t>, bool, std::optional<int>>(), nb::arg("quota"),
-            nb::arg("max_quota") = nb::none(), nb::arg("allow_remote_numa_fallback") = true,
-            nb::arg("numa_node") = nb::none())
+        .def(nb::init<size_t, std::optional<size_t>, bool>(), nb::arg("quota"), nb::arg("max_quota") = nb::none(),
+            nb::arg("allow_remote_numa_fallback") = true)
         .def_rw("quota", &kv::HostCacheTierConfig::quota)
         .def_rw("max_quota", &kv::HostCacheTierConfig::maxQuota)
         .def_rw("allow_remote_numa_fallback", &kv::HostCacheTierConfig::allowRemoteNumaFallback)
-        .def_rw("numa_node", &kv::HostCacheTierConfig::numaNode)
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
         .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
+
+    nb::class_<kv::HostMemBackingConfig>(m, "HostMemBackingConfig")
+        .def(nb::init<std::optional<int>, bool>(), nb::arg("numa_node") = nb::none(),
+            nb::arg("allow_remote_numa_fallback") = true)
+        .def_rw("numa_node", &kv::HostMemBackingConfig::numaNode)
+        .def_rw("allow_remote_numa_fallback", &kv::HostMemBackingConfig::allowRemoteNumaFallback)
+        .def("validate", &kv::HostMemBackingConfig::validate) DEF_COPY(kv::HostMemBackingConfig);
 
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
         .def(nb::init<size_t, std::string>(), nb::arg("quota"), nb::arg("path"))
@@ -1960,7 +1965,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
-                std::vector<kv::RegionConfig> regions)
+                std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1988,6 +1993,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->coldTierOffloadMinPriority = coldTierOffloadMinPriority;
                 cfg->hostSparsePoolQuota = hostSparsePoolQuota;
                 cfg->regions = std::move(regions);
+                cfg->hostMemBacking = std::move(hostMemBacking);
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -2001,7 +2007,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{},
             nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority,
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
-            nb::arg("regions") = std::vector<kv::RegionConfig>{})
+            nb::arg("regions") = std::vector<kv::RegionConfig>{},
+            nb::arg("host_mem_backing") = kv::HostMemBackingConfig{})
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2030,6 +2037,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "One positive, normalized cache-tier quota weight per layer group.")
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
         .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
+        .def_rw("host_mem_backing", &kv::KVCacheManagerConfig::hostMemBacking)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_rw("text_only", &kv::KVCacheManagerConfig::textOnly)
         .def_rw("pool_rebalance", &kv::KVCacheManagerConfig::poolRebalance)

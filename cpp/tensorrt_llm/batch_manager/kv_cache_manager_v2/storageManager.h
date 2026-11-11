@@ -394,11 +394,10 @@ private:
     //! `gpuPhysMemSize` is the shared GPU allocator's unit, which every GPU level reports.
     [[nodiscard]] static size_t tierCommitUnit(CacheTierConfig const& tierConfig, size_t gpuPhysMemSize);
 
-    //! Backing options for a tier: its fixed allocation unit together with the
-    //! page-placement policy the tier's config asks for. `gpuPhysMemSize` is the shared
-    //! GPU allocator's unit, as tierCommitUnit takes it.
+    //! Backing options for a tier: for a host tier, the page placement of the manager's
+    //! `backing`. `gpuPhysMemSize` is the shared GPU allocator's unit, as tierCommitUnit takes it.
     [[nodiscard]] static HostMemBackingOptions tierBackingOptions(
-        CacheTierConfig const& tierConfig, size_t gpuPhysMemSize);
+        CacheTierConfig const& tierConfig, size_t gpuPhysMemSize, HostMemBackingConfig const& backing);
 
     //! `slotSizeLists` holds every pool's size. The level's quota pays for all of them bar
     //! the ones `secondBudget` names, which are host memory charged to it instead. Groups with

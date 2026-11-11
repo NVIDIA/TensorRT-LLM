@@ -66,24 +66,9 @@ struct HostCacheTierConfig
     //! exceed anyway.
     std::optional<size_t> maxQuota;
 
-    //! Whether a page may come from a NUMA node other than the one the GPU
-    //! attaches to, when the local node cannot satisfy it.
-    //!
-    //! False keeps every page local, at the cost of capping the tier at one
-    //! node's memory: a quota sized from total system memory cannot then be
-    //! filled. True accepts a remote page, which the GPU reaches more slowly,
-    //! rather than failing the allocation.
-    //!
-    //! False additionally requires that a memory policy be settable. Where the
-    //! host tier is mmap-backed, a container without CAP_SYS_NICE cannot set
-    //! one, and the tier refuses to start rather than fall back to first touch
-    //! -- which prefers the local node but takes a remote page instead of
-    //! failing, and so would not be the strictness that was asked for.
+    //! Deprecated: set KVCacheManagerConfig::hostMemBacking instead. False here still makes the
+    //! host memory's placement strict; the tier itself does not read it.
     bool allowRemoteNumaFallback = true;
-
-    //! The node the tier's host memory goes to instead of the GPU's; the policy is still
-    //! allowRemoteNumaFallback's. Last, so positional initializers of the fields above stay valid.
-    std::optional<int> numaNode;
 
     [[nodiscard]] CacheTier tier() const noexcept
     {
@@ -96,8 +81,6 @@ struct HostCacheTierConfig
             throw std::invalid_argument("HostCacheTierConfig: quota must be > 0");
         if (maxQuota.has_value() && *maxQuota < quota)
             throw std::invalid_argument("HostCacheTierConfig: maxQuota must be >= quota");
-        if (numaNode && *numaNode < 0)
-            throw std::invalid_argument("HostCacheTierConfig: numa_node must be >= 0");
     }
 };
 
@@ -579,6 +562,32 @@ struct PoolRebalanceConfig
     }
 };
 
+//! How the KV cache manager backs the host cache tier's memory. HostMemBacking applies it where the
+//! memory is mapped; the tier takes the backed memory and does not read it.
+struct HostMemBackingConfig
+{
+    //! The NUMA node for the pages instead of the one the GPU attaches to.
+    std::optional<int> numaNode;
+
+    //! Whether a page may come from another NUMA node when the chosen node cannot satisfy it.
+    //!
+    //! False keeps every page on that node, at the cost of capping the memory at one node's: a
+    //! quota sized from total system memory cannot then be filled. True accepts a remote page,
+    //! which the GPU reaches more slowly, rather than failing the allocation.
+    //!
+    //! False additionally requires that a memory policy be settable. Where the memory is
+    //! mmap-backed, a container without CAP_SYS_NICE cannot set one, and the manager refuses to
+    //! start rather than fall back to first touch -- which prefers the local node but takes a
+    //! remote page instead of failing, and so would not be the strictness that was asked for.
+    bool allowRemoteNumaFallback = true;
+
+    void validate() const
+    {
+        if (numaNode && *numaNode < 0)
+            throw std::invalid_argument("HostMemBackingConfig: numa_node must be >= 0");
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Top-level KV cache manager configuration (mirrors _config.py::KVCacheManagerConfig).
 // ---------------------------------------------------------------------------
@@ -665,6 +674,8 @@ struct KVCacheManagerConfig
 
     // Unreferenced GPU pages below this priority are dropped instead of offloaded.
     Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority;
+
+    HostMemBackingConfig hostMemBacking;
 
     bool enableSwaScratchReuse() const noexcept
     {
