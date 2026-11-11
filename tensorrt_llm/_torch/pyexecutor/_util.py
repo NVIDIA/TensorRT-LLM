@@ -61,10 +61,10 @@ from ..speculative.spec_sampler_base import SpecSampler
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
-                           get_layer_attention_window, is_hybrid_linear,
-                           is_kimi_linear, is_mla, is_nemotron_hybrid,
-                           is_qwen3_hybrid, is_qwen4_exp, resolve_vocab_size,
-                           uses_vswa_kv_cache_layout)
+                           get_layer_attention_window, is_decode_only,
+                           is_hybrid_linear, is_kimi_linear, is_mla,
+                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
+                           resolve_vocab_size, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .engine.lora import make_lora_model_config
@@ -2088,10 +2088,12 @@ class KvCacheCreator:
         # A completed chunk-aware profiling run already prices the cached-KV
         # staging buffers in the measured peak. Do not subtract an additional
         # workspace reserve or install an attended-KV admission cap for it.
+        # A decode-only worker never runs the context-MLA gather at all.
         profiled_mla_chunks = (py_executor is not None and not self._skip_est
                                and self._mla_chunked_profile_length is not None)
-        w_bytes_per_token = (0 if profiled_mla_chunks else
-                             get_attention_workspace_bytes_per_token(
+        w_bytes_per_token = (0 if profiled_mla_chunks
+                             or is_decode_only(self._sparse_attention_config)
+                             else get_attention_workspace_bytes_per_token(
                                  self._model_engine.model.model_config,
                                  self._mapping))
         workspace_is_chunked_prefill_bounded = True
@@ -5054,6 +5056,7 @@ def create_torch_sampler_args(
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
     max_num_sequences: int,
+    watermark_config=None,
 ):
     # The sampler's per-slot state is indexed by sequence slots, so it must
     # be sized identically to the executor's slot pool.
@@ -5071,6 +5074,7 @@ def create_torch_sampler_args(
         disable_overlap_scheduler=disable_overlap_scheduler,
         enable_async_worker=enable_async_worker,
         enable_speculative_beam_history_d2h=enable_speculative_beam_history_d2h,
+        watermark_config=watermark_config,
     )
 
 
@@ -5104,6 +5108,7 @@ def instantiate_sampler(
         enable_speculative_beam_history_d2h=llm_args.
         enable_speculative_beam_history_d2h,
         max_num_sequences=max_num_sequences,
+        watermark_config=getattr(llm_args, "watermark_config", None),
     )
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):

@@ -144,6 +144,16 @@ def _broadcast_round_trip(request: trtllm.Request | ExecutorRequest) -> Executor
     return pickle.loads(pickle.dumps(items))[0].request
 
 
+@pytest.mark.parametrize("watermarking", [None, False])
+def test_request_envelope_preserves_watermark_opt_out(watermarking) -> None:
+    request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10)
+    request.py_watermarking = watermarking
+    restored = _broadcast_round_trip(request)
+    # A non-root rank must see the opt-out, or it samples a different token than the leader.
+    assert restored.inputs.watermarking is watermarking
+    assert executor_request_to_llm_request(42, restored, [], False).py_watermarking is watermarking
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("original_end_id", [None, 99])
 def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> None:
