@@ -2448,3 +2448,37 @@ def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.Mo
     assert run_kwargs["out"].data_ptr() == output.data_ptr()
     assert run_kwargs["softmax_scale"] == fmha._get_bmm1_scale(attn)
     assert run_kwargs["output_scale"] == 1.0
+
+def test_prims_ts_decode_task_manager_builds_schedule_without_gpu() -> None:
+    pytest.importorskip("cutlass.experimental.task_scheduling")
+    from cutlass.experimental.task_scheduling.task_manager import TaskManager
+
+    from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        make_decode_config,
+    )
+    from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
+        _compute_decode_gen_loop_domain,
+        _compute_total_kv_tiles,
+        build_decode_task_manager,
+    )
+
+    seq_len_kv = 256
+    cfg = make_decode_config(headdim=128)
+
+    task_manager = build_decode_task_manager(
+        cfg,
+        seq_len_kv=seq_len_kv,
+        batch_size=1,
+        num_heads_kv=1,
+        verbose=False,
+        exhaustive_deadlock_race_check=False,
+    )
+
+    assert isinstance(task_manager, TaskManager)
+    tile = int(cfg.tile_size_kv)
+    assert tile > 0
+    expected_kv_tiles = -(-seq_len_kv // tile)
+    assert _compute_total_kv_tiles(seq_len_kv, tile) == expected_kv_tiles
+    num_insts = int(cfg.num_insts_kv)
+    remaining = max(expected_kv_tiles - num_insts, 0)
+    assert _compute_decode_gen_loop_domain(expected_kv_tiles, num_insts) == -(-remaining // num_insts)

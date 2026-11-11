@@ -256,6 +256,34 @@ def _expected(storage, pool, slots, x, cache_format):
 
 
 @skip_pre_blackwell
+def test_cache_kernels_builds_and_reuses_kernel_namespace():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel as csa2_kernel
+
+    _sm100()
+    if not csa2_kernel.dsl_available():
+        pytest.skip("CSA2 cache kernels require the CuTe DSL")
+    # Do not clear the process-wide lru_cache: other tests share compiled
+    # kernels built from this namespace.
+    kernels = csa2_kernel._cache_kernels()
+    expected = {
+        "QuantizeScatterKernel",
+        "GatherDequantKernel",
+        "ScatterPackedKernel",
+        "StageCompactKernel",
+        "StageDequantKernel",
+        "SharedCompactKernel",
+        "SharedDecodeKernel",
+        "StageScaleKernel",
+        "StageScaleFinalizeKernel",
+    }
+    missing = expected - set(vars(kernels).keys())
+    assert not missing, f"missing cache kernel classes: {sorted(missing)}"
+    for name in expected:
+        assert isinstance(getattr(kernels, name), type), name
+    assert csa2_kernel._cache_kernels() is kernels
+
+
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "cache_format,dim",
