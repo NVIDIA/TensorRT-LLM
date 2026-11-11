@@ -83,6 +83,7 @@ COORDINATOR_RESERVATION_TIMEOUT_ENV = "TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIM
 COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S = 180.0
 COORDINATOR_RESERVATION_LOCK_STRIPES = 256
 COORDINATOR_STATE_SYNC_INTERVAL_S = 3.0
+COORDINATOR_READINESS_TIMEOUT_S = 5.0
 
 
 def coordinator_reservation_timeout() -> float:
@@ -612,16 +613,19 @@ class CoordinatorClient(DisaggCoordinator):
     async def _sync_coordinator_state(self, interval_s: float) -> None:
         while True:
             await asyncio.sleep(interval_s)
-            async with self._state_sync_lock:
-                await self._refresh_coordinator_state()
+            await self._refresh_coordinator_state()
 
-    async def _refresh_coordinator_state(self) -> None:
-        try:
-            await self._apply_cluster_info(await self.cluster_info())
-        except Exception as error:  # noqa: BLE001
-            self._is_ready = False
-            logger.warning(f"CoordinatorClient state sync failed: {error}")
-        self._state_sync_version += 1
+    async def _refresh_coordinator_state(self, if_version: Optional[int] = None) -> bool:
+        async with self._state_sync_lock:
+            if if_version is not None and if_version != self._state_sync_version:
+                return self._is_ready
+            try:
+                await self._apply_cluster_info(await self.cluster_info())
+            except Exception as error:  # noqa: BLE001
+                self._is_ready = False
+                logger.warning(f"CoordinatorClient state sync failed: {error}")
+            self._state_sync_version += 1
+            return self._is_ready
 
     async def _await_coordinator(self) -> Dict[str, Any]:
         """Poll the coordinator's /cluster_info until reachable, or raise.
@@ -671,10 +675,15 @@ class CoordinatorClient(DisaggCoordinator):
         if not self._is_ready:
             # Another fleet worker may have passed /health before this worker's
             # next background poll. Refresh its local routing state before rejecting.
-            version = self._state_sync_version
-            async with self._state_sync_lock:
-                if not self._is_ready and version == self._state_sync_version:
-                    await self._refresh_coordinator_state()
+            try:
+                # Include lock acquisition and router preparation in the health
+                # budget, independently of the longer inference-request timeout.
+                return await asyncio.wait_for(
+                    self._refresh_coordinator_state(if_version=self._state_sync_version),
+                    timeout=COORDINATOR_READINESS_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                return False
         return self._is_ready
 
     async def _apply_cluster_info(self, info: Dict[str, Any]) -> None:

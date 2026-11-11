@@ -51,6 +51,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     RouterConfig,
     ServerRole,
 )
+from tensorrt_llm.serve import disagg_coordinator as coordinator_module
 from tensorrt_llm.serve.coordinator_server import CoordinatorServer
 from tensorrt_llm.serve.disagg_coordinator import (
     COORDINATOR_RESERVATION_TIMEOUT_ENV,
@@ -488,6 +489,17 @@ async def test_coordinator_client_readiness_is_cached():
     assert await client.is_ready() is True
     client.cluster_info.assert_not_awaited()
     assert client._session is None
+
+    client._is_ready = False
+    # A zero budget exercises timeout handling without waiting on wall time.
+    with patch.object(coordinator_module, "COORDINATOR_READINESS_TIMEOUT_S", 0):
+        assert await client.is_ready() is False
+    client.cluster_info.assert_not_awaited()
+    assert not client._state_sync_lock.locked()
+
+    client.cluster_info.side_effect = None
+    client.cluster_info.return_value = {"is_ready": True}
+    assert await client.is_ready() is True
     await client.stop()
 
 
@@ -502,13 +514,38 @@ async def test_coordinator_state_sync_starts_in_background():
             "server_lists": {"context": [], "generation": []},
         }
     )
-    client._sync_coordinator_state = AsyncMock()
+    client.cluster_info = AsyncMock(
+        side_effect=[
+            RuntimeError("coordinator unavailable"),
+            {"is_ready": False},
+            {"is_ready": True},
+            {"is_ready": True},
+        ]
+    )
+    client._sync_router_server_lists = AsyncMock(
+        side_effect=[None, None, RuntimeError("router preparation failed"), None]
+    )
+    readiness = []
 
-    await client.start()
+    async def tick(interval_s: float) -> None:
+        assert interval_s == client._state_sync_interval_s
+        readiness.append(client._is_ready)
+        if len(readiness) == 5:
+            raise asyncio.CancelledError
 
-    assert client._is_ready is True
-    client._sync_coordinator_state.assert_called_once_with(10)
-    await client.stop()
+    # Control loop iterations without patching other tasks' asyncio.sleep.
+    controlled_asyncio = SimpleNamespace(**{**vars(asyncio), "sleep": tick})
+    with patch.object(coordinator_module, "asyncio", controlled_asyncio):
+        try:
+            await client.start()
+            assert client._is_ready is True
+            assert client._sync_task is not None
+            with pytest.raises(asyncio.CancelledError):
+                await client._sync_task
+            assert readiness == [True, False, False, False, True]
+            assert not client._state_sync_lock.locked()
+        finally:
+            await client.stop()
 
 
 def test_service_discovery_sets_coordinator_state_sync_interval():
