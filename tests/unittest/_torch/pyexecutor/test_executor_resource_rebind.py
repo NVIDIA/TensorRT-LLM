@@ -42,6 +42,12 @@ def _run_bounded(action):
         raise errors[0]
 
 
+def _stop_worker(executor):
+    if executor.worker_thread is not None:
+        executor._worker_phases.put(False)
+        _run_bounded(executor._join_worker_thread)
+
+
 def _enable_real_worker(executor, monkeypatch):
     monkeypatch.setenv("TLLM_NUMA_AWARE_WORKER_AFFINITY", "0")
     executor.worker_started = False
@@ -97,10 +103,11 @@ def test_profiling_worker_and_thread_local_state_survive_resource_rebind(executo
             ex.start_worker()
     finally:
         stop_requested.set()
-        _run_bounded(ex._stop_worker_thread)
+        _stop_worker(ex)
 
 
-def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monkeypatch):
+@pytest.mark.parametrize("terminal", [False, True])
+def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monkeypatch, terminal):
     ex, _events = executor
     _enable_real_worker(ex, monkeypatch)
     cleanup_started = threading.Event()
@@ -124,7 +131,10 @@ def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monk
 
     def release():
         try:
-            ex.release_resources()
+            if terminal:
+                ex.shutdown()
+            else:
+                ex.release_resources()
         except BaseException as error:
             release_errors.append(error)
         finally:
@@ -132,6 +142,7 @@ def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monk
 
     ex._event_loop_wrapper = event_loop
     releaser = None
+    engine = ex.model_engine
     try:
         ex.start_worker()
         assert cleanup_started.wait(5)
@@ -144,7 +155,8 @@ def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monk
         assert released.wait(5)
         if release_errors:
             raise release_errors[0]
-        ex.model_engine.release_executor_resources.assert_called_once()
+        engine.release_executor_resources.assert_called_once()
+        assert ex.worker_thread.is_alive() != terminal
     finally:
         finish_cleanup.set()
         try:
@@ -152,7 +164,7 @@ def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monk
                 releaser.join(10)
                 assert not releaser.is_alive()
         finally:
-            _run_bounded(ex._stop_worker_thread)
+            _stop_worker(ex)
 
 
 @pytest.mark.parametrize(
@@ -202,7 +214,7 @@ def test_phase_failure_is_visible_before_rebind_can_restart(
         assert ex._worker_phase_done.wait(5)
         assert cleanup_errors == [loop_error]
         assert ex._event_loop_error is (loop_error if loop_error is not None else cleanup_error)
-        _run_bounded(ex._stop_worker_thread)
+        _stop_worker(ex)
         assert uncaught == [cleanup_error if cleanup_error is not None else loop_error]
         assert watchdog.called == isinstance(loop_error, Exception)
         assert kill.called == isinstance(loop_error, Exception)
@@ -214,7 +226,7 @@ def test_phase_failure_is_visible_before_rebind_can_restart(
             ex.start_worker()
 
     finally:
-        _run_bounded(ex._stop_worker_thread)
+        _stop_worker(ex)
 
 
 def test_worker_start_failure_does_not_publish_an_unstarted_thread(executor, monkeypatch):
@@ -268,7 +280,7 @@ def test_sampler_start_failure_can_shut_down_active_phase(executor, monkeypatch)
         ex.sampler.async_worker_stop.assert_called_once()
     finally:
         stop_requested.set()
-        _run_bounded(ex._stop_worker_thread)
+        _stop_worker(ex)
 
 
 class _Engine(SimpleNamespace):
@@ -457,8 +469,19 @@ def test_final_shutdown_after_release_does_not_release_resources_twice(executor)
     assert not hasattr(ex, "model_engine")
 
 
-@pytest.mark.parametrize("failure_stage", ["graphs", "synchronize"])
-@pytest.mark.parametrize("release_first", [False, True])
+@pytest.mark.parametrize(
+    "release_first,failure_stage",
+    [
+        (False, "graphs"),
+        (True, "graphs"),
+        (False, "synchronize"),
+        (True, "synchronize"),
+        (False, "connector"),
+        (False, "listeners"),
+        (False, "encoder"),
+        (False, "sampler"),
+    ],
+)
 def test_terminal_release_error_stops_worker_and_allows_shutdown_retry(
     executor, monkeypatch, failure_stage, release_first
 ):
@@ -466,6 +489,18 @@ def test_terminal_release_error_stops_worker_and_allows_shutdown_retry(
     _enable_real_worker(ex, monkeypatch)
     stop_requested = threading.Event()
     cleanup_error = RuntimeError("terminal cleanup failed")
+    ex.kv_connector_manager = Mock()
+    ex.encoder_launch_executor = Mock()
+    ex.sampler = Mock(spec=AsyncWorkerMixin)
+    ex.sampler.async_worker_enabled.return_value = True
+    failure_calls = {
+        "graphs": (ex.model_engine, "release_executor_resources"),
+        "synchronize": (torch.cuda, "synchronize"),
+        "connector": (ex.kv_connector_manager, "shutdown"),
+        "listeners": (ex, "_shutdown_sleep_wakeup_listeners"),
+        "encoder": (ex.encoder_launch_executor, "shutdown"),
+        "sampler": (ex.sampler, "async_worker_stop"),
+    }
 
     def event_loop():
         assert stop_requested.wait(5)
@@ -482,11 +517,7 @@ def test_terminal_release_error_stops_worker_and_allows_shutdown_retry(
         assert worker.is_alive()
         assert ex._worker_phase_done.is_set() == release_first
         with monkeypatch.context() as patch:
-            owner, name = (
-                (engine, "release_executor_resources")
-                if failure_stage == "graphs"
-                else (torch.cuda, "synchronize")
-            )
+            owner, name = failure_calls[failure_stage]
             patch.setattr(owner, name, Mock(side_effect=cleanup_error))
             with pytest.raises(RuntimeError) as error:
                 _run_bounded(ex.shutdown)
@@ -503,7 +534,54 @@ def test_terminal_release_error_stops_worker_and_allows_shutdown_retry(
         assert events.count("unregister") == 1
     finally:
         stop_requested.set()
-        _run_bounded(ex._stop_worker_thread)
+        _stop_worker(ex)
+
+
+@pytest.mark.parametrize("phase_already_done", [False, True])
+def test_terminal_signal_survives_node_close_error(executor, monkeypatch, phase_already_done):
+    ex, events = executor
+    _enable_real_worker(ex, monkeypatch)
+    entered = threading.Event()
+    finish_phase = threading.Event()
+    cleanup_error = RuntimeError("node close failed")
+    node = Mock()
+    node.close.side_effect = cleanup_error
+    ex._openengine_node_server = node
+
+    def event_loop():
+        entered.set()
+        assert finish_phase.wait(5)
+        ex.shutdown_event.set()
+
+    ex._event_loop_wrapper = event_loop
+    try:
+        ex.start_worker()
+        assert entered.wait(5)
+        worker = ex.worker_thread
+        if phase_already_done:
+            finish_phase.set()
+            assert ex._worker_phase_done.wait(5)
+        with pytest.raises(RuntimeError) as error:
+            _run_bounded(ex.shutdown)
+        assert error.value is cleanup_error
+        assert not ex._closed
+        assert ex.resource_manager is not None
+        assert "graphs" not in events and "cache" not in events
+        if not phase_already_done:
+            assert worker.is_alive()
+            assert not ex._worker_phase_done.is_set()
+            finish_phase.set()
+        worker.join(5)
+        assert not worker.is_alive(), "The terminal signal must survive early cleanup failure"
+
+        node.close.side_effect = None
+        _run_bounded(ex.shutdown)
+        assert ex._closed
+        assert events.count("cache") == 1
+        assert events.count("unregister") == 1
+    finally:
+        finish_phase.set()
+        _stop_worker(ex)
 
 
 def test_terminal_pool_retry_stops_worker_after_profiling_release_error(executor, monkeypatch):
@@ -548,13 +626,13 @@ def test_terminal_pool_retry_stops_worker_after_profiling_release_error(executor
         assert events.count("unregister") == 1
     finally:
         stop_requested.set()
-        _run_bounded(ex._stop_worker_thread)
+        _stop_worker(ex)
 
 
 @pytest.mark.parametrize("unsafe_state", ["hang", "pending_dma"])
-def test_bound_unsafe_shutdown_retains_worker(executor, monkeypatch, unsafe_state):
+def test_bound_unsafe_shutdown_retains_resources(executor, monkeypatch, unsafe_state):
     ex, events = executor
-    ex._stop_worker_thread = Mock()
+    ex._join_worker_thread = Mock()
     ex._pp_mpi_progress_stop = threading.Event()
     if unsafe_state == "hang":
         ex.hang_detector.detected.return_value = True
@@ -562,11 +640,58 @@ def test_bound_unsafe_shutdown_retains_worker(executor, monkeypatch, unsafe_stat
         monkeypatch.setattr(executor_module, "_failed_kv_connector_executors", {})
         ex._kv_connector_failed = True
     ex.shutdown()
-    ex._stop_worker_thread.assert_not_called()
+    if unsafe_state == "hang":
+        ex._join_worker_thread.assert_not_called()
+    else:
+        ex._join_worker_thread.assert_called_once()
+        assert executor_module._failed_kv_connector_executors[id(ex)] is ex
     assert not ex._closed
     assert ex.resource_manager is not None
     assert "graphs" not in events
     assert "cache" not in events
+
+
+@pytest.mark.parametrize("unsafe_state", ["hang", "pending_dma"])
+def test_unsafe_terminal_signal_allows_natural_worker_exit(executor, monkeypatch, unsafe_state):
+    ex, events = executor
+    _enable_real_worker(ex, monkeypatch)
+    ex._pp_mpi_progress_stop = threading.Event()
+    entered = threading.Event()
+    finish_phase = threading.Event()
+    monkeypatch.setattr(executor_module, "_failed_kv_connector_executors", {})
+
+    def event_loop():
+        ex.shutdown_event.set()
+        entered.set()
+        assert finish_phase.wait(5)
+
+    ex._event_loop_wrapper = event_loop
+    try:
+        ex.start_worker()
+        assert entered.wait(5)
+        worker = ex.worker_thread
+        if unsafe_state == "hang":
+            ex.hang_detector.detected.return_value = True
+        else:
+            ex._kv_connector_failed = True
+            finish_phase.set()
+        _run_bounded(ex.shutdown)
+        assert not ex._closed
+        assert ex.resource_manager is not None
+        assert ex.kv_cache_transceiver is not None
+        assert not {"graphs", "synchronize", "unregister", "cache"}.intersection(events)
+        if unsafe_state == "hang":
+            assert worker.is_alive()
+            assert not ex._worker_phase_done.is_set()
+        else:
+            assert not worker.is_alive()
+            assert executor_module._failed_kv_connector_executors[id(ex)] is ex
+        finish_phase.set()
+        worker.join(5)
+        assert not worker.is_alive(), "No second stop signal should be needed"
+    finally:
+        finish_phase.set()
+        _stop_worker(ex)
 
 
 @pytest.mark.parametrize("closed,released", [(False, False), (True, False), (True, True)])

@@ -2129,9 +2129,8 @@ class PyExecutor:
                 # including on an exceptional exit, before rebinding.
                 self._worker_phase_done.set()
 
-    def _stop_worker_thread(self) -> None:
+    def _join_worker_thread(self) -> None:
         if self.worker_thread is not None:
-            self._worker_phases.put(False)
             self.worker_thread.join()
 
     def start_worker(self):
@@ -2568,6 +2567,10 @@ class PyExecutor:
         """Finally close the executor; closed executors cannot be rebound."""
         if self._closed:
             return
+        if self.worker_thread is not None:
+            # Terminal shutdown never starts another phase, even if cleanup
+            # raises. The current wrapper and its finally still run to completion.
+            self._worker_phases.put(False)
         # Capture model owners before any rank-local shutdown step can fail;
         # outer workers still need them for an all-rank unsafe preflight.
         terminal_engines = list(getattr(self, "_terminal_model_engines", ()))
@@ -2581,16 +2584,12 @@ class PyExecutor:
                     release_model_owned_graphs=True):
                 return
         else:
-            try:
-                for engine in self._terminal_model_engines:
-                    engine.release_executor_resources(
-                        release_model_owned_graphs=True)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-            finally:
-                # The released phase has no live transfers or execution work.
-                # Terminal cleanup failure must not leave its idle worker alive.
-                self._stop_worker_thread()
+            self._join_worker_thread()
+            for engine in self._terminal_model_engines:
+                engine.release_executor_resources(
+                    release_model_owned_graphs=True)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
         self._closed = True
         # The snapshot above keeps the model owners reachable for the outer
         # worker's collective terminal cleanup.
@@ -2605,7 +2604,7 @@ class PyExecutor:
         """Stop execution and release GPU resources; retain model ownership."""
         if getattr(self, "_shutdown_runtime_complete", False):
             if release_model_owned_graphs:
-                self._stop_worker_thread()
+                self._join_worker_thread()
             return self._release_execution_pools()
         node_server = getattr(self, "_openengine_node_server", None)
         if node_server is not None:
@@ -2644,6 +2643,8 @@ class PyExecutor:
             return False
         if self.worker_started:
             self._worker_phase_done.wait()
+        if release_model_owned_graphs:
+            self._join_worker_thread()
         if self.kv_connector_manager is not None and not self._kv_connector_failed:
             self.kv_connector_manager.shutdown()
         if self.dist.pp_size > 1 and self.worker_started:
@@ -2680,10 +2681,6 @@ class PyExecutor:
             # synchronization and allocator teardown can touch DMA-owned memory
             # or hang on a failed device, so retain the whole execution state.
             return False
-        if release_model_owned_graphs:
-            # Terminal shutdown cannot leave this idle worker holding model
-            # owners if later teardown fails. Profiling retains its TLS state.
-            self._stop_worker_thread()
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
         # that is referenced by raw pointers inside captured CUDA graphs.  If

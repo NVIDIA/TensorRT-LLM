@@ -246,7 +246,9 @@ def test_executor_stops_its_progress_thread_on_shutdown(monkeypatch, hang_detect
         if thread is not None:
             thread.stop()
         # The hang-detected path returns without joining these threads.
-        executor._stop_worker_thread()
+        executor._worker_phases.put(False)
+        executor.worker_thread.join(timeout=5)
+        assert not executor.worker_thread.is_alive()
         executor.broadcast_sample_state_handler.join()
         executor._broadcast_mpi_comm.Free()
 
@@ -266,7 +268,9 @@ def test_executor_runs_without_progress_thread_when_unavailable(monkeypatch, cau
         executor.shutdown()
         assert exit_hooks.unregistered == []
     finally:
-        executor._stop_worker_thread()
+        executor._worker_phases.put(False)
+        executor.worker_thread.join(timeout=5)
+        assert not executor.worker_thread.is_alive()
         executor.broadcast_sample_state_handler.join()
         executor._broadcast_mpi_comm.Free()
 
