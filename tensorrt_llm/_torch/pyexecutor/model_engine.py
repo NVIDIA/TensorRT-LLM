@@ -874,11 +874,20 @@ class ModelEngine:
         with self.warmup_scope():
             self._warmup_impl(resource_manager)
 
+    def _configure_allreduce_tuning(self) -> None:
+        """Configure profiling buckets from the resolved budget before runner warmup."""
+        from ..custom_ops.torch_custom_ops import AllReduceRunner
+
+        if not self.llm_args.enable_autotuner:
+            return
+        AllReduceRunner.configure_tuning_buckets(self.max_num_tokens)
+
     def _warmup_impl(self, resource_manager: ResourceManager | None = None) -> None:
         """
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
+        self._configure_allreduce_tuning()
         assert resource_manager is not None, "scheduled warmup requires a resource manager"
         assert isinstance(self._runner, ScheduledModelRunner)
         self._runner.warmup(resource_manager)
