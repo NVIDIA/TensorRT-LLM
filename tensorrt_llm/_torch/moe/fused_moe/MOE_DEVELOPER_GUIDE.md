@@ -512,7 +512,11 @@ literal also selects, descend from the CUTLASS family and stay in
 The exported CuteDSL kernel sources for `TrtllmCutedslMegaMoeNvfp4Impl` live under
 `tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/`, a copy of the upstream
 cutedsl_megamoe sources maintained in-tree; update it by copying newer upstream
-code in. `moe/kernels/megamoe_kernels.py` exposes the `KernelClass` entry
+code in. A copy-in must carry the tree's local live-row changes (`live_row_layout.py`,
+`helpers/live_rows.py`, their use in `token_comm.py` and `topk_reduce.py`, and the
+`live_row_word` argument of the Blackwell `block_scaled_swap_ab_mega_moe_kernel.py`);
+`tests/unittest/_torch/moe/test_live_rows.py` fails on the CPU if the kernel loses it.
+`moe/kernels/megamoe_kernels.py` exposes the `KernelClass` entry
 points. The runner constructs
 `ProblemDesc` and `ImplDesc` and dispatches internally; the public backend
 remains `MEGAMOE_CUTEDSL`. Rubin's smaller token buckets use the genphase

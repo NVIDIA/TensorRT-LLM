@@ -142,7 +142,10 @@ def test_megamoe_cutedsl_live_row_word_writes_are_stream_ordered(
     unsupported.write(live_rows.encode(3, 8))
     assert int(unsupported.tensor(device).item()) == live_rows.ALL_ROWS
     unsupported.write(live_rows.NO_ROWS)
-    assert int(unsupported.tensor(device).item()) == live_rows.ALL_ROWS and not unsupported._stream_writes_supported
+    assert (
+        int(unsupported.tensor(device).item()) == live_rows.ALL_ROWS
+        and not unsupported._stream_writes_supported
+    )
 
 
 def _init_worker(custom_paths: list) -> None:

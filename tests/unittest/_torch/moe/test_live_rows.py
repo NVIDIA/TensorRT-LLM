@@ -14,6 +14,8 @@
 # limitations under the License.
 """The live-row word's host reference (``live_row_count``, which the kernels compute too) and the engine's words."""
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -157,7 +159,9 @@ def test_launches_over_part_of_a_forward_keep_every_row(monkeypatch: pytest.Monk
             chunk_word = lr.current_word("cuda:0")
         assert lr.current_word("cuda:0") is engine
     assert chunk_word is lr._ALL_ROWS_WORDS[0]
-    assert lr.live_row_count(chunk_word._value, _CHUNKED_FORWARD["chunk"]) == _CHUNKED_FORWARD["chunk"]
+    assert (
+        lr.live_row_count(chunk_word._value, _CHUNKED_FORWARD["chunk"]) == _CHUNKED_FORWARD["chunk"]
+    )
 
 
 @pytest.mark.parametrize("num_chunks", [1, 2])
@@ -197,7 +201,9 @@ def test_a_moe_layer_reads_the_forward_word_only_when_it_runs_in_one_chunk(
     seen = []
 
     def run_chunks(x_chunks: List[torch.Tensor], *args: object, **kwargs: object) -> None:
-        seen.extend(lr.live_row_count(lr.current_word("cuda:0")._value, c.shape[0]) for c in x_chunks)
+        seen.extend(
+            lr.live_row_count(lr.current_word("cuda:0")._value, c.shape[0]) for c in x_chunks
+        )
         raise Stop
 
     monkeypatch.setattr(scheduler, "_run_chunks", run_chunks)
@@ -213,3 +219,35 @@ def test_a_moe_layer_reads_the_forward_word_only_when_it_runs_in_one_chunk(
         )
     # One launch over the whole forward keeps the real rows; chunks keep every row.
     assert seen == ([1600] if num_chunks == 1 else [chunk] * num_chunks)
+
+
+def test_the_sm100_megamoe_kernel_still_reads_the_word() -> None:
+    """The kernel tree is refreshed by copying upstream sources in; a copy that drops the
+    live-row changes would keep every padding row with nothing else failing on the CPU."""
+    import tensorrt_llm
+
+    kernel_file = (
+        Path(tensorrt_llm.__file__).parent
+        / "_torch/moe/kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega"
+        / "block_scaled_swap_ab_mega_moe_kernel.py"
+    )
+    tree = ast.parse(kernel_file.read_text())
+    kernel = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BlockScaledSwapAbMegaMoeKernel"
+    )
+    declares = [
+        node.value.value
+        for node in kernel.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "reads_live_row_word"
+    ]
+    call = next(
+        node
+        for node in kernel.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__call__"
+    )
+    assert declares == [True]
+    assert "live_row_word" in [argument.arg for argument in call.args.args]
