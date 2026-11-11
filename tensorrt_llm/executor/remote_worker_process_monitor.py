@@ -33,6 +33,11 @@ _RECEIVE_WAIT = 0.1
 # arrives after the helper's final report. Defer to that outcome briefly.
 _RETURN_GRACE = 2.0
 _START_TIMEOUT = 10.0
+# MPI sessions start a task on all ranks together after a barrier. Each live rank
+# starts its helper first in the worker call, and reports within _START_TIMEOUT or
+# raises. A rank still missing this long after the first report exited before
+# reporting, or reports elsewhere, while its peers wait in an init collective.
+_REGISTRATION_TIMEOUT = 3 * _START_TIMEOUT
 WORKER_WATCH_HINT = (
     "Set TRTLLM_WORKER_WATCH_HOST to this proxy's address reachable from every MPI worker "
     "and allow worker-to-proxy TCP traffic through the firewall. "
@@ -74,6 +79,7 @@ class RemoteWorkerProcessMonitor:
         self._stopped = threading.Event()
         self._seen: dict[int, tuple[dict, float]] = {}
         self._returned: dict[int, tuple[dict, float]] = {}
+        self._first_report_at: float | None = None
         self._failure: dict | None = None
         host = os.environ.get("TRTLLM_WORKER_WATCH_HOST") or get_local_ip()
         try:
@@ -182,6 +188,8 @@ class RemoteWorkerProcessMonitor:
             if previous is not None and sequence <= previous[0]["sequence"]:
                 return
             self._seen[rank] = (report, time.monotonic())
+            if self._first_report_at is None:
+                self._first_report_at = self._seen[rank][1]
             if report.get("kind") == "returned":
                 self._returned.setdefault(rank, (report, time.monotonic()))
         if report.get("kind") not in ("alive", "returned"):
@@ -203,9 +211,7 @@ class RemoteWorkerProcessMonitor:
                 # thread one receive interval to surface reports buffered while
                 # the whole process was stopped.
                 first_wait = (
-                    _RECEIVE_WAIT
-                    if now - waited_from > _RECEIVE_WAIT + _HEARTBEAT_INTERVAL
-                    else 0
+                    _RECEIVE_WAIT if now - waited_from > _RECEIVE_WAIT + _HEARTBEAT_INTERVAL else 0
                 )
                 for index in range(max(64, self._world_size * 64)):
                     if self._stopped.is_set() or not self._queue.poll(
@@ -228,10 +234,29 @@ class RemoteWorkerProcessMonitor:
                     expired = [
                         r for r, seen in self._seen.values() if now - seen > _HEARTBEAT_TIMEOUT
                     ]
+                    first = self._first_report_at
+                    unregistered = (
+                        sorted(set(range(self._world_size)) - self._seen.keys())
+                        if first is not None and now - first > _REGISTRATION_TIMEOUT
+                        else []
+                    )
                 if returned:
                     self._fail({**returned[0], "reason": "worker returned without an MPI result"})
                 elif expired:
                     self._fail({**expired[0], "reason": "heartbeat timed out"})
+                elif unregistered:
+                    # No process identity is known for a rank that never reported.
+                    self._fail(
+                        {
+                            "rank": unregistered[0],
+                            "pid": 0,
+                            "host": "unknown",
+                            "missing": unregistered,
+                            "endpoint": self.endpoint.address,
+                            "reason": f"no report within {_REGISTRATION_TIMEOUT:g} s "
+                            "of the first rank's report",
+                        }
+                    )
         except Exception as error:
             # Losing the supervisor is itself a terminal loss of worker coverage.
             self._fail(

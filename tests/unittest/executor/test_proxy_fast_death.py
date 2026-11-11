@@ -229,6 +229,8 @@ class _FakeWorkerInitStatusQueue:
 class _DeadAfterRegistrationMonitor:
     """Report a worker death only after the proxy registers identities."""
 
+    remote_failure = None
+
     def __init__(self):
         self.identities = []
 
@@ -964,6 +966,7 @@ def _proxy_awaiting_worker_init(
     proxy.mpi_session.check_worker_error.return_value = None
     proxy._worker_process_monitor = _Mock()
     proxy._worker_process_monitor.find_dead_worker.return_value = None
+    proxy._worker_process_monitor.remote_failure = None
 
     status_queue = _Mock()
     if ready_status is None:
@@ -1066,6 +1069,56 @@ def test_remote_supervision_failure_after_ready_preserves_startup_error():
     assert proxy._fatal_error is cause
     assert pending.queue.get_nowait().root_cause is cause
     called = [call[0] for call in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
+
+
+@pytest.mark.timeout(20, method="thread")
+def test_rank_lost_before_its_first_report_fails_init_before_ready(monkeypatch):
+    """A remote rank that never reports must fail init, not wait for READY.
+
+    Regression: a rank that exited after submission but before its helper's
+    first report could never expire, so the proxy waited for READY while the
+    reporting ranks blocked in the init collective.
+    """
+    from tensorrt_llm.executor import remote_worker_process_monitor as remote
+    from tensorrt_llm.executor.worker_process_monitor import WorkerProcessMonitor
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionClient
+
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monkeypatch.setattr(remote, "_REGISTRATION_TIMEOUT", 1.0)
+    proxy = _proxy_awaiting_worker_init(owns_session=True)
+    proxy.worker_init_status_queue.poll.side_effect = lambda _timeout: _time.sleep(0.05)
+    proxy.model_world_size = 2
+    proxy._shutdown_event = threading.Event()
+    proxy._worker_process_monitor = WorkerProcessMonitor()
+    watches = []
+
+    def submit(*_args, _process_watch, **_kwargs):
+        # Rank 0 reports and keeps running; rank 1 is gone before its report.
+        watches.append(remote.WorkerProcessWatch(_process_watch, 0))
+        return [_Future()]
+
+    proxy.mpi_session = _Mock(spec=RemoteMpiCommSessionClient)
+    proxy.mpi_session.check_worker_error.return_value = None
+    proxy.mpi_session.submit.side_effect = submit
+    pending = _FakeResult()
+    proxy._results = {1: pending}
+    try:
+        with pytest.raises(RuntimeError, match="died during initialization") as error:
+            proxy._start_executor_workers({})
+    finally:
+        proxy._worker_process_monitor.close()
+        for watch in watches:
+            watch.close()
+
+    cause = error.value.__cause__
+    assert isinstance(cause, RuntimeInitError) and cause.reason == "worker_died"
+    assert "ranks [1] did not report to process-watch endpoint tcp://127.0.0.1:" in str(cause)
+    # The rank may still run with its reports going elsewhere: keep the network hint.
+    assert remote.WORKER_WATCH_HINT in cause.hint
+    assert proxy._engine_dead is True
+    assert isinstance(pending.queue.get_nowait(), EngineDeadError)
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
     assert called.index("shutdown_abort") < called.index("release_exit_joins")
 
 

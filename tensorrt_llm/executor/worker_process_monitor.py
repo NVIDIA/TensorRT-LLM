@@ -131,6 +131,11 @@ class WorkerProcessMonitor:
         """Do not admit requests before every remote worker is supervised."""
         return self._remote is None or self._remote.wait_ready()
 
+    @property
+    def remote_failure(self) -> Optional[dict]:
+        """Return the remote supervision failure report, or None while healthy."""
+        return None if self._remote is None else self._remote.failure
+
     def register(self, identities: List[WorkerProcessIdentity]) -> None:
         """Register locally spawned worker identities for liveness checks."""
         with self._lock:

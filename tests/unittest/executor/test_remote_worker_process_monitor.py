@@ -105,6 +105,35 @@ def test_remote_readiness_requires_every_rank(monkeypatch, caplog):
         watch.close()
 
 
+@pytest.mark.timeout(20, method="thread")
+def test_rank_missing_after_the_first_report_fails_startup(monkeypatch):
+    # Regression: a rank that exited before its helper's first report was never
+    # seen, so it could not expire, and the proxy waited for READY while the
+    # surviving ranks blocked in the init collective.
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monkeypatch.setattr(remote, "_REGISTRATION_TIMEOUT", 2.0)
+    wake = threading.Event()
+    monitor = WorkerProcessMonitor()
+    endpoint = monitor.start_remote(2, wake)
+    watch = None
+    try:
+        # The deadline starts with the first report, not with the listener.
+        assert not wake.wait(2.5), "Ranks failed before any rank reported"
+        watch = remote.WorkerProcessWatch(endpoint, 0)
+        assert not wake.wait(0.5), "A missing rank failed before its deadline"
+        assert monitor.find_dead_worker() is None
+        assert wake.wait(6), "A rank that never reported stayed invisible"
+        dead = monitor.find_dead_worker()
+        assert dead is not None and dead.rank == 1
+        failure = monitor.remote_failure
+        assert failure["missing"] == [1] and failure["endpoint"] == endpoint.address
+        assert "no report within 2 s" in failure["reason"]
+    finally:
+        monitor.close()
+        if watch is not None:
+            watch.close()
+
+
 @pytest.mark.parametrize("override", [None, "missing.invalid"])
 def test_unresolvable_watch_host_reports_configuration_error(monkeypatch, override):
     if override is None:
@@ -236,6 +265,7 @@ def test_queued_heartbeats_prevent_false_death_after_receiver_pause(monkeypatch)
     reports = [dict(rank=r, pid=r + 1, host="worker", sequence=0, kind="alive") for r in (0, 1)]
     monitor._seen = {r["rank"]: (r, 0.0) for r in reports}
     monitor._returned = {}
+    monitor._first_report_at = 0.0
     frames = deque(dict(r, sequence=1) for r in reports)
 
     def poll(_timeout):
@@ -270,6 +300,7 @@ def test_continuous_traffic_cannot_hide_an_expired_rank(monkeypatch, invalid_sig
     reports = [dict(rank=r, pid=r + 1, host="worker", sequence=0, kind="alive") for r in (0, 1)]
     monitor._seen = {0: (reports[0], 100.0), 1: (reports[1], 0.0)}
     monitor._returned = {}
+    monitor._first_report_at = 0.0
     received = 0
 
     def poll(_timeout):
@@ -317,6 +348,7 @@ def _paused_receiver(monkeypatch, buffered_until_first_wait):
     reports = [dict(rank=r, pid=r + 1, host="worker", sequence=0, kind="alive") for r in (0, 1)]
     monitor._seen = {r["rank"]: (r, clock[0]) for r in reports}
     monitor._returned = {}
+    monitor._first_report_at = clock[0]
     frames = deque()
     paused = []
     empty_polls = []

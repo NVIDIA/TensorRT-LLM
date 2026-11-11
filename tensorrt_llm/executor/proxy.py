@@ -29,7 +29,7 @@ import torch
 import zmq
 import zmq.asyncio
 
-from tensorrt_llm._errors import RuntimeInitError
+from tensorrt_llm._errors import ERROR_HINTS, RuntimeInitError
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._startup_errors import (StartupErrorInfo,
                                           is_worker_startup_error,
@@ -948,12 +948,22 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._command_failure is not None:
             return self._command_failure
         dead_worker = self._worker_process_monitor.find_dead_worker()
-        if dead_worker is not None:
+        if dead_worker is None:
+            return None
+        failure = self._worker_process_monitor.remote_failure
+        if failure is not None and failure.get("missing"):
+            # No process is known for a rank that never reported: it exited
+            # first, or its reports reach a different endpoint.
             return RuntimeInitError(
-                f"MPI worker rank {dead_worker.rank} (pid {dead_worker.pid}) "
-                "lost process liveness",
-                reason="worker_died")
-        return None
+                f"MPI worker ranks {failure['missing']} did not report to "
+                f"process-watch endpoint {failure['endpoint']} during startup",
+                reason="worker_died",
+                hint=f"{ERROR_HINTS['worker_died']} If a rank is still running, "
+                f"its reports do not reach this proxy. {WORKER_WATCH_HINT}")
+        return RuntimeInitError(
+            f"MPI worker rank {dead_worker.rank} (pid {dead_worker.pid}) "
+            "lost process liveness",
+            reason="worker_died")
 
     def _start_executor_workers(self, worker_kwargs):
 
