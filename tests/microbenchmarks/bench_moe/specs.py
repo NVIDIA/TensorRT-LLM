@@ -458,4 +458,17 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         situ_beta=4.0,  # text_config.activation_situ_beta
         situ_linear_beta=25.0,  # text_config.activation_situ_linear_beta
     ),
+    "kimi_k3_1_pro": ModelSpec(
+        name="kimi_k3_1_pro",
+        num_experts=896,
+        top_k=16,
+        hidden_size=3584,
+        intermediate_size=3072,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    ),
 }
