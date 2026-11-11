@@ -382,7 +382,7 @@ def test_chunk_allocated_scratch_replay_matches_paged_continuation(
                         manager.layer_to_pool_mapping_dict[layer] for layer in (encoder, decoder)
                     ]
                     assert pools[0] != pools[1]
-                    assert all(cache.get_scratch_desc(pool).slot_ids for pool in pools)
+                    assert all(cache.get_scratch_slots(pool) for pool in pools)
                     assert (
                         manager.get_swa_buffer(0).data_ptr() != manager.get_swa_buffer(5).data_ptr()
                     )
@@ -469,8 +469,8 @@ def test_dspark_scratch_preserves_reserved_pages(cache_config, monkeypatch):
                 assert reserved_page >= 0
                 reserved_index = converter([reserved_page], CSA2CacheRole.SWA.index_mode)[0]
             else:
-                desc = cache.get_scratch_desc(pool)
-                assert desc.range.beg <= 4 < desc.range.end
+                scratch = cache.get_swa_scratch_range(pool)
+                assert scratch.beg <= 4 < scratch.end
                 assert base[4] == reserved_page
                 assert manager.get_cache_indices(0, 0, CSA2CacheRole.SWA)[4] == reserved_index
                 cache.suspend()

@@ -1469,6 +1469,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def receive_gen_init(self, admitted: List[LlmRequest], defer: bool = False) -> None:
         return None
 
+    def take_gen_receive_counters(self) -> Tuple[int, float]:
+        return 0, 0.0
+
     def start_deferred_gen_receives(self, wait_all: bool = True) -> None:
         return None
 
