@@ -4,10 +4,11 @@
 # Per-stage rerun policy for failed tests in L0 test stages, read by
 # jenkins/scripts/test_rerun.py (generate_rerun_tests_list --stage-name).
 #
-# It applies to stages whose pytest runs in the test container
-# (runLLMTestlistOnPlatformImpl). Stages that run through Slurm
-# (runLLMTestlistWithSbatch) do not rerun failed tests, so neither `default`
-# nor a rule here has any effect on them.
+# It applies to stages that run their tests through jenkins/scripts/run_tests.py:
+# stages whose pytest runs in the test container (runLLMTestlistOnPlatformImpl)
+# and single-node Slurm sbatch stages (runLLMTestlistWithSbatch) other than
+# PerfSanity. Multi-node and PerfSanity sbatch stages do not rerun failed tests,
+# so neither `default` nor a rule here has any effect on them.
 #
 # `default` applies to every such stage and must set every key below; it is the
 # only place the default values are defined. Each `stages` rule names a stage
