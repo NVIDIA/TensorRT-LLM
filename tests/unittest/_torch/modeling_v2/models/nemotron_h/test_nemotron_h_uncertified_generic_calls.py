@@ -3,7 +3,8 @@
 """A nemotron_h target's ``UNCERTIFIED_GENERIC_CALLS`` names the stock code it runs.
 
 A target that runs stock tensorrt_llm code no catalog entry certifies -- the BF16 tep8
-target's opt-in routed experts run in Modeling V1's ``create_moe`` layer -- lists it in
+target's opt-in routed experts and every routed expert of the BF16 dep16 target run in
+Modeling V1's ``create_moe`` layer -- lists it in
 ``UNCERTIFIED_GENERIC_CALLS``, so the dependency is visible and the list shrinks as entries
 replace stock calls. The same contract as the Kimi K3 targets'. This reads the source and
 imports nothing.
@@ -109,14 +110,21 @@ def _imports_moe(target_dir: Path) -> bool:
 
 
 def test_every_target_on_v1_moe_declares_its_generic_calls():
-    """A target that reaches Modeling V1's fused MoE says so; the BF16 tep8 target does."""
+    """A target that reaches Modeling V1's fused MoE says so; the BF16 tep8 and dep16 targets
+    do."""
     undeclared = [
         d.name
         for d in sorted(_FAMILY_DIR.iterdir())
         if (d / "modeling.py").is_file() and _imports_moe(d) and d not in _declaring_targets()
     ]
-    assert not undeclared, f"import tensorrt_llm._torch.moe without UNCERTIFIED_GENERIC_CALLS: {undeclared}"
-    assert "nemotron3_ultra_bf16__sm_100__tep8" in {d.name for d in _declaring_targets()}
+    assert not undeclared, (
+        f"import tensorrt_llm._torch.moe without UNCERTIFIED_GENERIC_CALLS: {undeclared}"
+    )
+    declaring = {d.name for d in _declaring_targets()}
+    assert {
+        "nemotron3_ultra_bf16__sm_100__tep8",
+        "nemotron3_ultra_bf16__sm_100__dep16",
+    } <= declaring
 
 
 @pytest.mark.parametrize("target_dir", _declaring_targets(), ids=lambda d: d.name)
