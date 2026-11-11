@@ -137,7 +137,7 @@ SUPPORTED_SM_VERSIONS = (90, 100, 103)
 _BLACKWELL_SM_VERSIONS = (100, 103)
 _BLACKWELL_WAVE_SMS = 148
 # Targets that take the register rungs and compile options below measured on hardware
-# (tuned on datacenter Blackwell, measured on Hopper H100 and H200 SXM).
+# (tuned on datacenter Blackwell, measured on Hopper H100 and H200 SXM and H20).
 _TUNED_SM_VERSIONS = (90, 100, 103)
 
 
@@ -146,14 +146,31 @@ def wave_sms(num_sms: int, sm_version: int) -> int:
     return _BLACKWELL_WAVE_SMS if sm_version in _BLACKWELL_SM_VERSIONS else num_sms
 
 
-# Co-resident clusters at one CTA per SM per cluster size on the 132-SM Hopper parts (H100 and
-# H200 SXM, cudaOccupancyMaxActiveClusters). GPC floorsweeping hosts fewer 4-CTA clusters than
-# 132 / 4; other Hopper SM counts scale the table.
+# Co-resident clusters per cluster size at one CTA per SM (cudaOccupancyMaxActiveClusters), by
+# SM count: H100 and H200 SXM (132 SMs) and H20 (78 SMs). GPC floorsweeping hosts fewer clusters
+# than SMs / cluster size, and no H20 GPC holds a cluster of more than 12 CTAs. Other Hopper SM
+# counts scale the 132-SM row and keep to portable clusters, which every SM90 GPU launches.
 _HOPPER_CLUSTER_ROWS = {
-    2: 66, 3: 39, 4: 30, 5: 22, 6: 17, 7: 15, 8: 15, 9: 9,
-    10: 7, 11: 7, 12: 7, 13: 7, 14: 7, 15: 7, 16: 7,
+    132: {
+        2: 66, 3: 39, 4: 30, 5: 22, 6: 17, 7: 15, 8: 15, 9: 9,
+        10: 7, 11: 7, 12: 7, 13: 7, 14: 7, 15: 7, 16: 7,
+    },
+    78: {
+        2: 39, 3: 18, 4: 15, 5: 10, 6: 8, 7: 7, 8: 7, 9: 3,
+        10: 3, 11: 1, 12: 1, 13: 0, 14: 0, 15: 0, 16: 0,
+    },
 }  # fmt: skip
-_HOPPER_CLUSTER_SMS = 132
+_HOPPER_PORTABLE_CLUSTER = 8
+
+
+def hopper_cluster_rows(cluster_size: int, num_sms: int) -> int:
+    """Clusters of ``cluster_size`` CTAs, one CTA per SM, that a Hopper GPU co-schedules."""
+    measured = _HOPPER_CLUSTER_ROWS.get(num_sms)
+    if measured is not None:
+        return measured[cluster_size]
+    if cluster_size > _HOPPER_PORTABLE_CLUSTER:
+        return 0
+    return _HOPPER_CLUSTER_ROWS[132][cluster_size] * num_sms // 132
 
 
 def cluster_fits(cluster_size: int, rows: int, num_sms: int, sm_version: int) -> bool:
@@ -164,7 +181,7 @@ def cluster_fits(cluster_size: int, rows: int, num_sms: int, sm_version: int) ->
     """
     if sm_version in _BLACKWELL_SM_VERSIONS or cluster_size < 2:
         return True
-    return rows <= _HOPPER_CLUSTER_ROWS[cluster_size] * num_sms // _HOPPER_CLUSTER_SMS
+    return rows <= hopper_cluster_rows(cluster_size, num_sms)
 
 
 def _regsel_rows(dtype: torch.dtype, num_rows: int, num_sms: int) -> bool:
@@ -1393,7 +1410,13 @@ def _route_16bit(
     fitting, histogram bin counts) edit it in place. Rules that differ by dtype test ``dtype``.
     """
     wave = wave_sms(num_sms, sm_version)
-    if dtype is torch.float16 and k == 2048 and 32768 < n <= 32768 + 64 and 32 < b <= 64:
+    if (
+        dtype is torch.float16
+        and k == 2048
+        and 32768 < n <= 32768 + 64
+        and 32 < b <= 64
+        and cluster_fits(2, b, num_sms, sm_version)
+    ):
         return {
             "kernel": "reg_clus",
             "tpl": (BLKC, 2, 2, k),
