@@ -1479,6 +1479,55 @@ def test_certified_cells(entry, cell, check, certifying, monkeypatch) -> None:  
     check(cell, monkeypatch)
 
 
+def _stable_kv_store_is_shared(cell) -> None:
+    args, pool = _kv_store_build(cell.spec, seed=_seed(cell.why))
+    if not isinstance(pool, _KvEnginePool):
+        shared = _stable.qsa_paged_kv_store.reference(**args)
+        _stable.qsa_paged_kv_store(**args)
+        _kv_store_compare((args["k_cache"], args["v_cache"]), shared)
+        return
+    try:
+        # The shared launcher stores into dense copies of the touched pages; the copy into the
+        # engine's pool, whose pages straddle 2^32 elements.
+        dense_k, dense_v, renamed = pool.dense(args["block_table"])
+        shared = _stable.qsa_paged_kv_store.reference(
+            **{**args, "k_cache": dense_k, "v_cache": dense_v, "block_table": renamed}
+        )
+        _stable.qsa_paged_kv_store(**args)
+        _kv_store_compare(pool.gathered(), shared)
+    finally:
+        pool.close()
+
+
+def _stable_sparse_gqa_is_shared(cell) -> None:
+    args = _sparse_gqa_build(cell.spec, _seed(cell.why))
+    got = _stable.qsa_paged_sparse_gqa(**args)
+    want = _stable.qsa_paged_sparse_gqa.reference(**args)
+    assert got.dtype == want.dtype and got.shape == want.shape, (got.shape, want.shape)
+    assert torch.equal(_bits(got), _bits(want)), "the stable-JIT kernels differ from the shared"
+
+
+_STABLE_CASES = [
+    pytest.param(
+        check, cell,
+        id=f"{name}: {cell.why[:44]}",
+        marks=[pytest.mark.high_cuda_memory] if cell.spec.get("large") else [],
+    )
+    for name, cells, check in (
+        ("kv_store", qsa_paged_kv_store.CELLS, _stable_kv_store_is_shared),
+        ("sparse_gqa", qsa_paged_sparse_gqa.CELLS, _stable_sparse_gqa_is_shared),
+    )
+    for cell in cells
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("check, cell", _STABLE_CASES)
+def test_stable_kernels_are_the_shared_launchers(check, cell) -> None:
+    """`qsa_triton_kernels__stable_jit`'s kernel copies write bitwise what the shared QSA
+    launchers they copy write, at every cell of the entries that launch them."""
+    check(cell)
+
+
 # `DecodeTarget._attention_block` at the checkpoint's shapes for one rank of a layout.
 
 PRL_DEV, PRL_BF, PRL_F8 = "cuda", torch.bfloat16, torch.float8_e4m3fn
