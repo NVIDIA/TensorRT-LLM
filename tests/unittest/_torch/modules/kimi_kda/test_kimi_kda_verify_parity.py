@@ -172,15 +172,14 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
 
 
 class _LayerCache:
-    def __init__(self, slots, dim3, w, h, v, k, t_max, device):
+    def __init__(self, slots, dim3, w, h, v, k, t_max, device, ssm_dtype=torch.float32):
         self.conv = torch.zeros(slots, dim3, w, dtype=torch.bfloat16, device=device)
-        self.temporal = torch.zeros(slots, h, v, k, dtype=torch.float32, device=device)
+        self.temporal = torch.zeros(slots, h, v, k, dtype=ssm_dtype, device=device)
         self.intermediate_conv_window = torch.zeros(
             slots, t_max, dim3, w, dtype=torch.bfloat16, device=device
         )
-        self.intermediate_ssm = torch.zeros(
-            slots, t_max, h, v, k, dtype=torch.float32, device=device
-        )
+        # The cache manager allocates the scratch states in the pool's dtype.
+        self.intermediate_ssm = torch.zeros(slots, t_max, h, v, k, dtype=ssm_dtype, device=device)
         # This double drives the sequential-verify path, not the KDA
         # fused-replay path, so it has no kda_* replay caches.
         self.has_kda_replay_caches = False
@@ -334,20 +333,8 @@ def test_kda_decode_matches_reference(num_heads):
     assert torch.equal(actual_cache.temporal[untouched], expected_cache.temporal[untouched])
 
 
-@pytest.mark.parametrize("batch", [1, 3])
-@pytest.mark.parametrize("t_steps", [2, 3])
-@pytest.mark.parametrize("mode", ["per_step", "batched", "batched_fused_proj"])
-def test_kda_verify_matches_sequential_decode(batch, t_steps, mode):
-    if not torch.cuda.is_available():
-        pytest.skip("needs a GPU")
-    torch.manual_seed(0)
-    device = "cuda"
-    cfg = _Cfg()
-    lin = cfg.linear_attn_config
-    h = lin["num_heads"]
-    dim = h * lin["head_dim"]
-    w = lin["short_conv_kernel_size"]
-
+def _make_verify_runtime(cfg, mode: str, t_steps: int, device: str):
+    """The mixer set up for one verify ``mode``, and the scratch buffers' step count."""
     runtime = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     # dt_bias is torch.empty at construction and only filled by
     # load_weights(); with random weights it holds heap garbage, and a
@@ -364,6 +351,24 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps, mode):
     else:
         # The packed convolution weight selects the one-launch verify path.
         runtime._build_mtp_conv_weights()
+    return runtime, t_max
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("t_steps", [2, 3])
+@pytest.mark.parametrize("mode", ["per_step", "batched", "batched_fused_proj"])
+def test_kda_verify_matches_sequential_decode(batch, t_steps, mode):
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    torch.manual_seed(0)
+    device = "cuda"
+    cfg = _Cfg()
+    lin = cfg.linear_attn_config
+    h = lin["num_heads"]
+    dim = h * lin["head_dim"]
+    w = lin["short_conv_kernel_size"]
+
+    runtime, t_max = _make_verify_runtime(cfg, mode, t_steps, device)
     slots = batch + 2  # non-trivial slot mapping
     cache = _LayerCache(slots, 3 * dim, w - 1, h, lin["head_dim"], lin["head_dim"], t_max, device)
     slot_indices = torch.arange(2, 2 + batch, device=device, dtype=torch.long)
@@ -419,3 +424,62 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps, mode):
         torch.testing.assert_close(
             cache.intermediate_ssm[:batch, t], ref_ssm_steps[t], rtol=2e-2, atol=2e-2
         )
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("t_steps", [2, 3])
+@pytest.mark.parametrize("mode", ["per_step", "batched", "batched_fused_proj"])
+@torch.no_grad()
+def test_kda_verify_bf16_pool_rounds_only_the_written_states(batch, t_steps, mode):
+    """A BF16 state pool verifies exactly like an FP32 pool holding the same values.
+
+    Every verify path reads the addressed rows into FP32 and carries the state
+    from step to step in FP32, so the output is the FP32 pool's bit for bit,
+    and each step's intermediate state is the FP32 pool's, rounded once to
+    BF16 when it is written: within one BF16 ulp of rounding the FP32 pool's
+    state with torch (the one-launch kernel's store can round a tie the other
+    way). Rounding between steps would change the outputs.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    torch.manual_seed(0)
+    device = "cuda"
+    cfg = _Cfg()
+    lin = cfg.linear_attn_config
+    h, head_dim = lin["num_heads"], lin["head_dim"]
+    dim = h * head_dim
+    w = lin["short_conv_kernel_size"]
+    runtime, t_max = _make_verify_runtime(cfg, mode, t_steps, device)
+    slots = batch + 2
+    shape = (slots, 3 * dim, w - 1, h, head_dim, head_dim, t_max, device)
+    fp32_cache = _LayerCache(*shape, ssm_dtype=torch.float32)
+    bf16_cache = _LayerCache(*shape, ssm_dtype=torch.bfloat16)
+    slot_indices = torch.arange(2, 2 + batch, device=device, dtype=torch.long)
+    conv_seed = torch.randn(batch, 3 * dim, w - 1, device=device) * 0.02
+    state_seed = (torch.randn(batch, h, head_dim, head_dim, device=device) * 0.02).bfloat16()
+    for cache in (fp32_cache, bf16_cache):
+        cache.conv[2 : 2 + batch] = conv_seed.bfloat16()
+        cache.temporal[2 : 2 + batch] = state_seed.to(cache.temporal.dtype)
+    pristine_bf16_pool = bf16_cache.temporal.clone()
+    x = torch.randn(batch * t_steps, cfg.hidden_size, dtype=torch.bfloat16, device=device) * 0.1
+
+    def verify(cache):
+        core = torch.empty(batch * t_steps, h, head_dim, dtype=torch.bfloat16, device=device)
+        runtime.forward_verify(
+            x, t_steps, cache, cache.conv, cache.temporal, slot_indices, output=core
+        )
+        return core
+
+    fp32_core = verify(fp32_cache)
+    bf16_core = verify(bf16_cache)
+
+    assert torch.equal(bf16_core, fp32_core)
+    written = bf16_cache.intermediate_ssm[:batch, :t_steps].float()
+    rounded = fp32_cache.intermediate_ssm[:batch, :t_steps].bfloat16().float()
+    torch.testing.assert_close(written, rounded, rtol=2**-7, atol=0)
+    assert (written != rounded).float().mean() < 1e-4, "states differ beyond rounding ties"
+    assert torch.equal(
+        bf16_cache.intermediate_conv_window[:batch, :t_steps],
+        fp32_cache.intermediate_conv_window[:batch, :t_steps],
+    )
+    assert torch.equal(bf16_cache.temporal, pristine_bf16_pool), "verify wrote the live pool"

@@ -1523,3 +1523,143 @@ def test_sparse_attention_graph_op_fills_live_rows_and_zeros_padding(monkeypatch
         glm.glm5_sparse_attention_inplace(hidden, "7", output)
     torch.testing.assert_close(output[:3], hidden[:3] * 2)
     assert torch.equal(output[3:], torch.zeros(2, 4))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_kda_layers_resolve_through_the_shared_breakable_graph_registry(monkeypatch):
+    """GLM KDA layers register with the shared mixer's ``kda_layers`` registry,
+    and inside a breakable graph the mixer's eager core op finds them there."""
+    from tensorrt_llm._torch.attention.backends import AttentionMetadata
+    from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import enable_breakable_cuda_graph
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    config = _config().text_config
+    model_config = SimpleNamespace(extra_attrs={})
+    with patch("tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer.AllReduce"):
+        # The second layer 0 stands for a draft layer reusing a target index.
+        layers = [
+            Glm5NextLinearAttention(config, idx, model_config=model_config) for idx in (0, 0, 1)
+        ]
+        unregistered = Glm5NextLinearAttention(config, 0)
+    registry = model_config.extra_attrs["kda_layers"]
+    assert [layer.layer_idx_str for layer in layers] == ["0", "0_0", "1"]
+    assert all(layer.register_to_config for layer in layers)
+    assert not unregistered.register_to_config
+    assert {key: ref() for key, ref in registry.items()} == {
+        layer.layer_idx_str: layer for layer in layers
+    }
+
+    metadata = Mock(spec=AttentionMetadata)
+    calls = []
+
+    def forward_impl(layer):
+        def run(hidden_states, attn_metadata, output=None, prequantized_input=None):
+            calls.append((layer, attn_metadata, output))
+            output.fill_(1)
+            return output
+
+        return run
+
+    for layer in layers:
+        monkeypatch.setattr(layer, "_forward_impl", forward_impl(layer))
+        monkeypatch.setattr(layer, "_project_output", lambda core: core)
+    hidden = torch.zeros(3, config.hidden_size, dtype=torch.bfloat16, device="cuda")
+    attrs = {"attention_metadata": lambda: metadata, "kda_layers": registry}
+    with model_extra_attrs(attrs), enable_breakable_cuda_graph():
+        for layer in layers:
+            assert kimi_kda_mixer._extract_kda_extra_attrs(layer.layer_idx_str) == (
+                metadata,
+                layer,
+            )
+            # The forward's metadata argument is unused: the op reads the live one.
+            core = layer(hidden, None)
+            assert core.shape == (3, layer.num_heads, layer.head_dim)
+            assert torch.equal(core, torch.ones_like(core))
+    assert [(layer, meta) for layer, meta, _ in calls] == [(layer, metadata) for layer in layers]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sparse_attention_breakable_graph_replays_live_rows_of_padded_batches(monkeypatch):
+    """Capture the sparse-attention break in a padded bucket, then replay it for
+    other live row counts: the layer sees only the live rows of the current
+    metadata, its result reaches the next graph segment, and padding is zero."""
+    from tensorrt_llm._torch.models import modeling_glm5_next as glm
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
+        BreakableCUDAGraph,
+        BreakableCUDAGraphCapture,
+        enable_breakable_cuda_graph,
+    )
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    bucket, hidden_size = 16, 32
+    torch.manual_seed(0)
+    weight = torch.randn(hidden_size, hidden_size, device="cuda")
+
+    class _SparseLayer(torch.nn.Module):
+        """Glm5NextSparseAttention.forward over a stand-in for the phase split."""
+
+        forward = Glm5NextSparseAttention.forward
+
+        def __init__(self):
+            super().__init__()
+            self.hidden_size = hidden_size
+            self.tp_all_reduce = None
+            self.rows_seen = []
+
+        def _forward_phases(self, hidden_states, ctx):
+            assert hidden_states.shape[0] == ctx.num_tokens
+            self.rows_seen.append(hidden_states.clone())
+            # A metadata-dependent term: replays must read the current metadata.
+            return hidden_states @ weight + ctx.offset
+
+    model_config = SimpleNamespace(extra_attrs={})
+    layer = _SparseLayer()
+    layer._graph_key = glm._register_graph_layer(model_config, "glm5_sparse_layers", 5, layer)
+    monkeypatch.setattr(glm, "build_glm5_next_runtime_context", lambda metadata: metadata)
+    current = {}
+    attrs = {
+        "attention_metadata": lambda: current["metadata"],
+        "glm5_sparse_layers": model_config.extra_attrs["glm5_sparse_layers"],
+    }
+    graph_input = torch.zeros(bucket, hidden_size, device="cuda")
+    graph_output = torch.zeros(bucket, hidden_size, device="cuda")
+
+    def body():
+        # Graph segment, eager break (the layer), graph segment.
+        attention_input = graph_input * 2
+        graph_output.copy_(layer(attention_input, None) + 1)
+
+    def set_batch(num_tokens, seed):
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        graph_input.copy_(torch.randn(graph_input.shape, generator=gen, device="cuda"))
+        graph_input[num_tokens:] = float("nan")  # padding rows hold garbage
+        current["metadata"] = SimpleNamespace(num_tokens=num_tokens, offset=float(seed))
+
+    graph = BreakableCUDAGraph()
+    stream = torch.cuda.Stream()
+    with model_extra_attrs(attrs):
+        set_batch(10, seed=1)
+        stream.wait_stream(torch.cuda.current_stream())
+        with enable_breakable_cuda_graph(), BreakableCUDAGraphCapture(graph, stream=stream):
+            body()
+        torch.cuda.synchronize()
+        assert graph.num_breaks == 1
+
+        for num_tokens, seed in ((7, 2), (13, 3), (bucket, 4)):
+            set_batch(num_tokens, seed)
+            live = graph_input[:num_tokens] * 2
+            expected = live @ weight + float(seed) + 1
+            graph_output.fill_(float("nan"))
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream), enable_breakable_cuda_graph():
+                graph.replay()
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            assert torch.equal(layer.rows_seen[-1], live)
+            torch.testing.assert_close(graph_output[:num_tokens], expected)
+            # Zeroed attention output plus the next segment's + 1.
+            assert torch.equal(
+                graph_output[num_tokens:], torch.ones_like(graph_output[num_tokens:])
+            )
+    assert [rows.shape[0] for rows in layer.rows_seen] == [10, 7, 13, bucket]
