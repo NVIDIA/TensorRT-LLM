@@ -135,6 +135,7 @@ class ModelSpec:
     expert_bias: Optional[bool] = None
     swiglu_clamp: float | None = None
     routed_scaling_factor: float = 1.0
+    routed_scale_after_combine: bool = False
     router_fp32: bool = False
     routing_renorm_eps: Optional[float] = None
     post_expert_norm_eps: Optional[float] = None
@@ -145,6 +146,12 @@ class ModelSpec:
     situ_linear_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if (
+            self.routed_scale_after_combine
+            and self.n_shared_experts
+            and self.shared_expert_mode == "fused"
+        ):
+            raise ValueError("Output routed scaling cannot also scale fused shared experts.")
         if self.post_expert_norm_eps is not None:
             if self.post_expert_norm_eps <= 0 or self.routing_method != "MUSE_SPARK_OPEN":
                 raise ValueError(
@@ -570,5 +577,19 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         router_fp32=True,
         n_group=1,
         topk_group=1,
+    ),
+    "reflection_beam": ModelSpec(
+        name="reflection_beam",
+        num_experts=256,
+        top_k=8,
+        hidden_size=5120,
+        intermediate_size=2560,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        router_fp32=True,
+        n_group=8,
+        topk_group=4,
+        routed_scaling_factor=2.5,
+        routed_scale_after_combine=True,
     ),
 }

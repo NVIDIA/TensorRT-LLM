@@ -670,6 +670,7 @@ includes full requested and observed dispatch/expert matrices.
 | `glm_5_3` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `muse_spark_open` | 256 | 8 | 4096 | 4096 | `NVFP4` | `MUSE_SPARK_OPEN` |
 | `mistral_large_4` | 128 | 4 | 6144 | 6144 | pass `--quant` | `RENORMALIZE` |
+| `reflection_beam` | 256 | 8 | 5120 | 2560 | pass `--quant` | `DEEPSEEK_V3` |
 | `glm_5` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
@@ -719,6 +720,12 @@ expert outputs required by this norm; do not substitute a norm of their sum.
 `mistral_large_4` uses FP32 softmax routing, normalized top-4 weights and
 plain SwiGLU. Its routed intermediate size is 6144; the dense MLP width
 24576 and the separate shared expert are outside this routed-expert preset.
+
+`reflection_beam` uses FP32 sigmoid routing with 8 groups, group top-2 score
+sums, 4 selected groups and normalized top-8 weights. The checkpoint's 2.5
+routed scaling is applied after expert aggregation, rather than folded into
+low-precision routing weights. The native grouping constraint can project
+a requested synthetic traffic plan; retain the routing observation metadata.
 
 Custom shapes can be used instead of `--model`:
 

@@ -238,6 +238,24 @@ class _UnfusedSharedMoE(torch.nn.Module):
         return routed + shared
 
 
+class _OutputScaledMoE(torch.nn.Module):
+    """Apply checkpoint routed scaling after expert aggregation and reduction."""
+
+    def __init__(self, moe: torch.nn.Module, scale: float):
+        super().__init__()
+        self.moe = moe
+        self.scale = float(scale)
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(super().__getattr__("moe"), name)
+
+    def forward(self, x: torch.Tensor, router_logits: torch.Tensor, **kwargs):
+        return self.moe(x, router_logits, **kwargs) * self.scale
+
+
 class _MusePostNormMoE(torch.nn.Module):
     """Own routed experts and their native post-expert normalization/combine."""
 
@@ -384,7 +402,9 @@ def _build_moe_module(
         num_experts=mc.num_experts,
         bias_dtype=torch.float32 if model.router_fp32 else dtype,
         profile_model_config=mc,
-        routed_scaling_factor=model.routed_scaling_factor,
+        routed_scaling_factor=(
+            1.0 if model.routed_scale_after_combine else model.routed_scaling_factor
+        ),
         renorm_eps=model.routing_renorm_eps,
     )
 
@@ -478,6 +498,8 @@ def _build_moe_module(
     moe.cuda(f"cuda:{torch.cuda.current_device()}")
     if post_norm is not None:
         moe = post_norm.attach_experts(moe)
+    if model.routed_scale_after_combine:
+        moe = _OutputScaledMoE(moe, model.routed_scaling_factor)
 
     # "unfused" baseline: the routed MoE above was built without fused shared
     # experts (mapping.py forces pretrained_config.n_shared_experts=0 in this mode);
