@@ -164,6 +164,17 @@ struct SparseResolveArgs
     //! compacted list -- but it is what makes a row's hit rate observable.
     int32_t* missCount;
 
+    //! [1] the step this resolve belongs to, as a count that wraps into SparseEntry's
+    //! timestamp field. Advanced once per step for the whole Batch, not once per resolve: a
+    //! step runs one resolve per layer, and an entry's age is in steps.
+    //!
+    //! Device-resident for the reason the watermarks are: it moves every step, so a captured
+    //! graph must read the current value rather than one baked in at capture.
+    //!
+    //! Whether the step also rebases follows from the value -- see SparseEntry::rebaseDue --
+    //! so there is nothing beside it that could disagree with it.
+    int32_t const* stepAge;
+
     //! Cumulative fetch statistics, which every row adds its own share of. Null skips it.
     //!
     //! Counted in the resolve because only the resolve can count either half: a padded
@@ -178,7 +189,7 @@ struct SparseResolveArgs
 
 //! Shared memory one CTA needs for `entriesPerSelection` entries and `selectionWidth`
 //! selections. The probe index grows as next_pow2(2 * (selectionWidth + maxInFlightUnits));
-//! per-entry recency and eviction scratch grow linearly with entriesPerSelection.
+//! the staged entry words and their classification grow linearly with entriesPerSelection.
 [[nodiscard]] size_t sparseResolveSharedBytes(
     int32_t entriesPerSelection, int32_t selectionWidth, int32_t maxInFlightUnits);
 
