@@ -1,0 +1,104 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Pyrefly diff
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]  # synchronize for push commit
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pyrefly-diff-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: >-
+      github.event.action != 'edited' || github.event.changes.base.ref.from != ''  # for edited event, only accept change-target-branch type
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYREFLY_BASE_ROOT: ${{ github.workspace }}/../pyrefly-base
+      PYREFLY_MERGED_ROOT: ${{ github.workspace }}/../pyrefly-merged
+      PYREFLY_REPORT_DIR: ${{ github.workspace }}/../pyrefly-diff
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Test Pyrefly automation
+        run: |
+          python3 -m unittest discover -s .github/scripts -p 'test_pyrefly_diff.py'
+          node --test .github/scripts/pyrefly_report.test.js
+      - name: Prepare target branch and merged PR
+        id: prepare
+        continue-on-error: true
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p "$PYREFLY_REPORT_DIR"
+          git fetch --no-tags origin "refs/heads/$BASE_REF"
+          base_sha=$(git rev-parse FETCH_HEAD)
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          git worktree add --detach "$PYREFLY_BASE_ROOT" "$base_sha"
+          git worktree add --detach "$PYREFLY_MERGED_ROOT" "$base_sha"
+          git -C "$PYREFLY_MERGED_ROOT" -c user.name=Pyrefly -c user.email=pyrefly@localhost \
+            merge --no-commit --no-ff "$HEAD_SHA"
+          git -C "$PYREFLY_MERGED_ROOT" diff --cached --name-status --find-renames -z "$base_sha" -- \
+            > "$PYREFLY_REPORT_DIR/changes"
+          git -C "$PYREFLY_MERGED_ROOT" restore --source "$base_sha" --worktree -- \
+            pyproject.toml scripts/run_pyrefly.sh scripts/pyrefly_workflow.py scripts/pyrefly_exclusion.py
+      - name: Install Pyrefly
+        id: install
+        if: steps.prepare.outcome == 'success'
+        continue-on-error: true
+        run: |
+          pyrefly_requirement=$(sed -n '/^pyrefly==/p' "$PYREFLY_BASE_ROOT/requirements-dev.txt")
+          test -n "$pyrefly_requirement"
+          python3 -m pip install "$pyrefly_requirement"
+      - name: Check target branch
+        id: base_check
+        if: steps.prepare.outcome == 'success' && steps.install.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        working-directory: ${{ env.PYREFLY_BASE_ROOT }}
+        env:
+          PYREFLY_REPORT_PATH: ${{ env.PYREFLY_REPORT_DIR }}/base.json
+        run: bash scripts/run_pyrefly.sh --full-project
+      - name: Check merged PR
+        id: merged_check
+        if: steps.prepare.outcome == 'success' && steps.install.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        working-directory: ${{ env.PYREFLY_MERGED_ROOT }}
+        env:
+          PYREFLY_REPORT_PATH: ${{ env.PYREFLY_REPORT_DIR }}/merged.json
+        run: bash scripts/run_pyrefly.sh --full-project
+      - name: Compare diagnostics
+        id: compare
+        if: ${{ !cancelled() }}
+        env:
+          BASE_SHA: ${{ steps.prepare.outputs.base_sha }}
+          CHECK_ERROR: >-
+            ${{ steps.prepare.outcome != 'success' && 'Could not prepare the PR merge against the target branch. See workflow logs.' ||
+                steps.install.outcome != 'success' && 'Could not install Pyrefly. See workflow logs.' ||
+                steps.base_check.outcome != 'success' && 'The target branch check did not complete. See workflow logs.' ||
+                steps.merged_check.outcome != 'success' && 'The merged PR check did not complete. See workflow logs.' || '' }}
+        run: |
+          python3 .github/scripts/pyrefly_diff.py \
+            --base-root "$PYREFLY_BASE_ROOT" --merged-root "$PYREFLY_MERGED_ROOT" \
+            --base-sha "$BASE_SHA" --output "$PYREFLY_REPORT_DIR" --error "$CHECK_ERROR"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: pyrefly-diff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PYREFLY_REPORT_DIR }}/*.json
+          if-no-files-found: error
+          retention-days: 14
