@@ -42,7 +42,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, MoeModelConfig
 
-_ROUTING_METHODS: Dict[str, type] = {
+_ROUTING_METHODS: Dict[str, type | str] = {
     "DEFAULT": DefaultMoeRoutingMethod,
     "RENORMALIZE": RenormalizeMoeRoutingMethod,
     "RENORMALIZE_NAIVE": RenormalizeNaiveMoeRoutingMethod,
@@ -51,6 +51,7 @@ _ROUTING_METHODS: Dict[str, type] = {
     "DEEPSEEK_V4": DeepSeekV4MoeRoutingMethod,
     "MINIMAX_M2": MiniMaxM2MoeRoutingMethod,
     "MINIMAX_M3": MiniMaxM3MoeRoutingMethod,
+    "MUSE_SPARK_OPEN": "tensorrt_llm._torch.models.modeling_musespark_open:MuseSparkOpenRoutingMethod",
     "SIGMOID_RENORM": SigmoidRenormMoeRoutingMethod,
 }
 
@@ -59,7 +60,9 @@ _ACTIVATIONS: Dict[str, ActivationType] = {
     "RELU2": ActivationType.Relu2,
 }
 
-_ROUTING_NAME_BY_CLS: Dict[type, str] = {cls: name for name, cls in _ROUTING_METHODS.items()}
+_ROUTING_NAME_BY_CLS: Dict[type, str] = {
+    cls: name for name, cls in _ROUTING_METHODS.items() if isinstance(cls, type)
+}
 _ALL_BACKENDS: List[str] = [b.value for b in MoeBackendType]
 _COMM_METHODS: Tuple[str, ...] = (
     "AUTO",
@@ -132,6 +135,9 @@ class ModelSpec:
     expert_bias: Optional[bool] = None
     swiglu_clamp: float | None = None
     routed_scaling_factor: float = 1.0
+    router_fp32: bool = False
+    routing_renorm_eps: Optional[float] = None
+    post_expert_norm_eps: Optional[float] = None
     # SiTU constants (Kimi-K3: activation_situ_beta / activation_situ_linear_beta).
     # SiTU is gated, so ``activation_type`` stays SWIGLU and only the epilogue
     # changes; backends take it through their own parameters (see build.py).
@@ -139,6 +145,17 @@ class ModelSpec:
     situ_linear_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if self.post_expert_norm_eps is not None:
+            if self.post_expert_norm_eps <= 0 or self.routing_method != "MUSE_SPARK_OPEN":
+                raise ValueError(
+                    "Per-expert post-norm requires Muse routing and a positive epsilon."
+                )
+            if self.routing_renorm_eps is None or self.routing_renorm_eps <= 0:
+                raise ValueError("Muse routing requires a positive normalization epsilon.")
+            if self.n_shared_experts or self.situ_beta is not None or self.swiglu_gptoss_style:
+                raise ValueError(
+                    "Muse routed-expert post-norm requires its native plain SwiGLU path."
+                )
         if (
             self.swiglu_gptoss_style
             and self.expert_bias is False
@@ -170,7 +187,15 @@ class ModelSpec:
 
     @property
     def routing_method_cls(self) -> type:
-        return _ROUTING_METHODS[self.routing_method]
+        cls = _ROUTING_METHODS[self.routing_method]
+        if isinstance(cls, str):
+            from importlib import import_module
+
+            module, name = cls.split(":")
+            cls = getattr(import_module(module), name)
+            _ROUTING_METHODS[self.routing_method] = cls
+            _ROUTING_NAME_BY_CLS[cls] = self.routing_method
+        return cls
 
     @property
     def activation_type_enum(self) -> ActivationType:
@@ -521,5 +546,17 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         n_group=1,
         topk_group=1,
         routed_scaling_factor=2.5,
+    ),
+    "muse_spark_open": ModelSpec(
+        name="muse_spark_open",
+        num_experts=256,
+        top_k=8,
+        hidden_size=4096,
+        intermediate_size=4096,
+        quant_algo=None,
+        routing_method="MUSE_SPARK_OPEN",
+        router_fp32=True,
+        routing_renorm_eps=1e-15,
+        post_expert_norm_eps=1e-8,
     ),
 }

@@ -668,6 +668,7 @@ includes full requested and observed dispatch/expert matrices.
 | `glm_5_3_flash` | 288 | 8 | 4096 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `minimax_m3_1_flash` | 128 | 4 | 6144 | 3072 | pass `--quant` | `MINIMAX_M3` |
 | `glm_5_3` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
+| `muse_spark_open` | 256 | 8 | 4096 | 4096 | `NVFP4` | `MUSE_SPARK_OPEN` |
 | `glm_5` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
@@ -704,6 +705,15 @@ shared expert and the surrounding transformer block are excluded.
 `glm_5_3` measures the routed-expert core with sigmoid DeepSeek routing,
 normalized top-8 weights scaled by 2.5, and plain SwiGLU without a clamp.
 The separate shared expert and the surrounding transformer block are excluded.
+
+`muse_spark_open` measures routed experts at the pooled MoE width 4096
+(the residual-stream width is 8192), with FP32 sigmoid routing and the native
+weight-first per-expert RMSNorm before weighted combine. The production finalize
+also reduces FC2 partials before this nonlinear norm under pure MoE TP.
+Supported layouts are pure EP and pure MoE TP without attention DP; the pooler,
+unpooler, and dense router projection are outside the routed-expert benchmark.
+The fixed release's MXFP4/MXFP8 implementations do not return unfinalized
+expert outputs required by this norm; do not substitute a norm of their sum.
 
 Custom shapes can be used instead of `--model`:
 

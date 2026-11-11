@@ -214,6 +214,7 @@ def _create_routing_method(
     bias_dtype: torch.dtype,
     profile_model_config: MoeModelConfig,
     routed_scaling_factor: float = 1.0,
+    renorm_eps: Optional[float] = None,
 ):
     """Create a routing-method instance mirroring ``test_moe_module._create_routing_method``."""
     if routing_method_cls in (RenormalizeMoeRoutingMethod, DefaultMoeRoutingMethod):
@@ -244,6 +245,16 @@ def _create_routing_method(
             callable_e_score_correction_bias=lambda: e_score_correction_bias,
             callable_tid2eid=lambda: None,
             is_hashed=False,
+        )
+
+    if routing_method_cls.__name__ == "MuseSparkOpenRoutingMethod":
+        assert renorm_eps is not None and renorm_eps > 0
+        e_score_correction_bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+        return routing_method_cls(
+            top_k=top_k,
+            num_experts=num_experts,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+            renorm_eps=renorm_eps,
         )
 
     if routing_method_cls is MiniMaxM3MoeRoutingMethod:
