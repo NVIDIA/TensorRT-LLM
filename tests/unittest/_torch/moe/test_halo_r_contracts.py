@@ -14,9 +14,11 @@ import ast
 import inspect
 import re
 import sys
+from collections.abc import Callable
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -33,6 +35,11 @@ from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
     _LiveBankLeaseProvider,
     build_rebalance_slot_scheduler_group,
 )
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.arena import _SharedSlotPool
+    from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.arena import LiveWeightArena
+    from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.geometry import BundleLayout
 
 pytestmark = pytest.mark.cpu_only
 
@@ -60,57 +67,57 @@ _WARMUP_SPIN_CYCLES = 1800 * 2_000_000_000
 class _Routes:
     """Just enough of a CUDA int32 [tokens, topk] tensor for the group's checks."""
 
-    def __init__(self, rows, *, dtype="int32", device="cuda:0"):
+    def __init__(self, rows, *, dtype="int32", device="cuda:0") -> None:
         self.shape = (rows, _TOPK)
         self.ndim = 2
         self.dtype = dtype
         self.device = device
 
-    def is_contiguous(self):
+    def is_contiguous(self) -> bool:
         return True
 
-    def get_device(self):
+    def get_device(self) -> int:
         return int(self.device.split(":")[1])
 
-    def __getitem__(self, rows):
+    def __getitem__(self, rows) -> _Routes:
         return _Routes(rows.stop)
 
 
 class _Tensor:
     _next_address = 0x10000
 
-    def __init__(self, name, trace=None):
+    def __init__(self, name, trace=None) -> None:
         self.name = name
         self.trace = trace
         _Tensor._next_address += 0x100
         self.address = _Tensor._next_address
 
-    def data_ptr(self):
+    def data_ptr(self) -> int:
         return self.address
 
-    def to(self, device):
+    def to(self, device) -> _Tensor:
         return self
 
-    def zero_(self):
+    def zero_(self) -> _Tensor:
         self.trace.append(("zero", self.name))
         return self
 
-    def fill_(self, value):
+    def fill_(self, value) -> _Tensor:
         self.trace.append(("fill", self.name, value))
         return self
 
-    def view(self, dtype):
+    def view(self, dtype) -> _Tensor:
         return self
 
 
-def _extract_function(path: Path, name: str, namespace: dict):
+def _extract_function(path: Path, name: str, namespace: dict) -> Callable[..., Any]:
     tree = ast.parse(path.read_text())
     function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace[name]
 
 
-def _spin_cycles_for_timeout():
+def _spin_cycles_for_timeout() -> Callable[[int | None], int]:
     """The scheduler runtime's conversion, run from its source without importing CUDA modules."""
     tree = ast.parse(_SCHEDULER_RUNTIME.read_text())
     namespace = {
@@ -124,19 +131,19 @@ def _spin_cycles_for_timeout():
 
 
 class _Stream(SimpleNamespace):
-    def __init__(self, handle, priority, trace):
+    def __init__(self, handle, priority, trace) -> None:
         super().__init__(cuda_stream=handle, priority=priority, trace=trace)
 
-    def wait_event(self, event):
+    def wait_event(self, event) -> None:
         self.trace.append(("main_wait", self.cuda_stream, event.recorded_on))
 
 
 class _Event:
-    def __init__(self, trace):
+    def __init__(self, trace) -> None:
         self.trace = trace
         self.recorded_on = None
 
-    def record(self, stream):
+    def record(self, stream) -> None:
         self.recorded_on = stream.cuda_stream
         self.trace.append(("main_record", stream.cuda_stream))
 
@@ -167,8 +174,8 @@ def _build(
     )
     priorities = {_MAIN: 0, _OTHER_MAIN: 0, _COPY: -1}
 
-    def call(name):
-        def record(*args):
+    def call(name) -> Callable[..., tuple[int]]:
+        def record(*args) -> tuple[int]:
             trace.append((name, *args))
             return (0,)
 
@@ -199,15 +206,15 @@ def _build(
     monkeypatch.setitem(sys.modules, _BREAKABLE_PACKAGE, breakable)
 
     class Config:
-        def __init__(self, **values):
+        def __init__(self, **values) -> None:
             self.__dict__.update(values)
             self.route_count = self.max_tokens_per_rank * self.topk
 
-        def validate(self):
+        def validate(self) -> None:
             trace.append(("validate_config", self.ctas))
 
     class Scheduler:
-        def __init__(self, cfg, device):
+        def __init__(self, cfg, device) -> None:
             self.cfg = cfg
             self.device = SimpleNamespace(index=int(device.split(":")[1]))
             self.outputs = SimpleNamespace(
@@ -217,13 +224,13 @@ def _build(
                 hot_expert_source_ranks="owners",
             )
 
-        def connect_peer_bases(self, bases):
+        def connect_peer_bases(self, bases) -> None:
             trace.append(("connect", len(bases)))
 
-        def bind_gpu_direct(self, stream):
+        def bind_gpu_direct(self, stream) -> None:
             trace.append(("bind_gpu_direct", stream))
 
-        def fused_launch_args(self):
+        def fused_launch_args(self) -> tuple[str | int, ...]:
             c = self.cfg
             names = ("slots", "ids", "levels", "owners", "peer", "status", "partial", "aux", "grid")
             return (
@@ -241,14 +248,14 @@ def _build(
             )
 
     class Symmetric:
-        def __init__(self, nbytes, device):
+        def __init__(self, nbytes, device) -> None:
             self.shareable = b"rank"
             self.ptr = 0x5000
 
-        def import_peer(self, handle):
+        def import_peer(self, handle) -> int:
             return 0x6000
 
-        def close(self):
+        def close(self) -> None:
             trace.append(("symmetric_close",))
 
     scheduler_package = ModuleType(_SCHEDULER_PACKAGE)
@@ -268,12 +275,12 @@ def _build(
     monkeypatch.setitem(sys.modules, multirank.__name__, multirank)
     monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
 
-    def submit_fused(handle, routes, spin_cycles):
+    def submit_fused(handle, routes, spin_cycles) -> None:
         trace.append(("submit", handle, routes.shape[0], spin_cycles))
         if state.fail_submit:
             raise RuntimeError("HALO-R kernel launch failed: unspecified launch failure")
 
-    def create(**kwargs):
+    def create(**kwargs) -> SimpleNamespace:
         # The group passes every argument by its schema name.
         trace.append(("create", len(kwargs)))
         state.create_args = kwargs
@@ -327,7 +334,7 @@ def _build(
         ),
     )
 
-    def allgather(value):
+    def allgather(value) -> list[Any]:
         trace.append(("allgather",))
         if isinstance(value, tuple):
             # A residency reset: every peer reports the same, unless a test makes rank 0 differ.
@@ -373,7 +380,7 @@ def _build(
     return _Env(group=group, endpoint=group.broadcaster, trace=trace, state=state)
 
 
-def _layer_call(group, rows, *, event=None):
+def _layer_call(group, rows, *, event=None) -> tuple[_Routes, int]:
     routes = _Routes(rows)
     physical, generation = group.plan_finish(group.plan_schedule(routes), defer_wait=True)
     group.wait_for_routes()
@@ -381,7 +388,7 @@ def _layer_call(group, rows, *, event=None):
     return physical, generation
 
 
-def _self_attributes(cls, method):
+def _self_attributes(cls, method) -> set[str]:
     """Names that ``cls.method`` assigns on ``self``."""
     source = inspect.getsource(cls)
     tree = ast.parse(source)
@@ -578,7 +585,7 @@ def test_each_launch_takes_the_spin_bound_of_its_moment(
     assert bound.warmup_cycles == warmup_cycles
     guard.register(bound)
 
-    def launched_cycles(rows=4):
+    def launched_cycles(rows=4) -> int:
         _layer_call(env.group, rows)
         return next(entry[3] for entry in reversed(env.trace) if entry[0] == "submit")
 
@@ -600,7 +607,7 @@ def test_a_breakable_buckets_first_eager_launch_waits_the_warmup_bound(monkeypat
     env = _build(monkeypatch)
     state = env.state
 
-    def launched_cycles(rows):
+    def launched_cycles(rows) -> int:
         _layer_call(env.group, rows)
         return next(entry[3] for entry in reversed(env.trace) if entry[0] == "submit")
 
@@ -957,7 +964,7 @@ def test_kernel_runs_in_the_remote_memory_sync_domain() -> None:
     )
 
 
-def _create_argument(env, name):
+def _create_argument(env, name) -> Any:
     """The value a fake native create received for the schema parameter ``name``."""
     names = _op_parameters("moe_rebalance_halo_r_create")
     # Every schema parameter is passed by name, so a reordered schema still binds each one.
@@ -1028,24 +1035,24 @@ def test_kernel_skips_resident_receivers_and_records_residency_before_ready() ->
 
 
 class _FakeVmm:
-    def __init__(self, trace):
+    def __init__(self, trace) -> None:
         self.trace = trace
         self.next_address = 0x100000
 
-    def reserve(self, nbytes):
+    def reserve(self, nbytes) -> int:
         self.next_address += 0x10000
         self.trace.append(("reserve", nbytes))
         return self.next_address
 
-    def import_(self, shareable):
+    def import_(self, shareable) -> str:
         self.trace.append(("import", shareable))
         return f"handle:{shareable}"
 
-    def map(self, address, nbytes, handle):
+    def map(self, address, nbytes, handle) -> None:
         self.trace.append(("map", address, nbytes, handle))
 
 
-def _pool(trace, *, rank, sets, gathered):
+def _pool(trace, *, rank, sets, gathered) -> _SharedSlotPool:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.arena import (
         _HelperSet,
         _SharedSlotPool,
@@ -1064,7 +1071,7 @@ def _pool(trace, *, rank, sets, gathered):
     )
     pool.vmm = _FakeVmm(trace)
 
-    def allgather(local):
+    def allgather(local) -> list[dict[str, str]]:
         trace.append(("allgather", dict(local)))
         return gathered.pop(0)
 
@@ -1077,7 +1084,7 @@ def test_peer_helper_chunks_are_mapped_once_per_set(sets) -> None:
     trace = []
     world = 4
 
-    def peers(index):
+    def peers(index) -> list[dict[str, str]]:
         return [{"w13": f"r{r}-s{index}-w13", "w2": f"r{r}-s{index}-w2"} for r in range(world)]
 
     pool = _pool(trace, rank=1, sets=sets, gathered=[peers(index) for index in range(sets)])
@@ -1115,13 +1122,13 @@ def test_peer_helper_mapping_refuses_mismatched_chunks() -> None:
 
 
 class _FakeChunkVmm(_FakeVmm):
-    def create(self, nbytes):
+    def create(self, nbytes) -> tuple[str, str]:
         self.trace.append(("create", nbytes))
         index = sum(1 for entry in self.trace if entry[0] == "create")
         return f"chunk{index}", f"shareable{index}"
 
 
-def _set_pool(trace, *, helper_multicast):
+def _set_pool(trace, *, helper_multicast) -> _SharedSlotPool:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.arena import _SharedSlotPool
 
     pool = _SharedSlotPool.__new__(_SharedSlotPool)
@@ -1174,7 +1181,7 @@ def test_halo_q_helper_sets_keep_a_multicast_object_per_level(monkeypatch, count
 def test_halo_r_helper_sets_get_no_multicast_object(monkeypatch, count) -> None:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
 
-    def create_multicast(*args):
+    def create_multicast(*args) -> None:
         raise AssertionError("HALO-R helper sets must not create multicast objects")
 
     monkeypatch.setattr(arena_module, "_create_multicast", create_multicast)
@@ -1188,7 +1195,7 @@ def test_halo_r_helper_sets_get_no_multicast_object(monkeypatch, count) -> None:
         assert set(helper_set.chunks) == set(helper_set.shareables) == {"w13", "w2"}
 
 
-def _cuda_view(shape, stride, dtype, element_size, pointer):
+def _cuda_view(shape, stride, dtype, element_size, pointer) -> SimpleNamespace:
     return SimpleNamespace(
         data_ptr=lambda: pointer,
         shape=shape,
@@ -1200,7 +1207,7 @@ def _cuda_view(shape, stride, dtype, element_size, pointer):
     )
 
 
-def _live_arena(world, slots, unicast_planes):
+def _live_arena(world, slots, unicast_planes) -> tuple[LiveWeightArena, BundleLayout]:
     from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.arena import (
         LivePlaneView,
         LiveTerminalView,
@@ -1211,7 +1218,7 @@ def _live_arena(world, slots, unicast_planes):
     bundle = BundleLayout.create(hidden=256, intermediate=128)
     addresses = iter(range(1 << 32, 1 << 40, 1 << 28))
 
-    def view(layout):
+    def view(layout) -> SimpleNamespace:
         shape, stride, dtype, element_size, _ = layout.kernel_metadata(slots)
         return _cuda_view(shape, stride, dtype, element_size, next(addresses))
 

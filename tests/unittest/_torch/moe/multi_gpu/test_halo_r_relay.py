@@ -53,6 +53,7 @@ import sys
 import time
 import traceback
 from types import SimpleNamespace
+from typing import Any
 
 import cloudpickle
 import pytest
@@ -256,7 +257,7 @@ class _Kernels:
             from cuda import nvrtc
         self.driver = driver
 
-        def check(result):
+        def check(result) -> Any:
             error, *values = result if isinstance(result, tuple) else (result,)
             if error not in (driver.CUresult.CUDA_SUCCESS, nvrtc.nvrtcResult.NVRTC_SUCCESS):
                 raise RuntimeError(f"CUDA error {error}")
@@ -583,7 +584,7 @@ class _Layers:
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
 
-    def _apply(self, layer: int, routes: torch.Tensor):
+    def _apply(self, layer: int, routes: torch.Tensor) -> halo_r_reference.Plan:
         """The reference plan of one launch, applied to the model; returns the plan."""
         counts = torch.bincount(routes.flatten().long(), minlength=self.experts).cpu().tolist()
         histogram = [sum(c) for c in zip(*MPI.COMM_WORLD.allgather(counts))]
@@ -966,7 +967,9 @@ def _case_gate_under_hog(layers: _Layers, use_graph: bool) -> list:
     return failures
 
 
-def _capture(layers: _Layers, layer_ids: list, keep_graph: bool = False):
+def _capture(
+    layers: _Layers, layer_ids: list, keep_graph: bool = False
+) -> tuple[torch.cuda.CUDAGraph, dict[int, torch.Tensor], list[str]]:
     """Capture layer calls as the breakable runner does: warm up eagerly on its capture stream,
     then capture there. Returns the graph, the static routes per layer and the warmup's failures.
     ``keep_graph`` keeps the captured cudaGraph_t for inspection (``raw_cuda_graph``)."""
@@ -1172,7 +1175,7 @@ def _case_graphs_failed_capture(layers: _Layers) -> list:
     return failures
 
 
-def _driver_call(result):
+def _driver_call(result) -> Any:
     """Unpack a cuda.bindings driver call; raise on an error."""
     from cuda.bindings import driver
 
@@ -1487,7 +1490,7 @@ for _kind in _TRAPS:
     )
 
 
-def _run_worker(case: str):
+def _run_worker(case: str) -> tuple[str | None, list[str]]:
     """One EP rank of a case; returns (skip reason or None, result)."""
     from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
 

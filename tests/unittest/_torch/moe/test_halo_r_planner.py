@@ -133,7 +133,7 @@ def test_plans_respect_helper_budget_and_conserve_routes(seed) -> None:
 def test_geometry_validation_rejects_unsupported_shapes(
     ep_size, home_experts, helper_slots, auxiliary_sms, message
 ) -> None:
-    def validate():
+    def validate() -> None:
         validate_halo_r_geometry(
             ep_size=ep_size,
             home_experts=home_experts,
@@ -158,13 +158,13 @@ class _Config:
     auxiliary_sms = 8
     helper_slot_mode = "shared_banks"
 
-    def __init__(self, planner):
+    def __init__(self, planner) -> None:
         self.planner = planner
 
-    def setup(self, ep_rank, ep_size):
+    def setup(self, ep_rank, ep_size) -> None:
         pass
 
-    def validate_expert_capacity(self, num_experts):
+    def validate_expert_capacity(self, num_experts) -> None:
         pass
 
 
@@ -173,15 +173,15 @@ class _Arena:
     helper_slots = 2
     bundle = None
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.provider = SimpleNamespace(pool=None)
         self.flags = torch.empty(4, dtype=torch.uint64)
 
-    def terminal_flags_tensor(self):
+    def terminal_flags_tensor(self) -> torch.Tensor:
         return self.flags
 
 
-def _allocate_arena(layer, monkeypatch, arena):
+def _allocate_arena(layer, monkeypatch, arena) -> _Arena:
     """Allocate ``arena`` through the layer handle, as the quant method does."""
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
 
@@ -198,7 +198,7 @@ def _allocate_arena(layer, monkeypatch, arena):
 
 
 class _Backend:
-    def __init__(self):
+    def __init__(self) -> None:
         self.tactic_autotune = False
         self.mapping = SimpleNamespace(local_rank=0)
         self.ep_process_group = object()
