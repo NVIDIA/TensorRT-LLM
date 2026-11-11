@@ -238,13 +238,16 @@ def test_the_memory_limit_is_read_from_the_process_own_cgroup(tmp_path):
 
 def test_the_host_memory_note_is_held_to_the_process_own_cgroup_limit(tmp_path, monkeypatch):
     """Defect 9 at the note itself: the limit preflight warns by is the process's cgroup's."""
-    # The mount's root states no limit; the step this process runs in does.
+    # The mount's root states no limit; the step this process runs in does. The node's free
+    # memory is stated too: the note must not depend on the host the test runs on.
     monkeypatch.setattr(preflight, "CGROUP_ROOT", tmp_path / "no-limit-at-the-root")
-    monkeypatch.setattr(preflight, "cgroup_memory_limit", lambda *a, **k: 1 << 30)
+    monkeypatch.setattr(preflight, "cgroup_memory_limit", lambda *a, **k: 64 << 30)
+    node = {"SC_PAGE_SIZE": 4096, "SC_AVPHYS_PAGES": (690 << 30) // 4096}
+    monkeypatch.setattr(preflight.os, "sysconf", node.__getitem__)
     spec = {"deployments": [{"name": "tp1", "options": {}}]}
     [note] = preflight.check_kv_cache_configs(spec, {})
     assert note.startswith("host memory: tp1: set no `kv_cache_config.host_cache_size`")
-    assert "this process may use 1 GiB (its cgroup's limit)" in note
+    assert "690 GiB" in note and "this process may use 64 GiB (its cgroup's limit)" in note
 
 
 # ------------------------------------------------------------------------ the decision file

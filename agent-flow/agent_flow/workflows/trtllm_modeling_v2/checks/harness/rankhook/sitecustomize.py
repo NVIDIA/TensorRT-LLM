@@ -32,14 +32,27 @@ _MODULE = "tensorrt_llm.executor.base_worker"
 _MARKER = "MV2FLOW_RANK_ENGINE"
 
 
+#: What one record holds at most of a collection or of an object that is no configuration:
+#: a tokenizer's vocabulary or a loader's state is not an option, and a record is one line.
+_MAX_ITEMS, _MAX_TEXT = 256, 400
+
+
 def _plain(value, depth=0):
-    """``value`` as JSON takes it: a config object as a mapping of its fields, an enum by its value."""
+    """``value`` as JSON takes it: a config object as a mapping of its fields, an enum by its value.
+
+    Only the configuration is walked: the worker's arguments, and under them mappings, lists
+    and config objects (their ``model_fields``). Anything else is named by its text.
+    """
     if isinstance(value, enum.Enum):
         value = value.value
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, float)):
         return value
+    if isinstance(value, str):
+        return value[:_MAX_TEXT]
+    if isinstance(value, (dict, list, tuple, set, frozenset)) and len(value) > _MAX_ITEMS:
+        return f"<{type(value).__name__} of {len(value)}>"
     if depth > 8:
-        return str(value)
+        return str(value)[:_MAX_TEXT]
     if isinstance(value, dict):
         return {str(k): _plain(v, depth + 1) for k, v in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -56,10 +69,11 @@ def _plain(value, depth=0):
                 if isinstance(other, str):
                     found.setdefault(other, found[name])
         return found
-    if hasattr(value, "__dict__") and not callable(value):
+    if depth == 0 and hasattr(value, "__dict__"):
+        # Arguments that are no config object: their public attributes are the options.
         public = {k: v for k, v in vars(value).items() if not k.startswith("_")}
         return {k: _plain(v, depth + 1) for k, v in public.items()}
-    return str(value)
+    return str(value)[:_MAX_TEXT]
 
 
 def _rank(worker):

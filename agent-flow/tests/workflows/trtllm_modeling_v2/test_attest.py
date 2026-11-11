@@ -138,6 +138,20 @@ def test_a_rank_prints_every_field_of_its_configuration_under_each_name_it_answe
         }
         kv_cache_config, speculative_config, n = Kv(), Draft(), 4
 
+    class Tokenizer:
+        def __init__(self):
+            self.vocab = {str(n): n for n in range(100_000)}
+
+        def __str__(self):
+            return "<tokenizer>"
+
+    # Only the configuration is walked: an object that is none is named, never dumped.
+    loose = SimpleNamespace(max_seq_len=8, tokenizer=Tokenizer(), table=list(range(1000)))
+    assert module["_plain"](loose) == {
+        "max_seq_len": 8,
+        "tokenizer": "<tokenizer>",
+        "table": "<list of 1000>",
+    }
     resolved = module["_plain"](Args())
     assert resolved == {
         "kv_cache_config": {"dtype": "fp8", "free_gpu_memory_fraction": 0.9},
