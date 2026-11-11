@@ -1024,7 +1024,7 @@ def test_kill_fires_when_no_delivery_event_is_supplied(monkeypatch):
     assert calls == [1]
 
 
-def test_delivery_is_checked_after_the_grace_not_before(monkeypatch):
+def test_delivery_is_checked_after_the_grace_not_before(monkeypatch: pytest.MonkeyPatch) -> None:
     """The check must come after the wait, else it defeats its own purpose.
 
     The grace exists so the error can reach the client. Sampling the flag
@@ -1038,15 +1038,18 @@ def test_delivery_is_checked_after_the_grace_not_before(monkeypatch):
 
     delivered = threading.Event()
 
-    def deliver_during_grace():
-        time.sleep(0.15)
+    def deliver_during_grace(remaining: float, cancelled: threading.Event | None) -> bool:
+        assert remaining == 0.5
+        assert cancelled is None
+        assert not delivered.is_set()
         delivered.set()
+        return True
 
-    t = threading.Thread(target=deliver_during_grace, daemon=True)
-    t.start()
+    wait = Mock(side_effect=deliver_during_grace)
+    monkeypatch.setattr(hang_detector_module, "_wait_out_kill_grace", wait)
     fired = hard_kill_on_rank_crash(4, error_delivered=delivered)
-    t.join(timeout=5)
 
+    wait.assert_called_once_with(0.5, None)
     assert fired is False, "the flag was set during the grace window; the kill must observe it"
     assert calls == []
 
