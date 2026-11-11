@@ -131,6 +131,9 @@ l0_h100:
   - unittest/disaggregated/test_sync_transfer_timing.py
   - unittest/disaggregated/test_kv_transfer.py
   - unittest/disaggregated/test_kv_transfer_mp.py
+  # KV pool rebalance on disaggregated context servers: gate/drain/back-off (CPU)
+  # and resize-then-send integrity with its negative control (1 GPU).
+  - unittest/disaggregated/test_kv_pool_rebalance.py
   - unittest/disaggregated/test_transceiver_bounded_polling.py
   - unittest/disaggregated/test_pool_matching.py
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py

@@ -3791,6 +3791,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("buffers"))
         .def("adjust", &kv::KvCacheManager::adjust, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("planned_slot_counts",
+            [](kv::KvCacheManager const& self)
+            {
+                nb::gil_scoped_release release;
+                auto const planned = self.plannedSlotCounts();
+                return std::vector<kv::SlotCount>(planned.begin(), planned.end());
+            })
         .def_prop_ro("need_adjustment",
             [](kv::KvCacheManager const& self)
             {

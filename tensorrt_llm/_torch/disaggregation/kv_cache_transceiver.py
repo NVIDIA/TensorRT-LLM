@@ -475,6 +475,64 @@ class KvCacheTransceiver(ABC):
         """Return True when a cancelled transfer may have corrupted a shared buffer."""
         return False
 
+    # -- KV pool rebalance ---------------------------------------------------
+    #
+    # ``KvCacheManager::adjust()`` resizes the KV pools this transceiver has
+    # registered and published. The executor drives a rebalance through these
+    # hooks; the defaults refuse one.
+
+    def kv_pool_rebalance_unsupported_reason(self) -> Optional[str]:
+        """Why this configuration can never rebalance, or None if it can.
+
+        Must depend on configuration only, so that every rank gets the same
+        answer: the executor uses it in a rank-uniform gate.
+        """
+        return "this transceiver runtime does not support KV pool rebalance"
+
+    def kv_pool_layout_shared_with_peers(self) -> bool:
+        """Whether a peer holds this rank's pool layout or registration keys.
+
+        A rebalance would leave such a peer computing addresses from a stale
+        layout. This is per-rank state; the executor agrees on it collectively.
+        """
+        return True
+
+    def kv_pool_rebalance_veto_reason(self,
+                                      allow_cross_node: bool = False
+                                      ) -> Optional[str]:
+        """Why this rank must not rebalance any more, or None.
+
+        Per-rank state that only ever goes from None to a reason, so the
+        executor agrees on it collectively: any rank's reason vetoes every
+        rank, for good. ``allow_cross_node`` is
+        ``kv_pool_rebalance_config.allow_cross_node_disagg``.
+        """
+        if self.kv_pool_layout_shared_with_peers():
+            return ("this instance receives KV from context peers, which hold "
+                    "its pool layout; only context-side rebalance is supported")
+        return None
+
+    def has_inflight_transfers(self) -> bool:
+        """Whether any send or receive still touches this rank's KV pools."""
+        return True
+
+    def oldest_send_waiting_for_peer_s(self) -> float:
+        """Seconds the oldest send has been waiting for its peer to ask, or 0.
+
+        A send whose peer has not asked yet waits on the peer's admission
+        queue, which can take seconds; the executor uses this to give up on a
+        drain early instead of stalling until the drain deadline.
+        """
+        return 0.0
+
+    def begin_kv_pool_resize(self) -> None:
+        """Release the pool registrations ahead of ``adjust()``."""
+        raise NotImplementedError
+
+    def end_kv_pool_resize(self) -> None:
+        """Republish the pool layout after ``adjust()``, successful or not."""
+        raise NotImplementedError
+
     @abstractmethod
     def prepare_context_requests(self, requests: List[LlmRequest]) -> None:
         """

@@ -5159,6 +5159,15 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "Number of PyExecutor iterations between checks of whether a pool rebalance "
         "should be attempted.")
 
+    allow_cross_node_disagg: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Disaggregated context servers: keep rebalancing after a KV transfer peer is "
+        "found on another node. Rebalancing there is validated for intra-node "
+        "transfers only, so by default it is switched off on every rank once a peer "
+        "on another host registers.")
+
 
 # Mixed-precision KV dtype: "mixed_<low dtype>_<high dtype>". The
 # first/last tokens and the attention inputs use the second dtype;

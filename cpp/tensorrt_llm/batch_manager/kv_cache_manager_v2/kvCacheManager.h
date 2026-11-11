@@ -399,6 +399,9 @@ public:
     // All KvCaches must be suspended before calling adjust().
     bool needAdjustment() const;
     void adjust();
+    // Hot-level slot count per pool group after the next adjust(): the current counts when it
+    // would leave the hot level alone. Valid until the tuner's state changes (a new sample).
+    TypedVec<PoolGroupIndex, SlotCount> plannedSlotCounts() const;
 
     // ---- Internals used by KvCache ----------------------------------------
 

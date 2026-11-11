@@ -1558,6 +1558,19 @@ bool KvCacheManager::needAdjustment() const
     return _needAdjustment(kHotLevel) || _needAdjustment(lastLevel);
 }
 
+TypedVec<PoolGroupIndex, SlotCount> KvCacheManager::plannedSlotCounts() const
+{
+    auto const apiLock = lockShared();
+    if (!_needAdjustment(kHotLevel))
+    {
+        TypedVec<PoolGroupIndex, SlotCount> current(mStorage->numPoolGroups(kHotLevel));
+        for (PoolGroupIndex pgIdx{0}; pgIdx < current.size(); ++pgIdx)
+            current[pgIdx] = mStorage->numSlots(pgIdx, kHotLevel);
+        return current;
+    }
+    return mStorage->planCacheLevel(kHotLevel, getQuota(kHotLevel), _getTargetRatioList(kHotLevel));
+}
+
 void KvCacheManager::adjust()
 {
     KVCM2_API_GUARD();

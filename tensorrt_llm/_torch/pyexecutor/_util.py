@@ -5033,6 +5033,8 @@ def create_py_executor_instance(
         enable_kv_pool_rebalance,
         kv_pool_rebalance_check_interval=llm_args.kv_cache_config.
         kv_pool_rebalance_config.check_interval,
+        kv_pool_rebalance_allow_cross_node=llm_args.kv_cache_config.
+        kv_pool_rebalance_config.allow_cross_node_disagg,
         enable_adp_dummy_fixes=should_enable_adp_dummy_fixes(mapping),
         enable_scheduler_aware_adp_dummy=should_enable_scheduler_aware_adp_dummy(
             getattr(config, "model_type", None), mapping,
