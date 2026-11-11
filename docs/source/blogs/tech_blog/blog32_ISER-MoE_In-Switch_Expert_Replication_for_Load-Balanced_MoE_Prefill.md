@@ -364,9 +364,9 @@ Tokens may execute only on an expert's owner or a rank holding its replica. Each
 
 Every Hierarchical plan is also feasible under Free placement after removing unused replicas, so $R_{\mathrm{free}}^*\le R_{\mathrm{hier}}^*$. Figure 12 illustrates the placement rules; the small average gap above is specific to the tested workloads.
 
-![Free selects receiver slots independently; Hierarchical places the same expert on both members of each selected aligned pair.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_slot_usage.svg)
+![Free places experts independently; Hierarchical places the same expert across each selected group.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_slot_usage.svg)
 
-*Figure 12. Example helper-slot placement on receiver ranks 0–3, with one slot per rank. Free selects receivers independently; Hierarchical places the same expert on both members of each selected aligned pair. Letters identify experts; owners are omitted.*
+*Figure 12. Free places experts independently in each slot. Hierarchical places the same expert on every rank in a selected group. Each box is one helper slot; letters identify experts.*
 
 **Solving the bound.** Mixed-integer linear programming gives lower bounds on $R_m^*$, and validated integral plans give feasible upper bounds. Equal bounds certify the optimum; unresolved cases retain an interval. Figure 13 uses 1,536 experts, top-16 routing, 131,072 tokens per step, random contiguous ownership, and Zipf popularity calibrated to a coefficient of variation of two.
 
