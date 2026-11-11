@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the silu_and_mul catalog entry.
+"""GPU test for the silu_and_mul operation of the glm5_next FP8 target.
 
 The entry owns what is certified. This file turns a cell's spec into tensors, shows that the
 cell data tell the clamp and the gate/up order apart, and drives the inputs the guard exists
@@ -13,16 +13,15 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_mul import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.activation.silu_and_mul import (  # noqa: E501
     GLM_SWIGLU_LIMIT,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_mul import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.activation.silu_and_mul import (  # noqa: E501
     silu_and_mul as op,
 )
 from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = [".."]
-from _cells import certified_cells  # noqa: E402 — needs the path declared above
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 pytestmark = pytest.mark.skipif(
@@ -55,44 +54,39 @@ def _build(spec: dict, seed: int) -> torch.Tensor:
     return x.to(torch.bfloat16)
 
 
-# The shapes each shipped target calls this entry with, by target directory under `models/`.
-# The entry's own `CELLS` are the op's whoever calls it.
+# The shapes the target calls this operation with, on top of the operation's own `CELLS`.
 #
 # GLM-5.3-Flash at TP4: the three dense layers' MLP (intermediate 12288 / 4 = 3072, so 2 x 3072
 # wide) at every step, and the MoE layers' shared expert (2048 / 4 = 512) on steps the
 # routed-expert decode path does not take (more than 4 rows). Generation steps are MTP-3
 # verifies of 4 rows per request, up to 64 requests; a 13,312-row prefill runs both on every
 # gathered row.
-TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "glm5_next/glm_5_3_flash_fp8__sm_10x__tp4": (
-        Cell(
-            why="dense MLP, MTP-3 verify of one request: 4 rows of 2 x 3072",
-            spec=dict(rows=4, cols=6144, swiglu_limit=GLM_SWIGLU_LIMIT),
-        ),
-        Cell(
-            why="dense MLP, MTP-3 verify of 64 requests: 256 rows of 2 x 3072",
-            spec=dict(rows=256, cols=6144, swiglu_limit=GLM_SWIGLU_LIMIT),
-        ),
-        Cell(
-            why="dense MLP over a 13,312-row prefill step",
-            spec=dict(rows=13312, cols=6144, swiglu_limit=GLM_SWIGLU_LIMIT),
-        ),
-        Cell(
-            why="shared expert, the smallest step past the 4-row decode path: 5 rows of 2 x 512",
-            spec=dict(rows=5, cols=1024, swiglu_limit=GLM_SWIGLU_LIMIT),
-        ),
-        Cell(
-            why="shared expert, MTP-3 verify of 64 requests: 256 rows of 2 x 512",
-            spec=dict(rows=256, cols=1024, swiglu_limit=GLM_SWIGLU_LIMIT),
-        ),
-        Cell(
-            why="shared expert over a 13,312-row prefill step",
-            spec=dict(rows=13312, cols=1024, swiglu_limit=GLM_SWIGLU_LIMIT),
-        ),
+CELLS: tuple[Cell, ...] = op.CELLS + (
+    Cell(
+        why="dense MLP, MTP-3 verify of one request: 4 rows of 2 x 3072",
+        spec=dict(rows=4, cols=6144, swiglu_limit=GLM_SWIGLU_LIMIT),
     ),
-}
-
-CELLS = certified_cells(op, TARGET_CELLS)
+    Cell(
+        why="dense MLP, MTP-3 verify of 64 requests: 256 rows of 2 x 3072",
+        spec=dict(rows=256, cols=6144, swiglu_limit=GLM_SWIGLU_LIMIT),
+    ),
+    Cell(
+        why="dense MLP over a 13,312-row prefill step",
+        spec=dict(rows=13312, cols=6144, swiglu_limit=GLM_SWIGLU_LIMIT),
+    ),
+    Cell(
+        why="shared expert, the smallest step past the 4-row decode path: 5 rows of 2 x 512",
+        spec=dict(rows=5, cols=1024, swiglu_limit=GLM_SWIGLU_LIMIT),
+    ),
+    Cell(
+        why="shared expert, MTP-3 verify of 64 requests: 256 rows of 2 x 512",
+        spec=dict(rows=256, cols=1024, swiglu_limit=GLM_SWIGLU_LIMIT),
+    ),
+    Cell(
+        why="shared expert over a 13,312-row prefill step",
+        spec=dict(rows=13312, cols=1024, swiglu_limit=GLM_SWIGLU_LIMIT),
+    ),
+)
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])

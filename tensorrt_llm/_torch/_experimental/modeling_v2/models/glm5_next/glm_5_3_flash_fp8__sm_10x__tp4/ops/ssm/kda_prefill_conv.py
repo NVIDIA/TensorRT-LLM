@@ -8,8 +8,7 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_custom_ops  # noqa: F401 -- registers trtllm::kda_prefill_conv
-
-from .._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: Channels of one head (KDA's K = V); the op's q / k / v outputs are ``[1, T, H, 128]``.
 _HEAD_DIM = 128

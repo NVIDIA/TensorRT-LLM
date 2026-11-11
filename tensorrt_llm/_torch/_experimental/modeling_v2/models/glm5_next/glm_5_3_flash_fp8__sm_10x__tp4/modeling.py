@@ -48,9 +48,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter im
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp8_quantize_1x128 import (
-    fp8_quantize_1x128,
-)
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -71,6 +68,7 @@ from .ops.comm.mhc_ar_boundary import mhc_ar_boundary
 from .ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
 from .ops.moe.decode_moe import MAX_ROWS as _DECODE_MOE_ROWS
 from .ops.moe.prefill_moe import PrefillMoeWorkspace
+from .ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
 from .schedule import DENSE_MLP, LINEAR_ATTENTION, StepSchedule
 
 # The deployment this target is written for; route() selects it on the same facts, and

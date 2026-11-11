@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ssm/kda_decode catalog entry.
+"""GPU test for the ssm/kda_decode operation of the glm5_next FP8 target.
 
 Inputs as the KDA layer hands them over: x_q / x_k / x_v column sections of the fused ``[q | k | v]``
 projection's rows, the forget and output gates the two halves of the batched ``[f_b; g_b]`` GEMM's output, beta
@@ -17,11 +17,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_decode import kda_decode as op
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.ssm.kda_decode import (  # noqa: E501
+    kda_decode as op,
+)
 from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = [".."]
-from _cells import certified_cells  # noqa: E402 -- needs the path declared above
+__extra_import_path__ = ["../../../.."]
 from _validating import (  # noqa: E402,F401 -- fixture by name
     assert_within_ulp,
     certifying,
@@ -46,36 +47,32 @@ STATE_BAND = 1e-4
 
 # The decode steps the shipped target runs, by target directory under `models/`: GLM-5.3-Flash's KDA at TP4,
 # CUDA-graph batches up to 64 requests.
-TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "glm5_next/glm_5_3_flash_fp8__sm_10x__tp4": (
-        Cell(
-            why="1 request on an fp32 pool by slot: the four-CTA cluster kernel",
-            spec=dict(batch=1, layout="indexed", pool=72),
-        ),
-        Cell(
-            why="8 requests on an fp32 pool by slot: the legacy compact-heads kernel",
-            spec=dict(batch=8, layout="indexed", pool=72),
-        ),
-        Cell(
-            why="64 requests on an fp32 pool by slot: the two-stage bulk-copy kernel",
-            spec=dict(batch=64, layout="indexed", pool=72),
-        ),
-        Cell(
-            why="1 request on staged rows of a bf16 pool (no slot indices)",
-            spec=dict(batch=1, layout="dense"),
-        ),
-        Cell(
-            why="8 requests on staged rows of a bf16 pool (no slot indices)",
-            spec=dict(batch=8, layout="dense"),
-        ),
-        Cell(
-            why="64 requests on staged rows of a bf16 pool (no slot indices)",
-            spec=dict(batch=64, layout="dense"),
-        ),
+CELLS: tuple[Cell, ...] = op.CELLS + (
+    Cell(
+        why="1 request on an fp32 pool by slot: the four-CTA cluster kernel",
+        spec=dict(batch=1, layout="indexed", pool=72),
     ),
-}
-
-CELLS = certified_cells(op, TARGET_CELLS)
+    Cell(
+        why="8 requests on an fp32 pool by slot: the legacy compact-heads kernel",
+        spec=dict(batch=8, layout="indexed", pool=72),
+    ),
+    Cell(
+        why="64 requests on an fp32 pool by slot: the two-stage bulk-copy kernel",
+        spec=dict(batch=64, layout="indexed", pool=72),
+    ),
+    Cell(
+        why="1 request on staged rows of a bf16 pool (no slot indices)",
+        spec=dict(batch=1, layout="dense"),
+    ),
+    Cell(
+        why="8 requests on staged rows of a bf16 pool (no slot indices)",
+        spec=dict(batch=8, layout="dense"),
+    ),
+    Cell(
+        why="64 requests on staged rows of a bf16 pool (no slot indices)",
+        spec=dict(batch=64, layout="dense"),
+    ),
+)
 
 
 def _heads(cols: torch.Tensor) -> torch.Tensor:

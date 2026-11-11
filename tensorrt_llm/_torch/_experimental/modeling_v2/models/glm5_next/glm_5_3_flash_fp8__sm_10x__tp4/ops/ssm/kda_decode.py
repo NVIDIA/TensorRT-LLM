@@ -8,8 +8,7 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 -- loads the library that registers trtllm::kda_decode
-
-from .._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: KDA's K = V.
 _HEAD_DIM = 128

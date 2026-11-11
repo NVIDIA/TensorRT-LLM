@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the fp8_blockwise_gemm catalog entry.
+"""GPU test for the fp8_blockwise_gemm operation of the glm5_next FP8 target.
 
 The entry owns the contract. This file turns a cell into block-FP8 operands (drawn directly as
 e4m3 codes and fp32 scales, so both sides read bit-identical values), runs the block-FP8
@@ -13,23 +13,22 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.fp8_blockwise_gemm import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.fp8_blockwise_gemm import (  # noqa: E501
     BLOCK,
     GLM_DENSE_DOWN,
     GLM_DENSE_GATE_UP,
     GLM_SHARED_DOWN,
     GLM_SHARED_GATE_UP,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.fp8_blockwise_gemm import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.fp8_blockwise_gemm import (  # noqa: E501
     fp8_blockwise_gemm as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp8_quantize_1x128 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
     fp8_quantize_1x128,
 )
 from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = [".."]
-from _cells import certified_cells  # noqa: E402 — needs the path declared above
+__extra_import_path__ = ["../../../.."]
 from _validating import (  # noqa: E402,F401 — path above; fixture by name
     assert_within_ulp,
     certifying,
@@ -77,8 +76,7 @@ def _build(spec: dict, seed: int) -> tuple[torch.Tensor, ...]:
     return x, w, x_scale, w_scale
 
 
-# The shapes each shipped target calls this entry with, by target directory under `models/`.
-# The entry's own `CELLS` are the op's whoever calls it.
+# The shapes the target calls this operation with, on top of the operation's own `CELLS`.
 #
 # GLM-5.3-Flash at TP4 runs four block-FP8 FFN projections -- the three dense layers' MLP and
 # every MoE layer's shared expert, each a gate_up and a down -- and, in the sequence-parallel
@@ -97,28 +95,24 @@ _ROWS = (
     (13312, "a 13,312-row prefill step"),
 )
 
-TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "glm5_next/glm_5_3_flash_fp8__sm_10x__tp4": (
-        *(
-            Cell(
-                why=f"{name} {shape['n']}x{shape['k']}, {m} rows: {what}",
-                spec=dict(m=m, **shape),
-            )
-            for name, shape in _FFN
-            for m, what in _ROWS
-        ),
+CELLS: tuple[Cell, ...] = op.CELLS + (
+    *(
         Cell(
-            why="sequence-parallel MLA prefill q_b over 64 heads (16384 x 1536), 3,328 rows",
-            spec=dict(m=3328, n=16384, k=1536),
-        ),
-        Cell(
-            why="sequence-parallel MLA prefill o over 64 heads (4096 x 16384), 3,328 rows",
-            spec=dict(m=3328, n=4096, k=16384),
-        ),
+            why=f"{name} {shape['n']}x{shape['k']}, {m} rows: {what}",
+            spec=dict(m=m, **shape),
+        )
+        for name, shape in _FFN
+        for m, what in _ROWS
     ),
-}
-
-CELLS = certified_cells(op, TARGET_CELLS)
+    Cell(
+        why="sequence-parallel MLA prefill q_b over 64 heads (16384 x 1536), 3,328 rows",
+        spec=dict(m=3328, n=16384, k=1536),
+    ),
+    Cell(
+        why="sequence-parallel MLA prefill o over 64 heads (4096 x 16384), 3,328 rows",
+        spec=dict(m=3328, n=4096, k=16384),
+    ),
+)
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])

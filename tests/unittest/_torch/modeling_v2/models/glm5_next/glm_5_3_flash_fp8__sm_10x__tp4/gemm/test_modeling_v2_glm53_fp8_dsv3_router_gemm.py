@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the dsv3_router_gemm catalog entry.
+"""GPU test for the dsv3_router_gemm operation of the glm5_next FP8 target.
 
 The entry owns the contract. This file turns a cell into the router's operands, gates the op
 against the entry's float64 reference in fp32 ulp, and drives the bias guard.
@@ -12,14 +12,15 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.dsv3_router_gemm import GLM_ROUTER
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.dsv3_router_gemm import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.dsv3_router_gemm import (  # noqa: E501
+    GLM_ROUTER,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.gemm.dsv3_router_gemm import (  # noqa: E501
     dsv3_router_gemm as op,
 )
 from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = [".."]
-from _cells import certified_cells  # noqa: E402 — needs the path declared above
+__extra_import_path__ = ["../../../.."]
 from _validating import (  # noqa: E402,F401 — path above; fixture by name
     ULP,
     assert_within_ulp,
@@ -61,44 +62,39 @@ def _build(spec: dict, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
     return hidden.to(torch.bfloat16), weight.to(torch.bfloat16).t()
 
 
-# The shapes each shipped target calls this entry with, by target directory under `models/`.
-# The entry's own `CELLS` are the op's whoever calls it.
+# The shapes the target calls this operation with, on top of the operation's own `CELLS`.
 #
 # GLM-5.3-Flash at TP4: the router is replicated, so every rank routes its rows over all 288
 # experts from the full hidden width. Generation steps are MTP-3 verifies of 4 rows per
 # request (up to 64 requests) and the drafter's single rows; a 13,312-row prefill runs
 # sequence parallel, each rank routing its own quarter (3,328 rows).
-TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "glm5_next/glm_5_3_flash_fp8__sm_10x__tp4": (
-        Cell(why="one row: the MTP drafter's decode step", spec=dict(rows=1, **GLM_ROUTER)),
-        Cell(
-            why="MTP-3 verify of one request: 4 rows on the small-M kernel",
-            spec=dict(rows=4, **GLM_ROUTER),
-        ),
-        Cell(
-            why="MTP-3 verify of two requests: 8 rows on the small-M kernel",
-            spec=dict(rows=8, **GLM_ROUTER),
-        ),
-        Cell(
-            why="MTP-3 verify of 8 requests: 32 rows on cuBLASLt",
-            spec=dict(rows=32, **GLM_ROUTER),
-        ),
-        Cell(
-            why="MTP-3 verify of 64 requests: 256 rows on cuBLASLt",
-            spec=dict(rows=256, **GLM_ROUTER),
-        ),
-        Cell(
-            why="sequence-parallel prefill: one rank's 3,328 rows of a 13,312-row step",
-            spec=dict(rows=3328, **GLM_ROUTER),
-        ),
-        Cell(
-            why="a 13,312-row prefill step routed in one call",
-            spec=dict(rows=13312, **GLM_ROUTER),
-        ),
+CELLS: tuple[Cell, ...] = op.CELLS + (
+    Cell(why="one row: the MTP drafter's decode step", spec=dict(rows=1, **GLM_ROUTER)),
+    Cell(
+        why="MTP-3 verify of one request: 4 rows on the small-M kernel",
+        spec=dict(rows=4, **GLM_ROUTER),
     ),
-}
-
-CELLS = certified_cells(op, TARGET_CELLS)
+    Cell(
+        why="MTP-3 verify of two requests: 8 rows on the small-M kernel",
+        spec=dict(rows=8, **GLM_ROUTER),
+    ),
+    Cell(
+        why="MTP-3 verify of 8 requests: 32 rows on cuBLASLt",
+        spec=dict(rows=32, **GLM_ROUTER),
+    ),
+    Cell(
+        why="MTP-3 verify of 64 requests: 256 rows on cuBLASLt",
+        spec=dict(rows=256, **GLM_ROUTER),
+    ),
+    Cell(
+        why="sequence-parallel prefill: one rank's 3,328 rows of a 13,312-row step",
+        spec=dict(rows=3328, **GLM_ROUTER),
+    ),
+    Cell(
+        why="a 13,312-row prefill step routed in one call",
+        spec=dict(rows=13312, **GLM_ROUTER),
+    ),
+)
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])

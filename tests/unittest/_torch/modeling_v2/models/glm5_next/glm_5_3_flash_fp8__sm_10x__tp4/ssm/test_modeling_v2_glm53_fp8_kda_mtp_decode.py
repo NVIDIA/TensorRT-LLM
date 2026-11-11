@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ssm/kda_mtp_decode catalog entry.
+"""GPU test for the ssm/kda_mtp_decode operation of the glm5_next FP8 target.
 
 Inputs as the KDA layer hands them over in a verify step: x_q / x_k / x_v column sections of the fused
 ``[q | k | v]`` projection's packed rows (1 + num_spec per request), the forget and output gates the two halves of
@@ -18,13 +18,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_mtp_decode import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.ssm.kda_mtp_decode import (  # noqa: E501
     kda_mtp_decode as op,
 )
 from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = [".."]
-from _cells import certified_cells  # noqa: E402 -- needs the path declared above
+__extra_import_path__ = ["../../../.."]
 from _validating import (  # noqa: E402,F401 -- fixture by name
     assert_within_ulp,
     certifying,
@@ -49,46 +48,42 @@ STATE_BAND = 1e-4
 # The MTP-3 verify steps the shipped target runs, by target directory under `models/`: GLM-5.3-Flash's KDA at
 # TP4, 1 + 3 tokens per request, CUDA-graph batches up to 64 requests, previous rounds accepting 0..3 drafts;
 # the pool bf16 (the default recurrent-state dtype) or fp32.
-TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "glm5_next/glm_5_3_flash_fp8__sm_10x__tp4": (
-        Cell(
-            why="MTP-3 verify of 1 request, 2 drafts pending, bf16 pool: the cluster-pair kernel",
-            spec=dict(batch=1, num_spec=3, pending=(2,), state_dtype=torch.bfloat16, pool=8),
-        ),
-        Cell(
-            why="MTP-3 verify of 8 requests, 0..3 drafts pending, bf16 pool: one CTA per (head, request)",
-            spec=dict(
-                batch=8,
-                num_spec=3,
-                pending=(0, 1, 2, 3, 3, 2, 1, 0),
-                state_dtype=torch.bfloat16,
-                pool=12,
-            ),
-        ),
-        Cell(
-            why="MTP-3 verify of 64 requests, 0..3 drafts pending, bf16 pool: the two-CTA-per-SM kernel",
-            spec=dict(
-                batch=64,
-                num_spec=3,
-                pending=tuple(n % 4 for n in range(64)),
-                state_dtype=torch.bfloat16,
-                pool=72,
-            ),
-        ),
-        Cell(
-            why="MTP-3 verify of 8 requests on an fp32 pool (mamba_ssm_cache_dtype float32)",
-            spec=dict(
-                batch=8,
-                num_spec=3,
-                pending=(3, 0, 2, 1, 1, 3, 0, 2),
-                state_dtype=torch.float32,
-                pool=12,
-            ),
+CELLS: tuple[Cell, ...] = op.CELLS + (
+    Cell(
+        why="MTP-3 verify of 1 request, 2 drafts pending, bf16 pool: the cluster-pair kernel",
+        spec=dict(batch=1, num_spec=3, pending=(2,), state_dtype=torch.bfloat16, pool=8),
+    ),
+    Cell(
+        why="MTP-3 verify of 8 requests, 0..3 drafts pending, bf16 pool: one CTA per (head, request)",
+        spec=dict(
+            batch=8,
+            num_spec=3,
+            pending=(0, 1, 2, 3, 3, 2, 1, 0),
+            state_dtype=torch.bfloat16,
+            pool=12,
         ),
     ),
-}
-
-CELLS = certified_cells(op, TARGET_CELLS)
+    Cell(
+        why="MTP-3 verify of 64 requests, 0..3 drafts pending, bf16 pool: the two-CTA-per-SM kernel",
+        spec=dict(
+            batch=64,
+            num_spec=3,
+            pending=tuple(n % 4 for n in range(64)),
+            state_dtype=torch.bfloat16,
+            pool=72,
+        ),
+    ),
+    Cell(
+        why="MTP-3 verify of 8 requests on an fp32 pool (mamba_ssm_cache_dtype float32)",
+        spec=dict(
+            batch=8,
+            num_spec=3,
+            pending=(3, 0, 2, 1, 1, 3, 0, 2),
+            state_dtype=torch.float32,
+            pool=12,
+        ),
+    ),
+)
 
 
 def _heads(cols: torch.Tensor) -> torch.Tensor:

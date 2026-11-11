@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the norm/rms_norm_gated_token_major catalog entry.
+"""GPU test for the norm/rms_norm_gated_token_major operation of the glm5_next FP8 target.
 
 The gate is a column section of a wider projection output, as the KDA layer reads it: ``z[t]`` is token t's
 ``[heads, N]`` block of the output-gate GEMM, and ``x`` holds the recurrence's per-head rows.
@@ -12,13 +12,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_token_major import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
     rms_norm_gated_token_major as op,
 )
 from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = [".."]
-from _cells import certified_cells  # noqa: E402 -- needs the path declared above
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 -- path above; fixture by name
 
 pytestmark = pytest.mark.skipif(get_sm_version() != 100, reason="certified on sm_100")
@@ -26,24 +25,20 @@ pytestmark = pytest.mark.skipif(get_sm_version() != 100, reason="certified on sm
 # The shapes the shipped target normalizes, by target directory under `models/`: GLM-5.3-Flash's KDA output
 # gate at TP4 (16 of 64 heads, head_dim 128, rms_norm_eps 1e-5, sigmoid gate), on the prefill path (decode and
 # verify fuse the norm into their kernels).
-TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "glm5_next/glm_5_3_flash_fp8__sm_10x__tp4": (
-        Cell(
-            why="a 13,312-token prompt: 212,992 rows, more programs than SMs (no PDL)",
-            spec=dict(tokens=13312, heads=16, width=128, eps=1e-5, gate_activation="sigmoid"),
-        ),
-        Cell(
-            why="a 32,768-token chunked-prefill step",
-            spec=dict(tokens=32768, heads=16, width=128, eps=1e-5, gate_activation="sigmoid"),
-        ),
-        Cell(
-            why="a 17-token prompt: fewer programs than SMs, so the PDL launch",
-            spec=dict(tokens=17, heads=16, width=128, eps=1e-5, gate_activation="sigmoid"),
-        ),
+CELLS: tuple[Cell, ...] = op.CELLS + (
+    Cell(
+        why="a 13,312-token prompt: 212,992 rows, more programs than SMs (no PDL)",
+        spec=dict(tokens=13312, heads=16, width=128, eps=1e-5, gate_activation="sigmoid"),
     ),
-}
-
-CELLS = certified_cells(op, TARGET_CELLS)
+    Cell(
+        why="a 32,768-token chunked-prefill step",
+        spec=dict(tokens=32768, heads=16, width=128, eps=1e-5, gate_activation="sigmoid"),
+    ),
+    Cell(
+        why="a 17-token prompt: fewer programs than SMs, so the PDL launch",
+        spec=dict(tokens=17, heads=16, width=128, eps=1e-5, gate_activation="sigmoid"),
+    ),
+)
 
 
 def _build(spec: dict, seed: int):

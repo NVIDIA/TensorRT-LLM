@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the fp8_block_scale_moe_runner catalog entry.
+"""GPU test for the fp8_block_scale_moe_runner operation of the glm5_next FP8 target.
 
 The entry owns the contract: `CELLS`, `reference`, `is_valid`. This file turns a cell into
 operands -- GLM-5.3-Flash's 288-expert stack drawn directly in e4m3 / fp32, so both sides read
@@ -16,20 +16,19 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp8_block_scale_moe_runner import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
     BLOCK,
     ROUTING_DEEPSEEK_V3,
     ROUTING_RENORMALIZE,
     Fp8BlockScaleMoeRunner,
     route_deepseek_v3,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp8_block_scale_moe_runner import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
     fp8_block_scale_moe_runner as op,
 )
 from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = [".."]
-from _cells import certified_cells  # noqa: E402 — needs the path declared above
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 pytestmark = pytest.mark.skipif(
@@ -181,33 +180,28 @@ def _seed(cell: Cell) -> int:
 
 # ── the certified cells ───────────────────────────────────────────────────
 
-# The shapes each shipped target calls this entry with, by target directory under `models/`.
-# The entry's own `CELLS` are the op's whoever calls it.
+# The shapes the target calls this operation with, on top of the operation's own `CELLS`.
 #
 # GLM-5.3-Flash at TP4 hands this op the generation steps its 4-row decode path does not take:
 # MTP-3 verifies of 4 rows per request, 2 to 64 requests, and any step of 5 rows or more.
-TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "glm5_next/glm_5_3_flash_fp8__sm_10x__tp4": (
-        Cell(
-            why="5 rows: the smallest step past the 4-row decode path; small-token routing",
-            spec=dict(tokens=5, **GLM),
-        ),
-        Cell(
-            why="MTP-3 verify of 2 requests: 8 rows, the small-token routing kernel's last count",
-            spec=dict(tokens=8, **GLM),
-        ),
-        Cell(
-            why="MTP-3 verify of 8 requests: 32 rows == H/128, the activation scales are square",
-            spec=dict(tokens=32, **GLM),
-        ),
-        Cell(
-            why="MTP-3 verify of 64 requests: 256 rows, the single-cluster routing kernel's last",
-            spec=dict(tokens=256, **GLM),
-        ),
+CELLS: tuple[Cell, ...] = op.CELLS + (
+    Cell(
+        why="5 rows: the smallest step past the 4-row decode path; small-token routing",
+        spec=dict(tokens=5, **GLM),
     ),
-}
-
-CELLS = certified_cells(op, TARGET_CELLS)
+    Cell(
+        why="MTP-3 verify of 2 requests: 8 rows, the small-token routing kernel's last count",
+        spec=dict(tokens=8, **GLM),
+    ),
+    Cell(
+        why="MTP-3 verify of 8 requests: 32 rows == H/128, the activation scales are square",
+        spec=dict(tokens=32, **GLM),
+    ),
+    Cell(
+        why="MTP-3 verify of 64 requests: 256 rows, the single-cluster routing kernel's last",
+        spec=dict(tokens=256, **GLM),
+    ),
+)
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])

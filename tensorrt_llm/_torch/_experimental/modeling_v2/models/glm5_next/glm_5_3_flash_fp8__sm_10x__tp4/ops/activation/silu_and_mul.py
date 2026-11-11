@@ -10,8 +10,7 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-
-from .._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: GLM-5.3-Flash's `swiglu_limit`.
 GLM_SWIGLU_LIMIT = 10.0

@@ -51,13 +51,6 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.fp8_blockwise_gemm import (
-    fp8_blockwise_gemm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp8_quantize_1x128 import (
-    fp8_quantize_1x128,
-)
-
 from ..checkpoint import Checkpoint, dequantize_block_fp8, share
 from ..dims import Dims
 from ..ops.attention.compact_sparse_rows import compact_sparse_rows
@@ -78,7 +71,9 @@ from ..ops.attention.sparse_mla_decode import (
     counter_bytes,
     sparse_mla_decode,
 )
+from ..ops.gemm.fp8_blockwise_gemm import fp8_blockwise_gemm
 from ..ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
+from ..ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
 from ..schedule import StepSchedule
 
 _BLOCK = 128

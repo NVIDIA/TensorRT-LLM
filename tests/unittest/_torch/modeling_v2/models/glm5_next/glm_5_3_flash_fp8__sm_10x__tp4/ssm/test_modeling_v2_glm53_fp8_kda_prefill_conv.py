@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ssm/kda_prefill_conv catalog entry.
+"""GPU test for the ssm/kda_prefill_conv operation of the glm5_next FP8 target.
 
 The conv pool is a view into wider per-slot records, as the hybrid cache manager lays it out, so a write past a
 slot's window shows up in the record's padding; the source is the token-major projection GEMM's output.
@@ -13,13 +13,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_prefill_conv import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.ssm.kda_prefill_conv import (  # noqa: E501
     kda_prefill_conv as op,
 )
 from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = [".."]
-from _cells import certified_cells  # noqa: E402 -- needs the path declared above
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 -- path above; fixture by name
 
 pytestmark = pytest.mark.skipif(get_sm_version() != 100, reason="certified on sm_100")
@@ -30,36 +29,32 @@ SLOT_PAD = 1024
 
 # The prefill steps the shipped target runs, by target directory under `models/`: GLM-5.3-Flash's KDA at TP4
 # (16 of 64 heads, [q | k | v] = 6144 channels), with --max_num_tokens 32768 and 13,312-token prompts.
-TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "glm5_next/glm_5_3_flash_fp8__sm_10x__tp4": (
-        Cell(
-            why="one 13,312-token prompt into a fresh slot",
-            spec=dict(heads=16, seq_lens=(13312,), slots=(5,), has_init=(False,), pool=8),
-        ),
-        Cell(
-            why="a 32,768-token step: two whole 13,312-token prompts and a 6,144-token first chunk",
-            spec=dict(
-                heads=16,
-                seq_lens=(13312, 13312, 6144),
-                slots=(3, 0, 6),
-                has_init=(False, False, False),
-                pool=8,
-            ),
-        ),
-        Cell(
-            why="the next step: the 7,168-token continuation from its slot's window, two fresh prompts",
-            spec=dict(
-                heads=16,
-                seq_lens=(7168, 13312, 12288),
-                slots=(6, 1, 4),
-                has_init=(True, False, False),
-                pool=8,
-            ),
+CELLS: tuple[Cell, ...] = op.CELLS + (
+    Cell(
+        why="one 13,312-token prompt into a fresh slot",
+        spec=dict(heads=16, seq_lens=(13312,), slots=(5,), has_init=(False,), pool=8),
+    ),
+    Cell(
+        why="a 32,768-token step: two whole 13,312-token prompts and a 6,144-token first chunk",
+        spec=dict(
+            heads=16,
+            seq_lens=(13312, 13312, 6144),
+            slots=(3, 0, 6),
+            has_init=(False, False, False),
+            pool=8,
         ),
     ),
-}
-
-CELLS = certified_cells(op, TARGET_CELLS)
+    Cell(
+        why="the next step: the 7,168-token continuation from its slot's window, two fresh prompts",
+        spec=dict(
+            heads=16,
+            seq_lens=(7168, 13312, 12288),
+            slots=(6, 1, 4),
+            has_init=(True, False, False),
+            pool=8,
+        ),
+    ),
+)
 
 
 def _build(spec: dict, seed: int):

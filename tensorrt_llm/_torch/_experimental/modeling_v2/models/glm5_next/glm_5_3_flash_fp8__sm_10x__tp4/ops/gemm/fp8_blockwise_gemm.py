@@ -9,8 +9,12 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-
-from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
+    Arch,
+    Cell,
+    OpWrapper,
+    true_fp32_matmul,
+)
 
 #: Block edge on every scale axis: 1x128 activations, 128x128 weights.
 BLOCK = 128

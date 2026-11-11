@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the fp8_quantize_1x128 catalog entry.
+"""GPU test for the fp8_quantize_1x128 operation of the glm5_next FP8 target.
 
 The entry owns the contract. This file turns a cell into an input, holds every code
 disagreement of a cell to a rounding tie, and adds what a cell cannot carry: the loud
@@ -13,17 +13,16 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp8_quantize_1x128 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
     BLOCK,
     block_scales,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp8_quantize_1x128 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
     fp8_quantize_1x128 as op,
 )
 from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = [".."]
-from _cells import certified_cells  # noqa: E402 — needs the path declared above
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying  # noqa: E402,F401 — path above; fixture by name
 
 pytestmark = pytest.mark.skipif(
@@ -101,8 +100,7 @@ def _assert_misses_are_ties(x: torch.Tensor, data: torch.Tensor, ref_data: torch
     return rel
 
 
-# The shapes each shipped target calls this entry with, by target directory under `models/`.
-# The entry's own `CELLS` are the op's whoever calls it.
+# The shapes the target calls this operation with, on top of the operation's own `CELLS`.
 #
 # GLM-5.3-Flash at TP4: every FFN input is the hidden row (4096); the down projections read
 # the SwiGLU output at the per-rank intermediate (dense 12288 / 4 = 3072, shared expert
@@ -110,44 +108,40 @@ def _assert_misses_are_ties(x: torch.Tensor, data: torch.Tensor, ref_data: torch
 # Generation steps are MTP-3 verifies of 4 rows per request (up to 64 requests); a 13,312-row
 # prefill runs sequence parallel, each rank quantizing its own quarter (3,328 rows) of the
 # FFN input and the down-projection inputs over every gathered row.
-TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "glm5_next/glm_5_3_flash_fp8__sm_10x__tp4": (
-        Cell(
-            why="MTP-3 verify of one request: 4 rows at hidden 4096",
-            spec=dict(rows=4, cols=4096, use_ue8m0=False),
-        ),
-        Cell(
-            why="MTP-3 verify of 64 requests: 256 rows at hidden 4096",
-            spec=dict(rows=256, cols=4096, use_ue8m0=False),
-        ),
-        Cell(
-            why="sequence-parallel prefill: one rank's 3,328 rows of 13,312 at hidden 4096",
-            spec=dict(rows=3328, cols=4096, use_ue8m0=False),
-        ),
-        Cell(
-            why="dense MLP down_proj input at TP4 (3072), 256 rows",
-            spec=dict(rows=256, cols=3072, use_ue8m0=False),
-        ),
-        Cell(
-            why="dense MLP down_proj input over a 13,312-row prefill step",
-            spec=dict(rows=13312, cols=3072, use_ue8m0=False),
-        ),
-        Cell(
-            why="shared expert down_proj input at TP4 (512), 256 rows",
-            spec=dict(rows=256, cols=512, use_ue8m0=False),
-        ),
-        Cell(
-            why="shared expert down_proj input over a 13,312-row prefill step",
-            spec=dict(rows=13312, cols=512, use_ue8m0=False),
-        ),
-        Cell(
-            why="MLA q_b input (q_lora 1536) over one rank's 3,328 sequence-parallel rows",
-            spec=dict(rows=3328, cols=1536, use_ue8m0=False),
-        ),
+CELLS: tuple[Cell, ...] = op.CELLS + (
+    Cell(
+        why="MTP-3 verify of one request: 4 rows at hidden 4096",
+        spec=dict(rows=4, cols=4096, use_ue8m0=False),
     ),
-}
-
-CELLS = certified_cells(op, TARGET_CELLS)
+    Cell(
+        why="MTP-3 verify of 64 requests: 256 rows at hidden 4096",
+        spec=dict(rows=256, cols=4096, use_ue8m0=False),
+    ),
+    Cell(
+        why="sequence-parallel prefill: one rank's 3,328 rows of 13,312 at hidden 4096",
+        spec=dict(rows=3328, cols=4096, use_ue8m0=False),
+    ),
+    Cell(
+        why="dense MLP down_proj input at TP4 (3072), 256 rows",
+        spec=dict(rows=256, cols=3072, use_ue8m0=False),
+    ),
+    Cell(
+        why="dense MLP down_proj input over a 13,312-row prefill step",
+        spec=dict(rows=13312, cols=3072, use_ue8m0=False),
+    ),
+    Cell(
+        why="shared expert down_proj input at TP4 (512), 256 rows",
+        spec=dict(rows=256, cols=512, use_ue8m0=False),
+    ),
+    Cell(
+        why="shared expert down_proj input over a 13,312-row prefill step",
+        spec=dict(rows=13312, cols=512, use_ue8m0=False),
+    ),
+    Cell(
+        why="MLA q_b input (q_lora 1536) over one rank's 3,328 sequence-parallel rows",
+        spec=dict(rows=3328, cols=1536, use_ue8m0=False),
+    ),
+)
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])

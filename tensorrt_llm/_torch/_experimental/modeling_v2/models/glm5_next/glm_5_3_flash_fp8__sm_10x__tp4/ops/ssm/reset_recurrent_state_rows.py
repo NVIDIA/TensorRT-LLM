@@ -13,7 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: Elements of a row one program zeroes.
 _BLOCK_SIZE = 256

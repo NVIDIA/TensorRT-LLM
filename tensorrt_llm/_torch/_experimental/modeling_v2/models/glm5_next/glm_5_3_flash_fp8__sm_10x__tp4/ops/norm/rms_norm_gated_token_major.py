@@ -21,7 +21,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
-from .._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 # Rows per program of the multi-row kernel. At the decode shape (thousands of 128-element rows) one row
 # per CTA leaves the kernel launch-limited; 4 rows with 4 warps reproduces the single-row kernel's

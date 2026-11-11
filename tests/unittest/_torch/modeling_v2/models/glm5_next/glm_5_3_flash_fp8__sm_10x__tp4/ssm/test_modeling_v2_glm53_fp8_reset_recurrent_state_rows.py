@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ssm/reset_recurrent_state_rows catalog entry.
+"""GPU test for the ssm/reset_recurrent_state_rows operation of the glm5_next FP8 target.
 
 The pools are views into wider per-slot records, as the hybrid cache manager lays them out, so a write past a
 slot's row shows up in the record's padding. The op writes zeros or nothing, so every comparison is exact.
@@ -12,13 +12,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.reset_recurrent_state_rows import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.ssm.reset_recurrent_state_rows import (  # noqa: E501
     reset_recurrent_state_rows as op,
 )
 from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = [".."]
-from _cells import certified_cells  # noqa: E402 -- needs the path declared above
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 -- path above; fixture by name
 
 pytestmark = pytest.mark.skipif(get_sm_version() != 100, reason="certified on sm_100")
@@ -31,42 +30,38 @@ CONV_ROW = 3 * HEADS * HEAD_DIM * WINDOW
 SLOT_PAD = 4096
 
 # The resets the shipped target issues before each KDA prefill, by target directory under `models/`.
-TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "glm5_next/glm_5_3_flash_fp8__sm_10x__tp4": (
-        Cell(
-            why="a 13,312-token prompt's prefill: one fresh request on the default bf16 pool",
-            spec=dict(
-                slots=8,
-                indices=(5,),
-                has_init=(False,),
-                state_dtype=torch.bfloat16,
-                with_conv=False,
-            ),
-        ),
-        Cell(
-            why="a chunked-prefill step: the continuing chunk keeps its row, two fresh prompts are zeroed",
-            spec=dict(
-                slots=8,
-                indices=(6, 1, 4),
-                has_init=(True, False, False),
-                state_dtype=torch.bfloat16,
-                with_conv=False,
-            ),
-        ),
-        Cell(
-            why="the same step on an fp32 pool (kv_cache_config.mamba_ssm_cache_dtype float32)",
-            spec=dict(
-                slots=8,
-                indices=(6, 1, 4),
-                has_init=(True, False, False),
-                state_dtype=torch.float32,
-                with_conv=False,
-            ),
+CELLS: tuple[Cell, ...] = op.CELLS + (
+    Cell(
+        why="a 13,312-token prompt's prefill: one fresh request on the default bf16 pool",
+        spec=dict(
+            slots=8,
+            indices=(5,),
+            has_init=(False,),
+            state_dtype=torch.bfloat16,
+            with_conv=False,
         ),
     ),
-}
-
-CELLS = certified_cells(op, TARGET_CELLS)
+    Cell(
+        why="a chunked-prefill step: the continuing chunk keeps its row, two fresh prompts are zeroed",
+        spec=dict(
+            slots=8,
+            indices=(6, 1, 4),
+            has_init=(True, False, False),
+            state_dtype=torch.bfloat16,
+            with_conv=False,
+        ),
+    ),
+    Cell(
+        why="the same step on an fp32 pool (kv_cache_config.mamba_ssm_cache_dtype float32)",
+        spec=dict(
+            slots=8,
+            indices=(6, 1, 4),
+            has_init=(True, False, False),
+            state_dtype=torch.float32,
+            with_conv=False,
+        ),
+    ),
+)
 
 
 def _build(spec: dict, seed: int):

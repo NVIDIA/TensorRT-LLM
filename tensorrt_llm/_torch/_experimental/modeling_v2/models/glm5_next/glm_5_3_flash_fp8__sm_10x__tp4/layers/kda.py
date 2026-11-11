@@ -47,22 +47,15 @@ from typing import Any, Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_token_major import (
-    rms_norm_gated_token_major,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_decode import kda_decode
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_mtp_decode import kda_mtp_decode
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_prefill import kda_prefill
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_prefill_conv import (
-    kda_prefill_conv,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.reset_recurrent_state_rows import (
-    reset_recurrent_state_rows,
-)
-
 from ..checkpoint import Checkpoint, cols, rows, share
 from ..dims import Dims
 from ..ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
+from ..ops.norm.rms_norm_gated_token_major import rms_norm_gated_token_major
+from ..ops.ssm.kda_decode import kda_decode
+from ..ops.ssm.kda_mtp_decode import kda_mtp_decode
+from ..ops.ssm.kda_prefill import kda_prefill
+from ..ops.ssm.kda_prefill_conv import kda_prefill_conv
+from ..ops.ssm.reset_recurrent_state_rows import reset_recurrent_state_rows
 from ..schedule import StepSchedule
 
 #: The head size and conv width the KDA kernels implement.

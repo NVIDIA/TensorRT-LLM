@@ -33,27 +33,16 @@ from dataclasses import dataclass
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_mul import (
-    silu_and_mul,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.dsv3_router_gemm import (
-    dsv3_router_gemm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.fp8_blockwise_gemm import (
-    fp8_blockwise_gemm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp8_block_scale_moe_runner import (
-    fp8_block_scale_moe_runner,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp8_quantize_1x128 import (
-    fp8_quantize_1x128,
-)
-
 from ..checkpoint import Checkpoint, cols, rows, share
 from ..dims import Dims
+from ..ops.activation.silu_and_mul import silu_and_mul
+from ..ops.gemm.dsv3_router_gemm import dsv3_router_gemm
+from ..ops.gemm.fp8_blockwise_gemm import fp8_blockwise_gemm
 from ..ops.moe.decode_moe import MAX_ROWS as DECODE_MOE_ROWS
 from ..ops.moe.decode_moe import decode_moe
+from ..ops.moe.fp8_block_scale_moe_runner import fp8_block_scale_moe_runner
 from ..ops.moe.prefill_moe import PrefillMoeWorkspace, prefill_moe
+from ..ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
 
 _BLOCK = 128
 #: The TRTLLM-gen runner's routing method: DeepSeek-V3 (sigmoid scores, correction bias,
