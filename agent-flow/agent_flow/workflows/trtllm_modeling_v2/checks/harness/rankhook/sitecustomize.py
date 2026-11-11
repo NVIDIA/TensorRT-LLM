@@ -46,7 +46,16 @@ def _plain(value, depth=0):
         return [_plain(v, depth + 1) for v in value]
     fields = getattr(type(value), "model_fields", None)
     if fields:
-        return {name: _plain(getattr(value, name, None), depth + 1) for name in fields}
+        found = {}
+        for name, field in fields.items():
+            found[name] = _plain(getattr(value, name, None), depth + 1)
+            # An options file may spell a field by an alias: the same value answers to it.
+            alias = getattr(field, "validation_alias", None)
+            spelled = [getattr(field, "alias", None), *(getattr(alias, "choices", None) or [alias])]
+            for other in spelled:
+                if isinstance(other, str):
+                    found.setdefault(other, found[name])
+        return found
     if hasattr(value, "__dict__") and not callable(value):
         public = {k: v for k, v in vars(value).items() if not k.startswith("_")}
         return {k: _plain(v, depth + 1) for k, v in public.items()}

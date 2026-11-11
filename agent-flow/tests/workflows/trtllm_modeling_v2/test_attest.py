@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import enum
+import json
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,7 +19,7 @@ from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
 from agent_flow.workflows.trtllm_modeling_v2.spec.deployments import Deployment, Server
 
-from ._helpers import rank_lines
+from ._helpers import TARGET_CLASS, rank_lines
 
 OPTIONS = {
     "tensor_parallel_size": 2,
@@ -100,6 +103,56 @@ def test_a_repeated_prompt_must_come_back_with_cached_tokens():
     assert attest.reuse_shortfall([0, 0, 0, 448, 0]) is None
     assert "the engine reused nothing" in attest.reuse_shortfall([0, 0])
     assert "unknown is not a pass" in attest.reuse_shortfall([0, None])
+
+
+def test_a_rank_prints_every_field_of_its_configuration_under_each_name_it_answers_to(
+    monkeypatch,
+):
+    hook = Path(attest.__file__).parent / "harness" / "rankhook" / "sitecustomize.py"
+    monkeypatch.setattr(sys, "path", [])  # the hook hands on to no other sitecustomize here
+    monkeypatch.delenv("MV2FLOW_RANK_FACTS", raising=False)
+    module: dict = {"__name__": "rankhook", "__file__": str(hook)}
+    exec(compile(hook.read_text(encoding="utf-8"), str(hook), "exec"), module)
+
+    class Dtype(enum.Enum):
+        FP8 = "fp8"
+
+    class Field:
+        def __init__(self, alias=None, choices=None):
+            self.alias = alias
+            self.validation_alias = SimpleNamespace(choices=choices) if choices else None
+
+    class Kv:
+        model_fields = {"dtype": Field(), "free_gpu_memory_fraction": Field()}
+        dtype, free_gpu_memory_fraction, _private = Dtype.FP8, 0.9, "unseen"
+
+    class Draft:
+        model_fields = {"speculative_model": Field(choices=["speculative_model_dir"])}
+        speculative_model = Path("/ckpt/draft")
+
+    class Args:
+        model_fields = {
+            "kv_cache_config": Field(),
+            "speculative_config": Field(),
+            "n": Field("num"),
+        }
+        kv_cache_config, speculative_config, n = Kv(), Draft(), 4
+
+    resolved = module["_plain"](Args())
+    assert resolved == {
+        "kv_cache_config": {"dtype": "fp8", "free_gpu_memory_fraction": 0.9},
+        "speculative_config": {
+            "speculative_model": "/ckpt/draft",
+            "speculative_model_dir": "/ckpt/draft",
+        },
+        "n": 4,
+        "num": 4,
+    }
+    # What the comparison then reads of it: a key spelled by its alias is known.
+    declared = {"speculative_config": {"speculative_model_dir": "/ckpt/draft"}, "num": 4}
+    record = {"rank": 0, "options": resolved, "target": TARGET_CLASS, "origin": "/r/t/__init__.py"}
+    line = f"MV2FLOW_RANK_ENGINE {json.dumps(record)}\n"
+    assert attest.attest(line, declared).status == attest.MATCH
 
 
 _FAKE_TRTLLM = {
