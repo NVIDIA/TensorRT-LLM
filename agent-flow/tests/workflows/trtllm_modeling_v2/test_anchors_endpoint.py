@@ -311,3 +311,10 @@ def test_a_disaggregated_deployments_boot_goes_through_its_endpoint_under_the_lo
     assert locked == [site / "ws"]
     started = (site / "ws" / "deployments" / "disagg@tp2" / "address.ctx.started.json").read_text()
     assert '"--server_role", "context"' in started
+    # Its accuracy names the benchmark; one the tree has not driven through an endpoint is
+    # reported, with no load.
+    result = gate_cli.run_check(
+        spec, "accuracy[mmmu]", "disagg", "tp2", workdir=site / "w", workspace=site / "ws",
+        runner=lambda *a, **k: CommandResult(0, ""),
+    )  # fmt: skip
+    assert not result.passed and result.detail.startswith("not judged through the hop")

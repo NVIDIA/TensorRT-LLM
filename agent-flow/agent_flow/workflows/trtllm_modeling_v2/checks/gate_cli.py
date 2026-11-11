@@ -31,7 +31,7 @@ from ..infra.compute.executor import select_command_executor, shell_runner_for
 from ..infra.files import read_json
 from ..spec import shorthand
 from ..spec import variants as variants_mod
-from ..spec.deployments import DISAGGREGATED, Benchmark, Deployment
+from ..spec.deployments import DEFAULT_BENCHMARK, DISAGGREGATED, Benchmark, Deployment
 from ..spec.task_schema import (
     TaskSchemaError,
     assembly_units,
@@ -283,7 +283,10 @@ def run_check(
                 **bound,
             )
         if through_endpoint:
-            [benchmark] = deployment.benchmarks or [Benchmark(name=gate.partition("[")[2][:-1])]
+            # `accuracy[<benchmark>]` names one of the deployment's; unnamed, its first.
+            wanted = gate.partition("[")[2].rstrip("]")
+            listed = [b for b in deployment.benchmarks if not wanted or b.name == wanted]
+            benchmark = listed[0] if listed else Benchmark(name=wanted or DEFAULT_BENCHMARK)
             held = anchors.frozen(workspace, deployment.name, benchmark.name) or anchors.resolve(
                 spec, deployment, benchmark, tree
             )
