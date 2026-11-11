@@ -341,9 +341,10 @@ def test_forward_async_receive_view_gate(
 
     if accepts_unowned_inputs is not None:
         RecordingBackend.accepts_unowned_inputs = accepts_unowned_inputs
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: world_size)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
-    attention = parallel.UlyssesAttention(RecordingBackend(), object())
+    attention = object.__new__(parallel.UlyssesAttention)
+    attention.inner_backend = RecordingBackend()
+    attention.process_group = object()
+    attention.world_size = world_size
     monkeypatch.setattr(attention, "_issue_async", issue_async)
     monkeypatch.setattr(attention, "_join_async", lambda: None)
     monkeypatch.setattr(
