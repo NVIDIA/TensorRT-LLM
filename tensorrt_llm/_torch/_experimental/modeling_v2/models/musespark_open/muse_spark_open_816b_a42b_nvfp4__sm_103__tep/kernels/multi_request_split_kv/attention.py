@@ -40,12 +40,17 @@ launches the real FMHA with the same arguments and is recorded with its reason
 Numerics: not bit-identical to the built-in FMHA (``multi_request_split_kv``'s module
 docstring: the same E4M3 Q, K and V as the built-in, with P rounded to E4M3 and FP16
 partials); deterministic; no cache byte changes.
+
+Cache blocks: 32 tokens. With ``MUSESPARK_OPEN_MULTI_REQUEST_SPLIT_KV_PAGE64=1`` a cache of
+64-token blocks is taken too; the kernel reads each block as two 32-token pages, so a call
+gives the output it gives on a 32-token cache holding the same keys.
 """
 
 from __future__ import annotations
 
 import collections
 import functools
+import os
 from dataclasses import dataclass, field
 from typing import ClassVar, Deque, Dict, Optional, Tuple
 
@@ -91,6 +96,15 @@ WINDOW = 2048
 #: Whether the target installs the path on the sliding-window layers too. Their 2048-key reads
 #: are short enough that the built-in FMHA's one launch is the faster choice there.
 SLIDING_LAYERS = False
+
+#: Opt-in: decode calls over a cache of 64-token blocks run the kernel too.
+PAGE64_ENV = "MUSESPARK_OPEN_MULTI_REQUEST_SPLIT_KV_PAGE64"
+
+
+def cache_pages() -> Tuple[int, ...]:
+    """The cache tokens per block this path takes: 32, and 64 under ``PAGE64_ENV``."""
+    return _mr.CACHE_PAGES if os.environ.get(PAGE64_ENV, "0") == "1" else (_mr.PAGE,)
+
 
 #: ``MultiRequestCensus`` outcome kinds.
 SERVED = "multi_request_split_kv"
@@ -177,7 +191,9 @@ class MultiRequestCall:
                 and (
                     pool.dtype != torch.float8_e4m3fn
                     or pool.dim() != 4
-                    or tuple(pool.shape[1:]) != (self.kv_heads, _mr.PAGE, _mr.HEAD_DIM)
+                    or pool.shape[1] != self.kv_heads
+                    or pool.shape[2] not in cache_pages()
+                    or pool.shape[3] != _mr.HEAD_DIM
                     or not pool.is_contiguous()
                 ),
                 "another cache view",
@@ -241,6 +257,7 @@ class MultiRequestCall:
                 q_fp8=q_fp8,
                 device_scale=q_fp8,
                 requests=requests,
+                cache_page=pool.shape[2],
             )
             not in _mr._compiled_keys
         ):
@@ -429,11 +446,19 @@ def install(model: torch.nn.Module, sliding: bool, min_requests: int = 2) -> int
     device_index = torch.cuda.current_device()
     pdl = {bool(trtllm_gen_fmha(attention.attn)._enable_pdl) for attention in chosen}
     windows = {WINDOW if attention.is_sliding else 0 for attention in chosen}
+    pages = cache_pages()
     for enable_pdl in sorted(pdl):
         for window in sorted(windows):
-            _mr.precompile(
-                device_index, enable_pdl, kv_heads, window, q_fp8=True, device_scale=True
-            )
+            for cache_page in pages:
+                _mr.precompile(
+                    device_index,
+                    enable_pdl,
+                    kv_heads,
+                    window,
+                    q_fp8=True,
+                    device_scale=True,
+                    cache_page=cache_page,
+                )
     census = MultiRequestCensus(tuple(attention.layer_idx for attention in chosen))
     for attention in chosen:
         attention.__class__ = _mr_class(type(attention))
@@ -447,6 +472,7 @@ def install(model: torch.nn.Module, sliding: bool, min_requests: int = 2) -> int
         f"more sequences the "
         f"decode FMHA of {full} full-attention and {len(chosen) - full} sliding-window layers "
         f"runs multi_request_split_kv ({kv_heads} KV heads per rank, builds "
-        f"pdl={sorted(pdl)} window={sorted(windows)} q=E4M3 + device scales)"
+        f"pdl={sorted(pdl)} window={sorted(windows)} q=E4M3 + device scales"
+        + (f", cache blocks of {list(pages)} tokens)" if len(pages) > 1 else ")")
     )
     return len(chosen)

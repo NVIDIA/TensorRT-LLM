@@ -79,6 +79,8 @@ MAX_ROWS = 8
 #: scans (two or four); every other instruction is the same.
 REQUEST_BUILDS = (64, 128)
 MAX_REQUESTS = REQUEST_BUILDS[-1]
+#: Cache tokens per block the builds read: 32, and 64 as two 32-key halves.
+CACHE_PAGES = (PAGE, 2 * PAGE)
 #: Page ids the loader stages per pass: one per lane.
 ID_CHUNK = 32
 #: log2(e): a device bmm1 scale times this is the softmax's exp2 scale.
@@ -96,7 +98,10 @@ class MultiRequestSplitKvKernel:
     kernel; ``window > 0`` the sliding-window one (row t of a request attends keys
     ``(L - M + t - window, L - M + t]``). ``rescale_cols`` is how many O columns the rare
     rescale holds in registers at once (16: the spill-free build). ``max_requests`` is the
-    build's request capacity (``REQUEST_BUILDS``).
+    build's request capacity (``REQUEST_BUILDS``). ``cache_page`` is the cache's tokens per
+    block (``CACHE_PAGES``): a 64-token block is read as its two 32-token halves, each the
+    32-key page every other part of the kernel works on, so the tiles, the page split and the
+    arithmetic are those of a 32-token cache holding the same keys.
     """
 
     def __init__(
@@ -116,8 +121,10 @@ class MultiRequestSplitKvKernel:
         q_fp8: bool = False,
         device_scale: bool = False,
         max_requests: int = REQUEST_BUILDS[0],
+        cache_page: int = PAGE,
     ):
         assert kv_heads in RANK_KV_HEADS, kv_heads
+        assert cache_page in CACHE_PAGES, cache_page
         assert max_requests in REQUEST_BUILDS, max_requests
         assert nq in (1, 2), nq
         assert not q_fp8 or nq == 1, "an E4M3 Q is one term"
@@ -146,6 +153,8 @@ class MultiRequestSplitKvKernel:
         self.tmem_warps = 9
         self.tmem_cols = 512
         self.max_requests = max_requests
+        #: 32-key pages per cache block.
+        self.sub = cache_page // PAGE
 
     def pair_index(self):
         if self.pairs == 1:
@@ -157,7 +166,7 @@ class MultiRequestSplitKvKernel:
     def __call__(
         self,
         q_ptr: cute.Pointer,  # BF16 (F8 when q_fp8) [requests * rows, hq * 64], row stride q_stride
-        pool_ptr: cute.Pointer,  # F8 [num_blocks, kv_heads, 32, 64], contiguous
+        pool_ptr: cute.Pointer,  # F8 [num_blocks, kv_heads, cache_page, 64], contiguous
         table_ptr: cute.Pointer,  # Int32 [requests, 2, table_width]
         seq_lens_ptr: cute.Pointer,  # Int32 [requests]
         part_o_ptr: cute.Pointer,  # F16 [slots, MAX_ROWS * hq, 64]
@@ -176,13 +185,17 @@ class MultiRequestSplitKvKernel:
         stream,
     ):
         NKV = self.kv_heads
+        SUB = self.sub
         q = cute.make_tensor(
             q_ptr,
             cute.make_layout((num_requests * rows, self.hq * D), stride=(q_stride, 1)),
         )
         pool = cute.make_tensor(
             pool_ptr,
-            cute.make_layout((num_blocks, NKV, PAGE, D), stride=(NKV * PAGE * D, PAGE * D, D, 1)),
+            cute.make_layout(
+                (num_blocks, NKV, SUB * PAGE, D),
+                stride=(NKV * SUB * PAGE * D, SUB * PAGE * D, D, 1),
+            ),
         )
         table = cute.make_tensor(
             table_ptr,
@@ -223,17 +236,29 @@ class MultiRequestSplitKvKernel:
         p_layout = sm100_utils.make_smem_layout_a(pv_mma, pv_tiler, F8, 1)
 
         # V pool as the PV B operand: (dims (64, head 2), keys 32, pair + pairs * block)
-        mV = cute.make_tensor(
-            pool.iterator,
-            cute.make_layout(
-                ((D, HKV), PAGE, self.pairs * num_blocks),
-                stride=((1, PAGE * D), D, HKV * PAGE * D),
-            ),
-        )
-        # K pool as one head's B operand: (keys 32, dims 64, head + kv_heads * block)
+        if cutlass.const_expr(SUB == 1):
+            mV = cute.make_tensor(
+                pool.iterator,
+                cute.make_layout(
+                    ((D, HKV), PAGE, self.pairs * num_blocks),
+                    stride=((1, PAGE * D), D, HKV * PAGE * D),
+                ),
+            )
+        else:
+            # A block's half pages: (dims (64, head 2), keys 32, half + SUB * (head + kv_heads
+            # * block)); the pair's second head lies one cache head (SUB * 32 keys) further.
+            mV = cute.make_tensor(
+                pool.iterator,
+                cute.make_layout(
+                    ((D, HKV), PAGE, SUB * NKV * num_blocks),
+                    stride=((1, SUB * PAGE * D), D, PAGE * D),
+                ),
+            )
+        # K pool as one head's B operand: (keys 32, dims 64, half + SUB * (head + kv_heads *
+        # block)); with SUB 1, head + kv_heads * block.
         mKb = cute.make_tensor(
             pool.iterator,
-            cute.make_layout((PAGE, D, NKV * num_blocks), stride=(D, 1, PAGE * D)),
+            cute.make_layout((PAGE, D, SUB * NKV * num_blocks), stride=(D, 1, PAGE * D)),
         )
         tma_op = cpasync.CopyBulkTensorTileG2SOp(one)
         sV_one = cute.select(sV_layout, mode=[0, 1, 2])
@@ -627,6 +652,7 @@ class MultiRequestSplitKvKernel:
     @cute.jit
     def load_role(self, tma_atom_k, tKsK, tKgK, tma_atom_v, tVsV, tVgV, table, segs, bars):
         S = self.stages
+        SUB = self.sub
         kv_full, kv_empty, s_full, p_full, o_done, q_full, p_full2, o_free = bars
         lens, lo, pref, info, rows = segs
         lane = cute.arch.lane_idx()
@@ -648,8 +674,12 @@ class MultiRequestSplitKvKernel:
                 # This chunk's page ids, one per lane (the block table is not written by any
                 # kernel of the step).
                 src = cutlass.min(p_lo + base + lane, p_hi - 1)
-                rk = table[b, 0, src]
-                rv = table[b, 1, src]
+                if cutlass.const_expr(SUB == 1):
+                    rk = table[b, 0, src]
+                    rv = table[b, 1, src]
+                else:
+                    rk = table[b, 0, src // SUB]
+                    rv = table[b, 1, src // SUB]
                 cnt = cutlass.min(Int32(ID_CHUNK), n_slots - base)
                 for jj in cutlass.range(cnt, unroll=1):
                     idx = base + jj
@@ -664,15 +694,24 @@ class MultiRequestSplitKvKernel:
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(kv_full + st, self.page_bytes)
                     # This CTA's pair of the page's K and V heads; a padding slot (id -1) lies
-                    # outside the tensor, so TMA fills it with zeros.
+                    # outside the tensor (a negative index), so TMA fills it with zeros.
                     kpair = self.pairs * kid + pair
                     vpair = self.pairs * vid + pair
+                    if cutlass.const_expr(SUB == 1):
+                        kbox = HKV * kpair
+                        vbox = vpair
+                    else:
+                        # The page is half (p_lo + idx) % SUB of its block: K head h at
+                        # SUB * (head + kv_heads * block) + half, V's pair at its first head's.
+                        half = (p_lo + idx) % SUB
+                        kbox = SUB * HKV * kpair + half
+                        vbox = SUB * HKV * vpair + half
                     box = (st // PAGES_PER_TILE) * (HKV * PAGES_PER_TILE) + st % PAGES_PER_TILE
                     for h in cutlass.range_constexpr(HKV):
                         if cutlass.const_expr(self.evict_first):
                             cute.copy(
                                 tma_atom_k,
-                                tKgK[None, 0, 0, HKV * kpair + h],
+                                tKgK[None, 0, 0, kbox + SUB * h],
                                 tKsK[None, box + h * PAGES_PER_TILE],
                                 tma_bar_ptr=kv_full + st,
                                 cache_policy=policy,
@@ -680,14 +719,14 @@ class MultiRequestSplitKvKernel:
                         else:
                             cute.copy(
                                 tma_atom_k,
-                                tKgK[None, 0, 0, HKV * kpair + h],
+                                tKgK[None, 0, 0, kbox + SUB * h],
                                 tKsK[None, box + h * PAGES_PER_TILE],
                                 tma_bar_ptr=kv_full + st,
                             )
                     if cutlass.const_expr(self.evict_first):
                         cute.copy(
                             tma_atom_v,
-                            tVgV[None, 0, 0, vpair],
+                            tVgV[None, 0, 0, vbox],
                             tVsV[None, st],
                             tma_bar_ptr=kv_full + st,
                             cache_policy=policy,
@@ -695,7 +734,7 @@ class MultiRequestSplitKvKernel:
                     else:
                         cute.copy(
                             tma_atom_v,
-                            tVgV[None, 0, 0, vpair],
+                            tVgV[None, 0, 0, vbox],
                             tVsV[None, st],
                             tma_bar_ptr=kv_full + st,
                         )

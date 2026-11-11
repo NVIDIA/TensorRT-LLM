@@ -31,7 +31,8 @@ included) row ``t`` of request ``b`` attends keys ``j`` with ``j <= L_b - M + t`
 bmm2_scale`` (``bmm1_scale[0]`` and ``bmm2_scale[0]`` when they are device tensors, read by the
 kernels after the dependency wait); K/V are the cache's E4M3 bytes, read through the request's
 ``block_tables[b, 0]`` (K) and ``block_tables[b, 1]`` (V) page ids into ``kv_pool [blocks, G,
-32, 64]``.
+32, 64]``, or ``kv_pool [blocks, G, 64, 64]`` read as each block's two 32-key halves (the same
+pages, page split, partials and output as a 32-token cache holding the same keys).
 
 Numerics (not bit-identical to the built-in FMHA): those of ``full_attention_split_kv`` (the
 8-row one-sequence kernel this target serves to a single request): an E4M3 Q enters as is (the
@@ -80,6 +81,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 HEAD_DIM = 64
 PAGE = 32
 Q_PER_KV = 8
+#: Cache tokens per block the kernel reads (a 64-token block as two 32-token pages).
+CACHE_PAGES = (PAGE, 2 * PAGE)
 #: Rows per request the row map is written for (one accepted token and up to 7 drafts) and
 #: requests per launch by build: the 64-request build (512 rows) up to 64 requests, the
 #: 128-request build (1024 rows) above.
@@ -189,6 +192,7 @@ def _compiled_kernel(
     device_scale: bool = False,
     stages: Optional[int] = None,
     max_requests: int = REQUEST_BUILDS[0],
+    cache_page: int = PAGE,
 ):
     """The compiled split kernel of one build (its ring depth from ``ring_stages`` unless
     ``stages`` is given)."""
@@ -199,7 +203,11 @@ def _compiled_kernel(
 
     from . import multi_request_split_kv_kernel as mk
 
-    assert (mk.MAX_ROWS, mk.REQUEST_BUILDS) == (MAX_ROWS, REQUEST_BUILDS)
+    assert (mk.MAX_ROWS, mk.REQUEST_BUILDS, mk.CACHE_PAGES) == (
+        MAX_ROWS,
+        REQUEST_BUILDS,
+        CACHE_PAGES,
+    )
     if stages is None:
         stages = ring_stages(device_index, 1 if q_fp8 else nq)
     kernel = mk.MultiRequestSplitKvKernel(
@@ -213,6 +221,7 @@ def _compiled_kernel(
         q_fp8=q_fp8,
         device_scale=device_scale,
         max_requests=max_requests,
+        cache_page=cache_page,
     )
     dtypes = (
         cutlass.Float8E4M3FN if q_fp8 else cutlass.BFloat16,  # q
@@ -258,12 +267,13 @@ def compiled_key(
     q_fp8: bool = False,
     device_scale: bool = False,
     requests: int = REQUEST_BUILDS[0],
+    cache_page: int = PAGE,
 ) -> tuple:
-    """The build a call of ``requests`` requests launches; an E4M3 Q is one term whatever
-    ``nq`` says."""
+    """The build a call of ``requests`` requests over a cache of ``cache_page`` tokens per
+    block launches; an E4M3 Q is one term whatever ``nq`` says."""
     return (int(device_index), bool(enable_pdl), int(kv_heads), int(window),
             1 if q_fp8 else int(nq), int(rescale_cols), bool(q_fp8),
-            bool(device_scale), request_build(int(requests)))  # fmt: skip
+            bool(device_scale), request_build(int(requests)), int(cache_page))  # fmt: skip
 
 
 def _compile(key: tuple):
@@ -271,7 +281,7 @@ def _compile(key: tuple):
     # that it is part of the compiled build's cache key.
     return _compiled_kernel(*key[:4], nq=key[4], rescale_cols=key[5], q_fp8=key[6],
                             device_scale=key[7], stages=ring_stages(key[0], key[4]),
-                            max_requests=key[8])  # fmt: skip
+                            max_requests=key[8], cache_page=key[9])  # fmt: skip
 
 
 def precompile(
@@ -282,6 +292,7 @@ def precompile(
     q_fp8: bool = False,
     device_scale: bool = False,
     requests: int = REQUEST_BUILDS[0],
+    cache_page: int = PAGE,
 ) -> tuple:
     """Compile one build of the split kernel (outside any CUDA-graph capture); returns its key.
 
@@ -295,6 +306,7 @@ def precompile(
         q_fp8=q_fp8,
         device_scale=device_scale,
         requests=requests,
+        cache_page=cache_page,
     )
     _compile(key)
     _compiled_keys.add(key)
@@ -425,10 +437,11 @@ class MultiRequestSplitKv(OpWrapper):
     Reads Q ``[B M, H 64]`` (``H = 8 G``), the generation preprocess's query: E4M3 with
     ``bmm1_scale`` / ``bmm2_scale`` as fp32 device tensors (the served call with the FP8 KV
     cache; ``bmm1_scale[0]`` and ``bmm2_scale[0]`` are read on the device after the dependency
-    wait), or BF16 with both scales as host floats. Also reads the pool ``[blocks, G, 32, 64]``
-    FP8 E4M3 (which must already hold the step's K/V), ``block_tables`` int32 ``[B, 2, pages]``
-    and ``seq_lens`` int32 ``[B]``. ``workspace`` is ``workspace_for``'s pair (allocated per
-    call when None). ``num_work`` (CTAs per pair) defaults to ``SMs / (G / 2)``.
+    wait), or BF16 with both scales as host floats. Also reads the pool ``[blocks, G, P, 64]``
+    (``P`` in ``CACHE_PAGES``) FP8 E4M3 (which must already hold the step's K/V),
+    ``block_tables`` int32 ``[B, 2, pages]`` and ``seq_lens`` int32 ``[B]``. ``workspace`` is
+    ``workspace_for``'s pair (allocated per call when None). ``num_work`` (CTAs per pair)
+    defaults to ``SMs / (G / 2)``.
 
     Loud preconditions (ValueError): E4M3 or BF16 Q with a unit last stride and 16-byte aligned
     rows, both scales host floats or both fp32 device tensors,
@@ -477,9 +490,10 @@ class MultiRequestSplitKv(OpWrapper):
         kv_heads = kv_pool.shape[1] if kv_pool.dim() == 4 else 0
         requests = seq_lens.numel()
         hq = kv_heads * Q_PER_KV
+        cache_page = kv_pool.shape[2] if kv_pool.dim() == 4 else 0
         if kv_heads not in RANK_KV_HEADS.values():
             raise ValueError(
-                f"multi_request_split_kv takes a pool [blocks, G, {PAGE}, {HEAD_DIM}] with G in "
+                f"multi_request_split_kv takes a pool [blocks, G, P, {HEAD_DIM}] with G in "
                 f"{sorted(RANK_KV_HEADS.values())}; got {tuple(kv_pool.shape)}"
             )
         sms = torch.cuda.get_device_properties(q.device).multi_processor_count
@@ -512,7 +526,8 @@ class MultiRequestSplitKv(OpWrapper):
             or rows != per * requests
             or not 1 <= per <= MAX_ROWS
             or kv_pool.dtype != torch.float8_e4m3fn
-            or tuple(kv_pool.shape[2:]) != (PAGE, HEAD_DIM)
+            or cache_page not in CACHE_PAGES
+            or kv_pool.shape[3] != HEAD_DIM
             or not kv_pool.is_contiguous()
             or block_tables.dtype != torch.int32
             or block_tables.dim() != 3
@@ -541,7 +556,8 @@ class MultiRequestSplitKv(OpWrapper):
             raise ValueError(
                 "multi_request_split_kv takes, on one sm_103 device and 16-byte "
                 f"aligned: BF16 or E4M3 q [B M, 8 G * {HEAD_DIM}] (1 <= M <= {MAX_ROWS}, 1 <= B <= "
-                f"{MAX_REQUESTS}), a contiguous FP8 E4M3 pool [blocks, G, {PAGE}, {HEAD_DIM}], "
+                f"{MAX_REQUESTS}), a contiguous FP8 E4M3 pool [blocks, G, P, {HEAD_DIM}] (P in "
+                f"{CACHE_PAGES}), "
                 "an int32 [B, 2, pages] table, contiguous int32 seq_lens [B], a BF16 out of q's "
                 "shape, bmm1 / bmm2 scales both host floats or both fp32 device tensors, and "
                 "partial buffers of at least num_work + B slots; got "
@@ -562,6 +578,7 @@ class MultiRequestSplitKv(OpWrapper):
             q_fp8=q_fp8,
             device_scale=device_scale,
             requests=requests,
+            cache_page=cache_page,
         )
         if torch.cuda.is_current_stream_capturing() and key not in _compiled_keys:
             raise RuntimeError(
@@ -652,6 +669,7 @@ class MultiRequestSplitKv(OpWrapper):
         rows = q2.shape[0] // requests
         kv_heads = kv_pool.shape[1]
         heads = kv_heads * Q_PER_KV
+        cache_page = kv_pool.shape[2]
 
         def e4m3(x: torch.Tensor) -> torch.Tensor:
             return x.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
@@ -673,8 +691,8 @@ class MultiRequestSplitKv(OpWrapper):
                 keys = torch.arange(length, device=q.device)
 
                 def gather(kv: int) -> torch.Tensor:
-                    pages = block_tables[b, kv, keys // PAGE].long()
-                    return pool_bytes[pages, :, keys % PAGE].view(torch.float8_e4m3fn).float()
+                    pages = block_tables[b, kv, keys // cache_page].long()
+                    return pool_bytes[pages, :, keys % cache_page].view(torch.float8_e4m3fn).float()
 
                 k, v = gather(0), gather(1)
                 for t in range(rows):
@@ -716,6 +734,8 @@ class MultiRequestSplitKv(OpWrapper):
             if length < rows:
                 raise ValueError(f"seq_lens[{b}] = {length} is shorter than its {rows} rows")
             first, end = attended_pages(length, rows, window)
+            sub = kv_pool.shape[2] // PAGE
+            first, end = first // sub, -(-end // sub)
             if block_tables.shape[2] < end:
                 raise ValueError(
                     f"a [.., 2, {block_tables.shape[2]}] table cannot address {length} keys"
