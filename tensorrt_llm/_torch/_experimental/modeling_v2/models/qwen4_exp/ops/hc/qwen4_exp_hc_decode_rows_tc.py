@@ -36,6 +36,7 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (
@@ -116,20 +117,6 @@ def _mbar_init_tx(mbar, nbytes, *, loc=None, ip=None):
         "{ mbarrier.init.shared::cta.b64 [$1], 1; fence.mbarrier_init.release.cluster; "
         "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$1], $2; mov.u32 $0, 0; }",
         "=r,r,r",
-        loc,
-        ip,
-        side_effects=True,
-    )
-
-
-@dsl_user_op
-def _mbar_wait0(mbar, *, loc=None, ip=None):
-    _asm(
-        T.i32(),
-        [cutlass.Int32(mbar)],
-        "{ .reg .pred p; WAIT: mbarrier.try_wait.parity.shared::cta.b64 p, [$1], 0; "
-        "@!p bra WAIT; mov.u32 $0, 0; }",
-        "=r,r",
         loc,
         ip,
         side_effects=True,
@@ -319,6 +306,9 @@ class _First2:
         )
         rbar = cutlass.Int32(sBar.iterator.toint())
         bbar = rbar + 8
+        # Pointer forms of the two mailbox barriers for the cluster-scope waits below.
+        rbar_ptr = sBar.iterator
+        bbar_ptr = sBar.iterator + 1
         if const_expr(split):
             # The K half's block rows (finalize + combine), a quarter formed by each of the 4
             # stream CTAs of this K half and pushed (st.async) into all four.
@@ -513,7 +503,18 @@ class _First2:
                         cute.autovec_copy(sh_vec[r, (None, k0 // VEC + p)], shg[k, None])
                         zg[k] = mGate[r].to(cutlass.Float32)
             if const_expr(split and g0 == 0):
-                _mbar_wait0(bbar)  # the K half's block rows have landed
+                # The K half's block rows have landed: the peers pushed them by st.async, whose
+                # complete-tx releases at cluster scope, so a relaxed cluster-scope wait followed
+                # by an acquire fence restricted to shared::cluster is the ISA's acquire pattern
+                # for it (and, unlike .acquire.cluster on the wait, costs no L1 invalidate).
+                while not prims.mbarrier_try_wait_parity(
+                    bbar_ptr,
+                    0,
+                    scope=prims.MBarrierScope.CLUSTER,
+                    order=prims.MemOrder.RELAXED,
+                ):
+                    pass
+                prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
             for k in cutlass.range_constexpr(g_n):
                 c = tidx + (g0 + k) * THREADS
                 if c < items:
@@ -656,7 +657,15 @@ class _First2:
                         v = sSsr[rr]
                     dst = red_addr + ((me * RPO + rl) * rld + nn) * 4
                     _st_async_f32(_mapa(dst, o), v, _mapa(rbar, o))
-        _mbar_wait0(rbar)
+        # The cluster's partials for this rank's rows have landed (same pattern as above).
+        while not prims.mbarrier_try_wait_parity(
+            rbar_ptr,
+            0,
+            scope=prims.MBarrierScope.CLUSTER,
+            order=prims.MemOrder.RELAXED,
+        ):
+            pass
+        prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
         # 5. Rank `me` finishes rows (2 me, 2 me + 1): rstd per stream, the logits, low / injection.
         for it in cutlass.range_constexpr(-(-(RPO * NC) // THREADS)):

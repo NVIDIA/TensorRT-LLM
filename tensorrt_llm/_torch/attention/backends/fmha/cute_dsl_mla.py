@@ -60,6 +60,9 @@ _SPLIT_PLAN_PIECE_COST_TILES = 60
 # ``assumed_align`` the decode runner compiles the page table and the KV
 # lengths with; their runtime pointers must keep it.
 _KERNEL_INPUT_ALIGN_BYTES = 16
+# Page size of the fallback thop op's precompiled TRTLLM-Gen MLA generation
+# kernels.
+_FALLBACK_MLA_GENERATION_TOKENS_PER_BLOCK = 32
 
 
 @triton.jit(
@@ -476,13 +479,27 @@ class CuteDslMlaFmha(PhasedFmha):
     ) -> tuple[bool, str]:
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
-        # Disable mixed context/generation batches until the CuTe DSL host
-        # overhead is reduced, except when no other library reads this
-        # layer's FP4 MLA 128-token KV pages (for example an NVFP4 manager's
-        # FP8 fallback layer); this path slices the generation inputs and
-        # page tables past num_contexts.
+        if meta.num_generations <= 0:
+            return False, "CuTe DSL MLA FMHA only supports decode-only batches."
+        seq_len_q = q.shape[0] // meta.num_generations
+        batch_size = meta.num_generations
+        helix_verify_group = seq_len_q > 1 and meta.helix_position_offsets is not None
+        # Under Helix the only other MLA generation library is the fallback
+        # thop op, since FlashInfer TRTLLM-Gen and PrimTS do not support Helix.
+        # Its TRTLLM-Gen generation pads 33 to 63 heads to a 64-row Q tile whose
+        # kernels exist only precompiled, for 32-token pages.
+        helix_decode_without_fallback_kernel = (
+            meta.helix_position_offsets is not None
+            and 32 < attn.num_heads < 64
+            and meta.tokens_per_block != _FALLBACK_MLA_GENERATION_TOKENS_PER_BLOCK
+        )
+        # Keep the mixed-batch performance restriction unless the generation
+        # sub-batch has no supported fallback. PhasedFmha slices generation
+        # lengths, and _run_mla_decode offsets the page table past contexts.
         exclusive_page_size = self._page_size_exclusive_to_cute_dsl(meta)
-        if meta.num_generations <= 0 or (meta.num_contexts != 0 and not exclusive_page_size):
+        if meta.num_contexts != 0 and not (
+            exclusive_page_size or helix_verify_group or helix_decode_without_fallback_kernel
+        ):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
@@ -498,8 +515,6 @@ class CuteDslMlaFmha(PhasedFmha):
             or getattr(meta, "is_spec_dec_dynamic_tree", False)
         ):
             return False, "CuTe DSL MLA FMHA does not support custom/tree speculative masks."
-        seq_len_q = q.shape[0] // meta.num_generations
-        batch_size = meta.num_generations
         if meta.helix_position_offsets is not None:
             if seq_len_q != 1 and not meta._helix_spec_tokens_valid:
                 # Multi-token decode under helix needs the per-token bound /
@@ -522,19 +537,11 @@ class CuteDslMlaFmha(PhasedFmha):
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
-        # A multi-token verify group at H=96 has nowhere else to go: TRTLLM-Gen
-        # rejects 64 < num_heads_q < 128 outright, so falling through the perf
-        # gate does not reach a faster kernel, it reaches an executor-init
-        # failure. That makes this a correctness carve-out rather than a perf
-        # tradeoff, so it is decided here instead of being folded into
-        # _PERF_MIN_BATCH_FP8, which stays a pure measured-win table.
-        # Single-token H=96 is already a measured table entry and still goes
-        # through the gate. Helix with seq_len_q > 1 implies
-        # _helix_spec_tokens_valid -- the helix block above returns False
-        # otherwise.
-        helix_h96_verify_group = (
-            attn.num_heads == 96 and seq_len_q > 1 and meta.helix_position_offsets is not None
-        )
+        # No fallback library supports a multi-token Helix verify group.
+        # Keep its correctness admission separate from the measured-win table;
+        # the metadata checks above and kernel can_implement below still apply.
+        # Other single-token Helix shapes retain the performance gate unless
+        # the fallback has no kernel for them.
         # The same failure without Helix: an FP8-KV multi-token verify group
         # (e.g. DSpark under attention DP, where every rank keeps all 96 heads)
         # is not in the FP8 perf table, and on SM100/SM103 the next library is
@@ -550,7 +557,15 @@ class CuteDslMlaFmha(PhasedFmha):
             and meta.helix_position_offsets is None
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
         )
-        if not (helix_h96_verify_group or fp8_wide_head_verify_group or exclusive_page_size):
+        # Single-token Helix decode without a fallback kernel is another
+        # coverage case kept out of the measured-win table; can_implement
+        # remains authoritative.
+        if not (
+            helix_verify_group
+            or fp8_wide_head_verify_group
+            or helix_decode_without_fallback_kernel
+            or exclusive_page_size
+        ):
             # Perf gate (NOT a correctness limit).
             favorable, reason = self._is_perf_favorable(
                 attn.num_heads,
