@@ -351,7 +351,9 @@ def source_captures(seed: int, length: int) -> dict | None:
     directory = os.environ.get("BEAM_DENSE_BLOCK_SOURCE_CAPTURES")
     if not directory:
         return None
-    captures = torch.load(Path(directory) / f"seed{seed}" / f"T{length}.pt", map_location="cuda")
+    captures = torch.load(
+        Path(directory) / f"seed{seed}" / f"T{length}.pt", map_location="cuda", weights_only=True
+    )
     x, positions = case_inputs(seed, length)
     assert torch.equal(captures["input"], x), "the generated input differs from the captured one"
     assert torch.equal(
