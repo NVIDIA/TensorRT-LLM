@@ -193,17 +193,27 @@ def _regsel_rows(dtype: torch.dtype, num_rows: int, num_sms: int) -> bool:
     return dtype is torch.bfloat16 and num_rows > 4 * num_sms
 
 
+# Shortest row (scores) whose K <= 1024 rows in batches beyond two waves take Hopper's 512-thread
+# slab, by SM count (default 64K): the 78-SM H20 streams 1.4x (H200) to 2x (H100 SXM) the DRAM
+# bytes per SM, and its 256-thread slab stays faster below 128K scores.
+_HOPPER_WIDE_SLAB_MIN_N = {78: 131072}
+
+
 def _wide_slab(b: int, n: int, k: int, wave: int, sm_version: int, regsel: bool = False) -> bool:
     """Whether a main slab that is not ``big`` runs 512-thread CTAs (two per SM) rather than 256.
 
     Batches of up to two waves do on every target. Hopper also streams long K <= 1024 rows of
-    taller batches with them, whose register prefetch pays off from 64K scores per row; at
-    K = 1024 rows below 128K scores whose survivors are read from registers (``regsel``) stay
-    on 256 threads.
+    taller batches with them, whose register prefetch pays off from 64K scores per row (128K on
+    the H20); at K = 1024 rows below 128K scores whose survivors are read from registers
+    (``regsel``) stay on 256 threads.
     """
     if b <= 2 * wave:
         return True
-    if sm_version in _BLACKWELL_SM_VERSIONS or k > 1024 or n < 65536:
+    if (
+        sm_version in _BLACKWELL_SM_VERSIONS
+        or k > 1024
+        or n < _HOPPER_WIDE_SLAB_MIN_N.get(wave, 65536)
+    ):
         return False
     return not (regsel and k == 1024 and n < 131072)
 
@@ -1613,6 +1623,18 @@ def _route_16bit(
                     vsel = v
                     cs = c
                     break
+                if dtype is torch.bfloat16 and v == 2 and 8 <= c <= amax:
+                    # A Hopper GPU that does not co-schedule these clusters (H20: 8 rows of 8 CTAs,
+                    # any 16-CTA cluster): K=2048 rows take twice the vectors on half the CTAs,
+                    # K <= 1024 rows stream through 4-CTA clusters; both beat the split main slab
+                    if k == 2048 and cluster_fits(c // 2, b, num_sms, sm_version):
+                        vsel = 4
+                        cs = c // 2
+                        break
+                    if k <= 1024 and cluster_fits(4, b, num_sms, sm_version):
+                        return _halve_u_streaming_16bit(
+                            _clus_plan_bf16(b, n, npad, k, 4, wave), b, n, k
+                        )
         if vsel and cs >= 2:
             return {
                 "kernel": "reg_clus",
