@@ -28,9 +28,7 @@
 #include "kv_cache_manager_v2/utils/math.h"
 #include "tensorrt_llm/common/logger.h"
 
-#if defined(TORCH_CUDA)
 #include "tensorrt_llm/batch_manager/kvCacheTransferProfiler.h"
-#endif
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
@@ -731,12 +729,14 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
 
     if (isGpuAccessibleMemory(coldTier))
     {
-#if defined(TORCH_CUDA)
-        common::RecordFunctionWithMetadata scope{common::ProfilerRegion::kKv};
+        ::tensorrt_llm::batch_manager::detail::KvCacheTransferScope scope;
         if (coldTier == CacheTier::HOST_MEM)
         {
-            scope.startWithLazyName([&] { return srcIsHot ? "trtllm::kv_cache_offload" : "trtllm::kv_cache_restore"; },
-                [&](common::ProfilerMetadata& metadata)
+            namespace profiler = ::tensorrt_llm::batch_manager::detail;
+            auto const operation
+                = srcIsHot ? profiler::KvTransferOperation::kOffload : profiler::KvTransferOperation::kOnboard;
+            scope.start(operation,
+                [&](auto& metadata)
                 {
                     PoolGroupIndex const hotPgIdx = srcIsHot ? srcPgIdx : dstPgIdx;
                     auto const& hotSizes = slotSize(kHotLevel, hotPgIdx);
@@ -748,11 +748,11 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                             devicePageBytes += hotSizes.at(poolIdx);
                         }
                     }
-                    ::tensorrt_llm::batch_manager::detail::addKvTransferMetadata(
-                        metadata, srcIsHot, "v2", devicePageBytes, numPages, stream);
+                    // The batch can also include host-resident sparse pools; describe only device traffic.
+                    profiler::addKvTransferMetadata(
+                        metadata, operation, profiler::KvManagerVersion::kV2, devicePageBytes, numPages, stream);
                 });
         }
-#endif
         MemAddress const coldBase = mLevels.at(coldLevel).storage->getBaseAddress(coldPgIdx, PoolIndex{0}, SlotId{0});
         bool const submitted = srcIsHot
             ? encodeBatch(reinterpret_cast<void*>(coldBase), pageIndices, numPages, stream)

@@ -16,23 +16,40 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/profiler.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 
 #include <cuda_runtime_api.h>
-#include <limits>
 
-namespace tensorrt_llm::batch_manager
+#if defined(TORCH_CUDA)
+#include "tensorrt_llm/common/profiler.h"
+#include <limits>
+#endif
+
+namespace tensorrt_llm::batch_manager::detail
 {
-namespace detail
+enum class KvTransferOperation
 {
+    kOffload,
+    kOnboard,
+};
+
+enum class KvManagerVersion
+{
+    kV1,
+    kV2,
+};
+
+#if defined(TORCH_CUDA)
 //! Called only inside a lazy metadata factory at a direct host/device copy boundary.
-inline void addKvTransferMetadata(common::ProfilerMetadata& metadata, bool offload, std::string_view managerVersion,
-    std::size_t bytesPerCopy, std::size_t copyCount, cudaStream_t stream)
+inline void addKvTransferMetadata(common::ProfilerMetadata& metadata, KvTransferOperation operation,
+    KvManagerVersion managerVersion, std::size_t bytesPerCopy, std::size_t copyCount, cudaStream_t stream)
 {
-    metadata.add("kv.operation", offload ? "offload" : "restore");
+    bool const offload = operation == KvTransferOperation::kOffload;
+    metadata.add("kv.operation", offload ? "offload" : "onboard");
     metadata.add("kv.source_tier", offload ? "gpu" : "host");
     metadata.add("kv.destination_tier", offload ? "host" : "gpu");
-    metadata.add("kv.manager_version", managerVersion);
+    metadata.add("kv.manager_version", managerVersion == KvManagerVersion::kV1 ? "v1" : "v2");
+    // Sizes and CUDA stream IDs are unsigned; omit values that cannot be represented by int64 metadata.
     constexpr auto kMax = static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
     if (copyCount <= kMax)
     {
@@ -47,11 +64,112 @@ inline void addKvTransferMetadata(common::ProfilerMetadata& metadata, bool offlo
         metadata.add("kv.payload_bytes", static_cast<std::int64_t>(bytesPerCopy * copyCount));
     }
     unsigned long long streamId{};
-    if (cudaStreamGetId(stream, &streamId) == cudaSuccess
-        && streamId <= static_cast<unsigned long long>(std::numeric_limits<std::int64_t>::max()))
+    auto const streamError = cudaStreamGetId(stream, &streamId);
+    if (streamError != cudaSuccess)
+    {
+        static_cast<void>(cudaGetLastError());
+    }
+    else if (streamId <= static_cast<unsigned long long>(std::numeric_limits<std::int64_t>::max()))
     {
         metadata.add("kv.cuda_stream_id", static_cast<std::int64_t>(streamId));
     }
 }
-} // namespace detail
-} // namespace tensorrt_llm::batch_manager
+
+//! Own one optional host/device submission scope without affecting the copy's error handling.
+class KvCacheTransferScope
+{
+public:
+    //! Start an observed migration; all field extraction remains lazy.
+    template <typename MetadataFactory>
+    void start(KvTransferOperation operation, MetadataFactory&& metadataFactory) noexcept
+    {
+        if (!mScope.isActive())
+        {
+            return;
+        }
+        mScope.startWithLazyName(
+            [operation]() -> std::string {
+                return operation == KvTransferOperation::kOffload ? "trtllm::kv_cache_offload"
+                                                                  : "trtllm::kv_cache_onboard";
+            },
+            std::forward<MetadataFactory>(metadataFactory));
+    }
+
+    //! Start a nonempty migration with common payload fields and optional caller fields.
+    template <typename MetadataFactory>
+    void start(KvTransferOperation operation, KvManagerVersion version, std::size_t bytesPerCopy, std::size_t copyCount,
+        cudaStream_t stream, MetadataFactory&& extraMetadata) noexcept
+    {
+        if (bytesPerCopy == 0 || copyCount == 0)
+        {
+            return;
+        }
+        start(operation,
+            [&](common::ProfilerMetadata& metadata)
+            {
+                addKvTransferMetadata(metadata, operation, version, bytesPerCopy, copyCount, stream);
+                std::forward<MetadataFactory>(extraMetadata)(metadata);
+            });
+    }
+
+    //! Infer direction once for direct host/device buffers; device reuse emits no migration scope.
+    template <typename MetadataFactory>
+    void startHostDeviceCopy(runtime::IBuffer const& source, runtime::IBuffer const& destination,
+        KvManagerVersion version, std::size_t bytes, cudaStream_t stream, MetadataFactory&& extraMetadata) noexcept
+    {
+        if (!mScope.isActive())
+        {
+            return;
+        }
+        try
+        {
+            auto const srcType = source.getMemoryType();
+            auto const dstType = destination.getMemoryType();
+            auto const isHost = [](runtime::MemoryType type)
+            {
+                return type == runtime::MemoryType::kCPU || type == runtime::MemoryType::kPINNED
+                    || type == runtime::MemoryType::kPINNEDPOOL;
+            };
+            bool const offload = srcType == runtime::MemoryType::kGPU && isHost(dstType);
+            if (offload || (isHost(srcType) && dstType == runtime::MemoryType::kGPU))
+            {
+                start(offload ? KvTransferOperation::kOffload : KvTransferOperation::kOnboard, version, bytes, 1,
+                    stream, std::forward<MetadataFactory>(extraMetadata));
+            }
+        }
+        catch (std::exception const& error)
+        {
+            common::reportProfilerFailure(error.what());
+        }
+        catch (...)
+        {
+            common::reportProfilerFailure("non-standard exception observing a KV transfer");
+        }
+    }
+
+private:
+    common::RecordFunctionWithMetadata mScope{common::ProfilerRegion::kKv};
+};
+#else
+template <typename Metadata>
+void addKvTransferMetadata(
+    Metadata&, KvTransferOperation, KvManagerVersion, std::size_t, std::size_t, cudaStream_t) noexcept
+{
+}
+
+//! Native builds without Torch keep the submission boundary as a compile-time no-op.
+class KvCacheTransferScope
+{
+public:
+    template <typename... Args>
+    void start(Args&&...) noexcept
+    {
+    }
+
+    template <typename... Args>
+    void startHostDeviceCopy(Args&&...) noexcept
+    {
+    }
+};
+#endif
+} // namespace tensorrt_llm::batch_manager::detail

@@ -115,18 +115,18 @@ under CUDA graphs, native transport coverage, or cross-process clock
 synchronization. Actual Python/C++ transfer and multi-rank validation are
 separate from CPU contract tests.
 
-## Native CPU/GPU cache offload and restore
+## Native CPU/GPU cache offload and onboard
 
 With `kv` selected, PyTorch-enabled native builds emit `trtllm::kv_cache_offload`
-(GPU to host) and `trtllm::kv_cache_restore` (host to GPU) at the existing copy
-submission boundaries. The legacy manager emits one scope per pool copy; V2
+(GPU to host) and `trtllm::kv_cache_onboard` (host to GPU) at the existing copy
+submission boundaries. The V1 manager emits one scope per pool copy; V2
 emits one scope per direct batched transfer. These scopes work independently of
 the NCCL and nanobind profiling build options. The existing native shared library
 owns the single cached selector and scope implementation; non-PyTorch builds
 omit these probes.
 
 The `TRTLLM1` payload identifies `kv.operation`, `kv.source_tier`,
-`kv.destination_tier`, `kv.manager_version` (`legacy` or `v2`), `kv.copy_count`,
+`kv.destination_tier`, `kv.manager_version` (`v1` or `v2`), `kv.copy_count`,
 `kv.bytes_per_copy`, and aggregate `kv.payload_bytes`. Legacy pitched copies
 report row payload times layer count, excluding allocation pitches. Partial
 copies report the copied tokens; packed, scaled, and layer-first full-copy paths
@@ -153,5 +153,5 @@ staging), device reuse, host-to-host copies, and empty/zero-byte work are not
 labeled CPU/GPU offload. No metadata or stream query is performed for inactive
 observers or observers that do not request inputs. Copy calls, streams, ready/
 finish events, eviction, and fallback behavior are unchanged.
-The disabled legacy path still performs cheap fixed copy-eligibility and payload
+The disabled V1 path still performs cheap fixed copy-eligibility and payload
 size checks, without allocating metadata or querying CUDA streams.
