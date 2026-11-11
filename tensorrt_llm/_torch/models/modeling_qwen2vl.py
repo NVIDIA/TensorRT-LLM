@@ -70,11 +70,11 @@ from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 from ..attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from ..modules.gated_mlp import GatedMLP
+from ..multimodal.model import MultimodalModelMixin
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_encoder import \
     prepare_encoder_attn_metadata as _prepare_qwen_vl_vision_attn_metadata
-from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
     fuse_input_embeds, get_attached_multimodal_embeddings,

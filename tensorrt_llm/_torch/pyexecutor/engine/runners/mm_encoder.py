@@ -10,11 +10,11 @@ import torch
 from torch import nn
 from typing_extensions import Self
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.multimodal.model import _build_request_multimodal_input
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.llm_request import get_multimodal_embedding_lengths
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType

@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import MultimodalItemScheduler
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,

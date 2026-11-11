@@ -14,13 +14,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
+from tensorrt_llm._torch.multimodal.model import (
     EncoderGroup,
     MultimodalEncoderContractError,
     MultimodalModelMixin,
     encode_multimodal_by_groups,
 )
-from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -876,7 +876,7 @@ def test_items_from_multiple_requests_stay_separated():
 
 
 def test_request_cache_input_is_built_once_and_shared_with_forward_views():
-    from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
+    from tensorrt_llm._torch.multimodal.model import _build_request_multimodal_input
 
     class Request:
         def __init__(self):

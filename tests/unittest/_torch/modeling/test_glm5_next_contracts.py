@@ -382,7 +382,7 @@ def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
         Glm5NextInputProcessor,
         _glm5_next_build_batched_input,
     )
-    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    from tensorrt_llm._torch.multimodal.model import (
         EncoderGroup,
         MultimodalModelMixin,
         encode_multimodal_by_groups,

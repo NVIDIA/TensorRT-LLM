@@ -14,10 +14,7 @@ Covers the pure helpers behind ``encode_multimodal_by_groups``:
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    _lengths_by_modality,
-    _reorder_embeds_by_manifest,
-)
+from tensorrt_llm._torch.multimodal.model import _lengths_by_modality, _reorder_embeds_by_manifest
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,

@@ -1284,12 +1284,10 @@ def test_the_wrapper_satisfies_the_encoder_profiling_gate():
     hands the tower's whole activation footprint to the KV cache. It is an
     isinstance test, which no amount of duck typing satisfies.
     """
-    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (  # noqa: PLC0415
-        MultimodalModelMixin,
-    )
     from tensorrt_llm._torch.models.modeling_musespark_open_omni import (  # noqa: PLC0415
         MuseSparkForConditionalGeneration,
     )
+    from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin  # noqa: PLC0415
 
     assert issubclass(MuseSparkForConditionalGeneration, MultimodalModelMixin)
     # The profiler calls this one directly, and the mixin's body raises
@@ -1305,12 +1303,10 @@ def test_the_wrapper_uses_the_mixins_forward():
 
     A local `forward` would fork the merge from the mixin's, silently.
     """
-    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (  # noqa: PLC0415
-        MultimodalModelMixin,
-    )
     from tensorrt_llm._torch.models.modeling_musespark_open_omni import (  # noqa: PLC0415
         MuseSparkForConditionalGeneration,
     )
+    from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin  # noqa: PLC0415
 
     assert "forward" not in vars(MuseSparkForConditionalGeneration)
     assert MuseSparkForConditionalGeneration.forward is MultimodalModelMixin.forward

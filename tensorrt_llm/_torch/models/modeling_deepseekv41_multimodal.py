@@ -17,10 +17,10 @@ from tensorrt_llm.inputs import (
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ..model_config import ModelConfig
+from ..multimodal.model import MultimodalModelMixin
 from .deepseek_v41_processor import IMAGE_PLACEHOLDER, DeepseekV41InputProcessor
 from .deepseek_v41_vision import DeepseekV41Aligner, DeepseekV41VisionModel
 from .modeling_deepseekv41 import DeepseekV41ForCausalLM
-from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_utils import register_auto_model
 
 

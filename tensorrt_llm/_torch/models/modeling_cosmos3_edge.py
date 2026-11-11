@@ -60,17 +60,13 @@ from ..modules.layer_norm import LayerNorm
 from ..modules.linear import TensorParallelMode
 from ..modules.mlp import MLP
 from ..modules.rms_norm import RMSNorm
+from ..multimodal.model import EncoderGroup, MultimodalModelMixin, encode_multimodal_by_groups
 from ..speculative import SpecMetadata
 from ..utils import relu2
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.cosmos3_edge_weight_mapper import Cosmos3EdgeHfWeightMapper
 from .modeling_cosmos3 import _get_cosmos3_model_paths
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
-from .modeling_multimodal_mixin import (
-    EncoderGroup,
-    MultimodalModelMixin,
-    encode_multimodal_by_groups,
-)
 from .modeling_qwen2vl import Qwen2_5_VLVisionAttention, _prepare_qwen_vl_vision_attn_metadata
 from .modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,

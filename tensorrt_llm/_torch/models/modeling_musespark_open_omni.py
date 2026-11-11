@@ -69,8 +69,8 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..model_config import ModelConfig
 from ..modules.embedding import Embedding
+from ..multimodal.model import MultimodalModelMixin
 from .checkpoints.hf.musespark_open_weight_mapper import load_musespark_open_omni_weights
-from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_musespark_open import MuseSparkOpenForCausalLM
 from .modeling_utils import register_auto_model, register_vision_encoder
 from .musespark_open_audio import (

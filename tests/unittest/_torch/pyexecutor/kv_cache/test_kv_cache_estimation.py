@@ -22,7 +22,7 @@ import tensorrt_llm.bindings.internal.batch_manager as batch_manager
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
 from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import (
     CacheCost,
     KvCacheCreator,

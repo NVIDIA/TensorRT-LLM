@@ -51,16 +51,16 @@ from ..modules.embedding import Embedding
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
-from .checkpoints.base_weight_mapper import BaseWeightMapper
-from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
-from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_encoder import MultimodalEncoderMixin, prepare_encoder_attn_metadata
-from .modeling_multimodal_mixin import (
+from ..multimodal.model import (
     EncoderGroup,
     MultimodalModelMixin,
     PreparedLlmInputs,
     encode_multimodal_by_groups,
 )
+from .checkpoints.base_weight_mapper import BaseWeightMapper
+from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
+from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_encoder import MultimodalEncoderMixin, prepare_encoder_attn_metadata
 from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,

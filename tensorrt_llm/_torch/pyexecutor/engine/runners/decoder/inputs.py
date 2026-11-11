@@ -16,7 +16,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
+from tensorrt_llm._torch.multimodal.model import _build_request_multimodal_input
 from tensorrt_llm._torch.pyexecutor import step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (

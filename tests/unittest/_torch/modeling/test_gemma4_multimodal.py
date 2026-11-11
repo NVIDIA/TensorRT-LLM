@@ -77,13 +77,13 @@ from tensorrt_llm._torch.models.modeling_gemma4mm import (  # noqa: E402
     Gemma4MultimodalEmbedder,
     Gemma4MultimodalModelBase,
 )
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin  # noqa: E402
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
     VisionNormalization,
     find_input_mm_embeds,
     get_multimodal_embeddings,
     vision_normalization_from_processor,
 )
+from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin  # noqa: E402
 from tensorrt_llm.inputs.multimodal import (  # noqa: E402
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,

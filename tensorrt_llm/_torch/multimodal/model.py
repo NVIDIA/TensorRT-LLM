@@ -49,14 +49,14 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.logger import logger
 
-from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
-from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
-from .modeling_multimodal_utils import (
+from ..models.modeling_multimodal_utils import (
     _store_chunked_prefill_embeddings,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
 
 
 class MultimodalEncoderContractError(ValueError):

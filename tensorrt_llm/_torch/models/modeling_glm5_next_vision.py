@@ -70,14 +70,10 @@ if IS_FLASHINFER_AVAILABLE:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace
 else:  # pragma: no cover - CPU / no-flashinfer environments
     flashinfer_apply_rope_with_cos_sin_cache_inplace = None
+from ..multimodal.model import EncoderGroup, MultimodalModelMixin, encode_multimodal_by_groups
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_glm5_next import Glm5NextForCausalLM, glm5_next_attention_mapping
 from .modeling_multimodal_encoder import MultimodalEncoderMixin, prepare_encoder_attn_metadata
-from .modeling_multimodal_mixin import (
-    EncoderGroup,
-    MultimodalModelMixin,
-    encode_multimodal_by_groups,
-)
 from .modeling_utils import (
     ModelConfig,
     QuantConfig,

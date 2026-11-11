@@ -73,12 +73,11 @@ from ..disaggregation.orchestration.pp_termination import \
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
-from ..models.modeling_multimodal_mixin import \
-    maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..moe.expert_statistic import ExpertStatistic
+from ..multimodal.model import maybe_prefetch_mm_encoder_for_next_iter
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SpecSampler
 from ..speculative.speculation_gate import SpeculationGate

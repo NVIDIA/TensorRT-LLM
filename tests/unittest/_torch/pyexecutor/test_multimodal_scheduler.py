@@ -13,7 +13,7 @@ from _torch.pyexecutor.multimodal_utils import (
     record_output,
 )
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+from tensorrt_llm._torch.multimodal.model import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )

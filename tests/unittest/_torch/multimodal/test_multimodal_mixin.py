@@ -21,11 +21,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+from tensorrt_llm._torch.modules.embedding import Embedding
+from tensorrt_llm._torch.multimodal.model import (
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
 )
-from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,
@@ -382,7 +382,7 @@ def test_cache_reinitialization_requires_same_capacity():
 
 
 def test_encoder_cache_creation_logs_embedding_row_capacity():
-    with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.info") as info:
+    with patch("tensorrt_llm._torch.multimodal.model.logger.info") as info:
         CountingEncoderMultimodalModel(
             make_embedding(hidden_size=4),
             torch.tensor([7]),
@@ -403,7 +403,7 @@ def test_encoder_cache_creation_logs_byte_capacity_without_embedding_metadata():
         multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
     )
 
-    with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.info") as info:
+    with patch("tensorrt_llm._torch.multimodal.model.logger.info") as info:
         model._initialize_multimodal_encoder_cache(4096)
 
     messages = [" ".join(map(str, call.args)) for call in info.call_args_list]
@@ -621,7 +621,7 @@ def test_encoder_cache_partial_hit_encodes_miss_and_interleaves():
     )
 
     model._get_or_encode_multimodal_embeddings([first])
-    with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.debug") as debug:
+    with patch("tensorrt_llm._torch.multimodal.model.logger.debug") as debug:
         embeddings = model._get_or_encode_multimodal_embeddings([partial])
 
     # Encoder ran twice: once for the initial miss item, once for the residual containing
@@ -672,7 +672,7 @@ def test_encoder_cache_logs_rejected_oversized_write():
     )
     param = make_keyed_multimodal_param(embedding_lengths=[2])
 
-    with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.debug") as debug:
+    with patch("tensorrt_llm._torch.multimodal.model.logger.debug") as debug:
         model._get_or_encode_multimodal_embeddings([param])
 
     cache = model._multimodal_encoder_cache

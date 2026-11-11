@@ -15,7 +15,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import CudaGraphLoraParams
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType

@@ -30,10 +30,10 @@ from ..attention.backends.interface import AttentionMetadata, AttentionRuntimeFe
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
+from ..multimodal.model import MultimodalModelMixin
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
 from ..tensor_lru_cache import TensorLRUCache

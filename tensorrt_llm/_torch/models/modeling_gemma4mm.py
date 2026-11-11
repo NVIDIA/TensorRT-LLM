@@ -52,15 +52,11 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear
+from ..multimodal.model import EncoderCachePartition, MultimodalModelMixin, PreparedLlmInputs
 from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
-from .modeling_multimodal_mixin import (
-    EncoderCachePartition,
-    MultimodalModelMixin,
-    PreparedLlmInputs,
-)
 from .modeling_multimodal_utils import (
     _MULTIMODAL_ENV_NAME,
     VisionNormalization,

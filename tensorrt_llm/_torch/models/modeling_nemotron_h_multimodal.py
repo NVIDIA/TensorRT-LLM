@@ -57,15 +57,11 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
+from ..multimodal.model import EncoderGroup, MultimodalModelMixin, encode_multimodal_by_groups
 from ..peft.lora.config import LoraConfig
 from ..peft.lora.ownership import DecoderLoraOwner
 from ..speculative import SpecMetadata
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_mixin import (
-    EncoderGroup,
-    MultimodalModelMixin,
-    encode_multimodal_by_groups,
-)
 from .modeling_multimodal_utils import (
     _is_mm_disagg,
     filter_mm_token_from_input_ids,

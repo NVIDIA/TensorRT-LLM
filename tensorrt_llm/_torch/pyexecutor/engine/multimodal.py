@@ -16,11 +16,11 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
+from tensorrt_llm._torch.multimodal.model import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned

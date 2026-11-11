@@ -1026,10 +1026,7 @@ class TestChunkedPrefillCaching:
         which spreads the pack dict as kwargs — so the wrappers must accept
         `multimodal_params` by keyword.
         """
-        from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-            EncoderGroup,
-            encode_multimodal_by_groups,
-        )
+        from tensorrt_llm._torch.multimodal.model import EncoderGroup, encode_multimodal_by_groups
 
         def _pack(params):
             return {"multimodal_params": params}

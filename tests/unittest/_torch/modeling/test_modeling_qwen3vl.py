@@ -2021,7 +2021,7 @@ def _normalization_transport_spec():
 @pytest.mark.parametrize("declared", [False, True])
 @pytest.mark.parametrize("modality", ["image", "video"])
 def test_normalization_transport_item_selection(declared: bool, modality: str) -> None:
-    from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+    from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
     from tensorrt_llm.inputs.multimodal import (
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
         MultimodalItemMetadata,
@@ -2171,7 +2171,7 @@ def test_normalization_transport_shared_handles_and_process(producer_dtype) -> N
 
 @pytest.mark.cpu_only
 def test_normalization_transport_partial_encoder_cache() -> None:
-    from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+    from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
     from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
     from tensorrt_llm.inputs.multimodal import (
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY,

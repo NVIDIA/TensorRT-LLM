@@ -26,8 +26,6 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
     MistralWeightMapper
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    MultimodalModelMixin, PreparedLlmInputs)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     _MULTIMODAL_ENV_NAME, _is_mm_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
@@ -40,6 +38,8 @@ from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.multimodal.model import (MultimodalModelMixin,
+                                                  PreparedLlmInputs)
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import nvtx_range

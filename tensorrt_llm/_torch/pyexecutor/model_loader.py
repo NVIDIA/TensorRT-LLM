@@ -54,7 +54,6 @@ from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
 from ..models.checkpoints.weight_load_plan import WeightLoadPlan
-from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.embedding import Embedding, LMHead
@@ -62,6 +61,7 @@ from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
 from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..moe.fused_moe.weight_owner import is_moe_weight_owner
+from ..multimodal.model import MultimodalModelMixin
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,

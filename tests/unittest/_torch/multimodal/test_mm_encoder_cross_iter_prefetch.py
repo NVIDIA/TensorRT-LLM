@@ -26,13 +26,13 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models import modeling_multimodal_mixin as mm_mixin
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
+from tensorrt_llm._torch.multimodal import model as mm_mixin
+from tensorrt_llm._torch.multimodal.model import (
     MultimodalModelMixin,
     _get_mm_aux_stream,
     maybe_prefetch_mm_encoder_for_next_iter,
 )
-from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,

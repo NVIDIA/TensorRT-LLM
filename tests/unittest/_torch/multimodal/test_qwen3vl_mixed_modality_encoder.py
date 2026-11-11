@@ -14,11 +14,8 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    EncoderGroup,
-    encode_multimodal_by_groups,
-)
 from tensorrt_llm._torch.models.modeling_qwen3vl import _qwen3vl_build_batched_input
+from tensorrt_llm._torch.multimodal.model import EncoderGroup, encode_multimodal_by_groups
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,

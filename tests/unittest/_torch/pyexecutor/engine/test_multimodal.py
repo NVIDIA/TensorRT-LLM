@@ -19,7 +19,7 @@ from _torch.pyexecutor.multimodal_utils import (
 
 import tensorrt_llm
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+from tensorrt_llm._torch.multimodal.model import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
     _build_request_multimodal_input,

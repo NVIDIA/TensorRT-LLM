@@ -23,7 +23,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausal
 from tensorrt_llm._torch.models.modeling_deepseekv41_multimodal import (
     DeepseekV41ForConditionalGeneration,
 )
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import PreparedLlmInputs
+from tensorrt_llm._torch.multimodal.model import PreparedLlmInputs
 from tensorrt_llm.inputs import create_input_processor_with_hash
 
 pytestmark = pytest.mark.cpu_only

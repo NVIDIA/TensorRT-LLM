@@ -50,7 +50,6 @@ from tensorrt_llm._torch.models import modeling_qwen3 as modeling_qwen3_mod
 from tensorrt_llm._torch.models import modeling_qwen3_moe as modeling_qwen3_moe_mod
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.modules import linear as linear_mod
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
@@ -61,6 +60,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep, override_
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import resolve_moe_impl
 from tensorrt_llm._torch.moe.fused_moe.quantization import UnquantizedFusedMoEMethod
+from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (

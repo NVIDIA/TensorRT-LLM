@@ -26,8 +26,8 @@ from _torch.pyexecutor.engine_test_utils import (
 )
 
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.multimodal.model import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.engine import model_setup
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
