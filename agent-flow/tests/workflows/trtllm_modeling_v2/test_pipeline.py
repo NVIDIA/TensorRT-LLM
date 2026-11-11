@@ -925,6 +925,48 @@ def test_a_spec_edited_between_two_starts_adds_and_drops_tasks(tmp_path, task_fi
     # Skipped as it stood: the cut turn is not started again for a deployment that is gone.
     assert "its turn raised" not in (tmp_path / "ws" / "journal.md").read_text()
     assert "- name: tep2" in (tmp_path / "ws" / "task.yaml").read_text()
+    # A deployment the spec asks for again gets its task again, not a skip that stays.
+    back = _spec(task_file, TEP2, mid)
+    calls = _run(tmp_path, back, monkeypatch, Script(), command_runner=healthy_smi(2))
+    assert [_task_id(p) for _, p in calls] == ["mid"]
+    stands = {t["id"]: (t["status"], t["note"]) for t in _tasks(tmp_path)}
+    assert stands["mid"] == ("done", "") and stands["kv_fp8"][0] == "skipped"
+    assert "task(s) added: mid" in (tmp_path / "ws" / "journal.md").read_text()
+
+
+def test_the_library_hash_at_a_tasks_start_survives_a_cut_during_its_turn(
+    tmp_path, task_file, repo, monkeypatch
+):
+    def kv(attempt, prompt):
+        if attempt == 1:
+            (repo / "tensorrt_llm" / "libtensorrt_llm.so").write_bytes(b"rebuilt for kv")
+            raise KeyboardInterrupt
+        return BLOCKED
+
+    script = Script(assembler=_by_task({"kv_fp8": kv}))
+    with pytest.raises(KeyboardInterrupt):
+        _run(tmp_path, _spec(task_file, KV_FP8), monkeypatch, script)
+    cut = {t["id"]: t for t in _tasks(tmp_path)}
+    # On disk before the worker was asked: the restart does not take the rebuilt libraries
+    # for the ones the task started from.
+    assert cut["kv_fp8"]["status"] == "running"
+    assert cut["kv_fp8"]["lib_start"] == cut["core"]["lib_end"] != ""
+    _run(tmp_path, _spec(task_file, KV_FP8), monkeypatch, script, max_attempts=1)
+    assert "- native libraries were changed by `kv_fp8`, which did not land" in _report(tmp_path)
+
+
+def test_a_task_list_that_cannot_be_read_is_refused_and_left_as_it_is(
+    tmp_path, task_file, monkeypatch
+):
+    _run(tmp_path, _spec(task_file), monkeypatch, Script())
+    tasks = tmp_path / "ws" / "tasks.yaml"
+    for torn in ("tasks: [unclosed", "- a\n- b\n", "tasks: 3\n"):
+        tasks.write_text(torn)
+        # It holds the attempts and grants every task has spent: not begun anew over it.
+        with pytest.raises(StateError, match="does not hold the task list") as refused:
+            _run(tmp_path, _spec(task_file), monkeypatch, Script())
+        assert "restore it, or start over with --clean" in str(refused.value)
+        assert tasks.read_text() == torn
 
 
 def test_another_first_deployment_is_not_taken_for_the_one_core_was_built_for(

@@ -95,6 +95,8 @@ STATED_ACCURACY_KEYS: tuple[str, ...] = (
 )
 
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
+#: The names of the run's own tasks: a deployment's task is called by its name.
+RESERVED_NAMES: tuple[str, ...] = ("survey", "config", "fix")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -438,6 +440,10 @@ def validate(block: Any, errors: list[str]) -> None:
                 errors.append(f"'{at}' is named twice; each deployment needs its own name")
             if name == "core" and index:
                 errors.append(f"'{at}': `core` is how the first deployment is addressed")
+            if name in RESERVED_NAMES:
+                errors.append(
+                    f"'{at}': `{name}` is a task of the run; name the deployment otherwise"
+                )
         sides = [role for role in ROLES if entry.get(role) is not None]
         if sides:
             if len(sides) != len(ROLES):

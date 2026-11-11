@@ -422,6 +422,10 @@ def test_options_files_are_written_without_mutation(tmp_path, spec):
         },
         {"deployments": [{"name": "badref", "options": {}, "relative_to": "missing"}]},
         {"deployments": [{"name": "first", "options": {}}, {"name": "core", "options": {}}]},
+        # The run's own tasks are called `survey`, `config` and `fix-<n>`.
+        {"deployments": [{"name": "first", "options": {}}, {"name": "survey", "options": {}}]},
+        {"deployments": [{"name": "config", "options": {}}]},
+        {"deployments": [{"name": "first", "options": {}}, {"name": "fix", "options": {}}]},
         {
             "deployments": [
                 {
@@ -732,6 +736,16 @@ def test_what_the_table_cannot_state_is_one_line_and_a_missing_key_says_its_fix(
             load(tmp_path, value)
         return str(raised.value)
 
+    # A deployment is not called what a task of the run is called.
+    fp8 = {"llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}}
+    for taken in ("survey", "config", "fix"):
+        said = f"'variants.{taken}': a variant needs a name of its own"
+        assert said in refused(shorthand(spec, variants={taken: fp8}))
+        stated = {
+            **spec,
+            "deployments": [{"name": "tp1", "options": {}}, {"name": taken, "options": {}}],
+        }
+        assert f"`{taken}` is a task of the run; name the deployment otherwise" in refused(stated)
     by_unit = shorthand(spec, runtime={"default": {"cuda_graph": True}, "mtp": {}})
     assert "state deployments: 'runtime' differs by unit" in refused(by_unit)
     per_feature = shorthand(spec, parallel="unified", members={"default": ["tp1"], "mtp": ["tep4"]})

@@ -318,6 +318,7 @@ def _land(tmp_path, *decisions: dict) -> tuple[object, list[str]]:
     pipeline._dispatch = dispatch
     pipeline._land = lambda task, role, tree, facts: ""
     pipeline._facts = lambda task, tree: {}
+    pipeline._save = lambda: None
     pipeline.w.task_data["trtllm_repo_path"] = str(tmp_path)
     pipeline._scan = lambda *a: Pipeline._scan(pipeline, *a)
     task = Task(id="k1-rms", kind="kernel", unit="core", ref="1", attempts=1)

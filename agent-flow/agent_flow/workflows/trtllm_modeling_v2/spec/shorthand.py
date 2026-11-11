@@ -37,6 +37,7 @@ from .deployments import (
     BENCHMARK_DEFAULTS,
     DEFAULT_BENCHMARK,
     INPUTS,
+    RESERVED_NAMES,
     TRANSCEIVER,
     Deployment,
     Server,
@@ -281,7 +282,7 @@ def validate(data: Mapping[str, Any], errors: list[str]) -> None:
         return
     reject_unknown_keys(disagg, DISAGG_KEYS, errors, where=f"{ACCURACY_FIELD}.{DISAGG}")
     validate_env(disagg.get("env"), errors, f"{ACCURACY_FIELD}.{DISAGG}.env")
-    taken = (*members, *FEATURES, "core")
+    taken = (*members, *FEATURES, "core", *RESERVED_NAMES)
     for name, entry in variants.items():
         where = f"variants.{name}"
         if not re.match(r"^[a-z][a-z0-9_]{0,40}$", str(name)) or name in taken:

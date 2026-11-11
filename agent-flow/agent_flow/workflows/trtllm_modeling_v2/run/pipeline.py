@@ -88,6 +88,8 @@ FREE_RESTARTS = 2
 #: The kinds whose task, not done, ends the run ``not onboarded``; and how many times a new
 #: start gives a task not done fresh attempts: theirs, then any other task's.
 GATING = ("config", "survey", "core")
+#: Why a task the spec or preflight dropped is skipped; it is open again once they ask for it.
+_DROPPED = "the spec or preflight no longer asks for it"
 GRANTS = (4, 2)
 #: How many ended tasks a dispatch lists, the newest; the file has every one.
 HISTORY_TASKS = 30
@@ -158,10 +160,21 @@ class Pipeline:
         #: The gating task the run stopped at, and the final pass's lines (``run/report.py``).
         self.stopped: Task | None = None
         self.final: list[Any] = []
-        try:
-            data = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
-        except (OSError, yaml.YAMLError):
-            data = {}
+        data: Any = {}
+        if self.path.exists():
+            # Only an absent list is begun anew: one that cannot be read holds the attempts
+            # and grants every task has spent.
+            try:
+                data = yaml.safe_load(self.path.read_text(encoding="utf-8"))
+                held = isinstance(data, dict) and isinstance(data.get("tasks"), list)
+                why = "" if held else "it is not a mapping with a `tasks` list"
+            except (OSError, yaml.YAMLError) as exc:
+                why = f"{type(exc).__name__}: {exc}".splitlines()[0]
+            if why:
+                raise StateError(
+                    f"{self.path} does not hold the task list ({why}): the run does not start "
+                    f"over a list it cannot read; restore it, or start over with --clean"
+                )
         self.tasks = [Task.from_dict(t) for t in data.get("tasks") or () if isinstance(t, dict)]
         #: Counts the starts that followed a finished run: each may have one `fix` task.
         self.entry = int(data.get("entry") or 0) + (1 if data.get("closed", True) else 0)
@@ -240,7 +253,11 @@ class Pipeline:
         return wanted
 
     def _plan(self) -> None:
-        """Add the wanted tasks the list lacks, in order; skip what is no longer wanted."""
+        """Add the wanted tasks the list lacks, in order; skip what is no longer wanted.
+
+        A task skipped because the spec dropped it is open again when the spec asks for
+        it again, with the attempts it had spent.
+        """
         wanted = self._wanted()
         have = {t.id: t for t in self.tasks}
         built, now = have.get("core"), next((t for t in wanted if t.id == "core"), None)
@@ -253,10 +270,14 @@ class Pipeline:
             )
         ids = {t.id for t in wanted}
         added = [t.id for t in wanted if t.id not in have]
+        for task in self.tasks:
+            if task.id in ids and task.status == SKIPPED and task.note == _DROPPED:
+                task.status, task.note = PENDING, ""
+                added.append(task.id)
         open_ = [t for t in self.tasks if t.status in (PENDING, RUNNING) and t.kind != "fix"]
         dropped = [t for t in open_ if t.id not in ids]
         for task in dropped:
-            task.status, task.note = SKIPPED, "the spec or preflight no longer asks for it"
+            task.status, task.note = SKIPPED, _DROPPED
         order = [have.get(t.id, t) for t in wanted] + [t for t in self.tasks if t.id not in ids]
         if added or dropped or order != self.tasks:
             self.tasks = order
@@ -337,7 +358,10 @@ class Pipeline:
             tree = self.integration.open(task.id)
         if not task.lib_start:
             # The task's start, not this attempt's: what an earlier attempt rebuilt counts.
+            # Saved before the dispatch: a process cut while the worker rebuilds must not
+            # take the rebuilt libraries for the ones the task started from.
             task.lib_start = library_digest(tree or repo)
+            self._save()
         path = decision_path(self.workspace, task.id, task.attempts)
         data = read_decision(path) if resumed else None
         facts: dict[str, Any] = {}
