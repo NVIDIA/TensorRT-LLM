@@ -8,7 +8,7 @@ replay that rewrites it on the device (``on_update_kv_lens`` / the MSA KV-length
 valid-block counts, ``_preprocess_inputs`` for ``kv_lens_cuda``), or another graph key's captured forward writing the
 same pooled CUDA graph metadata block, leaves the record describing values the device no longer holds. This test scans
 ``tensorrt_llm/_torch`` and fails if any of those buffers is the destination of a skipping helper; they have to go
-through the never-skipping ``device_copy.copy`` / ``device_copy.fill_tail``.
+through ``device_copy.copy`` / ``device_copy.fill_tail`` without ``unchanged`` (which skips the write too).
 
 CPU only: it parses the sources.
 """
@@ -40,6 +40,9 @@ _DEVICE_WRITTEN = {
 }
 # Helpers that may skip the write; their first argument is the destination (``_upload_block_table(dst, src)``).
 _SKIPPING = {"_upload_block_table"}
+# Calls that skip the write when passed ``unchanged`` (anything but a literal False); their second argument is the
+# destination (``device_copy.copy(site, dst, src)``, ``device_copy.fill_tail(site, buf, start, value)``).
+_SKIPPING_WHEN_UNCHANGED = {"copy", "fill_tail"}
 
 
 def _receiver_names(node) -> set:
@@ -54,6 +57,15 @@ def _receiver_names(node) -> set:
     return names
 
 
+def _may_skip(call: ast.Call) -> bool:
+    """Whether the call passes ``unchanged`` as anything but a literal False."""
+    return any(
+        kw.arg == "unchanged"
+        and not (isinstance(kw.value, ast.Constant) and kw.value.value is False)
+        for kw in call.keywords
+    )
+
+
 def _skipped_device_buffers(tree: ast.AST):
     hits = []
     for node in ast.walk(tree):
@@ -62,9 +74,14 @@ def _skipped_device_buffers(tree: ast.AST):
         f = node.func
         name = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "")
         if name in _SKIPPING:
-            bad = _receiver_names(node.args[0]) & _DEVICE_WRITTEN
-            if bad:
-                hits.append((node.lineno, name, sorted(bad)))
+            dst = node.args[0]
+        elif name in _SKIPPING_WHEN_UNCHANGED and len(node.args) > 1 and _may_skip(node):
+            dst = node.args[1]
+        else:
+            continue
+        bad = _receiver_names(dst) & _DEVICE_WRITTEN
+        if bad:
+            hits.append((node.lineno, name, sorted(bad)))
     return hits
 
 
@@ -72,7 +89,7 @@ def test_no_device_written_buffer_goes_through_the_skip_cache() -> None:
     found = []
     for path in sorted(_ROOT.rglob("*.py")):
         src = path.read_text()
-        if not any(helper in src for helper in _SKIPPING):
+        if "unchanged" not in src and not any(helper in src for helper in _SKIPPING):
             continue
         for line, helper, bad in _skipped_device_buffers(ast.parse(src)):
             found.append(f"{path.relative_to(_ROOT).as_posix()}:{line} {helper}({', '.join(bad)})")
@@ -82,14 +99,21 @@ def test_no_device_written_buffer_goes_through_the_skip_cache() -> None:
 
 
 def test_the_scan_sees_a_skipped_device_buffer() -> None:
-    """The scan itself: a skipping helper writing a device-written buffer is reported, a never-skipping one is not."""
+    """The scan itself: a skipping write of a device-written buffer is reported, a never-skipping one is not."""
     bad = ast.parse(
         "self._upload_block_table(self.msa_seq_lens_cuda[:b], host)\n"
-        "m._upload_block_table(m.msa_out_cache_loc, host)"
+        "m._upload_block_table(m.msa_out_cache_loc, host)\n"
+        "device_copy.copy(S.SEQ_LENS, self.msa_seq_lens_cuda[:b], host, unchanged=same)\n"
+        "device_copy.fill_tail(S.TAIL, self.msa_out_cache_loc, n, 0, unchanged=True)"
     )
     ok = ast.parse(
         "device_copy.copy(S.SEQ_LENS, self.msa_seq_lens_cuda[:b], host)\n"
+        "device_copy.copy(S.SEQ_LENS, self.msa_seq_lens_cuda[:b], host, unchanged=False)\n"
+        "device_copy.copy(S.BLOCK_TABLE, self.msa_block_table[:b], host, unchanged=same)\n"
         "self._upload_block_table(self.msa_block_table[:b], h)"
     )
-    assert [h[1] for h in _skipped_device_buffers(bad)] == ["_upload_block_table"] * 2
+    assert [h[1] for h in _skipped_device_buffers(bad)] == ["_upload_block_table"] * 2 + [
+        "copy",
+        "fill_tail",
+    ]
     assert _skipped_device_buffers(ok) == []
