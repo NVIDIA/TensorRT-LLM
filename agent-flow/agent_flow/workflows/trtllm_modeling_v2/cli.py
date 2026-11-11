@@ -84,10 +84,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-rounds",
         type=int,
-        default=DEFAULT_MAX_ROUNDS,
-        help="How many certification rounds the run gets, the first included; each later "
-        "one follows a repair. A run that spent them closes certification-failed. "
-        f"Default {DEFAULT_MAX_ROUNDS}.",
+        default=None,
+        help="Ignored, with a notice: a run certifies its final commit and repairs it at most "
+        f"{DEFAULT_MAX_ROUNDS - 1} time(s).",
     )
     parser.add_argument(
         "--clean",
@@ -307,6 +306,12 @@ def main(argv: list[str] | None = None) -> None:
     if lock is None:
         _claim_workspace(Path(args.workspace))
 
+    if args.max_rounds is not None:
+        print(
+            f"note: --max-rounds is ignored: a run certifies its final commit and repairs it "
+            f"at most {DEFAULT_MAX_ROUNDS - 1} time(s); drop the flag",
+            file=sys.stderr,
+        )
     # A driver watching the run tells a crashed orchestrator from a busy one by it.
     heartbeat = start_orchestrator_heartbeat(args.workspace, ORCHESTRATOR_HEARTBEAT_S)
 
@@ -320,7 +325,6 @@ def main(argv: list[str] | None = None) -> None:
     with TrtllmModelingV2Workflow(
         workspace=args.workspace,
         max_attempts=args.max_attempts,
-        max_rounds=args.max_rounds,
         clean=args.clean,
         dry_run=args.dry_run,
         agent_turn_timeout=args.agent_turn_timeout,

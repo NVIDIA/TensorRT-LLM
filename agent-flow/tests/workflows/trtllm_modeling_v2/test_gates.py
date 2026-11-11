@@ -400,6 +400,7 @@ def test_one_function_runs_a_check_on_the_deployment_it_names(tmp_path):
     assert command.startswith(f"cd {tree.resolve()} && export PYTHONPATH={tree.resolve()}")
     assert "CUDA_VISIBLE_DEVICES=4,5 " in command and "mpirun -n 2" in command
     assert "MV2FLOW_RANK_FACTS=1" in command and "TRTLLM_MODELING_V2=require" in command
+    assert "MY_SWITCH=1" in command  # the deployment's own environment
     assert boot.summary().startswith("[PASS] tep2:boot: engine cold-started")
     assert boot.path == gate_cli.IN_PROCESS and "[in process]" in boot.summary()
     assert (boot.engine[0]["status"], boot.engine[0]["ranks"]) == ("match", 2)

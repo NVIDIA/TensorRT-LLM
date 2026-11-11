@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import shlex
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -276,7 +276,7 @@ def run_serve_gate(
     spec = spec or ServeSpec.from_task(task_data)
     _verdict = verdict_factory(inspect_tree(task_data))
 
-    env = with_mode(environment, MODE_REQUIRE)
+    env = with_mode(replace(environment, env={**environment.env, **deployment.env}), MODE_REQUIRE)
     if boot is None:
         boot = resolve_boot_spec(task_data, deployment)
     directory = gate_workdir(workdir)

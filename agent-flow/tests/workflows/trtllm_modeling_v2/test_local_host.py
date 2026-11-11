@@ -208,8 +208,11 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
     assert run("--help") == 0
     assert "--dry-run" in capsys.readouterr().out
     workspace = tmp_path / "ws"
-    assert run("--task", str(task_file), "--workspace", str(workspace), "--dry-run") == 0
-    assert "--dry-run: preflight passed" in capsys.readouterr().out
+    argv = ["--task", str(task_file), "--workspace", str(workspace), "--dry-run"]
+    assert run(*argv, "--max-rounds", "9") == 0
+    said = capsys.readouterr()
+    assert "--dry-run: preflight passed" in said.out
+    assert "note: --max-rounds is ignored: " in said.err
     assert (workspace / "contract.yaml").is_file() and not (workspace / "tasks.yaml").exists()
 
     # A spec that states no model for its roles is a spec error: 2, before anything runs.

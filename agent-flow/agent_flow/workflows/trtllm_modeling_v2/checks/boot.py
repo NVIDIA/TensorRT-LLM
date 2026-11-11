@@ -218,7 +218,8 @@ def run_boot_gate(
     is a control run on the stock implementation, recorded as ``boot[<mode>]``.
     """
     spec = spec or BootSpec()
-    env = with_mode(environment, mode)
+    # The deployment's own environment is laid over the run's for every command of its checks.
+    env = with_mode(replace(environment, env={**environment.env, **deployment.env}), mode)
     gate_name = "boot" if mode == MODE_REQUIRE else f"boot[{mode}]"
     _verdict = verdict_factory(inspect_tree(task_data))
     config = check_configuration(task_data, deployment, max_tokens=spec.max_tokens)
