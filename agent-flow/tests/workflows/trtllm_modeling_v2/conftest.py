@@ -10,6 +10,7 @@ task spec that points at both.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import stat
@@ -217,4 +218,8 @@ def site(tmp_path, monkeypatch):
 
     monkeypatch.setattr(servers, "RELEASE_TIMEOUT_S", 1)
     monkeypatch.setattr(servers, "STOP_GRACE_S", 10)
-    return tmp_path
+    yield tmp_path
+    # A test that failed with servers up leaves none behind on a shared host.
+    for record in tmp_path.rglob(servers.OWNED_FILENAME):
+        with contextlib.suppress(Exception):
+            servers.clean_owned(record.parent, budget=5)

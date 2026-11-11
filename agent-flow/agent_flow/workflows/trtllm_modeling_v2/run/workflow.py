@@ -474,11 +474,6 @@ class TrtllmModelingV2Workflow:
     def _checkpoint(self, state: WorkflowState) -> None:
         save_state(self.state_path, state)
 
-    def _gate_env(self) -> RunEnvironment:
-        """The environment a check runs under: the run's, as preflight resolved it."""
-        assert self.environment is not None, "preflight must run before any check"
-        return self.environment
-
     def _close_run(self, state: WorkflowState, log, *, verdict: str, pipeline: Pipeline) -> None:
         state.done = True
         state.verdict = verdict
