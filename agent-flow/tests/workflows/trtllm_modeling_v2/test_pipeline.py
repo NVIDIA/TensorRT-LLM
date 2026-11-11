@@ -391,10 +391,11 @@ def test_core_spent_ends_the_run_not_onboarded_and_the_report_says_where(
     assert report[0] == "# not onboarded: stopped at `core`, not done after 3 attempt(s)"
     assert report[2].startswith("- result: [FAIL] tp1:boot: ")
     workspace = tmp_path / "ws"
+    # The command that shows it again, on the tree that was checked: here the checkout itself.
     assert report[3] == (
-        f"- reproduce: `trtllm-modeling-v2 gate boot --task {workspace}/task.yaml "
-        f"--deployment tp1 --tree {workspace}/worktrees/core`"
-    ) or report[3].startswith(f"- reproduce: `{workspace}/bin/trtllm-modeling-v2 gate boot ")
+        f"- reproduce: `{workspace}/bin/trtllm-modeling-v2 gate boot --task {workspace}/task.yaml "
+        f"--deployment tp1 --tree {tmp_path}/repo`"
+    )
     assert report[4] == "- last commit where `tp1:boot` passed: `none`"
     assert "## Done\n\n(none)" in "\n".join(report)
 
@@ -420,8 +421,9 @@ def test_a_turn_that_raises_or_runs_out_of_time_is_a_failed_attempt_with_why(
 def test_a_worker_that_never_gets_core_ready_stops_the_run_with_its_own_reason(
     tmp_path, task_file, monkeypatch
 ):
-    shell = _checks()
-    script = Script(assembler=_by_task({"core": BLOCKED}))
+    shell = _checks(fail={"tp1:boot"})
+    # Ready once, and the boot failed; then it gave up twice without reaching a check.
+    script = Script(assembler=_by_task({"core": [READY, BLOCKED]}))
     workflow = _workflow(tmp_path, shell_runner=shell)
     _install(monkeypatch, workflow, script)
     with workflow:
@@ -429,7 +431,12 @@ def test_a_worker_that_never_gets_core_ready_stops_the_run_with_its_own_reason(
     report = _report(tmp_path)
     assert report.startswith("# not onboarded: stopped at `core`, not done after 3 attempt(s)")
     assert "- result: it ended BLOCKED: blocked_reason: environment; no route to it" in report
-    assert "- no check of the run failed: see `" in report and shell.ran == []
+    # What ended it is the worker's own word, not the check an earlier attempt failed.
+    decisions = tmp_path / "ws" / "decisions"
+    assert (
+        f"- its last attempt ended at no check of the run: see `{decisions}/core-*.yaml`" in report
+    )
+    assert "- reproduce:" not in report and shell.ran == ["tp1:boot"]
 
 
 def test_the_config_task_runs_first_and_lands_only_when_the_tree_loads_the_config(
@@ -1340,6 +1347,58 @@ def test_a_worker_that_commits_nothing_is_still_held_to_the_onboard_check(
     assert "core (attempt 1 of 3): pending UNIT_READY: [FAIL] tp1:boot: " in journal
     assert _state(tmp_path).onboarded["commit"] == base == _git(repo, "rev-parse", "HEAD")
     assert _tasks(tmp_path)[1]["attempts"] == 2
+
+
+def test_a_run_that_is_not_onboarded_says_what_to_run_where_and_the_last_commit_that_passed(
+    tmp_path, task_file, repo, monkeypatch
+):
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.name", "T")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", f"base{_SIGNED}")
+    base = _git(repo, "rev-parse", "HEAD")
+    shell = _checks(fail={"tp1:accuracy"})
+    commits: list[str] = []
+
+    def core(attempt, prompt):
+        tree = Path(re.search(r"You work in `([^`]+)`", prompt).group(1))
+        (tree / FAMILY / "a.py").write_text(f"A = {attempt}\n")
+        _git(tree, "add", f"{FAMILY}/a.py")
+        _git(tree, "commit", "-q", "-m", f"core {attempt}{_SIGNED}")
+        commits.append(_git(tree, "rev-parse", "HEAD"))
+        return READY
+
+    script = Script(assembler=_by_task({"core": core}))
+    workflow = _workflow(tmp_path, git_runner=None, shell_runner=shell, max_attempts=2)
+    _install(monkeypatch, workflow, script)
+    with workflow:
+        assert workflow.run(_spec(task_file, KV_FP8)) is False
+    # The boot passed on each attempt's commit; the benchmark failed on both. Nothing landed.
+    assert shell.ran == ["tp1:boot", "tp1:accuracy", "tp1:boot", "tp1:accuracy"]
+    assert _git(repo, "rev-parse", "HEAD") == base and _state(tmp_path).onboarded == {}
+    workspace = tmp_path / "ws"
+    report = _report(tmp_path).splitlines()
+    assert report[0] == "# not onboarded: stopped at `core`, not done after 2 attempt(s)"
+    assert report[2].startswith("- result: [FAIL] tp1:accuracy[gsm8k]: ")
+    assert report[3] == (
+        f"- reproduce: `{workspace}/bin/trtllm-modeling-v2 gate 'accuracy[gsm8k]' --task "
+        f"{workspace}/task.yaml --deployment tp1 --tree {workspace}/worktrees/core`"
+    )
+    assert report[4] == "- last commit where `tp1:accuracy[gsm8k]` passed: `none`"
+    # A later start: the benchmark passes on the first new commit, then the boot breaks.
+    shell.fail.clear()
+    shell.fail.add("tp1:boot")
+    workflow = _workflow(tmp_path, git_runner=None, shell_runner=shell, max_attempts=1)
+    _install(monkeypatch, workflow, script)
+    with workflow:
+        assert workflow.run(task_file) is False
+    report = _report(tmp_path).splitlines()
+    assert report[2].startswith("- result: [FAIL] tp1:boot: ")
+    assert report[3].startswith(
+        f"- reproduce: `{workspace}/bin/trtllm-modeling-v2 gate boot --task"
+    )
+    assert report[4] == f"- last commit where `tp1:boot` passed: `{commits[1]}`"
 
 
 def test_a_process_that_died_after_the_commit_landed_goes_on_without_checking_again(

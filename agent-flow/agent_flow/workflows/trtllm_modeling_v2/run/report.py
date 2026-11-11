@@ -369,13 +369,17 @@ def _stopped(workflow, pipeline) -> list[str]:
     if task is None:
         return ["# not onboarded: the run ended before `core` was done"]
     status = workflow._contract_status()
-    failed = [v for c in _onboard_checks(workflow) if (v := status.last(c.key)) and not v.passed]
+    # A check ended core's last attempt when the last one recorded for it is the task's reason.
+    keys = {check.key for check in _onboard_checks(workflow)}
+    recorded = [v for v in status.verdicts if v.key in keys]
+    v = recorded[-1] if recorded else None
     lines = [f"# not onboarded: stopped at `{task.id}`, not done after {task.attempts} attempt(s)"]
     lines += ["", f"- result: {task.note or '(no reason recorded)'}"]
-    if task.kind == "core" and failed:
-        v = failed[-1]
+    if task.kind == "core" and v is not None and not v.passed and v.summary in task.note:
+        # The task's worktree holds what was checked; without one, the checkout does.
         tree = workflow.workspace / WORKTREES_DIRNAME / task.id
-        gate = f"gate {v.gate} --task {workflow.task_path} --deployment {v.deployment}"
+        tree = tree if tree.is_dir() else workflow.task_data["trtllm_repo_path"]
+        gate = f"gate {shlex.quote(v.gate)} --task {workflow.task_path} --deployment {v.deployment}"
         lines.append(f"- reproduce: `{pipeline.cli()} {gate} --tree {tree}`")
         passed = status.last(v.key, passed=True)
         lines.append(
@@ -383,7 +387,9 @@ def _stopped(workflow, pipeline) -> list[str]:
         )
     else:
         files = workflow.workspace / DECISIONS_DIRNAME
-        lines.append(f"- no check of the run failed: see `{files}/{task.id}-*.yaml`")
+        lines.append(
+            f"- its last attempt ended at no check of the run: see `{files}/{task.id}-*.yaml`"
+        )
     return lines
 
 
