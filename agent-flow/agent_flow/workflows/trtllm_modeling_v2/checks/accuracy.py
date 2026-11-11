@@ -26,7 +26,7 @@ from ..infra.compute.environment import RunEnvironment, env_assignments, single_
 from ..infra.files import write_text_atomic
 from ..spec.deployments import Benchmark, Deployment
 from . import anchors as anchors_mod
-from . import attest, datasets
+from . import attest, datasets, servers
 from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner, gate_workdir, with_mode
 from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
@@ -102,8 +102,10 @@ def launch_command(
     launch = deployment.server.launch.strip()
     if not launch:
         return environment.command(" ".join(parts))
-    # The prefix is the site's own words (it may begin with assignments): run as written.
-    inner = f"{single_task_scrub(list(env))}; {launch} {' '.join(parts)}"
+    # The prefix is the site's own words (it may begin with assignments): run as written,
+    # with the LLM API's launcher before the program where it has made several ranks.
+    program = " ".join([*servers.launcher(deployment.server), *parts])
+    inner = f"{single_task_scrub(list(env))}; {launch} {program}"
     return f"{' '.join(env_assignments(environment.env))} bash -c {shlex.quote(inner)}"
 
 

@@ -213,8 +213,18 @@ def _prove_agents(workflow, log) -> bool:
 
 
 def _compile_contract(workflow, log) -> bool:
-    """Compile the checks the run owes from the spec."""
+    """Compile the checks the run owes, and freeze what each benchmark is judged against.
+
+    Only what the workspace has not frozen yet is added: a resumed run is held to the
+    anchors its first start read. Frozen anchors that cannot be read stop the start.
+    """
     workflow._contract = contract_mod.compile_contract(workflow.task_data)
+    try:
+        workflow._anchors = anchors_mod.freeze(workflow.workspace, workflow.task_data)
+    except anchors_mod.AnchorError as exc:
+        print_message(f"[bold red]✘ anchors: {escape_markup(str(exc))}[/bold red]", log)
+        workflow.journal.section("anchors: the frozen file cannot be read", str(exc))
+        return False
     return True
 
 
@@ -230,19 +240,14 @@ def _write_contract(workflow) -> None:
 
 
 def _write_deployments(workflow) -> None:
-    """Freeze each benchmark's anchor, then say what the spec comes to: one line per deployment.
+    """Say what the spec comes to, one line per deployment.
 
-    Its name, its kind and servers, its benchmarks and where each one's anchor comes
-    from. Only what the workspace has not frozen yet is added: a resumed run is held to
-    the anchors its first start read.
+    Its name, its kind and servers, its benchmarks and where each one's frozen anchor
+    comes from.
     """
     found = deployments_mod.resolve(workflow.task_data)
-    try:
-        frozen = anchors_mod.freeze(workflow.workspace, workflow.task_data)
-        moved = anchors_mod.differences(workflow.workspace, workflow.task_data)
-    except Exception as exc:
-        workflow.journal.section("anchors: not frozen", f"{type(exc).__name__}: {exc}")
-        frozen, moved = {}, []
+    frozen = workflow._anchors
+    moved = anchors_mod.differences(workflow.workspace, workflow.task_data)
     sources = {
         key: f"{a.kind}" + (f" {a.value:g}" if a.value is not None else "") + f": {a.source}"
         for key, a in frozen.items()

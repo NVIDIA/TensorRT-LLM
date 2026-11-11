@@ -21,9 +21,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ..infra.compute.commands import ended_early
-from ..infra.compute.environment import RunEnvironment
+from ..infra.compute.environment import RunEnvironment, env_assignments, single_task_scrub
 from ..infra.git import git_output
 from ..spec.deployments import Deployment
+from . import servers
 from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner, gate_workdir, with_mode
 from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
@@ -151,9 +152,10 @@ def run_tests(
 ) -> GateResult:
     """Run each of ``deployment``'s native tests as one pytest job and judge the reports.
 
-    Every job runs under the deployment's environment with the Modeling V2 switch on. A
-    test that skipped proves nothing and fails the check, as does a node id that selects
-    nothing; the first job that does not pass ends it.
+    Every job runs under the deployment's environment with the Modeling V2 switch on,
+    behind the deployment's launch prefix when it has one. A test that skipped proves
+    nothing and fails the check, as does a node id that selects nothing; the first job
+    that does not pass ends it.
     """
     verdict = verdict_factory(inspect_tree(task_data))
     if not deployment.tests:
@@ -182,7 +184,18 @@ def run_tests(
             replace(environment, env={**environment.env, **kept, **deployment.env}), MODE_REQUIRE
         )
         root, argv = pytest_argv(repo, [test], report)
-        command = f"cd {shlex.quote(str(root))} && {env.python_command(argv, single_process=True)}"
+        launch = deployment.server.launch.strip() if deployment.server is not None else ""
+        if launch:
+            # Behind the deployment's prefix, as its server and its benchmark run: the
+            # prefix places the test (rank 0 runs it where the options ask for several),
+            # and nothing of this host's devices goes with it.
+            words = [*servers.launcher(deployment.server), shlex.quote(env.python)]
+            program = f"{launch} {' '.join(words)} {shlex.join(argv)}"
+            inner = f"{single_task_scrub(list(env.env))}; {program}"
+            run = f"{' '.join(env_assignments(env.env))} bash -c {shlex.quote(inner)}"
+        else:
+            run = env.python_command(argv, single_process=True)
+        command = f"cd {shlex.quote(str(root))} && {run}"
         commands.append(command)
         result = runner(command, None, timeout)
         tail = result.stdout + result.stderr

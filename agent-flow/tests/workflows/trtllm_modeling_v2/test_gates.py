@@ -312,7 +312,7 @@ def _spec(tmp_path, **more) -> dict:
             {
                 "name": "remote",
                 "options": {"tensor_parallel_size": 8},
-                "launch": "srun -N2 --ntasks=8 --mpi=pmix trtllm-llmapi-launch",
+                "launch": "srun -N2 --ntasks=8 --mpi=pmix",
                 "benchmarks": [{"name": "gsm8k", "env": {"JUDGE": "local"}}],
                 "tests": ["tests/unittest/test_accept.py::test_acceptance"],
             },
@@ -408,7 +408,8 @@ def test_accuracy_runs_trtllm_eval_behind_the_deployments_own_prefix(tmp_path):
     )
     assert "anchor: reference" in result.detail and result.path == gate_cli.IN_PROCESS
     [command] = runner.seen
-    # The prefix places the ranks: no device of this host and no launcher of the flow's.
+    # The prefix is the site's and places the ranks: the flow adds the LLM API's launcher
+    # for the eight its options ask for, and no device of this host.
     assert "; srun -N2 --ntasks=8 --mpi=pmix trtllm-llmapi-launch trtllm-eval " in command
     assert "CUDA_VISIBLE_DEVICES" not in command and "mpirun" not in command
     # The evaluator runs offline, on the dataset this host holds, under the benchmark's env.
@@ -490,10 +491,15 @@ def test_native_tests_run_one_job_each_and_a_skip_or_a_bad_exit_is_not_a_pass(tm
         result = gate_cli.run_check(data, "tests", "pd", runner=runner, **common)
         assert not result.passed and said in result.detail, (reports, result.detail)
         assert len(runner.seen) == 1  # the first job that does not pass ends the check
-    # An aggregated deployment's native tests run the same way.
+    # An aggregated deployment's native tests run behind its own prefix, as its server does.
     runner = _engine(reports=PASS)
     assert gate_cli.run_check(data, "tests", "remote", runner=runner, **common).passed
+    assert (
+        "; srun -N2 --ntasks=8 --mpi=pmix trtllm-llmapi-launch /usr/bin/python3 -m pytest"
+        in (runner.seen[0])
+    )
     assert "tests/unittest/test_accept.py::test_acceptance" in runner.seen[0]
+    assert "CUDA_VISIBLE_DEVICES" not in runner.seen[0]
     none = gate_cli.run_check(data, "tests", "tp1", runner=runner, **common)
     assert not none.passed and none.detail == "the deployment names no test"
 

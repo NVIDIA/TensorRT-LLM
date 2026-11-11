@@ -182,10 +182,21 @@ def flow_version() -> str:
 def inputs_digest(task_data: Mapping[str, Any]) -> str:
     """A hash of what the checks read of the spec: all of it but ``notes`` and ``agents``.
 
-    With the options each deployment resolves to, so an options file edited in place
-    counts as the spec edit it is.
+    With the content of what a check reads through it: the options each deployment
+    resolves to and the boot workload's prompt files, so a file edited in place counts
+    as the spec edit it is.
     """
     spec = {k: v for k, v in task_data.items() if k not in ("notes", "agents")}
+    boot = (task_data.get("accuracy") or {}).get("boot") or {}
+    levels = [boot, *(v for v in boot.values() if isinstance(v, Mapping))]
+    prompts = []
+    for path in sorted(
+        {str(level["prompts_file"]) for level in levels if level.get("prompts_file")}
+    ):
+        try:
+            prompts.append(hashlib.sha256(Path(path).read_bytes()).hexdigest())
+        except OSError:
+            prompts.append(f"unreadable:{path}")
     try:
         resolved = [
             {role: dict(server.options) for role, server in deployment.servers.items()}
@@ -193,7 +204,7 @@ def inputs_digest(task_data: Mapping[str, Any]) -> str:
         ]
     except (ValueError, OSError, KeyError):
         resolved = []
-    text = json.dumps([spec, resolved], sort_keys=True, default=str)
+    text = json.dumps([spec, resolved, prompts], sort_keys=True, default=str)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
@@ -211,12 +222,13 @@ def tree_id(
     ``repo``, which are outside git. With ``task_data``, also what the checks read of
     the spec, this workflow's own version and ``environment`` (a digest of where the
     checks run): a verdict counts only where all five are what they were.
-    ``""`` without a commit: nothing is established, and no verdict counts.
+    ``""`` without a commit or without a git tree for it: nothing is established, and no
+    verdict counts or is reused.
     """
-    if not commit:
+    words = (git(str(repo), "rev-parse", f"{commit}^{{tree}}") or "").split() if commit else []
+    if not words:
         return ""
-    words = (git(str(repo), "rev-parse", f"{commit}^{{tree}}") or "").split()
-    parts = [words[0] if words else commit, library_digest(repo)]
+    parts = [words[0], library_digest(repo)]
     if task_data is not None:
         parts += [inputs_digest(task_data), flow_version(), environment or "unknown-environment"]
     return "+".join(parts)
@@ -310,8 +322,14 @@ class ContractStatus:
         self.verdicts.append(verdict)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Synced: a verdict that cost a load must survive the node that measured it.
+        # A line a dead process tore is closed first: the new verdict is its own line.
+        torn = False
+        if self.path.is_file() and self.path.stat().st_size:
+            with self.path.open("rb") as written:
+                written.seek(-1, os.SEEK_END)
+                torn = written.read(1) != b"\n"
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(asdict(verdict)) + "\n")
+            handle.write(("\n" if torn else "") + json.dumps(asdict(verdict)) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         return verdict

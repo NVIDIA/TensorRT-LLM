@@ -8,15 +8,22 @@ from __future__ import annotations
 import json
 import math
 import re
+import sys
+import types
 
 import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import anchors, endpoint, gate_cli, servers
-from agent_flow.workflows.trtllm_modeling_v2.checks.boot import BootPrompt, BootSpec
+from agent_flow.workflows.trtllm_modeling_v2.checks.boot import (
+    BootPrompt,
+    BootSpec,
+    resolve_boot_spec,
+)
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import endpoint_eval
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import advice
 from agent_flow.workflows.trtllm_modeling_v2.spec import deployments
 from agent_flow.workflows.trtllm_modeling_v2.spec.deployments import Benchmark, Deployment, Server
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import TaskSchemaError
@@ -105,6 +112,61 @@ def test_anchors_are_frozen_once_and_a_later_start_adds_only_what_is_absent(tmp_
     assert anchors.differences(workspace, loaded) == [
         "tp1:gsm8k: frozen at 41.77; the tree's row now says 12"
     ]
+    # Frozen with each: the scale its scores are on and the count its floor is computed over.
+    assert (again["tp1:gsm8k"].unit, again["tp1:gsm8k"].samples) == ("percent", 1319)
+
+
+def test_frozen_means_frozen_a_none_stays_none_and_an_unreadable_file_is_not_read_as_none(
+    tmp_path,
+):
+    spec = _delivered(
+        tmp_path, parallel="tp1", model_key="Qwen/Qwen3-0.6B", agent="claude-test-model",
+        disagg=False,
+    )  # fmt: skip
+    loaded = _load(tmp_path, spec)
+    workspace = tmp_path / "ws"
+    assert anchors.freeze(workspace, loaded)["tp1:gsm8k"].kind == anchors.NONE
+    # A row written later does not turn a score with no verdict into a judged one.
+    _rows(tmp_path, "gsm8k", {"Qwen/Qwen3-0.6B": [{"accuracy": 41.77}]})
+    assert anchors.freeze(workspace, loaded)["tp1:gsm8k"].kind == anchors.NONE
+    assert anchors.frozen(workspace, "tp1", "gsm8k").kind == anchors.NONE
+    # A file that does not hold the anchors is not read as "nothing frozen yet".
+    for torn in ("- [not, an, anchor\n", "", "tp1: 41.77\n"):
+        (workspace / anchors.ANCHORS_FILENAME).write_text(torn)
+        with pytest.raises(anchors.AnchorError, match="delete it to freeze them again"):
+            anchors.freeze(workspace, loaded)
+
+
+def test_a_run_whose_frozen_anchors_cannot_be_read_stops_at_its_start(tmp_path, task_file):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / anchors.ANCHORS_FILENAME).write_text("- [not, an, anchor\n")
+    workflow = _workflow(tmp_path, dry_run=True)
+    with workflow:
+        assert not workflow.run(task_file)
+    journal = (workspace / "journal.md").read_text()
+    assert "anchors: the frozen file cannot be read" in journal
+    assert "delete it to freeze them again" in journal
+
+
+def test_a_benchmark_states_the_unit_of_its_scores(tmp_path):
+    spec = _native(tmp_path)
+    lcr = next(b for b in spec["deployments"][0]["benchmarks"] if b["name"] == "aa_lcr")
+    assert "unit" not in lcr
+    # 0.62 with the default unit reads as 0.62 percent: said at load, not guessed around.
+    loaded = _load(tmp_path, spec)
+    assert any(
+        w.startswith("anchor under one percent: `dep16` on `aa_lcr` declares 0.62")
+        for w in advice.spec_warnings(loaded)
+    )
+    lcr["unit"] = "fraction"
+    loaded = _load(tmp_path, spec)
+    assert deployments.resolve(loaded)[0].benchmark("aa_lcr").unit == "fraction"
+    assert not [w for w in advice.spec_warnings(loaded) if w.startswith("anchor under one")]
+    assert anchors.freeze(tmp_path / "ws", loaded)["dep16:aa_lcr"].unit == "fraction"
+    lcr["unit"] = "points"
+    with pytest.raises(TaskSchemaError, match="unit"):
+        _load(tmp_path, spec)
 
 
 def test_a_floor_is_two_standard_errors_and_a_relative_one_allows_for_both_scores():
@@ -122,10 +184,18 @@ def test_a_floor_is_two_standard_errors_and_a_relative_one_allows_for_both_score
     assert anchors.floor(reference, subset)[0].samples == 200
     printed = "Partial scores after 150/150 responses"
     assert anchors.floor(reference, subset, output=printed)[0].samples == 150
-    # A benchmark that reports a fraction is held on its own scale.
-    declared = anchors.Anchor("dep16", "aa_lcr", anchors.DECLARED, 0.62)
+    # The count frozen with the anchor is the floor's, whatever a later run prints.
+    fixed = anchors.Anchor("tp1", "gsm8k", anchors.REFERENCE, 41.77, samples=1319)
+    floor, source = anchors.floor(fixed, subset, output=printed)
+    assert (floor.samples, source) == (1319, "the count fixed with the anchor")
+    # A benchmark that states it reports a fraction is held on that scale; nothing is
+    # guessed from a score's size: 0.62 percent is a floor near zero.
+    declared = anchors.Anchor("dep16", "aa_lcr", anchors.DECLARED, 0.62, unit="fraction")
     floor, _ = anchors.floor(declared, Benchmark(name="aa_lcr", samples=100))
     assert floor.value == pytest.approx(0.62 - 2 * math.sqrt(0.62 * 0.38 / 100))
+    percent = anchors.Anchor("dep16", "aa_lcr", anchors.DECLARED, 0.62)
+    floor, _ = anchors.floor(percent, Benchmark(name="aa_lcr", samples=100))
+    assert floor.value == pytest.approx(0.62 - 2 * 100 * math.sqrt(0.0062 * 0.9938 / 100))
     none = anchors.Anchor("lone", "mmmu", anchors.NONE)
     assert anchors.floor(none, Benchmark(name="mmmu")) == (None, "no anchor")
     # A benchmark whose size nobody states has no error to hold it to.
@@ -248,9 +318,53 @@ def test_a_boot_through_the_endpoint_fails_when_nothing_starts_or_ranks_are_left
         holders.write_text("4242\n")  # a rank that outlives the stop
         return "Paris"
 
+    real = servers.ask
     monkeypatch.setattr(servers, "ask", ask)
     result = endpoint.run_endpoint_boot(_pd(), task_data=_task(site), workspace=workspace)
     assert not result.passed and result.infrastructure.startswith("ranks were left holding")
+    # They are still the run's until the devices are seen free: the next check starts nothing.
+    again = endpoint.run_endpoint_boot(_pd(), task_data=_task(site), workspace=workspace)
+    assert not again.passed and again.infrastructure.startswith("ranks an earlier check left")
+    holders.write_text("")
+    monkeypatch.setattr(servers, "ask", real)
+    # Devices that could not be looked at: the verdict stands and its line says so.
+    monkeypatch.setattr(servers, "_holders", lambda *a, **k: None)
+    unseen = endpoint.run_endpoint_boot(_pd(), task_data=_task(site), workspace=workspace)
+    assert unseen.passed and unseen.detail.endswith("; devices not verified free")
+
+
+def test_an_answer_counts_once_it_completed_and_an_image_deployment_is_sent_an_image(
+    site, monkeypatch
+):
+    workspace = site / "ws"
+    picture = site / "tests/integration/test_input_files/merlion.png"
+    picture.parent.mkdir(parents=True)
+    picture.write_bytes(b"png")
+    sees = Deployment(
+        name="vl",
+        ctx=Server(options={"a": 1}),
+        gen=Server(options={"a": 1}),
+        inputs=("text", "image"),
+    )
+    spec = resolve_boot_spec({}, sees)
+
+    def boot():
+        return endpoint.run_endpoint_boot(
+            sees, task_data=_task(site), workspace=workspace, spec=spec
+        )
+
+    result = boot()
+    assert result.passed, result.detail
+    assert "answered 3 prompt(s) with their keywords, 1 of them with an image" in result.detail
+    # A server that takes no image has not shown it serves one: said, and no pass.
+    monkeypatch.setenv("FAKE_NO_IMAGES", "1")
+    blind = boot()
+    assert not blind.passed and blind.detail.startswith("image not checked: vl did not answer")
+    monkeypatch.delenv("FAKE_NO_IMAGES")
+    # An answer cut off before it finished is not an answer.
+    monkeypatch.setenv("FAKE_UNFINISHED", "1")
+    cut = boot()
+    assert not cut.passed and "without a completed choice" in cut.detail
 
 
 def test_accuracy_through_the_endpoint_runs_the_trees_evaluator_and_is_held_to_the_anchor(
@@ -318,6 +432,48 @@ def test_the_evaluators_request_states_its_sampling():
         "truncate_prompt_tokens": 4096,
     }
     assert endpoint.ENDPOINT_BENCHMARKS == ("gsm8k",)
+    # No stop is said as no stop: a server's own default is not the evaluator's.
+    Sampling.stop = None
+    assert endpoint_eval.request_body("/ckpt/model", "Q", Sampling())["stop"] == []
+
+
+def test_the_evaluator_is_told_its_stop_strings_and_its_sample_count(monkeypatch, capsys):
+    built: dict = {}
+
+    class GSM8K:
+        def __init__(self, **kwargs):
+            built.update(kwargs)
+
+        def evaluate(self, llm, sampling):
+            built["stop"] = sampling.stop
+
+    class SamplingParams:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    package = types.ModuleType("tensorrt_llm")
+    modules = {
+        "tensorrt_llm": package,
+        "tensorrt_llm.evaluate": types.SimpleNamespace(GSM8K=GSM8K),
+        "tensorrt_llm.llmapi": types.SimpleNamespace(SamplingParams=SamplingParams),
+        "tensorrt_llm.llmapi.tokenizer": types.SimpleNamespace(load_hf_tokenizer=lambda m: None),
+    }
+    package.evaluate = modules["tensorrt_llm.evaluate"]
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    common = ["--url", "http://h:1", "--model", "/ckpt", "--benchmark", "gsm8k"]
+    assert endpoint_eval.main([*common, "--stop", '["Question:"]']) == 0
+    # The stop strings go into the task itself, which is what the evaluator generates by;
+    # the count is the split's when the command names none, never left to a default.
+    assert built["stop_strings"] == ["Question:"] and built["stop"] == ["Question:"]
+    assert built["num_samples"] == 1319
+    assert "endpoint-eval: gsm8k on 1319 samples, greedy, stop ['Question:']" in (
+        capsys.readouterr().out
+    )
+    built.clear()
+    assert endpoint_eval.main([*common, "--num_samples", "200"]) == 0
+    assert built["num_samples"] == 200 and "stop_strings" not in built
+    assert "on 200 samples, greedy, stop the task own" in capsys.readouterr().out
 
 
 def test_a_disaggregated_deployments_boot_goes_through_its_endpoint_under_the_lock(

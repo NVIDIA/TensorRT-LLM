@@ -80,7 +80,9 @@ BENCHMARK_DEFAULTS: tuple[str, ...] = (
     "samples",
     "score_pattern",
 )
-BENCHMARK_KEYS: tuple[str, ...] = ("name", "args", "anchor", "source", "env", *BENCHMARK_DEFAULTS)
+BENCHMARK_KEYS = ("name", "args", "anchor", "source", "unit", "env", *BENCHMARK_DEFAULTS)
+#: The scales a benchmark's scores and anchor may be on.
+UNITS: tuple[str, ...] = ("percent", "fraction")
 #: The ``accuracy`` keys a spec that states ``deployments`` keeps.
 STATED_ACCURACY_KEYS: tuple[str, ...] = (
     "benchmark",
@@ -109,6 +111,8 @@ class Benchmark:
     args: tuple[str, ...] = ()
     anchor: float | None = None
     source: str = ""
+    #: The scale its scores and its anchor are on: stated, never read off a score's size.
+    unit: str = "percent"
     env: Mapping[str, str] = field(default_factory=dict)
     model_key: str | None = None
     reference_yaml: str | None = None
@@ -123,6 +127,8 @@ class Benchmark:
             out["args"] = list(self.args)
         if self.anchor is not None:
             out.update(anchor=self.anchor, source=self.source)
+        if self.unit != UNITS[0]:
+            out["unit"] = self.unit
         if self.env:
             out["env"] = dict(self.env)
         for key in BENCHMARK_DEFAULTS:
@@ -381,6 +387,8 @@ def _validate_benchmarks(block: Any, errors: list[str], where: str) -> None:
                 )
         elif source is not None:
             errors.append(f"'{at}.source' says where an `anchor` comes from, and there is none")
+        if entry.get("unit") is not None and entry["unit"] not in UNITS:
+            errors.append(f"'{at}.unit' is the scale of its scores: one of {list(UNITS)}")
         validate_env(entry.get("env"), errors, f"{at}.env")
         validate_judging(entry, errors, at)
 
@@ -469,6 +477,7 @@ def benchmark_of(entry: Mapping[str, Any], defaults: Mapping[str, Any]) -> Bench
         args=split_args(entry.get("args")),
         anchor=float(entry["anchor"]) if entry.get("anchor") is not None else None,
         source=str(entry.get("source") or ""),
+        unit=str(entry.get("unit") or UNITS[0]),
         env={str(k): str(v) for k, v in (entry.get("env") or {}).items()},
         model_key=stated("model_key"),
         reference_yaml=stated("reference_yaml"),

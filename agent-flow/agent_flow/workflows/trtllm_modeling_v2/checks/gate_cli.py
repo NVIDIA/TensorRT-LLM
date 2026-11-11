@@ -329,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse(list(sys.argv[1:] if argv is None else argv))
     try:
         result = run_gate(args)
-    except (TaskSchemaError, KeyError, FileNotFoundError) as exc:
+    except (TaskSchemaError, KeyError, FileNotFoundError, anchors.AnchorError) as exc:
         # A KeyError's text is its argument's repr: say the argument.
         print(
             f"error: {exc.args[0] if isinstance(exc, KeyError) and exc.args else exc}",

@@ -107,20 +107,25 @@ def _gsm8k_on_disk(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("LLM_MODELS_ROOT", str(root))
 
 
-# A stand-in for `trtllm-serve`: it binds a port, reports it, answers /health and
-# /v1/completions, and writes down the command line and environment it was started with.
-# As a real server's ranks do under the rank hook, it prints what each rank runs: the
+# A stand-in for `trtllm-serve`: it binds a port, reports it, answers /health, completions
+# and chat completions, and writes down the command line and environment it was started
+# with. As a real server's ranks do under the rank hook, it prints what each rank runs: the
 # options it was given (FAKE_RANKS=0: nothing; FAKE_DTYPE: another KV dtype than asked),
 # from the directory it was started in. A prompt it has seen resumes from its cache
-# (FAKE_REUSE=0: never).
+# (FAKE_REUSE=0: never). FAKE_SERVE_EXIT: it refuses to start; FAKE_SERVE_HANG: it never
+# reports an address; FAKE_DIE_AFTER_BIND=<ctx|gen>: that side dies once the proxy is
+# being started;
+# FAKE_NO_IMAGES: it answers no chat completion; FAKE_UNFINISHED: no finish reason.
 _FAKE_SERVE = """#!{python}
-import http.server, json, os, signal, sys, threading
+import http.server, json, os, signal, sys, threading, time
 
 argv = sys.argv[1:]
 report = argv[argv.index("--report_addr") + 1]
 if os.environ.get("FAKE_SERVE_EXIT"):
     print("fake: refused to start")
     sys.exit(3)
+if os.environ.get("FAKE_SERVE_HANG"):
+    signal.pause()
 if "--config" in argv and os.environ.get("FAKE_RANKS", "1") == "1":
     import yaml
 
@@ -154,11 +159,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         asked = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        finish = None if os.environ.get("FAKE_UNFINISHED") else "stop"
+        if self.path.endswith("/chat/completions"):
+            if os.environ.get("FAKE_NO_IMAGES"):
+                return self.send_error(400, "this model takes no image")
+            text, image = asked["messages"][0]["content"]
+            assert image["image_url"]["url"].startswith("data:image/png;base64,")
+            message = {{"role": "assistant", "content": "A lion statue, asked: " + text["text"]}}
+            return self._send({{"choices": [{{"message": message, "finish_reason": finish}}]}})
         again = asked["prompt"] in seen and os.environ.get("FAKE_REUSE", "1") == "1"
         seen.append(asked["prompt"])
         usage = {{"prompt_tokens_details": {{"cached_tokens": 448 if again else 0}}}}
         text = " Paris, after: " + asked["prompt"]
-        self._send({{"choices": [{{"text": text}}], "usage": usage}})
+        self._send({{"choices": [{{"text": text, "finish_reason": finish}}], "usage": usage}})
 
 
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -167,6 +180,12 @@ with open(report + ".started.json", "w") as out:
 with open(report + ".tmp", "w") as out:
     out.write("127.0.0.1:%d\\n" % server.server_address[1])
 os.replace(report + ".tmp", report)
+died = {{"ctx": "context", "gen": "generation"}}.get(os.environ.get("FAKE_DIE_AFTER_BIND"))
+if died and died in argv:
+    while not os.path.exists(os.path.join(os.path.dirname(report), "proxy.yaml")):
+        time.sleep(0.01)
+    print("fake: %s worker died" % died)
+    sys.exit(4)
 signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
 server.serve_forever()
 """
@@ -193,6 +212,7 @@ def site(tmp_path, monkeypatch):
         path.chmod(path.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_SMI", str(tmp_path / "holders"))
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     from agent_flow.workflows.trtllm_modeling_v2.checks import servers
 
     monkeypatch.setattr(servers, "RELEASE_TIMEOUT_S", 1)

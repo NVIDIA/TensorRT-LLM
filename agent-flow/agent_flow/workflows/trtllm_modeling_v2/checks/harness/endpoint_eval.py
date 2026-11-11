@@ -24,6 +24,8 @@ from typing import Any
 #: The benchmarks whose evaluator the tree has driven through an endpoint: evaluator class
 #: name in ``tensorrt_llm.evaluate``. Any other is not judged through the hop.
 EVALUATORS: dict[str, str] = {"gsm8k": "GSM8K"}
+#: How many samples each scores when the command names no count: the whole split.
+SAMPLES: dict[str, int] = {"gsm8k": 1319}
 
 
 def request_body(model: str, prompt: str, sampling: Any) -> dict[str, Any]:
@@ -36,10 +38,9 @@ def request_body(model: str, prompt: str, sampling: Any) -> dict[str, Any]:
         "top_k": 1,
         "n": 1,
         "stream": False,
+        # Stated even when empty: a server's own default stop is not the evaluator's.
+        "stop": list(getattr(sampling, "stop", None) or []),
     }
-    stop = getattr(sampling, "stop", None)
-    if stop:
-        body["stop"] = stop
     truncate = getattr(sampling, "truncate_prompt_tokens", None)
     if truncate:
         body["truncate_prompt_tokens"] = int(truncate)
@@ -118,18 +119,30 @@ def main(argv: list[str] | None = None) -> int:
     from tensorrt_llm.llmapi import SamplingParams
     from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
+    stop = json.loads(args.stop) if args.stop else None
+    samples = args.num_samples or SAMPLES[args.benchmark]
+    # Stop strings a command states replace the task's own, in the task itself: the
+    # evaluator copies the task's `until` over whatever the sampling parameters hold.
+    stated = {"stop_strings": stop} if stop is not None else {}
     evaluator = getattr(evaluate, EVALUATORS[args.benchmark])(
         dataset_path=args.dataset_path,
-        num_samples=args.num_samples,
+        num_samples=samples,
         random_seed=0,
         apply_chat_template=args.apply_chat_template,
+        **stated,
     )
     sampling = SamplingParams(
         max_tokens=args.max_output_length,
         truncate_prompt_tokens=args.max_input_length,
-        stop=json.loads(args.stop) if args.stop else None,
+        stop=stop,
         temperature=0.0,
         top_k=1,
+    )
+    print(
+        f"endpoint-eval: {args.benchmark} on {samples} samples, greedy, stop "
+        f"{'the task own' if stop is None else stop}, input cut at {args.max_input_length} "
+        f"tokens, {args.max_output_length} new tokens",
+        flush=True,
     )
     llm = EndpointLLM(args.url, args.model, load_hf_tokenizer(args.model), args.concurrency)
     try:

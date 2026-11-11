@@ -578,19 +578,25 @@ def test_a_passing_verdict_counts_only_for_the_tree_it_measured(tmp_path):
     class Result:
         name, deployment, detail, passed, infrastructure = "boot", "tp1", "ok", True, ""
 
-    before = contract_mod.tree_id(repo, "aaaa", git=lambda *args: "")
+    def git(repo, *args):
+        return "tree-of-" + args[-1]
+
+    before = contract_mod.tree_id(repo, "aaaa", git=git)
     status.record(contract.checks[0], Result(), tree=before, round=1)
     assert contract_mod.evaluate(contract, status.on(before, 1)).missing == (contract.checks[1],)
     assert contract_mod.evaluate(contract, status.on(before, 1)).passed == (contract.checks[0],)
     # Another tree, another round, or a rebuilt native library: the verdict is not about it.
-    other = contract_mod.tree_id(repo, "bbbb", git=lambda *args: "")
+    other = contract_mod.tree_id(repo, "bbbb", git=git)
     assert not contract_mod.evaluate(contract, status.on(other)).passed
     assert not contract_mod.evaluate(contract, status.on(before, 2)).passed
     library = repo / "tensorrt_llm" / "libtensorrt_llm.so"
     library.write_bytes(b"elf")
-    rebuilt = contract_mod.tree_id(repo, "aaaa", git=lambda *args: "")
+    rebuilt = contract_mod.tree_id(repo, "aaaa", git=git)
     assert rebuilt != before
-    assert contract_mod.tree_id(repo, "", git=lambda *args: "") == ""
+    # No commit, or no git tree for it: nothing is established, so no verdict is reused.
+    assert contract_mod.tree_id(repo, "", git=git) == ""
+    assert contract_mod.tree_id(repo, "aaaa", git=lambda *args: "") == ""
+    assert not contract_mod.evaluate(contract, status.on("", 1)).passed
     # A result the infrastructure ended is never a pass.
     Result.infrastructure = "the session was lost"
     assert not status.record(contract.checks[1], Result(), tree=before, round=1).passed
@@ -928,6 +934,14 @@ def test_a_verdict_is_identified_by_content(tmp_path):
     assert identity(task=edited) != base
     assert identity(environment="env2") != base
     assert contract_mod.flow_version() in base
+    # A file a check reads through the spec counts by its content: edited in place, it is
+    # a spec edit.
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("The capital of France is\n")
+    filed = {**spec, "accuracy": {"boot": {"prompts_file": str(prompts)}}}
+    read = identity(task=filed)
+    prompts.write_text("The capital of Peru is\n")
+    assert identity(task=filed) != read
 
     # The latest outcome counts, and every append reaches the disk.
     status = contract_mod.ContractStatus.load(tmp_path)
@@ -940,3 +954,9 @@ def test_a_verdict_is_identified_by_content(tmp_path):
     Result.passed = False
     status.record(check, Result(), tree=base)
     assert not contract_mod.ContractStatus.load(tmp_path).on(base)["tp1:boot"].passed
+    # A line a dead process tore is closed before the next verdict, which stays its own.
+    with status.path.open("a") as ledger:
+        ledger.write('{"deployment": "tp1", "gate": "bo')
+    Result.passed = True
+    contract_mod.ContractStatus.load(tmp_path).record(check, Result(), tree=base)
+    assert contract_mod.ContractStatus.load(tmp_path).on(base)["tp1:boot"].passed

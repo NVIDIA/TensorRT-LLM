@@ -12,7 +12,8 @@ anchor's floor. A benchmark the tree has not driven through an endpoint is not s
 its verdict says it is not judged through the hop.
 
 Each check is one load: start, ask, stop. A stop that leaves ranks on the devices
-(:class:`~.servers.ServerError`) turns the check into no verdict.
+(:class:`~.servers.Leftover`) turns the check into no verdict; devices that could not be
+looked at are said in the verdict's line.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from ..spec.deployments import Benchmark, Deployment, Server
 from . import anchors as anchors_mod
 from . import attest, datasets, servers
 from .accuracy import judged, parse_eval_score, unparsed_score_detail
-from .boot import BootSpec, missing_keywords
+from .boot import DEFAULT_BOOT_IMAGE_PROMPT, BootSpec, missing_keywords
 from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner
 from .harness import endpoint_eval
 from .verdict import GateResult, inspect_tree, verdict_factory
@@ -57,13 +58,37 @@ def _attested(
     )
 
 
-def _stopped(running: servers.Running, env: Mapping[str, str]) -> str:
-    """Stop ``running``; why the check has no verdict when ranks were left, else ``""``."""
+def _stopped(running: servers.Running) -> tuple[str, str]:
+    """Stop ``running``: ``(why the check has no verdict, what its line adds)``.
+
+    Ranks left on the devices are no verdict. Devices that could not be looked at leave
+    the verdict standing and are said in its line, never taken for clean.
+    """
     try:
-        servers.stop(running, env=env)
+        note = servers.stop(running)
     except servers.ServerError as exc:
-        return str(exc)
-    return ""
+        return str(exc), ""
+    return "", f"; {note}" if note else ""
+
+
+def _started(deployment: Deployment, task_data: Mapping[str, Any], workspace, devices, timeout):
+    """``(running, None)``, or ``(None, fields)`` of the verdict of a deployment that did not start."""
+    try:
+        running = servers.start(
+            deployment,
+            model=str(task_data["checkpoint_path"]),
+            workspace=workspace,
+            env=_declared_env(task_data),
+            timeout=timeout,
+            tree=task_data.get("trtllm_repo_path"),
+            python=(task_data.get("environment") or {}).get("python"),
+            devices=devices,
+        )
+    except servers.Leftover as exc:
+        return None, dict(passed=False, detail=str(exc), infrastructure=str(exc))
+    except servers.ServerError as exc:
+        return None, dict(passed=False, detail=f"the deployment did not start: {exc}")
+    return running, None
 
 
 def run_endpoint_boot(
@@ -82,9 +107,7 @@ def run_endpoint_boot(
     """
     spec = spec or BootSpec()
     verdict = verdict_factory(inspect_tree(task_data))
-    env = _declared_env(task_data)
     started = time.monotonic()
-
     records: list[Mapping[str, Any]] = []
 
     def ran(**fields: Any) -> GateResult:
@@ -96,31 +119,28 @@ def run_endpoint_boot(
             **fields,
         )
 
-    try:
-        running = servers.start(
-            deployment,
-            model=str(task_data["checkpoint_path"]),
-            workspace=workspace,
-            env=env,
-            timeout=timeout,
-            tree=task_data.get("trtllm_repo_path"),
-            python=(task_data.get("environment") or {}).get("python"),
-            devices=devices,
-        )
-    except servers.ServerError as exc:
-        return ran(passed=False, detail=f"the deployment did not start: {exc}")
+    running, refused = _started(deployment, task_data, workspace, devices, timeout)
+    if running is None:
+        return ran(**refused)
     texts: list[str | None] = []
     cached: list[int | None] = []
     roles = deployment.servers
     failure = ""
     try:
-        prompts = [*spec.prompts, *(item.prompt for item in spec.items)]
-        images = {len(spec.prompts) + n for n, item in enumerate(spec.items) if item.images}
-        for index, prompt in enumerate(prompts):
-            if index in images:
-                texts.append(None)  # an image prompt is not sent as a text completion
+        for request in spec.requests(task_data.get("trtllm_repo_path")):
+            if request.get("images"):
+                # The server places the image and applies the chat template itself.
+                raw = request.get("render") == "raw"
+                prompt = DEFAULT_BOOT_IMAGE_PROMPT if raw else request["prompt"]
+                try:
+                    said = servers.ask_image(
+                        running, prompt, request["images"][0], max_tokens=spec.max_tokens
+                    )
+                except servers.ServerError as exc:
+                    raise servers.ServerError(f"image not checked: {exc}") from exc
+                texts.append(said)
                 continue
-            texts.append(servers.ask(running, prompt, max_tokens=spec.max_tokens))
+            texts.append(servers.ask(running, request["prompt"], max_tokens=spec.max_tokens))
         # With block reuse on, one more prompt is sent again and must resume from the cache.
         sends = max(
             (attest.reuse_sends(s.options) for s in roles.values() if attest.reuses(s.options)),
@@ -134,7 +154,7 @@ def run_endpoint_boot(
     finally:
         attested = [_attested(running, role, server, task_data) for role, server in roles.items()]
         records += [found.record() for found in attested]
-        left = _stopped(running, env)
+        left, note = _stopped(running)
     if left:
         return ran(passed=False, detail=left, infrastructure=left)
     if failure:
@@ -145,12 +165,11 @@ def run_endpoint_boot(
     shortfall = attest.reuse_shortfall(cached) if cached else None
     if shortfall:
         return ran(passed=False, detail=shortfall)
-    asked = [text for text in texts if text is not None]
-    empty = sum(1 for text in asked if not text.strip())
-    if empty or not asked:
+    empty = sum(1 for text in texts if not (text or "").strip())
+    if empty or not texts:
         return ran(
             passed=False,
-            detail=f"the endpoint was healthy but answered {empty} of {len(asked)} prompt(s) "
+            detail=f"the endpoint was healthy but answered {empty} of {len(texts)} prompt(s) "
             f"with nothing: health alone is not a boot",
         )
     missing = missing_keywords(spec, texts)
@@ -160,14 +179,14 @@ def run_endpoint_boot(
             detail=f"the endpoint's answers are missing {len(missing)} expected keyword(s): "
             f"{missing}. Keywords are matched against generated text only",
         )
-    skipped = (
-        f"; {len(texts) - len(asked)} image prompt(s) not sent" if len(asked) < len(texts) else ""
-    )
+    images = sum(1 for item in spec.items if item.images)
     return ran(
         passed=True,
         explained=True,
         detail=f"{deployment.kind} deployment `{deployment.name}` started and its endpoint "
-        f"answered {len(asked)} prompt(s) with their keywords; workload: {spec.source}{skipped}",
+        f"answered {len(texts)} prompt(s) with their keywords"
+        + (f", {images} of them with an image" if images else "")
+        + f"; workload: {spec.source}{note}",
     )
 
 
@@ -203,7 +222,6 @@ def run_endpoint_accuracy(
     """Score ``benchmark`` through ``deployment``'s endpoint and hold it to ``anchor``'s floor."""
     name = f"accuracy[{benchmark.name}]"
     verdict = verdict_factory(inspect_tree(task_data))
-    env = _declared_env(task_data)
     started = time.monotonic()
 
     def ran(**fields: Any) -> GateResult:
@@ -219,22 +237,14 @@ def run_endpoint_accuracy(
             f"through an endpoint ({', '.join(ENDPOINT_BENCHMARKS)} have); score it on an "
             f"aggregated deployment",
         )
-    dataset, said = datasets.find(benchmark.name, benchmark.dataset_path, env)
+    dataset, said = datasets.find(benchmark.name, benchmark.dataset_path, _declared_env(task_data))
     if said and not dataset:
         return ran(passed=False, detail=said, infrastructure=said)
-    try:
-        running = servers.start(
-            deployment,
-            model=str(task_data["checkpoint_path"]),
-            workspace=workspace,
-            env=env,
-            timeout=deployment.timeout,
-            tree=task_data.get("trtllm_repo_path"),
-            python=(task_data.get("environment") or {}).get("python"),
-            devices=environment.devices,
-        )
-    except servers.ServerError as exc:
-        return ran(passed=False, detail=f"the deployment did not start: {exc}")
+    running, refused = _started(
+        deployment, task_data, workspace, environment.devices, deployment.timeout
+    )
+    if running is None:
+        return ran(**refused)
     command = eval_command(
         environment,
         url=running.url,
@@ -249,7 +259,7 @@ def run_endpoint_accuracy(
             _attested(running, role, server, task_data)
             for role, server in deployment.servers.items()
         ]
-        left = _stopped(running, env)
+        left, note = _stopped(running)
     combined = result.stdout + result.stderr
     fields: dict[str, Any] = dict(
         command=command,
@@ -268,7 +278,7 @@ def run_endpoint_accuracy(
         return ran(
             passed=False, detail=unparsed_score_detail(combined, benchmark.score_pattern), **fields
         )
-    how = " through the endpoint"
+    how = f" through the endpoint{note}"
     return ran(
         **judged(
             measured, anchor, benchmark, relative_score=relative_score, output=combined, how=how

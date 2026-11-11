@@ -13,11 +13,15 @@ For a deployment and one of its benchmarks, in this order:
 4. ``none``: the score is reported and nothing judges it.
 
 The floor under a score is ``anchor - 2 x SE``, the binomial error at the anchor over the
-samples scored (:func:`floor`). :func:`freeze` writes the anchors to ``anchors.yaml`` in
-the workspace the first time a run starts and adds only what is absent on a later start,
-so no commit of the run, to the reference file or anywhere else, can move what its checks
-are held to. The checks read the frozen copy (:func:`frozen`); :func:`differences` says
-where the tree's row now differs from it, for the report.
+samples scored (:func:`floor`). A benchmark states the scale its scores are on (``unit``:
+``percent``, or ``fraction``); nothing is guessed from a score's size. :func:`freeze`
+writes the anchors to ``anchors.yaml`` in the workspace the first time a run starts, each
+with its unit and the sample count its floor is computed over, and adds only what is
+absent on a later start: no commit of the run and no later edit of the spec moves what
+its checks are held to, and an anchor frozen as ``none`` stays none. A file that cannot
+be read stops the start (:class:`AnchorError`): the user deletes it to freeze again. The
+checks read the frozen copy (:func:`frozen`); :func:`differences` says where the tree's
+row now differs from it, for the report.
 """
 
 from __future__ import annotations
@@ -61,6 +65,10 @@ _PARTIAL_TOTAL = re.compile(r"Partial scores after\s+(\d+)/(\d+)\s+responses")
 _NUM_SAMPLES_ARG = re.compile(r"^--num_samples(?:=(\d+))?$")
 
 
+class AnchorError(ValueError):
+    """The workspace's frozen anchors cannot be read: nothing is judged until they can."""
+
+
 @dataclass(frozen=True)
 class Anchor:
     """What one benchmark of one deployment is judged against."""
@@ -74,6 +82,10 @@ class Anchor:
     #: deployment it is relative to, or why there is none.
     source: str = ""
     relative_to: str | None = None
+    #: The scale ``value`` and the benchmark's scores are on: ``percent`` or ``fraction``.
+    unit: str = "percent"
+    #: The sample count the floor is computed over, fixed when the anchor is resolved.
+    samples: int | None = None
 
     @property
     def key(self) -> str:
@@ -192,7 +204,12 @@ def resolve(
     repo: str | Path | None = None,
 ) -> Anchor:
     """The anchor of ``benchmark`` on ``deployment``, read now from the spec and the tree."""
-    base = dict(deployment=deployment.name, benchmark=benchmark.name)
+    base = dict(
+        deployment=deployment.name,
+        benchmark=benchmark.name,
+        unit=benchmark.unit,
+        samples=samples_of(benchmark)[0],
+    )
     if benchmark.anchor is not None:
         return Anchor(kind=DECLARED, value=benchmark.anchor, source=benchmark.source, **base)
     path = Path(str(benchmark.reference_yaml or f"{REFERENCES_DIR}/{benchmark.name}.yaml"))
@@ -219,13 +236,22 @@ def resolve(
 
 
 def load(workspace: str | Path) -> dict[str, Anchor]:
-    """The anchors frozen in ``workspace``, by ``<deployment>:<benchmark>``."""
-    try:
-        rows = yaml.safe_load((Path(workspace) / ANCHORS_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
+    """The anchors frozen in ``workspace``, by ``<deployment>:<benchmark>``; none without a file.
+
+    Raises :class:`AnchorError` for a file that is there and does not hold them.
+    """
+    path = Path(workspace) / ANCHORS_FILENAME
+    if not path.exists():
         return {}
     known = set(Anchor.__dataclass_fields__)
-    found = [Anchor(**{k: v for k, v in row.items() if k in known}) for row in rows or ()]
+    try:
+        rows = yaml.safe_load(path.read_text(encoding="utf-8"))
+        found = [Anchor(**{k: v for k, v in row.items() if k in known}) for row in rows]
+    except (OSError, yaml.YAMLError, TypeError, AttributeError) as exc:
+        raise AnchorError(
+            f"{path} does not hold the frozen anchors ({type(exc).__name__}: {exc}): nothing "
+            f"is judged against a file that cannot be read; delete it to freeze them again"
+        ) from exc
     return {anchor.key: anchor for anchor in found}
 
 
@@ -312,17 +338,21 @@ def floor(
     ``reference - 2 x SE`` for a declared or reference anchor; for a relative one,
     ``relative_score - 2 x sqrt(2) x SE``, the error of the difference of two scores.
     ``None`` for no anchor, a relative one whose deployment has no score, or an unknown
-    sample count.
+    sample count. The count is the one fixed with the anchor; an anchor resolved with
+    none takes what the run printed.
     """
     relative = anchor.kind == RELATIVE
     reference = relative_score if relative else anchor.value
     if anchor.kind == NONE or reference is None:
         return None, "no anchor"
     samples, source = samples_of(benchmark, output)
+    if anchor.samples:
+        # Fixed with the anchor: what the run prints or the spec says later does not move it.
+        samples, source = anchor.samples, "the count fixed with the anchor"
     if samples is None:
         return None, source
-    # The binomial error is of a percentage: a score reported as a fraction is scaled.
-    scale = 100.0 if 0 <= reference <= 1 else 1.0
+    # The binomial error is of a percentage; the floor is on the benchmark's own scale.
+    scale = 100.0 if anchor.unit == "fraction" else 1.0
     se = binomial_se(reference * scale, samples) * (math.sqrt(2) if relative else 1.0) / scale
     return Floor(reference - FLOOR_K * se, reference, se, samples, relative), source
 
@@ -336,6 +366,7 @@ __all__ = [
     "REFERENCE",
     "RELATIVE",
     "Anchor",
+    "AnchorError",
     "Floor",
     "binomial_se",
     "differences",

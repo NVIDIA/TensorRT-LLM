@@ -61,7 +61,9 @@ def spec_warnings(task: Mapping[str, Any]) -> list[str]:
       anchor and no reference row carrying exactly its tags, so ``onboarded`` can only
       mean it boots;
     - a deployment is scored without CUDA graphs: a full benchmark takes 10 to 50 times
-      longer, and what is scored is not the captured path the target serves.
+      longer, and what is scored is not the captured path the target serves;
+    - a declared anchor of 1 or less on the percent scale: a fraction taken for a percentage
+      gives a floor every score clears.
 
     An anchor that exists is never questioned: a small model's measured score is low.
     """
@@ -100,6 +102,18 @@ def _warnings(task: Mapping[str, Any]) -> list[str]:
                 f"that already serves the checkpoint and write the row, or declare `anchor` "
                 f"with its `source`"
             )
+    for deployment in found:
+        for benchmark in deployment.benchmarks:
+            if (
+                benchmark.anchor is not None
+                and benchmark.anchor <= 1
+                and benchmark.unit == "percent"
+            ):
+                said.append(
+                    f"anchor under one percent: `{deployment.name}` on `{benchmark.name}` "
+                    f"declares {benchmark.anchor:g} with `unit: percent`; if the benchmark "
+                    f"reports a fraction, state `unit: fraction`, or every score passes"
+                )
     eager = [
         d.name
         for d in found

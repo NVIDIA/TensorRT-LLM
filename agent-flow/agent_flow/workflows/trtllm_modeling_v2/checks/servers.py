@@ -7,16 +7,22 @@ A server is ``trtllm-serve <checkpoint> --config <options> --port 0 --report_add
 port, the server writes ``<host>:<port>`` once it is bound (its host is rank 0's), and
 the flow reads it back. A disaggregated deployment is a context server, a generation
 server and ``trtllm-serve disaggregated`` with a proxy config written from the two
-addresses. The flow knows no scheduler: more than one node is the prefix's business.
+addresses. ``launch`` is the site's own prefix (a scheduler, a container) and nothing
+else: where the options ask for more than one rank the flow puts the LLM API's launcher
+before the program itself (:func:`launcher`).
 
 The flow owns what it starts. Each server runs in its own process group and under a name
-(``MV2FLOW_SERVER``) the site's ``launch`` and ``stop`` strings may use for their step;
-both are recorded in the workspace before the server is waited for. Stopping is a
-SIGTERM to the group, a wait, the site's ``stop`` when it gives one, and then a look
-through the same prefix at what still holds the devices: a holder that was not there
-before the start means ranks were left behind, and the check has no verdict. A new start
-first ends whatever an earlier process recorded and did not end. Nothing is ever killed
-by a pattern.
+(``MV2FLOW_SERVER``) the site's ``launch`` and ``stop`` strings may use for their step.
+What a later process needs to end it is recorded in the workspace before the server is
+waited for: the host, the group, its leader's start time, the ``stop`` command and the
+environment it runs in. Stopping is a SIGTERM to the group, a wait, the site's ``stop``,
+and then a look through the same prefix at what holds the devices: a holder that was not
+there before the start means ranks were left behind, the check has no verdict, and the
+record stays until the devices are seen free. A look that could not be taken is said
+(:data:`UNVERIFIED`), never taken for clean. A new start first ends what an earlier
+process recorded: it signals a recorded group only on the same host and while its leader
+is the process that was started, and otherwise runs the recorded ``stop`` alone. Nothing
+is ever killed by a pattern, and every wait is bounded by the deployment's ``timeout``.
 
 One load at a time: :func:`engine_lock` is one lock per workspace, taken around every
 check, a worker's own gate command included.
@@ -24,6 +30,7 @@ check, a worker's own gate command included.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -31,8 +38,8 @@ import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -48,14 +55,15 @@ from ..infra.files import write_text_atomic
 from ..spec.deployments import ROLES, Deployment, Server, write_options
 from .check_runtime import MODE_REQUIRE, engine_env
 
-#: What this run started and has not ended, in the workspace.
+#: What this run started and has not seen ended, in the workspace.
 OWNED_FILENAME = "servers.json"
 #: The name a server runs under, exported to its launch and stop commands.
 SERVER_NAME_ENV = "MV2FLOW_SERVER"
 #: How long a server gets to exit after SIGTERM before its group is killed.
 STOP_GRACE_S = 90
-#: How long the devices get to empty after a stop.
+#: How long the devices get to empty after a stop, and one look at them at most.
 RELEASE_TIMEOUT_S = 120
+PROBE_TIMEOUT_S = 120
 #: A deployment's start timeout when it states none: a load of a large checkpoint.
 START_TIMEOUT_S = 1800
 #: What a launch must not inherit from the orchestrator: the MPI and scheduler identity
@@ -63,27 +71,47 @@ START_TIMEOUT_S = 1800
 SCRUBBED_PREFIXES: tuple[str, ...] = ("PMI_", "PMIX_", "OMPI_", "MPI_", "SLURM_", "MV2_")
 #: The role names ``trtllm-serve --server_role`` takes for the two sides.
 SERVER_ROLES: dict[str, str] = {"ctx": "context", "gen": "generation"}
+#: What a verdict's line says when the devices could not be looked at after a stop.
+UNVERIFIED = "devices not verified free"
+#: Where the engine locks are: on this node whatever ``TMPDIR`` a caller has.
+LOCK_DIRS: tuple[str, ...] = ("/dev/shm", "/var/tmp", "/tmp")  # nosec B108
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-_HOLDERS = "nvidia-smi --query-compute-apps=pid --format=csv,noheader"
+# Each process holding a device, with the host it is on: one prefix may land on several.
+# A host whose devices cannot be listed fails the look; it is not a host with no holder.
+_HOLDERS = (
+    "bash -o pipefail -c 'h=$(hostname); nvidia-smi --query-compute-apps=pid --format=csv,noheader "
+    '| while read -r p; do echo "$h $p"; done\''
+)
 
 
 class ServerError(RuntimeError):
-    """A server that did not start, did not answer, or did not leave its devices."""
+    """A server that did not start or did not answer; the message names its log."""
+
+
+class Leftover(ServerError):
+    """Ranks still hold a device after a stop: whatever was measured is no verdict."""
 
 
 @dataclass
 class Owned:
-    """One server this run started: enough to end it from another process."""
+    """One server this run started: enough for another process to end it, and no more."""
 
     name: str
     pid: int
     pgid: int
+    host: str = ""
+    #: The leader's start time (``/proc/<pid>/stat``): the group is this server's only
+    #: while its leader is still that process.
+    started: str = ""
     launch: str = ""
     stop: str = ""
+    #: The environment its ``launch`` and ``stop`` commands were given by the spec.
+    env: dict[str, str] = field(default_factory=dict)
     address_file: str = ""
     log: str = ""
-    #: The device holders seen through the prefix before the start.
-    before: list[str] = field(default_factory=list)
+    #: The device holders seen through the prefix before the start; ``None`` when the
+    #: look could not be taken.
+    before: list[str] | None = None
 
 
 @dataclass
@@ -94,6 +122,8 @@ class Running:
     address: str
     owned: list[Owned]
     workspace: Path
+    #: The seconds every wait of its start had, and every wait of its stop has.
+    budget: float = START_TIMEOUT_S
 
     @property
     def url(self) -> str:
@@ -109,22 +139,20 @@ class Running:
             return ""
 
 
-# ------------------------------------------------------------------------------ the lock
-
-
 @contextlib.contextmanager
 def engine_lock(workspace: str | Path | None) -> Iterator[None]:
     """Hold the workspace's one engine lock: the run's checks and a worker's never overlap.
 
-    The lock file is node-local (the temporary directory), named by the workspace: a
-    shared filesystem does not always honour ``flock``. Without a workspace nothing is held.
+    The lock file is in a fixed node-local directory, named by the user and the workspace:
+    a shared filesystem does not always honour ``flock``, and two callers with different
+    ``TMPDIR`` must still meet at one file. Without a workspace nothing is held.
     """
     if workspace is None:
         yield
         return
     digest = hashlib.sha256(str(Path(workspace).resolve()).encode()).hexdigest()[:16]
-    path = Path(tempfile.gettempdir()) / f"mv2flow-engine-{digest}.lock"
-    with path.open("w") as handle:
+    directory = next(d for d in LOCK_DIRS if os.access(d, os.W_OK))
+    with (Path(directory) / f"mv2flow-engine-{os.getuid()}-{digest}.lock").open("w") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
@@ -135,13 +163,9 @@ def engine_lock(workspace: str | Path | None) -> Iterator[None]:
 # --------------------------------------------------------------------------- what is owned
 
 
-def _owned_path(workspace: Path) -> Path:
-    return Path(workspace) / OWNED_FILENAME
-
-
 def load_owned(workspace: str | Path) -> list[Owned]:
     try:
-        rows = json.loads(_owned_path(Path(workspace)).read_text(encoding="utf-8"))
+        rows = json.loads((Path(workspace) / OWNED_FILENAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     known = set(Owned.__dataclass_fields__)
@@ -150,7 +174,28 @@ def load_owned(workspace: str | Path) -> list[Owned]:
 
 def _save_owned(workspace: Path, owned: Sequence[Owned]) -> None:
     workspace.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(_owned_path(workspace), json.dumps([asdict(o) for o in owned], indent=1))
+    write_text_atomic(workspace / OWNED_FILENAME, json.dumps([asdict(o) for o in owned], indent=1))
+
+
+def _start_time(pid: int) -> str:
+    """When ``pid`` started, in the kernel's clock ticks; ``""`` when there is no such process."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return stat.rpartition(")")[2].split()[19]
+
+
+def _exited(owned: Owned) -> bool:
+    """Whether the leader this process started has exited.
+
+    It is left unreaped: its start time stays readable, so :func:`_end` still knows the
+    group for its own and ends whatever the leader left behind.
+    """
+    try:
+        return os.waitid(os.P_PID, owned.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        return not _alive(owned.pgid)
 
 
 def _alive(pgid: int) -> bool:
@@ -166,10 +211,17 @@ def _alive(pgid: int) -> bool:
     return True
 
 
-def _end(owned: Owned, env: Mapping[str, str], grace_s: float) -> None:
-    """End one server: its own group, then the site's stop. Its group only, never a pattern."""
-    for sig, wait in ((signal.SIGTERM, grace_s), (signal.SIGKILL, 10.0)):
-        if not _alive(owned.pgid):
+def _site_env(owned: Owned) -> dict[str, str]:
+    """What ``owned``'s launch and stop commands run with: the spec's words, its own name."""
+    return {**launch_env(owned.launch, owned.env), SERVER_NAME_ENV: owned.name}
+
+
+def _end(owned: Owned, grace_s: float) -> None:
+    """End one server: its own group while it is still its own, then the site's ``stop``."""
+    # Read before anything is reaped: a leader that exited keeps its start time until then.
+    ours = owned.host == socket.gethostname() and _start_time(owned.pid) == owned.started != ""
+    for sig, wait in ((signal.SIGTERM, grace_s), (signal.SIGKILL, min(10.0, grace_s))):
+        if not ours or not _alive(owned.pgid):
             break
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(owned.pgid, sig)
@@ -177,24 +229,78 @@ def _end(owned: Owned, env: Mapping[str, str], grace_s: float) -> None:
         while time.monotonic() < deadline and _alive(owned.pgid):
             time.sleep(0.2)
     if owned.stop:
-        subprocess.run(
-            ["bash", "-c", owned.stop],
-            env={**env, SERVER_NAME_ENV: owned.name},
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            subprocess.run(
+                ["bash", "-c", owned.stop],
+                env=_site_env(owned),
+                capture_output=True,
+                timeout=max(1.0, 6 * grace_s),
+                check=False,
+            )
+
+
+def _holders(launch: str, env: Mapping[str, str], timeout: float) -> list[str] | None:
+    """``<host> <pid>`` of each process holding a device where ``launch`` lands; ``None`` unknown."""
+    try:
+        done = subprocess.run(
+            ["bash", "-c", f"{launch} {_HOLDERS}".strip()],
+            env=dict(env),
             capture_output=True,
-            timeout=600,
-            check=False,
+            text=True,
+            timeout=max(1.0, timeout),
         )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if done.returncode:
+        return None
+    return sorted({" ".join(line.split()) for line in done.stdout.splitlines() if line.strip()})
 
 
-def clean_owned(workspace: str | Path, env: Mapping[str, str] | None = None) -> list[str]:
-    """End every server an earlier process of this run recorded; the names it ended."""
-    workspace = Path(workspace)
-    ended = []
-    for owned in load_owned(workspace):
-        _end(owned, launch_env(owned.launch, env or {}), STOP_GRACE_S)
-        ended.append(owned.name)
-    _save_owned(workspace, [])
-    return ended
+def _released(owned: Owned, grace_s: float, release_s: float) -> str:
+    """End ``owned`` and look at its devices: ``""`` free, :data:`UNVERIFIED`, or who holds them."""
+    _end(owned, grace_s)
+    deadline = time.monotonic() + release_s
+    while True:
+        now = _holders(owned.launch, _site_env(owned), min(PROBE_TIMEOUT_S, release_s))
+        if now is None or owned.before is None:
+            return UNVERIFIED
+        stray = sorted(set(now) - set(owned.before))
+        if not stray or time.monotonic() >= deadline:
+            return ", ".join(stray)
+        time.sleep(min(1.0, release_s))
+
+
+def _retire(workspace: Path, records: Sequence[Owned], budget: float) -> tuple[list[str], bool]:
+    """End ``records``, last started first; drop from the workspace those whose devices are not held.
+
+    Returns what still holds a device, by server, and whether any look could not be taken.
+    """
+    held, unverified = [], False
+    kept = {o.name: o for o in load_owned(workspace)}
+    for owned in reversed(list(records)):
+        said = _released(owned, min(STOP_GRACE_S, budget), min(RELEASE_TIMEOUT_S, budget))
+        if said and said != UNVERIFIED:
+            held.append(f"{owned.name}: {said}")
+            kept[owned.name] = owned
+            continue
+        unverified |= said == UNVERIFIED
+        kept.pop(owned.name, None)
+    _save_owned(workspace, list(kept.values()))
+    return held, unverified
+
+
+def clean_owned(workspace: str | Path, budget: float = STOP_GRACE_S) -> None:
+    """End every server an earlier process of this run recorded, each in its own environment.
+
+    Raises :class:`Leftover` while ranks of one still hold a device: the next load would
+    share them, so it does not start, and the record stays for the next try.
+    """
+    held, _ = _retire(Path(workspace), load_owned(workspace), budget)
+    if held:
+        raise Leftover(
+            "ranks an earlier check left still hold a device (" + "; ".join(held) + "): nothing "
+            "is started on them; end them (the site's `stop`), then start again"
+        )
 
 
 # ------------------------------------------------------------------------------ a launch
@@ -213,29 +319,42 @@ def launch_env(launch: str, declared: Mapping[str, str]) -> dict[str, str]:
     return env
 
 
-def local_launch(
-    server: Server, devices: Sequence[int], env: Mapping[str, str], declared: Sequence[str]
-) -> tuple[list[str], dict[str, str]]:
-    """How a server with no launch prefix starts on this host: ``(launcher argv, its environment)``.
+def launcher(server: Server) -> list[str]:
+    """What the flow puts before a program that runs ``server``'s ranks.
 
-    Behind a prefix the site places the ranks and the devices. Here the server gets
-    ``devices`` for itself; one rank runs its worker in its own process, with the MPI
-    bootstrap variables this process may have inherited from an allocation taken out
-    (all but those the spec ``declared``); more ranks start under ``mpirun`` and the LLM
-    API's launcher, as every in-process check starts them.
+    Nothing for one rank. Behind a launch prefix, which has placed the ranks, the LLM
+    API's launcher; on this host, ``mpirun`` and the launcher, as every in-process check
+    starts them.
     """
-    if server.launch.strip():
-        return [], dict(env)
+    if server.ranks <= 1:
+        return []
+    return [LLMAPI_LAUNCH] if server.launch.strip() else rank_launch(server.ranks, LLMAPI_LAUNCH)
+
+
+def local_env(
+    server: Server, devices: Sequence[int], env: Mapping[str, str], declared: Sequence[str]
+) -> dict[str, str]:
+    """``env`` for a server with no launch prefix: its own devices, and no MPI world it did not start.
+
+    One rank runs its worker in its own process, with the bootstrap variables this
+    process may have inherited from an allocation taken out (all but those the spec
+    ``declared``). Behind a prefix the site places both, and ``env`` is returned as it is.
+    """
     env = dict(env)
+    if server.launch.strip():
+        return env
     if devices:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in devices)
     if server.ranks > 1:
-        return rank_launch(server.ranks, LLMAPI_LAUNCH), env
+        return env
     kept = {"SLURM_PROCID", "SLURM_LOCALID", *MPI_SETTINGS_KEPT, *declared}
-    bootstrap = ("PMI", "MPI", "OMPI", "SLURM")
-    env = {k: v for k, v in env.items() if k in kept or not k.startswith(bootstrap)}
+    env = {
+        k: v
+        for k, v in env.items()
+        if k in kept or not k.startswith(("PMI", "MPI", "OMPI", "SLURM"))
+    }
     env.setdefault(SINGLE_PROCESS_WORKER_ENV, "1")
-    return [], env
+    return env
 
 
 def serve_argv(
@@ -263,94 +382,39 @@ def proxy_config(model: str, ctx_address: str, gen_address: str) -> dict[str, An
     }
 
 
-def _holders(launch: str, env: Mapping[str, str]) -> list[str] | None:
-    """The processes holding a device where ``launch`` lands; ``None`` when it cannot be asked."""
-    line = f"{launch} {_HOLDERS}".strip()
+def _tail(record: Owned, lines: int = 20) -> str:
+    """Where ``record``'s log is, and its last lines: what a start failure shows."""
     try:
-        done = subprocess.run(
-            ["bash", "-c", line], env=dict(env), capture_output=True, text=True, timeout=120
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if done.returncode:
-        return None
-    return sorted({word for word in done.stdout.split() if word.isdigit()})
-
-
-def _start_one(
-    name: str,
-    argv: Sequence[str],
-    env: Mapping[str, str],
-    server: Server,
-    directory: Path,
-    address_file: Path,
-    workspace: Path,
-    owned: list[Owned],
-    cwd: str | None = None,
-) -> Owned:
-    """Start one command behind ``server``'s prefix in its own group, and record it."""
-    address_file.unlink(missing_ok=True)
-    log = directory / f"{name}.log"
-    line = f"{server.launch} {' '.join(shlex.quote(a) for a in argv)}".strip()
-    # The line as it is started, beside the log, for whoever reads a start that failed.
-    (directory / f"{name}.launch").write_text(line + "\n", encoding="utf-8")
-    process_env = {**env, SERVER_NAME_ENV: name}
-    before = _holders(server.launch, process_env)
-    with log.open("wb") as sink:
-        process = subprocess.Popen(
-            ["bash", "-c", line],
-            stdout=sink,
-            stderr=subprocess.STDOUT,
-            env=process_env,
-            cwd=cwd,
-            start_new_session=True,
-        )
-    record = Owned(
-        name=name,
-        pid=process.pid,
-        pgid=process.pid,
-        launch=server.launch,
-        stop=server.stop,
-        address_file=str(address_file),
-        log=str(log),
-        before=before or [],
-    )
-    owned.append(record)
-    _save_owned(workspace, [*load_owned(workspace), record])
-    return record
-
-
-def _tail(path: str, lines: int = 20) -> str:
-    try:
-        return "\n".join(Path(path).read_text(errors="replace").splitlines()[-lines:])
+        text = "\n".join(Path(record.log).read_text(errors="replace").splitlines()[-lines:])
     except OSError:
-        return ""
+        text = ""
+    return f"({record.log}):\n{text}"
 
 
-def _await_address(record: Owned, deadline: float) -> str:
-    """The address a server reported, once it is bound; a ``ServerError`` if it ends first."""
+def _await(record: Owned, deadline: float, watched: Sequence[Owned] = (), address: str = "") -> str:
+    """Wait for ``record``'s address (or, given one, its health); fail when a server ends first.
+
+    ``watched`` are the servers it stands on: a context or generation server that dies
+    while the proxy is waited for fails the start at once, by its own name and log.
+    """
     path = Path(record.address_file)
+    what = "healthy" if address else "bound"
     while time.monotonic() < deadline:
-        if path.is_file() and path.read_text().strip():
+        for server in (record, *watched):
+            if _exited(server):
+                raise ServerError(
+                    f"{server.name} exited before {record.name} was {what} {_tail(server)}"
+                )
+        if not address and path.is_file() and path.read_text().strip():
             return path.read_text().strip()
-        if not _alive(record.pgid):
-            raise ServerError(f"{record.name} exited before it was bound:\n{_tail(record.log)}")
+        if address:
+            left = max(1.0, min(10.0, deadline - time.monotonic()))
+            with contextlib.suppress(urllib.error.URLError, OSError):
+                with _DIRECT.open(f"http://{address}/health", timeout=left) as reply:
+                    if reply.status == 200:
+                        return address
         time.sleep(0.2)
-    raise ServerError(f"{record.name} reported no address in time:\n{_tail(record.log)}")
-
-
-def _await_health(record: Owned, address: str, deadline: float) -> None:
-    while time.monotonic() < deadline:
-        try:
-            with _DIRECT.open(f"http://{address}/health", timeout=10) as reply:
-                if reply.status == 200:
-                    return
-        except (urllib.error.URLError, OSError):
-            pass
-        if not _alive(record.pgid):
-            raise ServerError(f"{record.name} exited before it was healthy:\n{_tail(record.log)}")
-        time.sleep(0.5)
-    raise ServerError(f"{record.name} was not healthy in time:\n{_tail(record.log)}")
+    raise ServerError(f"{record.name} was not {what} within its timeout {_tail(record)}")
 
 
 def start(
@@ -366,127 +430,137 @@ def start(
 ) -> Running:
     """Start ``deployment``'s servers and wait until the one to ask is healthy.
 
-    Ends first whatever an earlier process of the run left recorded. ``env`` is the
-    spec's environment; the deployment's own is laid over it. Every server runs from
-    ``tree`` with the Modeling V2 switch on and the rank hook loaded
+    Ends first whatever an earlier process of the run left recorded (:func:`clean_owned`).
+    ``env`` is the spec's environment; the deployment's own is laid over it. Every server
+    runs from ``tree`` with the Modeling V2 switch on and the rank hook loaded
     (``check_runtime.engine_env``), so its ranks say what they run. A server with no
-    launch prefix takes its ranks' share of ``devices``, in the order the servers start
-    (:func:`local_launch`). On any failure everything started here is stopped before the
-    error is raised.
+    launch prefix takes its ranks' share of ``devices``, in the order the servers start.
+    Every wait ends at the deployment's ``timeout``. On any failure everything started
+    here is stopped before the error is raised.
     """
     workspace = Path(workspace)
-    declared = {**(env or {}), **deployment.env}
-    clean_owned(workspace, declared)
-    declared = engine_env(declared, tree=tree, python=python)
+    budget = float(timeout or deployment.timeout or START_TIMEOUT_S)
+    deadline = time.monotonic() + budget
+    clean_owned(workspace, budget)
+    declared = engine_env({**(env or {}), **deployment.env}, tree=tree, python=python)
     directory = workspace / "deployments" / deployment.name
     directory.mkdir(parents=True, exist_ok=True)
     options = write_options(deployment, directory, {"modeling_v2": MODE_REQUIRE})
-    cwd = str(tree) if tree is not None else None
     left = list(devices)
-
-    def launched(server: Server, argv: list[str]) -> tuple[list[str], dict[str, str]]:
-        """``argv`` and the environment ``server`` starts with, here or behind its prefix."""
-        local = not server.launch.strip()
-        own = [left.pop(0) for _ in range(min(server.ranks, len(left)) if local else 0)]
-        launcher, env = local_launch(
-            server, own, launch_env(server.launch, declared), list(declared)
-        )
-        return [*launcher, *argv], env
-
-    deadline = time.monotonic() + (timeout or deployment.timeout or START_TIMEOUT_S)
     owned: list[Owned] = []
-    running = Running(deployment, "", owned, workspace)
+    running = Running(deployment, "", owned, workspace, budget)
+
+    def begin(name: str, server: Server, argv: Sequence[str], address_file: Path) -> Owned:
+        """Start ``argv`` behind ``server``'s prefix in its own group, and record it."""
+        # A server of this host with options takes its ranks' devices; the proxy has neither.
+        takes = server.ranks if server.options and not server.launch.strip() else 0
+        own = [left.pop(0) for _ in range(min(takes, len(left)))]
+        process_env = local_env(server, own, launch_env(server.launch, declared), list(declared))
+        process_env[SERVER_NAME_ENV] = name
+        address_file.unlink(missing_ok=True)
+        line = f"{server.launch} {shlex.join([*launcher(server), *argv])}".strip()
+        # The line as it is started, beside the log, for whoever reads a start that failed.
+        (directory / f"{name}.launch").write_text(line + "\n", encoding="utf-8")
+        look = min(PROBE_TIMEOUT_S, deadline - time.monotonic())
+        before = _holders(server.launch, process_env, look)
+        with (directory / f"{name}.log").open("wb") as sink:
+            process = subprocess.Popen(
+                ["bash", "-c", line],
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                env=process_env,
+                cwd=str(tree) if tree is not None else None,
+                start_new_session=True,
+            )
+        record = Owned(
+            name=name,
+            pid=process.pid,
+            pgid=process.pid,
+            host=socket.gethostname(),
+            started=_start_time(process.pid),
+            launch=server.launch,
+            stop=server.stop,
+            env={k: v for k, v in declared.items() if os.environ.get(k) != v},
+            address_file=str(address_file),
+            log=str(directory / f"{name}.log"),
+            before=before,
+        )
+        owned.append(record)
+        _save_owned(workspace, [*load_owned(workspace), record])
+        return record
+
     try:
         if deployment.server is not None:
-            server = deployment.server
-            record = _start_one(
-                deployment.name,
-                *launched(server, serve_argv(model, options["server"], directory / "address")),
-                server,
-                directory,
-                directory / "address",
-                workspace,
-                owned,
-                cwd,
-            )
-            running.address = _await_address(record, deadline)
-            _await_health(record, running.address, deadline)
+            address_file = directory / "address"
+            argv = serve_argv(model, options["server"], address_file)
+            record = begin(deployment.name, deployment.server, argv, address_file)
+            running.address = _await(record, deadline, address=_await(record, deadline))
             return running
-        addresses = {}
+        sides = []
         for role in ROLES:
-            server = getattr(deployment, role)
-            argv = serve_argv(model, options[role], directory / f"address.{role}", role=role)
-            record = _start_one(
-                f"{deployment.name}.{role}",
-                *launched(server, argv),
-                server,
-                directory,
-                directory / f"address.{role}",
-                workspace,
-                owned,
-                cwd,
+            address_file = directory / f"address.{role}"
+            argv = serve_argv(model, options[role], address_file, role=role)
+            sides.append(
+                begin(f"{deployment.name}.{role}", getattr(deployment, role), argv, address_file)
             )
-            addresses[role] = record
-        for role, record in addresses.items():
-            addresses[role] = _await_address(record, deadline)
+        ctx, gen = (_await(side, deadline) for side in sides)
         config = directory / "proxy.yaml"
-        config.write_text(
-            yaml.safe_dump(proxy_config(model, addresses["ctx"], addresses["gen"])), "utf-8"
+        config.write_text(yaml.safe_dump(proxy_config(model, ctx, gen)), "utf-8")
+        remaining = max(1, int(deadline - time.monotonic()))
+        argv = ["trtllm-serve", "disaggregated", "-c", str(config)]
+        argv += ["--server_start_timeout", str(remaining), "-r", "360000"]
+        argv += ["--report_addr", str(directory / "address.proxy")]
+        proxy = begin(
+            f"{deployment.name}.proxy", Server(options={}), argv, directory / "address.proxy"
         )
-        remaining = max(60, int(deadline - time.monotonic()))
-        proxy = _start_one(
-            f"{deployment.name}.proxy",
-            ["trtllm-serve", "disaggregated", "-c", str(config)]
-            + ["--server_start_timeout", str(remaining), "-r", "360000"]
-            + ["--report_addr", str(directory / "address.proxy")],
-            launch_env("", declared),
-            Server(options={}),
-            directory,
-            directory / "address.proxy",
-            workspace,
-            owned,
-            cwd,
-        )
-        running.address = _await_address(proxy, deadline)
-        _await_health(proxy, running.address, deadline)
+        running.address = _await(proxy, deadline, sides, _await(proxy, deadline, sides))
         return running
     except BaseException:
         with contextlib.suppress(ServerError):
-            stop(running, env=env)
+            stop(running)
         raise
 
 
-def stop(running: Running, *, env: Mapping[str, str] | None = None) -> None:
-    """Stop every server of ``running``, last started first, and see the devices emptied.
+def stop(running: Running) -> str:
+    """Stop every server of ``running``, last started first, and look at the devices.
 
-    Raises :class:`ServerError` naming what still holds a device where a prefix lands
+    Returns ``""`` when they are seen free, :data:`UNVERIFIED` when a look could not be
+    taken. Raises :class:`Leftover` naming what still holds a device where a prefix lands
     and was not there before the start: ranks were left behind, so whatever was measured
-    is not a verdict, and the next load would share its devices.
+    is not a verdict, and their record stays in the workspace until they are gone.
     """
-    declared = {**(env or {}), **running.deployment.env}
-    left: list[str] = []
-    for owned in reversed(running.owned):
-        process_env = launch_env(owned.launch, declared)
-        _end(owned, process_env, STOP_GRACE_S)
-        deadline = time.monotonic() + RELEASE_TIMEOUT_S
-        while True:
-            now = _holders(owned.launch, {**process_env, SERVER_NAME_ENV: owned.name})
-            stray = sorted(set(now or ()) - set(owned.before))
-            if not stray or time.monotonic() >= deadline:
-                break
-            time.sleep(1)
-        if stray:
-            left.append(f"{owned.name}: {', '.join(stray)}")
-    names = {o.name for o in running.owned}
-    _save_owned(
-        running.workspace, [o for o in load_owned(running.workspace) if o.name not in names]
-    )
+    held, unverified = _retire(running.workspace, running.owned, running.budget)
     running.owned.clear()
-    if left:
-        raise ServerError(
-            "ranks were left holding a device after the stop (" + "; ".join(left) + "): the "
+    if held:
+        raise Leftover(
+            "ranks were left holding a device after the stop (" + "; ".join(held) + "): the "
             "check has no verdict, and the site's `stop` must end them before the next load"
         )
+    return UNVERIFIED if unverified else ""
+
+
+# ------------------------------------------------------------------------------ asking
+
+
+def _post(
+    running: Running, path: str, body: Mapping[str, Any], timeout: float
+) -> Mapping[str, Any]:
+    request = urllib.request.Request(
+        f"{running.url}{path}",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    name = running.deployment.name
+    try:
+        with _DIRECT.open(request, timeout=timeout) as reply:
+            payload = json.loads(reply.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise ServerError(f"{name} did not answer {path}: {exc}") from exc
+    choice = (payload.get("choices") or [None])[0] if isinstance(payload, dict) else None
+    # An answer counts once it completed: a response cut off mid-way has no finish reason.
+    if not isinstance(choice, dict) or not choice.get("finish_reason"):
+        raise ServerError(f"{name} answered {path} without a completed choice: {payload}")
+    return payload
 
 
 def complete(
@@ -499,25 +573,36 @@ def complete(
         "max_tokens": int(max_tokens),
         "temperature": 0.0,
     }
-    request = urllib.request.Request(
-        f"{running.url}/v1/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with _DIRECT.open(request, timeout=timeout) as reply:
-            payload = json.loads(reply.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise ServerError(f"{running.deployment.name} did not answer a completion: {exc}") from exc
-    if not isinstance(payload, dict) or not payload.get("choices"):
-        raise ServerError(f"{running.deployment.name} answered without a completion: {payload}")
-    return payload
+    return _post(running, "/v1/completions", body, timeout)
 
 
 def ask(running: Running, prompt: str, *, max_tokens: int, timeout: float = 600) -> str:
     """One greedy completion from the deployment's endpoint; its text."""
     payload = complete(running, prompt, max_tokens=max_tokens, timeout=timeout)
     return str(payload["choices"][0].get("text") or "")
+
+
+def ask_image(
+    running: Running, prompt: str, image: str | Path, *, max_tokens: int, timeout: float = 600
+) -> str:
+    """One greedy chat completion over ``prompt`` and the image file ``image``; its text."""
+    try:
+        data = base64.b64encode(Path(image).read_bytes()).decode("ascii")
+    except OSError as exc:
+        raise ServerError(f"the image {image} cannot be read: {exc}") from exc
+    kind = Path(image).suffix.lstrip(".").lower().replace("jpg", "jpeg") or "png"
+    content = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/{kind};base64,{data}"}},
+    ]
+    body = {
+        "model": "deployment",
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": int(max_tokens),
+        "temperature": 0.0,
+    }
+    payload = _post(running, "/v1/chat/completions", body, timeout)
+    return str((payload["choices"][0].get("message") or {}).get("content") or "")
 
 
 def cached_tokens(payload: Mapping[str, Any]) -> int | None:
@@ -530,17 +615,21 @@ def cached_tokens(payload: Mapping[str, Any]) -> int | None:
 __all__ = [
     "OWNED_FILENAME",
     "SERVER_NAME_ENV",
+    "UNVERIFIED",
+    "Leftover",
     "Owned",
     "Running",
     "ServerError",
     "ask",
+    "ask_image",
     "cached_tokens",
     "clean_owned",
     "complete",
     "engine_lock",
     "launch_env",
-    "local_launch",
+    "launcher",
     "load_owned",
+    "local_env",
     "proxy_config",
     "serve_argv",
     "start",
