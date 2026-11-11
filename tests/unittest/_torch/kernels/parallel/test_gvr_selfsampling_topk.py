@@ -949,6 +949,45 @@ def test_selfsampling_hopper_clusters_are_coresident() -> None:
         assert plan["cluster"] == 4, (n, plan)
 
 
+def test_selfsampling_hopper_bf16_rows_past_coresident_register_clusters() -> None:
+    """BF16 rows whose register clusters a Hopper GPU does not co-schedule (H20: 8 rows of 8-CTA
+    clusters, any 16-CTA cluster) stream through 4-CTA clusters at K <= 1024 and take twice the
+    vectors on half the CTAs at K = 2048 rather than the split main slab; 132-SM Hopper and
+    Blackwell keep their 8-CTA register clusters."""
+    bf16 = torch.bfloat16
+    for k in (512, 1024):
+        for b, n in ((8, 131075), (4, 262127), (1, 262127)):
+            plan = ss_host._route_16bit(b, n, n, k, 78, 90, dtype=bf16)
+            assert (plan["kernel"], plan["cluster"]) == ("clus", 4), (k, b, n, plan)
+    for b, n, cs in ((8, 131087, 4), (4, 163775, 8), (1, 163775, 8)):
+        plan = ss_host._route_16bit(b, n, n, 2048, 78, 90, dtype=bf16)
+        assert (plan["kernel"], plan["tpl"]) == ("reg_clus", (ss_host.BLKC, 4, cs, 2048)), (b, n)
+    for k, n in ((512, 131075), (1024, 131075), (2048, 131087)):
+        for num_sms, sm_version in ((132, 90), (148, 100)):
+            plan = ss_host._route_16bit(8, n, n, k, num_sms, sm_version, dtype=bf16)
+            assert plan["tpl"] == (ss_host.BLKC, 2, 8, k), (k, num_sms, plan)
+
+
+def test_selfsampling_hopper_wide_slab_from_sm_count_threshold() -> None:
+    """Hopper streams the K = 512 rows of batches beyond two waves with 512-thread slabs from 64K
+    scores per row on 132 SMs and from 128K on the 78-SM H20 (BF16 K = 1024 batches that read
+    their survivors from registers start at 128K on both); Blackwell keeps 256 threads."""
+    assert ss_host._wide_slab(512, 65538, 512, 132, 90)
+    assert not ss_host._wide_slab(512, 65538, 512, 78, 90)
+    assert ss_host._wide_slab(512, 131075, 512, 78, 90)
+    assert ss_host._wide_slab(156, 65538, 512, 78, 90)  # two waves
+    assert not ss_host._wide_slab(512, 131075, 512, 148, 100)
+    for n, wide in ((65538, False), (131075, True), (262127, True)):
+        npad = (n + 63) // 64 * 64
+        for rows in (512, 1024):
+            plan = ss_host.route_streaming(rows, n, npad, 512, True, 78, 90)
+            assert (plan["tpl"][0] == 512) is wide, (n, rows, plan["tpl"])
+            for dtype in (torch.bfloat16, torch.float16):
+                plan = ss_host._route_streaming_16bit(rows, n, npad, 512, True, dtype, 78, 90)
+                assert (plan["tpl"][0] == 512) is wide, (n, rows, dtype, plan["tpl"])
+            assert ss_host.route_streaming(rows, n, npad, 512, True, 132, 90)["tpl"][0] == 512
+
+
 def _record_compile_requests(monkeypatch) -> list:
     """Route the launchers' compile requests to a recorder that returns no-op kernels."""
     real = ss_host._device()
