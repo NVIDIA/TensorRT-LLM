@@ -152,6 +152,7 @@ class MTPDraftWorker(MTPEagleWorker):
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
         tokens_per_request = draft_tokens.shape[-1] + 1
+        self._reject_watermark(spec_metadata)
         target_tokens = self._sample_tokens_for_batch(logits, spec_metadata, 0, batch_size)
         mode, base, frac = 0, 0, 0.0
         warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
