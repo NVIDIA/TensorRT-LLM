@@ -29,9 +29,12 @@ After the launches since the previous check, every rank compares:
 ``test_halo_r_traps`` makes one launch fail on purpose: a status word set
 before the route release, a READY cell that never arrives, or a CTA that
 cannot become resident. The failing rank must trap in that call, and its
-peers in that call or the next, at their wait for it. These cases fault
-every GPU of the node on purpose, so they run only when HALO_R_TEST_TRAPS=1;
-a directory-level test list entry skips them.
+peers in that call or the next, at their wait for it. A rank that does not
+trap is reported as such, not left waiting in the collective teardown. These
+cases fault every GPU of the node on purpose, so they run only when their own
+node id selects them (the post-merge ISOLATION entry in
+l0_gb200_multi_gpus.yml) or HALO_R_TEST_TRAPS=1; a directory-level test list
+entry skips them.
 
 The ranks run on one node through an MPIPoolExecutor, or on any number of
 nodes under ``trtllm-llmapi-launch`` through the MPI session it serves.
@@ -1425,7 +1428,9 @@ def _case_trap(layers: _Layers, kind: str) -> dict:
                 break
         if error is not None:
             break
-    layers.dead = error is not None
+    # A rank that did not trap cannot run the collective teardown with a trapped peer;
+    # every rank skips it and returns its outcome, so the parent reports which rank did not trap.
+    layers.dead = MPI.COMM_WORLD.allreduce(error is not None, op=MPI.LOR)
     return {"rank": rank, "error": error, "where": where, "seconds": time.monotonic() - start}
 
 
@@ -1592,13 +1597,21 @@ def test_halo_r(monkeypatch, case) -> None:
     assert not failures, "\n".join(failures[:20])
 
 
-@pytest.mark.skipif(
-    os.environ.get("HALO_R_TEST_TRAPS") != "1",
-    reason="faults every GPU of the node; set HALO_R_TEST_TRAPS=1 to run",
-)
+def _traps_selected(config: pytest.Config) -> bool:
+    """Whether the run opted in to the trap cases: HALO_R_TEST_TRAPS=1, or a node id naming them."""
+    return os.environ.get("HALO_R_TEST_TRAPS") == "1" or any(
+        "::test_halo_r_traps" in arg for arg in config.args
+    )
+
+
 @pytest.mark.parametrize("kind", _TRAPS)
-def test_halo_r_traps(monkeypatch, kind) -> None:
+def test_halo_r_traps(monkeypatch, request, kind) -> None:
     """A broken launch on rank 0 traps it in that call; every peer traps in that call or the next."""
+    if not _traps_selected(request.config):
+        pytest.skip(
+            "faults every GPU of the node; select test_halo_r_traps by node id "
+            "or set HALO_R_TEST_TRAPS=1 to run"
+        )
     results = _run_on_every_rank(monkeypatch, f"trap_{kind}")
     _skip_if_any(results)
     outcomes = {result["rank"]: result for _, result in results}
