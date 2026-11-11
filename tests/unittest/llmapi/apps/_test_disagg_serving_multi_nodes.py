@@ -44,6 +44,7 @@ WORKER_SHUTDOWN_TIMEOUT_S = 7200
 
 @pytest.fixture(scope="module", autouse=True)
 def require_supported_slurm_topology():
+    """Require the direct two-node Slurm topology used by this test."""
     required_variables = (
         "SLURM_PROCID",
         "SLURM_NODEID",
@@ -81,6 +82,7 @@ def get_the_other_host(idx=0):
 
 
 def wait_for_worker_ready():
+    """Wait for the generation worker's bounded readiness signal."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("0.0.0.0", WORKER_READY_PORT))
@@ -101,6 +103,7 @@ def wait_for_worker_ready():
 
 
 def signal_worker_ready(host: str):
+    """Signal generation-worker readiness to the pytest node."""
     deadline = time.monotonic() + WORKER_READY_TIMEOUT_S
     while time.monotonic() < deadline:
         try:
@@ -183,6 +186,7 @@ def gen_tp_pp_size(request):
 
 @pytest.fixture(scope="module")
 def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
+    """Start one context or generation worker on each Slurm node."""
     extra_config = {
         "cache_transceiver_config": {
             "backend": "DEFAULT"
@@ -231,6 +235,7 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
 
 @pytest.fixture(scope="module")
 def disagg_server(worker: RemoteOpenAIServer):
+    """Start the disaggregated router on the pytest node."""
     if is_disagg_node():
         print(f"starting disagg_server for rank {RANK} node rank {NODE_RANK}")
         ctx_url = "localhost:8001"  # Use localhost since the ctx server is on the same node
@@ -261,6 +266,7 @@ def client(disagg_server: RemoteDisaggOpenAIServer):
 
 def test_completion(client: openai.OpenAI,
                     disagg_server: RemoteDisaggOpenAIServer, model_name: str):
+    """Verify one completion while coordinating worker shutdown."""
     if is_pytest_node():
         print(f"running test_completion on rank {RANK} node rank {NODE_RANK}")
         wait_for_worker_ready()

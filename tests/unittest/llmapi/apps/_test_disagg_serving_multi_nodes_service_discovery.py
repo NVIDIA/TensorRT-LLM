@@ -39,6 +39,7 @@ WORKER_SHUTDOWN_TIMEOUT_S = 7200
 
 @pytest.fixture(autouse=True)
 def require_supported_slurm_topology():
+    """Require the direct two-node Slurm topology used by this test."""
     required_variables = (
         "SLURM_PROCID",
         "SLURM_NODEID",
@@ -59,6 +60,7 @@ def require_supported_slurm_topology():
 
 # This test uses exactly two nodes.
 def wait_for_worker_ready():
+    """Wait for the generation worker's bounded readiness signal."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("0.0.0.0", WORKER_READY_PORT))
@@ -78,6 +80,7 @@ def wait_for_worker_ready():
 
 
 def signal_worker_ready(host: str):
+    """Signal generation-worker readiness to the pytest node."""
     deadline = time.monotonic() + WORKER_READY_TIMEOUT_S
     while time.monotonic() < deadline:
         try:
@@ -139,6 +142,7 @@ def disagg_host():
 
 @pytest.fixture(params=["etcd", "http"])
 def service_discovery(request, disagg_host: str):
+    """Provide the requested service-discovery endpoint."""
     if request.param == "etcd" and is_disagg_node():
         work_dir = tempfile.mkdtemp()
         data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
@@ -177,6 +181,7 @@ def disagg_cluster_config(service_discovery: tuple):
 
 @pytest.fixture
 def worker(model_name: str, disagg_cluster_config: dict):
+    """Start one context or generation worker on each Slurm node."""
     extra_config = {
         "disagg_cluster": disagg_cluster_config,
         "cache_transceiver_config": {"backend": "DEFAULT"},
@@ -235,6 +240,7 @@ def worker(model_name: str, disagg_cluster_config: dict):
 # wait for ctx/gen servers to get ready
 @pytest.fixture
 def disagg_server(disagg_cluster_config: dict):
+    """Start the service-discovery router on the pytest node."""
     if is_disagg_node():
         disagg_config = {
             "disagg_cluster": disagg_cluster_config,
@@ -274,6 +280,7 @@ def test_completion(
     disagg_host: str,
     model_name: str,
 ):
+    """Verify repeated completions while coordinating worker shutdown."""
     disagg_health_url = f"http://{disagg_host}:{DISAGG_SERVER_PORT}/health/"
     if is_worker_task():
         wait_for_endpoint_ready(disagg_health_url, timeout=DISAGG_SERVER_START_TIMEOUT_S)
