@@ -83,6 +83,16 @@ The LTX-2 Community License Agreement applies only to use of the code in the
 `tensorrt_llm/_torch/visual_gen/models/ltx2/` directory of this project.
 
 --------------------------------------------------------------------------------
+LTX core (November 4, 2026 snapshot)
+--------------------------------------------------------------------------------
+Original Source: https://github.com/Lightricks/LTX-2
+Commit: 4f521619ae0029e8fbb64d555030c2b121a33b4f
+Copyright (c) 2025-2026 Lightricks Ltd.
+Licensed under the Apache License, Version 2.0.
+Applies to tensorrt_llm/_torch/visual_gen/models/ltx_core/.
+See the LICENSE and NOTICE files in that directory.
+
+--------------------------------------------------------------------------------
 Mamba
 --------------------------------------------------------------------------------
 Original Source: https://github.com/state-spaces/mamba

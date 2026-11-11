@@ -1100,3 +1100,47 @@ class TestLTX2CacheDiTWrapperPassthrough(unittest.TestCase):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx_core_scheduler_explicit_device():
+    from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.schedulers import LTX2Scheduler
+
+    with torch._C.DisableTorchFunction():
+        latent = torch.zeros(1, 128, 7, 8, 12, device="cuda")
+        sigmas = LTX2Scheduler().execute(8, latent=latent)
+    assert sigmas.device == latent.device
+    assert sigmas.shape == (9,)
+    assert sigmas[0] == 1 and sigmas[-1] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx_core_mixed_perturbation_cuda_graph():
+    from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.perturbations import (
+        BatchedPerturbationConfig,
+        Perturbation,
+        PerturbationConfig,
+        PerturbationType,
+    )
+
+    kind = PerturbationType.SKIP_VIDEO_SELF_ATTN
+    config = BatchedPerturbationConfig(
+        [
+            PerturbationConfig([Perturbation(kind, [2])]),
+            PerturbationConfig([]),
+        ]
+    )
+    values = torch.ones(2, 3, 4, device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            result = values * config.mask_like(kind, 2, values)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = values * config.mask_like(kind, 2, values)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(result[0]) == 0
+    torch.testing.assert_close(result[1], values[1], rtol=0, atol=0)

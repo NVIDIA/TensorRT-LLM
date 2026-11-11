@@ -1,12 +1,8 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-License-Identifier: LicenseRef-LTX-2
+# SPDX-License-Identifier: Apache-2.0
 
-from enum import Enum
+"""Compatibility imports from the pinned November 4 LTX core."""
 
-
-class CausalityAxis(Enum):
-    NONE = None
-    WIDTH = "width"
-    HEIGHT = "height"
-    WIDTH_COMPATIBILITY = "width-compatibility"
+from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.causality_axis import (
+    CausalityAxis as CausalityAxis,
+)

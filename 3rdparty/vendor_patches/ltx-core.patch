@@ -1,0 +1,3450 @@
+diff --git a/batch_split.py b/batch_split.py
+index 0793d35625d9204bc87d8e545027f161ae17dac4..5e89db568acf747b9d555955661bee6065e071fa 100644
+--- a/batch_split.py
++++ b/batch_split.py
+@@ -19,8 +19,8 @@ from typing import Any
+ import torch
+ from torch import nn
+ 
+-from ltx_core.guidance.perturbations import BatchedPerturbationConfig
+-from ltx_core.model.transformer.modality import Modality
++from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import BatchedPerturbationConfig
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.modality import Modality
+ 
+ 
+ def _split_perturbations(config: BatchedPerturbationConfig, sizes: list[int]) -> list[BatchedPerturbationConfig]:
+diff --git a/color/__init__.py b/color/__init__.py
+index 33937615ec9e46bb9e1f0a289f0f28f677600de2..629b527193efa2e627221067ad0c982a3eb0a295 100644
+--- a/color/__init__.py
++++ b/color/__init__.py
+@@ -4,8 +4,8 @@ VAE working-space helpers (``to_acescct_working_space``, ``to_hdr_linear``, ``Tr
+ hdr symbols (that would cycle: ``hdr`` imports ``color.primaries``).
+ """
+ 
+-from ltx_core.color.hlg import HlgGpuConverter, hlg_inverse_oetf
+-from ltx_core.color.primaries import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.color.hlg import HlgGpuConverter, hlg_inverse_oetf
++from tensorrt_llm._torch.visual_gen.models.ltx_core.color.primaries import (
+     ACESCG_TO_2020,
+     ACESCG_TO_SRGB,
+     EXR_CHROMATICITIES,
+@@ -16,7 +16,7 @@ from ltx_core.color.primaries import (
+     apply_acescg_to_srgb,
+     apply_srgb_to_acescg,
+ )
+-from ltx_core.color.yuv import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.color.yuv import (
+     ColorRange,
+     ColorSpace,
+     FrameConverter,
+diff --git a/color/hlg.py b/color/hlg.py
+index 09bcaab628bae071eaac8155021ba4b58636364b..c17c47bc16c9b9df445995bd0b3862b6cc8e5361 100644
+--- a/color/hlg.py
++++ b/color/hlg.py
+@@ -14,8 +14,8 @@ import torch
+ from colour.models import oetf_inverse_BT2100_HLG
+ from colour.models.rgb.transfer_functions.arib_std_b67 import CONSTANTS_ARIBSTDB67
+ 
+-from ltx_core.color.primaries import Primaries
+-from ltx_core.color.yuv import ColorRange, ColorSpace, rgb_to_yuv420p10
++from tensorrt_llm._torch.visual_gen.models.ltx_core.color.primaries import Primaries
++from tensorrt_llm._torch.visual_gen.models.ltx_core.color.yuv import ColorRange, ColorSpace, rgb_to_yuv420p10
+ 
+ # ARIB STD-B67 / BT.2100 HLG OETF constants (colour-science).
+ _HLG_A = float(CONSTANTS_ARIBSTDB67["a"])
+diff --git a/color/yuv.py b/color/yuv.py
+index 40c23b324b056c4c8ccfa4df4a649e6df78549da..b261651616b88d02f2dea4c4d37c0ef3b14818fc 100644
+--- a/color/yuv.py
++++ b/color/yuv.py
+@@ -13,7 +13,7 @@ import functools
+ import colour
+ import torch
+ 
+-from ltx_core.devices import upload_from_host
++from tensorrt_llm._torch.visual_gen.models.ltx_core.devices import upload_from_host
+ 
+ 
+ class ColorSpace(enum.Enum):
+diff --git a/components/diffusion_steps.py b/components/diffusion_steps.py
+index 509736532b5e9823c84189f74ed10de95f972456..af6d811245347dca92260a681bf24f33d3d3c453 100644
+--- a/components/diffusion_steps.py
++++ b/components/diffusion_steps.py
+@@ -1,7 +1,7 @@
+ import torch
+ 
+-from ltx_core.components.protocols import DiffusionStepProtocol
+-from ltx_core.utils import to_velocity
++from tensorrt_llm._torch.visual_gen.models.ltx_core.components.protocols import DiffusionStepProtocol
++from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import to_velocity
+ 
+ 
+ def _get_ancestral_step(
+diff --git a/components/guiders.py b/components/guiders.py
+index a06782461f1fba0d3f8bbb1fb8ac335f3f3fd32a..9d00481c599aa5d9f5fd4e44b89d115f1da33dd8 100644
+--- a/components/guiders.py
++++ b/components/guiders.py
+@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
+ 
+ import torch
+ 
+-from ltx_core.components.protocols import GuiderProtocol
++from tensorrt_llm._torch.visual_gen.models.ltx_core.components.protocols import GuiderProtocol
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/components/noisers.py b/components/noisers.py
+index 7df5a732e3afebcf1fd6aecbb185405722635389..129f0c63b84dba46a56a5795f014726ea028a30d 100644
+--- a/components/noisers.py
++++ b/components/noisers.py
+@@ -3,7 +3,7 @@ from typing import Protocol
+ 
+ import torch
+ 
+-from ltx_core.types import LatentState
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import LatentState
+ 
+ 
+ class Noiser(Protocol):
+diff --git a/components/patchifiers.py b/components/patchifiers.py
+index 1c711168218c44aba65b23e675aada3202a46a21..35d5c5b6516414693207b879d98487fe2c4ec76f 100644
+--- a/components/patchifiers.py
++++ b/components/patchifiers.py
+@@ -4,8 +4,8 @@ from typing import Optional, Tuple
+ import einops
+ import torch
+ 
+-from ltx_core.components.protocols import Patchifier
+-from ltx_core.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.components.protocols import Patchifier
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
+ 
+ 
+ class VideoLatentPatchifier(Patchifier):
+diff --git a/components/protocols.py b/components/protocols.py
+index 18e5836a38edda9f2fe6830edc5362e81e975891..d4663a3de9663efe7db34c2a4a3b82f23f8943e3 100644
+--- a/components/protocols.py
++++ b/components/protocols.py
+@@ -2,7 +2,7 @@ from typing import Protocol, Tuple
+ 
+ import torch
+ 
+-from ltx_core.types import AudioLatentShape, VideoLatentShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import AudioLatentShape, VideoLatentShape
+ 
+ 
+ class Patchifier(Protocol):
+diff --git a/components/schedulers.py b/components/schedulers.py
+index 4bf7ad93b0595085c40000fcf4ba802e6ae0129e..bc2f929bffb14667785518bc103e9f37a71e00db 100644
+--- a/components/schedulers.py
++++ b/components/schedulers.py
+@@ -5,7 +5,7 @@ import numpy
+ import scipy
+ import torch
+ 
+-from ltx_core.components.protocols import SchedulerProtocol
++from tensorrt_llm._torch.visual_gen.models.ltx_core.components.protocols import SchedulerProtocol
+ 
+ BASE_SHIFT_ANCHOR = 1024
+ MAX_SHIFT_ANCHOR = 4096
+diff --git a/conditioning/__init__.py b/conditioning/__init__.py
+index 60b553ab86a3eee346fc01ffe0cec07e47034ace..c222961f17d6053a63cf68890991188903a023d0 100644
+--- a/conditioning/__init__.py
++++ b/conditioning/__init__.py
+@@ -1,8 +1,8 @@
+ """Conditioning utilities: latent state, tools, and conditioning types."""
+ 
+-from ltx_core.conditioning.exceptions import ConditioningError
+-from ltx_core.conditioning.item import ConditioningItem
+-from ltx_core.conditioning.types import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.exceptions import ConditioningError
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.item import ConditioningItem
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.types import (
+     AudioConditionByLatentIndex,
+     AudioConditionByReferenceLatent,
+     ConditioningItemAttentionStrengthWrapper,
+diff --git a/conditioning/item.py b/conditioning/item.py
+index e6eef52d1983c1e2e433c27dc1e4735662696092..af3d96dcce6153b2cb665c5a9aade6037e366a84 100644
+--- a/conditioning/item.py
++++ b/conditioning/item.py
+@@ -1,7 +1,7 @@
+ from typing import Protocol
+ 
+-from ltx_core.tools import LatentTools
+-from ltx_core.types import LatentState
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import LatentTools
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import LatentState
+ 
+ 
+ class ConditioningItem(Protocol):
+diff --git a/conditioning/mask_utils.py b/conditioning/mask_utils.py
+index d0687757d8e2d62363184743ad5e2b1ebcfee53f..6ef21270349768167dc59b6f5395a7d505b13460 100644
+--- a/conditioning/mask_utils.py
++++ b/conditioning/mask_utils.py
+@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
+ import torch
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.types import LatentState
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.types import LatentState
+ 
+ 
+ def resolve_cross_mask(
+diff --git a/conditioning/types/__init__.py b/conditioning/types/__init__.py
+index f4da95ab2e8935cf40d28f40bbb2a02cbfb111e4..ddb05799be6811338a7164b416bd2630b7ca211e 100644
+--- a/conditioning/types/__init__.py
++++ b/conditioning/types/__init__.py
+@@ -1,12 +1,12 @@
+ """Conditioning type implementations."""
+ 
+-from ltx_core.conditioning.types.attention_strength_wrapper import ConditioningItemAttentionStrengthWrapper
+-from ltx_core.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
+-from ltx_core.conditioning.types.keyframe_slots import VideoGeneratedKeyframeSlots
+-from ltx_core.conditioning.types.latent_cond import AudioConditionByLatentIndex, VideoConditionByLatentIndex
+-from ltx_core.conditioning.types.mask_cond import VideoConditionByMask
+-from ltx_core.conditioning.types.reference_audio_cond import AudioConditionByReferenceLatent
+-from ltx_core.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.types.attention_strength_wrapper import ConditioningItemAttentionStrengthWrapper
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.types.keyframe_slots import VideoGeneratedKeyframeSlots
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.types.latent_cond import AudioConditionByLatentIndex, VideoConditionByLatentIndex
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.types.mask_cond import VideoConditionByMask
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.types.reference_audio_cond import AudioConditionByReferenceLatent
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
+ 
+ __all__ = [
+     "AudioConditionByLatentIndex",
+diff --git a/conditioning/types/attention_strength_wrapper.py b/conditioning/types/attention_strength_wrapper.py
+index 0327bfa409e1afb3a5e65331a90c5a91b7a5462b..6e0681dc3bfef3546c93e2958e8b2a17f320b6bd 100644
+--- a/conditioning/types/attention_strength_wrapper.py
++++ b/conditioning/types/attention_strength_wrapper.py
+@@ -4,10 +4,10 @@ from dataclasses import replace
+ 
+ import torch
+ 
+-from ltx_core.conditioning.item import ConditioningItem
+-from ltx_core.conditioning.mask_utils import update_attention_mask
+-from ltx_core.tools import LatentTools
+-from ltx_core.types import LatentState
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.item import ConditioningItem
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.mask_utils import update_attention_mask
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import LatentTools
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import LatentState
+ 
+ 
+ class ConditioningItemAttentionStrengthWrapper(ConditioningItem):
+diff --git a/conditioning/types/keyframe_cond.py b/conditioning/types/keyframe_cond.py
+index b23a5d049feca19d00ef2caef3c8182db8ca20a7..1702b9bc68a86c28e733809750bd1e08db3b47b1 100644
+--- a/conditioning/types/keyframe_cond.py
++++ b/conditioning/types/keyframe_cond.py
+@@ -1,10 +1,10 @@
+ import torch
+ 
+-from ltx_core.components.patchifiers import get_pixel_coords
+-from ltx_core.conditioning.item import ConditioningItem
+-from ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
+-from ltx_core.tools import VideoLatentTools
+-from ltx_core.types import DenoiseMask, LatentState, VideoLatentShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.components.patchifiers import get_pixel_coords
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.item import ConditioningItem
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import VideoLatentTools
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import DenoiseMask, LatentState, VideoLatentShape
+ 
+ 
+ class VideoConditionByKeyframeIndex(ConditioningItem):
+diff --git a/conditioning/types/keyframe_slots.py b/conditioning/types/keyframe_slots.py
+index ee0b535494c70456c90a04840abf2dda022bd774..04bab13adf4e8429a75997b82a82a466fbb6b4d6 100644
+--- a/conditioning/types/keyframe_slots.py
++++ b/conditioning/types/keyframe_slots.py
+@@ -17,11 +17,11 @@ from collections.abc import Sequence
+ 
+ import torch
+ 
+-from ltx_core.components.patchifiers import get_pixel_coords
+-from ltx_core.conditioning.item import ConditioningItem
+-from ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
+-from ltx_core.tools import VideoLatentTools
+-from ltx_core.types import DenoiseMask, GeneratedKeyframeLayout, LatentState
++from tensorrt_llm._torch.visual_gen.models.ltx_core.components.patchifiers import get_pixel_coords
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.item import ConditioningItem
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import VideoLatentTools
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import DenoiseMask, GeneratedKeyframeLayout, LatentState
+ 
+ 
+ class VideoGeneratedKeyframeSlots(ConditioningItem):
+diff --git a/conditioning/types/latent_cond.py b/conditioning/types/latent_cond.py
+index 4cfbd1454d10db23ace67b8848ea0df17bf1fd86..bb95b774ce39b80f1242be3e81fbd787eb1745f7 100644
+--- a/conditioning/types/latent_cond.py
++++ b/conditioning/types/latent_cond.py
+@@ -1,9 +1,9 @@
+ import torch
+ 
+-from ltx_core.conditioning.exceptions import ConditioningError
+-from ltx_core.conditioning.item import ConditioningItem
+-from ltx_core.tools import LatentTools
+-from ltx_core.types import LatentState
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.exceptions import ConditioningError
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.item import ConditioningItem
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import LatentTools
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import LatentState
+ 
+ 
+ class VideoConditionByLatentIndex(ConditioningItem):
+diff --git a/conditioning/types/mask_cond.py b/conditioning/types/mask_cond.py
+index 153e2ef0310c3b4bb4428eff16b4fe3819b626bf..4d495b3890cbfe21a7f81fa3dd3d70d1d2eb4327 100644
+--- a/conditioning/types/mask_cond.py
++++ b/conditioning/types/mask_cond.py
+@@ -4,9 +4,9 @@ from dataclasses import replace
+ 
+ import torch
+ 
+-from ltx_core.conditioning.item import ConditioningItem
+-from ltx_core.tools import LatentTools
+-from ltx_core.types import DenoiseMask, LatentState
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.item import ConditioningItem
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import LatentTools
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import DenoiseMask, LatentState
+ 
+ 
+ class VideoConditionByMask(ConditioningItem):
+diff --git a/conditioning/types/noise_mask_cond.py b/conditioning/types/noise_mask_cond.py
+index fbcb3b6f28842949080bbd17496207204a9b5543..b4827f68b783877c3e8bb42173f64f89a952441e 100644
+--- a/conditioning/types/noise_mask_cond.py
++++ b/conditioning/types/noise_mask_cond.py
+@@ -1,9 +1,9 @@
+ from dataclasses import dataclass
+ 
+-from ltx_core.components.patchifiers import get_pixel_coords
+-from ltx_core.conditioning.item import ConditioningItem
+-from ltx_core.tools import LatentTools, SpatioTemporalScaleFactors
+-from ltx_core.types import AudioLatentShape, LatentState, VideoLatentShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.components.patchifiers import get_pixel_coords
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.item import ConditioningItem
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import LatentTools, SpatioTemporalScaleFactors
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import AudioLatentShape, LatentState, VideoLatentShape
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/conditioning/types/reference_audio_cond.py b/conditioning/types/reference_audio_cond.py
+index 66292a216afbdff5a074102455c698d7755bbf2a..03dce67261db394f3e0e3be589df3d5bf95465e1 100644
+--- a/conditioning/types/reference_audio_cond.py
++++ b/conditioning/types/reference_audio_cond.py
+@@ -4,9 +4,9 @@ from __future__ import annotations
+ 
+ import torch
+ 
+-from ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
+-from ltx_core.tools import LatentTools
+-from ltx_core.types import DenoiseMask, LatentState
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import LatentTools
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import DenoiseMask, LatentState
+ 
+ 
+ class AudioConditionByReferenceLatent:
+diff --git a/conditioning/types/reference_video_cond.py b/conditioning/types/reference_video_cond.py
+index eee575411dfa0777f747e612fd5619d054ee6ed6..d366003c7f7bcff57c88d6591d66ff70ba4a8c17 100644
+--- a/conditioning/types/reference_video_cond.py
++++ b/conditioning/types/reference_video_cond.py
+@@ -2,11 +2,11 @@
+ 
+ import torch
+ 
+-from ltx_core.components.patchifiers import get_pixel_coords
+-from ltx_core.conditioning.item import ConditioningItem
+-from ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
+-from ltx_core.tools import VideoLatentTools
+-from ltx_core.types import DenoiseMask, LatentState, VideoLatentShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.components.patchifiers import get_pixel_coords
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.item import ConditioningItem
++from tensorrt_llm._torch.visual_gen.models.ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import VideoLatentTools
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import DenoiseMask, LatentState, VideoLatentShape
+ 
+ 
+ class VideoConditionByReferenceLatent(ConditioningItem):
+diff --git a/duration_head/__init__.py b/duration_head/__init__.py
+index b86baf6e62ef9995593992bc74b2d33987b40d28..8ec838b58dd1b1f91acbcdb536c78df88eae0760 100644
+--- a/duration_head/__init__.py
++++ b/duration_head/__init__.py
+@@ -1,7 +1,7 @@
+ """DurationHead: predicts shot duration from Connector token outputs."""
+ 
+-from ltx_core.duration_head.duration_head import AttentionPooler, DurationHead
+-from ltx_core.duration_head.model_configurator import DURATION_HEAD_KEY_OPS, DurationHeadConfigurator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.duration_head.duration_head import AttentionPooler, DurationHead
++from tensorrt_llm._torch.visual_gen.models.ltx_core.duration_head.model_configurator import DURATION_HEAD_KEY_OPS, DurationHeadConfigurator
+ 
+ __all__ = [
+     "DURATION_HEAD_KEY_OPS",
+diff --git a/duration_head/duration_head.py b/duration_head/duration_head.py
+index 17bc3b1b2e667d9b78cd3e16185715869e186190..343ad443fd5dbf1aedc7fa07a9f6d8fba58c8919 100644
+--- a/duration_head/duration_head.py
++++ b/duration_head/duration_head.py
+@@ -21,7 +21,7 @@ from __future__ import annotations
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
+ 
+ 
+ class AttentionPooler(nn.Module):
+diff --git a/duration_head/model_configurator.py b/duration_head/model_configurator.py
+index 53cd4c679aa4a7ba03ea2b7e7b62410cd4b0c0ac..f0f89677660a8aaa0cef3a7debd0463c116d7391 100644
+--- a/duration_head/model_configurator.py
++++ b/duration_head/model_configurator.py
+@@ -1,6 +1,6 @@
+-from ltx_core.duration_head.duration_head import DurationHead
+-from ltx_core.loader.sd_ops import SDOps
+-from ltx_core.model.model_protocol import ModelConfigurator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.duration_head.duration_head import DurationHead
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.model_protocol import ModelConfigurator
+ 
+ # DurationHead's tensors live under a "duration_head." key prefix, already exported in
+ # PyTorch's nn.MultiheadAttention layout. Layout-agnostic on purpose: this strips the
+diff --git a/guidance/__init__.py b/guidance/__init__.py
+index 8214c5c70987d09f7cbc95dfbd9c652a75300fb5..1b6aca7bf1d237245c426f810a5ddd916256a03f 100644
+--- a/guidance/__init__.py
++++ b/guidance/__init__.py
+@@ -1,6 +1,6 @@
+ """Guidance and perturbation utilities for attention manipulation."""
+ 
+-from ltx_core.guidance.perturbations import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import (
+     BatchedPerturbationConfig,
+     Perturbation,
+     PerturbationConfig,
+diff --git a/guidance/perturbations.py b/guidance/perturbations.py
+index dd9c8bd875bfe17ffdf28f0b6db45ca6462d011d..ad25ae9f40f1e84ad53278af5786a4408f7c35ee 100644
+--- a/guidance/perturbations.py
++++ b/guidance/perturbations.py
+@@ -4,7 +4,7 @@ from enum import IntEnum
+ import torch
+ from torch._prims_common import DeviceLikeType
+ 
+-from ltx_core.types import HostDeviceTensorPair
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import HostDeviceTensorPair
+ 
+ 
+ class PerturbationType(IntEnum):
+diff --git a/hdr.py b/hdr.py
+index 3f2ce8db91393cbc40142cd690f6470d73ab13e0..892e73c2aa7b407c402c01e9b0ae88864a0fcc48 100644
+--- a/hdr.py
++++ b/hdr.py
+@@ -9,7 +9,7 @@ import enum
+ import torch
+ from torch import Tensor
+ 
+-from ltx_core.color.primaries import Primaries
++from tensorrt_llm._torch.visual_gen.models.ltx_core.color.primaries import Primaries
+ 
+ __all__ = [
+     "TransferEncoding",
+diff --git a/loader/__init__.py b/loader/__init__.py
+index c984f26e22bb11a8478245daf1991eeb6ebe9c17..c8d9f6e5c8b7311e5225aa5c64a9f1a899530f48 100644
+--- a/loader/__init__.py
++++ b/loader/__init__.py
+@@ -1,10 +1,10 @@
+ """Unit-based model loading, checkpoint operations, and weight registries."""
+ 
+-from ltx_core.loader.helpers import parse_model_version
+-from ltx_core.loader.lora_request import LoraPathStrengthAndSDOps
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.registry import DummyRegistry, ModelRegistry
+-from ltx_core.loader.sd_ops import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.helpers import parse_model_version
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.lora_request import LoraPathStrengthAndSDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.registry import DummyRegistry, ModelRegistry
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import (
+     LTXV_LORA_COMFY_RENAMING_MAP,
+     KeyMatching,
+     KeyReplacement,
+diff --git a/loader/attention_ops.py b/loader/attention_ops.py
+index 37c8bd9d8abbd7cf5a84cd669265caa6003d9322..3db60bd94f5c081a284eea7b6e8e4bc9bfa5ae86 100644
+--- a/loader/attention_ops.py
++++ b/loader/attention_ops.py
+@@ -2,8 +2,8 @@
+ 
+ import torch
+ 
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.model.transformer.attention import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.attention import (
+     Attention,
+     AttentionCallable,
+     AttentionFunction,
+diff --git a/loader/buffers.py b/loader/buffers.py
+index a3e0d59699fafa3cfb8757fd7d90e266ed498164..1a0636dbac82623cce31940dbb12ce2b7012e121 100644
+--- a/loader/buffers.py
++++ b/loader/buffers.py
+@@ -7,7 +7,7 @@ from dataclasses import dataclass
+ 
+ import torch
+ 
+-from ltx_core.loader.units import UNIT_ALIGN, StateDictMetadata, TensorMetadata, Unit, active_dtype
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import UNIT_ALIGN, StateDictMetadata, TensorMetadata, Unit, active_dtype
+ 
+ _EXACT_PIN_BYTES = 2 << 20
+ 
+diff --git a/loader/checkpoint.py b/loader/checkpoint.py
+index 8dc635451dccf4a74a45cc2ae9249e0b33d7a926..1bafff46e93f9afafdd4055654340c0d32921896 100644
+--- a/loader/checkpoint.py
++++ b/loader/checkpoint.py
+@@ -12,8 +12,8 @@ from typing import Protocol
+ 
+ import torch
+ 
+-from ltx_core.loader.raw import DeviceStager, RawFiles, ReadChunk, read_raw
+-from ltx_core.loader.units import StateDictMetadata, TensorMapping, TensorMetadata
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.raw import DeviceStager, RawFiles, ReadChunk, read_raw
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import StateDictMetadata, TensorMapping, TensorMetadata
+ 
+ ReadTensor = Callable[[Path, str], torch.Tensor]
+ 
+diff --git a/loader/distributed.py b/loader/distributed.py
+index dc50eab095291eabc16ecc4612a2e4882faacc8a..e2fb36034a766d2096277978d647018f62ee0102 100644
+--- a/loader/distributed.py
++++ b/loader/distributed.py
+@@ -14,13 +14,13 @@ from typing import TypeVar
+ import torch
+ import torch.distributed as dist
+ 
+-from ltx_core.loader.buffers import layout_bytes, unit_offsets
+-from ltx_core.loader.helpers import assign_state_dict
+-from ltx_core.loader.lora import patched_keys
+-from ltx_core.loader.partitioners import LoRAPartitioning, RankPartitioner, _select_loras, apply_partitioners
+-from ltx_core.loader.registry import ModelRegistry, RegistryKeys
+-from ltx_core.loader.shell import ShellKey, materialize_nonpersistent_buffers, validate_bound_model
+-from ltx_core.loader.simple_builder import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.buffers import layout_bytes, unit_offsets
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.helpers import assign_state_dict
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.lora import patched_keys
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.partitioners import LoRAPartitioning, RankPartitioner, _select_loras, apply_partitioners
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.registry import ModelRegistry, RegistryKeys
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.shell import ShellKey, materialize_nonpersistent_buffers, validate_bound_model
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.simple_builder import (
+     SimpleBuilder,
+     _allocate_active,
+     _check_destination,
+@@ -29,8 +29,8 @@ from ltx_core.loader.simple_builder import (
+     _same_source,
+     _target_device,
+ )
+-from ltx_core.loader.state_loader import StateLoader
+-from ltx_core.loader.units import LoadMapping, MetadataUnit, PatchedUnitSpec, RankUnit, UnitSpec, active_dtype
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.state_loader import StateLoader
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import LoadMapping, MetadataUnit, PatchedUnitSpec, RankUnit, UnitSpec, active_dtype
+ 
+ _Model = TypeVar("_Model", bound=torch.nn.Module)
+ 
+diff --git a/loader/distributed_builders.py b/loader/distributed_builders.py
+index c1b2dce86c92819c95825b775be64459e8eb4b31..bc382a51c707107a830b1200d1d1a854f7bedec3 100644
+--- a/loader/distributed_builders.py
++++ b/loader/distributed_builders.py
+@@ -13,25 +13,25 @@ import torch.distributed as dist
+ from accelerate import dispatch_model, infer_auto_device_map
+ from accelerate.utils import get_balanced_memory
+ 
+-from ltx_core.loader.distributed import build_distributed, distributed_registry_keys
+-from ltx_core.loader.gemma import gemma3_builder, gemma4_builder
+-from ltx_core.loader.helpers import assign_state_dict
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.registry import DummyRegistry, ModelRegistry, RegistryKeys
+-from ltx_core.loader.simple_builder import SimpleBuilder
+-from ltx_core.multigpu.broadcast import BroadcastCoordinator
+-from ltx_core.multigpu.gemma.accelerate_wrapper import AccelerateGemmaWrapper
+-from ltx_core.multigpu.gemma.batch_parallel_wrapper import BatchParallelGemmaWrapper
+-from ltx_core.multigpu.transformer.attention import AttentionManager
+-from ltx_core.multigpu.transformer.sequence_parallel import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.distributed import build_distributed, distributed_registry_keys
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.gemma import gemma3_builder, gemma4_builder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.helpers import assign_state_dict
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.registry import DummyRegistry, ModelRegistry, RegistryKeys
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.simple_builder import SimpleBuilder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.broadcast import BroadcastCoordinator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.gemma.accelerate_wrapper import AccelerateGemmaWrapper
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.gemma.batch_parallel_wrapper import BatchParallelGemmaWrapper
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.transformer.attention import AttentionManager
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.transformer.sequence_parallel import (
+     SequenceParallelModelWrapper,
+     create_video_self_attention_module_ops,
+ )
+-from ltx_core.multigpu.transformer.tiled_data_parallel import TiledDataParallelModelWrapper
+-from ltx_core.text_encoders.gemma import gemma_model_type
+-from ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
+-from ltx_core.tiling import TileCountConfig
+-from ltx_core.tools import VideoLatentTools
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.transformer.tiled_data_parallel import TiledDataParallelModelWrapper
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma import gemma_model_type
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import TileCountConfig
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import VideoLatentTools
+ 
+ _Model = TypeVar("_Model", bound=torch.nn.Module)
+ 
+diff --git a/loader/gemma.py b/loader/gemma.py
+index e0b445bfb309b1d09f8a77678ba9a751e8793f9c..7e0bf0b80e4501aecdc5b41e14ff1d3d03bde407 100644
+--- a/loader/gemma.py
++++ b/loader/gemma.py
+@@ -4,10 +4,10 @@ from __future__ import annotations
+ 
+ from pathlib import Path
+ 
+-from ltx_core.loader.simple_builder import SimpleBuilder
+-from ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
+-from ltx_core.text_encoders.gemma.encoders.encoder_configurator import GemmaTextEncoderConfigurator, get_gemma_ops
+-from ltx_core.text_encoders.gemma.gemma_assets import GemmaAssets, build_gemma_hf_config
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.simple_builder import SimpleBuilder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.encoders.encoder_configurator import GemmaTextEncoderConfigurator, get_gemma_ops
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.gemma_assets import GemmaAssets, build_gemma_hf_config
+ 
+ 
+ def _builder(root: str | Path, allowed_types: frozenset[str]) -> SimpleBuilder[LTXGemmaTextEncoder]:
+diff --git a/loader/lora.py b/loader/lora.py
+index 9afd9878d406889626688b84b6c3d5c9b155c1fe..653b4dcfb985f54a0aebb6e078f125e84ac5f6bc 100644
+--- a/loader/lora.py
++++ b/loader/lora.py
+@@ -5,9 +5,9 @@ from dataclasses import dataclass, field
+ 
+ import torch
+ 
+-from ltx_core.devices import allow_async_transfer
+-from ltx_core.loader.placement import Placement
+-from ltx_core.loader.units import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.devices import allow_async_transfer
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.placement import Placement
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import (
+     MPS_HOST_FUSED_FP8,
+     FuseRule,
+     LoadMapping,
+diff --git a/loader/lora_request.py b/loader/lora_request.py
+index 388098754ebc2722c79c8736cfe8eaf899361f7b..51ce68df6c40e96471cc6f1c118ae3b15087d457 100644
+--- a/loader/lora_request.py
++++ b/loader/lora_request.py
+@@ -2,7 +2,7 @@
+ 
+ from typing import NamedTuple
+ 
+-from ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
+ 
+ 
+ class LoraPathStrengthAndSDOps(NamedTuple):
+diff --git a/loader/mapping.py b/loader/mapping.py
+index 9b008d93a38fa1a38cb4e48eb330b73596845f66..a966ddbc682a05731f2172b1e9bf5a0af334008a 100644
+--- a/loader/mapping.py
++++ b/loader/mapping.py
+@@ -12,11 +12,11 @@ from typing import TypeVar
+ 
+ import torch
+ 
+-from ltx_core.loader.buffers import unit_views
+-from ltx_core.loader.checkpoint import CheckpointReader, UnitSource
+-from ltx_core.loader.partitioners import FileReadPartitioner, apply_partitioners, stage_inputs
+-from ltx_core.loader.sd_ops import SDKeyValueOperation, SDOps
+-from ltx_core.loader.units import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.buffers import unit_views
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.checkpoint import CheckpointReader, UnitSource
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.partitioners import FileReadPartitioner, apply_partitioners, stage_inputs
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDKeyValueOperation, SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import (
+     FileReadUnit,
+     LoadMapping,
+     PatchedUnitSpec,
+diff --git a/loader/model_builder.py b/loader/model_builder.py
+index ea0dfbb7e13f7f5a716b26e47f37641d8155782f..93cad3866dadc9fd6de398441bbc09bd2e435c83 100644
+--- a/loader/model_builder.py
++++ b/loader/model_builder.py
+@@ -6,7 +6,7 @@ from typing import Protocol, TypeVar
+ 
+ import torch
+ 
+-from ltx_core.loader.registry import RegistryKeys
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.registry import RegistryKeys
+ 
+ _Model_co = TypeVar("_Model_co", covariant=True)
+ 
+diff --git a/loader/partitioners.py b/loader/partitioners.py
+index f64390a58bcdc69c8142ca6e65ea14c092abbba2..89a0f90bccdb751feada98f833c3b064fe7187ab 100644
+--- a/loader/partitioners.py
++++ b/loader/partitioners.py
+@@ -11,7 +11,7 @@ from typing import Protocol
+ 
+ import torch
+ 
+-from ltx_core.loader.units import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import (
+     FileReadUnit,
+     LoRAUnitSpec,
+     MetadataUnit,
+diff --git a/loader/placement.py b/loader/placement.py
+index 78a05562f5613e08b2d10411b6332e30ab9dc3ad..9160fe2dbd9f0a6e8388eb93e5c55a629b609301 100644
+--- a/loader/placement.py
++++ b/loader/placement.py
+@@ -7,7 +7,7 @@ from typing import Protocol
+ 
+ import torch
+ 
+-from ltx_core.loader.units import LoRAUnitSpec, PatchedUnitSpec, UnitSpec
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import LoRAUnitSpec, PatchedUnitSpec, UnitSpec
+ 
+ 
+ def packs_storage(device: torch.device) -> bool:
+diff --git a/loader/raw.py b/loader/raw.py
+index abc06e616c5a2ddff846051e4d99564006427fa5..8e81fba961e528322e7b23950978f9b99a12ea2a 100644
+--- a/loader/raw.py
++++ b/loader/raw.py
+@@ -20,7 +20,7 @@ from typing import NamedTuple
+ 
+ import torch
+ 
+-from ltx_core.loader.units import TensorMapping
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import TensorMapping
+ 
+ READ_WORKERS_ENV = "LTX_LOADER_READ_WORKERS"
+ # Reads are split into pieces of at most _READ_CHUNK_BYTES, and smaller reads are batched up to it, for a shared
+diff --git a/loader/registry.py b/loader/registry.py
+index f4680a95e839342e31f5329cf925f892768a4fde..5e5e71d7ca68b823f34d32e934a0d2629e4c4293 100644
+--- a/loader/registry.py
++++ b/loader/registry.py
+@@ -10,14 +10,14 @@ from pathlib import Path
+ 
+ import torch
+ 
+-from ltx_core.loader.buffers import host_bytes
+-from ltx_core.loader.checkpoint import CheckpointReader
+-from ltx_core.loader.mapping import build_mapping
+-from ltx_core.loader.placement import NO_RETENTION_POLICY, Placement, PlacementPolicy
+-from ltx_core.loader.raw import DeviceStager
+-from ltx_core.loader.sd_ops import SDOps
+-from ltx_core.loader.shell import ShellEntry, ShellKey
+-from ltx_core.loader.state_entry import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.buffers import host_bytes
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.checkpoint import CheckpointReader
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.mapping import build_mapping
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.placement import NO_RETENTION_POLICY, Placement, PlacementPolicy
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.raw import DeviceStager
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.shell import ShellEntry, ShellKey
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.state_entry import (
+     FusedKey,
+     SourceKey,
+     SourcePrefix,
+@@ -25,8 +25,8 @@ from ltx_core.loader.state_entry import (
+     StateKey,
+     selected_metadata,
+ )
+-from ltx_core.loader.units import UNIT_ALIGN, LoadMapping, PatchedUnitSpec, UnitSpec
+-from ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import UNIT_ALIGN, LoadMapping, PatchedUnitSpec, UnitSpec
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
+ 
+ 
+ class ModelRegistry:
+diff --git a/loader/shell.py b/loader/shell.py
+index abe7f8f2574bcdd1ef4706dc58cc17718cbbdaea..3bd4e1e7a26a6eac22037080f040e87777530c65 100644
+--- a/loader/shell.py
++++ b/loader/shell.py
+@@ -9,11 +9,11 @@ from types import MappingProxyType
+ 
+ import torch
+ 
+-from ltx_core.loader.helpers import module_tensors
+-from ltx_core.loader.mapping import validate_mapping
+-from ltx_core.loader.module_ops import ModuleOps, apply_module_ops
+-from ltx_core.loader.units import LoadMapping, TensorMetadata
+-from ltx_core.model.model_protocol import ModelConfigurator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.helpers import module_tensors
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.mapping import validate_mapping
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps, apply_module_ops
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import LoadMapping, TensorMetadata
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.model_protocol import ModelConfigurator
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+diff --git a/loader/simple_builder.py b/loader/simple_builder.py
+index 6bfd06744e4ef990acae1304b32b03f8a4b135fd..52e6a5838d7f5ee59775a87330640b9af5ecd453 100644
+--- a/loader/simple_builder.py
++++ b/loader/simple_builder.py
+@@ -10,15 +10,15 @@ from typing import Generic, TypeVar
+ 
+ import torch
+ 
+-from ltx_core.loader.buffers import layout_bytes, unit_views
+-from ltx_core.loader.helpers import assign_state_dict
+-from ltx_core.loader.lora import FLOAT_FUSE_RULE, LoRAFuser, bind_lora_factors, whole_adapter_spec
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.partitioners import Partitioner, apply_partitioners
+-from ltx_core.loader.placement import PlacementPolicy, packs_storage
+-from ltx_core.loader.registry import ActiveModelKey, ModelRegistry, RegistryKeys
+-from ltx_core.loader.sd_ops import SDOps
+-from ltx_core.loader.shell import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.buffers import layout_bytes, unit_views
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.helpers import assign_state_dict
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.lora import FLOAT_FUSE_RULE, LoRAFuser, bind_lora_factors, whole_adapter_spec
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.partitioners import Partitioner, apply_partitioners
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.placement import PlacementPolicy, packs_storage
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.registry import ActiveModelKey, ModelRegistry, RegistryKeys
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.shell import (
+     ShellEntry,
+     ShellKey,
+     create_shell,
+@@ -26,9 +26,9 @@ from ltx_core.loader.shell import (
+     shell_key,
+     validate_shell_projection,
+ )
+-from ltx_core.loader.state_entry import FusedKey
+-from ltx_core.loader.state_loader import StateLoader
+-from ltx_core.loader.units import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.state_entry import FusedKey
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.state_loader import StateLoader
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import (
+     FuseRule,
+     LoadMapping,
+     LoRAUnitSpec,
+@@ -38,7 +38,7 @@ from ltx_core.loader.units import (
+     UnitSpec,
+     active_dtype,
+ )
+-from ltx_core.model.model_protocol import ModelConfigurator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.model_protocol import ModelConfigurator
+ 
+ _Model = TypeVar("_Model", bound=torch.nn.Module)
+ 
+diff --git a/loader/state_entry.py b/loader/state_entry.py
+index 15343424f11174419a75844461a5f7799b0b2fd1..8f304f9d79d415db21724133747614c67fd95e6a 100644
+--- a/loader/state_entry.py
++++ b/loader/state_entry.py
+@@ -9,8 +9,8 @@ from types import MappingProxyType
+ 
+ import torch
+ 
+-from ltx_core.loader.placement import Placement
+-from ltx_core.loader.units import PatchedUnitSpec, UnitSpec
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.placement import Placement
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import PatchedUnitSpec, UnitSpec
+ 
+ SourcePrefix = tuple[tuple[Path, ...], tuple[str, ...]]
+ 
+diff --git a/loader/state_loader.py b/loader/state_loader.py
+index a142592f55dee07b3745c153344fb7f4539a7313..3e78ba4766e030f1ba800c87ae3878c0973b57f6 100644
+--- a/loader/state_loader.py
++++ b/loader/state_loader.py
+@@ -9,14 +9,14 @@ from typing import cast
+ 
+ import torch
+ 
+-from ltx_core.loader.buffers import host_bytes
+-from ltx_core.loader.checkpoint import CheckpointReader, UnitSource
+-from ltx_core.loader.lora import FLOAT_FUSE_RULE, LoRAFuser, patched_keys
+-from ltx_core.loader.mapping import ExecutionCache, file_read_parts, fill_from_source, validate_destination
+-from ltx_core.loader.placement import Placement, PlacementPolicy, packs_storage
+-from ltx_core.loader.registry import ModelRegistry, RegistryKeys
+-from ltx_core.loader.state_entry import FusedKey, SourceKey, StateEntry, StateKey
+-from ltx_core.loader.units import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.buffers import host_bytes
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.checkpoint import CheckpointReader, UnitSource
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.lora import FLOAT_FUSE_RULE, LoRAFuser, patched_keys
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.mapping import ExecutionCache, file_read_parts, fill_from_source, validate_destination
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.placement import Placement, PlacementPolicy, packs_storage
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.registry import ModelRegistry, RegistryKeys
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.state_entry import FusedKey, SourceKey, StateEntry, StateKey
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import (
+     UNIT_ALIGN,
+     LoRAUnitSpec,
+     PatchedUnitSpec,
+diff --git a/loader/streaming_builder.py b/loader/streaming_builder.py
+index c958141853f597a2d1b59dc7ed066b57a92d0537..bafaa39ec16d4fc43d75ff7ebf77f3ee09602cb1 100644
+--- a/loader/streaming_builder.py
++++ b/loader/streaming_builder.py
+@@ -10,24 +10,24 @@ from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+-from ltx_core.loader.buffers import host_bytes
+-from ltx_core.loader.checkpoint import CheckpointReader
+-from ltx_core.loader.lora import LoRAFuser, patched_keys
+-from ltx_core.loader.mapping import ExecutionCache, file_read_parts, fill_from_source
+-from ltx_core.loader.partitioners import DenseBlockPartitioner, Partitioner, apply_partitioners
+-from ltx_core.loader.placement import Placement
+-from ltx_core.loader.registry import ModelRegistry, RegistryKeys
+-from ltx_core.loader.sd_ops import SDKeyValueOperation, SDOps
+-from ltx_core.loader.shell import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.buffers import host_bytes
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.checkpoint import CheckpointReader
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.lora import LoRAFuser, patched_keys
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.mapping import ExecutionCache, file_read_parts, fill_from_source
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.partitioners import DenseBlockPartitioner, Partitioner, apply_partitioners
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.placement import Placement
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.registry import ModelRegistry, RegistryKeys
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDKeyValueOperation, SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.shell import (
+     create_shell,
+     materialize_nonpersistent_buffers,
+     validate_bound_model,
+     validate_shell_projection,
+ )
+-from ltx_core.loader.simple_builder import _target_device
+-from ltx_core.loader.state_entry import FusedKey, SourceKey, StateEntry
+-from ltx_core.loader.state_loader import StateLoader
+-from ltx_core.loader.streaming_delivery import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.simple_builder import _target_device
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.state_entry import FusedKey, SourceKey, StateEntry
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.state_loader import StateLoader
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.streaming_delivery import (
+     Readiness,
+     active_nbytes,
+     active_views,
+@@ -35,10 +35,10 @@ from ltx_core.loader.streaming_delivery import (
+     host_buffer_nbytes,
+     readiness_of,
+ )
+-from ltx_core.loader.streaming_model import StreamingModel
+-from ltx_core.loader.streaming_scheduler import BufferPool, StreamingScheduler
+-from ltx_core.loader.streaming_transport import make_transport
+-from ltx_core.loader.units import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.streaming_model import StreamingModel
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.streaming_scheduler import BufferPool, StreamingScheduler
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.streaming_transport import make_transport
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import (
+     LoadMapping,
+     LoRAUnitSpec,
+     MetadataUnit,
+@@ -49,7 +49,7 @@ from ltx_core.loader.units import (
+ )
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.loader.simple_builder import SimpleBuilder
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.simple_builder import SimpleBuilder
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+diff --git a/loader/streaming_delivery.py b/loader/streaming_delivery.py
+index f1109def398353438d41aa32e66aa331f769bb7b..072c1f8833f86f107b985d6c6a6fb58039e8f4a5 100644
+--- a/loader/streaming_delivery.py
++++ b/loader/streaming_delivery.py
+@@ -20,14 +20,14 @@ from enum import IntEnum
+ 
+ import torch
+ 
+-from ltx_core.loader.buffers import aligned_region_bytes, layout_bytes, unit_views
+-from ltx_core.loader.checkpoint import UnitSource
+-from ltx_core.loader.lora import LoRAFuser
+-from ltx_core.loader.mapping import ExecutionCache, file_read_parts, fill_from_source, transform
+-from ltx_core.loader.partitioners import stage_inputs
+-from ltx_core.loader.state_entry import StateEntry
+-from ltx_core.loader.streaming_transport import Transfer
+-from ltx_core.loader.units import PatchedUnitSpec, StateDictMetadata, TensorsUnit
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.buffers import aligned_region_bytes, layout_bytes, unit_views
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.checkpoint import UnitSource
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.lora import LoRAFuser
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.mapping import ExecutionCache, file_read_parts, fill_from_source, transform
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.partitioners import stage_inputs
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.state_entry import StateEntry
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.streaming_transport import Transfer
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import PatchedUnitSpec, StateDictMetadata, TensorsUnit
+ 
+ 
+ class Readiness(IntEnum):
+diff --git a/loader/streaming_model.py b/loader/streaming_model.py
+index ad0cf3554e3d13e64f587c32d442a1b53c60596f..47d544ab080051685ec991774d756ee486dd3204 100644
+--- a/loader/streaming_model.py
++++ b/loader/streaming_model.py
+@@ -6,8 +6,8 @@ from typing import Any
+ 
+ import torch
+ 
+-from ltx_core.loader.streaming_scheduler import StreamingScheduler
+-from ltx_core.loader.units import StreamedUnit
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.streaming_scheduler import StreamingScheduler
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import StreamedUnit
+ 
+ 
+ class StreamingModel(torch.nn.Module):
+diff --git a/loader/streaming_scheduler.py b/loader/streaming_scheduler.py
+index 2bad74189ae7ff978afa8a1702056b4692b530b9..4da7294e1b8d23cdb5f4d393a6293e9591c3893d 100644
+--- a/loader/streaming_scheduler.py
++++ b/loader/streaming_scheduler.py
+@@ -14,12 +14,12 @@ from threading import Event
+ 
+ import torch
+ 
+-from ltx_core.loader.buffers import aligned_region_bytes
+-from ltx_core.loader.checkpoint import UnitSource
+-from ltx_core.loader.lora import FLOAT_FUSE_RULE, LoRAFuser
+-from ltx_core.loader.mapping import ExecutionCache, file_read_parts
+-from ltx_core.loader.state_entry import StateEntry
+-from ltx_core.loader.streaming_delivery import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.buffers import aligned_region_bytes
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.checkpoint import UnitSource
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.lora import FLOAT_FUSE_RULE, LoRAFuser
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.mapping import ExecutionCache, file_read_parts
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.state_entry import StateEntry
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.streaming_delivery import (
+     Readiness,
+     Staged,
+     UnitViews,
+@@ -31,8 +31,8 @@ from ltx_core.loader.streaming_delivery import (
+     read_unit,
+     readiness_of,
+ )
+-from ltx_core.loader.streaming_transport import Completion, Transfer, Transport, make_transport
+-from ltx_core.loader.units import PatchedUnitSpec, TensorsUnit, UnitSpec
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.streaming_transport import Completion, Transfer, Transport, make_transport
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import PatchedUnitSpec, TensorsUnit, UnitSpec
+ 
+ 
+ class BufferPool:
+diff --git a/loader/units.py b/loader/units.py
+index 733868558e02215b0e79f02f51427ddb35cebfb1..b95d0b41d28c28ef28dfd01a31fc1478cbf5b655 100644
+--- a/loader/units.py
++++ b/loader/units.py
+@@ -15,7 +15,7 @@ from typing import NamedTuple, Protocol
+ 
+ import torch
+ 
+-from ltx_core.loader.sd_ops import ModelKeyGroup, SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import ModelKeyGroup, SDOps
+ 
+ UNIT_ALIGN = 512
+ """Byte alignment of every tensor in a packed unit layout: host owners and streaming buffers.
+diff --git a/loader/vocoder.py b/loader/vocoder.py
+index bd2c399d7ef1ddada46ff2e34286a5d88d972049..58e3ef1a497fdfb2caf9968cae7df308b2a8bc15 100644
+--- a/loader/vocoder.py
++++ b/loader/vocoder.py
+@@ -6,7 +6,7 @@ from collections.abc import Mapping
+ 
+ import torch
+ 
+-from ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
+ 
+ 
+ def _strip_one(key: str, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+diff --git a/modality_tiling.py b/modality_tiling.py
+index 6ad6f2868a0d0a18305ba7f475a959f92da8b930..e9925b16c08247569823e5e05a5c35ba9f955861 100644
+--- a/modality_tiling.py
++++ b/modality_tiling.py
+@@ -14,9 +14,9 @@ from functools import partial
+ 
+ import torch
+ 
+-from ltx_core.devices import upload_from_host
+-from ltx_core.model.transformer.modality import Modality
+-from ltx_core.tiling import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.devices import upload_from_host
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.modality import Modality
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+     DimensionTilingConfig,
+     SplitOperation,
+     Tile,
+@@ -26,8 +26,8 @@ from ltx_core.tiling import (
+     identity_mapping_operation,
+     split_at_seams,
+ )
+-from ltx_core.tools import VideoLatentTools
+-from ltx_core.types import VideoLatentShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import VideoLatentTools
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import VideoLatentShape
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/model/__init__.py b/model/__init__.py
+index cd2a259e0b3410329b2b6c9d6bfab2b2b9bc6376..19ac6370c510936fffcae82230bafa0011abbb45 100644
+--- a/model/__init__.py
++++ b/model/__init__.py
+@@ -1,7 +1,7 @@
+ """Model definitions for LTX-2."""
+ 
+-from ltx_core.model.disposable import Disposable, DisposableProtocol
+-from ltx_core.model.model_protocol import ModelConfigurator, ModelType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable, DisposableProtocol
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.model_protocol import ModelConfigurator, ModelType
+ 
+ __all__ = [
+     "Disposable",
+diff --git a/model/audio_vae/__init__.py b/model/audio_vae/__init__.py
+index c1cd3ac31e9f71e8dca2f1e786894dbab1ceae9c..78956e6ea97f2d573e5ed5cf501692b59d7ccf52 100644
+--- a/model/audio_vae/__init__.py
++++ b/model/audio_vae/__init__.py
+@@ -1,7 +1,7 @@
+ """Audio VAE model components."""
+ 
+-from ltx_core.model.audio_vae.audio_vae import AudioDecoder, AudioEncoder, decode_audio, encode_audio
+-from ltx_core.model.audio_vae.model_configurator import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.audio_vae import AudioDecoder, AudioEncoder, decode_audio, encode_audio
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.model_configurator import (
+     AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+     AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+     VOCODER_COMFY_KEYS_FILTER,
+@@ -9,8 +9,8 @@ from ltx_core.model.audio_vae.model_configurator import (
+     AudioEncoderConfigurator,
+     VocoderConfigurator,
+ )
+-from ltx_core.model.audio_vae.ops import AudioProcessor
+-from ltx_core.model.audio_vae.vocoder import Vocoder, VocoderWithBWE
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.ops import AudioProcessor
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.vocoder import Vocoder, VocoderWithBWE
+ 
+ __all__ = [
+     "AUDIO_VAE_DECODER_COMFY_KEYS_FILTER",
+diff --git a/model/audio_vae/attention.py b/model/audio_vae/attention.py
+index 46d5ebb29d340d75cd1907ce4e4bd7e14e80f394..675589ce4acf1689e8f4c96248ba2d905d1ca559 100644
+--- a/model/audio_vae/attention.py
++++ b/model/audio_vae/attention.py
+@@ -2,7 +2,7 @@ from enum import Enum
+ 
+ import torch
+ 
+-from ltx_core.model.common.normalization import NormType, build_normalization_layer
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import NormType, build_normalization_layer
+ 
+ 
+ class AttentionType(Enum):
+diff --git a/model/audio_vae/audio_vae.py b/model/audio_vae/audio_vae.py
+index c84dee3066e8830248f996f5af3e7843dbbd9cd4..178ce8d8eafcd64ced7896a1cbe8a521df1cfef1 100644
+--- a/model/audio_vae/audio_vae.py
++++ b/model/audio_vae/audio_vae.py
+@@ -3,18 +3,18 @@ from typing import Set, Tuple
+ import torch
+ import torch.nn.functional as F
+ 
+-from ltx_core.components.patchifiers import AudioPatchifier
+-from ltx_core.model.audio_vae.attention import AttentionType, make_attn
+-from ltx_core.model.audio_vae.causal_conv_2d import make_conv2d
+-from ltx_core.model.audio_vae.causality_axis import CausalityAxis
+-from ltx_core.model.audio_vae.downsample import build_downsampling_path
+-from ltx_core.model.audio_vae.ops import AudioProcessor, PerChannelStatistics
+-from ltx_core.model.audio_vae.resnet import ResnetBlock
+-from ltx_core.model.audio_vae.upsample import build_upsampling_path
+-from ltx_core.model.audio_vae.vocoder import Vocoder
+-from ltx_core.model.common.normalization import NormType, build_normalization_layer
+-from ltx_core.model.disposable import Disposable
+-from ltx_core.types import Audio, AudioLatentShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.components.patchifiers import AudioPatchifier
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.attention import AttentionType, make_attn
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.causal_conv_2d import make_conv2d
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.causality_axis import CausalityAxis
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.downsample import build_downsampling_path
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.ops import AudioProcessor, PerChannelStatistics
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.resnet import ResnetBlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.upsample import build_upsampling_path
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.vocoder import Vocoder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import NormType, build_normalization_layer
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import Audio, AudioLatentShape
+ 
+ LATENT_DOWNSAMPLE_FACTOR = 4
+ 
+diff --git a/model/audio_vae/causal_conv_2d.py b/model/audio_vae/causal_conv_2d.py
+index efb63861cd26ab6130ab88a0aeb7836d8e63c420..dab7e76fe9a24edc137d22c5d63ef0d2775e9772 100644
+--- a/model/audio_vae/causal_conv_2d.py
++++ b/model/audio_vae/causal_conv_2d.py
+@@ -1,7 +1,7 @@
+ import torch
+ import torch.nn.functional as F
+ 
+-from ltx_core.model.audio_vae.causality_axis import CausalityAxis
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.causality_axis import CausalityAxis
+ 
+ 
+ class CausalConv2d(torch.nn.Module):
+diff --git a/model/audio_vae/downsample.py b/model/audio_vae/downsample.py
+index 336735bcb4392bbce38015c2ed51a935b03c6260..0b319640aabba16b0adde2a7e867c3992f4e37d8 100644
+--- a/model/audio_vae/downsample.py
++++ b/model/audio_vae/downsample.py
+@@ -2,10 +2,10 @@ from typing import Set, Tuple
+ 
+ import torch
+ 
+-from ltx_core.model.audio_vae.attention import AttentionType, make_attn
+-from ltx_core.model.audio_vae.causality_axis import CausalityAxis
+-from ltx_core.model.audio_vae.resnet import ResnetBlock
+-from ltx_core.model.common.normalization import NormType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.attention import AttentionType, make_attn
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.causality_axis import CausalityAxis
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.resnet import ResnetBlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import NormType
+ 
+ 
+ class Downsample(torch.nn.Module):
+diff --git a/model/audio_vae/model_configurator.py b/model/audio_vae/model_configurator.py
+index 525700ae9e585f2bed4c53f3ce91c2c2d158ffd2..cc92c398a117fda2f5df50ef8978b35443756e6e 100644
+--- a/model/audio_vae/model_configurator.py
++++ b/model/audio_vae/model_configurator.py
+@@ -2,14 +2,14 @@ from collections.abc import Mapping
+ 
+ import torch
+ 
+-from ltx_core.loader.sd_ops import SDOps
+-from ltx_core.model.audio_vae.attention import AttentionType
+-from ltx_core.model.audio_vae.audio_vae import AudioDecoder, AudioEncoder
+-from ltx_core.model.audio_vae.causality_axis import CausalityAxis
+-from ltx_core.model.audio_vae.vocoder import MelSTFT, Vocoder, VocoderWithBWE
+-from ltx_core.model.common.normalization import NormType
+-from ltx_core.model.model_protocol import ModelConfigurator
+-from ltx_core.utils import check_config_value
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.attention import AttentionType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.audio_vae import AudioDecoder, AudioEncoder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.causality_axis import CausalityAxis
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.vocoder import MelSTFT, Vocoder, VocoderWithBWE
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import NormType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.model_protocol import ModelConfigurator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import check_config_value
+ 
+ 
+ def _vocoder_from_config(
+diff --git a/model/audio_vae/ops.py b/model/audio_vae/ops.py
+index d45fc1775cb068c26546d2250c736504ca290684..19fe564b68faf9d618a40d97074c0994a6965967 100644
+--- a/model/audio_vae/ops.py
++++ b/model/audio_vae/ops.py
+@@ -1,8 +1,7 @@
+ import torch
+-import torchaudio
+ from torch import nn
+ 
+-from ltx_core.types import Audio
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import Audio
+ 
+ 
+ class AudioProcessor(nn.Module):
+@@ -15,6 +14,8 @@ class AudioProcessor(nn.Module):
+         mel_hop_length: int,
+         n_fft: int,
+     ) -> None:
++        import torchaudio
++
+         super().__init__()
+         self.target_sample_rate = target_sample_rate
+         self.mel_transform = torchaudio.transforms.MelSpectrogram(
+@@ -37,6 +38,8 @@ class AudioProcessor(nn.Module):
+         """Resample audio to the processor's target sample rate if needed."""
+         if audio.sampling_rate == self.target_sample_rate:
+             return audio
++        import torchaudio
++
+         resampled = torchaudio.functional.resample(audio.waveform, audio.sampling_rate, self.target_sample_rate)
+         resampled = resampled.to(device=audio.waveform.device, dtype=audio.waveform.dtype)
+         return Audio(waveform=resampled, sampling_rate=self.target_sample_rate)
+diff --git a/model/audio_vae/resnet.py b/model/audio_vae/resnet.py
+index a529d6da8853daa1d0e2bb85e8fa2432dff5723e..5089b47e85ac00e3ccda0270f00db98d5f629d46 100644
+--- a/model/audio_vae/resnet.py
++++ b/model/audio_vae/resnet.py
+@@ -2,9 +2,9 @@ from typing import Tuple
+ 
+ import torch
+ 
+-from ltx_core.model.audio_vae.causal_conv_2d import make_conv2d
+-from ltx_core.model.audio_vae.causality_axis import CausalityAxis
+-from ltx_core.model.common.normalization import NormType, build_normalization_layer
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.causal_conv_2d import make_conv2d
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.causality_axis import CausalityAxis
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import NormType, build_normalization_layer
+ 
+ LRELU_SLOPE = 0.1
+ 
+diff --git a/model/audio_vae/upsample.py b/model/audio_vae/upsample.py
+index 3046e210ec62fef1118f88126b1e64ed7149a15f..917d928be9ea8a01a160960e10b320259e270a96 100644
+--- a/model/audio_vae/upsample.py
++++ b/model/audio_vae/upsample.py
+@@ -2,11 +2,11 @@ from typing import Set, Tuple
+ 
+ import torch
+ 
+-from ltx_core.model.audio_vae.attention import AttentionType, make_attn
+-from ltx_core.model.audio_vae.causal_conv_2d import make_conv2d
+-from ltx_core.model.audio_vae.causality_axis import CausalityAxis
+-from ltx_core.model.audio_vae.resnet import ResnetBlock
+-from ltx_core.model.common.normalization import NormType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.attention import AttentionType, make_attn
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.causal_conv_2d import make_conv2d
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.causality_axis import CausalityAxis
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.resnet import ResnetBlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import NormType
+ 
+ 
+ class Upsample(torch.nn.Module):
+diff --git a/model/audio_vae/vocoder.py b/model/audio_vae/vocoder.py
+index 9c607600c7459b1d9410a27145ad7aaa08dddc23..e764473276ddd5f68ae11566aced9b28dc05872d 100644
+--- a/model/audio_vae/vocoder.py
++++ b/model/audio_vae/vocoder.py
+@@ -8,8 +8,8 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
+-from ltx_core.model.audio_vae.resnet import LRELU_SLOPE, ResBlock1
+-from ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.audio_vae.resnet import LRELU_SLOPE, ResBlock1
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
+ 
+ 
+ def get_padding(kernel_size: int, dilation: int = 1) -> int:
+diff --git a/model/common/__init__.py b/model/common/__init__.py
+index 42713f7d0f4f42c3d9f7f01db55b24c5e3e2a165..1effb0ded13c1b00bbe853c3ddba39ba0437cb8b 100644
+--- a/model/common/__init__.py
++++ b/model/common/__init__.py
+@@ -1,6 +1,6 @@
+ """Common model utilities."""
+ 
+-from ltx_core.model.common.normalization import NormType, PixelNorm, build_normalization_layer
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import NormType, PixelNorm, build_normalization_layer
+ 
+ __all__ = [
+     "NormType",
+diff --git a/model/model_protocol.py b/model/model_protocol.py
+index 4d029d58bbddfabc130729745c7906435a36225e..096946ce653040fcdead0ee8cebcfa3338240a08 100644
+--- a/model/model_protocol.py
++++ b/model/model_protocol.py
+@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Protocol, TypeVar
+ import torch
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.guidance.perturbations import BatchedPerturbationConfig
+-    from ltx_core.model.transformer.modality import Modality
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import BatchedPerturbationConfig
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.modality import Modality
+ 
+ ModelType = TypeVar("ModelType", covariant=True, bound=torch.nn.Module)  # noqa: PLC0105
+ 
+diff --git a/model/transformer/__init__.py b/model/transformer/__init__.py
+index bd811f65becb5808c89cf98d1dec3d73256964a2..81995478d39dcf681124d07ec864b99de8a90463 100644
+--- a/model/transformer/__init__.py
++++ b/model/transformer/__init__.py
+@@ -1,8 +1,8 @@
+ """Transformer model components."""
+ 
+-from ltx_core.model.transformer.modality import Modality, TokenTimesteps
+-from ltx_core.model.transformer.model import LTXModel, X0Model
+-from ltx_core.model.transformer.model_configurator import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.modality import Modality, TokenTimesteps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.model import LTXModel, X0Model
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.model_configurator import (
+     LTXV_AUDIO_ONLY_MODEL_COMFY_RENAMING_MAP,
+     LTXV_MODEL_COMFY_RENAMING_MAP,
+     LTXAudioOnlyModelConfigurator,
+diff --git a/model/transformer/adaln.py b/model/transformer/adaln.py
+index 63200f899299220e822fefdfa5b2088f79da791e..806129b9bbc56bcc75e42d5dd6720c5b310b41aa 100644
+--- a/model/transformer/adaln.py
++++ b/model/transformer/adaln.py
+@@ -2,7 +2,7 @@ from typing import Optional, Tuple
+ 
+ import torch
+ 
+-from ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
+ 
+ # Number of AdaLN modulation parameters per transformer block.
+ # Base: 2 params (shift + scale) x 3 norms (self-attn, feed-forward, output).
+diff --git a/model/transformer/attention.py b/model/transformer/attention.py
+index 6ee0ca16e684d9b6ad35cd717b1e0cd6970be882..e03fbc46f1ac4119cd5ee310e163f1359f5a7d19 100644
+--- a/model/transformer/attention.py
++++ b/model/transformer/attention.py
+@@ -7,7 +7,7 @@ from typing import Protocol
+ import torch
+ from torch.nn.attention import SDPBackend, sdpa_kernel
+ 
+-from ltx_core.model.transformer.rope import LTXRopeType, apply_rotary_emb
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.rope import LTXRopeType, apply_rotary_emb
+ 
+ 
+ def _torch_default_sdpa_priority() -> list[SDPBackend]:
+diff --git a/model/transformer/compiling.py b/model/transformer/compiling.py
+index f657ec663dbcccdb28c6ae4853f7e7b7ec85b296..819f4cf77f4cc2bc687b0166744b80adbf5437da 100644
+--- a/model/transformer/compiling.py
++++ b/model/transformer/compiling.py
+@@ -11,13 +11,13 @@ from typing import Any, TypeVar
+ import torch
+ import torch.utils._pytree as pytree
+ 
+-from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.sd_ops import SDOps
+-from ltx_core.loader.simple_builder import SimpleBuilder
+-from ltx_core.model.transformer.cudagraph_capture import CudaGraphRunner
+-from ltx_core.model.transformer.model import LTXModel
+-from ltx_core.model.transformer.transformer_args import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.simple_builder import SimpleBuilder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.cudagraph_capture import CudaGraphRunner
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.model import LTXModel
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.transformer_args import (
+     AdaLNTimestepEmbedding,
+     BlockPerturbationsProcessor,
+     TransformerArgs,
+diff --git a/model/transformer/cudagraph_capture.py b/model/transformer/cudagraph_capture.py
+index 98dbd003fdfbb80df9c8d7ed6fb4bcaaae21ba2d..dae1369ba1c4c4af65464c457b4a52576c1d1cda 100644
+--- a/model/transformer/cudagraph_capture.py
++++ b/model/transformer/cudagraph_capture.py
+@@ -20,15 +20,15 @@ from typing import TYPE_CHECKING
+ import torch
+ import torch.utils._pytree as pytree
+ 
+-from ltx_core.guidance.perturbations import BatchedPerturbationConfig
+-from ltx_core.model.transformer.transformer_args import AdaLNTimestepEmbedding
+-from ltx_core.types import HostDeviceTensorPair
++from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import BatchedPerturbationConfig
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.transformer_args import AdaLNTimestepEmbedding
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import HostDeviceTensorPair
+ 
+ if TYPE_CHECKING:
+     # torch imports this under TYPE_CHECKING too (a runtime top-level import cycles).
+     from torch.cuda import _POOL_HANDLE
+ 
+-    from ltx_core.model.transformer.transformer_args import BlockPerturbationsProcessor, TransformerArgs
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.transformer_args import BlockPerturbationsProcessor, TransformerArgs
+ 
+ _BlockLoopFn = Callable[
+     ["TransformerArgs | None", "TransformerArgs | None", "BatchedPerturbationConfig"],
+diff --git a/model/transformer/feed_forward.py b/model/transformer/feed_forward.py
+index 95ebb2bc849c1957d1519e04f271b569ba355c35..acf476d2c0630cbe645390ffa3966625e5e318e3 100644
+--- a/model/transformer/feed_forward.py
++++ b/model/transformer/feed_forward.py
+@@ -1,6 +1,6 @@
+ import torch
+ 
+-from ltx_core.model.transformer.gelu_approx import GELUApprox
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.gelu_approx import GELUApprox
+ 
+ 
+ class FeedForward(torch.nn.Module):
+diff --git a/model/transformer/model.py b/model/transformer/model.py
+index 5def3b906497f451ec93a41560100d6cb2872cb7..09dd5d46daf7596858c3e272ea1bc4db03aab866 100644
+--- a/model/transformer/model.py
++++ b/model/transformer/model.py
+@@ -3,22 +3,22 @@ from enum import Enum
+ 
+ import torch
+ 
+-from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
+-from ltx_core.model.disposable import Disposable
+-from ltx_core.model.model_protocol import LTXModelProtocol
+-from ltx_core.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
+-from ltx_core.model.transformer.attention import AttentionOps, attention_label
+-from ltx_core.model.transformer.modality import Modality
+-from ltx_core.model.transformer.rope import LTXRopeType
+-from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
+-from ltx_core.model.transformer.transformer_args import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.model_protocol import LTXModelProtocol
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.attention import AttentionOps, attention_label
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.modality import Modality
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.rope import LTXRopeType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.transformer_args import (
+     AdaLNTimestepEmbedding,
+     BlockPerturbationsProcessor,
+     MultiModalTransformerArgsPreprocessor,
+     TransformerArgs,
+     TransformerArgsPreprocessor,
+ )
+-from ltx_core.utils import to_denoised
++from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import to_denoised
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/model/transformer/model_configurator.py b/model/transformer/model_configurator.py
+index b0086a7039d9be72bb76d1e0af1104177d505925..e8ab44c7324f0996bbe811fbcbac855214eaa749 100644
+--- a/model/transformer/model_configurator.py
++++ b/model/transformer/model_configurator.py
+@@ -1,11 +1,11 @@
+ import torch
+ 
+-from ltx_core.loader.sd_ops import SDOps
+-from ltx_core.model.model_protocol import ModelConfigurator
+-from ltx_core.model.transformer.model import LTXModel, LTXModelType
+-from ltx_core.model.transformer.rope import LTXRopeType
+-from ltx_core.model.transformer.text_projection import create_caption_projection
+-from ltx_core.utils import check_config_value
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.model_protocol import ModelConfigurator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.model import LTXModel, LTXModelType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.rope import LTXRopeType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.text_projection import create_caption_projection
++from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import check_config_value
+ 
+ 
+ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
+diff --git a/model/transformer/transformer.py b/model/transformer/transformer.py
+index 4d5983c8cf1028dd7ce8a6f287b4b3ea61b328f4..69cdea70f37cbbcdde0bc9f7e8a6a7851bc0d216 100644
+--- a/model/transformer/transformer.py
++++ b/model/transformer/transformer.py
+@@ -2,12 +2,12 @@ from dataclasses import dataclass, replace
+ 
+ import torch
+ 
+-from ltx_core.model.transformer.adaln import adaln_embedding_coefficient
+-from ltx_core.model.transformer.attention import Attention, AttentionCallable, AttentionOps
+-from ltx_core.model.transformer.feed_forward import FeedForward
+-from ltx_core.model.transformer.rope import LTXRopeType
+-from ltx_core.model.transformer.transformer_args import AdaLNTimestepEmbedding, TransformerArgs
+-from ltx_core.utils import rms_norm
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.adaln import adaln_embedding_coefficient
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.attention import Attention, AttentionCallable, AttentionOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.feed_forward import FeedForward
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.rope import LTXRopeType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.transformer_args import AdaLNTimestepEmbedding, TransformerArgs
++from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import rms_norm
+ 
+ 
+ @dataclass
+diff --git a/model/transformer/transformer_args.py b/model/transformer/transformer_args.py
+index f5ff2260a320d5fbdd2fffa28551e013973b1a69..c825a19dab4464d50287ee427594155e4e3e6dcb 100644
+--- a/model/transformer/transformer_args.py
++++ b/model/transformer/transformer_args.py
+@@ -3,10 +3,10 @@ from dataclasses import dataclass, replace
+ 
+ import torch
+ 
+-from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
+-from ltx_core.model.transformer.adaln import AdaLayerNormSingle
+-from ltx_core.model.transformer.modality import Modality
+-from ltx_core.model.transformer.rope import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.adaln import AdaLayerNormSingle
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.modality import Modality
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.rope import (
+     LTXRopeType,
+     generate_freq_grid_np,
+     generate_freq_grid_pytorch,
+diff --git a/model/upsampler/__init__.py b/model/upsampler/__init__.py
+index 4836bfc9f61368d82ff781a9c1ced835920914fb..52b853c37074773a1c035816b12a2cb8781d46d3 100644
+--- a/model/upsampler/__init__.py
++++ b/model/upsampler/__init__.py
+@@ -1,7 +1,7 @@
+ """Latent upsampler model components."""
+ 
+-from ltx_core.model.upsampler.model import LatentUpsampler, upsample_video
+-from ltx_core.model.upsampler.model_configurator import LatentUpsamplerConfigurator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.upsampler.model import LatentUpsampler, upsample_video
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.upsampler.model_configurator import LatentUpsamplerConfigurator
+ 
+ __all__ = [
+     "LatentUpsampler",
+diff --git a/model/upsampler/model.py b/model/upsampler/model.py
+index 48851d1be2b50c3fe5b05cbd775cd599cffc1668..fa79f94dacc84f41cd656623dab3190300356f69 100644
+--- a/model/upsampler/model.py
++++ b/model/upsampler/model.py
+@@ -1,11 +1,11 @@
+ import torch
+ from einops import rearrange
+ 
+-from ltx_core.model.disposable import Disposable
+-from ltx_core.model.upsampler.pixel_shuffle import PixelShuffleND
+-from ltx_core.model.upsampler.res_block import ResBlock
+-from ltx_core.model.upsampler.spatial_rational_resampler import SpatialRationalResampler
+-from ltx_core.model.video_vae import VideoEncoder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.upsampler.pixel_shuffle import PixelShuffleND
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.upsampler.res_block import ResBlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.upsampler.spatial_rational_resampler import SpatialRationalResampler
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae import VideoEncoder
+ 
+ 
+ class LatentUpsampler(torch.nn.Module, Disposable):
+diff --git a/model/upsampler/model_configurator.py b/model/upsampler/model_configurator.py
+index 9cbb925b2e7d93e8a47bf02c4e02954f574dee8a..230deea471fbd56d039cf72e9904bc30e89b09bd 100644
+--- a/model/upsampler/model_configurator.py
++++ b/model/upsampler/model_configurator.py
+@@ -1,5 +1,5 @@
+-from ltx_core.model.model_protocol import ModelConfigurator
+-from ltx_core.model.upsampler.model import LatentUpsampler
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.model_protocol import ModelConfigurator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.upsampler.model import LatentUpsampler
+ 
+ 
+ class LatentUpsamplerConfigurator(ModelConfigurator[LatentUpsampler]):
+diff --git a/model/upsampler/spatial_rational_resampler.py b/model/upsampler/spatial_rational_resampler.py
+index a4e055615d6635b4b0630b55d5e91968e2145d12..c95666d9c6ff24d59af1446596a3534deca26f38 100644
+--- a/model/upsampler/spatial_rational_resampler.py
++++ b/model/upsampler/spatial_rational_resampler.py
+@@ -3,8 +3,8 @@ from typing import Tuple
+ import torch
+ from einops import rearrange
+ 
+-from ltx_core.model.upsampler.blur_downsample import BlurDownsample
+-from ltx_core.model.upsampler.pixel_shuffle import PixelShuffleND
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.upsampler.blur_downsample import BlurDownsample
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.upsampler.pixel_shuffle import PixelShuffleND
+ 
+ 
+ def _rational_for_scale(scale: float) -> Tuple[int, int]:
+diff --git a/model/video_vae/__init__.py b/model/video_vae/__init__.py
+index a41fa6c1fbb62b9dcc069b2dcf557e96acbb1671..52694aa9fb36882ba5f3fa65e8b09d35b73aa8cf 100644
+--- a/model/video_vae/__init__.py
++++ b/model/video_vae/__init__.py
+@@ -1,32 +1,5 @@
+ """Video VAE package."""
+ 
+-from ltx_core.model.video_vae.memory_efficient_decode import CHANNELS_LAST_3D_WEIGHTS, MEMORY_EFFICIENT_DECODE
+-from ltx_core.model.video_vae.model_configurator import (
+-    DIFFUSION_VAE_DECODER_COMFY_KEYS_FILTER,
+-    VAE_DECODER_COMFY_KEYS_FILTER,
+-    VAE_ENCODER_COMFY_KEYS_FILTER,
+-    VideoDecoderConfigurator,
+-    VideoEncoderConfigurator,
+-    diffvae_tiling_geometry_from_vae_config,
+-    estimate_diffusion_decoder_weight_bytes,
+-    is_diffusion_video_vae,
+-    video_decoder_sd_ops_for_checkpoint,
+-)
+-from ltx_core.model.video_vae.video_vae import (
+-    ConvVideoDecoder,
+-    DiffusionVideoDecoder,
+-    VideoDecoder,
+-    VideoEncoder,
+-    get_video_chunks_number,
+-)
+-from ltx_core.tiling import (
+-    AUTO_TILING,
+-    AutoTiling,
+-    DimensionSizeConfig,
+-    PipelineTiling,
+-    TileSizeConfig,
+-    TilingConfig,
+-)
+ 
+ __all__ = [
+     "AUTO_TILING",
+@@ -52,3 +25,16 @@ __all__ = [
+     "is_diffusion_video_vae",
+     "video_decoder_sd_ops_for_checkpoint",
+ ]
++
++# Defer optional decoder dependencies until the requested decoder is used.
++import importlib
++
++_LAZY_EXPORTS = {'CHANNELS_LAST_3D_WEIGHTS': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.memory_efficient_decode', 'CHANNELS_LAST_3D_WEIGHTS'), 'MEMORY_EFFICIENT_DECODE': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.memory_efficient_decode', 'MEMORY_EFFICIENT_DECODE'), 'DIFFUSION_VAE_DECODER_COMFY_KEYS_FILTER': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.model_configurator', 'DIFFUSION_VAE_DECODER_COMFY_KEYS_FILTER'), 'VAE_DECODER_COMFY_KEYS_FILTER': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.model_configurator', 'VAE_DECODER_COMFY_KEYS_FILTER'), 'VAE_ENCODER_COMFY_KEYS_FILTER': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.model_configurator', 'VAE_ENCODER_COMFY_KEYS_FILTER'), 'VideoDecoderConfigurator': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.model_configurator', 'VideoDecoderConfigurator'), 'VideoEncoderConfigurator': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.model_configurator', 'VideoEncoderConfigurator'), 'diffvae_tiling_geometry_from_vae_config': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.model_configurator', 'diffvae_tiling_geometry_from_vae_config'), 'estimate_diffusion_decoder_weight_bytes': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.model_configurator', 'estimate_diffusion_decoder_weight_bytes'), 'is_diffusion_video_vae': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.model_configurator', 'is_diffusion_video_vae'), 'video_decoder_sd_ops_for_checkpoint': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.model_configurator', 'video_decoder_sd_ops_for_checkpoint'), 'ConvVideoDecoder': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae', 'ConvVideoDecoder'), 'DiffusionVideoDecoder': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae', 'DiffusionVideoDecoder'), 'VideoDecoder': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae', 'VideoDecoder'), 'VideoEncoder': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae', 'VideoEncoder'), 'get_video_chunks_number': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae', 'get_video_chunks_number'), 'AUTO_TILING': ('tensorrt_llm._torch.visual_gen.models.ltx_core.tiling', 'AUTO_TILING'), 'AutoTiling': ('tensorrt_llm._torch.visual_gen.models.ltx_core.tiling', 'AutoTiling'), 'DimensionSizeConfig': ('tensorrt_llm._torch.visual_gen.models.ltx_core.tiling', 'DimensionSizeConfig'), 'PipelineTiling': ('tensorrt_llm._torch.visual_gen.models.ltx_core.tiling', 'PipelineTiling'), 'TileSizeConfig': ('tensorrt_llm._torch.visual_gen.models.ltx_core.tiling', 'TileSizeConfig'), 'TilingConfig': ('tensorrt_llm._torch.visual_gen.models.ltx_core.tiling', 'TilingConfig')}
++
++def __getattr__(name):
++    if name not in _LAZY_EXPORTS:
++        raise AttributeError(name)
++    module, symbol = _LAZY_EXPORTS[name]
++    value = getattr(importlib.import_module(module), symbol)
++    globals()[name] = value
++    return value
+diff --git a/model/video_vae/attention.py b/model/video_vae/attention.py
+index af7d0bb3123cb9827a1ac93bc5441a7ca78f8de6..8b9320e9ac64c516c2b49cf3943a72f165de45c6 100644
+--- a/model/video_vae/attention.py
++++ b/model/video_vae/attention.py
+@@ -5,7 +5,7 @@ import torch.nn.functional as F
+ from einops import rearrange
+ from torch import nn
+ 
+-from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
+ 
+ 
+ class _RMSNorm2D(nn.Module):
+diff --git a/model/video_vae/conv_video_decoder.py b/model/video_vae/conv_video_decoder.py
+index b5372979e10142b2420f3b65cd7b95ced93f6321..477f0e455ab9e92c4280df78b724e5da57ea69be 100644
+--- a/model/video_vae/conv_video_decoder.py
++++ b/model/video_vae/conv_video_decoder.py
+@@ -10,25 +10,25 @@ import torch
+ from einops import rearrange
+ from torch import nn
+ 
+-from ltx_core.model.common.normalization import PixelNorm
+-from ltx_core.model.disposable import Disposable
+-from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
+-from ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
+-from ltx_core.model.video_vae.attention import AttnBlock3D
+-from ltx_core.model.video_vae.convolution import make_conv_nd
+-from ltx_core.model.video_vae.enums import NormLayerType, PaddingModeType
+-from ltx_core.model.video_vae.keyframes import DecodeKeyframes
+-from ltx_core.model.video_vae.ops import PerChannelStatistics, unpatchify
+-from ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
+-from ltx_core.model.video_vae.sampling import DepthToSpaceUpsample
+-from ltx_core.model.video_vae.video_vae import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import PixelNorm
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.attention import AttnBlock3D
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.convolution import make_conv_nd
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.enums import NormLayerType, PaddingModeType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import DecodeKeyframes
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.ops import PerChannelStatistics, unpatchify
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.sampling import DepthToSpaceUpsample
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import (
+     VideoDecoder,
+     iter_decoded_single_frames,
+     map_spatial_slice,
+     map_temporal_slice,
+     to_mapping_operation,
+ )
+-from ltx_core.tiling import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+     DEFAULT_MAPPING_OPERATION,
+     DEFAULT_SPLIT_OPERATION,
+     Tile,
+@@ -38,7 +38,7 @@ from ltx_core.tiling import (
+     masks_are_complementary,
+     scale_by_masks_1d,
+ )
+-from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
+ 
+ logger: logging.Logger = logging.getLogger(__name__)
+ 
+diff --git a/model/video_vae/convolution.py b/model/video_vae/convolution.py
+index 6003e3e5ce561be0565240f3fd317284e82f0f52..2f5898ecae2fa5d995488c91ed0b382e93b99efb 100644
+--- a/model/video_vae/convolution.py
++++ b/model/video_vae/convolution.py
+@@ -5,7 +5,7 @@ from einops import rearrange
+ from torch import nn
+ from torch.nn import functional as F
+ 
+-from ltx_core.model.video_vae.enums import PaddingModeType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.enums import PaddingModeType
+ 
+ 
+ def memory_format_of(t: torch.Tensor, prefer_channels_last_3d: bool = False) -> torch.memory_format:
+diff --git a/model/video_vae/diffusion_tiling.py b/model/video_vae/diffusion_tiling.py
+index 047fc5a824067b2aca4a8b6c9fd0aec17f34bdb8..f206ca6438a8ccad296f4663b50f10de92daeb1c 100644
+--- a/model/video_vae/diffusion_tiling.py
++++ b/model/video_vae/diffusion_tiling.py
+@@ -13,10 +13,10 @@ from typing import List, Literal, Sequence, Tuple
+ 
+ import torch
+ 
+-from ltx_core.color.yuv import frames_per_yuv_gemm
+-from ltx_core.model.video_vae.transformer.apply import resolve_attention_for_host
+-from ltx_core.model.video_vae.transformer.config import DiffVAEMode, NAttentionKind
+-from ltx_core.tiling import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.color.yuv import frames_per_yuv_gemm
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.apply import resolve_attention_for_host
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.config import DiffVAEMode, NAttentionKind
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+     DEFAULT_SPLIT_OPERATION,
+     DimensionInterval,
+     DimensionSizeConfig,
+@@ -29,7 +29,7 @@ from ltx_core.tiling import (
+     split_by_size,
+     untiled_mask_1d,
+ )
+-from ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -259,7 +259,7 @@ def stage4_feature_bytes(
+         raise ValueError(f"natten_trailing_pad_latent_frames must be >= 0, got {natten_trailing_pad_latent_frames}")
+ 
+     # Local import: types ↔ tiling cycle avoidance at module import time.
+-    from ltx_core.types import VIDEO_SCALE_FACTORS, VideoLatentShape, VideoPixelShape  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.types import VIDEO_SCALE_FACTORS, VideoLatentShape, VideoPixelShape  # noqa: PLC0415
+ 
+     latent = VideoLatentShape.from_pixel_shape(
+         VideoPixelShape(batch=1, frames=int(num_frames), height=int(height), width=int(width), fps=24.0),
+diff --git a/model/video_vae/diffusion_video_decoder.py b/model/video_vae/diffusion_video_decoder.py
+index 4c8d155b8ebb449d571b9304edb937d7f039e735..270e57f55bd022e79493c407c72b4615c3e2031f 100644
+--- a/model/video_vae/diffusion_video_decoder.py
++++ b/model/video_vae/diffusion_video_decoder.py
+@@ -10,11 +10,11 @@ from typing import Iterator, List, Literal, Tuple
+ import torch
+ from torch import nn
+ 
+-from ltx_core.devices import upload_from_host
+-from ltx_core.model.disposable import Disposable
+-from ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
+-from ltx_core.model.video_vae import decode_workspace, diffusion_tiling
+-from ltx_core.model.video_vae.keyframes import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.devices import upload_from_host
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae import decode_workspace, diffusion_tiling
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import (
+     DecodeKeyframes,
+     KeyframePlanes,
+     KeyframeStream,
+@@ -23,31 +23,31 @@ from ltx_core.model.video_vae.keyframes import (
+     remaining_time_strides,
+     upsample_keyframe_planes,
+ )
+-from ltx_core.model.video_vae.ops import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.ops import (
+     PerChannelStatistics,
+     apply_rms_norm_uint32_safe,
+     patchify_channels_last,
+     unpatchify,
+ )
+-from ltx_core.model.video_vae.transformer import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer import (
+     AdaLNZero,
+     ChannelLinear,
+     CombinedDiffusionNABlock,
+     LinearPixelShuffleUpsample,
+     NABlock,
+ )
+-from ltx_core.model.video_vae.transformer.rope_math import abs_rope_table_cache
+-from ltx_core.model.video_vae.transformer.stage5_tail import stage5_tail, stage5_tail_supported
+-from ltx_core.model.video_vae.video_vae import VideoDecoder, iter_decoded_single_frames
+-from ltx_core.tiling import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.rope_math import abs_rope_table_cache
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.stage5_tail import stage5_tail, stage5_tail_supported
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import VideoDecoder, iter_decoded_single_frames
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+     Tile,
+     TilingConfig,
+     group_tiles_by_temporal_slice,
+     masks_are_complementary,
+     scale_by_masks_1d,
+ )
+-from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
+-from ltx_core.utils import to_velocity
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import to_velocity
+ 
+ logger: logging.Logger = logging.getLogger(__name__)
+ 
+@@ -685,7 +685,7 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
+                 torch._dynamo.mark_dynamic(x, dim)
+                 torch._dynamo.mark_dynamic(stage4_feat, dim)
+ 
+-        from ltx_core.model.video_vae.transformer.dsl_kernels import DSLDiffusionBlockChain  # noqa: PLC0415
++        from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels import DSLDiffusionBlockChain  # noqa: PLC0415
+ 
+         if isinstance(self.diff_blocks, DSLDiffusionBlockChain):
+             # Ping-pong fused launches; same deferred (x, stage4_feat) contract.
+@@ -729,7 +729,7 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
+         # The DSL chain drives itself, so both streams recycle output buffers instead of
+         # allocating a volume per block per stream; the chunked blocks expose the same
+         # ``forward_x_ctx_with_keyframes``, so the fallback loop drives those.
+-        from ltx_core.model.video_vae.transformer.dsl_kernels import DSLDiffusionBlockChain  # noqa: PLC0415
++        from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels import DSLDiffusionBlockChain  # noqa: PLC0415
+ 
+         if isinstance(self.diff_blocks, DSLDiffusionBlockChain):
+             x, keyframe_x = self.diff_blocks.forward_x_ctx_with_keyframes(
+diff --git a/model/video_vae/keyframes.py b/model/video_vae/keyframes.py
+index fa6ee044b5f2956097f25a7e9fd410353ad043ea..c2642d638fc32e55efefc0766ac11dbc8d24e81a 100644
+--- a/model/video_vae/keyframes.py
++++ b/model/video_vae/keyframes.py
+@@ -20,8 +20,8 @@ from typing import NamedTuple, Sequence
+ import torch
+ from einops import rearrange
+ 
+-from ltx_core.devices import upload_from_host
+-from ltx_core.types import HostDeviceTensorPair
++from tensorrt_llm._torch.visual_gen.models.ltx_core.devices import upload_from_host
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import HostDeviceTensorPair
+ 
+ #: Keyframe planes visible to one video query (and video frames visible to one keyframe
+ #: query). Fixed at 2 upstream -- its backward kernel hardcodes at most two slots.
+diff --git a/model/video_vae/memory_efficient_decode.py b/model/video_vae/memory_efficient_decode.py
+index d217562b9d1f16bfd36d1a482603538aa9a8c9ac..df94911b5e565827b77073e8341dac74717591d6 100644
+--- a/model/video_vae/memory_efficient_decode.py
++++ b/model/video_vae/memory_efficient_decode.py
+@@ -19,8 +19,8 @@ from all four optimizations.  Causal mode benefits from optimizations 1, 3,
+ and 4; in-place conv (2) is skipped because the asymmetric causal padding
+ layout prevents clean in-place overwrites.
+ Usage via the ``ModuleOps`` pattern (preferred)::
+-    from ltx_core.loader.sd_ops import SDOps
+-    from ltx_core.model.video_vae import (
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae import (
+         CHANNELS_LAST_3D_WEIGHTS,
+         MEMORY_EFFICIENT_DECODE,
+         VAE_DECODER_COMFY_KEYS_FILTER,
+@@ -34,7 +34,7 @@ Usage via the ``ModuleOps`` pattern (preferred)::
+         (*decoder_builder.module_ops, MEMORY_EFFICIENT_DECODE)
+     ).with_sd_ops(sd_ops)
+ Or applied directly to an existing decoder::
+-    from ltx_core.model.video_vae.memory_efficient_decode import (
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.memory_efficient_decode import (
+         enable_memory_efficient_decode,
+     )
+     enable_memory_efficient_decode(decoder)
+@@ -54,16 +54,16 @@ from einops import rearrange
+ from torch import nn
+ from torch.nn import functional as F
+ 
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.sd_ops import SDOps
+-from ltx_core.model.common.normalization import PixelNorm
+-from ltx_core.model.video_vae.convolution import CausalConv3d, memory_format_of
+-from ltx_core.model.video_vae.ops import unpatchify
+-from ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
+-from ltx_core.model.video_vae.sampling import DepthToSpaceUpsample
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import PixelNorm
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.convolution import CausalConv3d, memory_format_of
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.ops import unpatchify
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.sampling import DepthToSpaceUpsample
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.video_vae import ConvVideoDecoder
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import ConvVideoDecoder
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -621,7 +621,7 @@ def enable_memory_efficient_decode(decoder: nn.Module) -> nn.Module:
+     that it can be restored later with :func:`disable_memory_efficient_decode`.
+     """
+     # Import here to avoid circular dependency at module level.
+-    from ltx_core.model.video_vae.video_vae import ConvVideoDecoder  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import ConvVideoDecoder  # noqa: PLC0415
+ 
+     if not isinstance(decoder, ConvVideoDecoder):
+         raise TypeError(f"Expected ConvVideoDecoder, got {type(decoder).__name__}")
+@@ -655,7 +655,7 @@ def disable_memory_efficient_decode(decoder: nn.Module) -> nn.Module:
+ 
+ def _is_video_decoder(model: nn.Module) -> bool:
+     """Matcher for the ``MEMORY_EFFICIENT_DECODE`` module op."""
+-    from ltx_core.model.video_vae.video_vae import ConvVideoDecoder  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import ConvVideoDecoder  # noqa: PLC0415
+ 
+     return isinstance(model, ConvVideoDecoder)
+ 
+diff --git a/model/video_vae/model_configurator.py b/model/video_vae/model_configurator.py
+index 52d50bd2b0e3117dcfad350faeebe9762bfa799e..298a305cc02dc5a595063b06ad330fc34491cb49 100644
+--- a/model/video_vae/model_configurator.py
++++ b/model/video_vae/model_configurator.py
+@@ -5,16 +5,16 @@ from pathlib import Path
+ import safetensors
+ import torch
+ 
+-from ltx_core.loader.checkpoint import CheckpointReader
+-from ltx_core.loader.sd_ops import KeyMatching, KeyReplacement, KeyValueOperation, SDOps
+-from ltx_core.model.model_protocol import ModelConfigurator
+-from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
+-from ltx_core.model.video_vae.transformer.dsl_kernels import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.checkpoint import CheckpointReader
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import KeyMatching, KeyReplacement, KeyValueOperation, SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.model_protocol import ModelConfigurator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels import (
+     FUSED_CTX_BIAS_BUFFER,
+     FUSED_CTX_WEIGHT_BUFFER,
+     NA_SOFTMAX_BOUND_BUFFER,
+ )
+-from ltx_core.model.video_vae.video_vae import ConvVideoDecoder, DiffusionVideoDecoder, VideoDecoder, VideoEncoder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import ConvVideoDecoder, DiffusionVideoDecoder, VideoDecoder, VideoEncoder
+ 
+ _CONV_VAE_CLASS_NAME = "CausalVideoAutoencoder"
+ 
+@@ -184,8 +184,8 @@ def diffvae_tiling_geometry_from_vae_config(config: dict) -> dict:
+     ``natten_trailing_pad_latent_frames``, ``out_channels``.
+     """
+     # Local import: avoid a hard cycle at module import time.
+-    from ltx_core.model.video_vae import diffusion_tiling as dt  # noqa: PLC0415
+-    from ltx_core.model.video_vae import diffusion_video_decoder as dvd  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae import diffusion_tiling as dt  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae import diffusion_video_decoder as dvd  # noqa: PLC0415
+ 
+     decoder_config = config.get("decoder", config)
+     stage_kernels = (
+diff --git a/model/video_vae/normalization.py b/model/video_vae/normalization.py
+index 45c003533a329d571e54cc483ccdcd2821883056..a0b24901d5137444c2fe3b7780de970d54f3d241 100644
+--- a/model/video_vae/normalization.py
++++ b/model/video_vae/normalization.py
+@@ -1,3 +1,3 @@
+-from ltx_core.model.common.normalization import PixelNorm, build_normalization_layer
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import PixelNorm, build_normalization_layer
+ 
+ __all__ = ["PixelNorm", "build_normalization_layer"]
+diff --git a/model/video_vae/resnet.py b/model/video_vae/resnet.py
+index 1423f2f2b62c602dfdbd31357520adcb87f604b1..f9814cbec716a214f95d66de7784ec74c899ba4f 100644
+--- a/model/video_vae/resnet.py
++++ b/model/video_vae/resnet.py
+@@ -3,10 +3,10 @@ from typing import Optional, Tuple, Union
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.common.normalization import PixelNorm
+-from ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
+-from ltx_core.model.video_vae.convolution import make_conv_nd, make_linear_nd
+-from ltx_core.model.video_vae.enums import NormLayerType, PaddingModeType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import PixelNorm
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.convolution import make_conv_nd, make_linear_nd
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.enums import NormLayerType, PaddingModeType
+ 
+ 
+ class ResnetBlock3D(nn.Module):
+diff --git a/model/video_vae/transformer/__init__.py b/model/video_vae/transformer/__init__.py
+index 19281aab84ff6ec0e497584571e9548f7c0e78ad..3dd8e549f4d76fa23e8f0d8fe25cae745259083f 100644
+--- a/model/video_vae/transformer/__init__.py
++++ b/model/video_vae/transformer/__init__.py
+@@ -1,6 +1,6 @@
+ """Neighborhood-Attention transformer building blocks for the diffusion video VAE."""
+ 
+-from ltx_core.model.video_vae.transformer.apply import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.apply import (
+     apply_diffvae_config,
+     apply_diffvae_mode,
+     build_compile_diffusion_decoder_op,
+@@ -8,57 +8,57 @@ from ltx_core.model.video_vae.transformer.apply import (
+     build_diffvae_mode_op,
+     resolve_attention_for_host,
+ )
+-from ltx_core.model.video_vae.transformer.attention import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import (
+     NAAttentionCallable,
+     NattenAttention,
+     NeighborhoodAttention3D,
+     configure_w_chunks,
+     natten_available,
+ )
+-from ltx_core.model.video_vae.transformer.blocks import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.blocks import (
+     DiffusionNABlock,
+     NABlock,
+ )
+-from ltx_core.model.video_vae.transformer.chunked.block import ChunkedDiffusionNABlock
+-from ltx_core.model.video_vae.transformer.combined.block import CombinedDiffusionNABlock
+-from ltx_core.model.video_vae.transformer.compiling import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.chunked.block import ChunkedDiffusionNABlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.combined.block import CombinedDiffusionNABlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.compiling import (
+     compile_diffusion_decoder,
+     configure_cutlass_fna_diffusion_decoder,
+     configure_natten_backend,
+ )
+-from ltx_core.model.video_vae.transformer.config import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.config import (
+     DiffVAEBlockKind,
+     DiffVAEConfig,
+     DiffVAEMode,
+     NAttentionKind,
+ )
+-from ltx_core.model.video_vae.transformer.dsl_kernels import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels import (
+     NA_SOFTMAX_BOUND_BUFFER,
+     DSLAttention,
+     DSLDiffusionNABlock,
+     enable_blackwell_dsl,
+     na_dsl_available,
+ )
+-from ltx_core.model.video_vae.transformer.fallback_na import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.fallback_na import (
+     EagerSdpaAttention,
+     TritonNaAttention,
+     triton_na_available,
+ )
+-from ltx_core.model.video_vae.transformer.layers import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.layers import (
+     AdaLNZero,
+     ChannelLinear,
+     LinearPixelShuffleUpsample,
+     modulate,
+ )
+-from ltx_core.model.video_vae.transformer.qkv import QKVProjections
+-from ltx_core.model.video_vae.transformer.rope import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.qkv import QKVProjections
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.rope import (
+     apply_abs_rope,
+     apply_abs_rope_slab,
+     configure_abs_rope,
+     default_rope_dim_split,
+     rope_inv_freqs,
+ )
+-from ltx_core.model.video_vae.transformer.swiglu import SwiGLU, SwiGLUTileSpec, configure_swiglu_tile
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.swiglu import SwiGLU, SwiGLUTileSpec, configure_swiglu_tile
+ 
+ __all__ = [
+     "NA_SOFTMAX_BOUND_BUFFER",
+diff --git a/model/video_vae/transformer/apply.py b/model/video_vae/transformer/apply.py
+index bb86c887fd0dbb351c786688724e609253468e66..a096e9931d7181cc7c6b14bce433ee2d396c6bba 100644
+--- a/model/video_vae/transformer/apply.py
++++ b/model/video_vae/transformer/apply.py
+@@ -13,28 +13,28 @@ from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.model.transformer.compiling import CompilationConfig, _config_fingerprint
+-from ltx_core.model.video_vae.transformer.attention import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.compiling import CompilationConfig, _config_fingerprint
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import (
+     NeighborhoodAttention3D,
+     configure_w_chunks,
+     natten_available,
+ )
+-from ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
+-from ltx_core.model.video_vae.transformer.chunked.block import ChunkedDiffusionNABlock
+-from ltx_core.model.video_vae.transformer.combined.block import CombinedDiffusionNABlock
+-from ltx_core.model.video_vae.transformer.compiling import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.chunked.block import ChunkedDiffusionNABlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.combined.block import CombinedDiffusionNABlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.compiling import (
+     compile_diffusion_decoder,
+     configure_natten_backend,
+ )
+-from ltx_core.model.video_vae.transformer.config import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.config import (
+     DiffVAEBlockKind,
+     DiffVAEConfig,
+     DiffVAEMode,
+     NAttentionKind,
+ )
+-from ltx_core.model.video_vae.transformer.dsl_kernels.block import DSLDiffusionNABlock
+-from ltx_core.model.video_vae.transformer.fallback_na import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.block import DSLDiffusionNABlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.fallback_na import (
+     EagerSdpaAttention,
+     TritonNaAttention,
+     joint_na_attention,
+@@ -43,7 +43,7 @@ from ltx_core.model.video_vae.transformer.fallback_na import (
+ )
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.video_vae import DiffusionVideoDecoder
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import DiffusionVideoDecoder
+ 
+ 
+ def _block_cls_for(cfg: DiffVAEConfig) -> type[DiffusionNABlock]:
+@@ -113,7 +113,7 @@ def _install_joint_attention(decoder: DiffusionVideoDecoder, cfg: DiffVAEConfig)
+     """
+     joint = joint_na_attention()
+     if cfg.attention is NAttentionKind.BLACKWELL_DSL:
+-        from ltx_core.model.video_vae.transformer.dsl_kernels import DSLJointAttention  # noqa: PLC0415
++        from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels import DSLJointAttention  # noqa: PLC0415
+ 
+         joint = DSLJointAttention(joint)
+     for module in decoder.modules():
+@@ -123,7 +123,7 @@ def _install_joint_attention(decoder: DiffusionVideoDecoder, cfg: DiffVAEConfig)
+ 
+ def _install_attention(decoder: DiffusionVideoDecoder, cfg: DiffVAEConfig) -> None:
+     if cfg.attention is NAttentionKind.BLACKWELL_DSL:
+-        from ltx_core.model.video_vae.transformer.dsl_kernels.apply_dsl import (  # noqa: PLC0415
++        from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.apply_dsl import (  # noqa: PLC0415
+             enable_blackwell_dsl,
+         )
+ 
+@@ -185,7 +185,7 @@ def apply_diffvae_mode(
+ 
+ 
+ def _diffusion_decoder_matcher(model: torch.nn.Module) -> bool:
+-    from ltx_core.model.video_vae.video_vae import DiffusionVideoDecoder  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import DiffusionVideoDecoder  # noqa: PLC0415
+ 
+     return isinstance(model, DiffusionVideoDecoder)
+ 
+diff --git a/model/video_vae/transformer/attention.py b/model/video_vae/transformer/attention.py
+index 85b50874cb556b40c545a77e850fe0a84f4c821e..f7ea2c63cd27f47bad732e7e88218304fe5aef31 100644
+--- a/model/video_vae/transformer/attention.py
++++ b/model/video_vae/transformer/attention.py
+@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Protocol
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.video_vae.transformer.det_attn_rope import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.det_attn_rope import (
+     det_project_qkv_eager,
+     det_project_qkv_lean,
+     det_qkv_rope,
+@@ -21,9 +21,9 @@ from ltx_core.model.video_vae.transformer.det_attn_rope import (
+     det_rope_qk_,
+     linear_into_phase_buffer,
+ )
+-from ltx_core.model.video_vae.transformer.det_rms_norm import DetRMSNorm
+-from ltx_core.model.video_vae.transformer.qkv import QKVProjections
+-from ltx_core.model.video_vae.transformer.rope_math import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.det_rms_norm import DetRMSNorm
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.qkv import QKVProjections
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.rope_math import (
+     DEFAULT_ABS_ROPE_NUM_TILES,
+     AbsRopeTableCache,
+     default_rope_dim_split,
+@@ -31,7 +31,7 @@ from ltx_core.model.video_vae.transformer.rope_math import (
+ )
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.keyframes import KeyframePlanes, KeyframeStream
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KeyframePlanes, KeyframeStream
+ 
+ try:
+     import natten
+diff --git a/model/video_vae/transformer/blocks.py b/model/video_vae/transformer/blocks.py
+index 4acf09251ab78bce440b9818666094fbf378d62f..b4b22349b28c8ecd531f3c33f815c742d6f70657 100644
+--- a/model/video_vae/transformer/blocks.py
++++ b/model/video_vae/transformer/blocks.py
+@@ -12,14 +12,14 @@ from typing import TYPE_CHECKING
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.video_vae import decode_workspace
+-from ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D
+-from ltx_core.model.video_vae.transformer.det_rms_norm import DetRMSNorm
+-from ltx_core.model.video_vae.transformer.layers import AdaLNZero
+-from ltx_core.model.video_vae.transformer.swiglu import SwiGLU, plain_mlp, plain_mlp_accumulate
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae import decode_workspace
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.det_rms_norm import DetRMSNorm
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.layers import AdaLNZero
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.swiglu import SwiGLU, plain_mlp, plain_mlp_accumulate
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.keyframes import KeyframeStream
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KeyframeStream
+ 
+ __all__ = [
+     "DiffusionNABlock",
+diff --git a/model/video_vae/transformer/chunked/attn.py b/model/video_vae/transformer/chunked/attn.py
+index 32cd02973f361e28989231c3fbb416d3954ed7a5..a389848f5f77dfd8a7901cbfe3c10e1815b24f6f 100644
+--- a/model/video_vae/transformer/chunked/attn.py
++++ b/model/video_vae/transformer/chunked/attn.py
+@@ -25,21 +25,21 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
+-from ltx_core.model.video_vae.keyframes import KeyframePlanes
+-from ltx_core.model.video_vae.ops import rms_norm_uint32_safe
+-from ltx_core.model.video_vae.transformer.attention import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KeyframePlanes
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.ops import rms_norm_uint32_safe
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import (
+     JointNAAttentionCallable,
+     NAAttentionCallable,
+     NattenAttention,
+     NeighborhoodAttention3D,
+     natten_available,
+ )
+-from ltx_core.model.video_vae.transformer.rope_math import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.rope_math import (
+     h_positions,
+     rot_abs_axis_impl,
+     t_positions,
+ )
+-from ltx_core.types import HostDeviceTensorPair
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import HostDeviceTensorPair
+ 
+ # Bound by ``chunked()`` for the duration of the opaque custom_op. Dynamo only sees
+ # the op call site; the Python body reads these at runtime.
+diff --git a/model/video_vae/transformer/chunked/block.py b/model/video_vae/transformer/chunked/block.py
+index 924a593ab3470ac4cc6fe6838a8acf8ebd4a4f5e..5d8ac4e740885896d3a0643fcb1554787df6119b 100644
+--- a/model/video_vae/transformer/chunked/block.py
++++ b/model/video_vae/transformer/chunked/block.py
+@@ -6,18 +6,18 @@ from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+-from ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
+-from ltx_core.model.video_vae.transformer.chunked.attn import chunked as residual_attn
+-from ltx_core.model.video_vae.transformer.chunked.attn import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.chunked.attn import chunked as residual_attn
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.chunked.attn import (
+     chunked_with_keyframes as residual_attn_with_keyframes,
+ )
+-from ltx_core.model.video_vae.transformer.chunked.context import deferred as inject_context
+-from ltx_core.model.video_vae.transformer.chunked.context import deferred_keyframes as inject_keyframe_context
+-from ltx_core.model.video_vae.transformer.chunked.mlp import residual_modulating_mlp
+-from ltx_core.model.video_vae.transformer.layers import LinearPixelShuffleUpsample
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.chunked.context import deferred as inject_context
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.chunked.context import deferred_keyframes as inject_keyframe_context
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.chunked.mlp import residual_modulating_mlp
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.layers import LinearPixelShuffleUpsample
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.keyframes import KeyframePlanes
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KeyframePlanes
+ 
+ 
+ class ChunkedDiffusionNABlock(DiffusionNABlock):
+diff --git a/model/video_vae/transformer/chunked/mlp.py b/model/video_vae/transformer/chunked/mlp.py
+index 515c1b1d81572d17ea7667c523a89c71e4d6a636..933abc730503857e48f58930d5c5d7d0c16f591e 100644
+--- a/model/video_vae/transformer/chunked/mlp.py
++++ b/model/video_vae/transformer/chunked/mlp.py
+@@ -6,8 +6,8 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
+-from ltx_core.model.video_vae.ops import rms_norm_uint32_safe
+-from ltx_core.model.video_vae.transformer.swiglu import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.ops import rms_norm_uint32_safe
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.swiglu import (
+     SwiGLUTileSpec,
+     _fused_gate_up_swiglu_triton,
+     _fused_up_mul_torch,
+@@ -18,7 +18,7 @@ from ltx_core.model.video_vae.transformer.swiglu import (
+     token_intervals,
+     triton_swiglu_available,
+ )
+-from ltx_core.tiling import DimensionInterval
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import DimensionInterval
+ 
+ 
+ def _channel_affine_bc(scale: torch.Tensor, shift: torch.Tensor, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+diff --git a/model/video_vae/transformer/combined/attn.py b/model/video_vae/transformer/combined/attn.py
+index 8b1e3396ceec62e2da9d53eb4beae7259a549c9b..a2f2a931b4fca5194f66a2fa652a00e397f086f1 100644
+--- a/model/video_vae/transformer/combined/attn.py
++++ b/model/video_vae/transformer/combined/attn.py
+@@ -10,16 +10,16 @@ from typing import TYPE_CHECKING
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.video_vae.ops import apply_rms_norm_uint32_safe
+-from ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D
+-from ltx_core.model.video_vae.transformer.rope_math import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.ops import apply_rms_norm_uint32_safe
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.rope_math import (
+     h_positions,
+     rot_abs_axis_impl,
+     t_positions,
+ )
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.keyframes import KeyframePlanes
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KeyframePlanes
+ 
+ # Transparent path: innermost per-axis rotation is a nested compile region.
+ _rot_abs_axis = torch.compiler.nested_compile_region(rot_abs_axis_impl)
+diff --git a/model/video_vae/transformer/combined/block.py b/model/video_vae/transformer/combined/block.py
+index c73fa9067ffb39d4151e630efe3ed9a611d57ff8..bb804eac617d2367d595a366e7984198f2ffccc3 100644
+--- a/model/video_vae/transformer/combined/block.py
++++ b/model/video_vae/transformer/combined/block.py
+@@ -6,14 +6,14 @@ from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+-from ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
+-from ltx_core.model.video_vae.transformer.combined.attn import full as residual_attn
+-from ltx_core.model.video_vae.transformer.combined.attn import full_with_keyframes as residual_attn_with_keyframes
+-from ltx_core.model.video_vae.transformer.combined.context import combined as inject_context
+-from ltx_core.model.video_vae.transformer.combined.mlp import residual_mlp
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.combined.attn import full as residual_attn
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.combined.attn import full_with_keyframes as residual_attn_with_keyframes
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.combined.context import combined as inject_context
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.combined.mlp import residual_mlp
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.keyframes import KeyframePlanes
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KeyframePlanes
+ 
+ 
+ class CombinedDiffusionNABlock(DiffusionNABlock):
+diff --git a/model/video_vae/transformer/combined/mlp.py b/model/video_vae/transformer/combined/mlp.py
+index e7066108d3cbe591ae9d7412418becadbba2289e..03f6026bbc2dbf8798ea3abe3030bec98f3e0d19 100644
+--- a/model/video_vae/transformer/combined/mlp.py
++++ b/model/video_vae/transformer/combined/mlp.py
+@@ -5,9 +5,9 @@ from __future__ import annotations
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.video_vae.ops import apply_rms_norm_uint32_safe
+-from ltx_core.model.video_vae.transformer.layers import modulate
+-from ltx_core.model.video_vae.transformer.swiglu import SwiGLUTileSpec, swiglu_tiled
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.ops import apply_rms_norm_uint32_safe
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.layers import modulate
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.swiglu import SwiGLUTileSpec, swiglu_tiled
+ 
+ 
+ def residual_mlp(
+diff --git a/model/video_vae/transformer/compiling.py b/model/video_vae/transformer/compiling.py
+index 20a766d3d3dd5cea6285bd51aab0682d5c17912d..21fee846f4937d951a802f1640b42fc44e657e89 100644
+--- a/model/video_vae/transformer/compiling.py
++++ b/model/video_vae/transformer/compiling.py
+@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING, Any, Callable
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.transformer.compiling import CompilationConfig
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.compiling import CompilationConfig
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.video_vae import DiffusionVideoDecoder
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import DiffusionVideoDecoder
+ 
+ 
+ def configure_natten_backend(module_root: nn.Module, backend: str | None) -> None:
+@@ -20,7 +20,7 @@ def configure_natten_backend(module_root: nn.Module, backend: str | None) -> Non
+     the pin onto ``natten_backend`` for introspection. ``backend=None`` restores NATTEN
+     auto-selection.
+     """
+-    from ltx_core.model.video_vae.transformer.attention import (  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import (  # noqa: PLC0415
+         NattenAttention,
+         NeighborhoodAttention3D,
+     )
+@@ -73,9 +73,9 @@ def compile_diffusion_decoder(
+         ):
+             return torch.compile(fn, **compile_kwargs)
+ 
+-    from ltx_core.model.video_vae.transformer.chunked.block import ChunkedDiffusionNABlock  # noqa: PLC0415
+-    from ltx_core.model.video_vae.transformer.combined.block import CombinedDiffusionNABlock  # noqa: PLC0415
+-    from ltx_core.model.video_vae.transformer.dsl_kernels.block import DSLDiffusionNABlock  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.chunked.block import ChunkedDiffusionNABlock  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.combined.block import CombinedDiffusionNABlock  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.block import DSLDiffusionNABlock  # noqa: PLC0415
+ 
+     if compile_det_stages:
+         for stage_blocks in decoder.det_stages:
+diff --git a/model/video_vae/transformer/det_attn_rope.py b/model/video_vae/transformer/det_attn_rope.py
+index 1d1dcfa58bba3808819b5d9dff8e441f0ef94621..06a775d00dc4a6459ff82e73dfc12bf8df8fdb9f 100644
+--- a/model/video_vae/transformer/det_attn_rope.py
++++ b/model/video_vae/transformer/det_attn_rope.py
+@@ -23,9 +23,9 @@ except ImportError:  # ltx-kernels is optional; the slab path below covers every
+     abs_rope_supported = None
+     run_abs_rope = None
+ 
+-from ltx_core.model.video_vae import decode_workspace
+-from ltx_core.model.video_vae.ops import apply_rms_norm_uint32_safe
+-from ltx_core.model.video_vae.transformer.rope_math import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae import decode_workspace
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.ops import apply_rms_norm_uint32_safe
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.rope_math import (
+     DEFAULT_ABS_ROPE_NUM_TILES,
+     AbsRopeTableCache,
+     RopeAxis,
+diff --git a/model/video_vae/transformer/det_rms_norm.py b/model/video_vae/transformer/det_rms_norm.py
+index 0082e6520884006f887b66596aecf37b365e324d..3ccc4679b05a1f10e0d9b0980dc79c1aea3e05c2 100644
+--- a/model/video_vae/transformer/det_rms_norm.py
++++ b/model/video_vae/transformer/det_rms_norm.py
+@@ -5,9 +5,9 @@ from __future__ import annotations
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.video_vae import decode_workspace
+-from ltx_core.model.video_vae.ops import apply_rms_norm_uint32_safe
+-from ltx_core.model.video_vae.transformer.row_rms_norm import row_rms_norm_, row_rms_norm_supported
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae import decode_workspace
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.ops import apply_rms_norm_uint32_safe
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.row_rms_norm import row_rms_norm_, row_rms_norm_supported
+ 
+ # Rows of a Q/K volume (or of a block input) normalised per chunk when the row kernel does not apply.
+ _NORM_CHUNK_ROWS: int = 1 << 22
+diff --git a/model/video_vae/transformer/dsl_kernels/__init__.py b/model/video_vae/transformer/dsl_kernels/__init__.py
+index 39a46d7fc6df667ceaeaebf24c9e12bbc95de3df..8fed58fb8066f61d90260acada83851c53a5796c 100644
+--- a/model/video_vae/transformer/dsl_kernels/__init__.py
++++ b/model/video_vae/transformer/dsl_kernels/__init__.py
+@@ -1,26 +1,26 @@
+ """Blackwell CuTe DSL pathway for DiffVAE (deferred stage-4 + fused stage-5)."""
+ 
+-from ltx_core.model.video_vae.transformer.dsl_kernels.apply_dsl import enable_blackwell_dsl
+-from ltx_core.model.video_vae.transformer.dsl_kernels.attn import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.apply_dsl import enable_blackwell_dsl
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.attn import (
+     NA_SOFTMAX_BOUND_BUFFER,
+     DSLAttention,
+     na_attention_dsl,
+     na_dsl_available,
+     require_softmax_bound,
+ )
+-from ltx_core.model.video_vae.transformer.dsl_kernels.block import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.block import (
+     FUSED_CTX_BIAS_BUFFER,
+     FUSED_CTX_WEIGHT_BUFFER,
+     DSLDiffusionNABlock,
+     fused_na_block_supported,
+ )
+-from ltx_core.model.video_vae.transformer.dsl_kernels.chain import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.chain import (
+     DSLChannelLinear,
+     DSLDiffusionBlockChain,
+     alloc_block_volume,
+     linear_into_block_volume,
+ )
+-from ltx_core.model.video_vae.transformer.dsl_kernels.joint_attn import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.joint_attn import (
+     DSLJointAttention,
+     dsl_joint_supported,
+     na_attention_joint_dsl,
+diff --git a/model/video_vae/transformer/dsl_kernels/apply_dsl.py b/model/video_vae/transformer/dsl_kernels/apply_dsl.py
+index 7bb509be85459818886e3dd09139a8f327bee99c..2c7a2078a3987b2aee2876461dc567c794f253c9 100644
+--- a/model/video_vae/transformer/dsl_kernels/apply_dsl.py
++++ b/model/video_vae/transformer/dsl_kernels/apply_dsl.py
+@@ -7,19 +7,19 @@ import math
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D
+-from ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
+-from ltx_core.model.video_vae.transformer.dsl_kernels.attn import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.attn import (
+     NA_SOFTMAX_BOUND_BUFFER,
+     DSLAttention,
+ )
+-from ltx_core.model.video_vae.transformer.dsl_kernels.block import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.block import (
+     FUSED_CTX_BIAS_BUFFER,
+     FUSED_CTX_WEIGHT_BUFFER,
+     DSLDiffusionNABlock,
+ )
+-from ltx_core.model.video_vae.transformer.dsl_kernels.chain import DSLChannelLinear, DSLDiffusionBlockChain
+-from ltx_core.model.video_vae.transformer.layers import ChannelLinear
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.chain import DSLChannelLinear, DSLDiffusionBlockChain
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.layers import ChannelLinear
+ 
+ 
+ def enable_blackwell_dsl(decoder: nn.Module) -> nn.Module:
+diff --git a/model/video_vae/transformer/dsl_kernels/attn.py b/model/video_vae/transformer/dsl_kernels/attn.py
+index 2f17c943794394b6e566d368ec995d5c7dc1af44..1641668ee6caa87c9bb0491f26a5ab7f53a33ee7 100644
+--- a/model/video_vae/transformer/dsl_kernels/attn.py
++++ b/model/video_vae/transformer/dsl_kernels/attn.py
+@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+-from ltx_core.model.video_vae.transformer.attention import NAAttentionCallable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import NAAttentionCallable
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D
+ 
+ #: Buffer holding the kernels' softmax bound. Registered by BLACKWELL_DSL apply
+ #: (NaN sentinel) and filled by DiffVAE decoder SDOps (``na_dsl_kernel=True``).
+diff --git a/model/video_vae/transformer/dsl_kernels/block.py b/model/video_vae/transformer/dsl_kernels/block.py
+index 2d71a45bef86299361f22388c8e8d3551e9e1149..a969eb14e4bfa34307df70f382284cdb167ccf04 100644
+--- a/model/video_vae/transformer/dsl_kernels/block.py
++++ b/model/video_vae/transformer/dsl_kernels/block.py
+@@ -6,11 +6,11 @@ from typing import TYPE_CHECKING, NamedTuple
+ 
+ import torch
+ 
+-from ltx_core.devices import upload_from_host
+-from ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
+-from ltx_core.model.video_vae.transformer.dsl_kernels.attn import require_softmax_bound
+-from ltx_core.model.video_vae.transformer.layers import AdaLNZero, LinearPixelShuffleUpsample
+-from ltx_core.types import HostDeviceTensorPair
++from tensorrt_llm._torch.visual_gen.models.ltx_core.devices import upload_from_host
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.attn import require_softmax_bound
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.layers import AdaLNZero, LinearPixelShuffleUpsample
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import HostDeviceTensorPair
+ 
+ #: The stage-4 upsample fused into ``context_proj``, packed by SDOps as one Linear per
+ #: pixel-shuffle subpixel: ``(P * C, Ctx)`` / ``(P * C,)``. Registered empty by
+@@ -19,7 +19,7 @@ FUSED_CTX_WEIGHT_BUFFER = "fused_ctx_weight"
+ FUSED_CTX_BIAS_BUFFER = "fused_ctx_bias"
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.keyframes import KeyframePlanes
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KeyframePlanes
+ 
+ 
+ class LiveKeyframes(NamedTuple):
+diff --git a/model/video_vae/transformer/dsl_kernels/chain.py b/model/video_vae/transformer/dsl_kernels/chain.py
+index eb177d136277bbff3197a58c97e7139df7838348..82a49ba72f653b5806f04db47c0578817b9883ae 100644
+--- a/model/video_vae/transformer/dsl_kernels/chain.py
++++ b/model/video_vae/transformer/dsl_kernels/chain.py
+@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.video_vae import decode_workspace
+-from ltx_core.model.video_vae.transformer.layers import ChannelLinear
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae import decode_workspace
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.layers import ChannelLinear
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.keyframes import KeyframePlanes
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KeyframePlanes
+ 
+ 
+ def alloc_block_volume(shape: tuple[int, ...], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+diff --git a/model/video_vae/transformer/dsl_kernels/joint_attn.py b/model/video_vae/transformer/dsl_kernels/joint_attn.py
+index a751cc529db996ee0051fe7f5e345122b75af08e..5adce62e070aeed2565ddcec43dd090b016c9537 100644
+--- a/model/video_vae/transformer/dsl_kernels/joint_attn.py
++++ b/model/video_vae/transformer/dsl_kernels/joint_attn.py
+@@ -26,18 +26,18 @@ from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+-from ltx_core.model.video_vae.transformer.attention import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import (
+     JointNAAttentionCallable,
+     NeighborhoodAttention3D,
+ )
+-from ltx_core.model.video_vae.transformer.dsl_kernels.attn import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.dsl_kernels.attn import (
+     NA_SOFTMAX_BOUND_BUFFER,
+     na_dsl_available,
+     require_softmax_bound,
+ )
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.keyframes import KeyframePlanes
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KeyframePlanes
+ 
+ 
+ @torch.library.custom_op("ltx_core::na_attention_joint_dsl", mutates_args=())
+@@ -62,7 +62,7 @@ def na_attention_joint_dsl(  # noqa: PLR0913 -- a custom_op schema takes only fl
+     from ltx_kernels.vae import run_na_attention_bound  # noqa: PLC0415
+     from ltx_kernels.vae.keyframe_slots import nearest_keyframe_slots  # noqa: PLC0415
+ 
+-    from ltx_core.devices import upload_from_host  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.devices import upload_from_host  # noqa: PLC0415
+ 
+     planes = int(keyframe_q.shape[1])
+     # Plane selection and slot tables are host work; free when the times and validity arrive on
+@@ -155,7 +155,7 @@ class DSLJointAttention(JointNAAttentionCallable):
+         keyframe_v: torch.Tensor,
+         keyframe_planes: KeyframePlanes,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        from ltx_core.model.video_vae.keyframes import KEYFRAME_CONTEXT_SLOTS  # noqa: PLC0415
++        from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KEYFRAME_CONTEXT_SLOTS  # noqa: PLC0415
+ 
+         if not self._available or not dsl_joint_supported(attn, q):
+             return self._fallback(attn, q, k, v, keyframe_q, keyframe_k, keyframe_v, keyframe_planes)
+diff --git a/model/video_vae/transformer/fallback_na/__init__.py b/model/video_vae/transformer/fallback_na/__init__.py
+index 923cf3510a7771febb997f8ad6aed548d668b1b2..b20352f407af29730020e0e1da3bf042e61ceaeb 100644
+--- a/model/video_vae/transformer/fallback_na/__init__.py
++++ b/model/video_vae/transformer/fallback_na/__init__.py
+@@ -13,14 +13,14 @@ from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+-from ltx_core.model.video_vae.transformer.fallback_na.eager import na3d as eager_na3d
+-from ltx_core.model.video_vae.transformer.fallback_na.joint_eager import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.fallback_na.eager import na3d as eager_na3d
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.fallback_na.joint_eager import (
+     sdpa_materializes_scores as joint_sdpa_materializes_scores,
+ )
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.model.video_vae.keyframes import KeyframePlanes
+-    from ltx_core.model.video_vae.transformer.attention import NAAttentionCallable, NeighborhoodAttention3D
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KeyframePlanes
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import NAAttentionCallable, NeighborhoodAttention3D
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -80,7 +80,7 @@ def na_attention_triton(
+     kernel_size: list[int],
+ ) -> torch.Tensor:
+     """Opaque Triton NA launch so the surrounding block graph stays whole under compile."""
+-    from ltx_core.model.video_vae.transformer.fallback_na.triton_na import (  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.fallback_na.triton_na import (  # noqa: PLC0415
+         na3d as triton_na3d,
+     )
+ 
+@@ -113,7 +113,7 @@ def na_attention_joint_eager(
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Opaque joint NA. Slot tables are built inside, so their T-dependent extent never
+     reaches Dynamo and cannot fight the decoder's ``mark_dynamic`` on T/H/W."""
+-    from ltx_core.model.video_vae.transformer.fallback_na.joint_eager import (  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.fallback_na.joint_eager import (  # noqa: PLC0415
+         joint_na3d,
+     )
+ 
+@@ -164,7 +164,7 @@ def na_attention_joint_triton(
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Opaque joint Triton NA. Slot tables are built inside for the same reason as the
+     eager op: their T-dependent extent must not reach Dynamo."""
+-    from ltx_core.model.video_vae.transformer.fallback_na.joint_triton import (  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.fallback_na.joint_triton import (  # noqa: PLC0415
+         joint_na3d as triton_joint_na3d,
+     )
+ 
+@@ -230,7 +230,7 @@ class TritonJointAttention:
+         keyframe_v: torch.Tensor,
+         keyframe_planes: KeyframePlanes,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        from ltx_core.model.video_vae.keyframes import KEYFRAME_CONTEXT_SLOTS  # noqa: PLC0415
++        from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KEYFRAME_CONTEXT_SLOTS  # noqa: PLC0415
+ 
+         if not triton_na_available():
+             raise ImportError(
+@@ -263,7 +263,7 @@ class EagerJointAttention:
+         keyframe_v: torch.Tensor,
+         keyframe_planes: KeyframePlanes,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        from ltx_core.model.video_vae.keyframes import KEYFRAME_CONTEXT_SLOTS  # noqa: PLC0415
++        from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import KEYFRAME_CONTEXT_SLOTS  # noqa: PLC0415
+ 
+         return na_attention_joint_eager(
+             *_joint_dtypes(q, k, v, keyframe_q, keyframe_k, keyframe_v),
+diff --git a/model/video_vae/transformer/fallback_na/joint_eager.py b/model/video_vae/transformer/fallback_na/joint_eager.py
+index 9522e7b5a59f37ff40af0659419f56f88f3508a5..5da91286db2d0f5c3c7f4dfa768402b1ba4f964d 100644
+--- a/model/video_vae/transformer/fallback_na/joint_eager.py
++++ b/model/video_vae/transformer/fallback_na/joint_eager.py
+@@ -51,7 +51,7 @@ import math
+ import torch
+ import torch.nn.functional as F
+ 
+-from ltx_core.model.video_vae.keyframes import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import (
+     KEYFRAME_CONTEXT_SLOTS,
+     keyframe_video_slots,
+     video_keyframe_slots,
+diff --git a/model/video_vae/transformer/fallback_na/joint_triton.py b/model/video_vae/transformer/fallback_na/joint_triton.py
+index 726737a79ed54a1dc21a3cef105bf7e2f27ccd2b..fb8b52436e253fe97be2edd2d7ba7ebfa6091e30 100644
+--- a/model/video_vae/transformer/fallback_na/joint_triton.py
++++ b/model/video_vae/transformer/fallback_na/joint_triton.py
+@@ -37,7 +37,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from ltx_core.model.video_vae.keyframes import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import (
+     KEYFRAME_CONTEXT_SLOTS,
+     keyframe_video_slots,
+     video_keyframe_slots,
+diff --git a/model/video_vae/transformer/rope.py b/model/video_vae/transformer/rope.py
+index e3a95b4339127754e688e7fba099bc51cbeafeeb..e3d47677c2f380465187f7d845a15f2d7f562c82 100644
+--- a/model/video_vae/transformer/rope.py
++++ b/model/video_vae/transformer/rope.py
+@@ -10,7 +10,7 @@ from __future__ import annotations
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.video_vae.transformer.rope_math import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.rope_math import (
+     DEFAULT_ABS_ROPE_NUM_TILES,
+     default_rope_dim_split,
+     h_positions,
+@@ -97,7 +97,7 @@ def configure_abs_rope(
+     compute_dtype: torch.dtype = torch.float32,
+ ) -> None:
+     """Set abs-RoPE tile count / compute dtype on every ``NeighborhoodAttention3D``."""
+-    from ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D  # noqa: PLC0415
+ 
+     if num_tiles < 1:
+         raise ValueError(f"num_tiles must be >= 1, got {num_tiles}")
+diff --git a/model/video_vae/transformer/stage5_tail.py b/model/video_vae/transformer/stage5_tail.py
+index 9c97fbc84e9eedf8de307ff921c0c362212b84b7..92bd8e97b088008e5aedb6d12669d1bcc27de930 100644
+--- a/model/video_vae/transformer/stage5_tail.py
++++ b/model/video_vae/transformer/stage5_tail.py
+@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover
+     tl = None  # type: ignore[assignment]
+ 
+ if triton is not None:
+-    from ltx_core.model.video_vae.transformer.row_rms_norm import rms_rstd
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.row_rms_norm import rms_rstd
+ 
+     @triton.jit
+     def _stage5_tail_kernel(
+diff --git a/model/video_vae/transformer/swiglu.py b/model/video_vae/transformer/swiglu.py
+index fc235c9cf8f630c274f75a58fa9df3e8283ea852..3ac10f84c3f8883252ebf62af435693c12fa4dab 100644
+--- a/model/video_vae/transformer/swiglu.py
++++ b/model/video_vae/transformer/swiglu.py
+@@ -16,7 +16,7 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
+-from ltx_core.tiling import DimensionInterval, split_by_count, split_by_size
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import DimensionInterval, split_by_count, split_by_size
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/model/video_vae/video_vae.py b/model/video_vae/video_vae.py
+index 565495dce0fae0cb1d31e059bf40bc86b98d63ab..789c9d58dfef14e24c83edc6f6956d06d785ec05 100644
+--- a/model/video_vae/video_vae.py
++++ b/model/video_vae/video_vae.py
+@@ -6,17 +6,17 @@ from typing import Any, Callable, Iterator, List, Protocol, Tuple
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.common.normalization import PixelNorm
+-from ltx_core.model.disposable import Disposable
+-from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
+-from ltx_core.model.video_vae.attention import AttnBlock3D
+-from ltx_core.model.video_vae.convolution import make_conv_nd, memory_format_of
+-from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
+-from ltx_core.model.video_vae.keyframes import DecodeKeyframes
+-from ltx_core.model.video_vae.ops import PerChannelStatistics, patchify
+-from ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
+-from ltx_core.model.video_vae.sampling import SpaceToDepthDownsample
+-from ltx_core.tiling import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.common.normalization import PixelNorm
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.attention import AttnBlock3D
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.convolution import make_conv_nd, memory_format_of
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import DecodeKeyframes
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.ops import PerChannelStatistics, patchify
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.sampling import SpaceToDepthDownsample
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+     DEFAULT_MAPPING_OPERATION,
+     DEFAULT_SPLIT_OPERATION,
+     DimensionIntervals,
+@@ -33,7 +33,7 @@ from ltx_core.tiling import (
+     scale_by_masks_1d,
+     untiled_mask_1d,
+ )
+-from ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors, VideoLatentShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors, VideoLatentShape
+ 
+ logger: logging.Logger = logging.getLogger(__name__)
+ 
+@@ -688,8 +688,6 @@ def map_spatial_interval_to_latent(
+     return slice(start, stop), mask_1d
+ 
+ 
+-from ltx_core.model.video_vae.conv_video_decoder import ConvVideoDecoder  # noqa: E402
+-from ltx_core.model.video_vae.diffusion_video_decoder import DiffusionVideoDecoder  # noqa: E402
+ 
+ __all__ = [
+     "ConvVideoDecoder",
+@@ -704,3 +702,16 @@ __all__ = [
+     "prepare_tiles_for_encoding",
+     "to_mapping_operation",
+ ]
++
++# Defer optional decoder dependencies until the requested decoder is used.
++import importlib
++
++_LAZY_EXPORTS = {'ConvVideoDecoder': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.conv_video_decoder', 'ConvVideoDecoder'), 'DiffusionVideoDecoder': ('tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.diffusion_video_decoder', 'DiffusionVideoDecoder')}
++
++def __getattr__(name):
++    if name not in _LAZY_EXPORTS:
++        raise AttributeError(name)
++    module, symbol = _LAZY_EXPORTS[name]
++    value = getattr(importlib.import_module(module), symbol)
++    globals()[name] = value
++    return value
+diff --git a/multigpu/__init__.py b/multigpu/__init__.py
+index 761b129422ec8fde9e3d8fdae5cd242d311ff0c0..7347dc867cfa38d314cfedc2f3827d0d324d4e6b 100644
+--- a/multigpu/__init__.py
++++ b/multigpu/__init__.py
+@@ -4,7 +4,7 @@ This package provides utilities for running LTX models across multiple GPUs
+ using tiled data-parallel techniques.
+ """
+ 
+-from ltx_core.multigpu import transformer, vae
+-from ltx_core.tiling import DimensionTilingConfig, TileCountConfig
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu import transformer, vae
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import DimensionTilingConfig, TileCountConfig
+ 
+ __all__ = ["DimensionTilingConfig", "TileCountConfig", "transformer", "vae"]
+diff --git a/multigpu/gemma/__init__.py b/multigpu/gemma/__init__.py
+index 35d60bdd195765b74c990b4084f8ccc4b8b376ec..6183f91c6099e2a192a947a78b3e69b8e123bd3a 100644
+--- a/multigpu/gemma/__init__.py
++++ b/multigpu/gemma/__init__.py
+@@ -1,5 +1,5 @@
+ """Multi-GPU utilities for the Gemma text encoder."""
+ 
+-from ltx_core.multigpu.gemma.accelerate_wrapper import AccelerateGemmaWrapper
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.gemma.accelerate_wrapper import AccelerateGemmaWrapper
+ 
+ __all__ = ["AccelerateGemmaWrapper"]
+diff --git a/multigpu/gemma/accelerate_wrapper.py b/multigpu/gemma/accelerate_wrapper.py
+index 4bdc782a7d07df6e8269576212b06cd9b47cbfae..8a90fd7ae5773206fec1e4f66f5a02a2186b2ebf 100644
+--- a/multigpu/gemma/accelerate_wrapper.py
++++ b/multigpu/gemma/accelerate_wrapper.py
+@@ -11,7 +11,7 @@ from __future__ import annotations
+ 
+ import torch
+ 
+-from ltx_core.multigpu.gemma.broadcast_wrapper import BroadcastGemmaWrapper
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.gemma.broadcast_wrapper import BroadcastGemmaWrapper
+ 
+ 
+ class AccelerateGemmaWrapper(BroadcastGemmaWrapper):
+diff --git a/multigpu/gemma/batch_parallel_wrapper.py b/multigpu/gemma/batch_parallel_wrapper.py
+index 365edf25d99a7aa39fb76e0f33f27ac6bc673e2e..d593ae6a2d7edc856e261ed5d88f259fca24ac9d 100644
+--- a/multigpu/gemma/batch_parallel_wrapper.py
++++ b/multigpu/gemma/batch_parallel_wrapper.py
+@@ -13,8 +13,8 @@ from __future__ import annotations
+ import torch
+ import torch.distributed as dist
+ 
+-from ltx_core.multigpu.gemma.broadcast_wrapper import BroadcastGemmaWrapper
+-from ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.gemma.broadcast_wrapper import BroadcastGemmaWrapper
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
+ 
+ 
+ def _partition(total: int, world_size: int) -> list[int]:
+diff --git a/multigpu/gemma/broadcast_wrapper.py b/multigpu/gemma/broadcast_wrapper.py
+index 999ad4312977a1adbbbb1fefb14d4a5704d187fb..53cc69a1011fbebb3b787d0375f358701b33ba42 100644
+--- a/multigpu/gemma/broadcast_wrapper.py
++++ b/multigpu/gemma/broadcast_wrapper.py
+@@ -5,9 +5,9 @@ from __future__ import annotations
+ import torch
+ import torch.distributed as dist
+ 
+-from ltx_core.model.disposable import Disposable
+-from ltx_core.multigpu.broadcast import BroadcastCoordinator
+-from ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.broadcast import BroadcastCoordinator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
+ 
+ # Bounds a wait on the source rank, which includes its Gemma load on a cold job and any prompt enhancement.
+ # Matches NCCL's default collective timeout, which bounded the receive these waits precede.
+diff --git a/multigpu/transformer/__init__.py b/multigpu/transformer/__init__.py
+index 1b970dc8e661e2aec407d789a159930d7adce0c5..1da7f7b27c9675455c78e241b11d2f0185d07083 100644
+--- a/multigpu/transformer/__init__.py
++++ b/multigpu/transformer/__init__.py
+@@ -4,7 +4,7 @@ This module provides utilities for running LTX transformer models across multipl
+ using tiled data parallelism.
+ """
+ 
+-from ltx_core.multigpu.transformer.tiled_data_parallel import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.transformer.tiled_data_parallel import (
+     TiledDataParallelModelWrapper,
+ )
+ 
+diff --git a/multigpu/transformer/attention.py b/multigpu/transformer/attention.py
+index 08fd77d8cbf487bcdd980b488276675509f963d0..850c4b8c0922bcd8d86a23c318208f73ef0dad78 100644
+--- a/multigpu/transformer/attention.py
++++ b/multigpu/transformer/attention.py
+@@ -1,7 +1,7 @@
+ import torch
+ import torch.distributed as dist
+ 
+-from ltx_core.model.transformer.attention import AttentionCallable, MaskedAttentionCallable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.attention import AttentionCallable, MaskedAttentionCallable
+ 
+ # Mirrors the kernel's DEFAULT_BARRIER_TIMEOUT_SECONDS (configs.cuh), which All2All converts to
+ # cycles via the device peak SM clock. Stored so the timeout can be read back to reset after a raise.
+diff --git a/multigpu/transformer/sequence_parallel.py b/multigpu/transformer/sequence_parallel.py
+index 81498fd70a2434b85053651fdacf6e02939978b6..e76df16fb9422ab64cbcdb67cee47ca98e2aae29 100644
+--- a/multigpu/transformer/sequence_parallel.py
++++ b/multigpu/transformer/sequence_parallel.py
+@@ -13,14 +13,14 @@ from itertools import accumulate
+ 
+ import torch
+ 
+-from ltx_core.guidance.perturbations import BatchedPerturbationConfig
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.model.transformer.attention import Attention
+-from ltx_core.model.transformer.cudagraph_capture import capture_key_scope
+-from ltx_core.model.transformer.modality import Modality
+-from ltx_core.model.transformer.model import LTXModel
+-from ltx_core.model.transformer.transformer import BasicAVTransformerBlock
+-from ltx_core.multigpu.transformer.attention import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import BatchedPerturbationConfig
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.attention import Attention
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.cudagraph_capture import capture_key_scope
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.modality import Modality
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.model import LTXModel
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.transformer import BasicAVTransformerBlock
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.transformer.attention import (
+     All2AllAttention,
+     AttentionManager,
+     AudioAll2AllAttention,
+diff --git a/multigpu/transformer/tiled_data_parallel.py b/multigpu/transformer/tiled_data_parallel.py
+index 711f6d9025ff473e41055de6c23d5a2c3bf8433c..c3765b6a50aaaae6b3b1e68f72bfa0f834e18156 100644
+--- a/multigpu/transformer/tiled_data_parallel.py
++++ b/multigpu/transformer/tiled_data_parallel.py
+@@ -18,13 +18,13 @@ from typing import TYPE_CHECKING
+ import torch
+ import torch.distributed as dist
+ 
+-from ltx_core.modality_tiling import VideoModalityTilingHelper
+-from ltx_core.model.transformer.modality import Modality
+-from ltx_core.tiling import TileCountConfig
+-from ltx_core.tools import VideoLatentTools
++from tensorrt_llm._torch.visual_gen.models.ltx_core.modality_tiling import VideoModalityTilingHelper
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.modality import Modality
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import TileCountConfig
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tools import VideoLatentTools
+ 
+ if TYPE_CHECKING:
+-    from ltx_core.guidance.perturbations import BatchedPerturbationConfig
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.guidance.perturbations import BatchedPerturbationConfig
+ 
+ 
+ class TiledDataParallelModelWrapper(torch.nn.Module):
+diff --git a/multigpu/vae/__init__.py b/multigpu/vae/__init__.py
+index ace1da492128675cafad9a2b5bc18eeec217e615..bdb15ae327a7b4f43ea251a3c0a769f443cea0eb 100644
+--- a/multigpu/vae/__init__.py
++++ b/multigpu/vae/__init__.py
+@@ -1,5 +1,5 @@
+ """Multi-GPU utilities for VAE decoding."""
+ 
+-from ltx_core.multigpu.vae.distributed_decoder import DistributedVideoDecoder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.multigpu.vae.distributed_decoder import DistributedVideoDecoder
+ 
+ __all__ = ["DistributedVideoDecoder"]
+diff --git a/multigpu/vae/distributed_decoder.py b/multigpu/vae/distributed_decoder.py
+index 7377521f342eac4aa2efe2c418d07f4f159c3ebc..9601697a5fbb67cb108855b138da70d46c0881db 100644
+--- a/multigpu/vae/distributed_decoder.py
++++ b/multigpu/vae/distributed_decoder.py
+@@ -30,11 +30,11 @@ import torch.distributed as dist
+ from einops import rearrange
+ from torch.multiprocessing import Queue
+ 
+-from ltx_core.devices import upload_from_host
+-from ltx_core.model.disposable import Disposable
+-from ltx_core.model.video_vae.keyframes import DecodeKeyframes
+-from ltx_core.model.video_vae.transformer.rope_math import abs_rope_table_cache
+-from ltx_core.model.video_vae.video_vae import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.devices import upload_from_host
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.keyframes import DecodeKeyframes
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.transformer.rope_math import abs_rope_table_cache
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.video_vae import (
+     VideoDecoder,
+     clip_generators,
+     iter_decoded_single_frames,
+@@ -43,7 +43,7 @@ from ltx_core.model.video_vae.video_vae import (
+     to_mapping_operation,
+     validate_single_frame_latents,
+ )
+-from ltx_core.tiling import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.tiling import (
+     Tile,
+     TileCountConfig,
+     TilingConfig,
+@@ -52,7 +52,7 @@ from ltx_core.tiling import (
+     masks_are_complementary,
+     scale_by_masks_1d,
+ )
+-from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape, VideoPixelShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape, VideoPixelShape
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/quantization/__init__.py b/quantization/__init__.py
+index 97b4954fc15bae8cbeda8a783554deb04fc1623f..05b34741942777caf22e6da18a4479b26fc6a159 100644
+--- a/quantization/__init__.py
++++ b/quantization/__init__.py
+@@ -1,3 +1,3 @@
+-from ltx_core.quantization.policy import QuantizationPolicy
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.policy import QuantizationPolicy
+ 
+ __all__ = ["QuantizationPolicy"]
+diff --git a/quantization/blockwise/__init__.py b/quantization/blockwise/__init__.py
+index 27c10513b6cc777cc4ddabddd31d1e1609899604..e43b2870d24438e188c322a46c647ca496ca1885 100644
+--- a/quantization/blockwise/__init__.py
++++ b/quantization/blockwise/__init__.py
+@@ -1,13 +1,13 @@
+ """Public blockwise FP8/FP6 policies; compiled kernels are checked on request."""
+ 
+-from ltx_core.quantization.policy import QuantizationPolicy
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.policy import QuantizationPolicy
+ 
+ __all__ = ["build_fp6_policy", "build_fp8_policy"]
+ 
+ 
+ def build_fp8_policy() -> QuantizationPolicy:
+     """Build a blockwise FP8 quantization policy."""
+-    from ltx_core.quantization.blockwise.unit import _kernels, build_policy  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.blockwise.unit import _kernels, build_policy  # noqa: PLC0415
+ 
+     _kernels()
+     return build_policy(fp6=False)
+@@ -15,7 +15,7 @@ def build_fp8_policy() -> QuantizationPolicy:
+ 
+ def build_fp6_policy() -> QuantizationPolicy:
+     """Build a blockwise FP6 quantization policy."""
+-    from ltx_core.quantization.blockwise.unit import _kernels, build_policy  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.blockwise.unit import _kernels, build_policy  # noqa: PLC0415
+ 
+     _kernels()
+     return build_policy(fp6=True)
+diff --git a/quantization/blockwise/unit.py b/quantization/blockwise/unit.py
+index 6ec6792dec3716bae8ef8387b05d6e3bc60001e8..bcf7237c494714863b64f461729c5595f63457e4 100644
+--- a/quantization/blockwise/unit.py
++++ b/quantization/blockwise/unit.py
+@@ -7,10 +7,10 @@ from typing import NamedTuple
+ 
+ import torch
+ 
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.sd_ops import KeyValueOperation, SDOps
+-from ltx_core.loader.units import FuseRule
+-from ltx_core.quantization.policy import QuantizationPolicy
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import KeyValueOperation, SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import FuseRule
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.policy import QuantizationPolicy
+ 
+ _BLOCK = 128
+ _EXCLUDED = (
+diff --git a/quantization/fp8_cast.py b/quantization/fp8_cast.py
+index 22339a845755143c7f5a19eec996b60a77db854b..8ae9e8bd6203271deafd652325bed8ef63faf2a6 100644
+--- a/quantization/fp8_cast.py
++++ b/quantization/fp8_cast.py
+@@ -5,11 +5,11 @@ from pathlib import Path
+ 
+ import torch
+ 
+-from ltx_core.loader.kernels import TRITON_AVAILABLE
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.sd_ops import KeyMatching, KeyReplacement, KeyValueOperation, SDOps
+-from ltx_core.loader.units import MPS_HOST_FUSED_FP8, FuseRule
+-from ltx_core.quantization.policy import QuantizationPolicy
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.kernels import TRITON_AVAILABLE
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import KeyMatching, KeyReplacement, KeyValueOperation, SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import MPS_HOST_FUSED_FP8, FuseRule
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.policy import QuantizationPolicy
+ 
+ BLOCK_SIZE = 1024
+ 
+@@ -23,7 +23,7 @@ def fused_add_round_launch(target_weight: torch.Tensor, original_weight: torch.T
+         )
+     import triton  # noqa: PLC0415
+ 
+-    from ltx_core.loader.kernels import fused_add_round_kernel  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.kernels import fused_add_round_kernel  # noqa: PLC0415
+ 
+     if original_weight.dtype == torch.float8_e4m3fn:
+         exponent_bits, mantissa_bits, exponent_bias = 4, 3, 7
+diff --git a/quantization/fp8_scaled_mm.py b/quantization/fp8_scaled_mm.py
+index a1f204177ddd1e1a4a4ed9298a0b0488e6500203..2f891dbca48e455a7659a03923e26683140e1d45 100644
+--- a/quantization/fp8_scaled_mm.py
++++ b/quantization/fp8_scaled_mm.py
+@@ -6,10 +6,10 @@ from typing import Callable
+ import torch
+ from torch import nn
+ 
+-from ltx_core.loader.checkpoint import CheckpointReader
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.units import FuseRule
+-from ltx_core.quantization.policy import QuantizationPolicy
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.checkpoint import CheckpointReader
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import FuseRule
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.policy import QuantizationPolicy
+ 
+ 
+ class FP8Linear(nn.Module):
+diff --git a/quantization/nvfp4/__init__.py b/quantization/nvfp4/__init__.py
+index b293ec87c4a87d75f7053076bf17a083a1308c00..36b29a9048ab2f7def9cb27b9a1842e598f8ef1b 100644
+--- a/quantization/nvfp4/__init__.py
++++ b/quantization/nvfp4/__init__.py
+@@ -8,9 +8,9 @@ from __future__ import annotations
+ 
+ from pathlib import Path
+ 
+-from ltx_core.quantization.nvfp4.kernels import require_nvfp4
+-from ltx_core.quantization.nvfp4.types import ActScale
+-from ltx_core.quantization.policy import QuantizationPolicy
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.kernels import require_nvfp4
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.types import ActScale
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.policy import QuantizationPolicy
+ 
+ __all__ = [
+     "ActScale",
+@@ -21,7 +21,7 @@ __all__ = [
+ 
+ def build_nvfp4_cast_policy(*, act_scale: ActScale = ActScale.FIXED_1) -> QuantizationPolicy:
+     """Build online BF16-to-NVFP4 conversion and fusion operations."""
+-    from ltx_core.quantization.nvfp4.unit import build_convert_policy  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.unit import build_convert_policy  # noqa: PLC0415
+ 
+     require_nvfp4()
+     return build_convert_policy(act_scale=act_scale)
+@@ -33,7 +33,7 @@ def build_nvfp4_prequant_policy(
+     act_scale: ActScale = ActScale.STATIC,
+ ) -> QuantizationPolicy:
+     """Build header-selected prequantized NVFP4 loading and fusion operations."""
+-    from ltx_core.quantization.nvfp4.prequant_unit import build_policy  # noqa: PLC0415
++    from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.prequant_unit import build_policy  # noqa: PLC0415
+ 
+     require_nvfp4()
+     return build_policy((Path(checkpoint_path),), act_scale=act_scale)
+diff --git a/quantization/nvfp4/convert.py b/quantization/nvfp4/convert.py
+index 53e1c95cd0399dd63f37b4e158f166649cad8ba6..7e13b1d39a448a2362261b3507c957f9e7432e69 100644
+--- a/quantization/nvfp4/convert.py
++++ b/quantization/nvfp4/convert.py
+@@ -11,9 +11,9 @@ import re
+ import torch
+ from torch import nn
+ 
+-from ltx_core.quantization.nvfp4.kernels import require_nvfp4
+-from ltx_core.quantization.nvfp4.linear import NVFP4Linear
+-from ltx_core.quantization.nvfp4.types import ActScale
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.kernels import require_nvfp4
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.linear import NVFP4Linear
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.types import ActScale
+ 
+ _LTX2_FV_NVFP4_SUFFIXES: tuple[str, ...] = (
+     "attn1.to_q",
+diff --git a/quantization/nvfp4/linear.py b/quantization/nvfp4/linear.py
+index afc922eb6de0fdd0337e57bf94325dae7f4713ab..40d13fbad84ee538819d1dc17de02345b29b1e72 100644
+--- a/quantization/nvfp4/linear.py
++++ b/quantization/nvfp4/linear.py
+@@ -15,8 +15,8 @@ import torch
+ from torch import nn
+ from typing_extensions import assert_never
+ 
+-from ltx_core.quantization.nvfp4.kernels import require_nvfp4
+-from ltx_core.quantization.nvfp4.types import ActScale
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.kernels import require_nvfp4
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.types import ActScale
+ 
+ E4M3_MAX = 448.0
+ E2M1_MAX = 6.0
+diff --git a/quantization/nvfp4/prequant_unit.py b/quantization/nvfp4/prequant_unit.py
+index 02745badf7a21a3a48757b0379f04145d02b383d..9bca92a2753e81ae8c4abd2a34042315297fad2e 100644
+--- a/quantization/nvfp4/prequant_unit.py
++++ b/quantization/nvfp4/prequant_unit.py
+@@ -9,13 +9,13 @@ from pathlib import Path
+ import torch
+ from torch import nn
+ 
+-from ltx_core.loader.checkpoint import CheckpointReader
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.sd_ops import SDOps
+-from ltx_core.quantization.nvfp4.linear import NVFP4Linear
+-from ltx_core.quantization.nvfp4.types import ActScale
+-from ltx_core.quantization.nvfp4.unit import NVFP4_FUSE_RULE
+-from ltx_core.quantization.policy import QuantizationPolicy
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.checkpoint import CheckpointReader
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.linear import NVFP4Linear
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.types import ActScale
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.unit import NVFP4_FUSE_RULE
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.policy import QuantizationPolicy
+ 
+ _AMBIGUOUS = ""
+ 
+diff --git a/quantization/nvfp4/unit.py b/quantization/nvfp4/unit.py
+index 5f1991e0bbcd3070077d38205c0232e40db021a3..b85d44499015f9335a575a3d766452044f7fe262 100644
+--- a/quantization/nvfp4/unit.py
++++ b/quantization/nvfp4/unit.py
+@@ -6,18 +6,18 @@ from collections.abc import Mapping
+ 
+ import torch
+ 
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.sd_ops import KeyValueOperation, SDOps
+-from ltx_core.loader.units import FuseRule
+-from ltx_core.quantization.nvfp4.convert import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import KeyValueOperation, SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import FuseRule
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.convert import (
+     _is_ltx2_fv_nvfp4_layer,
+     quantize_bf16_weight_to_nvfp4,
+     scale_shape,
+     swap_convert_linears,
+ )
+-from ltx_core.quantization.nvfp4.kernels import require_nvfp4
+-from ltx_core.quantization.nvfp4.types import ActScale
+-from ltx_core.quantization.policy import QuantizationPolicy
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.kernels import require_nvfp4
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.nvfp4.types import ActScale
++from tensorrt_llm._torch.visual_gen.models.ltx_core.quantization.policy import QuantizationPolicy
+ 
+ _FLOAT_INPUTS = frozenset({torch.bfloat16, torch.float16, torch.float32})
+ 
+diff --git a/quantization/policy.py b/quantization/policy.py
+index 9c8845387c80d8a4ae26e7f0f371d88eac6f4d39..186c6dce0811a6217bf4ec1d6903ea7247788738 100644
+--- a/quantization/policy.py
++++ b/quantization/policy.py
+@@ -5,10 +5,10 @@ from typing import TypeVar
+ 
+ import torch
+ 
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.sd_ops import SDOps
+-from ltx_core.loader.simple_builder import SimpleBuilder
+-from ltx_core.loader.units import FuseRule
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.simple_builder import SimpleBuilder
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.units import FuseRule
+ 
+ _Model = TypeVar("_Model", bound=torch.nn.Module)
+ 
+diff --git a/text_encoders/gemma/__init__.py b/text_encoders/gemma/__init__.py
+index 54f44ddeee109ac172c29f107619194dec5b92c2..b69f486e0a9c1133053d3b1e6eb262d2fe584cae 100644
+--- a/text_encoders/gemma/__init__.py
++++ b/text_encoders/gemma/__init__.py
+@@ -1,16 +1,16 @@
+ """Gemma text encoder components."""
+ 
+-from ltx_core.text_encoders.gemma.embeddings_processor import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.embeddings_processor import (
+     EmbeddingsProcessor,
+     EmbeddingsProcessorOutput,
+     convert_to_additive_mask,
+ )
+-from ltx_core.text_encoders.gemma.encoders.base_encoder import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.encoders.base_encoder import (
+     LTXGemmaTextEncoder,
+     build_gemma_tokenizer,
+     module_ops_from_gemma_root,
+ )
+-from ltx_core.text_encoders.gemma.encoders.encoder_configurator import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.encoders.encoder_configurator import (
+     EMBEDDINGS_PROCESSOR_KEY_OPS,
+     VIDEO_ONLY_EMBEDDINGS_PROCESSOR_KEY_OPS,
+     EmbeddingsProcessorConfigurator,
+@@ -19,7 +19,7 @@ from ltx_core.text_encoders.gemma.encoders.encoder_configurator import (
+     gemma_model_type,
+     get_gemma_ops,
+ )
+-from ltx_core.text_encoders.gemma.gemma_assets import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.gemma_assets import (
+     GemmaAssets,
+     build_gemma_hf_config,
+     build_gemma_hf_tokenizer,
+diff --git a/text_encoders/gemma/embeddings_connector.py b/text_encoders/gemma/embeddings_connector.py
+index 316deda954fd9ff27f2265b5857c48348d5a3bdb..112de908f2d9d6a82d6c956cf58cab07f7fec8e3 100644
+--- a/text_encoders/gemma/embeddings_connector.py
++++ b/text_encoders/gemma/embeddings_connector.py
+@@ -1,15 +1,15 @@
+ import torch
+ 
+-from ltx_core.model.model_protocol import ModelConfigurator
+-from ltx_core.model.transformer.attention import Attention
+-from ltx_core.model.transformer.feed_forward import FeedForward
+-from ltx_core.model.transformer.rope import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.model_protocol import ModelConfigurator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.attention import Attention
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.feed_forward import FeedForward
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer.rope import (
+     LTXRopeType,
+     generate_freq_grid_np,
+     generate_freq_grid_pytorch,
+     precompute_freqs_cis,
+ )
+-from ltx_core.utils import rms_norm
++from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import rms_norm
+ 
+ 
+ class _BasicTransformerBlock1D(torch.nn.Module):
+diff --git a/text_encoders/gemma/embeddings_processor.py b/text_encoders/gemma/embeddings_processor.py
+index d0a999b945ecfe8c724b2159f175f7e90ac9ed2e..bc375ef27722ac24848783cddef92e6653d0cd0b 100644
+--- a/text_encoders/gemma/embeddings_processor.py
++++ b/text_encoders/gemma/embeddings_processor.py
+@@ -3,8 +3,8 @@ from typing import NamedTuple
+ import torch
+ from torch import nn
+ 
+-from ltx_core.model.disposable import Disposable
+-from ltx_core.text_encoders.gemma.embeddings_connector import Embeddings1DConnector
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.embeddings_connector import Embeddings1DConnector
+ 
+ 
+ class EmbeddingsProcessorOutput(NamedTuple):
+diff --git a/text_encoders/gemma/encoders/base_encoder.py b/text_encoders/gemma/encoders/base_encoder.py
+index 93676a01b0437d1a6b45d6388d87281af3561456..76a7c8f17845056ec193696813261cece8b81af8 100644
+--- a/text_encoders/gemma/encoders/base_encoder.py
++++ b/text_encoders/gemma/encoders/base_encoder.py
+@@ -7,15 +7,15 @@ from typing import Any
+ import torch
+ from transformers import PreTrainedModel, ProcessorMixin
+ 
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.model.disposable import Disposable
+-from ltx_core.text_encoders.gemma.gemma_assets import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.disposable import Disposable
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.gemma_assets import (
+     TOKENIZER_MAX_LENGTH,
+     GemmaAssets,
+     build_gemma_hf_tokenizer,
+     build_gemma_processor,
+ )
+-from ltx_core.text_encoders.gemma.tokenizer import LTXGemmaTokenizer, PaddingSide
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.tokenizer import LTXGemmaTokenizer, PaddingSide
+ 
+ # Sampling decoding for the Gemma 3 self-enhance path.
+ GEMMA3_ENHANCE_GENERATION_KWARGS: dict[str, Any] = {"do_sample": True, "temperature": 0.7, "max_new_tokens": 512}
+diff --git a/text_encoders/gemma/encoders/encoder_configurator.py b/text_encoders/gemma/encoders/encoder_configurator.py
+index 88c60b2ca8127a62f4201d41bff1b65d1b7f43da..20b43d6cbbaf535d9e5d0fcddd9f3a302134fa5f 100644
+--- a/text_encoders/gemma/encoders/encoder_configurator.py
++++ b/text_encoders/gemma/encoders/encoder_configurator.py
+@@ -9,21 +9,21 @@ from transformers import AutoModelForImageTextToText, PretrainedConfig
+ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+ from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioAttention, Gemma4AudioRelPositionalEncoding
+ 
+-from ltx_core.loader import parse_model_version
+-from ltx_core.loader.module_ops import ModuleOps
+-from ltx_core.loader.sd_ops import SDOps
+-from ltx_core.model.model_protocol import ModelConfigurator
+-from ltx_core.text_encoders.gemma.embeddings_connector import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader import parse_model_version
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.module_ops import ModuleOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.loader.sd_ops import SDOps
++from tensorrt_llm._torch.visual_gen.models.ltx_core.model.model_protocol import ModelConfigurator
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.embeddings_connector import (
+     AudioEmbeddings1DConnectorConfigurator,
+     Embeddings1DConnectorConfigurator,
+ )
+-from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
+-from ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder, module_ops_from_gemma_root
+-from ltx_core.text_encoders.gemma.feature_extractor import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder, module_ops_from_gemma_root
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.feature_extractor import (
+     FeatureExtractorV1,
+     FeatureExtractorV2,
+ )
+-from ltx_core.text_encoders.gemma.gemma_assets import GemmaAssets, build_gemma_hf_config, resolve_gemma_weight_paths
++from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.gemma_assets import GemmaAssets, build_gemma_hf_config, resolve_gemma_weight_paths
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/text_encoders/gemma/gemma_assets.py b/text_encoders/gemma/gemma_assets.py
+index f8ba224663b26defaf27e04e5611cf3fb74a497a..6a3d6d19209eb0fe244d1344f170a09a822c6616 100644
+--- a/text_encoders/gemma/gemma_assets.py
++++ b/text_encoders/gemma/gemma_assets.py
+@@ -27,7 +27,7 @@ from transformers.image_processing_utils import BaseImageProcessor
+ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+ from transformers.video_processing_utils import BaseVideoProcessor
+ 
+-from ltx_core.utils import find_matching_file
++from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import find_matching_file
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/tiling.py b/tiling.py
+index 57f3f67a60663869927f7c84ad521431df94f03d..28309bbbd74064dc8d92bed1c30783ff89f2e6fd 100644
+--- a/tiling.py
++++ b/tiling.py
+@@ -7,7 +7,7 @@ from typing import Callable, NamedTuple, Sequence
+ 
+ import torch
+ 
+-from ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors, VideoPixelShape
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors, VideoPixelShape
+ 
+ 
+ def compute_trapezoidal_mask_1d(
+diff --git a/tools.py b/tools.py
+index 602da21ca162b6ff98f1106b8ce08bb83ba0e2b1..c4ec07fb74ac22182768ea1d8eaf86ec99df9da9 100644
+--- a/tools.py
++++ b/tools.py
+@@ -4,15 +4,15 @@ from typing import Protocol
+ import torch
+ from torch._prims_common import DeviceLikeType
+ 
+-from ltx_core.components.patchifiers import (
++from tensorrt_llm._torch.visual_gen.models.ltx_core.components.patchifiers import (
+     AudioLatentShape,
+     AudioPatchifier,
+     VideoLatentPatchifier,
+     VideoLatentShape,
+     get_pixel_coords,
+ )
+-from ltx_core.components.protocols import Patchifier
+-from ltx_core.types import DenoiseMask, LatentState, SpatioTemporalScaleFactors
++from tensorrt_llm._torch.visual_gen.models.ltx_core.components.protocols import Patchifier
++from tensorrt_llm._torch.visual_gen.models.ltx_core.types import DenoiseMask, LatentState, SpatioTemporalScaleFactors
+ 
+ DEFAULT_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
+ 
+diff --git a/types.py b/types.py
+index f50eee2bda4c3b9833fe8badba547e69fa481aeb..e5b6499b532934b4645456201fa5aaadda7963f7 100644
+--- a/types.py
++++ b/types.py
+@@ -3,7 +3,7 @@ from typing import NamedTuple
+ 
+ import torch
+ 
+-from ltx_core.devices import upload_from_host
++from tensorrt_llm._torch.visual_gen.models.ltx_core.devices import upload_from_host
+ 
+ 
+ class VideoPixelShape(NamedTuple):

@@ -23,6 +23,17 @@ vendors:
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:b4e502ee5bf3d4b4477d42d96d6fa953f1819e82398b40d17812f6fda7165b22
     digest: sha256-tree-v1:de7e56b151091c462d22b3c578cc6703167d0a7de995807f83cd25f3f5736354
+  ltx-core:
+    url: https://github.com/Lightricks/LTX-2.git
+    branch: main
+    commit: 4f521619ae0029e8fbb64d555030c2b121a33b4f
+    source: packages/ltx-core/src/ltx_core
+    destination: tensorrt_llm/_torch/visual_gen/models/ltx_core
+    include:
+    - '**/*.py'
+    patch: 3rdparty/vendor_patches/ltx-core.patch
+    patch_digest: sha256:24d0a3b80b1c436c5c4410ed11a3cc49aaae9f410c631be639b10dd449019168
+    digest: sha256-tree-v1:7938de02616575cf707e42911bb9beecee93b826fc50c2471abd0dd14e28b51c
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

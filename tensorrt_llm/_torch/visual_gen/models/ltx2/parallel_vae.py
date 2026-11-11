@@ -108,7 +108,7 @@ def tile_parallel_decode(
 
     for tile in mine:
         decoded = video_decoder.forward(latent[tile.in_coords], timestep, generator)
-        mask = tile.blend_mask(latent.device, latent.dtype)
+        mask = tile.blend_mask.to(device=latent.device, dtype=latent.dtype)
         oc = tile.out_coords
         tlen = min(oc[2].stop - oc[2].start, decoded.shape[2], buf.shape[2] - oc[2].start)
         mask_slice = mask[:, :, :tlen, :, :] if mask.shape[2] > 1 else mask

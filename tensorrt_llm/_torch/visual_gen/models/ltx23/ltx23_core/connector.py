@@ -3,9 +3,12 @@
 # SPDX-License-Identifier: LicenseRef-LTX-2
 """LTX-2.3 per-modality feature projections and LTX-2 connector configuration."""
 
-import math
-
 import torch
+
+from tensorrt_llm._torch.visual_gen.models.ltx_core.text_encoders.gemma.feature_extractor import (
+    FeatureExtractorV2,
+    _rescale_norm,
+)
 
 from ...ltx2.ltx2_core.connector import Embeddings1DConnector
 from ...ltx2.ltx2_core.rope import LTXRopeType
@@ -14,7 +17,7 @@ from ...ltx2.ltx2_core.rope import LTXRopeType
 _NUM_GEMMA_HIDDEN_STATES = 49
 
 
-class LTX23GemmaFeaturesExtractor(torch.nn.Module):
+class LTX23GemmaFeaturesExtractor(FeatureExtractorV2):
     """Split Gemma feature extractor (video + audio), pre-connector."""
 
     def __init__(
@@ -24,15 +27,18 @@ class LTX23GemmaFeaturesExtractor(torch.nn.Module):
         audio_dim: int = 2048,
         num_hidden_states: int = _NUM_GEMMA_HIDDEN_STATES,
     ) -> None:
-        super().__init__()
-        in_features = caption_channels * num_hidden_states
-        # Rescale uses the Gemma hidden width, not the flattened 3840*49 size.
-        self.embedding_dim = caption_channels
-        self.video_aggregate_embed = torch.nn.Linear(in_features, video_dim, bias=True)
-        self.audio_aggregate_embed = torch.nn.Linear(in_features, audio_dim, bias=True)
+        super().__init__(
+            video_aggregate_embed=torch.nn.Linear(
+                caption_channels * num_hidden_states, video_dim, bias=True
+            ),
+            embedding_dim=caption_channels,
+            audio_aggregate_embed=torch.nn.Linear(
+                caption_channels * num_hidden_states, audio_dim, bias=True
+            ),
+        )
 
     def _project(self, linear: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
-        return linear(x * math.sqrt(linear.out_features / self.embedding_dim))
+        return linear(_rescale_norm(x, linear.out_features, self.embedding_dim))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self._project(self.video_aggregate_embed, x), self._project(

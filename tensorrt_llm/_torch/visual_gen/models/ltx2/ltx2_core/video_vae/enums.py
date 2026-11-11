@@ -1,17 +1,11 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-License-Identifier: LicenseRef-LTX-2
+# SPDX-License-Identifier: Apache-2.0
 
-from enum import Enum
+"""Compatibility imports from the pinned November 4 LTX core."""
 
-
-class NormLayerType(Enum):
-    GROUP_NORM = "group_norm"
-    PIXEL_NORM = "pixel_norm"
-
-
-class PaddingModeType(Enum):
-    ZEROS = "zeros"
-    REFLECT = "reflect"
-    REPLICATE = "replicate"
-    CIRCULAR = "circular"
+from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.enums import (
+    NormLayerType as NormLayerType,
+)
+from tensorrt_llm._torch.visual_gen.models.ltx_core.model.video_vae.enums import (
+    PaddingModeType as PaddingModeType,
+)

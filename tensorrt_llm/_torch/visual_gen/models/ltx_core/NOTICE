@@ -1,0 +1,10 @@
+LTX core source: https://github.com/Lightricks/LTX-2
+Copyright (c) 2025-2026 Lightricks Ltd.
+Source commit: 4f521619ae0029e8fbb64d555030c2b121a33b4f (November 4, 2026)
+Source directory: packages/ltx-core/src/ltx_core
+License: Apache License 2.0; see LICENSE in this directory.
+
+NVIDIA compatibility modifications are recorded in
+3rdparty/vendor_patches/ltx-core.patch: package namespace relocation and
+lazy loading of optional audio and diffusion-video-decoder dependencies.
+The model algorithms are from the pinned source snapshot.

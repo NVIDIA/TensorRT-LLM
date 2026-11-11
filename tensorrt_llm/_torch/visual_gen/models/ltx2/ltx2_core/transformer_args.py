@@ -9,6 +9,10 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from tensorrt_llm._torch.visual_gen.models.ltx_core.model.transformer import (
+    transformer_args as upstream,
+)
+
 from .adaln import AdaLayerNormSingle
 from .modality import Modality
 from .rope import (
@@ -79,11 +83,9 @@ class TransformerArgsPreprocessor:
         batch_size: int,
         hidden_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        timestep = timestep * self.timestep_scale_multiplier
-        timestep, embedded_timestep = self.adaln(timestep.flatten(), hidden_dtype=hidden_dtype)
-        timestep = timestep.view(batch_size, -1, timestep.shape[-1])
-        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
-        return timestep, embedded_timestep
+        return upstream.TransformerArgsPreprocessor._prepare_timestep(
+            self, timestep, self.adaln, batch_size, hidden_dtype
+        )
 
     def _prepare_context(
         self,
@@ -98,11 +100,9 @@ class TransformerArgsPreprocessor:
     def _prepare_attention_mask(
         self, attention_mask: torch.Tensor | None, x_dtype: torch.dtype
     ) -> torch.Tensor | None:
-        if attention_mask is None or torch.is_floating_point(attention_mask):
-            return attention_mask
-        return (attention_mask - 1).to(x_dtype).reshape(
-            (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
-        ) * torch.finfo(x_dtype).max
+        return upstream.TransformerArgsPreprocessor._prepare_attention_mask(
+            self, attention_mask, x_dtype
+        )
 
     def _prepare_positional_embeddings(
         self,
@@ -288,21 +288,6 @@ class MultiModalTransformerArgsPreprocessor:
         batch_size: int,
         hidden_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        timestep = timestep * timestep_scale_multiplier
-        av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
-
-        scale_shift_timestep, _ = self.cross_scale_shift_adaln(
-            timestep.flatten(), hidden_dtype=hidden_dtype
+        return upstream.MultiModalTransformerArgsPreprocessor._prepare_cross_attention_timestep(
+            self, timestep, timestep, timestep_scale_multiplier, batch_size, hidden_dtype
         )
-        scale_shift_timestep = scale_shift_timestep.view(
-            batch_size, -1, scale_shift_timestep.shape[-1]
-        )
-
-        gate_noise_timestep, _ = self.cross_gate_adaln(
-            timestep.flatten() * av_ca_factor, hidden_dtype=hidden_dtype
-        )
-        gate_noise_timestep = gate_noise_timestep.view(
-            batch_size, -1, gate_noise_timestep.shape[-1]
-        )
-
-        return scale_shift_timestep, gate_noise_timestep

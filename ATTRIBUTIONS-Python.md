@@ -66039,3 +66039,12 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 <!-- End of NIXL Attributions -->
+
+## LTX core (vendored source, 1.6.1)
+
+Source: https://github.com/Lightricks/LTX-2/tree/4f521619ae0029e8fbb64d555030c2b121a33b4f/packages/ltx-core/src/ltx_core
+
+Copyright (c) 2025-2026 Lightricks Ltd. Licensed under Apache-2.0.
+The source, license, and notice are included under
+`tensorrt_llm/_torch/visual_gen/models/ltx_core/`. The exact revision and
+compatibility patch are recorded in `3rdparty/vendor_sources.lock.yaml`.

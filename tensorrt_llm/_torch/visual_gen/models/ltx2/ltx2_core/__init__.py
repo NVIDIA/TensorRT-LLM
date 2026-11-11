@@ -1,13 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
-"""LTX-2 core components ported from the official LTX-2 repository.
+"""TRTLLM interfaces for the pinned November 4, 2026 LTX core.
 
-Major modifications:
-- attention.py: Replaced nn.Linear with TRT-LLM Linear; removed standalone
-  attention computation (delegated to visual_gen attention backends).
-- transformer_args.py: Adapted mask preparation for TRT-LLM attention backends.
-- connector.py: Replaced nn.Linear with TRT-LLM Linear for quantization support.
+Shared model algorithms live in ``models.ltx_core``. This package translates
+TRTLLM tensor layouts, cached transformer inputs, and checkpoint factories;
+it also retains TRTLLM's native scheduler and fused-kernel integration.
 """
 
 from .adaln import AdaLayerNormSingle

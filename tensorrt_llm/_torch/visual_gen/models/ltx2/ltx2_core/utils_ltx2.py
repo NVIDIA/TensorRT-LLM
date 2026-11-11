@@ -8,6 +8,10 @@ import torch
 
 from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import rms_norm as _upstream_rms_norm
+from tensorrt_llm._torch.visual_gen.models.ltx_core.utils import (
+    to_velocity as _upstream_to_velocity,
+)
 
 # NVFP4 fused-quant AdaLN: every fused AdaLN CUDA kernel below has a ``_quant``
 # template specialization that emits packed FP4 + per-16-elem FP8 (e4m3) scale
@@ -62,36 +66,6 @@ def get_nvfp4_self_attn_input_scale(attn) -> Optional[torch.Tensor]:
     if getattr(attn, "_maybe_share_qkv_quantize", False):
         return get_nvfp4_input_scale(getattr(attn, "to_q", None))
     return None
-
-
-def to_velocity(
-    sample: torch.Tensor,
-    sigma: torch.Tensor,
-    denoised: torch.Tensor,
-    calc_dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """Convert denoised prediction to flow velocity (flow-matching parameterization).
-
-    velocity = (sample - denoised) / sigma
-    """
-    # Tensor sigma: keep on device. `.item()` would force a D2H sync that
-    # deadlocks under nsys profiling combined with CUDA graph replay.
-    # The scheduler guarantees sigma > 0 inside the denoise loop, so we
-    # skip the zero check on the tensor path (re-checking would re-sync).
-    if isinstance(sigma, torch.Tensor):
-        sigma = sigma.to(calc_dtype)
-    elif sigma == 0:
-        raise ValueError("Sigma can't be 0.0")
-    return ((sample.to(calc_dtype) - denoised.to(calc_dtype)) / sigma).to(sample.dtype)
-
-
-def rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Functional RMS normalization without learnable weights.
-
-    Used for adaptive layer norm where scale/shift come from external modulation.
-    Must match the reference: torch.nn.functional.rms_norm.
-    """
-    return torch.nn.functional.rms_norm(x, (x.shape[-1],), weight=None, eps=eps)
 
 
 # Hidden dims supported by the fused AdaLN CUDA kernels. Resolved once at
@@ -447,3 +421,11 @@ def apply_fused_resid_rmsnorm_shift_scale_dual(
         Fp4QuantizedTensor(out1_fp4, out1_sf),
         Fp4QuantizedTensor(out2_fp4, out2_sf),
     )
+
+
+def rms_norm(x, eps=1e-6):
+    return _upstream_rms_norm(x, eps=eps)
+
+
+def to_velocity(sample, sigma, denoised, calc_dtype=torch.float32):
+    return _upstream_to_velocity(sample, sigma, denoised, calc_dtype)
