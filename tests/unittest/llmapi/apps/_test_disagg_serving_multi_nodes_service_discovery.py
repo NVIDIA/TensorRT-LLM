@@ -66,7 +66,14 @@ def wait_for_worker_ready():
         listener.settimeout(WORKER_READY_TIMEOUT_S)
         connection, _ = listener.accept()
         with connection:
-            if connection.recv(5) != b"ready":
+            connection.settimeout(WORKER_READY_TIMEOUT_S)
+            ready_signal = b""
+            while len(ready_signal) < 5:
+                chunk = connection.recv(5 - len(ready_signal))
+                if not chunk:
+                    break
+                ready_signal += chunk
+            if ready_signal != b"ready":
                 raise RuntimeError("Generation worker sent an invalid ready signal")
 
 
