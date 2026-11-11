@@ -50,7 +50,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.mode import QuantAlgo, QuantMode
 
 from ..attention.attention import (maybe_allgather_for_helix_cp,
                                    maybe_slice_for_helix_cp)
@@ -167,7 +167,7 @@ _MLA_LATENT_SCALE_ENV = "TRTLLM_MLA_LATENT_SCALE"
 _MLA_LATENT_SCALE_DEFAULT = "auto"
 
 
-def _mla_latent_scales(weights, kv_cache_quantized: bool) -> Dict[str, float]:
+def _mla_latent_scales(weights, quant_mode: QuantMode) -> Dict[str, float]:
     """Per attention module, a power of two for its NoPE latent.
 
     ``kv_a_layernorm.weight`` sets the magnitude of the latent that the KV
@@ -177,19 +177,30 @@ def _mla_latent_scales(weights, kv_cache_quantized: bool) -> Dict[str, float]:
     output unchanged and moves the latent into the range a quantized KV cache
     resolves.
 
-    ``TRTLLM_MLA_LATENT_SCALE`` selects the RMS the latent is brought to:
-    ``auto`` (default) for 1.0, a number, or ``off``. Modules are left alone
-    when the KV cache is not quantized or when their ``kv_b_proj`` is
-    quantized itself.
+    ``TRTLLM_MLA_LATENT_SCALE`` selects which KV caches are scaled and to
+    which RMS: ``auto`` (default) brings the latent of an NVFP4 KV cache to
+    1.0, a number brings the latent of any quantized KV cache to that RMS, and
+    ``off`` scales nothing. Modules whose ``kv_b_proj`` is quantized itself
+    are left alone.
     """
     mode = os.environ.get(_MLA_LATENT_SCALE_ENV, _MLA_LATENT_SCALE_DEFAULT)
-    if mode == "off" or not kv_cache_quantized:
+    if mode == "off":
         return {}
-    target = 1.0 if mode == "auto" else float(mode)
-    if not target > 0:
-        raise ValueError(
-            f"{_MLA_LATENT_SCALE_ENV} must be 'auto', 'off' or a positive "
-            f"number, got {mode!r}")
+    if mode == "auto":
+        target = 1.0
+        scaled = quant_mode.has_fp4_kv_cache()
+    else:
+        try:
+            target = float(mode)
+        except ValueError:
+            target = math.nan
+        if not (target > 0 and math.isfinite(target)):
+            raise ValueError(
+                f"{_MLA_LATENT_SCALE_ENV} must be 'auto', 'off' or a positive "
+                f"number, got {mode!r}")
+        scaled = quant_mode.has_kv_cache_quant()
+    if not scaled:
+        return {}
     suffix = ".kv_a_layernorm.weight"
     float_dtypes = (torch.bfloat16, torch.float16, torch.float32)
     scales = {}
@@ -416,9 +427,7 @@ class DeepseekV3WeightLoader:
 
         has_shared_mtp_weights = detect_shared_mtp_weights()
         latent_scales = _mla_latent_scales(
-            weights,
-            self.model_config.quant_config.layer_quant_mode.has_kv_cache_quant(
-            ))
+            weights, self.model_config.quant_config.layer_quant_mode)
         if any(scale != 1.0 for scale in latent_scales.values()):
             logger.info("MLA latent scales: " + ", ".join(
                 f"{name}:{scale:g}"
