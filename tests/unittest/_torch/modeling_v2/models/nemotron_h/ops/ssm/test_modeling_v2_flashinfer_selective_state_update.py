@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.ops.ssm.flashinfer_selective_state_update import (  # noqa: E501
+    DEP16_NHEADS,
     DSTATE,
     ENGINE_SLOT_LAYERS,
     ENGINE_SLOTS_256,
@@ -114,22 +115,24 @@ def _case(spec: dict, seed: int) -> SimpleNamespace:
     """
     gen = torch.Generator(device=DEV).manual_seed(seed)
     batch = spec["batch"]
+    # The rank's geometry: the tp8 targets' 32 heads over one group, or dep16's 256 over 8.
+    heads, groups = spec.get("nheads", NHEADS), spec.get("ngroups", NGROUPS)
 
     def uniform(lo, hi):
-        return torch.empty(NHEADS, device=DEV).uniform_(lo, hi, generator=gen)
+        return torch.empty(heads, device=DEV).uniform_(lo, hi, generator=gen)
 
     A = -torch.exp(uniform(-3.2, 6.1))
     dt_bias = uniform(-8.1, -1.3).to(torch.bfloat16)
     D = uniform(-1.13, 3.94).to(torch.bfloat16)
 
-    xw, bw = NHEADS * HEADDIM, NGROUPS * DSTATE
-    width = xw + 2 * bw  # x | B | C: 2304 at the targets' rank
+    xw, bw = heads * HEADDIM, groups * DSTATE
+    width = xw + 2 * bw  # x | B | C: 2304 at a tp8 rank, 18432 at dep16
     conv = F.silu(torch.randn(batch, width, device=DEV, generator=gen) * 2).to(torch.bfloat16)
-    proj = torch.randn(batch, xw + width + NHEADS, device=DEV, generator=gen).to(torch.bfloat16)
+    proj = torch.randn(batch, xw + width + heads, device=DEV, generator=gen).to(torch.bfloat16)
 
     slots_total = spec.get("pool_slots", ENGINE_SLOTS_256)
     layers = spec.get("pool_layers", ENGINE_SLOT_LAYERS)
-    base = torch.empty(slots_total, layers, NHEADS, HEADDIM, DSTATE, device=DEV)
+    base = torch.empty(slots_total, layers, heads, HEADDIM, DSTATE, device=DEV)
     base.fill_(1.5)  # the other layers' sub-pages: a value the op must not touch
     layer = layers // 2
     pool = base[:, layer]
@@ -144,21 +147,21 @@ def _case(spec: dict, seed: int) -> SimpleNamespace:
     return SimpleNamespace(
         base=base,
         layer=layer,
-        dt_raw=proj[:, -NHEADS:],
+        dt_raw=proj[:, -heads:],
         args=[
             pool,
-            conv[:, :xw].view(batch, NHEADS, HEADDIM),
-            proj[:, -NHEADS:][:, :, None].expand(batch, NHEADS, HEADDIM),
-            A[:, None, None].expand(NHEADS, HEADDIM, DSTATE),
-            conv[:, xw : xw + bw].view(batch, NGROUPS, DSTATE),
-            conv[:, xw + bw :].view(batch, NGROUPS, DSTATE),
-            D[:, None].expand(NHEADS, HEADDIM),
+            conv[:, :xw].view(batch, heads, HEADDIM),
+            proj[:, -heads:][:, :, None].expand(batch, heads, HEADDIM),
+            A[:, None, None].expand(heads, HEADDIM, DSTATE),
+            conv[:, xw : xw + bw].view(batch, groups, DSTATE),
+            conv[:, xw + bw :].view(batch, groups, DSTATE),
+            D[:, None].expand(heads, HEADDIM),
             None,
-            dt_bias[:, None].expand(NHEADS, HEADDIM),
+            dt_bias[:, None].expand(heads, HEADDIM),
             True,
             torch.tensor(slots, dtype=torch.int32, device=DEV),
             PAD_SLOT_ID,
-            torch.empty(batch, NHEADS, HEADDIM, dtype=torch.bfloat16, device=DEV),
+            torch.empty(batch, heads, HEADDIM, dtype=torch.bfloat16, device=DEV),
         ],
     )
 
@@ -209,6 +212,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     deep = [s for s in case.args[10].tolist() if s >= 0 and s * case.base.stride(0) > 2**31]
     if cell.spec.get("pool_slots", ENGINE_SLOTS_256) == ENGINE_SLOTS_256:
         assert deep, "a cell at the 271-slot pool must name slots past 2^31 elements"
+    if cell.spec.get("nheads") == DEP16_NHEADS:
+        assert deep, "a dep16 cell must name slots past 2^31 elements"
     for slot in deep:
         assert not torch.equal(case.base[slot, case.layer], before[slot, case.layer]), slot
 

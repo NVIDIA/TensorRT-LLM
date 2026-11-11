@@ -22,7 +22,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (  # noqa:
 #: keyed by `(M, K, N)`: the fastest of the kernel's own tactic space in CUDA-graph replay on a
 #: GB200, rotating weights so no call reads them from L2. Fixed rather than autotuned so every
 #: rank of a group runs the same kernel on the same shape; any other shape takes the kernel's
-#: default tactic.
+#: default tactic (the dep16 shapes, not yet measured).
 TACTICS: dict[tuple[int, int, int], DirectTactic] = {
     (1, 8192, 4384): DirectTactic(128, 4, 1),
     (1, 8192, 1280): DirectTactic(128, 4, 1),
@@ -47,10 +47,11 @@ class FlashinferDirectBf16Gemm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100})
 
-    # The nemotron_h BF16 targets' decode projections at one and two rows: the
+    # The nemotron_h BF16 targets' decode projections at one and two rows: at tp8 the
     # rank's mamba in_proj (8192 -> 4384), qkv and shared-expert up projection
     # (8192 -> 1280), and fc1_latent (8192 -> 2048) -- the K = 8192 shapes where this
-    # kernel beats cublas_mm at batch 1.
+    # kernel beats cublas_mm at batch 1; at dep16 (attention DP) the unsharded in_proj
+    # (8192 -> 35072), qkv (8192 -> 8704) and shared-expert up (8192 -> 10240).
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"nemotron_h BF16 decode {what}, T={m}: 8192 -> {n}",
@@ -61,6 +62,9 @@ class FlashinferDirectBf16Gemm(OpWrapper):
             ("mamba in_proj", 4384),
             ("qkv / shared up", 1280),
             ("fc1_latent", 2048),
+            ("dep16 mamba in_proj", 35072),
+            ("dep16 qkv", 8704),
+            ("dep16 shared up", 10240),
         )
     )
 
@@ -72,7 +76,10 @@ class FlashinferDirectBf16Gemm(OpWrapper):
     cublas_mm is as fast or faster, and at eight the kernel is twice as slow --
     which is why the targets call it for one or two rows only. On the
     K = 1024 / 1280 / 2048 projections (o_proj, shared down, fc2_latent) it
-    does not win at any row count.
+    does not win at any row count. The dep16 shapes (7 to 8 times wider in N)
+    run the kernel's default tactic and have not been timed against cublas_mm;
+    the dep16 target can turn the kernel off
+    (TRTLLM_NEMOTRON_ULTRA_DEP16_LOWM_MAX_ROWS=0).
 
     PDL: the caller says whether the kernel is launched as a programmatic
     dependent (`pdl`). The kernel waits for its predecessor before it reads

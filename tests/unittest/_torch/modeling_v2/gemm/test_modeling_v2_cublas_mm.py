@@ -165,6 +165,27 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
         )
         for m in (1, 32, 8192)
     ),
+    # Nemotron-3 Ultra BF16 at dep16 (attention DP over 16 ranks): every dense projection
+    # unsharded, at one row, the decode CUDA-graph ceiling of 32 rows a rank and a 4096-token
+    # prefill step (the disaggregated context tier's per-rank chunk).
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__dep16": tuple(
+        Cell(
+            why=f"nemotron_h BF16 dep16 {what}, T={m}",
+            spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=out_dtype),
+        )
+        for what, k, n, out_dtype in (
+            ("mamba in_proj: 8192 -> 2 x 16384 + 2 x 1024 + 256", 8192, 35072, None),
+            ("mamba out_proj: 16384 -> 8192", 16384, 8192, None),
+            ("qkv: 8192 -> (64 + 2 + 2) x 128", 8192, 8704, None),
+            ("o_proj: 8192 -> 8192", 8192, 8192, None),
+            ("shared up: 8192 -> 10240", 8192, 10240, None),
+            ("shared down: 10240 -> 8192", 10240, 8192, None),
+            ("fc1_latent: 8192 -> 2048", 8192, 2048, None),
+            ("fc2_latent: 2048 -> 8192", 2048, 8192, None),
+            ("router: bf16 in, fp32 logits over 512 experts", 8192, 512, torch.float32),
+        )
+        for m in (1, 32, 4096)
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

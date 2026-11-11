@@ -24,6 +24,18 @@ ENGINE_SLOTS_256, ENGINE_SLOTS_32, ENGINE_SLOT_LAYERS = 271, 35, 48
 
 #: 48 scattered slots of the 271-slot pool, slot 0, the last slot and slots past 2^31 included.
 _SLOTS_48 = (ENGINE_SLOTS_256 - 1, 0, 170, 171, 269) + tuple(7 + 6 * i for i in range(43))
+#: The BF16 dep16 target (attention DP over 16 ranks) runs the whole mixer on every rank: 256 heads
+#: over 8 groups. Its pool at max_batch_size 32 per rank has 35 slots of 48 layers, slot stride
+#: 48 * 256 * 64 * 128 = 100.7M elements: the slots from 22 on lie past 2^31 elements of the base.
+DEP16_NHEADS, DEP16_NGROUPS, DEP16_SLOTS = 256, 8, 35
+_DEP16 = dict(
+    nheads=DEP16_NHEADS,
+    ngroups=DEP16_NGROUPS,
+    pool_slots=DEP16_SLOTS,
+    pool_layers=ENGINE_SLOT_LAYERS,
+)
+#: Eight scattered dep16 slots: both ends and both sides of 2^31 elements.
+_DEP16_SLOTS_8 = (DEP16_SLOTS - 1, 0, 21, 22, 5, 30, 13, 27)
 
 
 class FlashinferSelectiveStateUpdate(OpWrapper):
@@ -47,8 +59,9 @@ class FlashinferSelectiveStateUpdate(OpWrapper):
 
     # spec keys: batch, pool_slots / pool_layers (the pool as `[slots, layers, H, P, N]` viewed at
     # one layer; default the 271-slot x 48-layer engine pool), slots (explicit slot per row,
-    # default a seeded draw), pads (rows set to pad_slot_id). Always the targets' geometry: 32
-    # heads of 64 over one group of 128 states, an fp32 pool, D and dt_bias bf16 as stored.
+    # default a seeded draw), pads (rows set to pad_slot_id), nheads / ngroups (default the tp8
+    # targets' 32 heads over one group; dep16's 256 over 8). Heads of 64, groups of 128 states,
+    # an fp32 pool, D and dt_bias bf16 as stored.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode batch 32, where the targets switch to this kernel, at the engine's "
@@ -79,12 +92,28 @@ class FlashinferSelectiveStateUpdate(OpWrapper):
             why="pad_slot_id -1 rows: pool untouched, out still written",
             spec=dict(batch=32, pads=(1, 17, 31)),
         ),
+        Cell(
+            why="dep16 decode batch 1 into the 35-slot pool's last slot, past 2^31 elements",
+            spec=dict(_DEP16, batch=1, slots=(DEP16_SLOTS - 1,)),
+        ),
+        Cell(
+            why="dep16 decode batch 8, scattered slots on both sides of 2^31 elements",
+            spec=dict(_DEP16, batch=8, slots=_DEP16_SLOTS_8),
+        ),
+        Cell(
+            why="dep16 decode batch 32: the default switch and the CUDA-graph ceiling a rank",
+            spec=dict(_DEP16, batch=32),
+        ),
+        Cell(
+            why="dep16 pad_slot_id -1 rows: pool untouched, out still written",
+            spec=dict(_DEP16, batch=8, slots=_DEP16_SLOTS_8, pads=(1, 6)),
+        ),
     )
 
     note = """
-    Call site (the decode step of both nemotron_h BF16 targets, from 32 rows on; below that,
-    and for a mixed step's generation rows, they call `selective_state_update`, the Triton
-    kernel):
+    Call site (the decode step of the nemotron_h BF16 targets, from 32 rows on -- dep16 takes the
+    row count from `TRTLLM_NEMOTRON_ULTRA_DEP16_FI_SSU_MIN_ROWS`; below that, and for a mixed
+    step's generation rows, they call `selective_state_update`, the Triton kernel). At tp8:
 
         y = torch.empty(B, 32, 64, dtype=torch.bfloat16)
         flashinfer_selective_state_update(pool, x.view(B, 32, 64),
@@ -102,7 +131,9 @@ class FlashinferSelectiveStateUpdate(OpWrapper):
     a mixed step's generation rows do not after an odd number of context rows (8768 bytes
     each), which is why the targets keep those on the Triton kernel. The pool is the layer's
     `[slots, 32, 64, 128]` view of the V2 pool (slot stride 48 layers, inner dims dense),
-    fp32, updated in place with int64 slot offsets.
+    fp32, updated in place with int64 slot offsets. dep16 makes the same call over all 256
+    heads and 8 groups (x `[B, 256, 64]`, B and C `[B, 8, 128]`, x / B / C at 32768, 65536 and
+    67584 bytes into an aligned 70144-byte in_proj row).
 
     The kernel picks its algorithm per call from the row count: below two blocks per SM
     (`batch * nheads`) the tiled "simple" kernel, above it the producer-consumer "vertical"

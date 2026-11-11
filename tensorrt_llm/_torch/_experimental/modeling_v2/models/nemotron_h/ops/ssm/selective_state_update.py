@@ -168,6 +168,17 @@ class SelectiveStateUpdate(OpWrapper):
             spec=dict(_DEP4, batch=7, pads=(1, 4)),
         ),
         Cell(
+            why="BF16 dep16 decode batch 31: all 256 heads, engine fp32 pool, fp32 D and dt_bias",
+            spec=dict(
+                _DEP4,
+                batch=31,
+                pool_dtype=torch.float32,
+                param_dtype=torch.float32,
+                pool_slots=ENGINE_SLOTS,
+                pool_layers=ENGINE_SLOT_LAYERS,
+            ),
+        ),
+        Cell(
             why="tep8 decode batch 1 into the engine fp32 pool's last slot",
             spec=dict(
                 _TEP8,
