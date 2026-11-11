@@ -865,9 +865,16 @@ def test_a_commit_lands_labelled_by_its_paths_and_only_a_judge_path_is_refused(t
     )
     assert not (repo / "tensorrt_llm/evaluate").exists() and len(load_labels(tmp_path / "ws")) == 3
     # A reference file the spec names is the judge's too; `allowed_paths` is read no more.
-    spec = {"trtllm_repo_path": str(repo), "accuracy": {"reference_yaml": "refs/gsm8k.yaml"}}
+    spec = {
+        "trtllm_repo_path": str(repo),
+        "accuracy": {"reference_yaml": {"default": "refs/gsm8k.yaml", "mtp": "refs/mtp.yaml"}},
+        "deployments": [
+            {"name": "tp1", "benchmarks": [{"name": "x", "reference_yaml": "r/x.yaml"}]}
+        ],
+    }
     named = CommitPolicy.from_task(spec, identity=CommitIdentity("T", "t@example.com"))
     assert "refs/gsm8k.yaml is a judge path" in named.path_problem("refs/gsm8k.yaml")
+    assert named.path_problem("refs/mtp.yaml") and named.path_problem("r/x.yaml")
     assert named.path_problem("tests/integration/defs/accuracy/references/gsm8k.yaml")
     assert not named.path_problem("tests/integration/defs/accuracy/test_llm_api_pytorch.py")
 

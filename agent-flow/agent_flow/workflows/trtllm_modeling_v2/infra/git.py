@@ -178,16 +178,16 @@ class CommitPolicy:
             rel = _relative_inside(Path(workspace), Path(repo))
             if rel:
                 denied.append(rel.rstrip("/") + "/")
-        named = [(task_data.get("accuracy") or {}).get("reference_yaml")]
+        # The spec's own reference file, per deployment in shorthand, and each benchmark's.
+        spec_wide = (task_data.get("accuracy") or {}).get("reference_yaml")
+        named = list(spec_wide.values()) if isinstance(spec_wide, Mapping) else [spec_wide]
         for entry in task_data.get("deployments") or ():
             benchmarks = entry.get("benchmarks") if isinstance(entry, Mapping) else None
             named += [b.get("reference_yaml") for b in benchmarks or () if isinstance(b, Mapping)]
         stated = {
-            str(path)
-            if not Path(str(path)).is_absolute()
-            else _relative_inside(Path(path), Path(repo))
+            path if not Path(path).is_absolute() else _relative_inside(Path(path), Path(repo))
             for path in named
-            if path and repo
+            if isinstance(path, str) and path and repo
         }
         return cls(
             identity=identity,

@@ -40,7 +40,7 @@ from agent_flow.logger import get_logger
 from ..agents.prompts import PromptBundle, build_trtllm_modeling_v2_prompts
 from ..agents.roles import PACKAGED_SKILLS_DIR, resolve_role_agents
 from ..agents.turns import InProcessTurnExecutor, TurnRequest
-from ..checks import check_runtime
+from ..checks import check_runtime, conventions
 from ..checks import verdict as check_result
 from ..infra.compute.commands import CommandExecutor
 from ..infra.compute.environment import RunEnvironment
@@ -50,10 +50,11 @@ from . import certify as certify_mod
 from . import contract as contract_mod
 from . import pipeline as pipeline_mod
 from . import start as start_mod
-from .integration import own_paths
+from .integration import COMMIT_LABELS_FILENAME, own_paths
 from .journal import Journal
 from .pipeline import DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ROUNDS, Pipeline
 from .start import HOST_FACTS_FILENAME
+from .startup.preflight import PREFLIGHT_FILENAME
 from .state import (
     STAGE_EXECUTION,
     STAGE_PREFLIGHT,
@@ -79,6 +80,11 @@ RUN_FILES: tuple[str, ...] = (
     certify_mod.CERTIFICATION_FILENAME,
     certify_mod.REPORT_FILENAME,
     "surface.md",
+    # What the run recorded for its report: preflight's records, the conventions scan's
+    # findings, the label of each landed commit. The frozen anchors stay with the workspace.
+    PREFLIGHT_FILENAME,
+    conventions.CONVENTIONS_FILENAME,
+    COMMIT_LABELS_FILENAME,
 )
 RUN_DIRS: tuple[str, ...] = ("reports", "decisions", certify_mod.CERTIFY_DIRNAME)
 

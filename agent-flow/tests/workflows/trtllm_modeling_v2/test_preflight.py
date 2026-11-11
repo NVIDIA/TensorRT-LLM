@@ -161,7 +161,7 @@ def test_a_later_deployment_is_not_attempted_and_a_config_that_does_not_load_is_
         {
             "name": "scored",
             "options": {"tensor_parallel_size": 4},
-            "benchmarks": [{"name": "mmmu"}],
+            "benchmarks": [{"name": "mmmu"}, {"name": "gsm8k", "dataset_path": "/no/such/dir"}],
         },
     ]
     task = _task(tmp_path, parallel=None, deployments=stated)
@@ -174,11 +174,13 @@ def test_a_later_deployment_is_not_attempted_and_a_config_that_does_not_load_is_
         ("tp1", ""),
         ("tp8", ""),
         ("scored", "accuracy[mmmu]"),
+        ("scored", "accuracy[gsm8k]"),
     ]
     reasons = [r["reason"] for r in result.not_attempted]
     assert reasons[0].startswith("`tp1` cannot hold the weights: 300 GiB on 1 device(s)")
     assert reasons[1] == "`tp8` needs 8 free devices on this host; it has 4"
     assert reasons[2].startswith("no declared anchor and no reference row")
+    assert reasons[3] == "`dataset_path` /no/such/dir does not exist on this host"
     # The tree cannot load the checkpoint's config yet: recorded, and not a stop.
     assert result.config_error == "KeyError: 'kimi_k3' (on node-1)"
     assert "config:      the tree cannot load it yet: KeyError" in result.report()
