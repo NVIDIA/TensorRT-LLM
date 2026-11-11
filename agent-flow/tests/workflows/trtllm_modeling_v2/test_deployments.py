@@ -746,6 +746,11 @@ def test_what_the_table_cannot_state_is_one_line_and_a_missing_key_says_its_fix(
             "deployments": [{"name": "tp1", "options": {}}, {"name": taken, "options": {}}],
         }
         assert f"`{taken}` is a task of the run; name the deployment otherwise" in refused(stated)
+    # A boot prompt rendered by hand cannot go through an endpoint: refused, never replaced.
+    by_hand = {"prompt": "<image>What is it", "images": ["a.png"], "render": "raw"}
+    raw = {**spec, "accuracy": {**(spec.get("accuracy") or {}), "boot": {"prompts": [by_hand]}}}
+    said = "'accuracy.boot.prompts[0]': `render: raw` cannot be sent: a boot asks the deployment's"
+    assert said in refused(raw)
     by_unit = shorthand(spec, runtime={"default": {"cuda_graph": True}, "mtp": {}})
     assert "state deployments: 'runtime' differs by unit" in refused(by_unit)
     per_feature = shorthand(spec, parallel="unified", members={"default": ["tp1"], "mtp": ["tep4"]})

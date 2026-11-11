@@ -86,7 +86,12 @@ REMOVED_ENVIRONMENT_KEYS: tuple[str, ...] = (
 BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "keywords", "max_tokens")
 GATE_TIMEOUT_KEY = "timeout"
 BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "keywords", "keywords_any", "images", "render")
-BOOT_RENDERS: tuple[str, ...] = ("loader", "raw")
+BOOT_RENDERS: tuple[str, ...] = ("loader",)
+#: Why a boot prompt rendered by hand is refused, at load and by the check: said, not replaced.
+RAW_REFUSED = (
+    "`render: raw` cannot be sent: a boot asks the deployment's endpoint, which applies the "
+    "chat template itself; write the question in `prompt` and drop `render`"
+)
 
 #: Keys an earlier version of the spec read and this one does not, by path (``*`` is any
 #: key of a mapping), each with what holds instead. Dropped at load, one notice each.
@@ -332,7 +337,9 @@ def _validate_boot_level(level: Mapping[str, Any], errors: list[str], where: str
         for key in ("keywords", "keywords_any", "images"):
             if entry.get(key) is not None and not _strings(entry[key], nonempty=True):
                 errors.append(f"'{at}.{key}' must be a list of non-empty strings")
-        if entry.get("render") is not None and entry["render"] not in BOOT_RENDERS:
+        if entry.get("render") == "raw":
+            errors.append(f"'{at}': {RAW_REFUSED}")
+        elif entry.get("render") is not None and entry["render"] not in BOOT_RENDERS:
             errors.append(f"'{at}.render' must be one of {BOOT_RENDERS}")
     prompts_file = level.get("prompts_file")
     if prompts_file is not None and not (

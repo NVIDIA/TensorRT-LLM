@@ -118,7 +118,8 @@ def _gsm8k_on_disk(monkeypatch, tmp_path_factory):
 # reports an address; FAKE_DIE_AFTER_BIND=<ctx|gen>: that side dies once the proxy is
 # being started;
 # FAKE_NO_IMAGES: it answers a chat completion with a 400 whose body says why;
-# FAKE_UNFINISHED: no finish reason.
+# FAKE_UNFINISHED: no finish reason; FAKE_FINISH: that one. A chat completion's answer
+# says how many images came with it when that is not one.
 _FAKE_SERVE = """#!{python}
 import http.server, json, os, signal, sys, threading, time
 
@@ -170,14 +171,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         asked = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        finish = None if os.environ.get("FAKE_UNFINISHED") else "stop"
+        finish = None if os.environ.get("FAKE_UNFINISHED") else os.environ.get("FAKE_FINISH", "stop")
         if self.path.endswith("/chat/completions"):
             if os.environ.get("FAKE_NO_IMAGES"):
                 why = "this model takes no image; " + "set a vision tower; " * 20 + "END"
                 return self._send({{"error": why}}, 400)
-            text, image = asked["messages"][0]["content"]
-            assert image["image_url"]["url"].startswith("data:image/png;base64,")
-            message = {{"role": "assistant", "content": "A lion statue, asked: " + text["text"]}}
+            text, *images = asked["messages"][0]["content"]
+            for image in images:
+                assert image["image_url"]["url"].startswith("data:image/png;base64,")
+            said = "A lion statue, asked: " + text["text"]
+            said += "" if len(images) == 1 else " (%d images)" % len(images)
+            message = {{"role": "assistant", "content": said}}
             return self._send({{"choices": [{{"message": message, "finish_reason": finish}}]}})
         again = asked["prompt"] in seen and os.environ.get("FAKE_REUSE", "1") == "1"
         seen.append(asked["prompt"])

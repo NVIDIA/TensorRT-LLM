@@ -362,6 +362,41 @@ def test_a_boot_through_the_endpoint_has_a_stock_path_control_and_the_specs_own_
     late = endpoint.run_endpoint_boot(one, task_data=bounded, workspace=workspace)
     assert not late.passed and "tp1 reported no address within its timeout" in late.detail
     assert time.monotonic() - began < 30
+    # A request never outlives the check: each takes what remains of the start's own bound,
+    # the repeated prompt of block reuse too.
+    monkeypatch.delenv("FAKE_SERVE_HANG")
+    waits: list[float] = []
+
+    def slow(running, prompt, *, max_tokens, timeout):
+        waits.append(timeout)
+        time.sleep(0.6)
+        return " Paris"
+
+    def repeated(running, prompt, *, max_tokens, timeout):
+        waits.append(timeout)
+        return {"usage": {"prompt_tokens_details": {"cached_tokens": 448}}}
+
+    monkeypatch.setattr(servers, "ask", slow)
+    monkeypatch.setattr(servers, "complete", repeated)
+    reuse = {"max_batch_size": 8, "kv_cache_config": {"enable_block_reuse": True}}
+    reusing = Deployment(name="tp1", server=Server(options=reuse))
+    bounded["accuracy"]["boot"]["tp1"]["timeout"] = 20
+    assert endpoint.run_endpoint_boot(reusing, task_data=bounded, workspace=workspace).passed
+    assert len(waits) == 4 and 1 <= waits[3] <= waits[2] <= waits[1] <= waits[0] - 0.6 < 20
+
+    # Past the bound a request gets a second, and its failure says whose time was up.
+    def gone(running, prompt, *, max_tokens, timeout):
+        waits.append(timeout)
+        time.sleep(1.1)
+        raise servers.ServerError("tp1 did not answer /v1/completions: timed out")
+
+    monkeypatch.setattr(servers, "ask", gone)
+    bounded["accuracy"]["boot"]["tp1"]["timeout"] = 1
+    spent = endpoint.run_endpoint_boot(one, task_data=bounded, workspace=workspace)
+    assert not spent.passed and waits[-1] == 1.0
+    assert spent.detail.endswith(
+        "timed out (the check's 1 s were up: start and requests share them)"
+    )
 
 
 def test_a_boot_through_the_endpoint_fails_when_nothing_starts_or_ranks_are_left(
@@ -425,10 +460,29 @@ def test_an_answer_counts_once_it_completed_and_an_image_deployment_is_sent_an_i
     assert 'HTTP Error 400: Bad Request: {"error": "this model takes no image; ' in blind.detail
     assert "END" not in blind.detail
     monkeypatch.delenv("FAKE_NO_IMAGES")
-    # An answer cut off before it finished is not an answer.
+    # An answer cut off before it finished is not an answer; nor is one the executor timed out.
     monkeypatch.setenv("FAKE_UNFINISHED", "1")
     cut = boot()
     assert not cut.passed and "without a completed choice" in cut.detail
+    monkeypatch.delenv("FAKE_UNFINISHED")
+    monkeypatch.setenv("FAKE_FINISH", "timeout")
+    cut = boot()
+    assert not cut.passed and "(finish reason 'timeout', not stop or length)" in cut.detail
+    monkeypatch.delenv("FAKE_FINISH")
+    # The workload is sent as it is stated: every image of a prompt, with the prompt's own words.
+    second = site / "second.png"
+    second.write_bytes(b"png")
+    both = BootPrompt("Compare the two", images=(str(picture), str(second)), keywords=("2 images",))
+    spec = BootSpec(prompts=(), items=(both,))
+    result = boot()
+    assert result.passed, result.detail
+    # A prompt rendered by hand cannot go through an endpoint: refused in a line, not replaced.
+    spec = BootSpec(
+        prompts=(), items=(BootPrompt("<image>Compare", images=("a.png",), render="raw"),)
+    )
+    refused = boot()
+    assert not refused.passed
+    assert refused.detail.startswith("image not checked: `render: raw` cannot be sent: a boot asks")
 
 
 def test_accuracy_through_the_endpoint_runs_the_trees_evaluator_and_is_held_to_the_anchor(

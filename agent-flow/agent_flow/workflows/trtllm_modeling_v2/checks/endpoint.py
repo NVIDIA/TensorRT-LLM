@@ -25,11 +25,11 @@ from typing import Any, Mapping, Sequence
 
 from ..infra.compute.environment import RunEnvironment
 from ..spec.deployments import Benchmark, Deployment, Server
-from ..spec.task_schema import resolve_gate_timeout
+from ..spec.task_schema import RAW_REFUSED, resolve_gate_timeout
 from . import anchors as anchors_mod
 from . import attest, datasets, servers
 from .accuracy import judged, parse_eval_score, unparsed_score_detail
-from .boot import DEFAULT_BOOT_IMAGE_PROMPT, BootSpec, missing_keywords
+from .boot import BootSpec, missing_keywords
 from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner
 from .harness import endpoint_eval
 from .verdict import GateResult, inspect_tree, verdict_factory
@@ -118,9 +118,11 @@ def run_endpoint_boot(
 ) -> GateResult:
     """Start ``deployment``, hold its endpoint to the boot workload, and stop it.
 
-    Every text prompt of the workload is sent as a completion. Each must come back with
-    text, and the workload's keywords must be in the answers. The start is bounded by
-    ``timeout``, else the spec's ``accuracy.boot.timeout``, else the deployment's own.
+    The workload is sent as it is stated: a text prompt as a completion, a prompt with
+    images as one chat completion with every image. Each must come back completed and
+    with text, and the workload's keywords must be in the answers. The start and the
+    requests together end at ``timeout``, else the spec's ``accuracy.boot.timeout``,
+    else the deployment's own: a request takes the time that remains.
     ``mode`` other than ``require`` is a control run on the stock implementation,
     recorded as ``boot[<mode>]``.
     """
@@ -147,31 +149,38 @@ def run_endpoint_boot(
     cached: list[int | None] = []
     roles = deployment.servers
     failure = ""
+
+    def left() -> float:
+        """What remains of the check's time; a second at least, so a late request fails as one."""
+        return max(1.0, started + running.budget - time.monotonic())
+
     try:
         for request in spec.requests(task_data.get("trtllm_repo_path")):
+            asked = dict(max_tokens=spec.max_tokens, timeout=left())
             if request.get("images"):
-                # The server places the image and applies the chat template itself.
-                raw = request.get("render") == "raw"
-                prompt = DEFAULT_BOOT_IMAGE_PROMPT if raw else request["prompt"]
+                # The server places the images and applies the chat template itself, so a
+                # prompt rendered by hand cannot go as it is; it is not replaced by another.
+                if request.get("render") == "raw":
+                    raise servers.ServerError(f"image not checked: {RAW_REFUSED}")
                 try:
-                    said = servers.ask_image(
-                        running, prompt, request["images"][0], max_tokens=spec.max_tokens
-                    )
+                    said = servers.ask_image(running, request["prompt"], request["images"], **asked)
                 except servers.ServerError as exc:
                     raise servers.ServerError(f"image not checked: {exc}") from exc
                 texts.append(said)
                 continue
-            texts.append(servers.ask(running, request["prompt"], max_tokens=spec.max_tokens))
+            texts.append(servers.ask(running, request["prompt"], **asked))
         # With block reuse on, one more prompt is sent again and must resume from the cache.
         sends = max(
             (attest.reuse_sends(s.options) for s in roles.values() if attest.reuses(s.options)),
             default=0,
         )
         for _ in range(sends):
-            reply = servers.complete(running, attest.REUSE_PROMPT, max_tokens=1)
+            reply = servers.complete(running, attest.REUSE_PROMPT, max_tokens=1, timeout=left())
             cached.append(servers.cached_tokens(reply))
     except servers.ServerError as exc:
         failure = str(exc)
+        if time.monotonic() - started >= running.budget:
+            failure += f" (the check's {running.budget:g} s were up: start and requests share them)"
     finally:
         attested = [
             _attested(running, role, server, task_data, mode) for role, server in roles.items()

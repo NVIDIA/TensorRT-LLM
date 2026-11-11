@@ -81,6 +81,9 @@ UNVERIFIED = "devices not verified free"
 #: Where the engine locks are: on this node whatever ``TMPDIR`` a caller has.
 LOCK_DIRS: tuple[str, ...] = ("/dev/shm", "/var/tmp", "/tmp")  # nosec B108
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+#: The finish reasons of an answer that completed. The executor also ends a request with
+#: ``timeout`` or ``cancelled``: text may come with those, and it is no answer.
+COMPLETED: tuple[str, ...] = ("stop", "length")
 #: Printed once by each process a launch prefix starts: how many it starts is how many
 #: ranks it can place.
 _PROCESS = "MV2FLOW_PROCESS"
@@ -388,24 +391,24 @@ def local_env(
 ) -> dict[str, str]:
     """``env`` for a server with no launch prefix: its own devices, and no MPI world it did not start.
 
-    One rank runs its worker in its own process, with the bootstrap variables this
-    process may have inherited from an allocation taken out (all but those the spec
-    ``declared``). Behind a prefix the site places both, and ``env`` is returned as it is.
+    The MPI identity this process may have inherited from an allocation is taken out (all
+    but the settings and what the spec ``declared``): several ranks get theirs from the
+    ``mpirun`` the flow starts, and one rank runs its worker in its own process, without
+    the scheduler's variables either. Behind a prefix the site places both, and ``env``
+    is returned as it is.
     """
     env = dict(env)
     if server.launch.strip():
         return env
     if devices:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in devices)
-    if server.ranks > 1:
-        return env
-    kept = {"SLURM_PROCID", "SLURM_LOCALID", *MPI_SETTINGS_KEPT, *declared}
-    env = {
-        k: v
-        for k, v in env.items()
-        if k in kept or not k.startswith(("PMI", "MPI", "OMPI", "SLURM"))
-    }
-    env.setdefault(SINGLE_PROCESS_WORKER_ENV, "1")
+    one = server.ranks <= 1
+    kept = {*MPI_SETTINGS_KEPT, *declared, *(("SLURM_PROCID", "SLURM_LOCALID") if one else ())}
+    # Above one rank the scheduler's variables stay: `mpirun` reads its slots from them.
+    borrowed = ("PMI", "MPI", "OMPI", *(("SLURM",) if one else ()))
+    env = {k: v for k, v in env.items() if k in kept or not k.startswith(borrowed)}
+    if one:
+        env.setdefault(SINGLE_PROCESS_WORKER_ENV, "1")
     return env
 
 
@@ -512,10 +515,15 @@ def start(
     owned: list[Owned] = []
     running = Running(deployment, "", owned, workspace, budget)
 
-    def begin(name: str, server: Server, argv: Sequence[str], address_file: Path) -> Owned:
-        """Start ``argv`` behind ``server``'s prefix in its own group, and record it."""
-        # A server of this host with options takes its ranks' devices; the proxy has neither.
-        takes = server.ranks if server.options and not server.launch.strip() else 0
+    def begin(
+        name: str, server: Server, argv: Sequence[str], address_file: Path, engine: bool = True
+    ) -> Owned:
+        """Start ``argv`` behind ``server``'s prefix in its own group, and record it.
+
+        ``engine``: it loads the model, so it has ranks and devices; the proxy has neither.
+        What its options say, or that they say nothing, does not decide that.
+        """
+        takes = server.ranks if engine and not server.launch.strip() else 0
         own = [left.pop(0) for _ in range(min(takes, len(left)))]
         process_env = local_env(server, own, launch_env(server.launch, declared), list(declared))
         process_env[SERVER_NAME_ENV] = name
@@ -527,7 +535,7 @@ def start(
         before, placed = _look(server.launch, process_env, look)
         # Before a load: a prefix that starts another count of processes than the server
         # has ranks would only fail at engine start.
-        if server.launch.strip() and server.options and placed:
+        if server.launch.strip() and engine and placed:
             if rank_problem(name, placed, server.ranks):
                 raise ServerError(rank_problem(name, placed, server.ranks))
         with (directory / f"{name}.log").open("wb") as sink:
@@ -579,9 +587,8 @@ def start(
         argv = ["trtllm-serve", "disaggregated", "-c", str(config)]
         argv += ["--server_start_timeout", str(remaining), "-r", "360000"]
         argv += ["--report_addr", str(directory / "address.proxy")]
-        proxy = begin(
-            f"{deployment.name}.proxy", Server(options={}), argv, directory / "address.proxy"
-        )
+        address_file = directory / "address.proxy"
+        proxy = begin(f"{deployment.name}.proxy", Server(options={}), argv, address_file, False)
         running.address = _await(proxy, deadline, sides, _await(proxy, deadline, sides))
         return running
     except BaseException:
@@ -630,9 +637,14 @@ def _post(
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise ServerError(f"{name} did not answer {path}: {exc}") from exc
     choice = (payload.get("choices") or [None])[0] if isinstance(payload, dict) else None
-    # An answer counts once it completed: a response cut off mid-way has no finish reason.
-    if not isinstance(choice, dict) or not choice.get("finish_reason"):
-        raise ServerError(f"{name} answered {path} without a completed choice: {payload}")
+    # An answer counts once it completed: a response cut off mid-way has no finish reason,
+    # and one the executor timed out or cancelled says so in it.
+    reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+    if reason not in COMPLETED:
+        raise ServerError(
+            f"{name} answered {path} without a completed choice (finish reason {reason!r}, "
+            f"not {' or '.join(COMPLETED)}): {str(payload)[:300]}"
+        )
     return payload
 
 
@@ -656,18 +668,23 @@ def ask(running: Running, prompt: str, *, max_tokens: int, timeout: float = 600)
 
 
 def ask_image(
-    running: Running, prompt: str, image: str | Path, *, max_tokens: int, timeout: float = 600
+    running: Running,
+    prompt: str,
+    images: str | Path | Sequence[str | Path],
+    *,
+    max_tokens: int,
+    timeout: float = 600,
 ) -> str:
-    """One greedy chat completion over ``prompt`` and the image file ``image``; its text."""
-    try:
-        data = base64.b64encode(Path(image).read_bytes()).decode("ascii")
-    except OSError as exc:
-        raise ServerError(f"the image {image} cannot be read: {exc}") from exc
-    kind = Path(image).suffix.lstrip(".").lower().replace("jpg", "jpeg") or "png"
-    content = [
-        {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": f"data:image/{kind};base64,{data}"}},
-    ]
+    """One greedy chat completion over ``prompt`` and every image file of ``images``; its text."""
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for image in [images] if isinstance(images, (str, Path)) else images:
+        try:
+            data = base64.b64encode(Path(image).read_bytes()).decode("ascii")
+        except OSError as exc:
+            raise ServerError(f"the image {image} cannot be read: {exc}") from exc
+        kind = Path(image).suffix.lstrip(".").lower().replace("jpg", "jpeg") or "png"
+        url = f"data:image/{kind};base64,{data}"
+        content.append({"type": "image_url", "image_url": {"url": url}})
     body = {
         "model": "deployment",
         "messages": [{"role": "user", "content": content}],

@@ -120,6 +120,22 @@ def test_the_flow_adds_the_ranks_launcher_and_the_prefix_stays_the_sites(site, m
     env = _started(workspace, "local")["env"]
     assert env["CUDA_VISIBLE_DEVICES"] == "4" and env["TLLM_WORKER_USE_SINGLE_PROCESS"] == "1"
     assert "SLURM_JOB_ID" not in env and "PMIX_RANK" not in env and env["SLURM_PROCID"] == "7"
+    # A server takes its device because it is one, whatever its options say: `{}` too.
+    bare = Deployment(name="bare", server=Server(options={}))
+    servers.stop(servers.start(bare, model="/m", workspace=workspace, devices=(6,)))
+    assert _started(workspace, "bare")["env"]["CUDA_VISIBLE_DEVICES"] == "6"
+    # Several ranks on this host: `mpirun` makes their MPI world, and nothing of the one this
+    # process may be a rank of reaches it. The scheduler's variables stay: its slots are there.
+    two = Deployment(
+        name="two", server=Server(options={"tensor_parallel_size": 2}), env={"OMPI_MCA_btl": "self"}
+    )
+    servers.stop(servers.start(two, model="/m", workspace=workspace, devices=(4, 5)))
+    env = _started(workspace, "two")["env"]
+    assert "PMIX_RANK" not in env and "OMPI_COMM_WORLD_SIZE" not in env
+    assert (env["OMPI_MCA_btl"], env["SLURM_JOB_ID"], env["CUDA_VISIBLE_DEVICES"]) == (
+        "self", "7", "4,5",
+    )  # fmt: skip
+    assert "TLLM_WORKER_USE_SINGLE_PROCESS" not in env
 
 
 def test_a_disaggregated_deployment_is_two_servers_and_a_proxy_on_their_own_devices(site):
@@ -344,7 +360,10 @@ def test_one_engine_lock_per_workspace_wherever_tmpdir_points(site, monkeypatch)
     assert time.monotonic() - started < 5
 
 
-def test_an_answer_counts_only_once_it_completed(site, monkeypatch):
+@pytest.mark.parametrize("finish", ["stop", "length", "timeout", "cancelled", "None", "", None])
+def test_an_answer_counts_only_once_it_completed(site, monkeypatch, finish):
+    """The executor ends a request it timed out or cancelled with that word, and text may come with it."""
+
     class Reply:
         def __enter__(self):
             return self
@@ -353,9 +372,14 @@ def test_an_answer_counts_only_once_it_completed(site, monkeypatch):
             return None
 
         def read(self):
-            return b'{"choices":[{"text":"Paris","finish_reason":null}]}'
+            return json.dumps({"choices": [{"text": "Paris", "finish_reason": finish}]}).encode()
 
     monkeypatch.setattr(servers, "_DIRECT", SimpleNamespace(open=lambda *a, **kw: Reply()))
     running = servers.Running(_one(), "127.0.0.1:1", [], site)
-    with pytest.raises(servers.ServerError, match="without a completed choice"):
+    if finish in ("stop", "length"):
+        assert servers.ask(running, "capital", max_tokens=8) == "Paris"
+        return
+    with pytest.raises(servers.ServerError) as refused:
         servers.ask(running, "capital", max_tokens=8)
+    said = f"without a completed choice (finish reason {finish!r}, not stop or length)"
+    assert said in str(refused.value)
