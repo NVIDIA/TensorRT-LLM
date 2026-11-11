@@ -6,8 +6,9 @@
 Every accuracy check runs offline (``HF_DATASETS_OFFLINE=1``), so the dataset must be on
 disk before the engine loads. :func:`find` looks where it can be: the benchmark's stated
 ``dataset_path``, the copy the tree's own tests read under ``$LLM_MODELS_ROOT/datasets``,
-the HuggingFace cache. A known benchmark whose dataset is nowhere is a host problem, said
-before a load is spent on it and never a verdict about the target. Nothing is downloaded.
+the HuggingFace hub cache, the datasets an earlier evaluation left prepared. A known
+benchmark whose dataset is nowhere is a host problem, said before a load is spent on it
+and never a verdict about the target. Nothing is downloaded.
 """
 
 from __future__ import annotations
@@ -48,12 +49,16 @@ def find(
     ):
         return str(Path(env["LLM_MODELS_ROOT"]) / "datasets" / repo), "the models root"
     home = env.get("HF_HOME") or str(Path.home() / ".cache" / "huggingface")
-    for hub in (env.get("HF_HUB_CACHE"), str(Path(home) / "hub")):
-        snapshots = Path(hub or "") / f"datasets--{repo.replace('/', '--')}" / "snapshots"
-        newest = sorted(snapshots.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for snapshot in newest if hub else ():
+    hubs = [hub for hub in (env.get("HF_HUB_CACHE"), str(Path(home) / "hub")) if hub]
+    for hub in hubs:
+        snapshots = Path(hub) / f"datasets--{repo.replace('/', '--')}" / "snapshots"
+        for snapshot in sorted(snapshots.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True):
             if _holds_files(snapshot):
                 return str(snapshot), "the HuggingFace cache"
+    # What an earlier evaluation left prepared is the evaluator's own to find, offline too.
+    prepared = Path(env.get("HF_DATASETS_CACHE") or Path(home) / "datasets")
+    if _holds_files(prepared / repo.replace("/", "___").lower()):
+        return "", ""
     return "", (
         f"the dataset of `{benchmark}` ({repo}) is not on this host, and accuracy runs "
         f"offline: put it under $LLM_MODELS_ROOT/datasets/{repo}, or state `dataset_path`"

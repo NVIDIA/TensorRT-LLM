@@ -161,6 +161,7 @@ def test_a_dataset_is_found_where_it_is_on_this_host_and_never_downloaded(tmp_pa
     # Nothing of the host this runs on: its models root and its caches are out of the way.
     monkeypatch.delenv("LLM_MODELS_ROOT")
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_DATASETS_CACHE", raising=False)
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     # Nowhere: a host problem, said before a load is spent, with where to put it.
     path, said = datasets.find("gsm8k")
@@ -168,6 +169,11 @@ def test_a_dataset_is_found_where_it_is_on_this_host_and_never_downloaded(tmp_pa
     assert "$LLM_MODELS_ROOT/datasets/openai/gsm8k" in said
     # A benchmark this module does not know is the evaluator's to look up.
     assert datasets.find("mmlu") == ("", "")
+    # What an earlier evaluation prepared is the evaluator's own to find: nothing is passed.
+    prepared = tmp_path / "hf/datasets/openai___gsm8k/main/0.0.0"
+    prepared.mkdir(parents=True)
+    (prepared / "gsm8k-test.arrow").write_text("rows")
+    assert datasets.find("gsm8k") == ("", "")
     # The HuggingFace cache, then the models root over it, then a stated path over both.
     cached = _files(tmp_path / "hf/hub/datasets--openai--gsm8k/snapshots/abc123")
     assert datasets.find("gsm8k") == (str(cached), "the HuggingFace cache")
