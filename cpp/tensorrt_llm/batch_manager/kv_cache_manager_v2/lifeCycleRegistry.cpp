@@ -49,10 +49,12 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, in
 
 LifeCycle makeLifeCycle(RegionConfig const& region, int regionIndex)
 {
-    // RegionConfig::validate() admits request regions only; a token-block region would map
-    // to an AttnLifeCycle with the region's own window.
-    TLLM_CHECK_WITH_INFO(region.allocationUnit == RegionAllocationUnit::kRequest,
-        "Region '%s': only request regions are supported", region.name.c_str());
+    // A token-block region holds token blocks the way an attention layer's buffers do, with
+    // the region's own window and no sink blocks.
+    if (region.allocationUnit == RegionAllocationUnit::kTokenBlock)
+    {
+        return AttnLifeCycle{region.windowSize, 0, region.reusePolicy, regionIndex};
+    }
     return SsmLifeCycle{region.reusePolicy, regionIndex};
 }
 

@@ -134,12 +134,15 @@ struct KVCacheEvent
     std::optional<std::string> hashAlgo;
     std::optional<int> attentionDpRank;
     EventLayerGroupId layerGroupId;
+    //! Name of the region whose life cycle the layer group is; nullopt for a layer config's group
+    //! and for an event without a layer group.
+    std::optional<std::string> region;
 
     bool operator==(KVCacheEvent const& other) const
     {
         return eventId == other.eventId && data == other.data && windowSize == other.windowSize
             && hashAlgo == other.hashAlgo && attentionDpRank == other.attentionDpRank
-            && layerGroupId == other.layerGroupId;
+            && layerGroupId == other.layerGroupId && region == other.region;
     }
 };
 
@@ -163,6 +166,9 @@ public:
     void addCreatedEvent(
         std::vector<int> numBlocksPerCacheLevel, std::optional<std::vector<int>> layerGroupIds = std::nullopt);
     void setLayerGroupWindowSizes(std::map<int, int> windowSizes);
+    //! Region name of each layer group that is a region's life cycle; events of the other groups
+    //! carry no region.
+    void setLayerGroupRegions(std::map<int, std::string> regions);
     void addStoredEvent(KVCacheStoredData data, EventLayerGroupId layerGroupId = std::nullopt);
     void addRemovedEvent(std::vector<EventBlockHash> blockHashes, EventLayerGroupId layerGroupId = std::nullopt);
     void addUpdatedEvent(EventBlockHash blockHash, std::optional<KVCacheEventDiff> cacheLevel = std::nullopt,
@@ -231,11 +237,13 @@ private:
     std::vector<KVCacheEvent> drainPendingEventsUnlocked();
     void publishEventsUnlocked(std::vector<KVCacheEvent> events, std::optional<int> maxKvEventEntries = std::nullopt);
     int getWindowSize(EventLayerGroupId layerGroupId) const;
+    std::optional<std::string> getRegion(EventLayerGroupId layerGroupId) const;
     void dropHashCache(Digest const& blockKey);
 
     int mMaxKvEventEntries;
     int mWindowSize;
     std::map<int, int> mWindowSizeByLayerGroup;
+    std::map<int, std::string> mRegionByLayerGroup;
     std::optional<int> mAttentionDpRank;
     AttentionDpGatherFn mAttentionDpGather;
     HashAlgorithm mHashAlgo;

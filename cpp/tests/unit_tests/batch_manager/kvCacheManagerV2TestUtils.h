@@ -114,4 +114,58 @@ inline KVCacheManagerConfig makeReplayRegionConfig(size_t gpuQuota, std::optiona
     return config;
 }
 
+//! Window, in tokens, of the "hp_ring" region of makeMlaRegionConfig(); shorter than a block.
+constexpr int kMlaHpWindow = 3;
+
+//! A hybrid stage whose MLA state lives only in token-block regions: FP4 MLA layers 0 and 2 and an FP8
+//! MLA layer 3 are empty AttentionLayerConfigs, and their buffers form the regions "fp4_latent" (key and
+//! key_block_scale on 0 and 2), "fp8_latent" (key on 3) and "hp_ring" (mla_hp_tail on 0 and 2, window
+//! kMlaHpWindow), declared in that order. With `withKda`, SSM layer 1 holds REQUIRED state and the
+//! PRIVATE request region "replay" follows; without it the config has no layer life cycle.
+//!
+//! Lifecycles: with KDA, 0 is the SSM state and 1-4 are the regions in order; without it, 0-2 are the
+//! three MLA regions.
+inline KVCacheManagerConfig makeMlaRegionConfig(size_t gpuQuota, bool withKda)
+{
+    KVCacheManagerConfig config;
+    config.tokensPerBlock = 4;
+    config.cacheTiers.emplace_back(GpuCacheTierConfig{gpuQuota});
+    config.commitMinSnapshot = true;
+    auto tokenBlockRegion = [](char const* name, std::optional<int> windowSize)
+    {
+        return RegionConfig{.name = name,
+            .allocationUnit = RegionAllocationUnit::kTokenBlock,
+            .reusePolicy = ReusePolicy::REQUIRED,
+            .windowSize = windowSize};
+    };
+    auto fp4 = tokenBlockRegion("fp4_latent", std::nullopt);
+    auto fp8 = tokenBlockRegion("fp8_latent", std::nullopt);
+    auto hp = tokenBlockRegion("hp_ring", kMlaHpWindow);
+    for (LayerId const layerId : {0, 2})
+    {
+        fp4.buffers.push_back(RegionBuffer{.layerId = layerId, .buffer = BufferConfig{.role = "key", .size = 1280}});
+        fp4.buffers.push_back(
+            RegionBuffer{.layerId = layerId, .buffer = BufferConfig{.role = "key_block_scale", .size = 160}});
+        hp.buffers.push_back(
+            RegionBuffer{.layerId = layerId, .buffer = BufferConfig{.role = "mla_hp_tail", .size = 3456}});
+    }
+    fp8.buffers.push_back(RegionBuffer{.layerId = 3, .buffer = BufferConfig{.role = "key", .size = 2304}});
+
+    config.layers.emplace_back(AttentionLayerConfig{.layerId = 0});
+    if (withKda)
+    {
+        config.layers.emplace_back(SsmLayerConfig{.layerId = 1,
+            .buffers = {BufferConfig{.role = "state", .size = 4096}, BufferConfig{.role = "conv", .size = 1024}}});
+    }
+    config.layers.emplace_back(AttentionLayerConfig{.layerId = 2});
+    config.layers.emplace_back(AttentionLayerConfig{.layerId = 3});
+    config.regions = {std::move(fp4), std::move(fp8), std::move(hp)};
+    if (withKda)
+    {
+        config.regions.push_back(RegionConfig{.name = "replay",
+            .buffers = {RegionBuffer{.layerId = 1, .buffer = BufferConfig{.role = "old_x", .size = 2048}}}});
+    }
+    return config;
+}
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2::test

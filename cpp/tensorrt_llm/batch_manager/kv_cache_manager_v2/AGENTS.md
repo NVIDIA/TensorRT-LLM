@@ -131,18 +131,29 @@ and use `requiredSsmLifeCycleId()` only for prefix pruning.
 
 `KVCacheManagerConfig::regions` declares buffers whose lifecycle comes from a
 `RegionConfig` rather than from a layer config. Each region has a lifecycle of
-its own: the region index is part of the `SsmLifeCycle` key, so a region never
-merges with a layer lifecycle or another region of equal policy. Region
-lifecycles are registered after every layer lifecycle, in declaration order, so
-declaring one never renumbers the layer groups. Only request regions are
-supported, on layers that have an `SsmLayerConfig` (which may hold no buffers of
-its own); a `(layer, role)` pair belongs to one layer config or one region. A
-region is an `SsmLifeCycle` with the region's reuse policy, so every
-kind-dispatch site treats it as SSM state: one slot per cache and beam, and a
-`REQUIRED` region is snapshotted at commit and restored at a matched prefix like
-an SSM layer's state. Layer buffers and regions together have at most one
-`REQUIRED` SSM lifecycle, which `LifeCycleRegistry` checks at construction.
-`getRegionGroupId(name)` (`get_region_group_id`) resolves it.
+its own: the region index is part of the `SsmLifeCycle` and `AttnLifeCycle`
+keys, so a region never merges with a layer lifecycle or another region of equal
+parameters. Region lifecycles are registered after every layer lifecycle, in
+declaration order, so declaring one never renumbers the layer groups. A config
+may declare no layer buffers at all; its lifecycles are then all regions', and
+its layers are empty layer configs that place the region buffers. A
+`(layer, role)` pair belongs to one layer config or one region. Two kinds of
+region are supported, and each lowers to the lifecycle variant every
+kind-dispatch site already handles:
+
+- A request region (`kRequest`) holds one slot per cache and beam on layers with an
+  `SsmLayerConfig`. Its `SsmLifeCycle` carries the region’s reuse policy. The
+  single `REQUIRED` SSM lifecycle is snapshotted at commit and restored on reuse. Only a request region may set `fixedSlotCount`.
+- A token-block region (`kTokenBlock`) uses the `REQUIRED` policy, sits on
+  layers that have an `AttentionLayerConfig`, and is an
+  `AttnLifeCycle{windowSize, 0, REQUIRED, regionIndex}`: one page per token
+  block, with the region's optional window and no sink blocks. Its stale range,
+  slot floor, page-loss handling, conversation drop plan and match coverage are
+  those of an attention layer with that window.
+
+`getRegionGroupId(name)` (`get_region_group_id`) resolves a region's group, and
+`get_group_life_cycle(group)` returns any group's lifecycle (window, sinks,
+policy and region index) to Python.
 Optional SSM checkpoints require an exact endpoint match, including partial
 blocks. Fresh or unselected recurrent state must be initialized or reconstructed
 by the caller before inference. A pool-group index is a storage-layout index and is
@@ -595,7 +606,7 @@ Two exposed accessors look like they might leak shared state and do not:
   state, the eviction lists, or the stats aggregates. Accessors that read only
   state fixed at construction are lock-free: `num_layers`, `layer_ids`,
   `tokens_per_block`, `cache_tier_list`, `all_buffer_ids`, `get_layer_group_id`,
-  `get_life_cycle_pool_group_indices`,
+  `get_group_life_cycle`, `get_life_cycle_pool_group_indices`,
   `get_page_stride`, `get_page_index_scale`, `get_page_index_converter`,
   `get_mem_pool_base_address`, `supports_index_mode`, `init_config`, and the
   config flags. `any_remote_level_failed` is lock-free too but reads runtime

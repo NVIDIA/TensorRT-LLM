@@ -63,23 +63,41 @@ void RegionConfig::validate() const
     }
     auto const fail
         = [this](std::string const& what) { throw std::invalid_argument("RegionConfig '" + name + "': " + what); };
-    if (allocationUnit != RegionAllocationUnit::kRequest)
+    if (allocationUnit == RegionAllocationUnit::kRequest)
     {
-        fail("only request regions are supported");
+        if (reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY)
+        {
+            fail("SINK_REQUIRED_ONLY is only supported for attention layers");
+        }
+        if (windowSize.has_value())
+        {
+            fail("a request region has no window");
+        }
+        if (fixedSlotCount.has_value() && *fixedSlotCount <= 0)
+        {
+            fail("fixed_slot_count must be positive when set");
+        }
     }
-    // A request region is an SSM life cycle. How many SSM life cycles may be REQUIRED is checked
-    // by the LifeCycleRegistry, which sees the layer life cycles as well.
-    if (reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY)
+    else
     {
-        fail("SINK_REQUIRED_ONLY is only supported for attention layers");
+        if (reusePolicy != ReusePolicy::REQUIRED)
+        {
+            fail("a token-block region must use the REQUIRED reuse policy");
+        }
+        if (windowSize.has_value() && *windowSize <= 0)
+        {
+            fail("window_size must be positive when set");
+        }
+        // A fixed pool group is keyed by a request region's life cycle; a token-block region
+        // is sized by ratio like an attention layer.
+        if (fixedSlotCount.has_value())
+        {
+            fail("a token-block region has no fixed slot count");
+        }
     }
     if (buffers.empty())
     {
         fail("must declare at least one buffer");
-    }
-    if (fixedSlotCount.has_value() && *fixedSlotCount <= 0)
-    {
-        fail("fixed_slot_count must be positive when set");
     }
     std::set<std::pair<LayerId, DataRole>> seen;
     for (auto const& [layerId, buf] : buffers)
@@ -95,8 +113,7 @@ void RegionConfig::validate() const
         }
         if (buf.tokensPerBlockOverride.has_value() || buf.isSparse)
         {
-            fail("buffer '" + buf.role + "' sets tokensPerBlockOverride or isSparse, which request regions do not "
-                "support");
+            fail("buffer '" + buf.role + "' sets tokensPerBlockOverride or isSparse, which regions do not support");
         }
     }
 }
@@ -261,11 +278,13 @@ void _validateSelectionIds(std::vector<LayerConfig> const& layers)
     }
 }
 
-//! Region checks that need the layers: every region buffer sits on an SSM layer, and each
-//! (layer, role) pair belongs to one layer config or one region.
+//! Region checks that need the layers: a request region's buffers sit on SSM layers and a
+//! token-block region's on attention layers, and each (layer, role) pair belongs to one layer
+//! config or one region.
 void _validateRegions(std::vector<LayerConfig> const& layers, std::vector<RegionConfig> const& regions)
 {
     std::set<LayerId> ssmLayerIds;
+    std::set<LayerId> attentionLayerIds;
     std::set<std::pair<LayerId, DataRole>> owned;
     for (auto const& layer : layers)
     {
@@ -275,6 +294,10 @@ void _validateRegions(std::vector<LayerConfig> const& layers, std::vector<Region
                 if constexpr (std::is_same_v<std::decay_t<decltype(cfg)>, SsmLayerConfig>)
                 {
                     ssmLayerIds.insert(cfg.layerId);
+                }
+                else
+                {
+                    attentionLayerIds.insert(cfg.layerId);
                 }
                 for (auto const& buf : cfg.buffers)
                 {
@@ -291,13 +314,16 @@ void _validateRegions(std::vector<LayerConfig> const& layers, std::vector<Region
         {
             throw std::invalid_argument("KVCacheManagerConfig: region name '" + region.name + "' is declared twice");
         }
+        bool const isRequestRegion = region.allocationUnit == RegionAllocationUnit::kRequest;
+        auto const& hostLayerIds = isRequestRegion ? ssmLayerIds : attentionLayerIds;
         for (auto const& [layerId, buf] : region.buffers)
         {
-            if (ssmLayerIds.count(layerId) == 0)
+            if (hostLayerIds.count(layerId) == 0)
             {
                 throw std::invalid_argument("KVCacheManagerConfig: region '" + region.name + "' places buffer '"
-                    + buf.role + "' on layer " + std::to_string(layerId)
-                    + ", which has no SsmLayerConfig; request regions need one");
+                    + buf.role + "' on layer " + std::to_string(layerId) + ", which has no "
+                    + (isRequestRegion ? "SsmLayerConfig; request regions need one"
+                                       : "AttentionLayerConfig; token-block regions need one"));
             }
             if (!owned.emplace(layerId, buf.role).second)
             {

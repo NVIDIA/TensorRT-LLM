@@ -17,6 +17,7 @@
 
 #include "kvCacheManagerV2TestUtils.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/introspection.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/page.h"
@@ -48,6 +49,7 @@ namespace
 using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeConfig;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeHybridTieredConfig;
+using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeMlaRegionConfig;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeTieredConfig;
 
 class ReplayCacheTest : public ::testing::Test
@@ -1278,6 +1280,173 @@ TEST_F(ReplayCacheTest, PendingSsmSnapshotReleasePaths)
     ASSERT_TRUE(other->acquireSsmSnapshotSlot().has_value());
     other->close();
     EXPECT_EQ(freeSlots(), otherFreeBefore + 1);
+    manager->shutdown();
+}
+
+// Builds a manager over `config`, whose every life cycle comes from a region, with a typical step and a
+// constraint set, and checks that one cache resumes, grows to `capacity` with a page or slot in every region
+// group, and closes.
+void checkRegionOnlyConfigAllocates(KVCacheManagerConfig config, int capacity, cudaStream_t stream)
+{
+    config.typicalStep = BatchDesc{.kvCaches = {KVCacheDesc{.capacity = capacity, .historyLength = capacity / 2}}};
+    config.constraints = {BatchDesc{.kvCaches = {KVCacheDesc{.capacity = capacity, .historyLength = 0}}}};
+    ASSERT_NO_THROW(config.validate());
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto const& lifeCycles = manager->lifeCycles();
+    ASSERT_EQ(lifeCycles.numRegions(), static_cast<int>(config.regions.size()));
+    ASSERT_EQ(lifeCycles.size(), LifeCycleId{lifeCycles.numRegions()});
+    EXPECT_FALSE(lifeCycles.requiredSsmLifeCycleId().has_value());
+    for (auto const count : hotSlotCounts(*manager))
+    {
+        EXPECT_GT(count, 0);
+    }
+
+    auto cache = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(cache->resume(stream));
+    ASSERT_TRUE(cache->resize(capacity));
+    for (auto const& region : config.regions)
+    {
+        SCOPED_TRACE(region.name);
+        auto const group = manager->getRegionGroupId(region.name);
+        if (lifeCycles.isSsm(group))
+        {
+            EXPECT_GE(cache->getSsmBlockBaseIndex(group), 0);
+            continue;
+        }
+        // No history yet, so no block is stale, even in a windowed group.
+        auto const pages = cache->getAggregatedPageIndices(group);
+        ASSERT_EQ(pages.size(), static_cast<size_t>(capacity / config.tokensPerBlock));
+        for (auto const page : pages)
+        {
+            EXPECT_GE(page, 0);
+        }
+    }
+    cache->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, RegionOnlyConfigAllocates)
+{
+    // SSM layers with no buffers of their own; their only buffers are a PRIVATE request region's.
+    auto config = makeConfig();
+    config.layers.clear();
+    config.commitMinSnapshot = true;
+    RegionConfig region{.name = "replay"};
+    for (LayerId const layerId : {0, 1})
+    {
+        config.layers.emplace_back(SsmLayerConfig{.layerId = layerId});
+        region.buffers.push_back(
+            RegionBuffer{.layerId = layerId, .buffer = BufferConfig{.role = "old_x", .size = 2048}});
+    }
+    config.regions.push_back(std::move(region));
+    checkRegionOnlyConfigAllocates(config, 16, mStream);
+    // Empty attention layers whose only buffers are three token-block regions, one of them windowed.
+    checkRegionOnlyConfigAllocates(makeMlaRegionConfig(32 << 20, /*withKda=*/false), 16, mStream);
+}
+
+TEST_F(ReplayCacheTest, TokenBlockRegionFloorsFollowTheirWindows)
+{
+    // A windowless region takes the largest windowed floor on the manager, as a full-attention layer does:
+    // the HP ring's (kMlaHpWindow + 2) / 4 + 1 = 2 blocks. The SSM state and the replay region take one slot.
+    auto manager = std::make_shared<KvCacheManager>(makeMlaRegionConfig(32 << 20, /*withKda=*/true));
+    auto const floors = KvCacheIntrospection::hotMinSlots(*manager);
+    auto const poolGroups = manager->getLifeCyclePoolGroupIndices(kHotLevel);
+    for (auto const& [name, floor] :
+        std::map<std::string, SlotCount>{{"fp4_latent", 2}, {"fp8_latent", 2}, {"hp_ring", 2}, {"replay", 1}})
+    {
+        EXPECT_EQ(floors[poolGroups[manager->getRegionGroupId(name)]], floor) << name;
+    }
+    EXPECT_EQ(floors[poolGroups[manager->getBufferGroupId(1, "state")]], 1);
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, LosingAWindowlessRegionPageRemovesItsSubtree)
+{
+    // Losing the FP8 latent's committed page of block 1 removes blocks 1-3 from the tree, as for a
+    // full-attention layer. Losing the HP ring's page of block 3 removes only that page.
+    struct LostPage
+    {
+        char const* region;
+        int ordinal;
+        bool removesSubtree;
+    };
+
+    for (auto const& lost : {LostPage{"fp8_latent", 1, true}, LostPage{"hp_ring", 3, false}})
+    {
+        SCOPED_TRACE(lost.region);
+        auto manager = std::make_shared<KvCacheManager>(makeMlaRegionConfig(32 << 20, /*withKda=*/false));
+        auto const group = manager->getRegionGroupId(lost.region);
+        auto const tokens = makeTokens(16);
+        TokenSpan const span{tokens.data(), static_cast<int>(tokens.size())};
+        auto source = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(16));
+        source->commit(span);
+        auto block = source->blocks()[BlockOrdinal{lost.ordinal}].treeBlock;
+        auto last = source->blocks()[BlockOrdinal{3}].treeBlock;
+        source->close();
+        ASSERT_EQ(manager->radixTree().match({}, span).numTokens, 16);
+
+        // Drop the page as eviction does: once the eviction queue lets it go, its destructor unlinks it
+        // from the block and clears what the loss leaves stale.
+        ASSERT_NE(block->getPage(group), nullptr);
+        auto page = block->getPage(group)->sharedFromThis();
+        manager->storage().excludeFromEviction(*page);
+        page.reset();
+        EXPECT_EQ(block->getPage(group), nullptr);
+        EXPECT_EQ(block->isOrphan(), lost.removesSubtree);
+        EXPECT_EQ(last->isOrphan(), lost.removesSubtree);
+        block.reset();
+        last.reset();
+        manager->shutdown();
+    }
+}
+
+TEST_F(ReplayCacheTest, ConversationDropPlansSkipWindowlessRegions)
+{
+    // Two turns of one conversation, ending at 8 and 16 tokens. Each plan holds the HP ring's page of the
+    // block its window starts in and the SSM snapshot of its last block; neither holds a latent page,
+    // which every later turn passing through the block needs.
+    auto manager = std::make_shared<KvCacheManager>(makeMlaRegionConfig(32 << 20, /*withKda=*/true));
+    auto const tokens = makeTokens(16);
+    TokenSpan const span{tokens.data(), static_cast<int>(tokens.size())};
+    std::vector<std::unique_ptr<PlannedDropHandle>> plans;
+    for (int const turnEnd : {8, 16})
+    {
+        SCOPED_TRACE(turnEnd);
+        TokenSpan const turn{tokens.data(), turnEnd};
+        auto cache = manager->createKvCache({}, turn, turnEnd);
+        EXPECT_EQ(cache->numCommittedTokens(), turnEnd - 8);
+        ASSERT_TRUE(cache->resume(mStream));
+        ASSERT_TRUE(cache->resize(turnEnd));
+        cache->commit(TokenSpan{tokens.data() + cache->numCommittedTokens(), turnEnd - cache->numCommittedTokens()});
+        cache->stopCommitting();
+        plans.push_back(cache->planCommittedBlockDrop());
+        ASSERT_NE(plans.back(), nullptr);
+        cache->close();
+    }
+
+    auto const match = manager->radixTree().match({}, span);
+    ASSERT_EQ(match.numTokens, 16);
+    auto plannedDrops = [&](LifeCycleId group)
+    {
+        std::vector<int> counts;
+        for (auto const* block : match.blocks)
+        {
+            auto const* page = block->getPage(group);
+            counts.push_back(page == nullptr ? -1 : page->plannedDropCount);
+        }
+        return counts;
+    };
+    EXPECT_EQ(plannedDrops(manager->getRegionGroupId("fp4_latent")), (std::vector<int>{0, 0, 0, 0}));
+    EXPECT_EQ(plannedDrops(manager->getRegionGroupId("fp8_latent")), (std::vector<int>{0, 0, 0, 0}));
+    auto const hp = plannedDrops(manager->getRegionGroupId("hp_ring"));
+    EXPECT_EQ(hp.at(1), 1);
+    EXPECT_EQ(hp.at(3), 1);
+    auto const ssm = plannedDrops(manager->getBufferGroupId(1, "state"));
+    EXPECT_EQ(ssm.at(1), 1);
+    EXPECT_EQ(ssm.at(3), 1);
+    plans.clear();
     manager->shutdown();
 }
 
