@@ -53,6 +53,7 @@ bits, with more programs resident per SM (``SPLIT_REGISTER_CAP``: three).
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -90,6 +91,739 @@ SPLIT_REGISTER_CAP = 168
 #: The register caps ``split_max_registers`` takes.
 MIN_SPLIT_REGISTERS = 128
 MAX_SPLIT_REGISTERS = 255
+
+#: The one-cluster SWA block (CL8), ported from the sm_107 tree (lever ``swa_one_cluster_block``): a TEP4
+#: decode step of ONE request (4 KV heads and 32 query heads per rank, 32-key FP8 pages, window 2048, fused prep with
+#: the norm-gate, q_fp8, at most 8 rows) runs the whole sliding-window block as ONE cluster launch instead of the
+#: split + combine pair: grid (8, 4, 1), a cluster of 8 CTAs per KV head, each CTA one SM (320 threads, 180 KB dynamic
+#: SMEM); before the dependency wait the page ids and the window's cached K/V; after it the q/k prep, the step's K/V
+#: append (the stock bytes), mma.sync attention over 288 keys per CTA and the partials merged through distributed
+#: shared memory, then the norm-gate. Not bit-identical to the pair (another softmax partition, P in f16).
+#: ``MUSESPARK_OPEN_SWA_CL8=all`` turns it on; unset or ``0`` leaves the pair unchanged. The kernel is compiled with
+#: NVRTC on its first eager call per device (a call inside a CUDA-graph capture before that falls back to the pair
+#: and warns once).
+_SWA_CL8 = os.environ.get("MUSESPARK_OPEN_SWA_CL8", "0")
+
+_CL8_SMEM = 180 * 1024
+_CL8_SRC = r"""
+typedef unsigned short u16; typedef unsigned int u32; typedef unsigned char u8;
+typedef unsigned long long u64;
+
+#define D 64
+#define PG 32
+#ifndef HKV
+#define HKV 4  // KV heads per rank (tep4); -DHKV=2 builds tep8
+#endif
+#define GQ 8
+#define R 64
+#define S 8
+#define PAGES 9
+#define KEYS (PAGES * PG)
+#define RM (R / S)
+#define NPART S
+#define WINDOW 2048
+#define ROWF 68
+#define NT 320
+#define NTM 256  // the attention warps 0-7; warps 8-9 prep the step's new keys and values
+#define SK_OFF 0                         // K: FP8 [288][64 B]
+#define SV_OFF (KEYS * D)                // V: f16 [288][128 B]
+#define SQ_OFF (SV_OFF + KEYS * D * 2)   // Q: FP8 [64][64 B]
+#define RECV_OFF (SQ_OFF + R * D)
+#define SIDS_OFF (RECV_OFF + NPART * RM * ROWF * 4)
+#define WID_OFF (SIDS_OFF + 128)
+#define CS_OFF (WID_OFF + 128)
+#define SCR_OFF (CS_OFF + 8 * 64 * 4)          // key-half combine scratch [4][36][32] floats
+#define BAR_OFF (SCR_OFF + 4 * 36 * 32 * 4)
+#define RECV_BYTES (S * RM * 66 * 4)            // 8 senders x 8 rows x (64 O + m + l)
+#define NEG_INF __int_as_float(0xff800000)
+#ifdef CL8_POS64
+typedef long long pos_t;  // int64 position ids (a compile-time variant: a runtime select costs ~2 us here)
+#else
+typedef int pos_t;
+#endif
+#ifndef CL8_ABL
+#define CL8_ABL 0
+#endif
+// The QKV projection's output (q, k, v and the gate view) is written by the PDL predecessor while
+// this grid already runs. Declared `const __restrict__`, it is data the compiler may treat as
+// invariant for the whole kernel: a build with that qualifier loaded the gate through the
+// read-only path (LDG.E.CONSTANT) ABOVE griddepcontrol.wait (ACQBULK) and so read the previous
+// layer's gate in the engine (GSM8K 2/400). These two pointers therefore carry no __restrict__
+// (plain LDG after ACQBULK, checked in the SASS).
+#define LDP(p) (*(p))  // a load before the dependency wait
+#ifdef CL8_INSTR
+#define TSTAMP(k) do { __syncthreads(); if (tid == 0) { u64 t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); \
+    tbuf[(blockIdx.x + 8 * (blockIdx.y + HKV * blockIdx.z)) * 16 + (k)] = t_; } } while (0)
+#define TSTAMPM(k) do { asm volatile("bar.sync 1, 256;" ::: "memory"); if (tid == 0) { u64 t_; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_)); \
+    tbuf[(blockIdx.x + 8 * (blockIdx.y + HKV * blockIdx.z)) * 16 + (k)] = t_; } } while (0)
+#else
+#define TSTAMP(k) do {} while (0)
+#define TSTAMPM(k) do {} while (0)
+#endif
+
+__device__ __forceinline__ u32 sm32(const void* p) { return (u32)__cvta_generic_to_shared(p); }
+__device__ __forceinline__ u32 swz(int row, int chunk) { return (u32)(row * 128 + ((chunk ^ (row & 7)) << 4)); }
+// 64-byte rows (FP8 tiles): 16-byte chunk XOR (row / 2) % 4, conflict-free for ldmatrix's 8 rows
+__device__ __forceinline__ u32 swz8(int row, int chunk) { return (u32)(row * 64 + ((chunk ^ ((row >> 1) & 3)) << 4)); }
+__device__ __forceinline__ u32 ex2h2(u32 x) { u32 r; asm("ex2.approx.f16x2 %0, %1;" : "=r"(r) : "r"(x)); return r; }
+__device__ __forceinline__ void mma16832(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ float f_add(float a, float b) { float r; asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float f_mul(float a, float b) { float r; asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float f_mul_ftz(float a, float b) { float r; asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float f_fma_ftz(float a, float b, float c) { float r; asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c)); return r; }
+__device__ __forceinline__ float f_rsqrt(float x) { float r; asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x)); return r; }
+__device__ __forceinline__ float f_ex2(float x) { float r; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x)); return r; }
+__device__ __forceinline__ u16 f2bf(float x) { u16 h; asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(h) : "f"(x)); return h; }
+__device__ __forceinline__ float bf2f(u32 h) { return __uint_as_float((h & 0xffffu) << 16); }
+__device__ __forceinline__ float bf16r(float x) { return bf2f(f2bf(x)); }
+// two fp32 -> two E4M3 bytes, a in the low byte (RN, satfinite)
+__device__ __forceinline__ u32 e4m3x2(float a, float b) { u16 r; asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(b), "f"(a)); return (u32)r; }
+// two E4M3 bytes (low byte first) -> f16x2 (low half first); exact
+__device__ __forceinline__ u32 e4m3x2_f16x2(u32 v) { u32 r; u16 h = (u16)v; asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(h)); return r; }
+// two fp32 -> f16x2 (lo in the low half)
+__device__ __forceinline__ u32 f16x2(float lo, float hi) { u32 r; asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo)); return r; }
+__device__ __forceinline__ void ldsm4(u32 a, u32& r0, u32& r1, u32& r2, u32& r3) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+__device__ __forceinline__ void ldsm4t(u32 a, u32& r0, u32& r1, u32& r2, u32& r3) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+__device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void st_async2(u32 addr, float a, float b, u32 rbar) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.f32 [%0], {%1, %2}, [%3];" :: "r"(addr), "f"(a), "f"(b), "r"(rbar) : "memory");
+}
+__device__ __forceinline__ u32 mapa(u32 a, u32 rank) { u32 r; asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(rank)); return r; }
+__device__ __forceinline__ void st_cluster2(u32 addr, float a, float b) {
+  asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" :: "r"(addr), "f"(a), "f"(b) : "memory");
+}
+
+// preattn_prep's norm (+ scale) and RoPE of one thread's 16 dims (quarter `qt` = lanes 2qt, 2qt+1 of a 64-wide
+// head). The head's four quarters are lanes 4k .. 4k+3 of the warp (lane ^ 1, lane ^ 2). y: BF16 values as fp32.
+__device__ __forceinline__ void prep16(const float* x, float* y, float eps, float scale, const float* cs_row, int qt,
+                                       int rope) {
+  float sl[2];
+#pragma unroll
+  for (int j = 0; j < 2; ++j) {
+    float s = f_add(f_mul(x[8 * j], x[8 * j]), f_mul(x[8 * j + 1], x[8 * j + 1]));
+#pragma unroll
+    for (int e = 2; e < 8; ++e) s = f_add(s, f_mul(x[8 * j + e], x[8 * j + e]));
+    sl[j] = s;
+  }
+  float u = f_add(sl[0], sl[1]);                                 // lane bit 0
+  float v = f_add(u, __shfl_xor_sync(0xffffffffu, u, 1));        // lane bit 1
+  float total = f_add(v, __shfl_xor_sync(0xffffffffu, v, 2));    // lane bit 2
+  float inv = f_rsqrt(f_add(f_mul(total, 0.015625f), eps));
+#pragma unroll
+  for (int i = 0; i < 16; ++i) y[i] = bf16r(f_mul(bf16r(f_mul(x[i], inv)), scale));
+  if (rope) {
+#pragma unroll
+    for (int p = 0; p < 8; ++p) {
+      const float c = cs_row[qt * 8 + p], s = cs_row[32 + qt * 8 + p];
+      const float e = y[2 * p], od = y[2 * p + 1];
+      y[2 * p] = bf16r(f_fma_ftz(e, c, f_mul_ftz(-od, s)));
+      y[2 * p + 1] = bf16r(f_fma_ftz(od, c, f_mul_ftz(e, s)));
+    }
+  }
+}
+
+__device__ __forceinline__ void load16_bf16(const u16* p, float* x) {
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const uint4 v = *reinterpret_cast<const uint4*>(p + 8 * i);
+    x[8 * i + 0] = bf2f(v.x); x[8 * i + 1] = bf2f(v.x >> 16);
+    x[8 * i + 2] = bf2f(v.y); x[8 * i + 3] = bf2f(v.y >> 16);
+    x[8 * i + 4] = bf2f(v.z); x[8 * i + 5] = bf2f(v.z >> 16);
+    x[8 * i + 6] = bf2f(v.w); x[8 * i + 7] = bf2f(v.w >> 16);
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(NT, 1)
+swa_cl8(const u16* qkv, long long qkv_stride, u8* __restrict__ pool, const int* __restrict__ bt,
+        long long bt_req_stride, long long bt_kv_stride, const int* __restrict__ seq_lens,
+        const float* __restrict__ kv_scale, const float* __restrict__ cos_sin, const pos_t* __restrict__ positions,
+        float prep_eps, float q_scale, float sm_scale_log2, u16* __restrict__ out, long long out_stride,
+        const u16* gate, long long gate_tok_stride, long long gate_head_stride, float gate_eps,
+        int M, int q_stride, int k_col0, int v_col0, int rope, int pdl, u64* tbuf) {
+  extern __shared__ __align__(128) u8 smem[];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int rank = blockIdx.x, h = blockIdx.y, req = blockIdx.z;
+  TSTAMP(0);
+#ifdef CL8_INSTR
+  if (tid == 0) { u32 sm_; asm volatile("mov.u32 %0, %%smid;" : "=r"(sm_)); tbuf[(blockIdx.x + 8 * (blockIdx.y + HKV * blockIdx.z)) * 16 + 9] = sm_; }
+#endif
+
+  // ---------------- before the dependency wait: graph inputs and older cache bytes only
+  const int L = LDP(seq_lens + req);
+  const int past = L - M;
+  int lo = past - (WINDOW - 1);
+  if (lo < 0) lo = 0;
+  const int first_page = (lo >> 5) + rank * PAGES;
+  const int key0 = first_page * PG;
+  const float scale = LDP(kv_scale);
+  const float sb = bf16r(scale);
+  const float dequant = __fdiv_rn(1.0f, scale);
+  const float qk_scale = f_mul(f_mul(sm_scale_log2, dequant), dequant);
+  int* wpid = reinterpret_cast<int*>(smem + WID_OFF);
+  float* cs = reinterpret_cast<float*>(smem + CS_OFF);
+  const int* btr = bt + (long long)req * bt_req_stride;
+  if (tid == 0) {
+    const u32 bar = sm32(smem + BAR_OFF);
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(bar) : "memory");
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(bar), "r"(RECV_BYTES) : "memory");
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  // arrive now, wait right before the first push (by then every peer's mbarrier is armed): off the critical path
+  asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+  // warps 0-7: the window's cached K/V into registers, each thread loading its own pages' ids (no SMEM hand-off):
+  // keys < past only; keys >= L and missing pages are zero; keys in [past, L) are the step's own (warps 8-9)
+  uint4 rb[9];
+  if (tid < NTM) {
+    int pids[9];
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+      const int pl = 2 * i + (tid >> 7), kv = pl / PAGES, p = pl % PAGES, page = first_page + p;
+      pids[i] = (page * PG < past) ? LDP(btr + kv * bt_kv_stride + page) : -1;
+    }
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+      const int c = i * NTM + tid, pl = c >> 7, w = c & 127, p = pl % PAGES;
+      const int key = (first_page + p) * PG + (w >> 2);
+      uint4 v = make_uint4(0u, 0u, 0u, 0u);
+      if (pids[i] >= 0 && key < past)
+        v = LDP(reinterpret_cast<const uint4*>(pool + ((long long)pids[i] * HKV + h) * (PG * D) + w * 16));
+      rb[i] = v;
+    }
+  } else {
+    // warps 8-9: the new rows' page ids and the step's RoPE rows
+    const int u = tid - NTM;
+    if (u < 16) {
+      const int t = u >> 1, kv = u & 1, pos = past + t, page = pos >> 5;
+      int pid = -1;
+      if (t < M && page >= first_page && page < first_page + PAGES) pid = LDP(btr + kv * bt_kv_stride + page);
+      wpid[2 * t + kv] = pid;
+    }
+    if (rope) {
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        const int i = k * 64 + u, t = i >> 6, c = i & 63;
+        float v = 0.f;
+        if (t < M) v = LDP(cos_sin + (long long)LDP(positions + req * M + t) * 64 + c);
+        cs[i] = v;
+      }
+    }
+  }
+  TSTAMP(1);
+  // ---------------- the dependency wait: the QKV projection (q, k, v and the gate) from here on
+  if (pdl) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  }
+  __syncthreads();  // wpid / RoPE rows
+  TSTAMP(2);
+  // gate of the token this CTA merges (token `rank`): warp = query head, two columns per lane
+  float gv0 = 0.f, gv1 = 0.f;
+  if (rank < M && warp < 8) {
+    const u32 g2 = *reinterpret_cast<const u32*>(gate + (long long)(req * M + rank) * gate_tok_stride +
+                                                 (long long)(h * GQ + warp) * gate_head_stride + 2 * lane);
+    gv0 = bf2f(g2); gv1 = bf2f(g2 >> 16);
+  }
+  // query rows: row = token * 8 + query head, four threads per row (16 dims each). The q loads are issued first,
+  // the window's K/V tiles are written while they are in flight, then the prep runs.
+  if (warp < 8) {
+    const int row = tid >> 2, qt = tid & 3, t = row >> 3, qh = h * GQ + (row & 7);
+    float x[16], y[16];
+    if (t < M) {
+      load16_bf16(qkv + (long long)(req * M + t) * qkv_stride + (long long)qh * q_stride + qt * 16, x);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 16; ++i) x[i] = 0.f;
+    }
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+      const int c = i * NTM + tid, pl = c >> 7, w = c & 127, kv = pl / PAGES, p = pl % PAGES;
+      const int krow = p * PG + (w >> 2), part = w & 3;
+      const int key = key0 + krow;
+      if (key >= past && key < L) continue;  // the step's own keys: warps 8-9 write them
+      const uint4 v = rb[i];
+      if (kv == 0) {
+        *reinterpret_cast<uint4*>(smem + SK_OFF + swz8(krow, part)) = v;
+      } else {
+        uint4 a, b;
+        a.x = e4m3x2_f16x2(v.x); a.y = e4m3x2_f16x2(v.x >> 16); a.z = e4m3x2_f16x2(v.y); a.w = e4m3x2_f16x2(v.y >> 16);
+        b.x = e4m3x2_f16x2(v.z); b.y = e4m3x2_f16x2(v.z >> 16); b.z = e4m3x2_f16x2(v.w); b.w = e4m3x2_f16x2(v.w >> 16);
+        *reinterpret_cast<uint4*>(smem + SV_OFF + swz(krow, 2 * part)) = a;
+        *reinterpret_cast<uint4*>(smem + SV_OFF + swz(krow, 2 * part + 1)) = b;
+      }
+    }
+    if (CL8_ABL == 5) {
+#pragma unroll
+      for (int i = 0; i < 16; ++i) y[i] = x[i];
+    } else {
+      prep16(x, y, prep_eps, q_scale, cs + (t < M ? t : 0) * 64, qt, rope);
+    }
+    u32 q8[4];
+#pragma unroll
+    for (int p = 0; p < 8; ++p) {
+      float a = 0.f, b = 0.f;
+      if (t < M) { a = bf16r(f_mul(y[2 * p], sb)); b = bf16r(f_mul(y[2 * p + 1], sb)); }
+      const u32 e = e4m3x2(a, b);
+      if (p & 1) q8[p >> 1] |= e << 16; else q8[p >> 1] = e;
+    }
+    *reinterpret_cast<uint4*>(smem + SQ_OFF + swz8(row, qt)) = make_uint4(q8[0], q8[1], q8[2], q8[3]);
+  }
+  // the step's keys (warp 8) and values (warp 9) on this CTA's pages, four lanes per token
+  // the step's rows are consecutive positions on at most two pages: this CTA holds one iff it holds the first or last
+  if (warp >= 8 && (wpid[0] >= 0 || wpid[2 * (M - 1)] >= 0)) {
+    const int kvsel = warp - 8, t = lane >> 2, qt = lane & 3;
+    const int pid = (t < M) ? wpid[2 * t + kvsel] : -1;
+    float x[16], y[16];
+    if (pid >= 0) {
+      load16_bf16(qkv + (long long)(req * M + t) * qkv_stride + (kvsel ? v_col0 : k_col0) + h * D + qt * 16, x);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 16; ++i) x[i] = 0.f;
+    }
+    prep16(x, y, prep_eps, 1.0f, cs + t * 64, qt, rope);  // keys; the value warp discards it
+    if (pid >= 0) {
+      u32 e8[4], w[8];
+#pragma unroll
+      for (int p = 0; p < 8; ++p) {
+        const float a = bf16r(f_mul(kvsel ? x[2 * p] : y[2 * p], sb));
+        const float b = bf16r(f_mul(kvsel ? x[2 * p + 1] : y[2 * p + 1], sb));
+        const u32 e = e4m3x2(a, b);
+        if (p & 1) e8[p >> 1] |= e << 16; else e8[p >> 1] = e;
+        w[p] = e4m3x2_f16x2(e);
+      }
+      const int pos = past + t;
+      u8* dst = pool + ((long long)pid * HKV + h) * (PG * D) + (pos & 31) * D + qt * 16;
+      *reinterpret_cast<uint4*>(dst) = make_uint4(e8[0], e8[1], e8[2], e8[3]);
+      const int row = pos - key0;
+      if (kvsel == 0) {
+        *reinterpret_cast<uint4*>(smem + SK_OFF + swz8(row, qt)) = make_uint4(e8[0], e8[1], e8[2], e8[3]);
+      } else {
+        *reinterpret_cast<uint4*>(smem + SV_OFF + swz(row, 2 * qt)) = make_uint4(w[0], w[1], w[2], w[3]);
+        *reinterpret_cast<uint4*>(smem + SV_OFF + swz(row, 2 * qt + 1)) = make_uint4(w[4], w[5], w[6], w[7]);
+      }
+    }
+  }
+  __syncthreads();
+  TSTAMP(3);
+
+  if (warp < 8) {  // ======== attention warps
+  // ---------------- S = Q K^T: warp w = row block rb (rows 16rb.., tokens 2rb, 2rb+1) x key half kh (144 keys)
+  const int rb = warp & 3, kh = warp >> 2;
+  const int g = lane >> 2, c4 = lane & 3, mi = lane >> 3, rin = lane & 7;  // codespell:ignore
+  u32 qa[2][4];
+  {
+    const u32 sq = sm32(smem + SQ_OFF);
+    const int row = rb * 16 + (mi & 1) * 8 + rin;  // codespell:ignore
+#pragma unroll
+    for (int kk = 0; kk < 2; ++kk) ldsm4(sq + swz8(row, 2 * kk + (mi >> 1)), qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3]);
+  }
+  const int t_lo = 2 * rb, t_hi = t_lo + 1;
+  const int qp_lo = past + t_lo, qp_hi = past + t_hi;
+  // the keys row t attends: [max(lo, qp - WINDOW + 1), qp] (empty for t >= M)
+  const int jlo_lo = max(lo, qp_lo - WINDOW + 1), jhi_lo = t_lo < M ? qp_lo : -1;
+  const int jlo_hi = max(lo, qp_hi - WINDOW + 1), jhi_hi = t_hi < M ? qp_hi : -1;
+  const int jhi_u = max(jhi_lo, jhi_hi);  // the union of both rows' ranges is [jlo_lo, jhi_u]
+  const int kbase = key0 + kh * 144;
+  float sa[18][4];
+#pragma unroll
+  for (int n = 0; n < 18; ++n) sa[n][0] = sa[n][1] = sa[n][2] = sa[n][3] = 0.f;
+  if (CL8_ABL != 1) {
+    const u32 sk = sm32(smem + SK_OFF);
+#pragma unroll
+    for (int kk = 0; kk < 2; ++kk) {
+#pragma unroll
+      for (int n = 0; n < 18; n += 2) {
+        // matrices: (tile n, dims 32kk..+15), (tile n, +16..31), (tile n+1, ..), (tile n+1, ..): FP8 bytes
+        const int krow = kh * 144 + 8 * (n + (mi >> 1)) + rin;  // codespell:ignore
+        u32 b0, b1, b2, b3;
+        ldsm4(sk + swz8(krow, 2 * kk + (mi & 1)), b0, b1, b2, b3);
+        mma16832(sa[n], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b0, b1);
+        mma16832(sa[n + 1], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b2, b3);
+      }
+    }
+  }
+  TSTAMPM(4);
+  // mask (only tiles that straddle a row's range), softmax over the warp's 144 keys; the scale (> 0) is folded
+  // into the exponent: p = 2^(s * qk_scale - m * qk_scale)
+  float m_lo = NEG_INF, m_hi = NEG_INF;
+#pragma unroll
+  for (int n = 0; n < 18; ++n) {
+    const int jt = kbase + 8 * n;
+    const bool in_lo = jt >= jlo_lo && jt + 7 <= jhi_lo, in_hi = jt >= jlo_hi && jt + 7 <= jhi_hi;
+    if (!(in_lo && in_hi)) {
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int j = jt + 2 * c4 + e;
+        if ((unsigned)(j - jlo_lo) > (unsigned)(jhi_lo - jlo_lo)) sa[n][e] = NEG_INF;
+        if ((unsigned)(j - jlo_hi) > (unsigned)(jhi_hi - jlo_hi)) sa[n][2 + e] = NEG_INF;
+      }
+    }
+    m_lo = fmaxf(m_lo, fmaxf(sa[n][0], sa[n][1]));
+    m_hi = fmaxf(m_hi, fmaxf(sa[n][2], sa[n][3]));
+  }
+  m_lo = fmaxf(m_lo, __shfl_xor_sync(0xffffffffu, m_lo, 1)); m_lo = fmaxf(m_lo, __shfl_xor_sync(0xffffffffu, m_lo, 2));
+  m_hi = fmaxf(m_hi, __shfl_xor_sync(0xffffffffu, m_hi, 1)); m_hi = fmaxf(m_hi, __shfl_xor_sync(0xffffffffu, m_hi, 2));
+  // ONE2's m is max(-1e30, max(s * scale)); here m is kept in raw units and scaled once
+  const float ms_lo = fmaxf(m_lo * qk_scale, -1.0e30f), ms_hi = fmaxf(m_hi * qk_scale, -1.0e30f);
+  // P = 2^(s * scale - m) in f16 straight from the MUFU (ex2.approx.f16x2: two per op); the row sums come from the
+  // P.V MMA itself (a ones column), so they are the sums of exactly the P values that weigh V
+  u32 pl[18], ph[18];
+#pragma unroll
+  for (int n = 0; n < 18; ++n) {
+    const u32 xl = f16x2(fmaf(sa[n][0], qk_scale, -ms_lo), fmaf(sa[n][1], qk_scale, -ms_lo));
+    const u32 xh = f16x2(fmaf(sa[n][2], qk_scale, -ms_hi), fmaf(sa[n][3], qk_scale, -ms_hi));
+    pl[n] = (CL8_ABL == 3) ? xl : ex2h2(xl);
+    ph[n] = (CL8_ABL == 3) ? xh : ex2h2(xh);
+  }
+  const float m_lo_out = ms_lo, m_hi_out = ms_hi;
+  TSTAMPM(5);
+  // ---------------- O = P V over the warp's keys, plus l = P . 1 in an extra n8 tile (column 64)
+  float oa[8][4], la[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int n = 0; n < 8; ++n) oa[n][0] = oa[n][1] = oa[n][2] = oa[n][3] = 0.f;
+  {
+    const u32 sv = sm32(smem + SV_OFF);
+    const u32 ones = (g == 0) ? 0x3C003C00u : 0u;  // B column 0 of the extra tile: two f16 1.0
+#pragma unroll
+    for (int kk = 0; kk < 9; ++kk) {
+      if (CL8_ABL == 1 || CL8_ABL == 2) continue;
+      const u32 a0 = pl[2 * kk], a1 = ph[2 * kk], a2 = pl[2 * kk + 1], a3 = ph[2 * kk + 1];
+      const int vrow = kh * 144 + 16 * kk + (mi & 1) * 8 + rin;  // codespell:ignore
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        u32 b0, b1, b2, b3;
+        ldsm4t(sv + swz(vrow, 2 * q + (mi >> 1)), b0, b1, b2, b3);
+        mma16816(oa[2 * q], a0, a1, a2, a3, b0, b1);
+        mma16816(oa[2 * q + 1], a0, a1, a2, a3, b2, b3);
+      }
+      mma16816(la, a0, a1, a2, a3, ones, ones);
+    }
+  }
+  // row sums live in column 64 (lanes with c4 == 0): give them to the whole quad
+  const float l_lo = __shfl_sync(0xffffffffu, la[0], lane & ~3), l_hi = __shfl_sync(0xffffffffu, la[2], lane & ~3);
+  TSTAMPM(6);
+  // ---------------- combine the two key halves of each row block in the CTA (warp rb + 4 into warp rb)
+  float* scr = reinterpret_cast<float*>(smem + SCR_OFF) + rb * 36 * 32 + lane;
+  if (kh == 1) {
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) scr[(4 * n + e) * 32] = oa[n][e];
+    }
+    scr[32 * 32] = m_lo_out; scr[33 * 32] = m_hi_out; scr[34 * 32] = l_lo; scr[35 * 32] = l_hi;
+  }
+  asm volatile("bar.sync 1, 256;" ::: "memory");
+  if (kh == 0) {
+    const float m1_lo = scr[32 * 32], m1_hi = scr[33 * 32], l1_lo = scr[34 * 32], l1_hi = scr[35 * 32];
+    const float mlo = fmaxf(m_lo_out, m1_lo), mhi = fmaxf(m_hi_out, m1_hi);
+    const float a_lo = f_ex2(m_lo_out - mlo), b_lo = f_ex2(m1_lo - mlo);
+    const float a_hi = f_ex2(m_hi_out - mhi), b_hi = f_ex2(m1_hi - mhi);
+    const float L_lo = l_lo * a_lo + l1_lo * b_lo, L_hi = l_hi * a_hi + l1_hi * b_hi;
+    // push: row lo -> CTA t_lo, row hi -> CTA t_hi (only tokens < M: no CTA waits for the others)
+    float* recv = reinterpret_cast<float*>(smem + RECV_OFF);
+    const u32 slot = sm32(recv + (rank * RM + g) * ROWF);
+    const u32 bar = sm32(smem + BAR_OFF);
+    const u32 ra_lo = mapa(slot, t_lo), ra_hi = mapa(slot, t_hi);
+    const u32 rb_lo = mapa(bar, t_lo), rb_hi = mapa(bar, t_hi);
+    const float dq_lo = dequant, dq_hi = dequant;
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+      const float o0 = (oa[n][0] * a_lo + scr[(4 * n + 0) * 32] * b_lo) * dq_lo;
+      const float o1 = (oa[n][1] * a_lo + scr[(4 * n + 1) * 32] * b_lo) * dq_lo;
+      const float o2 = (oa[n][2] * a_hi + scr[(4 * n + 2) * 32] * b_hi) * dq_hi;
+      const float o3 = (oa[n][3] * a_hi + scr[(4 * n + 3) * 32] * b_hi) * dq_hi;
+      if (t_lo < M) st_async2(ra_lo + (8 * n + 2 * c4) * 4, o0, o1, rb_lo);
+      if (t_hi < M) st_async2(ra_hi + (8 * n + 2 * c4) * 4, o2, o3, rb_hi);
+    }
+    if (c4 == 0) {
+      if (t_lo < M) st_async2(ra_lo + 64 * 4, mlo, L_lo, rb_lo);
+      if (t_hi < M) st_async2(ra_hi + 64 * 4, mhi, L_hi, rb_hi);
+    }
+  }
+  }  // ======== attention warps
+  TSTAMP(7);
+  // ---------------- merge token `rank` once its 8 partials (one per CTA) have landed: query head = warp
+  if (rank < M && warp < 8 && CL8_ABL != 6) {
+    const u32 bar = sm32(smem + BAR_OFF);
+    u32 done = 0;
+    while (!done) {
+      asm volatile("{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0;\n\tselp.u32 %0, 1, 0, p;\n\t}"
+                   : "=r"(done) : "r"(bar) : "memory");
+    }
+    const float* recv = reinterpret_cast<const float*>(smem + RECV_OFF);
+    float ms[NPART], ls[NPART], mmax = NEG_INF;
+#pragma unroll
+    for (int s = 0; s < NPART; ++s) {
+      const float2 ml = *reinterpret_cast<const float2*>(recv + (s * RM + warp) * ROWF + 64);
+      ms[s] = ml.x; ls[s] = ml.y;
+      mmax = fmaxf(mmax, ms[s]);
+    }
+    float den = 0.f, n0 = 0.f, n1 = 0.f;
+#pragma unroll
+    for (int s = 0; s < NPART; ++s) {
+      const float w = ls[s] > 0.f ? f_ex2(ms[s] - mmax) : 0.f;
+      den += w * ls[s];
+      const float2 o = *reinterpret_cast<const float2*>(recv + (s * RM + warp) * ROWF + 2 * lane);
+      n0 += o.x * w; n1 += o.y * w;
+    }
+    const float a0 = bf16r(n0 / den), a1 = bf16r(n1 / den);
+    float sq = a0 * a0 + a1 * a1;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+    const float inv = f_rsqrt(sq * 0.015625f + gate_eps);
+    const float r0 = bf16r(a0 * inv) * bf16r(1.f / (1.f + __expf(-gv0)));
+    const float r1 = bf16r(a1 * inv) * bf16r(1.f / (1.f + __expf(-gv1)));
+    *reinterpret_cast<u32*>(out + (long long)(req * M + rank) * out_stride + (h * GQ + warp) * D + 2 * lane) =
+        (u32)f2bf(r0) | ((u32)f2bf(r1) << 16);
+  }
+  TSTAMP(8);
+}
+"""
+
+
+_CL8_FN = {}
+_CL8_WARNED = set()
+
+
+def _cl8_log(msg: str, warning: bool = False) -> None:
+    try:
+        from tensorrt_llm.logger import logger
+
+        (logger.warning if warning else logger.info)(msg)
+    except Exception:  # noqa: BLE001 - standalone copies load this file without tensorrt_llm
+        print(msg, flush=True)
+
+
+def _cl8_check(r):
+    if int(r[0]) != 0:
+        raise RuntimeError(f"swa_block CL8: CUDA/NVRTC error {r!r}")
+    return r[1] if len(r) == 2 else r[1:]
+
+
+def _cl8_function(device: torch.device, pos64: bool, hkv: int):
+    """The compiled CL8 kernel of ``device`` (int64 or int32 position ids: two compile-time builds; ``hkv`` KV heads
+    per rank: 4 at tep4, 2 at tep8); ``None`` if it is not compiled yet and a capture is running."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (index, bool(pos64), int(hkv))
+    fn = _CL8_FN.get(key)
+    if fn is not None:
+        return fn
+    if torch.cuda.is_current_stream_capturing():
+        if key not in _CL8_WARNED:
+            _CL8_WARNED.add(key)
+            _cl8_log(
+                "[musespark_open] swa_block CL8: first call inside a CUDA-graph capture; this "
+                "capture keeps the path CL8 replaces (compile happens on an eager call)",
+                warning=True,
+            )
+        return None
+    from cuda.bindings import driver as cu
+    from cuda.bindings import nvrtc
+
+    capability = torch.cuda.get_device_capability(index)
+    if tuple(capability) != (10, 3):
+        raise RuntimeError(
+            f"swa_block CL8 is built for sm_103 only, not compute capability {capability}"
+        )
+    prog = _cl8_check(nvrtc.nvrtcCreateProgram(_CL8_SRC.encode(), b"swa_cl8.cu", 0, [], []))
+    opts = [b"--gpu-architecture=sm_103a", b"-std=c++17", b"-default-device"]
+    if hkv != 4:
+        # The source's HKV defaults to 4 (the TEP4 build); the TEP8 build passes -DHKV=2.
+        opts.append(f"-DHKV={int(hkv)}".encode())
+    if pos64:
+        opts.append(b"-DCL8_POS64")
+    r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
+    n = _cl8_check(nvrtc.nvrtcGetProgramLogSize(prog))
+    log = b" " * n
+    nvrtc.nvrtcGetProgramLog(prog, log)
+    if int(r[0]) != 0:
+        raise RuntimeError("swa_block CL8 NVRTC compile failed:\n" + log.decode(errors="replace"))
+    n = _cl8_check(nvrtc.nvrtcGetCUBINSize(prog))
+    cubin = b" " * n
+    _cl8_check(nvrtc.nvrtcGetCUBIN(prog, cubin))
+    with torch.cuda.device(index):
+        mod = _cl8_check(cu.cuModuleLoadData(cubin))
+        f = _cl8_check(cu.cuModuleGetFunction(mod, b"swa_cl8"))
+        _cl8_check(
+            cu.cuFuncSetAttribute(
+                f,
+                cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                _CL8_SMEM,
+            )
+        )
+    regs = int(
+        _cl8_check(cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, f))
+    )
+    lmem = int(
+        _cl8_check(
+            cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f)
+        )
+    )
+    _CL8_FN[key] = (f, mod)
+    _cl8_log(
+        f"[musespark_open] swa_block CL8: MUSESPARK_OPEN_SWA_CL8={_SWA_CL8} compiled for sm_103a on "
+        f"device {index} (regs {regs}, local {lmem} B, smem {_CL8_SMEM // 1024} KB, cluster 8, "
+        f"320 threads, {int(hkv)} KV heads per rank, {'int64' if pos64 else 'int32'} positions)"
+    )
+    return _CL8_FN[key]
+
+
+def _cl8_eligible(
+    qkv,
+    kv_pool,
+    num_q_heads,
+    num_kv_heads,
+    window,
+    rows,
+    q_fp8,
+    fused_prep,
+    gate,
+    cos_sin,
+    position_ids,
+    hkv,
+) -> bool:
+    """A call the CL8 build of ``hkv`` KV heads per rank serves: ``hkv`` KV / ``8 hkv`` query heads
+    per rank (4 / 32 at TEP4, 2 / 16 at TEP8), the kernel's other conditions."""
+    return (
+        fused_prep
+        and gate is not None
+        and q_fp8
+        and num_kv_heads == hkv
+        and num_q_heads == 8 * hkv
+        and window == 2048
+        and 1 <= rows <= MAX_ROWS
+        and kv_pool.dim() == 4
+        and tuple(kv_pool.shape[1:]) == (hkv, 32, HEAD_DIM)
+        and qkv.stride(0) % 8 == 0
+        and qkv.data_ptr() % 16 == 0
+        and kv_pool.data_ptr() % 16 == 0
+        and (
+            cos_sin is None
+            or position_ids is None
+            or position_ids.dtype in (torch.int32, torch.int64)
+        )
+    )
+
+
+def _cl8_launch(
+    fn,
+    qkv,
+    kv_pool,
+    bt,
+    seq_lens,
+    kv_scale,
+    cos_sin,
+    positions,
+    prep_eps,
+    q_scale,
+    gate,
+    gate_eps,
+    out,
+    qkv_permuted,
+    enable_pdl,
+    rope,
+):
+    import ctypes
+
+    from cuda.bindings import driver as cu
+
+    reqs = seq_lens.numel()
+    rows = qkv.shape[0] // reqs
+    hkv = int(kv_pool.shape[1])
+    hq = 8 * hkv
+    # the raw projection: [q | gate] per query head (or [q | k | v | gate] permuted), then K and V of the KV heads
+    q_stride, k_col0 = (64, hq * 64) if qkv_permuted else (128, 2 * hq * 64)
+    v_col0 = k_col0 + hkv * 64
+    gts = gate.stride(0)
+    ghs = gate.stride(1) if gate.dim() == 3 else HEAD_DIM
+    cfg = cu.CUlaunchConfig()
+    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = 8, hkv, reqs
+    cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 320, 1, 1
+    cfg.sharedMemBytes = _CL8_SMEM
+    cfg.hStream = cu.CUstream(torch.cuda.current_stream(qkv.device).cuda_stream)
+    a1 = cu.CUlaunchAttribute()
+    a1.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+    a1.value.clusterDim.x, a1.value.clusterDim.y, a1.value.clusterDim.z = 8, 1, 1
+    attrs = [a1]
+    if enable_pdl:
+        a2 = cu.CUlaunchAttribute()
+        a2.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
+        a2.value.programmaticStreamSerializationAllowed = 1
+        attrs.append(a2)
+    cfg.attrs = attrs
+    cfg.numAttrs = len(attrs)
+    vp, ll, fl, ii = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_float, ctypes.c_int
+    args = (
+        (
+            qkv.data_ptr(),
+            qkv.stride(0),
+            kv_pool.data_ptr(),
+            bt.data_ptr(),
+            bt.stride(0),
+            bt.stride(1),
+            seq_lens.data_ptr(),
+            kv_scale.data_ptr(),
+            cos_sin.data_ptr() if rope else 0,
+            positions.data_ptr() if rope else 0,
+            float(prep_eps),
+            float(q_scale),
+            math.log2(math.e) / 8.0,
+            out.data_ptr(),
+            out.stride(0),
+            gate.data_ptr(),
+            gts,
+            ghs,
+            float(gate_eps),
+            rows,
+            q_stride,
+            k_col0,
+            v_col0,
+            int(rope),
+            int(bool(enable_pdl)),
+            0,
+        ),
+        (
+            vp,
+            ll,
+            vp,
+            vp,
+            ll,
+            ll,
+            vp,
+            vp,
+            vp,
+            vp,
+            fl,
+            fl,
+            fl,
+            vp,
+            ll,
+            vp,
+            ll,
+            ll,
+            fl,
+            ii,
+            ii,
+            ii,
+            ii,
+            ii,
+            ii,
+            vp,
+        ),
+    )
+    _cl8_check(cu.cuLaunchKernelEx(cfg, fn[0], args, 0))
+    return out
+
 
 
 @triton.jit
@@ -1180,6 +1914,43 @@ class SwaBlockAttention(OpWrapper):
                 f"swa_block's gate must be BF16 [rows, H * {HEAD_DIM}] or [rows, H, {HEAD_DIM}] "
                 f"with unit last stride, got {gate.dtype} {tuple(gate.shape)}"
             )
+        if _SWA_CL8 == "all" and _cl8_eligible(
+            qkv,
+            kv_pool,
+            num_q_heads,
+            num_kv_heads,
+            window,
+            rows,
+            q_fp8,
+            fused_prep,
+            gate,
+            cos_sin,
+            position_ids,
+            4,
+        ):
+            fn = _cl8_function(qkv.device, rope and positions.dtype == torch.int64, 4)
+            if fn is not None:
+                out = torch.empty(
+                    (rows, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device
+                )
+                return _cl8_launch(
+                    fn,
+                    qkv,
+                    kv_pool,
+                    block_tables.unsqueeze(0) if block_tables.dim() == 2 else block_tables,
+                    seq_lens,
+                    kv_scale_orig_quant,
+                    cos_sin,
+                    positions,
+                    prep_eps,
+                    q_scale,
+                    gate,
+                    gate_eps,
+                    out,
+                    qkv_permuted,
+                    enable_pdl,
+                    rope,
+                )
         out = torch.empty((rows, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
         group_rows = rows * Q_PER_KV
         part_o = torch.empty(
