@@ -110,6 +110,9 @@ l0_cpu:
   - unittest/_torch/pyexecutor
   - unittest/_torch/executor/test_handle_responses_fast_path.py
   - unittest/_torch/sampler/test_stop_criteria.py
+  # TurboQuant cold-page configuration, admission and factory dispatch: every test is cpu_only,
+  # and the GPU lists select unittest/_torch/kv_cache_compression with -m "not cpu_only".
+  - unittest/_torch/kv_cache_compression/test_turboquant_cold_page_config.py
   - unittest/test_startup.py
   - unittest/test_unified_cache.py
   - unittest/_torch/disaggregation

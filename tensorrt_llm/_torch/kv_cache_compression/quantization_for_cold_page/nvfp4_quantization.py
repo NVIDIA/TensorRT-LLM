@@ -19,7 +19,15 @@ from tensorrt_llm.quantization.modelopt_config import (
 )
 
 from ...pyexecutor.resource_manager import DataType
-from .quantization_for_cold_page import ColdPageQuantizationCompression
+from .quantization_for_cold_page import (
+    _DEEPSEEK_V4_COMPRESS,
+    _DEEPSEEK_V4_CSA_ROLES,
+    _DEEPSEEK_V4_HCA_ROLES,
+    _DEEPSEEK_V4_NOPE_DIM,
+    _DEEPSEEK_V4_ROW_STRIDE,
+    _SKIP_ROPE_QUANTIZATION_MODEL_TYPES,
+    ColdPageQuantizationCompression,
+)
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -47,37 +55,6 @@ _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
 _NVFP4_RESIDUAL_TRANSFORM = 2
-
-# These models use contiguous RoPE: key-only buffers are MLA latents with RoPE
-# trailing; key+value buffers are partial-rotary GQA with RoPE leading. Adding a
-# model requires verifying that placement, not just its model_type. Interleaved
-# RoPE or MLA caches exposing a value buffer need a separate layout rule.
-# Other models ignore skip_rope_quantization.
-_SKIP_ROPE_QUANTIZATION_MODEL_TYPES = frozenset(
-    {"deepseek_v4", "glm_moe_dsa", "qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
-)
-
-_DEEPSEEK_V4_PREFIX = "deepseek_v4_"
-_DEEPSEEK_V4_SWA = f"{_DEEPSEEK_V4_PREFIX}swa"
-_DEEPSEEK_V4_COMPRESS = f"{_DEEPSEEK_V4_PREFIX}compress"
-_DEEPSEEK_V4_INDEXER_COMPRESS = f"{_DEEPSEEK_V4_PREFIX}indexer_compress"
-_DEEPSEEK_V4_CSA_ROLES = frozenset({_DEEPSEEK_V4_COMPRESS, _DEEPSEEK_V4_INDEXER_COMPRESS})
-_DEEPSEEK_V4_HCA_ROLES = frozenset({_DEEPSEEK_V4_COMPRESS})
-_DEEPSEEK_V4_ROLES = frozenset(
-    {
-        _DEEPSEEK_V4_SWA,
-        _DEEPSEEK_V4_COMPRESS,
-        _DEEPSEEK_V4_INDEXER_COMPRESS,
-        f"{_DEEPSEEK_V4_PREFIX}compressor_kv",
-        f"{_DEEPSEEK_V4_PREFIX}compressor_score",
-        f"{_DEEPSEEK_V4_PREFIX}indexer_compressor_kv",
-        f"{_DEEPSEEK_V4_PREFIX}indexer_compressor_score",
-    }
-)
-_DEEPSEEK_V4_NOPE_DIM = 448
-_DEEPSEEK_V4_ROW_STRIDE = 512
-_DEEPSEEK_V4_ROPE_DIM = _DEEPSEEK_V4_ROW_STRIDE - _DEEPSEEK_V4_NOPE_DIM
-_DEEPSEEK_V4_FOOTER_SCALE_ROW_BYTES = 584
 
 
 @dataclass(frozen=True)
@@ -224,93 +201,6 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             )
             self._skip_rope_quantization = False
 
-    def _calculate_quantized_range(
-        self,
-        row_elements: int,
-        *,
-        skip_rope: bool,
-        rope: tuple[int, int] | None = None,
-        key_only: bool = False,
-        buffer_name: str,
-    ) -> tuple[int, int]:
-        """Return (start, count) of the numbers of each K or V vector that become NVFP4."""
-
-        if not skip_rope:
-            return 0, row_elements
-        if rope is None:
-            text_config = self.pretrained_config.get_text_config()
-            rope_parameters = getattr(text_config, "rope_parameters", None) or {}
-            if not isinstance(rope_parameters, dict):
-                raise ValueError(f"{buffer_name}: rope_parameters must be a mapping")
-            if any(isinstance(value, dict) for value in rope_parameters.values()):
-                raise NotImplementedError(
-                    f"{buffer_name}: layer-specific rope_parameters require an explicit "
-                    "cold-page RoPE layout"
-                )
-            # rotary_emb_base and rope_theta are rotation frequencies, never widths.
-            rope_dim = None
-            for width_field in ("rotary_dim", "qk_rope_head_dim"):
-                width = rope_parameters.get(width_field, getattr(text_config, width_field, None))
-                if width is not None:
-                    if type(width) is not int:
-                        raise ValueError(f"{buffer_name}: {width_field} must be an integer width")
-                    rope_dim = width
-                    break
-            if rope_dim is None:
-                rotary_factor = 1.0
-                for factor_field in ("rotary_pct", "partial_rotary_factor"):
-                    factor = rope_parameters.get(
-                        factor_field, getattr(text_config, factor_field, None)
-                    )
-                    if factor is not None:
-                        if type(factor) not in (int, float) or not math.isfinite(factor):
-                            raise ValueError(
-                                f"{buffer_name}: {factor_field} must be a finite rotary fraction"
-                            )
-                        rotary_factor = factor
-                        break
-                rope_dim = int(row_elements * rotary_factor)
-            if key_only:  # MLA latent vector: kv_lora_rank NoPE numbers, then the RoPE numbers.
-                kv_lora_rank = getattr(text_config, "kv_lora_rank", None)
-                if not isinstance(kv_lora_rank, int) or kv_lora_rank + rope_dim != row_elements:
-                    raise NotImplementedError(
-                        f"{buffer_name}: head_dim {row_elements} is not kv_lora_rank + "
-                        f"qk_rope_head_dim ({kv_lora_rank} + {rope_dim}) of an MLA latent vector, "
-                        "so its RoPE part cannot be located; skip_rope_quantization is unsupported here"
-                    )
-                rope = (kv_lora_rank, rope_dim)
-            else:  # GQA head: the leading numbers carry RoPE.
-                rope = (0, rope_dim)
-        rope_start, rope_elements = rope
-        if rope_start < 0 or rope_elements < 0 or rope_start + rope_elements > row_elements:
-            raise ValueError(
-                f"{buffer_name}: RoPE range [{rope_start}, {rope_start + rope_elements}) lies "
-                f"outside the {row_elements}-element row; check rotary_dim, qk_rope_head_dim, "
-                "rotary_pct and partial_rotary_factor in the model config"
-            )
-        if rope_elements == 0:
-            return 0, row_elements
-        if rope_elements >= row_elements:
-            raise ValueError(
-                f"{buffer_name}: every element is position-encoded, so skip_rope_quantization would "
-                "leave nothing to quantize; the K vectors of this model are entirely RoPE"
-            )
-        if rope_start == 0:  # RoPE leads the row (partial-rotary GQA heads).
-            start, elements = rope_elements, row_elements - rope_elements
-        elif rope_start + rope_elements == row_elements:  # RoPE trails the row (MLA, DeepSeek-V4).
-            start, elements = 0, rope_start
-        else:
-            raise ValueError(
-                f"{buffer_name}: RoPE elements [{rope_start}, {rope_start + rope_elements}) sit "
-                "inside the row; the kernel quantizes one contiguous range per row"
-            )
-        if start % _ELEMENTS_PER_SCALE or elements % _ELEMENTS_PER_SCALE:
-            raise ValueError(
-                f"{buffer_name}: the quantized range [{start}, {start + elements}) must start and "
-                f"end on {_ELEMENTS_PER_SCALE}-element NVFP4 scale groups"
-            )
-        return start, elements
-
     def _build_deepseek_v4_layer_layouts(
         self,
         cache_config: object,
@@ -323,47 +213,9 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
     ) -> dict[int, _Nvfp4LayerLayout | None]:
         """Build layouts for DeepSeek-V4 lifecycles; None selects lossless fallback."""
 
-        roles_by_layer: dict[int, set[str]] = {}
-        for layer in attention_layers:
-            layer_id = int(layer.layer_id)
-            buffer_roles = {str(buffer.role) for buffer in layer.buffers}
-            deepseek_v4_roles = {
-                role for role in buffer_roles if role.startswith(_DEEPSEEK_V4_PREFIX)
-            }
-            if deepseek_v4_roles:
-                if deepseek_v4_roles != buffer_roles or not buffer_roles <= _DEEPSEEK_V4_ROLES:
-                    raise NotImplementedError(
-                        f"Unsupported DeepSeek-V4 cold-page roles: {sorted(buffer_roles)}"
-                    )
-                roles_by_layer[layer_id] = buffer_roles
-
-        has_csa_cache = any(roles == _DEEPSEEK_V4_CSA_ROLES for roles in roles_by_layer.values())
-        model_layers: dict[int, int] = {}
-        if has_csa_cache:
-            model_layer = None
-            num_model_layers = 0
-            for layer in attention_layers:
-                layer_id = int(layer.layer_id)
-                roles = roles_by_layer.get(layer_id)
-                if roles is None:
-                    continue
-                if _DEEPSEEK_V4_SWA in roles:
-                    if num_model_layers == len(pp_layers):
-                        raise ValueError(
-                            "DeepSeek-V4 KVCM layout has more model-layer anchors than pp_layers"
-                        )
-                    model_layer = int(pp_layers[num_model_layers])
-                    num_model_layers += 1
-                elif model_layer is None:
-                    raise ValueError(
-                        "DeepSeek-V4 KVCM layout must begin each model layer with an SWA Page"
-                    )
-                model_layers[layer_id] = model_layer
-            if num_model_layers != len(pp_layers):
-                raise ValueError(
-                    "DeepSeek-V4 KVCM layout and pp_layers have different model-layer counts"
-                )
-
+        roles_by_layer, has_csa_cache, model_layers = self._deepseek_v4_model_layers(
+            attention_layers, pp_layers
+        )
         layouts: dict[int, _Nvfp4LayerLayout | None] = {}
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
@@ -385,29 +237,9 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 layouts[layer_id] = layout
                 continue
 
-            tokens_per_page = int(cache_config.tokens_per_block)
-            if tokens_per_page % 4 != 0:
-                raise ValueError("DeepSeek-V4 CSA Page geometry must divide tokens_per_block by 4")
-            tokens_per_page //= 4
-
-            element_bytes = 1 if runtime_type == 2 else 2
-            raw_bytes = tokens_per_page * _DEEPSEEK_V4_ROW_STRIDE * element_bytes
-            configured_bytes = next(
-                int(buffer.size)
-                for buffer in layer.buffers
-                if str(buffer.role) == _DEEPSEEK_V4_COMPRESS
+            tokens_per_page = self._deepseek_v4_csa_tokens_per_page(
+                cache_config, layer, runtime_type=runtime_type
             )
-            footer_bytes = tokens_per_page * _DEEPSEEK_V4_FOOTER_SCALE_ROW_BYTES
-            if runtime_type == 2 and configured_bytes == footer_bytes:
-                raise NotImplementedError(
-                    "NVFP4 cold-page compression does not support DeepSeek-V4 "
-                    "fp8_ds_mla footer-scale Pages"
-                )
-            if configured_bytes != raw_bytes:
-                raise ValueError(
-                    f"DeepSeek-V4 {_DEEPSEEK_V4_COMPRESS} buffer has "
-                    f"{configured_bytes} bytes; expected {raw_bytes} for an ordinary runtime Page"
-                )
 
             scale = _IDENTITY_NVFP4_SCALE
             if not is_draft:
