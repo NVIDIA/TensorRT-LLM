@@ -79,16 +79,19 @@ class NemotronHBf16Target(LlmapiAccuracyTestHarness):
         kv_cache_dtype: str = "auto",
         moe_backend: str | None = None,
         moe_max_num_tokens: int | None = None,
+        max_num_tokens: int | None = None,
     ) -> None:
         # `moe_backend` asks for the routed experts' backend by name; None leaves the LLM
         # API's default (AUTO), which runs the tp8 targets' own fused_moe and dep16's CUTLASS
-        # leaf. `moe_max_num_tokens` caps one MoE launch (moe_config.max_num_tokens).
+        # leaf. `moe_max_num_tokens` caps one MoE launch (moe_config.max_num_tokens);
+        # `max_num_tokens` overrides the class's engine step budget.
         moe_fields = dict(backend=moe_backend, max_num_tokens=moe_max_num_tokens)
         moe_fields = {k: v for k, v in moe_fields.items() if v is not None}
         moe_kwargs = dict(moe_config=MoeConfig(**moe_fields)) if moe_fields else {}
         engine_kwargs = {}
-        if self.MAX_NUM_TOKENS is not None:
-            engine_kwargs["max_num_tokens"] = self.MAX_NUM_TOKENS
+        max_num_tokens = max_num_tokens or self.MAX_NUM_TOKENS
+        if max_num_tokens is not None:
+            engine_kwargs["max_num_tokens"] = max_num_tokens
         # 1.1 TB of weights: about 128 GiB of them on each 185 GiB GPU at tp8 (123 GiB at
         # dep16), and the fraction applies to what is left. The batch ceiling (per rank under
         # attention DP) is the serving envelope the target was gated at: decode graphs up to
