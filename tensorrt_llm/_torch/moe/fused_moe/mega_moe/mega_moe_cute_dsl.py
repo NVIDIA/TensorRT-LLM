@@ -94,7 +94,6 @@ from ....autotuner import AutoTuner
 from ....cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
-from ...live_rows import current_word
 from ..activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
@@ -1727,7 +1726,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 helper_expert_count=_S_active,
                 hot_expert_weight_ready_flags=helper_ready_flags,
                 hot_expert_weight_ready_generation=int(helper_ready_generation),
-                live_row_word=current_word(combine_output.device),
             )
         finally:
             # Always clear: a raising op call must not leave the factory

@@ -11,8 +11,12 @@ def make_megamoe_aot_callable(function, kernel):
     # Home-only entries can omit the unused READY pair, as with direct JIT
     # calls. Helper-enabled entries require both READY operands explicitly.
     # Every argument after the READY pair (fc1_activation_per_token_scale,
-    # live_row_word) is optional too (defaults are right-aligned).
-    trailing_optional = len(argument_names) - 1 - argument_names.index("hot_expert_weight_ready_generation")
+    # live_row_word) is optional too (defaults are right-aligned); a kernel
+    # without the READY pair has none.
+    ready_last = "hot_expert_weight_ready_generation"
+    trailing_optional = (
+        len(argument_names) - 1 - argument_names.index(ready_last) if ready_last in argument_names else 0
+    )
     ready_optional = 2 if kernel.helper_expert_count == 0 else 0
     defaults = (None,) * (ready_optional + trailing_optional)
     return make_kwargs_wrapper(function, argument_names, arg_defaults=defaults)

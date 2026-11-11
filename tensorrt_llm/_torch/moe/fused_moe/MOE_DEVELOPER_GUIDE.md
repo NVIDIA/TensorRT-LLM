@@ -211,6 +211,8 @@ A model that runs other work on a side stream while the routed experts run (e.g.
 
 No external `Communication.dispatch` / `.combine`. Zero-token chunks still launch the kernel so peer EP ranks can cross the in-kernel NVLink barrier.
 
+Padding rows: the decoder runner writes how many of a forward's requests are real into a live-row word (`moe/live_rows.py`), and the SM100/SM103 MegaMoE CuteDSL kernel (the only kernel class with `reads_live_row_word`) neither routes nor computes the rows after them; the top-k reduce writes them zero. The word holds only for a launch over the rank's whole forward, rows request-major with padding last. A launch over part of a forward runs inside `live_rows.part_of_the_forward()` (the scheduler does this for every chunk when a forward splits into several), and under Helix CP + attention DP, where each CP rank's MoE runs on a slice of the rows, the engine registers no word. EPLB statistics still count the dropped rows.
+
 The DeepGEMM kernel's in-kernel barriers trap when a peer is late; their timeout is relaxed during warmup, see [Communication timeouts](#communication-timeouts).
 
 ### Communication timeouts
@@ -955,6 +957,7 @@ set wrong has a test that catches it:
 - `FusedCommMoEScheduler` calls `backend.quantize_input(...)` for every chunk including zero-token chunks (so peer ranks can cross the in-kernel NVLink barrier). Each fused-comm backend therefore MUST make `quantize_input` tolerate `x.shape[0] == 0` and return its own empty tensor layout; the scheduler does NOT synthesize backend-specific empty tensors.
 - Dynamic EPLB requires backend and quantization-method support; backends gate wrapper-level constraints in `validate_configurable_moe`. `MegaMoEDeepGemm` routes to slot IDs and migrates the transformed DG weights its quantization method registers (`num_slots % ep_size == 0`). `TrtllmCutedslMegaMoeNvfp4Impl` declares `supports_eplb=True`; its quantization method registers the MegaMoE-format derived params and `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
 - `FUSED_COMM` backends use `ignore_allreduce=False` for EPLB statistic update because the fused kernel AllReduces routing stats internally.
+- A MegaMoE CuteDSL launch reads the forward's live-row word (see [Fused-comm execution flow](#fused-comm-execution-flow-megamoe-style)): a new launch over part of a forward (another split, a model fast path) must enter `live_rows.part_of_the_forward()`, or it drops real rows.
 - Per-layer dynamic EPLB uses `MoeConfig.load_balancer.mode=per_layer_dynamic` with
   `num_slots` greater than the model expert count. Backend resolution selects
   `MEGAMOE_CUTEDSL` when no concrete backend is requested and rejects an

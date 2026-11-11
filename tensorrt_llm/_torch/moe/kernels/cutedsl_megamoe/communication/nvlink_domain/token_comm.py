@@ -948,7 +948,8 @@ class _MetadataPushRouter(KernelComponent):
         actual_token_count = Int32(self.max_tokens_per_rank)
         actual_elements = Int32(maximum_elements)
         if cutlass.const_expr(self._router_live_row_word is not None):
-            # Padding rows are neither loaded nor routed: an unloaded register goes to the trash below.
+            # Padding rows are not routed: only vectors that start before the end of the live rows
+            # are loaded, and every element past it, a straddling vector's tail too, goes to the trash.
             actual_token_count = cutlass.min(
                 live_row_count(self._router_live_row_word, self._router_token_rows), actual_token_count
             )
@@ -1656,7 +1657,8 @@ class TokenCommNonDeterministic(KernelComponent):
         ``epi_warps`` with a separate reduce registers this plane while registering no token-back machinery at
         all. Peers reach it through the symmetric heap, so it cannot be a caller tensor: only this component
         knows the wire dtype and the padded scale stride. Its ``data`` reset keeps it out of both the host zero
-        prefix and the per-launch tail reset, since every cell it exposes is rewritten each launch and the plane
+        prefix and the per-launch tail reset, since every cell a launch reads is rewritten by that launch (the
+        cells of rows the live-row word drops stay stale, and the top-k reduce does not read them) and the plane
         is far too large to be worth clearing.
         """
         workspace.register(

@@ -4,7 +4,7 @@ import types
 from abc import ABC, ABCMeta, abstractmethod
 from collections.abc import Iterator, Mapping
 from types import MappingProxyType
-from typing import Dict, Union, get_args, get_origin
+from typing import ClassVar, Dict, Union, get_args, get_origin
 
 from cutlass.cute.typing import SymInt
 
@@ -158,6 +158,10 @@ class KernelComponent(ABC, metaclass=_KernelComponentMeta):
 
 class KernelClass(KernelComponent):
     """Top-level host wrapper for one composable kernel implementation."""
+
+    # True for a kernel whose ``__call__`` takes ``live_row_word`` (helpers/live_rows.py) and drops the
+    # rows past the live ones; the caller then passes a word on every launch.
+    reads_live_row_word: ClassVar[bool] = False
 
     @abstractmethod
     def name(self) -> str:

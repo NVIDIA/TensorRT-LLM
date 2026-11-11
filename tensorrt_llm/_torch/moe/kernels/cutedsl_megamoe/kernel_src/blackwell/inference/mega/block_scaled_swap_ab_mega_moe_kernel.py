@@ -544,6 +544,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 max_ranks=self.world_size,
             ),
             stream=make_fake_stream(),
+            # The JIT path passes a live-row word on every launch, so the exported ABI takes one too.
+            live_row_word=make_ptr(cutlass.Int32, 0, AddressSpace.gmem, assumed_align=4),
         )
         if self.helper_expert_count > 0:
             fake_arguments.update(
@@ -638,7 +640,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         # keeps every existing positional caller valid.
         fc1_activation_per_token_scale: Optional[cute.Tensor] = None,
         # The forward's live-row word (helpers/live_rows.py): only the leading live rows of
-        # output_activation are routed and reduced, the others are written zero.
+        # output_activation are routed and reduced. The top-k reduce writes the others zero;
+        # with the reduce in the kernel the caller zeroes the output beforehand.
         live_row_word: Optional[cute.Pointer] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
@@ -726,7 +729,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             stream,
             fc1_activation_per_token_scale,
             live_row_word,
-            Int32(output_activation.shape[0]),  # the caller trims it to the launch's rows
+            # The launch's rows: the caller trims output_activation to them, except that a
+            # zero-token launch keeps the whole bucket.
+            Int32(output_activation.shape[0]),
         )
 
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
