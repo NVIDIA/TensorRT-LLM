@@ -22,13 +22,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from ..spec.deployments import ranks_of
 from .harness import workload_io
 
 MATCH = "match"
 MISMATCH = "mismatch"
 UNKNOWN = "unknown"
 #: The module path every Modeling V2 target's class lives under.
-TARGET_PACKAGE = "modeling_v2"
+TARGET_PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2."
 #: A prompt long enough to fill several cache blocks, sent again where block reuse is on.
 REUSE_PROMPT = " ".join(
     f"Sack {n} of grain was weighed twice at the mill, once on arrival and once before grinding."
@@ -87,8 +88,11 @@ def leaves(options: Mapping[str, Any], prefix: str = "") -> Iterator[tuple[str, 
 
 def _same(declared: Any, observed: Any) -> bool:
     if isinstance(declared, Mapping):
-        # An empty block asks for the block with its defaults: it is there.
-        return isinstance(observed, Mapping)
+        # An empty block asks for the block with its defaults; a stated one, inside a list,
+        # for each of its keys.
+        return isinstance(observed, Mapping) and all(
+            key in observed and _same(value, observed[key]) for key, value in declared.items()
+        )
     if isinstance(declared, bool) or isinstance(observed, bool) or declared is None:
         return declared is observed or declared == observed
     if isinstance(declared, (int, float)) and isinstance(observed, (int, float)):
@@ -100,10 +104,8 @@ def _same(declared: Any, observed: Any) -> bool:
             and all(_same(a, b) for a, b in zip(declared, observed))
         )
 
-    def name(value: Any) -> str:
-        return str(value).lower().removeprefix("torch.")
-
-    return name(declared) == name(observed)
+    # Text is compared as written: a path or a revision that differs by case is another one.
+    return str(declared).removeprefix("torch.") == str(observed).removeprefix("torch.")
 
 
 def _observed(resolved: Any, path: str) -> tuple[str, Any]:
@@ -143,7 +145,7 @@ def attest(
     from anywhere else ran another tree. ``target``: the model each rank built must be a
     Modeling V2 target (false for a control run on the stock path).
     """
-    ranks = max(1, int(options.get("tensor_parallel_size") or 1))
+    ranks = ranks_of(options)
     declared = list(leaves(options))
     records = rank_records(output)
     mismatches: list[str] = []
@@ -168,7 +170,7 @@ def attest(
         targets.add(built)
         if not built:
             unknown.append(f"{at}: the model class it built")
-        elif target and TARGET_PACKAGE not in built:
+        elif target and not built.startswith(TARGET_PACKAGE):
             mismatches.append(f"{at}: built {built}, not a Modeling V2 target")
         origin = str(record.get("origin") or "")
         origins.add(origin)
@@ -207,7 +209,8 @@ def reuse_shortfall(cached: Sequence[int | None]) -> str | None:
     resume. A repeat that reports no count is unknown, which is not a pass.
     """
     repeats = list(cached[1:])
-    if any(isinstance(count, int) and count > 0 for count in repeats):
+    counts = [c for c in repeats if isinstance(c, int) and not isinstance(c, bool)]
+    if any(count > 0 for count in counts):
         return None
     if not repeats or any(count is None for count in repeats):
         return (

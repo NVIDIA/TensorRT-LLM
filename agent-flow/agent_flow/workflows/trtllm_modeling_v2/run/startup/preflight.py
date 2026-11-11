@@ -147,7 +147,7 @@ def probe(task_data: Mapping[str, Any], deployment: Deployment, runner: Any) -> 
     command = environment.python_command(argv, single_process=True)
     if launch:
         words = " ".join(shlex.quote(word) for word in (environment.python, *argv))
-        inner = f"{single_task_scrub(list(env))}; {launch} {words}"
+        inner = f"{single_task_scrub(list(env), rank=False)}; {launch} {words}"
         command = f"{' '.join(env_assignments(environment.env))} bash -c {shlex.quote(inner)}"
     repo = shlex.quote(str(task_data["trtllm_repo_path"]))
     result = runner(f"cd {repo} && {command}", None, PROBE_TIMEOUT_S)

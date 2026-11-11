@@ -12,6 +12,7 @@ options (``checks/attest.py``); a benchmark with no anchor is a score with no ve
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import time
@@ -103,9 +104,13 @@ def launch_command(
     if not launch:
         return environment.command(" ".join(parts))
     # The prefix is the site's own words (it may begin with assignments): run as written,
-    # with the LLM API's launcher before the program where it has made several ranks.
+    # with the LLM API's launcher before the program where it has made several ranks. The
+    # evaluator is the one installed beside the run's interpreter, and nothing of the
+    # orchestrator's scheduler identity goes behind the prefix.
     program = " ".join([*servers.launcher(deployment.server), *parts])
-    inner = f"{single_task_scrub(list(env))}; {launch} {program}"
+    beside = os.path.dirname(environment.python) if os.path.isabs(environment.python) else ""
+    path = f'PATH={shlex.quote(beside)}:"$PATH"; ' if beside else ""
+    inner = f"{single_task_scrub(list(env), rank=False)}; {path}{launch} {program}"
     return f"{' '.join(env_assignments(environment.env))} bash -c {shlex.quote(inner)}"
 
 
@@ -226,7 +231,10 @@ def run_accuracy_gate(
             **{**fields, **more},
         )
 
-    dataset, said = datasets.find(benchmark.name, benchmark.dataset_path, environment.env)
+    # Looked for where the evaluator will: under the deployment's and the benchmark's own
+    # environment, over the run's.
+    declared = {**environment.env, **deployment.env, **benchmark.env}
+    dataset, said = datasets.find(benchmark.name, benchmark.dataset_path, declared)
     if said and not dataset:
         return ran(passed=False, detail=said, infrastructure=said)
     if timeout is None:

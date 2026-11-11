@@ -34,7 +34,7 @@ OPTIONS = {
 RESOLVED = {
     **OPTIONS,
     "cuda_graph_config": {"batch_sizes": [1, 2], "enable_padding": True},
-    "kv_cache_config": {"dtype": "NVFP4", "free_gpu_memory_fraction": 0.6, "tokens_per_block": 32},
+    "kv_cache_config": {"dtype": "nvfp4", "free_gpu_memory_fraction": 0.6, "tokens_per_block": 32},
     "max_seq_len": None,
 }
 
@@ -57,6 +57,8 @@ def test_declared_equals_observed_on_every_rank_with_no_option_known_by_name():
             "speculative_config is {'decoding_type'",
         ),
         ({"a_dtype_option_added_tomorrow": "auto"}, "a_dtype_option_added_tomorrow is 'auto'"),
+        # Text is compared as written: a path or a name that differs by case is another one.
+        ({"a_dtype_option_added_tomorrow": "FP8"}, "a_dtype_option_added_tomorrow is 'FP8'"),
     ],
 )
 def test_a_key_the_engine_resolved_otherwise_fails_the_check(resolved, said):
@@ -91,6 +93,23 @@ def test_the_model_class_and_the_import_origin_are_attested_on_every_rank():
     assert "imported tensorrt_llm from /opt/other/tensorrt_llm/__init__.py" in elsewhere.failure()
 
 
+def test_a_value_inside_a_list_and_every_rank_of_every_parallel_size_are_held():
+    inputs = [{"name": "token_type_ids", "dtype": "int32"}]
+    declared = {"cuda_graph_config": {"extra_model_inputs": inputs}}
+    other = {"cuda_graph_config": {"extra_model_inputs": [{**inputs[0], "dtype": "float32"}]}}
+    assert attest.attest(rank_lines(declared), declared).status == attest.MATCH
+    assert attest.attest(rank_lines(other), declared).status == attest.MISMATCH
+    # An engine's ranks are its tensor, pipeline and context parallel sizes, multiplied.
+    wide = {"tensor_parallel_size": 2, "pipeline_parallel_size": 2}
+    assert Server(options=wide).ranks == 4
+    half = attest.attest(rank_lines(wide, ranks=2), wide)
+    assert (half.status, half.ranks) == (attest.UNKNOWN, 4)
+    assert attest.attest(rank_lines(wide, ranks=4), wide).status == attest.MATCH
+    # The model class is in the Modeling V2 package, not one whose name contains it.
+    lookalike = rank_lines({}, target="tensorrt_llm._torch.models.not_modeling_v2.Stock")
+    assert attest.attest(lookalike, {}).status == attest.MISMATCH
+
+
 def test_a_repeated_prompt_must_come_back_with_cached_tokens():
     assert attest.reuses({"kv_cache_config": {"enable_block_reuse": True}})
     assert not attest.reuses(
@@ -103,6 +122,7 @@ def test_a_repeated_prompt_must_come_back_with_cached_tokens():
     assert attest.reuse_shortfall([0, 0, 0, 448, 0]) is None
     assert "the engine reused nothing" in attest.reuse_shortfall([0, 0])
     assert "unknown is not a pass" in attest.reuse_shortfall([0, None])
+    assert "the engine reused nothing" in attest.reuse_shortfall([0, True])  # no count of tokens
 
 
 def test_a_rank_prints_every_field_of_its_configuration_under_each_name_it_answers_to(

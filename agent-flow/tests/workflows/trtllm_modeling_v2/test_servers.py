@@ -150,7 +150,7 @@ def test_a_start_that_fails_names_the_server_and_its_log_and_leaves_nothing(site
     with pytest.raises(servers.ServerError) as raised:
         servers.start(_one(), model="/m", workspace=workspace, timeout=30)
     said = str(raised.value)
-    assert said.startswith("tp1 exited before tp1 was bound")
+    assert said.startswith("tp1 exited before tp1 was bound to an address")
     assert f"({workspace / 'deployments/tp1/tp1.log'})" in said and "fake: refused to start" in said
     assert servers.load_owned(workspace) == []
     monkeypatch.delenv("FAKE_SERVE_EXIT")
@@ -178,7 +178,7 @@ def test_every_wait_is_bounded_by_the_deployments_timeout(site, monkeypatch):
     monkeypatch.setattr(servers, "_holders", holders)
     monkeypatch.setenv("FAKE_SERVE_HANG", "1")  # it never reports an address
     began = time.monotonic()
-    with pytest.raises(servers.ServerError, match="tp1 was not bound within its timeout"):
+    with pytest.raises(servers.ServerError, match="tp1 reported no address within its timeout"):
         servers.start(_one(), model="/m", workspace=workspace, timeout=2)
     assert time.monotonic() - began < 15 and looks and max(looks) <= 2
     assert servers.load_owned(workspace) == []
@@ -221,6 +221,18 @@ def test_ranks_left_after_a_stop_are_no_verdict_and_stay_owned_until_the_devices
     running = servers.start(other, model="/m", workspace=workspace, timeout=30)
     assert [o.name for o in servers.load_owned(workspace)] == ["tep4"]
     servers.stop(running)
+
+
+def test_every_server_is_ended_before_the_devices_are_looked_at(tmp_path, monkeypatch):
+    """A deployment's other servers, still up while one stops, are not ranks left behind."""
+    roles = (("ctx", 1001), ("gen", 1002), ("proxy", 1003))
+    owned = [servers.Owned(f"pd.{role}", pid, pid, before=[]) for role, pid in roles]
+    holding = {"1001", "1002"}  # the two engines hold their devices until they are ended
+    monkeypatch.setattr(servers, "_end", lambda item, *a: holding.discard(str(item.pid)))
+    monkeypatch.setattr(servers, "_holders", lambda *a: sorted(holding))
+    monkeypatch.setattr(servers, "RELEASE_TIMEOUT_S", 0)
+    pd = Deployment(name="pd", ctx=Server(options={}), gen=Server(options={}))
+    assert servers.stop(servers.Running(pd, "", owned, tmp_path)) == "" and not holding
 
 
 def test_devices_that_cannot_be_looked_at_are_said_never_taken_for_clean(site, monkeypatch):

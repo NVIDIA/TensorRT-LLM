@@ -130,10 +130,12 @@ def binomial_se(score: float, samples: int) -> float:
 def model_key(task_data: Mapping[str, Any], benchmark: Benchmark) -> str:
     """The name the benchmark's reference rows are keyed by: stated, else ``<org>/<model>``.
 
-    The fallback is the checkpoint path's last two components.
+    Stated on the benchmark, else in the spec's ``accuracy``; the fallback is the
+    checkpoint path's last two components.
     """
-    if benchmark.model_key:
-        return str(benchmark.model_key)
+    stated = benchmark.model_key or (task_data.get("accuracy") or {}).get("model_key")
+    if isinstance(stated, str) and stated:
+        return stated
     parts = Path(str(task_data["checkpoint_path"]).rstrip("/")).parts
     return "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
 
@@ -146,7 +148,8 @@ def tags(deployment: Deployment, benchmark: Benchmark) -> dict[str, Any]:
     them. A row matches only its exact tags: the unquantized row never stands in for a
     deployment that quantizes its cache.
     """
-    options = next(iter(deployment.servers.values())).options
+    # Of a disaggregated deployment, the generation server's: it produces what is scored.
+    options = (deployment.gen or deployment.server).options
     implied: dict[str, Any] = {}
     dtype = str((options.get("kv_cache_config") or {}).get("dtype") or "").lower()
     if dtype in _KV_TAGS:

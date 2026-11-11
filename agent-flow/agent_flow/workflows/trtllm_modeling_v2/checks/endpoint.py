@@ -180,13 +180,19 @@ def run_endpoint_boot(
             f"{missing}. Keywords are matched against generated text only",
         )
     images = sum(1 for item in spec.items if item.images)
+    # The proxy reports the context server's usage: what the repeat shows is that side's cache.
+    side = " on the context server; the generation server's reuse is not shown by the proxy"
+    reused = (
+        f"; a repeated prompt resumed {max(c or 0 for c in cached)} cached tokens" if cached else ""
+    )
+    reused += side if cached and deployment.server is None else ""
     return ran(
         passed=True,
         explained=True,
         detail=f"{deployment.kind} deployment `{deployment.name}` started and its endpoint "
         f"answered {len(texts)} prompt(s) with their keywords"
         + (f", {images} of them with an image" if images else "")
-        + f"; workload: {spec.source}{note}",
+        + f"; workload: {spec.source}{reused}{note}",
     )
 
 
@@ -237,7 +243,8 @@ def run_endpoint_accuracy(
             f"through an endpoint ({', '.join(ENDPOINT_BENCHMARKS)} have); score it on an "
             f"aggregated deployment",
         )
-    dataset, said = datasets.find(benchmark.name, benchmark.dataset_path, _declared_env(task_data))
+    declared = {**_declared_env(task_data), **deployment.env, **benchmark.env}
+    dataset, said = datasets.find(benchmark.name, benchmark.dataset_path, declared)
     if said and not dataset:
         return ran(passed=False, detail=said, infrastructure=said)
     running, refused = _started(

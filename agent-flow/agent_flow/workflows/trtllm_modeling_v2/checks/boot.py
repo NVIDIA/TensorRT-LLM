@@ -38,6 +38,8 @@ DEFAULT_BOOT_IMAGE = "tests/integration/test_input_files/merlion.png"
 #: What the default image prompt asks, and the words any correct description
 #: of that photograph (the Merlion fountain in Singapore) contains one of.
 DEFAULT_BOOT_IMAGE_PROMPT = "Describe this image in one sentence."
+#: The finish reasons of an answer that did not complete.
+UNFINISHED: tuple[str, ...] = ("", "None", "timeout", "cancelled")
 
 
 DEFAULT_BOOT_IMAGE_KEYWORDS: tuple[str, ...] = (
@@ -289,6 +291,18 @@ def run_boot_gate(
             passed=False,
             detail=f"the engine exited cleanly but returned no record for {len(absent)} of "
             f"{len(requests)} prompt(s) ({', '.join(absent)})",
+            **ran,
+        )
+    # An answer counts once it completed: one cut off mid-way has no finish reason, and one
+    # the engine gave up on says so.
+    ended = {r["id"]: str(records[n].get("finish_reason") or "") for n, r in enumerate(requests)}
+    cut = [
+        f"{name} ({how or 'no finish reason'})" for name, how in ended.items() if how in UNFINISHED
+    ]
+    if cut:
+        return _verdict(
+            passed=False,
+            detail=f"the engine returned an answer that did not complete for {', '.join(cut)}",
             **ran,
         )
     texts = texts[:declared_requests]

@@ -96,6 +96,12 @@ _NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def ranks_of(options: Mapping[str, Any]) -> int:
+    """The ranks an engine of ``options`` runs: its tensor, pipeline and context parallel sizes, multiplied."""
+    sizes = ("tensor_parallel_size", "pipeline_parallel_size", "context_parallel_size")
+    return math.prod(max(1, int(options.get(size) or 1)) for size in sizes)
+
+
 @dataclass(frozen=True)
 class Benchmark:
     """One benchmark a deployment is scored on, with everything its judging reads.
@@ -153,8 +159,8 @@ class Server:
 
     @property
     def ranks(self) -> int:
-        """How many devices the server takes: its options' tensor-parallel size."""
-        return max(1, int(self.options.get("tensor_parallel_size") or 1))
+        """How many devices the server takes: one for each rank of its engine."""
+        return ranks_of(self.options)
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"options": self.options_path or dict(self.options)}

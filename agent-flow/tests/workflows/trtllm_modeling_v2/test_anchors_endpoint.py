@@ -80,6 +80,15 @@ def test_each_benchmark_of_each_deployment_gets_its_anchor_in_order(tmp_path):
         "lone:mmmu": (anchors.NONE, None, None),
     }
     assert found["dep16:aa_lcr"].source.startswith("trtllm-eval aa_lcr at DEP16")
+    # Of a context and a generation server that differ, the generation side's options name
+    # the row: it produces what is scored.
+    sides = Deployment(
+        name="pd",
+        ctx=Server(options={"kv_cache_config": {"dtype": "auto"}}),
+        gen=Server(options={"kv_cache_config": {"dtype": "fp8"}}),
+    )
+    assert anchors.tags(sides, Benchmark(name="gsm8k")) == {"kv_cache_quant_algo": "FP8"}
+    assert anchors.resolve(loaded, sides, Benchmark(name="gsm8k")).value == 95.9
     assert "the row of `moonshotai/Kimi-K3` with {'kv_cache_quant_algo': 'NVFP4'}" in (
         found["dep16:gsm8k"].source
     )
@@ -280,7 +289,11 @@ def test_a_boot_through_the_endpoint_holds_every_server_to_its_options(site, mon
     def boot():
         return endpoint.run_endpoint_boot(quantized, task_data=_task(site), workspace=workspace)
 
-    assert boot().passed
+    passed = boot()
+    assert passed.passed
+    # The proxy's usage is the context server's: the line says whose cache the repeat showed.
+    assert "a repeated prompt resumed 448 cached tokens on the context server" in passed.detail
+    assert "the generation server's reuse is not shown by the proxy" in passed.detail
     # Each server was started in the tree, with the switch on and the hook loaded.
     started = json.loads((workspace / "deployments/q/address.ctx.started.json").read_text())
     assert started["env"]["PYTHONPATH"].split(":")[1] == str(site.resolve())

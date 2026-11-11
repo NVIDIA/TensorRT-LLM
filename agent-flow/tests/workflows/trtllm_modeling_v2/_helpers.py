@@ -259,6 +259,7 @@ def driver_records(accepted: int = 320, iterations: int = 100, prompts: int = 32
             "iterations": iterations,
             "token_ids": list(range(accepted)),
             "text": "Paris is the capital of France",
+            "finish_reason": "stop",
             # What a repeated prompt resumes from the cache, where the boot sends one.
             "cached_tokens": 64,
         }

@@ -80,9 +80,14 @@ MPI_SETTINGS_KEPT: tuple[str, ...] = (
 _DECLARED_MPI_PREFIXES: tuple[str, ...] = ("OMPI_MCA_", "PMIX_MCA_", "OMPI_ALLOW_")
 
 
-def single_task_scrub(keep: Sequence[str] = ()) -> str:
-    """The shell loop that unsets the MPI bootstrap environment, but ``keep`` and the settings."""
-    kept = ["SLURM_PROCID", "SLURM_LOCALID", *MPI_SETTINGS_KEPT, *sorted(set(keep))]
+def single_task_scrub(keep: Sequence[str] = (), *, rank: bool = True) -> str:
+    """The shell loop that unsets the MPI bootstrap environment, but ``keep`` and the settings.
+
+    ``rank``: the variables that name this process's rank stay. Behind a launch prefix they
+    are the orchestrator's, not the launched program's, and go with the rest.
+    """
+    named = ("SLURM_PROCID", "SLURM_LOCALID") if rank else ()
+    kept = [*named, *MPI_SETTINGS_KEPT, *sorted(set(keep))]
     tests = " && ".join(f'[ "$v" != {name} ]' for name in dict.fromkeys(kept))
     return f'for v in ${{!PMI@}} ${{!PMIX@}} ${{!MPI@}} ${{!OMPI@}} ${{!SLURM@}}; do {tests} && unset "$v"; done'
 

@@ -407,8 +407,8 @@ def tests_check(workflow, commit: str, round: int = 0) -> DeliveryCheck | None:
     report.unlink(missing_ok=True)
     command = pytest_runner.pytest_command(python, repo, files, report, ("--timeout=180",))
     code, tail = _test_job(workflow, command, repo, pytest_runner.TIMEOUT_S)
-    outcome = pytest_runner.read_report(report)
-    ran = f"; {len(files)} test file(s) ran at {commit[:10]}"
+    outcome = pytest_runner.read_report(report, files)
+    ran = f"; {len(files)} test file(s) asked for at {commit[:10]}"
     if outcome.unread:
         return DeliveryCheck("tests", False, f"INCOMPLETE (exit {code}): {tail}")
     if code and outcome.verdict() == "CLEAN":

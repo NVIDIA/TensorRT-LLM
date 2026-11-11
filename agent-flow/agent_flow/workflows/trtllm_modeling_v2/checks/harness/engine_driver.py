@@ -92,7 +92,10 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
         {
             "token_ids": [int(t) for t in seq.token_ids],
             "text": seq.text,
-            "finish_reason": str(getattr(seq, "finish_reason", "")),
+            # As the engine states it: nothing, for an answer that did not complete.
+            "finish_reason": str(seq.finish_reason)
+            if getattr(seq, "finish_reason", None)
+            else None,
         }
         for seq in output.outputs
     ]

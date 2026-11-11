@@ -564,6 +564,19 @@ def load_and_validate_task_yaml(
         raise TaskSchemaError(
             f"{task_path} failed trtllm-modeling-v2 schema validation:{bullet}{bullet.join(errors)}"
         )
+    if not stated:
+        # The shorthand is read here, once: below the loader a spec states its deployments.
+        data[deployments_mod.DEPLOYMENTS_FIELD] = [
+            {**found.as_dict(), "benchmarks": [b.as_dict() for b in found.benchmarks]}
+            for found in shorthand.expand(data)
+        ]
+        for key in shorthand.SHORTHAND_KEYS:
+            data.pop(key, None)
+        if isinstance(accuracy, dict):
+            # What was stated per deployment is now each benchmark's own.
+            spent = (set(accuracy) - set(flat) - {"boot", "serve"}) | set(shorthand.ACCURACY_KEYS)
+            for key in spent & set(accuracy):
+                del accuracy[key]
     return data
 
 

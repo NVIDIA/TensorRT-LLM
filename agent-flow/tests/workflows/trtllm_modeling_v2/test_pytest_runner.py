@@ -80,7 +80,7 @@ def test_the_delivered_tests_run_once_at_the_commit_and_hold_on_their_passing(tm
     check = stage.check()
     assert check.passed, check.detail
     assert check.detail.startswith("CLEAN (2 passed, 0 skipped, 0 failing)")
-    assert f"2 test file(s) ran at {stage.head[:10]}" in check.detail
+    assert f"2 test file(s) asked for at {stage.head[:10]}" in check.detail
     # One job, from inside the tree, with the tree first on PYTHONPATH.
     [command] = stage.ran
     assert command.startswith(f"cd {stage.repo} && export PYTHONPATH={stage.repo}")
@@ -114,6 +114,20 @@ def test_a_selection_is_judged_from_its_report(tmp_path, files, verdict):
     command = pytest_runner.pytest_command(sys.executable, repo, sorted(files), report)
     subprocess.run(command, shell=True, capture_output=True, text=True)
     assert pytest_runner.read_report(report).describe().startswith(verdict)
+
+
+def test_a_delivered_file_that_did_not_run_is_not_certified_by_another(tmp_path):
+    tests = model_ops_tests_dir(TARGET)
+    files = {
+        f"{tests}/test_a.py": PASSING,
+        f"{tests}/norm/test_b.py": FAILING,
+        # The tree's own configuration takes the failing file's only test out of the run.
+        "pytest.ini": f"[pytest]\naddopts = --deselect={tests}/norm/test_b.py::test_a\n",
+    }
+    check = _Delivery(tmp_path, files).check()
+    assert not check.passed
+    assert check.detail.startswith("INCOMPLETE (1 passed, 0 skipped, 0 failing): no test of ")
+    assert f"no test of {tests}/norm/test_b.py ran" in check.detail
 
 
 def test_no_report_and_a_skip_that_must_not_be_are_not_passes(tmp_path):

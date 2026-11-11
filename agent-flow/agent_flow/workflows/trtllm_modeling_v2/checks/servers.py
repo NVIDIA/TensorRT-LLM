@@ -256,9 +256,8 @@ def _holders(launch: str, env: Mapping[str, str], timeout: float) -> list[str] |
     return sorted({" ".join(line.split()) for line in done.stdout.splitlines() if line.strip()})
 
 
-def _released(owned: Owned, grace_s: float, release_s: float) -> str:
-    """End ``owned`` and look at its devices: ``""`` free, :data:`UNVERIFIED`, or who holds them."""
-    _end(owned, grace_s)
+def _released(owned: Owned, release_s: float) -> str:
+    """Look at the devices of ``owned``, which was ended: ``""`` free, :data:`UNVERIFIED`, or who holds them."""
     deadline = time.monotonic() + release_s
     while True:
         now = _holders(owned.launch, _site_env(owned), min(PROBE_TIMEOUT_S, release_s))
@@ -273,12 +272,16 @@ def _released(owned: Owned, grace_s: float, release_s: float) -> str:
 def _retire(workspace: Path, records: Sequence[Owned], budget: float) -> tuple[list[str], bool]:
     """End ``records``, last started first; drop from the workspace those whose devices are not held.
 
-    Returns what still holds a device, by server, and whether any look could not be taken.
+    Every one is ended before the devices are looked at: the ranks of a deployment's other
+    server, still up, are not ranks left behind. Returns what still holds a device, by
+    server, and whether any look could not be taken.
     """
     held, unverified = [], False
     kept = {o.name: o for o in load_owned(workspace)}
     for owned in reversed(list(records)):
-        said = _released(owned, min(STOP_GRACE_S, budget), min(RELEASE_TIMEOUT_S, budget))
+        _end(owned, min(STOP_GRACE_S, budget))
+    for owned in reversed(list(records)):
+        said = _released(owned, min(RELEASE_TIMEOUT_S, budget))
         if said and said != UNVERIFIED:
             held.append(f"{owned.name}: {said}")
             kept[owned.name] = owned
@@ -398,7 +401,7 @@ def _await(record: Owned, deadline: float, watched: Sequence[Owned] = (), addres
     while the proxy is waited for fails the start at once, by its own name and log.
     """
     path = Path(record.address_file)
-    what = "healthy" if address else "bound"
+    what = "healthy" if address else "bound to an address"
     while time.monotonic() < deadline:
         for server in (record, *watched):
             if _exited(server):
@@ -414,7 +417,8 @@ def _await(record: Owned, deadline: float, watched: Sequence[Owned] = (), addres
                     if reply.status == 200:
                         return address
         time.sleep(0.2)
-    raise ServerError(f"{record.name} was not {what} within its timeout {_tail(record)}")
+    why = "was not healthy" if address else "reported no address"
+    raise ServerError(f"{record.name} {why} within its timeout {_tail(record)}")
 
 
 def start(

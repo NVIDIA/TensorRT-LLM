@@ -100,12 +100,14 @@ class Outcome:
     failing: tuple[str, ...] = ()
     #: Why there is no report to read.
     unread: str = ""
+    #: The test files asked for that the report has no case of: deselected, or not collected.
+    unrun: tuple[str, ...] = ()
 
     def verdict(self, *, skips_fail: bool = False) -> str:
-        """``FAILING``, ``INCOMPLETE`` (no report, or nothing passed), or ``CLEAN``."""
+        """``FAILING``, ``INCOMPLETE`` (no report, a file unrun, or nothing passed), or ``CLEAN``."""
         if self.failing or (skips_fail and self.skipped):
             return "FAILING"
-        return "CLEAN" if self.passed and not self.unread else "INCOMPLETE"
+        return "CLEAN" if self.passed and not (self.unread or self.unrun) else "INCOMPLETE"
 
     def describe(self, *, skips_fail: bool = False, limit: int = 5) -> str:
         """One line: the verdict and what makes it so."""
@@ -114,18 +116,37 @@ class Outcome:
         if self.unread:
             return f"{verdict} ({self.unread})"
         problems = [*self.failing, *(f"{name} skipped" for name in self.skipped if skips_fail)]
+        problems += [f"no test of {file} ran" for file in self.unrun]
         if problems:
             return f"{verdict} ({counts}): {'; '.join(problems[:limit])}"
         return f"{verdict} ({counts})" + ("" if self.passed else ": no test passed")
 
 
-def read_report(report: str | Path) -> Outcome:
-    """Every test case of the JUnit ``report``, by how it ended."""
+def read_report(report: str | Path, files: Sequence[str] = ()) -> Outcome:
+    """Every test case of the JUnit ``report``, by how it ended.
+
+    ``files`` are the test files the selection asked for: one the report has no case of
+    did not run (a configured deselection, a file not collected), and another file's
+    passing does not stand in for it.
+    """
     try:
         cases = list(ET.parse(report).getroot().iter("testcase"))  # nosec B314
     except (OSError, ET.ParseError) as exc:
         return Outcome(unread=f"no test report: {exc}")
     passed, skipped, failing = 0, [], []
+    # A case names its module by its dotted path from pytest's root: the tail of the file's.
+    heads = set()
+    for case in cases:
+        parts = (case.get("classname") or case.get("name") or "").split(".")
+        heads.update(".".join(parts[:end]) for end in range(1, len(parts) + 1))
+    unrun = [
+        file
+        for file in files
+        if not any(
+            f".{Path(file).with_suffix('').as_posix().replace('/', '.')}".endswith(f".{head}")
+            for head in heads
+        )
+    ]
     for case in cases:
         name = f"{case.get('classname', '')}::{case.get('name', '')}".strip(":")
         ended = next((c for c in case if c.tag in ("failure", "error", "skipped")), None)
@@ -136,7 +157,7 @@ def read_report(report: str | Path) -> Outcome:
         else:
             message = (ended.get("message") or ended.text or "").strip().splitlines()
             failing.append(f"{name} {ended.tag}: {message[0][:200] if message else ''}")
-    return Outcome(passed=passed, skipped=tuple(skipped), failing=tuple(failing))
+    return Outcome(passed, tuple(skipped), tuple(failing), unrun=tuple(unrun))
 
 
 def run_tests(
@@ -191,7 +212,7 @@ def run_tests(
             # and nothing of this host's devices goes with it.
             words = [*servers.launcher(deployment.server), shlex.quote(env.python)]
             program = f"{launch} {' '.join(words)} {shlex.join(argv)}"
-            inner = f"{single_task_scrub(list(env.env))}; {program}"
+            inner = f"{single_task_scrub(list(env.env), rank=False)}; {program}"
             run = f"{' '.join(env_assignments(env.env))} bash -c {shlex.quote(inner)}"
         else:
             run = env.python_command(argv, single_process=True)

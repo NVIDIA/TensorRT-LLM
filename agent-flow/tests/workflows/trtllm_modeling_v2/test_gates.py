@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -112,7 +113,7 @@ def _engine(*said: str, reports: str | None = None, code: int = 0, **changes):
 
 def _records(*texts):
     return "".join(
-        f"{workload_io.RECORD_MARKER} {json.dumps({'index': n, 'text': t})}\n"
+        f"{workload_io.RECORD_MARKER} {json.dumps({'index': n, 'text': t, 'finish_reason': 'stop'})}\n"
         for n, t in enumerate(texts)
     )
 
@@ -155,6 +156,12 @@ def test_one_function_runs_a_check_on_the_deployment_it_names(tmp_path):
     assert gate_cli.run_check(stated, "boot", runner=runner, **common).passed
     lyon = gate_cli.run_check(stated, "boot", "tep2", runner=runner, **common)
     assert not lyon.passed and "missing 1 expected keyword(s): ['Lyon']" in lyon.detail
+    # An answer that did not complete (no finish reason) is not an answer.
+    cut = f"{workload_io.RECORD_MARKER} {json.dumps({'index': 0, 'text': 'Paris'})}\n"
+    unfinished = gate_cli.run_check(stated, "boot", runner=_engine(cut), **common)
+    assert (
+        not unfinished.passed and "did not complete for b0 (no finish reason)" in unfinished.detail
+    )
     with pytest.raises(task_schema.TaskSchemaError, match="names no gate"):
         gate_cli.run_check(data, "perf", **common)
     with pytest.raises(KeyError, match="'dep4' names no deployment of this spec"):
@@ -181,6 +188,10 @@ def test_accuracy_runs_trtllm_eval_behind_the_deployments_own_prefix(tmp_path):
     # for the eight its options ask for, and no device of this host.
     assert "; srun -N2 --ntasks=8 --mpi=pmix trtllm-llmapi-launch trtllm-eval " in command
     assert "CUDA_VISIBLE_DEVICES" not in command and "mpirun" not in command
+    # The evaluator is the one beside the run's interpreter, and nothing of the
+    # orchestrator's scheduler identity goes behind the prefix: not its rank either.
+    assert '; PATH=/usr/bin:"$PATH"; srun -N2 ' in command
+    assert "SLURM_PROCID" not in command and "${!SLURM@}" in command
     # The evaluator runs offline, on the dataset this host holds, under the benchmark's env.
     assert "HF_DATASETS_OFFLINE=1" in command and "JUDGE=local" in command
     assert " gsm8k --dataset_path=" in command and "TLLM_EVAL_PARTIAL_SCORES_EVERY=50" in command
@@ -199,6 +210,23 @@ def test_accuracy_runs_trtllm_eval_behind_the_deployments_own_prefix(tmp_path):
         printed, None
     )
     assert accuracy_checks.parse_eval_score(printed, r"Eval accuracy: ([0-9.]+)") == 91.5
+
+
+def test_a_dataset_is_looked_for_under_the_deployments_own_environment(tmp_path, monkeypatch):
+    root = os.environ["LLM_MODELS_ROOT"]
+    for name in ("LLM_MODELS_ROOT", "HF_HUB_CACHE", "HF_DATASETS_CACHE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    data = _spec(tmp_path)
+    remote = next(entry for entry in data["deployments"] if entry["name"] == "remote")
+    runner = _engine("lm-eval gsm8k average accuracy: 91.0\n")
+    common = dict(workdir=tmp_path / "w", runner=runner)
+    lost = gate_cli.run_check(data, "accuracy[gsm8k]", "remote", **common)
+    assert not lost.passed and "is not on this host" in lost.infrastructure and not runner.seen
+    # Where the evaluator runs it has the deployment's models root: the dataset is there.
+    remote["env"] = {"LLM_MODELS_ROOT": root}
+    found = gate_cli.run_check(data, "accuracy[gsm8k]", "remote", **common)
+    assert found.passed and f"--dataset_path={root}/datasets/openai/gsm8k" in runner.seen[0]
 
 
 def test_a_relative_deployment_is_judged_against_the_other_ones_score_measured_first(

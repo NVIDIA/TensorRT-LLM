@@ -12,7 +12,7 @@ import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
-from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, task_schema
+from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, shorthand, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
 from .conftest import SCRATCH
@@ -192,6 +192,37 @@ def test_what_derive_cannot_know_is_asked_and_the_checkpoints_own_features_are_b
     assert [d["name"] for d in spec["deployments"]] == ["tp1", "tep4", "dep4", "multimodal"]
     # A quantized checkpoint is anchored to its own row, not the unquantized model's.
     assert spec["accuracy"]["discriminators"] == {"quant_algo": "NVFP4"}
+
+
+def test_the_shorthand_is_read_once_at_load_and_a_loaded_spec_states_its_deployments(
+    tmp_path, monkeypatch
+):
+    spec = _valid_spec(tmp_path) | {
+        "parallel": "unified",
+        "members": ["tp1", "tep2"],
+        "features": ["mtp"],
+        "variants": {"kv_fp8": {"llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}}},
+        "runtime": {"extra_flags": ["--max_batch_size=32"]},
+    }
+    spec["accuracy"] |= {
+        "model_key": {"default": "org/toy", "mtp": "org/toy-mtp"},
+        "max_seq_len": 4096,
+    }
+    loaded = load_and_validate_task_yaml(_write(tmp_path, spec))
+    # Below the loader there is one representation: the shorthand's keys are spent.
+    assert not {"members", "features", "variants", "runtime"} & set(loaded)
+    assert set(loaded["accuracy"]) == {"benchmark", "reference_yaml"}
+    assert [d["name"] for d in loaded["deployments"]] == ["tp1", "tep2", "mtp", "kv_fp8"]
+    monkeypatch.setattr(shorthand, "expand", lambda *a: pytest.fail("expanded below the loader"))
+    found = {d.name: d for d in deployments.resolve(loaded)}
+    assert list(found) == ["tp1", "tep2", "mtp", "kv_fp8"] and found["tp1"].core
+    assert found["tp1"].server.options["max_batch_size"] == 32
+    assert found["tp1"].server.options["max_seq_len"] == 4096
+    assert found["kv_fp8"].server.options["kv_cache_config"]["dtype"] == "fp8"
+    assert (found["mtp"].relative_to, found["tep2"].ranks) == ("tp1", 2)
+    # What was stated per deployment is each benchmark's own.
+    assert found["tp1"].benchmarks[0].model_key == "org/toy"
+    assert found["mtp"].benchmarks[0].model_key == "org/toy-mtp"
 
 
 def test_a_key_this_version_no_longer_reads_is_dropped_with_one_notice_each(tmp_path):
