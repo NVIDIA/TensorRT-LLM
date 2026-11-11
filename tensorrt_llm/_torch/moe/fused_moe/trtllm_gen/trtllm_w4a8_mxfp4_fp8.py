@@ -54,10 +54,11 @@ class TrtllmTrtllmGenW4a8Mxfp4Fp8Impl(TrtllmGenFusedMoEBase):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
         x = torch.nn.functional.pad(x, (0, pad_size))
-        # Two static per-tensor scales, one per side of the fused FC1: the
-        # post-communication path dequantizes with the gate-less scale.
-        scale = self.fc31_input_dequant[0] if post_quant_comm else self.fc31_input_gate_dequant[0]
-        x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x, scale)
+        # Both communication orderings quantize the FC1 input with its scale;
+        # fc31_input_dequant also includes the FC2 activation scale.
+        x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            x, self.fc31_input_gate_dequant[0]
+        )
         return x, None
 
     def run_moe(
