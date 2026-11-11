@@ -740,7 +740,7 @@ void TrtllmGenFmha<AttentionVariant>::initContext(AttentionVariant const& op)
     }
     if constexpr (std::is_same_v<AttentionVariant, MHA>)
     {
-        if (!isHalfOrBf16(op.type) || op.isRelativePosition())
+        if (!isHalfOrBf16(op.type) || op.isRelativePosition() || op.isQuantizedCrossCacheUnfused())
         {
             return;
         }
@@ -1580,7 +1580,7 @@ void FmhaV2Fmha<AttentionVariant>::initContext(AttentionVariant const& op)
 {
     if constexpr (std::is_same_v<AttentionVariant, MHA>)
     {
-        if (!isHalfOrBf16(op.type) || op.isRelativePosition())
+        if (!isHalfOrBf16(op.type) || op.isRelativePosition() || op.isQuantizedCrossCacheUnfused())
         {
             return;
         }

@@ -620,6 +620,13 @@ public:
         return position_embedding_type == PositionEmbeddingType::kRELATIVE;
     }
 
+    /// The fused context kernels read the encoder K/V back from the paged cross cache and learn its element
+    /// type only with paged-context FMHA, so without it they read a quantized cache as the activation type.
+    [[nodiscard]] bool isQuantizedCrossCacheUnfused() const
+    {
+        return cross_attention && use_kv_cache && quant_mode.hasKvCacheQuant() && !paged_context_fmha;
+    }
+
     [[nodiscard]] bool isALiBi() const
     {
         return position_embedding_type == PositionEmbeddingType::kALIBI
