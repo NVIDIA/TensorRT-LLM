@@ -76,6 +76,7 @@ def decoder_config(**changes: Any) -> DecoderRunnerConfig:
         mm_encoder_cache_enabled=False,
         enable_autotuner=True,
         cuda_graph_specialize_lora=False,
+        spec_decode_fast_paths=False,
     )
     spec = changes.get("spec_config")
     if spec is not None and changes.get("is_spec_decode", True):

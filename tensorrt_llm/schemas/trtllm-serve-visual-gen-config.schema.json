@@ -46,13 +46,22 @@
               },
               "oneOf": [
                 {
-                  "$ref": "#/$defs/SkipSoftmaxAttentionConfig"
+                  "$ref": "#/$defs/SkipSoftmaxAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/VideoSparseAttentionConfig"
+                  "$ref": "#/$defs/VideoSparseAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/SolAttentionConfig"
+                  "$ref": "#/$defs/SolAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 }
               ]
             },
@@ -472,6 +481,7 @@
         "W4A16_NVFP4",
         "NVFP4_AWQ",
         "NVFP4_ARC",
+        "NVFP4_PLUS",
         "NO_QUANT"
       ],
       "title": "QuantAlgo",
@@ -544,6 +554,22 @@
           "status": "prototype",
           "title": "V Dtype",
           "type": "string"
+        },
+        "vc_attention": {
+          "default": false,
+          "description": "Run the recipe as VC-Attention on the TRTLLM backend. V is stored as E4M3 residuals around 128-token tile means with one scale per channel; fp8 Q/K are Hadamard-rotated with one scale per 128 tokens. Requires TLLM_FMHA_LIBS=+prims_ts.",
+          "status": "prototype",
+          "title": "Vc Attention",
+          "type": "boolean"
+        },
+        "vc_repair_budget": {
+          "default": 0.0,
+          "description": "Fraction of tokens VC-Attention appends as V repair rows instead of restoring tile means; 0 restores the means. 0.005 to 0.02 are the useful range, 0.005 is the fastest setting measured at unchanged quality. vc_attention only.",
+          "exclusiveMaximum": 1.0,
+          "minimum": 0.0,
+          "status": "prototype",
+          "title": "Vc Repair Budget",
+          "type": "number"
         }
       },
       "title": "QuantAttentionConfig",
@@ -1006,7 +1032,7 @@
       "type": "object"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc3/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -1027,10 +1053,16 @@
           },
           "oneOf": [
             {
-              "$ref": "#/$defs/TeaCacheConfig"
+              "$ref": "#/$defs/TeaCacheConfig",
+              "required": [
+                "cache_backend"
+              ]
             },
             {
-              "$ref": "#/$defs/CacheDiTConfig"
+              "$ref": "#/$defs/CacheDiTConfig",
+              "required": [
+                "cache_backend"
+              ]
             }
           ]
         },
@@ -1130,6 +1162,6 @@
       "status": "prototype"
     }
   },
-  "title": "TensorRT-LLM 1.4.0rc3 trtllm-serve --visual_gen_args",
+  "title": "TensorRT-LLM 1.4.0rc4 trtllm-serve --visual_gen_args",
   "type": "object"
 }

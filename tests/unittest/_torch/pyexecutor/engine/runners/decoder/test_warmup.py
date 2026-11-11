@@ -31,14 +31,17 @@ from _torch.pyexecutor.engine_test_utils import (
 )
 
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
+import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs as graphs_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.models.modeling_utils import remove_weights
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warmup_module
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -47,7 +50,14 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
-from tensorrt_llm.llmapi.llm_args import DraftTargetDecodingConfig, PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import (
+    BaseSparseAttentionConfig,
+    DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+    DraftTargetDecodingConfig,
+    PrefillCudaGraphBackend,
+    SparseKvCacheOffloadConfig,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -189,6 +199,28 @@ class _StandInMambaCacheManager:
 
     def get_num_available_tokens(self, **_kwargs: object) -> int:
         return self._available_tokens
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cache_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
+@pytest.mark.parametrize("context_only", [False, True])
+def test_general_and_memory_pool_warmups_leave_out_generation_shapes_on_context_only_cache(
+    cache_flag: str, context_only: bool
+) -> None:
+    """A context-only cache that is not a Mamba hybrid one runs the general and memory-pool phases.
+
+    Both take their shapes from these lists, so the lists must hold context shapes only.
+    """
+    warmup = decoder_warmup(decoder_config(), agreement=_agreement(world_size=4, dwdp_size=4))
+    resources = _context_only_cache_resources(cache_flag, context_only)
+
+    max_shapes = warmup._get_max_shape_warmup_requests(resources)
+    general_shapes = warmup._get_full_general_warmup_requests(resources)
+
+    for shapes in (max_shapes, general_shapes):
+        has_generation = any(num_gen > 0 for _, num_gen in shapes)
+        assert has_generation is not context_only, shapes
+    assert ((1, 1) in general_shapes) is not context_only
 
 
 def _engine(
@@ -556,6 +588,110 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
     assert engine._completed_autotuner_warmup_num_tokens == 16
 
 
+def _context_only_warmup_requests(context_only: bool) -> Mock:
+    """Dummy requests that, like the real factory, build no generation rows on a context-only cache."""
+    requests = Mock()
+
+    def create_warmup_request(_resources, num_tokens, num_gen_requests):
+        return None if context_only and num_gen_requests else ScheduledRequests()
+
+    requests.create_warmup_request.side_effect = create_warmup_request
+    requests.release_batch_context.side_effect = lambda request, _resources: (
+        contextlib.nullcontext(request)
+    )
+    return requests
+
+
+def _context_only_cache_resources(cache_flag: str, context_only: bool) -> SimpleNamespace:
+    cache = SimpleNamespace(**{cache_flag: context_only}, get_num_available_tokens=lambda **_: 16)
+    return SimpleNamespace(
+        get_resource_manager=lambda key: (
+            cache if key == ResourceManagerType.KV_CACHE_MANAGER else None
+        )
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cache_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
+@pytest.mark.parametrize("context_only", [False, True])
+def test_attention_warmup_leaves_out_generation_shapes_on_context_only_cache(
+    cache_flag: str, context_only: bool
+) -> None:
+    """Under DWDP a missing warmup batch is fatal, so a context-only cache must not propose one."""
+    agreement = _agreement(world_size=4, dwdp_size=4)
+    requests = _context_only_warmup_requests(context_only)
+    forward_warmup = Mock()
+    warmup = decoder_warmup(
+        decoder_config(),
+        agreement=agreement,
+        dummy_requests=requests,
+        forward_warmup=forward_warmup,
+    )
+    resources = _context_only_cache_resources(cache_flag, context_only)
+
+    with patch("torch.cuda.synchronize"):
+        warmup._run_attention_warmup(resources, can_run_general_warmup=True)
+
+    num_gen_requests = [
+        kwargs["num_gen_requests"] for _, kwargs in requests.create_warmup_request.call_args_list
+    ]
+    assert num_gen_requests == ([0] if context_only else [1, 0, 1])
+    assert forward_warmup.call_count == len(num_gen_requests)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cache_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
+@pytest.mark.parametrize("context_only", [False, True])
+def test_autotuner_warmup_leaves_out_generation_shape_on_context_only_cache(
+    monkeypatch: pytest.MonkeyPatch, cache_flag: str, context_only: bool
+) -> None:
+    """The autotuner tunes only the context batch on a context-only cache, also under DWDP."""
+    requests = _context_only_warmup_requests(context_only)
+    engine = SimpleNamespace(
+        _config=SimpleNamespace(
+            enable_autotuner=True,
+            torch_compile_enabled=False,
+            torch_compile_prefill_only=False,
+            max_num_tokens=16,
+            max_batch_size=16,
+            max_seq_len=2,
+            original_max_draft_len=0,
+            max_total_draft_tokens=0,
+            is_spec_decode=False,
+            max_draft_len=0,
+            spec_config=None,
+        ),
+        _completed_autotuner_warmup_num_tokens=None,
+        _warmup_timer=_WarmupTimer(rank=0),
+        model=SimpleNamespace(modules=lambda: []),
+        mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
+        dist=object(),
+        guided_decoder=None,
+        _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext(), enabled=False),
+        _dummy_requests=requests,
+        _agreement=_agreement(world_size=4, dwdp_size=4),
+        _release_megamoe_profiling_scratch=Mock(),
+        _forward_warmup=Mock(),
+    )
+    resources = _context_only_cache_resources(cache_flag, context_only)
+    monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
+    monkeypatch.setattr(
+        decoder_warmup_module.AutoTuner, "get", Mock(return_value=Mock(profiling_cache={}))
+    )
+    monkeypatch.setattr(
+        decoder_warmup_module, "autotune", lambda **kwargs: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(decoder_warmup_module, "clear_memory_buffers", Mock())
+
+    DecoderWarmup._run_autotuner_warmup(engine, resources)
+
+    shapes = [args[1:] for args, _ in requests.create_warmup_request.call_args_list]
+    assert shapes == ([(16, 0)] if context_only else [(16, 0), (1, 1)])
+    assert engine._forward_warmup.call_count == len(shapes)
+
+
 @pytest.mark.parametrize("phase", ["general", "attention", "mamba", "prefill"])
 def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
     spec = DraftTargetDecodingConfig(max_draft_len=3, speculative_model="dummy")
@@ -732,6 +868,112 @@ def test_indexer_q_prewarm_skips_indexers_of_other_pp_stages() -> None:
 
     remote_indexer._project_and_quantize_q.assert_not_called()
     assert local_indexer._project_and_quantize_q.call_count == 3
+    owner.dist.tp_allgather.assert_called_once_with(1)
+
+
+def _decode_prewarm_owner(
+    modules: list[torch.nn.Module | Mock], tp_size: int, cp_size: int = 1, spec_config=None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=SimpleNamespace(modules=lambda: iter(modules)),
+        mapping=SimpleNamespace(tp_size=tp_size, cp_size=cp_size),
+        dist=Mock(),
+        _config=SimpleNamespace(max_num_tokens=96, spec_config=spec_config),
+    )
+
+
+def _kimi_linear_model(compiled: int = 7) -> Mock:
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearModel
+
+    # spec= keeps the test tied to the real class defining the hook.
+    model = Mock(spec=KimiLinearModel)
+    model.prewarm_decode_kernels.return_value = compiled
+    return model
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tp_size, cp_size, barrier", [(1, 1, None), (4, 1, "tp_allgather"), (4, 2, "tp_cp_allgather")]
+)
+@pytest.mark.parametrize("speculative", [False, True])
+def test_decode_prewarm_compiles_then_barriers(
+    tp_size: int, cp_size: int, barrier: str | None, speculative: bool
+) -> None:
+    """Every module with a ``prewarm_decode_kernels`` hook (here Kimi-K3's model) precompiles
+    for the runner's token budget (verify-batch kernels where speculative decoding runs), then the
+    TP (x CP) group meets once every compile on the rank has finished."""
+    model = _kimi_linear_model()
+    owner = _decode_prewarm_owner(
+        [torch.nn.Linear(2, 2), model], tp_size, cp_size, object() if speculative else None
+    )
+    events = []
+    model.prewarm_decode_kernels.side_effect = lambda *args: events.append("compile") or 7
+    for name in ("tp_allgather", "tp_cp_allgather"):
+        getattr(owner.dist, name).side_effect = lambda *args, name=name: events.append(name)
+
+    with patch.object(torch.cuda, "synchronize", side_effect=lambda: events.append("synchronize")):
+        DecoderWarmup._prewarm_model_decode_kernels(owner, None)
+
+    model.prewarm_decode_kernels.assert_called_once_with(96, speculative)
+    assert events == ["compile", "synchronize"] + ([barrier] if barrier else [])
+
+
+@pytest.mark.cpu_only
+def test_decode_prewarm_calls_any_module_with_the_hook() -> None:
+    """The hook is found by name, not by model class: every module defining it is called."""
+
+    class _OtherModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def prewarm_decode_kernels(self, max_num_tokens: int, verify_batches: bool) -> int:
+            self.calls.append((max_num_tokens, verify_batches))
+            return 2
+
+    other, kimi = _OtherModel(), _kimi_linear_model()
+    owner = _decode_prewarm_owner([other, torch.nn.Linear(2, 2), kimi], tp_size=1)
+    with patch.object(torch.cuda, "synchronize"):
+        DecoderWarmup._prewarm_model_decode_kernels(owner, None)
+    assert other.calls == [(96, False)]
+    kimi.prewarm_decode_kernels.assert_called_once_with(96, False)
+
+
+@pytest.mark.cpu_only
+def test_decode_prewarm_skips_verify_kernels_on_context_only_cache() -> None:
+    """A context-only worker never runs a verify batch, even with speculative decoding on."""
+    model = _kimi_linear_model()
+    owner = _decode_prewarm_owner([model], tp_size=1, spec_config=object())
+    with patch.object(torch.cuda, "synchronize"):
+        DecoderWarmup._prewarm_model_decode_kernels(owner, SimpleNamespace(kda_context_only=True))
+    model.prewarm_decode_kernels.assert_called_once_with(96, False)
+
+
+@pytest.mark.cpu_only
+def test_decode_prewarm_is_noop_without_hooks() -> None:
+    """For a model without the hook nothing is imported, compiled or synchronized."""
+    owner = _decode_prewarm_owner([torch.nn.Linear(2, 2)], tp_size=4)
+    with (
+        patch.dict(sys.modules, {"tensorrt_llm._torch.models.modeling_kimi_linear": None}),
+        patch.object(torch.cuda, "synchronize") as synchronize,
+    ):
+        DecoderWarmup._prewarm_model_decode_kernels(owner, None)
+    synchronize.assert_not_called()
+    owner.dist.tp_allgather.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_decode_prewarm_failure_still_reaches_barrier() -> None:
+    """A failed compile only defers it to the first forward; the rank still meets its peers."""
+    model = _kimi_linear_model()
+    model.prewarm_decode_kernels.side_effect = RuntimeError("no compiler")
+    owner = _decode_prewarm_owner([model], tp_size=2)
+    with (
+        patch.object(torch.cuda, "synchronize"),
+        patch.object(decoder_warmup_module.logger, "warning") as warning,
+    ):
+        DecoderWarmup._prewarm_model_decode_kernels(owner, None)
+    warning.assert_called_once()
     owner.dist.tp_allgather.assert_called_once_with(1)
 
 
@@ -1449,3 +1691,96 @@ class TestSamplingWarmup(unittest.TestCase):
             any("Skipping warm up as no KV Cache manager allocated." in log for log in logs)
         )
         self.assertGreaterEqual(warmup._metrics["sampling_warmup_seconds"], 0)
+
+
+class _OffloadingSparseAttentionConfig(BaseSparseAttentionConfig):
+    """Any sparse attention algorithm that offloads KV history to host memory."""
+
+    algorithm: str = "offloading"
+
+    def get_kv_cache_offload_config(self) -> SparseKvCacheOffloadConfig:
+        return SparseKvCacheOffloadConfig()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (None, False),
+        (DeepSeekSparseAttentionConfig(), False),
+        (DeepSeekV4SparseAttentionConfig(), False),
+        (DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True), True),
+        (_OffloadingSparseAttentionConfig(), True),
+    ],
+    ids=["none", "dsa", "dsv4", "dsv4_offload", "any_offload"],
+)
+def test_only_kv_cache_offload_makes_a_worker_decode_only(config, expected: bool) -> None:
+    assert is_decode_only(config) is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("max_total_draft_tokens", "expected"),
+    [(0, [(1, 1), (13, 13)]), (2, [(3, 1), (39, 13)])],
+)
+def test_generation_warmup_shapes_drop_context_tokens(
+    max_total_draft_tokens: int, expected: list[tuple[int, int]]
+) -> None:
+    warmup = SimpleNamespace(_config=SimpleNamespace(max_total_draft_tokens=max_total_draft_tokens))
+    configs = [(1, 0), (1, 1), (3, 1), (258, 0), (13, 13), (39, 13), (2, 0), (2, 1)]
+
+    assert DecoderWarmup._generation_warmup_shapes(warmup, configs) == expected
+
+
+@pytest.mark.cpu_only
+def test_generation_warmup_shapes_keep_generation_batches_stated_without_draft_tokens() -> None:
+    """The general and max-shape warmups state a generation batch as one token per
+    request whatever the draft length; it is still a pure-generation batch."""
+    warmup = SimpleNamespace(_config=SimpleNamespace(max_total_draft_tokens=2))
+    configs = [(1, 0), (1, 1), (258, 0), (13, 13), (2, 0)]
+
+    assert DecoderWarmup._generation_warmup_shapes(warmup, configs) == [(3, 1), (39, 13)]
+
+
+@pytest.mark.cpu_only
+def test_decode_only_skips_prefill_cuda_graph_capture() -> None:
+    """A decode-only worker never runs a context batch, so prefill graphs are dead weight."""
+    graphs = SimpleNamespace(
+        _config=SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            torch_compile_enabled=True,
+            prefill_cuda_graph_num_tokens=[16],
+        ),
+        sparse_attention_config=_OffloadingSparseAttentionConfig(),
+        _dummy_requests=SimpleNamespace(create_warmup_request=Mock()),
+    )
+
+    DecoderCudaGraphs._capture_prefill_cuda_graphs(graphs, Mock())
+
+    graphs._dummy_requests.create_warmup_request.assert_not_called()
+
+
+@pytest.mark.parametrize("decode_only", [False, True], ids=["default", "decode_only"])
+def test_decode_only_warmup_requests_generation_shapes_only(decode_only: bool) -> None:
+    """Every warmup phase of a decode-only worker builds pure-generation batches."""
+    with _warmup_and_resources() as (warmup, resource_manager):
+        shapes: list[tuple[int, int]] = []
+
+        def record(resources, num_tokens, num_gen_requests, **kwargs):
+            shapes.append((num_tokens, num_gen_requests))
+            return None  # No batch, so each phase skips its forward.
+
+        with (
+            patch.object(decoder_warmup_module, "is_decode_only", return_value=decode_only),
+            patch.object(graphs_module, "is_decode_only", return_value=decode_only),
+            patch.object(warmup._dummy_requests, "create_warmup_request", side_effect=record),
+            patch.object(warmup._graphs, "_capture_generation_cuda_graphs"),
+        ):
+            warmup.run(resource_manager)
+
+        assert shapes
+        context_shapes = [shape for shape in shapes if shape[0] != shape[1]]
+        if decode_only:
+            assert context_shapes == [], shapes
+        else:
+            assert context_shapes, shapes

@@ -233,6 +233,11 @@ routes, and optional token-validity bits mask ragged KV tails. Plans contain
 only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
 
+Both `k_summary` and `v_summary` are arithmetic means over the tokens present
+in each KV block, excluding padding in a partial final block. The kernel
+weights each proxy by its represented token count; do not pass V sums or
+pre-weight the summaries.
+
 The contiguous block-sparse path also consumes the SageAttention recipe in
 `AttentionForwardArgs`. Prediction sees the original Q/K/V. The attention core
 then quantizes the Q/K/V of a block-sparse call before FMHA selection, with
@@ -501,7 +506,8 @@ preserve its routing semantics. The PrimTS sparse MLA library
 (`prims_ts_sparse_mla`) is also enabled by default: it serves only DeepSeek-V4
 generation on SM100 and sits ahead of the TRTLLM-Gen libraries, so DeepSeek-V4
 decode on B200/GB200 runs on it unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
-removes it. Delta entries update the
+removes it. With sparse KV cache offload, it reads the compress-ratio-4
+layers' compressed rows from the sparse cache arena (§3.2.5). Delta entries update the
 default membership and follow canonical registry order, while an exact list
 preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
@@ -512,14 +518,17 @@ leaving the caller's `sparse_runtime_params` unchanged. The carrier holds both f
 `BlockSparseForwardInputs` in its nested `block_sparse_inputs` field.
 `Fmha.is_supported()` rejects a request that carries routes for every library
 that does not declare `supports_block_sparse_inputs`, so no dense kernel can
-silently drop the routing semantics.
+silently drop the routing semantics. Likewise a generation call whose
+QK-norm / RoPE / KV-append prologue the attention module deferred
+(`AttentionForwardArgs.kv_append.fold`, query = raw QKV projection) reaches only
+libraries that declare `supports_deferred_prologue`.
 For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
 `Fmha` owns both entry points. Libraries declare shared capabilities through
 class attributes, such as `supports_skip_correction`, `supports_block_sparse_inputs`,
-and `supports_fp4_mla`, and override only
+`supports_fp4_mla` and `supports_deferred_prologue`, and override only
 `_is_available()` and `_is_supported()` for implementation-specific checks.
 `is_available()` rejects unsupported static capabilities before calling
 `_is_available()`. `is_supported()` provides the same boundary for shared
@@ -634,7 +643,8 @@ The FMHA package is split by role:
 - `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
   PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen);
   it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
-  removes it.
+  removes it. For compress-ratio-4 layers under KV-cache offload, its extra
+  source is the layer's sparse cache arena (§3.2.5).
 - `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
   vendored PrimTS contiguous and paged wrappers. Paged generation passes a
   live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it
@@ -650,6 +660,13 @@ The FMHA package is split by role:
   MiniMax-M3 decode kernels for the generation phase.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
+- `fmha/gqa_decode.py` serves the layers built with a `GqaDecodeSetup`:
+  `gqa_decode` is trtllm-gen that also consumes the module's FP8 KV append and
+  deferred prologue, and `gqa_kv_replica_fused`, `gqa_kv_replica`,
+  `gqa_split_kv` and `gqa_segmented` take the generation calls their
+  `_is_supported` declares with dedicated kernels (`fmha/gqa_*.py`). Their
+  size conditions are evaluated at the upper bound of the selection-cache
+  cell (`generation_selection_cell`).
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the fallback library on the native phased
@@ -685,7 +702,66 @@ See `attention/backends/sparse/` and the
 [Sparse Attention Development Guide](../../../docs/source/developer-guide/sparse-attention-development-guide.md)
 for details.
 
-#### 3.2.5 Paged-context FMHA requires a fused kernel
+#### 3.2.5 Sparse KV cache offload
+
+With `enable_kv_cache_offload`, DSA layers and DeepSeek-V4 compress-ratio-4
+layers keep their sparse latent history in host-backed KVCacheManagerV2 pools.
+Each request reads it through a fixed-size GPU cache in the sparse cell arena,
+whose layout is described in
+[`SPARSE_ATTENTION_DESIGN.md`](../../../cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/SPARSE_ATTENTION_DESIGN.md).
+Offload serves single-beam generation-only batches on the SM100 family. The
+attention metadata carries the per-step state as `sparse_offload_state`
+(`attention/backends/sparse/offload.py`). It is `None` when offload is off.
+
+Each offloaded layer runs three steps in a generation step:
+
+1. **Write.** The new latent row goes to the request's reserved arena row, not
+   to the paged cache. DSA passes an `MlaLatentWriteTarget`
+   (`backends/trtllm.py`) to `mla_rope_generation`. Pool 0 starts at the
+   arena, each request owns a one-token page whose block offset is its row,
+   and `write_slots` is -1 for padding tokens. An NVFP4 latent's pointers also
+   name the scale arena. The DeepSeek-V4 compressor writes compressed rows
+   through the state's write indices. Attention raises unless
+   `sparse_offload_state.write_layer` is the current layer.
+2. **Fetch.** `fetch_sparse_indices` makes the selected history resident in
+   the arena and returns arena rows. These rows, merged with the row written
+   this step, replace the global KV-pool indices that the predictor would
+   otherwise hand to attention.
+3. **Attend.** `sparse_runtime_params.aux_kv_cache_pool_ptr` names the arena
+   base of the layer's data buffer, so the sparse MLA kernel reads arena rows
+   instead of paged-pool rows. An NVFP4 latent is first dequantized by
+   `nvfp4_mla_kv_cache_gather_direct` into an FP8 scratch, and
+   `aux_kv_cache_pool_ptr` names that scratch instead. The TRTLLM-Gen sparse
+   MLA kernels can read up to one 128-row KV tile past the last indexed row,
+   so the scratch ends in `NVFP4_SCRATCH_TAIL_ROWS` zeroed rows and every
+   arena pool ends in a matching zeroed tail.
+
+For an offloaded layer, the KV-cache manager's block tables and pool pointers
+do not describe where the history is. The arena-row indices are relative to
+the base of the layer's data arena, and a library must read through that base.
+`FallbackFmha` (TRTLLM-Gen through `thop.run_generation`) uses
+`aux_kv_cache_pool_ptr`. `prims_ts_sparse_mla` passes the DeepSeek-V4
+manager's cached view, `get_sparse_compress_buffers(layer_idx)[0]`, as its
+extra pool. A library must branch on the offload state in both its
+per-forward check and its launch, as `prims_ts_sparse_mla` does:
+
+```python
+def _reads_sparse_arena(self, metadata) -> bool:
+    return (
+        int(self.attn.compress_ratio) == 4
+        and getattr(metadata, "sparse_offload_state", None) is not None
+    )
+```
+
+Read the attribute with `getattr`: only the DSA and DeepSeek-V4 metadata
+define it. Scope the check to the layers that actually offload. For
+DeepSeek-V4, that is compress ratio 4 only; its other layers keep their
+compress pool. A library that reads offloaded layers must also mask -1 holes
+inside the live prefix, which offload produces, and over-read by no more than
+the arena tail. A library that cannot meet these requirements must decline
+offloaded layers in its per-forward check.
+
+#### 3.2.6 Paged-context FMHA requires a fused kernel
 
 `TrtllmAttentionMetadata` enables `use_paged_context_fmha` whenever chunked
 prefill, KV block reuse or speculative draft tokens are configured. Those

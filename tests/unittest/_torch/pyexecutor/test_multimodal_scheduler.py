@@ -1232,6 +1232,7 @@ def _make_v2_multimodal_scheduler(
     manager.context_replay_tokens.return_value = None
     manager.can_share_inflight_prefix = False
     manager.tokens_per_block = 10
+    manager.inforward_snapshot_rows = 0
     manager.enable_block_reuse = False
     manager.enable_joint_kv_cache_reuse = False
     manager._has_cp_helix = False
@@ -1286,6 +1287,44 @@ def _make_v2_request(request_id, prompt_len, item_rows=()):
         embedding_lengths=item_rows,
         prompt_len=prompt_len,
     )
+
+
+def test_default_wrapper_accepts_retiring_receive_probe_with_v1_scheduler() -> None:
+    scheduler = _scheduler(max_batch_size=1, max_num_tokens=10)
+    probe = Mock(return_value=True)
+    scheduler.set_retiring_gen_receives_probe(probe)
+    request = _make_v2_request(1, 10)
+
+    assert scheduler.schedule_request([request], set()).context_requests == [request]
+    probe.assert_not_called()
+
+
+def test_default_wrapper_forwards_live_retiring_receive_probe_to_v2() -> None:
+    scheduler, _ = _make_v2_multimodal_scheduler(
+        kv_capacity=0,
+        max_num_tokens=10,
+        encoder_max_num_tokens=4,
+        encoder_batch_size=1,
+    )
+    inner = scheduler.scheduler
+    inner._DEADLOCK_STALL_ITERS = 2
+    inner.kv_cache_manager.kv_connector_manager = None
+    inner.kv_cache_manager.has_pending_preemption.return_value = False
+    probe = Mock(return_value=True)
+    scheduler.set_retiring_gen_receives_probe(probe)
+    request = _make_v2_request(1, 10)
+
+    for _ in range(inner._DEADLOCK_STALL_ITERS + 1):
+        inner._detect_deadlock([request], set(), [request], set(), made_progress=False)
+        assert inner._stalled_schedules == 0
+    assert probe.call_count >= inner._DEADLOCK_STALL_ITERS + 1
+
+    # Releasing the ownership claim must restore ordinary deadlock detection.
+    probe.return_value = False
+    inner._detect_deadlock([request], set(), [request], set(), made_progress=False)
+    assert inner._stalled_schedules == 1
+    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+        inner._detect_deadlock([request], set(), [request], set(), made_progress=False)
 
 
 @pytest.mark.parametrize("scheduler_cls", [MultimodalScheduler, MultimodalEagerEncoderScheduler])

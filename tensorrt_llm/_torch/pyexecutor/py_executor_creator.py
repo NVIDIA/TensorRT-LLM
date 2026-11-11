@@ -19,6 +19,11 @@ from strenum import StrEnum
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
+from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
+from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
+from tensorrt_llm._torch.modules.dwdp.dense.manager import (
+    DenseDwdpManager, get_global_dense_dwdp_manager)
+from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
 from tensorrt_llm._utils import get_sm_version
@@ -49,7 +54,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, create_py_executor_resources,
                     instantiate_sampler, is_disagg_enabled, is_mla)
-from .config_utils import (is_hybrid_linear, is_minimax_m3,
+from .config_utils import (is_decode_only, is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -60,8 +65,9 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
-from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .scheduler import gen_preemption
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
@@ -252,6 +258,29 @@ class _ExecutorMemoryMonitor:
                 ))
 
 
+def _check_dense_dwdp_launch(llm_args: TorchLlmArgs) -> Optional[DenseMode]:
+    """Run the dense DWDP launch gate if ``dwdp_config.enable_dense`` asks for it.
+
+    It runs before the DWDP manager, the standalone dense DWDP manager and the
+    model are built, so a launch whose host dense DWDP cannot serve fails
+    before the weights load; ``TorchLlmArgs.validate_dwdp_launch`` already
+    refused what the arguments alone rule out.
+
+    Returns:
+        The mode dense DWDP runs in: attached to expert DWDP
+        (``dwdp_config.enable_experts``) or standalone on an attention-DP
+        instance. None when dense DWDP is not requested.
+
+    Raises:
+        ValueError: Dense DWDP is requested and the host violates one of its
+            requirements (see ``validate_dense_gate``).
+    """
+    dwdp_config = llm_args.dwdp_config
+    if dwdp_config is not None and dwdp_config.enable_dense:
+        return validate_dense_gate(llm_args)
+    return None
+
+
 def _flashinfer_one_engine_spec_supported(attn_backend: str,
                                           spec_config) -> bool:
     """Whether this speculation is qualified on the FlashInfer target backend.
@@ -355,6 +384,22 @@ def _enforce_overlap_spec_kv_correction(attn_backend: str,
     raise ValueError(message)
 
 
+def _rank_dspark_on_host_without_overlap(
+        spec_config, disable_overlap_scheduler: bool) -> None:
+    """Turn off DSpark device re-ranking when the overlap scheduler is off.
+
+    Device re-ranking reads the previous step's device tensors, which only the
+    overlap scheduler keeps. Without them it would skip every step while the
+    planner ranks from an older confidence copy than host ranking uses.
+    """
+    if (disable_overlap_scheduler and spec_config is not None
+            and getattr(spec_config, "enable_confidence_scheduling", False) and
+            getattr(spec_config, "enable_fused_confidence_scheduler", False)):
+        logger.info("DSpark device re-ranking needs the overlap scheduler; "
+                    "ranking draft positions on the host.")
+        spec_config.enable_fused_confidence_scheduler = False
+
+
 def _branch_snapshot_ctx_chunk_config(
     ctx_chunk_config: Optional[tuple],
     kv_cache_manager: Optional[BaseResourceManager],
@@ -387,6 +432,26 @@ def _branch_snapshot_ctx_chunk_config(
     chunk_unit_size = (ctx_chunk_config[1]
                        if ctx_chunk_config is not None else tokens_per_block)
     return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
+
+
+def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
+                           is_generation: bool) -> None:
+    """Reject the settings a non-generation model cannot run with; warn on those it ignores."""
+    if is_generation:
+        return
+    if mapping.has_pp():
+        raise ValueError(
+            "Pipeline parallelism is not supported for non-generation models "
+            "(pooling and mm_encoder_only); set pipeline_parallel_size=1.")
+    if mapping.enable_attention_dp:
+        raise ValueError(
+            "Non-generation models do not support attention DP; set "
+            "enable_attention_dp=False.")
+    if llm_args.enable_chunked_prefill:
+        logger.warning(
+            "enable_chunked_prefill is ignored for non-generation models: each "
+            "request runs whole in one forward, and requests longer than "
+            "max_num_tokens are rejected.")
 
 
 def _get_mapping(_mapping: Mapping) -> Mapping:
@@ -448,7 +513,7 @@ def get_guided_decoding_config(guided_decoding_backend: str,
 def _load_config_and_create_checkpoint_loader(
         llm_args: TorchLlmArgs, checkpoint_dir: Optional[str] = None):
     torch.cuda.set_per_process_memory_fraction(1.0)
-    checkpoint_loader = _construct_checkpoint_loader(
+    checkpoint_loader = construct_checkpoint_loader(
         llm_args.checkpoint_loader,
         llm_args.checkpoint_format,
         mx_config=llm_args.mx_config,
@@ -467,9 +532,10 @@ def create_encoder_executor(
 ):
     """Create an EncoderExecutor for models using the encode-only path.
 
-    Handles model loading and model_engine creation, then wraps in a
-    lightweight EncoderExecutor. Skips all decoder infrastructure
-    (KV cache, scheduler, sampler, drafter, speculative decoding).
+    Resolves the config, checkpoint loader and mapping, then lets
+    EncoderExecutor load the model and build its runner without ModelEngine.
+    Skips all decoder infrastructure (KV cache, scheduler, sampler, drafter,
+    speculative decoding).
 
     Args:
         llm_args: Configuration arguments.
@@ -486,17 +552,11 @@ def create_encoder_executor(
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
     dist = Distributed.get(mapping)
 
-    model_engine = ModelEngine(
+    return EncoderExecutor.create(
+        llm_args,
         model_path=checkpoint_dir,
-        llm_args=llm_args,
-        mapping=mapping,
-        dist=dist,
-        spec_config=None,
         checkpoint_loader=checkpoint_loader,
-    )
-
-    return EncoderExecutor(
-        model_engine=model_engine,
+        mapping=mapping,
         dist=dist,
     )
 
@@ -589,6 +649,12 @@ def _create_py_executor(
     kv_connector_config = llm_args.kv_connector_config
 
     scheduler_config = llm_args.scheduler_config
+    # Reserve paused-request headroom only when startup prerequisites allow it.
+    headroom_reason = gen_preemption.unsupported_headroom_reason(
+        scheduler_config.gen_preemption, llm_args)
+    if headroom_reason:
+        logger.warning(
+            f"[gen_preempt] GEN slot preemption disabled: {headroom_reason}")
 
     # Since peft_cache_config may be subject to change, avoid these changes propagate back
     # to llm_args.peft_cache_config
@@ -695,6 +761,9 @@ def _create_py_executor(
             "The overlap scheduler is designed for generation models and is not needed "
             "when only processing vision encoder inputs.")
 
+    _rank_dspark_on_host_without_overlap(spec_config,
+                                         llm_args.disable_overlap_scheduler)
+
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
 
     # Bridge DwdpConfig -> Mapping: ParallelConfig.to_mapping() doesn't know
@@ -708,8 +777,13 @@ def _create_py_executor(
     # with mapping.rank=0, so `mapping.rank % dwdp_size` would make every
     # worker think it is DWDP rank 0 (causing e.g. cuMemMap to self-import a
     # peer handle and fail with CUDA_ERROR_NOT_SUPPORTED).
-    if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
-        dwdp_size = llm_args.dwdp_config.dwdp_size
+    #
+    # Dense DWDP without expert DWDP (enable_experts=False) has no DWDP group:
+    # the mapping keeps dwdp_size 0.
+    dwdp_config = llm_args.dwdp_config
+    expert_dwdp = dwdp_config is not None and dwdp_config.enable_experts
+    if expert_dwdp and dwdp_config.dwdp_size > 1:
+        dwdp_size = dwdp_config.dwdp_size
         dwdp_rank = dwdp_global_rank() % dwdp_size
         mapping = Mapping(**{
             **mapping.to_dict(), "dwdp_size": dwdp_size,
@@ -732,6 +806,13 @@ def _create_py_executor(
             "generation servers; aggregated serving with Helix is not "
             "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
             "development only).")
+    if (is_decode_only(llm_args.sparse_attention_config)
+            and not is_disagg_enabled(cache_transceiver_config)):
+        raise NotImplementedError(
+            "Sparse KV cache offload runs only on disaggregated generation "
+            "servers: it admits one input token per request per step, so it "
+            "cannot serve context requests. Set cache_transceiver_config, or "
+            "disable sparse_attention_config.enable_kv_cache_offload.")
 
     has_spec_drafter = False
     if spec_config is not None:
@@ -778,46 +859,50 @@ def _create_py_executor(
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
+    # The dense DWDP gate runs before the DWDP block below: it picks the dense
+    # DWDP mode, attached to expert DWDP or standalone without it, and rejects
+    # a launch whose host dense DWDP cannot serve.
+    dense_mode = _check_dense_dwdp_launch(llm_args)
+
     # Initialize DWDP Manager.
     #
-    # DWDP needs every global DWDP rank to be a complete, unsharded model replica
-    # owning one expert slice -- `dwdp_rank = dwdp_global_rank() % dwdp_size` is
-    # only meaningful under that bijection. Disaggregated context workers satisfy
-    # this with TP=1, aggregated serving with full attention DP; everything that
-    # shards a replica across ranks is rejected. Pipeline and context parallelism
-    # are rejected even under attention DP, since pairing ranks that hold
-    # different layers as DWDP peers gives wrong expert weights rather than an
-    # error. The TP check tests `dp_size == tp_size` rather than
-    # `enable_attention_dp` so a future partial attention DP cannot slip through.
+    # TorchLlmArgs.validate_dwdp_launch already made sure that every global
+    # DWDP rank is a complete, unsharded model replica owning one expert slice
+    # -- `dwdp_rank = dwdp_global_rank() % dwdp_size` is only meaningful under
+    # that bijection -- and that the launch runs without CUDA graphs.
     dwdp_manager: Optional[DwdpManager] = None
-    if llm_args.dwdp_config is not None:
-        if llm_args.dwdp_config.dwdp_size <= 1:
+    if expert_dwdp:
+        # Only the CuteDSL MoE backends support DWDP (with NVFP4 weights), and
+        # AUTO resolves to none of them for the models DWDP serves. Without
+        # one, DWDP manages no MoE layer and every rank loads every expert
+        # before the launch fails.
+        if llm_args.moe_config.backend.upper() not in ("CUTEDSL",
+                                                       "CUTEDSL_FC12"):
             raise ValueError(
-                f"DWDP requires dwdp_size > 1, got {llm_args.dwdp_config.dwdp_size}."
-            )
-        if mapping.pp_size > 1 or mapping.cp_size > 1:
-            raise ValueError(
-                "DWDP requires each rank to be a complete model replica, so "
-                "pipeline and context parallelism are not supported, but got "
-                f"pp_size={mapping.pp_size}, cp_size={mapping.cp_size}.")
-        if mapping.tp_size > 1 and mapping.dp_size != mapping.tp_size:
-            raise ValueError(
-                "DWDP requires each rank to be a complete model replica: use "
-                "tp_size=1 (disaggregated context worker) or "
-                "enable_attention_dp=True (aggregated serving), but got "
-                f"tp_size={mapping.tp_size}, dp_size={mapping.dp_size}.")
-        # The host issues the expert prefetch as the MoE layers run, and the
-        # last layers of a pass already prefetch the next pass; a replayed
-        # CUDA graph would bind buffer slots the host schedule does not track.
-        if llm_args.cuda_graph_config is not None:
-            raise ValueError(
-                "DWDP does not support CUDA graphs; set cuda_graph_config=None."
-            )
-        dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
+                "DWDP requires an MoE backend that supports it: set "
+                "moe_config.backend: CUTEDSL (or CUTEDSL_FC12) with an NVFP4 "
+                "checkpoint, but got "
+                f"moe_config.backend={llm_args.moe_config.backend!r}.")
+        dwdp_manager = DwdpManager(config=dwdp_config,
                                    dist=dist,
                                    mapping=mapping)
         dwdp_manager.__enter__()
-        logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
+        logger.info(f"Dwdp Manager initialized. Config: {dwdp_config}")
+
+    # Standalone dense DWDP shards the dense weights over the attention-DP
+    # group. Its manager is registered before the model is built, because the
+    # model's layers capture it then; with expert DWDP, DwdpManager creates and
+    # registers the dense manager itself.
+    dense_dwdp_manager: Optional[DenseDwdpManager] = None
+    if dense_mode is DenseMode.STANDALONE:
+        dense_dwdp_manager = DenseDwdpManager(
+            DenseMode.STANDALONE,
+            mapping=mapping,
+            config=DenseConfig.from_dwdp_config(dwdp_config))
+        dense_dwdp_manager.__enter__()
+        logger.info(
+            "Dense DWDP manager initialized (standalone): attention-DP group "
+            f"of {mapping.tp_size} ranks")
 
     _startup_timer.mark_initialization("configuration_and_distributed_init")
     mem_monitor = _ExecutorMemoryMonitor()
@@ -865,6 +950,12 @@ def _create_py_executor(
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
+
+    is_generation = model_engine.model.model_config.is_generation
+    _check_no_kv_execution(llm_args, mapping, is_generation)
+    if not is_generation:
+        enable_chunked_context = False
+        model_engine.attn_runtime_features.chunked_prefill = False
 
     # Model loading can disable reuse after runtime features were created.
     model_engine.attn_runtime_features.cache_reuse = (
@@ -984,6 +1075,12 @@ def _create_py_executor(
         kv_cache_config.enable_block_reuse = False
         model_engine.attn_runtime_features.cache_reuse = False
 
+    # A user-set budget also bounds the transfers where PyExecutor would
+    # bypass the transfer window.
+    transfer_budget_is_explicit = (
+        cache_transceiver_config is not None
+        and cache_transceiver_config.max_tokens_in_buffer is not None)
+
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
     # tokens_per_block multiple: CacheTransBufferManager requires
@@ -1023,6 +1120,7 @@ def _create_py_executor(
                                      ctx_chunk_config)
 
     guided_decoder: Optional[GuidedDecoder] = None
+    capturable_guided_decoder: Optional[CapturableGuidedDecoder] = None
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
@@ -1044,8 +1142,10 @@ def _create_py_executor(
                 elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
                 ):
                     # CapturableGuidedDecoder is applicable to one-model speculative decoding.
+                    capturable_guided_decoder = CapturableGuidedDecoder(
+                        **kwargs)
                     success = model_engine.set_guided_decoder(
-                        CapturableGuidedDecoder(**kwargs))
+                        capturable_guided_decoder)
                     if not success:
                         raise ValueError(
                             f"Failed to set guided decoder for speculative decoding mode: {spec_config.spec_dec_mode.name}."
@@ -1181,6 +1281,8 @@ def _create_py_executor(
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None
+    # Whether DWDP was set up before the KV caches (below).
+    dwdp_set_up = False
 
     # Create the execution stream for model forward operations
     # for proper synchronization with KVCacheTransferManager's onboard/offload operations.
@@ -1211,6 +1313,14 @@ def _create_py_executor(
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
 
+        if not skip_est and is_decode_only(sparse_attention_config):
+            # The estimation dry run prefills dummy prompts, which a
+            # decode-only worker cannot execute. Size the KV cache from free
+            # memory instead, as with TRTLLM_SKIP_KV_CACHE_ESTIMATION=1.
+            logger.info("KV cache size estimation is not supported for a "
+                        "decode-only worker, disable it.")
+            skip_est = True
+
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,
             mapping=mapping,
@@ -1228,6 +1338,8 @@ def _create_py_executor(
             sparse_attention_config=sparse_attention_config,
             execution_stream=execution_stream,
             draft_config=draft_config,
+            gen_preemption_headroom=getattr(model_engine,
+                                            "gen_preemption_headroom", 0),
             skip_est=skip_est,
             is_disagg=is_disagg,
         )
@@ -1237,15 +1349,33 @@ def _create_py_executor(
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
+        # Without the estimation, build_managers sizes the final KV cache from
+        # the device memory free now, so DWDP is set up first: the KV cache
+        # then gets the replicated dense weights dense DWDP frees, and the
+        # expert prefetch ring holds its memory before the KV cache takes its
+        # share of the rest. With the estimation, it is set up below, before
+        # the estimation run measures the memory.
+        if not estimating_kv_cache and (dwdp_manager is not None
+                                        or dense_dwdp_manager is not None):
+            manager = (dwdp_manager
+                       if dwdp_manager is not None else dense_dwdp_manager)
+            manager.setup(model_engine.model)
+            dwdp_set_up = True
+
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE
                 if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
 
     # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
-    # weight manager + MoE backend fixup (single entry point).
-    if dwdp_manager is not None:
-        dwdp_manager.setup(model_engine.model)
+    # weight manager + MoE backend fixup (single entry point). Dense DWDP is set
+    # up there with expert DWDP, else here when it runs standalone. A launch
+    # without the estimation was set up above instead.
+    if not dwdp_set_up:
+        if dwdp_manager is not None:
+            dwdp_manager.setup(model_engine.model)
+        elif dense_dwdp_manager is not None:
+            dense_dwdp_manager.setup(model_engine.model)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -1284,6 +1414,7 @@ def _create_py_executor(
             sampler=sampler,
             drafter=drafter,
             guided_decoder=guided_decoder,
+            capturable_guided_decoder=capturable_guided_decoder,
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             kv_connector_manager=kv_connector_manager
@@ -1296,8 +1427,18 @@ def _create_py_executor(
             peft_cache_config=peft_cache_config,
             scheduler_config=scheduler_config,
             cache_transceiver_config=cache_transceiver_config,
+            transfer_budget_is_explicit=transfer_budget_is_explicit,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
+            # Without the KV-cache estimation the executor serves from its
+            # construction: it gets the DWDP manager or the standalone dense
+            # DWDP manager now, primes it and exits it at shutdown. With the
+            # estimation only the serving phase gets it (rebind_resources
+            # below), since release_resources() exits the managers the
+            # executor holds.
+            dwdp_manager=dwdp_manager if not estimating_kv_cache else None,
+            dense_dwdp_manager=dense_dwdp_manager
+            if not estimating_kv_cache else None,
             max_num_sequences=max_num_seq_slots,
         )
 
@@ -1356,6 +1497,7 @@ def _create_py_executor(
                     virtual_memory_pools=vm_pools,
                     execution_stream=execution_stream,
                     dwdp_manager=dwdp_manager,
+                    dense_dwdp_manager=dense_dwdp_manager,
                     max_num_sequences=max_num_seq_slots,
                 )
                 py_executor.rebind_resources(execution_resources)
@@ -1399,8 +1541,15 @@ def create_py_executor(
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
 ) -> PyExecutor:
-    """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
+    """Create a PyExecutor and roll back a partially initialized DWDP runtime.
+
+    On an error, a DWDP manager and a dense DWDP manager registered during the
+    construction are exited, in that order; managers registered before it are
+    left alone. Exiting the DWDP manager also exits the dense manager it
+    registered, so the second rollback finds a standalone one only.
+    """
     previous_dwdp_manager = get_global_dwdp_manager()
+    previous_dense_manager = get_global_dense_dwdp_manager()
     try:
         with monitor_executor_initialization(), _StartupTimer(
                 "executor_creation") as startup_timer:
@@ -1422,4 +1571,13 @@ def create_py_executor(
                 logger.error(
                     "Failed to roll back DWDP after PyExecutor construction error\n"
                     f"{traceback.format_exc()}")
+        current_dense_manager = get_global_dense_dwdp_manager()
+        if (current_dense_manager is not None
+                and current_dense_manager is not previous_dense_manager):
+            try:
+                current_dense_manager.__exit__(None, None, None)
+            except BaseException:
+                logger.error(
+                    "Failed to roll back dense DWDP after PyExecutor construction "
+                    f"error\n{traceback.format_exc()}")
         raise

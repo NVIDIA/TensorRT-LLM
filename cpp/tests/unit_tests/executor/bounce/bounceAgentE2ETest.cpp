@@ -138,9 +138,8 @@ std::unique_ptr<kvc::NixlTransferAgent> tryMakeAgent(kvc::BaseAgentConfig cfg, s
 }
 } // namespace
 
-// BaseAgentConfig::agentBufferSizeMb (derived from CacheTransceiverConfig's
-// agent_bounce_buffer_enable + kv_cache_bounce_size_mb) is the
-// ONLY on/off switch: 0 keeps bounce disabled, >0 enables it.
+// BaseAgentConfig::agentBufferSizeMb (CacheTransceiverConfig.kv_cache_bounce_size_mb, passed
+// through) is the ONLY on/off switch: 0 keeps bounce disabled, >0 enables it.
 TEST(BounceAgentE2E, AgentBufferSizeControlsBounce)
 {
     if (!hasCuda())

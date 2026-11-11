@@ -107,14 +107,6 @@ class ServerState:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
 
-    async def is_healthy(self) -> bool:
-        try:
-            async with self._session.get(
-                    f"{self._base_url}/health") as response:
-                return response.status == 200
-        except Exception:
-            return False
-
 
 class KvCacheAwareServerState(ServerState):
 
@@ -874,14 +866,17 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  track_routed_blocks: bool = True,
                  load_weight: float = 0.25,
                  load_cap: float = float("inf"),
+                 enable_tokenization_cache: bool = False,
                  **kwargs) -> None:
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_block_hashing(tokens_per_block,
-                                 custom_tokenizer,
-                                 tokenizer_dir,
-                                 use_harmony=use_harmony,
-                                 model_path=model_path)
+        self._init_block_hashing(
+            tokens_per_block,
+            custom_tokenizer,
+            tokenizer_dir,
+            use_harmony=use_harmony,
+            model_path=model_path,
+            enable_tokenization_cache=enable_tokenization_cache)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
@@ -1384,12 +1379,16 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  hash_skip_count: int = 0,
                  max_sessions: int = 100000,
                  use_harmony: Optional[bool] = None,
+                 enable_tokenization_cache: bool = False,
                  new_conversation_min_match_blocks: int = 32,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
         self._init_load_balancing(servers)
-        self._init_block_hashing(tokens_per_block, use_harmony=use_harmony)
+        self._init_block_hashing(
+            tokens_per_block,
+            use_harmony=use_harmony,
+            enable_tokenization_cache=enable_tokenization_cache)
 
         if new_conversation_min_match_blocks < 0:
             raise ValueError("new_conversation_min_match_blocks must be >= 0")
@@ -2256,7 +2255,6 @@ def build_disagg_routers(
     metadata_server: Optional[JsonDictionary] = None,
     server_preparation_func: Optional[Callable[[str], Awaitable[None]]] = None,
     disagg_node_id: int = 0,
-    is_delegating_client: bool = False,
 ) -> tuple[Router, Router]:
     """Build the ctx and gen routers for one disagg process.
 
@@ -2266,10 +2264,7 @@ def build_disagg_routers(
     caller (:class:`CoordinatorClient`) wraps those in a
     :class:`CoordinatorDelegatingRouter` so placement is delegated to the
     coordinator. Round-robin placement stays local.
-    ``is_delegating_client`` is accepted for call-site symmetry; router
-    construction itself does not depend on it.
     """
-    del is_delegating_client  # no build-time behavior differs by this flag
     ctx_router = create_router(ctx_router_config, ctx_servers,
                                metadata_server_cfg, metadata_server,
                                server_preparation_func, disagg_node_id)

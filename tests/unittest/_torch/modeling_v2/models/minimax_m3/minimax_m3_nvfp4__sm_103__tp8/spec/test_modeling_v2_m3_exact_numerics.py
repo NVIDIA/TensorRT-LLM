@@ -68,7 +68,12 @@ NORM_ULP_FRAC = 1e-3
 def _stock_accept(logits: torch.Tensor, draft: torch.Tensor):
     """The in-tree greedy strict acceptance (``SpecWorkerBase._sample_and_accept_draft_tokens_base``) of the gathered
     float logits of a decode-only batch, no forcing."""
-    md = SimpleNamespace(is_all_greedy_sample=True, is_ragged_verify=False, is_cuda_graph=False)
+    md = SimpleNamespace(
+        is_all_greedy_sample=True,
+        is_ragged_verify=False,
+        is_cuda_graph=False,
+        sharded_target_logits=False,
+    )
     worker = SimpleNamespace(force_num_accepted_tokens=0.0)
     worker._sample_tokens_for_batch = lambda *a: Eagle3OneModelWorker._sample_tokens_for_batch(
         worker, *a
@@ -76,6 +81,7 @@ def _stock_accept(logits: torch.Tensor, draft: torch.Tensor):
     worker._apply_force_accepted_tokens = lambda *a, **k: (
         Eagle3OneModelWorker._apply_force_accepted_tokens(worker, *a, **k)
     )
+    worker._fused_force_params = lambda *a: Eagle3OneModelWorker._fused_force_params(worker, *a)
     nreq = draft.shape[0]
     return Eagle3OneModelWorker._sample_and_accept_draft_tokens_base(
         worker, logits, draft, 0, nreq, md

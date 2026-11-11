@@ -42,7 +42,11 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     resolve_checkpoint_policy_defaults,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
-from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
+from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
+    Cosmos3SamplingPolicy,
+    SamplingSchedule,
+    resolve_sampling_schedule,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
     COSMOS3_EDGE_BACKBONE_TYPE,
     NEMOTRON_DENSE_RECIPE,
@@ -70,6 +74,22 @@ def _cleanup_gpu():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _resolved(policy: Cosmos3SamplingPolicy, flow_shift: float) -> SamplingSchedule:
+    """The schedule a request with ``flow_shift`` and no sigma_grid resolves to."""
+    return resolve_sampling_schedule(
+        policy,
+        sigma_grid=None,
+        flow_shift=flow_shift,
+        mode_flow_shift=1.0,
+        mode_use_karras_sigmas=None,
+    )
+
+
+def _native_flow_schedule(shift: float) -> SamplingSchedule:
+    """The schedule an Edge request without sigma_grid resolves to."""
+    return SamplingSchedule(grid="checkpoint_native_flow", flow_shift=shift)
 
 
 def _require_edge_checkpoint() -> str:
@@ -584,14 +604,14 @@ class TestNativeFlowSchedule:
     def _native_policy_and_scheduler(self, shift: float):
         scheduler = UniPCMultistepScheduler.from_config(EDGE_UNIPC_CONFIG)
         policy = Cosmos3SamplingPolicy.from_scheduler(scheduler, native_flow_schedule=True)
-        return policy, policy.set_flow_shift(scheduler, shift)
+        return policy, policy.set_flow_shift(scheduler, _resolved(policy, shift))
 
     def test_set_flow_shift_disables_karras(self):
         policy, scheduler = self._native_policy_and_scheduler(3.0)
         assert float(scheduler.config.flow_shift) == 3.0
         assert scheduler.config.use_karras_sigmas is False
         # Already matching → same instance.
-        assert policy.set_flow_shift(scheduler, 3.0) is scheduler
+        assert policy.set_flow_shift(scheduler, _resolved(policy, 3.0)) is scheduler
 
     def test_karras_rebuilt_even_at_checkpoint_shift(self):
         """flow_shift 1.0 equals the checkpoint value, but the native flow
@@ -602,14 +622,19 @@ class TestNativeFlowSchedule:
     def test_non_native_keeps_checkpoint_config(self):
         scheduler = UniPCMultistepScheduler.from_config(EDGE_UNIPC_CONFIG)
         policy = Cosmos3SamplingPolicy.from_scheduler(scheduler, native_flow_schedule=False)
-        assert policy.set_flow_shift(scheduler, 1.0) is scheduler
+        assert policy.set_flow_shift(scheduler, _resolved(policy, 1.0)) is scheduler
         assert scheduler.config.use_karras_sigmas is True
 
     @pytest.mark.parametrize("shift,steps", sorted(COSMOS_FRAMEWORK_FIXTURES))
     def test_matches_cosmos_framework_reference(self, shift, steps):
         fixture = COSMOS_FRAMEWORK_FIXTURES[(shift, steps)]
         policy, scheduler = self._native_policy_and_scheduler(shift)
-        policy.set_timesteps(scheduler, num_inference_steps=steps, device="cpu")
+        policy.set_timesteps(
+            scheduler,
+            num_inference_steps=steps,
+            device="cpu",
+            schedule=_native_flow_schedule(shift),
+        )
 
         assert scheduler.timesteps.tolist() == fixture["timesteps"]
         np.testing.assert_allclose(scheduler.sigmas.tolist(), fixture["sigmas"], atol=1e-6)
@@ -1148,7 +1173,7 @@ class TestSamplingRecipeMatrix:
         pipeline = fresh_pipeline()
         pipeline.load_standard_components(str(tmp_path), torch.device("cpu"), skip)
         assert pipeline.sampling.native_flow_schedule is True
-        scheduler = pipeline._scheduler_for(3.0)
+        scheduler = pipeline._scheduler_for(_native_flow_schedule(3.0))
         assert scheduler.config.use_karras_sigmas is False
         assert float(scheduler.config.flow_shift) == 3.0
 
@@ -1209,16 +1234,18 @@ class TestSchedulerCacheBounds:
     def test_arbitrary_shifts_never_enter_the_cache(self) -> None:
         pipeline = self._pipeline()
         for i in range(200):
-            pipeline._scheduler_for(7.0 + i * 1e-3)
+            pipeline._scheduler_for(_native_flow_schedule(7.0 + i * 1e-3))
         assert pipeline._scheduler_cache == {}
 
     def test_declared_shifts_are_memoized_and_shared(self) -> None:
         pipeline = self._pipeline()
-        first = pipeline._scheduler_for(3.0)
-        assert pipeline._scheduler_for(3.0) is first, "a declared shift must be reused"
+        first = pipeline._scheduler_for(_native_flow_schedule(3.0))
+        assert pipeline._scheduler_for(_native_flow_schedule(3.0)) is first, (
+            "a declared shift must be reused"
+        )
         assert len(pipeline._scheduler_cache) == 1
         # Streams key separately: they share knobs but must not share the object.
-        assert pipeline._scheduler_for(3.0, stream="audio") is not first
+        assert pipeline._scheduler_for(_native_flow_schedule(3.0), stream="audio") is not first
 
     def test_release_drops_retained_solver_state(self) -> None:
         pipeline = self._pipeline()
@@ -1247,7 +1274,7 @@ class TestSchedulerCacheBounds:
             )
 
         pipeline = self._pipeline()
-        pipeline._scheduler_for(7.5)  # non-cacheable shift: memoizes nothing
+        pipeline._scheduler_for(_native_flow_schedule(7.5))  # non-cacheable shift: memoizes nothing
         assert pipeline._scheduler_cache == {}
         pipeline.scheduler = _one_off()
         pipeline.audio_scheduler = _one_off()
@@ -1877,7 +1904,9 @@ class TestEdgeCheckpoint:
         # the two modes resolve to the same (shift, karras) pair and share one
         # cached scheduler rather than building two identical ones.
         schedulers = {
-            mode: edge_pipeline._scheduler_for(edge_pipeline._mode_params(mode)["flow_shift"])
+            mode: edge_pipeline._scheduler_for(
+                _native_flow_schedule(edge_pipeline._mode_params(mode)["flow_shift"])
+            )
             for mode in ("video", "image")
         }
         for scheduler in schedulers.values():
@@ -1930,7 +1959,7 @@ class TestEdgeCheckpoint:
         assert captured["guidance_scale"] == 5.0
         # Edge video defaults: 121 frames -> 31 latent frames, 480x832 -> 30x52.
         assert tuple(captured["latents"].shape) == (1, 48, 31, 30, 52)
-        assert captured["scheduler"] is edge_pipeline._scheduler_for(3.0)
+        assert captured["scheduler"] is edge_pipeline._scheduler_for(_native_flow_schedule(3.0))
         assert captured["scheduler"].num_inference_steps == 50
         assert captured["decoded"] is True
 

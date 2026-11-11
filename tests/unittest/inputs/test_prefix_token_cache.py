@@ -169,6 +169,18 @@ def test_conversations_sharing_a_long_preamble_find_their_own_entry() -> None:
     assert cache.hits == 16 and cache.resync_failures == 0
 
 
+def test_rewritten_end_of_cached_prompt_reuses_its_prefix() -> None:
+    """A chat template may replace the previous turn's generation prefix."""
+    tokenizer, cache = _MergeTokenizer(), _cache()
+    turn = _turns(1)[0]
+    previous = turn + "<ge>"
+    current = turn + "<gex reply text>"
+    assert not current.startswith(previous)
+    assert cache.encode(tokenizer, previous) == tokenizer(previous)["input_ids"]
+    assert cache.encode(tokenizer, current) == tokenizer(current)["input_ids"]
+    assert cache.hits == 1 and cache.resync_failures == 0
+
+
 def test_eviction_bounds_entry_count() -> None:
     tokenizer, cache = _MergeTokenizer(), _cache(max_entries=8)
     for prompt in _conversations(40):
@@ -321,3 +333,53 @@ def test_processor_bypasses_cache_when_disabled(monkeypatch: pytest.MonkeyPatch)
     prompt = _turns(1)[0]
     ids, _ = processor({"prompt": prompt}, SamplingParams(add_special_tokens=False))
     assert ids == _MergeTokenizer().encode(prompt)
+
+
+# --- Qwen2-VL family (Qwen3-VL, Qwen3.5) text-only path ----------------------
+
+
+class _NoSpecialTokensMergeTokenizer(_MergeTokenizer):
+    def __init__(self, num_special: int = 0) -> None:
+        self.num_special = num_special
+
+    def num_special_tokens_to_add(self) -> int:
+        return self.num_special
+
+
+def _qwen2vl_processor(monkeypatch: pytest.MonkeyPatch, tokenizer: Any):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.models import modeling_qwen2vl
+
+    monkeypatch.setenv("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", str(_MIN_CHARS))
+    monkeypatch.setattr(
+        modeling_qwen2vl.AutoProcessor, "from_pretrained", lambda *args, **kwargs: object()
+    )
+    config = SimpleNamespace(torch_dtype=None, vision_config=SimpleNamespace(temporal_patch_size=2))
+    return modeling_qwen2vl.Qwen2VLInputProcessorBase(
+        "unused", config, tokenizer, enable_tokenization_cache=True
+    )
+
+
+# Default SamplingParams add special tokens, a no-op for this tokenizer.
+@pytest.mark.parametrize("add_special_tokens", [True, False])
+def test_qwen2vl_processor_text_prompts_use_the_cache(
+    monkeypatch: pytest.MonkeyPatch, add_special_tokens: bool
+) -> None:
+    processor = _qwen2vl_processor(monkeypatch, _NoSpecialTokensMergeTokenizer())
+    assert type(processor).supports_tokenization_cache
+    cache = processor._prefix_token_cache
+    assert cache is not None
+    params = SamplingParams() if add_special_tokens else SamplingParams(add_special_tokens=False)
+    for prompt in _turns(4):
+        ids, extra = processor.call_with_text_prompt({"prompt": prompt}, params)
+        assert ids == _MergeTokenizer()(prompt)["input_ids"]
+        assert extra is None
+    assert cache.hits > 0
+
+
+def test_qwen2vl_processor_skips_the_cache_for_special_token_tokenizers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = _qwen2vl_processor(monkeypatch, _NoSpecialTokensMergeTokenizer(num_special=1))
+    assert processor._prefix_token_cache is None

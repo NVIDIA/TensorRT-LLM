@@ -55,6 +55,12 @@
 models:
   CompletionRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       model:
         kind: openai
         type: str
@@ -274,6 +280,12 @@ models:
       thinking_token_budget:
         kind: extension
         type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      watermarking:
+        kind: extension
+        type: Optional[bool]
         default: null
         status: prototype
         required: false
@@ -508,6 +520,12 @@ models:
 
   ChatCompletionRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       messages:
         kind: openai
         type: List[ChatCompletionMessageParam]
@@ -667,6 +685,12 @@ models:
       thinking_token_budget:
         kind: extension
         type: Optional[int]
+        default: null
+        status: prototype
+        required: false
+      watermarking:
+        kind: extension
+        type: Optional[bool]
         default: null
         status: prototype
         required: false
@@ -1057,6 +1081,12 @@ models:
 
   ResponsesRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       background:
         kind: openai
         type: Optional[bool]

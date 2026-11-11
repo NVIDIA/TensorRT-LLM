@@ -31,9 +31,10 @@ namespace kernels
 //!
 //! Grid is (blocksPerRow, rows); row `y` walks descriptors `[rowStarts[y], rowStarts[y + 1])` in sequence.
 //! All pointer and length arrays are device resident; `lines[i]` counts 16-byte lines, not bytes.
-//! TRTLLM_DWDP_GATHER_KERNEL=tma routes the launch to invokeDwdpFabricGatherTma (dwdpFabricGatherTma.h).
+//! `useTma` routes the launch to invokeDwdpFabricGatherTma (dwdpFabricGatherTma.h); a device without its
+//! requirements takes the register gather, with one warning.
 void invokeDwdpFabricGather(void* const* dsts, void const* const* srcs, int64_t const* lines, int64_t const* rowStarts,
-    int64_t rows, int64_t blocksPerRow, int64_t threads, cudaStream_t stream);
+    int64_t rows, int64_t blocksPerRow, int64_t threads, bool useTma, cudaStream_t stream);
 
 } // namespace kernels
 
