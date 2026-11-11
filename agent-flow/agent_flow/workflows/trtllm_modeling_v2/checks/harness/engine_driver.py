@@ -20,8 +20,6 @@ from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import engine_facts  # noqa: E402
-import reuse_probe  # noqa: E402
 import workload_io as wio  # noqa: E402
 
 MODELING_V2_ENV = "TRTLLM_MODELING_V2"
@@ -56,12 +54,6 @@ def make_input(llm: Any, request: Mapping[str, Any], *, model: str = "") -> Any:
     """Public text, token or multimodal input; images are local and never downloaded."""
     if request.get("token_ids") is not None:
         return {"prompt_token_ids": [int(t) for t in request["token_ids"]]}
-    if request.get("probe_tokens") is not None:
-        return {
-            "prompt_token_ids": reuse_probe.probe_prompt(
-                llm.tokenizer, int(request["probe_tokens"])
-            )
-        }
     prompt = str(request.get("prompt", ""))
     images = [str(p) for p in request.get("images") or ()]
     if not images:
@@ -93,6 +85,12 @@ def make_input(llm: Any, request: Mapping[str, Any], *, model: str = "") -> Any:
     )[0]
 
 
+def cached_tokens(output: Any) -> int | None:
+    """The response's public count of resumed prompt tokens; ``None`` where it reports none."""
+    value = getattr(output, "cached_tokens", None)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
 def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -> dict[str, Any]:
     """One request's result; retain every sequence instead of silently dropping alternatives."""
     sequences = [
@@ -112,7 +110,7 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
         "id": request.get("id", str(index)),
         "prompt_sha": wio.prompt_digest(str(request.get("prompt", request.get("token_ids", "")))),
         "prompt_tokens": len(prompt_ids) if prompt_ids is not None else None,
-        "cached_tokens": reuse_probe.cached_tokens(output),
+        "cached_tokens": cached_tokens(output),
         **first,
         "tokens": len(first["token_ids"]),
         "iterations": steps,
@@ -121,7 +119,7 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
     }
 
 
-def _run_requests(llm: Any, base: Any, spec: Mapping[str, Any]) -> dict[str, int]:
+def run_requests(llm: Any, base: Any, spec: Mapping[str, Any]) -> None:
     """Send the workload's requests, ``concurrency`` at a time, and print one record for each."""
     if spec.get("dataset"):
         raise ValueError("dataset was not normalized before engine launch")
@@ -138,7 +136,6 @@ def _run_requests(llm: Any, base: Any, spec: Mapping[str, Any]) -> dict[str, int
             else p
             for p in inputs
         ]
-    summary = {"requests": 0, "reported": 0, "hits": 0, "reused_tokens": 0}
     concurrency = max(1, int(spec.get("concurrency", 1)))
     for start in range(0, len(requests), concurrency):
         window = requests[start : start + concurrency]
@@ -156,27 +153,7 @@ def _run_requests(llm: Any, base: Any, spec: Mapping[str, Any]) -> dict[str, int
                 steps += 1
             if output is None:
                 raise RuntimeError("the engine streamed no output for a request")
-            index = start + offset
-            record = record_of(index, request, output, steps)
-            wio.emit(wio.RECORD_MARKER, record)
-            summary["requests"] += 1
-            cached = record["cached_tokens"]
-            if cached is not None:
-                summary["reported"] += 1
-                summary["hits"] += int(cached > 0)
-                summary["reused_tokens"] += cached
-    return summary
-
-
-def run_workload(llm: Any, base: Any, spec: Mapping[str, Any]) -> None:
-    """Run the workload's requests, then the cache probe where the spec asks for it."""
-    summary = _run_requests(llm, base, spec)
-    probe = (
-        reuse_probe.probe(llm, sampling_for(base, 1, True), spec["llm"])
-        if spec.get("reuse_probe")
-        else None
-    )
-    wio.emit(wio.REUSE_MARKER, {**summary, "probe": probe})
+            wio.emit(wio.RECORD_MARKER, record_of(start + offset, request, output, steps))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -184,13 +161,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--spec", required=True)
     options = parser.parse_args(argv)
     spec = json.loads(Path(options.spec).read_text(encoding="utf-8"))
-    import tensorrt_llm
-
-    wio.emit(wio.DRIVER_MARKER, {"tensorrt_llm": str(tensorrt_llm.__file__), "api": "LLM"})
     llm, base = build_llm(spec)
     try:
-        engine_facts.emit(llm, requested=spec["llm"])
-        run_workload(llm, base, spec)
+        run_requests(llm, base, spec)
     finally:
         llm.shutdown()
     return 0

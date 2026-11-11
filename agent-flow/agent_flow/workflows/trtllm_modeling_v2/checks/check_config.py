@@ -23,111 +23,7 @@ from ..spec.shorthand import (
     variant_spec,
 )
 from ..spec.task_schema import assembly_units
-from ..spec.variants import _deep_merge, base_unit, is_variant, variants
-
-
-def declared_engine(options: Mapping[str, Any]) -> dict[str, Any]:
-    """Requested fields, never evidence that a worker actually applied them."""
-    declared = {}
-    names = {
-        "modeling_v2": "modeling_v2",
-        "max_seq_len": "max_seq_len",
-        "max_batch_size": "max_batch_size",
-        "max_num_tokens": "max_num_tokens",
-        "enable_chunked_prefill": "chunked_prefill",
-        "tensor_parallel_size": "tp",
-        "pipeline_parallel_size": "pp",
-        "moe_expert_parallel_size": "ep",
-        "enable_attention_dp": "attention_dp",
-    }
-    for key, field in names.items():
-        if key in options:
-            declared[field] = options[key]
-    if "disable_overlap_scheduler" in options:
-        declared["overlap_scheduler"] = not options["disable_overlap_scheduler"]
-    kv = options.get("kv_cache_config") or {}
-    for key, field in (
-        ("enable_block_reuse", "block_reuse"),
-        ("dtype", "kv_cache_dtype"),
-        ("mamba_ssm_cache_dtype", "mamba_ssm_cache_dtype"),
-    ):
-        if key in kv:
-            declared[field] = kv[key]
-    if "mamba_state_config" in kv:
-        state = kv["mamba_state_config"] or {}
-        declared["mamba_snapshot"] = {
-            "periodic_snapshot_interval": state.get("periodic_snapshot_interval", 0),
-            "additional_snapshot_offsets_from_start": state.get(
-                "additional_snapshot_offsets_from_start", []
-            ),
-            "additional_snapshot_offsets_from_end": state.get(
-                "additional_snapshot_offsets_from_end", []
-            ),
-        }
-    if "cuda_graph_config" in options:
-        graph = options["cuda_graph_config"]
-        declared["cuda_graph"] = (
-            None
-            if graph is None
-            else {
-                **(
-                    {"batch_sizes": sorted(graph["batch_sizes"])}
-                    if graph.get("batch_sizes")
-                    else {}
-                ),
-                **(
-                    {"max_batch_size": graph["max_batch_size"]}
-                    if graph.get("max_batch_size")
-                    else {}
-                ),
-                "enable_padding": graph.get("enable_padding", False),
-            }
-        )
-    if "speculative_config" in options:
-        spec = options["speculative_config"]
-        declared["speculative"] = (
-            None
-            if spec is None
-            else {
-                "algorithm": spec["decoding_type"],
-                "max_draft_len": spec.get("max_draft_len", spec.get("num_nextn_predict_layers", 1)),
-            }
-        )
-    return declared
-
-
-#: The checks' explicit scheduler-token default.
-DEFAULT_MAX_NUM_TOKENS = 8192
-
-
-@dataclass(frozen=True)
-class EngineLimits:
-    """What one request may be in the unit's engine, read from its public constructor configuration."""
-
-    max_num_tokens: int = DEFAULT_MAX_NUM_TOKENS
-    max_seq_len: int | None = None
-    chunked_prefill: bool = False
-
-    @classmethod
-    def from_config(cls, config: Mapping[str, Any]) -> "EngineLimits":
-        """The request limits explicitly sent to the public LLM API."""
-        options = config["llm"]
-        return cls(
-            max_num_tokens=int(options.get("max_num_tokens") or DEFAULT_MAX_NUM_TOKENS),
-            max_seq_len=options.get("max_seq_len"),
-            chunked_prefill=bool(options.get("enable_chunked_prefill", False)),
-        )
-
-    def refuses(self, prompt_tokens: int, new_tokens: int) -> str:
-        """Why a prompt of ``prompt_tokens`` that generates ``new_tokens`` does not fit; ``""`` when it does."""
-        if self.max_seq_len is not None and prompt_tokens + new_tokens > self.max_seq_len:
-            return f"{prompt_tokens} + {new_tokens} tokens exceed max_seq_len {self.max_seq_len}"
-        if prompt_tokens > self.max_num_tokens and not self.chunked_prefill:
-            return (
-                f"{prompt_tokens} tokens exceed max_num_tokens {self.max_num_tokens} and "
-                f"chunked prefill is off"
-            )
-        return ""
+from ..spec.variants import _deep_merge, base_unit, variants
 
 
 def speculation_flags(features: Any, *, max_draft_len: int = 1) -> list[str]:
@@ -413,14 +309,6 @@ def launch_kv_caches(task_data: Mapping[str, Any]) -> list[LaunchKvCache]:
     return launches
 
 
-def engine_declaration(config: Mapping[str, Any], *, mode: str | None) -> dict[str, Any]:
-    """The exact public options sent to the engine, separate from actual facts."""
-    options = dict(config["llm"])
-    if mode:
-        options["modeling_v2"] = mode
-    return declared_engine(options)
-
-
 #: How every check samples unless a shorthand spec's runtime flags say otherwise: the
 #: check's own protocol, never an option of the engine.
 GREEDY_SAMPLING: dict[str, Any] = {"temperature": 0.0, "top_k": 1}
@@ -471,96 +359,15 @@ def deployment_of(
     return deployment_for(task_data, unit, member, world_size, features)
 
 
-#: The runtime input flag each engine field is set by, as a variant's runtime block names it.
-_FLAG_FIELDS: dict[str, str] = {
-    "--kv_cache_dtype": "kv_cache_dtype",
-    "--mamba_ssm_cache_dtype": "mamba_ssm_cache_dtype",
-    "--max_num_tokens": "max_num_tokens",
-    "--enable_chunked_prefill": "chunked_prefill",
-    "--max_batch_size": "max_batch_size",
-    "--disable_kv_cache_reuse": "block_reuse",
-    "--use_cuda_graph": "cuda_graph",
-    "--cuda_graph_batch_sizes": "cuda_graph",
-    "--cuda_graph_padding_enabled": "cuda_graph",
-    "--spec_decode_algo": "speculative",
-    "--spec_decode_max_draft_len": "speculative",
-}
-
-
-#: The runtime-block switch each engine field is set by.
-_SWITCH_FIELDS: dict[str, str] = {
-    "chunked_prefill": "chunked_prefill",
-    "kv_cache_reuse": "block_reuse",
-    "cuda_graph": "cuda_graph",
-    "overlap_scheduler": "overlap_scheduler",
-}
-
-
-#: The LLM-API option each engine field is set by; ``kv_cache_config`` by key.
-_OPTION_FIELDS: dict[str, str] = {
-    "max_num_tokens": "max_num_tokens",
-    "enable_chunked_prefill": "chunked_prefill",
-    "max_batch_size": "max_batch_size",
-    "speculative_config": "speculative",
-    "cuda_graph_config": "cuda_graph",
-    "disable_overlap_scheduler": "overlap_scheduler",
-}
-
-
-_KV_FIELDS: dict[str, str] = {
-    "dtype": "kv_cache_dtype",
-    "mamba_ssm_cache_dtype": "mamba_ssm_cache_dtype",
-    "enable_block_reuse": "block_reuse",
-    "mamba_state_config": "mamba_snapshot",
-}
-
-
-#: What a variant setting this module cannot place is listed as.
-UNKNOWN = "?"
-
-
-def subject_fields(task_data: Mapping[str, Any], unit: str | None) -> tuple[str, ...]:
-    """The engine fields a configuration variant is about: those its overlay sets.
-
-    A setting no field expresses is listed as :data:`UNKNOWN`. A unit that is not a
-    variant is about none.
-    """
-    if not is_variant(task_data, unit):
-        return ()
-    entry = variants(task_data)[str(unit)]
-    found: list[str] = []
-    runtime = entry.get("runtime") or {}
-    for key in runtime:
-        if key != "extra_flags":
-            found.append(_SWITCH_FIELDS.get(str(key), UNKNOWN))
-    for flag in runtime.get("extra_flags") or ():
-        name = str(flag).split("=", 1)[0].split()[0] if str(flag).strip() else ""
-        found.append(_FLAG_FIELDS.get(name, UNKNOWN))
-    options = entry.get("llm_api_options") or {}
-    for key, value in options.items():
-        if key == "kv_cache_config" and isinstance(value, Mapping):
-            found.extend(_KV_FIELDS.get(str(k), UNKNOWN) for k in value)
-        else:
-            found.append(_OPTION_FIELDS.get(str(key), UNKNOWN))
-    if entry.get("env"):
-        found.append(UNKNOWN)
-    return tuple(dict.fromkeys(found))
-
-
 __all__ = [
     "CaptureList",
-    "DEFAULT_MAX_NUM_TOKENS",
-    "EngineLimits",
     "LLM_API_CAPTURE_MAX_BATCH_SIZE",
     "LLM_API_DEFAULT_CAPTURE",
     "LaunchCapture",
     "LaunchKvCache",
-    "UNKNOWN",
     "GREEDY_SAMPLING",
     "check_configuration",
     "deployment_of",
-    "declared_engine",
-    "engine_declaration",
     "format_batches",
     "has_snapshot_policy",
     "launch_captures",
@@ -568,5 +375,4 @@ __all__ = [
     "llm_api_batch_sizes",
     "options_capture",
     "speculation_flags",
-    "subject_fields",
 ]

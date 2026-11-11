@@ -13,10 +13,9 @@ from typing import Any, Mapping, Sequence
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
 from ..spec.deployments import Deployment
-from ..spec.shorthand import resolve_llm_api_options
 from ..spec.task_schema import BOOT_KEYS, GATE_TIMEOUT_KEY, load_prompts_file, resolve_gate_timeout
-from . import check_config, feature_evidence
-from .check_config import EngineLimits, check_configuration, deployment_of, engine_declaration
+from . import attest
+from .check_config import check_configuration, deployment_of
 from .check_runtime import (
     BOOT_TIMEOUT_S,
     MODE_REQUIRE,
@@ -28,7 +27,6 @@ from .check_runtime import (
     with_mode,
     write_driver_spec,
 )
-from .runtime_evidence import attest_engine, engine_failure, engine_records
 from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
 #: The image a multimodal unit's boot sends when the task declares none: a
@@ -229,9 +227,10 @@ def run_boot_gate(
 
     ``features`` is the features the target under test implements, not those
     the run will finish with (default the run's). ``spec`` is the workload
-    (:func:`resolve_boot_spec`). The engine is held to what the gate declared
-    (:func:`engine_failure`). ``mode`` other than ``require`` is a control run
-    on the stock implementation, recorded as ``boot[<mode>]``.
+    (:func:`resolve_boot_spec`). Every rank's engine is held to the deployment's
+    options (``checks/attest.py``); with block reuse on, one more prompt is sent
+    again and must come back with cached tokens. ``mode`` other than ``require``
+    is a control run on the stock implementation, recorded as ``boot[<mode>]``.
     """
     spec = spec or BootSpec()
     env = with_mode(environment, mode)
@@ -242,23 +241,12 @@ def run_boot_gate(
     config = check_configuration(task_data, deployment, max_tokens=spec.max_tokens)
     requests = spec.requests(task_data.get("trtllm_repo_path"))
     declared_requests = len(requests)
-    limits = EngineLimits.from_config(config)
-    subjects = check_config.subject_fields(task_data, unit)
-    # A prompt the engine must split proves chunking only where the engine chunks: a variant
-    # that turns chunked prefill off is about chunking too, and owes no split prompt.
-    chunks = feature_evidence.about(subjects, feature_evidence.CHUNKED) and limits.chunked_prefill
-    if chunks:
-        length = chunk_probe_tokens(limits.max_num_tokens, limits.max_seq_len)
-        if length is None:
-            return _verdict(
-                name=gate_name,
-                member=member,
-                passed=False,
-                detail=f"this unit is about chunked prefill, and its engine's limits "
-                f"(max_num_tokens {limits.max_num_tokens}, max_seq_len {limits.max_seq_len}) "
-                f"leave no room for a prompt the engine would have to split",
-            )
-        requests.append({"id": "chunk", "probe_tokens": length, "max_tokens": 1})
+    options = (deployment.server or deployment.ctx).options
+    repeats = attest.reuse_sends(options) if attest.reuses(options) else 0
+    requests += [
+        {"id": f"{attest.REUSE_ID}{n}", "prompt": attest.REUSE_PROMPT, "max_tokens": 1}
+        for n in range(repeats)
+    ]
     if timeout is None:
         declared = resolve_gate_timeout(task_data.get("accuracy") or {}, "boot", unit)
         timeout = declared or BOOT_TIMEOUT_S
@@ -267,7 +255,6 @@ def run_boot_gate(
         config=config,
         requests=requests,
         max_tokens=spec.max_tokens,
-        reuse_probe=True,
     )
     command = engine_driver_command(env, spec_path)
 
@@ -291,20 +278,16 @@ def run_boot_gate(
         )
     if not result.ok:
         return _verdict(passed=False, detail=f"exited {result.returncode}", **ran)
-    declared = engine_declaration(config, mode=mode)
-    attested = attest_engine(combined, declared)
-    ran["engine"] = engine_records((attested,))
-    failure = engine_failure(
+    attested = attest.attest(
         combined,
-        attested,
-        options=resolve_llm_api_options(task_data.get("accuracy") or {}, unit),
-        asks=bool(declared.get("block_reuse")),
+        {**options, "modeling_v2": mode},
+        tree=task_data.get("trtllm_repo_path"),
+        target=mode == MODE_REQUIRE,
     )
+    ran["engine"] = (attested.record(),)
+    failure = attested.failure()
     if failure:
         return _verdict(passed=False, detail=failure, **ran)
-    unobserved = feature_evidence.unobserved(attested, subjects)
-    if unobserved:
-        return _verdict(passed=False, detail=feature_evidence.unobserved_detail(unobserved), **ran)
 
     records = {int(r.get("index", -1)): r for r in parse_driver_records(combined)}
     texts = [
@@ -326,14 +309,13 @@ def run_boot_gate(
             detail=f"the engine exited cleanly but generated nothing for {', '.join(empty)}",
             **ran,
         )
-    chunked = ""
-    if chunks:
-        shortfall = chunk_shortfall(
-            [records.get(n) for n in range(len(requests))], limits.max_num_tokens
-        )
+    reused = ""
+    if repeats:
+        cached = [records[n].get("cached_tokens") for n in range(declared_requests, len(requests))]
+        shortfall = attest.reuse_shortfall(cached)
         if shortfall:
             return _verdict(passed=False, detail=shortfall, **ran)
-        chunked = f"; a prompt past max_num_tokens {limits.max_num_tokens} was served in chunks"
+        reused = f"; a repeated prompt resumed {max(c or 0 for c in cached)} cached tokens"
     missing = missing_keywords(spec, texts)
     if missing:
         return _verdict(
@@ -353,7 +335,7 @@ def run_boot_gate(
     return _verdict(
         passed=True,
         detail=f"engine cold-started and produced {checked} for {len(texts)} prompt(s)"
-        f"{sent}; workload: {spec.source}{chunked}",
+        f"{sent}; workload: {spec.source}{reused}",
         **ran,
     )
 
@@ -378,51 +360,12 @@ def missing_keywords(spec: BootSpec, texts: Sequence[str | None]) -> list[str]:
     return missing
 
 
-def chunk_shortfall(records: Sequence[Mapping[str, Any] | None], max_num_tokens: int) -> str | None:
-    """Why no request shows chunked prefill ran; ``None`` when one does.
-
-    A request whose prompt, less the tokens the KV cache resumed, is longer
-    than ``max_num_tokens`` cannot be computed in one step: one served is the
-    evidence.
-    """
-    longest = 0
-    for record in records:
-        if not record:
-            continue
-        prompt = record.get("prompt_tokens")
-        if not isinstance(prompt, int):
-            continue
-        cached = record.get("cached_tokens")
-        computed = prompt - (cached if isinstance(cached, int) else 0)
-        if computed > max_num_tokens:
-            return None
-        longest = max(longest, computed)
-    return (
-        f"no request was longer than max_num_tokens {max_num_tokens} past what the KV cache "
-        f"resumed (the longest computed {longest} prompt tokens), so the engine never split a "
-        f"context into chunks and this check shows nothing of chunked prefill"
-    )
-
-
-def chunk_probe_tokens(max_num_tokens: int, max_seq_len: int | None) -> int | None:
-    """The length of a prompt the engine must split: twice ``max_num_tokens``, within ``max_seq_len``.
-
-    ``None`` when the engine's limits leave no room for one.
-    """
-    want = 2 * int(max_num_tokens) + 1
-    if max_seq_len is not None:
-        want = min(want, int(max_seq_len) - 2)
-    return want if want > max_num_tokens else None
-
-
 __all__ = [
     "BootPrompt",
     "BootSpec",
     "DEFAULT_BOOT_IMAGE",
     "DEFAULT_BOOT_IMAGE_KEYWORDS",
     "DEFAULT_BOOT_IMAGE_PROMPT",
-    "chunk_probe_tokens",
-    "chunk_shortfall",
     "missing_keywords",
     "resolve_boot_spec",
     "run_boot_gate",

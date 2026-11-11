@@ -30,14 +30,6 @@ from typing import Any, Iterable, Mapping
 
 #: One per request the engine driver ran.
 RECORD_MARKER = "MV2FLOW_RECORD"
-#: What the driver imported, once, before the engine starts.
-DRIVER_MARKER = "MV2FLOW_DRIVER"
-#: What the engine runs once it is up, once per engine a harness builds (see
-#: :mod:`.engine_facts`).
-ENGINE_MARKER = "MV2FLOW_ENGINE"
-#: What the engine reused from its KV cache over the workload, once per engine,
-#: after the workload (see :mod:`.reuse_probe`).
-REUSE_MARKER = "MV2FLOW_REUSE"
 #: What one rank's executor worker runs, printed by that worker as it sets its
 #: engine up, once per rank (see ``rankhook/sitecustomize.py``).
 RANK_ENGINE_MARKER = "MV2FLOW_RANK_ENGINE"
@@ -52,17 +44,6 @@ TEXT_FIELDS: tuple[str, ...] = (
     "instruction",
     "query",
 )
-
-#: Benchmarks whose dataset the gates know without a declaration. The source
-#: is a Hugging Face id, read from the local cache only.
-KNOWN_DATASETS: dict[str, dict[str, Any]] = {
-    "gsm8k": {
-        "source": "openai/gsm8k",
-        "config": "main",
-        "split": "test",
-        "text_field": "question",
-    },
-}
 
 _LOCAL_SUFFIXES: tuple[str, ...] = (".jsonl", ".json", ".parquet", ".arrow", ".yaml", ".yml")
 _LIST_KEYS: tuple[str, ...] = ("prompts", "data", "rows", "examples", "items")
@@ -320,13 +301,9 @@ def normalize_file(source: str, target: str) -> None:
 
 
 __all__ = [
-    "DRIVER_MARKER",
     "DatasetError",
-    "ENGINE_MARKER",
-    "KNOWN_DATASETS",
     "RANK_ENGINE_MARKER",
     "RECORD_MARKER",
-    "REUSE_MARKER",
     "TEXT_FIELDS",
     "emit",
     "is_lfs_pointer",

@@ -51,7 +51,6 @@ from ..spec.task_schema import (
     resolve_per_unit,
 )
 from . import contract as contract_mod
-from . import requirements as requirements_mod
 
 #: Under the workspace: one directory per certification round, with its checks' files.
 CERTIFY_DIRNAME = "certify"
@@ -546,16 +545,6 @@ def write_report(workflow, verdict: str, certification: Certification | None, ta
         if not certification.passed:
             lines += ["", "## What keeps it from delivery", ""]
             lines += [f"- {line}" for line in certification.failures()]
-    if workflow._contract is not None:
-        matrix = requirements_mod.requirements_matrix(
-            task, workflow._contract, workflow._gate_env().world_size
-        )
-        lines += [
-            "",
-            "## Coverage: what the contract proves, member by member",
-            "",
-            matrix.render(),
-        ]
     left = uncertified_lines(workflow.workspace)
     if left:
         lines += ["", "## What the workers left uncertified", "", *left]

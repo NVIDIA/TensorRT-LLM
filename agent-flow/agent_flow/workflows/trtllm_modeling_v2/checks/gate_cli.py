@@ -46,7 +46,6 @@ from . import anchors, check_config, check_runtime, datasets, disagg, endpoint, 
 from . import boot as boot_checks
 from . import verdict as check_result
 from .accuracy import resolve_model_key
-from .harness import workload_io
 
 #: The gates this command runs, by the name it takes.
 GATE_NAMES: tuple[str, ...] = (
@@ -146,44 +145,6 @@ def claimed_devices(workspace: str | Path | None) -> tuple[int, ...]:
         return ()
 
 
-class _ImportWatch:
-    """A check's runner, noting where each engine the check started imported the package from.
-
-    The engine driver says it once per engine (``workload_io.DRIVER_MARKER``). A
-    check one of whose engines imported ``tensorrt_llm`` from anywhere but the
-    tree it measures did not measure that tree: :meth:`judge` fails it, whatever
-    it measured. A command that does not say is not judged.
-    """
-
-    def __init__(self, runner: Callable[..., Any], tree: Path) -> None:
-        self.runner = runner
-        self.tree = Path(tree).resolve()
-        self.roots: set[str] = set()
-
-    def __call__(self, command: str, env: Mapping[str, str] | None = None, timeout: int = 1800):
-        result = self.runner(command, env, timeout)
-        output = f"{getattr(result, 'stdout', '')}\n{getattr(result, 'stderr', '')}"
-        for record in workload_io.parse_marked(output, workload_io.DRIVER_MARKER):
-            origin = Path(str(record.get("tensorrt_llm") or ""))
-            if origin.name:
-                # .../<root>/tensorrt_llm/__init__.py -> <root>
-                package = origin.parent if origin.name == "__init__.py" else origin
-                self.roots.add(str(package.parent.resolve()))
-        return result
-
-    def judge(self, result: check_result.GateResult) -> check_result.GateResult:
-        others = sorted(root for root in self.roots if Path(root) != self.tree)
-        if not others:
-            return result
-        return replace(
-            result,
-            passed=False,
-            explained=True,
-            detail=f"its engines imported tensorrt_llm from {', '.join(others)}, not from the tree "
-            f"it measures ({self.tree}); what it measured: {result.detail}",
-        )
-
-
 def run_check(
     task_data: Mapping[str, Any],
     gate: str,
@@ -212,7 +173,7 @@ def run_check(
     accuracy anchor is relative is judged against ``anchor_score`` (its unit's
     score at the same member on the same tree); without one its unit's
     benchmark runs here first. A check whose engines imported the package from
-    another tree fails (:class:`_ImportWatch`): it measured something else.
+    another tree fails (``checks/attest.py``): it measured something else.
     """
     name = gate_name(gate)
     if name not in GATE_NAMES:
@@ -248,7 +209,7 @@ def run_check(
         unit_environment = replace(unit_environment, python=python)
     if runner is None:
         runner = shell_runner_for(select_command_executor(environment))
-    runner = watch = _ImportWatch(check_runtime.in_tree(runner, tree), tree)
+    runner = check_runtime.in_tree(runner, tree)
     stated = features is not None
     features = list(features) if stated else features_for(spec, unit)
     # What the check runs: the deployment the unit or variant is at this member.
@@ -374,7 +335,7 @@ def run_check(
 
     # One load at a time: the run's checks and a worker's own never share the devices.
     with servers.engine_lock(workspace):
-        return watch.judge(measure())
+        return measure()
 
 
 def run_gate(args: argparse.Namespace) -> check_result.GateResult:

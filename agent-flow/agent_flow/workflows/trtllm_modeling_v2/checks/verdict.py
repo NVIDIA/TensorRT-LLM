@@ -12,7 +12,7 @@ from typing import Any, Callable, Mapping
 
 from ..infra.compute.commands import CommandResult
 from ..infra.git import git_output
-from .runtime_evidence import describe_engine
+from .attest import describe as describe_engine
 
 #: What a gate records when it could not ask git anything — no repository, no
 #: ``git`` on the host, no commits yet. Never an exception: a gate adjudicates
@@ -78,10 +78,9 @@ class GateResult:
     #: verdict about the target: the workflow re-runs the gate once a session
     #: is back instead of recording it or handing it to the assembler.
     infrastructure: str = ""
-    #: One record per engine the gate built (:meth:`EngineAttestation.record`):
-    #: the configuration it ran against the declared one, the pools it sized
-    #: and the device memory it left free. Empty for a gate that built none.
-    #: Not hashed: the records are mappings.
+    #: One record per server the check attested (:meth:`.attest.Attestation.record`):
+    #: its options against what every rank's engine ran. Empty for a check that
+    #: attested none. Not hashed: the records are mappings.
     engine: tuple[Mapping[str, Any], ...] = field(default=(), hash=False)
 
     def summary(self) -> str:
@@ -125,14 +124,6 @@ def lost_session(result: CommandResult) -> dict[str, Any]:
     }
 
 
-def tree_commit(repo_root: str | Path | None) -> str | None:
-    """The full commit ``HEAD`` names in ``repo_root``, or ``None`` if git cannot say."""
-    if not repo_root:
-        return None
-    answer = git_output(repo_root, "rev-parse", "HEAD")
-    return answer.strip() if answer and answer.strip() else None
-
-
 @dataclass
 class GateLog:
     """Every gate a run has fired, in order. The journal's raw material."""
@@ -154,6 +145,5 @@ __all__ = [
     "describe_tree_state",
     "inspect_tree",
     "lost_session",
-    "tree_commit",
     "verdict_factory",
 ]

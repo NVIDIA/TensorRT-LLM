@@ -276,19 +276,65 @@ def driver_records(accepted: int = 320, iterations: int = 100, prompts: int = 32
             "iterations": iterations,
             "token_ids": list(range(accepted)),
             "text": "Paris is the capital of France",
+            # What a repeated prompt resumes from the cache, where the boot sends one.
+            "cached_tokens": 64,
         }
         lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
     return "\n".join(lines) + "\n"
 
 
+#: A model class under the Modeling V2 package, as a rank that built a target reports it.
+TARGET_CLASS = "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.model.GptOssModel"
+
+
+def rank_lines(
+    options: dict, /, *, tree: str = "/repo", ranks: int | None = None, **changes
+) -> str:
+    """The record each rank of an engine running ``options`` from ``tree`` prints."""
+    count = ranks if ranks is not None else int(options.get("tensor_parallel_size") or 1)
+    lines = []
+    for rank in range(count):
+        record = {
+            "rank": rank,
+            "options": options,
+            "target": TARGET_CLASS,
+            "origin": f"{tree}/tensorrt_llm/__init__.py",
+            **changes,
+        }
+        lines.append(f"{workload_io.RANK_ENGINE_MARKER} {json.dumps(record)}")
+    return "\n".join(lines) + "\n"
+
+
+def attested(command: str, **changes) -> str:
+    """What the ranks of the engine ``command`` starts print: the options it was given, as run."""
+    tree = re.match(r"cd (\S+) &&", command)
+    spec = re.search(r"--spec '?([^\s']+)", command)
+    config = re.search(r"--config=([^\s']+)", command)
+    if spec:
+        options = dict(json.loads(Path(spec.group(1)).read_text(encoding="utf-8"))["llm"])
+        options.pop("model", None)
+        mode = re.search(r"TRTLLM_MODELING_V2=(\w+)", command)
+        options["modeling_v2"] = mode.group(1) if mode else "off"
+    elif config:
+        options = yaml.safe_load(Path(config.group(1)).read_text(encoding="utf-8"))
+    else:
+        return ""
+    return rank_lines(options, tree=tree.group(1) if tree else "/repo", **changes)
+
+
 def passing_shell(score: float = 90.0, accepted: int = 320, iterations: int = 100):
     def runner(command, env=None, timeout=0):
         if "trtllm-eval" in command:
-            return CommandResult(returncode=0, stdout=f"lm-eval gsm8k average accuracy: {score}\n")
+            return CommandResult(
+                returncode=0,
+                stdout=f"lm-eval gsm8k average accuracy: {score}\n" + attested(command),
+            )
         # The gates that need per-request structure run the engine driver,
         # which prints one record per prompt.
         if "engine_driver.py" in command:
-            return CommandResult(returncode=0, stdout=driver_records(accepted, iterations))
+            return CommandResult(
+                returncode=0, stdout=driver_records(accepted, iterations) + attested(command)
+            )
         return CommandResult(
             returncode=0,
             stdout=(

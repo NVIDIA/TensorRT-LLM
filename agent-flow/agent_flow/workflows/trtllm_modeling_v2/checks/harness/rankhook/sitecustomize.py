@@ -3,13 +3,15 @@
 
 """Have every rank's executor worker print what its engine runs, as it sets the engine up.
 
-The gates put this directory first on ``PYTHONPATH`` and set
+The checks put this directory first on ``PYTHONPATH`` and set
 ``MV2FLOW_RANK_FACTS=1`` (``check_runtime.RANK_FACTS_ENV``), so this
-``sitecustomize`` runs at interpreter start in every process of the gate's
+``sitecustomize`` runs at interpreter start in every process of the check's
 job. In each it waits for ``tensorrt_llm.executor.base_worker`` to be
 imported and wraps ``BaseWorker.setup_engine``: once the worker's engine is
-set up, the worker prints one ``MV2FLOW_RANK_ENGINE`` record carrying its
-rank (``engine_facts.emit_rank``).
+set up, the worker prints one ``MV2FLOW_RANK_ENGINE`` record with its rank,
+its engine's resolved configuration (the worker's ``llm_args``, every field),
+the class of the model it built and where it imported ``tensorrt_llm`` from.
+``checks/attest.py`` compares the record with the options the check declared.
 
 Without the variable this module only hands on to the next ``sitecustomize``
 on ``sys.path``, the one it shadows; that hand-on moves forward along
@@ -19,21 +21,68 @@ loop.
 Standard library only.
 """
 
-import importlib.util
+import enum
+import json
 import os
 import sys
 
 _HERE = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
 _ENABLED = os.environ.get("MV2FLOW_RANK_FACTS") == "1"
 _MODULE = "tensorrt_llm.executor.base_worker"
-_FACTS = os.path.join(os.path.dirname(_HERE), "engine_facts.py")
+_MARKER = "MV2FLOW_RANK_ENGINE"
+
+
+def _plain(value, depth=0):
+    """``value`` as JSON takes it: a config object as a mapping of its fields, an enum by its value."""
+    if isinstance(value, enum.Enum):
+        value = value.value
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if depth > 8:
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _plain(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_plain(v, depth + 1) for v in value]
+    fields = getattr(type(value), "model_fields", None)
+    if fields:
+        return {name: _plain(getattr(value, name, None), depth + 1) for name in fields}
+    if hasattr(value, "__dict__") and not callable(value):
+        public = {k: v for k, v in vars(value).items() if not k.startswith("_")}
+        return {k: _plain(v, depth + 1) for k, v in public.items()}
+    return str(value)
+
+
+def _rank(worker):
+    """The MPI rank of ``worker``: its own ``rank``, else the launcher's rank variables."""
+    rank = getattr(worker, "rank", None)
+    if isinstance(rank, int) and not isinstance(rank, bool):
+        return rank
+    for name in ("OMPI_COMM_WORLD_RANK", "PMIX_RANK", "PMI_RANK", "SLURM_PROCID"):
+        if os.environ.get(name, "").isdigit():
+            return int(os.environ[name])
+    return None
 
 
 def _report(worker):
-    spec = importlib.util.spec_from_file_location("mv2flow_engine_facts", _FACTS)
-    facts = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(facts)
-    facts.emit_rank(worker)
+    """Print this rank's record; a worker that cannot be read prints why, which reads unknown."""
+    record = {"rank": _rank(worker)}
+    try:
+        import tensorrt_llm
+
+        model = getattr(
+            getattr(getattr(worker, "engine", None), "model_engine", None), "model", None
+        )
+        record["options"] = _plain(worker.llm_args)
+        record["target"] = (
+            f"{type(model).__module__}.{type(model).__qualname__}" if model is not None else None
+        )
+        record["origin"] = str(getattr(tensorrt_llm, "__file__", "") or "")
+    # An observation of an engine that is up must never stop it.
+    except Exception as exc:  # noqa: BLE001
+        record = {"rank": record["rank"], "error": f"{type(exc).__name__}: {exc}"[:500]}
+    sys.stdout.write(f"{_MARKER} {json.dumps(record, sort_keys=True, default=str)}\n")
+    sys.stdout.flush()
 
 
 def _wrap(module):

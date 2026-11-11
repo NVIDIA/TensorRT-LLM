@@ -133,7 +133,6 @@ def write_driver_spec(
     max_tokens: int = 64,
     concurrency: int = 1,
     ignore_eos: bool = False,
-    reuse_probe: bool = False,
 ) -> Path:
     """Write public engine options and the workload to materialize before engine launch."""
     spec = {
@@ -143,7 +142,6 @@ def write_driver_spec(
         "max_tokens": int(max_tokens),
         "concurrency": int(concurrency),
         "ignore_eos": bool(ignore_eos),
-        "reuse_probe": bool(reuse_probe),
     }
     if not dataset:
         spec["requests"] = workload_io.normalize_requests(spec)

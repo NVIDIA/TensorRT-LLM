@@ -1,0 +1,214 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Attestation: a deployment's options against what every rank's engine ran."""
+
+from __future__ import annotations
+
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+import yaml
+
+from agent_flow.workflows.trtllm_modeling_v2.checks import attest
+from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
+from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
+
+from ._helpers import rank_lines
+
+OPTIONS = {
+    "tensor_parallel_size": 2,
+    "enable_attention_dp": True,
+    "max_batch_size": 64,
+    "cuda_graph_config": {},
+    "speculative_config": None,
+    "kv_cache_config": {"dtype": "nvfp4", "free_gpu_memory_fraction": 0.6},
+    "a_dtype_option_added_tomorrow": "fp8",
+}
+#: What the engine resolved: every stated key, with the defaults it filled in around them.
+RESOLVED = {
+    **OPTIONS,
+    "cuda_graph_config": {"batch_sizes": [1, 2], "enable_padding": True},
+    "kv_cache_config": {"dtype": "NVFP4", "free_gpu_memory_fraction": 0.6, "tokens_per_block": 32},
+    "max_seq_len": None,
+}
+
+
+def test_declared_equals_observed_on_every_rank_with_no_option_known_by_name():
+    found = attest.attest(rank_lines(RESOLVED), OPTIONS, tree="/repo")
+    assert found.status == attest.MATCH and found.failure() is None
+    assert (found.ranks, found.keys) == (2, 8)
+    assert "modeling_v2" in found.target and found.origin == "/repo/tensorrt_llm/__init__.py"
+
+
+@pytest.mark.parametrize(
+    "resolved,said",
+    [
+        ({"max_batch_size": 32}, "rank 0: max_batch_size is 32, declared 64"),
+        ({"kv_cache_config": {"dtype": "fp8"}}, "kv_cache_config.dtype is 'fp8', declared 'nvfp4'"),
+        ({"cuda_graph_config": None}, "cuda_graph_config is None, declared {}"),
+        (
+            {"speculative_config": {"decoding_type": "MTP"}},
+            "speculative_config is {'decoding_type'",
+        ),
+        ({"a_dtype_option_added_tomorrow": "auto"}, "a_dtype_option_added_tomorrow is 'auto'"),
+    ],
+)
+def test_a_key_the_engine_resolved_otherwise_fails_the_check(resolved, said):
+    found = attest.attest(rank_lines({**RESOLVED, **resolved}), OPTIONS)
+    assert found.status == attest.MISMATCH and said in found.failure()
+
+
+def test_a_missing_rank_or_key_reads_unknown_and_never_passes():
+    one_rank = attest.attest(rank_lines(RESOLVED, ranks=1), OPTIONS)
+    assert one_rank.status == attest.UNKNOWN
+    assert "rank 1: it printed no record" in one_rank.failure()
+    assert "unknown is not a pass" in one_rank.failure()
+    no_key = {k: v for k, v in RESOLVED.items() if k != "enable_attention_dp"}
+    assert "rank 0: enable_attention_dp is not in the engine's configuration" in (
+        attest.attest(rank_lines(no_key), OPTIONS).failure()
+    )
+    unread = attest.attest(rank_lines(RESOLVED, options=None, error="AttributeError: x"), OPTIONS)
+    assert "rank 0: AttributeError: x" in unread.failure()
+    assert attest.attest("", OPTIONS).status == attest.UNKNOWN
+
+
+def test_the_model_class_and_the_import_origin_are_attested_on_every_rank():
+    stock = rank_lines(RESOLVED, target="tensorrt_llm._torch.models.modeling_qwen3.Qwen3")
+    assert "not a Modeling V2 target" in attest.attest(stock, OPTIONS).failure()
+    # A control run on the stock path is not held to a Modeling V2 class.
+    assert attest.attest(stock, OPTIONS, target=False).status == attest.MATCH
+    assert (
+        "the model class it built"
+        in attest.attest(rank_lines(RESOLVED, target=None), OPTIONS).failure()
+    )
+    elsewhere = attest.attest(rank_lines(RESOLVED, tree="/opt/other"), OPTIONS, tree="/repo")
+    assert "imported tensorrt_llm from /opt/other/tensorrt_llm/__init__.py" in elsewhere.failure()
+
+
+def test_a_repeated_prompt_must_come_back_with_cached_tokens():
+    assert attest.reuses({"kv_cache_config": {"enable_block_reuse": True}})
+    assert not attest.reuses(
+        {"kv_cache_config": {"enable_block_reuse": False}}
+    ) and not attest.reuses({})
+    # One repeat; with attention DP a request may land on any rank, so one more per rank.
+    assert attest.reuse_sends({"tensor_parallel_size": 4}) == 2
+    assert attest.reuse_sends({"tensor_parallel_size": 4, "enable_attention_dp": True}) == 5
+    assert attest.reuse_shortfall([0, 448]) is None
+    assert attest.reuse_shortfall([0, 0, 0, 448, 0]) is None
+    assert "the engine reused nothing" in attest.reuse_shortfall([0, 0])
+    assert "unknown is not a pass" in attest.reuse_shortfall([0, None])
+
+
+_FAKE_TRTLLM = {
+    "tensorrt_llm/executor/__init__.py": "",
+    "tensorrt_llm/executor/base_worker.py": """
+        import types
+
+
+        class Model:
+            pass
+
+
+        Model.__module__ = "tensorrt_llm._torch._experimental.modeling_v2.models.fake.model"
+
+
+        class BaseWorker:
+            def __init__(self, llm_args):
+                self.llm_args = llm_args
+                self.rank = 0
+                self.engine = None
+
+            def setup_engine(self):
+                self.engine = types.SimpleNamespace(
+                    model_engine=types.SimpleNamespace(model=Model()))
+    """,
+    "tensorrt_llm/__init__.py": """
+        import os
+        import types
+
+        from tensorrt_llm.executor.base_worker import BaseWorker
+
+
+        class SamplingParams:
+            def __init__(self, **fields):
+                self.__dict__.update(fields)
+
+
+        class Output:
+            def __init__(self, ids, cached):
+                self.prompt_token_ids = ids
+                self.cached_tokens = cached
+                self.outputs = [types.SimpleNamespace(
+                    token_ids=[11, 12], text=" Paris", finish_reason="length")]
+
+            def __iter__(self):
+                yield self
+
+
+        class LLM:
+            # Resumes a prompt it has seen (FAKE_REUSE=0: never); FAKE_DTYPE is the KV dtype
+            # its engine resolves whatever was asked; FAKE_WORKER=0 sets no worker up here.
+
+            def __init__(self, model=None, **options):
+                if os.environ.get("FAKE_DTYPE"):
+                    options["kv_cache_config"]["dtype"] = os.environ["FAKE_DTYPE"]
+                self.seen = []
+                self.tokenizer = None
+                if os.environ.get("FAKE_WORKER", "1") == "1":
+                    BaseWorker(types.SimpleNamespace(**options)).setup_engine()
+
+            def generate_async(self, inputs, params=None, streaming=False, **kwargs):
+                again = inputs in self.seen and os.environ.get("FAKE_REUSE", "1") == "1"
+                self.seen.append(inputs)
+                return Output(list(range(len(inputs.split()))), 448 if again else 0)
+
+            def shutdown(self):
+                pass
+    """,
+}
+
+
+def _real_boot(tmp_path: Path, **env):
+    """A boot through the real engine driver and rank hook, on a stand-in ``tensorrt_llm``."""
+    repo = tmp_path / "repo"
+    for name, text in _FAKE_TRTLLM.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(text), encoding="utf-8")
+    options = tmp_path / "core.yaml"
+    options.write_text(yaml.safe_dump({"kv_cache_config": {"dtype": "fp8"}}), encoding="utf-8")
+    task = {
+        "checkpoint_path": "/ckpt/model",
+        "parallel": "tp1",
+        "trtllm_repo_path": str(repo),
+        "runtime": {"kv_cache_reuse": True},
+        "accuracy": {"llm_api_options": str(options)},
+    }
+    environment = RunEnvironment(
+        kind="local", python=sys.executable, world_size=1, env={"PYTHONPATH": str(repo), **env}
+    )
+    return boot_checks.run_boot_gate(
+        environment, task_data=task, unit="core", member="tp1", workdir=tmp_path / "gates"
+    )
+
+
+def test_a_real_boot_is_held_to_what_its_rank_printed_and_to_a_cache_that_reused(tmp_path):
+    passed = _real_boot(tmp_path / "ok")
+    assert passed.passed, passed.detail + passed.stdout_tail
+    assert "a repeated prompt resumed 448 cached tokens" in passed.detail
+    assert passed.engine[0]["status"] == attest.MATCH and passed.engine[0]["ranks"] == 1
+    assert "[engine match: 1 rank(s) x" in passed.summary()
+
+    other = _real_boot(tmp_path / "dtype", FAKE_DTYPE="auto")
+    assert not other.passed
+    assert "rank 0: kv_cache_config.dtype is 'auto', declared 'fp8'" in other.detail
+
+    cold = _real_boot(tmp_path / "cold", FAKE_REUSE="0")
+    assert not cold.passed and "the engine reused nothing" in cold.detail
+
+    # An engine none of whose ranks said what it ran: unknown, not a pass.
+    silent = _real_boot(tmp_path / "silent", FAKE_WORKER="0")
+    assert not silent.passed and "rank 0: it printed no record" in silent.detail
