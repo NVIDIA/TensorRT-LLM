@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Python extensions for executor requests."""
 
 from copy import copy, deepcopy
@@ -755,6 +767,7 @@ class LlmResult:
         self.ctx_usage = None
         # Explicit context-to-generation remote-tail replay boundary.
         self.remote_tail_start: Optional[int] = None
+        self.retained_prefix = None
         # Time breakdown metrics for performance analysis
         # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
         self.time_breakdown_metrics = time_breakdown_metrics
@@ -975,6 +988,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logprobs_mode = LogprobMode(
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
+        self.py_retained_export = None
+        self.py_retained_loaded = False
+        self.py_retained_import_receipt = None
         self.py_conversation_params = None
         # Uncached-prefill estimate published by the attention-DP router, if
         # any. The V2 scheduler drops it when the demotion aging bound lets the
@@ -1265,6 +1281,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
             llm_result.remote_tail_start = self.py_csa2_remote_tail_start
         llm_result.cached_tokens = self.cached_tokens
+        if is_final:
+            llm_result.retained_prefix = self.py_retained_export
         return LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,

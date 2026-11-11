@@ -161,27 +161,48 @@ class RecvReqInfo:
     # Single-use token the receiver minted for this writer; echoed in every
     # KV result. Carried as a separate REQUEST_DATA frame, not in to_bytes().
     kv_result_report_token: bytes = field(default=b"", repr=False, compare=False)
+    retained_proofs: Optional[dict[int, str]] = None
 
     def to_bytes(self) -> bytes:
-        return msgpack.packb(
-            {
-                "sender_req_id": self.sender_req_id,
-                "instance_name": self.instance_name,
-                "instance_rank": self.instance_rank,
-                "block_ids_per_layer_groups": [
-                    arr.tobytes() for arr in self.block_ids_per_layer_groups
-                ],
-                "unique_rid": self.unique_rid,
-                "dst_start_token": self.dst_start_token,
-                "aux_slot": self.aux_slot,
-                "slice_id": self.slice_id,
-                "context_first": self.context_first,
+        data = {
+            "sender_req_id": self.sender_req_id,
+            "instance_name": self.instance_name,
+            "instance_rank": self.instance_rank,
+            "block_ids_per_layer_groups": [
+                arr.tobytes() for arr in self.block_ids_per_layer_groups
+            ],
+            "unique_rid": self.unique_rid,
+            "dst_start_token": self.dst_start_token,
+            "aux_slot": self.aux_slot,
+            "slice_id": self.slice_id,
+            "context_first": self.context_first,
+        }
+        if self.retained_proofs is not None:
+            data["retained_proofs"] = {
+                str(rank): proof for rank, proof in self.retained_proofs.items()
             }
-        )
+        return msgpack.packb(data)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RecvReqInfo":
         d = msgpack.unpackb(data, raw=False)
+        if "retained_proofs" in d:
+            proofs = d["retained_proofs"]
+            if (
+                type(proofs) is not dict
+                or not 0 < len(proofs) <= 8
+                or any(
+                    type(rank) is not str
+                    or len(rank) != 1
+                    or rank not in "01234567"
+                    or type(proof) is not str
+                    or len(proof) != 64
+                    or any(c not in "0123456789abcdef" for c in proof)
+                    for rank, proof in proofs.items()
+                )
+            ):
+                raise ValueError("invalid retained native request proof map")
+            d["retained_proofs"] = {int(rank): proof for rank, proof in proofs.items()}
         d["block_ids_per_layer_groups"] = [
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
@@ -442,7 +463,8 @@ class AgentResult(Enum):
     FAILED_QUIESCED = "FAILED_QUIESCED"
 
 
-# KV_AGENT_RESULT is [type, frame]; the frame is one binary struct carrying instance_rank,
+# KV_AGENT_RESULT carries [type, result, report_token] and an optional retained
+# certificate as the fourth frame. The binary result contains instance_rank,
 # unique_rid, slice_id, is_last, status and transfer_size.
 _KV_RESULT_FRAME = struct.Struct("<qqq?Bq")
 # Per-writer KV result report token length.
@@ -476,12 +498,13 @@ def _make_kv_result_msg(
     *,
     kv_result_report_token: bytes,
     transfer_size=0,
+    retained_digest=None,
 ):
     """Build a KV_AGENT_RESULT message. ALL result sends (success AND failed/cancelled) must go
     through this single binary frame so the receiver's _KV_RESULT_FRAME.unpack never hits a stale
     ascii payload (which would fail to decode and leave the RX task stuck forever). The writer
     echoes the report token the receiver handed it, so a forged result is dropped."""
-    return [
+    message = [
         MessageType.KV_AGENT_RESULT,
         _KV_RESULT_FRAME.pack(
             int(instance_rank),
@@ -493,6 +516,26 @@ def _make_kv_result_msg(
         ),
         bytes(kv_result_report_token),
     ]
+    if retained_digest is not None:
+        message.append(retained_digest.encode("ascii"))
+    return message
+
+
+def _retained_metadata(owner, name):
+    return None if owner is None else vars(owner).get(name)
+
+
+def _retained_write_digest(meta):
+    plans = _retained_metadata(meta.task, "_retained_coverage_by_rank")
+    return None if plans is None else plans[meta.peer_rank].digest
+
+
+def _retained_frame_matches(session, peer_rank, proof):
+    plans = _retained_metadata(session, "_retained_coverage_expected_writers")
+    if plans is None:
+        return proof is None
+    plan = plans.get(peer_rank)
+    return plan is not None and proof == plan.digest.encode("ascii")
 
 
 def _make_aux_result_msg(instance_rank: int, unique_rid: int, result: AgentResult) -> list[bytes]:
@@ -643,6 +686,7 @@ class _SessionQuiescence:
     unique_rid: int
     peer_rank: int
     endpoint: Optional[str]
+    retained_digest: Optional[str] = None
 
 
 class Sender(SenderBase):
@@ -659,12 +703,16 @@ class Sender(SenderBase):
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
         context_first_ownership: bool = False,
+        retained_profile=None,
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._enforce_physical_ownership = enforce_physical_ownership
         self._context_first_ownership = context_first_ownership
+        self._retained_profile = retained_profile
+        self._retained_request_ids: set[int] = set()
+        self._retained_proofs: dict[tuple[int, str, int], str] = {}
         self._retirement_watchdog = retirement_watchdog
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
@@ -729,6 +777,9 @@ class Sender(SenderBase):
         return getattr(self, "_enforce_physical_ownership", False) or (
             getattr(self, "_context_first_ownership", False) and context_first
         )
+
+    def _retained_result_digest(self, unique_rid, instance_name, instance_rank):
+        return getattr(self, "_retained_proofs", {}).get((unique_rid, instance_name, instance_rank))
 
     def _owns_task(self, task: SendTaskBase) -> bool:
         """Read the immutable session selection, including standalone task callers.
@@ -834,6 +885,13 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if self._shutdown_requested:
                 raise RuntimeError("cannot create a TxSession after Sender shutdown")
+            if unique_rid in getattr(self, "_retained_request_ids", ()):
+                raise RuntimeError("cannot reuse a retained native claim ID")
+            if (
+                _retained_metadata(tx_session, "_retained_admission") is not None
+                and unique_rid in self._pre_cancelled_rids
+            ):
+                raise RuntimeError("cannot admit a fenced retained native claim ID")
             if owned and unique_rid in self._sessions:
                 raise RuntimeError("cannot replace an owned TxSession")
             if unique_rid in self._pre_cancelled_rids:
@@ -843,6 +901,21 @@ class Sender(SenderBase):
                     self._pre_cancelled_rids.pop(unique_rid)
             if not (pre_cancel and owned):
                 self._sessions[unique_rid] = tx_session if owned else weakref.ref(tx_session)
+                if _retained_metadata(tx_session, "_retained_admission") is not None:
+                    if (
+                        len(self._retained_proofs) + len(tx_session._retained_coverage_by_rank)
+                        > 65536
+                    ):
+                        self._sessions.pop(unique_rid, None)
+                        raise RuntimeError(
+                            "retained native proof tombstone budget exhausted; restart engine generation"
+                        )
+                    self._retained_request_ids.add(unique_rid)
+                    for plan in tx_session._retained_coverage_by_rank.values():
+                        b = plan.binding
+                        self._retained_proofs[
+                            (unique_rid, b.destination_instance, b.destination_rank)
+                        ] = plan.digest
         if pre_cancel:
             if owned:
                 tx_session.cancel_local(by_peer=cancelled_by_peer, report_unsubmitted_aux=False)
@@ -1187,6 +1260,7 @@ class Sender(SenderBase):
                         True,
                         AgentResult.FAILED_QUIESCED,
                         kv_result_report_token=meta.kv_result_report_token,
+                        retained_digest=_retained_write_digest(meta),
                     )
                 dealer.send(message)
             except Exception as error:
@@ -1208,6 +1282,31 @@ class Sender(SenderBase):
     def _make_agent_request(
         write_meta: WriteMeta, device_id: int
     ) -> TransferRequest | _TransferRequestGroup:
+        retained_groups = None
+        retained_plans = _retained_metadata(write_meta.task, "_retained_coverage_by_rank")
+        if retained_plans is not None:
+            if write_meta.meta_type is not WriteMetaType.KV:
+                raise ValueError("retained native operation requires GPU KV descriptors")
+            from .retained_coverage import check_native_operation
+
+            plan = retained_plans.get(write_meta.peer_rank)
+            if plan is None:
+                raise ValueError("retained native operation targets an uncertified destination")
+            registrar = getattr(write_meta.task, "_retained_native_registrar", None)
+            if registrar is None:
+                raise ValueError(
+                    "retained native operation has no authoritative registration owner"
+                )
+            check_native_operation(
+                plan,
+                write_meta,
+                source_info=registrar.self_rank_info,
+                destination_info=registrar.get_peer_rank_info(
+                    plan.binding.destination_instance, plan.binding.destination_rank
+                ),
+                source_device_id=device_id,
+            )
+            retained_groups = (_TransferGroup("VRAM", "VRAM", 0, write_meta.src_ptrs.size),)
         if not (write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size):
             raise ValueError(
                 f"Pointer/size mismatch for unique_rid={write_meta.unique_rid}: "
@@ -1215,7 +1314,9 @@ class Sender(SenderBase):
                 f"{write_meta.dst_ptrs.size=}, "
                 f"{write_meta.sizes.size=}"
             )
-        if write_meta.meta_type == WriteMetaType.AUX:
+        if retained_groups is not None:
+            groups = retained_groups
+        elif write_meta.meta_type == WriteMetaType.AUX:
             groups = (_TransferGroup("DRAM", "DRAM", 0, write_meta.src_ptrs.size),)
         else:
             if write_meta.dst_device_id is None:
@@ -1308,6 +1409,7 @@ class Sender(SenderBase):
                     True,  # is_last_slice — ensures receiver resolves its task future
                     AgentResult.FAILED,
                     kv_result_report_token=write_meta.kv_result_report_token,
+                    retained_digest=_retained_write_digest(write_meta),
                 )
             )
             return
@@ -1347,6 +1449,7 @@ class Sender(SenderBase):
                         True,  # is_last_slice — ensures receiver resolves its task future
                         AgentResult.FAILED,
                         kv_result_report_token=write_meta.kv_result_report_token,
+                        retained_digest=_retained_write_digest(write_meta),
                     )
                 )
                 return
@@ -1423,6 +1526,7 @@ class Sender(SenderBase):
             agent_result,
             transfer_size=transfer_size,
             kv_result_report_token=write_meta.kv_result_report_token,
+            retained_digest=_retained_write_digest(write_meta),
         )
         if agent_result == AgentResult.IN_DOUBT:
             self._retain_in_doubt_transfer(write_meta, result_msg)
@@ -1780,7 +1884,7 @@ class Sender(SenderBase):
         if timer is not None or disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
             transfer_bytes = _capture_transfer_bytes(kv_sizes, timer, peer_ri.instance_rank)
 
-        return WriteMeta(
+        write_meta = WriteMeta(
             task=task,
             src_ptrs=src_frags,
             dst_ptrs=dst_frags,
@@ -1798,6 +1902,18 @@ class Sender(SenderBase):
             kv_result_report_token=req_info.kv_result_report_token,
             transfer_bytes=transfer_bytes,
         )
+        retained_plans = _retained_metadata(task, "_retained_coverage_by_rank")
+        if retained_plans is not None:
+            from .retained_coverage import check_native_operation
+
+            plan = retained_plans.get(peer_ri.instance_rank)
+            if plan is None:
+                raise ValueError("retained native writer was not certified for this destination")
+            check_native_operation(plan, write_meta, source_info=self_ri, destination_info=peer_ri)
+            # Strong immutable byte roots live on the task's frozen plan.
+            # Recheck immediately before MemoryDescs are built as well.
+            write_meta.src_ptrs, write_meta.dst_ptrs, write_meta.sizes = plan.arrays()
+        return write_meta
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -1870,6 +1986,18 @@ class Sender(SenderBase):
             raise first_error
 
     def _dispatch_task_to_peer(self, task: KVSendTask | AuxSendTask, info: RecvReqInfo) -> None:
+        retained_plans = _retained_metadata(task, "_retained_coverage_by_rank")
+        if retained_plans is not None:
+            plan = retained_plans.get(info.instance_rank)
+            if (
+                plan is None
+                or info.instance_name != plan.binding.destination_instance
+                or (getattr(info, "retained_proofs", None) or {}).get(self._instance_rank)
+                != plan.digest
+            ):
+                raise ValueError(
+                    "retained REQUEST_DATA does not bind the certified generation/claim/peer"
+                )
         owned = False
         if self._owns_task(task):
             admission = self._begin_task_operation(task, info.instance_rank)
@@ -1883,6 +2011,7 @@ class Sender(SenderBase):
             if (
                 owned
                 and getattr(self, "_context_first_ownership", False)
+                and getattr(task, "_retained_admission", None) is None
                 and task._params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
             ):
                 peer = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
@@ -1961,10 +2090,24 @@ class Sender(SenderBase):
         session = None
         with self._sessions_lock:
             session = self._get_session(unique_rid)
+            retained = unique_rid in getattr(self, "_retained_request_ids", ())
+            if retained:
+                if len(message) != 5:
+                    return
+                expected = self._retained_result_digest(
+                    unique_rid, message[2].decode(), int(message[3])
+                )
+                if expected is None or message[4] != expected.encode("ascii"):
+                    return
+            elif len(message) == 5:
+                return
             owned = (
                 session._enforce_physical_ownership
                 if session is not None
-                else self.ownership_enabled(context_first=len(message) == 4)
+                else (
+                    self.ownership_enabled(context_first=len(message) == 4)
+                    or unique_rid in getattr(self, "_retained_request_ids", ())
+                )
             )
             if session is None or owned:
                 # Parked with the peer as who asked: the session built afterwards reads its
@@ -1978,7 +2121,9 @@ class Sender(SenderBase):
                 session.cancel_local(by_peer=True)
             else:
                 session.cancel(by_peer=True)
-        if owned and len(message) == 4:
+        if owned and (len(message) == 4 or (retained and len(message) == 5)):
+            # Retained len5 has already passed the generation/nonce-bound
+            # proof above; it needs the same ordered physical fence as len4.
             # Routing is carried by CANCEL itself, not by expiring REQUEST_DATA.
             self._queue_session_quiescence(unique_rid, message[2].decode(), int(message[3]))
 
@@ -1991,7 +2136,12 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if self._shutdown_requested or key in self._pending_session_quiescence:
                 return
-            marker = _SessionQuiescence(unique_rid, instance_rank, endpoint)
+            marker = _SessionQuiescence(
+                unique_rid,
+                instance_rank,
+                endpoint,
+                self._retained_result_digest(unique_rid, instance_name, instance_rank),
+            )
             self._pending_session_quiescence[key] = marker
             self._send_task_queues[hash(key) % self._num_threads].put(marker)
 
@@ -2019,13 +2169,14 @@ class Sender(SenderBase):
         ):
             return False
         try:
-            self._get_or_connect_thread_dealer(marker.endpoint).send(
-                [
-                    MessageType.SESSION_QUIESCED,
-                    str(self._instance_rank).encode("ascii"),
-                    str(marker.unique_rid).encode("ascii"),
-                ]
-            )
+            message = [
+                MessageType.SESSION_QUIESCED,
+                str(self._instance_rank).encode("ascii"),
+                str(marker.unique_rid).encode("ascii"),
+            ]
+            if getattr(marker, "retained_digest", None) is not None:
+                message.append(marker.retained_digest.encode("ascii"))
+            self._get_or_connect_thread_dealer(marker.endpoint).send(message)
         except Exception as error:
             logger.warning(f"Failed to acknowledge fenced session {marker.unique_rid}: {error}")
             return False
@@ -2061,10 +2212,22 @@ class Sender(SenderBase):
                 received_timestamp = disagg_diagnostics.capture_timestamp()
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
+            expected = self._retained_result_digest(
+                info.unique_rid, info.instance_name, info.instance_rank
+            )
+            if expected is not None:
+                if (getattr(info, "retained_proofs", None) or {}).get(
+                    self._instance_rank
+                ) != expected:
+                    return
+            elif getattr(info, "retained_proofs", None) is not None:
+                # Retained publication is legal only after source admission;
+                # do not cache a caller's ungranted physical coordinates.
+                return
             fenced = (
                 self.ownership_enabled(info.context_first)
-                and info.unique_rid in self._pre_cancelled_rids
-            )
+                or info.unique_rid in getattr(self, "_retained_request_ids", ())
+            ) and info.unique_rid in self._pre_cancelled_rids
             if session is None and not fenced:
                 self._save_peer_req_info(info)
         if received_timestamp is not None:
@@ -2129,6 +2292,9 @@ class Sender(SenderBase):
                     True,  # is_last_slice
                     AgentResult.FAILED,
                     kv_result_report_token=info.kv_result_report_token,
+                    retained_digest=self._retained_result_digest(
+                        info.unique_rid, info.instance_name, info.instance_rank
+                    ),
                 )
             ]
             if include_aux:
@@ -2189,6 +2355,9 @@ class Sender(SenderBase):
                     True,
                     AgentResult.FAILED,
                     kv_result_report_token=info.kv_result_report_token,
+                    retained_digest=self._retained_result_digest(
+                        info.unique_rid, info.instance_name, info.instance_rank
+                    ),
                 )
             else:
                 with self._sessions_lock:
@@ -2224,7 +2393,11 @@ class Sender(SenderBase):
         *,
         defer_to_worker: bool,
     ) -> None:
-        if defer_to_worker or self.ownership_enabled(info.context_first):
+        if (
+            defer_to_worker
+            or self.ownership_enabled(info.context_first)
+            or info.unique_rid in getattr(self, "_retained_request_ids", ())
+        ):
             # Listener-side rejection must share the worker's ordered stream;
             # it cannot overtake an ambiguous write's pending IN_DOUBT report.
             thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
@@ -2281,9 +2454,19 @@ class Sender(SenderBase):
                 peer_ri = self._registrar.get_peer_rank_info(
                     req_info.instance_name, req_info.instance_rank
                 )
-                self._get_or_connect_dealer(peer_ri.self_endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                message = [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                proof = self._retained_result_digest(
+                    unique_rid, req_info.instance_name, req_info.instance_rank
                 )
+                if proof is not None:
+                    message.extend(
+                        [
+                            self._registrar.self_rank_info.instance_name.encode(),
+                            str(self._instance_rank).encode("ascii"),
+                            proof.encode("ascii"),
+                        ]
+                    )
+                self._get_or_connect_dealer(peer_ri.self_endpoint).send(message)
             except Exception as e:
                 logger.warning(f"send_cancel_to_receivers: failed for rid={unique_rid}: {e}")
 
@@ -2360,14 +2543,27 @@ class TxSession(TxSessionBase):
         overall_timeout_s: Optional[float] = None,
         *,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        retained_admission=None,
     ):
         super().__init__(sender, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
         self._overall_timeout_s = overall_timeout_s
         self._deadline_monotonic_s: Optional[float] = None
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        self._enforce_physical_ownership = Sender.ownership_enabled(
-            sender, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        self._retained_admission = retained_admission
+        if retained_admission is not None:
+            from .retained_profile import RetainedAdmission
+
+            if not isinstance(retained_admission, RetainedAdmission):
+                raise ValueError("retained source requires a typed complete coverage admission")
+            retained_admission.validate(sender, request_id, params, prompt_len, "send")
+            if retirement_watchdog is None:
+                raise ValueError("retained source requires the native retirement watchdog")
+        self._enforce_physical_ownership = (
+            retained_admission is not None
+            or Sender.ownership_enabled(
+                sender, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+            )
         )
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
@@ -2403,6 +2599,8 @@ class TxSession(TxSessionBase):
         # Must be last: makes session visible to listener thread,
         # so all attributes above must be initialized first.
         try:
+            if retained_admission is not None:
+                retained_admission.install(self)
             self._sender.setup_session(self)
         except Exception:
             with self._sender._sessions_lock:
@@ -2553,6 +2751,11 @@ class TxSession(TxSessionBase):
             )
             task._unique_rid = self.disagg_request_id
             task._enforce_physical_ownership = self._enforce_physical_ownership
+            retained_plans = getattr(self, "_retained_coverage_by_rank", None)
+            if retained_plans is not None:
+                task._retained_coverage_by_rank = retained_plans
+                task._retained_native_registrar = self._sender._registrar
+                task._retained_admission = self._retained_admission
             task.bind_logical_outcomes(self._logical_outcomes)
             self.kv_tasks.append(task)
             self._has_last_slice |= chunk.is_last
@@ -3072,12 +3275,15 @@ class Receiver(ReceiverBase):
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
         context_first_ownership: bool = False,
+        retained_profile=None,
     ):
         self._registrar = peer_registrar
         self._agent = agent
         self._enforce_physical_ownership = enforce_physical_ownership
         self._context_first_ownership = context_first_ownership
+        self._retained_profile = retained_profile
         self._retirement_watchdog = retirement_watchdog
+        self._retained_request_ids: set[int] = set()
         self._dealers = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
@@ -3181,8 +3387,25 @@ class Receiver(ReceiverBase):
             with self._sessions_lock:
                 if self._shutdown:
                     raise RuntimeError("cannot create an RxSession after Receiver shutdown")
+                if rx_session.disagg_request_id in getattr(self, "_retained_request_ids", ()):
+                    raise RuntimeError("cannot reuse a retained native receive claim ID")
+                if (
+                    getattr(rx_session, "_enforce_physical_ownership", False)
+                    and rx_session.disagg_request_id in self._sessions
+                ):
+                    # Replacing the root would orphan the original destination
+                    # while remote writers may still access its pages. Match
+                    # Sender's owned-session admission rule under this lock.
+                    raise RuntimeError("cannot replace an owned RxSession")
                 if getattr(rx_session, "_enforce_physical_ownership", False):
                     self._sessions[rx_session.disagg_request_id] = rx_session
+                    if _retained_metadata(rx_session, "_retained_admission") is not None:
+                        if len(self._retained_request_ids) >= 65536:
+                            self._sessions.pop(rx_session.disagg_request_id, None)
+                            raise RuntimeError(
+                                "retained native receive ID budget exhausted; restart engine generation"
+                            )
+                        self._retained_request_ids.add(rx_session.disagg_request_id)
                 else:
                     self._sessions[rx_session.disagg_request_id] = weakref.ref(rx_session)
                 if rx_session.disagg_request_id in self._pre_cancelled_rids:
@@ -3243,6 +3466,14 @@ class Receiver(ReceiverBase):
             aux_slot=task._aux_slot,
             slice_id=task.slice_id,
             context_first=task._params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST,
+            retained_proofs=(
+                None
+                if getattr(task, "_retained_admission", None) is None
+                else {
+                    plan.binding.source_rank: plan.digest
+                    for plan in task._retained_admission.selected_plans
+                }
+            ),
         )
 
     def dispatch_task(self, task: KVRecvTask) -> None:
@@ -3255,6 +3486,7 @@ class Receiver(ReceiverBase):
         protected_context_first = (
             task._enforce_physical_ownership
             and getattr(self, "_context_first_ownership", False)
+            and getattr(task, "_retained_admission", None) is None
             and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
         )
         try:
@@ -3376,6 +3608,13 @@ class Receiver(ReceiverBase):
             return
 
         peer_ranks = list(peer_overlap.ranks)
+        retained_plans = _retained_metadata(session, "_retained_coverage_expected_writers")
+        if retained_plans is not None and (
+            sender_dp_rank is None or set(peer_ranks) != set(retained_plans)
+        ):
+            raise PeerIncompatibleError(
+                "native writer cohort differs from retained coverage certificate"
+            )
         published_writers: set[int] = set()
         published_writer_timestamps: Optional[
             list[tuple[int, disagg_diagnostics.DiagnosticTimestamp]]
@@ -3525,9 +3764,18 @@ class Receiver(ReceiverBase):
                 [rank_info.instance_name.encode(), str(rank_info.instance_rank).encode("ascii")]
             )
         sent = set()
+        proofs = {}
+        plans = _retained_metadata(session, "_retained_coverage_expected_writers")
+        if plans is not None:
+            for rank, plan in plans.items():
+                from .rank_info import RankInfo
+
+                info = RankInfo.from_bytes(plan.source_rank_info_bytes)
+                proofs[info.sender_endpoints[rank]] = plan.digest
         for endpoint in sender_endpoints:
             try:
-                self._get_or_connect_dealer(endpoint).send(message)
+                frame = message if plans is None else [*message, proofs[endpoint].encode("ascii")]
+                self._get_or_connect_dealer(endpoint).send(frame)
                 sent.add(endpoint)
             except Exception as e:
                 logger.warning(f"send_cancel_to_senders: failed for rid={unique_rid}: {e}")
@@ -3571,6 +3819,9 @@ class Receiver(ReceiverBase):
         peer_rank, unique_rid = int(message[1]), int(message[2])
         session = self._get_session(unique_rid)
         if session is not None and session._enforce_physical_ownership:
+            proof = message[3] if len(message) == 4 else None
+            if not _retained_frame_matches(session, peer_rank, proof):
+                return
             session.process_session_quiesced(peer_rank)
 
     def _handle_cancel_session(self, message: list[bytes]):
@@ -3579,6 +3830,20 @@ class Receiver(ReceiverBase):
         with self._sessions_lock:
             session_entry = self._sessions.get(unique_rid)
             session = self._resolve_session_entry(unique_rid, session_entry)
+            plans = _retained_metadata(session, "_retained_coverage_expected_writers")
+            if plans is not None:
+                if len(message) != 5:
+                    return
+                peer_rank = int(message[3])
+                plan = plans.get(peer_rank)
+                if (
+                    plan is None
+                    or message[2].decode() != plan.binding.source_instance
+                    or not _retained_frame_matches(session, peer_rank, message[4])
+                ):
+                    return
+            elif len(message) == 5:
+                return
             if session is None:
                 # Parked with the peer as who asked: the session built afterwards reads its
                 # cancellation from here, and an id on its own would read as a local cancel.
@@ -3595,7 +3860,7 @@ class Receiver(ReceiverBase):
                 f"_process_kv_agent_result: unexpected msg_type={message[0]!r}, expected KV_AGENT_RESULT"
             )
             return
-        if len(message) != 3:
+        if len(message) not in (3, 4):
             logger.error("_process_kv_agent_result: malformed KV result, dropping")
             return
         peer_rank, unique_rid, receiver_slice_id, is_last_slice, status_code, transfer_size = (
@@ -3603,6 +3868,10 @@ class Receiver(ReceiverBase):
         )
         kv_result_report_token = message[2]
         session = self._get_session(unique_rid)
+        proof = message[3] if len(message) == 4 else None
+        if session is not None and not _retained_frame_matches(session, peer_rank, proof):
+            logger.warning("Discarding KV result outside retained generation/claim/peer binding")
+            return
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
             with disagg_diagnostics.suppress_diagnostic_errors():
                 diagnostic_result = _AGENT_RESULT_BY_CODE.get(status_code)
@@ -3690,12 +3959,27 @@ class RxSession(RxSessionBase):
         prompt_len: Optional[int] = None,
         *,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        retained_admission=None,
     ):
         super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        self._enforce_physical_ownership = Receiver.ownership_enabled(
-            receiver, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        self._retained_admission = retained_admission
+        if retained_admission is not None:
+            from .retained_profile import RetainedAdmission
+
+            if not isinstance(retained_admission, RetainedAdmission):
+                raise ValueError(
+                    "retained destination requires a typed complete coverage admission"
+                )
+            retained_admission.validate(receiver, request_id, params, prompt_len, "receive")
+            if retirement_watchdog is None:
+                raise ValueError("retained destination requires the native retirement watchdog")
+        self._enforce_physical_ownership = (
+            retained_admission is not None
+            or Receiver.ownership_enabled(
+                receiver, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+            )
         )
         self._receiver: Receiver  # narrow base class type for Pylance
         self.request_id = request_id
@@ -3743,6 +4027,8 @@ class RxSession(RxSessionBase):
             else None
         )
         try:
+            if retained_admission is not None:
+                retained_admission.install(self)
             self._receiver.setup_session(self)
         except Exception:
             if self._aux_physical_owner is not None:
@@ -3986,6 +4272,10 @@ class RxSession(RxSessionBase):
         self, chunk: Chunk, expected_write_bytes: Optional[int] = None
     ) -> Optional[KVRecvTask]:
         """Create an unpublished task under the cancellation linearization lock."""
+        if _retained_metadata(self, "_retained_coverage_expected_writers") is not None:
+            from .retained_coverage import check_destination_publication
+
+            check_destination_publication(self, chunk, expected_write_bytes)
         with self.lock:
             if self._closed or self._terminal_status is not None:
                 return None
@@ -4000,6 +4290,7 @@ class RxSession(RxSessionBase):
             )
             task.bind_logical_outcomes(self._logical_outcomes)
             task._enforce_physical_ownership = self._enforce_physical_ownership
+            task._retained_admission = self._retained_admission
             task.begin_publication()
             self._kv_tasks.append(task)
             if self._retirement is not None and chunk.is_last:
@@ -4081,6 +4372,26 @@ class RxSession(RxSessionBase):
                     f"KV result for request {self.request_id} slice={receiver_slice_id} "
                     f"does not match the report token published for writer {peer_rank}"
                 )
+            retained_plans = _retained_metadata(self, "_retained_coverage_expected_writers")
+            if retained_plans is not None and status == AgentResult.SUCCESS:
+                from .retained_coverage import check_completed_writer
+
+                try:
+                    check_completed_writer(
+                        retained_plans,
+                        self.disagg_request_id,
+                        peer_rank,
+                        receiver_slice_id,
+                        is_last_slice,
+                        transfer_size,
+                    )
+                except Exception as error:
+                    # A wrong/partial success is not proof that all future
+                    # accesses ceased. Quarantine the existing native owner;
+                    # logical failure never frees these published pages.
+                    task.fail(error)
+                    self._record_ownership_evidence_error(error)
+                    raise
             if status not in (
                 AgentResult.SUCCESS,
                 AgentResult.FAILED,
@@ -4629,6 +4940,7 @@ class TransferWorkerConfig:
     tx_overall_timeout_s: Optional[float] = None
     enforce_physical_ownership: bool = False
     context_first_ownership: bool = False
+    retained_profile: object = None
     # Internal activation gate: only the qualified containment policy supplies it.
     quiescence_fatal_callback: Optional[Callable[[QuiescenceFatalEvent], None]] = None
     # C++ transfer-agent bounce buffer size in MiB
@@ -4643,9 +4955,19 @@ class TransferWorkerConfig:
 class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
         self._config = config
+        if config.retained_profile is not None:
+            from .retained_profile import RetainedLocalProfile
+
+            if not isinstance(config.retained_profile, RetainedLocalProfile):
+                raise ValueError("retained worker requires a validated local native profile")
+            config.retained_profile.check_manager(config.kv_cache_manager)
         self._retirement_watchdog = None
         if config.quiescence_fatal_callback is not None:
-            if not (config.enforce_physical_ownership or config.context_first_ownership):
+            if not (
+                config.enforce_physical_ownership
+                or config.context_first_ownership
+                or config.retained_profile is not None
+            ):
                 raise ValueError("deadline retirement requires physical ownership")
             for timeout in (config.tx_overall_timeout_s, config.rx_timeout_s):
                 if timeout is None or not math.isfinite(timeout) or timeout <= 0:
@@ -4792,6 +5114,7 @@ class TransferWorker:
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
                 context_first_ownership=self._config.context_first_ownership,
+                retained_profile=self._config.retained_profile,
             )
             self._receiver = Receiver(
                 self._peer_registrar,
@@ -4799,6 +5122,7 @@ class TransferWorker:
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
                 context_first_ownership=self._config.context_first_ownership,
+                retained_profile=self._config.retained_profile,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint

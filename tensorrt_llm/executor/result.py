@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import asyncio
 import dataclasses
@@ -602,7 +614,9 @@ class GenerationResultBase:
 
             self._outputs[
                 0].request_perf_metrics = response.request_perf_metrics
-            if not self._outputs[0].disaggregated_params:
+            if (not self._outputs[0].disaggregated_params or
+                (response.disaggregated_params is not None and
+                 response.disaggregated_params.retained_prefix is not None)):
                 disaggregated_params = response.disaggregated_params
 
                 # Generation only response has no disaggregated_params attached
@@ -677,6 +691,12 @@ class GenerationResultBase:
                     self._disaggregated_params or DisaggregatedParams(),
                     ctx_usage=ctx_usage,
                 )
+            retained_prefix = getattr(response_result, "retained_prefix", None)
+            if retained_prefix is not None:
+                self._disaggregated_params = dataclasses.replace(
+                    self._disaggregated_params or DisaggregatedParams(),
+                    retained_prefix=retained_prefix,
+                )
             if context_phase_params is not None:
                 existing_disagg_params = self.disaggregated_params
                 remote_tail_start = getattr(response_result,
@@ -687,6 +707,7 @@ class GenerationResultBase:
                 self._disaggregated_params = dataclasses.replace(
                     existing_disagg_params or DisaggregatedParams(),
                     request_type="context_only",
+                    retained_prefix=None,
                     first_gen_tokens=[] if remote_tail_start is not None else
                     context_phase_params.first_gen_tokens,
                     ctx_request_id=context_phase_params.req_id,
@@ -1152,7 +1173,9 @@ class GenerationResult(GenerationResultBase):
         )
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
-        self._disaggregated_params = disaggregated_params
+        self._disaggregated_params = (dataclasses.replace(
+            disaggregated_params, retained_prefix=None) if disaggregated_params
+                                      is not None else None)
         # minimal sampling params needed for logprob calculation
         self._logprob_params = logprob_params
         self.trace_headers = generation_request.trace_headers
