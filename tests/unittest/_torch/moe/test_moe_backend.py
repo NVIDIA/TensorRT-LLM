@@ -4369,8 +4369,8 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
 def test_sm107_kimi_k3_genphase_tactics_take_precedence() -> None:
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
-    def k3_key(world_size: int, max_tokens_per_rank: int) -> tuple:
-        return megamoe_op._megamoe_problem_key(
+    def k3_key(world_size: int, max_tokens_per_rank: int, **overrides) -> tuple:
+        fields = dict(
             sm_version=107,
             world_size=world_size,
             num_topk=16,
@@ -4387,9 +4387,10 @@ def test_sm107_kimi_k3_genphase_tactics_take_precedence() -> None:
             in_kernel_fc2_reduce=False,
             combine_format="bf16",
         )
+        fields.update(overrides)
+        return megamoe_op._megamoe_problem_key(**fields)
 
     table = megamoe_op._SM107_KIMI_K3_GENPHASE_TACTICS
-    assert len(table) == 1
     for key, tactic in table.items():
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=107)
         assert key == k3_key(key[1], key[7])
@@ -4402,6 +4403,27 @@ def test_sm107_kimi_k3_genphase_tactics_take_precedence() -> None:
         assert megamoe_op._default_megamoe_tactic_for_key(
             k3_key(4, bucket), num_tokens=bucket
         ) == megamoe_op._unpack_tactic(megamoe_op._SM107_GENPHASE_TACTICS[bucket])
+
+    # Keys next to the 512 entry keep the default they had without the K3 table.
+    for key in (
+        k3_key(8, 512),
+        k3_key(4, 448),
+        k3_key(4, 512, combine_format="32e4m3xe8m0"),
+        k3_key(4, 512, helper_expert_count=8),
+        k3_key(4, 512, apply_topk_in_fc1=True),
+    ):
+        assert key not in table
+        assert megamoe_op._default_megamoe_tactic_for_key(
+            key, num_tokens=key[7]
+        ) == megamoe_op._default_megamoe_tactic_for_problem(
+            sm_version=key[0],
+            max_tokens_per_rank=key[7],
+            num_tokens=key[7],
+            apply_topk_in_fc1=key[9],
+            in_kernel_fc2_reduce=key[13],
+            combine_format=key[14],
+            shape_tuned_tactic=megamoe_op._SM107_DSV4_PRO_DEFAULT_TACTICS.get(key),
+        )
 
 
 @pytest.mark.gpu
