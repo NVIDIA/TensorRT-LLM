@@ -237,7 +237,7 @@ class _StopLauncher(Exception):
 
 def _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generation_servers):
     """Run the real disaggregated_mpi_worker up to the rank-communicator split."""
-    from tensorrt_llm.commands import serve
+    from tensorrt_llm.commands.serve_cli import disaggregated as serve
 
     config = tmp_path / "disagg.yaml"
     config.write_text(

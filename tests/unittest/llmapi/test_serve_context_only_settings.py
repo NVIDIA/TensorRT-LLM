@@ -36,6 +36,7 @@ import yaml
 from click.testing import CliRunner
 
 from tensorrt_llm.commands import serve
+from tensorrt_llm.commands.serve_cli import disaggregated as disagg
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
 
@@ -198,7 +199,7 @@ def test_a_disaggregated_mpi_worker_takes_its_role_from_the_server_type(
     config = SimpleNamespace(
         server_configs=[server], allow_request_chat_template=False, internal_request_auth_key=None
     )
-    monkeypatch.setattr(serve, "parse_disagg_config_file", lambda path: config)
+    monkeypatch.setattr(disagg, "parse_disagg_config_file", lambda path: config)
     monkeypatch.setenv("TLLM_DISAGG_INSTANCE_IDX", "0")
     real_launch_server = serve.launch_server
     monkeypatch.setattr(
@@ -210,11 +211,11 @@ def test_a_disaggregated_mpi_worker_takes_its_role_from_the_server_type(
 
     if refused:
         with pytest.raises(click.BadParameter, match="dwdp_config.enable_dense is for context"):
-            serve._launch_disaggregated_server("unused.yaml", llm_args)
+            disagg._launch_disaggregated_server("unused.yaml", llm_args)
         launch.assert_not_called()
     else:
         with pytest.raises(_LlmBuilt):
-            serve._launch_disaggregated_server("unused.yaml", llm_args)
+            disagg._launch_disaggregated_server("unused.yaml", llm_args)
     assert len(_dense_warnings(warnings)) == int(warned)
 
 
@@ -275,22 +276,22 @@ def test_a_disaggregated_mpi_launch_refuses_generation_servers_on_every_rank(
     path.write_text(yaml.safe_dump(config))
     monkeypatch.delenv("TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT", raising=False)
     monkeypatch.setattr(
-        serve._command_telemetry,
+        disagg._command_telemetry,
         "apply_disaggregated_telemetry_config",
         lambda *args, **kwargs: None,
     )
     set_cuda_device = Mock(side_effect=_PastTheCheck)
-    monkeypatch.setattr(serve, "set_cuda_device", set_cuda_device)
+    monkeypatch.setattr(disagg, "set_cuda_device", set_cuda_device)
 
     if refused:
         with pytest.raises(click.BadParameter, match="Set it under context_servers only"):
-            serve.disaggregated_mpi_worker.callback(
+            disagg.disaggregated_mpi_worker.callback(
                 config_file=str(path), log_level="info", telemetry=False
             )
         set_cuda_device.assert_not_called()
     else:
         with pytest.raises(_PastTheCheck):
-            serve.disaggregated_mpi_worker.callback(
+            disagg.disaggregated_mpi_worker.callback(
                 config_file=str(path), log_level="info", telemetry=False
             )
 

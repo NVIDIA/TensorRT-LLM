@@ -21,7 +21,6 @@ import json
 import os
 import signal
 import socket
-import subprocess  # nosec B404
 import sys
 import tempfile
 import warnings
