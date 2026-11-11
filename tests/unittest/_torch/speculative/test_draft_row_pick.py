@@ -28,7 +28,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
-from tensorrt_llm._torch.speculative.mtp import draft_layer_picks_rows
+from tensorrt_llm._torch.speculative.interface import DraftRowPick, draft_layer_picks_rows
+from tensorrt_llm._torch.speculative.mtp import MTPWorker
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -44,6 +45,7 @@ class _Meta:
         self._seq_lens_cuda = self._seq_lens.cuda()
         self.kv_lens_cuda = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
         self.num_contexts = num_contexts
+        self.num_seqs = len(seq_lens)
         self.num_ctx_tokens = int(sum(seq_lens[:num_contexts]))
         self.kv_cache_manager = None
         self.enable_flash_mla = False
@@ -75,6 +77,7 @@ class _DraftAttnLayer(nn.Module):
         self.kv_writes = []  # every row the attention saw, per call
         self.post_rows = []  # rows the post-attention part ran on, per call
         self.inputs = []  # hidden input rows, per call
+        self.all_rank_num_tokens = []  # the all_rank_num_tokens argument, per call
 
     def _attention(self, input_ids, position_ids, hidden_states):
         x = (
@@ -92,7 +95,9 @@ class _DraftAttnLayer(nn.Module):
         return y / y.norm(dim=-1, keepdim=True)
 
     def shared_head(self, hidden_states, lm_head, attn_metadata, return_context_logits=False):
-        assert return_context_logits
+        if not return_context_logits:  # the request's last row, as DeepseekV3MTPHead
+            last = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            hidden_states = hidden_states[last]
         return hidden_states @ self.head
 
 
@@ -111,6 +116,7 @@ class _PickingMtpLayer(_DraftAttnLayer):
         pick_rows=None,
     ):
         self.inputs.append(hidden_states.clone())
+        self.all_rank_num_tokens.append(all_rank_num_tokens)
         attn_out, residual = self._attention(input_ids, position_ids, hidden_states)
         if pick_rows is not None:
             attn_out, residual = attn_out[pick_rows], residual[pick_rows]
@@ -133,6 +139,7 @@ class _PlainMtpLayer(_DraftAttnLayer):
     ):
         assert "pick_rows" not in kwargs
         self.inputs.append(hidden_states.clone())
+        self.all_rank_num_tokens.append(all_rank_num_tokens)
         attn_out, residual = self._attention(input_ids, position_ids, hidden_states)
         return self._post(attn_out, residual)
 
@@ -167,6 +174,7 @@ class _Eagle3Model(_DraftAttnLayer):
     ):
         assert pick_rows is None or self.supports_pick_rows
         self.inputs.append(hidden_states.clone())
+        self.all_rank_num_tokens.append(all_rank_num_tokens)
         attn_out, residual = self._attention(input_ids, position_ids, hidden_states)
         if pick_rows is not None:
             attn_out, residual = attn_out[pick_rows], residual[pick_rows]
@@ -185,8 +193,7 @@ def _worker(is_mtp_eagle, fast_paths):
     w.draft_head = None
     w._d2t = None
     w._draft_folds_kv_lens_increment = False
-    w._step0_picks_rows = False
-    w._step0_picks_rows_for = None
+    w._step0_row_pick = DraftRowPick("test draft layer")
     w.draft_kv_cache_context = lambda md, mgr: contextlib.nullcontext(md)
     w.sample_draft_tokens = (
         lambda logits,
@@ -198,7 +205,9 @@ def _worker(is_mtp_eagle, fast_paths):
     return w
 
 
-def _run_loop(layer, is_mtp_eagle, fast_paths, num_contexts, num_gens, k, seed):
+def _run_loop(
+    layer, is_mtp_eagle, fast_paths, num_contexts, num_gens, k, seed, all_rank=None, subseq=None
+):
     g = torch.Generator().manual_seed(seed)
     ctx_lens = torch.randint(2, 9, (num_contexts,), generator=g).tolist()
     seq_lens = ctx_lens + [k + 1] * num_gens
@@ -223,8 +232,8 @@ def _run_loop(layer, is_mtp_eagle, fast_paths, num_contexts, num_gens, k, seed):
         runtime_draft_len=k,
         batch_indices_cuda=torch.arange(b, dtype=torch.int32, device="cuda"),
         wants_advanced_draft_sampling=False,
-        all_rank_num_tokens=None,
-        subseq_all_rank_num_tokens=None,
+        all_rank_num_tokens=all_rank,
+        subseq_all_rank_num_tokens=subseq,
         max_num_requests=b,
     )
     inputs["spec_metadata"] = spec_metadata
@@ -251,7 +260,7 @@ def _run_loop(layer, is_mtp_eagle, fast_paths, num_contexts, num_gens, k, seed):
         pre_draft_seq_lens=md._seq_lens_cuda.clone(),
     )
     torch.cuda.synchronize()
-    return tokens, md.kv_lens_cuda.clone(), worker._step0_picks_rows
+    return tokens, md.kv_lens_cuda.clone(), worker._step0_row_pick._picks_rows
 
 
 def _compare(ref_layer, ref, layer, out, b, n_rows):
@@ -309,6 +318,121 @@ def test_layer_without_pick_support_is_unaffected(layer_cls):
     n_rows = ref_layer.kv_writes[0].shape[0]
     assert not _compare(ref_layer, ref, layer, out, num_contexts + num_gens, n_rows)
     assert layer.post_rows == ref_layer.post_rows
+
+
+@pytest.mark.parametrize("is_mtp_eagle", [True, False])
+@pytest.mark.parametrize("picking", [True, False])
+def test_step0_pick_uses_per_request_counts_under_attention_dp(is_mtp_eagle, picking):
+    """Attention DP: a picked step 0 hands the layer the per-request counts
+    (``subseq_all_rank_num_tokens``, the counts of its post-attention rows);
+    an unpicked one the full step-0 counts. Later steps always get the
+    per-request counts."""
+    num_contexts, num_gens, k = 2, 3, 3
+    b = num_contexts + num_gens
+    full_counts, per_request_counts = [101, 202], [5, 6]
+    if is_mtp_eagle:
+        layer = _PickingMtpLayer(seed=7) if picking else _PlainMtpLayer(seed=7)
+    else:
+        layer = _Eagle3Model(seed=11, supports=picking)
+    _, _, picked = _run_loop(
+        layer, is_mtp_eagle, False, num_contexts, num_gens, k, 3, full_counts, per_request_counts
+    )
+    assert picked == picking
+    step0 = per_request_counts if picking else full_counts
+    assert layer.all_rank_num_tokens == [step0] + [per_request_counts] * (k - 1)
+    assert layer.post_rows[0] == (b if picking else layer.kv_writes[0].shape[0])
+
+
+def test_step0_pick_requires_per_request_counts_with_attention_dp():
+    with pytest.raises(AssertionError):
+        _run_loop(_PickingMtpLayer(seed=7), True, False, 2, 3, 3, 3, [101, 202], None)
+
+
+def _mtp_worker(mapping=None):
+    """An ``MTPWorker`` whose steps around the draft loop are stubbed out."""
+    w = object.__new__(MTPWorker)
+    w.guided_decoder = None
+    w.sa_enhancer = None
+    w.mapping = mapping
+    w._auxiliary_state_handlers = []
+    w._row_pick = DraftRowPick("test MTP layers")
+    w._execute_guided_decoder_if_present = lambda logits: None
+    w._commit_target_mamba_states = lambda *args: None
+    w.update_mtp_hidden_states = lambda **kwargs: None
+    w.change_attn_metadata = lambda *args: None
+    w.get_draft_kv_cache_manager = lambda resource_manager: None
+    w.draft_kv_cache_context = lambda md, mgr: contextlib.nullcontext(md)
+    w._restore_attn_metadata_from_spec_dec = lambda md: None
+    w._prepare_next_new_tokens = lambda *args: None
+    w.sample_draft_tokens = lambda logits, spec_metadata, batch_size, draft_step: logits.argmax(
+        -1
+    ).to(torch.int32)
+    return w
+
+
+def _run_mtp_worker(layer_cls, mapping=None, num_contexts=2, num_gens=3, k=3, seed=9):
+    """``MTPWorker.forward``'s draft loop over ``k`` MTP layers, in the
+    layout after ``change_attn_metadata`` (``k`` rows per generation)."""
+    g = torch.Generator().manual_seed(seed)
+    seq_lens = torch.randint(2, 9, (num_contexts,), generator=g).tolist() + [k] * num_gens
+    b, n = num_contexts + num_gens, sum(seq_lens)
+    md = _Meta(seq_lens, num_contexts, [60] * b)
+    layers = [layer_cls(seed=100 + i) for i in range(k)]
+    draft_inputs = {
+        "input_ids": torch.randint(0, VOCAB, (n,), generator=g, dtype=torch.int32).cuda(),
+        "position_ids": torch.randint(0, 1000, (n,), generator=g, dtype=torch.int32).cuda(),
+        "hidden_states": torch.randn(n, H, generator=g).cuda(),
+        "attn_metadata": md,
+    }
+    accepted = torch.randint(0, VOCAB, (b, k + 1), generator=g, dtype=torch.int32).cuda()
+    num_acc = torch.ones(b, dtype=torch.int32, device="cuda")
+    worker = _mtp_worker(mapping)
+    worker.sample_and_accept_draft_tokens = lambda *args: (accepted, num_acc)
+    worker.prepare_drafter_inputs = lambda **kwargs: draft_inputs
+    out = worker._forward_impl(
+        draft_inputs["input_ids"],
+        draft_inputs["position_ids"],
+        draft_inputs["hidden_states"],
+        torch.zeros(b, VOCAB, device="cuda"),
+        md,
+        SimpleNamespace(runtime_draft_len=k, batch_indices_cuda=None),
+        SimpleNamespace(mtp_layers=layers, embed_tokens=None, lm_head=None),
+    )
+    torch.cuda.synchronize()
+    return out["next_draft_tokens"], layers, worker._row_pick._picks_rows, b, n
+
+
+def test_mtp_worker_layers_pick_matches_full():
+    """Vanilla MTP: every MTP layer runs after attention only on each
+    request's last row; draft tokens and every layer's carried hidden input
+    match, and each layer's attention still sees (and writes) every row."""
+    ref_tokens, ref_layers, ref_picked, b, n = _run_mtp_worker(_PlainMtpLayer)
+    tokens, layers, picked, _, _ = _run_mtp_worker(_PickingMtpLayer)
+    assert picked and not ref_picked
+    assert torch.equal(tokens, ref_tokens)
+    for layer, ref_layer in zip(layers, ref_layers):
+        assert layer.post_rows == [b] and ref_layer.post_rows == [n]
+        assert [x.shape[0] for x in layer.kv_writes] == [n]
+        torch.testing.assert_close(layer.inputs[0], ref_layer.inputs[0], rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(layer.kv_writes[0], ref_layer.kv_writes[0], rtol=1e-5, atol=1e-5)
+
+
+def test_mtp_worker_declines_pick_under_attention_dp():
+    adp = SimpleNamespace(enable_attention_dp=True, cp_size=1)
+    tokens, layers, picked, b, n = _run_mtp_worker(_PickingMtpLayer, mapping=adp)
+    ref_tokens, _, _, _, _ = _run_mtp_worker(_PlainMtpLayer)
+    assert not picked
+    assert all(layer.post_rows == [n] for layer in layers)
+    assert torch.equal(tokens, ref_tokens)
+
+
+def test_draft_row_pick_resolves_again_on_class_change():
+    resolver = DraftRowPick("test")
+    assert resolver.resolve([_PickingMtpLayer(0)])
+    assert not resolver.resolve([_OverridingMtpLayer(0)])
+    assert resolver.resolve([_PickingMtpLayer(0)])
+    assert not resolver.resolve([_PickingMtpLayer(0), _PlainMtpLayer(0)])
+    assert not DraftRowPick("test").resolve([_PickingMtpLayer(0)], decline="attention DP")
 
 
 def test_draft_layer_picks_rows_gates(monkeypatch):
@@ -470,5 +594,5 @@ def test_eagle3_decoder_layer_pick_rows():
     torch.testing.assert_close(picked_save, full_save[pick], rtol=1e-5, atol=1e-5)
     assert seen == {"attn": [n, n], "mlp": [n, pick.numel()]}
     model.supports_pick_rows = False
-    with pytest.raises(ValueError):
+    with pytest.raises(AssertionError):
         Eagle3DraftModel.forward(model, pick_rows=pick, **kwargs)

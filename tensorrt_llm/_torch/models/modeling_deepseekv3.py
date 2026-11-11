@@ -1742,7 +1742,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
 
 class DeepseekV3MTP(DeepseekV3DecoderLayer):
-    # forward takes ``pick_rows`` (see speculative.mtp.draft_layer_picks_rows).
+    # forward takes ``pick_rows`` (see speculative.interface.draft_layer_picks_rows).
     supports_pick_rows = True
 
     def __init__(self,

@@ -893,7 +893,7 @@ class Eagle3DraftModel(DecoderModel):
                 use_mla=use_mla,
                 aux_stream=self.aux_stream,
             )
-        # forward takes ``pick_rows`` (see speculative.mtp.
+        # forward takes ``pick_rows`` (see speculative.interface.
         # draft_layer_picks_rows) with one decoder layer: a later layer's
         # attention would need every row.
         self.supports_pick_rows = self.num_layers == 1
@@ -959,8 +959,10 @@ class Eagle3DraftModel(DecoderModel):
         ``supports_pick_rows``): the layer's attention runs on every input row,
         everything after it on ``pick_rows`` only, so both outputs have
         ``len(pick_rows)`` rows."""
-        if pick_rows is not None and not self.supports_pick_rows:
-            raise ValueError("pick_rows needs a single draft decoder layer")
+        # The worker passes pick_rows only when supports_pick_rows: a second
+        # decoder layer's attention would need every row.
+        assert pick_rows is None or self.supports_pick_rows, (
+            "pick_rows needs a single draft decoder layer")
         # When ``all_rank_num_tokens`` is supplied the caller wants this draft
         # forward to run with a different attention-DP token distribution
         # (e.g. the worker's per-step value); restore the original on exit so

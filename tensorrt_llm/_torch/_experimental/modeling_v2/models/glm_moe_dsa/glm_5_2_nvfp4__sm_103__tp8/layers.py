@@ -900,6 +900,9 @@ class GlmDecoderLayer(_AdoptedLayerMixin, _PostAttentionHopMixin, DeepseekV3Deco
 class GlmMtpLayer(_AdoptedLayerMixin, _PostAttentionHopMixin, DeepseekV3MTP):
     """The draft layer: the built-in MTP layer, with the target's decode composition."""
 
+    # Step 0 keeps only the live rows through its own hop (arm_live_rows below), not the
+    # built-in pick_rows argument.
+    supports_pick_rows = False
     # The draft front packs this rank's chunk of the projection input; None keeps the
     # built-in norms and concatenation.
     draft_front = None

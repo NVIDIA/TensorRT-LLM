@@ -24,9 +24,10 @@ from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .fused_accept import step0_epilogue, step0_gather_ids
-from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
-                        SpecWorkerBase, supports_sharded_target_sampling)
-from .mtp import _select_mtp_position_ids, draft_layer_picks_rows
+from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, DraftRowPick,
+                        SpecMetadata, SpecWorkerBase,
+                        supports_sharded_target_sampling)
+from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 
@@ -500,10 +501,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # deferred kv_lens increment itself.
         self._draft_folds_kv_lens_increment = False
         # Whether the draft layer runs its post-attention part on step 0 only
-        # on the rows the loop reads (see draft_layer_picks_rows), and the
-        # draft layer class that was resolved for.
-        self._step0_picks_rows = False
-        self._step0_picks_rows_for = None
+        # on the rows the loop reads (see draft_layer_picks_rows).
+        self._step0_row_pick = DraftRowPick("Draft step 0 layer")
         # MXFP8 copy of the LM head for greedy draft tokens (MTP Eagle), set
         # by the model once its weights are loaded.
         self.draft_head = None
@@ -520,23 +519,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             and draft_model.folds_kv_lens_increment)
 
     def _step0_draft_layer_picks_rows(self, draft_model) -> bool:
-        """Whether the draft layer of step 0 takes ``pick_rows``. Resolved
-        again whenever the layer's class changes (a model may re-class its
-        draft layer after ``set_draft_model``)."""
+        """Whether the draft layer of step 0 takes ``pick_rows`` (see
+        draft_layer_picks_rows)."""
         if self.is_mtp_eagle:
             mtp_layers = getattr(draft_model, "mtp_layers", None)
             draft_layer = mtp_layers[0] if mtp_layers else None
         else:
             draft_layer = getattr(draft_model, "model", None)
-        if type(draft_layer) is not self._step0_picks_rows_for:
-            self._step0_picks_rows_for = type(draft_layer)
-            self._step0_picks_rows = draft_layer_picks_rows(
-                draft_layer, self.mapping)
-            logger.info(f"Draft step 0 runs {type(draft_layer).__name__} "
-                        "after attention on " +
-                        ("one row per request" if self.
-                         _step0_picks_rows else "every row"))
-        return self._step0_picks_rows
+        return self._step0_row_pick.resolve([draft_layer], self.mapping)
 
     @property
     def max_draft_len(self) -> int:
@@ -935,15 +925,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # reads (step 0's gather ids) are known before the forward, and
                 # the layer runs everything after its attention on them only.
                 # Under attention DP every rank makes the same decision (it
-                # depends on the model and the metadata kind only), and the
-                # post-attention collectives get the per-request counts the
-                # later steps use.
+                # depends on the model only), and the post-attention
+                # collectives get the per-request counts the later steps use.
                 pick_rows = None
-                if (i == 0 and self._step0_draft_layer_picks_rows(draft_model)
-                        and
-                    (spec_metadata.all_rank_num_tokens is None
-                     or getattr(spec_metadata, "subseq_all_rank_num_tokens",
-                                None) is not None)):
+                if i == 0 and self._step0_draft_layer_picks_rows(draft_model):
+                    # set_spec_metadata_all_rank_num_tokens sets both.
+                    assert (spec_metadata.all_rank_num_tokens is None
+                            or spec_metadata.subseq_all_rank_num_tokens
+                            is not None)
                     if use_epilogue:
                         pick_rows = step0_gather_ids(
                             pre_draft_seq_lens, num_accepted_tokens,
@@ -990,8 +979,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                            token_buffer is not None else None,
                                            last_out=token_buffer[0] if
                                            token_buffer is not None else None,
-                                           hidden_rows_picked=pick_rows
-                                           is not None)
+                                           picked_gather_ids=pick_rows)
                     if step0 is None:
                         token_buffer = None  # needs the epilogue's row 0
                 if i == 0 and step0 is not None:

@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import inspect
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, List, Optional
 
@@ -16,7 +14,7 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, SpecWorkerBase
+from .interface import DraftRowPick, SpecMetadata, SpecWorkerBase
 from .sa_enhancer import SADraftEnhancer
 
 if TYPE_CHECKING:
@@ -36,34 +34,6 @@ def _select_mtp_position_ids(position_ids: torch.Tensor,
     if position_ids.dim() == 1:
         return position_ids[token_indices]
     return position_ids[..., token_indices]
-
-
-def draft_layer_picks_rows(layer: Optional[torch.nn.Module],
-                           mapping=None) -> bool:
-    """Whether ``layer`` is fed the rows to keep after its attention.
-
-    A draft layer opts in with ``supports_pick_rows = True`` and a
-    ``pick_rows`` forward argument (``[n]`` indices into its input rows).
-    Given ``pick_rows``, the layer's attention still runs on every input row
-    (writing the draft KV of each of them), and the rest of the layer (the
-    residual, norms, MLP / MoE and final norm, all per-token) runs on those
-    ``n`` rows only, so it returns ``n`` rows: the input rows ``pick_rows``
-    would have selected from the full output. Under attention DP the caller
-    passes the per-rank picked row counts as ``all_rank_num_tokens``, which a
-    supporting layer uses only after the pick.
-
-    Context parallelism (sharded attention outputs) is declined, as is any
-    layer without the attribute or whose ``forward`` does not name
-    ``pick_rows`` (a subclass that overrides ``forward`` without it).
-    ``TLLM_SPEC_DISABLE_DRAFT_ROW_PICK=1`` turns picking off.
-    """
-    if layer is None or not getattr(layer, "supports_pick_rows", False):
-        return False
-    if "pick_rows" not in inspect.signature(type(layer).forward).parameters:
-        return False
-    if mapping is not None and mapping.cp_size > 1:
-        return False
-    return os.environ.get("TLLM_SPEC_DISABLE_DRAFT_ROW_PICK", "0") != "1"
 
 
 class MTPHiddenStatesManager(BaseResourceManager):
@@ -302,10 +272,7 @@ class MTPWorker(SpecWorkerBase):
             model_config, "mapping", None)
         self.is_thop = False
         self._is_mamba_hybrid_cache = None
-        # Whether the MTP layers take ``pick_rows``, and the layer class that
-        # was resolved for.
-        self._picks_rows = False
-        self._picks_rows_for = None
+        self._row_pick = DraftRowPick("MTP layers")
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if spec_config.sa_config is not None:
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
@@ -317,22 +284,12 @@ class MTPWorker(SpecWorkerBase):
     def _mtp_layers_pick_rows(self, draft_model) -> bool:
         """Whether the MTP layers take ``pick_rows`` (see
         draft_layer_picks_rows). Declined under attention DP, where this
-        worker's MTP layers get no per-rank token counts."""
-        mtp_layers = getattr(draft_model, "mtp_layers", None)
-        layer_cls = type(mtp_layers[0]) if mtp_layers else None
-        if layer_cls is not self._picks_rows_for:
-            self._picks_rows_for = layer_cls
-            self._picks_rows = (mtp_layers is not None and all(
-                draft_layer_picks_rows(layer, self.mapping)
-                for layer in mtp_layers)
-                                and not (self.mapping is not None
-                                         and self.mapping.enable_attention_dp))
-            logger.info(
-                f"MTP layers ({getattr(layer_cls, '__name__', None)}) "
-                "run after "
-                "attention on " +
-                ("one row per request" if self._picks_rows else "every row"))
-        return self._picks_rows
+        worker passes the MTP layers no per-rank token counts."""
+        adp = self.mapping is not None and self.mapping.enable_attention_dp
+        return self._row_pick.resolve(list(
+            getattr(draft_model, "mtp_layers", None) or ()),
+                                      self.mapping,
+                                      decline="attention DP" if adp else None)
 
     def _commit_target_mamba_states(
         self,

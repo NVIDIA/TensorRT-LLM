@@ -225,20 +225,25 @@ def _step0_epilogue_kernel(
     BLOCK_C: tl.constexpr,
     BLOCK_H: tl.constexpr,
     LAST: tl.constexpr,
-    PICKED: tl.constexpr,  # hidden row i is request i's row (the draft layer kept only those)
+    # The draft layer kept only the gather-id rows: ``ids_out_ptr`` already holds the ids (read, not
+    # written) and the hidden rows need no gather (``hid_ptr`` / ``hid_out_ptr`` unused).
+    PICKED: tl.constexpr,
 ):
     """One program per request ``i`` (every write is to row ``i`` only; ``seq_lens_ptr`` is never written)."""
     i = tl.program_id(0)
-    gid, acc = _step0_gather_id(
-        seq_lens_ptr, num_accepted_ptr, i, num_contexts, num_ctx_tokens, K, BLOCK_C
-    )
+    if PICKED:
+        gid = tl.load(ids_out_ptr + i)
+        acc = tl.load(num_accepted_ptr + i).to(tl.int64)
+    else:
+        gid, acc = _step0_gather_id(
+            seq_lens_ptr, num_accepted_ptr, i, num_contexts, num_ctx_tokens, K, BLOCK_C
+        )
+        tl.store(ids_out_ptr + i, gid)
+        h = tl.arange(0, BLOCK_H)
+        hm = h < H
+        v = tl.load(hid_ptr + gid * hid_stride + h, mask=hm)
+        tl.store(hid_out_ptr + i.to(tl.int64) * H + h, v, mask=hm)
     dkv = tl.where(i < num_contexts, 1, acc - K)
-    tl.store(ids_out_ptr + i, gid)
-    h = tl.arange(0, BLOCK_H)
-    hm = h < H
-    hid_row = i.to(tl.int64) if PICKED else gid
-    v = tl.load(hid_ptr + hid_row * hid_stride + h, mask=hm)
-    tl.store(hid_out_ptr + i.to(tl.int64) * H + h, v, mask=hm)
     for r in tl.static_range(R):
         p = tl.load(pos_ptr + r * pos_row_stride + gid)
         for j in tl.static_range(1, K):
@@ -284,13 +289,15 @@ def step0_epilogue(
     num_ctx_tokens: int,
     accepted_tokens: Optional[torch.Tensor] = None,
     last_out: Optional[torch.Tensor] = None,
-    hidden_rows_picked: bool = False,
+    picked_gather_ids: Optional[torch.Tensor] = None,
 ) -> Optional[Step0Epilogue]:
     """``seq_lens`` must not alias ``seq_lens_out`` (read the pre-draft-loop copy). With ``accepted_tokens``
     ``[b, >= draft_len + 1]`` and ``last_out`` (contiguous ``[b]``), also ``last_out[i] =
-    accepted_tokens[i, num_accepted[i] - 1]``. ``hidden_rows_picked``: ``hidden_states`` holds only the
-    ``gather_ids`` rows (``[b, H]``, in request order) instead of every input row. Returns None when the
-    shapes are not supported (caller keeps the stock path)."""
+    accepted_tokens[i, num_accepted[i] - 1]``. ``picked_gather_ids`` (the ``step0_gather_ids`` the draft
+    layer was given as ``pick_rows``): ``hidden_states`` holds only those rows (``[b, H]``, in request order),
+    and the result reuses both instead of gathering. Returns None when the shapes are not supported (caller
+    keeps the stock path)."""
+    picked = picked_gather_ids is not None
     if (
         seq_lens.data_ptr() == seq_lens_out.data_ptr()
         or hidden_states.dim() != 2
@@ -301,14 +308,20 @@ def step0_epilogue(
         or draft_len < 1
     ):
         return None
+    if picked:
+        assert hidden_states.shape[0] == batch_size and picked_gather_ids.shape == (batch_size,)
+        assert picked_gather_ids.dtype == torch.int64 and picked_gather_ids.is_contiguous()
     pos2 = position_ids.reshape(-1, position_ids.shape[-1])
     if pos2.dim() != 2 or (pos2.shape[0] > 1 and pos2.stride(0) < pos2.shape[1]):
         return None
     rows = pos2.shape[0]
     h = hidden_states.shape[1]
     dev = hidden_states.device
-    ids = torch.empty((batch_size,), dtype=torch.int64, device=dev)
-    hid = torch.empty((batch_size, h), dtype=hidden_states.dtype, device=dev)
+    if picked:
+        ids, hid = picked_gather_ids, hidden_states
+    else:
+        ids = torch.empty((batch_size,), dtype=torch.int64, device=dev)
+        hid = torch.empty((batch_size, h), dtype=hidden_states.dtype, device=dev)
     pos_all = torch.empty(
         (max(draft_len - 1, 1), rows, batch_size), dtype=position_ids.dtype, device=dev
     )
@@ -343,7 +356,7 @@ def step0_epilogue(
         BLOCK_C=max(16, triton.next_power_of_2(max(num_contexts, 1))),
         BLOCK_H=triton.next_power_of_2(h),
         LAST=last,
-        PICKED=hidden_rows_picked,
+        PICKED=picked,
         num_warps=4,
     )
     return Step0Epilogue(ids, hid, pos_all, tuple(position_ids.shape[:-1]))

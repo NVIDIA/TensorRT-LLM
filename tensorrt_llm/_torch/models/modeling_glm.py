@@ -847,7 +847,7 @@ class Glm4DecoderLayer(DecoderLayer):
 
 
 class Glm4MTP(Glm4DecoderLayer):
-    # forward takes ``pick_rows`` (see speculative.mtp.draft_layer_picks_rows).
+    # forward takes ``pick_rows`` (see speculative.interface.draft_layer_picks_rows).
     supports_pick_rows = True
 
     def __init__(
@@ -913,8 +913,8 @@ class Glm4MTP(Glm4DecoderLayer):
         every input row and the rest of the layer, which is per-token, on
         ``pick_rows`` only; the output then has ``len(pick_rows)`` rows and
         ``all_rank_num_tokens`` counts those rows."""
-        if pick_rows is not None and lora_params is not None:
-            raise ValueError("pick_rows does not support LoRA (per-request row layout)")
+        # LoRA params describe every input row; the draft workers pass none to MTP layers.
+        assert pick_rows is None or lora_params is None, "pick_rows does not support LoRA"
 
         def norm_embeds():
             return self.enorm(embed_tokens(input_ids))  # emdedding
