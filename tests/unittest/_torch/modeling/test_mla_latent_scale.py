@@ -6,11 +6,15 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_deepseekv3 import _MLA_LATENT_SCALE_ENV, _mla_latent_scales
+from tensorrt_llm.quantization.mode import QuantAlgo, QuantMode
 
 pytestmark = pytest.mark.cpu_only
 
 _LATENT_DIM = 512
 _PREFIX = "model.layers.{}.self_attn"
+_NVFP4_KV = QuantMode.from_quant_algo(kv_cache_quant_algo=QuantAlgo.NVFP4)
+_FP8_KV = QuantMode.from_quant_algo(kv_cache_quant_algo=QuantAlgo.FP8)
+_UNQUANTIZED_KV = QuantMode.from_quant_algo()
 
 
 def _checkpoint(layernorm_rms, projection_dtype=torch.bfloat16):
@@ -29,7 +33,7 @@ def _checkpoint(layernorm_rms, projection_dtype=torch.bfloat16):
 def test_scales_bring_the_latent_to_unit_rms(monkeypatch):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "auto")
     weights = _checkpoint([0.004, 0.03, 0.2, 0.8])
-    scales = _mla_latent_scales(weights, kv_cache_quantized=True)
+    scales = _mla_latent_scales(weights, _NVFP4_KV)
     assert scales == {
         _PREFIX.format(0): 256.0,
         _PREFIX.format(1): 32.0,
@@ -41,37 +45,38 @@ def test_scales_bring_the_latent_to_unit_rms(monkeypatch):
         assert 2**-0.5 <= gamma.pow(2).mean().sqrt() <= 2**0.5
 
 
-def test_enabled_by_default(monkeypatch):
+def test_default_scales_nvfp4_kv_caches_only(monkeypatch):
     monkeypatch.delenv(_MLA_LATENT_SCALE_ENV, raising=False)
-    scales = _mla_latent_scales(_checkpoint([0.004]), kv_cache_quantized=True)
-    assert scales == {_PREFIX.format(0): 256.0}
+    weights = _checkpoint([0.004])
+    assert _mla_latent_scales(weights, _NVFP4_KV) == {_PREFIX.format(0): 256.0}
+    assert _mla_latent_scales(weights, _FP8_KV) == {}
+    assert _mla_latent_scales(weights, _UNQUANTIZED_KV) == {}
 
 
-def test_target_rms_from_environment(monkeypatch):
+def test_explicit_target_scales_every_quantized_kv_cache(monkeypatch):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "0.25")
-    scales = _mla_latent_scales(_checkpoint([0.004]), kv_cache_quantized=True)
-    assert scales == {_PREFIX.format(0): 64.0}
+    weights = _checkpoint([0.004])
+    assert _mla_latent_scales(weights, _NVFP4_KV) == {_PREFIX.format(0): 64.0}
+    assert _mla_latent_scales(weights, _FP8_KV) == {_PREFIX.format(0): 64.0}
+    assert _mla_latent_scales(weights, _UNQUANTIZED_KV) == {}
 
 
-@pytest.mark.parametrize("value", ["0", "-1"])
-def test_rejects_non_positive_target(monkeypatch, value):
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "on"])
+def test_rejects_invalid_target(monkeypatch, value):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, value)
     with pytest.raises(ValueError, match=_MLA_LATENT_SCALE_ENV):
-        _mla_latent_scales(_checkpoint([0.004]), kv_cache_quantized=True)
+        _mla_latent_scales(_checkpoint([0.004]), _NVFP4_KV)
 
 
-def test_off_and_unquantized_kv_cache_leave_weights_alone(monkeypatch):
-    weights = _checkpoint([0.004])
+def test_off_leaves_weights_alone(monkeypatch):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "off")
-    assert _mla_latent_scales(weights, kv_cache_quantized=True) == {}
-    monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "auto")
-    assert _mla_latent_scales(weights, kv_cache_quantized=False) == {}
+    assert _mla_latent_scales(_checkpoint([0.004]), _NVFP4_KV) == {}
 
 
 def test_quantized_projection_is_skipped(monkeypatch):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "auto")
     weights = _checkpoint([0.004], projection_dtype=torch.float8_e4m3fn)
-    assert _mla_latent_scales(weights, kv_cache_quantized=True) == {}
+    assert _mla_latent_scales(weights, _NVFP4_KV) == {}
 
 
 def test_scaled_weights_keep_the_projection_output(monkeypatch):
@@ -79,7 +84,7 @@ def test_scaled_weights_keep_the_projection_output(monkeypatch):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "auto")
     weights = _checkpoint([0.004])
     name = _PREFIX.format(0)
-    scale = _mla_latent_scales(weights, kv_cache_quantized=True)[name]
+    scale = _mla_latent_scales(weights, _NVFP4_KV)[name]
     gamma = weights[f"{name}.kv_a_layernorm.weight"]
     projection = weights[f"{name}.kv_b_proj.weight"]
     x = torch.randn(8, _LATENT_DIM, generator=torch.Generator().manual_seed(1))
