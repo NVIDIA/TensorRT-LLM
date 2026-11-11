@@ -17,10 +17,12 @@ request (1 for plain decode, 1 + the draft length while MTP verifies drafts).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Optional, Sequence
 
 import torch
+from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._utils import async_tensor_h2d
 
 LINEAR_ATTENTION = "linear_attention"
@@ -42,7 +44,7 @@ class LayerSchedule:
         return len(self.attention)
 
     @classmethod
-    def from_text_config(cls, text: Any) -> "LayerSchedule":
+    def from_text_config(cls, text: PretrainedConfig) -> "LayerSchedule":
         num_layers = int(text.num_hidden_layers)
         attention = tuple(text.layer_types)
         mlp = tuple(text.mlp_layer_types)
@@ -81,7 +83,7 @@ class ContextRows:
 
     @classmethod
     def build(
-        cls, cu_seqlens: Sequence[int], cached_lens: Sequence[int], kpool: int, device
+        cls, cu_seqlens: Sequence[int], cached_lens: Sequence[int], kpool: int, device: torch.device
     ) -> "ContextRows":
         positions: list[int] = []
         request_ids: list[int] = []
@@ -111,29 +113,23 @@ class GenerationRows:
     ``kv_lens`` only (so CUDA graphs replay it on refreshed metadata).
 
     Row ``b * T + t`` is generation request ``b``'s token ``t``: ``positions`` is ``[B, T]``,
-    ``visible`` (the row's visible prefix length) and ``num_candidates`` (its complete-pool
-    count) are ``[B * T]``, and ``tables`` is the request's block table repeated per row, as
-    the pool scoring and expansion kernels address it.
+    ``visible`` (the row's visible prefix length) is ``[B * T]``, and ``tables`` is the
+    request's block table repeated per row, as the pool scoring and expansion kernels address
+    it.
     """
 
     positions: torch.Tensor  # [B, T] int64
     visible: torch.Tensor  # [B * T] int64
-    num_candidates: torch.Tensor  # [B * T] int32
-    tables: torch.Tensor  # [B * T, max pages] int32
+    tables: torch.Tensor  # [B * T, max pages] int64
 
     @classmethod
     def build(
-        cls, kv_lens: torch.Tensor, block_tables: torch.Tensor, tokens: int, kpool: int
+        cls, kv_lens: torch.Tensor, block_tables: torch.Tensor, tokens: int
     ) -> "GenerationRows":
         steps = torch.arange(tokens, device=kv_lens.device)
         positions = (kv_lens - tokens).unsqueeze(1) + steps
         visible = (positions + 1).reshape(-1)
-        return cls(
-            positions,
-            visible,
-            (visible // kpool).to(torch.int32),
-            block_tables.repeat_interleave(tokens, dim=0),
-        )
+        return cls(positions, visible, block_tables.repeat_interleave(tokens, dim=0))
 
 
 @dataclass
@@ -150,17 +146,17 @@ class StepSchedule:
     cached_lens: list[int]
     #: Live per-request visible lengths (cached + this step's tokens) on the device.
     kv_lens: torch.Tensor
-    #: The GLM block tables of the batch, ``[batch, max pages]`` int32 slot ids.
+    #: The GLM block tables of the batch, ``[batch, max pages]`` int64 slot ids.
     block_tables: torch.Tensor
-    metadata: Any
+    metadata: AttentionMetadata
     _context_rows: dict[int, ContextRows] = field(default_factory=dict)
-    _generation_rows: dict[int, GenerationRows] = field(default_factory=dict)
+    _generation_rows: Optional[GenerationRows] = None
 
     @property
     def num_generation_tokens(self) -> int:
         return self.num_generations * self.gen_tokens_per_request
 
-    def context_rows(self, kpool: int, device) -> ContextRows:
+    def context_rows(self, kpool: int, device: torch.device) -> ContextRows:
         rows = self._context_rows.get(kpool)
         if rows is None:
             rows = ContextRows.build(
@@ -169,27 +165,17 @@ class StepSchedule:
             self._context_rows[kpool] = rows
         return rows
 
-    def generation_rows(self, kpool: int) -> GenerationRows:
-        rows = self._generation_rows.get(kpool)
-        if rows is None:
-            rows = GenerationRows.build(
+    def generation_rows(self) -> GenerationRows:
+        if self._generation_rows is None:
+            self._generation_rows = GenerationRows.build(
                 self.kv_lens[self.num_contexts :],
                 self.block_tables[self.num_contexts : self.num_contexts + self.num_generations],
                 self.gen_tokens_per_request,
-                kpool,
             )
-            self._generation_rows[kpool] = rows
-        return rows
-
-    def max_context_visible(self) -> int:
-        """The largest visible length of a context row of this step (a host int)."""
-        return max(
-            int(self.cached_lens[i]) + int(self.ctx_cu_seqlens[i + 1]) - int(self.ctx_cu_seqlens[i])
-            for i in range(self.num_contexts)
-        )
+        return self._generation_rows
 
     @classmethod
-    def build(cls, attn_metadata) -> "StepSchedule":
+    def build(cls, attn_metadata: AttentionMetadata) -> "StepSchedule":
         """The step's schedule from the engine-prepared metadata.
 
         Prefill reads the host context schedules the metadata prepared before the forward;

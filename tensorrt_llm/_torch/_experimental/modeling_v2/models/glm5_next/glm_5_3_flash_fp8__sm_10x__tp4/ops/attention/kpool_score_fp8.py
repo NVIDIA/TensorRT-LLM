@@ -49,9 +49,10 @@ class KpoolScoreFp8(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100})
     # The indexer has 32 heads of 128 and scores pools of 4 over 32-token blocks. Each cell
-    # gives (cached, new) per context request and the scored row range; max_kv_len is the
-    # longest request's cached + new, as the module path passes it. The two-request cell
-    # takes the copy path and puts the second request's rows at another table's key range.
+    # gives (cached, new) per context request and the scored row range (a rank's ceil(T / 4)
+    # sequence-parallel rows); max_kv_len is the largest visible length among those rows, as
+    # `MlaLayer.context_rows` passes it. The two-request cell takes the copy path and puts the
+    # second request's rows at another table's key range.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="one rank's sequence-parallel quarter of a 13,312-token prompt (rows 0-3327)",
@@ -62,8 +63,8 @@ class KpoolScoreFp8(OpWrapper):
             spec=dict(context=((0, 13312),), rows=(9984, 13312)),
         ),
         Cell(
-            why="a 2,047-token prompt below the sequence-parallel threshold: every row",
-            spec=dict(context=((0, 2047),), rows=(0, 2047)),
+            why="rank 1's quarter (rows 10-19) of a 37-token prompt: two to five pools",
+            spec=dict(context=((0, 37),), rows=(10, 20)),
         ),
         Cell(
             why="two packed context requests, a chunk continuation and a fresh prompt",
@@ -75,32 +76,35 @@ class KpoolScoreFp8(OpWrapper):
     The scores are those of the E4M3-rounded operands. With per-row scales `amax / 448`, an
     operand's relative rounding error is at most 2**-4 and a score moves by a few percent of
     its scale; a score whose operands are on the E4M3 grid is exact up to FP32 accumulation.
-    The module path checks that the selection follows the BF16 scorer's closely, not exactly.
+    The pools selected from these scores can therefore differ from those of the BF16 scores
+    (`kpool_score`) where two pools score within that rounding of each other.
 
-    sm_100 only (DeepGEMM MQA logits). The module path calls it for packed context rows when a
-    host `max_kv_len` is known and falls back to `kpool_score` when this returns None.
+    sm_100 only (DeepGEMM MQA logits). The target scores every packed context row here
+    (`MlaLayer.context_rows`); when this returns None the rows have no complete pool and
+    attend their incomplete trailing pool only.
 
     Transients grow with tables * pools: the gathered BF16 keys, their FP8 copy and scale,
-    the padded logits and, for several tables, the row copy. The module path tiles packed
-    context rows into calls of bounded size; this entry takes whatever it is given.
+    the padded logits and, for several tables, the row copy. The target splits packed context
+    rows into calls of bounded size (`_score_calls` in `layers/mla.py`); this entry takes
+    whatever it is given.
     """
 
     def __call__(
         self,
-        q,
-        weights,
-        index_pool,
-        block_tables,
-        kv_lens,
-        tokens_per_block,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_lens: torch.Tensor,
+        tokens_per_block: int,
         *,
-        head_dim,
-        kpool,
-        q_scale,
-        w_scale,
-        request_ids,
-        max_kv_len,
-    ):
+        head_dim: int,
+        kpool: int,
+        q_scale: float,
+        w_scale: float,
+        request_ids: torch.Tensor,
+        max_kv_len: int,
+    ) -> torch.Tensor | None:
         n = q.shape[0]
         pools = max(0, int(max_kv_len)) // kpool
         tables = block_tables.shape[0]
@@ -143,20 +147,20 @@ class KpoolScoreFp8(OpWrapper):
 
     def reference(
         self,
-        q,
-        weights,
-        index_pool,
-        block_tables,
-        kv_lens,
-        tokens_per_block,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_lens: torch.Tensor,
+        tokens_per_block: int,
         *,
-        head_dim,
-        kpool,
-        q_scale,
-        w_scale,
-        request_ids,
-        max_kv_len,
-    ):
+        head_dim: int,
+        kpool: int,
+        q_scale: float,
+        w_scale: float,
+        request_ids: torch.Tensor,
+        max_kv_len: int,
+    ) -> torch.Tensor | None:
         """The exact scores the FP8 call approximates, FP32 from the BF16 operands, as a
         contiguous ``[N, pools]``: FP32 minimum past each row's ``kv_lens[r] // kpool``, None
         where the op returns None."""
@@ -184,20 +188,20 @@ class KpoolScoreFp8(OpWrapper):
 
     def is_valid(
         self,
-        q,
-        weights,
-        index_pool,
-        block_tables,
-        kv_lens,
-        tokens_per_block,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_lens: torch.Tensor,
+        tokens_per_block: int,
         *,
-        head_dim,
-        kpool,
-        q_scale,
-        w_scale,
-        request_ids,
-        max_kv_len,
-    ):
+        head_dim: int,
+        kpool: int,
+        q_scale: float,
+        w_scale: float,
+        request_ids: torch.Tensor,
+        max_kv_len: int,
+    ) -> None:
         assert q.dim() == 3 and q.shape[2] == head_dim
         n, num_heads, _ = q.shape
         assert weights.shape == (n, num_heads)

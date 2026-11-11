@@ -33,21 +33,18 @@ from dataclasses import dataclass
 
 import torch
 
-from ..checkpoint import Checkpoint, cols, rows, share
+from tensorrt_llm._torch.autotuner import AutoTuner
+
+from ..checkpoint import BLOCK, Checkpoint, cols, rows, share
 from ..dims import Dims
 from ..ops.activation.silu_and_mul import silu_and_mul
 from ..ops.gemm.dsv3_router_gemm import dsv3_router_gemm
 from ..ops.gemm.fp8_blockwise_gemm import fp8_blockwise_gemm
 from ..ops.moe.decode_moe import MAX_ROWS as DECODE_MOE_ROWS
 from ..ops.moe.decode_moe import decode_moe
-from ..ops.moe.fp8_block_scale_moe_runner import fp8_block_scale_moe_runner
+from ..ops.moe.fp8_block_scale_moe_runner import ROUTING_DEEPSEEK_V3, fp8_block_scale_moe_runner
 from ..ops.moe.prefill_moe import PrefillMoeWorkspace, prefill_moe
 from ..ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
-
-_BLOCK = 128
-#: The TRTLLM-gen runner's routing method: DeepSeek-V3 (sigmoid scores, correction bias,
-#: grouped top-k, normalized weights times the routed scaling factor).
-_ROUTING_DEEPSEEK_V3 = 2
 
 
 @dataclass
@@ -83,7 +80,7 @@ def _load_gated(ck: Checkpoint, prefix: str, intermediate: int, dims: Dims) -> G
     """``prefix``'s gate / up / down projections at this rank's intermediate share: gate and up
     rows, down columns, and the matching 128-blocks of their scales."""
     start, end = share(intermediate, dims.tp_size, dims.tp_rank)
-    sb, se = start // _BLOCK, end // _BLOCK
+    sb, se = start // BLOCK, end // BLOCK
     gate = ck.read(f"{prefix}gate_proj.weight", cut=rows(start, end))
     gate_s = ck.read(f"{prefix}gate_proj.weight_scale_inv", cut=rows(sb, se), dtype=torch.float32)
     up = ck.read(f"{prefix}up_proj.weight", cut=rows(start, end))
@@ -113,17 +110,17 @@ def load_moe(ck: Checkpoint, dims: Dims, layer: int) -> MoeWeights:
     num_experts, hidden = dims.num_experts, dims.hidden
     inter = dims.moe_intermediate_local
     start, end = share(dims.moe_intermediate, dims.tp_size, dims.tp_rank)
-    sb, se = start // _BLOCK, end // _BLOCK
+    sb, se = start // BLOCK, end // BLOCK
     device = ck.device
     w31 = torch.empty((num_experts, 2 * inter, hidden), dtype=torch.float8_e4m3fn, device=device)
     s31 = torch.empty(
-        (num_experts, 2 * inter // _BLOCK, hidden // _BLOCK), dtype=torch.float32, device=device
+        (num_experts, 2 * inter // BLOCK, hidden // BLOCK), dtype=torch.float32, device=device
     )
     w2 = torch.empty((num_experts, hidden, inter), dtype=torch.float8_e4m3fn, device=device)
     s2 = torch.empty(
-        (num_experts, hidden // _BLOCK, inter // _BLOCK), dtype=torch.float32, device=device
+        (num_experts, hidden // BLOCK, inter // BLOCK), dtype=torch.float32, device=device
     )
-    half = inter // _BLOCK
+    half = inter // BLOCK
     for e in range(num_experts):
         ep = f"{prefix}experts.{e}."
         w31[e, :inter] = ck.read(f"{ep}up_proj.weight", cut=rows(start, end))
@@ -215,7 +212,17 @@ class MoeLayer:
             )
             return out.view_as(x)
         x_fp8, x_scale = fp8_quantize_1x128(flat)
-        routed = fp8_block_scale_moe_runner(
+        routed = self._runner(logits, x_fp8, x_scale)
+        shared = _gated_from_fp8(w.shared, x_fp8, x_scale, self.limit)
+        return (routed + shared).view_as(x)
+
+    def _runner(
+        self, logits: torch.Tensor, x_fp8: torch.Tensor, x_scale: torch.Tensor
+    ) -> torch.Tensor:
+        """The routed experts of rows quantized 1 x 128 on the TRTLLM-gen runner (routing in
+        the kernel), this rank's partial."""
+        w = self.w
+        return fp8_block_scale_moe_runner(
             logits,
             w.bias,
             x_fp8,
@@ -233,12 +240,10 @@ class MoeLayer:
             0,  # local_expert_offset: every rank holds every expert
             self.num_experts,
             self.scaling,
-            _ROUTING_DEEPSEEK_V3,
+            ROUTING_DEEPSEEK_V3,
             gemm1_clamp_limit=self.limit,
             tune_max_num_tokens=self.tune_max_num_tokens,
         )
-        shared = _gated_from_fp8(w.shared, x_fp8, x_scale, self.limit)
-        return (routed + shared).view_as(x)
 
     def prefill_partial(
         self,
@@ -250,6 +255,11 @@ class MoeLayer:
         """Every row of a sequence-parallel prefill step, from the gathered quantized rows and
         router logits: the routed experts with the shared expert's output as the addend."""
         w = self.w
+        if AutoTuner.get().is_tuning_mode:
+            # Generation steps of more than decode_moe's rows run the TRTLLM-gen runner, which
+            # the engine's tuning warmup never reaches (its generation steps fit decode_moe).
+            # One call here tunes the runner for every row bucket up to the step token budget.
+            self._runner(logits, x_fp8, x_scale)
         shared = _gated_from_fp8(w.shared, x_fp8, x_scale, self.limit)
         return prefill_moe(
             x_fp8,

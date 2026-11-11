@@ -30,8 +30,8 @@ def _rows(spec: dict):
     rows are positions ``kv_b - T .. kv_b - 1`` (``[B, T]``, or ``[B]`` when ``T = 1``) of
     generation table ``b``, whose pools reach back to the first member of the first row's
     pool. Context cells: the pool-final positions each ``(cached, new)`` request completes in
-    the step (one row per pool, with request ids), as the module path's context schedule
-    lists them; their pools span every page of the request.
+    the step (one row per pool, with request ids), as the target's context schedule
+    (``ContextRows.final_positions``) lists them; their pools span every page of the request.
     """
     if "context" in spec:
         positions, request_ids, pages = [], [], []
@@ -63,7 +63,7 @@ def _args(spec: dict, seed: int):
     no row reaches). The pool is a coalesced view: the second of two subpages of every slot,
     rows padded by 64 columns, as a layer's indexer pool sits in the cache's pages.
     Generation tables follow one context request's table, so the op reads a row slice of the
-    step's tables, like the module path's generation slice.
+    step's tables, like the target's generation slice.
     """
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     positions, request_ids, pages = _rows(spec)

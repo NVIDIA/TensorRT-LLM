@@ -12,22 +12,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from transformers import PretrainedConfig
+
+from tensorrt_llm.mapping import Mapping
+
 from .schedule import LayerSchedule
 
 #: The checkpoint's key prefix of the text model.
 TEXT_PREFIX = "model.language_model."
-
-#: The MoE routing the decode, prefill and runner kernels implement (DeepSeek-V3's noaux_tc):
-#: sigmoid scores, top-k over the scores plus the correction bias in a single group, the
-#: selected scores normalized, and one shared expert.
-_MOE_ROUTING = {
-    "scoring_func": "sigmoid",
-    "topk_method": "noaux_tc",
-    "n_group": 1,
-    "topk_group": 1,
-    "norm_topk_prob": True,
-    "n_shared_experts": 1,
-}
 
 
 @dataclass(frozen=True)
@@ -108,13 +100,11 @@ class Dims:
         return f"{TEXT_PREFIX}layers.{layer}."
 
     @classmethod
-    def from_config(cls, text, mapping, mtp: bool, max_num_tokens: int) -> "Dims":
-        routing = {name: getattr(text, name, None) for name in _MOE_ROUTING}
-        if routing != _MOE_ROUTING:
-            raise ValueError(
-                f"the target's MoE kernels implement the routing {_MOE_ROUTING}; the checkpoint "
-                f"configures {routing}"
-            )
+    def from_config(
+        cls, text: PretrainedConfig, mapping: Mapping, mtp: bool, max_num_tokens: int
+    ) -> "Dims":
+        """The sizes of a config ``routing.fp8_model_refused`` admits (the MoE routing, the
+        geometry the kernels compile in and the KDA gate bound are checked there)."""
         linear = dict(text.linear_attn_config)
         return cls(
             tp_size=mapping.tp_size,
@@ -127,7 +117,7 @@ class Dims:
             kda_heads=int(linear["num_heads"]),
             kda_head_dim=int(linear["head_dim"]),
             kda_conv_size=int(linear["short_conv_kernel_size"]),
-            kda_gate_lower_bound=float(linear.get("gate_lower_bound", -5.0)),
+            kda_gate_lower_bound=float(linear["gate_lower_bound"]),
             mla_heads=int(text.num_attention_heads),
             q_lora=int(text.q_lora_rank),
             kv_lora=int(text.kv_lora_rank),

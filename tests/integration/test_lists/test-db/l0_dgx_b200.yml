@@ -121,8 +121,10 @@ l0_dgx_b200:
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100Default::test_gsm8k_mtp_vanilla
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused::test_gsm8k_mtp
   # GLM-5.3-Flash FP8 modeling_v2 target: the fused all-reduce + mHC boundary, one 4-rank matrix
-  # (it skips with fewer than 4 GPUs, so the l0_b200 directory entry cannot run it).
+  # (it skips with fewer than 4 GPUs, so the l0_b200 directory entry cannot run it), and the whole
+  # model with MTP-3: GSM8K, its acceptance length and the metadata contract.
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/comm/test_modeling_v2_mhc_ar_boundary.py
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/test_accuracy.py::TestModelingV2Glm53FlashFp8Sm10xTp4::test_gsm8k_mtp3
   # Exercise VisualGen worker-failure containment with live CUDA allocations
   # spread across four local processes.
   - unittest/_torch/visual_gen/test_executor_lifecycle_multi_gpu.py::test_sigkill_one_worker_contains_real_multi_gpu_group
@@ -317,10 +319,8 @@ l0_dgx_b200:
   tests:
   # GLM-5.3-Flash modeling_v2 split target without speculation (SM100 only).
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100Default::test_gsm8k
-  # GLM-5.3-Flash FP8 modeling_v2 target: GSM8K without speculation and with MTP-3 (plus its
-  # acceptance length).
+  # GLM-5.3-Flash FP8 modeling_v2 target: GSM8K without speculation.
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/test_accuracy.py::TestModelingV2Glm53FlashFp8Sm10xTp4::test_gsm8k
-  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/test_accuracy.py::TestModelingV2Glm53FlashFp8Sm10xTp4::test_gsm8k_mtp3
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=fp8]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=nvfp4]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=False-eval_mode=inferencex-kv_dtype=fp8]

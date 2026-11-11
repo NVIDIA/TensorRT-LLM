@@ -14,8 +14,8 @@ the FP32 ``A_log`` and ``dt_bias``, which stay FP32.
 Projections. One ``[q; k; v]`` GEMM gives the conv inputs. One ``[f_a; g_a; b]`` GEMM (rows
 padded to a multiple of 8) gives both gates' low-rank inputs and the beta logits, and one batched
 GEMM of its adjacent ``f_a`` / ``g_a`` columns with ``[f_b; g_b]`` gives the forget-gate and the
-output-gate logits. ``[f_a; g_a; b]`` and ``o_proj`` products of at most 32 rows run on
-``low_m_bf16_gemm``, larger ones and the ``[q; k; v]`` GEMM on cuBLAS. In a CUDA-graph-captured
+output-gate logits. ``[f_a; g_a; b]`` and ``o_proj`` run on ``low_m_bf16_gemm`` (its low-M
+kernels for decode-sized steps, cuBLAS otherwise), the ``[q; k; v]`` GEMM on cuBLAS. In a CUDA-graph-captured
 generation step of at most 128 rows the gate projections run on the aux stream beside the
 ``[q; k; v]`` GEMM.
 
@@ -33,7 +33,7 @@ Rows of a step are packed context first, and each kind of row runs one recurrenc
 
 Cache contract (``kv_cache_manager.mamba_layer_cache(layer)``): ``conv`` is the live
 ``[slots, 3D, 3]`` BF16 conv pool (``[q | k | v]`` sections), ``temporal`` the
-``[slots, H, 128, 128]`` V-first recurrent pool (FP32 for this model). With speculative
+``[slots, H, 128, 128]`` V-first recurrent pool (FP32: the GLM cache manager allocates no other). With speculative
 decoding the layer cache also carries the verify kernel's replay caches: their committed conv
 window is seeded from the live pool (``commit_conv_window``) after every prefill and plain
 decode, and ``prev_num_accepted_tokens`` (the previous round's accepted drafts per slot, which
@@ -43,11 +43,11 @@ the runtime records after sampling) tells the verify kernel how many cached draf
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from ..checkpoint import Checkpoint, cols, rows, share
+from ..checkpoint import Checkpoint, Cut, cols, rows, share
 from ..dims import Dims
 from ..ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
 from ..ops.norm.rms_norm_gated_token_major import rms_norm_gated_token_major
@@ -57,20 +57,28 @@ from ..ops.ssm.kda_prefill import kda_prefill
 from ..ops.ssm.kda_prefill_conv import kda_prefill_conv
 from ..ops.ssm.reset_recurrent_state_rows import reset_recurrent_state_rows
 from ..schedule import StepSchedule
+from .streams import AuxStream
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.metadata import (
+        Glm5NextMamba2Metadata,
+    )
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaLayerCache
 
 #: The head size and conv width the KDA kernels implement.
 _HEAD_DIM = 128
 _CONV_WIDTH = 4
 #: The ``[f_a; g_a; b]`` projection's rows are padded to a multiple of this.
 _GATE_ROWS_ALIGN = 8
-#: Products of at most this many rows run on ``low_m_bf16_gemm``.
-_LOW_M_ROWS = 32
 #: Captured generation steps of at most this many rows run the gate projections on the aux
 #: stream beside the ``[q; k; v]`` GEMM.
 _OVERLAP_MAX_ROWS = 128
 #: KDA prefill takes the persistent engine route: the chunk-decomposed route, which the auto
-#: router picks whenever 2 * sequences * heads fits the SMs, can stall one CTA on its mbarrier
-#: pipeline under serving load and hang every rank at the next collective.
+#: router picks whenever 2 * sequences * heads fits the SMs (16 heads per rank and FP32 state
+#: here), can stall one CTA of ``kernel_chain_dv2`` on its mbarrier pipeline under serving load
+#: (alternating 1- and 8-request 13K-token prefills) and hang every rank at the next collective.
+#: Return to the auto route once that route passes the same alternating serving load.
 _PREFILL_ROUTE = "engine"
 
 
@@ -115,7 +123,7 @@ def load_kda(ck: Checkpoint, dims: Dims, layer: int) -> KdaWeights:
     device = ck.device
     bf16 = torch.bfloat16
 
-    def read(name: str, cut=None, dtype: torch.dtype = bf16) -> torch.Tensor:
+    def read(name: str, cut: Optional[Cut] = None, dtype: torch.dtype = bf16) -> torch.Tensor:
         return ck.read(f"{prefix}{name}", cut=cut, dtype=dtype)
 
     qkv = torch.empty((3 * d, hidden), dtype=bf16, device=device)
@@ -163,14 +171,9 @@ def load_kda(ck: Checkpoint, dims: Dims, layer: int) -> KdaWeights:
     return weights
 
 
-def _linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """``x [n, K] @ weight [N, K]^T`` in BF16: the low-M kernels up to ``_LOW_M_ROWS`` rows."""
-    if x.shape[0] <= _LOW_M_ROWS:
-        return low_m_bf16_gemm(x, weight)
-    return torch.nn.functional.linear(x, weight)
-
-
-def _commit_conv_window(cache: Any, slots: torch.Tensor, conv_pool: torch.Tensor) -> None:
+def _commit_conv_window(
+    cache: MambaLayerCache, slots: torch.Tensor, conv_pool: torch.Tensor
+) -> None:
     """Seed the verify kernel's replay conv caches of ``slots`` from the live conv pool, which a
     prefill or a plain decode just advanced (a layer cache without replay caches has none)."""
     if getattr(cache, "has_kda_replay_caches", False):
@@ -185,18 +188,10 @@ class KdaLayer:
         dims: the model's sizes and this rank's shares.
         layer_idx: the decoder layer's index, which names its recurrent and conv state in the
             hybrid cache.
-        aux_stream: the stream the gate projections of a captured generation step run on.
-        events: ``(fork, join)``, the events that order the aux stream against the current one.
+        aux: the aux stream the gate projections of a captured generation step run on.
     """
 
-    def __init__(
-        self,
-        w: KdaWeights,
-        dims: Dims,
-        layer_idx: int,
-        aux_stream: Optional[torch.cuda.Stream],
-        events: tuple[Any, Any],
-    ) -> None:
+    def __init__(self, w: KdaWeights, dims: Dims, layer_idx: int, aux: AuxStream) -> None:
         self.w = w
         self.layer_idx = layer_idx
         self.heads = dims.kda_heads_local
@@ -205,10 +200,11 @@ class KdaLayer:
         self.lower_bound = dims.kda_gate_lower_bound
         self.scale = dims.kda_head_dim**-0.5
         self.norm_eps = dims.rms_eps
-        self.aux_stream = aux_stream
-        self.fork_event, self.join_event = events
+        self.aux = aux
 
-    def partial(self, x: torch.Tensor, step: StepSchedule, attn_metadata: Any) -> torch.Tensor:
+    def partial(
+        self, x: torch.Tensor, step: StepSchedule, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
         """This rank's ``o_proj`` partial (before the TP reduction) of every row of the step.
 
         Args:
@@ -242,7 +238,7 @@ class KdaLayer:
             else:
                 cores.append(self._verify(generation, tokens, cache, generation_slots))
         core = cores[0] if len(cores) == 1 else torch.cat(cores)
-        return _linear(core, self.w.o_proj)
+        return low_m_bf16_gemm(core, self.w.o_proj)
 
     # -- projections ----------------------------------------------------------------------
 
@@ -255,7 +251,7 @@ class KdaLayer:
         the ``[f_a; g_a; b]`` GEMM, then ``f_b`` / ``g_b`` as one batched GEMM over its adjacent
         ``f_a`` / ``g_a`` columns. ``beta`` is a column view of the first GEMM's output."""
         hd = self.head_dim
-        fa_ga_b = _linear(x, self.w.fa_ga_b)
+        fa_ga_b = low_m_bf16_gemm(x, self.w.fa_ga_b)
         beta = fa_ga_b[:, 2 * hd : 2 * hd + self.heads]
         pair = fa_ga_b[:, : 2 * hd].reshape(-1, 2, hd).transpose(0, 1)  # [2, n, hd] strided
         gates = torch.bmm(pair, self.w.fb_gb_t)  # [2, n, D]
@@ -267,27 +263,20 @@ class KdaLayer:
         """``(qkv [n, 3D], (beta, forget, out_gate))`` of generation rows ``x``. In a captured
         step of at most ``_OVERLAP_MAX_ROWS`` rows the gate projections run on the aux stream
         while the ``[q; k; v]`` GEMM runs on the current one; otherwise both run in order."""
-        if (
-            self.aux_stream is None
-            or x.shape[0] > _OVERLAP_MAX_ROWS
-            or not torch.cuda.is_current_stream_capturing()
-        ):
-            return torch.nn.functional.linear(x, self.w.qkv), self._gates(x)
-        # In a capture the aux stream's outputs need no record_stream: every later use of the
-        # aux stream first waits for the current stream (the fork below).
-        self.fork_event.record()
-        qkv = torch.nn.functional.linear(x, self.w.qkv)
-        with torch.cuda.stream(self.aux_stream):
-            self.fork_event.wait()
-            gates = self._gates(x)
-            self.join_event.record()
-        self.join_event.wait()
-        return qkv, gates
+        qkv = lambda: torch.nn.functional.linear(x, self.w.qkv)  # noqa: E731
+        gates = lambda: self._gates(x)  # noqa: E731
+        if x.shape[0] > _OVERLAP_MAX_ROWS:
+            return qkv(), gates()
+        return self.aux.fork_join(qkv, gates)
 
     # -- the three row kinds ----------------------------------------------------------------
 
     def _prefill(
-        self, x: torch.Tensor, hybrid: Any, cache: Any, slots: torch.Tensor
+        self,
+        x: torch.Tensor,
+        hybrid: Glm5NextMamba2Metadata,
+        cache: MambaLayerCache,
+        slots: torch.Tensor,
     ) -> torch.Tensor:
         """The gated core ``[T, D]`` of the context rows ``x [T, hidden]`` of ``slots`` (int32
         ``[num_contexts]``), each sequence continuing from its slot's conv history and state."""
@@ -340,22 +329,14 @@ class KdaLayer:
         )
         return core.view(tokens, self.channels)
 
-    def _decode(self, x: torch.Tensor, cache: Any, slots: torch.Tensor) -> torch.Tensor:
+    def _decode(self, x: torch.Tensor, cache: MambaLayerCache, slots: torch.Tensor) -> torch.Tensor:
         """The gated core ``[B, D]`` of one new row per request (``x [B, hidden]``, ``slots``
-        int32 ``[B]``); the requests' conv windows and state rows advance in place."""
+        int32 ``[B]``); the requests' conv windows and FP32 state rows advance in place."""
         w = self.w
         d, batch = self.channels, x.shape[0]
         conv_pool, state_pool = cache.conv, cache.temporal
+        assert state_pool.dtype == torch.float32, f"KDA state pool {state_pool.dtype}, not FP32"
         qkv, (beta, forget, out_gate) = self._project(x)
-        # The kernel keeps an FP32 state: it updates FP32 pool rows by slot, and a lower-precision
-        # pool through dense FP32 copies of the requests' rows (request b on row b) written back.
-        kernel_state, kernel_slots, kernel_conv = state_pool, slots, conv_pool
-        staged = state_pool.dtype != torch.float32
-        if staged:
-            slots_long = slots.long()
-            kernel_state = state_pool.index_select(0, slots_long).float()
-            kernel_conv = conv_pool.index_select(0, slots_long)
-            kernel_slots = None
         # Allocated per call: inside a CUDA graph capture this is the graph pool's stable buffer.
         out = x.new_empty((batch, 1, self.heads, self.head_dim))
         kda_decode(
@@ -368,30 +349,27 @@ class KdaLayer:
             bias_q=w.conv_bias,
             bias_k=w.conv_bias,
             bias_v=w.conv_bias,
-            conv_state_q=kernel_conv[:, :d],
-            conv_state_k=kernel_conv[:, d : 2 * d],
-            conv_state_v=kernel_conv[:, 2 * d :],
+            conv_state_q=conv_pool[:, :d],
+            conv_state_k=conv_pool[:, d : 2 * d],
+            conv_state_v=conv_pool[:, 2 * d :],
             a_log=w.a_log,
             g=self._heads(forget),
             dt_bias=w.dt_bias,
             beta=beta.unsqueeze(0),
             onorm_g=self._heads(out_gate),
             onorm_weight=w.o_norm_f32,
-            ssm_state_indices=kernel_slots,
-            state=kernel_state,
+            ssm_state_indices=slots,
+            state=state_pool,
             lower_bound=self.lower_bound,
             scale=self.scale,
             onorm_eps=self.norm_eps,
             output=out,
         )
-        if staged:
-            conv_pool.index_copy_(0, slots_long, kernel_conv)
-            state_pool.index_copy_(0, slots_long, kernel_state.to(state_pool.dtype))
         _commit_conv_window(cache, slots, conv_pool)
         return out.view(batch, d)
 
     def _verify(
-        self, x: torch.Tensor, tokens_per_request: int, cache: Any, slots: torch.Tensor
+        self, x: torch.Tensor, tokens_per_request: int, cache: MambaLayerCache, slots: torch.Tensor
     ) -> torch.Tensor:
         """The gated core ``[B * T, D]`` of ``T = tokens_per_request`` rows per request (the
         golden row, then ``T - 1`` drafts; ``x [B * T, hidden]``, ``slots`` int32 ``[B]``)."""

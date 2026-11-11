@@ -149,16 +149,16 @@ class KpoolUpdate(OpWrapper):
 
     def __call__(
         self,
-        index_pool,
-        block_tables,
-        positions,
-        ape,
-        tokens_per_block,
+        index_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        positions: torch.Tensor,
+        ape: torch.Tensor,
+        tokens_per_block: int,
         *,
-        head_dim,
-        kpool,
-        request_ids=None,
-    ):
+        head_dim: int,
+        kpool: int,
+        request_ids: torch.Tensor | None = None,
+    ) -> None:
         if request_ids is not None and positions.dim() != 1:
             # The same-pool skip compares POS[b] with POS[b + 1], which is only valid
             # when consecutive rows belong to one table.
@@ -188,16 +188,16 @@ class KpoolUpdate(OpWrapper):
 
     def reference(
         self,
-        index_pool,
-        block_tables,
-        positions,
-        ape,
-        tokens_per_block,
+        index_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        positions: torch.Tensor,
+        ape: torch.Tensor,
+        tokens_per_block: int,
         *,
-        head_dim,
-        kpool,
-        request_ids=None,
-    ):
+        head_dim: int,
+        kpool: int,
+        request_ids: torch.Tensor | None = None,
+    ) -> None:
         """The refresh in plain torch, in place on ``index_pool``: every row's key from the
         members visible at its position, and of the rows on one pool the last one's, as
         refreshing the rows one after another leaves it. The BF16 roundings of the
@@ -233,16 +233,16 @@ class KpoolUpdate(OpWrapper):
 
     def is_valid(
         self,
-        index_pool,
-        block_tables,
-        positions,
-        ape,
-        tokens_per_block,
+        index_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        positions: torch.Tensor,
+        ape: torch.Tensor,
+        tokens_per_block: int,
         *,
-        head_dim,
-        kpool,
-        request_ids=None,
-    ):
+        head_dim: int,
+        kpool: int,
+        request_ids: torch.Tensor | None = None,
+    ) -> None:
         assert index_pool.dtype == torch.bfloat16 and index_pool.dim() == 3
         assert index_pool.stride(2) == 1 and index_pool.shape[1] == tokens_per_block
         assert index_pool.shape[2] >= 3 * head_dim, "rows are [k | gate | pool key]"

@@ -32,9 +32,10 @@ run; tactics sum in different orders (and the FMA backends give the mixer the un
 so they differ from each other in the last bits.
 
 ``tactic`` is ``(backend, tile_n, num_k_splits, bigfuse_block_size, tile_m)``. ``fused_hc_tactic``
-picks it as ``mHC.fused_hc`` does: the autotuner over ``fused_hc_tactics``, the tensor-core fallback
-on a cache miss, and ``DETERMINISTIC_TACTIC`` under ``FORCE_DETERMINISTIC=1``. ``fused_hc_scratch``
-allocates the three workspaces a tactic needs.
+picks it as ``mHC.fused_hc`` does: the autotuner over ``fused_hc_tactics`` (one tactic for every TP
+rank), the tensor-core fallback on a cache miss, and ``DETERMINISTIC_TACTIC`` under
+``FORCE_DETERMINISTIC=1`` or ``FORCE_MHC_KERNEL_DETERMINISTIC=1``. ``fused_hc_scratch`` allocates
+the three workspaces a tactic needs.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from __future__ import annotations
 import math
 import os
 from functools import lru_cache
-from typing import Any, List, Optional, Sequence
+from typing import Optional, Sequence
 
 import torch
 
@@ -50,6 +51,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch.autotuner import (
     AutoTuner,
     ConstraintSpec,
+    DistributedTuningStrategy,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
@@ -69,13 +71,20 @@ MIX = (2 + MULT) * MULT
 #: ``tactic[0]`` -> the op's backend code.
 BACKENDS = {"fused_half_mma": 0, "fused_half_fma": 1, "fused_all_mma": 2, "fused_all_fma": 3}
 
-#: The tactic under ``FORCE_DETERMINISTIC=1`` and the fallback without the tensor-core backends:
+#: The tactic under deterministic mode (``deterministic_requested``) and the fallback without the
+#: tensor-core backends:
 #: half-fused FMA, two columns per CTA, no hidden split, 256-thread BigFuse. It has no cross-CTA
 #: floating-point atomics and one reduction order for every row count.
 DETERMINISTIC_TACTIC = ("fused_half_fma", 2, 1, 256, 1)
 
 #: The autotuner's key for this op's tactic choice.
 TUNING_OP = "glm5_next::mhc_fused_hc"
+
+#: A tactic: ``(backend, tile_n, num_k_splits, bigfuse_block_size, tile_m)``.
+Tactic = tuple[str, int, int, int, int]
+
+#: The op's arguments besides the tensors the autotuner sees: the RMSNorm weight and the scalars.
+_RunnerArg = torch.Tensor | int | float | None
 
 # (tile_n, num_k_splits) pairs of the half-fused FMA kernel (C++ pickFhcFma).
 _HALF_FMA_TN_KS = (
@@ -141,7 +150,16 @@ def _mma_bigfuse_block_size(rows: int) -> int:
     return 256 if rows >= 256 else 512
 
 
-def default_fused_hc_tactic(rows: int, hidden: int, mma_enabled: bool) -> tuple:
+def deterministic_requested() -> bool:
+    """Whether the environment asks for run-to-run identical mHC results, as ``mHC.fused_hc``
+    reads it: ``FORCE_DETERMINISTIC=1`` or ``FORCE_MHC_KERNEL_DETERMINISTIC=1``."""
+    return (
+        os.environ.get("FORCE_DETERMINISTIC", "0") == "1"
+        or os.environ.get("FORCE_MHC_KERNEL_DETERMINISTIC", "0") == "1"
+    )
+
+
+def default_fused_hc_tactic(rows: int, hidden: int, mma_enabled: bool) -> Tactic:
     """The tactic of a call the autotuner has no entry for: ``mHC.fused_hc``'s fallback, resolved.
 
     The half-fused TF32 kernel at its own default split count and BigFuse CTA size where the
@@ -154,7 +172,7 @@ def default_fused_hc_tactic(rows: int, hidden: int, mma_enabled: bool) -> tuple:
 
 def fused_hc_tactics(
     rows: int, hidden: int, mma_enabled: bool, pin_small_m_half_fma: bool
-) -> list[tuple]:
+) -> list[Tactic]:
     """The tactics ``mHC.fused_hc``'s autotuner profiles for ``rows`` rows (a tuning bucket).
 
     Up to 32 rows: the all-in-one FMA kernel at every tile shape whose grid stays within four
@@ -168,7 +186,7 @@ def fused_hc_tactics(
     count (4 up to 4 rows, else 2) and one BigFuse CTA size (512), so that those candidates differ
     only in tile width, which assigns columns to CTAs without changing any sum.
     """
-    tactics: dict[tuple, None] = {}
+    tactics: dict[Tactic, None] = {}
     mma_splits = _mma_split_options(hidden)
     mma_ok = mma_enabled and bool(mma_splits)
     if rows <= 32:
@@ -277,7 +295,7 @@ def _tuning_bucket(rows: int) -> int:
     return -(-rows // 128) * 128
 
 
-def _rows_of_x(shapes) -> int:
+def _rows_of_x(shapes: Sequence[Sequence[int]]) -> int:
     return shapes[0][0]
 
 
@@ -286,6 +304,13 @@ class _FusedHcRunner(TunableRunner):
 
     The inputs are ``[x, residual, post, comb, fn, scale, base]``; the rest of the op's arguments
     arrive as keyword arguments. Rows are bucketed by powers of two up to 128, then in steps of 128.
+
+    The TP ranks share the profiling (``PARALLEL``, as ``mHC.fused_hc``'s runner does): each rank
+    times its share of the candidates and every rank keeps the fastest of all, so every rank runs
+    the same tactic. In decode every rank holds the same rows, and a tactic sums in its own order,
+    so ranks on different tactics would carry streams that differ in the last bits and could route
+    a row to different experts. The ranks call the autotuner in lockstep: the target pads a
+    sequence-parallel step's rows to the same count on every rank.
     """
 
     tuning_config = TuningConfig(
@@ -300,23 +325,26 @@ class _FusedHcRunner(TunableRunner):
         constraint_specs=tuple(
             ConstraintSpec(input_idx=i, dim_idx=0, infer_shape=_rows_of_x) for i in (1, 2, 3)
         ),
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
     )
 
     def __init__(self, hidden: int) -> None:
         self.hidden = hidden
 
-    def unique_id(self):
+    def unique_id(self) -> tuple[int, int]:
         return (MULT, self.hidden)
 
     def get_valid_tactics(
-        self, inputs: List[torch.Tensor], profile: OptimizationProfile, **kwargs
-    ) -> List[Any]:
+        self, inputs: list[torch.Tensor], profile: OptimizationProfile, **kwargs: _RunnerArg
+    ) -> list[Tactic]:
         x = inputs[0]
         return fused_hc_tactics(
             x.shape[0], self.hidden, fused_hc_mma_enabled(), _pins_small_m_half_fma(x.device)
         )
 
-    def forward(self, inputs: List[torch.Tensor], *, tactic: Any = -1, **kwargs) -> Any:
+    def forward(
+        self, inputs: list[torch.Tensor], *, tactic: Sequence | int = -1, **kwargs: _RunnerArg
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x = inputs[0]
         rows = x.shape[0]
         if tactic == -1:
@@ -353,18 +381,20 @@ def fused_hc_tactic(
     sinkhorn_eps: float,
     post_mult: float,
     layer_input_eps: float,
-) -> tuple:
+) -> Tactic:
     """The tactic for an ``mhc_fused_hc`` call with these arguments, chosen as ``mHC.fused_hc`` does.
 
-    ``DETERMINISTIC_TACTIC`` when ``FORCE_DETERMINISTIC=1``. Otherwise the autotuner's choice under
-    ``TUNING_OP``. In tuning mode it profiles ``fused_hc_tactics`` at every row bucket -- powers of
-    two up to 128 and, from a call of 128 rows, multiples of 128 up to ``max(1024, min(M, 8192))``
-    -- running the op on these weights and on bucket-sized activations. Outside it, it looks up the
-    call's row bucket (rows rounded up to a power of two, or above 128 to a multiple of 128) and
-    returns ``default_fused_hc_tactic`` on a miss. The arguments are ``mhc_fused_hc``'s without the
+    ``DETERMINISTIC_TACTIC`` when ``deterministic_requested()``. Otherwise the autotuner's choice
+    under ``TUNING_OP``. In tuning mode it profiles ``fused_hc_tactics`` at every row bucket --
+    powers of two up to 128 and, from a call of 128 rows, multiples of 128 up to ``max(1024,
+    min(M, 8192))`` -- running the op on these weights and on bucket-sized activations, with the
+    candidates shared out over the TP ranks and the fastest kept on all of them; every rank must
+    make the call, with the same row count. Outside it, it looks up the call's row bucket (rows
+    rounded up to a power of two, or above 128 to a multiple of 128) and returns
+    ``default_fused_hc_tactic`` on a miss. The arguments are ``mhc_fused_hc``'s without the
     tactic and the workspaces.
     """
-    if os.environ.get("FORCE_DETERMINISTIC", "0") == "1":
+    if deterministic_requested():
         return DETERMINISTIC_TACTIC
     rows, hidden = x.shape
     runner = _RUNNERS.get(hidden)
@@ -456,11 +486,12 @@ class MhcFusedHc(OpWrapper):
     5120 or 7168; the FMA backends take any hidden divisible by 64. The kernels are compiled for 4
     streams. The lagged pre-mix variant (`pre_mix_ext` / `pre_mix_out`) is not used.
 
-    `fused_hc_tactic` tunes with every rank profiling on its own, as `mHC.fused_hc` does, so two TP
-    ranks can settle on different tactics and carry streams that differ in the last bits;
-    `FORCE_DETERMINISTIC=1` puts every rank on `DETERMINISTIC_TACTIC`. The candidates of a row
-    count do not depend on the weights or the scalars, and a step's boundaries share their shapes,
-    so a tactic can be chosen once per step.
+    `fused_hc_tactic` tunes as `mHC.fused_hc` does: the TP ranks share the profiling and keep one
+    tactic, so their streams stay bitwise equal. `FORCE_DETERMINISTIC=1` or
+    `FORCE_MHC_KERNEL_DETERMINISTIC=1` puts every rank on `DETERMINISTIC_TACTIC`, whose sums do not
+    depend on the row count either. The candidates of a row count do not depend on the weights or
+    the scalars, and a step's boundaries share their shapes, so a tactic can be chosen once per
+    step.
 
     The op checks the split workspaces of the first three backends against the split count it
     runs, and neither the all-in-one FMA kernel's workspaces nor any counter array; `is_valid`

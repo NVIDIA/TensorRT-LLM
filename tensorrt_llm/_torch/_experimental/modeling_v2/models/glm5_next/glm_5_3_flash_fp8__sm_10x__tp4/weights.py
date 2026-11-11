@@ -34,15 +34,15 @@ and the MTP layer's when no speculative decoding builds it.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, Union
 
 import torch
 
 from .checkpoint import Checkpoint, cols, rows, share
 from .dims import TEXT_PREFIX, Dims
-from .layers.ffn import load_dense_mlp, load_moe
-from .layers.kda import load_kda
-from .layers.mla import load_mla
+from .layers.ffn import DenseMlpWeights, MoeWeights, load_dense_mlp, load_moe
+from .layers.kda import KdaWeights, load_kda
+from .layers.mla import MlaWeights, load_mla
 from .schedule import DENSE_MLP, LINEAR_ATTENTION
 
 #: Checkpoint key prefix of the vision tower, which this text-only target never loads.
@@ -67,8 +67,8 @@ class DecoderLayerWeights:
     post_norm: torch.Tensor  # [hidden] bf16
     hc_attn: HcWeights
     hc_ffn: HcWeights
-    attention: Any  # layers.kda.KdaWeights | layers.mla.MlaWeights
-    mlp: Any  # layers.ffn.DenseMlpWeights | layers.ffn.MoeWeights
+    attention: Union[KdaWeights, MlaWeights]
+    mlp: Union[DenseMlpWeights, MoeWeights]
 
 
 @dataclass
@@ -80,10 +80,10 @@ class MtpLayerWeights:
     hnorm: torch.Tensor  # [hidden] bf16
     eh_proj: torch.Tensor  # [hidden, 2 * hidden / tp] bf16, this rank's input columns
     head_norm: torch.Tensor  # [hidden] bf16, shared_head.norm
-    input_norm: torch.Tensor
-    post_norm: torch.Tensor
-    attention: Any  # layers.mla.MlaWeights
-    mlp: Any  # layers.ffn.MoeWeights
+    input_norm: torch.Tensor  # [hidden] bf16
+    post_norm: torch.Tensor  # [hidden] bf16
+    attention: MlaWeights
+    mlp: MoeWeights
 
 
 @dataclass
@@ -141,7 +141,7 @@ def _mtp_layer(ck: Checkpoint, dims: Dims) -> MtpLayerWeights:
 
 
 def load_model_weights(
-    weights: Any, dims: Dims, lm_head_weight: torch.Tensor, device: torch.device
+    weights: Mapping[str, Any], dims: Dims, lm_head_weight: torch.Tensor, device: torch.device
 ) -> ModelWeights:
     """Read this rank's weights and fill the shell's vocabulary-parallel ``lm_head`` share."""
     ck = Checkpoint(weights, device)

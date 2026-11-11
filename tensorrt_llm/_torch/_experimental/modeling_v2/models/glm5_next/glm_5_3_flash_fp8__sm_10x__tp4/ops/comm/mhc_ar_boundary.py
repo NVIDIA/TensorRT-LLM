@@ -14,27 +14,25 @@ add their partial mixer sums over distributed shared memory in a fixed order. Th
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
+    Arch,
+    Cell,
+    OpWrapper,
+    true_fp32_matmul,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 from ... import native_ops
+from ..mhc.mhc_big_fuse import sinkhorn
 
 WORLD = 4
 MAX_ROWS = 8
 MULT = 4
 HIDDEN = 4096
-
-
-def _sinkhorn(logits: torch.Tensor, iters: int, eps: float) -> torch.Tensor:
-    """Softmax over the rows, a column normalization, then ``iters - 1`` row / column pairs."""
-    comb = logits.softmax(-1) + eps
-    comb = comb / (comb.sum(-2, keepdim=True) + eps)
-    for _ in range(iters - 1):
-        comb = comb / (comb.sum(-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(-2, keepdim=True) + eps)
-    return comb
 
 
 class MhcArBoundary(OpWrapper):
@@ -53,7 +51,7 @@ class MhcArBoundary(OpWrapper):
     ``mHC.fused_hc(..., norm_weight=...)`` returns, ``post`` without its trailing unit dimension.
     """
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100})
 
     # GLM-5.3-Flash at tp4: hc_mult 4, hidden 4096, 20 Sinkhorn iterations.
     _GLM = dict(world=WORLD, mult=MULT, hidden=HIDDEN, sinkhorn_iters=20)
@@ -75,23 +73,23 @@ class MhcArBoundary(OpWrapper):
 
     def __call__(
         self,
-        partial,
-        workspace,
-        rank,
-        residual,
-        post,
-        comb,
-        fn,
-        scale,
-        base,
-        norm_weight,
-        sinkhorn_iters,
-        norm_eps,
-        hc_eps,
-        sinkhorn_eps,
-        post_mult,
-        layer_input_eps,
-    ):
+        partial: torch.Tensor,
+        workspace: torch.Tensor,
+        rank: int,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        fn: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        norm_weight: torch.Tensor,
+        sinkhorn_iters: int,
+        norm_eps: float,
+        hc_eps: float,
+        sinkhorn_eps: float,
+        post_mult: float,
+        layer_input_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         rows = partial.shape[0]
         residual_out = torch.empty_like(residual)
         post_out = torch.empty((rows, MULT), dtype=torch.float32, device=partial.device)
@@ -124,44 +122,50 @@ class MhcArBoundary(OpWrapper):
 
     def reference(
         self,
-        partial,
-        workspace,
-        rank,
-        residual,
-        post,
-        comb,
-        fn,
-        scale,
-        base,
-        norm_weight,
-        sinkhorn_iters,
-        norm_eps,
-        hc_eps,
-        sinkhorn_eps,
-        post_mult,
-        layer_input_eps,
-    ):
+        partial: Sequence[torch.Tensor],
+        workspace: torch.Tensor,
+        rank: int,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        fn: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        norm_weight: torch.Tensor,
+        sinkhorn_iters: int,
+        norm_eps: float,
+        hc_eps: float,
+        sinkhorn_eps: float,
+        post_mult: float,
+        layer_input_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """The same outputs in FP32 torch. A collective: ``partial`` is the group's partials in rank
         order, not this rank's one; ``workspace`` and ``rank`` are ignored.
 
-        The all-reduce result and the new streams are rounded to BF16 where the op's outputs are
-        (the next block reads the stored streams); everything else stays FP32 until the outputs.
+        Rounded to BF16 where the op stores a tensor: the all-reduce result and the new streams (the
+        next block reads the stored streams); everything else stays FP32, with FP32 matmuls. The
+        collapsed layer input is normalized in FP32: the kernel takes its RMS from the Gram matrix of
+        the new streams and never stores the row, so unlike the unfused path (the library all-reduce,
+        then ``mHC.fused_hc``) it is not rounded to BF16 before the RMSNorm. That moves the layer
+        input by under 2 ulp per element (0.8 ulp RMS) against the unfused path.
         """
         rows = residual.shape[0]
-        x = torch.stack([p.float() for p in partial]).sum(0).to(torch.bfloat16).float()
-        streams = residual.float().reshape(rows, MULT, HIDDEN)
-        post_prev = post.float().reshape(rows, MULT, 1)
-        comb_prev = comb.float().reshape(rows, MULT, MULT)
-        new = (x.unsqueeze(1) * post_prev + torch.bmm(comb_prev.mT, streams)).to(torch.bfloat16)
-        flat = new.float().reshape(rows, MULT * HIDDEN)
-        mixes = flat @ fn.float().T * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
+        with true_fp32_matmul():
+            x = torch.stack([p.float() for p in partial]).sum(0).to(torch.bfloat16).float()
+            streams = residual.float().reshape(rows, MULT, HIDDEN)
+            post_prev = post.float().reshape(rows, MULT, 1)
+            comb_prev = comb.float().reshape(rows, MULT, MULT)
+            new = (x.unsqueeze(1) * post_prev + torch.bmm(comb_prev.mT, streams)).to(torch.bfloat16)
+            flat = new.float().reshape(rows, MULT * HIDDEN)
+            rstd = torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
+            mixes = flat @ fn.float().T * rstd
         scales = torch.cat(
             [scale[0].expand(MULT), scale[1].expand(MULT), scale[2].expand(MULT * MULT)]
         ).float()
         mixes = mixes * scales + base.float()
         pre = torch.sigmoid(mixes[:, :MULT]) + hc_eps
         post_out = torch.sigmoid(mixes[:, MULT : 2 * MULT]) * post_mult
-        comb_out = _sinkhorn(
+        comb_out = sinkhorn(
             mixes[:, 2 * MULT :].reshape(rows, MULT, MULT), sinkhorn_iters, sinkhorn_eps
         )
         collapsed = (new.float() * pre.unsqueeze(-1)).sum(1)
@@ -171,8 +175,24 @@ class MhcArBoundary(OpWrapper):
         return new, post_out, comb_out, (layer_input * norm_weight.float()).to(torch.bfloat16)
 
     def is_valid(
-        self, partial, workspace, rank, residual, post, comb, fn, scale, base, norm_weight, **kwargs
-    ):
+        self,
+        partial: torch.Tensor,
+        workspace: torch.Tensor,
+        rank: int,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        fn: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        norm_weight: torch.Tensor,
+        sinkhorn_iters: int,
+        norm_eps: float,
+        hc_eps: float,
+        sinkhorn_eps: float,
+        post_mult: float,
+        layer_input_eps: float,
+    ) -> None:
         rows, hidden = partial.shape
         assert 1 <= rows <= MAX_ROWS, f"{rows} rows; at most {MAX_ROWS}"
         assert hidden == HIDDEN and residual.shape == (rows, MULT, HIDDEN), (

@@ -18,4 +18,5 @@ add_modeling_v2_family(glm5_next)
 add_modeling_v2_target(
   glm5_next glm_5_3_flash_fp8__sm_10x__tp4
   ARCHS 100f
-  SOURCES *.cu *.cpp)
+  SOURCES *.cu *.cpp
+  REQUIRES MULTI_DEVICE)

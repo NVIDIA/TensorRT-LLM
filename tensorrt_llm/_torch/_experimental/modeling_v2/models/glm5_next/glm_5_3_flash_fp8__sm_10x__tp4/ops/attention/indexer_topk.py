@@ -6,10 +6,10 @@ count per row.
 Row ``r`` picks the ``select_k`` highest of its ``num_cand[r]`` complete-pool scores
 ``scores[r, :num_cand[r]]``. A row with ``num_cand[r] <= select_k`` keeps all its pools,
 ``0 .. num_cand[r] - 1`` in order and ``-1`` after them; a longer row gets ``select_k`` pool ids
-in an unspecified order. Columns at and past ``num_cand[r]`` are not read. The module path
-reaches this kernel through ``TopK`` (decode implementation ``CUTE_DSL_RADIX``) with
-``is_prefill=False`` and ``sequence_lengths = scan_lengths = num_cand``, for decode, verify and
-context rows alike.
+in an unspecified order. Columns at and past ``num_cand[r]`` are not read. The target selects
+the pools of its sequence-parallel context rows with it (``MlaLayer.context_rows``), on the
+scores of ``kpool_score_fp8``; generation rows select with ``kpool_select``. The op is the CuTe
+DSL radix decode top-k (``trtllm::cute_dsl_indexer_topk_decode``) with ``next_n = 1``.
 """
 
 from __future__ import annotations
@@ -36,12 +36,13 @@ class IndexerTopk(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_100})
-    # select_k = index_topk / index_kpool = 512. A verify or decode row scores the BF16
-    # scorer's full capacity of 32,800 pools (4,100 32-token pages); context rows score the
-    # FP8 scorer's [rows, max_kv_len // 4] view, whose rows DeepGEMM pads (`row_pad` extra
-    # columns). `kv` is a generation cell's KV length after the step; context cells give the
-    # prompt's row range, whose candidate counts run up from (row + 1) // 4. `levels` rounds
-    # the scores to that many values per unit, so the k-th value is tied many times.
+    # select_k = index_topk / index_kpool = 512. The target's context rows score the FP8
+    # scorer's [rows, max_kv_len // 4] view, max_kv_len being the largest visible length of
+    # the scored rows, and DeepGEMM pads its rows (`row_pad` extra columns); context cells give
+    # a rank's sequence-parallel row range, whose candidate counts run up from (row + 1) // 4.
+    # The generation cells (`kv` the KV length after the step) drive the op at the 32,800-pool
+    # width of a full block table. `levels` rounds the scores to that many values per unit, so
+    # the k-th value is tied many times.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="MTP-3 verify of one 13K-token request, BF16-scorer width",
@@ -60,12 +61,16 @@ class IndexerTopk(OpWrapper):
             spec=dict(requests=8, tokens=1, kv=13312, width=32800),
         ),
         Cell(
-            why="sequence-parallel quarter (rows 0-3327): short rows keep every pool",
-            spec=dict(rows=(0, 3328), width=3328, row_pad=256),
+            why="rank 0's quarter of a 13,312-token prompt (rows 0-3327, 832 pools)",
+            spec=dict(rows=(0, 3328), width=832, row_pad=64),
         ),
         Cell(
             why="last sequence-parallel quarter of a 13,312-token prompt (rows 9984-13311)",
             spec=dict(rows=(9984, 13312), width=3328, row_pad=256),
+        ),
+        Cell(
+            why="rank 1's quarter (rows 10-19) of a 37-token prompt: five pools, all short rows",
+            spec=dict(rows=(10, 20), width=5, row_pad=3),
         ),
         Cell(
             why="heavy ties at the k-th score",
@@ -80,21 +85,35 @@ class IndexerTopk(OpWrapper):
 
     JIT: the first call of a compile key compiles a CuTe DSL kernel for seconds. The key is
     the score dtype, next_power_of_2(C), select_k and, through the dispatch on the row count,
-    the occupancy band (the cluster size or the large-occupancy variant). Compile every key a
-    deployment reaches before serving and before CUDA-graph capture:
-    `warmup_cute_dsl_radix_topk_decode(top_k=select_k, num_cols=C, next_n=1)` in
-    `tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops` compiles every row band of one width.
-    The FP8 context scorer's width follows the step's longest prompt, so each power-of-two
-    bucket of it compiles on first use. Registered only where the CuTe DSL is available.
+    the occupancy band (the cluster size or the large-occupancy variant). The target's C is
+    the FP8 context scorer's width, which follows the largest visible length of a scoring call,
+    so each power-of-two bucket of it, and each row band, compiles on its first prefill step
+    unless a warmup compiled it: `warmup_cute_dsl_radix_topk_decode(top_k=select_k,
+    num_cols=C, next_n=1)` in `tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops` compiles
+    every row band of one width. Registered only where the CuTe DSL is available.
 
     FP32 scores only: BF16 and FP16 scores take other kernels of the dispatch.
     """
 
-    def __call__(self, scores, num_cand, selected, *, select_k):
+    def __call__(
+        self,
+        scores: torch.Tensor,
+        num_cand: torch.Tensor,
+        selected: torch.Tensor,
+        *,
+        select_k: int,
+    ) -> torch.Tensor:
         torch.ops.trtllm.cute_dsl_indexer_topk_decode(scores, num_cand, selected, select_k, 1)
         return selected
 
-    def reference(self, scores, num_cand, selected, *, select_k):
+    def reference(
+        self,
+        scores: torch.Tensor,
+        num_cand: torch.Tensor,
+        selected: torch.Tensor,
+        *,
+        select_k: int,
+    ) -> torch.Tensor:
         """A fresh ``[R, select_k]`` int32 selection; ``selected`` is not read.
 
         A long row's winners are its ``select_k`` highest scores, ties at the k-th score broken
@@ -120,7 +139,14 @@ class IndexerTopk(OpWrapper):
             out[chunk] = order.sort(dim=1).values.to(torch.int32)
         return out
 
-    def is_valid(self, scores, num_cand, selected, *, select_k):
+    def is_valid(
+        self,
+        scores: torch.Tensor,
+        num_cand: torch.Tensor,
+        selected: torch.Tensor,
+        *,
+        select_k: int,
+    ) -> None:
         assert scores.dtype == torch.float32, f"FP32 scores only; got {scores.dtype}"
         assert scores.dim() == 2 and scores.stride(1) == 1, f"scores strides {scores.stride()}"
         # The compiled kernel assumes a 32-byte-aligned base for its vector loads.

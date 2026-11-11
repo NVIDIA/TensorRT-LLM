@@ -66,7 +66,7 @@ The scale warp copies each row's scales with 4-byte ``cp.async`` from the same i
 bytes in shared memory match the TMA tile load's, so the output is bitwise the same.
 """
 
-from typing import Dict, Tuple, Union
+from typing import Callable, Dict, Tuple, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -1718,7 +1718,7 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         cluster_shape_mn: Tuple[int, int],
         raster_along_m: bool = False,
         gather_a: bool = False,
-    ):
+    ) -> None:
         super().__init__(cutlass.Float32, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
         self.raster_along_m = raster_along_m
         self.gather_a = gather_a
@@ -1911,7 +1911,32 @@ DEFAULT_GATHERED_TACTICS: Dict[Tuple[int, int], GroupedGemmTactic] = {
     (1024, 4096): (False, (128, 128), (1, 8), False),
 }
 
-_compiled_kernels: Dict[Tuple, object] = {}
+#: A compiled launcher: called with the wrapper's runtime arguments (sizes, raw pointers and the
+#: C tensor); returns nothing.
+CompiledGemm = Callable[..., None]
+
+_compiled_kernels: Dict[Tuple[int, int, GroupedGemmTactic, bool], CompiledGemm] = {}
+
+
+_OPERAND_DTYPES = {
+    "a": torch.float8_e4m3fn,
+    "b": torch.float8_e4m3fn,
+    "sfa": torch.float32,
+    "sfb": torch.float32,
+    "tile_expert": torch.int32,
+    "row_index": torch.int32,
+    "out": torch.bfloat16,
+}
+
+
+def _check_operands(**operands: torch.Tensor) -> None:
+    """Raise unless each operand has its dtype and is contiguous: the kernels read raw pointers
+    with dense layouts, so another dtype or a strided view is read as wrong values."""
+    for name, t in operands.items():
+        if t.dtype != _OPERAND_DTYPES[name]:
+            raise ValueError(f"{name} must be {_OPERAND_DTYPES[name]}; got {t.dtype}")
+        if not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous; got strides {t.stride()}")
 
 
 def _c_view(out: torch.Tensor) -> torch.Tensor:
@@ -1919,7 +1944,11 @@ def _c_view(out: torch.Tensor) -> torch.Tensor:
     return out.view(1, *out.shape).permute(1, 2, 0)
 
 
-def _compile(n: int, k: int, tactic: GroupedGemmTactic, out: torch.Tensor, gather_a: bool = False):
+def _compile(
+    n: int, k: int, tactic: GroupedGemmTactic, out: torch.Tensor, gather_a: bool = False
+) -> CompiledGemm:
+    """The kernel for ``(n, k, tactic, gather_a)``, compiled on its first use. The row count and
+    the expert count are runtime arguments, so no other call compiles again."""
     use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
     key = (n, k, tactic, gather_a)
     compiled = _compiled_kernels.get(key)
@@ -1936,7 +1965,7 @@ def _compile(n: int, k: int, tactic: GroupedGemmTactic, out: torch.Tensor, gathe
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
 
-    def ptr(dtype, align=16):
+    def ptr(dtype: type[cutlass.Numeric], align: int = 16) -> cute.Pointer:
         return make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=align)
 
     c_fake = cute.runtime.from_dlpack(_c_view(out)).mark_layout_dynamic(leading_dim=1)
@@ -2008,8 +2037,10 @@ def grouped_blockwise_fp8_gemm(
         tactic: ``(use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along_m)``;
             defaults to the tuned choice for (N, K).
 
-    N must be a multiple of 128 times the cluster's N size and K a multiple of 128. The call
-    reads no device data on the host, so it is safe inside CUDA graph capture.
+    N must be a multiple of 128 times the cluster's N size and K a multiple of 128. Every
+    operand is read through its raw pointer with the dense layout above, so each must be
+    contiguous. The call reads no device data on the host, so it is safe inside CUDA graph
+    capture.
     """
     rows, k = a.shape
     num_experts, n, k_b = b.shape
@@ -2022,6 +2053,7 @@ def grouped_blockwise_fp8_gemm(
         raise ValueError("tile_expert must be Int32 with rows / 128 entries")
     if tuple(out.shape) != (rows, n) or out.dtype != torch.bfloat16:
         raise ValueError(f"bad output: {tuple(out.shape)} {out.dtype}")
+    _check_operands(a=a, b=b, sfa=sfa, sfb=sfb, tile_expert=tile_expert, out=out)
     if tactic is None:
         tactic = DEFAULT_TACTICS.get((n, k), FALLBACK_TACTIC)
     compiled = _compile(n, k, tactic, out)
@@ -2071,7 +2103,13 @@ def grouped_blockwise_fp8_gemm_gathered(
     rows = out.shape[0]
     if k_b != k or rows % GROUP_ROW_ALIGNMENT != 0:
         raise ValueError(f"bad shapes: x {tuple(x.shape)}, b {tuple(b.shape)}, out {rows}")
-    if tuple(sfx.shape) != (k // 128, num_tokens) or sfx.stride(1) != 1:
+    # The kernel reads token t of K block j at ``j * sfx.stride(0) + t``: the tokens must be
+    # adjacent (a one-token scale's column stride is never read).
+    if (
+        tuple(sfx.shape) != (k // 128, num_tokens)
+        or (num_tokens > 1 and sfx.stride(1) != 1)
+        or (k > 128 and sfx.stride(0) < num_tokens)
+    ):
         raise ValueError(f"bad sfx: {tuple(sfx.shape)} strides {sfx.stride()}")
     if tuple(sfb.shape) != (num_experts, n // 128, k // 128):
         raise ValueError(f"bad sfb: {tuple(sfb.shape)}")
@@ -2081,6 +2119,9 @@ def grouped_blockwise_fp8_gemm_gathered(
         raise ValueError("tile_expert must be Int32 with rows / 128 entries")
     if tuple(out.shape) != (rows, n) or out.dtype != torch.bfloat16:
         raise ValueError(f"bad output: {tuple(out.shape)} {out.dtype}")
+    if sfx.dtype != torch.float32:
+        raise ValueError(f"sfx must be FP32; got {sfx.dtype}")
+    _check_operands(a=x, b=b, sfb=sfb, tile_expert=tile_expert, row_index=row_index, out=out)
     if tactic is None:
         tactic = DEFAULT_GATHERED_TACTICS.get((n, k), FALLBACK_TACTIC)
     compiled = _compile(n, k, tactic, out, gather_a=True)

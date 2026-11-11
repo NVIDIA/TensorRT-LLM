@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """KDA prefill: the gated delta rule over packed raw q / k / v from each sequence's resident state row, the
-final state written back to the row."""
+final state written back to the row.
+
+Copied from kimi_k3_vl's entry (``models/kimi_k3_vl/ops/ssm/kda_prefill.py``), which wraps the same
+``trtllm::kda_prefill`` op. This entry adds the op's ``sm_reserve`` argument, and its reference returns the state
+pool as the call leaves it (each final state rounded once to the pool dtype) where kimi_k3_vl's writes the pool in
+place.
+"""
 
 from __future__ import annotations
 

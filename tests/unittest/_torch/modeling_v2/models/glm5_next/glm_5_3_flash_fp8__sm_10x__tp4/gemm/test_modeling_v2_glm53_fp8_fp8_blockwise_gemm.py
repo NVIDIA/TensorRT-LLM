@@ -26,6 +26,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flas
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
     fp8_quantize_1x128,
 )
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../.."]
@@ -136,6 +137,48 @@ def test_block_fp8_linear_from_bf16_rows() -> None:
     with validating(op):
         out = op(x, w, x_scale, w_scale)
     _compare(out, op.reference(x, w, x_scale, w_scale))
+
+
+def test_tuned_tactic_under_cuda_graph_capture() -> None:
+    """A decode step's FFN input as the target runs it: `fp8_quantize_1x128`, then the op at the
+    tactic the autotuner picked in warmup, captured in a CUDA graph and replayed on new rows.
+    Tuning profiles only the call's own row bucket. The replayed quantization equals an eager
+    one bit for bit, and the product holds the certified band against the reference on it."""
+    shape = GLM_SHARED_GATE_UP
+    g = torch.Generator(device=DEV).manual_seed(47)
+    rows = torch.randn(32, shape["k"], generator=g, device=DEV).to(torch.bfloat16)
+    _, w, _, w_scale = _build(dict(m=1, **shape), seed=53)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    try:
+        x, x_scale = fp8_quantize_1x128(rows)
+        with autotune(skip_dynamic_tuning_buckets=True):
+            op(x, w, x_scale, w_scale)
+        assert any(
+            key[0] == "trtllm::cute_dsl_fp8_gemm_blackwell::gemm"
+            for key in tuner.profiling_cache.cache
+        ), "the warmup tuned nothing"
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            warm_x, warm_scale = fp8_quantize_1x128(rows)
+            op(warm_x, w, warm_scale, w_scale)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            x, x_scale = fp8_quantize_1x128(rows)
+            out = op(x, w, x_scale, w_scale)
+        for seed in (59, 61):
+            fresh = torch.Generator(device=DEV).manual_seed(seed)
+            rows.copy_(torch.randn(rows.shape, generator=fresh, device=DEV).to(torch.bfloat16))
+            graph.replay()
+            torch.cuda.synchronize()
+            eager_x, eager_scale = fp8_quantize_1x128(rows)
+            assert torch.equal(x.view(torch.uint8), eager_x.view(torch.uint8))
+            assert torch.equal(x_scale, eager_scale)
+            _compare(out, op.reference(x, w, x_scale, w_scale))
+    finally:
+        tuner.clear_cache()
 
 
 def test_guard_refuses_a_transposed_activation_scale() -> None:

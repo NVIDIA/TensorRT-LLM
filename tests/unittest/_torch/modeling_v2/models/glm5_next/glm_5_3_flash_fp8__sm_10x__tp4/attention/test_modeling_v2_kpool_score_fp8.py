@@ -36,10 +36,10 @@ def _on_e4m3_grid(shape, g: torch.Generator) -> torch.Tensor:
     return (x * torch.exp2(e.float())).to(torch.bfloat16)
 
 
-def _args(spec: dict, seed: int, exact: bool = True):
+def _args(spec: dict, seed: int, exact: bool = True) -> tuple[tuple, dict]:
     """Packed context rows of ``(cached, new)`` requests, restricted to ``rows``, with the
-    host bound ``max_kv_len`` of the longest request, as the target scores them. With
-    ``exact`` the queries and every pool key are on the E4M3 grid (``_on_e4m3_grid``)."""
+    host bound ``max_kv_len`` the target passes: the largest visible length among those rows.
+    With ``exact`` the queries and every pool key are on the E4M3 grid (``_on_e4m3_grid``)."""
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     visible, request_ids = [], []
     for i, (cached, new) in enumerate(spec["context"]):
@@ -49,7 +49,7 @@ def _args(spec: dict, seed: int, exact: bool = True):
     visible = torch.cat(visible)[lo:hi].to(DEVICE)
     request_ids = torch.cat(request_ids)[lo:hi].to(DEVICE)
     pages, slots = spec.get("pages", PAGES), spec.get("slots", SLOTS)
-    max_kv_len = max(cached + new for cached, new in spec["context"])
+    max_kv_len = int(visible.max())
     tables = torch.zeros(len(spec["context"]), pages, dtype=torch.int64, device=DEVICE)
     for t, (cached, new) in enumerate(spec["context"]):
         used = -(-(cached + new) // TPB)

@@ -83,6 +83,10 @@ class CompactSparseRows(OpWrapper):
             why="one rank's sequence-parallel quarter of a 13,312-token prompt (rows 0-3327)",
             spec=dict(rows=3328, width=2112, kv=3328),
         ),
+        Cell(
+            why="rank 1's quarter (rows 10-19) of a 37-token prompt: short rows",
+            spec=dict(rows=10, width=2112, kv=20),
+        ),
     )
 
     note = """
@@ -93,7 +97,7 @@ class CompactSparseRows(OpWrapper):
     attention would read past the cache. `kpool_expand` writes in-range ids or -1 only.
     """
 
-    def __call__(self, indices):
+    def __call__(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         rows = indices.shape[0]
         width = triton.cdiv(indices.shape[1], 64) * 64
         packed = torch.empty((rows, width), dtype=torch.int32, device=indices.device)
@@ -114,7 +118,7 @@ class CompactSparseRows(OpWrapper):
         )
         return packed, lengths, nonempty
 
-    def reference(self, indices):
+    def reference(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """A stable partition of each row (valid ids first, in order), then the padding and the
         dummy id of an empty row."""
         rows, width = indices.shape
@@ -131,7 +135,7 @@ class CompactSparseRows(OpWrapper):
         packed[:, 0] = torch.where(count > 0, packed[:, 0], 0)
         return packed, count.clamp(min=1).to(torch.int32), count > 0
 
-    def is_valid(self, indices):
+    def is_valid(self, indices: torch.Tensor) -> None:
         assert indices.dim() == 2 and indices.dtype == torch.int32, (
             f"indices must be int32 [R, W]; got {indices.dtype} {tuple(indices.shape)}: the "
             "kernel stores the loaded ids into an int32 output"

@@ -26,10 +26,10 @@ KPOOL, SELECT_K = 4, 512
 def _args(spec: dict, seed: int):
     """Scores and candidate counts the way the target hands them over.
 
-    Generation cells: request ``b``'s KV length after the step is ``kv - b % 4`` and its rows
-    see ``kv_b - T + 1 .. kv_b`` positions; the scores are the BF16 scorer's full-capacity
-    rows. Context cells: rows ``lo .. hi - 1`` of a prompt see ``row + 1`` positions; the
-    scores are a view of DeepGEMM's row-padded logits. Every column a row must not read (at
+    Context cells: rows ``lo .. hi - 1`` of a prompt see ``row + 1`` positions; the scores are
+    a view of DeepGEMM's row-padded logits. Generation cells: request ``b``'s KV length after
+    the step is ``kv - b % 4`` and its rows see ``kv_b - T + 1 .. kv_b`` positions, over rows
+    a full block table wide. Every column a row must not read (at
     or past its count, and the row padding) holds +inf, so a read past the count wins the
     selection. ``levels`` rounds the scores to quarter steps: the k-th score ties many times.
     """

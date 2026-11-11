@@ -1,7 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """One-token KDA decode of B requests: the width-4 conv, the gated delta rule on each request's state row and
-the gated output RMS norm, with the conv windows and state rows updated in place."""
+the gated output RMS norm, with the conv windows and state rows updated in place.
+
+Copied from kimi_k3_vl's entry (``models/kimi_k3_vl/ops/ssm/kda_decode.py``), which wraps the same
+``trtllm::kda_decode`` op. This entry fixes the op's mode flags to the forms GLM-5.3-Flash runs (output norm,
+lower-bound gate, beta sigmoid, conv windows updated in place); its reference computes every request at once and
+returns the state and conv pools as the call leaves them, where kimi_k3_vl's loops over requests, takes every
+mode flag and updates the pools in place.
+"""
 
 from __future__ import annotations
 

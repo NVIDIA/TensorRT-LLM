@@ -2,18 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP8 casts of head-major ``[H, R, D]`` batched-GEMM outputs into row-major ``[R, H * D]``.
 
-The sequence-parallel MLA context rows run their per-head products (query into the latent
-space, latent output into the value space) as ``torch.bmm`` over the heads, which returns
-head-major tensors. Each consumer wants the rows contiguous and in FP8, so each cast reads
-the head-major tensor once and writes the row-major FP8 copy, in place of a transposing copy
-followed by the cast.
+The MLA layers run their per-head products as ``torch.bmm`` over the heads, which returns
+head-major tensors: the query into the latent space (generation rows with a rank's 16 heads,
+sequence-parallel context rows with all 64) and the context rows' latent output into the value
+space. Each consumer wants the rows contiguous and in FP8, so each cast reads the head-major
+tensor once and writes the row-major FP8 copy, in place of a transposing copy followed by the
+cast.
 
-``saturate_fp8``: the attention query, ``clamp(+-448)`` then E4M3 (the saturating conversion
-the sparse attention applies to its query).
+``saturate_fp8``: the attention query, ``clamp(+-448)`` then E4M3 (the sparse attention takes an
+E4M3 query).
 
-``quantize_1x128``: the o_proj input, the 1 x 128 block quantization ``fp8_quantize_1x128``
-computes (scale ``448 / amax`` with ``amax`` floored at BF16 ``1e-10``, FP32 product, saturating E4M3), with
-its K-block-major ``[H * D / 128, R]`` FP32 dequantization scales.
+``quantize_1x128``: the context rows' o_proj input, the 1 x 128 block quantization
+``fp8_quantize_1x128`` computes (scale ``448 / amax`` with ``amax`` floored at BF16 ``1e-10``,
+FP32 product, saturating E4M3), with its K-block-major ``[H * D / 128, R]`` FP32 dequantization
+scales.
 """
 
 from __future__ import annotations
@@ -23,6 +25,8 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from ..quantization.fp8_quantize_1x128 import fp8_quantize_1x128
 
 _FP8_MAX = 448.0
 
@@ -64,20 +68,30 @@ class SaturateFp8(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100})
     CELLS: tuple[Cell, ...] = (
+        Cell(why="MLA generation query, one draft row, 16 heads", spec=dict(h=16, r=1, d=512)),
+        Cell(
+            why="MLA generation query, MTP-3 verify of one request, 16 heads",
+            spec=dict(h=16, r=4, d=512),
+        ),
+        Cell(
+            why="MLA generation query, MTP-3 verify of eight requests, 16 heads",
+            spec=dict(h=16, r=32, d=512),
+        ),
         Cell(why="MLA context query, 13K prompt / 4 ranks", spec=dict(h=64, r=3328, d=512)),
         Cell(why="MLA context query, ragged rows", spec=dict(h=64, r=517, d=512)),
+        Cell(why="MLA context query, 37-token prompt / 4 ranks", spec=dict(h=64, r=10, d=512)),
     )
 
-    def __call__(self, x):
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
         h, r, d = x.shape
         out = torch.empty((r, h, d), dtype=torch.float8_e4m3fn, device=x.device)
         _saturate_kernel[(triton.cdiv(r, 8), h)](x, out, r, h, d, 8, num_warps=4)
         return out
 
-    def reference(self, x):
+    def reference(self, x: torch.Tensor) -> torch.Tensor:
         return x.transpose(0, 1).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
 
-    def is_valid(self, x):
+    def is_valid(self, x: torch.Tensor) -> None:
         assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.dim() == 3
         assert x.shape[2] % 128 == 0
 
@@ -90,21 +104,22 @@ class Quantize1x128(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         Cell(why="MLA context values, 13K prompt / 4 ranks", spec=dict(h=64, r=3328, d=256)),
         Cell(why="MLA context values, ragged rows", spec=dict(h=64, r=517, d=256)),
+        Cell(why="MLA context values, 37-token prompt / 4 ranks", spec=dict(h=64, r=10, d=256)),
     )
 
-    def __call__(self, x):
+    def __call__(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h, r, d = x.shape
         out = torch.empty((r, h * d), dtype=torch.float8_e4m3fn, device=x.device)
         scale = torch.empty((h * d // 128, r), dtype=torch.float32, device=x.device)
         _quantize_kernel[(triton.cdiv(r, 8), h)](x, out, scale, r, h, d, 8, num_warps=4)
         return out, scale
 
-    def reference(self, x):
+    def reference(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``fp8_quantize_1x128``'s plain-torch reference on the row-major copy."""
         h, r, d = x.shape
-        q, s = torch.ops.trtllm.fp8_quantize_1x128(x.transpose(0, 1).reshape(r, h * d))
-        return q, s.view(h * d // 128, -1)[:, :r]
+        return fp8_quantize_1x128.reference(x.transpose(0, 1).reshape(r, h * d))
 
-    def is_valid(self, x):
+    def is_valid(self, x: torch.Tensor) -> None:
         assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.dim() == 3
         assert x.shape[2] % 128 == 0
 

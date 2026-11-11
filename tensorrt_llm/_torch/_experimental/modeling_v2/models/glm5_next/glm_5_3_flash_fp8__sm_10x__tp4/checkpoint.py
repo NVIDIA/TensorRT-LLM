@@ -11,22 +11,22 @@ not load (the vision tower, and the MTP layer without speculative decoding).
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 import torch
 
 #: An index into a checkpoint tensor: one slice per leading axis.
 Cut = tuple[slice, ...]
 
+#: The side of the checkpoint's square FP8 scale blocks (``weight_scale_inv``).
+BLOCK = 128
+
 
 class Checkpoint:
-    def __init__(self, weights: Any, device: torch.device) -> None:
+    def __init__(self, weights: Mapping[str, Any], device: torch.device) -> None:
         self.weights = weights
         self.device = device
         self.read_keys: set[str] = set()
-
-    def has(self, key: str) -> bool:
-        return key in self.weights
 
     def read(
         self, key: str, cut: Optional[Cut] = None, dtype: Optional[torch.dtype] = None
@@ -80,7 +80,7 @@ def share(total: int, tp_size: int, tp_rank: int) -> tuple[int, int]:
 
 
 def dequantize_block_fp8(
-    weight: torch.Tensor, scale: torch.Tensor, block: int = 128
+    weight: torch.Tensor, scale: torch.Tensor, block: int = BLOCK
 ) -> torch.Tensor:
     """BF16 ``weight`` from a 128 x 128 block-FP8 weight and its FP32 block scales."""
     n, k = weight.shape

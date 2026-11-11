@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GLM-5.3-Flash block-FP8 on sm_100 / sm_103, tp4: model construction and forward.
+"""GLM-5.3-Flash block-FP8 on sm_100, tp4: model construction and forward.
 
 The checkpoint is the composite ``Glm5NextForConditionalGeneration`` release, served text
 only (``disable_mm_encoder``). The engine builds ``ModelingV2Glm53FlashFp8Sm10xTp4``, a
@@ -29,12 +29,13 @@ mHC layers on catalog and target operations, ``weights.py`` reads the checkpoint
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Union
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     disable_v2_by_default,
     step_contract_enabled,
@@ -49,6 +50,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
     flashinfer_rmsnorm,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.metadata import Glm5NextMamba2Metadata
 from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
@@ -56,13 +58,16 @@ from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping as ParallelMapping
 
+from ..routing import fp8_model_refused
 from . import weights as _weights
 from .dims import Dims
 from .layers.ffn import DenseMlp, MoeLayer
 from .layers.kda import KdaLayer
 from .layers.mhc import Mhc
 from .layers.mla import MlaLayer, SparseAttentionScratch
+from .layers.streams import AuxStream
 from .ops.comm.mhc_ar_boundary import WORLD as _FUSED_BOUNDARY_WORLD
 from .ops.comm.mhc_ar_boundary import mhc_ar_boundary
 from .ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
@@ -71,16 +76,14 @@ from .ops.moe.prefill_moe import PrefillMoeWorkspace
 from .ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
 from .schedule import DENSE_MLP, LINEAR_ATTENTION, StepSchedule
 
-# The deployment this target is written for; route() selects it on the same facts, and
-# the constructor states them again for a direct construction.
-_SMS = ((10, 0), (10, 3))
-_TP = 4
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
 #: The TP all-reduce of more rows than this runs on NCCL; fewer on the one-shot kernel,
 #: whose workspace the fused boundary shares.
 _ONESHOT_MAX_ROWS = 512
-#: Head products of at most this many rows run on ``low_m_bf16_gemm``.
-_LOW_M_ROWS = 32
 _AR_NONE = int(AllReduceFusionOp.NONE)
 
 #: The prepared hybrid-cache metadata fields the KDA layers read (``StepSchedule.build`` reads
@@ -121,7 +124,7 @@ class _Comm:
     """This rank's TP collectives: the all-reduce (one-shot up to ``_ONESHOT_MAX_ROWS`` rows,
     NCCL above), and the all-gather / reduce-scatter of sequence-parallel prefill."""
 
-    def __init__(self, mapping) -> None:
+    def __init__(self, mapping: ParallelMapping) -> None:
         self.tp_size = mapping.tp_size
         self.tp_rank = mapping.tp_rank
         self.group = list(mapping.tp_group)
@@ -130,10 +133,11 @@ class _Comm:
         self.large = allreduce_group_args(mapping, int(AllReduceStrategy.NCCL))
         # The one-shot all-reduce's Lamport workspace, which the fused boundary also rotates.
         self.workspace = get_allreduce_workspace(mapping)
+        # The fused boundary stores through the workspace's peer pointers, which are null
+        # without peer access (the library all-reduce then falls back to NCCL).
+        self.peer_access = can_access_peer(mapping)
 
     def allreduce(self, x: torch.Tensor) -> torch.Tensor:
-        if self.tp_size == 1:
-            return x
         args = self.small if x.shape[0] <= _ONESHOT_MAX_ROWS else self.large
         return allreduce(
             x.contiguous(),
@@ -160,8 +164,6 @@ class _Comm:
 
     def gather_vocab(self, local: torch.Tensor) -> torch.Tensor:
         """``[rows, vocab / tp]`` shards -> ``[rows, vocab]``, rank-major along the vocabulary."""
-        if self.tp_size == 1:
-            return local
         rows = local.shape[0]
         stacked = allgather(local.contiguous(), None, self.group, self.process_group)
         return stacked.view(self.tp_size, rows, -1).transpose(0, 1).reshape(rows, -1)
@@ -183,7 +185,17 @@ class _Layer:
     """One decoder layer's parts: the attention (KDA or MLA), the FFN, the two mHC sites and
     the two RMSNorm weights."""
 
-    def __init__(self, index, kind, attention, mlp, hc_attn, hc_ffn, input_norm, post_norm):
+    def __init__(
+        self,
+        index: int,
+        kind: str,
+        attention: Union[KdaLayer, MlaLayer],
+        mlp: Union[DenseMlp, MoeLayer],
+        hc_attn: Mhc,
+        hc_ffn: Mhc,
+        input_norm: torch.Tensor,
+        post_norm: torch.Tensor,
+    ) -> None:
         self.index = index
         self.kind = kind
         self.attention = attention
@@ -216,7 +228,9 @@ class PrefillTarget:
         self.comm = core.comm
         self.moe_workspace = PrefillMoeWorkspace()
 
-    def forward(self, step: StepSchedule, input_ids: torch.Tensor, attn_metadata) -> torch.Tensor:
+    def forward(
+        self, step: StepSchedule, input_ids: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
         core = self.core
         comm = self.comm
         dims = core.dims
@@ -278,7 +292,9 @@ class PrefillTarget:
         residual = residual + comm.scatter(self._ffn_partial(mtp.mlp, x, num_tokens), rows)
         return comm.gather(flashinfer_rmsnorm(residual, mtp.w.head_norm, eps), num_tokens)
 
-    def _ffn_partial(self, mlp, x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    def _ffn_partial(
+        self, mlp: Union[DenseMlp, MoeLayer], x: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
         """The FFN's intermediate-split output for every row, from this rank's rows ``x``.
 
         Every FFN GEMM input is the 1 x 128 block-FP8 quantization of the row, a per-row
@@ -322,13 +338,19 @@ class DecodeTarget:
         self.core = core
         self.comm = core.comm
 
-    def forward(self, step: StepSchedule, input_ids: torch.Tensor, attn_metadata) -> torch.Tensor:
+    def forward(
+        self, step: StepSchedule, input_ids: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
         core = self.core
         comm = self.comm
         eps = core.dims.rms_eps
         layers = core.layers
         x = torch.nn.functional.embedding(input_ids, core.w.embed)
-        fused = x.shape[0] <= _DECODE_MOE_ROWS and comm.tp_size == _FUSED_BOUNDARY_WORLD
+        fused = (
+            x.shape[0] <= _DECODE_MOE_ROWS
+            and comm.tp_size == _FUSED_BOUNDARY_WORLD
+            and comm.peer_access
+        )
         residual = _expand_streams(x, core.dims.hc_mult)
         post, comb, x = layers[0].hc_attn.pre_mapping(residual)
         x = flashinfer_rmsnorm(x, layers[0].input_norm, eps)
@@ -381,7 +403,15 @@ class DecodeTarget:
         residual = residual + comm.allreduce(mtp.mlp.partial(x))
         return flashinfer_rmsnorm(residual, mtp.w.head_norm, eps)
 
-    def _fused_boundary(self, partial, residual, post, comb, hc: Mhc, norm_weight):
+    def _fused_boundary(
+        self,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        hc: Mhc,
+        norm_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """What ``hc.fused_hc(allreduce(partial), residual, post, comb, norm_weight, eps)``
         returns, with the TP all-reduce of ``partial`` fused in."""
         rows, mult = residual.shape[0], hc.mult
@@ -396,25 +426,21 @@ class DecodeTarget:
             hc.scale,
             hc.base,
             norm_weight,
-            hc.sinkhorn_iters,
-            hc.norm_eps,
-            hc.eps,
-            hc.sinkhorn_eps,
-            hc.post_mult_value,
-            self.core.dims.rms_eps,
+            *hc.scalars(self.core.dims.rms_eps),
         )
         return residual_out.view_as(residual), post_out.view(rows, mult), comb_out, layer_input
 
 
 def _linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """``x @ weight.T`` for a BF16 weight: the low-M kernel for decode-sized steps."""
-    rows = x.reshape(-1, x.shape[-1])
-    if rows.shape[0] <= _LOW_M_ROWS:
-        return low_m_bf16_gemm(rows.contiguous(), weight).view(*x.shape[:-1], -1)
-    return torch.nn.functional.linear(x, weight)
+    """``x @ weight.T`` for a BF16 weight: ``low_m_bf16_gemm``, which takes its low-M kernels
+    for the shapes and row counts it covers and cuBLAS otherwise."""
+    rows = x.reshape(-1, x.shape[-1]).contiguous()
+    return low_m_bf16_gemm(rows, weight).view(*x.shape[:-1], -1)
 
 
-def _mtp_own_columns(core, input_ids: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+def _mtp_own_columns(
+    core: "Glm53FlashFp8Sm10xTp4Core", input_ids: torch.Tensor, hidden_states: torch.Tensor
+) -> torch.Tensor:
     """This rank's input columns of the MTP layer's row-parallel eh_proj:
     ``cat(enorm(embed(input_ids)), hnorm(hidden_states))[:, rank's quarter]``."""
     mtp = core.mtp
@@ -451,7 +477,7 @@ class Glm53FlashFp8Sm10xTp4Core(DecoderModel):
         # surface this target reads (``_check_step_contract``).
         self._contract_pending = step_contract_enabled()
 
-    def load(self, weights: Any, lm_head_weight: torch.Tensor) -> None:
+    def load(self, weights: Mapping[str, Any], lm_head_weight: torch.Tensor) -> None:
         device = torch.device("cuda", torch.cuda.current_device())
         self.w = _weights.load_model_weights(weights, self.dims, lm_head_weight, device)
 
@@ -467,15 +493,14 @@ class Glm53FlashFp8Sm10xTp4Core(DecoderModel):
         dims = self.dims
         mapping = self.model_config.mapping
         self.comm = _Comm(mapping)
-        aux_stream = torch.cuda.Stream()
-        events = (torch.cuda.Event(), torch.cuda.Event())
+        aux = AuxStream()
         scratch = SparseAttentionScratch(dims)
         self.layers = []
         for i, w in enumerate(self.w.layers):
             if w.attention_kind == LINEAR_ATTENTION:
-                attention = KdaLayer(w.attention, dims, i, aux_stream, events)
+                attention = KdaLayer(w.attention, dims, i, aux)
             else:
-                attention = MlaLayer(w.attention, dims, i, aux_stream, events, scratch)
+                attention = MlaLayer(w.attention, dims, i, aux, scratch)
             mlp = DenseMlp(w.mlp, dims, i) if w.mlp_kind == DENSE_MLP else MoeLayer(w.mlp, dims, i)
             self.layers.append(
                 _Layer(
@@ -494,13 +519,13 @@ class Glm53FlashFp8Sm10xTp4Core(DecoderModel):
             layer = dims.mtp_layer
             self.mtp = _Mtp(
                 m,
-                MlaLayer(m.attention, dims, layer, aux_stream, events, scratch),
+                MlaLayer(m.attention, dims, layer, aux, scratch),
                 MoeLayer(m.mlp, dims, layer),
             )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
-    def select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
+    def select_target(self, attn_metadata: AttentionMetadata) -> "PrefillTarget | DecodeTarget":
         """A step with any context row is the prefill target's (mixed steps included); a
         generation-only step is the decode target's. One host int read, so a captured decode
         graph sees a constant."""
@@ -514,7 +539,7 @@ class Glm53FlashFp8Sm10xTp4Core(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         assert inputs_embeds is None, "this text-only target embeds the input ids itself"
         target = self.select_target(attn_metadata)
@@ -522,7 +547,7 @@ class Glm53FlashFp8Sm10xTp4Core(DecoderModel):
             self._check_step_contract(attn_metadata)
         return target.forward(StepSchedule.build(attn_metadata), input_ids, attn_metadata)
 
-    def _check_step_contract(self, attn_metadata) -> None:
+    def _check_step_contract(self, attn_metadata: AttentionMetadata) -> None:
         """Opt-in first-forward fail-fast (``TRTLLM_MODELING_V2_VALIDATE``): every field of the
         engine-prepared metadata and every KV cache manager member the layers read must exist,
         so an upstream rename fails here rather than mid-forward. They are fixed at engine
@@ -537,13 +562,20 @@ class Glm53FlashFp8Sm10xTp4Core(DecoderModel):
             for name in _CACHE_MANAGER_MEMBERS:
                 getattr(manager, name)
             cache = manager.mamba_layer_cache(next(x.index for x in self.layers if x.is_kda))
-            for name in ("conv", "temporal") + (_KDA_REPLAY_FIELDS if self.dims.mtp else ()):
+            # A disaggregated context server's manager allocates no verify replay caches.
+            verifies = self.dims.mtp and not getattr(manager, "kda_context_only", False)
+            for name in ("conv", "temporal") + (_KDA_REPLAY_FIELDS if verifies else ()):
                 getattr(cache, name)
         except AttributeError as exc:
             raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
         self._contract_pending = False
 
-    def mtp_forward(self, input_ids, hidden_states, attn_metadata) -> torch.Tensor:
+    def mtp_forward(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
         """The MTP layer on the metadata of this draft call: the worker rewrites the metadata
         in place between draft steps, so the target is chosen per call."""
         step = StepSchedule.build(attn_metadata)
@@ -576,7 +608,11 @@ class _VocabParallelHead:
     ) -> torch.Tensor:
         local = _linear(hidden_states, self.lm_head.weight)
         gather = self.gather_output if gather_output is None else gather_output
-        return self.comm.gather_vocab(local) if gather else local
+        if not gather:
+            return local
+        logits = self.comm.gather_vocab(local)
+        # The last rank's shard is padded to the shard size; the padding is no vocabulary entry.
+        return logits[..., : -self.padding_size] if self.padding_size else logits
 
 
 class MTPLayer:
@@ -590,13 +626,13 @@ class MTPLayer:
 
     def __call__(
         self,
-        embed_tokens: Any = None,
-        all_rank_num_tokens: Any = None,
+        embed_tokens: Optional[torch.Tensor] = None,
+        all_rank_num_tokens: Optional[list[int]] = None,
         input_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         hidden_states: Optional[torch.Tensor] = None,
-        attn_metadata: Any = None,
-        spec_metadata: Any = None,
+        attn_metadata: Optional[AttentionMetadata] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         del embed_tokens, all_rank_num_tokens, position_ids, kwargs  # NoPE; own embedding
@@ -606,7 +642,11 @@ class MTPLayer:
         return hidden_states
 
     def shared_head(
-        self, hidden_states, lm_head, attn_metadata, return_context_logits: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: nn.Module,
+        attn_metadata: AttentionMetadata,
+        return_context_logits: bool = False,
     ) -> torch.Tensor:
         if not return_context_logits:
             last = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
@@ -618,7 +658,7 @@ class DraftModel:
     """The container the speculative worker reaches the drafter through. ``embed_tokens``
     resolves through the core on every read: the container is built before the weights are."""
 
-    def __init__(self, core: Glm53FlashFp8Sm10xTp4Core, lm_head) -> None:
+    def __init__(self, core: Glm53FlashFp8Sm10xTp4Core, lm_head: nn.Module) -> None:
         self.core = core
         self.mtp_layers = [MTPLayer(core)]
         self.lm_head = lm_head
@@ -648,27 +688,22 @@ def _normalize_top_config(config: PretrainedConfig, text: PretrainedConfig) -> N
 class ModelingV2Glm53FlashFp8Sm10xTp4(
     DecoderModelForCausalLM[Glm53FlashFp8Sm10xTp4Core, PretrainedConfig]
 ):
-    """GLM-5.3-Flash block-FP8, sm_100 / sm_103, tp4, text only."""
+    """GLM-5.3-Flash block-FP8, sm_100, tp4, text only."""
 
-    def __init__(self, model_config: ModelConfig, *args, **kwargs) -> None:
+    #: The KDA layers reset a fresh request's recurrent state and conv window in their prefill
+    #: only, so the engine must not run a one-token prompt as a decode row.
+    resets_recurrent_state_in_context = True
+
+    def __init__(self, model_config: ModelConfig, *args: Any, **kwargs: Any) -> None:
+        # ``route`` declines the same facts; this covers a direct construction.
+        refused = fp8_model_refused(model_config, torch.cuda.get_device_capability())
+        if not model_config.disable_mm_encoder:
+            refused.append("the vision encoder (only disable_mm_encoder)")
+        if refused:
+            raise ValueError(f"the block-FP8 glm5_next target does not run {'; '.join(refused)}")
         mapping = model_config.mapping
-        assert torch.cuda.get_device_capability() in _SMS, (
-            f"this target runs on sm100 / sm103, not {torch.cuda.get_device_capability()}"
-        )
-        assert (
-            mapping.world_size == _TP
-            and mapping.tp_size == _TP
-            and mapping.moe_tp_size == _TP
-            and not mapping.enable_attention_dp
-            and mapping.pp_size == 1
-            and mapping.cp_size == 1
-        ), f"this target is tp4 with the experts split by intermediate, not {mapping}"
-        assert model_config.disable_mm_encoder, "this target serves the text model only"
         config = model_config.pretrained_config
         text = _text_config(config)
-        assert not bool(getattr(text, "tie_word_embeddings", False)), (
-            "the checkpoint's lm_head is its own weight, not the embedding"
-        )
         _normalize_top_config(config, text)
         super().__init__(
             Glm53FlashFp8Sm10xTp4Core(model_config, text),
@@ -702,13 +737,9 @@ class ModelingV2Glm53FlashFp8Sm10xTp4(
     # -- engine contracts ----------------------------------------------------------------
 
     @property
-    def mamba_metadata_cls(self) -> type:
+    def mamba_metadata_cls(self) -> type[Glm5NextMamba2Metadata]:
         """The hybrid-cache metadata the engine prepares for this model: GLM block tables, KDA
         state indices and the context schedules ``schedule.StepSchedule`` reads."""
-        from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.metadata import (
-            Glm5NextMamba2Metadata,
-        )
-
         return Glm5NextMamba2Metadata
 
     @property
@@ -720,22 +751,25 @@ class ModelingV2Glm53FlashFp8Sm10xTp4(
         """The text config's context limit; the model has no RoPE (NoPE MLA, KDA)."""
         return int(self.text_config.max_position_embeddings)
 
-    def validate_request(self, request: Any) -> None:
-        """Reject media: the vision tower is not built."""
-        params = getattr(request, "multimodal_params", None) or getattr(
-            getattr(request, "py_request", None), "multimodal_params", None
-        )
-        if params is not None and getattr(params, "multimodal_data", None):
-            raise ValueError("this GLM-5.3-Flash deployment serves text only (disable_mm_encoder)")
+    def validate_request(self, request: LlmRequest) -> None:
+        """Reject media on admission, as that request's own error: the vision tower is not built,
+        and the forward would assert on the whole step."""
+        data = request.py_multimodal_data or {}
+        media = [kind for kind in ("image", "video") if data.get(kind)]
+        if media:
+            raise ValueError(
+                f"this GLM-5.3-Flash deployment serves text only (disable_mm_encoder); the "
+                f"request carries {' and '.join(media)} input"
+            )
 
-    def set_guided_decoder(self, guided_decoder) -> bool:
+    def set_guided_decoder(self, guided_decoder: CapturableGuidedDecoder) -> bool:
         if self.spec_worker is not None:
             return self.spec_worker.set_guided_decoder(guided_decoder)
         return False
 
     # -- weights -------------------------------------------------------------------------
 
-    def load_weights(self, weights: Any, *args: Any, **kwargs: Any) -> None:
+    def load_weights(self, weights: Mapping[str, Any], *args: Any, **kwargs: Any) -> None:
         assert self.lm_head.weight.dtype == torch.bfloat16, (
             f"the checkpoint's lm_head is BF16, the shell built {self.lm_head.weight.dtype}"
         )
@@ -756,16 +790,17 @@ class ModelingV2Glm53FlashFp8Sm10xTp4(
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
-        spec_metadata=None,
+        spec_metadata: Optional[SpecMetadata] = None,
         lora_params: Optional[dict] = None,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> Union[torch.Tensor, dict[str, torch.Tensor]]:
         """One engine step. ``resource_manager`` stays inside ``**kwargs``, and ``position_ids``
         reaches the worker in the engine's ``[1, T]`` shape (the worker squeezes it itself).
 
         A step padded for a prefill CUDA graph or attention-DP peers (``padded_num_tokens``,
         neither of which this deployment runs) is cut back to its ``num_tokens`` rows before
-        the decoder, as the built-in model cuts its output."""
+        the decoder, as the built-in model cuts its output. Context logits go through the
+        shell's ``LMHead``, whose bounded context-logits plan the logits processor applies."""
         multimodal = kwargs.get("multimodal_params")
         assert not multimodal, "this target serves text only"
         if attn_metadata.padded_num_tokens is not None:
@@ -781,6 +816,8 @@ class ModelingV2Glm53FlashFp8Sm10xTp4(
         )
         head = self._head
         if self.spec_worker is None:
+            if return_context_logits:
+                head = self.lm_head
             return self.logits_processor.forward(hidden, head, attn_metadata, return_context_logits)
         logits = self.spec_worker.target_logits(
             hidden[spec_metadata.gather_ids],

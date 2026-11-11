@@ -5,11 +5,11 @@ context rows, in one launch.
 
 The context-row counterpart of ``mla_prologue``. For each packed context row ``r`` of a prefill
 step: the RMSNorms of the q_a and kv_a halves of the fused input GEMM output, the LayerNorm of
-the indexer key, and the paged-cache writes of the normalized latent (FP8: ``clamp(latent *
-scale, +-448)`` as E4M3) and of the indexer row ``[k | gate]`` at cache position
-``positions[r]`` of block table ``block_tables[request_ids[r]]``. It returns the normalized q_a
-rows (``q_resid``) for the q_b and indexer query projections. The module path runs the same math
-as RMSNorm, RMSNorm, LayerNorm, cat and the indexed cache writes.
+the indexer key, and the paged-cache writes of the normalized latent (``clamp(latent * scale,
++-448)`` as E4M3, into the FP8 latent cache) and of the indexer row ``[k | gate]`` at cache
+position ``positions[r]`` of block table ``block_tables[request_ids[r]]``. It returns the
+normalized q_a rows (``q_resid``) for the q_b and indexer query projections: one launch in place
+of RMSNorm, RMSNorm, LayerNorm, cat and the indexed cache writes.
 """
 
 from __future__ import annotations
@@ -50,7 +50,6 @@ def _context_prologue_kernel(
     Q_PAD: tl.constexpr,
     KV_DIM: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    FP8: tl.constexpr,
 ):
     # A prefill step packs up to max_num_tokens rows: 64-bit row offsets.
     r = tl.program_id(0).to(tl.int64)
@@ -72,11 +71,8 @@ def _context_prologue_kernel(
     off = pos - page * tpb
     slot = tl.load(bt_ptr + tbl * bt_stride + page).to(tl.int64)
     latent_dst = latent_pool_ptr + slot * latent_slot_stride + off * latent_row_stride + kd
-    if FP8:
-        scaled = kv.to(tl.float32) * tl.load(scale_ptr)
-        tl.store(latent_dst, tl.clamp(scaled, -448.0, 448.0).to(latent_pool_ptr.dtype.element_ty))
-    else:
-        tl.store(latent_dst, kv.to(latent_pool_ptr.dtype.element_ty))
+    scaled = kv.to(tl.float32) * tl.load(scale_ptr)
+    tl.store(latent_dst, tl.clamp(scaled, -448.0, 448.0).to(latent_pool_ptr.dtype.element_ty))
     # indexer key LayerNorm and gate -> index cache
     hd = tl.arange(0, HEAD_DIM)
     k = tl.load(idx_ptr + r * idx_stride + hd).to(tl.float32)
@@ -121,36 +117,35 @@ class MlaContextPrologue(OpWrapper):
     The block table of row r is `block_tables[request_ids[r]]`, a row of the step's tables in
     batch order: context requests first, so a context request's id is its index among them.
 
-    Rows writing the same cache position race; the module path never packs a position twice.
-    The latent pool may be BF16, in which case it receives the BF16 latent; only the FP8 cache
-    this target serves is certified.
+    Rows writing the same cache position race; the target's context schedule
+    (`ContextRows`) never packs a position twice. The latent pool is the FP8 cache this target
+    serves; only its write (scale, clamp, E4M3) is compiled in.
     """
 
     def __call__(
         self,
-        qkv,
-        idx,
-        q_norm_weight,
-        kv_norm_weight,
-        k_norm_weight,
-        k_norm_bias,
-        rms_eps,
-        ln_eps,
-        positions,
-        request_ids,
-        block_tables,
-        latent_pool,
-        index_pool,
-        tokens_per_block,
-        scale,
-    ):
+        qkv: torch.Tensor,
+        idx: torch.Tensor,
+        q_norm_weight: torch.Tensor,
+        kv_norm_weight: torch.Tensor,
+        k_norm_weight: torch.Tensor,
+        k_norm_bias: torch.Tensor,
+        rms_eps: float,
+        ln_eps: float,
+        positions: torch.Tensor,
+        request_ids: torch.Tensor,
+        block_tables: torch.Tensor,
+        latent_pool: torch.Tensor,
+        index_pool: torch.Tensor,
+        tokens_per_block: int,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
         q_dim, kv_dim = q_norm_weight.shape[0], kv_norm_weight.shape[0]
         head_dim = k_norm_weight.shape[0]
         rows = positions.shape[0]
         q_resid = torch.empty((rows, q_dim), dtype=torch.bfloat16, device=qkv.device)
         if rows == 0:
             return q_resid
-        fp8 = latent_pool.dtype == torch.float8_e4m3fn
         _context_prologue_kernel[(rows,)](
             qkv,
             idx,
@@ -164,7 +159,7 @@ class MlaContextPrologue(OpWrapper):
             block_tables,
             latent_pool,
             index_pool,
-            scale if fp8 else qkv,
+            scale,
             rms_eps,
             ln_eps,
             qkv.stride(0),
@@ -179,32 +174,31 @@ class MlaContextPrologue(OpWrapper):
             Q_PAD=triton.next_power_of_2(q_dim),
             KV_DIM=kv_dim,
             HEAD_DIM=head_dim,
-            FP8=fp8,
             num_warps=4,
         )
         return q_resid
 
     def reference(
         self,
-        qkv,
-        idx,
-        q_norm_weight,
-        kv_norm_weight,
-        k_norm_weight,
-        k_norm_bias,
-        rms_eps,
-        ln_eps,
-        positions,
-        request_ids,
-        block_tables,
-        latent_pool,
-        index_pool,
-        tokens_per_block,
-        scale,
-    ):
+        qkv: torch.Tensor,
+        idx: torch.Tensor,
+        q_norm_weight: torch.Tensor,
+        kv_norm_weight: torch.Tensor,
+        k_norm_weight: torch.Tensor,
+        k_norm_bias: torch.Tensor,
+        rms_eps: float,
+        ln_eps: float,
+        positions: torch.Tensor,
+        request_ids: torch.Tensor,
+        block_tables: torch.Tensor,
+        latent_pool: torch.Tensor,
+        index_pool: torch.Tensor,
+        tokens_per_block: int,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
         """FP32 norms rounded once to BF16, then the indexed cache writes, in plain torch."""
 
-        def rms(x, w):
+        def rms(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             x = x.float()
             return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + rms_eps) * w.float()).to(
                 torch.bfloat16
@@ -226,33 +220,30 @@ class MlaContextPrologue(OpWrapper):
         pos = positions.long()
         page = block_tables[request_ids.long(), pos // tokens_per_block].long()
         off = pos % tokens_per_block
-        if latent_pool.dtype == torch.float8_e4m3fn:
-            quantized = (latent.float() * scale).clamp(-448, 448).to(latent_pool.dtype)
-            # Indexed writes into FP8 payloads go through their byte views.
-            latent_pool.view(torch.uint8)[page, off] = quantized.view(torch.uint8)
-        else:
-            latent_pool[page, off] = latent.to(latent_pool.dtype)
+        quantized = (latent.float() * scale).clamp(-448, 448).to(latent_pool.dtype)
+        # Indexed writes into FP8 payloads go through their byte views.
+        latent_pool.view(torch.uint8)[page, off] = quantized.view(torch.uint8)
         index_pool[page, off, : 2 * head_dim] = packed.to(index_pool.dtype)
         return q_resid
 
     def is_valid(
         self,
-        qkv,
-        idx,
-        q_norm_weight,
-        kv_norm_weight,
-        k_norm_weight,
-        k_norm_bias,
-        rms_eps,
-        ln_eps,
-        positions,
-        request_ids,
-        block_tables,
-        latent_pool,
-        index_pool,
-        tokens_per_block,
-        scale,
-    ):
+        qkv: torch.Tensor,
+        idx: torch.Tensor,
+        q_norm_weight: torch.Tensor,
+        kv_norm_weight: torch.Tensor,
+        k_norm_weight: torch.Tensor,
+        k_norm_bias: torch.Tensor,
+        rms_eps: float,
+        ln_eps: float,
+        positions: torch.Tensor,
+        request_ids: torch.Tensor,
+        block_tables: torch.Tensor,
+        latent_pool: torch.Tensor,
+        index_pool: torch.Tensor,
+        tokens_per_block: int,
+        scale: torch.Tensor,
+    ) -> None:
         for t in (qkv, idx):
             assert t.dtype == torch.bfloat16 and t.dim() == 2 and t.stride(-1) == 1
         kv_dim, head_dim = kv_norm_weight.shape[0], k_norm_weight.shape[0]
@@ -267,10 +258,10 @@ class MlaContextPrologue(OpWrapper):
         assert request_ids.shape == positions.shape and request_ids.is_contiguous()
         assert qkv.shape[0] == idx.shape[0] == positions.shape[0]
         assert block_tables.dim() == 2 and block_tables.stride(-1) == 1
-        assert latent_pool.dtype in (torch.float8_e4m3fn, torch.bfloat16)
+        # Only the FP8 cache's write (scale, clamp, E4M3) is compiled in.
+        assert latent_pool.dtype == torch.float8_e4m3fn, f"latent pool {latent_pool.dtype}"
         assert latent_pool.shape[-1] == kv_dim and latent_pool.stride(-1) == 1
-        if latent_pool.dtype == torch.float8_e4m3fn:
-            assert scale.dtype == torch.float32 and scale.numel() == 1
+        assert scale.dtype == torch.float32 and scale.numel() == 1
         assert index_pool.dtype == torch.bfloat16 and index_pool.stride(-1) == 1
         assert index_pool.shape[-1] >= 2 * head_dim and tokens_per_block > 0
         if positions.shape[0] == 0:

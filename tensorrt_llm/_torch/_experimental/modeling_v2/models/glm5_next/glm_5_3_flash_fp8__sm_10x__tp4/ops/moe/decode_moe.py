@@ -6,12 +6,15 @@ Every CTA (one per SM) computes the routing itself (sigmoid scores, FP32 correct
 normalized weights times the routed scaling factor) and derives the same static schedule from it,
 while its producer warp already streams the shared expert, whose weights do not depend on the
 routing. FC1 tiles (4 up and 4 gate rows of one expert over H, 32 KB) go round robin over the CTAs,
-the CTAs without FC2 rows taking the tail; the compute warps multiply them with the BF16 rows on the
-tensor cores (e4m3 and BF16 both convert to f16 exactly; FP32 accumulation, each 128 x 128 block's
-partial times its scale) and the epilogue warps apply the clamped SwiGLU and the routing weight and
-publish the activation. For FC2, each of 128 CTAs owns 32 output columns and streams every distinct
-expert's down-projection tile, adding the expert's activation once its FC1 tiles are complete, so
-FC2 overlaps the FC1 tail; the experts are summed in a fixed order in FP32 before the single BF16
+the CTAs without FC2 rows taking the tail; the compute warps multiply them with the rows, converted
+to f16, on the tensor cores (FP32 accumulation, each 128 x 128 block's partial times its scale) and
+the epilogue warps apply the clamped SwiGLU and the routing weight and publish the activation. e4m3
+converts to f16 exactly; a BF16 element does for magnitudes in [2^-14, 65504], while a smaller one
+rounds to f16's subnormal grid (an absolute error of at most 2^-25) and a larger one overflows.
+Both callers pass RMS-normalized layer inputs (the decoder layer's and the MTP layer's), far inside
+that range. For FC2, each of 128 CTAs owns 32 output columns and streams every distinct expert's
+down-projection tile, adding the expert's activation once its FC1 tiles are complete, so FC2
+overlaps the FC1 tail; the experts are summed in a fixed order in FP32 before the single BF16
 rounding. The rank's result is the moe_tp partial the caller all-reduces. The kernel is in
 ``csrc/decodeMoe.cu``.
 
@@ -58,12 +61,17 @@ class DecodeMoe(OpWrapper):
     )
 
     note = """
-    Top-8 ties go to the lower expert index. The kernel is compiled for H = 4096, I = 512 and
-    E = 288 (moe_tp4) and holds at most 4 rows; larger steps are the caller's to route to the
-    grouped GEMMs. Its FC1 -> FC2 scratch and counters are device-global (the counters double-buffered
-    by call parity), so calls on one device must be ordered on one stream. Each distinct expert of the step
-    is read from HBM once, so the time follows the number of distinct experts the rows select
-    (one request's MTP-3 verify rows choose 14-33 of them, shared expert included).
+    Top-8 ties go to the lower expert index. The scores are computed as the routing kernels of the
+    larger steps' grouped GEMMs compute them (the tanh form of the sigmoid, plus the FP32 bias), so
+    near-equal experts order alike on both sides of the 4-row switch. The kernel is compiled for
+    H = 4096, I = 512 and E = 288 (moe_tp4) and holds at most 4 rows; larger steps are the caller's
+    to route to the grouped GEMMs. Its FC1 -> FC2 scratch and counters are device-global (the
+    counters double-buffered by call parity), so calls on one device must be ordered on one stream.
+    Its CTAs, one per SM, wait on each other, so they must all be resident at once: the op raises
+    when the device cannot hold the grid, and work that keeps SMs busy while waiting on this launch
+    would hang it. Each distinct expert of the step is read from HBM once, so the time follows the
+    number of distinct experts the rows select (one request's MTP-3 verify rows choose 14-33 of
+    them, shared expert included).
     """
 
     def __call__(self, x, logits, bias, scaling, limit, w31, s31, w2, s2, sw31, ss31, sw2, ss2):

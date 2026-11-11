@@ -1,7 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Dynamic 1x128 block-FP8 quantization of BF16 rows: e4m3 codes and one FP32 scale per 128
-columns of a row, the scales returned K-block-major (`[ceil(K/128), M]`) on the sm_100 family."""
+columns of a row, the scales returned K-block-major (`[ceil(K/128), M]`) on the sm_100 family.
+
+Copied from qwen4_exp's entry (`models/qwen4_exp/ops/quantization/fp8_quantize_1x128.py`), which
+wraps the same op. The reference here diverges from that one in two ways: `block_scales` divides
+tensor by tensor (torch evaluates `scalar / tensor` as a rounded reciprocal times the scalar, up
+to one ulp off the quotient the kernel computes), and the reference clamps to +-448 before the
+E4M3 cast, as the kernel's saturating conversion does. The cells are at GLM's widths.
+"""
 
 from __future__ import annotations
 
@@ -110,13 +117,17 @@ class Fp8Quantize1x128(OpWrapper):
     Source: compiled-in C++, `torch.ops.trtllm.fp8_quantize_1x128` (thop/fp8Quantize.cpp:
     `fp8CS1x128` -> `launch_scale_1x128`, which takes `scale_1x128_vec_kernel` when the input
     is 16-byte aligned and K % 8 == 0, as at every cell). The kernel's two fp32 divisions
-    (`448 / amax`, then `1 / that`) are compiled approximately, so neither output is
-    reproducible to the last bit: the test holds scales to a few fp32 ulp of the exact ones and
-    every code disagreement to a rounding tie.
+    (`448 / amax`, then `1 / that`) are IEEE round-to-nearest in the default build (`FAST_MATH`
+    off), the quotients `block_scales` computes, and its fp32 product and saturating E4M3
+    conversion round as the reference's do. A `FAST_MATH=ON` build compiles the divisions
+    approximately (within 2 ulp each); the test's bands admit that build too.
+
+    The target also runs this op inside its captured decode steps; the fp8_blockwise_gemm test
+    drives that capture (quantizer and GEMM at a tuned tactic).
 
     Not certified: `M == 0`, a short tail block (`K % 128 != 0`), all-zero blocks (the
     `AMAX_FLOOR` scale), inf / NaN inputs, `use_ue8m0=True`, the element-wise fallback kernel
-    (an input whose storage offset breaks 16-byte alignment), CUDA-graph capture, sm_103.
+    (an input whose storage offset breaks 16-byte alignment), sm_103.
     """
 
     def __call__(
@@ -131,7 +142,8 @@ class Fp8Quantize1x128(OpWrapper):
         input: torch.Tensor,
         use_ue8m0: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`(data, scales[ceil(K/128), M])` from exactly rounded fp32 divisions.
+        """`(data, scales[ceil(K/128), M])` from exactly rounded fp32 divisions, as a fresh
+        contiguous pair.
 
         No matmul, so nothing here depends on the TF32 setting.
         """

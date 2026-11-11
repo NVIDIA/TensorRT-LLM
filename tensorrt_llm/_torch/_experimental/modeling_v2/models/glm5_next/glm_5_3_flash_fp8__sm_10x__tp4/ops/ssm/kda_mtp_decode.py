@@ -222,7 +222,13 @@ class KdaMtpDecode(OpWrapper):
         caches_after = [cache.clone() for cache in (k_cache, g_cache, v_cache, beta_cache)]
         counts = num_accepted_tokens.tolist()
 
-        def step(state, key, log_decay, value, b):
+        def step(
+            state: torch.Tensor,
+            key: torch.Tensor,
+            log_decay: torch.Tensor,
+            value: torch.Tensor,
+            b: torch.Tensor,
+        ) -> torch.Tensor:
             state = state * log_decay.exp().unsqueeze(-2)
             err = (value - (state * key.unsqueeze(-2)).sum(-1)) * b.unsqueeze(-1)
             return state + err.unsqueeze(-1) * key.unsqueeze(-2)

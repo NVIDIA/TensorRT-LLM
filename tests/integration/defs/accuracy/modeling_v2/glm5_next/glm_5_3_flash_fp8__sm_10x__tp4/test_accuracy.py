@@ -23,7 +23,7 @@ disabled.
 
 import pytest
 
-from tensorrt_llm import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
@@ -32,15 +32,14 @@ from .....conftest import llm_models_root
 from ....accuracy_core import GSM8K, LlmapiAccuracyTestHarness, assert_acceptance_length_for_llm
 from ..._env import scoped_env_overrides
 
-# The target asserts its SM at construction: certification is per GPU architecture.
-skip_not_sm10x = pytest.mark.skipif(
-    get_sm_version() not in (100, 103),
-    reason="the glm5_next FP8 target is certified on sm_100 and sm_103 only",
+# The target refuses other GPUs at construction: certification is per GPU architecture.
+skip_not_sm100 = pytest.mark.skipif(
+    get_sm_version() != 100, reason="the glm5_next FP8 target is certified on sm_100 only"
 )
 
 
 class TestModelingV2Glm53FlashFp8Sm10xTp4(LlmapiAccuracyTestHarness):
-    """GLM-5.3-Flash block-FP8 / sm_10x / tp4, without speculation and with one-model MTP-3.
+    """GLM-5.3-Flash block-FP8 / sm_100 / tp4, without speculation and with one-model MTP-3.
 
     The MTP variant also gates the acceptance length: a miscomputed draft layer only slows
     decoding (every draft is rejected), so accuracy alone cannot see it. The acceptance
@@ -73,7 +72,7 @@ class TestModelingV2Glm53FlashFp8Sm10xTp4(LlmapiAccuracyTestHarness):
     # Each engine also checks, on its first forward, that the metadata fields and cache members
     # the target reads exist (TRTLLM_MODELING_V2_VALIDATE, passed to the ranks).
 
-    @skip_not_sm10x
+    @skip_not_sm100
     @pytest.mark.skip_less_device(4)
     def test_gsm8k(self):
         with (
@@ -81,8 +80,27 @@ class TestModelingV2Glm53FlashFp8Sm10xTp4(LlmapiAccuracyTestHarness):
             LLM(self.MODEL_PATH, env_overrides=rank_env, **self._llm_kwargs()) as llm,
         ):
             GSM8K(self.MODEL_NAME).evaluate(llm)
+            self._check_one_token_prompt(llm)
 
-    @skip_not_sm10x
+    @staticmethod
+    def _check_one_token_prompt(llm: LLM) -> None:
+        """A one-token prompt runs as a one-row prefill step from a zero KDA state.
+
+        Its output must not depend on which request held its slot before. Without speculation
+        the engine may run a final one-token context as a decode-graph row, which would skip the
+        slot reset the KDA prefill does; the target opts out of that, so the prompt takes the
+        one-row prefill path in both tests.
+        """
+        params = SamplingParams(max_tokens=16, temperature=0)
+        token = llm.tokenizer.encode("Hello", add_special_tokens=False)[:1]
+        fresh = llm.generate(token, params).outputs[0].token_ids
+        llm.generate("Write a long story about a lighthouse keeper. " * 20, params)
+        after = llm.generate(token, params).outputs[0].token_ids
+        assert after == fresh, (
+            f"one-token prompt changed with the slot's history: {fresh} -> {after}"
+        )
+
+    @skip_not_sm100
     @pytest.mark.skip_less_device(4)
     def test_gsm8k_mtp3(self):
         with (
@@ -99,3 +117,4 @@ class TestModelingV2Glm53FlashFp8Sm10xTp4(LlmapiAccuracyTestHarness):
         ):
             GSM8K(self.MODEL_NAME).evaluate(llm)
             assert_acceptance_length_for_llm(self.ACCEPTANCE_KEY, llm)
+            self._check_one_token_prompt(llm)

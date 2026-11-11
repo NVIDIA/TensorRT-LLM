@@ -131,6 +131,10 @@ class KpoolExpand(OpWrapper):
             why="a 13,312-token prompt's last sequence-parallel quarter (rows 9984-13311)",
             spec=dict(context=((0, 13312),), rows=(9984, 13312)),
         ),
+        Cell(
+            why="rank 1's quarter (rows 10-19) of a 37-token prompt: short rows",
+            spec=dict(context=((0, 37),), rows=(10, 20)),
+        ),
     )
 
     note = """
@@ -144,17 +148,17 @@ class KpoolExpand(OpWrapper):
 
     def __call__(
         self,
-        selected,
-        kv_lens,
-        block_tables,
-        tokens_per_block,
+        selected: torch.Tensor,
+        kv_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        tokens_per_block: int,
         *,
-        base_row,
-        rows_per_slot,
-        kpool,
-        out_width,
-        request_ids=None,
-    ):
+        base_row: int,
+        rows_per_slot: int,
+        kpool: int,
+        out_width: int,
+        request_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         n, select_k = selected.shape
         if out_width < select_k * kpool + kpool - 1:
             raise ValueError(
@@ -186,17 +190,17 @@ class KpoolExpand(OpWrapper):
 
     def reference(
         self,
-        selected,
-        kv_lens,
-        block_tables,
-        tokens_per_block,
+        selected: torch.Tensor,
+        kv_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        tokens_per_block: int,
         *,
-        base_row,
-        rows_per_slot,
-        kpool,
-        out_width,
-        request_ids=None,
-    ):
+        base_row: int,
+        rows_per_slot: int,
+        kpool: int,
+        out_width: int,
+        request_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """The member and tail positions of each row, mapped through its block table."""
         n, select_k = selected.shape
         dev = selected.device
@@ -208,7 +212,7 @@ class KpoolExpand(OpWrapper):
         num_cand = kv // kpool
         last_page = block_tables.shape[1] - 1
 
-        def row_ids(positions, valid):
+        def row_ids(positions: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
             page = (positions // tokens_per_block).clamp(0, last_page)
             slot = block_tables[table.view(-1, *([1] * (positions.dim() - 1))), page].long()
             ids = base_row + slot * rows_per_slot + positions % tokens_per_block
@@ -227,17 +231,17 @@ class KpoolExpand(OpWrapper):
 
     def is_valid(
         self,
-        selected,
-        kv_lens,
-        block_tables,
-        tokens_per_block,
+        selected: torch.Tensor,
+        kv_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        tokens_per_block: int,
         *,
-        base_row,
-        rows_per_slot,
-        kpool,
-        out_width,
-        request_ids=None,
-    ):
+        base_row: int,
+        rows_per_slot: int,
+        kpool: int,
+        out_width: int,
+        request_ids: torch.Tensor | None = None,
+    ) -> None:
         n, select_k = selected.shape
         assert selected.dtype == torch.int32 and selected.stride(1) == 1, (
             f"selected must be int32 with unit-stride rows; got {selected.dtype} "

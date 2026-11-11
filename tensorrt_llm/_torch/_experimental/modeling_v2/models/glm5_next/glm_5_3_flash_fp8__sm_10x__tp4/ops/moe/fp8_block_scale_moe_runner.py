@@ -2,7 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """DeepSeek-style FP8 block-scale mixture-of-experts layer, routed in the kernel: sigmoid +
 correction-bias top-k routing, grouped FC1 GEMM, FP8 requantization, clamped SwiGLU, FP8
-requantization, grouped FC2 GEMM and the routing-weighted combine, in one trtllm-gen call."""
+requantization, grouped FC2 GEMM and the routing-weighted combine, in one trtllm-gen call.
+
+Copied from qwen4_exp's entry (``models/qwen4_exp/ops/moe/fp8_block_scale_moe_runner.py``), which
+wraps the same op. The reference here diverges from that one: it also routes from the logits
+(``route_deepseek_v3``) where qwen4_exp's models the pre-routed path only; it rounds each expert's
+FC2 output and the combine weights to BF16, as the kernel reads them, where qwen4_exp's combines in
+FP32; and ``requantize_1x128`` divides tensor by tensor rather than by a Python scalar (a rounded
+reciprocal times the value). The cells are at GLM-5.3-Flash's TP4 geometry.
+"""
 
 from __future__ import annotations
 

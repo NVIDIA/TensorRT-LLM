@@ -7,6 +7,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4 import (  # noqa: E501
+    native_ops,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.moe.decode_moe import (  # noqa: E501
     decode_moe as op,
 )
@@ -80,6 +83,48 @@ def test_independent_rows() -> None:
     args[1] = torch.randn(spec["m"], spec["e"], generator=g, device="cuda")
     args[2] = (torch.rand(spec["e"], generator=g, device="cuda") - 0.5) * 0.1
     _compare(op(*args), op.reference(*args))
+
+
+def test_schema_and_fake(monkeypatch) -> None:
+    """The kernel writes only ``out``, as the schema declares, and the fake agrees with the op."""
+    args = _build(op.CELLS[0].spec, seed=3)
+    out = torch.empty(args[0].shape, dtype=torch.bfloat16, device="cuda")
+    op_args = (*args, out, False)
+    # SchemaCheckMode compares every input with allclose, which has no float8 CUDA kernel: compare
+    # the float8 weights as FP32 (the op itself still receives float8).
+    allclose = torch.allclose
+
+    def allclose_with_float8(actual, expected, *comparison_args, **comparison_kwargs):
+        if actual.dtype == expected.dtype == torch.float8_e4m3fn:
+            actual, expected = actual.float(), expected.float()
+        return allclose(actual, expected, *comparison_args, **comparison_kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "allclose", allclose_with_float8)
+        torch.library.opcheck(native_ops.decode_moe.default, op_args, test_utils=("test_schema",))
+    torch.library.opcheck(native_ops.decode_moe.default, op_args, test_utils=("test_faketensor",))
+
+
+def test_rejects_operands_the_kernel_cannot_read() -> None:
+    """The binding refuses, before the launch, operands the kernel would read with the wrong shape,
+    dtype or alignment."""
+    args = _build(op.CELLS[0].spec, seed=5)
+    rows, hidden = args[0].shape
+    out = torch.empty(rows, hidden, dtype=torch.bfloat16, device="cuda")
+    shifted = torch.empty(rows * hidden + 8, dtype=torch.bfloat16, device="cuda")
+    bad = (
+        (0, "x", args[0][:, : hidden // 2].contiguous()),
+        (0, "x", shifted[1 : 1 + rows * hidden].view(rows, hidden)),
+        (1, "logits", args[1].to(torch.bfloat16)),
+        (5, "w31", args[5][:, :512]),
+        (8, "s2", args[8].transpose(1, 2).contiguous()),
+        (12, "ss2", args[12].t()),
+    )
+    for index, name, tensor in bad:
+        call = list(args)
+        call[index] = tensor
+        with pytest.raises(RuntimeError, match=f"decode_moe: {name} must"):
+            native_ops.decode_moe(*call, out, False)
 
 
 def test_cuda_graph_capture_and_replay() -> None:

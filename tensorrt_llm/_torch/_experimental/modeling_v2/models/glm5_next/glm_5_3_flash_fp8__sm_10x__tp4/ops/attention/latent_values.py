@@ -3,8 +3,9 @@
 """The absorbed value projection of a sparse MLA decode step, written row-major for o_proj.
 
 ``out[r, h * V : (h + 1) * V] = latent[r, h, :] @ w_v_t[h]`` (BF16 inputs, FP32
-accumulation), and zero for rows that selected no key. The module path runs a batched GEMM
-that returns head-major ``[H, R, V]``, a transposing copy and a select over the result.
+accumulation), and zero for rows that selected no key: one launch in place of a batched GEMM
+that returns head-major ``[H, R, V]``, a transposing copy and a select over the result. The
+target runs it on its generation rows with a rank's 16 heads (``MlaLayer.generation_partial``).
 """
 
 from __future__ import annotations
@@ -62,7 +63,9 @@ class LatentValues(OpWrapper):
         Cell(why="CUDA-graph batch of 64 verify requests", spec=dict(r=256, h=16, l=512, v=256)),
     )
 
-    def __call__(self, latent, w_v_t, keep):
+    def __call__(
+        self, latent: torch.Tensor, w_v_t: torch.Tensor, keep: torch.Tensor
+    ) -> torch.Tensor:
         rows, heads, lat = latent.shape
         v = w_v_t.shape[2]
         out = torch.empty((rows, heads * v), dtype=torch.bfloat16, device=latent.device)
@@ -71,17 +74,27 @@ class LatentValues(OpWrapper):
         )
         return out
 
-    def reference(self, latent, w_v_t, keep):
+    def reference(
+        self, latent: torch.Tensor, w_v_t: torch.Tensor, keep: torch.Tensor
+    ) -> torch.Tensor:
         with true_fp32_matmul():
             out = torch.einsum("rhl,hlv->rhv", latent.float(), w_v_t.float())
         out = torch.where(keep[:, None, None], out, 0.0)
         return out.reshape(latent.shape[0], -1).to(torch.bfloat16)
 
-    def is_valid(self, latent, w_v_t, keep):
+    def is_valid(self, latent: torch.Tensor, w_v_t: torch.Tensor, keep: torch.Tensor) -> None:
         assert latent.dtype == torch.bfloat16 and latent.is_contiguous() and latent.dim() == 3
-        assert w_v_t.dtype == torch.bfloat16 and w_v_t.is_contiguous()
-        assert keep.dtype == torch.bool and keep.shape == (latent.shape[0],)
-        assert w_v_t.shape[2] % 32 == 0 and latent.shape[2] % 128 == 0
+        rows, heads, lat = latent.shape
+        # The kernel reads w_v_t at (h * L + k) * V + n and takes H, L and V from latent and
+        # w_v_t separately: a weight of other heads or another latent width is read misaligned.
+        assert w_v_t.dtype == torch.bfloat16 and w_v_t.is_contiguous() and w_v_t.dim() == 3
+        assert w_v_t.shape[:2] == (heads, lat), (
+            f"w_v_t must be [{heads}, {lat}, V] for latent {tuple(latent.shape)}; "
+            f"got {tuple(w_v_t.shape)}"
+        )
+        assert keep.dtype == torch.bool and keep.shape == (rows,)
+        # Whole 32-column tiles of V and 128-wide K steps, with no masks on either.
+        assert w_v_t.shape[2] % 32 == 0 and lat % 128 == 0
 
 
 latent_values = LatentValues()

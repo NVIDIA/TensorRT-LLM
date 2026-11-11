@@ -29,7 +29,9 @@ pytestmark = pytest.mark.skipif(
 _TPB, _SLOTS = 32, 512
 
 
-def _prologue_args(spec: dict, seed: int):
+def _prologue_args(spec: dict, seed: int) -> list:
+    """``n`` requests of ``t`` consecutive rows each, at positions past the first two pages, with
+    the int64 GLM block tables the target passes."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     n, t = spec["n"], spec["t"]
 
@@ -43,7 +45,7 @@ def _prologue_args(spec: dict, seed: int):
     positions = torch.randint(64, 600, (n, 1), generator=g, device="cuda") + torch.arange(
         t, device="cuda"
     )
-    tables = torch.randperm(_SLOTS, generator=g, device="cuda")[: n * 20].view(n, 20).int()
+    tables = torch.randperm(_SLOTS, generator=g, device="cuda")[: n * 20].view(n, 20)
     latent_pool = torch.zeros(_SLOTS, _TPB, 512, device="cuda", dtype=torch.float8_e4m3fn)
     index_pool = torch.zeros(_SLOTS, _TPB, 288, device="cuda", dtype=torch.bfloat16)
     scale = torch.tensor(0.7, device="cuda")

@@ -22,10 +22,9 @@ from _validating import certifying, validating  # noqa: E402,F401 -- path above;
 
 pytestmark = pytest.mark.skipif(get_sm_version() != 100, reason="certified on sm_100")
 
-#: GLM-5.3-Flash's KDA at TP4: 64 heads over 4 ranks, K = V = 128, conv width 4.
-HEADS, HEAD_DIM, WINDOW = 16, 128, 3
+#: GLM-5.3-Flash's KDA at TP4: 64 heads over 4 ranks, K = V = 128.
+HEADS, HEAD_DIM = 16, 128
 STATE_ROW = HEADS * HEAD_DIM * HEAD_DIM
-CONV_ROW = 3 * HEADS * HEAD_DIM * WINDOW
 #: Elements past each slot's row in its record (the other layers' rows in the real manager).
 SLOT_PAD = 4096
 
@@ -38,7 +37,6 @@ CELLS: tuple[Cell, ...] = op.CELLS + (
             indices=(5,),
             has_init=(False,),
             state_dtype=torch.bfloat16,
-            with_conv=False,
         ),
     ),
     Cell(
@@ -48,7 +46,6 @@ CELLS: tuple[Cell, ...] = op.CELLS + (
             indices=(6, 1, 4),
             has_init=(True, False, False),
             state_dtype=torch.bfloat16,
-            with_conv=False,
         ),
     ),
     Cell(
@@ -58,33 +55,24 @@ CELLS: tuple[Cell, ...] = op.CELLS + (
             indices=(6, 1, 4),
             has_init=(True, False, False),
             state_dtype=torch.float32,
-            with_conv=False,
         ),
     ),
 )
 
 
-def _build(spec: dict, seed: int):
+def _build(spec: dict, seed: int) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     """``(records, args)``: the per-slot records, nonzero everywhere, and the op's arguments viewing them."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     slots = spec["slots"]
-    state_records = torch.randn(slots, STATE_ROW + SLOT_PAD, generator=gen, device="cuda").to(
+    records = torch.randn(slots, STATE_ROW + SLOT_PAD, generator=gen, device="cuda").to(
         spec["state_dtype"]
     )
-    records = [state_records]
-    states = state_records[:, :STATE_ROW].view(slots, HEADS, HEAD_DIM, HEAD_DIM)
-    conv = None
-    if spec["with_conv"]:
-        conv_records = torch.randn(slots, CONV_ROW + SLOT_PAD, generator=gen, device="cuda").to(
-            torch.bfloat16
-        )
-        records.append(conv_records)
-        conv = conv_records[:, :CONV_ROW].view(slots, 3 * HEADS * HEAD_DIM, WINDOW)
+    states = records[:, :STATE_ROW].view(slots, HEADS, HEAD_DIM, HEAD_DIM)
     indices = torch.tensor(
         spec["indices"], dtype=spec.get("index_dtype", torch.int32), device="cuda"
     )
     has_init = torch.tensor(spec["has_init"], dtype=torch.bool, device="cuda")
-    return records, (states, indices, has_init, conv)
+    return records, (states, indices, has_init)
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
@@ -93,44 +81,35 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 -- pytest reso
     nothing, so there is no band)."""
     certifying(op)
     records, args = _build(cell.spec, zlib.crc32(cell.why.encode()) % 2**31)
-    before = [r.clone() for r in records]
-    want_states, want_conv = op.reference(*args)
+    before = records.clone()
+    want_states = op.reference(*args)
     assert op(*args) is None
-    states, _, _, conv = args
-    assert torch.equal(states, want_states)
-    if conv is not None:
-        assert torch.equal(conv, want_conv)
-    for record, old, row in zip(records, before, (STATE_ROW, CONV_ROW)):
-        assert torch.equal(record[:, row:], old[:, row:]), "the op wrote past a slot's row"
+    assert torch.equal(args[0], want_states)
+    assert torch.equal(records[:, STATE_ROW:], before[:, STATE_ROW:]), (
+        "the op wrote past a slot's row"
+    )
 
 
 def test_empty_batch_launches_nothing() -> None:
     """No request, no launch: the pools are untouched (a zero-row grid is not launched at all)."""
     records, args = _build(
-        dict(slots=4, indices=(), has_init=(), state_dtype=torch.float32, with_conv=True), seed=3
+        dict(slots=4, indices=(), has_init=(), state_dtype=torch.float32), seed=3
     )
-    before = [r.clone() for r in records]
+    before = records.clone()
     op(*args)
-    assert all(torch.equal(r, b) for r, b in zip(records, before))
+    assert torch.equal(records, before)
 
 
 def test_guard_refuses_a_flag_per_slot() -> None:
     """``has_initial_states`` is read by request index: a per-slot flag vector of another length is taken and
     zeroes rows by the wrong requests' flags."""
-    _, (states, indices, _, conv) = _build(
-        dict(
-            slots=8,
-            indices=(6, 1),
-            has_init=(True, False),
-            state_dtype=torch.float32,
-            with_conv=False,
-        ),
-        seed=4,
+    _, (states, indices, _) = _build(
+        dict(slots=8, indices=(6, 1), has_init=(True, False), state_dtype=torch.float32), seed=4
     )
     per_slot = torch.zeros(8, dtype=torch.bool, device="cuda")
     with pytest.raises(AssertionError, match="one flag per request"):
         with validating(op):
-            op(states, indices, per_slot, conv)
+            op(states, indices, per_slot)
 
 
 def test_guard_refuses_overlapping_rows() -> None:

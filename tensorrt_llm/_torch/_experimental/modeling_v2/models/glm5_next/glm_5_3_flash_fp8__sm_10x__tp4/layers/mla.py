@@ -47,11 +47,11 @@ rows_per_slot + p % tokens_per_block``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from ..checkpoint import Checkpoint, dequantize_block_fp8, share
+from ..checkpoint import BLOCK, Checkpoint, dequantize_block_fp8, share
 from ..dims import Dims
 from ..ops.attention.compact_sparse_rows import compact_sparse_rows
 from ..ops.attention.head_major import quantize_1x128, saturate_fp8
@@ -75,10 +75,16 @@ from ..ops.gemm.fp8_blockwise_gemm import fp8_blockwise_gemm
 from ..ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
 from ..ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
 from ..schedule import StepSchedule
+from .streams import AuxStream
 
-_BLOCK = 128
-#: Products of at most this many rows run on ``low_m_bf16_gemm``.
-_LOW_M_ROWS = 32
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
+        Glm5NextCacheManager,
+    )
+
+#: Block-FP8 projections of at most this many rows run on ``low_m_bf16_gemm`` over the
+#: weight's dequantized BF16 copy; more rows run the FP8 GEMM.
+_BF16_COPY_MAX_ROWS = 32
 #: The indexer key LayerNorm's epsilon.
 _INDEX_KEY_NORM_EPS = 1e-6
 #: The expanded selection is padded to the sparse attention's 64-column tiles.
@@ -148,7 +154,7 @@ def load_mla(ck: Checkpoint, dims: Dims, layer: int) -> MlaWeights:
     def read_fp8(name: str, shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
         weight = ck.read(f"{prefix}{name}.weight")
         scale = ck.read(f"{prefix}{name}.weight_scale_inv", dtype=torch.float32)
-        blocks = (-(-shape[0] // _BLOCK), -(-shape[1] // _BLOCK))
+        blocks = (-(-shape[0] // BLOCK), -(-shape[1] // BLOCK))
         assert weight.dtype == torch.float8_e4m3fn and tuple(weight.shape) == shape, (
             f"{prefix}{name}: {weight.dtype} {tuple(weight.shape)}, expected block-FP8 {shape}"
         )
@@ -163,7 +169,7 @@ def load_mla(ck: Checkpoint, dims: Dims, layer: int) -> MlaWeights:
     o, o_scale = read_fp8("o_proj", (hidden, heads * v_head))
     kv_b = read_bf16("kv_b_proj.weight", (heads * (nope + v_head), kv_lora))
     # The fused [q_a; kv_a] rows keep each source's 128-row scale blocks.
-    assert q_lora % _BLOCK == 0, f"q_lora {q_lora} splits a 128-row scale block"
+    assert q_lora % BLOCK == 0, f"q_lora {q_lora} splits a 128-row scale block"
     qkv_a = torch.cat([q_a, kv_a])
     qkv_a_scale = torch.cat([q_a_scale, kv_a_scale])
 
@@ -179,14 +185,14 @@ def load_mla(ck: Checkpoint, dims: Dims, layer: int) -> MlaWeights:
     del per_head, kv_b
     h0, h1 = share(heads, dims.tp_size, dims.tp_rank)
     q0, q1, v0, v1 = h0 * nope, h1 * nope, h0 * v_head, h1 * v_head
-    assert q0 % _BLOCK == 0 and v0 % _BLOCK == 0, "a head share splits a 128-wide scale block"
+    assert q0 % BLOCK == 0 and v0 % BLOCK == 0, "a head share splits a 128-wide scale block"
     local = MlaHeads(
         q_b=q_b[q0:q1],
-        q_b_scale=q_b_scale[q0 // _BLOCK : q1 // _BLOCK],
+        q_b_scale=q_b_scale[q0 // BLOCK : q1 // BLOCK],
         w_k=full.w_k[h0:h1],
         w_v_t=full.w_v_t[h0:h1],
         o=o[:, v0:v1].contiguous(),
-        o_scale=o_scale[:, v0 // _BLOCK : v1 // _BLOCK].contiguous(),
+        o_scale=o_scale[:, v0 // BLOCK : v1 // BLOCK].contiguous(),
     )
 
     index_kgw = torch.cat(
@@ -283,7 +289,7 @@ class _CachePools:
     tokens_per_block: int
 
 
-def _cache_pools(manager: Any, layer_idx: int) -> _CachePools:
+def _cache_pools(manager: Glm5NextCacheManager, layer_idx: int) -> _CachePools:
     """Layer ``layer_idx``'s pools from the KV cache manager's documented buffers: views only, no
     allocation or device work, so a captured step reads the same storage on replay."""
     latent = manager.get_latent_state_buffer(layer_idx)
@@ -388,14 +394,6 @@ def _score_calls(
     return calls
 
 
-def _linear_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """``x [n, K] @ weight [N, K]^T`` for a BF16 weight: ``low_m_bf16_gemm`` up to
-    ``_LOW_M_ROWS`` rows, cuBLAS above."""
-    if x.shape[0] <= _LOW_M_ROWS:
-        return low_m_bf16_gemm(x, weight)
-    return torch.nn.functional.linear(x, weight)
-
-
 def _fp8_gemm(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """``x [n, K] @ weight [N, K]^T`` for a 128 x 128 block-FP8 weight: ``x``'s 1 x 128
     quantization and the blockwise FP8 GEMM, BF16 out."""
@@ -406,9 +404,9 @@ def _fp8_gemm(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> tor
 def _linear_fp8(
     x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, weight_bf16: torch.Tensor
 ) -> torch.Tensor:
-    """``x @ weight^T`` for a block-FP8 weight: up to ``_LOW_M_ROWS`` rows on
+    """``x @ weight^T`` for a block-FP8 weight: up to ``_BF16_COPY_MAX_ROWS`` rows on
     ``low_m_bf16_gemm`` over its dequantized copy ``weight_bf16``, the FP8 GEMM above."""
-    if x.shape[0] <= _LOW_M_ROWS:
+    if x.shape[0] <= _BF16_COPY_MAX_ROWS:
         return low_m_bf16_gemm(x, weight_bf16)
     return _fp8_gemm(x, weight, scale)
 
@@ -422,9 +420,8 @@ class MlaLayer:
         dims: the model's sizes and this rank's shares.
         layer_idx: the layer's index (the MTP layer's is ``dims.mtp_layer``), which names its
             latent and indexer pools in the KV cache manager.
-        aux_stream: the stream a captured generation step runs its second input GEMM and its
-            query branch on; None runs everything on the current stream.
-        events: ``(fork, join)``, the events that order the aux stream against the current one.
+        aux: the aux stream a captured generation step runs its second input GEMM and its
+            query branch on.
         scratch: the model's shared sparse attention buffers.
     """
 
@@ -433,8 +430,7 @@ class MlaLayer:
         w: MlaWeights,
         dims: Dims,
         layer_idx: int,
-        aux_stream: Optional[torch.cuda.Stream],
-        events: tuple[Any, Any],
+        aux: AuxStream,
         scratch: SparseAttentionScratch,
     ) -> None:
         if not dims.index_always_select_tail:
@@ -445,8 +441,7 @@ class MlaLayer:
             )
         self.w = w
         self.layer_idx = layer_idx
-        self.aux_stream = aux_stream
-        self.fork_event, self.join_event = events
+        self.aux = aux
         self.scratch = scratch
         self.heads = dims.mla_heads
         self.heads_local = dims.mla_heads_local
@@ -483,14 +478,14 @@ class MlaLayer:
         assert num_rows == step.num_generation_tokens, (
             f"{num_rows} rows for {step.num_generation_tokens} generation tokens"
         )
-        rows = step.generation_rows(self.kpool)
+        rows = step.generation_rows()
         pools = _cache_pools(step.metadata.kv_cache_manager, self.layer_idx)
         tpb = pools.tokens_per_block
         first = step.num_contexts
         tables = step.block_tables[first : first + step.num_generations]
-        qkv, idx = self._fork_join(
+        qkv, idx = self.aux.fork_join(
             lambda: _linear_fp8(x, w.qkv_a, w.qkv_a_scale, w.qkv_a_bf16),
-            lambda: _linear_bf16(x, w.index_kgw),
+            lambda: low_m_bf16_gemm(x, w.index_kgw),
         )
         q_resid = mla_prologue(
             qkv,
@@ -523,7 +518,7 @@ class MlaLayer:
                 head_dim=self.index_head_dim,
                 kpool=self.kpool,
             )
-            q_index = _linear_bf16(q_resid, w.index_q).view(
+            q_index = low_m_bf16_gemm(q_resid, w.index_q).view(
                 num_rows, self.index_heads, self.index_head_dim
             )
             scores = kpool_score(
@@ -556,7 +551,7 @@ class MlaLayer:
             q = q.view(num_rows, self.heads_local, self.qk_nope)
             return saturate_fp8(torch.bmm(q.transpose(0, 1), w.local.w_k))
 
-        (packed, lengths, nonempty), query_fp8 = self._fork_join(select, query)
+        (packed, lengths, nonempty), query_fp8 = self.aux.fork_join(select, query)
         latent = sparse_mla_decode(
             query_fp8,
             pools.kv_rows,
@@ -597,7 +592,7 @@ class MlaLayer:
         tpb = pools.tokens_per_block
         tables = step.block_tables
         qkv = _linear_fp8(x, w.qkv_a, w.qkv_a_scale, w.qkv_a_bf16)
-        idx = _linear_bf16(x, w.index_kgw)
+        idx = low_m_bf16_gemm(x, w.index_kgw)
         q_resid = mla_context_prologue(
             qkv,
             idx,
@@ -638,7 +633,7 @@ class MlaLayer:
         num_cand = (visible // self.kpool).to(torch.int32)
         q_resid = q_resid[lo:hi]
         index_weights = idx[lo:hi, 2 * self.index_head_dim :]
-        q_index = _linear_bf16(q_resid, w.index_q).view(
+        q_index = low_m_bf16_gemm(q_resid, w.index_q).view(
             num_rows, self.index_heads, self.index_head_dim
         )
         selected = torch.empty(num_rows, self.select_k, dtype=torch.int32, device=x.device)
@@ -704,19 +699,3 @@ class MlaLayer:
         projected = fp8_blockwise_gemm(values, full.o, values_scale, full.o_scale)
         # A row that selected no key has an unspecified attention output; it projects to zero.
         out[lo:hi] = torch.where(nonempty[:, None], projected, 0)
-
-    def _fork_join(self, main: Callable[[], Any], aux: Callable[[], Any]) -> tuple[Any, Any]:
-        """``(main(), aux())``: in a CUDA graph capture ``aux`` runs on the aux stream beside
-        ``main``, otherwise both run in order on the current stream."""
-        if self.aux_stream is None or not torch.cuda.is_current_stream_capturing():
-            return main(), aux()
-        # In a capture the aux stream's outputs need no record_stream: every use of the aux
-        # stream starts by waiting for the current stream (the fork).
-        self.fork_event.record()
-        main_out = main()
-        with torch.cuda.stream(self.aux_stream):
-            self.fork_event.wait()
-            aux_out = aux()
-            self.join_event.record()
-        self.join_event.wait()
-        return main_out, aux_out

@@ -4,7 +4,9 @@
 
 The loader imports this module right after the target is found in the family
 library, so a fake for an op the library does not define fails the load. Both ops
-write their outputs in place and return nothing.
+write their outputs in place and return nothing. Each fake is named ``fake_<op>``
+and takes the op's schema arguments by their schema names, in schema order; the
+target's fake-op test checks both against the library.
 """
 
 import torch
@@ -15,12 +17,14 @@ _NS = namespace_of(__name__)
 
 
 @torch.library.register_fake(f"{_NS}::decode_moe")
-def _(x, logits, bias, scaling, limit, w31, s31, w2, s2, sw31, ss31, sw2, ss2, out, pdl):
+def fake_decode_moe(
+    x, logits, bias, scaling, limit, w31, s31, w2, s2, sw31, ss31, sw2, ss2, out, pdl
+):
     return None
 
 
 @torch.library.register_fake(f"{_NS}::mhc_ar_boundary")
-def _(
+def fake_mhc_ar_boundary(
     partial,
     workspace,
     rank,

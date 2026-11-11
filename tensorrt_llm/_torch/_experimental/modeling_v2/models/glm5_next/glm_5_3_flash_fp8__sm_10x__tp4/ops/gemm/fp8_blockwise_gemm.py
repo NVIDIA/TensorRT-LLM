@@ -105,9 +105,12 @@ class Fp8BlockwiseGemm(OpWrapper):
     MLA prefill's q_b and o (16384 x 1536, 4096 x 16384) -- from 1 to 13,312 rows, all with N
     and K multiples of 128.
 
+    The target's decode steps run this op, after `fp8_quantize_1x128`, inside CUDA graphs at
+    the tactics its warmup tuned; the test certifies that at one decode shape (a tuned tactic,
+    captured and replayed). The other cells run the default tactic.
+
     Not certified: N or K not a multiple of 128 (the kernel needs K % 16 == 0 and N % 8 == 0
-    for its TMA alignment), a warm autotuner cache (a tuned tactic other than the default),
-    CUDA-graph capture, sm_103.
+    for its TMA alignment), sm_103.
     """
 
     def __call__(

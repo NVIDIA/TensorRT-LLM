@@ -37,9 +37,7 @@ def _kpool_score_kernel(
     POOL,
     BT,
     KV_LENS,
-    REQ,
     OUT,
-    num_rows,
     w_row_stride,
     w_head_stride,
     slot_stride,
@@ -55,123 +53,55 @@ def _kpool_score_kernel(
     H: tl.constexpr,
     HP: tl.constexpr,
     BP: tl.constexpr,
-    ROWS: tl.constexpr,
-    PRECISION: tl.constexpr,
-    HAS_REQ: tl.constexpr,
-    DOT_DTYPE: tl.constexpr = tl.float32,
 ):
-    """Score ``BP`` pools for ``ROWS`` consecutive rows: ``sum_h w[h] * relu(q_h . key_j * s)``.
+    """Score ``BP`` pools of row ``r`` against block table ``r``: ``sum_h w[h] * relu(q_h . key_j
+    * s)``, BF16 operands into the tensor-core dot with FP32 accumulation.
 
-    Pools whose last member is not yet visible to a row (``j >= kv_len //
-    KPOOL``) get ``min_value`` so a following top-k never picks them ahead of a
-    candidate. Row ``r`` reads block table ``REQ[r]`` when ``HAS_REQ`` (packed
-    context rows of several requests), else table ``r``. ``ROWS > 1`` is for
-    query tokens that share a block table (one request, or one request per
-    group under ``HAS_REQ``): the ``BP`` pool keys are gathered once and reused
-    for every row of the program. A group straddling two requests (only at
-    request boundaries) gathers per row instead.
+    Pools whose last member is not yet visible to the row (``j >= kv_len // KPOOL``) get
+    ``min_value`` so a following top-k never picks them ahead of a candidate; a block of pools
+    past every visible one stores ``min_value`` without gathering keys.
     """
-    # The FP32 score matrix can exceed 2**31 elements during long-context prefill.
-    r0 = tl.program_id(0).to(tl.int64) * ROWS
+    r = tl.program_id(0).to(tl.int64)
     j0 = tl.program_id(1) * BP
     j = j0 + tl.arange(0, BP)
-    d = tl.arange(0, HD)
-    h = tl.arange(0, HP)
-    hmask = h < H
-    r_last = tl.minimum(r0 + ROWS - 1, num_rows - 1)
-    pos = j.to(tl.int64) * KPOOL
-    page = pos // tpb
-    off = pos - page * tpb
-    if HAS_REQ:
-        t0 = tl.load(REQ + r0).to(tl.int64)
-        t_last = tl.load(REQ + r_last).to(tl.int64)
-        shared = t0 == t_last
+    out_row = OUT + r * num_pools_max
+    num_cand = tl.load(KV_LENS + r).to(tl.int64) // KPOOL
+    if j0 >= num_cand:
+        tl.store(out_row + j, tl.full([BP], min_value, tl.float32), mask=j < num_pools_max)
     else:
-        t0 = r0.to(tl.int64)
-        shared = True
-    if shared:
-        # The last row of the group has the largest visible length (rows of
-        # one request are in position order); a block past its candidates is
-        # past every row's.
-        kv_last = tl.load(KV_LENS + r_last).to(tl.int64)
-        if j0 >= kv_last // KPOOL:
-            for i in tl.static_range(ROWS):
-                r = r0 + i
-                tl.store(
-                    OUT + r * num_pools_max + j,
-                    tl.full([BP], min_value, tl.float32),
-                    mask=(j < num_pools_max) & (r < num_rows),
-                )
-        else:
-            valid_any = j < kv_last // KPOOL
-            slot = tl.load(BT + t0 * bt_stride + page, mask=valid_any, other=0).to(tl.int64)
-            kptr = POOL + slot * slot_stride + off * row_stride + 2 * HD
-            keys = tl.load(kptr[:, None] + d[None, :], mask=valid_any[:, None], other=0.0).to(
-                DOT_DTYPE
-            )
-            for i in tl.static_range(ROWS):
-                r = r0 + i
-                in_range = r < num_rows
-                kv_len = tl.load(KV_LENS + r, mask=in_range, other=0).to(tl.int64)
-                valid = j < kv_len // KPOOL
-                q = tl.load(
-                    Q + r * H * HD + h[:, None] * HD + d[None, :],
-                    mask=hmask[:, None] & in_range,
-                    other=0.0,
-                ).to(DOT_DTYPE)
-                scores = tl.dot(q, tl.trans(keys), input_precision=PRECISION)  # [HP, BP]
-                scores = tl.maximum(scores * q_scale, 0.0)
-                w = tl.load(
-                    W + r * w_row_stride + h * w_head_stride, mask=hmask & in_range, other=0.0
-                ).to(tl.float32)
-                mixed = tl.sum(scores * (w * w_scale)[:, None], axis=0)
-                mixed = tl.where(valid, mixed, min_value)
-                tl.store(OUT + r * num_pools_max + j, mixed, mask=(j < num_pools_max) & in_range)
-    else:
-        for i in tl.static_range(ROWS):
-            r = r0 + i
-            in_range = r < num_rows
-            kv_len = tl.load(KV_LENS + r, mask=in_range, other=0).to(tl.int64)
-            tbl = tl.load(REQ + r, mask=in_range, other=0).to(tl.int64)
-            valid = j < kv_len // KPOOL
-            slot = tl.load(BT + tbl * bt_stride + page, mask=valid, other=0).to(tl.int64)
-            kptr = POOL + slot * slot_stride + off * row_stride + 2 * HD
-            keys = tl.load(kptr[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(DOT_DTYPE)
-            q = tl.load(
-                Q + r * H * HD + h[:, None] * HD + d[None, :],
-                mask=hmask[:, None] & in_range,
-                other=0.0,
-            ).to(DOT_DTYPE)
-            scores = tl.dot(q, tl.trans(keys), input_precision=PRECISION)  # [HP, BP]
-            scores = tl.maximum(scores * q_scale, 0.0)
-            w = tl.load(
-                W + r * w_row_stride + h * w_head_stride, mask=hmask & in_range, other=0.0
-            ).to(tl.float32)
-            mixed = tl.sum(scores * (w * w_scale)[:, None], axis=0)
-            mixed = tl.where(valid, mixed, min_value)
-            tl.store(OUT + r * num_pools_max + j, mixed, mask=(j < num_pools_max) & in_range)
+        d = tl.arange(0, HD)
+        h = tl.arange(0, HP)
+        hmask = h < H
+        valid = j < num_cand
+        pos = j.to(tl.int64) * KPOOL
+        page = pos // tpb
+        off = pos - page * tpb
+        slot = tl.load(BT + r * bt_stride + page, mask=valid, other=0).to(tl.int64)
+        kptr = POOL + slot * slot_stride + off * row_stride + 2 * HD
+        keys = tl.load(kptr[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(tl.bfloat16)
+        q = tl.load(
+            Q + r * H * HD + h[:, None] * HD + d[None, :], mask=hmask[:, None], other=0.0
+        ).to(tl.bfloat16)
+        scores = tl.dot(q, tl.trans(keys), input_precision="ieee")  # [HP, BP]
+        scores = tl.maximum(scores * q_scale, 0.0)
+        w = tl.load(W + r * w_row_stride + h * w_head_stride, mask=hmask, other=0.0)
+        mixed = tl.sum(scores * (w.to(tl.float32) * w_scale)[:, None], axis=0)
+        tl.store(out_row + j, tl.where(valid, mixed, min_value), mask=j < num_pools_max)
 
 
 class KpoolScore(OpWrapper):
     """``q`` BF16 ``[N, H, head_dim]`` (contiguous), ``weights`` ``[N, H]`` (any strides) ->
     FP32 ``[N, num_pools_max]`` pool scores.
 
-    Row ``r`` reads block table ``request_ids[r]`` when given, else table ``r``, and sees
-    ``kv_lens[r]`` positions: columns ``[0, kv_lens[r] // kpool)`` are its scores. Without
-    ``max_kv_len`` every other column is the FP32 minimum. With ``max_kv_len`` (a host bound on
-    every ``kv_lens[r]``) only the 64-pool blocks some row can see are launched; columns past
-    them are left unwritten, so a reader stops at each row's ``kv_lens[r] // kpool``.
-    ``rows_per_program > 1`` scores that many consecutive rows per program and gathers their
-    shared pool keys once: the rows must share a table, either a stride-0 broadcast table or
-    ``request_ids`` with each request's rows consecutive and in position order.
+    Row ``r`` reads block table ``r`` and sees ``kv_lens[r]`` positions: columns ``[0,
+    kv_lens[r] // kpool)`` are its scores, every other column is the FP32 minimum.
     """
 
     ARCHS = frozenset({Arch.SM_100})
     # The indexer has 32 heads of 128 and scores pools of 4 over 32-token blocks. The tables
-    # are 4,100 pages wide, so the capacity is num_pools_max = 32,800 pools. Generation cells
-    # give the requests' KV length after the step; context cells give (cached, new) per
-    # request and the scored row range. A verify step scores one row per program on per-row
-    # copies of the generation tables; packed context rows score 16 per program.
+    # are 4,100 pages wide, so the capacity is num_pools_max = 32,800 pools. The cells give the
+    # requests' KV length after the step; a verify step scores its rows on per-row copies of
+    # the generation tables (`GenerationRows.tables`).
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="MTP-3 verify of one 13K-token request",
@@ -190,77 +120,48 @@ class KpoolScore(OpWrapper):
             spec=dict(requests=8, tokens=1, kv=13312),
         ),
         Cell(
-            why="one rank's sequence-parallel quarter of a 13,312-token prompt (rows 0-3327)",
-            spec=dict(context=((0, 13312),), rows=(0, 3328)),
-        ),
-        Cell(
-            why="a 13,312-token prompt's last sequence-parallel quarter (rows 9984-13311)",
-            spec=dict(context=((0, 13312),), rows=(9984, 13312)),
-        ),
-        Cell(
-            why="two packed context requests: a 16-row group straddles the request boundary",
-            spec=dict(context=((4099, 1001), (0, 1313)), rows=(0, 2314)),
+            why="one row: an MTP draft step of one 13K-token request",
+            spec=dict(requests=1, tokens=1, kv=13312),
         ),
     )
 
     note = """
-    The packed context rows of this model are scored by `kpool_score_fp8` on sm_100; this
-    scorer takes them when the FP8 scorer has nothing to score (no complete pool) or the
-    BF16 path is forced (TRTLLM_GLM_INDEXER_BF16=1 in the module path).
+    The target scores its generation rows here (`MlaLayer.generation_partial`); packed context
+    rows are scored by `kpool_score_fp8`.
 
     Only BF16 queries and BF16 pool keys: the dot reads both as BF16, so an FP32 query would
     be rounded to BF16 silently. `is_valid` refuses it.
-
-    `rows_per_program > 1` without `request_ids` and without a stride-0 table raises. With
-    `request_ids`, a group whose first and last rows share a request but whose middle rows do
-    not would score the middle rows against the wrong table: `is_valid` requires request ids
-    in non-decreasing order and each request's visible lengths non-decreasing.
     """
 
     def __call__(
         self,
-        q,
-        weights,
-        index_pool,
-        block_tables,
-        kv_lens,
-        tokens_per_block,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_lens: torch.Tensor,
+        tokens_per_block: int,
         *,
-        num_pools_max,
-        head_dim,
-        kpool,
-        q_scale,
-        w_scale,
-        rows_per_program=1,
-        request_ids=None,
-        max_kv_len=None,
-    ):
+        num_pools_max: int,
+        head_dim: int,
+        kpool: int,
+        q_scale: float,
+        w_scale: float,
+    ) -> torch.Tensor:
         n, num_heads, hd = q.shape
         if hd != head_dim:
             raise ValueError(f"kpool_score: q head_dim {hd} != {head_dim}")
         out = torch.empty(n, num_pools_max, dtype=torch.float32, device=q.device)
         if n == 0:
             return out
-        rows = max(1, int(rows_per_program))
-        if rows > 1 and n > 1 and request_ids is None and block_tables.stride(0) != 0:
-            raise ValueError(
-                "kpool_score: rows_per_program > 1 needs a broadcast block table or request_ids"
-            )
         bp = 64
-        score_blocks = triton.cdiv(num_pools_max, bp)
-        if max_kv_len is not None:
-            score_blocks = min(score_blocks, triton.cdiv(max(0, int(max_kv_len)) // kpool, bp))
-            if score_blocks == 0:
-                return out
-        _kpool_score_kernel[(triton.cdiv(n, rows), score_blocks)](
+        _kpool_score_kernel[(n, triton.cdiv(num_pools_max, bp))](
             q,
             weights,
             index_pool,
             block_tables,
             kv_lens,
-            kv_lens if request_ids is None else request_ids,
             out,
-            n,
             weights.stride(0),
             weights.stride(1),
             index_pool.stride(0),
@@ -276,46 +177,32 @@ class KpoolScore(OpWrapper):
             H=num_heads,
             HP=max(16, triton.next_power_of_2(num_heads)),
             BP=bp,
-            ROWS=rows,
-            # BF16 operands into the tensor-core dot, FP32 accumulation.
-            PRECISION="ieee",
-            DOT_DTYPE=tl.bfloat16,
-            HAS_REQ=request_ids is not None,
-            # Row groups are register-heavy; two warps per program keep more
-            # programs resident, which hides the gathered key loads.
-            num_warps=2 if rows > 1 else 4,
+            num_warps=4,
         )
         return out
 
     def reference(
         self,
-        q,
-        weights,
-        index_pool,
-        block_tables,
-        kv_lens,
-        tokens_per_block,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_lens: torch.Tensor,
+        tokens_per_block: int,
         *,
-        num_pools_max,
-        head_dim,
-        kpool,
-        q_scale,
-        w_scale,
-        rows_per_program=1,
-        request_ids=None,
-        max_kv_len=None,
-    ):
-        """The scores in FP32 from the BF16 operands, every invisible column the FP32 minimum.
-
-        ``rows_per_program`` and ``max_kv_len`` change only which columns the op writes, not
-        what it writes, so they are not read here.
-        """
+        num_pools_max: int,
+        head_dim: int,
+        kpool: int,
+        q_scale: float,
+        w_scale: float,
+    ) -> torch.Tensor:
+        """The scores in FP32 from the BF16 operands, every invisible column the FP32 minimum."""
         n = q.shape[0]
         dev = q.device
         out = torch.full((n, num_pools_max), FP32_MIN, dtype=torch.float32, device=dev)
         if n == 0:
             return out
-        table = torch.arange(n, device=dev) if request_ids is None else request_ids.long()
+        table = torch.arange(n, device=dev)
         pools = (kv_lens.long() // kpool).clamp(max=num_pools_max)
         pool_keys = index_pool[:, :, 2 * head_dim : 3 * head_dim]
         chunk = 32
@@ -337,22 +224,19 @@ class KpoolScore(OpWrapper):
 
     def is_valid(
         self,
-        q,
-        weights,
-        index_pool,
-        block_tables,
-        kv_lens,
-        tokens_per_block,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_lens: torch.Tensor,
+        tokens_per_block: int,
         *,
-        num_pools_max,
-        head_dim,
-        kpool,
-        q_scale,
-        w_scale,
-        rows_per_program=1,
-        request_ids=None,
-        max_kv_len=None,
-    ):
+        num_pools_max: int,
+        head_dim: int,
+        kpool: int,
+        q_scale: float,
+        w_scale: float,
+    ) -> None:
         assert q.dtype == torch.bfloat16 and index_pool.dtype == torch.bfloat16, (
             f"the dot reads q and the pool keys as BF16; got {q.dtype}, {index_pool.dtype}"
         )
@@ -367,6 +251,8 @@ class KpoolScore(OpWrapper):
         assert kv_lens.shape == (n,)
         if n == 0:
             return
+        # Row r reads table r.
+        assert block_tables.stride(0) == 0 or block_tables.shape[0] >= n
         widest = int(kv_lens.max())
         # A row with more pools than num_pools_max loses the rest without a sign.
         assert widest // kpool <= num_pools_max, f"{widest // kpool} pools > {num_pools_max}"
@@ -374,25 +260,6 @@ class KpoolScore(OpWrapper):
             f"a visible length of {widest} exceeds the tables' "
             f"{block_tables.shape[1] * tokens_per_block} positions"
         )
-        if max_kv_len is not None:
-            # Columns past max_kv_len // kpool are never written.
-            assert widest <= max_kv_len, f"kv_lens reach {widest} > max_kv_len {max_kv_len}"
-        if request_ids is None:
-            assert block_tables.stride(0) == 0 or block_tables.shape[0] >= n
-        else:
-            assert request_ids.shape == (n,)
-            assert 0 <= int(request_ids.min()) and int(request_ids.max()) < block_tables.shape[0]
-        if rows_per_program > 1 and n > 1:
-            # A group shares its first row's table and its last row's candidates.
-            lens = kv_lens.long()
-            if request_ids is None:
-                assert bool((lens.diff() >= 0).all()), "rows must be in position order"
-            else:
-                req = request_ids.long()
-                assert bool((req.diff() >= 0).all()), "each request's rows must be consecutive"
-                assert bool(((lens.diff() >= 0) | (req.diff() != 0)).all()), (
-                    "each request's rows must be in position order"
-                )
 
 
 kpool_score = KpoolScore()

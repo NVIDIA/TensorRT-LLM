@@ -31,12 +31,13 @@ pytestmark = pytest.mark.skipif(
 
 DEV = "cuda"
 
-#: The kernel's two fp32 divisions are approximate, each within CUDA's documented 2 ulp of the
-#: exact quotient, and the returned scale is two divisions deep.
+#: The default build divides exactly, so its scales are the reference's. A `FAST_MATH=ON` build
+#: divides approximately, each division within CUDA's documented 2 ulp, and the returned scale is
+#: two divisions deep: the gate admits that build.
 SCALE_ULP_GATE = 4
 
-#: A code can only disagree with the exactly rounded one when the exact product sits within
-#: the first division's 2 ulp of an e4m3 rounding midpoint.
+#: A code can only disagree with the exactly rounded one when the scale it multiplies by is off,
+#: so when the exact product sits within that division's 2 ulp of an e4m3 rounding midpoint.
 TIE_REL_GATE = 2.0 * 2.0**-23
 
 
@@ -52,12 +53,13 @@ def _compare(
 ) -> None:
     """Scales within 4 fp32 ulp; codes at most one e4m3 step apart, >= 99.5% bit-exact.
 
-    The kernel's two fp32 divisions are approximate, so neither output is reproducible to the
-    last bit: a scale can sit up to 2 ulp from `amax / 448` per division, and a code can land
-    on the other side of a rounding midpoint when the exact product sits within that band of
-    it -- one e4m3 step, never more. `_assert_misses_are_ties` holds every such miss to the
-    band. bf16 inputs make exact midpoints common (`x * 448 / amax` of two bf16 values often
-    has few significant bits), which is why the bit-exact floor is 99.5% and not higher.
+    The default build's divisions are exact, so it matches the reference bit for bit. The
+    bands admit a `FAST_MATH=ON` build, whose approximate divisions can put a scale up to 2 ulp
+    from `amax / 448` per division and a code on the other side of a rounding midpoint when
+    the exact product sits within that band of it -- one e4m3 step, never more.
+    `_assert_misses_are_ties` holds every such miss to the band. bf16 inputs make exact
+    midpoints common (`x * 448 / amax` of two bf16 values often has few significant bits),
+    which is why that build's bit-exact floor is 99.5% and not higher.
 
     A wrong recipe is far outside this: a power-of-two scale, a per-row or per-tensor amax,
     blocks down the row axis or offset by 64 columns, or 240 as the e4m3 maximum each change

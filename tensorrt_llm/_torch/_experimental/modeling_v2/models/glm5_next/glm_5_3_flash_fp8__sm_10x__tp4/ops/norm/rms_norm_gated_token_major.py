@@ -9,6 +9,11 @@ The kernel, its launch configuration and its PDL policy are those Modeling V1's
 ``trtllm::rms_norm_gated_token_major`` (``tensorrt_llm/_torch/modules/mamba/layernorm_gated.py``) uses for
 these layouts; this entry does not import it. The V1 op's generic one-row-per-program kernel for other
 layouts is not part of this entry, so it takes the multi-row kernel's layouts only.
+
+The entry's contract and reference are copied from kimi_k3_vl's
+(``models/kimi_k3_vl/ops/norm/rms_norm_gated_token_major.py``), which calls the V1 op; the reference is
+the same computation. qwen4_exp's entry (``models/qwen4_exp/ops/norm/rms_norm_gated_token_major.py``)
+also calls the V1 op, launching the multi-row kernel itself for its prefill shapes.
 """
 
 from __future__ import annotations

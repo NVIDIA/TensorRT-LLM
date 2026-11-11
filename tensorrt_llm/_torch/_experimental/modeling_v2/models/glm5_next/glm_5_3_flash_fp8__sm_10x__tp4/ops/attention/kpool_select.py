@@ -6,9 +6,11 @@ Per row: the ``select_k`` highest pool scores among the row's ``kv_len // kpool`
 pools (an exact radix select on the FP32 bits), each selected pool expanded to its ``kpool``
 latent-cache row ids, then the rows of the incomplete trailing pool, packed from column 0 in
 pool order and padded with -1. A row with no visible key gets one dummy id 0, length 1 and
-``nonempty`` False. The module path runs a radix top-k, an expand kernel and a compaction
-kernel; the selected set is the same (up to the choice among pools of equal score at the
-threshold) and the packed order is ascending pool index instead of the top-k's order.
+``nonempty`` False. The result is that of ``kpool_expand`` and ``compact_sparse_rows`` on the
+pools a top-k selects (up to the choice among pools of equal score at the threshold), with the
+selected pools in ascending order; the target's context rows take those three steps
+(``indexer_topk``, ``kpool_expand``, ``compact_sparse_rows``), its generation rows this one
+launch (``MlaLayer.generation_partial``).
 """
 
 from __future__ import annotations
@@ -199,17 +201,17 @@ class KpoolSelect(OpWrapper):
 
     def __call__(
         self,
-        scores,
-        kv_lens,
-        block_tables,
-        tokens_per_block,
+        scores: torch.Tensor,
+        kv_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        tokens_per_block: int,
         *,
-        select_k,
-        kpool,
-        base_row,
-        rows_per_slot,
-        out_width,
-    ):
+        select_k: int,
+        kpool: int,
+        base_row: int,
+        rows_per_slot: int,
+        out_width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         rows = scores.shape[0]
         width = triton.cdiv(out_width, 64) * 64
         packed = torch.empty((rows, width), dtype=torch.int32, device=scores.device)
@@ -240,17 +242,17 @@ class KpoolSelect(OpWrapper):
 
     def reference(
         self,
-        scores,
-        kv_lens,
-        block_tables,
-        tokens_per_block,
+        scores: torch.Tensor,
+        kv_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        tokens_per_block: int,
         *,
-        select_k,
-        kpool,
-        base_row,
-        rows_per_slot,
-        out_width,
-    ):
+        select_k: int,
+        kpool: int,
+        base_row: int,
+        rows_per_slot: int,
+        out_width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_cand = (kv_lens.long() // kpool).clamp(max=scores.shape[1])
         col = torch.arange(scores.shape[1], device=scores.device)
         masked = torch.where(col[None, :] < num_cand[:, None], scores, float("-inf"))
@@ -258,7 +260,7 @@ class KpoolSelect(OpWrapper):
         top = torch.where(torch.gather(masked, 1, top) > float("-inf"), top, -1)
         top = torch.sort(torch.where(top >= 0, top, scores.shape[1]), dim=1).values
         top = torch.where(top < scores.shape[1], top, -1).int()
-        expanded = kpool_expand(
+        expanded = kpool_expand.reference(
             top,
             kv_lens,
             block_tables,
@@ -268,15 +270,25 @@ class KpoolSelect(OpWrapper):
             kpool=kpool,
             out_width=out_width,
         )
-        return compact_sparse_rows(expanded)
+        return compact_sparse_rows.reference(expanded)
 
     def is_valid(
-        self, scores, kv_lens, block_tables, tokens_per_block, *, select_k, kpool, **kwargs
-    ):
+        self,
+        scores: torch.Tensor,
+        kv_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        tokens_per_block: int,
+        *,
+        select_k: int,
+        kpool: int,
+        base_row: int,
+        rows_per_slot: int,
+        out_width: int,
+    ) -> None:
         assert scores.dtype == torch.float32 and scores.stride(1) == 1
         assert kv_lens.shape == (scores.shape[0],) and block_tables.shape[0] == scores.shape[0]
         assert select_k & (select_k - 1) == 0, f"select_k {select_k} must be a power of two"
-        assert kwargs["out_width"] >= select_k * kpool + kpool - 1
+        assert out_width >= select_k * kpool + kpool - 1
 
 
 kpool_select = KpoolSelect()

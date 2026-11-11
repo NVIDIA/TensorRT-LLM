@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GLM-5.3-Flash block-FP8 on sm_100 / sm_103: tensor-parallel attention and experts over 4 ranks."""
+"""GLM-5.3-Flash block-FP8 on sm_100: tensor-parallel attention and experts over 4 ranks."""
 
 from tensorrt_llm._torch._experimental.modeling_v2._native import load_target_ops
 

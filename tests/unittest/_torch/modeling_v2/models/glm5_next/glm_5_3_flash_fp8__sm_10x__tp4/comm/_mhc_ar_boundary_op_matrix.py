@@ -81,7 +81,7 @@ def _boundary_inputs(rows: int, seed: int) -> dict:
         post=post,
         comb=comb.contiguous(),
         fn=torch.randn(MIX, MULT * HIDDEN, generator=gen, device="cuda") * 0.02,
-        scale=torch.ones(3, device="cuda"),
+        scale=0.75 + 0.5 * torch.rand(3, generator=gen, device="cuda"),
         base=torch.randn(MIX, generator=gen, device="cuda") * 0.1,
         norm_weight=(1 + 0.1 * torch.randn(HIDDEN, generator=gen, device="cuda")).to(
             torch.bfloat16
@@ -119,7 +119,7 @@ def _report(out, ref) -> None:
         print(f"[report] {name}: {element:.2f} ulp per element, {rms:.3f} ulp RMS", flush=True)
 
 
-def _compare(out, ref) -> None:
+def _compare(out, ref, layer_input_rms_ulp: float = BF16_RMS_ULP) -> None:
     """The BF16 outputs within 3 ulp per element against the row scale and 0.5 ulp relative RMS, the FP32
     coefficients within 5e-3 absolute.
 
@@ -144,7 +144,8 @@ def _compare(out, ref) -> None:
         return
     for name, o, r in zip(OUTPUTS, out, ref):
         if r.dtype == torch.bfloat16:
-            assert_within_ulp(o, r, element_ulp=BF16_ELEMENT_ULP, rms_ulp=BF16_RMS_ULP)
+            rms_ulp = layer_input_rms_ulp if name == "layer_input" else BF16_RMS_ULP
+            assert_within_ulp(o, r, element_ulp=BF16_ELEMENT_ULP, rms_ulp=rms_ulp)
         else:
             torch.testing.assert_close(
                 o, r, rtol=0.0, atol=FP32_ATOL, msg=lambda m, n=name: f"{n}: {m}"
@@ -236,6 +237,49 @@ def check_the_gate_discriminates_a_wrong_reduction() -> None:
         raise AssertionError("the band accepted a reduction that dropped a rank")
 
 
+def check_matches_the_unfused_boundary() -> None:
+    """The decode target's wiring of the op against the path it replaces: the library one-shot all-reduce of
+    the partials, then the mHC site's ``fused_hc``, on a real ``Mhc`` site.
+
+    The same band, except 1 ulp RMS on the layer input: the unfused path rounds the collapsed row to BF16
+    before its RMSNorm and the op does not (see ``MhcArBoundary.reference``). Measured on B200 over the three
+    cells: the layer input within 1.95 ulp per element and 0.77 ulp RMS, the streams within 0.2 ulp, the
+    coefficients within 4e-5.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.layers.mhc import (  # noqa: E501
+        Mhc,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.modeling import (  # noqa: E501
+        DecodeTarget,
+    )
+
+    for cell in entry.CELLS:
+        rows, seed = cell.spec["rows"], 20
+        inputs = _boundary_inputs(rows, seed)
+        dims = SimpleNamespace(
+            hc_mult=MULT,
+            hc_sinkhorn_iters=cell.spec["sinkhorn_iters"],
+            rms_eps=NORM_EPS,
+            hc_eps=HC_EPS,
+        )
+        hc = Mhc(SimpleNamespace(fn=inputs["fn"], scale=inputs["scale"], base=inputs["base"]), dims)
+        target = SimpleNamespace(
+            comm=SimpleNamespace(workspace=WORKSPACE, tp_rank=RANK),
+            core=SimpleNamespace(dims=SimpleNamespace(rms_eps=LAYER_INPUT_EPS)),
+        )
+        partial = _partial(RANK, rows, seed)
+        streams = (inputs["residual"], inputs["post"], inputs["comb"])
+        fused = DecodeTarget._fused_boundary(target, partial, *streams, hc, inputs["norm_weight"])
+        unfused = hc.fused_hc(
+            library_allreduce(partial), *streams, inputs["norm_weight"], LAYER_INPUT_EPS
+        )
+        _compare(
+            fused, tuple(t.view_as(f) for t, f in zip(unfused, fused)), layer_input_rms_ulp=1.0
+        )
+
+
 def check_is_valid_rejects_what_the_kernel_cannot_take() -> None:
     cell = entry.CELLS[0]
     inputs = _boundary_inputs(9, 0)
@@ -251,6 +295,7 @@ CHECKS = (
     check_interleaves_with_the_library_allreduce,
     check_cuda_graph_replay,
     check_the_gate_discriminates_a_wrong_reduction,
+    check_matches_the_unfused_boundary,
     check_is_valid_rejects_what_the_kernel_cannot_take,
 )
 

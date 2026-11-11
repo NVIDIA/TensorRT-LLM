@@ -19,8 +19,8 @@ Buffers the caller owns and passes on every call:
   its semaphores after every launch, so ordered launches on one stream (and replays of one
   CUDA graph) share it; launches that can run concurrently each need their own.
 
-``buffer_bytes`` gives both sizes for a largest call; a CUDA-graph capture needs both buffers
-allocated before it starts.
+A CUDA-graph capture needs both buffers allocated before it starts; the target's
+``SparseAttentionScratch`` (``layers/mla.py``) holds one of each for every sparse MLA layer.
 """
 
 from __future__ import annotations
@@ -35,9 +35,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     OpWrapper,
     true_fp32_matmul,
 )
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-#: Workspace bytes the kernel needs: the TRTLLM-GEN share of the generation attention
-#: workspace (``CUBLAS_WORKSPACE_SIZE``), which is what the module path reserves for it.
+#: Workspace bytes the kernel needs: 32 MiB, the TRTLLM-GEN share of TensorRT-LLM's generation
+#: attention workspace (``CUBLAS_WORKSPACE_SIZE``).
 WORKSPACE_BYTES = 32 * 1024 * 1024
 
 #: The native NoPE MLA geometry: absorbed 512-wide queries and latents, no rotary part, and
@@ -53,13 +54,6 @@ def counter_bytes(rows: int, num_heads: int, sm_count: int) -> int:
     return get_trtllm_gen_multi_ctas_kv_counter_bytes(rows, num_heads, sm_count)
 
 
-def buffer_bytes(max_rows: int, num_heads: int, sm_count: int) -> tuple[int, int]:
-    """``(workspace, counter)`` bytes covering every call of up to ``max_rows`` rows (for
-    example the engine's ``max_num_tokens``) of ``num_heads`` heads on a GPU of ``sm_count``
-    SMs (``torch.cuda.get_device_properties(device).multi_processor_count``)."""
-    return WORKSPACE_BYTES, counter_bytes(max_rows, num_heads, sm_count)
-
-
 class SparseMlaDecode(OpWrapper):
     """``query`` E4M3 ``[R, H, 512]`` over ``kv_rows`` E4M3 ``[N, 1, 512]`` -> BF16 ``[R, H, 512]``.
 
@@ -72,11 +66,11 @@ class SparseMlaDecode(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_100})
-    # TP4 decode and verify rows attend with the rank's 16 heads; the sequence-parallel
-    # context rows attend with all 64 for the rank's quarter of a prompt, and a prompt below
-    # the sequence-parallel threshold (2,048 tokens) with 16 heads for every row. Every row
-    # selects 512 pools of 4 plus a tail of up to 3: lengths up to 2,051 in packed rows of
-    # 2,112. `kv` is the requests' KV length after the step (generation cells).
+    # TP4 decode and verify rows attend with the rank's 16 heads; the context rows of a prefill
+    # step attend sequence parallel, all 64 heads for the rank's ceil(T / 4) rows, whatever the
+    # prompt length. Every row selects up to 512 pools of 4 plus a tail of up to 3: lengths up
+    # to 2,051 in packed rows of 2,112. `kv` is the requests' KV length after the step
+    # (generation cells); context cells give the prompt and the rank's row range.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="MTP-3 verify of one 13K-token request, 16 heads",
@@ -95,12 +89,16 @@ class SparseMlaDecode(OpWrapper):
             spec=dict(heads=16, requests=8, tokens=1, kv=13312),
         ),
         Cell(
+            why="one row: an MTP draft step of one 13K-token request, 16 heads",
+            spec=dict(heads=16, requests=1, tokens=1, kv=13312),
+        ),
+        Cell(
             why="one rank's sequence-parallel quarter of a 13,312-token prompt, 64 heads",
             spec=dict(heads=64, context=((0, 13312),), rows=(0, 3328)),
         ),
         Cell(
-            why="a 2,047-token prompt below the sequence-parallel threshold, 16 heads",
-            spec=dict(heads=16, context=((0, 2047),), rows=(0, 2047)),
+            why="rank 1's quarter (rows 10-19) of a 37-token prompt, 64 heads: short rows",
+            spec=dict(heads=64, context=((0, 37),), rows=(10, 20)),
         ),
     )
 
@@ -109,16 +107,29 @@ class SparseMlaDecode(OpWrapper):
     and the cache are E4M3 already), so an output moves by a few percent of its own scale
     against FP32 attention; the entry's test derives its band from that rounding.
 
-    The query is E4M3: the caller applies the saturating conversion (`clamp(+-448)`) the
-    module path applies to the absorbed BF16 query. `kv_rows` is the uniformly strided row
-    view of the latent pool (row id = base_row + slot * rows_per_slot + offset); the kernel
-    reads it as 32-row pages, so its row count is a multiple of 32.
+    The query is E4M3: the target converts the absorbed BF16 query with `saturate_fp8`
+    (`clamp(+-448)`, then E4M3). `kv_rows` is the uniformly strided row view of the latent pool
+    (row id = base_row + slot * rows_per_slot + offset); the kernel reads it as 32-row pages,
+    so its row count is a multiple of 32.
 
-    Heads: 16, 32 and 64 run this kernel in the module path; 64 < H < 128 has no TRTLLM-GEN
-    kernel and raises. A zero length is not supported by the kernel; `is_valid` refuses it.
+    Heads: the target attends with 16 (generation rows, one rank's share of 64) and 64
+    (context rows); TensorRT-LLM's sparse MLA attention also runs this kernel at 32, and
+    64 < H < 128 has no TRTLLM-GEN kernel and raises. A zero length is not supported by the
+    kernel; `is_valid` refuses it. The launch uses programmatic dependent launch unless
+    `TRTLLM_ENABLE_PDL=0`.
     """
 
-    def __call__(self, query, kv_rows, packed, lengths, workspace, counter, bmm1_scale, bmm2_scale):
+    def __call__(
+        self,
+        query: torch.Tensor,
+        kv_rows: torch.Tensor,
+        packed: torch.Tensor,
+        lengths: torch.Tensor,
+        workspace: torch.Tensor,
+        counter: torch.Tensor,
+        bmm1_scale: float | torch.Tensor,
+        bmm2_scale: float | torch.Tensor,
+    ) -> torch.Tensor:
         return trtllm_batch_decode_with_kv_cache_mla(
             query=query.unsqueeze(1),
             kv_cache=kv_rows.view(-1, 1, PAGE_ROWS, KV_LORA_RANK),
@@ -132,6 +143,7 @@ class SparseMlaDecode(OpWrapper):
             sparse_mla_top_k=packed.shape[1],
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
+            enable_pdl=get_env_enable_pdl(),
             backend="trtllm-gen",
             sparse_mla_top_k_lens=lengths,
             multi_ctas_kv_counter_buffer=counter,
@@ -139,8 +151,16 @@ class SparseMlaDecode(OpWrapper):
         ).squeeze(1)
 
     def reference(
-        self, query, kv_rows, packed, lengths, workspace, counter, bmm1_scale, bmm2_scale
-    ):
+        self,
+        query: torch.Tensor,
+        kv_rows: torch.Tensor,
+        packed: torch.Tensor,
+        lengths: torch.Tensor,
+        workspace: torch.Tensor,
+        counter: torch.Tensor,
+        bmm1_scale: float | torch.Tensor,
+        bmm2_scale: float | torch.Tensor,
+    ) -> torch.Tensor:
         """FP32 attention of the dequantized (exact) E4M3 operands over each row's selected
         latent rows, one BF16 rounding. ``workspace`` and ``counter`` are not read."""
         rows, heads, dim = query.shape
@@ -163,13 +183,23 @@ class SparseMlaDecode(OpWrapper):
             out[part] = attended.to(torch.bfloat16)
         return out
 
-    def is_valid(self, query, kv_rows, packed, lengths, workspace, counter, bmm1_scale, bmm2_scale):
+    def is_valid(
+        self,
+        query: torch.Tensor,
+        kv_rows: torch.Tensor,
+        packed: torch.Tensor,
+        lengths: torch.Tensor,
+        workspace: torch.Tensor,
+        counter: torch.Tensor,
+        bmm1_scale: float | torch.Tensor,
+        bmm2_scale: float | torch.Tensor,
+    ) -> None:
         assert query.dtype == kv_rows.dtype == torch.float8_e4m3fn, (
             f"the kernel is the E4M3 x E4M3 one; got query {query.dtype}, cache {kv_rows.dtype}"
         )
         assert query.dim() == 3 and query.shape[2] == KV_LORA_RANK and query.is_contiguous()
         rows, heads, _ = query.shape
-        assert heads in (16, 32, 64), f"{heads} heads; the module path runs 16, 32 or 64"
+        assert heads in (16, 32, 64), f"{heads} heads; the kernel is run at 16, 32 or 64"
         assert kv_rows.shape[-1] == KV_LORA_RANK and kv_rows.shape[0] % PAGE_ROWS == 0
         assert packed.dtype == torch.int32 and packed.dim() == 2 and packed.is_contiguous()
         assert lengths.dtype == torch.int32 and lengths.shape == (rows,)

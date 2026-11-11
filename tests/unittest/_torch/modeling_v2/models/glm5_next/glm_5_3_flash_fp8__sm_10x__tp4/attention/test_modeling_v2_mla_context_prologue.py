@@ -86,9 +86,11 @@ def test_mla_context_prologue_matches_reference(cell, certifying):  # noqa: F811
     Both sides normalize in FP32 and round once, but the kernel's sums and reciprocal square
     roots differ from torch's in the last FP32 bits, which can move a value to the
     neighbouring BF16 one: at most one BF16 step, ``2**-7 |x|``, for the q_a rows and the
-    normalized indexer keys. The latent is rounded to BF16 and then quantized: a BF16 step can
-    move its E4M3 code by one step, at most ``2**-3 |x|`` (``2**-9`` among subnormals). The
-    gate columns are copied, bit for bit.
+    normalized indexer keys. An indexer key the LayerNorm bias cancels to near zero keeps the
+    FP32 error of the terms it cancelled, so its band has an absolute floor of ``2**-16`` (keys
+    are of order one; one such element of 552,064 differed by 3e-8 at 2.6e-6). The latent is
+    rounded to BF16 and then quantized: a BF16 step can move its E4M3 code by one step, at most
+    ``2**-3 |x|`` (``2**-9`` among subnormals). The gate columns are copied, bit for bit.
     """
     certifying(mla_context_prologue)
     args, latent_storage, index_storage, scale = _args(
@@ -122,7 +124,7 @@ def test_mla_context_prologue_matches_reference(cell, certifying):  # noqa: F811
     assert bool(((got - want).abs() <= torch.clamp(2**-3 * want.abs(), min=2**-9)).all())
     index, index_ref = _pools(latent_storage, index_storage)[1], _pools(*ref_storage)[1]
     got, want = index[written][:, :HD].float(), index_ref[written][:, :HD].float()
-    assert bool(((got - want).abs() <= 2**-7 * want.abs()).all())
+    assert bool(((got - want).abs() <= torch.clamp(2**-7 * want.abs(), min=2**-16)).all())
     assert torch.equal(index[written][:, HD : 2 * HD], index_ref[written][:, HD : 2 * HD])
 
 

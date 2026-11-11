@@ -47,7 +47,7 @@ def _lengths(spec: dict) -> torch.Tensor:
 def _args(spec: dict, seed: int):
     """The op's arguments: the rows of the coalesced FP8 pool (every row outside the layer's
     subpage is NaN, except row 0, the dummy id), each row's distinct selected layer rows
-    packed in front of -1 padding, E4M3 queries, zeroed buffers, and the module path's scales
+    packed in front of -1 padding, E4M3 queries, zeroed buffers, and the target's scales
     (a host float for bmm1, the device dequantization scale for bmm2). ``empty_rows`` trailing
     rows selected nothing: one dummy id 0, length 1."""
     g = torch.Generator(device=DEVICE).manual_seed(seed)

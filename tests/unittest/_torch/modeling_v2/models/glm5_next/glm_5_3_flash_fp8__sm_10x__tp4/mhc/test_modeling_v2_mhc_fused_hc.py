@@ -191,6 +191,7 @@ def test_cuda_graph_capture_and_replay(all_in_one: bool) -> None:
 def test_tuned_tactic_is_a_candidate_and_holds(monkeypatch) -> None:
     """A cold tuner gives the fallback; a tuning pass picks a candidate that is then looked up."""
     monkeypatch.delenv("FORCE_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("FORCE_MHC_KERNEL_DETERMINISTIC", raising=False)
     spec = op.CELLS[1].spec
     rows = spec["rows"]
     args = _inputs(rows, spec["norm"], seed=5) + scalars(spec)
@@ -211,8 +212,12 @@ def test_tuned_tactic_is_a_candidate_and_holds(monkeypatch) -> None:
         tuner.clear_cache()
 
 
-def test_force_deterministic_pins_the_tactic(monkeypatch) -> None:
-    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+@pytest.mark.parametrize("variable", ["FORCE_DETERMINISTIC", "FORCE_MHC_KERNEL_DETERMINISTIC"])
+def test_force_deterministic_pins_the_tactic(monkeypatch, variable: str) -> None:
+    """Either switch the built-in mHC path honours pins the tactic, without consulting the tuner."""
+    monkeypatch.delenv("FORCE_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("FORCE_MHC_KERNEL_DETERMINISTIC", raising=False)
+    monkeypatch.setenv(variable, "1")
     spec = op.CELLS[3].spec
     args = _inputs(spec["rows"], spec["norm"], seed=3) + scalars(spec)
     assert fused_hc_tactic(*args) == DETERMINISTIC_TACTIC

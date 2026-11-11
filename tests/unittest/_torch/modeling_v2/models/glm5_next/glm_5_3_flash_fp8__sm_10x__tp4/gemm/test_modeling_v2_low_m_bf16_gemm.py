@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the glm5_next fp8 tp4 low_m_bf16_gemm entry."""
+"""GPU test for the glm5_next fp8 tp4 low_m_bf16_gemm entry.
 
+Every row count a table entry runs compiles its own CuTe DSL kernel, seconds each. The default
+run drives the row counts at the tactic boundaries of each shape; ``LOW_M_BF16_GEMM_TEST_ALL_M=1``
+drives every row count from 1 to 32.
+"""
+
+import os
 import zlib
 
 import pytest
@@ -47,12 +53,33 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     _compare(op(x, weight), op.reference(x, weight.detach()))
 
 
+#: The largest row count a table entry serves.
+_MAX_M = 32
+
+_ALL_M = os.environ.get("LOW_M_BF16_GEMM_TEST_ALL_M", "0") == "1"
+
+
+def _boundary_row_counts(n: int, k: int) -> list[int]:
+    """The first and last row count of every run of row counts that take the same choice
+    (kernel and tactic, or cuBLAS), up to ``_MAX_M``: each tactic at its smallest and largest
+    M, both sides of every switch, and a direct tactic's row tile skipped where it does not
+    divide M."""
+    choices = [low_m_choice(m, n, k) for m in range(1, _MAX_M + 1)]
+    ends = {1, _MAX_M}
+    for m in range(2, _MAX_M + 1):
+        if choices[m - 1] != choices[m - 2]:
+            ends.update((m - 1, m))
+    return sorted(ends)
+
+
 @pytest.mark.parametrize("shape", sorted(_CHOICES), ids=lambda s: f"{s[0]}x{s[1]}")
-def test_every_row_count(shape):
-    """Every M of the table's range picks a tactic its kernel accepts (direct tactics need their
-    row tile to divide M) and computes the product."""
+def test_row_counts(shape: tuple[int, int]) -> None:
+    """Every row count driven picks a tactic its kernel accepts (direct tactics need their row
+    tile to divide M) and computes the product: the tactic boundaries, or with
+    ``LOW_M_BF16_GEMM_TEST_ALL_M=1`` every row count of the table's range."""
     n, k = shape
-    for m in range(1, 33):
+    row_counts = range(1, _MAX_M + 1) if _ALL_M else _boundary_row_counts(n, k)
+    for m in row_counts:
         x, weight = _build(m, n, k, seed=m)
         choice = low_m_choice(m, n, k)
         if choice is not None and choice[0] == "direct":
