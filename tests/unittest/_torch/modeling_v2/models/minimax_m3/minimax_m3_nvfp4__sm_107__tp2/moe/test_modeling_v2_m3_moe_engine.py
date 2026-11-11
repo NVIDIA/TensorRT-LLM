@@ -94,8 +94,10 @@ def compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     a rounding boundary: one bf16 ulp of a slot output or of the sum, or, rarely, one intermediate NVFP4 code, which
     reaches the output as one weight column's share. Measured over every cell, both routing cases and 3 seeds each
     on the tp4 engine (GB300, intermediate 768): at most 1.48 ulp element, 0.18 ulp RMS; the tp2 engine runs the
-    same recipes over twice the intermediate. These bands are acceptance criteria, not universal error bounds;
-    a misread recipe (the activation's
+    same recipes over twice the intermediate. A measured tp2 three-token random cell gives 0.98 ulp RMS and passes
+    the 4-ulp element band: three shared gate/up bf16 roundings move one MXFP8 down-input code (4.0 vs 4.5), while
+    the engine equals the stock block bit for bit. BAND_RMS leaves ~1.5x headroom on this observation only; these
+    bands are acceptance criteria, not universal error bounds. A misread recipe (the activation's
     1 / (sf x (1 / sc)) spelling of the reciprocal on ~0.06% of its codes) measured 12 ulp element, 7 ulp RMS.
     """
     assert_within_ulp(out, ref, element_ulp=BAND_ELEMENT, rms_ulp=BAND_RMS)
@@ -122,17 +124,23 @@ def test_certified_cells(cell, case) -> None:
     compare(out, op.reference(hidden, layer))
 
 
-@pytest.mark.parametrize("m", (1, 2, 4, 8))
+@pytest.mark.parametrize("m", (1, 2, 3, 4, 8))
 def test_routed_part_is_trtllm_gen_bit_for_bit(m) -> None:
     check_routed_part(op, _state(m), m, seed=100 + m)
 
 
 @pytest.mark.parametrize("seed", (1, 2, 3))
-@pytest.mark.parametrize("m", (4, 8))
+@pytest.mark.parametrize("m", (3, 4, 8))
 def test_full_output_is_the_stock_block_bit_for_bit(m, seed) -> None:
-    """The TP2 operating points (one / two requests verifying 3 drafts): the whole layer output, shared expert
-    included, against the stock block (TRTLLM-Gen routed + MXFP8 GatedMLP shared, shared.add_(routed))."""
+    """The three-token build and TP2 operating points (one / two requests verifying 3 drafts): the whole layer
+    output, shared expert included, against stock (TRTLLM-Gen routed + MXFP8 GatedMLP shared, shared.add_(routed))."""
     check_full_output(op, _state(m), m, seed=200 + 10 * m + seed)
+
+
+def test_three_token_random_certified_cell_is_the_stock_block_bit_for_bit() -> None:
+    cell = next(candidate for candidate in op.CELLS if candidate.spec["tokens"] == 3)
+    seed = zlib.crc32((cell.why + "random").encode()) % 2**31
+    check_full_output(op, _state(3), 3, seed=seed)
 
 
 def test_layers_on_one_state_do_not_leak_into_each_other() -> None:
