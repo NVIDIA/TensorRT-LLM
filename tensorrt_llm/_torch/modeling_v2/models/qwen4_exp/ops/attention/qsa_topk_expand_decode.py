@@ -106,12 +106,13 @@ class _TopkExpandKernel:
         len_ptr: cute.Pointer,
         topk_ptr: cute.Pointer,
         sel_ptr: cute.Pointer,
+        order_ptr: cute.Pointer,
         rows: cutlass.Int32,
         stream,
     ):
         # The keys arrive as a tensor, as the TVM-FFI entry takes its stream from a GPU
         # tensor; their layout is rebuilt with the static width and row stride the 16-byte
-        # loads need. The row count is the call's.
+        # loads need. The row count is the call's. `order_ptr` is the wide kernel's (unread).
         mKeys = cute.make_tensor(
             keys_t.iterator, cute.make_layout((rows, self.width), stride=(self.key_stride, 1))
         )
@@ -427,14 +428,14 @@ class _TopkExpandKernel:
                     mSel[row, col] = val
 
 
-def _cache_slabs(width: int, threads: int, ctas: int, extra_words: int = 0) -> int:
+def _cache_slabs(width: int, threads: int, ctas: int) -> int:
     """Slabs of the wide kernel's window cache: as many of the table's as the shared memory
     left after the fixed state and the candidate list hold with `ctas` CTAs an SM (11 of
     4096 columns at one CTA of 1024 threads: a window of up to 45056 blocks, 180224 tokens,
     is read from global once)."""
     slab = KPT * threads
     per_cta = min(_SMEM_LIMIT, _SMEM_SM // ctas - _SMEM_RESERVED)
-    room = per_cta - (_WIDE_FIXED_WORDS + 2 * slab + extra_words) * 4 - _WIDE_PAD
+    room = per_cta - (_WIDE_FIXED_WORDS + 2 * slab) * 4 - _WIDE_PAD
     return max(0, min(-(-width // slab), room // (slab * 4)))
 
 
@@ -487,20 +488,15 @@ class _TopkExpandWideKernel:
         self.warps = threads // 32
         self.slab = KPT * threads
         self.ctas = ctas
-        # `order`: CTA b takes the row of the b-th longest window (ties to the lower row), so the
-        # CTAs launched last get the shortest windows. Every row's selection is the same.
+        # `order`: CTA b takes row `row_order[b]` (longest window first), so the CTAs launched
+        # last get the shortest windows. Every row's selection is the same.
         self.order = bool(order)
-        self.cache_slabs = _cache_slabs(
-            width, threads, ctas, (_ORDER_MAX_ROWS + 32) if self.order else 0
-        )
+        self.cache_slabs = _cache_slabs(width, threads, ctas)
         self.per_warp = -(-block_topk // self.warps)
         self.prefilter = bool(prefilter) and self.per_warp <= 32
 
     def smem_bytes(self) -> int:
-        order_words = (_ORDER_MAX_ROWS + 32) if self.order else 0
-        return (
-            self.cache_slabs * self.slab + 2 * self.slab + _WIDE_FIXED_WORDS + order_words
-        ) * 4 + _WIDE_PAD
+        return (self.cache_slabs * self.slab + 2 * self.slab + _WIDE_FIXED_WORDS) * 4 + _WIDE_PAD
 
     @cute.jit
     def __call__(
@@ -511,6 +507,7 @@ class _TopkExpandWideKernel:
         len_ptr: cute.Pointer,
         topk_ptr: cute.Pointer,
         sel_ptr: cute.Pointer,
+        order_ptr: cute.Pointer,
         rows: cutlass.Int32,
         stream,
     ):
@@ -525,11 +522,12 @@ class _TopkExpandWideKernel:
         mSel = cute.make_tensor(
             sel_ptr, cute.make_layout((rows, self.final), stride=(self.final, 1))
         )
+        mOrder = cute.make_tensor(order_ptr, per_row)
         ld_keys = cute.make_copy_atom(
             cute.nvgpu.CopyG2ROp(), cutlass.Int32, num_bits_per_copy=32 * KPT
         )
         g2s = cute.make_copy_atom(cpasync.CopyG2SOp(), cutlass.Int32, num_bits_per_copy=32 * KPT)
-        self.kernel(mKeys, mEnd, mPos, mLen, mTopk, mSel, ld_keys, g2s).launch(
+        self.kernel(mKeys, mEnd, mPos, mLen, mTopk, mSel, mOrder, ld_keys, g2s).launch(
             grid=[rows, 1, 1],
             block=[self.threads, 1, 1],
             smem=self.smem_bytes(),
@@ -885,7 +883,16 @@ class _TopkExpandWideKernel:
 
     @cute.kernel
     def kernel(
-        self, mKeys, mEnd, mPos, mLen, mTopk, mSel, ld_keys: cute.CopyAtom, g2s: cute.CopyAtom
+        self,
+        mKeys,
+        mEnd,
+        mPos,
+        mLen,
+        mTopk,
+        mSel,
+        mOrder,
+        ld_keys: cute.CopyAtom,
+        g2s: cute.CopyAtom,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
@@ -897,37 +904,6 @@ class _TopkExpandWideKernel:
         k: cutlass.Constexpr = self.k
         cr: cutlass.Constexpr = self.cr
         smem = cutlass.utils.SmemAllocator()
-        if const_expr(self.order):
-            # 0a. This CTA's row: the one whose window ranks `block_idx` by length, from the
-            # host-filled row ends (read before the wait). Four threads rank a row, each over
-            # every fourth row; the ranks are a permutation, so every row has one CTA.
-            sEnd = smem.allocate_tensor(
-                cutlass.Int32, cute.make_layout((_ORDER_MAX_ROWS,), stride=(1,)), byte_alignment=128
-            )
-            sRow = smem.allocate_tensor(
-                cutlass.Int32, cute.make_layout((32,), stride=(1,)), byte_alignment=128
-            )
-            nrows = cute.size(mEnd)
-            for t0 in cutlass.range(0, nrows, nt):
-                if t0 + tidx < nrows:
-                    sEnd[t0 + tidx] = mEnd[t0 + tidx]
-            cute.arch.sync_threads()
-            q4 = tidx % 4
-            for r0 in cutlass.range(0, nrows, nt // 4):
-                tt = r0 + tidx // 4
-                cnt = cutlass.Int32(0)
-                if tt < nrows:
-                    e = sEnd[tt]
-                    for u in cutlass.range(q4, nrows, 4):
-                        eu = sEnd[u]
-                        if (eu > e) | ((eu == e) & (u < tt)):
-                            cnt = cnt + 1
-                cnt = cnt + cute.arch.shuffle_sync_bfly(cnt, offset=1)
-                cnt = cnt + cute.arch.shuffle_sync_bfly(cnt, offset=2)
-                if (tt < nrows) & (q4 == 0) & (cnt == row):
-                    sRow[0] = tt
-            cute.arch.sync_threads()
-            row = sRow[0]
         sK = None
         if const_expr(self.cache_slabs > 0):
             # `KPT` consecutive keys (mode 0) of each thread-slab column (mode 1).
@@ -968,16 +944,22 @@ class _TopkExpandWideKernel:
             cutlass.Int32, cute.make_layout((KPT, nt), stride=(1, KPT)), byte_alignment=128
         )
 
-        # 0. Shared state and the row's host-filled metadata, before the wait.
+        # 0. Shared state and the row's host-filled metadata, before the wait. Under `order`
+        # the row is `row_order`'s, a device sort earlier in the step: read after the wait.
         for b in cutlass.range_constexpr(-(-_HIST // nt)):
             if tidx + b * nt < _HIST:
                 hist[tidx + b * nt] = cutlass.Int32(0)
         if tidx == 0:
             state[5] = cutlass.Int32(0)  # candidates compacted
+        if const_expr(self.order):
+            if const_expr(self.pdl):
+                cute.arch.griddepcontrol_wait()
+                cute.arch.griddepcontrol_launch_dependents()
+            row = mOrder[row]
         n = mEnd[row]
         seqlen = mLen[row]
         visible = cutlass.Int32(mPos[row]) + 1
-        if const_expr(self.pdl):
+        if const_expr(self.pdl and not self.order):
             cute.arch.griddepcontrol_wait()
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -1168,22 +1150,29 @@ _COMPILED: dict = {}
 _SMS: dict = {}
 
 
-#: Rows the ordered launch ranks (its shared row-end table).
-_ORDER_MAX_ROWS = 1024
+def _sms(device) -> int:
+    sms = _SMS.get(device.index)
+    if sms is None:
+        sms = _SMS[device.index] = torch.cuda.get_device_properties(device).multi_processor_count
+    return sms
 
 
 def _wide_config(rows: int, device, ordered: bool = False) -> tuple:
     """The wide kernel's `(threads, CTAs an SM, prefilter, order)` for a call of `rows` rows:
     one 1024-thread CTA an SM (the largest window cache) while the rows fit one wave, two once
-    they do not, so one CTA's walks overlap the other's loads. With `ordered`, past one wave and
-    up to `_ORDER_MAX_ROWS` rows: one CTA an SM with the rows ranked by window length, so the
-    second wave takes the shortest windows. The same selection either way."""
-    sms = _SMS.get(device.index)
-    if sms is None:
-        sms = _SMS[device.index] = torch.cuda.get_device_properties(device).multi_processor_count
-    if ordered and sms < rows <= _ORDER_MAX_ROWS:
-        return (_WIDE_THREADS, 1, True, True)
+    they do not, so one CTA's walks overlap the other's loads. With `ordered` (a `row_order`
+    given), past one wave the CTAs take the rows in that order, so the last wave takes the
+    shortest windows: one CTA an SM up to two waves, two past them. The same selection either
+    way."""
+    sms = _sms(device)
+    if ordered and rows > sms:
+        return (_WIDE_THREADS, 1 if rows <= 2 * sms else 2, True, True)
     return (_WIDE_THREADS, 1 if rows <= sms else 2, True, False)
+
+
+def orders_rows(scores) -> bool:
+    """Whether a call over `scores` reads `row_order`: the wide kernel past one wave of rows."""
+    return scores.shape[1] > MAX_WIDTH and scores.shape[0] > _sms(scores.device)
 
 
 _INDEX_TYPES = {torch.int32: cutlass.Int32, torch.int64: cutlass.Int64}
@@ -1199,10 +1188,11 @@ def launch(
     token_topk,
     pdl=True,
     out=None,
-    ordered_wide=False,
+    row_order=None,
 ):
     """The launch behind `QsaTopkExpandDecode.__call__`: writes `topk_indices` and returns the
-    token selection `[rows, token_topk + compress_ratio - 1]` int32 (`out` when given)."""
+    token selection `[rows, token_topk + compress_ratio - 1]` int32 (`out` when given).
+    `row_order`: int32 `[rows]`, a permutation of the rows, longest window first."""
     rows, width = scores.shape
     block_topk = topk_indices.shape[1]
     sel = out
@@ -1223,7 +1213,7 @@ def launch(
         query_positions.dtype,
         sequence_lengths.dtype,
         pdl,
-        None if width <= MAX_WIDTH else _wide_config(rows, scores.device, ordered_wide),
+        None if width <= MAX_WIDTH else _wide_config(rows, scores.device, row_order is not None),
     )
     ptrs = (
         row_ends.data_ptr(),
@@ -1231,6 +1221,7 @@ def launch(
         sequence_lengths.data_ptr(),
         topk_indices.data_ptr(),
         sel.data_ptr(),
+        (row_ends if row_order is None else row_order).data_ptr(),
     )
     fn = _COMPILED.get(key)
     if fn is None:
@@ -1268,6 +1259,7 @@ def launch(
             ),
             make_ptr(cutlass.Int32, ptrs[3], gm, assumed_align=4),
             make_ptr(cutlass.Int32, ptrs[4], gm, assumed_align=4),
+            make_ptr(cutlass.Int32, ptrs[5], gm, assumed_align=4),
             cutlass.Int32(rows),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
@@ -1458,6 +1450,9 @@ class QsaTopkExpandDecode(OpWrapper):
     kernel, `_TopkExpandWideKernel`); `topk_indices` int32 `[rows, K]` contiguous; `row_ends` int32,
     the positions and lengths int32 or int64, each a contiguous `[rows]`. Ties: the higher
     block at the threshold, as `qsa_canonical_selection` rewrites the CUDA top-k's pick.
+    `row_order` (optional): int32 `[rows]`, a permutation of the rows, longest window first,
+    read by the wide kernel past one wave of rows (`orders_rows`), after the wait; a caller
+    sorts once a step for every layer.
 
     Compiled once per score-table width and row stride (the block table's, fixed for an
     engine), k, compress ratio, token budget, index dtypes and PDL: the row count is a
@@ -1490,7 +1485,7 @@ class QsaTopkExpandDecode(OpWrapper):
     The widths are derived from `max_seq_len` (288, 512 and 8192 (+4) pages of 32 tokens),
     not read off an engine. 4096 is `MAX_WIDTH`: 1024 threads, the largest CTA; wider
     tables take the wide kernel, compiled per row-count class (one CTA an SM up to the
-    SM count, two past it).
+    SM count, two past it; with a `row_order`, one up to twice the SM count, two past it).
 
     `is_valid` refuses `token_topk != k * compress_ratio`. It sizes the selection's rows
     while `k * compress_ratio` places the tokens, so a smaller budget writes past each row.
@@ -1518,7 +1513,7 @@ class QsaTopkExpandDecode(OpWrapper):
         compress_ratio,
         token_topk,
         out=None,
-        ordered_wide=False,
+        row_order=None,
     ):
         return launch(
             scores,
@@ -1529,7 +1524,7 @@ class QsaTopkExpandDecode(OpWrapper):
             compress_ratio,
             token_topk,
             out=out,
-            ordered_wide=ordered_wide,
+            row_order=row_order,
         )
 
     def reference(
@@ -1542,11 +1537,11 @@ class QsaTopkExpandDecode(OpWrapper):
         compress_ratio,
         token_topk,
         out=None,
-        ordered_wide=False,
+        row_order=None,
     ):
         """`(topk_indices_after, selection)`: a stable descending sort per row (ties to the
         higher block), the k first in block order, then the expansion entry's reference.
-        `ordered_wide` picks a launch, not a result."""
+        `row_order` picks a launch, not a result."""
         rows, _ = scores.shape
         k = topk_indices.shape[1]
         out = torch.full_like(topk_indices, -1)
@@ -1578,7 +1573,7 @@ class QsaTopkExpandDecode(OpWrapper):
         compress_ratio,
         token_topk,
         out=None,
-        ordered_wide=False,
+        row_order=None,
     ):
         assert scores.dtype == torch.float32 and scores.stride(1) == 1, (
             "fp32 scores, unit column stride"
@@ -1605,6 +1600,15 @@ class QsaTopkExpandDecode(OpWrapper):
             and out.is_contiguous()
             and out.shape == (scores.shape[0], token_topk + compress_ratio - 1)
         ), "out: contiguous int32 [rows, token_topk + compress_ratio - 1]"
+        assert row_order is None or (
+            row_order.dtype == torch.int32
+            and row_order.is_contiguous()
+            and row_order.shape == (rows,)
+            and torch.equal(
+                torch.sort(row_order).values,
+                torch.arange(rows, dtype=torch.int32, device=row_order.device),
+            )
+        ), "row_order: a contiguous int32 permutation of the rows"
 
 
 qsa_topk_expand_decode = QsaTopkExpandDecode()

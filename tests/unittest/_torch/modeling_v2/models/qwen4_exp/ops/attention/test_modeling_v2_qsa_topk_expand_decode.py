@@ -139,27 +139,33 @@ def test_wide_rows_equal_the_canonical_composition(width: int, distribution: str
     assert torch.equal(fused, composed), "fused token expansion"
 
 
-@pytest.mark.parametrize("rows", [149, 192, 288, 576])
+@pytest.mark.parametrize("rows", [149, 192, 288, 576, 1500])
 @pytest.mark.parametrize("distribution", ["relu_sum", "relu_sparse"])
-def test_wide_rows_past_one_wave_ordered_by_window(rows: int, distribution: str) -> None:
-    """`ordered_wide` past one wave of rows: block lists and token selections equal the default
-    launch's and the reference's, over ragged windows with ties."""
+def test_wide_rows_past_one_wave_in_row_order(rows: int, distribution: str) -> None:
+    """A `row_order` past one wave of rows (longest window first, and an arbitrary permutation):
+    block lists and token selections equal the default launch's and the reference's, over
+    ragged windows with ties."""
     g = torch.Generator(device=DEV).manual_seed(rows)
     pos = torch.randint(1, 262143, (rows,), generator=g, device=DEV)
     pos[::17] = 99999  # ties of window length
     pos[3] = 262143
     spec = dict(rows=rows, pos=pos.tolist(), width=65568, **{distribution: True})
+    ends = _build(spec, seed=rows + 1)[1]
+    orders = (
+        None,
+        torch.argsort(ends, descending=True, stable=True).to(torch.int32),
+        torch.randperm(rows, generator=g, device=DEV).to(torch.int32),
+    )
     outs = []
-    for order in (True, False):
+    for row_order in orders:
         args = _build(spec, seed=rows + 1)
-        sel = op(*args, ordered_wide=order)
+        sel = op(*args, row_order=row_order)
         torch.cuda.synchronize()
         outs.append((args[4].clone(), sel.clone()))
     want_topk, want_sel = op.reference(*_build(spec, seed=rows + 1))
-    assert torch.equal(outs[0][0], outs[1][0]), "block list: ordered vs two CTAs an SM"
-    assert torch.equal(outs[0][1], outs[1][1]), "token selection: ordered vs two CTAs an SM"
-    assert torch.equal(outs[0][0], want_topk), "block list vs reference"
-    assert torch.equal(outs[0][1], want_sel.to(torch.int32)), "token selection vs reference"
+    for topk, sel in outs:
+        assert torch.equal(topk, want_topk), "block list vs reference"
+        assert torch.equal(sel, want_sel.to(torch.int32)), "token selection vs reference"
 
 
 # The decode-path shapes, captured in the decode CUDA graph: tp1's one row at 2560 columns,
@@ -200,6 +206,45 @@ def test_reads_after_the_wait_under_graph_replay(spec) -> None:
         assert torch.equal(graph_sel, sel) and torch.equal(got_topk, args[4]), f"replay {trial}"
         want_topk, want_sel = op.reference(src, *args[1:])
         assert torch.equal(got_topk, want_topk), f"replay {trial}: block list"
+        assert torch.equal(graph_sel, want_sel), f"replay {trial}: token selection"
+
+
+def test_row_order_sorted_in_the_graph_follows_the_replayed_metadata() -> None:
+    """The decode step's ordered launch: the row order sorted inside the graph from the row
+    ends, then read by the selection after the wait. Each replay refills the scores and the
+    rows' positions, lengths and ends (288 ragged rows at the 65568-wide table)."""
+    rows = 288
+    g = torch.Generator(device=DEV).manual_seed(rows)
+
+    def spec():
+        pos = torch.randint(1, 262143, (rows,), generator=g, device=DEV)
+        return dict(rows=rows, pos=pos.tolist(), width=65568, relu_sum=True)
+
+    args = _build(spec(), seed=21)
+    src = args[0].clone()
+
+    def step():
+        args[0].copy_(src * 1.0)
+        order = torch.argsort(args[1], descending=True, stable=True).to(torch.int32)
+        return op(*args, row_order=order)
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        step()
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_sel = step()
+    for trial in range(3):
+        fresh = _build(spec(), seed=100 + trial)
+        src.copy_(fresh[0])
+        for i in (1, 2, 3):
+            args[i].copy_(fresh[i])
+        graph.replay()
+        torch.cuda.synchronize()
+        want_topk, want_sel = op.reference(src, *args[1:])
+        assert torch.equal(args[4], want_topk), f"replay {trial}: block list"
         assert torch.equal(graph_sel, want_sel), f"replay {trial}: token selection"
 
 
