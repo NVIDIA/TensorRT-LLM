@@ -39,12 +39,12 @@ THROWAWAY_LOGITS_DTYPE_ENV = "TRTLLM_THROWAWAY_TOPK_LOGITS_DTYPE"
 THROWAWAY_MIN_CONTEXT_ENV = "TRTLLM_THROWAWAY_TOPK_MIN_CONTEXT"
 
 _HEAD_DIM = 128
-_SUPPORTED_NUM_HEADS = (4, 32, 64)
 # (heads, index_topk, compress_ratio) of the indexers the kernels are validated for: DS-V3.2,
 # GLM-5.x, DSV4-Flash and DSV4-Pro. Other geometries select kernel variants that are not tested;
 # the H4 kernels are validated only under Qwen3.8-Flash-Next's fixed-weight contract
 # (``model_config``), which the DSA indexer does not use.
 _VALIDATED_GEOMETRIES = frozenset({(64, 2048, 1), (32, 2048, 1), (64, 512, 4), (64, 1024, 4)})
+VALIDATED_NUM_HEADS = tuple(sorted({heads for heads, _, _ in _VALIDATED_GEOMETRIES}))
 _DEFAULT_MAX_CHUNK = 8192
 # Below this many context tokens (history + chunk rows) the unfused DeepGEMM logits + GVR Top-K
 # is as fast or faster; from 64K on the fused path wins for every supported indexer geometry
@@ -88,9 +88,50 @@ def throwaway_topk_min_context() -> int:
     return min_context
 
 
+def throwaway_topk_max_chunk() -> int:
+    """Returns the most query rows one kernel launch handles.
+
+    ``TRTLLM_THROWAWAY_TOPK_MAX_CHUNK`` overrides the default; larger chunks run in tiles.
+    """
+    value = os.environ.get(THROWAWAY_MAX_CHUNK_ENV, str(_DEFAULT_MAX_CHUNK))
+    try:
+        max_chunk = int(value)
+    except ValueError:
+        max_chunk = 0
+    if max_chunk <= 0:
+        raise ValueError(f"{THROWAWAY_MAX_CHUNK_ENV} must be a positive integer, got {value!r}")
+    return max_chunk
+
+
+def throwaway_topk_logits_dtype() -> torch.dtype:
+    """Returns the score dtype from ``TRTLLM_THROWAWAY_TOPK_LOGITS_DTYPE`` (default fp32)."""
+    name = os.environ.get(THROWAWAY_LOGITS_DTYPE_ENV, "fp32")
+    if name not in _LOGITS_DTYPES:
+        raise ValueError(
+            f"{THROWAWAY_LOGITS_DTYPE_ENV} must be one of {sorted(_LOGITS_DTYPES)}, got {name!r}"
+        )
+    return _LOGITS_DTYPES[name]
+
+
+def validate_throwaway_topk_env() -> None:
+    """Parses the tuning variables up front so an invalid value fails at model construction
+    instead of falling back to the unfused path at the first long chunk.
+
+    Raises:
+        ValueError: If a tuning variable holds an invalid value.
+    """
+    throwaway_topk_min_context()
+    throwaway_topk_max_chunk()
+    throwaway_topk_logits_dtype()
+
+
 def throwaway_topk_supported(n_heads: int, head_dim: int) -> bool:
-    """Returns True when this indexer geometry can use the fused kernels (FP8 or MXFP4 K)."""
-    return IS_CUTLASS_DSL_AVAILABLE and head_dim == _HEAD_DIM and n_heads in _SUPPORTED_NUM_HEADS
+    """Returns True when the DSA indexer may use the fused kernels for this head layout.
+
+    The head counts come from ``_VALIDATED_GEOMETRIES`` so this gate agrees with the one
+    ``get_throwaway_prefill_topk`` applies when it builds the runner.
+    """
+    return IS_CUTLASS_DSL_AVAILABLE and head_dim == _HEAD_DIM and n_heads in VALIDATED_NUM_HEADS
 
 
 class ThrowawayPrefillTopK:
@@ -142,15 +183,9 @@ class ThrowawayPrefillTopK:
             FP8MQATopKWrapper,
         )
 
-        self.max_chunk_size = int(os.environ.get(THROWAWAY_MAX_CHUNK_ENV, _DEFAULT_MAX_CHUNK))
+        self.max_chunk_size = throwaway_topk_max_chunk()
         if logits_dtype is None:
-            logits_name = os.environ.get(THROWAWAY_LOGITS_DTYPE_ENV, "fp32")
-            if logits_name not in _LOGITS_DTYPES:
-                raise ValueError(
-                    f"{THROWAWAY_LOGITS_DTYPE_ENV} must be one of {sorted(_LOGITS_DTYPES)}, "
-                    f"got {logits_name!r}"
-                )
-            logits_dtype = _LOGITS_DTYPES[logits_name]
+            logits_dtype = throwaway_topk_logits_dtype()
         elif logits_dtype not in _LOGITS_DTYPES.values():
             raise ValueError(
                 f"logits_dtype must be float32, bfloat16 or float16, got {logits_dtype}"
@@ -195,6 +230,11 @@ class ThrowawayPrefillTopK:
         self._failed = False
         # (kv_prefix_len, rows) of the plan the wrapper currently holds, or None.
         self._planned_key: Optional[Tuple[int, int]] = None
+
+    @property
+    def compress_ratio(self) -> int:
+        """KV compression ratio the kernels were built for."""
+        return self._compress_ratio
 
     def can_run(self, num_k_rows: int) -> bool:
         """Returns True when ``num_k_rows`` compressed keys fit the staging buffer."""

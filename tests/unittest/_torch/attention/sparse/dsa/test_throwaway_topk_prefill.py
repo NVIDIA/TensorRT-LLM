@@ -43,11 +43,16 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     IndexerPrefillChunkMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.throwaway_topk import (
+    THROWAWAY_LOGITS_DTYPE_ENV,
     THROWAWAY_MAX_CHUNK_ENV,
     THROWAWAY_MIN_CONTEXT_ENV,
     ThrowawayPrefillTopK,
     get_throwaway_prefill_topk,
+    throwaway_topk_logits_dtype,
+    throwaway_topk_max_chunk,
     throwaway_topk_min_context,
+    throwaway_topk_supported,
+    validate_throwaway_topk_env,
 )
 from tensorrt_llm._utils import get_sm_version
 
@@ -698,6 +703,7 @@ def test_warmup_builds_the_kernels_before_the_first_chunk(monkeypatch, config, q
 
 class _FakeRunner:
     num_keys = 16
+    compress_ratio = 1
 
     def __init__(self, can_run=True, ran=True):
         self._can_run = can_run
@@ -735,14 +741,15 @@ def _chunk(kv_prefix_len, token_start=3):
     )
 
 
-def _call(indexer, chunk, q_begin=0, q_end=10, q_scale=None):
+def _call(indexer, chunk, q_begin=0, q_end=10, q_scale=None, compress_ratios=(1,)):
     q = torch.arange(32 * 4 * 2, dtype=torch.float32).reshape(32, 4, 2)
     weights = torch.arange(32 * 4, dtype=torch.float32).reshape(32, 4)
     k = torch.zeros(20, 2)
     k_scale = torch.ones(20)
     out = torch.zeros(32, 8, dtype=torch.int32)
+    metadata = SimpleNamespace(compress_ratios=list(compress_ratios))
     handled = Indexer._run_throwaway_chunk(
-        indexer, None, chunk, q, weights, k, k_scale, q_begin, q_end, out, q_scale=q_scale
+        indexer, metadata, chunk, q, weights, k, k_scale, q_begin, q_end, out, q_scale=q_scale
     )
     return handled, q, weights, out
 
@@ -838,6 +845,44 @@ def test_prewarm_builds_the_shared_runner_and_warms_it(
         assert built[0]["qkv_dtype"] == "mxfp4"
         assert built[0]["device"] == torch.device("cuda", 0)
         assert indexer._throwaway_topk is runner  # the forward reuses the warmed runner
+
+
+def test_dispatch_rejects_a_runner_built_for_another_compress_ratio():
+    runner = _FakeRunner()
+    with pytest.raises(RuntimeError, match="compress_ratio"):
+        _call(_fake_indexer(runner), _chunk(5), compress_ratios=(4,))
+    assert runner.calls == []
+
+
+def test_tuning_env_is_validated_up_front(monkeypatch):
+    for name in (THROWAWAY_MAX_CHUNK_ENV, THROWAWAY_LOGITS_DTYPE_ENV, THROWAWAY_MIN_CONTEXT_ENV):
+        monkeypatch.delenv(name, raising=False)
+    validate_throwaway_topk_env()
+    assert throwaway_topk_max_chunk() == 8192
+    assert throwaway_topk_logits_dtype() == torch.float32
+    monkeypatch.setenv(THROWAWAY_MAX_CHUNK_ENV, "4096")
+    monkeypatch.setenv(THROWAWAY_LOGITS_DTYPE_ENV, "bf16")
+    assert throwaway_topk_max_chunk() == 4096
+    assert throwaway_topk_logits_dtype() == torch.bfloat16
+    for name, bad in (
+        (THROWAWAY_MAX_CHUNK_ENV, "0"),
+        (THROWAWAY_MAX_CHUNK_ENV, "8K"),
+        (THROWAWAY_LOGITS_DTYPE_ENV, "fp8"),
+        (THROWAWAY_MIN_CONTEXT_ENV, "-1"),
+    ):
+        with monkeypatch.context() as m:
+            m.setenv(name, bad)
+            with pytest.raises(ValueError, match=name):
+                validate_throwaway_topk_env()
+
+
+def test_supported_heads_match_validated_geometries(monkeypatch):
+    monkeypatch.setattr(throwaway_topk_module, "IS_CUTLASS_DSL_AVAILABLE", True)
+    assert throwaway_topk_supported(64, HEAD_DIM)
+    assert throwaway_topk_supported(32, HEAD_DIM)
+    # The H4 kernels are validated only under the Qwen fixed-weight contract.
+    assert not throwaway_topk_supported(4, HEAD_DIM)
+    assert not throwaway_topk_supported(64, 64)
 
 
 def test_min_context_env(monkeypatch):

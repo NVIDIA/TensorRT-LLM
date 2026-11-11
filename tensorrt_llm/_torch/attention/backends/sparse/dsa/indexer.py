@@ -49,12 +49,14 @@ from .params import DSAParams
 from .throwaway_topk import (
     THROWAWAY_MIN_CONTEXT_ENV,
     THROWAWAY_TOPK_ENV,
+    VALIDATED_NUM_HEADS,
     PlanCache,
     ThrowawayPrefillTopK,
     get_throwaway_prefill_topk,
     throwaway_topk_min_context,
     throwaway_topk_requested,
     throwaway_topk_supported,
+    validate_throwaway_topk_env,
 )
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
@@ -1040,11 +1042,14 @@ class Indexer(nn.Module):
         if throwaway_topk_requested() and not self._use_throwaway_topk:
             logger.warning_once(
                 f"{THROWAWAY_TOPK_ENV}=1 but the fused throwaway Top-K needs SM100/SM103 and an "
-                f"indexer with head_dim 128 and 4/32/64 heads (got SM{get_sm_version()}, "
+                f"indexer with head_dim 128 and {'/'.join(map(str, VALIDATED_NUM_HEADS))} heads "
+                f"(got SM{get_sm_version()}, "
                 f"heads={self.n_heads}, head_dim={self.head_dim}); "
                 "using the unfused indexer + Top-K path",
                 key="throwaway_topk_unsupported",
             )
+        if self._use_throwaway_topk:
+            validate_throwaway_topk_env()
         self._throwaway_topk_min_context = (
             throwaway_topk_min_context() if self._use_throwaway_topk else 0
         )
@@ -1785,14 +1790,22 @@ class Indexer(nn.Module):
                 key="throwaway_topk_short_context",
             )
             return False
+        compress_ratio = _effective_compress_ratio_divisor(
+            _select_indexer_compress_ratio(metadata.compress_ratios)
+        )
         if self._throwaway_topk is None:
-            compress_ratio = _effective_compress_ratio_divisor(
-                _select_indexer_compress_ratio(metadata.compress_ratios)
-            )
             if not self._build_throwaway_topk(
                 compress_ratio, metadata.kv_cache_manager.max_seq_len, q_fp8.device
             ):
                 return False
+        elif self._throwaway_topk.compress_ratio != compress_ratio:
+            # The runner's ratio sets the causal window of every row; a mismatch would select
+            # from the wrong keys.
+            raise RuntimeError(
+                f"Throwaway Top-K runner was built for compress_ratio "
+                f"{self._throwaway_topk.compress_ratio}, but this step's indexer cache uses "
+                f"{compress_ratio}"
+            )
         if not self._throwaway_topk.can_run(chunk_k_fp8.shape[0]):
             logger.info_once(
                 f"Throwaway Top-K: a chunk with {chunk_k_fp8.shape[0]} keys exceeds the staging "
