@@ -176,6 +176,15 @@ def judged(
     how: str = "",
 ) -> dict[str, Any]:
     """The verdict fields of ``measured`` against ``anchor``'s floor; a score alone without one."""
+    if anchor.unit == "fraction" and measured > 1:
+        # Compared as it is, a percentage would clear any floor a fraction sets.
+        return dict(
+            passed=False,
+            measured=measured,
+            detail=f"measured {measured:.4f}{how}, which is no fraction: the benchmark's `unit` "
+            f"says its scores are fractions, and this one is on another scale; state the unit "
+            f"the evaluator reports",
+        )
     floor, source = anchors_mod.floor(
         anchor, benchmark, relative_score=relative_score, output=output
     )

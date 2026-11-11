@@ -14,7 +14,13 @@ import types
 import pytest
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import anchors, endpoint, gate_cli, servers
+from agent_flow.workflows.trtllm_modeling_v2.checks import (
+    accuracy,
+    anchors,
+    endpoint,
+    gate_cli,
+    servers,
+)
 from agent_flow.workflows.trtllm_modeling_v2.checks.boot import (
     BootPrompt,
     BootSpec,
@@ -201,6 +207,14 @@ def test_a_floor_is_two_standard_errors_and_a_relative_one_allows_for_both_score
     declared = anchors.Anchor("dep16", "aa_lcr", anchors.DECLARED, 0.62, unit="fraction")
     floor, _ = anchors.floor(declared, Benchmark(name="aa_lcr", samples=100))
     assert floor.value == pytest.approx(0.62 - 2 * math.sqrt(0.62 * 0.38 / 100))
+    # A score that is no fraction is not held to a fraction's floor, which it would clear.
+    scored = accuracy.judged(
+        62.0, declared, Benchmark(name="aa_lcr", samples=100), relative_score=None, output=""
+    )
+    assert not scored["passed"] and "which is no fraction" in scored["detail"]
+    assert accuracy.judged(
+        0.61, declared, Benchmark(name="aa_lcr", samples=100), relative_score=None, output=""
+    )["passed"]
     percent = anchors.Anchor("dep16", "aa_lcr", anchors.DECLARED, 0.62)
     floor, _ = anchors.floor(percent, Benchmark(name="aa_lcr", samples=100))
     assert floor.value == pytest.approx(0.62 - 2 * 100 * math.sqrt(0.0062 * 0.9938 / 100))
