@@ -1441,7 +1441,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def check_logprobs(cls, data):
         if (top_logprobs := data.get("top_logprobs")) is not None:
             check_logprobs_limit("top_logprobs", top_logprobs)
-            if not data.get("logprobs"):
+            if top_logprobs > 0 and not data.get("logprobs"):
                 raise ValueError(
                     "logprobs must be true when using top_logprobs")
         return data
