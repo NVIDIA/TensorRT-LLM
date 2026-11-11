@@ -59,9 +59,8 @@ else()
   nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
 endif()
 
-target_compile_definitions(
-  ${TRTLLM_NB_MODULE}
-  PRIVATE TRTLLM_ENABLE_NANOBIND_PROFILING=$<BOOL:${ENABLE_NANOBIND_PROFILING}>)
+set_property(TARGET ${TRTLLM_NB_MODULE}
+             PROPERTY TRTLLM_NANOBIND_PROFILER_CONSUMER ON)
 if(ENABLE_NANOBIND_PROFILING)
   if(NOT EXISTS "${nanobind_SOURCE_DIR}/src/trtllm_pytorch_tensor_adapter.h")
     message(
@@ -88,15 +87,15 @@ if(ENABLE_NANOBIND_PROFILING)
   set_property(TARGET ${TRTLLM_NB_MODULE}
                PROPERTY LINK_LIBRARIES "${TRTLLM_NB_LINK_LIBRARIES}")
   target_compile_features(${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE cxx_std_20)
-  target_compile_definitions(${TRTLLM_NB_PROFILING_RUNTIME}
-                             PRIVATE TRTLLM_ENABLE_NANOBIND_PROFILING=1)
+  set_property(TARGET ${TRTLLM_NB_PROFILING_RUNTIME}
+               PROPERTY TRTLLM_NANOBIND_PROFILER_CONSUMER ON)
   target_include_directories(
     ${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE ${PROJECT_SOURCE_DIR}/include
                                            ${TORCH_INCLUDE_DIRS})
   # Reuse the shared core's selector and scope implementation; do not embed a
   # hidden second copy in the nanobind static library or Python module.
   target_link_libraries(
-    ${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE th_common ${TORCH_LIBRARIES}
+    ${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE ${SHARED_TARGET} ${TORCH_LIBRARIES}
                                            ${TORCH_PYTHON_LIB})
 endif()
 

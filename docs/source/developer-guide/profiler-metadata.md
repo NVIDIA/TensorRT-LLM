@@ -219,11 +219,11 @@ it is a Tensor. Tensor handles are copied without reading data or synchronizing
 devices; Python Tensor subclasses are recognized by their concrete C subtype.
 Symbolic shape/stride failures can omit the observational scope, never the call.
 
-The private Tensor adapter supports PyTorch 2.14 and the full, GIL-enabled
+The private Tensor adapter requires PyTorch 2.14 or newer and the full, GIL-enabled
 CPython API. The pinned nanobind version is recorded in
 [`3rdparty/fetch_content.json`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/3rdparty/fetch_content.json).
-Other Torch minors, stable Python ABI and free-threaded Python are not supported
-by this instrumentation. Revalidate private headers and adapter/vectorcall
+Validation currently covers PyTorch 2.14; newer minors still need compatibility
+validation. Stable Python ABI and free-threaded Python are unsupported. Revalidate private headers and adapter/vectorcall
 behavior when updating either dependency. OFF builds do not include the private
 adapter. Source overrides must include the checked-in dispatcher patch; configure
 time checks reject incompatible overrides when profiling is enabled.
