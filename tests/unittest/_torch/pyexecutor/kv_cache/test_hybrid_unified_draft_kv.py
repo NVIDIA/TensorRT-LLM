@@ -27,13 +27,14 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import common as mamba_common
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import mamba_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
     _insert_draft_pool_ratio,
 )
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -180,6 +181,54 @@ def test_hybrid_cache_size_per_token_adds_the_draft_layer_bytes(monkeypatch):
     for kwargs in estimate_kwargs:
         assert "layer_specs" not in kwargs
         assert "shared_draft_block_width" not in kwargs
+
+
+@pytest.mark.parametrize(
+    ("target_attention_bytes", "expected_scratch_bytes"),
+    # Kimi K3 c383: context server 9072 + 2880 = 11952 B per token, generation
+    # server 15408 + 2880 = 18288 B per token.
+    [(9072, 1147392), (15408, 1755648)],
+    ids=["c383_ctx", "c383_gen"],
+)
+def test_hybrid_cache_size_reserves_the_draft_scratch_of_every_request(
+    monkeypatch, target_attention_bytes, expected_scratch_bytes
+):
+    """Each of max_batch_size requests holds max_draft_len + 1 tokens beyond
+    its history in the target's attention layers and the draft layers."""
+    monkeypatch.setattr(
+        mamba_common.KVCacheManager,
+        "get_cache_size_per_token",
+        lambda *args, **kwargs: target_attention_bytes,
+    )
+    monkeypatch.setattr(
+        mamba_common,
+        "_get_local_mamba_cache_layout",
+        lambda *args, **kwargs: (
+            SimpleNamespace(get_states_bytes_per_layer=lambda mapping: 1 << 20),
+            3,
+            1,
+        ),
+    )
+    max_batch_size, max_draft_len = 16, 5
+    specs = tuple(_draft_spec(_NUM_TARGET_LAYERS + i) for i in range(5))
+    common = dict(
+        max_batch_size=max_batch_size,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        tokens_per_block=128,
+        spec_config=MTPDecodingConfig(max_draft_len=max_draft_len),
+    )
+
+    without_draft = MambaHybridCacheManagerV2.get_cache_size_per_token(
+        object(), Mapping(), **common
+    )
+    with_draft = MambaHybridCacheManagerV2.get_cache_size_per_token(
+        object(), Mapping(), layer_specs=specs, shared_draft_block_width=5, **common
+    )
+
+    bytes_per_token = with_draft[0]
+    assert bytes_per_token == target_attention_bytes + 5 * 576
+    assert expected_scratch_bytes == max_batch_size * (max_draft_len + 1) * bytes_per_token
+    assert with_draft[1] - without_draft[1] == expected_scratch_bytes
 
 
 def test_plain_target_still_gets_target_and_draft_specs():
