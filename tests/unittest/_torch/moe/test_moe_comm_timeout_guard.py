@@ -14,9 +14,11 @@
 # limitations under the License.
 """Tests for the MoE communication timeout guard and its backend proxies.
 
-The budget and guard tests are CPU-only. The proxy tests call each backend's native setter, so
-they need the built extensions, and the DeepGEMM and DeepEP round trips also need a GPU. They
-import the backends inside the tests, because the CPU-only stage collects this whole file.
+The budget and guard tests are CPU-only. The NVLink one-sided and moe_a2a proxy tests call the
+native ops, so they need the built extensions; the DeepGEMM and NCCL-EP mapping tests use
+stand-ins. All proxy tests except the DeepGEMM and DeepEP round trips, which need a GPU, are
+CPU-only. They import the backends inside the tests, because the CPU-only stage collects this
+whole file.
 """
 
 import gc
@@ -341,6 +343,7 @@ class TestGuard:
 
 
 class TestBackendProxies:
+    @pytest.mark.cpu_only
     def test_nvlink_one_sided_proxy_sets_the_completion_flag_budget(self) -> None:
         from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided
 
@@ -353,6 +356,7 @@ class TestBackendProxies:
         finally:
             proxy.set_timeout_seconds(None)
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("timeout_sec", [-1, 86401])
     def test_moe_a2a_set_timeout_rejects_out_of_range(self, timeout_sec: int) -> None:
         before = torch.ops.trtllm.moe_a2a_get_timeout()
@@ -362,6 +366,7 @@ class TestBackendProxies:
 
         assert torch.ops.trtllm.moe_a2a_get_timeout() == before
 
+    @pytest.mark.cpu_only
     def test_deepgemm_proxy_maps_the_native_default_to_zero(self) -> None:
         from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm import (
             _DeepGemmTimeoutProxy,
@@ -410,6 +415,7 @@ class TestBackendProxies:
         finally:
             proxy.set_timeout_seconds(None)
 
+    @pytest.mark.cpu_only
     def test_nccl_ep_proxy_converts_seconds_to_group_nanoseconds(self) -> None:
         from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import _NcclEpGroupTimeoutProxy
 
