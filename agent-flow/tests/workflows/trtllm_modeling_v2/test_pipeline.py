@@ -585,7 +585,7 @@ def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_findi
     tmp_path, task_file, repo, monkeypatch
 ):
     """Each landing is read for the conventions; findings hold nothing and go to the fix."""
-    task = _spec(task_file, KV_FP8)
+    task = _spec(task_file, KV_FP8, TEP2)
     modeling = repo / TARGET_REL / "modeling.py"
     head = _Head()
     shell = _checks(fail={"kv_fp8:boot"})
@@ -609,7 +609,8 @@ def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_findi
         return READY
 
     script = Script(assembler=_by_task({"core": core, "kv_fp8": kv, "fix-1": fix}))
-    workflow = _workflow(tmp_path, shell_runner=shell, git_runner=head)
+    kwargs = dict(shell_runner=shell, git_runner=head, command_runner=healthy_smi(2))
+    workflow = _workflow(tmp_path, **kwargs)
     calls = _install(monkeypatch, workflow, script)
     with workflow:
         assert workflow.run(task) is True
@@ -618,33 +619,40 @@ def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_findi
     assert set(found.values()) == {"core", "kv_fp8", "fix-1"} and all(
         t["status"] == "done" and t["attempts"] <= 1 for t in _tasks(tmp_path)
     )
-    assert [_task_id(p) for _, p in calls] == ["core", "kv_fp8", "fix-1"]
+    assert [_task_id(p) for _, p in calls] == ["core", "kv_fp8", "tep2", "fix-1"]
     goal = _prompts(calls, "fix-1")[0]
     assert "repair what the final pass found, every item:" in goal
     assert "- check `kv_fp8:boot` failed at c0ffee1: [FAIL] kv_fp8:boot: " in goal
     assert f"- convention: {TARGET_REL}/modeling.py:1 imports Modeling V1 ({v1})" in goal
     assert "(first at `core`)" in goal and "(first at `kv_fp8`)" in goal
     assert "## Tag `fix`" in goal and "A check runs again with `" in goal
-    # After the fix: what failed and core's own run once more, on the new commit. What
-    # passed before keeps the commit it was measured on.
+    # A deployment whose boot failed is not scored: its benchmark would start the same
+    # engine to the same end. After the fix, that deployment's checks and core's own run
+    # once more, on the new commit (core's benchmark first, as what `kv_fp8` is held to).
+    # What passed before keeps the commit it was measured on.
     assert shell.ran == [
         "tp1:boot",
         "tp1:accuracy",
         "kv_fp8:boot",
-        "kv_fp8:accuracy",
+        "tep2:boot",
+        "tep2:accuracy",
         "kv_fp8:boot",
-        "tp1:boot",
         "tp1:accuracy",
+        "kv_fp8:accuracy",
+        "tp1:boot",
     ]
+    named = goal.split("## What the run did before this task")[0]
+    assert "kv_fp8:accuracy" not in named and "tep2" not in named
     report = _report(tmp_path)
     assert "| `kv_fp8` | `boot` | - | - | PASS | in process | `f1xed00` |" in report
-    assert "| PASS | in process | `c0ffee1` |" in report.split("| `kv_fp8` | `accuracy")[1]
+    assert "| PASS | in process | `f1xed00` |" in report.split("| `kv_fp8` | `accuracy")[1]
+    assert "| `tep2` | `boot` | - | - | PASS | in process | `c0ffee1` |" in report
     # Nothing of the final pass moves the onboard record.
     assert report.startswith("# onboarded: commit `c0ffee1`")
     left = report.split("## Convention findings left")[1].split("##")[0]
     assert "quant.py" in left and "(first at `kv_fp8`)" in left and "Modeling V1" not in left
     # The next start has its own entry: what is still found gets one more fix task, once.
-    calls = _run(tmp_path, task, monkeypatch, Script(), shell_runner=shell, git_runner=head)
+    calls = _run(tmp_path, task, monkeypatch, Script(), **kwargs)
     assert [_task_id(p) for _, p in calls] == ["fix-2"]
     assert "Modeling V1" not in calls[0][1] and "quant.py" in calls[0][1]
     assert "extra.py" in calls[0][1] and "(first at `fix-1`)" in calls[0][1]
@@ -708,6 +716,33 @@ def test_the_survey_is_held_to_its_schema_and_spent_it_ends_the_run(
     calls = _run(tmp_path, task_file, monkeypatch, Script(surveyor=surveyor))
     assert [role for role, _ in calls] == ["surveyor", "surveyor", "assembler"]
     assert _state(tmp_path).onboarded
+
+
+def test_a_fix_that_breaks_core_is_reported_and_takes_nothing_back(
+    tmp_path, task_file, monkeypatch
+):
+    head = _Head()
+    shell = _checks(fail={"kv_fp8:accuracy"})
+
+    def fix(attempt, prompt):
+        shell.fail.clear()
+        shell.fail.add("tp1:boot")  # what it changed for the one broke the other
+        head.at = "f1xed00"
+        return READY
+
+    script = Script(assembler=_by_task({"fix-1": fix}))
+    workflow = _workflow(tmp_path, shell_runner=shell, git_runner=head)
+    _install(monkeypatch, workflow, script)
+    with workflow:
+        assert workflow.run(_spec(task_file, KV_FP8)) is True
+    report = _report(tmp_path)
+    # Onboarded on the commit where core's checks passed; what the head does now is a line.
+    assert report.startswith("# onboarded: commit `c0ffee1`")
+    assert _state(tmp_path).onboarded["commit"] == "c0ffee1"
+    assert "| `tp1` | `boot` | - | - | FAIL | in process | `f1xed00` |" in report
+    assert "| `kv_fp8` | `accuracy[gsm8k]` | 90 | relative (the score of `tp1`) | PASS |" in report
+    # Core's benchmark ran on the new commit as what `kv_fp8` is held to, then its boot.
+    assert shell.ran[-3:] == ["tp1:accuracy", "kv_fp8:accuracy", "tp1:boot"]
 
 
 # ------------------------------------------------------------------ the bounds, resume
@@ -871,6 +906,30 @@ def test_a_spec_edited_between_two_starts_adds_and_drops_tasks(tmp_path, task_fi
     # Skipped as it stood: the cut turn is not started again for a deployment that is gone.
     assert "its turn raised" not in (tmp_path / "ws" / "journal.md").read_text()
     assert "- name: tep2" in (tmp_path / "ws" / "task.yaml").read_text()
+
+
+def test_another_first_deployment_is_not_taken_for_the_one_core_was_built_for(
+    tmp_path, task_file, monkeypatch
+):
+    _run(tmp_path, _spec(task_file, KV_FP8), monkeypatch, Script())
+    assert _state(tmp_path).onboarded and _tasks(tmp_path)[1]["ref"] == "tp1"
+    # `core` is the first deployment. With another one first, what was built and onboarded
+    # would be reported as that one's: the start is refused, with what to do.
+    spec = yaml.safe_load(task_file.read_text())
+    spec["deployments"] = [{"name": "tep2", "options": {"tensor_parallel_size": 2}}]
+    task_file.write_text(yaml.safe_dump(spec))
+    workflow = _workflow(tmp_path, command_runner=healthy_smi(2))
+    calls = _install(monkeypatch, workflow, Script())
+    with workflow, pytest.raises(StateError) as refused:
+        workflow.run(task_file)
+    said = str(refused.value)
+    assert "the first deployment is `tep2` now" in said and "was built for `tp1`" in said
+    assert "put `tp1` first again, or start over with --clean" in said and calls == []
+    # A deployment added after it changes nothing of that.
+    calls = _run(
+        tmp_path, _spec(task_file, TEP2), monkeypatch, Script(), command_runner=healthy_smi(2)
+    )
+    assert [_task_id(p) for _, p in calls] == ["tep2"]
 
 
 def test_the_run_state_round_trips_and_another_versions_is_refused(tmp_path):

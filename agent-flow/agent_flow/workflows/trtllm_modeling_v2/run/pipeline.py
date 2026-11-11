@@ -67,6 +67,7 @@ from . import report as report_mod
 from .contract import library_digest
 from .integration import REPAIR_TURNS, Integration, repair_block, worktree_block
 from .startup import preflight as preflight_mod
+from .state import StateError
 
 TASKS_FILENAME = "tasks.yaml"
 #: What the operator's `feedback` command appends to; every dispatch says to read it.
@@ -104,8 +105,8 @@ class Task:
 
     id: str
     kind: str
-    #: The deployment it works for, by unit name (``core`` for the first), and a kernel
-    #: task's vocabulary queue row.
+    #: The deployment it works for, by unit name (``core`` for the first), and what it
+    #: refers to: a kernel task's vocabulary queue row, a deployment task's deployment.
     unit: str = ""
     ref: str = ""
     goal: str = ""
@@ -241,13 +242,21 @@ class Pipeline:
             if deployment.core:
                 goal = f"assemble the target for `{deployment.name}`: modeling, weights and routing"
             kind = "core" if deployment.core else "deployment"
-            wanted.append(Task(unit, kind, unit=unit, goal=goal))
+            wanted.append(Task(unit, kind, unit=unit, ref=deployment.name, goal=goal))
         return wanted
 
     def _plan(self) -> None:
         """Add the wanted tasks the list lacks, in order; skip what is no longer wanted."""
         wanted = self._wanted()
         have = {t.id: t for t in self.tasks}
+        built, now = have.get("core"), next((t for t in wanted if t.id == "core"), None)
+        if built and now and built.ref and built.ref != now.ref:
+            # `core` is whatever the spec lists first: its task and the onboard record are
+            # about the deployment that was first then.
+            raise StateError(
+                f"the first deployment is `{now.ref}` now, and this workspace's `core` was built "
+                f"for `{built.ref}`: put `{built.ref}` first again, or start over with --clean"
+            )
         ids = {t.id for t in wanted}
         added = [t.id for t in wanted if t.id not in have]
         open_ = [t for t in self.tasks if t.status in (PENDING, RUNNING) and t.kind != "fix"]

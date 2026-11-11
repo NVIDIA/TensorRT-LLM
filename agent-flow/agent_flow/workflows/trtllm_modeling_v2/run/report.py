@@ -13,9 +13,10 @@ verdict; with none judged the record says ``accuracy unjudged (boot only)``.
 
 **The final pass** (:func:`final_pass`) runs once, after the last task: every other check
 of every done deployment, the target's delivered tests and the commit audit, on the
-checkout's head. Each is a report line naming the commit it was measured on. When one
-failed or the conventions scan has findings, one `fix` task names them all; then the
-failed checks and core's own run once more. A pass on record for the same content is
+checkout's head. Each is a report line naming the commit it was measured on. A deployment
+whose boot failed there is not scored. When a check failed or the conventions scan has
+findings, one `fix` task names them all; then the deployments that had a failure and core's
+own checks run once more. A pass on record for the same content is
 reused (``run/contract.py``); deployments not done or not attempted are skipped.
 
 **The report** (:func:`write_report`), ``delivery_report.md``, is what the run delivers.
@@ -220,6 +221,24 @@ def _owed(pipeline) -> list[contract_mod.Check]:
     ]
 
 
+def _measure_owed(pipeline, commit: str, only: Collection[str] | None = None) -> list:
+    """Each owed check (of the deployments ``only`` names, when given) on the head; those that failed.
+
+    A deployment whose boot failed is not scored or tested there: every later check of it
+    would start the same engine to the same end.
+    """
+    w, repo = pipeline.w, Path(str(pipeline.w.task_data["trtllm_repo_path"]))
+    done, failed, down = pipeline.done_deployments(), [], set()
+    for check in _owed(pipeline):
+        if check.deployment in down or (only is not None and check.deployment not in only):
+            continue
+        verdict = measure(w, check, tree=repo, commit=commit, bases=done)
+        if not verdict.passed:
+            failed.append(verdict)
+            down |= {check.deployment} if check.gate == "boot" else set()
+    return failed
+
+
 def git_lines(
     repo: Path, policy: CommitPolicy, trees: Sequence[str], commit: str = ""
 ) -> list[Line]:
@@ -336,11 +355,7 @@ def final_pass(pipeline) -> None:
     repo, commit = Path(str(w.task_data["trtllm_repo_path"])), w._head()
     done = pipeline.done_deployments()
     w.journal.event("final pass", f"on {commit[:12]}: {', '.join(done) or 'no deployment done'}")
-    failed = [
-        v
-        for c in _owed(pipeline)
-        if not (v := measure(w, c, tree=repo, commit=commit, bases=done)).passed
-    ]
+    failed = _measure_owed(pipeline, commit)
     lines = delivery_lines(w, commit)
     cli = gate_cli.invocation(w.task_path, w.workspace / CHECKS_DIRNAME / "fix", "<name>")
     problems = [f"check `{v.key}` failed at {commit[:12]}: {v.summary or v.detail}" for v in failed]
@@ -352,10 +367,11 @@ def final_pass(pipeline) -> None:
         said = [*problems, *(f"convention: {finding}" for finding in findings)]
         fix = pipeline.fix(said, f"A check runs again with `{cli}`.")
         if fix.status == pipeline.DONE:
+            # Once more on what the fix left: the deployments that had a failure, whole, and
+            # core's own checks, which nothing of this takes the onboard record from.
             commit = w._head()
-            again = [contract_mod.Check(v.deployment, v.gate) for v in failed]
-            for check in [*again, *_onboard_checks(w)]:
-                measure(w, check, tree=repo, commit=commit, bases=done)
+            _measure_owed(pipeline, commit, only={v.deployment for v in failed})
+            onboard_check(w, repo, commit)
             lines = delivery_lines(w, commit)
     pipeline.final = lines
 
