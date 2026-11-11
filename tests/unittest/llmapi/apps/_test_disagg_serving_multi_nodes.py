@@ -15,7 +15,8 @@ import time
 import openai
 import pytest
 from test_common import cluster_env
-from test_common.http_utils import wait_for_endpoint_down, wait_for_endpoint_ready
+from test_common.http_utils import (wait_for_endpoint_down,
+                                    wait_for_endpoint_ready)
 
 from tensorrt_llm._utils import get_sm_version
 
