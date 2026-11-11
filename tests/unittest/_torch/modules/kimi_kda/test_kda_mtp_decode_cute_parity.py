@@ -611,8 +611,10 @@ def test_round2_replay(B, H, M):
     _assert_close(
         "state2(cute vs cpu)", cute2["recurrent_state"], cpu2["recurrent_state"], atol=1e-4
     )
-    for name in ("k_cache", "g_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v"):
+    for name in ("k_cache", "g_cache", "v_cache", "beta_cache"):
         _assert_close(f"{name}2(cute vs cpu)", cute2[name], cpu2[name], atol=2e-2, rtol=4e-3)
+    for name in ("cs_q", "cs_k", "cs_v"):
+        torch.testing.assert_close(cute2[name], cpu2[name], rtol=0, atol=0)
     _assert_close(
         "out2(cute vs fla)", cute2["out"][0, rows].float(), fla_out2[0, rows], atol=5e-2, rtol=5e-2
     )
