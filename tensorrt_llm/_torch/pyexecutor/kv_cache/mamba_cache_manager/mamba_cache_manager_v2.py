@@ -76,6 +76,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import HybridCachePolicy
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.step_upload_kernels import copy_small_pinned_pair
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -227,6 +228,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # match the last upload keeps the uploaded state indices and dummy mask
     # without rebuilding them.
     _skips_steady_state_index_upload = False
+    # HybridCachePolicy.state_index_upload_kernel; declared on the class for
+    # instances built without running __init__.
+    _state_index_upload_kernel = False
     # In-forward Mamba snapshots (staging rows: inforward_snapshot_rows): longest
     # tail, and the fewest chunk tokens before P (the convolution window at P
     # must lie inside the chunk). See _setup_inforward_snapshot.
@@ -354,6 +358,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._hybrid_cache_policy = (
             hybrid_cache_policy if hybrid_cache_policy is not None else HybridCachePolicy()
         )
+        self._state_index_upload_kernel = self._hybrid_cache_policy.state_index_upload_kernel
+        # Pinned snapshots read by in-flight state-index upload kernels, with the
+        # event after which each is free (_upload_state_indices_and_dummy_mask).
+        self._state_upload_snapshots: list = []
         self._low_priority_snapshot_prompt_len = 0
         if kv_cache_config.enable_block_reuse and not is_draft:
             self._low_priority_snapshot_prompt_len = max(
@@ -1833,9 +1841,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         )
                     self._host_replay_indices[i] = replay_index
 
-        self._state_indices_buffer.update(self._host_state_indices)
         is_dummy = [req.is_dummy for req in requests]
-        self._refresh_dummy_request_mask(is_dummy)
+        if not self._upload_state_indices_and_dummy_mask(is_dummy):
+            self._state_indices_buffer.update(self._host_state_indices)
+            self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
         for req, value, dummy in zip(requests, state_values, is_dummy):
             self._request_id_to_state_index[req.py_request_id] = value
@@ -1935,13 +1944,53 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             )
 
     def _refresh_dummy_request_mask(self, is_dummy: list[bool]) -> None:
+        self._fill_dummy_request_mask_host(is_dummy)
+        self._dummy_request_mask_buffer.update(self._dummy_request_mask_host)
+
+    def _fill_dummy_request_mask_host(self, is_dummy: list[bool]) -> None:
         count = len(is_dummy)
         if count > self._dummy_request_mask_host.shape[0]:
             raise ValueError("Dummy-request batch exceeds state-index capacity")
         self._dummy_request_mask_host.zero_()
         if count:
             self._dummy_request_mask_host[:count].copy_(torch.tensor(is_dummy, dtype=torch.bool))
-        self._dummy_request_mask_buffer.update(self._dummy_request_mask_host)
+
+    def _upload_state_indices_and_dummy_mask(self, is_dummy: list[bool]) -> bool:
+        """Both uploads of ``_setup_state_indices`` as one SM kernel.
+
+        See ``HybridCachePolicy.state_index_upload_kernel``. Like the two
+        ``DeviceCopyBuffer.update`` calls it replaces, nothing is written while
+        both buffers already hold the host values. Otherwise one kernel writes
+        both at the same stream position. The kernel reads fresh pinned
+        snapshots of the host buffers (an admission and the scheduled batch
+        may refill those in one iteration before the first upload has run);
+        the pinned allocator does not see a kernel's reads, so the snapshots
+        are held until an event recorded after the kernel. Returns False
+        (nothing uploaded) to fall back to the copies.
+        """
+        if not self._state_index_upload_kernel or self._dummy_request_mask_buffer is None:
+            return False
+        self._fill_dummy_request_mask_host(is_dummy)
+        indices, mask = self._state_indices_buffer, self._dummy_request_mask_buffer
+        if indices.matches(self._host_state_indices) and mask.matches(
+            self._dummy_request_mask_host
+        ):
+            return True
+        snapshots = tuple(
+            torch.empty_like(host, pin_memory=prefer_pinned()).copy_(host)
+            for host in (self._host_state_indices, self._dummy_request_mask_host)
+        )
+        if not copy_small_pinned_pair(indices.tensor, snapshots[0], mask.tensor, snapshots[1]):
+            return False
+        indices.record(self._host_state_indices)
+        mask.record(self._dummy_request_mask_host)
+        done = torch.cuda.Event()
+        done.record()
+        self._state_upload_snapshots = [
+            (held, event) for held, event in self._state_upload_snapshots if not event.query()
+        ]
+        self._state_upload_snapshots.append((snapshots, done))
+        return True
 
     @override
     def get_state_indices(
