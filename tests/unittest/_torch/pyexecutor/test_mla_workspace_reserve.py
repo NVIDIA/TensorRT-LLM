@@ -397,3 +397,22 @@ def test_ctx_cap_no_cap_during_warmup():
     # cap even if a cap were carried, and short-circuit before reading the manager.
     exe = _executor_with_manager(SimpleNamespace(fp8_ctx_mla_kv_len_cap=262144), is_warmup=True)
     assert exe._get_ctx_mla_kv_len_cap() is None
+
+
+@pytest.mark.parametrize("floor", [64, 128, 200])
+def test_workspace_reserve_covers_minimum_partition(floor: int) -> None:
+    reserve, cap = get_mla_context_workspace_reserve(
+        1024, 3, 2, 4096, fixed_bytes=512, min_workspace_tokens=floor
+    )
+    assert reserve >= 2 * floor
+    assert cap >= floor
+    assert 1024 - reserve >= 512
+
+
+def test_workspace_reserve_rejects_unaffordable_floor() -> None:
+    from tensorrt_llm._errors import ResourceError
+
+    with pytest.raises(ResourceError, match="workspace floor"):
+        get_mla_context_workspace_reserve(
+            1024, 3, 2, 4096, fixed_bytes=512, min_workspace_tokens=256
+        )

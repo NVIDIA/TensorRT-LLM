@@ -1610,12 +1610,13 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     expected_budget: int,
     expected_cap: int | None,
     kv_cost: CacheCost = CacheCost(slope=3),
+    max_num_tokens: int = 16,
+    max_seq_len: int = 128,
 ) -> None:
     """Verify measured chunk capacity and preserve Hopper's existing reserve policy."""
 
     pool_ratio = [0.2, 0.3, 0.5]
     avg_seq_len = 128
-    max_seq_len = 4096
     user_max_tokens = 1024
     estimation_max_tokens = 256
     kv_cache_config = KvCacheConfig(
@@ -1645,7 +1646,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
             mapping=Mapping(),
             net_max_seq_len=max_seq_len,
             kv_connector_manager=None,
-            max_num_tokens=256,
+            max_num_tokens=max_num_tokens,
             max_beam_width=1,
             tokens_per_block=128,
             max_seq_len=max_seq_len,
@@ -2377,3 +2378,30 @@ def test_profiling_failure_releases_resources_and_restores_response_state():
     warmup_scope.__exit__.assert_called_once()
     assert executor.enable_iter_perf_stats is True
     assert executor.set_gather_responses.call_args.args == (False,)
+
+
+def test_estimation_workspace_reserve_covers_chunked_batch_floor() -> None:
+    # Four buffer slots times 48 query tokens exceeds the 128-token budget split.
+    test_estimation_temporarily_uses_inferred_pool_sizing(
+        sm=100,
+        chunked_workspace_profiled=False,
+        chunked_prefill=True,
+        bounded=True,
+        expected_budget=320,
+        expected_cap=192,
+        max_num_tokens=48,
+        max_seq_len=4096,
+    )
+
+
+def test_estimation_workspace_reserve_covers_first_request() -> None:
+    # Without bounded partitions, the request retained for progress needs its full KV length.
+    test_estimation_temporarily_uses_inferred_pool_sizing(
+        sm=100,
+        chunked_workspace_profiled=False,
+        chunked_prefill=False,
+        bounded=True,
+        expected_budget=320,
+        expected_cap=192,
+        max_seq_len=192,
+    )

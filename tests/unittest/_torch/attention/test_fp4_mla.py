@@ -1900,6 +1900,46 @@ def _create_fp4_mla_v2_manager(
     )
 
 
+def _prepare_fp4_mla_decode_metadata(
+    manager: Fp4MlaKVCacheManagerV2,
+    context_len: int,
+    metadata: trtllm_backend.TrtllmAttentionMetadata | None = None,
+) -> trtllm_backend.TrtllmAttentionMetadata:
+    if metadata is None:
+        metadata = trtllm_backend.TrtllmAttentionMetadata(
+            seq_lens=torch.tensor([context_len], dtype=torch.int32),
+            request_ids=[0],
+            max_num_requests=1,
+            num_contexts=1,
+            prompt_lens=[context_len],
+            max_num_tokens=context_len + 1,
+            kv_cache_manager=manager,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        )
+    metadata.num_contexts = 1
+    metadata.seq_lens = torch.tensor([context_len], dtype=torch.int32)
+    metadata.prompt_lens = [context_len]
+    metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
+    metadata.prepare()
+    scatter_fp4_mla_kv_cache(
+        metadata,
+        torch.randn(context_len, 576, device="cuda", dtype=torch.bfloat16) * 0.25,
+        layer_idx=0,
+        token_offset=0,
+        phase="context",
+        local_layer=0,
+        v_head_dim=512,
+    )
+    metadata.num_contexts = 0
+    metadata.seq_lens = torch.tensor([1], dtype=torch.int32)
+    metadata.kv_cache_params = KVCacheParams(
+        use_cache=True, num_cached_tokens_per_seq=[context_len]
+    )
+    metadata.prepare()
+    return metadata
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
@@ -1916,31 +1956,7 @@ def test_fp4_mla_rope_generation_quantizes_q(monkeypatch: pytest.MonkeyPatch) ->
     manager = _create_fp4_mla_v2_manager(max_tokens=1024, max_seq_len=128, max_batch_size=1)
     try:
         manager.add_dummy_requests([0], [16])
-        metadata = trtllm_backend.TrtllmAttentionMetadata(
-            seq_lens=torch.tensor([15], dtype=torch.int32),
-            request_ids=[0],
-            max_num_requests=1,
-            num_contexts=1,
-            prompt_lens=[15],
-            max_num_tokens=16,
-            kv_cache_manager=manager,
-            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
-            mapping=Mapping(world_size=1, tp_size=1, rank=0),
-        )
-        metadata.prepare()
-        scatter_fp4_mla_kv_cache(
-            metadata,
-            torch.zeros(15, head_dim, device="cuda", dtype=torch.bfloat16),
-            layer_idx=0,
-            token_offset=0,
-            phase="context",
-            local_layer=0,
-            v_head_dim=kv_lora_rank,
-        )
-        metadata.num_contexts = 0
-        metadata.seq_lens = torch.tensor([1], dtype=torch.int32)
-        metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[15])
-        metadata.prepare()
+        metadata = _prepare_fp4_mla_decode_metadata(manager, 15)
         attention = trtllm_backend.TrtllmAttention(
             layer_idx=0,
             num_heads=num_heads,
@@ -1962,15 +1978,12 @@ def test_fp4_mla_rope_generation_quantizes_q(monkeypatch: pytest.MonkeyPatch) ->
         fused_q = torch.linspace(
             -1, 1, num_heads * head_dim, device="cuda", dtype=torch.bfloat16
         ).reshape(1, num_heads, head_dim)
-        projected_q = torch.linspace(
-            -1, 1, num_heads * 192, device="cuda", dtype=torch.bfloat16
-        ).reshape(1, num_heads, 192)
         latent_cache = torch.linspace(-1, 1, head_dim, device="cuda", dtype=torch.bfloat16).reshape(
             1, head_dim
         )
         attention.mla_rope_generation(
             fused_q,
-            projected_q[..., -rope_dim:],
+            fused_q[..., -rope_dim:].clone(),
             latent_cache,
             metadata,
             torch.empty(2, dtype=torch.int32, device="cuda"),
@@ -2882,6 +2895,7 @@ def _assert_fp4_mla_attention_decode_accuracy(
     enable_block_reuse: bool = False,
     packed_queries: bool = False,
     split_kv: int | None = None,
+    expected_prepack_v: bool | None = None,
 ) -> None:
     _reset_triton_allocator()
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
@@ -2908,6 +2922,11 @@ def _assert_fp4_mla_attention_decode_accuracy(
         enable_block_reuse=enable_block_reuse,
     )
     try:
+        if expected_prepack_v is not None:
+            v_packed = metadata.fp4_mla_state.workspaces.get(
+                fp4_mla_v_cache._triton_v_packed_attr(0)
+            )
+            assert (v_packed is not None) is expected_prepack_v
         v_packed_pool = fp4_mla_backend._get_fp4_mla_v_packed_pool(metadata, 0)
         assert (v_packed_pool is None) is (backend == "triton" or fused_v_transpose)
 
@@ -3045,6 +3064,7 @@ def test_fp4_mla_attention_decode_triton_matches_reference(
         seq_lens=[131, 512],
         seed=29,
         query_len_per_seq=query_len_per_seq,
+        expected_prepack_v=prepack_v,
     )
 
 
@@ -3052,23 +3072,17 @@ def test_fp4_mla_attention_decode_triton_matches_reference(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="requires SM100 or SM103, where FP4 MLA runs on the triton backend",
 )
-def test_fp4_mla_triton_decode_masks_kv_len_after_full_page_step(monkeypatch) -> None:
-    """A decode step that fills its page does not unmask a later, shorter step.
-
-    Both steps use the same eager attention metadata. The second sequence reuses
-    the first one's page, which still holds the first sequence's KV past the
-    second one's length, so attending past that length changes the output.
-    """
+@pytest.mark.parametrize("prepack_v", [False, True])
+def test_fp4_mla_triton_decode_masks_kv_len_after_full_page_step(
+    monkeypatch, prepack_v: bool
+) -> None:
+    """Reuse eager metadata after a full page, retaining stale KV beyond the shorter length."""
     _reset_triton_allocator()
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_TRITON_PREPACK_V", str(int(prepack_v)))
     torch.manual_seed(0)
     page_size = FP4_MLA_TOKENS_PER_BLOCK
-    num_heads = 16
-    kv_lora_rank = 512
-    qk_rope_head_dim = 64
-    head_dim = kv_lora_rank + qk_rope_head_dim
-    sm_scale = 0.1
-    device = torch.device("cuda")
+    num_heads, kv_lora_rank, rope_dim = 16, 512, 64
     manager = _create_fp4_mla_v2_manager(
         max_tokens=2 * page_size, max_seq_len=page_size, max_batch_size=1
     )
@@ -3076,148 +3090,63 @@ def test_fp4_mla_triton_decode_masks_kv_len_after_full_page_step(monkeypatch) ->
         manager.add_dummy_requests([0], [page_size])
         for pool in manager._iter_fp4_mla_physical_pool_views():
             pool.view(torch.uint8).zero_()
-        metadata = trtllm_backend.TrtllmAttentionMetadata(
-            seq_lens=torch.tensor([page_size - 1], dtype=torch.int32),
-            request_ids=[0],
-            max_num_requests=1,
-            num_contexts=1,
-            prompt_lens=[page_size - 1],
-            max_num_tokens=page_size,
-            kv_cache_manager=manager,
-            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
-            mapping=Mapping(world_size=1, tp_size=1, rank=0),
-        )
-        rotary_cos_sin = torch.zeros(
-            (page_size, qk_rope_head_dim, 2), dtype=torch.float32, device=device
-        )
-        rotary_cos_sin[..., 0] = 1.0
-
-        def decode_after_prefill(context_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-            metadata.num_contexts = 1
-            metadata.seq_lens = torch.tensor([context_len], dtype=torch.int32)
-            metadata.prompt_lens = [context_len]
-            metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
-            metadata.prepare()
-            context_latent = (
-                torch.randn(context_len, head_dim, dtype=torch.bfloat16, device=device) * 0.25
-            ).clamp_(-1.0, 1.0)
-            scatter_fp4_mla_kv_cache(
-                metadata,
-                context_latent,
-                layer_idx=0,
-                token_offset=0,
-                phase="context",
-                local_layer=0,
-                v_head_dim=kv_lora_rank,
-            )
-
-            metadata.num_contexts = 0
-            metadata.seq_lens = torch.tensor([1], dtype=torch.int32)
-            metadata.kv_cache_params = KVCacheParams(
-                use_cache=True, num_cached_tokens_per_seq=[context_len]
-            )
-            metadata.prepare()
-            generation_latent = (
-                torch.randn(1, head_dim, dtype=torch.bfloat16, device=device) * 0.25
-            ).clamp_(-1.0, 1.0)
-            q_nope = (
-                torch.randn(1, num_heads, kv_lora_rank, dtype=torch.bfloat16, device=device) * 0.25
-            ).clamp_(-1.0, 1.0)
-            q_pe = (
-                torch.randn(1, num_heads, qk_rope_head_dim, dtype=torch.bfloat16, device=device)
+        rotary_cos_sin = torch.zeros(page_size, rope_dim, 2, device="cuda")
+        rotary_cos_sin[..., 0] = 1
+        metadata = None
+        for context_len in (page_size - 1, 50):
+            metadata = _prepare_fp4_mla_decode_metadata(manager, context_len, metadata)
+            q = (
+                torch.randn(
+                    1, num_heads, kv_lora_rank + rope_dim, device="cuda", dtype=torch.bfloat16
+                )
                 * 0.25
-            ).clamp_(-1.0, 1.0)
-            q = torch.cat((q_nope, torch.zeros_like(q_pe)), dim=-1).contiguous()
+            )
             assert scatter_fp4_mla_kv_cache(
                 metadata,
-                generation_latent,
+                torch.randn(1, kv_lora_rank + rope_dim, device="cuda", dtype=torch.bfloat16) * 0.25,
                 layer_idx=0,
                 token_offset=0,
                 phase="generation",
                 local_layer=0,
                 v_head_dim=kv_lora_rank,
                 rotary_cos_sin=rotary_cos_sin,
-                q_pe=q_pe,
+                q_pe=q[..., kv_lora_rank:].clone(),
                 q_rope_out=q[..., kv_lora_rank:],
                 q_quant_input=q,
             )
-            # The reference reads the quantized cache only, so decode without the HP overlay.
-            metadata.fp4_mla_state.hp_pool.zero_()
-            output = torch.empty(1, num_heads, kv_lora_rank, dtype=torch.bfloat16, device=device)
+            state = metadata.fp4_mla_state
+            state.hp_pool.zero_()  # The reference reads the quantized cache without the HP overlay.
+            output = torch.empty(1, num_heads, kv_lora_rank, device="cuda", dtype=torch.bfloat16)
             run_fp4_mla_attention_decode(
                 metadata,
                 layer_idx=0,
                 local_layer=0,
                 q=q,
                 output=output,
-                sm_scale=sm_scale,
+                sm_scale=0.1,
                 kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                prequantized_q=metadata.fp4_mla_state.prequantized_q,
-                prequantized_q_sf=metadata.fp4_mla_state.prequantized_q_sf,
-                q_batch_capacity=metadata.fp4_mla_state.q_batch_capacity,
+                qk_rope_head_dim=rope_dim,
+                prequantized_q=state.prequantized_q,
+                prequantized_q_sf=state.prequantized_q_sf,
+                q_batch_capacity=state.q_batch_capacity,
             )
-            torch.cuda.synchronize()
             reference, _ = _fp4_mla_attention_decode_reference(
                 metadata,
                 q[..., :kv_lora_rank],
                 q[..., kv_lora_rank:],
-                sm_scale=sm_scale,
+                sm_scale=0.1,
                 kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
+                qk_rope_head_dim=rope_dim,
             )
-            return output.float(), reference
-
-        # The first sequence ends exactly on the page boundary, the second one inside it.
-        for context_len in (page_size - 1, 50):
-            output, reference = decode_after_prefill(context_len)
-            relative_l2 = float(
-                (
-                    torch.linalg.vector_norm(output - reference)
-                    / torch.linalg.vector_norm(reference)
-                ).item()
-            )
-            assert relative_l2 < 0.15, (
-                f"decode after a {context_len}-token prefill diverged from the reference: "
-                f"relative L2 {relative_l2}"
-            )
-            torch.testing.assert_close(output, reference, atol=1.5e-1, rtol=1.5e-1)
+            relative_l2 = torch.linalg.vector_norm(
+                output.float() - reference
+            ) / torch.linalg.vector_norm(reference)
+            assert relative_l2 < 0.15, f"decode after {context_len}-token prefill: {relative_l2=}"
+            torch.testing.assert_close(output.float(), reference, atol=0.15, rtol=0.15)
     finally:
         torch.cuda.synchronize()
         _reset_triton_allocator()
         manager.shutdown()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="requires SM100 or SM103, where FP4 MLA runs on the triton backend",
-)
-@pytest.mark.parametrize("prepack_v", [None, "1"], ids=["default", "opt-in"])
-def test_fp4_mla_triton_prepack_v_is_opt_in_on_sm100_sm103(
-    monkeypatch, prepack_v: str | None
-) -> None:
-    """SM100/SM103 keep a prepacked copy of V for the whole KV pool only when it is requested."""
-    _reset_triton_allocator()
-    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.delenv("TRTLLM_FP4_MLA_PREPACK_V", raising=False)
-    if prepack_v is None:
-        monkeypatch.delenv("TRTLLM_FP4_MLA_TRITON_PREPACK_V", raising=False)
-    else:
-        monkeypatch.setenv("TRTLLM_FP4_MLA_TRITON_PREPACK_V", prepack_v)
-    kv_cache_manager, metadata, _, _, _ = _build_fp4_mla_attention_decode_case(
-        seq_lens=[131, 512], num_heads=16, seed=29
-    )
-    try:
-        v_packed = metadata.fp4_mla_state.workspaces.get(fp4_mla_v_cache._triton_v_packed_attr(0))
-        assert (v_packed is not None) is (prepack_v is not None)
-    finally:
-        torch.cuda.synchronize()
-        _reset_triton_allocator()
-        kv_cache_manager.shutdown()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
 
 
 @pytest.mark.skipif(

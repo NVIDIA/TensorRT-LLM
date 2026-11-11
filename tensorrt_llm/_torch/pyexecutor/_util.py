@@ -45,6 +45,7 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 from ..attention.backends import get_sparse_attn_kv_cache_manager
+from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.sparse.params import \
     get_indexer_mqa_logits_workspace_bytes
 from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
@@ -708,31 +709,40 @@ def get_indexer_mqa_logits_workspace_reserve(kv_cache_memory: int,
     return workspace_memory
 
 
-def get_mla_context_workspace_reserve(budget_bytes, k_bytes_per_token,
-                                      w_bytes_per_token, kv_len_cap,
-                                      fixed_bytes):
-    """Bytes to reserve for the fp8 context-MLA workspace, and the token admission cap that reserve covers.
+def get_mla_context_workspace_reserve(budget_bytes,
+                                      k_bytes_per_token,
+                                      w_bytes_per_token,
+                                      kv_len_cap,
+                                      fixed_bytes,
+                                      min_workspace_tokens=0):
+    """Reserve FP8 context-MLA staging bytes and return the covered token count.
 
-    Reserve ``w * kv_len_cap`` (the worst-case summed attended KV), clamped to the per-token split
-    ``(budget - fixed) * w / (k + w)`` so a memory-constrained node shares the budget at a common token
-    count rather than starving the KV pool. ``fixed`` is the part of the KV cache cost that does not scale
-    with tokens (``CacheCost.intercept``, for example a hybrid model's recurrent states or the FP4 MLA
-    high-precision pages of the resident sequences); the pool needs it in full, so only the rest of the
-    budget is split. The admission cap is
-    ``reserve / w == min(kv_len_cap, (budget - fixed) / (k + w))`` tokens; the scheduler admits at most that
-    much summed attended KV, so the fp8 dequant staging buffer this reserve covers stays within it. This
-    accounts for the fp8 staging term only -- the separate BF16 full-gather buffers on the reuse path are not
-    yet charged here (tracked as a follow-up), so this bounds but does not by itself guarantee the reuse-path
-    peak. Returns ``(reserve_bytes, cap_tokens)``, or ``(0, None)`` when any input is non-positive or the
-    budget does not exceed ``fixed``.
+    Split only the budget beyond ``fixed_bytes`` (``CacheCost.intercept``) between
+    KV tokens and workspace: ``(budget - fixed) * w / (k + w)``, capped at
+    ``w * kv_len_cap``. The minimum workspace takes precedence over that split:
+    it covers one request, or the bounded cached partitions and query-token floor
+    of a complete chunked-prefill batch. Raise if that floor leaves no variable
+    KV budget, before allocating the pool.
+
+    The admission cap is ``int(reserve / w)``. This accounts only for FP8 staging;
+    separate BF16 full-gather buffers are not charged here. Return ``(0, None)``
+    for non-positive inputs or when the budget does not exceed the fixed cost.
     """
     token_budget_bytes = budget_bytes - fixed_bytes
     if not (token_budget_bytes > 0 and k_bytes_per_token > 0
             and w_bytes_per_token > 0 and kv_len_cap and kv_len_cap > 0):
         return 0, None
-    reserve = min(
-        w_bytes_per_token * kv_len_cap, token_budget_bytes * w_bytes_per_token /
-        (k_bytes_per_token + w_bytes_per_token))
+    minimum_reserve = w_bytes_per_token * min_workspace_tokens
+    if minimum_reserve >= token_budget_bytes:
+        raise ResourceError(
+            "The context-MLA workspace floor leaves no variable KV cache budget. "
+            "Lower max_num_tokens or max_seq_len, or increase the KV cache memory budget."
+        )
+    reserve = max(
+        minimum_reserve,
+        min(
+            w_bytes_per_token * kv_len_cap, token_budget_bytes *
+            w_bytes_per_token / (k_bytes_per_token + w_bytes_per_token)))
     return reserve, int(reserve / w_bytes_per_token)
 
 
@@ -2088,7 +2098,8 @@ class KvCacheCreator:
         # (get_mla_context_workspace_kv_len_cap) -- but clamp it to the per-token split
         # (budget - c) * w / (k + w), where c is the fixed (token-independent) part of the KV cost, so a
         # memory-constrained node shares the budget at a common token count instead of starving the pool.
-        # Equivalently the pool keeps c plus max((budget - c - w*L_cap)/k, (budget - c)/(k+w)) tokens.
+        # The single-request/partition workspace floor takes precedence over that split, covering the
+        # first request retained by the scheduler and the complete batch's query-token floor.
         # The reserve covers exactly reserve/w tokens of summed attended KV; that count is carried to the
         # KV manager as the scheduler's admission cap so it never re-derives the cap from pool layout (which V2
         # overstates). No cap or w == 0 -> no-op.
@@ -2125,13 +2136,25 @@ class KvCacheCreator:
         if w_bytes_per_token > 0 and kv_len_cap:
             budget_before = kv_cache_max_memory
             kv_cost = self._get_kv_size_per_token()
+            # A bounded cached partition has at most chunk_size * buffer_batch_size KV tokens.
+            # contextWorkspaceLayout also floors K/V staging at buffer_batch_size * query_tokens
+            # for the complete batch. Both are bounded by this same runtime buffer size.
+            min_workspace_tokens = self._max_seq_len
+            if self._llm_args.enable_chunked_prefill:
+                chunk_buffer_tokens = (
+                    AttentionRuntimeFeatures.chunked_prefill_buffer_batch_size *
+                    self._max_num_tokens)
+                min_workspace_tokens = (
+                    chunk_buffer_tokens if workspace_is_chunked_prefill_bounded
+                    else max(min_workspace_tokens, chunk_buffer_tokens))
             workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
                 get_mla_context_workspace_reserve(
                     budget_before,
                     kv_cost.slope,
                     w_bytes_per_token,
                     kv_len_cap,
-                    fixed_bytes=kv_cost.intercept))
+                    fixed_bytes=kv_cost.intercept,
+                    min_workspace_tokens=min_workspace_tokens))
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
                 logger.info(

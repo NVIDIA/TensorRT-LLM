@@ -8923,8 +8923,8 @@ class PyExecutor:
         """Trim context requests to the summed attended-KV workspace reservation.
 
         Cached prefixes can push total_kv_len far past `max_num_tokens`.
-        The first request is always kept: it attends at most `max_seq_len` and at most its pool, both covered
-        by the cap, so one request always fits and forward progress is guaranteed. Deferred requests stay
+        The first request is always kept: the reserve covers either `max_seq_len` or the bounded
+        chunked-prefill partition buffer, so its workspace fits even above the admission cap. Deferred requests stay
         active and retry next iteration, mirroring `_waiting_requests`.
         """
         cap = self._get_ctx_mla_kv_len_cap()
