@@ -206,7 +206,7 @@ def main():
         print("=== No arguments specified, running pre-commit on ALL files ===")
 
     # Install relevant packages from requirements-dev.txt
-    deps = ["pre-commit", "bandit", "pyrefly", "pytest"]
+    deps = ["pre-commit", "bandit", "pyrefly", "pytest", "tomli"]
     with open("requirements-dev.txt") as f:
         reqs = f.readlines()
     reqs_to_install = [
@@ -215,7 +215,7 @@ def main():
             if re.match(rf"^{re.escape(dep)}(?:\[|[<>=!~;\s]|$)", line)
         ]
     ]
-    run_cmd(shlex.join(["pip3", "install", *reqs_to_install]))
+    run_cmd(shlex.join(["python3", "-m", "pip", "install", *reqs_to_install]))
 
     # Install pre-commit hooks
     run_cmd("pre-commit install")
