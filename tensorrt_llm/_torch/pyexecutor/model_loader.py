@@ -19,6 +19,7 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
+    DEEPSEEK_V3_MLA_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -146,6 +147,18 @@ _MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS = replace(
 _MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     rope_fusion=frozenset({False}),
+    moe_backends=frozenset({"CUTLASS"}),
+    moe_tp_sizes=frozenset({1, 2}),
+    moe_ep_sizes=frozenset({1, 2}),
+    moe_cluster_sizes=frozenset({1}),
+)
+# DeepSeek-V3 MLA fuses RoPE into the TRTLLM attention op (the base
+# `rope_fusion`), so it keeps the base BF16 dense RoPE pins and adds the Qwen3
+# MoE CUTLASS backend and partition pins. The CUTLASS pin also fixes the router
+# `e_score_correction_bias` dtype (fp32 here, bf16 under the TRTLLM MoE
+# backend) and keeps the shared experts out of the routed-expert tensors.
+_MX_DEEPSEEK_V3_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     moe_backends=frozenset({"CUTLASS"}),
     moe_tp_sizes=frozenset({1, 2}),
     moe_ep_sizes=frozenset({1, 2}),
@@ -1069,6 +1082,20 @@ class ModelLoader:
             transform_abi_id=QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="deepseek-v3-for-causal-lm-bf16-cutlass-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_deepseekv3",
+                "DeepseekV3ForCausalLM"),
+            architecture="DeepseekV3ForCausalLM",
+            model_type="deepseek_v3",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=
+            DEEPSEEK_V3_MLA_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_DEEPSEEK_V3_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
         ),
     ))
 

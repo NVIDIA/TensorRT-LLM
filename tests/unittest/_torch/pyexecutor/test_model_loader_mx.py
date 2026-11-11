@@ -43,6 +43,7 @@ from tensorrt_llm._torch.attention import mla as mla_mod
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models import modeling_deepseekv3 as modeling_deepseekv3_mod
 from tensorrt_llm._torch.models import modeling_llama as modeling_llama_mod
 from tensorrt_llm._torch.models import modeling_mistral as modeling_mistral_mod
 from tensorrt_llm._torch.models import modeling_phi3 as modeling_phi3_mod
@@ -722,6 +723,26 @@ def _qwen3_moe_hf_config(**overrides: object) -> Qwen3MoeConfig:
     return Qwen3MoeConfig(**values)
 
 
+_DEEPSEEK_V3_PROFILE_ID = "deepseek-v3-for-causal-lm-bf16-cutlass-target-v1"
+
+
+def _deepseek_v3_lite_expert_config() -> PretrainedConfig:
+    # The DeepSeek-V3-Lite expert shapes: 72 routed experts, top-6, MoE intermediate size 1536.
+    return PretrainedConfig(
+        architectures=["DeepseekV3ForCausalLM"],
+        model_type="deepseek_v3",
+        hidden_size=2560,
+        intermediate_size=12288,
+        moe_intermediate_size=1536,
+        n_routed_experts=72,
+        n_shared_experts=2,
+        num_experts_per_tok=6,
+        num_hidden_layers=30,
+        first_k_dense_replace=1,
+        torch_dtype=torch.bfloat16,
+    )
+
+
 def _qwen3_30b_a3b_expert_config() -> Qwen3MoeConfig:
     # The Qwen3-30B-A3B expert shapes: 128 experts, top-8, MoE intermediate size 768.
     return _qwen3_moe_hf_config(
@@ -737,6 +758,7 @@ def _qwen3_30b_a3b_expert_config() -> Qwen3MoeConfig:
 # needs an entry.
 _MOE_PROFILE_CANARY_CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
     _QWEN3_MOE_PROFILE_ID: _qwen3_30b_a3b_expert_config,
+    _DEEPSEEK_V3_PROFILE_ID: _deepseek_v3_lite_expert_config,
 }
 
 
@@ -1425,7 +1447,10 @@ def _documented_names(text: str, start: str, end: str, known_names: set[str]) ->
 
 
 # The documentation spells these families differently from their architecture names.
-_MX_FAMILY_DISPLAY_NAMES = {"Qwen3MoeForCausalLM": "Qwen3 MoE"}
+_MX_FAMILY_DISPLAY_NAMES = {
+    "Qwen3MoeForCausalLM": "Qwen3 MoE",
+    "DeepseekV3ForCausalLM": "DeepSeek-V3",
+}
 
 
 def _documented_family(profile: PostTransformProfile) -> str:
@@ -1474,6 +1499,11 @@ _MX_E2E_ROWS = {
         "qwen3-moe-bf16",
         "qwen3-moe",
         "TRTLLM_MX_QWEN3_MOE_MODEL",
+    ),
+    "deepseek-v3-for-causal-lm-bf16-cutlass-target-v1": (
+        "deepseek-v3-bf16",
+        "deepseek-v3",
+        "TRTLLM_MX_DEEPSEEK_V3_MODEL",
     ),
     "qwen3-for-causal-lm-fp8-block-sm90-target-v1": (
         "qwen3-fp8-block",
@@ -3768,6 +3798,14 @@ _UNQUALIFIED_RUNTIME_VARIANTS = [
             None,
             id="qwen3-moe",
         ),
+        pytest.param(
+            modeling_deepseekv3_mod.DeepseekV3ForCausalLM,
+            "DeepseekV3ForCausalLM",
+            "deepseek_v3",
+            True,
+            None,
+            id="deepseek-v3",
+        ),
     ],
 )
 def test_bf16_profiles_reject_unqualified_runtime_variants(
@@ -3973,6 +4011,14 @@ def test_qwen3_tied_profile_rejects_unqualified_runtime_variants(
             {"rope_fusion": True},
             "rope_fusion",
             id="qwen3-moe-fused-rope",
+        ),
+        pytest.param(
+            modeling_deepseekv3_mod.DeepseekV3ForCausalLM,
+            "DeepseekV3ForCausalLM",
+            "deepseek_v3",
+            {"rope_fusion": False},
+            "rope_fusion",
+            id="deepseek-v3-unfused-rope",
         ),
         pytest.param(
             modeling_qwen3_mod.Qwen3ForCausalLM,
