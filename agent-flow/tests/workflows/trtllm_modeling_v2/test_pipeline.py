@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
+from agent_flow.workflows.trtllm_modeling_v2.agents.turns import TurnTimeout
 from agent_flow.workflows.trtllm_modeling_v2.checks import gate_cli
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.git import CommitIdentity, CommitPolicy
@@ -27,6 +28,7 @@ from agent_flow.workflows.trtllm_modeling_v2.run.integration import (
     Integration,
     load_labels,
     own_paths,
+    worktree_block,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import NOTES_FILENAME
 from agent_flow.workflows.trtllm_modeling_v2.run.state import (
@@ -369,6 +371,24 @@ def test_core_spent_ends_the_run_not_onboarded_and_the_report_says_where(
     assert "## Done\n\n(none)" in "\n".join(report)
 
 
+def test_a_turn_that_raises_or_runs_out_of_time_is_a_failed_attempt_with_why(
+    tmp_path, task_file, monkeypatch
+):
+    def core(attempt, prompt):
+        if attempt == 1:
+            raise TurnTimeout("003-assembler: no answer within 60s; the turn was stopped.")
+        if attempt == 2:
+            raise OSError("the CLI could not be started")
+        return READY
+
+    script = Script(assembler=_by_task({"core": core}))
+    calls = _run(tmp_path, _spec(task_file), monkeypatch, script)
+    second, third = _prompts(calls, "core")[1:]
+    assert "its turn raised TurnTimeout: 003-assembler: no answer within 60s" in second
+    assert "its turn raised OSError: the CLI could not be started" in third
+    assert _tasks(tmp_path)[1]["attempts"] == 3 and _state(tmp_path).onboarded
+
+
 def test_a_worker_that_never_gets_core_ready_stops_the_run_with_its_own_reason(
     tmp_path, task_file, monkeypatch
 ):
@@ -477,6 +497,40 @@ def test_a_check_that_cannot_be_run_is_a_failed_line_not_a_crash(tmp_path, task_
     assert said in _verdicts(tmp_path)[2]["detail"]
     # It goes to the one fix task with everything else that failed.
     assert said in _prompts(calls, "fix-1")[0]
+
+
+def test_a_check_the_infrastructure_ended_runs_once_more_and_is_no_verdict_of_its_own(
+    tmp_path, task_file, monkeypatch
+):
+    inner = _checks()
+    lost = {"left": 1}
+
+    def shell(command, env=None, timeout=0):
+        if "/eval." in command and lost["left"]:
+            lost["left"] -= 1
+            inner.ran.append("tp1:accuracy (session lost)")
+            return CommandResult(returncode=1, infrastructure="the allocation ended under it")
+        return inner(command, env, timeout)
+
+    calls = _run(tmp_path, _spec(task_file), monkeypatch, Script(), shell_runner=shell)
+    # Not the worker's failure and not the target's: the check runs again in the same
+    # attempt, and what is recorded is the verdict of the run that measured something.
+    assert inner.ran == ["tp1:boot", "tp1:accuracy (session lost)", "tp1:accuracy"]
+    assert len(calls) == 1 and _tasks(tmp_path)[1]["attempts"] == 1
+    assert [v["passed"] for v in _verdicts(tmp_path)] == [True, True]
+    journal = (tmp_path / "ws" / "journal.md").read_text()
+    assert (
+        "check without a verdict**: tp1:accuracy[gsm8k]: the allocation ended under it" in journal
+    )
+    # Lost twice running, it is recorded as not passed, and the attempt fails on it.
+    lost["left"] = 2
+    task = _spec(task_file, KV_FP8)
+    (tmp_path / "ws" / ".trtllm_modeling_v2_state.json").unlink()
+    (tmp_path / "ws" / "tasks.yaml").unlink()
+    (tmp_path / "ws" / "contract_status.jsonl").unlink()
+    calls = _run(tmp_path, task, monkeypatch, Script(), shell_runner=shell, max_attempts=1)
+    assert _state(tmp_path).onboarded == {} and len(calls) == 1
+    assert "did not run to a verdict: the allocation ended under it" in _tasks(tmp_path)[1]["note"]
 
 
 # ----------------------------------------------------------------------- the final pass
@@ -719,11 +773,17 @@ def test_a_new_start_reopens_what_was_not_done_within_its_grants(tmp_path, task_
     task = _spec(task_file, KV_FP8)
     script = Script(assembler=_by_task({"kv_fp8": BLOCKED}))
 
-    def turns() -> int:
+    def turns(script=script) -> int:
         return len(_prompts(_run(tmp_path, task, monkeypatch, script), "kv_fp8"))
 
     # Its own three attempts, then fresh ones on each of two more starts, and no more.
-    assert [turns() for _ in range(4)] == [3, 3, 3, 0]
+    assert [turns() for _ in range(2)] == [3, 3]
+    # A fresh attempt has the same number as one of the earlier set: the decision that one
+    # left is not taken for this one's when its worker writes none.
+    silent = Script(assembler=_by_task({"kv_fp8": lambda attempt, prompt: None}))
+    assert turns(silent) == 6  # each attempt: its turn, then the one asked to write the file
+    assert "wrote no valid decision file" in _tasks(tmp_path)[2]["note"]
+    assert turns() == 0
     stands = {t["id"]: t for t in _tasks(tmp_path)}
     assert (stands["kv_fp8"]["status"], stands["kv_fp8"]["grants"]) == ("not done", 2)
     assert "`kv_fp8` | deployment | kv_fp8 | not done | 3 | 2 |" in _report(tmp_path)
@@ -948,6 +1008,29 @@ def test_uncommitted_work_or_a_commit_that_breaks_the_rules_does_not_land(tmp_pa
     assert _git(repo, "rev-list", "--merges", "--count", "HEAD") == "0"
 
 
+def test_a_worker_whose_branch_is_behind_the_checkout_is_told_to_rebase_first(tmp_path):
+    repo = _checkout(tmp_path)
+    integration = _integration(repo, tmp_path)
+    tree = integration.open("kv_fp8")
+    assert "## Your branch is behind the checkout" not in worktree_block(tree, repo)
+    # An earlier attempt left a commit of its own; other tasks have landed since.
+    (tree / FAMILY / "a.py").write_text("A = 2\n")
+    _git(tree, "commit", "-q", "-am", f"kv{_SIGNED}")
+    (repo / "shared.py").write_text("S = 2\n")
+    _git(repo, "commit", "-q", "-am", f"other{_SIGNED}")
+    head = _git(repo, "rev-parse", "HEAD")
+    said = worktree_block(integration.open("kv_fp8"), repo)
+    assert f"You work in `{tree}`" in said and "## Your branch is behind the checkout" in said
+    assert "1 commit(s) landed on the checkout after your branch was cut" in said
+    assert f"    git -C {tree} rebase {head}" in said
+    # A branch with nothing of its own is simply moved to the head: nothing to rebase.
+    fresh = integration.open("tep2")
+    (repo / "shared.py").write_text("S = 3\n")
+    _git(repo, "commit", "-q", "-am", f"another{_SIGNED}")
+    assert "is behind the checkout" not in worktree_block(integration.open("tep2"), repo)
+    assert _git(fresh, "rev-parse", "HEAD") == _git(repo, "rev-parse", "HEAD")
+
+
 def test_a_commit_lands_labelled_by_its_paths_and_only_a_judge_path_is_refused(tmp_path):
     repo = _checkout(tmp_path)
     integration = _integration(repo, tmp_path)
@@ -1095,6 +1178,9 @@ def test_on_a_real_checkout_core_lands_only_the_commit_the_onboard_check_passed(
     tree = _git(repo, "rev-parse", f"{onboarded}^{{tree}}")
     assert {v["tree"].split("+")[0] for v in _verdicts(tmp_path)[:2]} == {tree}
     assert {v["commit"] for v in _verdicts(tmp_path)[:2]} == {onboarded}
+    # With the libraries of the tree that was measured, which here are not the checkout's.
+    assert {v["tree"].split("+")[1] for v in _verdicts(tmp_path)[:2]} == {record["libraries"]}
+    assert record["libraries"] != contract_mod.library_digest(repo)
     # The libraries it accepted are not the checkout's: kept beside the record, and said.
     kept = workspace / "onboarded_libraries" / "tensorrt_llm" / "libs" / "libtensorrt_llm.so"
     assert kept.read_bytes() == b"rebuilt"
@@ -1116,6 +1202,8 @@ def test_on_a_real_checkout_core_lands_only_the_commit_the_onboard_check_passed(
     assert "tensorrt_llm/evaluate/lm_eval.py is a judge path" in stands["tep2"]["note"]
     assert not (repo / "tensorrt_llm/evaluate").exists()
     assert "an easier judge" not in _git(repo, "log", "--format=%s")
+    # One short turn to put the branch right, and no more.
+    assert len(_prompts(calls, "tep2")) == 2
     assert "## Your finished work could not be integrated" in _prompts(calls, "tep2")[1]
     assert report.startswith(f"# onboarded: commit `{onboarded}`")
     final = report.split("## Final pass")[1].split("##")[0]
@@ -1153,6 +1241,10 @@ def test_a_worker_that_commits_nothing_is_still_held_to_the_onboard_check(
     goal = _prompts(calls, "fix-1")[0]
     assert f"- git:target-committed at {base[:12]}: uncommitted, so a clone would not have" in goal
     assert "[FAIL] git:target-committed at `" in _report(tmp_path)
+    # The target's own tests ran there too; a run that left no report is no pass.
+    assert f"- tests at {base[:12]}: INCOMPLETE (pytest exited 0)" in goal
+    final = _report(tmp_path).split("## Final pass")[1].split("##")[0]
+    assert "[ok] tests:modules at `" in final and "[FAIL] tests at `" in final
     # The target was there already: what the check judges is the head as it is. Its
     # failure is the attempt's result line, word for word, with no turn to "put it right".
     assert shell.ran == ["tp1:boot", "tp1:boot", "tp1:accuracy"]
@@ -1160,6 +1252,49 @@ def test_a_worker_that_commits_nothing_is_still_held_to_the_onboard_check(
     assert "core (attempt 1 of 3): pending UNIT_READY: [FAIL] tp1:boot: " in journal
     assert _state(tmp_path).onboarded["commit"] == base == _git(repo, "rev-parse", "HEAD")
     assert _tasks(tmp_path)[1]["attempts"] == 2
+
+
+def test_a_process_that_died_after_the_commit_landed_goes_on_without_checking_again(
+    tmp_path, task_file, repo, monkeypatch
+):
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.name", "T")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", f"base{_SIGNED}")
+
+    def core(attempt, prompt):
+        tree = Path(re.search(r"You work in `([^`]+)`", prompt).group(1))
+        (tree / FAMILY / "a.py").write_text("A = 1\n")
+        _git(tree, "add", f"{FAMILY}/a.py")
+        _git(tree, "commit", "-q", "-m", f"core{_SIGNED}")
+        return READY
+
+    shell = _checks()
+    kwargs = dict(git_runner=None, shell_runner=shell)
+    script = Script(assembler=_by_task({"core": core}))
+    _run(tmp_path, _spec(task_file), monkeypatch, script, **kwargs)
+    landed = _git(repo, "rev-parse", "HEAD")
+    record = _state(tmp_path).onboarded
+    assert record["commit"] == landed and shell.ran == ["tp1:boot", "tp1:accuracy"]
+    # As the workspace stood had the process died between the fast-forward and its records:
+    # the task still running, no onboard record, the worktree already removed.
+    workspace = tmp_path / "ws"
+    tasks = yaml.safe_load((workspace / "tasks.yaml").read_text())
+    tasks["tasks"][1]["status"], tasks["closed"] = "running", False
+    (workspace / "tasks.yaml").write_text(yaml.safe_dump(tasks))
+    state = load_state(workspace / ".trtllm_modeling_v2_state.json")
+    state.onboarded = {}
+    save_state(workspace / ".trtllm_modeling_v2_state.json", state)
+    calls = _run(tmp_path, task_file, monkeypatch, script, **kwargs)
+    # The worker's answer stands, the branch is not landed twice, and what passed before the
+    # commit went in is not measured again: the record is written from the ledger.
+    assert calls == [] and shell.ran == ["tp1:boot", "tp1:accuracy"]
+    assert _git(repo, "rev-parse", "HEAD") == landed
+    again = _state(tmp_path).onboarded
+    assert (again["commit"], again["accuracy"], again["ref"]) == (landed, "judged", record["ref"])
+    assert _tasks(tmp_path)[1]["status"] == "done" and _tasks(tmp_path)[1]["commit"] == landed
+    assert _report(tmp_path).startswith(f"# onboarded: commit `{landed}`")
 
 
 def test_the_onboard_record_stands_when_the_accepted_libraries_cannot_be_kept(

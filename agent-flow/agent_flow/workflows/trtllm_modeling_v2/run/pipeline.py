@@ -52,7 +52,6 @@ from ..agents.prompts._render import render_template
 from ..agents.prompts.kernel import KernelContext, kernel_prompt
 from ..agents.prompts.survey import capture_lists_block
 from ..agents.prompts.tags import tag_section, task_tags
-from ..agents.turns import TurnTimeout
 from ..checks import conventions, gate_cli
 from ..infra.files import write_text_atomic
 from ..operators.coverage import (
@@ -311,9 +310,7 @@ class Pipeline:
             self._save()
             try:
                 result = self._work(task, resumed)
-            except TurnTimeout as exc:
-                result = TurnResult(error=f"its turn ran out of time: {exc}")
-            except Exception as exc:  # the turn's own failure, not the pipeline's
+            except Exception as exc:  # the turn's own failure (a timeout too), not the pipeline's
                 result = TurnResult(error=f"its turn raised {type(exc).__name__}: {exc}")
         task.decision = result.decision
         task.summary = first_paragraph(result.data.get("summary"))

@@ -44,9 +44,6 @@ CHECKOUT_WORKERS = 16
 _CHECKOUT = ("-c", f"checkout.workers={CHECKOUT_WORKERS}")
 #: A ``git worktree add`` that failed is cleaned up and tried again after this.
 ADD_RETRY_S = 5.0
-#: Each integrated task's branch tip, so a task whose integration a restart
-#: interrupted is not integrated a second time.
-INTEGRATED_FILENAME = "integrated.json"
 #: In the workspace: the label of every commit the run landed, for the report.
 COMMIT_LABELS_FILENAME = "commit_labels.json"
 #: A fast-forward that meets another git process's index lock is tried again.
@@ -216,51 +213,15 @@ class Integration:
         self._git(self.repo, "worktree", "remove", "--force", "--force", str(tree))
         shutil.rmtree(tree, ignore_errors=True)
 
-    def _integrated(self) -> dict[str, str]:
-        path = self.root / INTEGRATED_FILENAME
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-        return record if isinstance(record, dict) else {}
-
-    def integrated_tip(self, task_id: str) -> str:
-        """The branch tip last integrated for ``task_id``, or empty when none is recorded."""
-        return str(self._integrated().get(task_id) or "")
-
-    def _record(self, task_id: str, tip: str) -> None:
-        record = {**self._integrated(), task_id: tip}
-        self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / INTEGRATED_FILENAME).write_text(json.dumps(record, indent=1), encoding="utf-8")
-
-    def _already_in(self, task_id: str) -> bool:
-        """The task's branch went in before, and is in the checkout as it was then.
-
-        A process that dies between a task's fast-forward and its checkpoint
-        resumes the task, and its worker's decision is read again; the branch
-        must not be integrated twice, from a worktree half removed.
-        """
-        tip = self.integrated_tip(task_id)
-        if not tip:
-            return False
-        current = git_checked(
-            self.repo, "rev-parse", "--verify", "--quiet", self.branch(task_id), check=False
-        )
-        if current.strip() != tip:
-            return False
-        return self._git(self.repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode == 0
-
     def integrate(self, task_id: str, check: Callable[[Path, str], str] | None = None) -> Outcome:
         """Rebase the task's branch onto the checkout's head and fast-forward it in.
 
         ``check(tree, commit)`` runs on the rebased, clean worktree before the checkout
-        moves; what it returns, when not empty, is why the branch does not land.
+        moves; what it returns, when not empty, is why the branch does not land. A branch
+        that is in the checkout already (a process stopped between the fast-forward and
+        its records) has nothing to integrate, and its check finds its pass on record.
         """
         tree, branch = self.tree(task_id), self.branch(task_id)
-        if self._already_in(task_id):
-            # Checked before it went in: a process that stopped there does not check again.
-            tip = self.integrated_tip(task_id)
-            return Outcome(True, f"{branch} was integrated before the restart", tip)
         if not (tree / ".git").exists():
             return Outcome(False, f"task {task_id} has no worktree at {tree}")
         if _rebase_in_progress(tree):
@@ -322,7 +283,6 @@ class Integration:
             if merged.returncode != 0:
                 # The checkout moved while the check ran, or git refused: nothing landed.
                 return Outcome(False, f"fast-forward of {branch} failed: {merged.stderr.strip()}")
-            self._record(task_id, tip)
             self._label(task_id, head, branch)
         said = (
             f"integrated {branch} ({ahead} commit(s))" if ahead != "0" else "nothing to integrate"

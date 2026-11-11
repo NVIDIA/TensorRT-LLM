@@ -117,7 +117,6 @@ def measure(
                 tree=tree,
                 workspace=workflow.workspace,
                 runner=workflow._shell_runner_override,
-                devices=tuple(workflow._state.devices) or None,
                 relative_score=relative,
                 measure_base=False,
             )
