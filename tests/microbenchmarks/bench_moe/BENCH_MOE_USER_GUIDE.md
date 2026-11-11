@@ -716,6 +716,8 @@ Supported layouts are pure EP and pure MoE TP without attention DP; the pooler,
 unpooler, and dense router projection are outside the routed-expert benchmark.
 The fixed release's MXFP4/MXFP8 implementations do not return unfinalized
 expert outputs required by this norm; do not substitute a norm of their sum.
+Its NCCL reduction rejects element counts above signed int32 so that
+overflowing counts cannot be reported as successful performance measurements.
 
 `mistral_large_4` uses FP32 softmax routing, normalized top-4 weights and
 plain SwiGLU. Its routed intermediate size is 6144; the dense MLP width
