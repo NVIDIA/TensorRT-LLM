@@ -313,22 +313,47 @@ def test_k3_fused_moe(case, m):
     assert det and ulp_m8 <= 1 and rearmed
 
 
-def test_k3_fused_moe_mixed_m_sequence():
-    """M 8, 1, 5, 2, 8, 7 back to back on one stream: each call the bits of the same call alone (the scratch the
-    calls share is re-armed by each)."""
+@pytest.mark.parametrize(
+    "routing_cases",
+    [
+        pytest.param(("random",) * 6, id="random"),
+        pytest.param(
+            (
+                "16_local_disjoint",
+                "none_local",
+                "4_local",
+                "none_local",
+                "16_local_disjoint",
+                "none_local",
+            ),
+            id="empty-full-transitions",
+        ),
+    ],
+)
+def test_k3_fused_moe_mixed_m_sequence(routing_cases):
+    """Changing M and local group counts preserves output bits and re-arms shared scratch after each call."""
     _ops()
     proc, _, bias = _experts()
-    logits8, x8 = _tokens("random")
-    alone = {
-        m: _fused(proc, bias, x8[:m].contiguous(), logits8[:m].contiguous())
-        for m in (1, 2, 5, 7, 8)
-    }
-    seq = [
-        (m, _fused(proc, bias, x8[:m].contiguous(), logits8[:m].contiguous()))
-        for m in (8, 1, 5, 2, 8, 7)
-    ]
-    assert all(torch.equal(_bits(y), _bits(alone[m])) for m, y in seq)
-    assert _scratch_rearmed()
+    sequence = tuple(zip((8, 1, 5, 2, 8, 7), routing_cases))
+    alone = {}
+    for num_tokens, case in sequence:
+        if (num_tokens, case) not in alone:
+            logits8, x8 = _tokens(case)
+            alone[num_tokens, case] = _fused(
+                proc, bias, x8[:num_tokens].contiguous(), logits8[:num_tokens].contiguous()
+            )
+    for num_tokens, case in sequence:
+        logits8, x8 = _tokens(case)
+        output = _fused(
+            proc, bias, x8[:num_tokens].contiguous(), logits8[:num_tokens].contiguous()
+        )
+        assert torch.equal(_bits(output), _bits(alone[num_tokens, case])), (num_tokens, case)
+        if case == "none_local":
+            assert bool((output == 0).all()), num_tokens
+        else:
+            assert bool(torch.isfinite(output).all()), (num_tokens, case)
+            assert bool((output != 0).any()), (num_tokens, case)
+        assert _scratch_rearmed(), (num_tokens, case)
 
 
 def test_k3_fused_moe_partial_rows_past_m():

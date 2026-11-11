@@ -932,7 +932,7 @@ _r0_kernel_cache: dict = {}
 def _compile_gvr_direct(kernel):
     """Compile a ``GvrTopKKernel`` with symbolic shapes, mirroring the
     production runner's fake-tensor construction (128-bit loads, no
-    ``order_row`` / ``output_values``)."""
+    ``order_row`` and optional ``output_values``)."""
     n_rows, n_cols, n_batch = cute.sym_int(), cute.sym_int(), cute.sym_int()
     in_f = _crt.make_fake_compact_tensor(
         kernel.dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=16
@@ -944,11 +944,75 @@ def _compile_gvr_direct(kernel):
     oi_f = _crt.make_fake_compact_tensor(
         cutlass.Int32, (n_rows, kernel.top_k), stride_order=(1, 0), assumed_align=16
     )
+    ov_f = (
+        _crt.make_fake_compact_tensor(
+            kernel.dtype, (n_rows, kernel.top_k), stride_order=(1, 0), assumed_align=16
+        )
+        if kernel.return_output_values
+        else None
+    )
     fs = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
     # __call__(input, pre_idx, seq_lens, output_values, output_indices, order_row, stream)
     return cute.compile(
-        kernel, in_f, pi_f, sl_f, None, oi_f, None, stream=fs, options="--enable-tvm-ffi"
+        kernel, in_f, pi_f, sl_f, ov_f, oi_f, None, stream=fs, options="--enable-tvm-ffi"
     )
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("cluster_size", [1, 4], ids=["solo", "cluster"])
+def test_cute_dsl_gvr_topk_decode_phase_values(cluster_size, tie_aware_check):
+    """Values must track indices through reseeding and plateau emission."""
+    num_rows, num_candidates, top_k = 3, 32768, 1024
+    logits, pre_idx, seq_lens = _make_inputs_impl(
+        num_rows, num_candidates, top_k, torch.float32, next_n=1, seed=29
+    )
+    logits[1].fill_(5.0)
+    logits[2].fill_(-1.0)
+    permutation = torch.randperm(num_candidates, device="cuda")
+    num_winners, plateau_size = 512, 8500
+    logits[2, permutation[:num_winners]] = (
+        5.0 + torch.arange(num_winners, device="cuda", dtype=torch.float32) * 0.01
+    )
+    logits[2, permutation[num_winners : num_winners + plateau_size]] = 1.0
+    # Worst-case reseeding hints, but keep the documented slot-0 invariant
+    # (pre_idx[..., 0] = per-group argmax) that the indexer relies on.
+    pre_idx.zero_()
+    pre_idx[:, 0] = logits.argmax(dim=1).to(torch.int32)
+    kernel = _GvrTopKKernel(
+        dtype=cutlass.Float32,
+        top_k=top_k,
+        next_n=1,
+        num_threads=512,
+        compress_ratio=1,
+        use_256bit_load=False,
+        min_blocks_per_mp=1,
+        cluster_size=cluster_size,
+        return_output_values=True,
+        enable_r0=False,
+    )
+    compiled = _compile_gvr_direct(kernel)
+    out_indices = torch.full((num_rows, top_k), -7, dtype=torch.int32, device="cuda")
+    out_values = torch.full(
+        (num_rows, top_k), float("nan"), dtype=torch.float32, device="cuda"
+    )
+    compiled(logits, pre_idx, seq_lens, out_values, out_indices, None)
+    torch.cuda.synchronize()
+
+    _gvr_check(tie_aware_check, out_indices, logits, seq_lens, top_k, 1)
+    # Output values must be bitwise the logits at the emitted indices.
+    assert torch.equal(out_values, torch.gather(logits, 1, out_indices.long()))
+    reference_values = torch.topk(logits, top_k, dim=1).values
+    assert torch.equal(out_values.sort(dim=1, descending=True).values, reference_values)
+    # Row 1 is one whole tie class with n_eff > top_k: membership is only
+    # tie-interchangeable, so check uniqueness/range and value fidelity
+    # instead of pinning a specific index set or order.
+    row1 = out_indices[1].to(torch.int64)
+    assert int(row1.min().item()) >= 0 and int(row1.max().item()) < num_candidates
+    assert int(torch.unique(row1).numel()) == top_k
+    assert torch.equal(out_values[1], torch.full_like(out_values[1], 5.0))
+    # Row 2: distinct winners, then a tie plateau that must spill into top-K.
+    assert int((out_values[2] >= 5.0).sum().item()) == num_winners
+    assert int((out_values[2] == 1.0).sum().item()) == top_k - num_winners
 
 
 def _run_gvr_direct(logits, pre_idx, seq_lens, top_k, enable_r0, cluster_size):
