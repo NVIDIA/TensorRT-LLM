@@ -10,7 +10,7 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, List,
 
 import torch
 
-from tensorrt_llm._profiler import MetadataValue, record_function_with_metadata
+from tensorrt_llm._profiler import MetadataValue, record_workflow_scope
 from tensorrt_llm._utils import prefer_pinned, wait_event
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig,
@@ -1322,9 +1322,8 @@ class CUDAGraphRunner:
                 (key.batch_size * self.max_beam_width - key.num_contexts) *
                 token_per_generation)
 
-    @record_function_with_metadata(
-        "trtllm::cuda_graph_capture",
-        metadata_factory=_decoder_capture_workflow_metadata)
+    @record_workflow_scope("trtllm::cuda_graph_capture",
+                           metadata_factory=_decoder_capture_workflow_metadata)
     def capture(
         self,
         key: KeyType,
@@ -1465,9 +1464,8 @@ class CUDAGraphRunner:
         else:
             step_inputs.copy_(dst, src)
 
-    @record_function_with_metadata(
-        "trtllm::cuda_graph_replay",
-        metadata_factory=_decoder_replay_workflow_metadata)
+    @record_workflow_scope("trtllm::cuda_graph_replay",
+                           metadata_factory=_decoder_replay_workflow_metadata)
     def replay(
         self,
         key: KeyType,
@@ -3545,9 +3543,8 @@ class EncoderCUDAGraphRunner:
                                         sequence_length])
         return torch.cat(output_slices, dim=0)
 
-    @record_function_with_metadata(
-        "trtllm::cuda_graph_capture",
-        metadata_factory=_encoder_capture_workflow_metadata)
+    @record_workflow_scope("trtllm::cuda_graph_capture",
+                           metadata_factory=_encoder_capture_workflow_metadata)
     def capture(
         self,
         key: EncoderKeyType,
@@ -3753,9 +3750,8 @@ class EncoderCUDAGraphRunner:
         self.num_feature_replays += 1
         return self.graph_outputs[key]
 
-    @record_function_with_metadata(
-        "trtllm::cuda_graph_replay",
-        metadata_factory=_encoder_replay_workflow_metadata)
+    @record_workflow_scope("trtllm::cuda_graph_replay",
+                           metadata_factory=_encoder_replay_workflow_metadata)
     def replay(
         self,
         key: EncoderKeyType,
