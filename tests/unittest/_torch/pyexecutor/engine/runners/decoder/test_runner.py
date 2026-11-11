@@ -1097,3 +1097,18 @@ def test_live_row_word_keeps_every_row_of_a_helix_cp_slice(helix: bool) -> None:
         # A launch over the whole forward keeps the 20 rows of the 5 real requests.
         assert word == live_rows.encode(_LIVE_REAL, _LIVE_REQUESTS)
         assert rows // _LIVE_REQUESTS * _LIVE_REAL == 20
+
+
+@pytest.mark.cpu_only
+def test_decoder_skips_the_live_row_word_until_a_kernel_reads_it() -> None:
+    """A model without a kernel that reads the word pays nothing for it on any forward."""
+    engine, _, resources, inputs = _padded_decode()
+    with (
+        patch(
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs.torch.cuda.Event",
+            return_value=Mock(),
+        ),
+        patch.object(decoder_runner_module, "forward_word") as forward_word,
+    ):
+        engine.forward(inputs, resource_manager=resources)
+    forward_word.assert_not_called()

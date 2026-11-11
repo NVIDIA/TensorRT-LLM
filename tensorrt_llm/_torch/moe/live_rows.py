@@ -98,6 +98,15 @@ class LiveRowWord:
         self._tensor: Optional[torch.Tensor] = None
         self._writes = True
 
+    @property
+    def read_by_kernels(self) -> bool:
+        """Whether a kernel has allocated the word and its writes reach the device.
+
+        Until then a write would only be recorded, and the forward that allocates the word
+        keeps every row, so the engine need not compute the word.
+        """
+        return self._tensor is not None and self._writes
+
     def tensor(self, device: torch.device) -> torch.Tensor:
         if self._tensor is None:
             if torch.cuda.is_current_stream_capturing():
