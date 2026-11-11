@@ -50,6 +50,7 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .block_verification import block_verification_enabled, verify_drafts
 
 
 @triton.jit
@@ -2775,14 +2776,30 @@ class SpecWorkerBase(nn.Module, ABC):
                 batch_size,
                 slot=spec_metadata.rng_accept_slot)
 
-            gen_accepted, gen_num_accepted = rejection_sampling_one_model(
-                draft_probs=full_draft_probs,
-                draft_token_ids=full_draft_tokens,
-                target_probs=target_probs,
-                deterministic=True,
-                seed=seed,
-                offset=offset,
-            )
+            if block_verification_enabled() and not is_ragged:
+                # Joint (block) verification: lossless like the token-level
+                # rule below, and it accepts at least as many drafts. Batches
+                # above TRTLLM_SPEC_BLOCK_VERIFICATION_MAX_BATCH, and ragged
+                # (confidence-scheduled) windows, keep the token-level rule.
+                gen_accepted, gen_num_accepted = verify_drafts(
+                    full_draft_tokens,
+                    full_draft_probs,
+                    target_probs,
+                    seed,
+                    offset,
+                    slot_ids=spec_metadata.batch_slot_ids[num_contexts:
+                                                          batch_size],
+                    dummy_slot=spec_metadata.dummy_slot_row,
+                    token_level=rejection_sampling_one_model)
+            else:
+                gen_accepted, gen_num_accepted = rejection_sampling_one_model(
+                    draft_probs=full_draft_probs,
+                    draft_token_ids=full_draft_tokens,
+                    target_probs=target_probs,
+                    deterministic=True,
+                    seed=seed,
+                    offset=offset,
+                )
 
             if self.force_num_accepted_tokens != 0.0:
                 # Fill gen_accepted positions 1..runtime_draft_len with all draft tokens
