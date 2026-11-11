@@ -41,6 +41,16 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.fixture(autouse=True)
+def _isolate_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Clock patches must not change time.sleep/monotonic for other threads.
+    monkeypatch.setattr(
+        hang_detector_module,
+        "time",
+        SimpleNamespace(monotonic=time.monotonic, sleep=time.sleep),
+    )
+
+
 def test_detector_fires_after_timeout():
     fired = []
     hd = HangDetector(timeout=2, on_detected=lambda: fired.append(time.monotonic()))
@@ -172,13 +182,9 @@ def test_pause_suppresses_detection():
 def test_status_provider_errors_are_logged(monkeypatch):
     events = []
 
-    async def no_sleep(_timeout):
-        pass
-
     def failing_provider():
         raise RuntimeError("provider failed")
 
-    monkeypatch.setattr(hang_detector_module.asyncio, "sleep", no_sleep)
     monkeypatch.setattr(
         hang_detector_module,
         "_best_effort_log_error",
@@ -286,18 +292,8 @@ def test_rank_crash_kill_fires_for_multi_rank(monkeypatch):
 
 
 def _assert_slept_then_killed(order, grace):
-    """Assert the grace was slept out EXACTLY ONCE before EXACTLY ONE kill.
-
-    Patching time.sleep is process-wide, so an unrelated background thread can
-    append its own ("sleep", x) while this runs; asserting exact list equality
-    would flake on that. But the counts must still be pinned: sleeping the
-    grace twice before killing (i.e. crash + 2*grace) is precisely the bug
-    class this PR series introduced with its two independent timers, and a
-    membership-only check accepts it.
-    """
-    assert order.count(("sleep", grace)) == 1, order
-    assert order.count("kill") == 1, order
-    assert order.index(("sleep", grace)) < order.index("kill"), order
+    """Assert exactly one grace wait followed by exactly one kill."""
+    assert order == [("sleep", grace), "kill"]
 
 
 def test_rank_crash_kill_sleeps_grace_before_kill(monkeypatch):
@@ -425,10 +421,10 @@ def test_watchdog_cancel_disarms_this_timer(monkeypatch):
         watchdog.join(timeout=60.0)
 
 
-def test_watchdog_deadline_is_grace_from_arming(monkeypatch):
-    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "5")
+def test_watchdog_deadline_is_grace_from_arming(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: 1000.0)
     watchdog = hang_detector_module.RankCrashKillWatchdog(world_size=2, grace=5.0)
-    assert watchdog.deadline == pytest.approx(time.monotonic() + 5.0, abs=0.5)
+    assert watchdog.deadline == 1005.0
 
 
 def test_kill_keeps_original_deadline_on_handover(monkeypatch):
@@ -1060,12 +1056,13 @@ def test_watchdog_threads_the_delivery_event_through(monkeypatch):
         hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
     )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
+    monkeypatch.setattr(hang_detector_module.RankCrashKillWatchdog, "start", lambda self: None)
 
     delivered = threading.Event()
     delivered.set()
     wd = start_rank_crash_kill_watchdog(4, error_delivered=delivered)
     assert wd is not None
-    wd.join(timeout=5)
+    wd.run()
 
     assert calls == [], "watchdog killed despite a delivered error"
 

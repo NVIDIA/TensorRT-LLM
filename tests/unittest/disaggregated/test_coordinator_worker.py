@@ -478,139 +478,17 @@ def test_coordinator_client_configures_empty_delegating_kv_router():
 async def test_coordinator_client_readiness_is_cached():
     config = _make_config([], [], "round_robin", "round_robin")
     client = CoordinatorClient("http://coordinator", config)
-    client._is_ready = True
+    client.cluster_info = AsyncMock(side_effect=[{"is_ready": False}, {"is_ready": True}])
+
+    assert await client.is_ready() is False
+    assert await client.is_ready() is True
+    assert client.cluster_info.await_count == 2
+    client.cluster_info.reset_mock()
 
     assert await client.is_ready() is True
+    client.cluster_info.assert_not_awaited()
     assert client._session is None
     await client.stop()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("coordinator_ready", [False, True])
-async def test_lagging_fleet_worker_refreshes_before_rejecting_requests(
-    coordinator_ready: bool,
-) -> None:
-    config = _make_config([], [], "round_robin", "round_robin")
-    healthy = CoordinatorClient("http://coordinator", config)
-    lagging = CoordinatorClient("http://coordinator", config)
-    healthy._is_ready = True
-    lagging.cluster_info = AsyncMock(return_value={"is_ready": coordinator_ready})
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def prepare_servers(info: dict) -> None:
-        started.set()
-        await release.wait()
-
-    lagging._sync_router_server_lists = AsyncMock(side_effect=prepare_servers)
-    assert await healthy.is_ready() is True
-    requests = [asyncio.create_task(lagging.is_ready()) for _ in range(8)]
-    try:
-        await asyncio.wait_for(started.wait(), timeout=5)
-        assert lagging._is_ready is False
-        assert all(not request.done() for request in requests)
-        release.set()
-        results = await asyncio.wait_for(asyncio.gather(*requests), timeout=5)
-        assert results == [coordinator_ready] * len(requests)
-        lagging.cluster_info.assert_awaited_once()
-        lagging._sync_router_server_lists.assert_awaited_once()
-    finally:
-        release.set()
-        for request in requests:
-            request.cancel()
-        await asyncio.gather(*requests, return_exceptions=True)
-        await healthy.stop()
-        await lagging.stop()
-
-
-@pytest.mark.asyncio
-async def test_cancelled_readiness_refresh_releases_sync_lock() -> None:
-    config = _make_config([], [], "round_robin", "round_robin")
-    client = CoordinatorClient("http://coordinator", config)
-    started = asyncio.Event()
-
-    async def fetch_info() -> dict:
-        started.set()
-        await asyncio.Event().wait()
-        return {"is_ready": True}
-
-    client.cluster_info = AsyncMock(side_effect=fetch_info)
-    request = asyncio.create_task(client.is_ready())
-    try:
-        await asyncio.wait_for(started.wait(), timeout=5)
-        request.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await request
-        client.cluster_info.side_effect = None
-        client.cluster_info.return_value = {"is_ready": True}
-        assert await asyncio.wait_for(client.is_ready(), timeout=5) is True
-    finally:
-        request.cancel()
-        await asyncio.gather(request, return_exceptions=True)
-        await client.stop()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("initially_ready", [False, True])
-async def test_readiness_waits_for_background_router_sync(initially_ready: bool) -> None:
-    config = _make_config([], [], "round_robin", "round_robin")
-    client = CoordinatorClient("http://coordinator", config)
-    client._is_ready = initially_ready
-    client.cluster_info = AsyncMock(return_value={"is_ready": True})
-    started = asyncio.Event()
-    release = asyncio.Event()
-    fingerprints_applied = Mock()
-    client._sync_render_fingerprints = fingerprints_applied
-
-    async def prepare_servers(info: dict) -> None:
-        started.set()
-        await release.wait()
-
-    client._sync_router_server_lists = AsyncMock(side_effect=prepare_servers)
-    sync = asyncio.create_task(client._sync_coordinator_state(0))
-    request = None
-    try:
-        await asyncio.wait_for(started.wait(), timeout=5)
-        assert client._is_ready is False
-        request = asyncio.create_task(client.is_ready())
-        await asyncio.sleep(0)
-        assert not request.done()
-        release.set()
-        assert await asyncio.wait_for(request, timeout=5) is True
-        fingerprints_applied.assert_called()
-    finally:
-        sync.cancel()
-        if request is not None:
-            request.cancel()
-            await asyncio.gather(request, return_exceptions=True)
-        await asyncio.gather(sync, return_exceptions=True)
-        await client.stop()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["unready", "fetch", "preparation", "fingerprints"])
-async def test_readiness_stays_false_until_state_sync_recovers(failure: str) -> None:
-    config = _make_config([], [], "round_robin", "round_robin")
-    client = CoordinatorClient("http://coordinator", config)
-    client.cluster_info = AsyncMock(return_value={"is_ready": failure != "unready"})
-    client._sync_router_server_lists = AsyncMock()
-    client._sync_render_fingerprints = Mock()
-    if failure == "fetch":
-        client.cluster_info.side_effect = TimeoutError("coordinator timed out")
-    elif failure == "preparation":
-        client._sync_router_server_lists.side_effect = RuntimeError("server not prepared")
-    elif failure == "fingerprints":
-        client._sync_render_fingerprints.side_effect = ValueError("invalid fingerprint")
-
-    try:
-        assert await client.is_ready() is False
-        client.cluster_info.side_effect = None
-        client.cluster_info.return_value = {"is_ready": True}
-        client._sync_router_server_lists.side_effect = None
-        client._sync_render_fingerprints.side_effect = None
-        assert await client.is_ready() is True
-    finally:
-        await client.stop()
 
 
 @pytest.mark.asyncio
@@ -652,7 +530,13 @@ async def test_cluster_info_updates_readiness_and_local_servers():
     client.ctx_router.remove_server = AsyncMock(wraps=client.ctx_router.remove_server)
     client.ctx_router.add_server = AsyncMock(wraps=client.ctx_router.add_server)
     client.ctx_router.prepare_servers = AsyncMock()
-    client.ctx_router._fetch_server_info = AsyncMock(return_value={})
+
+    async def fetch_server_info(server: str, timeout: float) -> dict:
+        assert client._is_ready is False
+        return {}
+
+    client.ctx_router._fetch_server_info = AsyncMock(side_effect=fetch_server_info)
+    client._is_ready = True
 
     await client._apply_cluster_info(
         {
