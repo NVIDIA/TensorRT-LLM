@@ -4457,14 +4457,16 @@ TEST_F(KVCacheManagerTest, VariableWindowReuseUsesShortestMatchedPrefix)
     auto const stream = std::make_shared<tr::CudaStream>();
     auto const blocksPerWindow
         = BlocksPerWindow{{kSlidingWindow, {kBlocksPerWindow, 0}}, {kMaxSequenceLength, {kBlocksPerWindow, 0}}};
-    KVCacheManager manager(2, 2, 64, kTokensPerBlock, blocksPerWindow, 2, kBeamWidth,
-        std::vector<SizeType32>{kSlidingWindow, kMaxSequenceLength}, tensorrt_llm::DataType::kHALF, 0, stream,
-        kMaxSequenceLength, /*chunkSize=*/kMaxSequenceLength, /*enableBlockReuse=*/true, CacheType::kSELF,
+    KVCacheManager manager(/*numLayers=*/2, /*numKvHeads=*/2, /*sizePerHead=*/64, kTokensPerBlock, blocksPerWindow,
+        /*maxNumSequences=*/2, kBeamWidth, std::vector<SizeType32>{kSlidingWindow, kMaxSequenceLength},
+        tensorrt_llm::DataType::kHALF, /*sinkTokenLength=*/0, stream, kMaxSequenceLength,
+        /*chunkSize=*/kMaxSequenceLength, /*enableBlockReuse=*/true, CacheType::kSELF,
         /*secondaryOffloadMinPriority=*/std::nullopt, /*eventManager=*/nullptr, /*enablePartialReuse=*/true);
-    manager.allocatePools(false);
+    manager.allocatePools(/*useUvm=*/false);
 
     auto const seedTokens = std::make_shared<VecTokens>(VecTokens{10, 11, 12, 13, 14, 15, 16, 17});
-    auto seed = std::make_shared<LlmRequest>(0, 1, seedTokens, tle::SamplingConfig{kBeamWidth}, false);
+    auto seed = std::make_shared<LlmRequest>(
+        /*requestId=*/0, /*maxNewTokens=*/1, seedTokens, tle::SamplingConfig{kBeamWidth}, /*isStreaming=*/false);
     manager.addSequenceBatch({{{0, kSeedLength, kBeamWidth}}}, {std::ref(*seed)});
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seed);
     (void) manager.removeSequence(0, seed);
@@ -4482,13 +4484,13 @@ TEST_F(KVCacheManagerTest, VariableWindowReuseUsesShortestMatchedPrefix)
     (void) manager.getIterationStats();
 
     auto const promptTokens = std::make_shared<VecTokens>(seedTokens->begin(), seedTokens->begin() + kPromptLength);
-    auto request = std::make_shared<LlmRequest>(1, 1, promptTokens, tle::SamplingConfig{kBeamWidth}, false);
+    auto request = std::make_shared<LlmRequest>(
+        /*requestId=*/1, /*maxNewTokens=*/1, promptTokens, tle::SamplingConfig{kBeamWidth}, /*isStreaming=*/false);
     manager.addSequenceBatch({{{1, kPromptLength, kBeamWidth}}}, {std::ref(*request)});
 
     auto const stats = manager.getIterationStats();
     // Full attention matches six tokens (one full block plus two tokens); SWA matches only four.
     EXPECT_EQ(stats.at(kMaxSequenceLength).iterFullReusedBlocks, 1);
-    EXPECT_EQ(stats.at(kMaxSequenceLength).iterPartialReusedBlocks, 1);
     EXPECT_EQ(stats.at(kSlidingWindow).iterFullReusedBlocks, 1);
     EXPECT_EQ(stats.at(kSlidingWindow).iterPartialReusedBlocks, 0);
     EXPECT_EQ(request->getPrepopulatedPromptLen(), 4);

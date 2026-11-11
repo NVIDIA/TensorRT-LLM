@@ -39,6 +39,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestSta
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from utils.util import getSMVersion  # isort: skip
 
@@ -113,7 +114,7 @@ class Scenario:
 
 
 class TestExaoneMoe(unittest.TestCase):
-    @parameterized.expand([63, 65, 85])
+    @parameterized.expand([63, 65, 85, 100, 130])
     @torch.no_grad()
     def test_exaone_moe_prefix_reuse_logits(self, prefix_len: int) -> None:
         """Full and partial prefix hits preserve logits across the sliding window."""
@@ -129,6 +130,8 @@ class TestExaoneMoe(unittest.TestCase):
             num_key_value_heads=1,
             num_experts=4,
             num_experts_per_tok=2,
+            is_moe_layer=[False] * NUM_HIDDEN_LAYERS,
+            mlp_layer_types=["dense"] * NUM_HIDDEN_LAYERS,
             vocab_size=256,
             max_position_embeddings=max_seq_len,
             sliding_window=window_size,
@@ -148,7 +151,10 @@ class TestExaoneMoe(unittest.TestCase):
         prefix = [(i * 7 + 3) % config.vocab_size for i in range(prefix_len)]
         # The prefix ends inside a block, and the suffix crosses the SWA boundary.
         prompt = prefix + [(i * 11 + 5) % config.vocab_size for i in range(48)]
-        windows = [window_size, window_size, window_size, max_seq_len]
+        windows = [
+            window_size if layer_type == "sliding_attention" else max_seq_len
+            for layer_type in config.layer_types
+        ]
         baseline = None
         for block_reuse, partial_reuse, expected_reused in (
             (False, False, 0),
@@ -175,7 +181,10 @@ class TestExaoneMoe(unittest.TestCase):
                     dtype=tensorrt_llm.bindings.DataType.BF16,
                 )
                 try:
-                    self.assertEqual(manager.max_attention_window_vec, [64, 64, 64, None])
+                    self.assertEqual(
+                        manager.max_attention_window_vec,
+                        [None if window == max_seq_len else window for window in windows],
+                    )
                     for request_id, tokens, expected_hit in (
                         (1, prefix, 0),
                         (2, prompt, expected_reused),
@@ -194,6 +203,24 @@ class TestExaoneMoe(unittest.TestCase):
                             self.assertEqual(reused, expected_hit)
                             self.assertEqual(request.context_current_position, expected_hit)
                             self.assertEqual(request.prepopulated_prompt_len, expected_hit)
+                            if request_id == 2 and block_reuse:
+                                stale_blocks = max(
+                                    0, (reused + 1 - window_size) // tokens_per_block
+                                )
+                                sliding_pages = manager.get_batch_cache_indices(
+                                    [request_id], layer_idx=0
+                                )[0]
+                                full_pages = manager.get_batch_cache_indices(
+                                    [request_id], layer_idx=3
+                                )[0]
+                                self.assertEqual(
+                                    sliding_pages[:stale_blocks], [BAD_PAGE_INDEX] * stale_blocks
+                                )
+                                self.assertTrue(
+                                    all(
+                                        page != BAD_PAGE_INDEX for page in full_pages[:stale_blocks]
+                                    )
+                                )
                             remaining = len(tokens) - reused
                             self.assertTrue(manager.resize_context(request, remaining))
                             metadata = get_attention_backend("TRTLLM").Metadata(
@@ -207,7 +234,7 @@ class TestExaoneMoe(unittest.TestCase):
                                 prompt_lens=[remaining],
                                 max_num_requests=1,
                                 max_num_tokens=max_seq_len,
-                                runtime_features=AttentionRuntimeFeatures(cache_reuse=block_reuse),
+                                runtime_features=AttentionRuntimeFeatures(cache_reuse=True),
                             )
                             metadata.prepare()
                             logits = model.forward(
@@ -223,9 +250,10 @@ class TestExaoneMoe(unittest.TestCase):
                             self.assertEqual(logits.shape, (remaining, config.vocab_size))
                             self.assertTrue(torch.isfinite(logits).all().item())
                             if request_id == 2:
-                                if baseline is None:
+                                if not block_reuse:
                                     baseline = logits
                                 else:
+                                    self.assertIsNotNone(baseline)
                                     # Cached prefix rows are omitted from context logits.
                                     torch.testing.assert_close(
                                         logits, baseline[reused:], atol=1e-2, rtol=1e-2
