@@ -8847,13 +8847,14 @@ class PyExecutor:
         """Cap on the summed context attended-KV length (total_kv_len) per forward step, cached.
 
         The KV-cache estimator is the single decision point: it reserves context-MLA workspace only when
-        cached tokens can grow it past the profiled floor, and carries the exact token cap that reserve
-        covers onto the KV manager as `fp8_ctx_mla_kv_len_cap` (`min(L_cap, (budget-fixed)/(k+w))`). The
+        cached tokens can grow it past the profiled floor, and carries the token cap that reserve covers onto
+        the KV manager as `fp8_ctx_mla_kv_len_cap` (`min(L_cap, max(floor, reserve/w))`, the reserve being
+        the split `(budget-fixed)*w/(k+w)` capped at `w*L_cap`, or the workspace floor when larger). The
         scheduler reads that decision directly rather than re-deriving it from pool layout, which V2 overstates
         (`blocks_in_primary_pool` forwards `get_page_index_upper_bound`, not the available-page count).
         A carried value of None -- no affected MLA workspace or no reservation needed -- means no admission
-        cap is applied. A carried 0 is a real cap (a budget so
-        tight the reserve covers under one token), not "no cap", so it must not be collapsed into None.
+        cap is applied. A carried 0 is a real cap (without chunked prefill, a budget smaller than one token's
+        KV and workspace), not "no cap", so it must not be collapsed into None.
         """
         cap = getattr(self, "_ctx_mla_kv_len_cap", "unset")
         if cap != "unset":
@@ -8875,11 +8876,11 @@ class PyExecutor:
         lands here sees context throughput collapse with nothing in the log at default level. Called from
         the cached resolution in `_get_ctx_mla_kv_len_cap`, so it fires at most once per executor.
 
-        Only the memory budget can produce a cap this small: the reserve is clamped to
-        `(budget - fixed) * w / (k + w)` (`get_mla_context_workspace_reserve`) and the cap is that reserve
-        divided by `w`, while the `fp8_context_mla_kv_len_cap` override is floored at `max_seq_len`
-        (`get_mla_context_workspace_kv_len_cap`). So the override is never the cause, and raising it is
-        never the fix -- point at the budget instead.
+        Only the memory budget can produce a cap this small: the cap is `min(L_cap, max(floor, reserve / w))`
+        (`get_mla_context_workspace_reserve`), where the `fp8_context_mla_kv_len_cap` override in `L_cap` is
+        floored at `max_seq_len` (`get_mla_context_workspace_kv_len_cap`), and both the split reserve and,
+        without chunked prefill, the floor shrink with the budget. So the override is never the cause, and
+        raising it is never the fix -- point at the budget instead.
         """
         cap = self._ctx_mla_kv_len_cap
         if cap is None:
@@ -8923,9 +8924,10 @@ class PyExecutor:
         """Trim context requests to the summed attended-KV workspace reservation.
 
         Cached prefixes can push total_kv_len far past `max_num_tokens`.
-        The first request is always kept: the reserve covers either `max_seq_len` or the bounded
-        chunked-prefill partition buffer, so its workspace fits even above the admission cap. Deferred requests stay
-        active and retry next iteration, mirroring `_waiting_requests`.
+        The first request is always kept: the reserve covers what one request can hold with its workspace
+        (at most `max_seq_len` tokens) or, with chunked prefill, the partition buffer of a complete batch, so its
+        workspace fits even above the admission cap. Deferred requests stay active and retry next iteration,
+        mirroring `_waiting_requests`.
         """
         cap = self._get_ctx_mla_kv_len_cap()
         if cap is None or len(context_requests) <= 1:

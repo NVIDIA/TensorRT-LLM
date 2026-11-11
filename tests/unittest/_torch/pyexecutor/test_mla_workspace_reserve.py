@@ -28,6 +28,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 import tensorrt_llm._utils
+from tensorrt_llm._errors import ResourceError
 from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -410,8 +411,6 @@ def test_workspace_reserve_covers_minimum_partition(floor: int) -> None:
 
 
 def test_workspace_reserve_rejects_unaffordable_floor() -> None:
-    from tensorrt_llm._errors import ResourceError
-
     with pytest.raises(ResourceError, match="workspace floor"):
         get_mla_context_workspace_reserve(
             1024, 3, 2, 4096, fixed_bytes=512, min_workspace_tokens=256

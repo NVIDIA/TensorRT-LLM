@@ -5518,8 +5518,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "context-MLA models (e.g. DeepSeek / Kimi with an fp8 KV cache). None (default) reserves for the "
         "never-stall worst case min(max_batch_size, max_num_tokens) * max_seq_len. A smaller value reserves "
         "less workspace (freeing KV cache) and defers context requests whose summed attended KV would "
-        "exceed it; it is floored at max_seq_len and capped at the worst case. Safe at any value -- the "
-        "scheduler enforces it -- trading prefill batching under heavy reuse for KV cache capacity."
+        "exceed it; it is floored at max_seq_len and capped at the worst case. The reserve still covers the "
+        "workspace of one forward step (one request, or 4 * max_num_tokens tokens of staging with chunked "
+        "prefill), so a value below that frees no further KV cache. Safe at any value -- the scheduler "
+        "enforces it -- trading prefill batching under heavy reuse for KV cache capacity."
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
