@@ -34,6 +34,7 @@ profiles:
 | `phi3-for-causal-lm-bf16-target-v1` | `Phi3ForCausalLM` | `Phi3ForCausalLM` / `phi3` | Target model | 1 | `trtllm-phi3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen3_5-for-conditional-generation-bf16-complete-v1` | `Qwen3_5VLModel` | `Qwen3_5ForConditionalGeneration` / `qwen3_5` | Complete model | 1 | `trtllm-qwen3_5-dense-vl-complete-layout-v1` | Single-node dense BF16 vision-language model with its vision encoder, unquantized weights and KV cache, TRTLLM attention, fused QK-norm/M-RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen3-moe-for-causal-lm-bf16-cutlass-target-v1` | `Qwen3MoeForCausalLM` | `Qwen3MoeForCausalLM` / `qwen3_moe` | Target model | 1 | `trtllm-qwen3-moe-cutlass-target-layout-v1` | Single-node MoE BF16, unquantized weights and KV cache, TRTLLM attention, CUTLASS MoE backend, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, MoE TP=1 or 2 and MoE EP=1 or 2 with MoE TP x MoE EP = TP, MoE cluster=1, PP/CP=1, no LoRA, sparse attention, attention DP, MoE load balancer, DWDP, speculative mode, or separately loaded draft model |
+| `qwen3_5-moe-for-conditional-generation-bf16-cutlass-complete-v1` | `Qwen3_5MoeVLModel` | `Qwen3_5MoeForConditionalGeneration` / `qwen3_5_moe` | Complete model | 1 | `trtllm-qwen3_5-moe-vl-cutlass-complete-layout-v1` | Single-node MoE BF16 vision-language model with its vision encoder, unquantized weights and KV cache, TRTLLM attention, CUTLASS MoE backend, fused QK-norm/M-RoPE, untied embeddings, TP=1 or 2, MoE TP=1 or 2 and MoE EP=1 or 2 with MoE TP x MoE EP = TP, MoE cluster=1, PP/CP=1, no LoRA, sparse attention, attention DP, MoE load balancer, DWDP, speculative mode, or separately loaded draft model |
 
 The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, the transfer scope that
@@ -119,14 +120,37 @@ checkpoints that resolve to the exact `Qwen3_5ForConditionalGeneration` /
 Qwen3.5-9B is the qualified canary and the only checkpoint that the
 donor/receiver rows cover. Checkpoints with tied embeddings, such as
 Qwen3.5-0.8B, 2B, and 4B, quantized checkpoints such as the FP8 and NVFP4
-variants, the Qwen3.5 MoE vision-language root, the text-only
-`Qwen3_5ForCausalLM` root, and the Qwen3-VL roots do not match this profile.
+variants, the Qwen3.5 MoE vision-language root (which has its own profile
+below), the text-only `Qwen3_5ForCausalLM` root, and the Qwen3-VL roots do not
+match this profile.
 The root sizes its M-RoPE buffers by `max_num_tokens` (and the PP size), and
 `SourceIdentity` hashes every realized buffer shape, so a donor and a receiver
 must use the same `max_num_tokens` to share weights. The vision configuration
 is bound by the checkpoint artifact identity and the realized vision parameter
 shapes rather than by the model fingerprint, which hashes the text
 configuration.
+
+The Qwen3.5 MoE vision-language identity covers Hugging Face-format checkpoints
+that resolve to the exact `Qwen3_5MoeForConditionalGeneration` /
+`qwen3_5_moe` pair, served with the vision encoder in the same instance, and
+combines the dense Qwen3.5 vision-language constraints with the Qwen3 MoE
+backend and partition pins: every decoder layer holds a replicated router,
+CUTLASS routed experts, a fused shared expert, and a replicated shared-expert
+gate. Qwen3.5-35B-A3B is the qualified canary; Qwen3.6-35B-A3B declares the same
+identity and layout. FP8 and GPTQ variants fall back. Qwen3.5-122B-A10B shares
+the identity and the per-layer tensor layout, so it qualifies wherever TP=2 holds
+its roughly 234 GiB of BF16 weights, which takes GPUs with more than about 120 GiB
+of memory each, such as B200 or B300; the Qwen3.5-35B-A3B rows exercise that
+layout and no row loads the 122B. Qwen3.5-397B-A17B does not fit at TP=2 or
+below on any current GPU, so it falls back at the TP constraint. The text-only
+`Qwen3_5MoeForCausalLM` root is a different identity and falls back. The profile
+pins the CUTLASS MoE backend, which `moe_config.backend: AUTO` selects for BF16
+weights, and admits MoE TP=2 and MoE EP=2 at TP=2 like the Qwen3 MoE profile.
+Qwen3.5-35B-A3B holds about 66 GiB of BF16 weights after loading, so a TP=1
+donor or receiver needs an 80 GB GPU. The stacked expert tensors of the checkpoint are
+unfused into the CUTLASS layout while loading; the receiver never loads, and the
+loader-only `weight_loading_mode` of the expert backend that this changes does
+not affect forward.
 
 The Qwen3 MoE identity covers Hugging Face-format checkpoints that resolve to
 the exact `Qwen3MoeForCausalLM` / `qwen3_moe` pair; Qwen3-30B-A3B is the
@@ -182,9 +206,9 @@ disabled until layout state is tracked and qualified independently for each
 submodel.
 
 The Llama, Qwen2, Qwen3, Mistral, Phi3, and Qwen3 MoE profiles are text-only and
-do not enable reward-model, embedding, or vision-language roots; Qwen3 MoE is
-the only qualified MoE root. FP16, quantized weight formats other than SM90 FP8
-block scales on Qwen3, a quantized KV cache, alternate attention backends, YaRN
+do not enable reward-model, embedding, or vision-language roots; Qwen3 MoE and
+the Qwen3.5 MoE vision-language root are the only qualified MoE roots. FP16,
+quantized weight formats other than SM90 FP8 block scales on Qwen3, a quantized KV cache, alternate attention backends, YaRN
 or LongRoPE scaling, tied embeddings, TP greater than 2, PP greater than 1, CP
 greater than 1, LoRA, sparse attention, attention DP, multi-node transfer, and
 speculative decoding require separate qualification rows. The Qwen3 FP8
@@ -198,9 +222,9 @@ additionally pins the realized attention window: every attention layer must run
 without a sliding window, so sliding-window checkpoints such as Ministral fall
 back to the Hugging Face path until they are qualified separately. The dense
 profiles do not constrain MoE-only backend and mapping settings because dense
-roots do not consume them; the Qwen3 MoE profile pins them as the table above
-lists. `SourceIdentity` still requires donor and receiver configurations to
-match.
+roots do not consume them; the Qwen3 MoE and Qwen3.5 MoE profiles pin them as
+the table above lists. `SourceIdentity` still requires donor and receiver
+configurations to match.
 
 The Qwen3.5 dense vision-language profile carries the vision encoder together
 with the language model and realizes interleaved M-RoPE (`rope_type=mrope`),
@@ -339,6 +363,12 @@ requires exact token equality. MoE rows also require every rank's routed-expert
 tensor shapes in the final manifests to match the row's MoE EP x MoE TP
 partition, so the comparisons cannot pass on a partition that all roles share
 but the row did not request.
+The Qwen3.5 MoE rows use `qwen3_5-moe-bf16-tp1`, `qwen3_5-moe-bf16-tp2`, and
+`qwen3_5-moe-bf16-tp2-ep2`, with `TRTLLM_MX_QWEN3_5_MOE_MODEL` overriding the
+default `Qwen3.5-35B-A3B` checkpoint. They probe with images and, like the Qwen3
+MoE rows, disable the finalize fusion. The TP=1 row holds the roughly 66 GiB of
+weights after loading (about 71 GiB at the memory-profiling peak) on one GPU and
+skips below 80 GB of device memory.
 The Qwen3 FP8 block-scale profile rows use `qwen3-fp8-block-tp1` /
 `qwen3-fp8-block-tp2` with Qwen3-8B-FP8, overridable through
 `TRTLLM_MX_QWEN3_FP8_MODEL`; they run only on SM90 GPUs, which the H100 CI
@@ -582,8 +612,8 @@ path.
 
 - Post-transform MX reception is currently limited to the exact Llama,
   Qwen2/Qwen2.5 dense, Qwen3 dense (BF16 or SM90 FP8 block-scale), Mistral
-  dense, Phi3 dense, Qwen3.5 dense vision-language, and Qwen3 MoE profiles
-  above. Other roots and variants that do not match the documented identity and
+  dense, Phi3 dense, Qwen3.5 dense vision-language, Qwen3 MoE, and Qwen3.5 MoE
+  profiles above. Other roots and variants that do not match the documented identity and
   runtime envelope safely fall back to Hugging Face loading until explicitly
   qualified.
 - Mistral checkpoints served through the native `mistral` checkpoint format
@@ -593,8 +623,8 @@ path.
 - Phi LongRoPE variants (128k-context Phi-3, Phi-3.5-mini, and Phi-4-mini),
   tied-embedding variants, and the Phi-3-small, vision, MoE, and Phi4MM
   multimodal roots are not qualified and use the Hugging Face fallback.
-- Qwen3.5 vision-language checkpoints fall back when they run with speculative
-  decoding (MTP or DFlash), without a local vision encoder (`disable_mm_encoder`
+- Qwen3.5 dense and MoE vision-language checkpoints fall back when they run
+  with speculative decoding (MTP or DFlash), without a local vision encoder (`disable_mm_encoder`
   or multimodal encoder/prefill disaggregation), as encoder-only workers, with
   tied embeddings, or with quantized weights.
 - The MX server and Redis lifecycle is external to TensorRT LLM. Every

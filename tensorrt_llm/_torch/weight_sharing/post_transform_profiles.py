@@ -886,3 +886,17 @@ class PostTransformProfileRegistry:
         return PostTransformQualificationDecision(
             PostTransformQualificationReason.QUALIFIED, profile=profile
         )
+
+
+# Stable contract for the unquantized Qwen3.5 MoE vision-language root: the
+# dense Qwen3.5 vision-language contract (vision tower, gated-delta-net and
+# gated full-attention tensors, Q/K norm state, complete-model receiver
+# finalization) with the MLP replaced by a sparse block. The block holds the
+# replicated router and `shared_expert_gate` weights, a fused `gate_up_proj`
+# shared expert, and CUTLASS routed-expert tensors (`w3_w1_weight` with the up
+# projection before the gate projection, and `w2_weight`) partitioned by MoE TP
+# or EP. Routed expert layouts differ per MoE implementation, so another
+# implementation needs its own ID.
+QWEN3_5_MOE_VL_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1 = (
+    "trtllm-qwen3_5-moe-vl-cutlass-complete-layout-v1"
+)

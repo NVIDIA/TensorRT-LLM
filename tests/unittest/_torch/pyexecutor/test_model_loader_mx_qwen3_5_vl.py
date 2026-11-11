@@ -627,7 +627,7 @@ def test_qwen3_5_vl_profile_matches_its_exact_identity() -> None:
         ),
         pytest.param(
             {"root_model_class": modeling_qwen3_5_mod.Qwen3_5MoeVLModel},
-            PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED,
+            PostTransformQualificationReason.ARCHITECTURE_NOT_REGISTERED,
             id="moe-vlm-root",
         ),
         pytest.param(
