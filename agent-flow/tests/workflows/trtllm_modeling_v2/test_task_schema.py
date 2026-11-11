@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2 import cli
 from agent_flow.workflows.trtllm_modeling_v2.spec import deployments, derive, shorthand, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
@@ -28,6 +27,7 @@ def _valid_spec(tmp_path) -> dict:
         "arch": "sm_103",
         "parallel": "tp1",
         "trtllm_repo_path": str(repo),
+        "agents": {"defaults": {"backend": "claude-code", "model": "test-model"}},
         "environment": {
             "kind": "local",
             "python": "/usr/bin/python3",
@@ -127,71 +127,66 @@ def _site(root: Path, **changes) -> Path:
     return path
 
 
-def _derive(root: Path, goal: str | None = None, *, clean: bool = False, **site) -> Path:
-    return cli._derive_spec(
-        _checkpoint(root), _site(root, **site), root / "ws", goal=goal, clean=clean
+def _derive(root: Path, **site) -> tuple[Path, derive.Derivation]:
+    site_path = _site(root, **site)
+    derivation = derive.derive_spec(
+        _checkpoint(root), yaml.safe_load(site_path.read_text()), site_path=site_path
     )
+    return derive.write_derivation(root / "ws", derivation), derivation
 
 
 def _engine(root: Path, name: str) -> dict:
     return yaml.safe_load((root / "ws" / derive.ENGINES_DIRNAME / f"{name}.yaml").read_text())
 
 
-def test_the_goal_overrides_what_the_checkpoint_and_the_site_say(tmp_path):
-    goal = "-mtp multimodal tp1 dep4 isl=1024 osl=256 arch=sm_103 disagg@dep4 kv=bf16/fp8"
-    site = dict(
-        device={"arch": "sm_100", "gpus_per_node": 4},
-        defaults={"disagg": {"env": {"LLM_MODELS_ROOT": "/models"}}},
-    )
-    spec = load_and_validate_task_yaml(_derive(tmp_path, goal, **site))
-    assert spec["arch"] == "sm_103" and "features" not in spec and "members" not in spec
-    found = {d.name: d for d in deployments.resolve(spec)}
-    # The members in order, then each feature and each extra KV dtype, once.
-    assert list(found) == ["tp1", "dep4", "multimodal", "disagg", "kv_fp8"]
-    assert found["multimodal"].inputs == ("text", "image") and found["tp1"].inputs == ("text",)
-    # disagg where the goal puts it, with the site's environment.
-    assert found["disagg"].ctx.options["tensor_parallel_size"] == 4
-    assert found["disagg"].env == {"LLM_MODELS_ROOT": "/models"}
-    # The first KV dtype is core's; each other one a deployment judged against core's score.
-    assert "dtype" not in found["tp1"].server.options["kv_cache_config"]
-    assert found["kv_fp8"].server.options["kv_cache_config"]["dtype"] == "fp8"
-    assert found["kv_fp8"].relative_to == "tp1"
-    core = _engine(tmp_path, "tp1")
-    assert (core["max_seq_len"], core["max_batch_size"]) == (1280, 64)
-    assert _engine(tmp_path, "dep4")["max_batch_size"] == 16  # one rank's share of it
+def test_derive_writes_the_first_deployment_only_and_says_what_it_left_open(tmp_path):
+    agents = {"defaults": {"backend": "claude-code", "model": "m"}}
+    path, derivation = _derive(tmp_path, agents=agents, defaults={"members": ["tep4", "dep4"]})
+    written = yaml.safe_load(path.read_text())
+    # The smallest spec: one deployment, the site's first member, its options beside the spec.
+    assert written["deployments"] == [{"name": "tep4", "options": "engines/tep4.yaml"}]
+    assert not {"members", "features", "variants", "runtime", "parallel"} & set(written)
+    # The checkpoint's towers and drafter are the operator's to add: the first serves text.
+    assert written["scope"] == "text_only" and written["accuracy"] == {"model_key": "org/newmodel"}
+    assert derivation.questions == []
+    core = _engine(tmp_path, "tep4")
+    assert (core["max_seq_len"], core["max_batch_size"]) == (5120, 64)
+    assert core["tensor_parallel_size"] == 4 and core["speculative_config"] is None
     # Core's switches: graphs and the overlap scheduler on, reuse and chunked prefill off.
     assert core["kv_cache_config"]["enable_block_reuse"] is False
-    assert core["enable_chunked_prefill"] is False and core["max_num_tokens"] == 8192
-    assert core["cuda_graph_config"] == {} and core["disable_overlap_scheduler"] is False
-    assert core["speculative_config"] is None
-    with pytest.raises(derive.DeriveError) as bad:
-        derive.parse_goal("multimodal:smoke kv=fp8 kv=nvfp4 mtp@tep4")
-    said = str(bad.value)
-    assert "'multimodal:smoke' is not a member, a feature or a setting" in said
-    assert "'kv=nvfp4' kv= is named once" in said
-    assert "'mtp@tep4': only disagg takes a member of its own" in said
+    assert core["enable_chunked_prefill"] is False and core["cuda_graph_config"] == {}
+    spec = load_and_validate_task_yaml(path)
+    [first] = deployments.resolve(spec)
+    assert first.core and first.name == "tep4" and first.inputs == ("text",)
+    # No benchmark states an empty mapping, and nothing of another deployment is in this one.
+    assert "benchmarks" not in written["deployments"][0]
+    assert first.benchmarks[0].discriminators in (None, {})
 
-
-def test_what_derive_cannot_know_is_asked_and_the_checkpoints_own_features_are_built(tmp_path):
+    # What it cannot know is left open, one line each, and the spec is written all the same.
     checkpoint = _checkpoint(tmp_path)
-    # Unsaid, the checkpoint's own drafter and tower are built, one deployment each.
-    spec = load_and_validate_task_yaml(_derive(tmp_path, "tp1"))
-    assert [d.name for d in deployments.resolve(spec)] == ["tp1", "mtp", "multimodal"]
-    assert _engine(tmp_path, "mtp")["speculative_config"]["decoding_type"] == "MTP"
     config = json.loads((checkpoint / "config.json").read_text())
     del config["_name_or_path"]
     config["quantization_config"] = {"quant_algo": "NVFP4"}
+    config["max_position_embeddings"] = 2048
     (checkpoint / "config.json").write_text(json.dumps(config))
-    with pytest.raises(derive.DeriveError) as excinfo:
-        cli._derive_spec(
-            checkpoint, _site(tmp_path), tmp_path / "ws", goal="multimodal", clean=True
-        )
-    assert "accuracy.model_key" in str(excinfo.value)
-    spec = yaml.safe_load((tmp_path / "ws" / derive.SPEC_FILENAME).read_text())
-    # The checkpoint's drafter is left out: the goal names its features and not it.
-    assert [d["name"] for d in spec["deployments"]] == ["tp1", "tep4", "dep4", "multimodal"]
+    site = yaml.safe_load(_site(tmp_path, device={}).read_text())
+    derivation = derive.derive_spec(checkpoint, site)
+    assert [q.partition(":")[0] for q in derivation.questions] == [
+        "arch",
+        "agents.defaults.model",
+        "accuracy.model_key",
+    ]
+    assert "arch" not in derivation.spec and "accuracy" not in derivation.spec
+    assert "leave `accuracy` out to onboard on boot only" in derivation.questions[2]
+    # A default workload is fitted to what the model reaches.
+    assert (derivation.deployment, derivation.options["max_seq_len"]) == ("tp1", 2048)
     # A quantized checkpoint is anchored to its own row, not the unquantized model's.
+    config["_name_or_path"] = "org/newmodel"
+    (checkpoint / "config.json").write_text(json.dumps(config))
+    spec = derive.derive_spec(checkpoint, site).spec
     assert spec["accuracy"]["discriminators"] == {"quant_algo": "NVFP4"}
+    with pytest.raises(derive.DeriveError, match="must state `trtllm_repo_path`"):
+        derive.derive_spec(checkpoint, {"environment": {}})
 
 
 def test_the_shorthand_is_read_once_at_load_and_a_loaded_spec_states_its_deployments(

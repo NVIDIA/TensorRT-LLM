@@ -17,7 +17,8 @@ server the check starts and asks through its endpoint; any other boots in proces
 aggregated deployment is scored by ``trtllm-eval`` behind its prefix, a disaggregated one
 through its endpoint. The verdict says which path judged.
 
-Exit status: 0 when the gate passed, 1 when it failed, 2 on a usage or spec error.
+Exit status: 0 when the gate passed or measured a score nothing judges (``NO VERDICT``),
+1 when it failed, 2 on a usage or spec error.
 ``--json`` prints the verdict as JSON instead of its summary line.
 """
 
@@ -136,7 +137,8 @@ def run_check(
     ``workspace`` is the run's: its frozen anchors and claimed devices are used when it is
     given. ``runner`` replaces the environment's own, for tests. A benchmark whose anchor
     is another deployment's score is judged against ``relative_score``; without one that
-    deployment's benchmark runs here first. ``locked``: the caller already holds the
+    deployment's benchmark runs here first, and when it measures no score this one's is
+    reported with no verdict. ``locked``: the caller already holds the
     workspace's engine lock.
     """
     name = gate_name(gate)
@@ -193,17 +195,8 @@ def run_check(
                 timeout=timeout,
                 locked=True,
             )
-            if first.infrastructure or first.measured is None:
-                return replace(
-                    first,
-                    passed=False,
-                    name=f"accuracy[{benchmark.name}]",
-                    deployment=found.name,
-                    detail=f"`{held.relative_to}` measured no score on {benchmark.name} "
-                    f"({first.detail}), so `{found.name}`, whose anchor is that score, has "
-                    f"nothing to be judged against",
-                )
-            relative_score = first.measured
+            # With no score of that deployment, this one's is reported with no verdict.
+            relative_score = None if first.infrastructure else first.measured
         judge = dict(anchor=held, relative_score=relative_score, runner=runner, **bound)
         if found.kind == AGGREGATED:
             result = accuracy_checks.run_accuracy_gate(

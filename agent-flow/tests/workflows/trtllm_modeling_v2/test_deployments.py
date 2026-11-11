@@ -845,35 +845,40 @@ def test_a_run_reads_a_spec_that_states_its_deployments(tmp_path):
     ]
 
 
-def test_intake_derive_writes_native_deployments_and_prints_its_warnings(tmp_path, capsys):
+def test_intake_derive_writes_the_smallest_spec_and_prints_its_warnings(tmp_path, capsys):
     checkpoint, repo = _dirs(tmp_path)
     (tmp_path / "ckpt" / "config.json").write_text(
         json.dumps({"architectures": ["ToyForCausalLM"], "_name_or_path": "org/toy"})
     )
     out = tmp_path / "out"
-    goal = "tp1 dep4 disagg@dep4 kv=bf16/fp8 arch=sm_103 max_batch_size=64"
-    argv = ["derive", "--checkpoint", checkpoint, "--repo", repo, "--goal", goal, "--out", str(out)]
-    assert derive.main(argv) == 0
-    printed = capsys.readouterr().out
+    argv = ["derive", "--checkpoint", checkpoint, "--repo", repo, "--out", str(out)]
+    assert derive.main([*argv, "--goal", "tp1 dep4 disagg@dep4 kv=bf16/fp8"]) == 0
+    said = capsys.readouterr()
+    # A goal is accepted and ignored, with one notice that says what to do instead.
+    assert said.err.count("\n") == 1 and said.err.startswith("note: --goal is ignored: ")
+    assert "by editing the spec's `deployments`" in said.err
+    printed = said.out
     written = yaml.safe_load((out / derive.SPEC_FILENAME).read_text())
     assert "parallel" not in written and "members" not in written and "variants" not in written
-    assert [d["name"] for d in written["deployments"]] == ["tp1", "dep4", "disagg", "kv_fp8"]
-    assert written["deployments"][0] == {"name": "tp1", "options": "engines/tp1.yaml"}
-    assert written["deployments"][2]["ctx"] == {"options": "engines/disagg.ctx.yaml"}
-    assert written["deployments"][3]["relative_to"] == "tp1"
-    # The options are the engine's own: the attention-DP share of the batch is in the file.
-    dep4 = yaml.safe_load((out / "engines" / "dep4.yaml").read_text())
-    assert (dep4["tensor_parallel_size"], dep4["max_batch_size"]) == (4, 16)
-    assert (
-        yaml.safe_load((out / "engines" / "kv_fp8.yaml").read_text())["kv_cache_config"]["dtype"]
-        == "fp8"
-    )
-    # What was written loads as it is, and comes to the same deployments.
+    assert written["deployments"] == [{"name": "tp1", "options": "engines/tp1.yaml"}]
+    assert sorted(p.name for p in (out / "engines").iterdir()) == ["tp1.yaml"]
+    # The options are the engine's own, stated rather than left to its defaults.
+    tp1 = yaml.safe_load((out / "engines" / "tp1.yaml").read_text())
+    assert (tp1["max_seq_len"], tp1["max_batch_size"]) == (5120, 64)
+    # What it left for the operator, one `open:` line each.
+    opened = [line.strip() for line in printed.splitlines() if line.strip().startswith("open:")]
+    assert [line.split(":")[1].strip() for line in opened] == [
+        "arch",
+        "agents.defaults.model",
+        "environment",
+    ]
+    # Once those are answered, what was written loads as it is.
     written["environment"]["python"] = "/opt/venv/bin/python"
     written["agents"] = {"defaults": {"backend": "claude-code", "model": "m"}}
+    written["arch"] = "sm_103"
     (out / derive.SPEC_FILENAME).write_text(yaml.safe_dump(written, sort_keys=False))
     loaded = load_and_validate_task_yaml(out / derive.SPEC_FILENAME)
-    assert [d.name for d in deployments.resolve(loaded)] == ["tp1", "dep4", "disagg", "kv_fp8"]
+    assert [d.name for d in deployments.resolve(loaded)] == ["tp1"]
     assert "warning: no accuracy anchor: `tp1` on `gsm8k` has no declared anchor" in printed
     assert derive.main(["--help"]) == 0
     assert derive.main(["lint", "--task", "x.yaml"]) == 2

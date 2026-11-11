@@ -20,6 +20,7 @@ from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
     parse_inventory,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
+from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
 from ._helpers import healthy_smi
 
@@ -128,6 +129,33 @@ def test_only_a_hard_blocker_of_the_first_deployment_stops_the_run(tmp_path, see
     with pytest.raises(preflight.PreflightError) as stopped:
         preflight.run_preflight(_task(tmp_path), runner=healthy_smi(**seen))
     assert said in str(stopped.value)
+
+
+def test_a_spec_that_names_no_temporary_directory_takes_the_systems(tmp_path):
+    """Only a host with no writable one stops the run, and in one line."""
+    task = _task(tmp_path, environment={"kind": "local", "python": sys.executable})
+    task["agents"] = {"defaults": {"backend": "claude-code", "model": "m"}}
+    path = tmp_path / "task.yaml"
+    path.write_text(json.dumps(task))
+    loaded = load_and_validate_task_yaml(path)
+    assert "TMPDIR" not in loaded["environment"].get("env", {})
+    assert preflight.run_preflight(loaded, runner=healthy_smi()).devices == (0,)
+
+    def probed(tmpdir: str) -> dict:
+        env = {"PATH": "/usr/bin:/bin", **({"TMPDIR": tmpdir} if tmpdir else {})}
+        argv = [sys.executable, "-c", preflight.PROBE_SOURCE, str(tmp_path / "ckpt")]
+        out = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=tmp_path).stdout
+        line = next(x for x in out.splitlines() if x.startswith(preflight.PROBE_MARKER))
+        return json.loads(line[len(preflight.PROBE_MARKER) :])
+
+    # The probe writes where the engine will: the system's directory when none is named.
+    assert "tmp_error" not in probed("") and "tmp_error" in probed(str(tmp_path / "absent"))
+    with pytest.raises(preflight.PreflightError) as stopped:
+        preflight.run_preflight(loaded, runner=healthy_smi(tmp_error="OSError: read-only"))
+    assert str(stopped.value) == (
+        "the temporary directory is not writable where `tp1` runs (on this host): "
+        "OSError: read-only (on node-1)"
+    )
 
 
 def test_the_other_hard_blockers_are_read_from_files(tmp_path, monkeypatch):

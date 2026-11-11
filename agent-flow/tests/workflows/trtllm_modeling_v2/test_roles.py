@@ -19,6 +19,7 @@ from typing import Any
 
 import anyio
 import pytest
+import yaml
 from jinja2 import StrictUndefined, UndefinedError
 
 from agent_flow.backends import claude_code
@@ -44,6 +45,10 @@ from agent_flow.workflows.trtllm_modeling_v2.run import start
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import ROLE_BY_KIND, TAGS_BY_KIND
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe
 from agent_flow.workflows.trtllm_modeling_v2.run.startup.agent_probe import AGENT_PROBE_SKIP_ENV
+from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
+    TaskSchemaError,
+    load_and_validate_task_yaml,
+)
 
 from ._helpers import _workflow
 
@@ -92,17 +97,25 @@ def test_a_claude_role_keeps_its_stop_hook_and_a_codex_role_gets_none(tmp_path):
     assert backend.disabled_skills == ("imagegen", "cluster-jobs")
 
 
-def test_a_role_whose_model_the_spec_does_not_state_is_refused():
+def test_a_role_whose_model_the_spec_does_not_state_is_one_line_of_the_schema(task_file):
     """Nothing is inherited from the launching session or the environment."""
-    spec = {"agents": {"defaults": {"model": "m"}, "roles": {"planner": {"backend": "codex"}}}}
-    with pytest.raises(roles.AgentConfigError, match="states no model for planner:"):
-        roles.resolve_role_agents(spec)
-    with pytest.raises(roles.AgentConfigError, match="surveyor, kernel_writer"):
-        roles.resolve_role_agents({})
-    spec["agents"]["roles"]["planner"]["model"] = "codex-m"
+    spec = {"agents": {"defaults": {"model": "m"}, "roles": {"surveyor": {"backend": "codex"}}}}
+    assert roles.unstated_models(spec) == ["surveyor"]
+    assert roles.unstated_models({}) == list(roles.ROLES)
+    spec["agents"]["roles"]["surveyor"]["model"] = "codex-m"
+    assert roles.unstated_models(spec) == []
     agents = roles.resolve_role_agents(spec)
-    assert (agents["planner"].backend, agents["planner"].model) == ("codex", "codex-m")
+    assert (agents["surveyor"].backend, agents["surveyor"].model) == ("codex", "codex-m")
     assert (agents["assembler"].backend, agents["assembler"].model) == ("claude-code", "m")
+    # Said when the spec loads, with every other line of the schema, before anything starts.
+    data = yaml.safe_load(task_file.read_text())
+    data["agents"] = {"defaults": {"backend": "claude-code"}}
+    task_file.write_text(yaml.safe_dump(data))
+    with pytest.raises(TaskSchemaError) as raised:
+        load_and_validate_task_yaml(task_file)
+    lines = [line for line in str(raised.value).splitlines() if "agents.defaults.model" in line]
+    assert len(lines) == 1 and "unstated for surveyor, kernel_writer, assembler" in lines[0]
+    assert "fix: `agents: {defaults: {backend: claude-code, model: <model>}}`" in lines[0]
 
 
 @pytest.fixture

@@ -221,7 +221,7 @@ def test_the_command_line_dry_runs_a_spec_and_its_exit_code_says_how_it_went(
     task_file.write_text(yaml.safe_dump(spec))
     other = tmp_path / "ws-no-agents"
     assert run("--task", str(task_file), "--workspace", str(other), "--dry-run") == 2
-    assert "states no model for" in capsys.readouterr().err
+    assert "missing agents.defaults.model: " in capsys.readouterr().err
 
     # A refused spec still says which of its keys were ignored on the way.
     spec["profile"], spec["feature"] = "smoke", ["mtp"]

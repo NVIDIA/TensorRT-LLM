@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import re
+import textwrap
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -222,7 +223,8 @@ def resolve(
     try:
         score = load_reference_score(path, key, discriminators=wanted)
     except (KeyError, FileNotFoundError, TypeError, ValueError, yaml.YAMLError) as exc:
-        why = str(exc).strip("'\"").splitlines()[0][:300]
+        # Whole words: what it says to do is at the end of the line.
+        why = textwrap.shorten(str(exc).strip("'\"").splitlines()[0], 1200, placeholder=" ...")
     else:
         shown = f" with {wanted}" if wanted else ""
         return Anchor(
@@ -347,7 +349,10 @@ def floor(
     relative = anchor.kind == RELATIVE
     reference = relative_score if relative else anchor.value
     if anchor.kind == NONE or reference is None:
-        return None, "no anchor"
+        return (
+            None,
+            f"`{anchor.relative_to}` has no score to hold it to" if relative else "no anchor",
+        )
     samples, source = samples_of(benchmark, output)
     if anchor.samples:
         # Fixed with the anchor: what the run prints or the spec says later does not move it.

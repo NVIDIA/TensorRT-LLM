@@ -29,49 +29,41 @@ ROLES: tuple[str, ...] = (
 )
 
 
-class AgentConfigError(ValueError):
-    """A role has no model the spec states; no worker was started."""
-
-
 def resolve_role_agents(
     task_data: Mapping[str, Any], *, roles: Sequence[str] = ROLES
 ) -> dict[str, AgentConfig]:
-    """Every role from ``agents.defaults`` and ``agents.roles.<role>``; nothing is inherited.
-
-    A role whose model the spec does not state is refused: the run never guesses which model
-    its workers run on, and a default would hold on one host and not another.
-    """
-    missing = [role for role in roles if not _model_configured(task_data, role)]
-    if missing:
-        raise AgentConfigError(
-            f"task.yaml states no model for {', '.join(missing)}: write "
-            "`agents.defaults: {backend, model, reasoning_effort}` (or the role's own "
-            "`agents.roles.<role>.model`); no worker was started"
-        )
+    """Every role from ``agents.defaults`` and ``agents.roles.<role>``; nothing is inherited."""
     return {role: resolve_agent_config(task_data, role) for role in roles}
 
 
-def _model_configured(task_data: Mapping[str, Any], role: str) -> bool:
-    """Whether the spec states the role's model: its own, or the defaults' on the same backend."""
+def unstated_models(task_data: Mapping[str, Any], roles: Sequence[str] = ROLES) -> list[str]:
+    """The roles whose model the spec does not state: its own, or the defaults' on their backend.
+
+    The run never guesses which model its workers run on: a default would hold on one host
+    and not another. The spec's loader refuses a spec that leaves one out.
+    """
     agents = task_data.get(AGENTS_FIELD)
-    if not isinstance(agents, Mapping):
-        return False
+    agents = agents if isinstance(agents, Mapping) else {}
     defaults = agents.get("defaults")
     defaults = defaults if isinstance(defaults, Mapping) else {}
-    roles = agents.get("roles")
-    override = roles.get(role) if isinstance(roles, Mapping) else None
-    override = override if isinstance(override, Mapping) else {}
-    if override.get("model") is not None:
-        return True
-    inherited_backend = defaults.get("backend", "claude-code")
-    backend = override.get("backend", inherited_backend)
-    return defaults.get("model") is not None and backend == inherited_backend
+    overrides = agents.get("roles")
+    overrides = overrides if isinstance(overrides, Mapping) else {}
+    inherited = defaults.get("backend", "claude-code")
+    unstated = []
+    for role in roles:
+        own = overrides.get(role)
+        own = own if isinstance(own, Mapping) else {}
+        if own.get("model") is None and (
+            defaults.get("model") is None or own.get("backend", inherited) != inherited
+        ):
+            unstated.append(role)
+    return unstated
 
 
 __all__ = [
-    "AgentConfigError",
     "PACKAGED_SKILLS_DIR",
     "ROLES",
     "packaged_skills",
     "resolve_role_agents",
+    "unstated_models",
 ]

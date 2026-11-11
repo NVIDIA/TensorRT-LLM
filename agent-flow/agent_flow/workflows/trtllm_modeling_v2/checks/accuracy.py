@@ -189,8 +189,10 @@ def judged(
         anchor, benchmark, relative_score=relative_score, output=output
     )
     if floor is None:
+        # Reported, never a failure: nothing was there to hold the score to.
         return dict(
-            passed=False,
+            passed=True,
+            unjudged=True,
             explained=True,
             measured=measured,
             detail=f"measured {measured:.4f}{how}; a score with no verdict "

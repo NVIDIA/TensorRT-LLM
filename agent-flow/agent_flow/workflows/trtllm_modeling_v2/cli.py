@@ -35,36 +35,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "a fixed order, then the certification of the final commit."
         ),
     )
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument(
+    parser.add_argument(
         "--task",
         type=Path,
-        help="Path to the task YAML file. It is validated before any agent "
-        "is constructed and copied verbatim into `<workspace>/task.yaml`, "
-        "which every agent reads.",
-    )
-    source.add_argument(
-        "--checkpoint",
-        type=Path,
-        help="A HuggingFace checkpoint directory: derive the run's spec from its "
-        "config.json, --site and --goal into `<workspace>/task.derived.yaml` and run "
-        "it. A question the derivation cannot answer stops "
-        "here, to be answered in the spec. Re-running the same command takes the spec "
-        "as it stands, edits included; --clean derives it again.",
-    )
-    parser.add_argument(
-        "--site",
-        type=Path,
-        default=None,
-        help="With --checkpoint: the site.yaml, the environment, device "
-        "and defaults the spec is derived with.",
-    )
-    parser.add_argument(
-        "--goal",
-        default=None,
-        help="With --checkpoint: the features, members and workload in one line, e.g. "
-        '"mtp disagg@tep4 tp1 tep4 dep4 isl=8192 osl=1024" (spec/derive.py). '
-        "Features the checkpoint carries are built unless named `-<feature>`.",
+        required=True,
+        help="Path to the task YAML file. It is validated before any agent is constructed "
+        "and written, resolved, to `<workspace>/task.yaml`, which every agent reads. "
+        "`trtllm-modeling-v2 intake derive` writes a first one from a checkpoint.",
     )
     parser.add_argument(
         "--workspace",
@@ -112,12 +89,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         + ", ".join(f"{role} {int(s) // 3600}h" for role, s in DEFAULT_ROLE_TURN_TIMEOUTS.items())
         + ").",
     )
-    args = parser.parse_args(argv)
-    if args.checkpoint is not None and args.site is None:
-        parser.error("--checkpoint needs --site <site.yaml>")
-    if args.checkpoint is None and (args.goal is not None or args.site is not None):
-        parser.error("--site and --goal go with --checkpoint")
-    return args
+    return parser.parse_args(argv)
 
 
 def _commit_identity(task_data: dict) -> CommitIdentity:
@@ -182,36 +154,6 @@ def _claim_workspace(workspace: Path):
     return handle
 
 
-def _derive_spec(
-    checkpoint: Path, site: Path, workspace: Path, *, goal: str | None, clean: bool
-) -> Path:
-    """The fast path: the workspace's derived spec, derived anew when there is none or on ``clean``.
-
-    Raises :class:`~.spec.derive.DeriveError` with every open question of a
-    new derivation: the spec is written first, to be answered in.
-    """
-    import yaml
-
-    from .spec import derive as derive_mod
-
-    path = workspace / derive_mod.SPEC_FILENAME
-    if path.is_file() and not clean:
-        print(f"→ {path}: the spec derived before, as it stands; --clean derives it again")
-        return path
-    site_data = yaml.safe_load(site.read_text(encoding="utf-8")) or {}
-    derivation = derive_mod.derive_spec(
-        checkpoint, site_data, derive_mod.parse_goal(goal), site_path=site
-    )
-    derive_mod.write_derivation(workspace, derivation)
-    print(f"→ derived {path}")
-    if derivation.questions:
-        raise derive_mod.DeriveError(
-            f"{path} leaves {len(derivation.questions)} question(s) open; answer them in it and "
-            "run the same command again:\n  - " + "\n  - ".join(derivation.questions)
-        )
-    return path
-
-
 def _lazy_main(module: str) -> Callable[[list[str]], int]:
     """``module``'s ``main``, imported only when its subcommand runs."""
 
@@ -255,7 +197,7 @@ def _feedback(argv: list[str]) -> int:
 #: A run is ``trtllm-modeling-v2 --task ...``; a first argument named here
 #: dispatches instead, and everything after it is the subcommand's own.
 SUBCOMMANDS = {
-    # From a request to a spec, before launch: `intake derive ...` (spec/INTAKE.md).
+    # A first spec from a checkpoint and a site, before launch: `intake derive ...`.
     "intake": _lazy_main(".spec.derive"),
     "gate": _lazy_main(".checks.gate_cli"),
     # The operator's loop of a run: wait, status.
@@ -273,25 +215,10 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     # Validate at the CLI boundary: an invalid spec must abort before any
     # agent is constructed.
-    from .spec.derive import DeriveError
-
-    lock = None
     notices: list[str] = []
     try:
-        if args.checkpoint is not None:
-            # The spec is written into the workspace, so it is claimed first.
-            lock = _claim_workspace(Path(args.workspace))
-            args.task = str(
-                _derive_spec(
-                    Path(args.checkpoint),
-                    Path(args.site),
-                    Path(args.workspace),
-                    goal=args.goal,
-                    clean=args.clean,
-                )
-            )
         task_data = load_and_validate_task_yaml(args.task, notices)
-    except (TaskSchemaError, DeriveError) as exc:
+    except TaskSchemaError as exc:
         # A refused spec still says which of its keys were ignored on the way.
         for notice in notices:
             print(f"note: {notice}", file=sys.stderr)
@@ -303,8 +230,7 @@ def main(argv: list[str] | None = None) -> None:
     os.environ[ENV_NAME], os.environ[ENV_EMAIL] = identity.name, identity.email
     os.environ.update(identity.env())
 
-    if lock is None:
-        _claim_workspace(Path(args.workspace))
+    _claim_workspace(Path(args.workspace))
 
     if args.max_rounds is not None:
         print(
@@ -319,7 +245,6 @@ def main(argv: list[str] | None = None) -> None:
     # task's notes would reach the others, and one run's the next.
     os.environ.setdefault("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
 
-    from .agents.roles import AgentConfigError
     from .run.workflow import TrtllmModelingV2Workflow
 
     with TrtllmModelingV2Workflow(
@@ -331,7 +256,7 @@ def main(argv: list[str] | None = None) -> None:
     ) as workflow:
         try:
             delivered = workflow.run(args.task)
-        except (AgentConfigError, TaskSchemaError) as exc:
+        except TaskSchemaError as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(2)
         except KeyboardInterrupt:

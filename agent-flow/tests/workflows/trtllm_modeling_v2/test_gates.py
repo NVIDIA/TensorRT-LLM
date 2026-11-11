@@ -61,6 +61,7 @@ def _spec(tmp_path, **more) -> dict:
         "arch": "sm_103",
         "trtllm_repo_path": str(tmp_path / "repo"),
         "environment": {"python": "/usr/bin/python3", "env": {"TMPDIR": "/scratch/tmp"}},
+        "agents": {"defaults": {"backend": "claude-code", "model": "test-model"}},
         "accuracy": {"model_key": "org/toy", "reference_yaml": "r.yaml"},
         "deployments": [
             {"name": "tp1", "options": {"max_seq_len": 5120}},
@@ -258,6 +259,37 @@ def test_a_relative_deployment_is_judged_against_the_other_ones_score_measured_f
     assert "MY_SWITCH=1" not in runner.seen[0] and "MY_SWITCH=1" in runner.seen[1]
     assert gate_cli.main(["boot", "--task", str(path), "--deployment", "nope"]) == 2
     assert "error: 'nope' names no deployment of this spec" in capsys.readouterr().err
+
+
+def test_a_score_nothing_judges_is_a_report_line_and_never_a_failure(tmp_path, capsys, monkeypatch):
+    data = _spec(tmp_path)
+    for entry in data["deployments"]:
+        if entry["name"] == "tep2":
+            entry["options"]["kv_cache_config"] = {"dtype": "fp8"}
+    path = tmp_path / "task.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    # No row for the model and nothing declared: tp1's score is held to nothing.
+    (tmp_path / "repo" / "r.yaml").write_text("org/other:\n  - accuracy: 90.0\n")
+    runner = _engine("lm-eval gsm8k average accuracy: 61.5\n")
+    monkeypatch.setattr(gate_cli, "shell_runner_for", lambda executor, **kwargs: runner)
+    argv = ["accuracy", "--task", str(path), "--workdir", str(tmp_path / "w")]
+    assert gate_cli.main(argv) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("[NO VERDICT] tp1:accuracy[gsm8k]: measured 61.5000; a score with no")
+    # What to do about it is said whole: the line is cut at no word.
+    assert "(citing where the score came from)" in out and "on the same GPU type.)" in out
+    result = gate_cli.run_check(data, "accuracy[gsm8k]", "tp1", workdir=tmp_path / "w")
+    assert result.unjudged and result.passed and result.measured == 61.5
+    assert result.floor is None and "no declared anchor and no reference row" in result.detail
+    # A deployment judged against another's score, when that one measured none: its own
+    # score is reported the same way.
+    (tmp_path / "repo" / "r.yaml").write_text("org/toy:\n  - accuracy: 90.0\n")
+    runner = _engine("no score here\n", "lm-eval gsm8k average accuracy: 85\n")
+    monkeypatch.setattr(gate_cli, "shell_runner_for", lambda executor, **kwargs: runner)
+    result = gate_cli.run_check(data, "accuracy[gsm8k]", "tep2", workdir=tmp_path / "w")
+    assert result.unjudged and result.passed and result.measured == 85.0
+    assert "a score with no verdict (`tp1` has no score to hold it to)" in result.detail
+    assert result.summary().startswith("[NO VERDICT] tep2:accuracy[gsm8k]: measured 85.0000")
 
 
 def test_native_tests_run_one_job_each_and_a_skip_or_a_bad_exit_is_not_a_pass(tmp_path):

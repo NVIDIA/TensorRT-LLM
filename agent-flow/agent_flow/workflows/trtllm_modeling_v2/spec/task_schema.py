@@ -24,7 +24,7 @@ import yaml
 
 from agent_flow.agent_runtime import AGENTS_FIELD, validate_agents
 
-from ..agents.roles import ROLES
+from ..agents.roles import ROLES, unstated_models
 from ..infra.compute.environment import EnvironmentError, check_tmpdir
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
 from ..operators.coverage import MODELING_V2_PACKAGE
@@ -502,6 +502,16 @@ def load_and_validate_task_yaml(
         )
     reject_unknown_keys({k: v for k, v in data.items() if k != "perf"}, TOP_LEVEL_KEYS, errors)
     errors.extend(validate_agents(data, ROLES))
+    unstated = unstated_models(data)
+    if unstated:
+        errors.append(
+            missing(
+                "agents.defaults.model",
+                f"the model the roles run on, never inherited from the launching session "
+                f"(unstated for {', '.join(unstated)})",
+                "agents: {defaults: {backend: claude-code, model: <model>}}",
+            )
+        )
     for name, what in REQUIRED_PATH_FIELDS.items():
         value = data.get(name)
         if not isinstance(value, str) or not value.strip():

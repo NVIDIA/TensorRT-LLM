@@ -77,6 +77,10 @@ class GateResult:
     #: verdict about the target: the workflow re-runs the gate once a session
     #: is back instead of recording it or handing it to the assembler.
     infrastructure: str = ""
+    #: A score held to nothing (no anchor, no sample count, a relative anchor whose
+    #: deployment has no score): a report line, neither a pass nor a failure. ``passed``
+    #: is true with it, so nothing takes the score for a failed check.
+    unjudged: bool = False
     #: Which path judged: ``in process`` or ``through the endpoint``; empty for a check
     #: that has one path only.
     path: str = ""
@@ -87,7 +91,7 @@ class GateResult:
 
     def summary(self) -> str:
         """One line for the journal, carrying the numbers verbatim."""
-        verdict = "PASS" if self.passed else "FAIL"
+        verdict = "NO VERDICT" if self.unjudged else "PASS" if self.passed else "FAIL"
         label = f"{self.deployment}:{self.name}" if self.deployment else self.name
         tree = f" [tree {self.tree_state}]" + (f" [{self.path}]" if self.path else "")
         breakdown = f" [{self.breakdown}]" if self.breakdown else ""

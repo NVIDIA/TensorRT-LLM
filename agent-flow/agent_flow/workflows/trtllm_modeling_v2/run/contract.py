@@ -256,6 +256,8 @@ class Verdict:
     se: float | None = None
     #: The gate's one-line summary, with its numbers.
     summary: str = ""
+    #: A score nothing judged: reported, neither a pass nor a failure.
+    unjudged: bool = False
 
     @property
     def key(self) -> str:
@@ -318,6 +320,7 @@ class ContractStatus:
             reference=_number(getattr(result, "reference", None)),
             se=_number(getattr(result, "se", None)),
             summary=str(result.summary())[:1000] if hasattr(result, "summary") else "",
+            unjudged=bool(getattr(result, "unjudged", False)),
         )
         self.verdicts.append(verdict)
         self.path.parent.mkdir(parents=True, exist_ok=True)
