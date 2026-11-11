@@ -342,7 +342,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         if tail_before is not None:
             assert torch.equal(full[:, output.shape[1] :], tail_before), "rows past output written"
         if engine is None:
-            assert pool is not None and pool_before is not None
             named = set(args["initial_state_indices"].tolist())
             unnamed = [s for s in range(pool.shape[0]) if s not in named]
             assert torch.equal(pool[unnamed], pool_before[unnamed]), "unnamed slots written"

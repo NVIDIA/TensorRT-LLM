@@ -1033,8 +1033,6 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
     if any(error is not None for error in subgroup_errors):
         raise RuntimeError(f"Subgroup fallback scenario failed: {subgroup_errors}")
 
-    assert subgroup_effective is not None and subgroup_weights is not None
-
     body_loader = _rank_striped_loader()
     body_error = None
     try:

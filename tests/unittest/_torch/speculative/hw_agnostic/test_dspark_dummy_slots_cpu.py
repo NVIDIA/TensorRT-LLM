@@ -67,7 +67,6 @@ def test_all_padding_families_preserve_real_slot_ownership(monkeypatch, physical
             assert list(worker._free_slots) == [1, 2, 3]
             assert worker._batch_to_slot[:3].tolist() == [0, 4, 4]
     # Removing a real request releases exactly its slot, never a dummy's.
-    assert dummy is not None
     meta.request_ids = [dummy, 0]
     meta.num_generations = 2
     DSparkSpecMetadata.prepare(meta)

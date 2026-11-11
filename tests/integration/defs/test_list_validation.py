@@ -22,29 +22,12 @@ from .perf.test_perf import PerfTestConfig
 from .test_list_parser import get_test_name_corrections, parse_test_list
 
 
-# A function to convert the mako test list or test-db to a list of test names.
+# A function to convert the test list or test-db to a list of test names.
 def parse_test_list_or_db(test_list, trt_config):
 
-    # For mako test list.
+    # For plain-text test lists.
     if test_list.endswith("txt"):
-        # Mako options that may not always be defined, but are required in test lists.
-        # Defined first so that values from `trt_config` can overwrite values.
-        mako_opts = {
-            "level": 4,
-            "idx": 0,
-            "priority": 0,
-            "host_mem_available_mib":
-            1e8,  # Set to very large to cover all tests.
-            "gpu_memory": 1e6,  # Set to very large to cover all tests.
-            "system_gpu_count": 128,  # Set to very large to cover all tests.
-        }
-        mako_opts.update(trt_config["mako_opts"])
-
-        test_names, _ = parse_test_list(test_list,
-                                        print_mako=False,
-                                        no_mako=False,
-                                        mako_opts=mako_opts,
-                                        test_prefix=trt_config["test_prefix"])
+        test_names, _ = parse_test_list(test_list, trt_config["test_prefix"])
 
     # For yaml-based test db.
     elif test_list.endswith("yml"):

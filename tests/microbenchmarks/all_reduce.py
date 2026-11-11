@@ -152,7 +152,6 @@ def profile_allreduce(
                     output = linear(x, all_reduce_params=allreduce_params)
                 else:
                     output = allreduce(x, all_reduce_params=allreduce_params)
-        assert output is not None, "At least one iteration is required"
         return output if fusion == AllReduceFusionOp.NONE else output[0]
 
     start = [torch.cuda.Event(enable_timing=True) for _ in range(outer_loop)]
@@ -205,7 +204,6 @@ def profile_allreduce(
                 discard_nccl_window_tensor_outputs((input, residual)):
             if not enable_cudagraph:
                 output = allreduce(input, all_reduce_params=allreduce_params)
-            assert output is not None
             torch.testing.assert_close(
                 output,
                 allreduce_ref,
@@ -460,7 +458,6 @@ def _profile_ub(mapping,
         output = None
         for _ in range(loop_num):
             output = allreduce(ub_input, all_reduce_params=allreduce_params)
-        assert output is not None, "At least one iteration is required"
         return output
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(outer_loop)]

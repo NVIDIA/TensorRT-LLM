@@ -779,11 +779,9 @@ def test_unsupported_calls_refused_before_launch():
     before = [_snapshot(st, lyrs) for st, lyrs in objects]
     for m in (0, DECODE_MAX + 1):
         with pytest.raises(ValueError):
-            # pyrefly: ignore [bad-argument-count]
             k3_moe(*_routed_zeros(m), OFFSET, layers[0])
     for m in (0, WIDE_MAX + 1):
         with pytest.raises(ValueError):
-            # pyrefly: ignore [bad-argument-count]
             k3_moe(*_routed_zeros(m), OFFSET, wide_layers[0])
     with pytest.raises(ValueError, match="head"):
         k3_moe(x_fp8, x_sf, ids, weights, OFFSET, flags_layer)

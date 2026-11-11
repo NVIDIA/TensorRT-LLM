@@ -236,7 +236,6 @@ def _generate_ltx23_av(rank, world_size, *, video_out_path, audio_out_path, conf
             _cleanup_cuda()
 
     if rank == 0:
-        assert video is not None
         assert video.shape == (
             1,
             LTX23_LPIPS_NUM_FRAMES,
@@ -355,8 +354,6 @@ def _generate_ltx23_retake_video(
             del pipeline
             _cleanup_cuda()
     if rank == 0:
-        assert video is not None and audio is not None
-        assert frame_rate is not None and audio_rate is not None
         save_video(
             video, output_path, audio=audio, frame_rate=frame_rate, audio_sample_rate=audio_rate
         )

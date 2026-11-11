@@ -256,7 +256,6 @@ def test_input_contract_and_mutation_schema():
     writes = {a.name for a in schema.arguments if a.alias_info and a.alias_info.is_write}
     assert writes == {"row_counters", "workspace"}
     with pytest.raises(RuntimeError, match="workspace"):
-        # pyrefly: ignore [bad-argument-count]
         op(*inputs, state.row_counters, state.workspace[:16])
 
 

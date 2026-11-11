@@ -351,7 +351,7 @@ def test_mamba2_chunk_scan_selective_state_update(
 
     if req_type == "context":
         if use_initial_states:
-            assert remove_padding and cu_seqlens is not None
+            assert remove_padding
             chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
                 cu_seqlens, chunk_size
             )

@@ -33,5 +33,5 @@ def test_missing_prompt_rejected():
 
 def test_messages_rejected():
     with pytest.raises(ValidationError):
-        # pyrefly: ignore [missing-argument, unexpected-keyword]
-        TokenizeRequest(messages=[{"role": "user", "content": "hello"}])
+        # pyrefly: ignore [unexpected-keyword]
+        TokenizeRequest(prompt="hello", messages=[{"role": "user", "content": "hello"}])

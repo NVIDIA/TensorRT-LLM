@@ -852,7 +852,7 @@ max-args = 10
 [tool.pyrefly]
 # Keep the existing diagnostic scope while adopting Pyrefly's error names.
 preset = "off"
-project-includes = ["tensorrt_llm", "tests"]
+project-includes = ["tensorrt_llm"]
 # Shared by Pyrefly project checks and the changed-file/report filters.
 project-excludes = [
     "tensorrt_llm/_torch/kernels/**",
@@ -863,32 +863,9 @@ project-excludes = [
     "tensorrt_llm/_torch/attention/backends/prims_ts/kernels/**",
     "tensorrt_llm/_torch/_experimental/**",
 ]
-# Shared test packages and cross-directory helpers used by pytest's import setup.
-search-path = [
-    ".",
-    "tests",
-    "tests/unittest",
-    "tests/integration",
-    "examples",
-    "examples/llm-api",
-    "examples/llm-api/out_of_tree_example",
-    "examples/disaggregated/slurm/cache_transceiver_test",
-    "scripts",
-    "jenkins/scripts/cbts",
-    "tests/unittest/llmapi/apps",
-    "tests/unittest/_torch/pyexecutor",
-    "tests/unittest/_torch/modeling_v2/comm",
-    "tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/comm",
-    "tests/unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/moe",
-    "tests/unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/moe",
-    "tests/integration/defs/disaggregated",
-    "tests/integration/defs/llmapi",
-    "tests/integration/defs/sysinfo",
-    "tests/integration/defs/utils",
-    "tests/scripts/perf-sanity/cache_transceiver_precheck",
-]
-# Resolve sibling test helpers relative to each importing file.
-enable-fallback-search-path = true
+# Keep test helper paths out of product import resolution.
+search-path = ["."]
+enable-fallback-search-path = false
 python-version = "3.10"
 check-unannotated-defs = true
 infer-return-types = "never"
@@ -943,7 +920,6 @@ ignore-missing-imports = [
     "smg_grpc_proto.*",
     "transformers_modules",
     "transformers_modules.*",
-    "requests.packages.urllib3.util.retry",
     "imageio",
     "imageio.v3",
     "causal_conv1d",
@@ -964,10 +940,34 @@ missing-argument = "error"
 unexpected-keyword = "error"
 unexpected-positional-argument = "error"
 
-[[tool.pyrefly.sub-config]]
-matches = "tests/**"
+# Test settings are read by scripts/run_pyrefly.sh, not by Pyrefly directly.
+[tool.pyrefly-tests]
+project-includes = ["tests"]
+# Paths are relative to the repository root and apply only to the test pass.
+search-path = [
+    ".",
+    "tests",
+    "tests/unittest",
+    "tests/integration",
+    "examples",
+    "examples/llm-api",
+    "examples/llm-api/out_of_tree_example",
+    "examples/disaggregated/slurm/cache_transceiver_test",
+    "scripts",
+    "jenkins/scripts/cbts",
+    "tests/unittest/llmapi/apps",
+    "tests/unittest/_torch/pyexecutor",
+    "tests/unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm",
+    "tests/unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels",
+    "tests/integration/defs/disaggregated",
+    "tests/integration/defs/llmapi",
+    "tests/integration/defs/sysinfo",
+    "tests/integration/defs/utils",
+    "tests/scripts/perf-sanity/cache_transceiver_precheck",
+]
+enable-fallback-search-path = true
 
-[tool.pyrefly.sub-config.errors]
+[tool.pyrefly-tests.errors]
 missing-argument = "ignore"
 unexpected-keyword = "ignore"
 bad-argument-count = "ignore"
@@ -976,7 +976,6 @@ bad-argument-count = "ignore"
 [tool.pyrefly-exclusions]
 symbols = [
     "etcd3.*",
-    "nvrtc",
     "PreTrainedConfig",
     "CSA2TrtllmMetadata",
     "MoEImplBase",

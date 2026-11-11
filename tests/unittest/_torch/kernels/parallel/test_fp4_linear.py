@@ -353,7 +353,6 @@ def nvfp4_gemm_perf_test(
             with torch.inference_mode(), autotune():
                 output_ref = torch.ops.trtllm.nvfp4_gemm_cutlass(
                     x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_tensor, dtype)
-        assert output_ref is not None
         torch.testing.assert_close(output, output_ref)
         print(f"PASSED")
 
@@ -387,7 +386,6 @@ def nvfp4_gemm_perf_test(
             buffer_idx = buffer_idx + 1
 
     if test_ref:
-        assert output_ref is not None
         torch.testing.assert_close(output, output_ref)
         print(f"PASSED")
 

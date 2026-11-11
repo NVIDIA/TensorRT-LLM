@@ -747,7 +747,6 @@ def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
         if tensor_parallel_size == 1:
             admitted_encoder_keys = encoder_replay_keys[encoder_replay_count_before_admission:]
             assert any(key[0] == 2 for key in admitted_encoder_keys)
-            assert encoder_runner is not None
             assert set(encoder_replay_keys) <= set(encoder_runner.graphs)
             replayed_mixed_keys = {
                 key for key in decoder_replay_keys if key.num_contexts and key.num_encoder_tokens

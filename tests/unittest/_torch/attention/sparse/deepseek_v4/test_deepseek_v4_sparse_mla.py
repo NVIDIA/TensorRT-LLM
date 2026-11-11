@@ -1322,8 +1322,6 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
             )
 
             if uniform_metadata is not None:
-                assert uniform_q is not None
-                assert uniform_q_pe is not None and uniform_latent is not None
                 uniform_cu_q = torch.empty(batch_size + 1, dtype=torch.int32, device=device)
                 uniform_cu_kv = torch.empty_like(uniform_cu_q)
                 uniform_counter = torch.empty_like(fmha_scheduler_counter)
@@ -1789,4 +1787,4 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
 
 
 if __name__ == "__main__":
-    test_deepseek_v4_sparse_mla(context_lengths=[4399], generation_seq_len_q=2)
+    test_deepseek_v4_sparse_mla(context_lengths=[4399], generation_seq_len_q=1)

@@ -355,7 +355,6 @@ def test_minimax_m3_nvfp4_horizontal_producer_rejects_invalid_inputs(
             num_heads_q,
             num_kv_heads,
             *weights,
-            # pyrefly: ignore [bad-argument-count]
             rope_cache,
             position_ids,
         )

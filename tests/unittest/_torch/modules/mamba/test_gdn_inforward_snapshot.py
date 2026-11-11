@@ -166,7 +166,6 @@ def test_split_conv_states_match_two_iterations():
                 at_point = expected_live[slot].clone()
         if entry is not None:
             expected_stage[entry.row] = expected_live[slot]
-            assert at_point is not None
             expected_live[slot] = at_point
         start += length
 

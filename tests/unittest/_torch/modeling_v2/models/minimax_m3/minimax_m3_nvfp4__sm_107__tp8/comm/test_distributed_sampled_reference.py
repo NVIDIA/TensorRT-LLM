@@ -185,7 +185,6 @@ def test_distributed_sampled_reference(nreq: int, top_p: float, graph_mode: bool
                 graph.replay()
             else:
                 outputs = call()
-            assert outputs is not None
             for destination, output in zip(records, outputs):
                 destination[draw].copy_(output)
         torch.cuda.synchronize()

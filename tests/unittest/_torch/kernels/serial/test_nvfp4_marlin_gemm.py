@@ -76,27 +76,18 @@ class TestNvfp4MarlinGemm(unittest.TestCase):
 
         torch.random.manual_seed(0)
 
+        input_bf16 = input_e2m1 = input_e4m3_scale = None
         is_bf16_act = act_dtype == "bf16"
 
         if is_bf16_act:
             # BF16 activations — no FP4 quantization needed
             input_bf16 = torch.randn((batch_size, input_dim), dtype=torch.bfloat16).cuda()
             input_fp32 = input_bf16.float().cpu()
-            mat_a = input_bf16
-            scale_a = torch.zeros(1, dtype=torch.uint8, device="cuda")
-            alpha_arg = torch.ones(1, dtype=torch.float32, device="cuda")
         else:
             # FP4 activations with swizzled scales (for act dequant kernel)
             input_e2m1, input_e4m3_scale, input_fp32 = random_fp4_tensor_and_sf(
                 (batch_size, input_dim), sf_vec_size
             )
-            mat_a = input_e2m1.cuda()
-            m_padded = (batch_size + 128 - 1) // 128 * 128
-            act_sf_gpu = input_e4m3_scale.cuda()
-            scale_a = torch.ops.trtllm.block_scale_interleave_reverse(
-                act_sf_gpu.view(m_padded, -1)
-            ).flatten()
-            alpha_arg = torch.FloatTensor([alpha]).cuda()
 
         # FP4 weights with UN-swizzled scales (for Marlin processing)
         weights_e2m1, weights_e4m3_scale_raw, weights_fp32 = float_tensor_to_e2m1_and_ufp8_scale(
@@ -107,6 +98,7 @@ class TestNvfp4MarlinGemm(unittest.TestCase):
         )
 
         weights_fp32_transposed = torch.transpose(weights_fp32, 0, 1)
+        alpha_tensor = torch.FloatTensor([alpha]).cuda()
 
         ref_output_fp32 = torch.matmul(input_fp32, weights_fp32_transposed)
         if not is_bf16_act:
@@ -137,6 +129,21 @@ class TestNvfp4MarlinGemm(unittest.TestCase):
         weight_global_scale = marlin_utils.nvfp4_marlin_process_global_scale(
             torch.tensor(1.0, dtype=torch.bfloat16, device="cuda")
         )
+
+        if is_bf16_act:
+            # BF16 path: pass BF16 activations directly, dummy scale_a/alpha
+            mat_a = input_bf16
+            scale_a = torch.zeros(1, dtype=torch.uint8, device="cuda")
+            alpha_arg = torch.ones(1, dtype=torch.float32, device="cuda")
+        else:
+            # FP4 path: unswizzle activation scales for the dequant kernel
+            mat_a = input_e2m1.cuda()
+            m_padded = (batch_size + 128 - 1) // 128 * 128
+            act_sf_gpu = input_e4m3_scale.cuda()
+            scale_a = torch.ops.trtllm.block_scale_interleave_reverse(
+                act_sf_gpu.view(m_padded, -1)
+            ).flatten()
+            alpha_arg = alpha_tensor
 
         output = torch.ops.trtllm.marlin_nvfp4_gemm(
             mat_a,

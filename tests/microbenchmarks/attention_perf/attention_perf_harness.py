@@ -839,7 +839,6 @@ def _collect_signals_inproc(
         kv_mgr = _build_mla_kv_cache_manager(case) if case.is_mla else _build_kv_cache_manager(case)
     try:
         if case.is_dsa:
-            assert metadata is not None
             from tensorrt_llm._torch.attention.backends.sparse.dsa.module import _forward_dsa_attn
 
             # DSA context: indexer (sparse top-k select) + sparse MLA forward.

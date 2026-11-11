@@ -779,7 +779,6 @@ def test_single_node_transfer(tmp_path):
             f"gen log tail:\n{_log_tail(gen_log)}"
         )
 
-    assert ctx_proc is not None and gen_proc is not None
     if ctx_proc.returncode != 0:
         pytest.fail(f"ctx mpirun failed (rc={ctx_proc.returncode}):\n{_log_tail(ctx_log)}")
     if gen_proc.returncode != 0:

@@ -1586,7 +1586,6 @@ def test_prefix_load_recovery_lifetime(
                 if not is_async or not mixed_batch:
                     assert not output.prefix_loads
                 if mixed_batch:
-                    assert context is not None and generation is not None
                     assert batch.context_requests == [context]
                     assert batch.generation_requests == [generation]
                     assert {

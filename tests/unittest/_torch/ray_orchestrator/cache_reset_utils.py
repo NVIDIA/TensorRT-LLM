@@ -146,7 +146,6 @@ def check_cache_reset_events_through_control_rpc(tmp_path, ranks=1):
             assert output.outputs[0].token_ids
             before = _replay_until(replays[0], 0, "BlockStored")
             start_seqs = [before[-1][0] + 1]
-            assert cursors is not None, "No subscription reset completed"
             start_seqs.extend(cursors[rank] + 1 for rank in range(1, ranks))
 
             # Consume all earlier batches so the next observed marker must be

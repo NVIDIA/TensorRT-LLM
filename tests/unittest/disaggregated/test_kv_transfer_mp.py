@@ -90,7 +90,6 @@ def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = 
     # Use CPU tensors for gloo backend compatibility
     encoded = None
     if dist.get_rank(group) == src:
-        assert s is not None, "Source rank must provide the string"
         encoded = s.encode("utf-8")
         length = torch.tensor([len(encoded)], dtype=torch.long)
     else:
@@ -98,7 +97,7 @@ def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = 
 
     dist.broadcast(length, src=src, group=group)
 
-    if encoded is not None:
+    if dist.get_rank(group) == src:
         data = torch.tensor(list(encoded), dtype=torch.uint8)
     else:
         data = torch.empty(length.item(), dtype=torch.uint8)
@@ -409,7 +408,6 @@ def worker_fn(
     if rank in [0] + gen_ranks:
         if rank == ctx_instance_num:
             # gen rank 0 sends
-            assert gen_layer_num_per_pp is not None
             gen_layer_num_per_pp_tensor = torch.tensor(gen_layer_num_per_pp, dtype=torch.long)
         else:
             gen_layer_num_per_pp_tensor = torch.zeros(gen_pp, dtype=torch.long)

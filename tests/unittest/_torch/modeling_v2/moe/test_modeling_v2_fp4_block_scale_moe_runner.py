@@ -204,7 +204,6 @@ def test_deepseek_geometry():
         _assert_moe_close(y, exp)
         top = _dev(y, exp)  # after the loop: the largest token count's numbers
         worst = tuple(max(a, b) for a, b in zip(worst, top))
-    assert top is not None, "Expected at least one token count"
     print(
         f"  test_deepseek_geometry OK (worst {worst[0]:.2f} elt / {worst[1]:.2f} rms ulp; "
         f"at T={token_counts[-1]} {top[0]:.2f} elt / {top[1]:.2f} rms ulp)"
@@ -810,7 +809,6 @@ def test_ep_window_18_of_72():
     assert torch.equal(past, torch.zeros_like(past)), (
         "a window entirely past the routing space returned nonzero rows"
     )
-    assert top_win is not None and top_sum is not None and top_drop is not None
     print(
         f"  test_ep_window_18_of_72 OK (window {worst_win[0]:.2f} elt / "
         f"{worst_win[1]:.2f} rms, sum {worst_sum[0]:.2f} elt / {worst_sum[1]:.2f} rms, "
@@ -865,7 +863,6 @@ def test_r1_geometry():
         _assert_moe_close(y, exp)
         top = _dev(y, exp)  # after the loop: the largest token count's numbers
         worst = tuple(max(a, b) for a, b in zip(worst, top))
-    assert top is not None, "Expected at least one token count"
     print(
         f"  test_r1_geometry OK (worst {worst[0]:.2f} elt / {worst[1]:.2f} rms ulp; "
         f"at T={_R1_TOKENS[-1]} {top[0]:.2f} elt / {top[1]:.2f} rms ulp)"
@@ -1080,7 +1077,6 @@ def test_ep_window_64_of_256():
         elt, rms = _dev(bad, against)
         assert rms > 25.0, f"{name} only {rms:.1f} rms ulp away — not discriminated"
         print(f"    {name:31s} {elt:9.3g} elt / {rms:6.1f} rms ulp")
-    assert top_win is not None and top_sum is not None and top_drop is not None
     print(
         f"  test_ep_window_64_of_256 OK (window {worst_win[0]:.2f} elt / "
         f"{worst_win[1]:.2f} rms, sum {worst_sum[0]:.2f} elt / {worst_sum[1]:.2f} rms, "
@@ -1238,7 +1234,6 @@ def test_many_experts_top10_geometry(many_expert_layer):  # noqa: F811
             f"{name} is only {rms:.1f} rms ulp from the correct result, against a "
             f"2 ulp gate — this test would not catch it"
         )
-    assert top is not None, "Expected at least one token count"
     print(
         f"  test_many_experts_top10_geometry OK (worst {worst[0]:.2f} elt / "
         f"{worst[1]:.2f} rms ulp; at T={_MANY_TOKENS[-1]} {top[0]:.2f} elt / "

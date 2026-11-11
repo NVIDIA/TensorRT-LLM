@@ -67,7 +67,6 @@ async def test_ctx_failure_releases_pending_gen_placement(
         await release_selection.wait()
         if not reserved_before_cancel:
             selected = await reserve()
-        assert selected is not None
         server, info, request_id = selected
         selection_completed.set()
         return web.Response(

@@ -206,14 +206,7 @@ def test_optimized_two_pool_prefill_and_decode(
                 pytest.raises(RuntimeError, match="backend failure"),
             ):
                 Attention.forward_impl(
-                    # pyrefly: ignore [bad-argument-count]
-                    module,
-                    *inputs,
-                    metadata,
-                    PredefinedAttentionMask.CAUSAL,
-                    None,
-                    None,
-                    None,
+                    module, *inputs, metadata, PredefinedAttentionMask.CAUSAL, None, None, None
                 )
             assert metadata.kv_cache_manager is manager
             assert metadata.kv_layout == kv_layout

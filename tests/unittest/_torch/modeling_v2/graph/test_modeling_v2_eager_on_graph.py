@@ -153,7 +153,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         if graph is not None:
             x_static.copy_(x_new)
             graph.replay()
-            assert h_static is not None
             got, got_outs = h_static.clone(), [o.clone() for o in outs_static]
         else:
             got, got_outs = _body(x_new, breaks, broken)

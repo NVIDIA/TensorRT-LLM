@@ -27,8 +27,9 @@ import pynvml
 
 try:
     from cuda.bindings import driver as cuda
+    from cuda.bindings import nvrtc
 except ImportError:
-    from cuda import cuda
+    from cuda import cuda, nvrtc
 
 # Logger
 logger = logging.getLogger(__name__)

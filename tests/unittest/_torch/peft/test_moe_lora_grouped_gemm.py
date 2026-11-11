@@ -533,7 +533,6 @@ def test_fp8_moe_rejects_misaligned_rank(schema, max_rank):
         else "requires active ranks divisible by 16"
     )
     with pytest.raises(RuntimeError, match=error):
-        # pyrefly: ignore [bad-argument-count]
         _call_fused_moe(*inputs, dtype, kwargs)
 
 

@@ -2113,7 +2113,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                                                      sparse_config, gen_indices,
                                                      cached_lens, dtype, device)
     elif sparse_attn_algo == "deepseek_v4":
-        assert ref_compressor is not None and ref_indexer_compressor is not None
         kv_cache_for_ref = populate_gen_deepseek_v4_kv_cache(
             mla, ref_compressor, ref_indexer_compressor, AttentionCls,
             pretrained_config, kv_cache_manager, mapping, sparse_config,
@@ -2226,7 +2225,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     batch_ctx_indices = list(range(num_contexts))
     batch_gen_indices = list(range(num_contexts, len(batch_order)))
     if sparse_attn_algo == "deepseek_v4":
-        assert ref_indexer_compressor is not None
         reference_topk_indices_local = calculate_reference_deepseek_v4_topk_indices(
             mla=mla,
             ref_indexer_compressor=ref_indexer_compressor,

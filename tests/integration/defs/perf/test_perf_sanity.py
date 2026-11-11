@@ -4961,7 +4961,6 @@ class PerfSanityTestConfig:
         if benchmark_mode == "ctx_only":
             spec_decoding = bool(ctx_server_config.spec_decoding_type)
         else:
-            assert gen_server_config is not None
             spec_decoding = bool(ctx_server_config.spec_decoding_type) or bool(
                 gen_server_config.spec_decoding_type
             )

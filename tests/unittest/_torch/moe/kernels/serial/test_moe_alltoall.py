@@ -665,7 +665,6 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
         for rank in range(ep_size):
             cuda_streams_all_ranks[rank].synchronize()
 
-        assert gathered_expert_statics is not None
         gathered_expert_statics_cpu = gathered_expert_statics.cpu()
         for rank in range(ep_size):
             for i in range(expert_count):

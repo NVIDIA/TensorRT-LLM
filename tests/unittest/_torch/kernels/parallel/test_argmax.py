@@ -204,7 +204,6 @@ def test_argmax_performance(N):
 
     print(f"{'=' * 70}")
 
-    assert out is not None, "At least one iteration is required"
     # Verify correctness
     expected_max, expected_idx = torch.max(x, dim=-1, keepdim=True)
     torch.testing.assert_close(out[:, 0:1], expected_max, atol=1e-4, rtol=1e-4)

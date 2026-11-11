@@ -2677,8 +2677,6 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 intermediate_size, None, None, 0, num_experts, routed_scaling,
                 routing_method_type, act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "fp8":
-            assert scale_c_fc1 is not None
-            assert scale_gate_fc1 is not None and scale_c_fc2 is not None
             output = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
                 input_hidden_states.cuda().to(torch.float8_e4m3fn),

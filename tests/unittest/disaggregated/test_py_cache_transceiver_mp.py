@@ -68,7 +68,6 @@ def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = 
     """Broadcast a string from src rank to all other ranks in the group."""
     encoded = None
     if dist.get_rank(group) == src:
-        assert s is not None, "Source rank must provide the string"
         encoded = s.encode("utf-8")
         length = torch.tensor([len(encoded)], dtype=torch.long)
     else:
@@ -76,7 +75,7 @@ def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = 
 
     dist.broadcast(length, src=src, group=group)
 
-    if encoded is not None:
+    if dist.get_rank(group) == src:
         data = torch.tensor(list(encoded), dtype=torch.uint8)
     else:
         data = torch.empty(length.item(), dtype=torch.uint8)

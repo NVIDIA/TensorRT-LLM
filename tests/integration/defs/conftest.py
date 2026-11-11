@@ -291,6 +291,7 @@ def medusa_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="function")
 def deepseek_v3_model_root(request):
     models_root = llm_models_root()
+    deepseek_v3_model_root = ""
     if request.param == "DeepSeek-V3":
         deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3")
     elif request.param == "DeepSeek-V3-Lite-bf16":
@@ -310,6 +311,7 @@ def deepseek_v3_model_root(request):
 @pytest.fixture(scope="function")
 def gpt_oss_model_root(request):
     models_root = os.path.join(llm_models_root(), "gpt_oss")
+    gpt_oss_model_root = ""
     if request.param == "gpt-oss-20b":
         gpt_oss_model_root = os.path.join(models_root, "gpt-oss-20b")
     assert exists(gpt_oss_model_root), f"{gpt_oss_model_root} does not exist!"

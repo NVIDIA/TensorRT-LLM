@@ -1278,7 +1278,6 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
                     expected_context + ([20, 30] if overlap else [19, 29]),
                 )
                 if mixed:
-                    assert context is not None
                     self.assertEqual(inputs["context_requests"], [context])
                     self.assertEqual(metadata.seq_lens.tolist(), [1128, 1, 1])
                     self.assertEqual(context.context_current_position, 4000)

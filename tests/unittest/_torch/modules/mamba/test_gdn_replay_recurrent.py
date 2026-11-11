@@ -532,7 +532,6 @@ def test_gdn_cached_replay_all_layer_commit_matches_reference(state_layout):
     if state_views is not None:
         actual_states = torch.stack(state_views)
 
-    assert actual_states is not None
     torch.testing.assert_close(actual_states.float(), expected_states.float(), rtol=2e-2, atol=2e-2)
 
 

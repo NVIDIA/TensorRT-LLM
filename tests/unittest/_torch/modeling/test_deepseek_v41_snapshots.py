@@ -321,7 +321,6 @@ def test_encoder_snapshot_resumes_without_replay(
                 model, metadata, [fresh], ids[start : start + length], [start], [length], 1
             )
             start += length
-        assert output is not None, "Expected at least one input chunk"
         torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
         for layer, role, slot, before in saved:
             torch.testing.assert_close(

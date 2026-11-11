@@ -386,7 +386,6 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
                         f"Token {t} compress out[{out_pos}]: expected valid index, got {global_idx}"
                     )
                     pool_based_idx = global_idx - compressed_offset
-                    assert compressed_buffer_flat is not None
                     actual = compressed_buffer_flat[pool_based_idx]
 
                     physical_idx = _local_to_physical_idx(

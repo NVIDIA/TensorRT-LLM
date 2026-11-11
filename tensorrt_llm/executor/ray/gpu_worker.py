@@ -45,6 +45,7 @@ from ..rpc_worker_mixin import RpcWorkerMixin
 if TYPE_CHECKING:
     from tensorrt_llm.logger import Logger
 
+# Bound lazily in __init__ because Ray cannot pickle the logger; declared for type checkers.
 logger: "Logger"
 
 __all__ = [

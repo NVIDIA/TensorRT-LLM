@@ -1510,7 +1510,6 @@ def test_bounded_replay_full_module_graph_changes_hit_position(replay_module_fac
         # The oracle uses the same approximate/truncated replay policy,
         # not a full-prefix reconstruction. Context/gen kernels can differ
         # by ordinary BF16 reduction rounding.
-        assert captured is not None
         torch.testing.assert_close(captured, expected, atol=0.03, rtol=0.03)
         torch.testing.assert_close(manager.get_main_buffer(0)[slots], old_main, atol=0, rtol=0)
         torch.testing.assert_close(

@@ -884,7 +884,6 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
             "adaptive-skip pass count out of range"
         )
         seed_counts = seed_row[:, 3:6].to(torch.int32)
-    assert seed_counts is not None
     for row in range(num_rows):
         ctx = int(context_lens[row // next_n].item())
         tag = f"row={row} ctx={ctx} next_n={next_n} pbk={phys_block_kv}"

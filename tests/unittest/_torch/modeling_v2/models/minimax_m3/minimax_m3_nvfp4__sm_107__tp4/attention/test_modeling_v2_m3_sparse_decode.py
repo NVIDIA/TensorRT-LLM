@@ -291,7 +291,6 @@ def test_invalid_slot_fails_closed(fault, monkeypatch) -> None:
     # The reference walks each token's first min(16, blocks) entries and drops -1: the corrupt slots as -1.
     ref_topk = case.topk.clone()
     if fault == "page_out_of_pool":
-        assert hits is not None
         for h, t, k in hits:
             ref_topk[h, req * 4 + t, k] = -1
     else:

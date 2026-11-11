@@ -2587,6 +2587,7 @@ def _run_rank_mask_one_rank_masked_test(
 def _exercise_mnnvl_checkpoint_graph_replay(
     config: CommTestConfig, rank: int, communication
 ) -> bool:
+    any_allocation_is_mapped = None
     worker_inputs = _prepare_worker_inputs(rank, config)
     _, local_slot_start, local_slot_end = _compute_ep_partition(
         config.num_experts, config.ep_size, rank
@@ -2626,9 +2627,6 @@ def _exercise_mnnvl_checkpoint_graph_replay(
         def allocations_are_mapped() -> bool:
             return communication.mnnvl_mem.mapped
 
-        def any_allocation_is_mapped() -> bool:
-            return communication.mnnvl_mem.mapped
-
     else:
         stable_addresses = (
             communication.alltoall_workspace.data_ptr(),
@@ -2646,6 +2644,11 @@ def _exercise_mnnvl_checkpoint_graph_replay(
                 workspace is not None and workspace.mapped
                 for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
             )
+
+    if config.comm_type == COMM_NVLINK_ONE_SIDED:
+
+        def any_allocation_is_mapped() -> bool:
+            return communication.mnnvl_mem.mapped
 
     for cycle in range(3):
         free_before_prepare = torch.cuda.mem_get_info()[0]

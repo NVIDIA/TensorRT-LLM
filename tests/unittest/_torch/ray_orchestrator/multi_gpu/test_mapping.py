@@ -127,7 +127,6 @@ class TestMapping(unittest.TestCase):
         )
 
         if test_type == "parity":
-            assert mapping_mpi is not None
             mapping_device_mesh.build_mesh()
 
             properties = []

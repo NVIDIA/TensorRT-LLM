@@ -462,7 +462,6 @@ async def test_chat_streaming_image(async_client: openai.AsyncOpenAI,
         if delta.content:
             str_chunks.append(delta.content)
     # test finish_reason
-    assert delta is not None, "Expected at least one streaming response"
     if delta.content == "":
         assert finish_reason == "stop"
     assert finish_reason_counter == 1

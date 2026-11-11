@@ -118,7 +118,6 @@ def test_guard_refuses_mixed_devices(index) -> None:
     inputs[index] = inputs[index].to(f"cuda:{other_device}")
     with pytest.raises(AssertionError, match="device"):
         with validating(attn_res_fwd):
-            # pyrefly: ignore [bad-argument-count]
             attn_res_fwd(*inputs, RMS_EPS)
 
 

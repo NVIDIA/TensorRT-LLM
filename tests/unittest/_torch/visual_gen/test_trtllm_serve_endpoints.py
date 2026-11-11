@@ -3558,7 +3558,6 @@ async def test_video_omni_inputs(endpoint, transport, omni_generator, omni_refer
     assert omni_generator.last_inputs == prompt
     assert omni_generator.last_ref_bytes == expected
     if omni_generator._model == "minimax-h3-ref2va":
-        assert order is not None
         assert omni_generator.last_params.extra_params["reference_order"] == order
 
 

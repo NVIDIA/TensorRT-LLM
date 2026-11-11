@@ -226,7 +226,7 @@ def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
     input_processor = create_input_processor_with_hash(_ItemMetadataFakeProcessor([1]))
 
     with pytest.raises(ValueError, match="do not match"):
-        # pyrefly: ignore [bad-argument-count, unexpected-keyword]
+        # pyrefly: ignore [unexpected-keyword]
         input_processor({"prompt": "unused"}, sampling_params=None)
 
 
@@ -267,7 +267,7 @@ def test_mm_item_metadata_rejects_wrong_return_type():
     input_processor = create_input_processor_with_hash(BadMetadataProcessor([2]))
 
     with pytest.raises(TypeError, match="must return a"):
-        # pyrefly: ignore [bad-argument-count, unexpected-keyword]
+        # pyrefly: ignore [unexpected-keyword]
         input_processor({"prompt": "unused"}, sampling_params=None)
 
 

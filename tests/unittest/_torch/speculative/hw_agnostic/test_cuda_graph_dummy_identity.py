@@ -93,7 +93,6 @@ def test_padding_families_never_consume_real_worker_slots(monkeypatch, physical_
             assert list(worker._free_slots) == [1, 2, 3]
             assert worker._batch_to_slot[:3].tolist() == [0, 4, 4]
 
-    assert dummy_id is not None
     metadata.request_ids = [0, dummy_id]
     metadata.num_generations = 2
     DSparkSpecMetadata.prepare(metadata)

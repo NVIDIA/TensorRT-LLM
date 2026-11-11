@@ -141,7 +141,7 @@ if is_linux():
                 pass
         p.kill()
 
-elif is_windows():
+elif sys.platform == "win32":
     import pywintypes
     import win32api
     import win32job

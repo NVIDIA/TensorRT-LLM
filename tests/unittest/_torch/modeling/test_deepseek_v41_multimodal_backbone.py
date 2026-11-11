@@ -260,7 +260,6 @@ def test_engram_image_boundaries_survive_request_lifecycle(monkeypatch: pytest.M
         if start == 7:
             addresses = {layer: hashes.data_ptr() for layer, hashes in actual.items()}
         else:
-            assert addresses is not None
             assert {layer: hashes.data_ptr() for layer, hashes in actual.items()} == addresses
 
 
