@@ -173,6 +173,11 @@ class HybridCachePolicy:
     # token boundary and takes a whole state slot whatever the prompt length, while a
     # short prompt is cheap to recompute. 0: off. Needs block reuse.
     low_priority_snapshot_prompt_len: int = 0
+    # When the batch's recurrent-state indices or dummy-request mask change, write
+    # both device buffers with one SM kernel from pinned snapshots instead of two
+    # copy-engine copies, whose engine hand-offs delay the execution stream in front
+    # of the next step's inputs. Unchanged buffers are not written either way.
+    state_index_upload_kernel: bool = False
 
 
 class DecodePrologue(Protocol):
