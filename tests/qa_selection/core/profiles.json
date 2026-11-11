@@ -36,12 +36,5 @@
     "device_memory_mib": 284208,
     "max_gpu_per_node": 4,
     "cpu_arch": "aarch64"
-  },
-  "VR200": {
-    "sm": 107,
-    "device_name": "VR NVL72 ES",
-    "device_memory_mib": 168896,
-    "max_gpu_per_node": 4,
-    "cpu_arch": "aarch64"
   }
 }

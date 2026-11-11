@@ -59,9 +59,9 @@ A profile is what the selection rules ask about a machine:
 try another allocation policy; `--ladder` overrides it for a run.
 
 **Cluster machines** are in [`core/profiles.json`](core/profiles.json). The cluster selects in a
-CPU container before any GPU is allocated, so every machine it schedules needs an entry there. To
-add one, run the plugin on the machine without `--machine`, and copy the `profile` of its
-`local.json` under the machine's name.
+CPU container before any GPU is allocated, so `--machine` names an entry there. To add one, run
+the plugin on the machine without `--machine`, and copy the `profile` of its `local.json` under the
+machine's name.
 
 **This host** needs no entry. Without `--machine`, the plugin reads the profile from `nvidia-smi`,
 not counting display GPUs (`DGX Display`), and records it as `profile` in `local.json`. When
@@ -110,7 +110,7 @@ qa_selection/
 ## Tests
 
 ```bash
-pytest tests/qa_selection/tests      # 28 tests, no wheel
+pytest tests/qa_selection/tests      # 27 tests, no wheel
 ```
 
 The tests are the plugin's contracts with its callers: the options and files the QA pipeline's
@@ -126,7 +126,7 @@ it. Each test states a command line and the answer expected back.
 | A named machine is decided from its catalogue profile, never the collecting host: its architecture, wherever the mark sits | [`test_arch.py`](tests/test_arch.py) (6) |
 | A test's GPU count is its markers, read as the integration conftest reads them | [`test_gpu_count.py`](tests/test_gpu_count.py) (4) |
 | Each kept test is on its smallest rung, in the record and in exactly one list; a test above the largest rung is deselected with its reason | [`test_ladder.py`](tests/test_ladder.py) (3), [`test_largest_rung.py`](tests/test_largest_rung.py) (1) |
-| The catalogue is the six cluster machines; without `--ladder`, a run uses the profile's ladder, and the record carries the profile | [`test_profiles.py`](tests/test_profiles.py) (9) |
+| The catalogue is the five cluster machines; without `--ladder`, a run uses the profile's ladder, and the record carries the profile | [`test_profiles.py`](tests/test_profiles.py) (8) |
 | Without `--machine`, this host is the target, recorded as `local`: a saved `local.json` profile, else a probe; a bad `local.json`, or a host it cannot probe, is a usage error before collection | [`test_saved_profile.py`](tests/test_saved_profile.py) (2), [`test_local_machine.py`](tests/test_local_machine.py) (1), [`test_unprobed_host.py`](tests/test_unprobed_host.py) (1) |
 
 ## Config

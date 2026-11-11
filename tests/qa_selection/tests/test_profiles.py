@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The machine catalogue: the six cluster machines, and the ladder each runs by default.
+"""The machine catalogue: the five cluster machines, and the ladder each runs by default.
 
     pytest --collect-only -p qa_selection.plugin --machine=GB200 --selection-out-dir=out/
     -> out/GB200.json: "machine", "profile" (its catalogue entry), "ladder"
@@ -38,7 +38,6 @@ DEFAULT_LADDERS = {
     "B300": [1, 4, 8],
     "GB200": [4],
     "GB300": [4],
-    "VR200": [4],
 }
 
 
