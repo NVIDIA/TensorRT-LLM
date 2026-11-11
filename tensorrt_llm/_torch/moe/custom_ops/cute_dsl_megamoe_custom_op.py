@@ -519,10 +519,11 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
 # DSv4-Pro (world_size, num_experts_per_rank) -> inclusive max_tokens_per_rank range whose
 # default turns combine_dedup on. Only buckets measured faster are listed: dedup trims the
 # combine traffic by the duplicate-destination rate, which falls as the world size grows.
+# EP16 stays off: its best bucket gained ~4.5% but the dedup combine region holds 16 rows
+# per token instead of top-k's 6, about 1.2 GB more shared workspace per rank.
 _SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS: dict[Tuple[int, int], Tuple[int, int]] = {
     (4, 96): (8192, 32768),
     (8, 48): (4096, 16384),
-    (16, 24): (8192, 8192),
 }
 
 
