@@ -596,18 +596,19 @@ def _resolve_max_seq_len_q_alias(
     seq_len_q: Optional[int],
     max_q_len: Optional[int],
     default: Optional[int],
+    validate: bool = True,
 ) -> Optional[int]:
     """Resolve the legacy fixed-Q name and the explicit static-bound name."""
 
     legacy_bound = (
         _validate_positive_int(seq_len_q, "seq_len_q")
-        if seq_len_q is not None
-        else None
+        if validate and seq_len_q is not None
+        else seq_len_q
     )
     explicit_bound = (
         _validate_positive_int(max_q_len, "max_q_len")
-        if max_q_len is not None
-        else None
+        if validate and max_q_len is not None
+        else max_q_len
     )
     if (
         legacy_bound is not None
@@ -1586,12 +1587,13 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     device=None,
     store_softmax_stats: bool = False,
     use_kv_bounds: bool = False,
+    validate: bool = True,
 ) -> int:
     """Return caller-workspace bytes for one automatic MLA policy.
 
     The arguments define the static geometry used to resolve the same automatic
     policy and private scratch layout as
-    :func:`batch_mla_decode_with_paged_kv_cache`, without compiling a kernel.
+    :func:`batch_mla_decode_with_paged_kv_cache`, without compiling attention kernels.
     ``max_q_len`` is the static per-request Q bound for both fixed and
     packed-query launches;
     ``seq_len_q`` remains a backward-compatible fixed-Q alias. If neither is
@@ -1601,34 +1603,48 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     bounds add no scratch, while statistics add split-state sidecars. Use
     a contiguous ``torch.int8`` or ``torch.uint8`` CUDA buffer; MLA does not require its
     contents to be initialized before first use.
+
+    ``validate=False`` skips repeated input/device validation. The caller must
+    ensure supported hardware, valid geometry and dtypes, and a static Q bound
+    covering every request. Alias and device resolution are retained, as is
+    the shared automatic-policy cache; a cold policy lookup may still query
+    device properties or compile a hardware occupancy probe. Warm up outside
+    CUDA graph capture.
     """
 
-    if not isinstance(store_softmax_stats, bool):
-        raise TypeError("store_softmax_stats must be a bool")
-    if not isinstance(use_kv_bounds, bool):
-        raise TypeError("use_kv_bounds must be a bool")
-    batch_size = _validate_positive_int(batch_size, "batch_size")
-    num_qo_heads = _validate_positive_int(num_qo_heads, "num_qo_heads")
-    _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
-    page_size = _validate_page_size(page_size)
-    max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
+    if not isinstance(validate, bool):
+        raise TypeError("validate must be a bool")
+    if validate:
+        if not isinstance(store_softmax_stats, bool):
+            raise TypeError("store_softmax_stats must be a bool")
+        if not isinstance(use_kv_bounds, bool):
+            raise TypeError("use_kv_bounds must be a bool")
+        batch_size = _validate_positive_int(batch_size, "batch_size")
+        num_qo_heads = _validate_positive_int(num_qo_heads, "num_qo_heads")
+        _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
+        page_size = _validate_page_size(page_size)
+        max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
     max_q_len = _resolve_max_seq_len_q_alias(
         seq_len_q=seq_len_q,
         max_q_len=max_q_len,
         default=1,
+        validate=validate,
     )
     assert max_q_len is not None
-    _validate_mla_query_head_extent(
-        batch_size=batch_size,
-        num_qo_heads=num_qo_heads,
-        max_q_len=max_q_len,
-    )
-    _validate_mask(mask_type)
+    if validate:
+        _validate_mla_query_head_extent(
+            batch_size=batch_size,
+            num_qo_heads=num_qo_heads,
+            max_q_len=max_q_len,
+        )
+        _validate_mask(mask_type)
     if kv_dtype is None:
         kv_dtype = q_dtype
-    _validate_mla_dtype_pair(q_dtype, kv_dtype, out_dtype)
+    if validate:
+        _validate_mla_dtype_pair(q_dtype, kv_dtype, out_dtype)
     resolved_device, device_index = _resolve_cuda_device(device)
-    _validate_runtime_device(resolved_device)
+    if validate:
+        _validate_runtime_device(resolved_device)
 
     spec = _resolve_mla_decode_launch_spec(
         device_index,
@@ -1649,13 +1665,8 @@ def get_prims_ts_batch_mla_decode_workspace_size(
         store_softmax_stats,
         use_kv_bounds,
     )
-    return _make_mla_workspace_layout(
-        spec.kernel_workspace_bytes,
-        batch_size,
-        num_qo_heads,
-        max_q_len,
-        include_lse=False,
-    ).total_bytes
+    # No final LSE section is needed; only the kernel scratch alignment remains.
+    return _align_up(spec.kernel_workspace_bytes)
 
 
 def _prepare_mla_runtime(

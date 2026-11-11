@@ -455,13 +455,16 @@ def _resolve_q_mode(
     qo_indptr: Optional[torch.Tensor],
     max_q_len: Optional[int],
     require_packed_max: bool,
+    validate: bool = True,
 ) -> tuple[bool, Optional[int]]:
     """Resolve fixed versus packed Q without exposing an internal mode knob."""
 
-    seq_len_q = _validate_seq_len_q(seq_len_q)
+    if validate:
+        seq_len_q = _validate_seq_len_q(seq_len_q)
     if qo_indptr is None:
         if max_q_len is not None:
-            max_q_len = _validate_seq_len_q(max_q_len)
+            if validate:
+                max_q_len = _validate_seq_len_q(max_q_len)
             if max_q_len != seq_len_q:
                 raise ValueError(
                     "fixed seq_len_q and max_q_len must agree: "
@@ -479,7 +482,8 @@ def _resolve_q_mode(
                 "workspace/JIT interface"
             )
         return True, None
-    max_q_len = _validate_seq_len_q(max_q_len)
+    if validate:
+        max_q_len = _validate_seq_len_q(max_q_len)
     if seq_len_q != 1 and seq_len_q != max_q_len:
         raise ValueError(
             "seq_len_q and max_q_len must agree when both provide the "
@@ -2233,11 +2237,12 @@ def get_prims_ts_batch_decode_workspace_size(
     split_kv: bool = True,
     use_attention_sinks: bool = False,
     store_softmax_stats: bool = False,
+    validate: bool = True,
 ) -> int:
     """Return caller-workspace bytes for one automatic FMHA policy.
 
     The arguments resolve the same policy and scratch layout as
-    :func:`batch_decode_with_paged_kv_cache`, without compiling a kernel.
+    :func:`batch_decode_with_paged_kv_cache`, without compiling attention kernels.
     Allocate at least the returned number of bytes as a contiguous
     ``torch.int8`` or ``torch.uint8`` CUDA tensor and zero it before its first
     FMHA launch. Re-zero a reused buffer whenever any workspace-layout input,
@@ -2255,9 +2260,9 @@ def get_prims_ts_batch_decode_workspace_size(
     ``storage_page_size`` defaults to the semantic ``page_size``. A larger
     physical page is supported only for semantic page size four and activates
     encoded ``(physical page, subpage)`` locators.
-    This sizing helper validates that every cumulative-offset delta is positive
-    and no larger than the bound. If ``device`` is omitted, it is inferred from
-    ``qo_indptr`` for a packed launch. ``k_dtype`` defaults to ``q_dtype`` and
+    By default, this sizing helper validates that every cumulative-offset delta
+    is positive and no larger than the bound. If ``device`` is omitted, it is
+    inferred from ``qo_indptr`` for a packed launch. ``k_dtype`` defaults to ``q_dtype`` and
     ``v_dtype`` to ``k_dtype``; pass ``v_dtype=torch.float8_e4m3fn`` with
     BF16 Q/K to size the QK-BF16/PV-FP8 launch. ``kv_dtype`` is a
     compatibility alias for both K and V and must agree with explicit dtypes.
@@ -2270,46 +2275,61 @@ def get_prims_ts_batch_decode_workspace_size(
     ``store_softmax_stats`` must also match the plan: enabled standalone
     reducers reserve an additional FP32 maximum and denominator per split and
     output row.
+
+    ``validate=False`` skips repeated input/device validation and packed-Q
+    offset readbacks. The caller must ensure supported hardware, valid geometry,
+    dtypes and metadata, and a static Q bound covering every request. Alias and
+    device resolution are retained, as is the shared automatic-policy cache;
+    a cold policy lookup may still query device properties or compile a hardware
+    occupancy probe. Warm up outside CUDA graph capture.
     """
 
-    if not isinstance(store_softmax_stats, bool):
-        raise TypeError("store_softmax_stats must be a bool")
-    batch_size = _validate_positive_int(batch_size, "batch_size")
+    if not isinstance(validate, bool):
+        raise TypeError("validate must be a bool")
+    if validate:
+        if not isinstance(store_softmax_stats, bool):
+            raise TypeError("store_softmax_stats must be a bool")
+        batch_size = _validate_positive_int(batch_size, "batch_size")
     packed_query, resolved_seq_len_q = _resolve_q_mode(
         seq_len_q=seq_len_q,
         qo_indptr=qo_indptr,
         max_q_len=max_q_len,
         require_packed_max=True,
+        validate=validate,
     )
     assert resolved_seq_len_q is not None
     seq_len_q = resolved_seq_len_q
-    _validate_head_geometry(num_qo_heads, num_kv_heads)
-    _validate_decode_query_head_extent(
-        batch_size=batch_size,
-        num_qo_heads=num_qo_heads,
-        max_q_len=seq_len_q,
-    )
-    head_dim = _validate_head_dim(head_dim)
-    page_size = _validate_page_size(page_size)
-    storage_page_size = _validate_storage_page_size(
-        page_size,
-        page_size if storage_page_size is None else storage_page_size,
-    )
-    max_kv_len = _validate_max_kv_len(max_kv_len, "max_kv_len")
-    _validate_layout(kv_layout)
-    _validate_mask(mask_type)
-    window_left = _validate_window_left(window_left, mask_type)
+    if validate:
+        _validate_head_geometry(num_qo_heads, num_kv_heads)
+        _validate_decode_query_head_extent(
+            batch_size=batch_size,
+            num_qo_heads=num_qo_heads,
+            max_q_len=seq_len_q,
+        )
+        head_dim = _validate_head_dim(head_dim)
+        page_size = _validate_page_size(page_size)
+        storage_page_size = _validate_storage_page_size(
+            page_size,
+            page_size if storage_page_size is None else storage_page_size,
+        )
+        max_kv_len = _validate_max_kv_len(max_kv_len, "max_kv_len")
+        _validate_layout(kv_layout)
+        _validate_mask(mask_type)
+        window_left = _validate_window_left(window_left, mask_type)
+    elif storage_page_size is None:
+        storage_page_size = page_size
     k_dtype, v_dtype = _resolve_kv_dtypes(q_dtype, k_dtype, v_dtype, kv_dtype)
     if out_dtype is None:
         out_dtype = q_dtype
-    _validate_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype)
+    if validate:
+        _validate_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype)
     inferred_device = (
         qo_indptr.device
         if device is None and isinstance(qo_indptr, torch.Tensor)
         else device
     )
     resolved_device, _ = _resolve_cuda_device(inferred_device)
-    if qo_indptr is not None:
+    if validate and qo_indptr is not None:
         _validate_qo_indptr(
             qo_indptr,
             expected_device=resolved_device,
@@ -2341,6 +2361,7 @@ def get_prims_ts_batch_decode_workspace_size(
         split_kv=split_kv,
         use_attention_sinks=use_attention_sinks,
         store_softmax_stats=store_softmax_stats,
+        validate=validate,
     ).total_bytes
 
 
@@ -3026,11 +3047,13 @@ def _resolve_decode_workspace_layout(
     share_pattern_across_kv_heads: bool = True,
     use_attention_sinks: bool = False,
     store_softmax_stats: bool = False,
+    validate: bool = True,
 ) -> _DecodeWorkspaceLayout:
     """Resolve the byte layout for one already-validated semantic key."""
 
     resolved_device, device_index = _resolve_cuda_device(device)
-    _validate_runtime_device(resolved_device)
+    if validate:
+        _validate_runtime_device(resolved_device)
     spec = _resolve_decode_launch_spec(
         device_index,
         batch_size,
