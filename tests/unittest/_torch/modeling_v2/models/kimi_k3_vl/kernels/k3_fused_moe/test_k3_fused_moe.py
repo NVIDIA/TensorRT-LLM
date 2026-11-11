@@ -354,6 +354,39 @@ def test_k3_fused_moe_partial_rows_past_m():
         assert torch.equal(_bits(y_poisoned), _bits(y_zeroed)), m
 
 
+@pytest.mark.parametrize("num_tokens", [1, 5, 8])
+def test_k3_fused_moe_zero_weights_reused_output(num_tokens):
+    """Zero routing weights overwrite active output rows without touching padding or poisoning reuse."""
+    ops = _ops()
+    _, raw, bias = _experts()
+    logits8, x8 = _tokens("16_local")
+    logits = logits8[:num_tokens].contiguous()
+    latent = x8[:num_tokens].contiguous()
+    ids, weights, x_fp8, x_sf = ops.k3_route_quant(logits, bias, latent, RSF)
+    assert bool(((ids >= OFFSET) & (ids < OFFSET + E_LOCAL)).all())
+    layer = _layer()
+    reference = _reference(raw, _deq_x(x_fp8, x_sf), ids, weights).bfloat16()
+    expected = layer(x_fp8, x_sf, ids, weights, OFFSET)
+    assert _compare(expected, reference)["ok"]
+    assert bool((expected != 0).any())
+    assert _scratch_rearmed()
+
+    output = torch.full((num_tokens + 1, H), 17.0, dtype=torch.bfloat16, device="cuda")
+    for routing_weights in (weights, torch.zeros_like(weights), weights):
+        output[:num_tokens].fill_(float("nan"))
+        actual = layer(x_fp8, x_sf, ids, routing_weights, OFFSET, out=output)
+        assert actual.shape == (num_tokens, H)
+        assert actual.dtype == torch.bfloat16
+        assert actual.data_ptr() == output.data_ptr()
+        assert bool(torch.isfinite(actual).all())
+        if routing_weights is weights:
+            assert torch.equal(_bits(actual), _bits(expected))
+        else:
+            assert torch.equal(actual, torch.zeros_like(actual))
+        assert bool((output[num_tokens:] == 17.0).all())
+        assert _scratch_rearmed()
+
+
 def test_token_limit():
     _ops()
     proc, _, bias = _experts()

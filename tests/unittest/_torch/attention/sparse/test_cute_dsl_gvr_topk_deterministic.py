@@ -126,6 +126,44 @@ def test_deterministic_prefill(rows, n, k):
 
 
 @skip_not_sm100
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_prefill_mixed_short_and_unaligned_windows(deterministic):
+    num_columns = 8192
+    top_k = 512
+    starts = [0, 1, 2, 3, 1, 3, 1, num_columns]
+    lengths = [0, 1, top_k - 1, top_k, top_k + 1, 4093, num_columns - 1, 0]
+    ends = [start + length for start, length in zip(starts, lengths)]
+    base = _row(num_columns, top_k, "unique")
+    scores = torch.full((len(starts), num_columns), 2.0)
+    for row_index, (start, end) in enumerate(zip(starts, ends)):
+        scores[row_index, start:end] = base[start:end]
+    output = torch.full((len(starts), top_k), -99, dtype=torch.int32, device="cuda")
+
+    ss.run_prefill(
+        scores.cuda(),
+        torch.tensor(starts, dtype=torch.int32, device="cuda"),
+        torch.tensor(ends, dtype=torch.int32, device="cuda"),
+        output,
+        deterministic=deterministic,
+    )
+    actual = output.cpu()
+
+    for row_index, (start, end) in enumerate(zip(starts, ends)):
+        length = end - start
+        if length <= top_k:
+            # Unique scores, so every window element is selected: the row
+            # must be exactly the window-relative indices 0..length-1 plus
+            # -1 padding, as a multiset. The -99 sentinel still catches
+            # unwritten slots, duplicates fail the multiset, and any
+            # column outside [start, end) (score 2.0) fails too — without
+            # assuming the kernel's output ordering.
+            expected = sorted([-1] * (top_k - length) + list(range(length)))
+            assert actual[row_index].sort().values.tolist() == expected
+        else:
+            assert set(actual[row_index].tolist()) == _oracle(scores[row_index, start:end], top_k)
+
+
+@skip_not_sm100
 def test_default_path_is_the_original_kernel():
     b, n, k = _SHAPES[2]
     row = _row(n, k, "unique")
