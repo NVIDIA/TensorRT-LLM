@@ -473,6 +473,14 @@ def test_scheduler_output_copies_only_new_tokens():
 
     assert req.copied_tokens == len(req.tokens)
 
+    # A shorter token list reports no new tokens.
+    del req.tokens[-2:]
+    output = manager.build_scheduler_output(batch, AsyncRequests({}, {}),
+                                            kv_cache_manager)
+    reported = output.cached_requests[0]
+    assert reported.new_tokens == []
+    assert reported.computed_position == len(req.tokens) - 1
+
 
 class _MinimalWorker(KvCacheConnectorWorker):
     """A worker satisfying the ABC and nothing more."""
