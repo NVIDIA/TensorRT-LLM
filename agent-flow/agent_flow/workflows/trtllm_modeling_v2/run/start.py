@@ -21,7 +21,7 @@ from agent_flow.prompts import dump_prompt_bundle
 
 from ..agents.prompts import PROMPTS_DIRNAME, build_trtllm_modeling_v2_prompts
 from ..agents.prompts._render import render_template
-from ..agents.roles import packaged_skills
+from ..agents.roles import materialize_skills, packaged_skills
 from ..agents.turns import TURNS_DIRNAME
 from ..checks import anchors as anchors_mod
 from ..checks import gate_cli
@@ -114,7 +114,7 @@ def start(workflow, state, log) -> bool:
         )
     dump_prompt_bundle(workflow.prompts, workflow.workspace / PROMPTS_DIRNAME)
     _write_host_facts(workflow, result)
-    workflow._materialize_skills()
+    materialize_skills(workflow.workspace)
     owed = [f"- `{check.key}`" for check in workflow._contract.checks]
     owed += [f"- note: {note}" for note in workflow._contract.notes]
     workflow.journal.section(f"checks owed: {len(workflow._contract.checks)}", "\n".join(owed))

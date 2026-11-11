@@ -14,7 +14,6 @@ what :meth:`TrtllmModelingV2Workflow.run` returns and what the process exits 0 o
 
 from __future__ import annotations
 
-import filecmp
 import hashlib
 import shutil
 from pathlib import Path
@@ -34,7 +33,7 @@ from agent_flow.console import print_message
 from agent_flow.logger import get_logger
 
 from ..agents.prompts import PromptBundle, build_trtllm_modeling_v2_prompts
-from ..agents.roles import PACKAGED_SKILLS_DIR, resolve_role_agents
+from ..agents.roles import resolve_role_agents
 from ..agents.turns import InProcessTurnExecutor, TurnRequest
 from ..checks import check_runtime, conventions
 from ..checks import verdict as check_result
@@ -53,9 +52,6 @@ from .start import HOST_FACTS_FILENAME
 from .startup.preflight import PREFLIGHT_FILENAME
 from .state import STATE_FILENAME, WorkflowState, load_state, save_state
 
-#: Where the run's skills go under the workspace, each agent session's cwd:
-#: Claude Code reads `.claude/skills`, Codex `.agents/skills`.
-SKILL_DIRS: tuple[str, ...] = (".claude/skills", ".agents/skills")
 #: What ``--clean`` removes of an earlier run in the same workspace. The frozen anchors,
 #: the operator's notes and the onboarded libraries stay with the workspace.
 RUN_FILES: tuple[str, ...] = (
@@ -73,20 +69,6 @@ RUN_FILES: tuple[str, ...] = (
     COMMIT_LABELS_FILENAME,
 )
 RUN_DIRS: tuple[str, ...] = ("reports", "decisions", report_mod.CHECKS_DIRNAME)
-
-
-def _same_tree(a: Path, b: Path) -> bool:
-    """Whether directory ``b`` holds exactly ``a``'s files with the same bytes."""
-
-    def files(root: Path) -> list[Path]:
-        found = (p for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
-        return sorted(p.relative_to(root) for p in found)
-
-    return (
-        b.is_dir()
-        and files(a) == files(b)
-        and all(filecmp.cmp(a / f, b / f, shallow=False) for f in files(a))
-    )
 
 
 class TrtllmModelingV2Workflow:
@@ -228,20 +210,6 @@ class TrtllmModelingV2Workflow:
             decision_file=str(decision_file) if decision_file is not None else None,
         )
         return self._turns.run(request).text
-
-    def _materialize_skills(self) -> None:
-        """Copy the packaged skills into the workspace, where every backend finds them."""
-        if not PACKAGED_SKILLS_DIR.is_dir():
-            return
-        for destination in (self.workspace / name for name in SKILL_DIRS):
-            destination.mkdir(parents=True, exist_ok=True)
-            for skill_dir in sorted(p for p in PACKAGED_SKILLS_DIR.iterdir() if p.is_dir()):
-                target = destination / skill_dir.name
-                # A resumed run: the copy is current, and the directory may be read-only
-                # to this process (a sandbox protects `.claude/skills`).
-                if not _same_tree(skill_dir, target):
-                    shutil.rmtree(target, ignore_errors=True)
-                    shutil.copytree(skill_dir, target)
 
     # ------------------------------------------------------------ orchestration
 

@@ -47,6 +47,8 @@ from ..agents.decisions import (
     first_paragraph,
     read_decision,
 )
+from ..agents.prompts._common import tidy
+from ..agents.prompts._render import render_template
 from ..agents.prompts.kernel import KernelContext, kernel_prompt
 from ..agents.prompts.survey import capture_lists_block
 from ..agents.prompts.tags import tag_section, task_tags
@@ -64,29 +66,24 @@ from ..operators.coverage import (
 from ..spec import deployments as deployments_mod
 from . import report as report_mod
 from .contract import library_digest
-from .integration import REPAIR_TURNS, Integration, rebase_block, repair_block, worktree_block
+from .integration import REPAIR_TURNS, Integration, repair_block, worktree_block
 from .startup import preflight as preflight_mod
 
 TASKS_FILENAME = "tasks.yaml"
 #: What the operator's `feedback` command appends to; every dispatch says to read it.
 NOTES_FILENAME = "operator_notes.md"
 CONFIG_ID, SURVEY_ID = "config", "survey"
-#: The role each task kind's turn runs as, and the tag sections its dispatch carries.
-ROLE_BY_KIND = {
-    "config": "assembler",
-    "survey": "surveyor",
-    "kernel": "kernel_writer",
-    "core": "assembler",
-    "deployment": "assembler",
-    "fix": "assembler",
+#: Each task kind: the role its turn runs as, and the tag sections its dispatch carries.
+KINDS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "config": ("assembler", ("assemble", "fix")),
+    "survey": ("surveyor", ("survey",)),
+    "kernel": ("kernel_writer", ()),
+    "core": ("assembler", ("assemble",)),
+    "deployment": ("assembler", ("feature",)),
+    "fix": ("assembler", ("assemble", "fix")),
 }
-TAGS_BY_KIND = {
-    "config": ("assemble", "fix"),
-    "survey": ("survey",),
-    "core": ("assemble",),
-    "deployment": ("feature",),
-    "fix": ("assemble", "fix"),
-}
+ROLE_BY_KIND = {kind: role for kind, (role, _) in KINDS.items()}
+TAGS_BY_KIND = {kind: tags for kind, (_, tags) in KINDS.items() if tags}
 PENDING, RUNNING, DONE, NOT_DONE, SKIPPED = "pending", "running", "done", "not done", "skipped"
 #: Decisions that mean the worker did what the task asked.
 FINISHED = decision_table.finishing()
@@ -108,9 +105,9 @@ class Task:
 
     id: str
     kind: str
-    #: The deployment it works for, by unit name: ``core`` for the first, else its own.
+    #: The deployment it works for, by unit name (``core`` for the first), and a kernel
+    #: task's vocabulary queue row.
     unit: str = ""
-    #: A kernel task's vocabulary queue row.
     ref: str = ""
     goal: str = ""
     status: str = PENDING
@@ -118,14 +115,14 @@ class Task:
     attempts: int = 0
     cuts: int = 0
     grants: int = 0
-    #: The decision its last turn wrote; why it is not done, which its next attempt is
-    #: told; the first paragraph of the worker's own summary.
+    #: The decision its last turn wrote, why it is not done (its next attempt's note), and
+    #: the first paragraph of the worker's own summary.
     decision: str = ""
     note: str = ""
     summary: str = ""
-    #: The checkout's head once the task landed.
+    #: The checkout's head once it landed, and the content hash of the native libraries its
+    #: tree held when it started and when it ended.
     commit: str = ""
-    #: The content hash of the native libraries its tree held when it started and ended.
     lib_start: str = ""
     lib_end: str = ""
 
@@ -206,9 +203,9 @@ class Pipeline:
 
     def _wanted(self) -> list[Task]:
         """The tasks preflight, the spec and the vocabulary ask for, in the module's order."""
-        w = self.w
+        w, pre = self.w, self.w._preflight
         wanted: list[Task] = []
-        error = str(getattr(w._preflight, "config_error", "") or "")
+        error = str(getattr(pre, "config_error", "") or "")
         if error or self.by_id(CONFIG_ID):
             goal = (
                 "make the tree load the checkpoint's config: `ModelConfig.from_pretrained` "
@@ -216,9 +213,9 @@ class Pipeline:
                 "worktree before your commits land."
             )
             wanted.append(Task(CONFIG_ID, "config", unit=self.units[0], goal=goal))
-        goal = "map the checkpoint's computation steps onto the catalog: write plan.md and vocabulary.yaml"
         survey = self.by_id(SURVEY_ID)
         if survey is None:
+            goal = "map the checkpoint's computation steps onto the catalog: write plan.md and vocabulary.yaml"
             survey = Task(SURVEY_ID, "survey", goal=goal)
             if not w.survey_first or w.vocabulary_path.exists():
                 # A workspace that holds a vocabulary has had its survey.
@@ -230,9 +227,7 @@ class Pipeline:
             queue = load_vocabulary(w.vocabulary_path, units=self.units)
         except VocabularyError:
             queue = ()  # no vocabulary: a run told to start without a survey
-        left = {
-            r["deployment"] for r in getattr(w._preflight, "not_attempted", ()) if not r["check"]
-        }
+        left = {r["deployment"] for r in getattr(pre, "not_attempted", ()) if not r["check"]}
         rows = rows_by_unit(queue, self.units)
         for unit, deployment in zip(self.units, deployments_mod.resolve(w.task_data)):
             if deployment.name in left:
@@ -241,12 +236,13 @@ class Pipeline:
                 name = f"k{item.n}-{item.target.strip('/').split('/')[-1]}"
                 goal = f"{item.mode} `{item.target}` as vocabulary queue row {item.n} says"
                 wanted.append(Task(name, "kernel", unit=unit, ref=str(item.n), goal=goal))
+            goal = (
+                f"make the deployment `{unit}` boot and score, without changing the ones before it"
+            )
             if deployment.core:
                 goal = f"assemble the target for `{deployment.name}`: modeling, weights and routing"
-                wanted.append(Task(unit, "core", unit=unit, goal=goal))
-            else:
-                goal = f"make the deployment `{unit}` boot and score, without changing the ones before it"
-                wanted.append(Task(unit, "deployment", unit=unit, goal=goal))
+            kind = "core" if deployment.core else "deployment"
+            wanted.append(Task(unit, kind, unit=unit, goal=goal))
         return wanted
 
     def _plan(self) -> None:
@@ -255,13 +251,8 @@ class Pipeline:
         have = {t.id: t for t in self.tasks}
         ids = {t.id for t in wanted}
         added = [t.id for t in wanted if t.id not in have]
-        dropped = [
-            t
-            for t in self.tasks
-            if t.id not in ids
-            and t.kind in ("core", "deployment", "kernel")
-            and t.status in (PENDING, RUNNING)
-        ]
+        open_ = [t for t in self.tasks if t.status in (PENDING, RUNNING) and t.kind != "fix"]
+        dropped = [t for t in open_ if t.id not in ids]
         for task in dropped:
             task.status, task.note = SKIPPED, "the spec or preflight no longer asks for it"
         order = [have.get(t.id, t) for t in wanted] + [t for t in self.tasks if t.id not in ids]
@@ -367,9 +358,8 @@ class Pipeline:
         task.lib_end = library_digest(tree or repo)
         if data is None:
             names = ", ".join(decision_table.names(role))
-            return TurnResult(
-                error=f"its turn wrote no valid decision file at {path} (one of {names})"
-            )
+            said = f"its turn wrote no valid decision file at {path} (one of {names})"
+            return TurnResult(error=said)
         result = TurnResult(str(data["decision"]), data)
         if result.decision not in FINISHED:
             return result
@@ -431,7 +421,7 @@ class Pipeline:
                 return outcome.detail
             if not (outcome.base or outcome.repairable) or turn > REPAIR_TURNS + 1:
                 return f"its branch did not integrate: {outcome.detail}"
-            note = rebase_block(outcome, tree) if outcome.base else repair_block(outcome)
+            note = repair_block(outcome, tree)
             path = decision_path(self.workspace, task.id, task.attempts, turn)
             path.unlink(missing_ok=True)
             self._dispatch(task, role, f"{block}\n\n{note}", path)
@@ -450,25 +440,22 @@ class Pipeline:
         no finding fails the task or sends it back to its worker.
         """
         target_rel = str(getattr(self.w._preflight, "target_rel", "") or "")
-        repo = self.w.task_data.get("trtllm_repo_path")
+        repo, arch = self.w.task_data.get("trtllm_repo_path"), self.w.task_data.get("arch")
         if not (target_rel and repo):
             return
         item = self._queue_item(task) if task.kind == "kernel" else None
         paths = entry_paths(item, target_rel, repo) if item is not None else None
+        landing, named = (paths[0] if paths else ""), str(data.get("entry") or "").strip()
         try:
             found = conventions.scan(
-                repo,
-                target_rel,
-                str(self.w.task_data.get("arch") or ""),
-                landing=paths[0] if paths else "",
-                named=str(data.get("entry") or "").strip(),
+                repo, target_rel, str(arch or ""), landing=landing, named=named
             )
             new = conventions.record(self.workspace, task.id, found)
         except Exception as exc:  # a scan that cannot read the tree says so, and holds nothing
             new = [f"the scan could not run: {type(exc).__name__}: {exc}"]
         if new:
-            said = "; ".join(new)
-            self.w.journal.event("conventions", f"{task.id}: {len(new)} finding(s): {said}")
+            said = f"{task.id}: {len(new)} finding(s): {'; '.join(new)}"
+            self.w.journal.event("conventions", said)
 
     def _dispatch(self, task: Task, role: str, block: str, path: Path) -> None:
         """One turn of ``role`` for ``task``, told to write its decision at ``path``."""
@@ -495,152 +482,92 @@ class Pipeline:
     # ---------------------------------------------------------------------- the prompts
     def _context(self, task: Task) -> str:
         """What every dispatch carries after its task: the operator's notes, the host, the libraries."""
-        w = self.w
-        parts = [
-            "## The operator's notes\n\n"
-            f"Read `{self.workspace / NOTES_FILENAME}` first, if it exists. Use what concerns "
-            "your task, and read it again before you write your decision. It is information, "
-            "never a reason to change an anchor or a check."
-        ]
-        if w.host_facts_path.is_file():
-            parts.append(
-                "## Host facts\n\n"
-                f"Read `{w.host_facts_path}` before you debug anything about this machine: "
-                "`pytest`'s exit code, the `TMPDIR` bound, the launch rules, which errors are "
-                "noise. If you learn a new one, append it under `## Learned during this run`.\n\n"
-                "The workflow running this task, its checks included, is the package at "
-                f"`{Path(__file__).resolve().parents[1]}`. An `agent-flow/` directory in your "
-                "worktree is another copy of it, which may differ: read the running one."
-            )
-        rebuilt = [
-            f"- libraries were changed by `{t.id}`: rebuild before you boot"
-            for t in self.tasks
-            if t is not task and t.lib_end not in ("", t.lib_start, task.lib_start)
-        ]
-        if rebuilt:
-            kept = self.workspace / report_mod.LIBRARIES_DIRNAME
-            parts.append("## Native libraries\n\n" + "\n".join(rebuilt))
-            if kept.is_dir():
-                parts[-1] += f"\n\nThe ones the onboard check accepted are kept in `{kept}`."
-        return "\n\n".join(parts)
+        kept = self.workspace / report_mod.LIBRARIES_DIRNAME
+        return render_template(
+            "dispatch/context.md.j2",
+            notes=self.workspace / NOTES_FILENAME,
+            host_facts=self.w.host_facts_path if self.w.host_facts_path.is_file() else "",
+            package=Path(__file__).resolve().parents[1],
+            rebuilt=[
+                t.id
+                for t in self.tasks
+                if t is not task and t.lib_end not in ("", t.lib_start, task.lib_start)
+            ],
+            kept=kept if kept.is_dir() else "",
+        )
 
     def _prompt(self, task: Task, block: str) -> str:
-        """``task``'s dispatch: its goal, why it runs again, its section, then its worktree."""
-        note = ""
+        """``task``'s dispatch: its goal, why it runs again, what came before, its section, its worktree."""
+        w, note = self.w, ""
         if task.note:
             note = (
                 f"Attempt {task.attempts} of {self.max_attempts} of task `{task.id}`. The "
                 f"previous attempt did not finish:\n\n{task.note}"
             )
-        if task.kind == "kernel":
-            parts = (self._kernel_prompt(task, note), self._history_block(task), block)
-        else:
-            header = f"## Your task: `{task.id}` ({task.kind})\n\n{task.goal}"
-            if note:
-                header += f"\n\n## Why this task runs again\n\n{note}"
-            tags = task_tags(TAGS_BY_KIND[task.kind][0], TAGS_BY_KIND[task.kind][1:])
-            body = self._survey_prompt() if task.kind == "survey" else self._unit_prompt(task)
-            parts = (header, self._history_block(task), tag_section(tags), body, block)
-        return "\n\n".join(p.strip() for p in parts if p and p.strip())
-
-    def _history_block(self, task: Task) -> str:
-        """What the tasks before ``task`` came to, by reference: the newest, one line each."""
         ended = [t for t in self.tasks if t is not task and t.status in (DONE, NOT_DONE, SKIPPED)]
-        if not ended:
-            return ""
-        lines = [
-            "## What the run did before this task",
-            "",
-            "Each line is a task that ended, with its worker's own summary; its decision file "
-            f"is `{self.workspace / decision_table.DECISIONS_DIRNAME}/<task>-<attempt>.yaml`. "
-            "A done task's commits are in the checkout: build on them. Nothing of a task not "
-            "done landed. A kernel row not done was skipped: where the target needs that "
-            "entry, write its wrapper in the target's own `ops/`.",
-            "",
-        ]
-        left = len(ended) - HISTORY_TASKS
-        if left > 0:
-            lines.append(f"- ({left} earlier task(s): `{self.path}`)")
+        lines = []
         for t in ended[-HISTORY_TASKS:]:
             state = "skipped" if t.kind == "kernel" and t.status == NOT_DONE else t.status
             said = clip((t.summary or t.note).replace("\n", " "), 300)
             lines.append(f"- `{t.id}` ({t.kind}): {state} {t.decision}. {said}".rstrip())
-        return "\n".join(lines)
+        history = ended and render_template(
+            "dispatch/history.md.j2",
+            decisions=self.workspace / decision_table.DECISIONS_DIRNAME,
+            earlier=max(0, len(ended) - HISTORY_TASKS),
+            tasks=self.path,
+            lines=lines,
+        )
+        if task.kind == "kernel":
+            return tidy("\n\n".join((self._kernel_prompt(task, note), history or "", block)))
+        facts: dict[str, Any] = dict(survey="")
+        if task.kind == "survey":
+            facts["survey"] = f"{w._surface_block}\n{capture_lists_block(w.task_data)}"
+        else:
+            facts.update(self._unit(task))
+        tags = task_tags(TAGS_BY_KIND[task.kind][0], TAGS_BY_KIND[task.kind][1:])
+        head = render_template(
+            "dispatch/task.md.j2",
+            task=task,
+            note=note,
+            history=history or "",
+            tags=tag_section(tags),
+            workspace=self.workspace,
+            task_path=w.task_path,
+            plan_path=w.plan_path,
+            vocabulary_path=w.vocabulary_path,
+            reminder=DECISION_REMINDER,
+            **facts,
+        )
+        return tidy(f"{head}\n\n{block}")
 
     def cli(self) -> str:
         """The workflow's CLI as an agent calls it: by path, when preflight installed it."""
         script = self.workspace / "bin" / gate_cli.CLI_NAME
         return str(script) if script.is_file() else gate_cli.CLI_NAME
 
-    def _checks_block(self, deployment: deployments_mod.Deployment) -> str:
-        """The checks ``deployment`` owes, the command that runs one, and who runs them when."""
-        name = deployment.name
-        left = {
-            r["check"]
-            for r in getattr(self.w._preflight, "not_attempted", ())
-            if r["deployment"] == name
-        }
-        owed = [
-            c for c in (self.w._contract.of(name) if self.w._contract else ()) if c.gate not in left
-        ]
-        if not owed:
-            return ""
-        command = gate_cli.invocation(
-            self.w.task_path, self.workspace / "gates" / name, name, self.cli()
-        )
-        when = (
-            "When you end ready, the run itself boots and scores this deployment on your "
-            "committed worktree, and your commits land only when that passes: a failure there "
-            "is this attempt's result and your next attempt's note."
-            if deployment.core
-            else "After the last task the run runs each of them once on the checkout; what "
-            "fails there goes to one `fix` task and is reported."
-        )
-        return (
-            f"## The checks `{name}` owes\n\n{', '.join(f'`{c.key}`' for c in owed)}\n\n"
-            "**Run them yourself, on your worktree, before you finish**, and list each with "
-            f"its result under `checks` in your decision file:\n\n    {command}\n\n"
-            f"{when} Start with the cheapest (the boot); a benchmark you cannot afford in this "
-            "turn you say so under `checks`, with what you ran instead."
-        )
-
-    def _unit_prompt(self, task: Task) -> str:
-        """An assembler turn: the config, core, a further deployment, or the final repair."""
+    def _unit(self, task: Task) -> dict[str, Any]:
+        """What an assembler's dispatch says of its deployment: its options, its checks, their command."""
         w = self.w
-        unit = task.unit or self.units[0]
-        deployment = deployments_mod.resolve(w.task_data)[self.units.index(unit)]
+        deployment = deployments_mod.resolve(w.task_data)[self.units.index(task.unit)]
+        name, repair = deployment.name, task.kind in ("fix", CONFIG_ID)
+        skipped = getattr(w._preflight, "not_attempted", ())
+        left = {r["check"] for r in skipped if r["deployment"] == name}
+        owed = [c.key for c in w._contract.of(name) if c.gate not in left and not repair]
         files = [f"`{s.options_path}`" for s in deployment.servers.values() if s.options_path]
-        options = f"Its options: {', '.join(files)}.\n\n" if files else ""
-        body = (
-            f"Workspace: {self.workspace}\nRepository: {w.task_data['trtllm_repo_path']}\n"
-            f"Target: {w._preflight.target_rel}\nUnit: **{unit}**\n\n"
-            f"{deployments_mod.describe((deployment,))}\n\n{options}"
-            f"Read `{w.task_path}` (the spec), `{w.plan_path}` (the plan) and "
-            f"`{w.vocabulary_path}` (the computation-step list you derive against)."
-        )
-        if task.kind in ("fix", CONFIG_ID):
-            body += " Repair what your task names, and nothing else; every check that passed must keep passing."
-        elif deployment.core:
-            body += " Write the unit."
-        else:
-            body += (
-                " The target exists. Make it serve this deployment as well, without changing "
-                "what it does in the ones before it: every check that passed must keep passing."
-            )
-        checks = "" if task.kind in ("fix", CONFIG_ID) else self._checks_block(deployment)
-        return f"{body}\n\n{checks}\n\n{DECISION_REMINDER}"
-
-    def _survey_prompt(self) -> str:
-        w = self.w
-        return (
-            f"Workspace: {self.workspace}\n\n"
-            f"Read `{w.task_path}` for the run's spec: the checkpoint, the "
-            f"architecture, the deployments it brings up and the accuracy anchor.\n\n"
-            f"{w._surface_block}\n"
-            f"{capture_lists_block(w.task_data)}\n"
-            f"Write `{w.plan_path}` and `{w.vocabulary_path}` as the `survey` "
-            f"section specifies. The orchestrator parses `vocabulary.yaml` and refuses "
-            f"a malformed one, so follow the schema exactly.\n\n" + DECISION_REMINDER
+        files = files or [f"`deployments.{name}` in the spec"]
+        return dict(
+            repo=w.task_data["trtllm_repo_path"],
+            target=w._preflight.target_rel,
+            unit=task.unit,
+            deployment=name,
+            described=deployments_mod.describe((deployment,)),
+            options=", ".join(files),
+            repair=repair,
+            core=deployment.core,
+            checks=", ".join(f"`{key}`" for key in owed),
+            command=gate_cli.invocation(
+                w.task_path, self.workspace / "gates" / name, name, self.cli()
+            ),
         )
 
     def _queue_item(self, task: Task) -> QueueItem | None:

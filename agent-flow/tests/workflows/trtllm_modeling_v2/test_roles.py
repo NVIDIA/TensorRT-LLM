@@ -432,6 +432,29 @@ def test_all_template_resources_are_declared_as_package_data() -> None:
         _render._ENVIRONMENT.get_template(name)
 
 
+def test_the_run_puts_its_own_skills_where_each_backend_reads_them(tmp_path):
+    roles.materialize_skills(tmp_path)
+    names = set(roles.packaged_skills())
+    assert names and "trtllm-modeling-v2-entry" in names
+    for directory in roles.SKILL_DIRS:
+        copied = tmp_path / directory
+        assert {p.name for p in copied.iterdir()} == names
+        packaged = roles.PACKAGED_SKILLS_DIR / "trtllm-modeling-v2-entry" / "SKILL.md"
+        assert (
+            copied / "trtllm-modeling-v2-entry" / "SKILL.md"
+        ).read_bytes() == packaged.read_bytes()
+    # A copy that is current is left alone: on a resumed run the directory may be read-only.
+    kept = tmp_path / roles.SKILL_DIRS[0] / "trtllm-modeling-v2-entry"
+    before = kept.stat().st_ino
+    roles.materialize_skills(tmp_path)
+    assert kept.stat().st_ino == before
+    # One that differs is replaced whole.
+    (kept / "SKILL.md").write_text("stale\n")
+    (kept / "left-over.md").write_text("x\n")
+    roles.materialize_skills(tmp_path)
+    assert not (kept / "left-over.md").exists() and (kept / "SKILL.md").read_text() != "stale\n"
+
+
 def test_the_feature_skill_names_only_paths_the_tree_has():
     """The skill and the workers' reuse rule are maps of paths: a path the tree lost is stale."""
     from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import worker

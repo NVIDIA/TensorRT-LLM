@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from ..agents.prompts._render import render_template
 from ..infra.files import write_text_atomic
 from ..infra.git import (
     LABEL_TARGET,
@@ -394,66 +395,22 @@ def _checked_out(tree: Path) -> bool:
     return bool(gitdir) and Path(gitdir, "index").exists()
 
 
-def _behind_note(tree: Path, repo: Path) -> str:
-    """What a worker whose branch lacks the checkout's head is told; "" when it holds it."""
-    head = (git_output(repo, "rev-parse", "HEAD") or "").strip()
-    if not head or git_output(tree, "merge-base", "--is-ancestor", head, "HEAD") is not None:
-        return ""
-    behind = (git_output(tree, "rev-list", "--count", f"HEAD..{head}") or "").strip()
-    if not behind.isdigit() or behind == "0":
-        return ""
-    return (
-        f"\n\n## Your branch is behind the checkout\n\n{behind} commit(s) landed on the checkout "
-        f"after your branch was cut; its head is `{head}`. Rebase onto that head before anything "
-        "else, for this turn only despite the rule against it:\n\n"
-        f"    git -C {tree} rebase {head}\n\n"
-        "Resolve each conflict so that both your change and the landed one stand, then "
-        f"`git -C {tree} add` the resolved files and `GIT_EDITOR=true git -C {tree} rebase "
-        f"--continue` until the rebase is done. If the two cannot both stand, `git -C {tree} "
-        "rebase --abort` and say why in your decision file."
-    )
-
-
 def worktree_block(tree: Path, repo: Path) -> str:
-    """What a worker in its own worktree is told, appended to its turn prompt."""
-    return (
-        "## Your worktree\n\n"
-        f"You work in `{tree}`, your own branch of the checkout `{repo}`. Edit, build, test and "
-        f"commit there and nowhere else; do not touch `{repo}`. Read paths relative to your "
-        "worktree where the prompt names the checkout. Commit with\n\n"
-        f"    git -C {tree} add <path> [path...] && git -C {tree} commit -s -m <message>\n\n"
-        f"Run a check on your work with `--tree {tree}`. When you finish, the orchestrator "
-        "audits your commits and rebases them onto the checkout; uncommitted changes are not "
-        "integrated and fail the task." + _behind_note(tree, repo)
+    """What a worker in its own worktree is told; first, to rebase when its branch lacks the head."""
+    head = (git_output(repo, "rev-parse", "HEAD") or "").strip()
+    behind = ""
+    if head and git_output(tree, "merge-base", "--is-ancestor", head, "HEAD") is None:
+        behind = (git_output(tree, "rev-list", "--count", f"HEAD..{head}") or "").strip()
+    behind = behind if behind.isdigit() and behind != "0" else ""
+    said = render_template(
+        "dispatch/worktree.md.j2", tree=tree, repo=repo, head=head, behind=behind
     )
+    return said.strip()
 
 
-def repair_block(outcome: Outcome) -> str:
-    """What a worker whose finished worktree could not be integrated as it stands is told."""
-    return (
-        "## Your finished work could not be integrated as it stands\n\n"
-        f"{outcome.detail}\n\n"
-        "Do not start the task again. Put the worktree right (commit what belongs to the task "
-        "with `git commit -s`, drop what does not, and leave the worktree on its branch), "
-        "then write your decision as you did when you finished."
-    )
-
-
-def rebase_block(outcome: Outcome, tree: Path) -> str:
-    """What a worker whose finished branch did not rebase is told, after its worktree block."""
+def repair_block(outcome: Outcome, tree: Path) -> str:
+    """What a worker whose finished branch did not go in is told: a conflict, or a worktree to put right."""
     files = ", ".join(f"`{f}`" for f in outcome.conflicts) or "files git did not name"
-    return (
-        "## Your finished work did not integrate\n\n"
-        "Your task already finished, but rebasing its branch onto the checkout's head "
-        f"`{outcome.base}` stopped on conflicts in {files}: another task changed them after "
-        "your worktree was cut. Do not start the task again. In your worktree, and for this "
-        "turn only, rebase despite the rule against it:\n\n"
-        f"    git -C {tree} rebase {outcome.base}\n\n"
-        "Resolve each conflict so that both your change and the other task's stand, then "
-        f"`git -C {tree} add` the resolved files and `GIT_EDITOR=true git -C {tree} rebase "
-        "--continue` until the rebase is done; the commits keep their messages and sign-offs. "
-        "Run your task's tests again on the rebased tree, commit any fix with `git commit -s`, "
-        "and write your decision as you did when you finished. If the two changes "
-        f"cannot both stand, `git -C {tree} rebase --abort` and end `BLOCKED`, naming the "
-        "files and why."
-    )
+    return render_template(
+        "dispatch/repair.md.j2", base=outcome.base, files=files, tree=tree, detail=outcome.detail
+    ).strip()
