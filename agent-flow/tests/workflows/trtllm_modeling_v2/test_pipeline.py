@@ -765,6 +765,18 @@ def test_a_dry_run_stops_after_preflight_with_no_agent_turn_and_no_engine_comman
     assert not (tmp_path / "ws" / "tasks.yaml").exists()
 
 
+def test_a_clean_start_removes_the_runs_records_and_keeps_what_is_the_workspaces(tmp_path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    records = ("preflight.json", "conventions.json", "commit_labels.json", "journal.md")
+    kept = ("anchors.yaml", "servers.json")  # frozen once per workspace; what is still owned
+    for name in (*records, *kept):
+        (workspace / name).write_text("{}")
+    _workflow(tmp_path, clean=True)
+    assert not [name for name in records if (workspace / name).exists()]
+    assert all((workspace / name).exists() for name in kept)
+
+
 def test_a_failed_preflight_ends_the_run_before_any_agent(tmp_path, task_file, monkeypatch):
     busy = healthy_smi(free=20000)
     calls = _run(tmp_path, task_file, monkeypatch, Script(), command_runner=busy)
