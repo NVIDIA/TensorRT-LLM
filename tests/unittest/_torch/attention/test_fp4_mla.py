@@ -2837,6 +2837,18 @@ def _assert_fp4_mla_attention_decode_accuracy(
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
         )
+        if backend == "triton":
+            # The reference attends with the decode's own packed probabilities, so the output check
+            # takes the decode's QK scores as given. Check the row maxima and exp-sums the decode
+            # derived from them against the reference's independent scores.
+            workspaces = metadata.fp4_mla_state.workspaces
+            softmax_stats = torch.stack(
+                (
+                    workspaces["_fp4_mla_attention_max_buf"][: q.shape[0], :num_heads],
+                    workspaces["_fp4_mla_attention_denom_buf"][: q.shape[0], :num_heads],
+                ),
+                dim=-1,
+            )
         output_float = output.float()
         error = output_float - ref_output
         output_rows = output_float.reshape(output_float.shape[0], -1)
