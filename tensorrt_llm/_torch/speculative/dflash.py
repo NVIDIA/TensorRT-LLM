@@ -2415,38 +2415,42 @@ class DFlashWorker(SpecWorkerBase):
                     vocab_size = gen_logits.shape[-1]
                     gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                    gen_logits = self._refine_block_logits(
-                        draft_model, gen_logits, inputs, spec_metadata
+                    gen_draft_tokens = self._sampled_chain_draft_tokens(
+                        draft_model, gen_logits, inputs, spec_metadata, batch_size, num_contexts
                     )
-
-                    # DFlash 2: replace the independent per-position picks with
-                    # one coherent path through the block (absent for plain
-                    # DFlash).
-                    if getattr(draft_model, "lilicorr", None) is not None:
-                        gen_logits = self._apply_lilicorr(
-                            draft_model,
-                            gen_logits,
-                            gen_hidden_states.reshape(num_gens, K, -1),
-                            inputs["lilicorr_anchor"],
-                            spec_metadata,
+                    if gen_draft_tokens is None:
+                        gen_logits = self._refine_block_logits(
+                            draft_model, gen_logits, inputs, spec_metadata
                         )
-                        vocab_size = gen_logits.shape[-1]
-                    elif getattr(draft_model, "has_candidate_selector", False):
-                        gen_logits = self._apply_dflash2_selector(
-                            draft_model,
-                            gen_logits,
-                            gen_hidden_states.reshape(num_gens, K, -1),
-                            inputs["first_prev_tokens"],
-                            spec_metadata,
-                        )
-                        vocab_size = gen_logits.shape[-1]
 
-                    gen_draft_tokens = self.sample_draft_tokens(
-                        gen_logits,
-                        spec_metadata,
-                        batch_size,
-                        num_contexts=num_contexts,
-                    )
+                        # DFlash 2: replace the independent per-position picks with
+                        # one coherent path through the block (absent for plain
+                        # DFlash).
+                        if getattr(draft_model, "lilicorr", None) is not None:
+                            gen_logits = self._apply_lilicorr(
+                                draft_model,
+                                gen_logits,
+                                gen_hidden_states.reshape(num_gens, K, -1),
+                                inputs["lilicorr_anchor"],
+                                spec_metadata,
+                            )
+                            vocab_size = gen_logits.shape[-1]
+                        elif getattr(draft_model, "has_candidate_selector", False):
+                            gen_logits = self._apply_dflash2_selector(
+                                draft_model,
+                                gen_logits,
+                                gen_hidden_states.reshape(num_gens, K, -1),
+                                inputs["first_prev_tokens"],
+                                spec_metadata,
+                            )
+                            vocab_size = gen_logits.shape[-1]
+
+                        gen_draft_tokens = self.sample_draft_tokens(
+                            gen_logits,
+                            spec_metadata,
+                            batch_size,
+                            num_contexts=num_contexts,
+                        )
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
@@ -2542,6 +2546,23 @@ class DFlashWorker(SpecWorkerBase):
         variant, which reads slots 0..K-1 instead.
         """
         return dflash_draft_slot_ids(num_gens, block_size, num_draft_tokens, False, device="cuda")
+
+    def _sampled_chain_draft_tokens(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        inputs: dict,
+        spec_metadata,
+        batch_size: int,
+        num_contexts: int,
+    ) -> Optional[torch.Tensor]:
+        """Draft tokens ``[num_gens, K]`` of a drafter that feeds each sampled token into
+        the next position's logits, or None to refine and sample the block logits.
+
+        Plain DFlash has no such chain. `DSparkWorker._sampled_chain_draft_tokens`
+        chains the Markov head through the sampled tokens.
+        """
+        return None
 
     def _refine_block_logits(
         self,

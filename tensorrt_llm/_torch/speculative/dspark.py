@@ -21,6 +21,7 @@
 
 import json
 import math
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
@@ -36,8 +37,20 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
+from .fast_rejection_sampling import fast_rs_draft_markov_feedback
+from .fast_topp_rejection_sampling import fast_topp_rs_draft_markov_feedback
 from .interface import SpecMetadata, SpecWorkerBase
 from .vocab_parallel import tp_pair_exchange
+
+# Feed the Markov head the token drawn at the previous draft position (SGLang's DSpark draft
+# chain) instead of that position's argmax when rejection sampling draws the drafts.
+MARKOV_SAMPLED_FEEDBACK_ENV_VAR = "TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK"
+
+
+def markov_sampled_feedback_enabled() -> bool:
+    """Whether ``TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1`` is set."""
+    return os.environ.get(MARKOV_SAMPLED_FEEDBACK_ENV_VAR, "0") == "1"
+
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
@@ -1344,6 +1357,98 @@ class DSparkWorker(DFlashWorker):
         return self._vocab_parallel.head.markov_tokens(
             local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
         )
+
+    def _markov_sampled_feedback_applies(
+        self, draft_model, gen_logits: torch.Tensor, spec_metadata
+    ) -> bool:
+        """Whether this step chains the Markov head through the sampled tokens.
+
+        Needs the opt-in (``TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1``), a Markov head, a
+        rejection-sampling batch (the drafts are drawn, not argmaxed) and the fused
+        rejection-sampling path (``TLLM_SPEC_FAST_RS=1`` with a top-k-free sampling mode) over
+        full-vocab fp32 logits. Otherwise the greedy chain stays, which is lossless too (the
+        proposal is then conditioned on the argmax tokens).
+        """
+        if not (
+            markov_sampled_feedback_enabled()
+            and getattr(draft_model, "has_markov_head", False)
+            and spec_metadata.wants_advanced_draft_sampling
+            and spec_metadata.draft_probs is not None
+            and spec_metadata.batch_slot_ids is not None
+        ):
+            return False
+        num_gens, k, vocab = gen_logits.shape
+        flat = gen_logits.reshape(num_gens * k, vocab)
+        w1, w2 = draft_model.markov_w1, draft_model.markov_w2
+        applies = (
+            not self._draft_logits_are_sharded(flat, spec_metadata)
+            and w2.shape[0] == vocab
+            and w1.shape == w2.shape
+            and w1.is_contiguous()
+            and w2.is_contiguous()
+            and self._fast_rs_applies(spec_metadata, flat, vocab, site="markov feedback")
+        )
+        if not getattr(self, "_sampled_feedback_reported", False):
+            # Once per worker, so a run's log shows which chain the opt-in took.
+            self._sampled_feedback_reported = True
+            if applies:
+                logger.info(
+                    "TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1: the Markov chain advances on "
+                    "the sampled draft tokens."
+                )
+            else:
+                logger.warning(
+                    "TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1 needs TLLM_SPEC_FAST_RS=1, "
+                    "advanced_sampling_mode=no_topk or no_topk_no_topp and full-vocab draft "
+                    "logits; keeping the greedy Markov chain for the rejection proposal."
+                )
+        return applies
+
+    def _sampled_chain_draft_tokens(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        inputs: dict,
+        spec_metadata,
+        batch_size: int,
+        num_contexts: int,
+    ) -> Optional[torch.Tensor]:
+        """With sampled-token feedback, position ``i``'s proposal is
+        ``softmax((base_i + markov_w2 @ markov_w1[x_{i-1}]) / T)`` with ``x_{i-1}`` the token
+        drawn at position ``i - 1`` (the anchor for ``i = 0``), drawn and stored for the
+        rejection test position by position. Lossless like the greedy chain: the verifier
+        only needs each stored proposal to be the distribution its token was drawn from.
+        Returns None, so the greedy chain refines the block logits, when the feedback does
+        not apply."""
+        if not self._markov_sampled_feedback_applies(draft_model, gen_logits, spec_metadata):
+            return None
+        chain_args = (
+            gen_logits,
+            inputs["first_prev_tokens"],
+            draft_model.markov_w1,
+            draft_model.markov_w2,
+            spec_metadata.request_temperatures[num_contexts:batch_size],
+        )
+        req_args = (
+            spec_metadata.batch_slot_ids[num_contexts:batch_size],
+            self._fast_rs_dummy_row(spec_metadata),
+            spec_metadata.draft_probs,
+            spec_metadata.request_seeds[num_contexts:batch_size],
+            spec_metadata.request_offsets[num_contexts:batch_size],
+        )
+        if spec_metadata.advanced_sampling_mode.skips_top_p:
+            tokens = fast_rs_draft_markov_feedback(*chain_args, *req_args, step_offset=1)
+        else:
+            # Top-p honoured (no_topk): the chain advances on tokens drawn from the nuclei the
+            # verifier's targets are filtered to, and each stored proposal is its nucleus.
+            tokens = fast_topp_rs_draft_markov_feedback(
+                *chain_args,
+                spec_metadata.request_top_ps[num_contexts:batch_size],
+                *req_args,
+                step_offset=1,
+            )
+        spec_metadata.draft_probs_last_dim = gen_logits.shape[-1]
+        return tokens
 
     def _refine_block_logits(
         self,
