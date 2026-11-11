@@ -78,10 +78,23 @@ l0_cpu:
   # kernels/parallel_hw_agnostic/test_fused_qk_norm_rope.py.
   # The GPU lists' attention/ entries run -m "not cpu_only", so hw_agnostic/ runs only here.
   - unittest/_torch/attention
-  # Kimi K3 MLA decode view from the attention metadata: every test is cpu_only (CPU tensors).
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_decode_view.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_launch.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_pool_layout.py
+  # Kimi K3 host-side checks on CPU tensors (MLA decode view and launch, KDA pool layout, MoE front geometry):
+  # every test is cpu_only.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/test_k3_mla_decode_view.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/test_k3_mla_launch.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_kda_verify/test_k3_kda_pool_layout.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_moe_front_geometry.py
+  # Kimi K3 kernel source checks (cluster-scope mailbox waits, tcgen05 fences): read the kernel sources only.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/test_k3_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_ctm_gemv/test_k3_ctm_gemv_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_decode_gemv/test_k3_decode_gemv_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_drafter/test_k3_drafter_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_fused_moe_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_kda_attn/test_k3_kda_attn_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_kda_verify/test_k3_kda_verify_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/test_k3_mla_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_sandwich/test_k3_sandwich_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_k3_moe_engines_source_checks.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
@@ -93,6 +106,7 @@ l0_cpu:
   # The qwen4_exp default target's cpu_only tests (its routing among them); this stage runs
   # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
+  - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_routing.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
@@ -117,15 +131,18 @@ l0_cpu:
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_equality.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_job.py
   # The GPU stages run with -m "not cpu_only", so this entry is what runs it.
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_decode_step.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_mnnvl_workspace.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_decode_worker.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_capture_view.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_ctx_rows_start.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_draft_block_rows.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_drafter_comm.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_spec_worker_gate.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_decode_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_decode_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_mnnvl_workspace.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_k3_decode_worker.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_capture_view.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_ctx_rows_start.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_draft_block_rows.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_drafter_comm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_spec_worker_gate.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_uncertified_generic_calls.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_uncertified_generic_calls.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_uncertified_generic_calls.py
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
   # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.
@@ -170,6 +187,7 @@ l0_cpu:
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
   - unittest/_torch/misc/test_grammar_matcher.py
   - unittest/_torch/models/checkpoints
+  - unittest/_torch/modeling/test_modeling_pplx_decider.py
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
@@ -336,11 +354,13 @@ l0_cpu:
   - unittest/llmapi/test_config_overrides.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   - unittest/llmapi/test_executor.py
+  - unittest/llmapi/test_embedding_arch_routing.py
   - unittest/llmapi/test_gc_utils.py
   - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_kv_hints.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_llm.py::test_startup_metrics_by_server_info
   - unittest/llmapi/test_gms_args.py
   - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_custom_tokenizer_aliases.py
@@ -372,6 +392,7 @@ l0_cpu:
   - unittest/llmapi/test_serve_report_addr.py
   - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py
+  - unittest/llmapi/test_startup_checks.py
   - unittest/llmapi/test_tokenizer_aliases.py
   - unittest/llmapi/test_tokenizer_decode.py
   - unittest/llmapi/test_trtllm_serve_config_schemas.py
