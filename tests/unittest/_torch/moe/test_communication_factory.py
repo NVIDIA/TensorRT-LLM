@@ -422,16 +422,16 @@ def test_nccl_ep_downgrades_unsupported_low_precision_combine(
 
 
 @pytest.mark.parametrize("window_available", [False, True])
-def test_nccl_ep_dispatch_window(monkeypatch: pytest.MonkeyPatch, window_available: bool):
+def test_nccl_ep_dispatch_window(monkeypatch: pytest.MonkeyPatch, window_available: bool) -> None:
     """Dispatch uses a registered window or the persistent output on allocation refusal."""
 
     class FakeTensor:
-        def __init__(self, tensor, **kwargs):
+        def __init__(self, tensor: torch.Tensor, **kwargs: object) -> None:
             self.tensor = tensor
             self.__dict__.update(kwargs)
 
     class FakeHandle:
-        def dispatch(self, _, outputs, **__):
+        def dispatch(self, _: object, outputs: SimpleNamespace, **__: object) -> None:
             """Check dispatch's selected destination and emulate its output write."""
             if window_available:
                 assert outputs.tokens.window.handle == 123

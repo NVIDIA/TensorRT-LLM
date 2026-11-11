@@ -1273,14 +1273,16 @@ def _worker_nccl_ep_cuda_graph_replay(
         torch.cuda.synchronize()
 
         availability = MPI.COMM_WORLD.allgather((comm._ctx.zerocopy_enabled, warmup_uses_window))
-        if not all(enabled for enabled, _ in availability):
-            return {"rank": rank, "skip_reason": "NCCL-EP zero-copy is unavailable"}
-        if not force_window_fallback and not all(available for _, available in availability):
-            return {"rank": rank, "skip_reason": "Warmup could not acquire an NCCL window"}
+        zerocopy_enabled = availability[0][0]
+        assert all(enabled == zerocopy_enabled for enabled, _ in availability), availability
+        if zerocopy_enabled:
+            assert all(available for _, available in availability), availability
 
         allocate = torch.ops.trtllm.allocate_output_with_nccl_window
 
-        def refuse_window(input_tensor, _kind, group):
+        def refuse_window(
+            input_tensor: torch.Tensor, _kind: int, group: list[int]
+        ) -> tuple[torch.Tensor, int, int]:
             """Use the native plain allocator to inject an ordinary window refusal."""
             return allocate(input_tensor, int(BufferKind.DEFAULT), group)
 
@@ -1288,7 +1290,7 @@ def _worker_nccl_ep_cuda_graph_replay(
             patch.object(
                 torch.ops.trtllm, "allocate_output_with_nccl_window", side_effect=refuse_window
             )
-            if force_window_fallback
+            if force_window_fallback and zerocopy_enabled
             else nullcontext()
         )
 
@@ -1307,21 +1309,30 @@ def _worker_nccl_ep_cuda_graph_replay(
             torch.cuda.synchronize()
 
             uses_window = recv_hs.data_ptr() != comm._ctx.output_tokens_buf.data_ptr()
-            assert uses_window == (not force_window_fallback)
-            if force_window_fallback:
-                refused.assert_called_once()
-            assert recv_scales.dtype == routing_dtype
+            capture_states = MPI.COMM_WORLD.allgather(
+                (
+                    uses_window,
+                    refused.call_count if refused is not None else 0,
+                    recv_scales.dtype == routing_dtype,
+                )
+            )
+            # Validate on every rank before any rank enters collective replay.
+            if zerocopy_enabled:
+                assert all(
+                    window == (not force_window_fallback) and calls == int(force_window_fallback)
+                    for window, calls, _ in capture_states
+                ), capture_states
+            assert all(dtype_matches for _, _, dtype_matches in capture_states), capture_states
             output_ptr = recv_hs.data_ptr()
 
             def replay_and_check(expected_sender: int, expected_weight: float) -> dict:
                 graph.replay()
                 torch.cuda.synchronize()
-                assert recv_hs.data_ptr() == output_ptr
-                if force_window_fallback:
-                    assert output_ptr == comm._ctx.output_tokens_buf.data_ptr()
                 valid = recv_slots[:, 0] >= 0
                 received = recv_hs[valid, 0].to(torch.float32).round().to(torch.int64)
                 return {
+                    "pointer_stable": recv_hs.data_ptr() == output_ptr,
+                    "uses_persistent_output": output_ptr == comm._ctx.output_tokens_buf.data_ptr(),
                     "valid_count": int(valid.sum().item()),
                     "sender_matches": bool(torch.all(received == expected_sender + 1).item()),
                     "weights_match": bool(
@@ -1337,6 +1348,7 @@ def _worker_nccl_ep_cuda_graph_replay(
             peer_result = replay_and_check(peer_rank, 0.25)
             return {
                 "rank": rank,
+                "zerocopy_enabled": zerocopy_enabled,
                 "uses_window": uses_window,
                 "local": local_result,
                 "peer": peer_result,
@@ -2521,12 +2533,14 @@ def _run_nccl_ep_cuda_graph_replay_test(
     ]
     results = sorted((future.result() for future in futures), key=lambda result: result["rank"])
     for result in results:
-        if "skip_reason" in result:
-            pytest.skip(result["skip_reason"])
-    for result in results:
         rank = result["rank"]
+        if result["zerocopy_enabled"]:
+            assert result["uses_window"] == (not force_window_fallback), result
         for replay_name in ("local", "peer"):
             replay = result[replay_name]
+            assert replay["pointer_stable"], result
+            if force_window_fallback and result["zerocopy_enabled"]:
+                assert replay["uses_persistent_output"], result
             valid_count = replay["valid_count"]
             assert valid_count == 16, (
                 f"rank {rank}: {replay_name} replay received {valid_count} valid rows, expected 16"
