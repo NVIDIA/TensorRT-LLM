@@ -30,6 +30,19 @@ tests:
     launch:
       mode: mpi
       world_size: 8
+  # ModelingV2 Nemotron-3 Ultra BF16 dep16: 16 GB200 GPUs over four trays (SM100), attention DP.
+  - case: accuracy/modeling_v2/nemotron_h/nemotron3_ultra_bf16__sm_100__dep16/test_accuracy.py::TestModelingV2Nemotron3UltraBf16Sm100Dep16::test_gsm8k
+    launch:
+      mode: mpi
+      nodes: 4
+  - case: accuracy/modeling_v2/nemotron_h/nemotron3_ultra_bf16__sm_100__dep16/test_accuracy.py::TestModelingV2Nemotron3UltraBf16Sm100Dep16::test_gsm8k_megamoe_cutedsl
+    launch:
+      mode: mpi
+      nodes: 4
+  - case: accuracy/modeling_v2/nemotron_h/nemotron3_ultra_bf16__sm_100__dep16/test_accuracy.py::TestModelingV2Nemotron3UltraBf16Sm100Dep16::test_gsm8k_trtllm_moe
+    launch:
+      mode: mpi
+      nodes: 4
   # ModelingV2 Nemotron-3 Ultra BF16 tep8 and tp8ep2: 8 GB200 GPUs over two trays (SM100).
   - case: accuracy/modeling_v2/nemotron_h/nemotron3_ultra_bf16__sm_100__tep8/test_accuracy.py::TestModelingV2Nemotron3UltraBf16Sm100Tep8::test_gsm8k
     launch:
