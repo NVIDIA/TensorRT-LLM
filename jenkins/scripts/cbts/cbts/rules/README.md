@@ -14,6 +14,7 @@ for the overall CBTS architecture.
 | `python_formatting.py` | `PythonFormattingRule` | `noop` | Python files with verified equivalent complete ASTs and unchanged comments |
 | `waives.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
+| `test_infrastructure.py` | `TestInfrastructureRule` | `testinfraonly` / `testsonly` | Reviewed list/lint/diagnostic tools and templates → registered scripts/tools tests; LLM-args manifest generator and JSON → usage tests (JSON also builds docs); CBTS infrastructure → CPU scripts tests |
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs), and the exact VisualGen serve schema |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
@@ -21,7 +22,7 @@ for the overall CBTS architecture.
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
-| `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
+| `out_of_scope.py` | `OutOfScopeRule` | `noop` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, and microbenchmarks; reviewed infrastructure tests belong to TestInfrastructureRule |
 
 ## PythonFormattingRule
 
@@ -607,3 +608,16 @@ and `OUT_OF_SCOPE_DIRECTORY_FILENAMES` in `out_of_scope.py` list the policies.
 | `lookup_paths_into_block_filters` | testdef | Runs `find_match_for_path` over a set of anchors; returns block_filters and miss set. |
 | `resolve_affected_stages` | all narrowing rules | Maps `block_filters` keys to stage names via `stages_by_yaml_stem`. |
 | `stages_by_yaml_stem` | all rules | Builds `{yaml_stem: [Stage, ...]}` index from the parsed Groovy stages. |
+
+
+`ImportSanityRule` contributes the registered import-sanity inventory whenever a
+Python diff changes module execution or a module-reached class body/signature.
+It claims no files: runtime rule/coverage obligations and PR test changes remain
+independent. Missing sanity selectors or active registrations force fallback.
+Its block filters are additive must-run contributions, including under Tier 2.
+
+
+Tier 2 uses exact changed-symbol coverage lookup. Missing historical function
+records do not trigger caller or file-level expansion. Import sanity and PR test
+changes remain explicit additive contributions. Full fallback retains the baseline
+CI case universe; it does not establish test sufficiency for new behavior.

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 version: 0.0.1
 l0_sanity_check:
 - condition:
@@ -19,6 +21,16 @@ l0_sanity_check:
         - '*5090*'
       linux_distribution_name: ubuntu*
   tests:
+    # Import sanity uses fresh interpreters and the real package environment.
+    # These checks supplement functional tests; they do not waive CBTS fallback.
+    - unittest/others/test_import_sanity.py
+    - unittest/others/test_import_gpu_free.py
+    - unittest/others/test_import_cuda_context.py
+    - unittest/others/test_mimalloc_thp.py
+    - unittest/llmapi/apps/test_serve_lazy_import.py
+    - unittest/dynamo/test_imports.py
+    # This API guard lacks cpu_only; a CPU-list entry alone deselects it.
+    - unittest/_torch/moe/test_moe_backend.py::test_import_deep_gemm_rejects_mega_moe_without_block_m_heuristic
     - llmapi/test_llm_examples.py::test_llmapi_quickstart
     - llmapi/test_llm_examples.py::test_llmapi_example_inference
     - llmapi/test_llm_examples.py::test_llmapi_example_inference_async

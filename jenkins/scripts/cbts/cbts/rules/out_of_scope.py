@@ -14,8 +14,8 @@
 """OutOfScopeRule — claims changes outside product-test selection.
 
 Emits scope="noop" with no product-test contribution and sanity / perfsanity
-off. CBTS infrastructure edits select CPU scripts tests. Noop changes add no
-CPU stages. Build and repository checks run upstream.
+off. TestInfrastructureRule owns the reviewed infrastructure paths that need
+unit tests. Noop changes add no CPU stages. Build and repository checks run upstream.
 
 `is_out_of_scope` is the single source of truth for these path patterns;
 `TestsDefRule` imports it to skip the same paths, so out-of-scope claims
@@ -31,8 +31,9 @@ from typing import Optional
 
 from cbts.blocks import Stage, YAMLIndex
 
-from ._helpers import reconstruct_diff_pre_image, resolve_affected_stages, stages_by_yaml_stem
+from ._helpers import reconstruct_diff_pre_image
 from .base import PRInputs, Rule, RuleResult
+from .test_infrastructure import test_infrastructure_paths
 
 # Exact files that affect repository metadata or external gates, but not the
 # pre-merge test stages CBTS selects. Do not widen this to `.github/`: workflow
@@ -175,9 +176,7 @@ class OutOfScopeRule(Rule):
     def __init__(
         self, yaml_index: YAMLIndex, stages: dict[str, Stage], repo_root: Path | None = None
     ) -> None:
-        self.yaml_index = yaml_index
         self._repo_root = repo_root
-        self._stages_by_yaml = stages_by_yaml_stem(stages)
 
     def _is_check_only_pyproject(self, path: str, pr: PRInputs) -> bool:
         if self._repo_root is None or Path(path).name != "pyproject.toml":
@@ -195,28 +194,9 @@ class OutOfScopeRule(Rule):
             path
             for path in pr.changed_files
             if is_out_of_scope(path) or self._is_check_only_pyproject(path, pr)
-        }
+        } - test_infrastructure_paths(pr.changed_files)
         if not claimed:
             return None
-        if any(path.startswith("jenkins/scripts/cbts/") for path in claimed):
-            # The scripts suite includes CBTS tests and the infrastructure
-            # consumers of its command-line interfaces and selection artifacts.
-            filters = {
-                (block.yaml_stem, block.block_index): {"unittest/scripts": {"unittest/scripts"}}
-                for block in self.yaml_index.blocks
-                if block.yaml_stem == "l0_cpu" and "unittest/scripts" in block.tests
-            }
-            scripts_registered = bool(filters)
-            stages = resolve_affected_stages(filters, self.yaml_index, self._stages_by_yaml)
-            return RuleResult(
-                handled_files=claimed,
-                affected_stages=stages,
-                scope="testsonly" if scripts_registered and stages else None,
-                block_filters=filters,
-                sanity_relevant=False,
-                perfsanity_relevant=False,
-                reason="outofscope: CBTS infrastructure changes require CPU scripts tests",
-            )
         return RuleResult(
             handled_files=claimed,
             affected_stages=set(),

@@ -203,11 +203,6 @@ def apply_coverage_tier(
     if note:
         return None, note
 
-    selector = CoverageSelector(db, repo_root, no_data_policy=no_data_policy)
-    cov = selector.decide(residual, pr.raw_diffs or pr.diffs, selection_diffs=pr.diffs)
-    if not cov.ok:
-        return None, f"coverage tier declined: {cov.reason}"
-
     rule_block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
     for _, r in pairs:
         for key, prefix_to_waives in r.block_filters.items():
@@ -215,23 +210,18 @@ def apply_coverage_tier(
             for prefix, waives in prefix_to_waives.items():
                 dst.setdefault(prefix, set()).update(waives)
 
+    selector = CoverageSelector(
+        db,
+        repo_root,
+        import_sanity_files={path for _, rule in pairs for path in rule.import_sanity_files},
+    )
+    cov = selector.decide(residual, pr.raw_diffs or pr.diffs, selection_diffs=pr.diffs)
+    if not cov.ok:
+        return None, f"coverage tier declined: {cov.reason}"
+
     nd = ""
     if cov.no_data_funcs:
-        shown = ", ".join(cov.no_data_funcs[:3])
-        more = f" (+{len(cov.no_data_funcs) - 3})" if len(cov.no_data_funcs) > 3 else ""
-        caller_bounded = set(cov.caller_bounded_funcs)
-        fallback_count = len(set(cov.no_data_funcs) - caller_bounded)
-        bound = {
-            "file": "bounded to each file's whole test set",
-            "importers": "bounded via importers",
-            "ignore": "NOT bounded",
-        }[no_data_policy]
-        bounds: list[str] = []
-        if caller_bounded:
-            bounds.append(f"{len(caller_bounded)} bounded via local callers")
-        if fallback_count:
-            bounds.append(f"{fallback_count} {bound}")
-        nd = f"; new/uncovered function(s), {', '.join(bounds)}: {shown}{more}"
+        nd = f"; {len(cov.no_data_funcs)} changed symbol(s) have no DB rows (no inferred tests)"
 
     known = db.known_by_family()
     untrusted = selector.untrusted_families()
@@ -273,8 +263,16 @@ def apply_coverage_tier(
             "removed_cases": n_removed,
             "dropped_stages": len(dropped),
             "outcome": "narrowed" if narrowed else "nothing_removable",
-            "no_data_policy": no_data_policy,
+            "selection_policy": "symbol_lookup",
+            "no_data_policy": "ignore",
+            "changed_symbols": {path: sorted(names) for path, names in cov.changed_symbols.items()},
+            "import_files": cov.import_files,
             "no_diff_files": len(cov.no_diff_files),
+            **(
+                {"retained_external_tests": cov.retained_external_tests}
+                if cov.retained_external_tests
+                else {}
+            ),
             **({"no_data_funcs": list(cov.no_data_funcs)} if cov.no_data_funcs else {}),
             **(
                 {"caller_bounded_funcs": list(cov.caller_bounded_funcs)}

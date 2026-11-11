@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Import sanity: cold imports and related behavior checks, without inference.
+# Selectors are relative to tests/. Run the full inventory with pytest -n 0:
+# current xdist reporting and CUDA teardown hooks interact with unittest
+# subtests and mocked CUDA state in the behavior checks.
+# One visible GPU covers the full inventory. With CUDA_VISIBLE_DEVICES="",
+# the CUDA-context check and two guided-decoder checks are skipped. Both
+# profiles require the real native/CUDA/MPI dependencies.
+# CBTS preserves covering registrations as mandatory import checks; runtime
+# changes and unresolved side effects still require rule/coverage bounds.
+
+# Cold imports, GPU-free imports, process state and public exports (CPU).
+- unittest/others/test_import_sanity.py
+- unittest/others/test_import_gpu_free.py
+- unittest/others/test_mimalloc_thp.py
+- unittest/llmapi/apps/test_serve_lazy_import.py
+- unittest/dynamo/test_imports.py
+
+# Executor error handling (CPU).
+- unittest/executor/test_forward_error_survival.py::test_executor_loop_survives_a_failed_forward
+- unittest/executor/test_forward_error_survival.py::test_executor_loop_overlap_survives_a_failed_forward
+
+# Coordinator lifecycle with mocked ctx/gen workers (CPU).
+- unittest/disaggregated/test_coordinator_e2e.py::test_disagg_completion_e2e_through_coordinator
+
+# Configuration, decoder inputs and request merging.
+- unittest/llmapi/test_llm_args.py::test_single_cp_rank_mapping_carries_no_cp_config
+- unittest/llmapi/test_llm_args.py::test_context_parallelism_rejects_cp_config_other_than_helix
+- unittest/llmapi/test_llm_args.py::test_context_parallelism_accepts_supported_cp_config
+- unittest/_torch/pyexecutor/engine/runners/decoder/test_inputs.py::DecoderInputPreparerTestCase::test_prepare_inputs_single_cp_rank_ignores_cp_type
+- unittest/_torch/pyexecutor/engine/runners/decoder/test_inputs.py::DecoderInputPreparerTestCase::test_prepare_inputs_rejects_unsupported_cp_type_with_context_parallelism
+- unittest/_torch/pyexecutor/test_request_utils.py::test_merge_requests_single_cp_rank_merges_as_without_cp
+- unittest/_torch/pyexecutor/test_request_utils.py::test_merge_requests_rejects_unsupported_cp_type_with_context_parallelism
+
+# Attention imports, backend selection and page-index contracts.
+- unittest/_torch/attention/test_backends_importable.py
+- unittest/_torch/attention/test_flashinfer_trtllm_gen_fmha.py::test_flashinfer_availability_by_sm
+- unittest/_torch/attention/test_fmha_page_index.py::test_flashinfer_uses_v2_page_index_upper_bound_directly
+
+# External APIs, priming state and mocked distributed bootstrap.
+- unittest/_torch/moe/test_moe_backend.py::test_import_deep_gemm_rejects_pre_situ_mega_moe_api
+- unittest/_torch/moe/test_moe_backend.py::test_import_deep_gemm_rejects_mega_moe_without_barrier_timeout
+- unittest/_torch/moe/test_moe_backend.py::test_import_deep_gemm_rejects_mega_moe_without_block_m_heuristic
+- unittest/_torch/moe/test_moe_backend.py::test_megamoe_deepgemm_primes_reachable_tiles_before_staging
+- unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_mpi_bootstrap_store_failure_raises_on_every_rank
+- unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_mpi_bootstrap_loopback_across_hosts_raises_on_every_rank
+
+# Raw-weight cache reuse with fresh consumable wrappers (CPU).
+- unittest/_torch/models/checkpoints/hf/test_weight_loader.py::test_weight_cache_reuses_raw_weights_with_fresh_consumable_wrapper
+
+# Visible-device CUDA context and guided-decoder bitmasks (one GPU).
+- unittest/others/test_import_cuda_context.py
+- unittest/_torch/misc/test_guided_decoder_bitmask.py::test_build_fails_request_on_dead_end_row
+- unittest/_torch/misc/test_guided_decoder_bitmask.py::test_build_dead_end_isolates_the_failing_request
+
+# Remaining gaps include lazy native-op first calls, optional-provider absence,
+# registered-host-buffer allocation and real multi-node collective/kernel paths.
