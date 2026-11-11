@@ -84,7 +84,11 @@
 先问"是否使用 slurm 模式"。
 
 - 不用：不写 `slurm-environment`。
-- 用：问 `slurm_partition`、`docker_image`，以及（agent-flow 有 v2-onboard 时）是否使用 GPU pool。
+- 用：`slurm_partition`、`docker_image`、`account`、`qos` 都先由 skill 推断再请用户确认，不让用户从空白开始填：
+  有 `sinfo` 就建议用 Slurm；分区取 `sinfo` 里的默认 GPU 分区；镜像取仓库
+  `jenkins/current_image_tags.properties` 里的 CI 镜像（Grace 架构 GPU 用 SBSA 版）；
+  `account`、`qos` 取 `sacctmgr` 的 association。用户给的旧 task.yaml 或 memory 优先。
+  agent-flow 有 v2-onboard 时，再问是否使用 GPU pool。
   - 不用 pool：`account`、`qos`、`container_mounts` 直接写在 `slurm-environment` 下面，agent 会读到。
   - 用 pool：这些字段写在 `slurm-environment.gpu_pool` 下面，不在两处重复。用户只填 `nodes` 和
     `max_nodes`；`account`、`qos`、`gpus_per_node`、`hours`、`container_mounts` 由 skill 从当前环境
