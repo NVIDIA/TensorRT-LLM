@@ -33,7 +33,13 @@ from .open_search_db_utils import add_id, get_history_data, post_new_perf_data
 POST_MERGE_THRESHOLD = 0.05
 PRE_MERGE_THRESHOLD = 0.1
 
-_URM_BASE = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main"
+# Where people open a run's outputs, by the location that the pipeline publishes test results to
+# (globalVars["llm_artifacts_primary"], aws when unset). artifactory.nvidia.com is opened in its
+# native browser, which signs people in; urm serves direct links.
+_ARTIFACT_BASES = {
+    "aws": "https://artifactory.nvidia.com/ui/native/sw-tensorrt-llm-generic-local/llm-artifacts/LLM/main",
+    "urm": "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main",
+}
 
 
 def get_job_info():
@@ -65,6 +71,15 @@ def get_job_info():
     raw_branch = global_vars.get("build_branch")
     branch = raw_branch if isinstance(raw_branch, str) else ""
     commit = os.getenv("gitlabCommit", "")
+    primary = global_vars.get("llm_artifacts_primary") or "aws"
+    artifact_base = _ARTIFACT_BASES.get(primary, _ARTIFACT_BASES["aws"])
+    # Original OCI/base reference, not the derived Enroot artifact or dispatcher.
+    runtime_image = os.getenv("TRTLLM_CI_RUNTIME_IMAGE", "").strip()
+    digest_match = re.fullmatch(r"[^@\s]+@(sha256:[0-9a-f]{64})", runtime_image)
+    runtime_image_digest = digest_match.group(1) if digest_match else "unknown"
+    runtime_image_identity_strength = (
+        "digest_pinned" if digest_match else "reference_only" if runtime_image else "unknown"
+    )
 
     # Initialize PR-specific fields
     trigger_mr_user = ""
@@ -95,9 +110,11 @@ def get_job_info():
 
         # Set trigger_mr_commit to commit
         trigger_mr_commit = commit
-        artifact_url = f"{_URM_BASE}/L0_MergeRequest_PR/{job_id}" if job_id else ""
+        artifact_url = (
+            f"{artifact_base}/L0_MergeRequest_PR/{job_id}/test-results/" if job_id else ""
+        )
     else:
-        artifact_url = f"{_URM_BASE}/L0_PostMerge/{job_id}" if job_id else ""
+        artifact_url = f"{artifact_base}/L0_PostMerge/{job_id}/test-results/" if job_id else ""
 
     return {
         "b_is_baseline": False,
@@ -113,6 +130,10 @@ def get_job_info():
         "s_job_url": job_url,
         "s_branch": branch,
         "s_commit": commit,
+        "s_runtime_image": runtime_image or "unknown",
+        "s_runtime_image_source": "TRTLLM_CI_RUNTIME_IMAGE" if runtime_image else "unknown",
+        "s_runtime_image_digest": runtime_image_digest,
+        "s_runtime_image_identity_strength": runtime_image_identity_strength,
         "b_is_post_merge": is_post_merge,
         "b_is_pr_job": is_pr_job,
         "s_trigger_mr_user": trigger_mr_user,

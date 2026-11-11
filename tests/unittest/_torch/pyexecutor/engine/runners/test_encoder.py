@@ -744,26 +744,48 @@ def test_scheduled_encoder_args_reject_extra_model_inputs() -> None:
 
 
 @pytest.mark.parametrize("backend", ["piecewise", "breakable"])
-def test_scheduled_encoder_args_drop_prefill_cuda_graphs(backend: str) -> None:
-    llm_args = TorchLlmArgs(model="dummy", prefill_cuda_graph_backend=backend)
+@pytest.mark.parametrize("mm_encoder_only", [False, True])
+def test_scheduled_encoder_args_drop_prefill_cuda_graphs(
+    backend: str, mm_encoder_only: bool
+) -> None:
+    llm_args = TorchLlmArgs(
+        model="dummy", prefill_cuda_graph_backend=backend, mm_encoder_only=mm_encoder_only
+    )
 
     with patch.object(encoder_module.logger, "warning") as warning:
         resolved = resolve_scheduled_encoder_args(llm_args)
 
     warning.assert_called_once()
+    graph_setting = (
+        "multimodal_config.encoder_cuda_graph"
+        if mm_encoder_only
+        else "cuda_graph_config=EncodeCudaGraphConfig(...)"
+    )
+    assert graph_setting in warning.call_args.args[0]
+    assert "torch_compile_config still applies" not in warning.call_args.args[0]
+    assert ("the default torch_compile_config is dropped" in warning.call_args.args[0]) == (
+        backend == "piecewise"
+    )
     assert resolved.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
     assert resolved.torch_compile_config is None
     assert llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend(backend)
 
 
-def test_scheduled_encoder_args_keep_explicit_compile_config() -> None:
+@pytest.mark.parametrize("mm_encoder_only", [False, True])
+def test_scheduled_encoder_args_keep_explicit_compile_config(mm_encoder_only: bool) -> None:
     compile_config = TorchCompileConfig(max_num_streams=1)
     llm_args = TorchLlmArgs(
-        model="dummy", prefill_cuda_graph_backend="piecewise", torch_compile_config=compile_config
+        model="dummy",
+        prefill_cuda_graph_backend="piecewise",
+        torch_compile_config=compile_config,
+        mm_encoder_only=mm_encoder_only,
     )
 
-    resolved = resolve_scheduled_encoder_args(llm_args)
+    with patch.object(encoder_module.logger, "warning") as warning:
+        resolved = resolve_scheduled_encoder_args(llm_args)
 
+    warning.assert_called_once()
+    assert "torch_compile_config still applies" in warning.call_args.args[0]
     assert resolved.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
     assert resolved.torch_compile_config == compile_config
 

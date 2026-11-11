@@ -246,6 +246,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     warmup._graphs = graphs
     warmup._metadata = SimpleNamespace(_warmup_dspark_ragged_compressor_metadata=Mock())
     warmup._context_warmups_supported = True
+    warmup._context_logits_heads = ()
     warmup._torch_compile_bypass = runner._bypass_torch_compile
     warmup._get_full_general_warmup_requests = Mock(return_value=[(4, 0)])
     warmup._get_max_shape_warmup_requests = Mock(return_value=[(8, 0)])

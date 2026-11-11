@@ -19,6 +19,7 @@ import math
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import backend_case
 import pytest
 import torch
 from backend_case import (
@@ -33,8 +34,14 @@ from backend_case import (
 from utils.util import getSMVersion
 
 pytestmark = pytest.mark.skipif(
+    getSMVersion() not in (100, 103, 107),
+    reason="PrimsTS attention kernels require SM100, SM103, or SM107",
+)
+
+
+_REQUIRES_BLACKWELL_MLA = pytest.mark.skipif(
     getSMVersion() not in (100, 103),
-    reason="PrimsTS attention kernels require SM100 or SM103",
+    reason="MLA PrimsTS integration requires SM100 or SM103",
 )
 
 
@@ -70,63 +77,199 @@ _DEEPSEEK_V3_LITE_MLA = {
 }
 
 
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
 @pytest.mark.parametrize(
-    "phase_args",
+    (
+        "seq_lens",
+        "num_cached_tokens",
+        "num_contexts",
+        "dtype",
+        "kv_dtype",
+        "use_kv_cache_manager_v2",
+    ),
     [
+        pytest.param([65, 37], [0, 0], 2, "bfloat16", None, False, id="native-context-v1"),
+        pytest.param([65, 37], [0, 0], 2, "bfloat16", None, True, id="native-context-v2"),
+        pytest.param([1, 1], [64, 96], 0, "bfloat16", None, False, id="native-generation-v1"),
+        pytest.param([1, 1], [64, 96], 0, "bfloat16", None, True, id="native-generation-v2"),
+        pytest.param([41, 1], [0, 63], 1, "bfloat16", None, False, id="native-mixed-v1"),
+        pytest.param([41, 1], [0, 63], 1, "bfloat16", None, True, id="native-mixed-v2"),
+        pytest.param([65, 37], [0, 0], 2, "bfloat16", "fp8", False, id="fp8-context-bf16-v1"),
+        pytest.param([65, 37], [0, 0], 2, "float16", "fp8", True, id="fp8-context-fp16-v2"),
+        pytest.param([1, 1], [64, 96], 0, "float16", "fp8", False, id="fp8-generation-fp16-v1"),
         pytest.param(
-            {
-                "seq_lens": [65, 37],
-                "num_cached_tokens": [0, 0],
-                "num_contexts": 2,
-            },
-            id="context",
+            [1, 1], [8191, 4096], 0, "bfloat16", "fp8", True, id="fp8-long-generation-bf16-v2"
         ),
-        pytest.param(
-            {
-                "seq_lens": [1, 1],
-                "num_cached_tokens": [64, 96],
-                "num_contexts": 0,
-            },
-            id="generation",
-        ),
-        pytest.param(
-            {
-                "seq_lens": [41, 1],
-                "num_cached_tokens": [0, 63],
-                "num_contexts": 1,
-            },
-            id="mixed",
-        ),
+        pytest.param([41, 1], [0, 63], 1, "bfloat16", "fp8", False, id="fp8-mixed-bf16-v1"),
+        pytest.param([41, 1], [0, 63], 1, "float16", "fp8", True, id="fp8-mixed-fp16-v2"),
     ],
 )
 def test_prims_ts_qwen2_gqa(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
-    phase_args: dict,
+    seq_lens: list[int],
+    num_cached_tokens: list[int],
+    num_contexts: int,
+    kv_dtype: str | None,
+    dtype: str,
 ) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    if kv_dtype == "fp8":
+        monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
     case = BackendCase(
-        **_QWEN2_7B,
-        **phase_args,
+        **{**_QWEN2_7B, "dtype": dtype},
+        seq_lens=seq_lens,
+        num_cached_tokens=num_cached_tokens,
+        num_contexts=num_contexts,
+        kv_dtype=kv_dtype,
         use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
 
     run_case(case)
 
 
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize(
+    (
+        "dtype",
+        "preprocessing",
+        "head_dim",
+        "use_kv_cache_manager_v2",
+        "num_cached_tokens",
+        "kv_dtype",
+    ),
+    [
+        pytest.param("bfloat16", "cached-rope", 128, False, [0, 0], None, id="native-v1"),
+        pytest.param("bfloat16", "cached-rope", 128, True, [0, 0], None, id="native-v2"),
+        pytest.param(
+            "bfloat16",
+            "cached-rope",
+            128,
+            False,
+            [0, 0],
+            "fp8",
+            id="fp8-bf16-cached-rope-d128-v1-context",
+        ),
+        pytest.param(
+            "bfloat16",
+            "cached-rope",
+            256,
+            True,
+            [32, 64],
+            "fp8",
+            id="fp8-bf16-cached-rope-d256-v2-prefix",
+        ),
+        pytest.param(
+            "bfloat16",
+            "computed-rope",
+            128,
+            True,
+            [0, 0],
+            "fp8",
+            id="fp8-bf16-computed-rope-d128-v2-context",
+        ),
+        pytest.param(
+            "bfloat16",
+            "computed-rope",
+            256,
+            False,
+            [32, 64],
+            "fp8",
+            id="fp8-bf16-computed-rope-d256-v1-prefix",
+        ),
+        pytest.param(
+            "float16",
+            "cached-rope",
+            128,
+            True,
+            [32, 64],
+            "fp8",
+            id="fp8-fp16-cached-rope-d128-v2-prefix",
+        ),
+        pytest.param(
+            "float16",
+            "cached-rope",
+            256,
+            False,
+            [0, 0],
+            "fp8",
+            id="fp8-fp16-cached-rope-d256-v1-context",
+        ),
+        pytest.param(
+            "float16",
+            "computed-rope",
+            128,
+            False,
+            [32, 64],
+            "fp8",
+            id="fp8-fp16-computed-rope-d128-v1-prefix",
+        ),
+        pytest.param(
+            "float16",
+            "computed-rope",
+            256,
+            True,
+            [0, 0],
+            "fp8",
+            id="fp8-fp16-computed-rope-d256-v2-context",
+        ),
+    ],
+)
 def test_prims_ts_context_receives_zeroed_v_tail(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
+    kv_dtype: str | None,
+    num_cached_tokens: list[int],
+    dtype: str,
+    preprocessing: str,
+    head_dim: int,
 ) -> None:
-    import backend_case
-
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillPagedTSWrapper
 
+    original_run_context = PrimsTSFmha.run_context
+
+    def run_context_with_selected_preprocessing(self, params):
+        # An absent cosine/sine table selects the preprocessing kernel that
+        # computes RoPE coefficients, with the same RoPE semantics.
+        with monkeypatch.context() as context_patch:
+            if preprocessing == "computed-rope":
+                context_patch.setattr(self.attn, "rotary_cos_sin", None)
+            return original_run_context(self, params)
+
     original_build_kv_cache_manager = backend_case._build_kv_cache_manager
+    original_fill_kv_cache = backend_case.fill_kv_cache_logical
+    original_generate_inputs = backend_case.generate_inputs
+    trt_managers: set[int] = set()
+    inputs_for_check: dict = {}
+
+    def generate_inputs(*args, **kwargs):
+        inputs = original_generate_inputs(*args, **kwargs)
+        # Bound RoPE operands so FP8 rounding at a bin boundary stays within
+        # the cache oracle's tolerance. Valid V values remain unmodified.
+        for tensor in (inputs["q"], inputs["new_k"], *inputs["cached_k"]):
+            tensor.clamp_(-1, 1)
+        inputs_for_check.update(inputs)
+        return inputs
+
+    def fill_cache_and_poison_tail(manager, layer_idx, request_ids, *args, **kwargs):
+        original_fill_kv_cache(manager, layer_idx, request_ids, *args, **kwargs)
+        if id(manager) not in trt_managers:
+            return
+        pool = manager.get_buffers(layer_idx, kv_layout="HND")
+        page_size = pool.shape[3]
+        block_indices = manager.get_batch_cache_indices(list(request_ids), layer_idx)
+        for batch_idx, seq_len in enumerate(case.token_nums):
+            tail_start = (seq_len - 1) % page_size + 1
+            physical_page = int(block_indices[batch_idx][(seq_len - 1) // page_size])
+            pool[physical_page, 1, :, tail_start:, :].fill_(float("nan"))
+
     original_run = BatchPrefillPagedTSWrapper.run
-    zeroed_tails: list[tuple[int, int]] = []
+    checked_tails: list[tuple[int, int]] = []
+    plan_flags: list[bool] = []
+    original_plan = BatchPrefillPagedTSWrapper.plan
+
+    def record_plan(self: BatchPrefillPagedTSWrapper, *args, **kwargs) -> None:
+        plan_flags.append(kwargs["paged_v_tail_is_zero"])
+        original_plan(self, *args, **kwargs)
 
     def build_kv_cache_manager_with_nan_v(
         case: BackendCase,
@@ -135,7 +278,7 @@ def test_prims_ts_context_receives_zeroed_v_tail(
     ) -> object:
         manager = original_build_kv_cache_manager(case, backend, kv_dtype)
         if backend == "TRTLLM":
-            manager.get_buffers(0, kv_layout="HND")[:, 1].fill_(float("nan"))
+            trt_managers.add(id(manager))
         return manager
 
     def run_with_zeroed_v_tail_check(
@@ -148,8 +291,8 @@ def test_prims_ts_context_receives_zeroed_v_tail(
         seq_lens_kv: torch.Tensor,
         **kwargs: object,
     ) -> torch.Tensor:
-        # The TRT-LLM producer promises zeroed V tails to PrimTS. Check the
-        # invariant at the handoff, before the PrimTS consumer launches.
+        # Check the producer's zero-tail contract before the consumer runs,
+        # including preservation of every valid V element in the last page.
         page_size = v_cache.shape[2]
         seq_lens = seq_lens_kv.cpu().tolist()
         page_indices = block_tables.cpu()
@@ -160,8 +303,19 @@ def test_prims_ts_context_receives_zeroed_v_tail(
                 continue
             physical_page = int(page_indices[batch_idx, logical_last_page].item())
             tail = v_cache[physical_page, :, tail_start:, :]
-            assert torch.count_nonzero(tail).item() == 0
-            zeroed_tails.append((batch_idx, tail_start))
+            assert torch.count_nonzero(tail.float()).item() == 0
+            new_v_start = sum(case.seq_lens[:batch_idx])
+            new_v = inputs_for_check["new_v"][new_v_start : new_v_start + case.seq_lens[batch_idx]]
+            logical_v = torch.cat(
+                (
+                    inputs_for_check["cached_v"][batch_idx],
+                    new_v.view(-1, case.num_kv_heads, case.head_dim),
+                )
+            )
+            expected = logical_v[logical_last_page * page_size :].to(v_cache.dtype)
+            actual = v_cache[physical_page, :, :tail_start, :].transpose(0, 1)
+            torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+            checked_tails.append((batch_idx, tail_start))
 
         return original_run(
             self,
@@ -175,6 +329,9 @@ def test_prims_ts_context_receives_zeroed_v_tail(
         )
 
     monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
+    monkeypatch.setattr(PrimsTSFmha, "run_context", run_context_with_selected_preprocessing)
+    monkeypatch.setattr(backend_case, "generate_inputs", generate_inputs)
+    monkeypatch.setattr(backend_case, "fill_kv_cache_logical", fill_cache_and_poison_tail)
     monkeypatch.setattr(
         backend_case,
         "_build_kv_cache_manager",
@@ -185,11 +342,15 @@ def test_prims_ts_context_receives_zeroed_v_tail(
         "run",
         run_with_zeroed_v_tail_check,
     )
+    monkeypatch.setattr(BatchPrefillPagedTSWrapper, "plan", record_plan)
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    rope = dict(_QWEN2_7B["rope"])
+    rope["dim"] = head_dim
     case = BackendCase(
-        **_QWEN2_7B,
+        **{**_QWEN2_7B, "head_dim": head_dim, "dtype": dtype, "rope": rope},
         seq_lens=[65, 37],
-        num_cached_tokens=[0, 0],
+        num_cached_tokens=num_cached_tokens,
+        kv_dtype=kv_dtype,
         num_contexts=2,
         use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
@@ -197,13 +358,51 @@ def test_prims_ts_context_receives_zeroed_v_tail(
     results = run_case(case)
 
     assert "TRTLLM" in results
-    assert zeroed_tails == [(0, 1), (1, 5)]
+    assert torch.isfinite(results["TRTLLM"]).all()
+    assert checked_tails == [(0, 1), (1, 5)]
+    assert plan_flags == [True]
 
 
+@pytest.mark.parametrize(
+    ("dtype", "kv_dtype"),
+    [("bfloat16", None), ("float16", "fp8")],
+    ids=["native-bf16", "fp8-fp16"],
+)
+def test_prims_ts_decode_with_computed_rope(
+    monkeypatch: pytest.MonkeyPatch, dtype: str, kv_dtype: str | None
+) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+
+    original_run_generation = PrimsTSFmha.run_generation
+
+    def run_generation_without_rope_table(self, params):
+        with monkeypatch.context() as context_patch:
+            context_patch.setattr(self.attn, "rotary_cos_sin", None)
+            return original_run_generation(self, params)
+
+    monkeypatch.setattr(PrimsTSFmha, "run_generation", run_generation_without_rope_table)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
+    run_case(
+        BackendCase(
+            **{**_QWEN2_7B, "dtype": dtype},
+            seq_lens=[1, 1],
+            num_cached_tokens=[65, 37],
+            num_contexts=0,
+            kv_dtype=kv_dtype,
+            use_kv_cache_manager_v2=True,
+        )
+    )
+
+
+@pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["fp16-kv", "fp8-kv"])
 def test_prims_ts_fp16_dense_context_with_alternate_shape(
     monkeypatch: pytest.MonkeyPatch,
+    kv_dtype: str | None,
 ) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    if kv_dtype == "fp8":
+        monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
     case = BackendCase(
         num_heads=8,
         num_kv_heads=2,
@@ -212,6 +411,7 @@ def test_prims_ts_fp16_dense_context_with_alternate_shape(
         num_cached_tokens=[0, 0],
         num_contexts=2,
         dtype="float16",
+        kv_dtype=kv_dtype,
         causal=False,
         kv_layout="HND",
         page_size=64,
@@ -363,6 +563,7 @@ def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
 
 
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_deepseek_v3_lite_mla_generation(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
@@ -381,6 +582,7 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
 
 @pytest.mark.parametrize("num_heads", [6, 12, 96])
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_fp8_mla_preprocessing(
     monkeypatch: pytest.MonkeyPatch, num_heads: int, use_kv_cache_manager_v2: bool
 ) -> None:
@@ -447,6 +649,7 @@ def test_prims_ts_fp8_mla_preprocessing(
 @pytest.mark.parametrize("num_heads", [6, 12, 96])
 @pytest.mark.parametrize("batch_size", [2, 65])
 @pytest.mark.parametrize("max_seq_len", [64, 128], ids=["short-kv", "regular-kv"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_fp8_mla_scales_and_graph_replay(
     monkeypatch: pytest.MonkeyPatch, num_heads: int, batch_size: int, max_seq_len: int
 ) -> None:
@@ -606,7 +809,7 @@ def test_prims_ts_context_lazy_rescale_with_late_key_block(
     wrapper.plan(
         device=device,
         batch_size=1,
-        max_seq_len_q=q_len,
+        max_q_len=q_len,
         max_kv_len=kv_len,
         num_qo_heads=1,
         num_kv_heads=1,
@@ -617,7 +820,7 @@ def test_prims_ts_context_lazy_rescale_with_late_key_block(
         out_dtype=dtype,
         page_size=page_size,
         mask_type="dense",
-        sm_scale=sm_scale,
+        softmax_scale=sm_scale,
     )
     wrapper.run(query, k_cache, v_cache, qo_indptr, block_tables, seq_lens, out=output)
     torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
@@ -720,7 +923,7 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
     wrapper.plan(
         device=device,
         batch_size=batch_size,
-        max_seq_len_q=3,
+        max_q_len=3,
         max_kv_len=max_seq_len,
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
@@ -738,12 +941,12 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
 
     assert len(compile_records) == 3
     assert [
-        (args[0].max_seq_len_q, args[0].max_kv_len, policy["scheduler"])
+        (args[0].max_q_len, args[0].max_kv_len, args[0].runtime_lengths, policy["scheduler"])
         for args, policy, _compiled in compile_records
     ] == [
-        (96, 96, "clc_dynamic_persistent"),
-        (128, 128, "nonpersistent"),
-        (3, 64, "clc_dynamic_persistent"),
+        (None, None, True, "clc_dynamic_persistent"),
+        (None, None, True, "nonpersistent"),
+        (None, None, True, "clc_dynamic_persistent"),
     ]
     assert compile_records[0][0] != compile_records[2][0]
     assert len({id(recorded) for _args, _policy, recorded in compile_records}) == 3
@@ -863,11 +1066,11 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
         head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         packed_query=False,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        o_data_type=dtype,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
         mask_type="causal",
         workspace_buffer=external_workspace,
     )
@@ -924,6 +1127,7 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
 
 
 @pytest.mark.parametrize("max_seq_len", [64, 1024], ids=["short-kv", "regular-kv"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
     from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchMLADecodePagedTSWrapper,
@@ -978,7 +1182,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         qk_rope_head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         q_dtype=dtype,
         kv_dtype=dtype,
         out_dtype=dtype,
@@ -999,11 +1203,11 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         qk_rope_head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         packed_query=False,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        o_data_type=dtype,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
         mask_type="causal",
         workspace_buffer=external_workspace,
     )
@@ -1019,7 +1223,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         kv_cache,
         block_tables,
         seq_lens,
-        bmm1_scale=bmm1_scale,
+        softmax_scale=bmm1_scale,
         out=output,
     )
     graph = torch.cuda.CUDAGraph()
@@ -1029,7 +1233,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
             kv_cache,
             block_tables,
             seq_lens,
-            bmm1_scale=bmm1_scale,
+            softmax_scale=bmm1_scale,
             out=output,
             validate=False,
         )
@@ -1047,8 +1251,8 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         max_kv_len=max_seq_len,
-        max_seq_len_q=1,
-        bmm1_scale=bmm1_scale,
+        max_q_len=1,
+        softmax_scale=bmm1_scale,
         out_dtype=dtype,
         out=torch.empty_like(output),
         mask_type="causal",
@@ -1130,11 +1334,11 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
             head_dim,
             page_size,
             max_seq_len,
-            max_seq_len_q=1,
+            max_q_len=1,
             packed_query=False,
-            q_data_type=dtype,
-            kv_data_type=dtype,
-            o_data_type=dtype,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            out_dtype=dtype,
             mask_type="causal",
             workspace_buffer=shared_workspace,
         )
@@ -1289,11 +1493,11 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
             head_dim,
             page_size,
             max_seq_len,
-            max_seq_len_q=1,
+            max_q_len=1,
             packed_query=False,
-            q_data_type=dtype,
-            kv_data_type=dtype,
-            o_data_type=dtype,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            out_dtype=dtype,
             mask_type="causal",
             workspace_buffer=shared_workspace,
         )
@@ -1404,18 +1608,54 @@ _CACHE_FREE_CASE = dict(
 )
 
 
-@pytest.mark.parametrize("outlier", [1.0, 10.0])
 @pytest.mark.parametrize(
-    ("qk_dtype", "v_dtype", "vc_attention", "vc_repair_budget", "vc_smooth", "seq_len"),
+    (
+        "qk_dtype",
+        "v_dtype",
+        "vc_attention",
+        "vc_repair_budget",
+        "vc_smooth",
+        "seq_len",
+        "outlier",
+        "cuda_graph",
+    ),
     [
-        ("bf16", "fp8", False, 0.0, True, 256),
-        ("fp8", "fp8", False, 0.0, True, 256),
-        ("bf16", "fp8", True, 0.0, True, 256),
-        ("bf16", "fp8", True, 0.0, False, 200),
-        ("bf16", "fp8", True, 0.01, True, 200),
-        ("fp8", "fp8", True, 0.0, True, 200),
-        ("fp8", "fp8", True, 0.0, False, 256),
-        ("fp8", "fp8", True, 0.01, True, 256),
+        pytest.param(
+            "bf16",
+            "fp8",
+            False,
+            0.0,
+            True,
+            200,
+            1.0,
+            True,
+            id="bf16-qk-fp8-v-partial-cuda-graph",
+        ),
+        pytest.param(
+            "fp8",
+            "fp8",
+            False,
+            0.0,
+            True,
+            256,
+            1.0,
+            True,
+            id="fp8-qkv-cuda-graph",
+        ),
+        ("bf16", "fp8", False, 0.0, True, 200, 10.0, False),
+        ("fp8", "fp8", False, 0.0, True, 256, 10.0, False),
+        ("bf16", "fp8", True, 0.0, True, 256, 1.0, False),
+        ("bf16", "fp8", True, 0.0, True, 256, 10.0, False),
+        ("bf16", "fp8", True, 0.0, False, 200, 1.0, False),
+        ("bf16", "fp8", True, 0.0, False, 200, 10.0, False),
+        ("bf16", "fp8", True, 0.01, True, 200, 1.0, False),
+        ("bf16", "fp8", True, 0.01, True, 200, 10.0, False),
+        ("fp8", "fp8", True, 0.0, True, 200, 1.0, False),
+        ("fp8", "fp8", True, 0.0, True, 200, 10.0, False),
+        ("fp8", "fp8", True, 0.0, False, 256, 1.0, False),
+        ("fp8", "fp8", True, 0.0, False, 256, 10.0, False),
+        ("fp8", "fp8", True, 0.01, True, 256, 1.0, False),
+        ("fp8", "fp8", True, 0.01, True, 256, 10.0, False),
     ],
 )
 def test_prims_ts_cache_free_fp8_recipes(
@@ -1427,6 +1667,7 @@ def test_prims_ts_cache_free_fp8_recipes(
     vc_smooth: bool,
     seq_len: int,
     outlier: float,
+    cuda_graph: bool,
 ) -> None:
     """Cache-free recipes plan FP8 operands, fold the per-tensor scales, and match SDPA.
 
@@ -1435,6 +1676,8 @@ def test_prims_ts_cache_free_fp8_recipes(
     logits are unchanged. Each sample is checked against SDPA. The VC rows cover both
     V-Smooth phases, inside the window with tile means and after it on the plain
     demean-off plan, and a length that is not a multiple of the 128-token tile.
+    The CUDA graph rows replay quantization and attention with changed Q/K/V,
+    covering both float/tensor and tensor/tensor global-scale combinations.
     """
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillTSWrapper
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
@@ -1447,6 +1690,20 @@ def test_prims_ts_cache_free_fp8_recipes(
     )
     plans: list[dict] = []
     runs: list[dict] = []
+    forward_calls: list[tuple] = []
+    if cuda_graph:
+        from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+
+        assert not vc_attention
+        forward = PrimsTSFmha._forward_without_kv_cache
+
+        def recording_forward(self: PrimsTSFmha, *args: object, **kwargs: object) -> None:
+            # The library keeps only a weak reference to its owning attention.
+            forward_calls.append((self.attn, self, args, kwargs))
+            forward(self, *args, **kwargs)
+
+        monkeypatch.setattr(PrimsTSFmha, "_forward_without_kv_cache", recording_forward)
+
     plan, run = BatchPrefillTSWrapper.plan, BatchPrefillTSWrapper.run
 
     def recording_plan(self, *args, **kwargs):
@@ -1504,8 +1761,8 @@ def test_prims_ts_cache_free_fp8_recipes(
         assert (run_kwargs["vc"].q_scale is not None) == (qk_dtype == "fp8")
         assert (plan_kwargs["vc_config"].repair_tiles > 0) == (vc_repair_budget > 0)
         assert plan_kwargs["vc_config"].demean == (vc_smooth and not vc_repair_budget)
-        assert run_kwargs["output_scale"] is None
-        assert run_kwargs["scale_softmax_log2"] is None
+        assert run_kwargs["output_scale"] == 1.0
+        assert run_kwargs["softmax_scale"] == 1.0 / math.sqrt(case.head_dim)
     else:
         # The quantize op returns BF16-rounded dequant scales.
         torch.testing.assert_close(
@@ -1515,13 +1772,11 @@ def test_prims_ts_cache_free_fp8_recipes(
             expected = (
                 dequant_scale(inputs["q"])
                 * dequant_scale(inputs["new_k"])
-                * (math.log2(math.e) / math.sqrt(case.head_dim))
+                / math.sqrt(case.head_dim)
             )
-            torch.testing.assert_close(
-                run_kwargs["scale_softmax_log2"], expected, rtol=1e-2, atol=0.0
-            )
+            torch.testing.assert_close(run_kwargs["softmax_scale"], expected, rtol=1e-2, atol=0.0)
         else:
-            assert run_kwargs["scale_softmax_log2"] is None
+            assert run_kwargs["softmax_scale"] == 1.0 / math.sqrt(case.head_dim)
     # The second sample's output is ``outlier`` times larger. Normalize it before comparing.
     sample_gain = torch.tensor([1.0, outlier], device=out.device).view(-1, 1)
     torch.testing.assert_close(
@@ -1530,6 +1785,39 @@ def test_prims_ts_cache_free_fp8_recipes(
         atol=FP8_ATOL + BF16_ATOL,
         rtol=BF16_RTOL,
     )
+
+    if cuda_graph:
+        ((_owner, library, args, kwargs),) = forward_calls
+        q_input, k_input, v_input = args[:3]
+        captured_output = args[4].output
+        assert captured_output is not None
+        original_q, original_k, original_v = q_input.clone(), k_input.clone(), v_input.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward(library, *args, **kwargs)
+        # Replay the warmed adapter, including quantization and its live scales.
+        for q_gain, k_gain, v_gain in ((3.0, 0.7, 0.3), (0.3, 1.7, 3.0)):
+            q_input.copy_(original_q * q_gain)
+            k_input.copy_(original_k * k_gain)
+            v_input.copy_(original_v * v_gain)
+            captured_output.zero_()
+            graph.replay()
+            expected = (
+                torch.nn.functional.scaled_dot_product_attention(
+                    bhsd(q_input), bhsd(k_input), bhsd(v_input)
+                )
+                .transpose(1, 2)
+                .reshape_as(captured_output)
+            )
+            relative_error = (captured_output.float() - expected).norm() / expected.norm()
+            assert relative_error.item() < 0.15
+            torch.testing.assert_close(
+                captured_output.float() / v_gain,
+                expected / v_gain,
+                atol=FP8_ATOL + BF16_ATOL,
+                rtol=BF16_RTOL,
+            )
+        assert len(plans) == 1
 
 
 def test_prims_ts_recipe_requires_prims_ts_library(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1601,3 +1889,142 @@ def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch
 
     assert calls["fallback"] > 0
     assert calls["prims_context"] == 0
+
+
+def test_prims_ts_fp8_decode_bf16_device_scales(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check FP8 decode with live device scales across graph replay."""
+    import cutlass
+
+    from tensorrt_llm._torch.attention.backends.prims_ts import decode
+    from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        make_decode_config,
+    )
+
+    torch.manual_seed(123)
+    head_dim, page_size, head_ratio = 128, 64, 8
+    batch_size, kv_heads = 2, 2
+    qo_heads = kv_heads * head_ratio
+    max_kv_len = 2048
+    pages_per_seq = max_kv_len // page_size
+    num_pages = batch_size * pages_per_seq
+    q = torch.randn(batch_size, qo_heads, head_dim, device="cuda").to(torch.float8_e4m3fn)
+    k = torch.randn(num_pages, kv_heads, page_size, head_dim, device="cuda").to(torch.float8_e4m3fn)
+    v = torch.randn_like(k, dtype=torch.float32).to(torch.float8_e4m3fn)
+    # Permuted pages and padded table rows catch assumptions about pool layout.
+    table = torch.full((batch_size, pages_per_seq + 3), -1, dtype=torch.int32, device="cuda")
+    table[:, :pages_per_seq] = torch.randperm(num_pages, device="cuda").reshape(batch_size, -1)
+    lengths_host = [max_kv_len - 13, max_kv_len // 2 + 7]
+    lengths = torch.tensor(lengths_host, dtype=torch.int32, device="cuda")
+    bmm1 = torch.tensor([0.25 / math.sqrt(head_dim)], device="cuda")
+    bmm2 = torch.tensor([1.75], device="cuda")
+    output = torch.empty_like(q, dtype=torch.bfloat16)
+    splits = 4
+    cfg = make_decode_config(
+        headdim=head_dim,
+        args={"tile_size_q": 16, "groups_tokens_heads_q": True, "use_keeps_mma_ab": False},
+        seq_len_q=1,
+        seq_len_kv=max_kv_len,
+        batch_size=batch_size,
+        num_heads_q=qo_heads,
+        num_heads_kv=kv_heads,
+        qkv_dtype=cutlass.Float8E4M3FN,
+        o_dtype=cutlass.BFloat16,
+        qkv_layout="pagedKv",
+        num_tokens_per_page=page_size,
+        split_kv_mode="gmem_reduction_with_separate_kernel",
+        splits_kv=splits,
+        max_splits_kv=splits,
+        mask_type="causal",
+        auto_tuner=False,
+    )
+
+    spec = decode._decode_launch_spec_from_config(
+        cfg,
+        batch_size=batch_size,
+        num_qo_heads=qo_heads,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        seq_len_q=1,
+        max_active_clusters=torch.cuda.get_device_properties(0).multi_processor_count,
+    )
+    monkeypatch.setattr(decode, "_resolve_decode_launch_spec", lambda *args, **kwargs: spec)
+    wrapper = decode.BatchDecodePagedTSWrapper()
+    wrapper.plan(
+        q.device,
+        batch_size,
+        qo_heads,
+        kv_heads,
+        head_dim,
+        page_size,
+        max_kv_len,
+        q_dtype=q.dtype,
+        out_dtype=output.dtype,
+        mask_type="causal",
+        softmax_scale=bmm1,
+        output_scale=bmm2,
+    )
+
+    def run() -> torch.Tensor:
+        return wrapper.run(
+            q,
+            (k, v),
+            lengths,
+            table,
+            out=output,
+            softmax_scale=bmm1,
+            output_scale=bmm2,
+            validate=False,
+        )
+
+    def reference() -> torch.Tensor:
+        results = []
+        for batch_idx, length in enumerate(lengths_host):
+            ids = table[batch_idx, :pages_per_seq].long()
+            keys = k.float()[ids].permute(1, 0, 2, 3).reshape(kv_heads, -1, head_dim)[:, :length]
+            values = v.float()[ids].permute(1, 0, 2, 3).reshape(kv_heads, -1, head_dim)[:, :length]
+            keys = keys.repeat_interleave(head_ratio, dim=0)
+            values = values.repeat_interleave(head_ratio, dim=0)
+            scores = torch.einsum("hd,htd->ht", q[batch_idx].float(), keys) * bmm1
+            results.append(torch.einsum("ht,htd->hd", scores.softmax(-1), values) * bmm2)
+        return torch.stack(results)
+
+    def check_output() -> None:
+        # The FP8 kernel rounds the intermediate P operand to E4M3.
+        torch.testing.assert_close(output.float(), reference(), atol=0.01, rtol=0.05)
+
+    wrapper.run(
+        q,
+        (k, v),
+        lengths,
+        table,
+        out=output,
+        softmax_scale=bmm1,
+        output_scale=bmm2,
+        validate=True,
+    )
+    torch.cuda.synchronize()
+    check_output()
+
+    def no_host_read(*args, **kwargs):
+        raise AssertionError("decode must not read scales back to the host")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(torch.Tensor, "item", no_host_read)
+        guard.setattr(torch.Tensor, "__float__", no_host_read)
+        sync_debug_mode = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            run()
+        finally:
+            torch.cuda.set_sync_debug_mode(sync_debug_mode)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        # Both attention scores and final output must consume updated scales.
+        bmm1.mul_(2)
+        bmm2.mul_(0.5)
+        graph.replay()
+    torch.cuda.synchronize()
+    check_output()
