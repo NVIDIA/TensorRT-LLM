@@ -185,6 +185,9 @@ class KimiK3MLAAttention(MLA):
             fuse_qkv_a_proj=fuse_qkv_a_proj,
             rms_norm_eps=rms_norm_eps,
         )
+        # Keep this layer's KV-cache precision: a layer-wise quant config would
+        # replace it with its projection's config, and exclude_modules with the
+        # global kv_cache_quant_algo (apply_quant_config_exclude_modules).
         self._skip_layerwise_quant_config = True
         # Keep the base MLA registration enabled so breakable CUDA graphs use
         # the shared custom op. The output gate is a base hook and runs on both
