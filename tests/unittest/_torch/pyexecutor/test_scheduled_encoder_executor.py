@@ -23,7 +23,7 @@ from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import (
     ScheduledEncoderExecutor,
     fit_batch,
 )
-from tensorrt_llm.bindings.executor import FinishReason, OutputConfig, Request
+from tensorrt_llm.bindings.executor import FinishReason, OutputConfig, Request, SamplingConfig
 from tensorrt_llm.executor.utils import is_context_length_exceeded_message
 from tensorrt_llm.mapping import Mapping
 
@@ -258,6 +258,16 @@ def test_a_survivable_forward_error_fails_only_its_batch():
         assert error.error_msg == "bad batch"
         h.result(later)
         assert h.executor.can_enqueue_requests()
+
+
+def test_a_failed_forward_answers_a_request_with_children_once():
+    with _harness() as h:
+        h.runner.errors.append(RuntimeError("bad batch"))
+        failed = h.submit(sampling_config=SamplingConfig(num_return_sequences=2))
+        h.executor.start_worker()
+
+        (error,) = h.executor.await_responses(timeout=WAIT)
+        assert (error.request_id, error.error_msg) == (failed, "bad batch")
 
 
 def test_a_fatal_forward_error_fails_everything_queued_and_shuts_down():

@@ -582,6 +582,7 @@ class ScheduledEncoderExecutor:
         traceback.print_exc()
         error_msg = str(error) or "error"
         logger.error(f"Encountered an error in forward function: {error_msg}")
+        # Child requests share their parent's client, which takes one error.
         responses = [
             (
                 request.py_request_id,
@@ -592,6 +593,7 @@ class ScheduledEncoderExecutor:
                 ),
             )
             for request in requests
+            if not request.is_child
         ]
         released = [request.py_request_id for request in requests]
         if self._error_budget.consume(error_msg):
