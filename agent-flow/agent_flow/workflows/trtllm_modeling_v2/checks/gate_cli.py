@@ -202,6 +202,13 @@ def run_check(
             )
             # With no score of that deployment, this one's is reported with no verdict.
             relative_score = None if first.infrastructure else first.measured
+        if held.kind == anchors.RELATIVE and relative_score is not None:
+            # The other deployment's score is on its own scale: it is brought to this
+            # benchmark's before anything is held to it.
+            base = anchors.frozen(workspace, held.relative_to, benchmark.name)
+            other = deployments_mod.named(task_data, held.relative_to).benchmark(benchmark.name)
+            unit = base.unit if base else other.unit if other else held.unit
+            relative_score = anchors.rescale(relative_score, unit, held.unit)
         judge = dict(anchor=held, relative_score=relative_score, runner=runner, **bound)
         if found.kind == AGGREGATED:
             result = accuracy_checks.run_accuracy_gate(

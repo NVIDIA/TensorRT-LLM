@@ -30,7 +30,9 @@ from ..infra.files import write_text_atomic
 from ..infra.git import (
     LABEL_TARGET,
     CommitPolicy,
+    audit_change,
     audit_commits,
+    changed_paths,
     git_checked,
     git_output,
     link_native,
@@ -286,13 +288,13 @@ class Integration:
         if self.policy is None:
             return
         out = git_checked(
-            self.repo, "log", "--no-merges", "--name-only", "--format=%x1e%H%x1f%s%x1f",
-            f"{head}..{branch}", check=False,
+            self.repo, "log", "--no-merges", "--raw", "-z", "--no-renames",
+            "--format=%x1e%H%x1f%s%x1f", f"{head}..{branch}", check=False,
         )  # fmt: skip
         rows = load_labels(self.root.parent)
         for record in filter(str.strip, out.split("\x1e")):
-            sha, subject, names = record.split("\x1f", 2)
-            paths = names.split()
+            sha, subject, raw = record.split("\x1f", 2)
+            paths = [path for _, path in changed_paths(raw)]
             outside = [p for p in paths if self.policy.label([p]) != LABEL_TARGET]
             rows.append(
                 dict(
@@ -309,10 +311,15 @@ class Integration:
         """What in the task's own commits breaks the run's commit rules, said for its worker; "" if nothing."""
         if self.policy is None:
             return ""
+        fork = git_checked(tree, "merge-base", head, branch, check=False).strip() or head
         findings = audit_commits(tree, f"{head}..{branch}", self.policy)
+        said = {finding.problem for finding in findings}
+        # What lands is what is audited: the net change too, which a merge commit's own
+        # edits are part of and no single commit shows.
+        net = audit_change(tree, fork, branch, self.policy)
+        findings += [finding for finding in net if finding.problem not in said]
         if not findings:
             return ""
-        fork = git_checked(tree, "merge-base", head, branch, check=False).strip() or head
         return (
             f"commits on {branch} break the run's commit rules:\n"
             + "\n".join(f"  - {f.render()}" for f in findings)

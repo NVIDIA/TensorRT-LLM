@@ -20,6 +20,10 @@ its worker:
   ``.claude/`` or ``.cc-writes/``;
 - no path is under the run's own workspace or a judge path (the evaluator, the accuracy
   references). Any other path lands and is labelled ``target``, ``shared`` or ``mixed``.
+
+The path rules hold for the branch's net change as well (:func:`audit_change`), so an edit
+that only a merge commit carries is seen. Paths are read NUL-delimited, as git knows them
+and never as it quotes them, and compared by path component.
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 # Seconds. A git query that takes longer than this is a sick host, and the
 # gate's answer is `unknown` rather than a stall in front of a multi-hour run.
@@ -82,8 +86,9 @@ def git_checked(repo: str | Path, *args: str, check: bool = True) -> str:
 COMMIT_POLICY_FIELD = "commit_policy"
 COMMIT_POLICY_KEYS: tuple[str, ...] = ("allow_co_authors",)
 
-#: What scores the run, as repo-relative prefixes: the evaluator and the reference rows the
-#: anchors come from. A commit of the run's that touches one is refused.
+#: What scores the run, repo-relative, each a file or a directory with everything under
+#: it: the evaluator and the reference rows the anchors come from. A commit of the run's
+#: that touches one is refused.
 JUDGE_PATHS: tuple[str, ...] = (
     "tensorrt_llm/evaluate/",
     "tensorrt_llm/commands/eval.py",
@@ -180,26 +185,25 @@ class CommitPolicy:
         for entry in task_data.get("deployments") or ():
             benchmarks = entry.get("benchmarks") if isinstance(entry, Mapping) else None
             named += [b.get("reference_yaml") for b in benchmarks or () if isinstance(b, Mapping)]
-        stated = {
-            path if not Path(path).is_absolute() else _relative_inside(Path(path), Path(repo))
-            for path in named
-            if isinstance(path, str) and path and repo
-        }
+        stated: set[str] = set()
+        for path in named:
+            if isinstance(path, str) and path and repo:
+                stated |= _as_git_knows(path, Path(repo))
         return cls(
             identity=identity,
             own_paths=tuple(own_paths),
             denied_paths=tuple(denied),
-            judge_paths=(*JUDGE_PATHS, *sorted(stated - {""})),
+            judge_paths=(*JUDGE_PATHS, *sorted(stated)),
             allow_co_authors=bool(block.get("allow_co_authors", False)),
         )
 
     def path_problem(self, path: str) -> str:
         """Why ``path`` (repo-relative) may not be committed by this run, or ``""``."""
         for prefix in self.denied_paths:
-            if path.startswith(prefix):
+            if _within(path, prefix):
                 return f"{path} is under {prefix}, which this run never commits (its own workspace)"
         for prefix in self.judge_paths:
-            if path.startswith(prefix):
+            if _within(path, prefix):
                 return (
                     f"{path} is a judge path ({prefix}): what scores the run is not its to change"
                 )
@@ -207,7 +211,7 @@ class CommitPolicy:
 
     def label(self, paths: Sequence[str]) -> str:
         """``target``, ``shared`` or ``mixed``: whether a commit's ``paths`` are the target's own."""
-        own = [any(path.startswith(prefix) for prefix in self.own_paths) for path in paths]
+        own = [any(_within(path, prefix) for prefix in self.own_paths) for path in paths]
         return LABEL_TARGET if all(own) else LABEL_MIXED if any(own) else LABEL_SHARED
 
 
@@ -226,6 +230,27 @@ def validate_commit_policy_block(block: Any, errors: list[str]) -> None:
         )
     if "allow_co_authors" in block and not isinstance(block["allow_co_authors"], bool):
         errors.append(f"'{COMMIT_POLICY_FIELD}.allow_co_authors' must be true or false")
+
+
+def _within(path: str, root: str) -> bool:
+    """Whether ``path`` is ``root`` or lies under it, by path component: never by its spelling."""
+    root = root.rstrip("/")
+    return path == root or path.startswith(root + "/")
+
+
+def _as_git_knows(path: str, repo: Path) -> set[str]:
+    """The repo-relative names a file the spec wrote as ``path`` is committed under.
+
+    Its name with ``.`` and ``..`` taken out, and what that resolves to: a link and the
+    file it points at are both the judge's. Each only when inside ``repo``.
+    """
+    full = Path(path) if Path(path).is_absolute() else repo / path
+    spelled = (Path(os.path.normpath(full)), Path(os.path.normpath(repo)))
+    found: set[str] = set()
+    for name, root in (spelled, (full.resolve(), repo.resolve())):
+        with contextlib.suppress(ValueError):
+            found.add(name.relative_to(root).as_posix())
+    return found - {"", "."}
 
 
 def _relative_inside(path: Path, root: Path) -> str:
@@ -322,7 +347,7 @@ def audit_commits(
         "%x1f%(trailers:key=Signed-off-by,valueonly,separator=%x1d)"
         "%x1f%(trailers:key=Co-authored-by,valueonly,separator=%x1d)%x1f"
     )
-    args = ["log", "--no-merges", "--raw", "--no-renames", f"--format={fmt}", rev_range]
+    args = ["log", "--no-merges", "--raw", "-z", "--no-renames", f"--format={fmt}", rev_range]
     out = _git(repo, *args, timeout=None)
     if out is None or out.returncode != 0:
         why = "git could not be run" if out is None else out.stderr.strip()
@@ -349,18 +374,43 @@ def audit_commits(
             found("carries Co-authored-by")
         if policy.identity is not None and author != policy.identity.render():
             found(f"authored as {author!r}, not the run's {policy.identity.render()!r}")
-        for line in raw.splitlines():
-            if not line.startswith(":") or "\t" not in line:
-                continue
-            meta, path = line.split("\t", 1)
-            modes = meta.split()
-            if len(modes) >= 2 and modes[1] == "120000" and modes[0] != ":120000":
-                found(f"adds a symlink: {path}")
-            if is_sandbox_placeholder(path) and not (len(modes) >= 2 and modes[1] == "000000"):
-                found(f"adds a sandbox placeholder: {path}")
-            if policy.path_problem(path):
-                found(policy.path_problem(path))
+        for problem in _path_problems(policy, raw):
+            found(problem)
     return findings
+
+
+def audit_change(
+    repo: str | Path, base: str, tip: str, policy: CommitPolicy
+) -> list[CommitFinding]:
+    """Hold the net change from ``base`` to ``tip`` to the path rules.
+
+    What a branch brings however its history got there: an edit that only a merge commit
+    carries is in no commit :func:`audit_commits` reads.
+    """
+    out = _git(repo, "diff", "--raw", "-z", "--no-renames", base, tip, timeout=None)
+    if out is None or out.returncode != 0:
+        why = "git could not be run" if out is None else out.stderr.strip()
+        raise CommitPolicyError(f"git diff {base} {tip} failed: {why}")
+    subject = "the branch's net change"
+    return [CommitFinding(tip, subject, p) for p in _path_problems(policy, out.stdout)]
+
+
+def changed_paths(raw: str) -> Iterator[tuple[list[str], str]]:
+    """``(modes, path)`` of every entry in git's NUL-delimited ``--raw`` output."""
+    tokens = iter(raw.split("\0"))
+    for token in tokens:
+        if token.strip().startswith(":"):
+            yield token.split(), next(tokens, "")
+
+
+def _path_problems(policy: CommitPolicy, raw: str) -> Iterator[str]:
+    for modes, path in changed_paths(raw):
+        if len(modes) >= 2 and modes[1] == "120000" and modes[0] != ":120000":
+            yield f"adds a symlink: {path}"
+        if is_sandbox_placeholder(path) and not (len(modes) >= 2 and modes[1] == "000000"):
+            yield f"adds a sandbox placeholder: {path}"
+        if policy.path_problem(path):
+            yield policy.path_problem(path)
 
 
 def is_sandbox_placeholder(path: str) -> bool:

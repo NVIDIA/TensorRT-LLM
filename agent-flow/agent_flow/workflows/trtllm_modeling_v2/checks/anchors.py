@@ -222,8 +222,10 @@ def resolve(
     key, wanted = model_key(task_data, benchmark), tags(deployment, benchmark)
     try:
         score = load_reference_score(path, key, discriminators=wanted)
-    except (KeyError, FileNotFoundError, TypeError, ValueError, yaml.YAMLError) as exc:
-        # Whole words: what it says to do is at the end of the line.
+    except (KeyError, OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        # A reference that is missing, unreadable or holds no such row is no anchor, said
+        # with its reason: it never stops the deployments it does not judge. Whole words:
+        # what it says to do is at the end of the line.
         why = textwrap.shorten(str(exc).strip("'\"").splitlines()[0], 1200, placeholder=" ...")
     else:
         shown = f" with {wanted}" if wanted else ""
@@ -329,6 +331,13 @@ def samples_of(benchmark: Benchmark, output: str = "") -> tuple[int | None, str]
     if benchmark.name in KNOWN_SAMPLES:
         return KNOWN_SAMPLES[benchmark.name], f"the {benchmark.name} split size"
     return None, f"no sample count for `{benchmark.name}`: state its `samples`"
+
+
+def rescale(score: float, unit: str, to: str) -> float:
+    """``score``, stated in ``unit``, on the scale ``to``: a fraction is a hundredth of a percent."""
+    return score * {("fraction", "percent"): 100.0, ("percent", "fraction"): 0.01}.get(
+        (unit, to), 1.0
+    )
 
 
 def floor(

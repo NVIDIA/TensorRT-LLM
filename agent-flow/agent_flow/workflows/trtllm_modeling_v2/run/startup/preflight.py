@@ -38,7 +38,7 @@ from ...infra.compute.environment import (
 from ...operators.coverage import MODELING_V2_PACKAGE
 from ...spec import deployments as deployments_mod
 from ...spec.advice import checkpoint_notes, spec_warnings, unfit
-from ...spec.deployments import Deployment
+from ...spec.deployments import Deployment, Server
 from ...spec.task_schema import (
     DEFAULT_PARALLEL,
     derive_checkpoint_segment,
@@ -121,19 +121,33 @@ class PreflightResult:
         ]
         if self.config_error:
             lines.append(f"config:      the tree cannot load it yet: {self.config_error}")
-        skipped = [f"{r['deployment']} {r['check']}: {r['reason']}" for r in self.not_attempted]
-        lines += [f"not attempted: {line}" for line in skipped]
+        for r in self.not_attempted:
+            what = f"{r['deployment']} {r['check']}".rstrip()
+            lines.append(f"not attempted: {what}: {r['reason']}")
         return "\n".join(lines + [f"note: {note}" for note in self.notes])
 
 
-def _prefix(task_data: Mapping[str, Any], deployment: Deployment) -> str:
-    """The prefix ``deployment``'s first server starts behind; the spec's own when it has none."""
-    launch = next(iter(deployment.servers.values())).launch.strip()
+def _prefix(task_data: Mapping[str, Any], server: Server) -> str:
+    """The prefix ``server`` starts behind; the spec's own when it states none."""
+    launch = server.launch.strip()
     return launch or str((task_data.get("environment") or {}).get("launch") or "").strip()
 
 
-def probe(task_data: Mapping[str, Any], deployment: Deployment, runner: Any) -> dict[str, Any]:
-    """What is seen where ``deployment``'s engine will run, from every host that answered.
+def _prefixes(task_data: Mapping[str, Any], deployment: Deployment) -> dict[str, int]:
+    """Each prefix a server of ``deployment`` starts behind, with the ranks it places there."""
+    needs: dict[str, int] = {}
+    for server in deployment.servers.values():
+        prefix = _prefix(task_data, server)
+        needs[prefix] = needs.get(prefix, 0) + server.ranks
+    return needs
+
+
+def probe(
+    task_data: Mapping[str, Any], deployment: Deployment, runner: Any, launch: str | None = None
+) -> dict[str, Any]:
+    """What is seen where a server of ``deployment`` will run, from every host that answered.
+
+    ``launch`` is that server's prefix; unnamed, the first server's.
 
     ``devices`` is ``(host, index, free MiB, total MiB, arch)`` of each device seen;
     ``tree_error``, ``config_error`` and ``tmp_error`` are the first a host reported;
@@ -143,7 +157,8 @@ def probe(task_data: Mapping[str, Any], deployment: Deployment, runner: Any) -> 
     env = {**environment.env, **deployment.env}
     environment = with_mode(replace(environment, env=env), MODE_REQUIRE)
     argv = ["-c", PROBE_SOURCE, str(task_data["checkpoint_path"])]
-    launch = _prefix(task_data, deployment)
+    if launch is None:
+        launch = next(iter(_prefixes(task_data, deployment)))
     command = environment.python_command(argv, single_process=True)
     if launch:
         words = " ".join(shlex.quote(word) for word in (environment.python, *argv))
@@ -200,37 +215,47 @@ def resolve_target_identity(task_data: Mapping[str, Any], config: Mapping[str, A
     return family, f"{MODELING_V2_PACKAGE}/models/{family}/{name}"
 
 
-def _claim(task_data, core: Deployment, need: int, runner: Any, result: PreflightResult) -> tuple:
-    """Hold the first deployment to what its probe sees; ``(a device's MiB, this host's free ones)``."""
-    seen, arch = probe(task_data, core, runner), str(task_data["arch"])
-    prefix = _prefix(task_data, core)
-    where = f"where `{core.name}` runs ({f'behind `{prefix}`' if prefix else 'on this host'})"
+def _claim(task_data, core: Deployment, runner: Any, result: PreflightResult) -> tuple:
+    """Hold each server of the first deployment to what a probe behind its own prefix sees.
+
+    A server's ranks must be free where it runs: on this host, or behind its prefix.
+    ``(a device's MiB, this host's free devices)``; the second is ``None`` when no server
+    of the first deployment starts on this host with no prefix.
+    """
+    arch, memory, free = str(task_data["arch"]), None, None
     blockers = (
         ("error", "the probe did not answer"),
         ("tree_error", "the tree does not import"),
         ("tmp_error", "the temporary directory is not writable"),
     )
-    for key, what in blockers:
-        if seen.get(key):
-            raise PreflightError(f"{what} {where}: {seen[key]}")
-    devices = [d for d in seen["devices"] if d[4] == arch]
-    if not devices:
-        others = sorted({d[4] for d in seen["devices"]}) or seen.get("devices_error") or "none"
-        raise PreflightError(f"`{core.name}` needs {arch} devices; {where} the probe saw {others}")
-    idle = [d for d in devices if d[2] >= MIN_FREE_MEMORY_FRACTION * d[3]]
-    busy = [f"device {d[1]} on {d[0]} is in use: {d[2]} of {d[3]} MiB free" for d in devices]
-    result.notes += [line for line, d in zip(busy, devices) if d not in idle]
-    if len(idle) < need:
-        raise PreflightError(
-            f"`{core.name}` needs {need} free {arch} device(s) on this host; {len(idle)} of "
-            f"{len(devices)} are free:\n  - " + "\n  - ".join(result.notes or ["(none seen)"])
-        )
-    memory = min(d[3] for d in devices)
+    for prefix, need in _prefixes(task_data, core).items():
+        seen = probe(task_data, core, runner, prefix)
+        at = f"behind `{prefix}`" if prefix else "on this host"
+        where = f"where `{core.name}` runs ({at})"
+        for key, what in blockers:
+            if seen.get(key):
+                raise PreflightError(f"{what} {where}: {seen[key]}")
+        devices = [d for d in seen["devices"] if d[4] == arch]
+        if not devices:
+            others = sorted({d[4] for d in seen["devices"]}) or seen.get("devices_error") or "none"
+            raise PreflightError(
+                f"`{core.name}` needs {arch} devices; {where} the probe saw {others}"
+            )
+        idle = [d for d in devices if d[2] >= MIN_FREE_MEMORY_FRACTION * d[3]]
+        busy = [f"device {d[1]} on {d[0]} is in use: {d[2]} of {d[3]} MiB free" for d in devices]
+        result.notes += [line for line, d in zip(busy, devices) if d not in idle]
+        if len(idle) < need:
+            raise PreflightError(
+                f"`{core.name}` needs {need} free {arch} device(s) {at}; {len(idle)} of "
+                f"{len(devices)} are free:\n  - " + "\n  - ".join(result.notes or ["(none seen)"])
+            )
+        memory = min([d[3] for d in devices] + ([memory] if memory else []))
+        result.config_error = result.config_error or seen.get("config_error", "")
+        if not prefix:
+            free = [d[1] for d in idle]
     if unfit(task_data, core, memory):
         raise PreflightError(unfit(task_data, core, memory))
-    result.config_error = seen.get("config_error", "")
-    # The devices seen are this host's only when the first deployment starts here.
-    return memory, None if prefix else [d[1] for d in idle]
+    return memory, free
 
 
 def run_preflight(
@@ -268,31 +293,37 @@ def run_preflight(
         result.anchors = anchors_mod.freeze(workspace, task_data)
     memory, free = None, None
     if claim:
-        memory, free = _claim(task_data, core, widest, runner, result)
+        memory, free = _claim(task_data, core, runner, result)
     else:
         result.notes.append("dry run: nothing was probed; a real start probes where it runs")
-    env = dict(result.environment.env)
+    env, probed, left = dict(result.environment.env), _prefixes(task_data, core), set()
     for deployment in found:
-        same = _prefix(task_data, deployment) == _prefix(task_data, core)
+        # A device's memory is known only where the first deployment was probed.
+        same = set(_prefixes(task_data, deployment)) <= set(probed)
         why = unfit(task_data, deployment, memory if same else None)
         wants = sum(here[deployment.name])
         if not why and free is not None and wants > len(free):
             why = f"`{deployment.name}` needs {wants} free devices on this host; it has {len(free)}"
         if why and deployment is not core:
             result.not_attempted.append(dict(deployment=deployment.name, check="", reason=why))
+            left.add(deployment.name)
             continue
         widest = max(widest, wants)
         result.world_size = max([result.world_size, *here[deployment.name]])
         for benchmark in deployment.benchmarks:
             name = benchmark.name
-            path, said = datasets.find(name, benchmark.dataset_path, {**env, **deployment.env})
-            anchor = result.anchors.get(f"{deployment.name}:{name}")
-            anchor = anchor or anchors_mod.resolve(task_data, deployment, benchmark)
+            # The environment the check itself looks under: the benchmark's own, last.
+            looked = {**env, **deployment.env, **benchmark.env}
+            path, said = datasets.find(name, benchmark.dataset_path, looked)
             reason = said if said and not path else ""
             if reason and deployment is core:
                 raise PreflightError(f"`{core.name}` is scored on `{name}`: {said}")
-            reason = reason or (anchor.source if anchor.kind == anchors_mod.NONE else "")
-            if reason and deployment is not core:
+            # A benchmark nothing judges runs and is reported with no verdict; what is
+            # not attempted is what cannot run: no dataset, or no base to be held to.
+            anchor = result.anchors.get(f"{deployment.name}:{name}")
+            if not reason and anchor is not None and anchor.relative_to in left:
+                reason = f"it is judged against `{anchor.relative_to}`, which is not attempted"
+            if reason:
                 record = dict(deployment=deployment.name, check=f"accuracy[{name}]", reason=reason)
                 result.not_attempted.append(record)
     result.devices = tuple(free[:widest] if free is not None else range(widest))

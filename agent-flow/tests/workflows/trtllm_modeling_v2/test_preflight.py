@@ -22,7 +22,7 @@ from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
-from ._helpers import healthy_smi
+from ._helpers import MOVES, healthy_smi
 
 _SCRATCH = "/scratch/mv2flow-run-tmp"
 
@@ -95,15 +95,41 @@ def test_the_probe_runs_where_the_first_deployments_engine_will(tmp_path):
         {"name": "tp1", "options": {}},
     ]
     task = _task(tmp_path, parallel=None, deployments=stated)
-    runner = healthy_smi(4)
+    runner = healthy_smi(16)
     result = preflight.run_preflight(task, runner=runner)
     # Behind the prefix, which places the ranks: no device of this host is claimed for it.
     assert "; srun -N4 -n16 /opt/venv/bin/python -c " in runner.seen[0]
     assert result.devices == (0,)  # the later deployment's, which starts here
     assert any(n.startswith("devices: the first 1 of this host are taken") for n in result.notes)
     alone = _task(tmp_path, parallel=None, deployments=stated[:1])
-    result = preflight.run_preflight(alone, runner=healthy_smi(4))
+    result = preflight.run_preflight(alone, runner=healthy_smi(16))
     assert result.devices == () and "(none claimed here)" in result.report()
+    # Its ranks are held to the devices free where it runs: behind the prefix, not here.
+    with pytest.raises(preflight.PreflightError) as short:
+        preflight.run_preflight(alone, runner=healthy_smi(16, free=1000))
+    assert "`dep16` needs 16 free sm_103 device(s) behind `srun -N4 -n16`; 0 of 16 are free" in (
+        str(short.value)
+    )
+    # Each server of a disaggregated first deployment is probed behind its own prefix
+    # and owes its own ranks there: the generation side too, and here when it has none.
+    halves = {
+        "name": "pd",
+        "ctx": {"options": {"tensor_parallel_size": 4, **MOVES}, "launch": "srun -w n1"},
+        "gen": {"options": {"tensor_parallel_size": 2, **MOVES}, "launch": "srun -w n2"},
+    }
+    seen = []
+
+    def by_prefix(command, env=None, timeout=0):
+        seen.append("n1" if "srun -w n1" in command else "n2" if "srun -w n2" in command else "")
+        return healthy_smi(4 if seen[-1] == "n1" else 1)(command, env, timeout)
+
+    split = _task(tmp_path, parallel=None, deployments=[halves])
+    with pytest.raises(preflight.PreflightError) as short:
+        preflight.run_preflight(split, runner=by_prefix)
+    assert seen == ["n1", "n2"]
+    assert "`pd` needs 2 free sm_103 device(s) behind `srun -w n2`; 1 of 1 are free" in (
+        str(short.value)
+    )
     # With no prefix of its own, the spec's prefix for one-GPU commands is where it runs.
     task = _task(tmp_path)
     task["environment"]["launch"] = "srun -N1 --gpus=1"
@@ -191,6 +217,12 @@ def test_a_later_deployment_is_not_attempted_and_a_config_that_does_not_load_is_
             "options": {"tensor_parallel_size": 4},
             "benchmarks": [{"name": "mmmu"}, {"name": "gsm8k", "dataset_path": "/no/such/dir"}],
         },
+        {
+            "name": "held",
+            "options": {"tensor_parallel_size": 4},
+            "relative_to": "tp8",
+            "benchmarks": [{"name": "gsm8k", "dataset_path": str(_files(tmp_path / "data"))}],
+        },
     ]
     task = _task(tmp_path, parallel=None, deployments=stated)
     _weights(tmp_path, 300)
@@ -201,14 +233,19 @@ def test_a_later_deployment_is_not_attempted_and_a_config_that_does_not_load_is_
     assert [(r["deployment"], r["check"]) for r in result.not_attempted] == [
         ("tp1", ""),
         ("tp8", ""),
-        ("scored", "accuracy[mmmu]"),
         ("scored", "accuracy[gsm8k]"),
+        ("held", "accuracy[gsm8k]"),
     ]
     reasons = [r["reason"] for r in result.not_attempted]
     assert reasons[0].startswith("`tp1` cannot hold the weights: 300 GiB on 1 device(s)")
     assert reasons[1] == "`tp8` needs 8 free devices on this host; it has 4"
-    assert reasons[2].startswith("no declared anchor and no reference row")
-    assert reasons[3] == "`dataset_path` /no/such/dir does not exist on this host"
+    # What cannot run is not attempted: no dataset, or a base that is itself not attempted.
+    assert reasons[2] == "`dataset_path` /no/such/dir does not exist on this host"
+    assert reasons[3] == "it is judged against `tp8`, which is not attempted"
+    # A benchmark nothing anchors can run: it is scored and reported with no verdict.
+    assert result.anchors["scored:mmmu"].kind == "none"
+    assert "not attempted: tp1: `tp1` cannot hold" in result.report()
+    assert "not attempted: held accuracy[gsm8k]: it is judged" in result.report()
     # The tree cannot load the checkpoint's config yet: recorded, and not a stop.
     assert result.config_error == "KeyError: 'kimi_k3' (on node-1)"
     assert "config:      the tree cannot load it yet: KeyError" in result.report()
@@ -269,6 +306,34 @@ def test_a_dataset_is_found_where_it_is_on_this_host_and_never_downloaded(tmp_pa
     stated = _files(tmp_path / "mine")
     assert datasets.find("gsm8k", str(stated), env)[0] == str(stated)
     assert "does not exist on this host" in datasets.find("gsm8k", str(tmp_path / "gone"), env)[1]
+
+
+def test_preflight_looks_for_a_dataset_as_the_check_will_under_each_ones_own_environment(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("LLM_MODELS_ROOT")
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    root = str(_files(tmp_path / "models/datasets/openai/gsm8k").parents[2])
+    gsm8k = {"name": "gsm8k"}
+    stated = [
+        {"name": "tp1", "options": {}, "benchmarks": []},
+        # The deployment's own environment names the models root.
+        {"name": "its", "options": {}, "env": {"LLM_MODELS_ROOT": root}, "benchmarks": [gsm8k]},
+        # The benchmark's own is merged last, over the deployment's.
+        {
+            "name": "own",
+            "options": {},
+            "env": {"LLM_MODELS_ROOT": "/no/such/root"},
+            "benchmarks": [{**gsm8k, "env": {"LLM_MODELS_ROOT": root}}],
+        },
+        {"name": "nowhere", "options": {}, "benchmarks": [gsm8k]},
+    ]
+    task = _task(tmp_path, parallel=None, deployments=stated)
+    result = preflight.run_preflight(task, runner=healthy_smi())
+    assert [(r["deployment"], r["check"]) for r in result.not_attempted] == [
+        ("nowhere", "accuracy[gsm8k]")
+    ]
+    assert "is not on this host, and accuracy runs offline" in result.not_attempted[0]["reason"]
 
 
 def _entry_source(impl, archs):

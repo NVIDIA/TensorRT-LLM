@@ -131,7 +131,7 @@ def test_anchors_are_frozen_once_and_a_later_start_adds_only_what_is_absent(tmp_
 
 
 def test_frozen_means_frozen_a_none_stays_none_and_an_unreadable_file_is_not_read_as_none(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
     spec = _delivered(
         tmp_path, parallel="tp1", model_key="Qwen/Qwen3-0.6B", agent="claude-test-model",
@@ -144,6 +144,14 @@ def test_frozen_means_frozen_a_none_stays_none_and_an_unreadable_file_is_not_rea
     _rows(tmp_path, "gsm8k", {"Qwen/Qwen3-0.6B": [{"accuracy": 41.77}]})
     assert anchors.freeze(workspace, loaded)["tp1:gsm8k"].kind == anchors.NONE
     assert anchors.frozen(workspace, "tp1", "gsm8k").kind == anchors.NONE
+
+    # A reference that cannot be read is no anchor, with the reason, and stops nothing.
+    def unreadable(path, key, **said):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(anchors, "load_reference_score", unreadable)
+    unread = anchors.freeze(tmp_path / "other", loaded)["tp1:gsm8k"]
+    assert unread.kind == anchors.NONE and "Permission denied" in unread.source
     # A file that does not hold the anchors is not read as "nothing frozen yet".
     for torn in ("- [not, an, anchor\n", "", "tp1: 41.77\n"):
         (workspace / anchors.ANCHORS_FILENAME).write_text(torn)

@@ -75,3 +75,39 @@ def test_bad_queue_tiers_are_batched_as_vocabulary_errors(tier):
     )
     with pytest.raises(vocab.VocabularyError, match=r"queue\[0\].tier"):
         vocab.parse_vocabulary(doc)
+
+
+def _rows(*targets):
+    rows = [
+        {"n": n, "mode": vocab.MODE_VERIFY, "target": target, "surface": "k=64"}
+        for n, target in enumerate(targets, 1)
+    ]
+    return _doc(verdict=vocab.VERDICT_AFTER_ADDITIONS, queue=rows)
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["ops/../escape", "ops/norm/..", "../escape", "ops/norm/../../escape", "norm/./rms", "ops/rms"],
+)
+def test_a_row_lands_inside_the_catalog_or_the_target_by_path_component(target):
+    with pytest.raises(vocab.VocabularyError, match="lands inside the catalog or the target"):
+        vocab.parse_vocabulary(_rows(target))
+
+
+def test_one_row_writes_one_landing_and_a_shared_rows_variant_is_the_targets_own():
+    # The same entry spelled twice is one landing: the second row is refused, not run.
+    with pytest.raises(vocab.VocabularyError) as refused:
+        vocab.parse_vocabulary(_rows("ops/norm/rms", "/ops/norm/rms/"))
+    assert "queue[1] lands at ops/norm/rms, as row 1: one row writes one entry" in str(
+        refused.value
+    )
+    [local, shared] = vocab.parse_vocabulary(_rows("ops/norm/rms", "norm/rms"))
+    home = "tensorrt_llm/_torch/_experimental/modeling_v2/models/family/target"
+    assert vocab.entry_paths(local, home)[0] == f"{home}/ops/norm/rms.py"
+    assert vocab.entry_paths(shared, home)[0] == f"{home}/ops/norm/rms__r2.py"
+    # Every file a row writes is under the target or its mirrored tests.
+    tests = vocab.model_ops_tests_dir(home)
+    for item in (local, shared):
+        assert all(
+            p.startswith((f"{home}/ops/", f"{tests}/")) for p in vocab.entry_paths(item, home)
+        )

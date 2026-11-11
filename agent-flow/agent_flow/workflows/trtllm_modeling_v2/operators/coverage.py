@@ -38,8 +38,6 @@ OP_MATRIX_SUFFIX = "_op_matrix"
 #: Separates a shared entry's name from the site of its local variant. No entry name has it.
 VARIANT_SEPARATOR = "__"
 _SITE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
-#: A kernel task named by ``<mode>:<entry>`` numbers its dispatch from here, above any row.
-REF_DISPATCH_BASE, REF_DISPATCH_SPAN = 10_000, 90_000
 #: The unit a queue row belongs to when it names none.
 UNIT_CORE = "core"
 #: Cells one queue row may list: a row covers each axis of the envelope, not their product.
@@ -137,7 +135,7 @@ def _queue(raw: Any, bad: Callable[[str], None], units: Sequence[str] | None) ->
         return ()
     items: list[QueueItem] = []
     modes: dict[str, str] = {}
-    variants: dict[str, int] = {}
+    landings: dict[str, int] = {}
     for index, row in enumerate(raw or ()):
         at = f"queue[{index}]"
         n = row.get("n") if isinstance(row, dict) else None
@@ -148,8 +146,19 @@ def _queue(raw: Any, bad: Callable[[str], None], units: Sequence[str] | None) ->
             bad(f"{at}.n = {n} is a duplicate dispatch number")
         item = _row(at, row, int(n), bad, units)
         target, mode = item.target, item.mode
+        parts = target.strip().strip("/").split("/")
+        local = len(parts) == 3 and parts[0] == MODEL_OPS_DIRNAME
         if not target:
             bad(f"{at}.target must name exactly one catalog entry")
+        elif not (local or _shared(target)) or {".", ".."} & set(parts) or not all(parts):
+            # By path component: a row writes inside the catalog or the target, nowhere else.
+            bad(
+                f"{at}.target {target!r} is not `<category>/<name>` or "
+                f"`{MODEL_OPS_DIRNAME}/<category>/<name>`, each a plain name: an entry lands "
+                f"inside the catalog or the target"
+            )
+            items.append(item)
+            continue
         elif VARIANT_SEPARATOR in target.rsplit("/", 1)[-1]:
             bad(f"{at}.target {target!r} names a local variant; name the entry, its row lands it")
         elif modes.get(target, mode) != mode:
@@ -160,8 +169,10 @@ def _queue(raw: Any, bad: Callable[[str], None], units: Sequence[str] | None) ->
             )
         else:
             modes[target] = mode
-        if item.variant and variants.setdefault(item.variant, item.n) != item.n:
-            bad(f"{at} lands at {item.variant}, as row {variants[item.variant]}: name a `site`")
+        landing = item.variant or "/".join(parts)
+        if landings.setdefault(landing, item.n) != item.n:
+            how = "name a `site`" if item.variant else "one row writes one entry"
+            bad(f"{at} lands at {landing}, as row {landings[landing]}: {how}")
         items.append(item)
     known = {item.n for item in items}
     for item in items:

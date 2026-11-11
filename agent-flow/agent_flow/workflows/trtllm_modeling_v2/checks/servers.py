@@ -223,24 +223,32 @@ def _site_env(owned: Owned) -> dict[str, str]:
 
 
 def _end(owned: Owned, grace_s: float) -> None:
-    """End one server: its own group while it is still its own, then the site's ``stop``."""
+    """End one server within ``grace_s``: its own group while it is still its own, then the site's ``stop``.
+
+    The time is shared: SIGTERM gets what the kill and the site's ``stop`` do not need,
+    and each wait is for what then remains.
+    """
     # Read before anything is reaped: a leader that exited keeps its start time until then.
     ours = owned.host == socket.gethostname() and _start_time(owned.pid) == owned.started != ""
-    for sig, wait in ((signal.SIGTERM, grace_s), (signal.SIGKILL, min(10.0, grace_s))):
+    deadline = time.monotonic() + grace_s
+    kill_s, stop_s = min(10.0, grace_s / 6), grace_s / 3 if owned.stop else 0.0
+    for sig, until in (
+        (signal.SIGTERM, deadline - stop_s - kill_s),
+        (signal.SIGKILL, deadline - stop_s),
+    ):
         if not ours or not _alive(owned.pgid):
             break
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(owned.pgid, sig)
-        deadline = time.monotonic() + wait
-        while time.monotonic() < deadline and _alive(owned.pgid):
-            time.sleep(0.2)
+        while time.monotonic() < until and _alive(owned.pgid):
+            time.sleep(min(0.2, max(0.0, until - time.monotonic())))
     if owned.stop:
         with contextlib.suppress(OSError, subprocess.TimeoutExpired):
             subprocess.run(
                 ["bash", "-c", owned.stop],
                 env=_site_env(owned),
                 capture_output=True,
-                timeout=max(1.0, 6 * grace_s),
+                timeout=max(stop_s, deadline - time.monotonic()),
                 check=False,
             )
 
@@ -253,7 +261,7 @@ def _holders(launch: str, env: Mapping[str, str], timeout: float) -> list[str] |
             env=dict(env),
             capture_output=True,
             text=True,
-            timeout=max(1.0, timeout),
+            timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -266,13 +274,16 @@ def _released(owned: Owned, release_s: float) -> str:
     """Look at the devices of ``owned``, which was ended: ``""`` free, :data:`UNVERIFIED`, or who holds them."""
     deadline = time.monotonic() + release_s
     while True:
-        now = _holders(owned.launch, _site_env(owned), min(PROBE_TIMEOUT_S, release_s))
+        # Each look and each pause is for the time that remains, never a fresh allowance.
+        left = max(0.1, deadline - time.monotonic())
+        now = _holders(owned.launch, _site_env(owned), min(PROBE_TIMEOUT_S, left))
         if now is None or owned.before is None:
             return UNVERIFIED
         stray = sorted(set(now) - set(owned.before))
-        if not stray or time.monotonic() >= deadline:
+        left = deadline - time.monotonic()
+        if not stray or left <= 0:
             return ", ".join(stray)
-        time.sleep(min(1.0, release_s))
+        time.sleep(min(1.0, left / 2))
 
 
 def _retire(workspace: Path, records: Sequence[Owned], budget: float) -> tuple[list[str], bool]:
@@ -479,7 +490,7 @@ def start(
         line = f"{server.launch} {shlex.join([*launcher(server), *argv])}".strip()
         # The line as it is started, beside the log, for whoever reads a start that failed.
         (directory / f"{name}.launch").write_text(line + "\n", encoding="utf-8")
-        look = min(PROBE_TIMEOUT_S, deadline - time.monotonic())
+        look = max(0.1, min(PROBE_TIMEOUT_S, deadline - time.monotonic()))
         before = _holders(server.launch, process_env, look)
         with (directory / f"{name}.log").open("wb") as sink:
             process = subprocess.Popen(
@@ -498,7 +509,9 @@ def start(
             started=_start_time(process.pid),
             launch=server.launch,
             stop=server.stop,
-            env={k: v for k, v in declared.items() if os.environ.get(k) != v},
+            # Every declared value, one that equals this process's own too: a later
+            # process that ends the server may run with another.
+            env=dict(declared),
             address_file=str(address_file),
             log=str(directory / f"{name}.log"),
             before=before,

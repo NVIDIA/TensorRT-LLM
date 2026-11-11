@@ -479,12 +479,12 @@ def test_the_config_task_runs_first_and_lands_only_when_the_tree_loads_the_confi
     assert _state(tmp_path).onboarded
 
 
-def test_what_preflight_left_out_gets_no_task_and_a_base_with_no_score_gives_no_verdict(
+def test_what_preflight_left_out_gets_no_task_and_a_score_nothing_judges_gives_no_verdict(
     tmp_path, task_file, monkeypatch
 ):
     mid = {"name": "mid", "options": {"max_batch_size": 8}}
     kv = {**KV_FP8, "relative_to": "mid"}
-    # Scored on a benchmark nothing anchors: preflight leaves that one check out.
+    # Scored on a benchmark nothing anchors: it runs, and its score is a line with no verdict.
     unanchored = {"name": "mmlu", "reference_yaml": "refs/none.yaml"}
     (tmp_path / "engines").mkdir()
     (tmp_path / "engines" / "wide.yaml").write_text("max_batch_size: 4\n")
@@ -503,7 +503,7 @@ def test_what_preflight_left_out_gets_no_task_and_a_base_with_no_score_gives_no_
     report = _report(tmp_path)
     left = report.split("## Not attempted")[1].split("##")[0]
     assert "- `tep2`: `tep2` needs 2 free devices on this host; it has 1" in left
-    assert "- `wide` accuracy[mmlu]: " in left
+    assert "`wide`" not in left
     # `kv_fp8` is held to `mid`'s score, and `mid` is not done: its checks are not run for
     # it, and the score is reported with no verdict. What preflight left out is not run.
     assert shell.ran == [
@@ -513,9 +513,12 @@ def test_what_preflight_left_out_gets_no_task_and_a_base_with_no_score_gives_no_
         "kv_fp8:accuracy",
         "wide:boot",
         "wide:accuracy",
+        "wide:accuracy",
     ]
-    assert "| `wide` | `accuracy[gsm8k]` |" in report and "`accuracy[mmlu]` |" not in report
-    assert "`wide:accuracy[mmlu]`" not in _prompts(calls, "wide")[0]
+    assert "| `wide` | `accuracy[gsm8k]` |" in report
+    assert "| `wide` | `accuracy[mmlu]` | 90 | none (no declared anchor" in report
+    assert "| no verdict | trtllm-eval |" in report.split("| `wide` | `accuracy[mmlu]` |")[1]
+    assert "`wide:accuracy[mmlu]`" in _prompts(calls, "wide")[0]
     # Each deployment's dispatch names its options: a file, or where the spec states them.
     assert f"Its options: `{tmp_path}/engines/wide.yaml`." in _prompts(calls, "wide")[0]
     assert "Its options: `deployments.kv_fp8` in the spec." in _prompts(calls, "kv_fp8")[0]
@@ -1240,6 +1243,74 @@ def test_a_commit_lands_labelled_by_its_paths_and_only_a_judge_path_is_refused(t
     assert named.path_problem("refs/mtp.yaml") and named.path_problem("r/x.yaml")
     assert named.path_problem("tests/integration/defs/accuracy/references/gsm8k.yaml")
     assert not named.path_problem("tests/integration/defs/accuracy/test_llm_api_pytorch.py")
+
+
+def test_the_judge_is_guarded_by_path_as_git_knows_it_and_by_what_lands(tmp_path):
+    repo = _checkout(tmp_path)
+    (repo / "refs").mkdir()
+    (repo / "refs/gsm8k.yaml").write_text("org/toy: []\n")
+    (repo / "alias.yaml").symlink_to("refs/gsm8k.yaml")
+    # A reference the spec names through `.`, `..` and a link: the link and its file are guarded.
+    spec = {
+        "trtllm_repo_path": str(repo),
+        "accuracy": {"reference_yaml": {"default": "./refs/../alias.yaml"}},
+    }
+    policy = CommitPolicy.from_task(spec, workspace=repo / "ws", own_paths=own_paths(TARGET_REL))
+    assert policy.path_problem("alias.yaml") and policy.path_problem("refs/gsm8k.yaml")
+    said = policy.path_problem("tensorrt_llm/commands/eval.py")
+    assert said.startswith("tensorrt_llm/commands/eval.py is a judge path")
+    assert policy.path_problem("ws/journal.md") == (
+        "ws/journal.md is under ws/, which this run never commits (its own workspace)"
+    )
+    # A file is matched exactly and a directory by path component, never by a shared spelling.
+    for free in (
+        "refs/gsm8k.yaml.orig",
+        "tensorrt_llm/commands/eval.py.backup",
+        "tensorrt_llm/evaluate_more/x.py",
+        "wsx/journal.md",
+    ):
+        assert not policy.path_problem(free), free
+    assert policy.label([f"{FAMILY}/a b.py"]) == "target"
+    assert policy.label([f"{FAMILY}_more/a.py"]) == "shared"
+    # A name git would quote is read as it is: the evaluator's directory is still the judge's.
+    integration = _integration(repo, tmp_path)
+    tree = integration.open("quoted")
+    (tree / "tensorrt_llm/evaluate").mkdir(parents=True)
+    (tree / "tensorrt_llm/evaluate/na\u00efve eval.py").write_text("EASIER = True\n")
+    _git(tree, "add", "-A")
+    _git(tree, "commit", "-q", "-m", f"an easier judge{_SIGNED}")
+    outcome = integration.integrate("quoted")
+    assert not outcome.merged
+    assert "tensorrt_llm/evaluate/na\u00efve eval.py is a judge path" in outcome.detail
+    # A target file with a space in its name lands, labelled the target's own.
+    tree = integration.open("spaced")
+    (tree / FAMILY / "a b.py").write_text("B = 1\n")
+    _git(tree, "add", "-A")
+    _git(tree, "commit", "-q", "-m", f"a spaced name{_SIGNED}")
+    assert integration.integrate("spaced").merged
+    [row] = load_labels(tmp_path / "ws")
+    assert (row["label"], row["outside"]) == ("target", [])
+    # An edit only a merge commit carries is in no single commit, and is still seen.
+    tree = integration.open("merged")
+    _git(tree, "checkout", "-q", "-b", "side")
+    (tree / FAMILY / "side.py").write_text("S = 1\n")
+    _git(tree, "add", "-A")
+    _git(tree, "commit", "-q", "-m", f"a side change{_SIGNED}")
+    _git(tree, "checkout", "-q", integration.branch("merged"))
+    (tree / FAMILY / "own.py").write_text("O = 1\n")
+    _git(tree, "add", "-A")
+    _git(tree, "commit", "-q", "-m", f"the task's change{_SIGNED}")
+    _git(tree, "merge", "-q", "--no-ff", "--no-commit", "side")
+    (tree / "tensorrt_llm/commands").mkdir(parents=True)
+    (tree / "tensorrt_llm/commands/eval.py").write_text("EASIER = True\n")
+    _git(tree, "add", "-A")
+    _git(tree, "commit", "-q", "-m", f"merge side{_SIGNED}")
+    outcome = integration.integrate("merged")
+    assert not outcome.merged and outcome.repairable
+    assert "the branch's net change: tensorrt_llm/commands/eval.py is a judge path" in (
+        outcome.detail
+    )
+    assert not (repo / "tensorrt_llm/commands").exists()
 
 
 def test_on_a_real_checkout_core_lands_only_the_commit_the_onboard_check_passed(

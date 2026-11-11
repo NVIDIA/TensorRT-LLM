@@ -261,6 +261,33 @@ def test_a_relative_deployment_is_judged_against_the_other_ones_score_measured_f
     assert "error: 'nope' names no deployment of this spec" in capsys.readouterr().err
 
 
+def test_a_relative_score_is_held_to_its_base_on_one_scale(tmp_path):
+    data = _spec(tmp_path)
+    # The base scores in fractions and the deployment held to it in percent.
+    toy = {"name": "toy", "samples": 100}
+    data["deployments"][0]["benchmarks"] = [
+        {**toy, "unit": "fraction", "anchor": 0.9, "source": "measured"}
+    ]
+    for entry in data["deployments"]:
+        if entry["name"] == "tep2":
+            # No reference row carries its tags: it is judged against the base's score.
+            entry["options"]["kv_cache_config"] = {"dtype": "fp8"}
+            entry["benchmarks"] = [{**toy, "unit": "percent"}]
+    scores = [f"lm-eval toy average accuracy: {score}\n" for score in (0.9, 2, 0.9, 88)]
+    runner = _engine(*scores)
+    low = gate_cli.run_check(data, "accuracy[toy]", "tep2", workdir=tmp_path / "w", runner=runner)
+    # 0.9 of the base is 90 percent: 2 percent is far under it, not over 0.9 percent.
+    assert not low.passed and low.reference == 90.0 and low.measured == 2.0
+    held = gate_cli.run_check(data, "accuracy[toy]", "tep2", workdir=tmp_path / "w", runner=runner)
+    assert held.passed and "the other deployment's score 90.0000" in held.detail
+    # A score the run already has is brought to the same scale.
+    given = gate_cli.run_check(
+        data, "accuracy[toy]", "tep2", workdir=tmp_path / "w", relative_score=0.9,
+        runner=_engine(scores[1]),
+    )  # fmt: skip
+    assert not given.passed and given.reference == 90.0
+
+
 def test_a_score_nothing_judges_is_a_report_line_and_never_a_failure(tmp_path, capsys, monkeypatch):
     data = _spec(tmp_path)
     for entry in data["deployments"]:

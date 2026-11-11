@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import socket
+import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -33,9 +35,10 @@ def _one(name="tp1", **server) -> Deployment:
     return Deployment(name=name, server=Server(options={"max_seq_len": 5120}, **server))
 
 
-def test_a_server_runs_this_tree_is_asked_and_is_stopped(site):
+def test_a_server_runs_this_tree_is_asked_and_is_stopped(site, monkeypatch):
     workspace, tree = site / "ws", site / "tree"
     tree.mkdir()
+    monkeypatch.setenv("SITE_VALUE", "declared")
     running = servers.start(
         _one(),
         model="/ckpt/model",
@@ -43,6 +46,7 @@ def test_a_server_runs_this_tree_is_asked_and_is_stopped(site):
         timeout=30,
         tree=tree,
         python="/opt/v/bin/py",
+        env={"SITE_VALUE": "declared"},
     )
     try:
         assert running.address.startswith("127.0.0.1:")
@@ -64,6 +68,10 @@ def test_a_server_runs_this_tree_is_asked_and_is_stopped(site):
         assert argv[argv.index("--port") + 1] == "0" and "--num_serve_frontends=1" in argv
         [owned] = servers.load_owned(workspace)
         assert (owned.name, owned.pgid, owned.host) == ("tp1", owned.pid, HOST) and owned.started
+        # A declared value is recorded though it equals this process's own: whoever ends
+        # the server later, under another, still runs the site's commands with it.
+        monkeypatch.setenv("SITE_VALUE", "another process's")
+        assert servers._site_env(owned)["SITE_VALUE"] == "declared"
         assert "Paris" in servers.ask(running, "The capital of France is", max_tokens=8)
     finally:
         assert servers.stop(running) == ""
@@ -191,6 +199,32 @@ def test_every_wait_is_bounded_by_the_deployments_timeout(site, monkeypatch):
     assert servers.load_owned(workspace) == []
 
 
+def test_the_waits_of_a_stop_share_its_budget(monkeypatch):
+    owned = servers.Owned("tp1", 10001, 10001, before=[], stop="sleep 999")
+    clock, looks, budgets = [0.0], [], []
+
+    def holders(launch, env, budget):
+        looks.append(budget)
+        clock[0] += 0.1 if len(looks) == 1 else budget  # a later look takes all it is given
+        return ["node-1 4242"]
+
+    def stalled(argv, **said):
+        budgets.append(said["timeout"])
+        raise subprocess.TimeoutExpired(argv, said["timeout"])
+
+    with monkeypatch.context() as patched:
+        patched.setattr(servers, "_holders", holders)
+        patched.setattr(servers.time, "monotonic", lambda: clock[0])
+        patched.setattr(servers.time, "sleep", lambda n: clock.__setitem__(0, clock[0] + n))
+        # One second to see the devices free is one second, however many looks it takes.
+        assert servers._released(owned, 1.0) == "node-1 4242"
+        assert len(looks) > 1 and clock[0] <= 1.0 + 1e-9
+    # The site's `stop` gets what remains of the grace, never a multiple of it.
+    monkeypatch.setattr(servers.subprocess, "run", stalled)
+    servers._end(owned, 1.0)
+    assert budgets and max(budgets) <= 1.0
+
+
 def test_ranks_left_after_a_stop_are_no_verdict_and_stay_owned_until_the_devices_are_free(site):
     workspace = site / "ws"
     holders = site / "holders"
@@ -288,15 +322,11 @@ def test_one_engine_lock_per_workspace_wherever_tmpdir_points(site, monkeypatch)
     with servers.engine_lock(workspace):
         monkeypatch.setenv("TMPDIR", str(site / "two"))  # a worker's own temporary directory
         directory = next(d for d in servers.LOCK_DIRS if os.access(d, os.W_OK))
-        held = 0
-        for path in Path(directory).glob(f"mv2flow-engine-{os.getuid()}-*.lock"):
-            with path.open("w") as other:
-                try:
-                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    fcntl.flock(other, fcntl.LOCK_UN)
-                except OSError:
-                    held += 1
-        assert held == 1  # this workspace's, found without the first caller's TMPDIR
+        digest = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()[:16]
+        # This workspace's lock, found without the first caller's TMPDIR, and held.
+        with (Path(directory) / f"mv2flow-engine-{os.getuid()}-{digest}.lock").open("w") as other:
+            with pytest.raises(OSError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
     started = time.monotonic()
     with servers.engine_lock(workspace), servers.engine_lock(None):
         pass
