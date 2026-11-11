@@ -22,6 +22,7 @@ import uvloop
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm.commands.serve_cli._net import _listener_address_family
 from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
 from tensorrt_llm.inputs.media_io import _close_aiohttp_session
 from tensorrt_llm.logger import logger
@@ -379,7 +380,7 @@ def launch_server(
         if mode.num_frontends > 1 and port == 0:
             raise click.UsageError("Multiple OpenEngine frontends require a fixed --port")
         if mode.is_launcher:
-            family = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][0]
+            family = _listener_address_family("OpenEngine server", host, port, policy="first")
             try:
                 with socket.create_server((host, port), family=family):
                     pass

@@ -275,9 +275,8 @@
     "D212": 6
   },
   "tensorrt_llm/commands/serve.py": {
-    "D202": 2,
-    "D212": 2,
-    "D415": 5
+    "D212": 1,
+    "D415": 3
   },
   "tensorrt_llm/evaluate/lm_eval.py": {
     "D200": 1,
@@ -1033,5 +1032,9 @@
     "D205": 1,
     "D212": 1,
     "F811": 3
+  },
+  "tensorrt_llm/commands/serve_cli/disaggregated.py": {
+    "D202": 2,
+    "D415": 2
   }
 }

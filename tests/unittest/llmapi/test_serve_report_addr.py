@@ -32,14 +32,10 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-import tensorrt_llm.commands.serve as serve_module
-from tensorrt_llm.commands.serve import (
-    _bind_failure,
-    _publish_bound_address,
-    disaggregated,
-    launch_server,
-    launch_visual_gen_server,
-)
+import tensorrt_llm.commands.serve_cli._net as net_module
+from tensorrt_llm.commands.serve import launch_server, launch_visual_gen_server
+from tensorrt_llm.commands.serve_cli._net import _bind_failure, _publish_bound_address
+from tensorrt_llm.commands.serve_cli.disaggregated import disaggregated
 
 # The reader half lives with the integration helpers, so both halves of the
 # round trip are exercised together and a change to either side fails here.
@@ -237,7 +233,8 @@ def test_disaggregated_rejects_a_worker_fleet(
 def test_bind_failure_reports_an_unresolvable_host(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed name lookup never reached a port, so no port holder is diagnosed."""
     diagnosed_ports = []
-    monkeypatch.setattr(serve_module, "_diagnose_port_in_use", diagnosed_ports.append)
+    # _bind_failure looks the diagnosis up in its own module.
+    monkeypatch.setattr(net_module, "_diagnose_port_in_use", diagnosed_ports.append)
     error = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
 
     raised = _bind_failure("disaggregated server", "nvl72049-T03", 0, error)
@@ -270,14 +267,14 @@ def test_listeners_report_an_unresolvable_host(monkeypatch: pytest.MonkeyPatch, 
     def unresolvable(host, *args, **kwargs):
         raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
 
-    monkeypatch.setattr(serve_module.socket, "getaddrinfo", unresolvable)
+    monkeypatch.setattr(socket, "getaddrinfo", unresolvable)
 
     with pytest.raises(RuntimeError, match="address lookup failed for host 'nvl72049-T03'"):
         launch("nvl72049-T03")
 
 
 def test_bind_failure_names_the_port_holder(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(serve_module, "_diagnose_port_in_use", lambda port: f"pid=1 holds {port}")
+    monkeypatch.setattr(net_module, "_diagnose_port_in_use", lambda port: f"pid=1 holds {port}")
     error = OSError(errno.EADDRINUSE, "Address already in use")
 
     raised = _bind_failure("server", "localhost", 8000, error)

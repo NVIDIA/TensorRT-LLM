@@ -389,6 +389,8 @@ l0_cpu:
   - unittest/llmapi/test_serve_multi_frontend_helpers.py
   - unittest/llmapi/test_serve_multi_frontend_route_gate.py
   - unittest/llmapi/test_serve_num_frontends_default.py
+  - unittest/llmapi/test_serve_cli_net.py
+  - unittest/llmapi/test_serve_cli_wiring.py
   - unittest/llmapi/test_serve_report_addr.py
   - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py
@@ -405,6 +407,11 @@ l0_cpu:
   - unittest/quantization/test_nvfp4_plus_format.py
   - unittest/scaffolding
   - unittest/scripts
+  - unittest/serve
+  # VisualGen serve tests are also collected by the entry above. This entry keeps
+  # them for VisualGen-only PRs, where CBTS keeps only entries containing visual_gen/
+  # (with the trailing slash).
+  - unittest/serve/api/visual_gen/
   - unittest/tools
   - unittest/usage
   - unittest/utils/test_logger.py

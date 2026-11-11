@@ -334,6 +334,10 @@ common-files: &common_files |
         tensorrt_llm/commands/bench.py |
         tensorrt_llm/commands/eval.py |
         tensorrt_llm/commands/serve.py |
+        tensorrt_llm/commands/serve_cli/_disagg_fleet.py |
+        tensorrt_llm/commands/serve_cli/_net.py |
+        tensorrt_llm/commands/serve_cli/_telemetry.py |
+        tensorrt_llm/commands/serve_cli/disaggregated.py |
         tensorrt_llm/evaluate/__init__.py |
         tensorrt_llm/evaluate/cnn_dailymail.py |
         tensorrt_llm/evaluate/interface.py |
@@ -1058,6 +1062,10 @@ legacy-files: &legacy_files |
         tensorrt_llm/commands/bench.py |
         tensorrt_llm/commands/eval.py |
         tensorrt_llm/commands/serve.py |
+        tensorrt_llm/commands/serve_cli/_disagg_fleet.py |
+        tensorrt_llm/commands/serve_cli/_net.py |
+        tensorrt_llm/commands/serve_cli/_telemetry.py |
+        tensorrt_llm/commands/serve_cli/disaggregated.py |
         tensorrt_llm/evaluate/__init__.py |
         tensorrt_llm/evaluate/cnn_dailymail.py |
         tensorrt_llm/evaluate/interface.py |
