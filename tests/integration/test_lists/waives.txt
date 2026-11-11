@@ -244,7 +244,6 @@ unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/gemm
 unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/gemm/test_modeling_v2_m3_pinned_gemm.py::test_pinned_decision_matches_every_stock_candidate[1000.0-1536x6144-m16] SKIP (https://nvbugs/7054054)
 unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/gemm/test_modeling_v2_m3_pinned_gemm.py::test_pinned_decision_matches_every_stock_candidate[1000.0-1536x6144-m48] SKIP (https://nvbugs/7054054)
 unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/gemm/test_modeling_v2_m3_pinned_gemm.py::test_pinned_decision_matches_every_stock_candidate[1000.0-3072x6144-m24] SKIP (https://nvbugs/7054054)
-unittest/_torch/modeling_v2/test_modeling_v2_env_scope.py SKIP (https://nvbugs/7024242)
 unittest/_torch/modules/mamba/test_flashinfer_gdn_decode.py::test_fi_decode_misaligned_index_slice SKIP (https://nvbugs/6842831)
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
 unittest/_torch/moe/test_dynamic_eplb_contracts.py::test_on_autotune_builds_balanced_powerlaw_input SKIP (https://nvbugs/7034332)
