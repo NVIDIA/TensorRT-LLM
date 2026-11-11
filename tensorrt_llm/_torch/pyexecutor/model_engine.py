@@ -587,6 +587,7 @@ class ModelEngine:
                 and self.llm_args.lora_config.cuda_graph_specialize_lora
             ),
             spec_decode_fast_paths=self.spec_decode_fast_paths,
+            watermark_config=self.llm_args.watermark_config,
             **extra_fields,
         )
 
