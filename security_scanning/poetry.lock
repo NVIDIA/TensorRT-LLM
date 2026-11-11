@@ -261,14 +261,14 @@ typing-extensions = {version = ">=4.2", markers = "python_version < \"3.13\""}
 
 [[package]]
 name = "annotated-doc"
-version = "0.0.5"
+version = "0.0.6"
 description = "Document parameters, class attributes, return types, and variables inline, with Annotated."
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "annotated_doc-0.0.5-py3-none-any.whl", hash = "sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101"},
-    {file = "annotated_doc-0.0.5.tar.gz", hash = "sha256:c7e58ce09192557605d8bbd92836d7e1d520ac9580096042c0bfd197efacf1bb"},
+    {file = "annotated_doc-0.0.6-py3-none-any.whl", hash = "sha256:361ca0950cc7082f53fa69e9328409f40a62c61e57e0a47e1825a08078a58a53"},
+    {file = "annotated_doc-0.0.6.tar.gz", hash = "sha256:7969bb69912085b2285849c0dcac0b4b374fd180c13cf10a87f284ffcf347bbf"},
 ]
 
 [[package]]
@@ -2326,6 +2326,17 @@ files = [
 ]
 
 [[package]]
+name = "llist"
+version = "0.7.1"
+description = "Linked list data structures for Python"
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "llist-0.7.1.tar.gz", hash = "sha256:6f73a120136897a0bce61c202188f4f3891d9f70aa906d21fc1ee1cf43659eca"},
+]
+
+[[package]]
 name = "lxml"
 version = "6.1.3"
 description = "Powerful and Pythonic XML processing library combining libxml2/libxslt with the ElementTree API."
@@ -2519,14 +2530,14 @@ htmlsoup = ["BeautifulSoup4"]
 
 [[package]]
 name = "markdown-it-py"
-version = "4.2.0"
+version = "4.3.0"
 description = "Python port of markdown-it. Markdown parsing, done right!"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "markdown_it_py-4.2.0-py3-none-any.whl", hash = "sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a"},
-    {file = "markdown_it_py-4.2.0.tar.gz", hash = "sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49"},
+    {file = "markdown_it_py-4.3.0-py3-none-any.whl", hash = "sha256:7aa1511a46c39138de78d9eba92ce47e63124d8003fc98b3a351909e04239efa"},
+    {file = "markdown_it_py-4.3.0.tar.gz", hash = "sha256:91a58fa5b72c71a40cf7177250fd767480d7a2bb3ac426ccfb76fb90305fdaaa"},
 ]
 
 [package.dependencies]
@@ -2534,12 +2545,13 @@ mdurl = ">=0.1,<1.0"
 
 [package.extras]
 benchmarking = ["psutil", "pytest", "pytest-benchmark"]
-compare = ["commonmark (>=0.9,<1.0)", "markdown (>=3.4,<4.0)", "markdown-it-pyrs", "mistletoe (>=1.0,<2.0)", "mistune (>=3.0,<4.0)", "panflute (>=2.3,<3.0)"]
+compare = ["markdown (>=3.4,<4.0)", "markdown-it-pyrs", "mistletoe (>=1.0,<2.0)", "mistune (>=3.0,<4.0)", "panflute (>=2.3,<3.0)"]
+coverage = ["coverage", "pytest-cov"]
 linkify = ["linkify-it-py (>=1,<3)"]
 plugins = ["mdit-py-plugins (>=0.5.0)"]
 profiling = ["gprof2dot"]
 rtd = ["ipykernel", "jupyter_sphinx", "mdit-py-plugins (>=0.5.0)", "myst-parser", "pyyaml", "sphinx", "sphinx-book-theme (>=1.0,<2.0)", "sphinx-copybutton", "sphinx-design"]
-testing = ["coverage", "pytest", "pytest-cov", "pytest-regressions", "pytest-timeout", "requests"]
+testing = ["flit_core (>=3.4,<5)", "pytest", "pytest-regressions", "pytest-timeout", "requests"]
 
 [[package]]
 name = "markupsafe"
@@ -3842,36 +3854,36 @@ nvidia-cublas = "*"
 
 [[package]]
 name = "nvidia-cudnn-frontend"
-version = "1.32.2"
+version = "1.32.3"
 description = "NVIDIA cuDNN Frontend — Python and C++ Graph API with SOTA attention (SDPA / Flash Attention), MoE grouped GEMM fusions, and FP8/MXFP8 kernels for Hopper, Blackwell, and Rubin GPUs."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "nvidia_cudnn_frontend-1.32.2-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:63cca25d7366bcc40033d19a7d0f554836d2bfc8e38b897a8c846c2d18d231b2"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bec65f8e856b353669448fcc5acf4e5b55f787242ba834d46d2a98dccf017020"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp310-cp310-win_amd64.whl", hash = "sha256:8a4f3749770a4c4fcda7cbed11a7f4a02b9929cc28d85147e27f11b4dcd9142f"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:46d88a5fffa2abad2c1a50bc3e3eafc718e351bb8a5fd5b8b49056647b802448"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6601f501d6a0ae07835e7286223cb55308a43f82b75a6067cfd7b9c7bb4e26b1"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp311-cp311-win_amd64.whl", hash = "sha256:0d30dda79440ceefcecc9ee22376dedcbc785c3ad8b10dbea6c1725e0d3d0dc3"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp311-cp311-win_arm64.whl", hash = "sha256:a15663c73fcfaf1aa7e8fa1ccd9404c742c41d21521b592364bde344f004c001"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7d55ceb51bad55ee1cd2c650b78d657bde8b09cdb545d48de38dc0e8e4d9388b"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:321f3d915697c1113a48b6a602d3e243d24c56e9033b44eef8a87768703c1449"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp312-cp312-win_amd64.whl", hash = "sha256:ae955adc84a17553a0e2d2a52afbb9caf59258c5dd00c1339979412bb3863b65"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp312-cp312-win_arm64.whl", hash = "sha256:b58b7e808e21f9ed0dea7bc8a356eed42140d1353182c707417181840da2e306"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f0d0c5b1292c361911833c010c31d7dc4ed94f7412d88148b2f3f65e6a604925"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fe08d602c5f8c1e2eaed1663c7066c475ab70360f431391a50aeabcb81357f17"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp313-cp313-win_amd64.whl", hash = "sha256:dfa4c3561e96e7b37ee0044fac6b7f0297384500a909eca6269d7a2186be97b7"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp313-cp313-win_arm64.whl", hash = "sha256:98665b9a49fe408099beb75dae27b84fa0ddb0abe4d08bcedb1ba06d681deb1b"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c99d5be7c23cb14146d67bdfea1105eb7be7d03037c37658ff5217283a3ebf65"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e4104f4b6008c356adb08c73c2dcf3fe4402c242ebe3aaf0dac0bf43a6b36870"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp314-cp314-win_amd64.whl", hash = "sha256:79735bf32675b872d16f35dd7b6066f9f95b52460984f78a897e83184ffb17b4"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp314-cp314-win_arm64.whl", hash = "sha256:2d8acc652514fd7384e7ea0a0e95eff5f931eb3c09372bae3a92f0f4bd32742f"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1fc087142489e6551292e91dc7f35bc37b9ce3b1a7d022257afd971b326b8344"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:766a957510bfee4e88d6b40e285402b2de2c5ff6090ee92e41121e95b0f52a64"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp314-cp314t-win_amd64.whl", hash = "sha256:ac05eece142d89c301ce10af47742447001ab21d44e83c788e8ae3515f853f11"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp314-cp314t-win_arm64.whl", hash = "sha256:3e7add671c763a8ad4b4c2449a42b37ebfc278813e3c7bdcd78c1f60d15718e3"},
-    {file = "nvidia_cudnn_frontend-1.32.2-cp315-cp315-win_arm64.whl", hash = "sha256:9f25fd5aedb387827215d69345ca187702893b3d23ccda570357808e9dff62ec"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:26a7053324ea9831aabff256d34703d3218c903afc895552804a131be51206cd"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d729fb052b35fc04db8e2b0b99dfcef4bf14cf3d1c22896b51a5d85224ba7592"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp310-cp310-win_amd64.whl", hash = "sha256:d766b0f5e60f2993fad33f353772c37bab8717f77797b2439607ccabe7a92c40"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7b765382cfe55ec2970c43d0e2168948888b94456eac6f5a7039054b60e6755f"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:63e39ca52dc006b0768b9b9cc1448ac2e3b488fbdf4534538059dd49c792c460"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp311-cp311-win_amd64.whl", hash = "sha256:38a95cb8eb9516e42abca76d089264a633a52c3f97668f331534a8a8f679f336"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp311-cp311-win_arm64.whl", hash = "sha256:71bf01e62ee2bd861c860f280bb16345535d8a2d648ede18fe7e2d8704303217"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e3c045ce8f270e564960685fa3f900b5eed99980708de6ca4030a223e8a850cf"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e620f77f3988c44f2dc0f36fc859d75603bfdb99b7208574ed58f414cc4a5e80"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp312-cp312-win_amd64.whl", hash = "sha256:c5c8c590a34ba7661c75dfd8b13675e74fa96d678b21444805787471cf6faee8"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp312-cp312-win_arm64.whl", hash = "sha256:7af8304bf38b262badc873d090db1d2dbd0733540f8eb679b8060e7b74862088"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:98aebb66416e39108f98f33b703a24bcb96517429daaad8709fb95f2710f72be"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6f441b2778f985ec1423db4c0dec5966bb491751b07f99a90d06541c70d3e459"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp313-cp313-win_amd64.whl", hash = "sha256:3f25ed26e0d206c7ee4725560a1e8b80c917c3e82c00ada653214b97887924b6"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp313-cp313-win_arm64.whl", hash = "sha256:ad85aae2e0a16e96594e74bfa1ae72eb68028917202d306882ca207835c4d79f"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7c1cee2babb2fac65d10ceea55b6b32b3bb78e44db472d287047d732fdb3f1ff"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:57e0233b2969f108aee5f45ec57294f93ece82130e87031f730f2366abbfdf63"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp314-cp314-win_amd64.whl", hash = "sha256:1fd86374f37ea17df0f6591f0cfb90a3c3eba16acedd42f87f8715e2e1b6d83f"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp314-cp314-win_arm64.whl", hash = "sha256:52ecb3e773c62b3391b8e72b4ac17bd463dee765b1c7de7bf5d219668d033dcc"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2334bc4db53af4405c588ac6fc2adb0ac5943b7c5676d8c403f1f3bf8ad3fccd"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:50723a6ab601e51a5fb36cc6f71945439e43e25b0e34590fab60adb001f4c46e"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp314-cp314t-win_amd64.whl", hash = "sha256:428d201c72a0599b02bc9a8b6af4e31f99b4b57e04fdf47bc8644382311ff5b9"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp314-cp314t-win_arm64.whl", hash = "sha256:75a5ce181db5891203255819262e320779eba8474c680fce651d3f2b32f0a88c"},
+    {file = "nvidia_cudnn_frontend-1.32.3-cp315-cp315-win_arm64.whl", hash = "sha256:3024d8b4ba525aec46038159ca69bec2b5afe2dabcd43bcc51c26af7078b9e4c"},
 ]
 
 [package.dependencies]
@@ -4274,14 +4286,14 @@ dev = ["PyYAML (>=5.1.0)", "attrs", "build", "bump-my-version", "coveralls", "no
 
 [[package]]
 name = "openai"
-version = "3.48.0"
+version = "3.49.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "openai-3.48.0-py3-none-any.whl", hash = "sha256:1a798238712133c237712907cc68a059c10b264ca284b9d7f1c253212db67802"},
-    {file = "openai-3.48.0.tar.gz", hash = "sha256:8786c46c2496baef3ca840ff6abff59882a7735b08f610bfe96fcf407338527d"},
+    {file = "openai-3.49.0-py3-none-any.whl", hash = "sha256:3977754792115027ba80ae16996ba3366478b5b228e1ab58e2660bd7ac8c3d78"},
+    {file = "openai-3.49.0.tar.gz", hash = "sha256:44badf2bea9bcd643dafa0bc4d5a109a14395889219fd68b8560322288196e96"},
 ]
 
 [package.dependencies]
@@ -7818,4 +7830,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "ece98e947291daf72eb60bf23da35ece757155d6b847658da7dbdd25dbd809b4"
+content-hash = "43c9df3898494fa3dcadf2735614100657e891c6c840b4c01763bdedb5609a8c"
