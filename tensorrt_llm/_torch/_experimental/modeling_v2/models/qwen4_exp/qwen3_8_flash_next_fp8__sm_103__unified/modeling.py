@@ -713,7 +713,8 @@ _LOG_PREFIX = "modeling_v2 qwen4_exp fp8 unified target"
 # end L runs through L, leaving the GDN and PLE state at P in the live slot and staging the state
 # at L (`PrefillTarget._gdn_split`). The fewest chunk tokens before P a split request takes: past
 # `_GDN_INPLACE_MAX_TOKENS` (the main chunk's FlashInfer path) and covering the conv (3) and PLE
-# (9 columns, 2 ids) windows that end at P.
+# (9 columns, 2 ids) windows that end at P. The manager plans the splits, so the bind declines one
+# whose `inforward_snapshot_min_main` is lower (`_inforward_stage`).
 _INFORWARD_MIN_MAIN = _GDN_INPLACE_MAX_TOKENS + 1
 
 #: Rows up to which `tp_sum` takes the multicast NVLink one-shot kernel
@@ -808,11 +809,20 @@ def _inforward_stage(cm, gdn_layers, ple_layer: int) -> _InforwardStage | None:
     """The in-forward snapshot staging rows of `cm`, or None when it plans no snapshots."""
     if getattr(cm, "inforward_snapshot_rows", 0) <= 0:
         return None
-    _pool.require(
-        cm,
-        ("inforward_snapshot_stage_views", "inforward_ple_stage_views", "conv_state_shape"),
-        "stages the in-forward snapshot's prompt-end GDN and PLE state",
-    )
+    missing = [
+        name
+        for name in ("inforward_snapshot_stage_views", "inforward_ple_stage_views")
+        if not hasattr(cm, name)
+    ]
+    min_main = getattr(cm, "inforward_snapshot_min_main", 0)
+    if missing or min_main < _INFORWARD_MIN_MAIN:
+        raise NotImplementedError(
+            f"the KV cache manager {type(cm).__name__} plans in-forward Mamba snapshots; this "
+            "target serves them only from a manager that stages the GDN and PLE prompt-end "
+            f"state and splits at least {_INFORWARD_MIN_MAIN} tokens before the snapshot point, "
+            f"and this one lacks {missing} and splits from {min_main} tokens. "
+            "kv_cache_config.enable_block_reuse=False turns the snapshots off"
+        )
     ple = cm.inforward_ple_stage_views(ple_layer)
     assert ple is not None, (
         f"the KV cache manager plans in-forward snapshots but stages no PLE state for decoder "
@@ -6865,11 +6875,6 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
                 f"a {state_dtype} recurrent-state cache; the target serves {served} "
                 "(kv_cache_config.mamba_ssm_cache_dtype)"
             )
-
-    @property
-    def inforward_snapshot_min_main(self) -> int:
-        """Fewest chunk tokens before the snapshot point for an in-forward snapshot split."""
-        return _INFORWARD_MIN_MAIN
 
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config

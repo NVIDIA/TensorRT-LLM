@@ -358,3 +358,29 @@ _VARIANTS = [
 def test_launch_variants_are_bitwise_the_plain_launch(helper, args) -> None:
     """A padded CUDA-graph GDN call and a partly publishing PLE launch against the plain ones."""
     helper(*args)
+
+
+def _manager(rows=ROWS, min_main=_m._INFORWARD_MIN_MAIN, ple=True):
+    """A manager stub that plans `rows` staging rows and splits from `min_main` tokens."""
+    views = {
+        "inforward_snapshot_stage_views": lambda i: (f"ssm{i}", f"conv{i}"),
+        "inforward_ple_stage_views": lambda layer: ("ple_conv", "ple_ngram"),
+    }
+    if not ple:
+        del views["inforward_ple_stage_views"]
+    return types.SimpleNamespace(
+        inforward_snapshot_rows=rows, inforward_snapshot_min_main=min_main, **views
+    )
+
+
+def test_the_bind_takes_only_snapshots_the_split_serves() -> None:
+    """No staging rows: no stage. A manager that stages no PLE state, or plans splits of fewer
+    tokens before P than the main chunk's FlashInfer path takes (the stock manager's conv-width
+    minimum, 3), is declined at bind rather than asserted on mid-step."""
+    assert _m._inforward_stage(_manager(rows=0), [0, 2], 1) is None
+    stage = _m._inforward_stage(_manager(), [0, 2], 1)
+    assert stage.ssm == {0: "ssm0", 2: "ssm2"} and stage.ple_conv == "ple_conv"
+    with pytest.raises(NotImplementedError, match=r"lacks \[\] and splits from 3 tokens"):
+        _m._inforward_stage(_manager(min_main=D_CONV - 1), [0, 2], 1)
+    with pytest.raises(NotImplementedError, match="lacks \\['inforward_ple_stage_views'\\]"):
+        _m._inforward_stage(_manager(ple=False), [0, 2], 1)
