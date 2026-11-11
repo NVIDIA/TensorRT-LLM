@@ -8,11 +8,24 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from pyrefly_diff import _new_errors, _read_report, _renames, main
+from pyrefly_diff import _new_diagnostics, _read_report, _renames, main
 
 
 def _error(path: str = "module.py", line: int = 1, name: str = "unknown_name") -> dict:
-    return {"path": path, "line": line, "name": "unknown-name", "description": f"Unknown {name}"}
+    """A diagnostic as Pyrefly reports it."""
+    return {
+        "path": path,
+        "line": line,
+        "column": 1,
+        "name": "unknown-name",
+        "concise_description": f"Unknown {name}",
+        "description": f"Unknown {name}\n  Looked in /absolute/scan/root",
+    }
+
+
+def _diagnostic(path: str = "module.py", line: int = 1, name: str = "unknown_name") -> dict:
+    """The same diagnostic as the comparison reports it."""
+    return {"path": path, "line": line, "name": "unknown-name", "message": f"Unknown {name}"}
 
 
 class DiffTests(unittest.TestCase):
@@ -76,13 +89,13 @@ class DiffTests(unittest.TestCase):
         report = self._run_cli()
         self.assertEqual(report["base_ref"], "release/test")
         self.assertEqual(report["base_sha"], "b" * 40)
-        self.assertEqual(report["errors"], [added])
+        self.assertEqual(report["diagnostics"], [_diagnostic(line=2, name="new_name")])
         self.assertIsNone(report["error"])
 
     def test_failed_workflow_step_produces_incomplete_report_without_scan_results(self) -> None:
-        report = self._run_cli(error="Could not install Pyrefly.")
-        self.assertEqual(report["error"], "Could not install Pyrefly.")
-        self.assertEqual(report["errors"], [])
+        report = self._run_cli(error="Could not install the target branch dependencies.")
+        self.assertEqual(report["error"], "Could not install the target branch dependencies.")
+        self.assertEqual(report["diagnostics"], [])
 
     def test_rename_input_preserves_spaces_and_accepts_an_empty_diff(self) -> None:
         changes = Path(self.directory.name) / "changes"
@@ -94,27 +107,36 @@ class DiffTests(unittest.TestCase):
     def test_line_shifts_do_not_report_existing_errors(self) -> None:
         (self.base / "module.py").write_text("unknown_name\n")
         (self.merged / "module.py").write_text("# inserted\n\nunknown_name\nnew_name\n")
-        added = _error(line=4, name="new_name")
-        result = _new_errors([_error()], [_error(line=3), added], self.base, self.merged, {})
-        self.assertEqual(result, [added])
+        result = _new_diagnostics(
+            [_error()],
+            [_error(line=3), _error(line=4, name="new_name")],
+            self.base,
+            self.merged,
+            {},
+        )
+        self.assertEqual(result, [_diagnostic(line=4, name="new_name")])
 
     def test_additional_identical_occurrence_is_new(self) -> None:
         (self.base / "module.py").write_text("unknown_name\n")
         (self.merged / "module.py").write_text("unknown_name\nunknown_name\n")
-        result = _new_errors([_error()], [_error(), _error(line=2)], self.base, self.merged, {})
-        self.assertEqual(result, [_error(line=2)])
+        result = _new_diagnostics(
+            [_error()], [_error(), _error(line=2)], self.base, self.merged, {}
+        )
+        self.assertEqual(result, [_diagnostic(line=2)])
 
     def test_fixing_one_error_does_not_hide_a_different_new_error(self) -> None:
         (self.base / "module.py").write_text("unknown_name\n")
         (self.merged / "module.py").write_text("different_name\n")
-        added = _error(name="different_name")
-        self.assertEqual(_new_errors([_error()], [added], self.base, self.merged, {}), [added])
+        result = _new_diagnostics(
+            [_error()], [_error(name="different_name")], self.base, self.merged, {}
+        )
+        self.assertEqual(result, [_diagnostic(name="different_name")])
 
     def test_rename_preserves_existing_errors(self) -> None:
         (self.base / "module.py").write_text("unknown_name\n")
         (self.merged / "renamed.py").write_text("unknown_name\n")
         self.assertEqual(
-            _new_errors(
+            _new_diagnostics(
                 [_error()],
                 [_error(path="renamed.py")],
                 self.base,
@@ -127,8 +149,14 @@ class DiffTests(unittest.TestCase):
     def test_new_diagnostic_in_unchanged_file_is_reported(self) -> None:
         for root in (self.base, self.merged):
             (root / "client.py").write_text("call_api()\n")
-        added = {**_error(path="client.py"), "name": "missing-argument"}
-        self.assertEqual(_new_errors([], [added], self.base, self.merged, {}), [added])
+        result = _new_diagnostics([], [_error(path="client.py")], self.base, self.merged, {})
+        self.assertEqual(result, [_diagnostic(path="client.py")])
+
+    def test_matching_ignores_the_scan_root_in_long_descriptions(self) -> None:
+        for root in (self.base, self.merged):
+            (root / "module.py").write_text("unknown_name\n")
+        merged = {**_error(), "description": "Unknown unknown_name\n  Looked in /another/root"}
+        self.assertEqual(_new_diagnostics([_error()], [merged], self.base, self.merged, {}), [])
 
     def test_advisory_exit_success_does_not_hide_tool_failure(self) -> None:
         report_path = self.base / "report.json"

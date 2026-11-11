@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Compare two Pyrefly JSON reports and their corresponding source trees."""
+"""Report the Pyrefly diagnostics that a merged PR tree adds to its target branch."""
 
 import argparse
+import functools
 import json
 import os
 import sys
@@ -24,20 +25,29 @@ def _read_report(path: Path) -> list[dict[str, Any]]:
     return errors
 
 
+@functools.cache
+def _source_lines(path: Path) -> list[str]:
+    return path.read_text(errors="replace").splitlines()
+
+
+def _message(error: dict[str, Any]) -> str:
+    # The long description of some diagnostics embeds absolute paths of the scanned tree.
+    return error.get("concise_description") or error.get("description", "")
+
+
 def _fingerprint(
     error: dict[str, Any], root: Path, renames: dict[str, str]
 ) -> tuple[str, str, str, str]:
     path = Path(error["path"])
     if path.is_absolute() or ".." in path.parts:
         raise ValueError(f"Expected a repository-relative diagnostic path: {path}")
-    lines = (root / path).read_text(errors="replace").splitlines()
+    lines = _source_lines(root / path)
     line = error["line"]
     source = lines[line - 1].strip() if isinstance(line, int) and 0 < line <= len(lines) else ""
-    message = error.get("concise_description") or error.get("description", "")
-    return renames.get(path.as_posix(), path.as_posix()), error["name"], message, source
+    return renames.get(path.as_posix(), path.as_posix()), error["name"], _message(error), source
 
 
-def _new_errors(
+def _new_diagnostics(
     baseline: list[dict[str, Any]],
     merged: list[dict[str, Any]],
     base_root: Path,
@@ -52,7 +62,14 @@ def _new_errors(
         if existing[key]:
             existing[key] -= 1
         else:
-            added.append(error)
+            added.append(
+                {
+                    "path": error["path"],
+                    "line": error["line"],
+                    "name": error["name"],
+                    "message": _message(error),
+                }
+            )
     return added
 
 
@@ -87,12 +104,12 @@ def main() -> None:
         "base_ref": pull["base"]["ref"],
         "base_sha": args.base_sha,
         "head_sha": pull["head"]["sha"],
-        "errors": [],
+        "diagnostics": [],
         "error": args.error or None,
     }
     if not args.error:
         try:
-            report["errors"] = _new_errors(
+            report["diagnostics"] = _new_diagnostics(
                 _read_report(output / "base.json"),
                 _read_report(output / "merged.json"),
                 args.base_root,

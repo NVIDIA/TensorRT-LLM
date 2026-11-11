@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Publishes the result of pyrefly-diff.yml to one review thread per PR. This workflow holds
+# write permissions, so it runs only default-branch code and reads the scan artifact as
+# data. Never check out or execute PR code here.
 name: Publish Pyrefly report
 
 on:
@@ -9,9 +12,10 @@ on:
     types: [completed]
 
 permissions:
-  contents: read
   actions: read
   pull-requests: write
+  # GitHub lets an app resolve or reopen a review thread only with write access to contents.
+  contents: write
 
 concurrency:
   group: pyrefly-report-${{ github.event.workflow_run.head_repository.id }}-${{ github.event.workflow_run.head_branch }}
