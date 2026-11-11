@@ -458,23 +458,6 @@ def should_skip_trtllm(
                 f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large intermediate_size "
                 f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
             )
-        # NVFP4 flaky tactic failures with large model configs at seq=8.
-        # For example of observed failures:
-        #   - act=Relu2-e60_k4_h2048_i1408-seq=8: tactic[28] tile [32,36],
-        #     12.79% mismatch, 187/188 tactics pass.
-        if (
-            num_experts >= 60
-            and model_config.top_k >= 4
-            and model_config.hidden_size >= 2048
-            and model_config.intermediate_size >= 1408
-            and seq_len == 8
-        ):
-            return (
-                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model config"
-                f"(num_experts={num_experts}, top_k={model_config.top_k}, "
-                f"hidden_size={model_config.hidden_size}, intermediate_size={model_config.intermediate_size})"
-                f"and seq_len=8: flaky happen tactics failure with tactic[24] and tactic[28]"
-            )
         # Issue: NVFP4 with large expert count + large hidden_size
         # has a single FP4BlockScaleMoERunner tactic with accuracy failure.
         # Observed: e256_k8_h7168_i2048, seq=1, bfloat16 — tactic[204] with tile
