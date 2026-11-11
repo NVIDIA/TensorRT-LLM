@@ -1954,16 +1954,14 @@ def _make_fused_qk_norm_rope_test_config():
     return text_cfg, model_cfg
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
-@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
-@torch.inference_mode()
-def test_horizontal_producer_explicit_caches_match_manager(
-    monkeypatch: pytest.MonkeyPatch, kv_dtype: str
-) -> None:
-    """Exercise real producer dispatch and replay the PCG custom op."""
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("MiniMax-M3 MSA requires SM100 or SM103")
+def _make_horizontal_producer_layer(
+    kv_dtype: str,
+) -> tuple[MiniMaxM3Attention, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a sparse layer wired for the horizontal producer, plus its paged caches.
+
+    Returns the layer and zeroed two-page main, index-K and NVFP4 scale caches
+    in the HND layouts the producer accepts for ``kv_dtype``.
+    """
     _, model_cfg = _make_fused_qk_norm_rope_test_config()
     layer = MiniMaxM3Attention(
         model_config=model_cfg,
@@ -1982,9 +1980,6 @@ def test_horizontal_producer_explicit_caches_match_manager(
     torch.manual_seed(7)
     for norm in (layer.q_norm, layer.k_norm, layer.index_q_norm, layer.index_k_norm):
         norm.weight = nn.Parameter(torch.randn(128, dtype=torch.bfloat16, device="cuda") * 0.1)
-    packed = torch.randn((4, 11 * 128), dtype=torch.bfloat16, device="cuda")
-    positions = torch.arange(4, dtype=torch.int32, device="cuda")
-    slots = torch.tensor([0, 129, -1, -1], dtype=torch.int32, device="cuda")
     nvfp4 = kv_dtype == "nvfp4"
     main = torch.zeros(
         (2, 2, 2, 128, 64 if nvfp4 else 128),
@@ -1993,6 +1988,40 @@ def test_horizontal_producer_explicit_caches_match_manager(
     )
     index = torch.zeros((2, 1, 128, 128), dtype=torch.float8_e4m3fn, device="cuda")
     scales = torch.zeros((2, 2, 2, 128, 8), dtype=torch.uint8, device="cuda")
+    return layer, main, index, scales
+
+
+def _count_plan_resolutions(
+    monkeypatch: pytest.MonkeyPatch, layer: MiniMaxM3Attention
+) -> list[int]:
+    """Spy on the layer's producer-plan validation; returns a one-element call counter."""
+    calls = [0]
+    resolve = layer._resolve_fused_producer_plan
+
+    def counting_resolve(*args: object, **kwargs: object) -> object:
+        """Count the call and delegate to the real validation."""
+        calls[0] += 1
+        return resolve(*args, **kwargs)
+
+    monkeypatch.setattr(layer, "_resolve_fused_producer_plan", counting_resolve)
+    return calls
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+@torch.inference_mode()
+def test_horizontal_producer_explicit_caches_match_manager(
+    monkeypatch: pytest.MonkeyPatch, kv_dtype: str
+) -> None:
+    """Exercise real producer dispatch and replay the PCG custom op."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("MiniMax-M3 MSA requires SM100 or SM103")
+    layer, main, index, scales = _make_horizontal_producer_layer(kv_dtype)
+    packed = torch.randn((4, 11 * 128), dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(4, dtype=torch.int32, device="cuda")
+    slots = torch.tensor([0, 129, -1, -1], dtype=torch.int32, device="cuda")
+    nvfp4 = kv_dtype == "nvfp4"
     manager = create_autospec(MiniMaxM3KVCacheManagerV2, instance=True, spec_set=True)
     manager.is_nvfp4_layer.return_value = nvfp4
     manager.get_buffers.return_value = main
@@ -2044,6 +2073,171 @@ def test_horizontal_producer_explicit_caches_match_manager(
     eager = snapshot(op(*args))
     for actual, reference in zip(replay, eager):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+class _ReachedProducerLaunch(Exception):
+    """Raised once the producer passed every check and starts building kernel arguments."""
+
+
+class _PositionsAtLaunch:
+    """position_ids stand-in that stops the producer right before its kernel launch."""
+
+    def reshape(self, *shape: int) -> torch.Tensor:
+        """The producer reshapes positions only after its plan and capacity checks pass."""
+        raise _ReachedProducerLaunch
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+@torch.inference_mode()
+def test_horizontal_producer_plan_reuses_and_invalidates(
+    monkeypatch: pytest.MonkeyPatch, kv_dtype: str
+) -> None:
+    """The producer plan is validated once per distinct set of cache views and parameters."""
+    layer, main, index, scales = _make_horizontal_producer_layer(kv_dtype)
+    nvfp4 = kv_dtype == "nvfp4"
+    views = {
+        "buffers": main,
+        "index_k_cache": index,
+        "scale_buffers": scales if nvfp4 else None,
+        "out_cache_loc": torch.zeros(4, dtype=torch.int32, device="cuda"),
+    }
+    calls = _count_plan_resolutions(monkeypatch, layer)
+
+    plan = layer._fused_producer_plan(**views)
+    assert plan is not None
+    assert layer._fused_producer_plan(**views) is plan
+    assert calls[0] == 1
+
+    def expect_miss(supported: bool = True, **new_views: torch.Tensor) -> object:
+        """Assert the next lookup re-validates once and the one after it hits."""
+        before = calls[0]
+        views.update(new_views)
+        new_plan = layer._fused_producer_plan(**views)
+        assert calls[0] == before + 1
+        assert (new_plan is not None) == supported
+        assert layer._fused_producer_plan(**views) is new_plan
+        assert calls[0] == before + 1
+        return new_plan
+
+    expect_miss(buffers=main.clone())
+    expect_miss(index_k_cache=index.clone())
+    expect_miss(out_cache_loc=views["out_cache_loc"].clone())
+    if nvfp4:
+        expect_miss(scale_buffers=scales.clone())
+    norms = (layer.q_norm, layer.k_norm, layer.index_q_norm, layer.index_k_norm)
+    for position, norm in enumerate(norms):
+        norm.weight = nn.Parameter(norm.weight.detach().clone())
+        assert expect_miss()[1][6 + position] is norm.weight
+    # Mismatched epsilons reject the plan; once they agree again it resolves with the new value.
+    layer.k_norm.variance_epsilon = 1e-5
+    expect_miss(supported=False)
+    for norm in norms:
+        norm.variance_epsilon = 1e-5
+    assert expect_miss()[1][5] == 1e-5
+    layer.rotary_emb.rotary_cos_sin = layer.rotary_emb.rotary_cos_sin.clone()
+    assert expect_miss()[1][10] is layer.rotary_emb.rotary_cos_sin
+
+    layer.qkv_proj.inv_kv_scales = layer.qkv_proj.inv_kv_scales.clone()
+    if nvfp4:
+        assert expect_miss()[0] is layer.qkv_proj.inv_kv_scales
+    else:
+        # FP8 layers do not read the NVFP4 KV scales, so replacing them keeps the plan.
+        before = calls[0]
+        assert layer._fused_producer_plan(**views) is not None
+        assert calls[0] == before
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@pytest.mark.parametrize(
+    "kv_dtype, layout",
+    [
+        ("fp8", "int64_slots"),
+        ("nvfp4", "int64_slots"),
+        ("fp8", "strided_slots"),
+        ("nvfp4", "padded_head_rows"),
+    ],
+)
+@torch.inference_mode()
+def test_horizontal_producer_plan_caches_unsupported_layout(
+    monkeypatch: pytest.MonkeyPatch, kv_dtype: str, layout: str
+) -> None:
+    """An unsupported layout resolves to ``None`` once and stays ``None`` without re-validating."""
+    layer, main, index, scales = _make_horizontal_producer_layer(kv_dtype)
+    # The supported slot table is the head of a larger allocation, so the strided view below shares
+    # its address and shape and differs only in stride.
+    backing = torch.zeros(8, dtype=torch.int32, device="cuda")
+    slots = backing[:4]
+    supported = (main, index, scales if kv_dtype == "nvfp4" else None, slots)
+    if layout == "int64_slots":
+        unsupported = (*supported[:3], slots.to(torch.int64))
+    elif layout == "strided_slots":
+        strided = backing[::2]
+        assert (strided.data_ptr(), strided.shape) == (slots.data_ptr(), slots.shape)
+        unsupported = (*supported[:3], strided)
+    else:
+        # Rows padded past 128 per head: valid HND geometry the packed producer cannot write.
+        padded = torch.zeros((2, 2, 2, 129, 64), dtype=torch.uint8, device="cuda")[:, :, :, :128]
+        unsupported = (padded, *supported[1:])
+    calls = _count_plan_resolutions(monkeypatch, layer)
+
+    # The same layer accepts its supported views, so the rejection below is the layout's alone.
+    plan = layer._fused_producer_plan(*supported)
+    assert plan is not None
+    assert calls[0] == 1
+    assert layer._fused_producer_plan(*unsupported) is None
+    assert layer._fused_producer_plan(*unsupported) is None
+    assert calls[0] == 2
+    assert layer._fused_producer_plan(*supported) is plan
+    assert calls[0] == 2
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+@torch.inference_mode()
+def test_horizontal_producer_checks_slot_capacity_after_plan_hit(
+    monkeypatch: pytest.MonkeyPatch, kv_dtype: str
+) -> None:
+    """A cached plan does not skip the per-step check that every packed row has a slot."""
+    layer, main, index, scales = _make_horizontal_producer_layer(kv_dtype)
+    slots = torch.zeros(2, dtype=torch.int32, device="cuda")
+    cache_tensors = (main, index, scales if kv_dtype == "nvfp4" else None, slots)
+    metadata = SimpleNamespace(kv_cache_manager=None)
+    calls = _count_plan_resolutions(monkeypatch, layer)
+
+    def produce(num_rows: int) -> object:
+        """Run the producer over ``num_rows`` packed rows against the two-slot table."""
+        packed = torch.zeros((num_rows, 11 * 128), dtype=torch.bfloat16, device="cuda")
+        return layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+            packed, _PositionsAtLaunch(), metadata, cache_tensors=cache_tensors
+        )
+
+    with pytest.raises(_ReachedProducerLaunch):
+        produce(2)
+    assert calls[0] == 1
+    assert produce(3) is None
+    assert calls[0] == 1
+    with pytest.raises(_ReachedProducerLaunch):
+        produce(1)
+    assert calls[0] == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@torch.inference_mode()
+def test_horizontal_producer_plan_cache_is_bounded() -> None:
+    """Distinct cache views never grow the per-layer plan cache past its bound."""
+    layer, main, index, _ = _make_horizontal_producer_layer("fp8")
+    bound = modeling_minimaxm3._MAX_FUSED_PRODUCER_PLANS
+    slot_tables = [torch.zeros(4, dtype=torch.int32, device="cuda") for _ in range(2 * bound + 4)]
+    for slots in slot_tables:
+        plan = layer._fused_producer_plan(main, index, None, slots)
+        assert plan is not None
+        assert len(layer.__dict__["_fused_producer_plans"]) <= bound
+    assert layer._fused_producer_plan(main, index, None, slot_tables[-1]) is plan
 
 
 @pytest.mark.gpu

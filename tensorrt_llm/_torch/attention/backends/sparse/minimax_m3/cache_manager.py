@@ -339,7 +339,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # Decode-step shortcuts a model opts into (RuntimeHooks.msa); see configure_decode_shortcuts.
     skip_unchanged_block_offsets = False
     reuse_pool_views = False
-    block_ids_from_views = False
 
     _main_kv_mapper_kind = MapperKind.HND
     _main_kv_view_layout = "NHD"
@@ -1041,7 +1040,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self,
         skip_unchanged_block_offsets: bool,
         reuse_pool_views: bool,
-        block_ids_from_views: bool = False,
     ) -> None:
         """Turn on the decode-step shortcuts a model opted into.
 
@@ -1049,14 +1047,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         whose inputs equal the previous copy's into the same destination.
         ``reuse_pool_views``: hand out one pool view per geometry instead of
         re-wrapping the pool memory on every attention call.
-        ``block_ids_from_views``: fill :meth:`get_block_ids_per_seq` rows from the
-        page-index views directly (see there).
         """
         self.skip_unchanged_block_offsets = skip_unchanged_block_offsets
         self.reuse_pool_views = reuse_pool_views
-        self.block_ids_from_views = block_ids_from_views
-        if block_ids_from_views:
-            logger.info("[M3 host] block-id tables filled from page-index views")
 
     def _pool_view(
         self,
@@ -1282,32 +1275,21 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         The rows are written through a numpy view of a single zero-filled,
         pinned result, so the attention metadata builders ship it to the device
-        in one asynchronous copy.
-
-        With ``block_ids_from_views`` each row is slice-copied from the request's
-        page-index view (an int32 array) rather than built as a Python list of the
-        whole padded row first; the table is the same.
+        in one asynchronous copy. Each row is slice-copied from the request's
+        pool-0 page-index view (an int32 array), the same row
+        :meth:`get_batch_cache_indices` returns: the view spans the whole
+        ``max_seq_len`` capacity, so building it as a Python list would cost
+        host time on every decode step in proportion to ``max_seq_len``, not
+        to the live context.
         """
-        if self.block_ids_from_views:
-            views = [self.kv_cache_map[req_id].get_base_page_indices(0) for req_id in request_ids]
-            max_blocks = max((len(view) for view in views), default=0)
-            padded_tensor = torch.zeros(
-                (len(views), max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
-            )
-            rows = padded_tensor.numpy()
-            for row, view in zip(rows, views):
-                row[: len(view)] = view
-            rows[rows == BAD_PAGE_INDEX] = 0
-            return padded_tensor
-        block_ids_per_seq = self.get_batch_cache_indices(request_ids)
-        batch = len(block_ids_per_seq)
-        max_blocks = max((len(block_ids) for block_ids in block_ids_per_seq), default=0)
+        views = [self.kv_cache_map[req_id].get_base_page_indices(0) for req_id in request_ids]
+        max_blocks = max((len(view) for view in views), default=0)
         padded_tensor = torch.zeros(
-            (batch, max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
+            (len(views), max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
         )
         rows = padded_tensor.numpy()
-        for row, block_ids in zip(rows, block_ids_per_seq):
-            row[: len(block_ids)] = block_ids
+        for row, view in zip(rows, views):
+            row[: len(view)] = view
         # BAD_PAGE_INDEX marks padding, which this tensor reports as 0.
         rows[rows == BAD_PAGE_INDEX] = 0
         return padded_tensor

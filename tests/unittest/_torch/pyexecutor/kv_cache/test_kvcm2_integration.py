@@ -2027,10 +2027,8 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
         # prefix. Any other keeps its history and covers [0, chunk end).
         pytest.param(False, False, 8192, 0, 0, (9216, 8192), True, id="fresh_past_zero-dflash"),
         pytest.param(False, False, 8192, 0, 0, (9216, None), False, id="fresh_past_zero-pard"),
-        # MTP, Eagle and two-engine drafters keep the draft request view: it
-        # reads position 0 with the whole prompt as its (last) chunk, and the
-        # resize keeps the cache's history.
-        pytest.param(True, False, 8192, 8192, 0, (10243, None), False, id="draft_view"),
+        # Target chunk progress sizes the mirror while its history is preserved.
+        pytest.param(True, False, 8192, 8192, 0, (9216, None), False, id="draft_view"),
         # Disaggregated generation init: the mirror holds no drafter K/V for
         # the transferred prompt (10240 tokens), so the whole prompt is
         # history; the capacity stays absolute, as the drafter's positions.
@@ -2084,7 +2082,7 @@ def test_unpaired_draft_mirror_context_resize(
     manager._prepare_draft_resources(batch)
 
     kv_cache.resize.assert_called_once_with(*expected_resize)
-    assert views == [uses_draft_view]
+    assert views == [False]
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])

@@ -10,6 +10,7 @@ reached through the ``interfaces`` Protocols.
 
 import os
 import time
+import traceback
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
@@ -132,6 +133,9 @@ class DisaggTransferCoordinator:
         self._unpublished_gen_receives: Dict[
             int, Tuple[LlmRequest, Optional["torch.cuda.Event"]]
         ] = {}
+        self._retiring_gen_receives: Dict[int, LlmRequest] = {}
+        self._gen_termination_requested: Set[int] = set()
+        self._fleet_has_retiring_gen_receives = False
 
     # -- loop head -----------------------------------------------------------
 
@@ -190,7 +194,12 @@ class DisaggTransferCoordinator:
                 if self._is_error_cleanup_blocked(req)
             ],
         }
+        if self._retiring_gen_receives:
+            local_vote["retiring_gen_receives"] = True
         all_votes = self._dist.tp_allgather(local_vote)
+        self._fleet_has_retiring_gen_receives = any(
+            vote.get("retiring_gen_receives", False) for vote in all_votes
+        )
         voted_error_ids = {rid for vote in all_votes for rid in vote["error_ids"]}
         blocked_error_ids = {rid for vote in all_votes for rid in vote["blocked_ids"]}
         ready_error_ids = voted_error_ids - blocked_error_ids
@@ -797,8 +806,12 @@ class DisaggTransferCoordinator:
             user_canceled_ids = set(self._registry.canceled_request_ids())
             for req in gen_status.cancelled_requests:
                 req_id = req.parent_request_id if req.is_child else req.py_request_id
-                if req_id not in user_canceled_ids:
+                if (
+                    req_id not in user_canceled_ids
+                    and req.py_request_id not in self._retiring_gen_receives
+                ):
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
+        self._retire_cancelled_gen_receives()
         if not self.inflight_cancel_active():
             self._check_transfer_errors("generation requests")
 
@@ -862,8 +875,108 @@ class DisaggTransferCoordinator:
             self._inflight_cancel_unsupported_logged = True
         return False
 
+    @property
+    def has_retiring_gen_receives(self) -> bool:
+        """Return TP-wide retirement under multi-rank ADP, rank-local otherwise."""
+        if self._enable_attention_dp and self._dist.world_size != 1:
+            return self._fleet_has_retiring_gen_receives
+        return self.has_local_retiring_gen_receives
+
+    @property
+    def has_local_retiring_gen_receives(self) -> bool:
+        """Whether cancelled receives still retain resources on this rank."""
+        return bool(self._retiring_gen_receives)
+
+    def cancel_gen_logically(self, request: LlmRequest) -> bool:
+        """Detach a qualified model-idle GEN result from physical retirement.
+
+        Args:
+            request: Generation request selected at an executor cancellation boundary.
+
+        Returns:
+            Whether the executor may report cancellation. Retained destinations
+            must still pass defer_gen_termination before resource release.
+        """
+        if not request.is_generation_only_request or request.state not in (
+            LlmRequestState.DISAGG_GENERATION_INIT,
+            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+            LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+            LlmRequestState.DISAGG_TRANS_ERROR,
+        ):
+            return False
+        cancel = getattr(self._transceiver, "cancel_gen_logically", None)
+        if not callable(cancel):
+            return False
+        pending = self._unpublished_gen_receives.get(request.py_request_id)
+        try:
+            if cancel(request, pending[1] if pending else None) is not True:
+                return False
+        except RuntimeError as error:
+            logger.error(
+                f"Logical GEN cancellation failed for request {request.py_request_id}; "
+                f"falling back to transfer cancellation: {error}\n{traceback.format_exc()}"
+            )
+            return False
+        # The transceiver now owns any unpublished fence. Remove the only
+        # publication path before the executor makes the result terminal.
+        self._unpublished_gen_receives.pop(request.py_request_id, None)
+        if not self.request_cancellation(request):
+            self._retiring_gen_receives[request.py_request_id] = request
+        return True
+
+    def defer_gen_termination(self, request: LlmRequest) -> bool:
+        """Retain a cancelled destination after its terminal response is published.
+
+        Args:
+            request: Request reaching ordinary executor resource termination.
+
+        Returns:
+            Whether receive retirement must complete before termination can run.
+        """
+        if request.py_request_id not in self._retiring_gen_receives:
+            return False
+        self._gen_termination_requested.add(request.py_request_id)
+        return True
+
+    def _retire_cancelled_gen_receives(self) -> None:
+        """Release each cancelled receive once, after response delivery and safe evidence."""
+        for request_id, request in list(self._retiring_gen_receives.items()):
+            if request_id not in self._gen_termination_requested:
+                continue
+            if not self.request_cancellation(request):
+                continue
+            del self._retiring_gen_receives[request_id]
+            self._gen_termination_requested.remove(request_id)
+            self._effects.terminate_request(request)
+
     def request_cancellation(self, request: LlmRequest) -> bool:
-        """Best-effort cancellation that leaves ownership intact on errors."""
+        """Cancel transfers, retaining unpublished fences and resources until safe.
+
+        Transfer a qualified unpublished CUDA fence to the transceiver before
+        cancelling. False retains ownership for later progress; True permits
+        retirement. An earlier failure remains the request's logical outcome.
+        """
+        try:
+            pending = self._unpublished_gen_receives.get(request.py_request_id)
+            if (
+                pending is not None
+                and pending[1] is not None
+                and self._transceiver.supports_idle_request_cancellation(request) is True
+            ):
+                cancel = getattr(self._transceiver, "cancel_gen_logically", None)
+                if callable(cancel) and cancel(request, pending[1]) is True:
+                    # A parked failure still owns its result. Transfer only the
+                    # unpublished fence so cancellation closes admission and
+                    # starts bounded retirement without replacing that result.
+                    self._unpublished_gen_receives.pop(request.py_request_id, None)
+                elif not pending[1].query():
+                    return False
+        except RuntimeError as error:
+            logger.error(
+                f"GEN receive fence hand-off failed for request {request.py_request_id}; "
+                f"retaining resources and retrying: {error}\n{traceback.format_exc()}"
+            )
+            return False
         try:
             return self._transceiver.cancel_request(request)
         except Exception as error:
@@ -1044,13 +1157,19 @@ class DisaggTransferCoordinator:
         Call this at the end of an iteration that queued nothing, after the
         pass has drained its ready work, so the pending-transfer check sees the
         state that work left behind. The check is rank-local; the sleep only
-        paces and never gates a collective.
+        paces and never gates a collective. Logically cancelled receives remain
+        pending while their published accesses or unpublished CUDA fences drain.
         """
-        # Context sends are tracked by the transfer manager; generation
-        # receives live in the request state, so both directions are covered.
-        waiting_on_transfer = self._transfers.has_any_inflight_requests() or any(
-            req.is_disagg_generation_init_state or req.is_disagg_generation_transmission_in_progress
-            for req in self._registry.active_requests()
+        # Context sends are tracked by the transfer manager. Generation receives
+        # remain visible through active requests or the retirement registry.
+        waiting_on_transfer = (
+            bool(self._retiring_gen_receives)
+            or self._transfers.has_any_inflight_requests()
+            or any(
+                req.is_disagg_generation_init_state
+                or req.is_disagg_generation_transmission_in_progress
+                for req in self._registry.active_requests()
+            )
         )
         if waiting_on_transfer:
             time.sleep(0.001)
@@ -1128,6 +1247,12 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
         )
 
     def inflight_cancel_active(self) -> bool:
+        return False
+
+    def cancel_gen_logically(self, request: LlmRequest) -> bool:
+        return False
+
+    def defer_gen_termination(self, request: LlmRequest) -> bool:
         return False
 
     def request_cancellation(self, request: LlmRequest) -> bool:
