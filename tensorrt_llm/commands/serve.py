@@ -1224,15 +1224,15 @@ def launch_rerank_server(
         llm_args["model_kwargs"] = model_kwargs
 
     llm = PyTorchLLM(encode_only=True, **llm_args)
-    server = OpenAIServer(generator=llm,
-                          model=model,
-                          server_role=ServerRole.RERANK,
-                          metadata_server_cfg=metadata_server_cfg,
-                          tool_parser=None,
-                          embedding_max_queue_delay=max_queue_delay,
-                          embedding_max_queue_size=max_queue_size,
-                          graceful_shutdown_timeout=llm.args.
-                          serve_graceful_shutdown_timeout_s)
+    server = OpenAIServer(
+        generator=llm,
+        model=model,
+        server_role=ServerRole.RERANK,
+        metadata_server_cfg=metadata_server_cfg,
+        tool_parser=None,
+        embedding_max_queue_delay=max_queue_delay,
+        embedding_max_queue_size=max_queue_size,
+        graceful_shutdown_timeout=llm.args.serve_graceful_shutdown_timeout_s)
     asyncio.run(server(host, port))
 
 
