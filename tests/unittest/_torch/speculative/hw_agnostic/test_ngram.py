@@ -146,7 +146,9 @@ def test_ngram_pool_manager_draft_order():
     manager_oldest.get_draft_tokens(prefix=[100, 101, 1, 2], request_id=0, max_sequence_length=100)
     manager_oldest.get_draft_tokens(prefix=[100, 101, 3, 4], request_id=1, max_sequence_length=100)
 
-    draft_oldest = manager_oldest.get_draft_tokens(prefix=[50, 100, 101], request_id=2, max_sequence_length=100)
+    draft_oldest = manager_oldest.get_draft_tokens(
+        prefix=[50, 100, 101], request_id=2, max_sequence_length=100
+    )
     assert draft_oldest == [1, 2]
 
     config_newest = NGramDecodingConfig(
@@ -160,7 +162,9 @@ def test_ngram_pool_manager_draft_order():
     manager_newest.get_draft_tokens(prefix=[100, 101, 1, 2], request_id=0, max_sequence_length=100)
     manager_newest.get_draft_tokens(prefix=[100, 101, 3, 4], request_id=1, max_sequence_length=100)
 
-    draft_newest = manager_newest.get_draft_tokens(prefix=[50, 100, 101], request_id=2, max_sequence_length=100)
+    draft_newest = manager_newest.get_draft_tokens(
+        prefix=[50, 100, 101], request_id=2, max_sequence_length=100
+    )
     assert draft_newest == [3, 4]
 
 
