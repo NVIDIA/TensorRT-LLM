@@ -291,8 +291,17 @@ class _MusePostNormMoE(torch.nn.Module):
         self.post_expert_norm_weight = torch.nn.Parameter(
             torch.zeros(hidden_size, dtype=dtype, device=device), requires_grad=False
         )
-        self.all_reduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
+        self._all_reduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
         self.nvtx = LayerNvtx("moe", 0, ("finalize", "all_reduce"))
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """Reject counts that the NCCL wrapper cannot represent."""
+        if self.mapping.tp_size > 1 and x.numel() > 2**31 - 1:
+            raise RuntimeError(
+                f"MuseSparkOpen benchmark refused NCCL AllReduce with {x.numel()} elements: "
+                "this TensorRT-LLM path uses a signed int32 element count."
+            )
+        return self._all_reduce(x)
 
     def finalize_callback(self) -> Callable[..., torch.Tensor]:
         import weakref
