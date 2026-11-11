@@ -37,6 +37,8 @@ DISAGG_SERVER_PORT = 8000
 # server on the other node starts independently and may need longer, so the
 # default 180-second readiness window of the disagg server is too short.
 DISAGG_SERVER_START_TIMEOUT_S = 1200
+WORKER_READY_PORT = 8003
+WORKER_READY_TIMEOUT_S = 300
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -75,6 +77,32 @@ def get_the_other_host(idx=0):
         assert curr_host in node_list
         node_list.remove(curr_host)
     return node_list[idx]
+
+
+def wait_for_worker_ready():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", WORKER_READY_PORT))
+        listener.listen(1)
+        listener.settimeout(WORKER_READY_TIMEOUT_S)
+        connection, _ = listener.accept()
+        with connection:
+            if connection.recv(5) != b"ready":
+                raise RuntimeError(
+                    "Generation worker sent an invalid ready signal")
+
+
+def signal_worker_ready(host: str):
+    deadline = time.monotonic() + WORKER_READY_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, WORKER_READY_PORT),
+                                          timeout=5) as connection:
+                connection.sendall(b"ready")
+                return
+        except OSError:
+            time.sleep(1)
+    raise RuntimeError("Generation worker could not signal readiness")
 
 
 def is_ctx_node():
@@ -239,8 +267,7 @@ def test_completion(client: openai.OpenAI,
         message = completion.choices[0].text
         assert message.startswith('2.')
 
-        # Give the generation worker time to observe the router before shutdown.
-        time.sleep(10)
+        wait_for_worker_ready()
         disagg_server.terminate()
 
     elif is_gen_node() and is_worker_task():
@@ -248,6 +275,7 @@ def test_completion(client: openai.OpenAI,
         url = f"http://{get_the_other_host(0)}:{DISAGG_SERVER_PORT}/health/"
         wait_for_endpoint_ready(url,
                                 timeout=DISAGG_SERVER_START_TIMEOUT_S + 300)
+        signal_worker_ready(get_the_other_host(0))
         wait_for_endpoint_down(url)
         assert True
     else:

@@ -4,8 +4,10 @@
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import tempfile
+import time
 import uuid
 
 import openai
@@ -30,6 +32,8 @@ LOCAL_RANK = int(os.environ.get("SLURM_LOCALID", RANK % SLURM_NTASKS_PER_NODE))
 # so that all nodes can have the same disagg server config
 DISAGG_SERVER_PORT = 8000
 DISAGG_SERVER_START_TIMEOUT_S = 1200
+WORKER_READY_PORT = 8003
+WORKER_READY_TIMEOUT_S = 300
 
 
 @pytest.fixture(autouse=True)
@@ -53,6 +57,30 @@ def require_supported_slurm_topology():
 
 
 # This test uses exactly two nodes.
+def wait_for_worker_ready():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", WORKER_READY_PORT))
+        listener.listen(1)
+        listener.settimeout(WORKER_READY_TIMEOUT_S)
+        connection, _ = listener.accept()
+        with connection:
+            if connection.recv(5) != b"ready":
+                raise RuntimeError("Generation worker sent an invalid ready signal")
+
+
+def signal_worker_ready(host: str):
+    deadline = time.monotonic() + WORKER_READY_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, WORKER_READY_PORT), timeout=5) as connection:
+                connection.sendall(b"ready")
+                return
+        except OSError:
+            time.sleep(1)
+    raise RuntimeError("Generation worker could not signal readiness")
+
+
 def is_ctx_node():
     return NODE_RANK == 0
 
@@ -256,10 +284,12 @@ def test_completion(
             message = completion.choices[0].text
             assert message.startswith("2.")
 
+        wait_for_worker_ready()
         disagg_server.terminate()
 
     elif is_gen_node() and is_worker_task():
-        # keep gen workers alive until the test ends
+        # Keep the generation worker alive until the test ends.
+        signal_worker_ready(disagg_host)
         wait_for_endpoint_down(disagg_health_url)
         assert True
     else:
