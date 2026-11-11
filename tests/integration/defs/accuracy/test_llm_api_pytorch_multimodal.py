@@ -638,7 +638,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         """MMMU-val on the K3 VL checkpoint (16 GPUs, DEP16).
 
         No automated L0 stage schedules 16-GPU functional tests; this case is
-        registered in qa/llm_function_multinode.txt and run by QA's weekly
+        registered in qa/llm_function_multinode.yml and run by QA's weekly
         multinode pipeline (qualified on 4x4 GB300 nodes; reference in
         references/mmmu.yaml). Mirrors examples/kimi_k3/run_eval_kimi_k3.sbatch
         --task mmmu: the base eval_extra_llm_options.yaml serving config with
