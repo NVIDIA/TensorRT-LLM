@@ -667,6 +667,7 @@ includes full requested and observed dispatch/expert matrices.
 | `kimi_k3_1_pro` | 896 | 16 | 3584 † | 3072 | pass `--quant` | `DEEPSEEK_V3` |
 | `glm_5_3_flash` | 288 | 8 | 4096 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `minimax_m3_1_flash` | 128 | 4 | 6144 | 3072 | pass `--quant` | `MINIMAX_M3` |
+| `glm_5_3` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `glm_5` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
@@ -699,6 +700,10 @@ The separate shared expert and the surrounding transformer block are excluded.
 scaled by 2. Its SwiGLU-OAI activation uses gate sigmoid scale 1.702, linear
 offset 1, and clamp 7, without expert FC1/FC2 linear biases. The separate
 shared expert and the surrounding transformer block are excluded.
+
+`glm_5_3` measures the routed-expert core with sigmoid DeepSeek routing,
+normalized top-8 weights scaled by 2.5, and plain SwiGLU without a clamp.
+The separate shared expert and the surrounding transformer block are excluded.
 
 Custom shapes can be used instead of `--model`:
 
