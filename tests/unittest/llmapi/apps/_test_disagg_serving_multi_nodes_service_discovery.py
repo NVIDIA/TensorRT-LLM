@@ -53,16 +53,17 @@ def require_supported_slurm_topology() -> None:
         "SLURM_LOCALID",
         "SLURM_NODELIST",
     )
-    missing_variables = [
-        variable for variable in required_variables
-        if variable not in os.environ
-    ]
+    missing_variables = [variable for variable in required_variables if variable not in os.environ]
     if missing_variables:
-        launcher_hint = (" trtllm-llmapi-launch removes these variables."
-                         if "SLURM_PROCID" in missing_variables else "")
+        launcher_hint = (
+            " trtllm-llmapi-launch removes these variables."
+            if "SLURM_PROCID" in missing_variables
+            else ""
+        )
         pytest.fail(
             "This test must run directly under a two-node Slurm allocation; "
-            f"missing: {', '.join(missing_variables)}.{launcher_hint}")
+            f"missing: {', '.join(missing_variables)}.{launcher_hint}"
+        )
     if len(NODE_LIST) != 2:
         pytest.fail(
             f"This test requires exactly two Slurm nodes; SLURM_NODELIST expands to {NODE_LIST}"
@@ -82,25 +83,24 @@ def wait_for_gen_task_handshake() -> None:
             raise RuntimeError(
                 "Generation task did not connect to rank 0 on port "
                 f"{GEN_TASK_HANDSHAKE_PORT} within "
-                f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s") from error
+                f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s"
+            ) from error
         with connection:
             connection.settimeout(GEN_TASK_HANDSHAKE_TIMEOUT_S)
             ready_signal = b""
             try:
                 while len(ready_signal) < len(READY_MESSAGE):
-                    chunk = connection.recv(
-                        len(READY_MESSAGE) - len(ready_signal))
+                    chunk = connection.recv(len(READY_MESSAGE) - len(ready_signal))
                     if not chunk:
                         break
                     ready_signal += chunk
             except TimeoutError as error:
                 raise RuntimeError(
                     "Generation task did not complete its handshake within "
-                    f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s") from error
+                    f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s"
+                ) from error
             if ready_signal != READY_MESSAGE:
-                raise RuntimeError(
-                    f"Generation task sent an invalid handshake: {ready_signal!r}"
-                )
+                raise RuntimeError(f"Generation task sent an invalid handshake: {ready_signal!r}")
 
 
 def send_gen_task_handshake(host: str) -> None:
@@ -109,8 +109,7 @@ def send_gen_task_handshake(host: str) -> None:
     last_error: OSError | None = None
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection((host, GEN_TASK_HANDSHAKE_PORT),
-                                          timeout=5) as connection:
+            with socket.create_connection((host, GEN_TASK_HANDSHAKE_PORT), timeout=5) as connection:
                 connection.sendall(READY_MESSAGE)
                 return
         except OSError as error:
@@ -118,7 +117,8 @@ def send_gen_task_handshake(host: str) -> None:
             time.sleep(1)
     raise RuntimeError(
         f"Could not reach rank 0 at {host}:{GEN_TASK_HANDSHAKE_PORT} within "
-        f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s") from last_error
+        f"{GEN_TASK_HANDSHAKE_TIMEOUT_S}s"
+    ) from last_error
 
 
 def is_ctx_node() -> bool:
@@ -150,8 +150,7 @@ def env():
     # one matches, overrides this.
     if get_sm_version() == 103 and platform.machine().lower() == "aarch64":
         e["UCX_TLS"] = "cuda_copy,cuda_ipc,sm,self,tcp"
-    cluster_env.apply_ucx_env(e,
-                              cluster_name=os.environ.get("SLURM_CLUSTER_NAME"))
+    cluster_env.apply_ucx_env(e, cluster_name=os.environ.get("SLURM_CLUSTER_NAME"))
     return e
 
 
@@ -175,15 +174,17 @@ def service_discovery(request, disagg_host: str):
     else:
         work_dir = tempfile.mkdtemp()
         data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
-        etcd = subprocess.Popen([
-            "etcd",
-            "--data-dir",
-            data_dir,
-            "--listen-client-urls",
-            "http://0.0.0.0:2379",
-            "--advertise-client-urls",
-            f"http://{disagg_host}:2379",
-        ])
+        etcd = subprocess.Popen(
+            [
+                "etcd",
+                "--data-dir",
+                data_dir,
+                "--listen-client-urls",
+                "http://0.0.0.0:2379",
+                "--advertise-client-urls",
+                f"http://{disagg_host}:2379",
+            ]
+        )
         yield etcd, f"etcd://{disagg_host}:2379"
         try:
             etcd.kill()
@@ -207,9 +208,7 @@ def worker(model_name: str, disagg_cluster_config: dict):
     """Start one context or generation worker on each Slurm node."""
     extra_config = {
         "disagg_cluster": disagg_cluster_config,
-        "cache_transceiver_config": {
-            "backend": "DEFAULT"
-        },
+        "cache_transceiver_config": {"backend": "DEFAULT"},
         "kv_cache_config": {
             "free_gpu_memory_fraction": 0.8,
             "enable_block_reuse": False,
@@ -229,15 +228,15 @@ def worker(model_name: str, disagg_cluster_config: dict):
         tp_size, pp_size = 1, 1
         args = ["--tp_size", str(tp_size), "--pp_size", str(pp_size)]
         with RemoteOpenAIServer(
-                model_path,
-                port=port,
-                cli_args=args,
-                host="0.0.0.0",
-                env=env(),
-                llmapi_launch=False,
-                rank=0,
-                extra_config=extra_config,
-                role=ServerRole.CONTEXT,
+            model_path,
+            port=port,
+            cli_args=args,
+            host="0.0.0.0",
+            env=env(),
+            llmapi_launch=False,
+            rank=0,
+            extra_config=extra_config,
+            role=ServerRole.CONTEXT,
         ) as server:
             yield server
     elif is_gen_node() and is_worker_task():
@@ -246,15 +245,15 @@ def worker(model_name: str, disagg_cluster_config: dict):
         tp_size, pp_size = 1, 1
         args = ["--tp_size", str(tp_size), "--pp_size", str(pp_size)]
         with RemoteOpenAIServer(
-                model_path,
-                port=port,
-                cli_args=args,
-                host="0.0.0.0",
-                env=env(),
-                llmapi_launch=False,
-                rank=0,
-                extra_config=extra_config,
-                role=ServerRole.GENERATION,
+            model_path,
+            port=port,
+            cli_args=args,
+            host="0.0.0.0",
+            env=env(),
+            llmapi_launch=False,
+            rank=0,
+            extra_config=extra_config,
+            role=ServerRole.GENERATION,
         ) as server:
             yield server
     else:
@@ -275,13 +274,13 @@ def disagg_server(disagg_cluster_config: dict):
         print(f"starting disagg_server for rank {RANK} node rank {NODE_RANK}")
         # ctx/gen servers are unnecessary for service discovery test
         with RemoteDisaggOpenAIServer(
-                ctx_servers=[],
-                gen_servers=[],
-                port=DISAGG_SERVER_PORT,
-                disagg_config=disagg_config,
-                llmapi_launch=False,
-                env=env(),
-                wait_ready=False,  # wait it to be ready in test body
+            ctx_servers=[],
+            gen_servers=[],
+            port=DISAGG_SERVER_PORT,
+            disagg_config=disagg_config,
+            llmapi_launch=False,
+            env=env(),
+            wait_ready=False,  # wait it to be ready in test body
         ) as server:
             yield server
     else:
