@@ -1662,8 +1662,8 @@ def _dispatch_cross_iter_prefetch(
 ) -> None:
     """H2D-copy MM data, run the encoder, and cache embeddings on `aux_stream`.
 
-    Stamps a CUDA event on every candidate's `py_mm_encoder_event` so the
-    request's first input preparation waits on it before reading staged tensors.
+    Stamps a CUDA event on every candidate's `py_mm_encoder_event` so input
+    preparation waits on it for the first chunk that reads staged tensors.
     The event covers all work queued in the aux-stream block, so the same
     event object is shared across all candidates.
     """
