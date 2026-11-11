@@ -222,9 +222,9 @@ engine skip the warmup-only pass:
   Such a buffer that a smaller shape regrows after a larger shape's capture goes unnoticed, so
   compare a model's outputs with and without the switch before relying on it.
 - The switch is ignored, with a warning, for LoRA CUDA graphs, FlashInfer MXFP8 decode GEMMs that
-  need autotuning, encoder-decoder models and DWDP, and when not every rank sets it. The KV cache
-  estimation executor always uses both passes, so the KV cache size does not depend on the switch.
-- The switch has not been validated with pipeline parallelism.
+  need autotuning, encoder-decoder models, DWDP and pipeline parallelism, and when not every rank
+  sets it. The KV cache estimation executor always uses both passes, so the KV cache size does not
+  depend on the switch.
 - With the switch, the final model engine's `gen_cuda_graph_capture_seconds` includes each shape's
   eager warmup forward and, after a fallback, the discarded pass; `gen_cuda_graph_warmup_seconds`
   then covers only a fallback's warmup-only pass.
