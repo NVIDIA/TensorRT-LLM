@@ -318,6 +318,12 @@ Qwen/Qwen3.8-Flash-Next:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 95.11
+  # FP8 KV cache over the checkpoint's bf16 KV, measured on the modeling_v2 FP8 target: TEP4 on
+  # GB300, MTP draft length 3, the breakable prefill graph, bf16 Mamba SSM cache.
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 95.15
   - quant_algo: MIXED_PRECISION
     accuracy: 96.36
   - quant_algo: MIXED_PRECISION
