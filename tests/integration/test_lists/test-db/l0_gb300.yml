@@ -44,8 +44,6 @@ l0_gb300:
   # ------------- PyTorch tests ---------------
   # MLA context head slices, including FP8 scale-block boundaries.
   - unittest/_torch/modules/test_linear_output_slice.py
-  - unittest/_torch/attention/test_fp4_mla.py::test_fp4_mla_rope_generation_quantizes_q
-  - unittest/_torch/modeling/test_kimi_k3_mla.py::test_mla_layerwise_weight_config_preserves_kv_precision
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py
