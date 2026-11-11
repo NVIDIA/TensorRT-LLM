@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU tests for the FP8 unified target's attention entries other than `thop_attention`: every
 certified cell against the entry's `reference` over the engine's paged state, plus the TP index
-split, captured stores, kernels without cells and the call sites."""
+split, captured stores, kernels without cells, the call sites and the FP8 KV range probe."""
 
 import math
 import types
 import zlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import cuda.bindings.driver as cuda_drv
 import pytest
@@ -1662,7 +1663,9 @@ def test_decode_index_selection_split_over_tp_is_the_replicated_selection(monkey
             return M._decode_index_selection(core, split, q, vectors, n, rpr, PRL_DEV, cache, **kw)
 
     # The selections are taken over the planes the layer left (its rows' index keys stored).
-    full_out, scratch = layer(types.SimpleNamespace(core=core, _index_split=None), None)
+    full_out, scratch = layer(
+        types.SimpleNamespace(core=core, _index_split=None, _kv_probe=None), None
+    )
     q = M._index_query(core, scratch)
     full = select(None, q, q8, rows, p)
     halves = [select(rank, q, q8, rows, p) for rank in (0, 1)]
@@ -1713,13 +1716,16 @@ def test_decode_index_selection_split_over_tp_is_the_replicated_selection(monkey
             handed.append(part.clone())
             return torch.cat(halves)
 
-        out, _ = layer(types.SimpleNamespace(core=core, _index_split=([0, 1], None, rank)), nccl)
+        out, _ = layer(
+            types.SimpleNamespace(core=core, _index_split=([0, 1], None, rank), _kv_probe=None),
+            nccl,
+        )
         restore()
         assert len(handed) == 1 and torch.equal(handed[0], halves[rank])
         assert torch.equal(out, full_out), "the layer over the gathered selection"
         # The plan: the prologue stores the index queries in the permuted order.
         target = types.SimpleNamespace(
-            core=core, _index_split=([0, 1], None, rank), _index_plan=plans[rank]
+            core=core, _index_split=([0, 1], None, rank), _index_plan=plans[rank], _kv_probe=None
         )
         out, scr = layer(target, lambda part, sizes, g_, pg: gathered)
         restore()
@@ -1958,10 +1964,13 @@ def _prl_site(monkeypatch, built, prologue, site):
         if site == "trunk":
             qkv = torch.empty(rows, core.qkv_width, dtype=PRL_BF, device=PRL_DEV)
             scratch = torch.empty(rows, core.index_scratch_width, dtype=PRL_BF, device=PRL_DEV)
+            # The FP8 KV range probe reads the packed K/V on both branches; this is its last layer.
+            target = types.SimpleNamespace(core=core, _kv_probe=M._KvRangeProbe(PRL_LAYER))
             out = M.DecodeTarget._attention_block(
-                types.SimpleNamespace(core=core), x, PRL_LAYER, L, qkv, scratch, None, qsa,
+                target, x, PRL_LAYER, L, qkv, scratch, None, qsa,
                 {"predicted_tokens_per_seq": p}, False,
             )  # fmt: skip
+            assert target._kv_probe is None, "the probe reported on its last layer and was dropped"
         else:
             roles, planes, position = pools
             draft = types.SimpleNamespace(
@@ -2112,3 +2121,78 @@ _SITE_CASES = [
 def test_call_sites(check, case, monkeypatch) -> None:
     """What the target's call sites hand the entries beyond a cell."""
     check(case, monkeypatch)
+
+
+# ---- the FP8 KV range probe (`TRTLLM_MODELING_V2_VALIDATE` over an fp8 pool) ----------------
+# The pool stores K/V at the unit scale, so a magnitude past the e4m3 maximum saturates. The probe
+# reports the largest magnitude of the first eager forward's attention layers, once, and never
+# reads a tensor under CUDA graph capture.
+
+PROBE_LAST = 11
+
+
+def _probe_kv(peak: float = 1.0):
+    """K and V of one layer, 5 rows x 2 heads x 8 dims, with `peak` as V's largest value."""
+    k = torch.linspace(-1.0, 1.0, 80, device=DEV).reshape(5, 2, 8).to(torch.bfloat16)
+    v = torch.linspace(-0.5, 0.5, 80, device=DEV).reshape(5, 2, 8).to(torch.bfloat16)
+    v[3, 1, 4] = peak
+    return k, v
+
+
+def _probe_forward(probe, peaks):
+    """One forward's attention layers 3, 7 and PROBE_LAST; returns each `observe` result."""
+    return [
+        probe.observe(layer, *_probe_kv(peak)) for layer, peak in zip((3, 7, PROBE_LAST), peaks)
+    ]
+
+
+def test_a_forward_within_the_e4m3_range_is_silent(monkeypatch) -> None:
+    logger = Mock()
+    monkeypatch.setattr(M, "logger", logger)
+    assert _probe_forward(M._KvRangeProbe(PROBE_LAST), (1.0, 300.0, 448.0)) == [True, True, False]
+    logger.warning.assert_not_called()
+
+
+@pytest.mark.parametrize("peak", [-600.0, float("nan")])
+def test_a_magnitude_past_the_e4m3_maximum_is_reported_once(monkeypatch, peak) -> None:
+    """A negative value counts by its magnitude; a NaN counts as out of range. The oversized value
+    is in a middle layer: the report waits for the forward's last one."""
+    logger = Mock()
+    monkeypatch.setattr(M, "logger", logger)
+    assert _probe_forward(M._KvRangeProbe(PROBE_LAST), (1.0, peak, 1.0)) == [True, True, False]
+    logger.warning.assert_called_once()
+    assert "e4m3 maximum 448" in logger.warning.call_args.args[0]
+
+
+def test_the_probe_runs_only_when_asked_over_an_fp8_pool() -> None:
+    core = SimpleNamespace(quant_mode=M.QM_FP8_KV_CACHE, attn_layers=[3, 7, PROBE_LAST])
+    assert M._KvRangeProbe.for_target(core, True)._last == PROBE_LAST
+    assert M._KvRangeProbe.for_target(core, False) is None
+    for quant_mode in (0, M.QM_NVFP4_KV_CACHE):
+        other = SimpleNamespace(quant_mode=quant_mode, attn_layers=core.attn_layers)
+        assert M._KvRangeProbe.for_target(other, True) is None
+
+
+def test_observing_under_capture_reads_nothing(monkeypatch) -> None:
+    logger = Mock()
+    monkeypatch.setattr(M, "logger", logger)
+    probe = M._KvRangeProbe(PROBE_LAST)
+    k, v = _probe_kv(1000.0)
+    scratch = torch.zeros(1, device=DEV)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        scratch.add_(1)  # warm the allocator off the capture stream
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    kept = []
+    with torch.cuda.graph(graph):
+        scratch.add_(1)
+        # The last layer, with an out-of-range value: a read here would fail the capture (a host
+        # sync) and a report would fire.
+        kept.append(probe.observe(PROBE_LAST, k, v))
+    assert kept == [True], "a captured forward does not end the probe"
+    logger.warning.assert_not_called()
+    # The first eager forward after capture is what reports.
+    assert _probe_forward(probe, (1.0, 1.0, 1000.0)) == [True, True, False]
+    logger.warning.assert_called_once()

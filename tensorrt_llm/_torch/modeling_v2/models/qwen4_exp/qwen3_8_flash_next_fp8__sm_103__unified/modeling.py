@@ -3967,6 +3967,45 @@ def _step_args(md: TrtllmAttentionMetadata, num_contexts, num_ctx_tokens, paged_
     )
 
 
+class _KvRangeProbe:
+    """`TRTLLM_MODELING_V2_VALIDATE` over an fp8 KV pool: reports, once, the largest K/V
+    magnitude the first eager forward's attention layers store.
+
+    The pool takes K/V at the unit scale, so anything past the e4m3 maximum saturates silently
+    (a bf16 inf included). One host sync per attention layer of that one forward; a forward
+    under CUDA graph capture is passed over without a read."""
+
+    def __init__(self, last_layer: int) -> None:
+        self._last = last_layer
+        self._worst = 0.0
+
+    @classmethod
+    def for_target(cls, core, enabled: bool) -> "_KvRangeProbe | None":
+        """A probe over `core`'s attention layers when `enabled` and the pool is fp8."""
+        if not enabled or core.quant_mode != QM_FP8_KV_CACHE:
+            return None
+        return cls(core.attn_layers[-1])
+
+    def observe(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> bool:
+        """Fold one attention layer's K/V in; False once the forward's last layer has reported."""
+        if torch.cuda.is_current_stream_capturing():
+            return True
+        peak = float(torch.maximum(k.abs().amax(), v.abs().amax()))
+        # A NaN stays: `max` would drop it.
+        self._worst = math.nan if math.isnan(peak + self._worst) else max(self._worst, peak)
+        if layer != self._last:
+            return True
+        limit = torch.finfo(torch.float8_e4m3fn).max
+        # Written so that NaN fails too.
+        if not self._worst <= limit:
+            logger.warning(
+                f"FP8 KV cache: the first forward stores a K/V magnitude of {self._worst:g}, "
+                f"past the e4m3 maximum {limit:g}; the pool is written at the unit scale, "
+                "so those values saturate"
+            )
+        return False
+
+
 # ------------------------------------------------------------------ prefill ---
 
 
@@ -4011,6 +4050,8 @@ class PrefillTarget:
     def __init__(self, core: Qwen4ExpUnifiedModelingV2) -> None:
         self.core = core
         self._contract_pending = step_contract_enabled()
+        # Dropped once it has reported.
+        self._kv_probe = _KvRangeProbe.for_target(core, self._contract_pending)
         self._layers = _layer_views(core)
         self._stack = _stack_views(core)
         self._step: _PrefillStep | None = None
@@ -4387,6 +4428,8 @@ class PrefillTarget:
         num_tokens = step.num_tokens
         proj = proj[:num_tokens]
         q_rows, k_dst, v_dst = _attn_in_heads(core, proj)
+        if self._kv_probe is not None and not self._kv_probe.observe(i, k_dst, v_dst):
+            self._kv_probe = None
         qkv = proj_qkv[:num_tokens]
         if not sparse:
             # The dense op reads a compact `[q | k | v]`.
@@ -5616,6 +5659,8 @@ class DecodeTarget:
     def __init__(self, core: Qwen4ExpUnifiedModelingV2) -> None:
         self.core = core
         self._contract_pending = step_contract_enabled()
+        # Dropped once it has reported.
+        self._kv_probe = _KvRangeProbe.for_target(core, self._contract_pending)
         self._layers = _layer_views(core)
         self._stack = _stack_views(core)
         self._index_split = _index_split_group(core)
@@ -5705,6 +5750,15 @@ class DecodeTarget:
             )
             # One compact `[q | k | v]` copy: read flat by the dense op, per head by sparse GQA.
             qkv.copy_(qkv_view)
+        if self._kv_probe is not None:
+            # Both branches leave the normalized, rotated K/V in the packed copy.
+            k_rows, v_rows = torch.split(
+                torch.reshape(qkv, [qkv.shape[0], -1, core.head_dim])[:, core.heads_q :],
+                core.heads_kv,
+                1,
+            )
+            if not self._kv_probe.observe(i, k_rows, v_rows):
+                self._kv_probe = None
 
         if sparse:
             kv = pools.kv[i]
