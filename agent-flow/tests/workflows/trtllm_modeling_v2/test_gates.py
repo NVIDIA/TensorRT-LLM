@@ -376,4 +376,10 @@ def test_native_tests_run_one_job_each_and_a_skip_or_a_bad_exit_is_not_a_pass(tm
     assert "tests/unittest/test_accept.py::test_acceptance" in runner.seen[0]
     assert "CUDA_VISIBLE_DEVICES" not in runner.seen[0]
     none = gate_cli.run_check(data, "tests", "tp1", runner=runner, **common)
-    assert not none.passed and none.detail == "the deployment names no test"
+    # Nothing to run is no failure: said as such, and the command exits 0. Two workers of
+    # the first whole runs wrote `[FAIL] tp1:tests` into their receipts as a failed check.
+    assert none.passed and none.nothing and not none.unjudged
+    assert none.summary().startswith(
+        "[NOTHING TO RUN] tp1:tests: `tp1` states no `tests` in the spec, so this check has "
+        "nothing to run; the target's own unit tests run with pytest, not with the gate"
+    )

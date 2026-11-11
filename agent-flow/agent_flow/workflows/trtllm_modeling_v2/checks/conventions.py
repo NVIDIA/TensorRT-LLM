@@ -29,8 +29,21 @@ from ..operators.coverage import MODEL_OPS_DIRNAME, OP_MATRIX_SUFFIX, model_ops_
 
 #: In the workspace: every finding a landing showed, with the task that first showed it.
 CONVENTIONS_FILENAME = "conventions.json"
-#: Where Modeling V1's models live: what a Modeling V2 target imports from there is said.
-V1_MODELS = "tensorrt_llm._torch.models"
+#: Modeling V1 model code, which a target does not import (the tree's Modeling V2 README,
+#: "Modeling V1 code"): the model classes, the layers, fused MoE.
+V1_CODE: tuple[str, ...] = (
+    "tensorrt_llm._torch.models",
+    "tensorrt_llm._torch.modules",
+    "tensorrt_llm._torch.moe",
+)
+#: What lives beside it and is a runtime interface every target uses: the decoder base
+#: classes (`DecoderModel`, `DecoderModelForCausalLM`) and the checkpoint loaders. The
+#: model config, the attention and speculative metadata and the KV cache managers are
+#: outside those packages and are not looked at.
+V1_INTERFACES: tuple[str, ...] = (
+    "tensorrt_llm._torch.models.modeling_utils",
+    "tensorrt_llm._torch.models.checkpoints",
+)
 
 
 def _named(node: ast.AST) -> str:
@@ -101,21 +114,32 @@ def untested(root: Path, tests_dir: str, category: str, name: str) -> str:
     return f"{tests[0].relative_to(root)} never reads the entry's CELLS: they were not driven"
 
 
+def _under(name: str, roots: tuple[str, ...]) -> bool:
+    return any(name == root or name.startswith(f"{root}.") for root in roots)
+
+
 def v1_imports(root: Path, target: Path) -> list[str]:
-    """Each import of Modeling V1's models in the target's sources, by file and line."""
+    """Each import of Modeling V1 model code in the target's sources, by file and line.
+
+    A runtime interface is no finding: a worker told to "repair" the decoder base class
+    changes shared code for nothing.
+    """
     found: list[str] = []
     for source in sorted(target.rglob("*.py")):
         tree = _parsed(source)
         for node in ast.walk(tree) if tree else ():
-            modules: list[str] = []
+            module, names = "", []
             if isinstance(node, ast.Import):
-                modules = [alias.name for alias in node.names]
+                names = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom) and not node.level:
-                modules = [node.module or ""]
-            for module in modules:
-                if module == V1_MODELS or module.startswith(f"{V1_MODELS}."):
+                # `from <package> import <module>` names the module too.
+                module = node.module or ""
+                names = [f"{module}.{alias.name}" for alias in node.names]
+            for name in names:
+                if _under(name, V1_CODE) and not _under(name, V1_INTERFACES):
                     where = f"{source.relative_to(root)}:{node.lineno}"
-                    found.append(f"{where} imports Modeling V1 ({module})")
+                    said = f"{where} imports Modeling V1 model code ({module or name})"
+                    found += [said] if said not in found else []
     return found
 
 

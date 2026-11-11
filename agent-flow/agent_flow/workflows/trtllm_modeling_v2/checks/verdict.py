@@ -81,6 +81,9 @@ class GateResult:
     #: deployment has no score): a report line, neither a pass nor a failure. ``passed``
     #: is true with it, so nothing takes the score for a failed check.
     unjudged: bool = False
+    #: Nothing was asked of the check (a deployment that names no test): a line, neither
+    #: a pass nor a failure. ``passed`` is true with it, so the command exits 0.
+    nothing: bool = False
     #: Which path judged: ``trtllm-eval`` or ``through the endpoint``; empty for a check
     #: that has one path only.
     path: str = ""
@@ -94,6 +97,7 @@ class GateResult:
     def summary(self) -> str:
         """One line for the journal, carrying the numbers verbatim."""
         verdict = "NO VERDICT" if self.unjudged else "PASS" if self.passed else "FAIL"
+        verdict = "NOTHING TO RUN" if self.nothing else verdict
         label = f"{self.deployment}:{self.name}" if self.deployment else self.name
         tree = f" [tree {self.tree_state}]" + (f" [{self.path}]" if self.path else "")
         tree += f" [files {self.files}]" if self.files else ""

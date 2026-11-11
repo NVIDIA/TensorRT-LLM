@@ -266,7 +266,7 @@ def test_a_receipt_key_of_the_wrong_type_gets_one_turn_and_never_costs_the_decis
     assert (core["status"], core["attempts"]) == ("done", 1) and _state(tmp_path).onboarded
     # The report prints whatever it finds as text.
     report = (tmp_path / "ws" / "delivery_report.md").read_text()
-    assert "- `core` left not done: 7" in report and "| ready | ['boot', 'passed'] |" in report
+    assert "\n- `core`: 7\n" in report and "| ready | ['boot', 'passed'] |" in report
     path = tmp_path / "receipt.yaml"
     listed = "must be a list with one line of text per item (`[]` when nothing); it is"
     forms = {
@@ -422,8 +422,8 @@ def test_the_report_lists_what_the_workers_left_not_done(tmp_path, task_file, mo
     (decisions / "core-1.yaml").write_text("decision: ready\nnot_done: [first turn]\n")
     (decisions / "core-1.2.yaml").write_text("decision: ready\nnot_done: |\n  lm_head at M=8192\n")
     assert report_mod._not_done(tmp_path) == [
-        "- `core` left not done: lm_head at M=8192",
-        "- `k1-rms` left not done: cached-prefix context (31+33 tokens) fails in shared code",
+        "- `core`: lm_head at M=8192",
+        "- `k1-rms`: cached-prefix context (31+33 tokens) fails in shared code",
     ]
     # The receipt's own example is a mapping to YAML; no form a worker writes stops the report.
     forms = {
@@ -439,13 +439,32 @@ def test_the_report_lists_what_the_workers_left_not_done(tmp_path, task_file, mo
     for form, lines in forms.items():
         (decisions / "core-1.2.yaml").write_text(f"decision: ready\nnot_done: {form}\n")
         said = [line for line in report_mod._not_done(tmp_path) if "`core`" in line]
-        assert said == [f"- `core` left not done: {line}" for line in lines], form
-    # In the report a reader opens, not only in the helper that collects them.
+        assert said == [f"- `core`: {line}" for line in lines], form
+    # A sentence several tasks wrote is one line that names them, before each task's own:
+    # the first whole run's report had 24 such lines, most of them one sentence five times.
+    same = "The new test is not registered in a CI test list"
+    for name, own in (("k1-rms-2", "2^31 probes not run"), ("k2-mm-1", "one cell at M=1")):
+        text = f"decision: ready\nnot_done:\n  - {same}\n  - {own}\n"
+        (decisions / f"{name}.yaml").write_text(text)
+    (decisions / "core-1.2.yaml").write_text(f"decision: ready\nnot_done: [{same}, lm_head]\n")
+    assert report_mod._not_done(tmp_path) == [
+        f"- `core`, `k1-rms`, `k2-mm`: {same}",
+        "- `core`: lm_head",
+        "- `k1-rms`: 2^31 probes not run",
+        "- `k2-mm`: one cell at M=1",
+    ]
+    # In the report a reader opens, under a heading of its own: what the flow itself did
+    # not check is not drowned by what the receipts say.
     said = {"decision": "ready", "summary": "x", "not_done": ["lm_head at M=8192"]}
     _run(tmp_path, task_file, monkeypatch, Script(assembler=lambda turn, prompt: said))
     report = (tmp_path / "ws" / "delivery_report.md").read_text()
+    left = report.split("## What the workers left")[1].split("##")[0]
+    assert left.strip() == "- `core`: lm_head at M=8192"
     unchecked = report.split("## What the run did not check")[1].split("##")[0]
-    assert "- `core` left not done: lm_head at M=8192" in unchecked
+    assert "lm_head" not in unchecked and unchecked.strip().startswith(
+        "- whether the target's tests are registered with the repository's CI"
+    )
+    assert report.index("## What the run did not check") < report.index("## What the workers left")
 
 
 # ----------------------------------------------------------------------------- the backend

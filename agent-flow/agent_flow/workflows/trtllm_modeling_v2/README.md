@@ -27,10 +27,10 @@ On one host with a simple environment, fill `checkpoint_path`, `trtllm_repo_path
 2. **Survey** writes `plan.md` and `vocabulary.yaml` (the operators the checkpoint needs, and the kernel rows to add).
 3. **Core**, after the kernel rows it needs: each task is one agent turn in its own worktree, 3 attempts, a spent kernel row skipped. When the worker says `ready`, code runs `core`'s boot and benchmarks on its commit; only a pass lands it. A `config`, `survey` or `core` task that spends its attempts ends the run `not onboarded`.
 4. **Each further deployment**, in the spec's order. One that spends its attempts is `not done`: nothing of it lands and the run goes on.
-5. **Final pass**, once: every check the done deployments owe, the target's tests, and the convention scan (an entry without `CELLS` or `ARCHS`, a Modeling V1 import; reported, never a gate). What fails goes to one `fix` task, then every check of each deployment that had a failure, and `core`'s, run again.
+5. **Final pass**, once: every check the done deployments owe, the target's tests, and the convention scan (an entry without `CELLS` or `ARCHS`, an import of Modeling V1 model code; reported, never a gate). What fails goes to one `fix` task, then every check of each deployment that had a failure, and `core`'s, run again.
 6. **Report**: `<ws>/delivery_report.md`.
 
-A check is `trtllm-modeling-v2 gate <boot|accuracy|tests> --task <ws>/task.yaml --deployment <name> --tree <tree>`, the same command for the run and for a worker. Its verdict line names the directory of its files.
+A check is `trtllm-modeling-v2 gate <boot|accuracy|tests> --task <ws>/task.yaml --deployment <name> --tree <tree>`, the same command for the run and for a worker. Its verdict line names the directory of its files; `tests` on a deployment that states none says `[NOTHING TO RUN]` and exits 0.
 
 ## The report
 
@@ -40,10 +40,10 @@ A check is `trtllm-modeling-v2 gate <boot|accuracy|tests> --task <ws>/task.yaml 
 | deployment | check | score | anchor | verdict | judged | commit | engine attested |
 | `tp1` | `accuracy[gsm8k]` | 41.7 | reference 41.77 (...) | PASS | trtllm-eval | `fa0d912fafd2` | [engine match: 1 rank(s) x 15 option(s); target ...] |
 ## Not done / Not attempted / Changed outside the target / Skipped kernel rows
-## Convention findings left / Final pass / What the run did not check / Models per role / Tasks
+## Convention findings left / Final pass / What the run did not check / What the workers left / Models per role / Tasks
 ```
 
-A run that is not onboarded says in its first lines where it stopped, the result line, the `gate` command that reproduces it and the last commit where that check passed. A score nothing judges is `no verdict`, never a pass or a failure. `engine attested` is every option of the deployment against what each rank's engine resolved; a rank that reported nothing is `unknown`, which fails the check.
+A run that is not onboarded says in its first lines where it stopped, the result line, the `gate` command that reproduces it and the last commit where that check passed. A score nothing judges is `no verdict`, never a pass or a failure. `engine attested` is every option of the deployment against what each rank's engine resolved; a rank that reported nothing is `unknown`, which fails the check. Each row names the commit it was measured on, and a line under the table says which checks were not measured on the head. "What the workers left" is each task's own `not_done`, a sentence several tasks wrote printed once.
 
 ## A multi-node site, and disaggregation
 

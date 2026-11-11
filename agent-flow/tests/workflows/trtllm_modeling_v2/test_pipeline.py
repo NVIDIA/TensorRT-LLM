@@ -226,6 +226,8 @@ def test_core_is_onboarded_by_code_then_one_deployment_is_not_done_and_the_next_
     assert "| PASS | trtllm-eval | `c0ffee1` |" in report
     assert "| `tep2` | `boot` | - | - | PASS | through the endpoint | `c0ffee1` |" in report
     assert "| `kv_fp8` |" not in report.split("## Done")[1].split("##")[0]
+    # Every row is of the head here, so nothing is said under the table.
+    assert "Not measured on the head" not in report
     # The tasks, in a reader's word for what each belongs to: a deployment.
     tasks = report.split("## Tasks")[1]
     assert "| task | kind | deployment | status | attempts | grants | decision | summary |" in tasks
@@ -704,7 +706,7 @@ def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_findi
     goal = _prompts(calls, "fix-1")[0]
     assert "repair what the final pass found, every item:" in goal
     assert "- check `kv_fp8:boot` failed at c0ffee1: [FAIL] kv_fp8:boot: " in goal
-    assert f"- convention: {TARGET_REL}/modeling.py:1 imports Modeling V1 ({v1})" in goal
+    assert f"- convention: {TARGET_REL}/modeling.py:1 imports Modeling V1 model code ({v1})" in goal
     assert "(first at `core`)" in goal and "(first at `kv_fp8`)" in goal
     assert "## Task: the final fix" in goal and "Reproduce a failed check with the gate" in goal
     # The text says what ran and what will run, as the list of checks below has it.
@@ -733,6 +735,15 @@ def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_findi
     assert "| `kv_fp8` | `boot` | - | - | PASS | through the endpoint | `f1xed00` |" in report
     assert "| PASS | trtllm-eval | `f1xed00` |" in report.split("| `kv_fp8` | `accuracy")[1]
     assert "| `tep2` | `boot` | - | - | PASS | through the endpoint | `c0ffee1` |" in report
+    # Each row names its commit, and a reader still takes the table for the head: one line
+    # under it says which checks were not measured there, and why.
+    under = report.split("## Done")[1].split("##")[0].strip().splitlines()[-1]
+    assert under == (
+        "Not measured on the head `f1xed00`: `tep2:boot`, `tep2:accuracy[gsm8k]` (on "
+        "`c0ffee1`). Each passed on its commit; what passed is measured again only after a "
+        "`fix` task, and then only for the first deployment and for a deployment that had a "
+        "failure."
+    )
     # Nothing of the final pass moves the onboard record.
     assert report.startswith("# onboarded: commit `c0ffee1`")
     left = report.split("## Convention findings left")[1].split("##")[0]

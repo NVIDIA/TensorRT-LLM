@@ -177,18 +177,24 @@ def run_tests(
     runner: ShellRunner = default_shell_runner,
     timeout: int | None = None,
     name: str = "tests",
-    missing: str = "the deployment names no test",
 ) -> GateResult:
     """Run each of ``deployment``'s native tests as one pytest job and judge the reports.
 
     Every job runs under the deployment's environment with the Modeling V2 switch on,
     behind the deployment's launch prefix when it has one. A test that skipped proves
     nothing and fails the check, as does a node id that selects nothing; the first job
-    that does not pass ends it.
+    that does not pass ends it. A deployment that names no test has nothing to run, which
+    is no failure: the run owes this check only where `tests` are stated.
     """
     verdict = verdict_factory(inspect_tree(task_data))
     if not deployment.tests:
-        return verdict(name=name, deployment=deployment.name, passed=False, detail=missing)
+        said = (
+            f"`{deployment.name}` states no `tests` in the spec, so this check has nothing "
+            f"to run; the target's own unit tests run with pytest, not with the gate"
+        )
+        return verdict(
+            name=name, deployment=deployment.name, passed=True, nothing=True, detail=said
+        )
     timeout = timeout or deployment.timeout or TIMEOUT_S
     repo = task_data["trtllm_repo_path"]
     directory = gate_workdir(workdir)

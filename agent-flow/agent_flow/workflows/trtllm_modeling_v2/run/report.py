@@ -576,7 +576,7 @@ def _stopped(workflow, pipeline) -> list[str]:
 
 
 def _not_done(workspace: Path) -> list[str]:
-    """Each task's `not_done` list from its last receipt, one line per item."""
+    """What each task's last receipt left not done, by task; a line several tasks wrote, once."""
 
     def order(path: Path) -> tuple[str, list[int]]:
         task, _, token = path.stem.rpartition("-")
@@ -585,7 +585,7 @@ def _not_done(workspace: Path) -> list[str]:
     # By task, attempt and turn: the last of a task is the latest word of its worker.
     files = sorted((workspace / DECISIONS_DIRNAME).glob("*.yaml"), key=order)
     last = {order(path)[0]: path for path in files if order(path)[0]}
-    lines: list[str] = []
+    left: list[tuple[str, str]] = []
     for task, path in sorted(last.items()):
         try:
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -601,8 +601,14 @@ def _not_done(workspace: Path) -> list[str]:
             # `- what: why` is a mapping to YAML, and one item to its writer.
             pairs = item.items() if isinstance(item, dict) else ()
             said = "; ".join(f"{what}: {why}" for what, why in pairs) or str(item)
-            lines.append(f"- `{task}` left not done: {' '.join(said.split())}")
-    return lines
+            left.append((task, " ".join(said.split())))
+    # The same sentence from every kernel task is one line with its tasks, before the rest.
+    writers: dict[str, list[str]] = {}
+    for task, said in left:
+        writers.setdefault(said, []).append(task)
+    shared = [(tasks, said) for said, tasks in writers.items() if len(tasks) > 1]
+    alone = [([task], said) for task, said in left if len(writers[said]) == 1]
+    return [f"- {', '.join(f'`{t}`' for t in tasks)}: {said}" for tasks, said in shared + alone]
 
 
 def findings_left(workflow) -> list[str]:
@@ -629,12 +635,14 @@ def _done_rows(workflow, pipeline) -> list[str]:
     left = {
         (r["deployment"], r["check"]) for r in getattr(workflow._preflight, "not_attempted", ())
     }
-    rows = []
+    rows, earlier = [], {}
     for name in pipeline.done_deployments():
         for check in (c for c in workflow._contract.of(name) if (name, c.gate) not in left):
             v = workflow._selected.get(check.key)
             if v is None and check in first:
                 v = status.at(check.key, onboarded)
+            if v is not None and v.passed and not v.unjudged and v.commit:
+                earlier.setdefault(v.commit[:12], []).append(check.key)
             held = frozen.get(f"{name}:{check.gate[9:-1]}") if "[" in check.gate else None
             anchor = "-"
             if held is not None:
@@ -647,7 +655,28 @@ def _done_rows(workflow, pipeline) -> list[str]:
             row = f"| `{name}` | `{check.gate}` | {' | '.join(cells)} | `{commit}` | {attested} |"
             rows.append(row)
     head = "| deployment | check | score | anchor | verdict | judged | commit | engine attested |"
-    return [head, "|---" * 8 + "|", *rows] if rows else []
+    return [head, "|---" * 8 + "|", *rows, *_earlier(workflow, earlier)] if rows else []
+
+
+def _earlier(workflow, passed: dict[str, list[str]]) -> list[str]:
+    """One line under the table when checks passed on another commit than the head.
+
+    Each row names its commit, and a reader still takes the table for the head.
+    """
+    head = (workflow._head() or "")[:12]
+    there = [
+        f"{', '.join(f'`{key}`' for key in keys)} (on `{commit}`)"
+        for commit, keys in passed.items()
+        if head and commit != head
+    ]
+    if not there:
+        return []
+    return [
+        "",
+        f"Not measured on the head `{head}`: {'; '.join(there)}. Each passed on its commit; "
+        "what passed is measured again only after a `fix` task, and then only for the first "
+        "deployment and for a deployment that had a failure.",
+    ]
 
 
 def write_report(workflow, pipeline) -> Path:
@@ -713,8 +742,8 @@ def write_report(workflow, pipeline) -> Path:
     )
     section("Convention findings left", [f"- {f}" for f in findings_left(w)])
     section("Final pass", [f"- {line.render()}" for line in pipeline.final])
-    unchecked = [*NOT_CHECKED, *w._contract.notes]
-    section("What the run did not check", [f"- {x}" for x in unchecked] + _not_done(w.workspace))
+    section("What the run did not check", [f"- {x}" for x in (*NOT_CHECKED, *w._contract.notes)])
+    section("What the workers left", _not_done(w.workspace))
     section(
         "Models per role",
         [
