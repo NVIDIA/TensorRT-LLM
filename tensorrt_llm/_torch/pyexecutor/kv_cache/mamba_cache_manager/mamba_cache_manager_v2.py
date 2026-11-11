@@ -119,6 +119,36 @@ class InforwardSnapshotEntry(NamedTuple):
     num_after: int  # chunk tokens from P to the prompt end
 
 
+def format_insufficient_mamba_gpu_quota_error(
+    gpu_quota: int,
+    minimum_live_quota: int,
+    max_batch_size: int,
+    pp_size: int,
+    feasible_max_batch_size: int,
+) -> str:
+    """Explain a too-small V2 Mamba GPU quota and how to shrink max_batch_size."""
+    message = (
+        "The V2 Mamba GPU cache quota is too small for live recurrent "
+        f"states and attention pages: got {gpu_quota} bytes, need at "
+        f"least {minimum_live_quota} bytes. This floor reserves recurrent "
+        f"state for max_batch_size={max_batch_size} sequences on each "
+        f"pipeline-parallel rank (pp_size={pp_size})."
+    )
+    if feasible_max_batch_size > 0:
+        message += (
+            " Reduce max_batch_size in the configuration (a value of "
+            f"{feasible_max_batch_size} would fit this quota) or increase "
+            "the GPU KV-cache budget."
+        )
+    else:
+        message += (
+            " Even max_batch_size=1 does not fit this quota. Increase the "
+            "GPU KV-cache budget, for example by raising "
+            "kv_cache_config.max_tokens or free GPU memory."
+        )
+    return message
+
+
 def _uses_fp4_mla_cache_layout(
     dtype: DataType, kv_cache_type: CacheTypeCpp, pretrained_config: object
 ) -> bool:
@@ -800,6 +830,28 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 high = mid
         return low
 
+    def _largest_max_batch_size_for_gpu_quota(self, gpu_quota: int) -> int:
+        """Largest max_batch_size whose live-state floor fits in gpu_quota.
+
+        The live floor grows with max_batch_size (resident sequences scale
+        with max_batch_size * pp_size). Search in [0, max_batch_size).
+        """
+        original = self.max_batch_size
+        if original <= 0:
+            return 0
+        try:
+            low, high = 0, original
+            while low + 1 < high:
+                mid = (low + high) // 2
+                self.max_batch_size = mid
+                if self._minimum_live_gpu_quota() <= gpu_quota:
+                    low = mid
+                else:
+                    high = mid
+            return low
+        finally:
+            self.max_batch_size = original
+
     def _minimum_live_gpu_quota(self) -> int:
         """Return the minimum quota for live states and one attention page."""
         attention_block_quota = self._attention_cache_bytes_per_token() * self.tokens_per_block
@@ -817,9 +869,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         minimum_live_quota = self._minimum_live_gpu_quota()
         if minimum_live_quota > gpu_quota:
             raise ValueError(
-                "The V2 Mamba GPU cache quota is too small for live recurrent "
-                f"states and attention pages: got {gpu_quota} bytes, need at "
-                f"least {minimum_live_quota} bytes."
+                format_insufficient_mamba_gpu_quota_error(
+                    gpu_quota,
+                    minimum_live_quota,
+                    self.max_batch_size,
+                    self.mapping.pp_size,
+                    self._largest_max_batch_size_for_gpu_quota(gpu_quota),
+                )
             )
         # _build_base_config already constructed every attention layer,
         # including dtype-specific scale and subclass-provided side buffers.

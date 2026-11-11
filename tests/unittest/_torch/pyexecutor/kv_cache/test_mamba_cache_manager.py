@@ -3215,18 +3215,26 @@ def test_v2_hybrid_fallback_warns_about_snapshot_retention(monkeypatch) -> None:
         mgr.shutdown()
 
 
-def test_v2_hybrid_rejects_quota_below_live_state_floor():
+def _live_quota_floor_stub(
+    *,
+    max_batch_size: int = 2,
+    pp_size: int = 1,
+    gen_preemption_headroom: int = 0,
+    dummy_slots: int = 1,
+) -> MambaHybridCacheManagerV2:
+    """A V2 hybrid manager stub for live GPU-quota checks. No CUDA."""
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.layer_specs = None
     mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
-    mgr.max_batch_size = 2
-    mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+    mgr.max_batch_size = max_batch_size
+    mgr.gen_preemption_headroom = gen_preemption_headroom
+    mgr.mapping = Mapping(world_size=pp_size, rank=0, tp_size=1, pp_size=pp_size)
     mgr.local_num_mamba_layers = 1
     mgr._mamba_layer_mask = [True, False]
     mgr.ssm_bytes = 64
     mgr.conv_bytes = 32
-    mgr._num_reserved_dummy_slots = 1
+    mgr._num_reserved_dummy_slots = dummy_slots
     mgr.tokens_per_block = 32
     mgr.num_local_layers = 2
     mgr.pp_layers = [0, 1]
@@ -3237,6 +3245,12 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr.get_layer_bytes_per_token = lambda **kwargs: 8
     mgr._attention_cache_bytes_per_token = lambda: 16
     mgr.kv_cache_config = KvCacheConfig(enable_partial_reuse=False)
+    return mgr
+
+
+@pytest.mark.cpu_only
+def test_v2_hybrid_rejects_quota_below_live_state_floor():
+    mgr = _live_quota_floor_stub(max_batch_size=2)
     minimum_quota = mgr._minimum_live_gpu_quota()
 
     base_config = KVCacheManagerConfig(
@@ -3245,8 +3259,74 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
         layers=[],
     )
 
-    with pytest.raises(ValueError, match="too small for live recurrent states"):
+    with pytest.raises(ValueError, match="too small for live recurrent states") as exc_info:
         mgr._build_cache_config(base_config)
+
+    message = str(exc_info.value)
+    assert f"got {minimum_quota - 1} bytes" in message
+    assert f"need at least {minimum_quota} bytes" in message
+    assert "max_batch_size=2" in message
+    assert "pp_size=1" in message
+    # The stub's floor still fits a smaller batch; the error should name it.
+    feasible = mgr._largest_max_batch_size_for_gpu_quota(minimum_quota - 1)
+    assert feasible >= 1
+    assert feasible < 2 or "Reduce max_batch_size" in message
+    assert f"a value of {feasible} would fit this quota" in message
+    # The search must not leave the configured batch size mutated.
+    assert mgr.max_batch_size == 2
+
+
+@pytest.mark.cpu_only
+def test_v2_hybrid_quota_error_names_a_feasible_max_batch_size():
+    # The default trtllm-serve max_batch_size is 2048; a quota that only
+    # covers 128 sequences should point at 128, not just the byte counts.
+    requested = 2048
+    feasible = 128
+    mgr = _live_quota_floor_stub(max_batch_size=requested)
+    tight = _live_quota_floor_stub(max_batch_size=feasible)
+    quota = tight._minimum_live_gpu_quota()
+    assert mgr._minimum_live_gpu_quota() > quota
+
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=quota)],
+        layers=[],
+    )
+
+    with pytest.raises(ValueError, match="too small for live recurrent states") as exc_info:
+        mgr._build_cache_config(base_config)
+
+    message = str(exc_info.value)
+    assert f"max_batch_size={requested}" in message
+    assert f"a value of {feasible} would fit this quota" in message
+    assert "Even max_batch_size=1 does not fit" not in message
+    assert mgr._largest_max_batch_size_for_gpu_quota(quota) == feasible
+    assert mgr.max_batch_size == requested
+
+
+@pytest.mark.cpu_only
+def test_v2_hybrid_quota_error_when_even_batch_size_one_does_not_fit():
+    mgr = _live_quota_floor_stub(max_batch_size=2, pp_size=2)
+    one = _live_quota_floor_stub(max_batch_size=1, pp_size=2)
+    quota = one._minimum_live_gpu_quota() - 1
+    assert quota >= 0
+
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=quota)],
+        layers=[],
+    )
+
+    with pytest.raises(ValueError, match="too small for live recurrent states") as exc_info:
+        mgr._build_cache_config(base_config)
+
+    message = str(exc_info.value)
+    assert "max_batch_size=2" in message
+    assert "pp_size=2" in message
+    assert "Even max_batch_size=1 does not fit this quota" in message
+    assert "a value of" not in message
+    assert mgr._largest_max_batch_size_for_gpu_quota(quota) == 0
+    assert mgr.max_batch_size == 2
 
 
 @skip_no_cuda
