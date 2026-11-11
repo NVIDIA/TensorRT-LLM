@@ -141,6 +141,13 @@ _FORCE_ACCEPT_RNG_SEED = 0xACCE9D
 _FORCE_ACCEPT_RNG_COUNTER_STRIDE = 6007
 _FORCE_ACCEPT_RNG_SLOT_STRIDE = 1009
 
+# Write the CUDA-graph padding slots' one-hot draft-prob rows with index_fill_
+# and a pinned, non-blocking slot copy. The default assigns Python scalars
+# through a device index, which stages each scalar as a pageable host tensor and
+# blocks the host until the stream drains.
+_DEVICE_ONEHOT_SCALARS = os.environ.get("TRTLLM_DFLASH_DEVICE_ONEHOT_SCALARS",
+                                        "0") == "1"
+
 
 def should_use_separate_draft_kv_cache(spec_config) -> bool:
     """
@@ -1173,6 +1180,21 @@ class SpecMetadata:
             return
         onehot_vocab = (self.draft_probs_last_dim if self.draft_probs_last_dim
                         > 0 else self.draft_probs_vocab_size)
+        if _DEVICE_ONEHOT_SCALARS:
+            logger.info_once(
+                "Speculative decoding: padding-slot one-hot draft-prob rows "
+                "are written with index_fill_, no host sync.",
+                key="device_onehot_padding_draft_probs")
+            slots = torch.tensor(padding_slot_ids,
+                                 dtype=torch.long,
+                                 pin_memory=prefer_pinned()).to(
+                                     self.draft_probs.device, non_blocking=True)
+            # Same elements and values as the indexed writes below; the scalar
+            # is a kernel argument, so no host tensor is staged.
+            self.draft_probs[:, :draft_len, :onehot_vocab].index_fill_(
+                0, slots, 0.0)
+            self.draft_probs[:, :draft_len, 0].index_fill_(0, slots, 1.0)
+            return
         slots = torch.tensor(padding_slot_ids,
                              dtype=torch.long,
                              device=self.draft_probs.device)
