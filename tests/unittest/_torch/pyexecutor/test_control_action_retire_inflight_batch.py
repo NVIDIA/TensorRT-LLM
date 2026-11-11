@@ -164,6 +164,7 @@ class _ControlExecutor:
         self.hang_detector = _NoHangDetector()
         self._active_control_id = None
         self.dwdp_manager = None
+        self.disagg = SimpleNamespace(has_retiring_gen_receives=False)
 
     def _num_inflight_kv_transfers(self):
         return self._transfers

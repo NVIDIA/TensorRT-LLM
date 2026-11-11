@@ -110,7 +110,7 @@ class _RequestQueue:
         self.items = list(items)
         self.polls = []
 
-    def get_from_request_queue(self, timeout):
+    def get_from_request_queue(self, timeout, wait_for_batch=True):
         self.polls.append(timeout)
         items, self.items = self.items, []
         return items

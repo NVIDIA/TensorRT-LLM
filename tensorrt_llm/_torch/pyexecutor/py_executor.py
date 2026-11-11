@@ -8636,10 +8636,12 @@ class PyExecutor:
         # The transport choice must be identical on every rank, so `idle` has
         # to be too: it follows the all-rank live-request count and the
         # replicated waiting queue.
+        broadcast_kwargs = {"prefer_cpu": idle}
+        if use_hint and new_requests_hint > 0:
+            # Every rank agrees rank 0 holds requests: skip the count probe.
+            broadcast_kwargs["known_nonempty"] = True
         new_requests = self.request_broadcaster.broadcast(
-            new_requests,
-            known_nonempty=use_hint and new_requests_hint > 0,
-            prefer_cpu=idle)
+            new_requests, **broadcast_kwargs)
         if isinstance(waiting_queue, GenAdmissionWaitingQueue):
             if self._gen_admission.needs_clock:
                 waiting_queue.set_now(self.request_broadcaster.rank0_now,

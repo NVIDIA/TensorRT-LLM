@@ -56,6 +56,8 @@ def _make_stub_executor(rank=0, queued_items=None):
     # No KV connector attached.
     stub.kv_connector_manager = None
     stub._has_pending_connector_transfers = lambda: False
+    # No generation-side receive is retiring.
+    stub.disagg = SimpleNamespace(has_retiring_gen_receives=False)
     return stub
 
 
@@ -75,9 +77,11 @@ def test_idle_ignores_hint_and_keeps_blocking_probe():
     _fetch(stub, waiting_queue, total_num_active_requests=0, new_requests_hint=0)
 
     # Idle path: the hint must not skip the (blocking) fetch/probe wake path.
-    stub.executor_request_queue.get_from_request_queue.assert_called_once_with(None)
+    stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
+        None, wait_for_batch=True
+    )
     stub.request_broadcaster.broadcast.assert_called_once()
-    assert stub.request_broadcaster.broadcast.call_args.kwargs["known_nonempty"] is False
+    assert stub.request_broadcaster.broadcast.call_args.kwargs.get("known_nonempty", False) is False
 
 
 def test_pending_control_requests_block_fetch():
@@ -108,10 +112,10 @@ def test_busy_zero_hint_with_connector_still_fetches():
     _fetch(stub, waiting_queue, total_num_active_requests=4, new_requests_hint=0)
 
     stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
-        datetime.timedelta(0)
+        datetime.timedelta(0), wait_for_batch=True
     )
     stub.kv_connector_manager.take_finished_prefix_loads.assert_called_once_with()
-    assert stub.request_broadcaster.broadcast.call_args.kwargs["known_nonempty"] is False
+    assert stub.request_broadcaster.broadcast.call_args.kwargs.get("known_nonempty", False) is False
     assert len(waiting_queue) == len(items)
 
 
@@ -127,7 +131,7 @@ def test_pending_control_with_draining_connector_ignores_hint():
     stub.executor_request_queue.get_from_request_queue.assert_not_called()
     stub.kv_connector_manager.take_finished_prefix_loads.assert_called_once_with()
     stub.request_broadcaster.broadcast.assert_called_once()
-    assert stub.request_broadcaster.broadcast.call_args.kwargs["known_nonempty"] is False
+    assert stub.request_broadcaster.broadcast.call_args.kwargs.get("known_nonempty", False) is False
 
 
 def _with_tracked_transfers(stub, local_inflight, poll_interval_ms=5000):
@@ -148,7 +152,7 @@ def test_idle_with_tracked_context_transfer_polls_instead_of_blocking():
     _fetch(stub, waiting_queue, total_num_active_requests=0, new_requests_hint=None)
 
     stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
-        datetime.timedelta(milliseconds=5000)
+        datetime.timedelta(milliseconds=5000), wait_for_batch=True
     )
     assert stub.request_broadcaster.broadcast.call_args.kwargs["prefer_cpu"] is True
 
@@ -169,5 +173,5 @@ def test_idle_transfer_poll_is_tp_wide_under_attention_dp():
     stub.dist.tp_allreduce.assert_called_once()
     assert stub.dist.tp_allreduce.call_args.args[0] == 0
     stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
-        datetime.timedelta(milliseconds=5000)
+        datetime.timedelta(milliseconds=5000), wait_for_batch=True
     )
