@@ -1,6 +1,6 @@
 --- a/csrc/api/api.cpp
 +++ b/csrc/api/api.cpp
-@@ -7,9 +7,38 @@
+@@ -7,9 +7,44 @@
  
  PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
      m.doc() = "FlashMLA";
@@ -38,6 +38,12 @@
 +    // they never call into Python; and they keep no mutable state between calls, so calls from
 +    // different Python threads need no serialization by the GIL. A binding that takes or returns
 +    // Python objects, calls into Python, or shares mutable state must not get this guard.
++    //
++    // These conditions were checked for the FlashMLA commit pinned in 3rdparty/fetch_content.json, and
++    // they are properties of that commit only. Whenever the pin moves, check them again for every
++    // binding of the new version and for the functions they bind. The patch still applying does not
++    // show that they hold: a binding added upstream gets no guard (and can deadlock as described above
++    // if it launches kernels), and a change inside a bound function leaves this file untouched.
 +    m.def("sparse_decode_fwd", &sparse_attn_decode_interface, pybind11::call_guard<pybind11::gil_scoped_release>());
 +    m.def("dense_decode_fwd", &dense_attn_decode_interface, pybind11::call_guard<pybind11::gil_scoped_release>());
 +    m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface, pybind11::call_guard<pybind11::gil_scoped_release>());
