@@ -267,6 +267,29 @@ spec_config = MTPDecodingConfig(
 )
 ```
 
+### Vocab-parallel target tokens under tensor parallelism
+
+With plain tensor parallelism (no attention DP, no pipeline or context
+parallelism) and an evenly vocab-sharded LM head, the one-model MTP, MTP-Eagle,
+Eagle3 (linear), draft-target, PARD and SA workers select their target tokens
+from each rank's vocab shard of the target logits instead of gathering them:
+
+* Greedy batches take the global argmax across the ranks: the same tokens as
+  the gathered logits.
+* Temperature-only batches (every sampled request sets only `temperature`: no
+  `top_k` / `top_p` / `min_p`, no `seed`, no penalties, no rejection sampling,
+  no guided decoding) draw their target tokens by Gumbel-max on the shards when
+  CUDA graphs are enabled. The tokens follow the same distribution,
+  softmax(logits / temperature), as the gathered sampler (up to a tail below
+  ~4e-9 probability that is never drawn), but from a different random stream,
+  so an unseeded request does not reproduce the tokens of a run that gathers
+  the logits. A request that sets `seed` keeps the gathered sampler and its
+  per-request random stream.
+
+`TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=0` keeps the greedy selection on the
+shards but samples temperature-only batches from the gathered logits again;
+`TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0` gathers the logits for both.
+
 ## Beam search
 
 Beam search is a decoding strategy that maintains multiple candidate sequences (beams) during text generation, exploring different possible continuations to find higher quality outputs. Unlike greedy decoding or sampling, beam search considers multiple hypotheses simultaneously.

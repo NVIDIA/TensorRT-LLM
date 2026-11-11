@@ -332,8 +332,13 @@ def create_spec_metadata(
         num_seq_slots=config.num_seq_slots,
         # The decode CUDA graphs then capture the temperature-only variant.
         temperature_only_graphs=config.cuda_graph_config is not None
-        and config.spec_decode_fast_paths
-        and supports_sharded_target_sampling(config.spec_config, mapping),
+        and (
+            config.spec_samples_sharded_temperature
+            or (
+                config.spec_decode_fast_paths
+                and supports_sharded_target_sampling(config.spec_config, mapping)
+            )
+        ),
     )
 
 

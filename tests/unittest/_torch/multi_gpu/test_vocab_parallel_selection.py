@@ -316,11 +316,225 @@ def _worker_accept_check(rank, tp, mnnvl):
     assert torch.equal(out[1], ref[1])
 
 
+@torch.inference_mode()
+def _worker_argmax_check(rank, tp, mnnvl):
+    """The vocab-parallel greedy argmax of the stock one-model workers
+    (``SpecWorkerBase.enable_vocab_parallel_argmax``), through the TP key
+    exchange and through the NCCL pair exchange: target and draft tokens equal
+    ``torch.argmax`` over the gathered logits, ties included, eagerly and under
+    CUDA-graph replay."""
+    from tensorrt_llm._torch.distributed.ll_exchange import TPKeyExchange
+    from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+
+    class _Worker(SpecWorkerBase):
+        verifies_on_target_shard = True
+
+        @property
+        def max_draft_len(self):
+            return 4
+
+        def _forward_impl(self, *args, **kwargs):
+            raise NotImplementedError
+
+    head, vocab = _make_head(rank, tp, mnnvl)
+    lm_head = head.lm_head
+    mapping = lm_head.mapping
+    key_exchange = TPKeyExchange.create(mapping, max_rows=512)
+    assert key_exchange is not None, "no peer memory for the key exchange"
+    try:
+        for use_key_exchange in (True, False):
+            worker = _Worker()
+            assert worker.enable_vocab_parallel_argmax(
+                lm_head, key_exchange if use_key_exchange else None
+            )
+            assert (worker.key_exchange is not None) == use_key_exchange
+            assert worker.mapping is mapping
+            for rows in (1, 7, 64, 300):
+                gen = torch.Generator(device="cuda").manual_seed(rows)
+                full = torch.randint(-4, 4, (rows, vocab), device="cuda", generator=gen).to(
+                    torch.bfloat16
+                )
+                if rows >= 5:
+                    full = _special_rows(full)
+                    # NaN logits do not occur in decoding; the key exchange
+                    # orders them by their bit pattern.
+                    full[2] = 0.0
+                expected = torch.argmax(full.float(), dim=-1).to(torch.int32)
+                assert torch.equal(worker._sharded_argmax(_shard(full, rank)), expected)
+
+            # Through target_logits and the target sampler, from the real head.
+            md = SimpleNamespace(
+                is_all_greedy_sample=True,
+                temperature_only=False,
+                enable_penalty=False,
+                sharded_target_logits=False,
+                is_cuda_graph=False,
+                is_ragged_verify=False,
+            )
+            hidden = torch.randn(48, HIDDEN, device="cuda").to(torch.bfloat16)
+            expected = torch.argmax(lm_head(hidden).float(), dim=-1).to(torch.int32)
+
+            def target_tokens():
+                logits = worker.target_logits(hidden, lm_head, LogitsProcessor(), None, md, None)
+                assert md.sharded_target_logits and logits.shape[-1] == SHARD
+                return worker._sample_tokens_for_batch(logits, md, 0, hidden.shape[0])
+
+            assert torch.equal(target_tokens(), expected)
+            graph, out = _capture(target_tokens, hidden)
+            for _ in range(3):
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(out, expected)
+
+            # Greedy draft tokens of a vocab-sharded draft head, then d2t.
+            gen = torch.Generator(device="cuda").manual_seed(3)
+            full = torch.randint(-4, 4, (33, vocab), device="cuda", generator=gen).to(
+                torch.bfloat16
+            )
+            full[0] = 1.0  # tied across every shard: id 0
+            full[1, SHARD - 1] = full[1, vocab - 1] = 9.0  # tied across shards: id SHARD - 1
+            worker._d2t = torch.arange(vocab, device="cuda") % 7
+            draft_md = SimpleNamespace(
+                wants_advanced_draft_sampling=False,
+                draft_vocab_size=vocab,
+                vocab_size=vocab,
+                is_cuda_graph=False,
+            )
+            greedy = torch.argmax(full.float(), dim=-1)
+            assert greedy[:2].tolist() == [0, SHARD - 1]
+            draft = worker.sample_draft_tokens(_shard(full, rank), draft_md, full.shape[0])
+            assert torch.equal(draft, (greedy + worker._d2t[greedy]).to(torch.int32))
+            gathered = MPI.COMM_WORLD.allgather(draft.cpu())
+            assert all(torch.equal(g, gathered[0]) for g in gathered)
+    finally:
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.barrier()
+        key_exchange.close()
+
+
+@torch.inference_mode()
+def _worker_temperature_check(rank, tp, mnnvl):
+    """Temperature-only target tokens of the stock one-model workers
+    (``SpecWorkerBase.enable_vocab_parallel_argmax`` with the TP key exchange):
+    the Gumbel-max draw on the shard equals the draw over the gathered logits
+    with the same noise, on every rank, with the device seed advancing once per
+    step; greedy rows of the batch take the argmax; greedy and temperature-only
+    CUDA graphs replayed in any order keep their own path; and the draws follow
+    ``softmax(logits / T)``."""
+    from _torch.helpers import chi_square, gumbel_max_reference
+
+    from tensorrt_llm._torch.distributed.ll_exchange import TPKeyExchange
+    from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+    from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+
+    class _Worker(SpecWorkerBase):
+        verifies_on_target_shard = True
+
+        @property
+        def max_draft_len(self):
+            return 4
+
+        def _forward_impl(self, *args, **kwargs):
+            raise NotImplementedError
+
+    head, vocab = _make_head(rank, tp, mnnvl)
+    lm_head = head.lm_head
+    key_exchange = TPKeyExchange.create(lm_head.mapping, max_rows=512)
+    assert key_exchange is not None, "no peer memory for the key exchange"
+    try:
+        worker = _Worker()
+        assert worker.enable_vocab_parallel_argmax(lm_head, key_exchange)
+        assert worker.samples_sharded_temperature
+        worker.cache_derived_state()
+
+        def metadata(greedy):
+            return SimpleNamespace(
+                is_all_greedy_sample=greedy,
+                temperature_only=not greedy,
+                enable_penalty=False,
+                sharded_target_logits=False,
+                is_cuda_graph=False,
+                is_ragged_verify=False,
+                temperatures=temps,
+            )
+
+        # Four groups of identical rows: a near-greedy, a moderate and a large
+        # temperature, and greedy rows (sentinel temperature) inside the batch.
+        rows, groups = 256, 4
+        group_temps = torch.tensor([0.05, 1.0, 20.0, 1e-5], device="cuda")
+        temps = group_temps.repeat_interleave(rows // groups)
+        gen = torch.Generator(device="cuda").manual_seed(13)
+        # The near-greedy group's logits are scaled down to the same spread of logits / T.
+        scale = torch.tensor([0.05, 4.0, 4.0, 4.0], device="cuda")[:, None]
+        hidden = (torch.randn(groups, HIDDEN, device="cuda", generator=gen) * scale).to(
+            torch.bfloat16
+        )
+        hidden = hidden.repeat_interleave(rows // groups, dim=0)
+        gathered = lm_head(hidden)
+        greedy_tokens = torch.argmax(gathered.float(), dim=-1).to(torch.int32)
+        greedy_md, temperature_md = metadata(True), metadata(False)
+
+        def target_tokens(md):
+            logits = worker.target_logits(hidden, lm_head, LogitsProcessor(), None, md, None)
+            assert md.sharded_target_logits and logits.shape[-1] == SHARD
+            return worker._sample_tokens_for_batch(logits, md, 0, rows)
+
+        def expected_draw():
+            return gumbel_max_reference(
+                gathered, temps, worker._gumbel_seed, GREEDY_TEMPERATURE_THRESHOLD
+            )
+
+        sampled_rows = temps >= GREEDY_TEMPERATURE_THRESHOLD
+        for step in (1, 2):
+            tokens = target_tokens(temperature_md)
+            assert int(worker._gumbel_seed) == step
+            assert torch.equal(tokens, expected_draw())
+            assert torch.equal(tokens[~sampled_rows], greedy_tokens[~sampled_rows])
+            gathered_tokens = MPI.COMM_WORLD.allgather(tokens.cpu())
+            assert all(torch.equal(t, gathered_tokens[0]) for t in gathered_tokens)
+        assert torch.equal(target_tokens(greedy_md), greedy_tokens)
+        assert int(worker._gumbel_seed) == 2
+
+        # One graph per key, replayed interleaved as mixed traffic would.
+        greedy_graph, greedy_out = _capture(lambda: target_tokens(greedy_md), hidden)
+        temperature_graph, temperature_out = _capture(lambda: target_tokens(temperature_md), hidden)
+        seed = int(worker._gumbel_seed)
+        counts = torch.zeros((groups - 1, vocab), dtype=torch.int64, device="cuda")
+        for step, graph in enumerate("gttgtgtt" + "t" * 40):
+            if graph == "g":
+                greedy_graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(greedy_out, greedy_tokens), step
+                assert int(worker._gumbel_seed) == seed
+                continue
+            temperature_graph.replay()
+            torch.cuda.synchronize()
+            seed += 1
+            assert int(worker._gumbel_seed) == seed
+            assert torch.equal(temperature_out, expected_draw()), step
+            for group in range(groups - 1):
+                counts[group] += torch.bincount(
+                    temperature_out.view(groups, -1)[group].long(), minlength=vocab
+                )
+        assert torch.equal(temperature_out[~sampled_rows], greedy_tokens[~sampled_rows])
+        for group in range(groups - 1):
+            row = group * (rows // groups)
+            probs = torch.softmax(gathered[row].double() / group_temps[group].double(), dim=-1)
+            stat, crit = chi_square(counts[group].cpu(), probs.cpu())
+            assert stat < crit, (float(group_temps[group]), stat, crit)
+    finally:
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.barrier()
+        key_exchange.close()
+
+
 _CHECKS = {
     "argmax": _argmax_check,
     "sample": _sample_check,
     "markov": _markov_check,
     "worker_accept": _worker_accept_check,
+    "worker_argmax": _worker_argmax_check,
+    "worker_temperature": _worker_temperature_check,
 }
 
 
