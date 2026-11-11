@@ -2449,6 +2449,7 @@ def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.Mo
     assert run_kwargs["softmax_scale"] == fmha._get_bmm1_scale(attn)
     assert run_kwargs["output_scale"] == 1.0
 
+
 def test_prims_ts_decode_task_manager_builds_schedule_without_gpu() -> None:
     pytest.importorskip("cutlass.experimental.task_scheduling")
     from cutlass.experimental.task_scheduling.task_manager import TaskManager
@@ -2481,4 +2482,6 @@ def test_prims_ts_decode_task_manager_builds_schedule_without_gpu() -> None:
     assert _compute_total_kv_tiles(seq_len_kv, tile) == expected_kv_tiles
     num_insts = int(cfg.num_insts_kv)
     remaining = max(expected_kv_tiles - num_insts, 0)
-    assert _compute_decode_gen_loop_domain(expected_kv_tiles, num_insts) == -(-remaining // num_insts)
+    assert _compute_decode_gen_loop_domain(expected_kv_tiles, num_insts) == -(
+        -remaining // num_insts
+    )
