@@ -102,7 +102,7 @@ def native_libraries(repo: Path) -> list[Path]:
     return sorted(found)
 
 
-def _content_hash(path: Path) -> str:
+def content_hash(path: Path) -> str:
     """The SHA-256 of a file's bytes, read every time: size and time do not say content."""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -122,7 +122,7 @@ def library_digest(repo: str | Path) -> str:
     for library in native_libraries(root):
         try:
             digest.update(
-                f"{library.relative_to(root).as_posix()} {_content_hash(library)}\n".encode()
+                f"{library.relative_to(root).as_posix()} {content_hash(library)}\n".encode()
             )
         except OSError:
             continue
@@ -303,6 +303,11 @@ class ContractStatus:
         The latest outcome counts: a failure recorded after a pass replaces it.
         """
         return {v.key: v for v in self.verdicts if tree and v.tree == tree}
+
+    def at(self, key: str, commit: str) -> Verdict | None:
+        """The latest verdict of ``key`` that was measured at ``commit``."""
+        found = [v for v in self.verdicts if v.key == key and commit and v.commit == commit]
+        return found[-1] if found else None
 
     def last(self, key: str, *, passed: bool | None = None) -> Verdict | None:
         """The latest verdict of ``key`` on any content; with ``passed``, the latest that was."""

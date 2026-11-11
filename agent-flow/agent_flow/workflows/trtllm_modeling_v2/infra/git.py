@@ -102,6 +102,9 @@ LABEL_TARGET, LABEL_SHARED, LABEL_MIXED = "target", "shared", "mixed"
 SANDBOX_PLACEHOLDER_NAMES: tuple[str, ...] = (".mcp.json",)
 SANDBOX_PLACEHOLDER_DIRS: tuple[str, ...] = (".claude", ".cc-writes")
 
+#: What an untracked file must end in to be a source: Python imports it, or the build reads it.
+SOURCE_SUFFIXES: tuple[str, ...] = (".py", ".cpp", ".cc", ".cu", ".cuh", ".h", ".hpp")
+
 ENV_NAME = "MV2FLOW_GIT_NAME"
 ENV_EMAIL = "MV2FLOW_GIT_EMAIL"
 
@@ -411,6 +414,27 @@ def _path_problems(policy: CommitPolicy, raw: str) -> Iterator[str]:
             yield f"adds a sandbox placeholder: {path}"
         if policy.path_problem(path):
             yield policy.path_problem(path)
+
+
+def uncommitted(tree: str | Path, ignore: Sequence[str] = (), git: Any = None) -> list[str] | None:
+    """The files in ``tree`` that its commit does not hold: changed ones, and untracked sources.
+
+    An untracked source is imported or built by a check and absent from the commit that
+    then lands. Not counted: what git ignores, an untracked file that is no source (what
+    an engine or an evaluator leaves where it ran), a sandbox placeholder, and ``ignore``
+    (the native build a worktree links, the run's workspace). ``None`` when git cannot say.
+    """
+    out = (git or git_output)(str(tree), "status", "--porcelain", "--untracked-files=all")
+    if out is None:
+        return None
+    found = []
+    for line in filter(str.strip, out.splitlines()):
+        path = line[3:].strip().strip('"')
+        if line.startswith("??") and not path.endswith(SOURCE_SUFFIXES):
+            continue
+        if not is_sandbox_placeholder(path) and not any(_within(path, root) for root in ignore):
+            found.append(path)
+    return found
 
 
 def is_sandbox_placeholder(path: str) -> bool:

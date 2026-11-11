@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,6 +58,7 @@ from ._helpers import (
     facts,
     healthy_smi,
     passing_shell,
+    scripted_refs,
 )
 
 FAMILY = str(Path(TARGET_REL).parent)
@@ -387,6 +389,24 @@ def test_a_first_deployment_nothing_judges_is_onboarded_on_its_boot_and_says_so(
         assert "tp1: it names no benchmark, so its boot alone judges it" in report
 
 
+def test_only_a_benchmark_with_an_anchor_can_refuse_onboarded(
+    tmp_path, task_file, repo, monkeypatch
+):
+    refs = repo / "tests/integration/defs/accuracy/references/gsm8k.yaml"
+    refs.write_text(yaml.safe_dump({"another/model": [{"accuracy": 85.6}]}))
+    # No anchor, the boot passes, the evaluator fails: nothing judged the score it never gave.
+    shell = _checks(fail={"tp1:accuracy"})
+    calls = _run(tmp_path, _spec(task_file), monkeypatch, Script(), shell_runner=shell)
+    assert len(calls) == 1 and _state(tmp_path).onboarded["accuracy"] == "unjudged (boot only)"
+    report = _report(tmp_path)
+    assert report.splitlines()[0].endswith("; accuracy unjudged (boot only)")
+    # Its failure is a line of its own, and its row says it failed.
+    said = "- `tp1:accuracy[gsm8k]` has no anchor, and its evaluation failed: [FAIL] tp1:accuracy"
+    assert said in report
+    assert "| `tp1` | `accuracy[gsm8k]` | - | none (no declared anchor" in report
+    assert "| FAIL | trtllm-eval |" in report
+
+
 def test_core_spent_ends_the_run_not_onboarded_and_the_report_says_where(
     tmp_path, task_file, monkeypatch
 ):
@@ -534,6 +554,16 @@ def test_what_preflight_left_out_gets_no_task_and_a_score_nothing_judges_gives_n
     assert "| `kv_fp8` | `accuracy[gsm8k]` | 90 | relative (the score of `mid`) | no verdict |" in (
         report
     )
+    # It waits for its base: once `mid` is done and scored, the score on record is judged
+    # against it, and nothing of `kv_fp8` is loaded again.
+    shell = _checks(score=91.0)
+    _run(tmp_path, task, monkeypatch, Script(), shell_runner=shell)
+    assert shell.ran == ["mid:boot", "mid:accuracy"]
+    report = _report(tmp_path)
+    assert "| `kv_fp8` | `accuracy[gsm8k]` | 90 | relative (the score of `mid`) | PASS |" in report
+    judged = [v for v in _verdicts(tmp_path) if v["gate"].startswith("accuracy")][-1]
+    assert (judged["deployment"], judged["passed"], judged["unjudged"]) == ("kv_fp8", True, False)
+    assert judged["reference"] == 91.0 and "its score on record, judged now" in judged["detail"]
 
 
 def test_a_check_that_cannot_be_run_is_a_failed_line_not_a_crash(tmp_path, task_file, monkeypatch):
@@ -595,9 +625,12 @@ class _Head:
 
     def __init__(self, at: str = "c0ffee1"):
         self.at = at
+        self.refs: dict[str, str] = {}
 
     def __call__(self, repo, *args, stdin=None):
-        return self.at + "\n" if args[:1] == ("rev-parse",) else ""
+        if args[:1] in (("rev-parse",), ("update-ref",)):
+            return scripted_refs(self.refs, self.at, args)
+        return ""
 
 
 def test_the_final_pass_runs_once_and_one_fix_task_names_every_failure_and_finding(
@@ -993,6 +1026,130 @@ def test_another_first_deployment_is_not_taken_for_the_one_core_was_built_for(
     assert [_task_id(p) for _, p in calls] == ["tep2"]
 
 
+class _Tree(_Head):
+    """A scripted git that also says what the tree holds outside its commit."""
+
+    dirt = ""
+
+    def __call__(self, repo, *args, stdin=None):
+        return self.dirt if args[:2] == ("status", "--porcelain") else super().__call__(repo, *args)
+
+
+def test_a_tree_that_is_not_its_commit_gives_no_verdict_on_record_or_not(
+    tmp_path, task_file, monkeypatch
+):
+    git, shell = _Tree(), _checks()
+    task = _spec(task_file, KV_FP8)
+    run = dict(shell_runner=shell, git_runner=git, max_attempts=1)
+    # An untracked source: a check would import it, and the commit that lands would not hold it.
+    git.dirt = "?? tensorrt_llm/extra.py\n"
+    _run(tmp_path, task, monkeypatch, Script(), **run)
+    said = "[NO VERDICT] tp1:boot: 1 file(s) in the tree are in no commit: tensorrt_llm/extra.py"
+    assert said in _tasks(tmp_path)[1]["note"]
+    assert shell.ran == [] and _verdicts(tmp_path) == [] and not _state(tmp_path).onboarded
+    # What a sandbox drops into a directory is no source, nor what an engine leaves behind.
+    git.dirt = "?? .mcp.json\n?? tensorrt_llm/.claude/x.py\n?? core.4242\n?? lm_cache/a.db\n"
+    _run(tmp_path, task, monkeypatch, Script(), **run)
+    assert _state(tmp_path).onboarded
+    assert shell.ran == ["tp1:boot", "tp1:accuracy", "kv_fp8:boot", "kv_fp8:accuracy"]
+    # A pass on record is no verdict about a tree that is not the commit: not reused, not run.
+    git.dirt = " M tensorrt_llm/model.py\n"
+    _run(tmp_path, task, monkeypatch, Script(), **run)
+    assert len(shell.ran) == 4 and len(_verdicts(tmp_path)) == 4
+    report = _report(tmp_path)
+    assert "| `kv_fp8` | `boot` | - | - | no verdict | - | `c0ffee1` |" in report
+    journal = (tmp_path / "ws" / "journal.md").read_text()
+    assert "[NO VERDICT] kv_fp8:boot: 1 file(s) in the tree are in no commit" in journal
+    # The onboard record stands. After the fix task core's own checks were asked again,
+    # of the same tree: no verdict there either, and the row says so.
+    assert report.startswith("# onboarded: commit `c0ffee1`")
+    assert "| `tp1` | `boot` | - | - | no verdict | - | `c0ffee1` |" in report
+
+
+def test_the_runs_own_workspace_inside_the_tree_is_no_uncommitted_source(tmp_path):
+    listed = "?? ws/turns/probe.py\n?? other/probe.py\n"
+    workflow = SimpleNamespace(
+        task_data={"trtllm_repo_path": str(tmp_path)},
+        _git=lambda repo, *args: "c0ffee1\n" if args[0] == "rev-parse" else listed,
+        _commit_policy=lambda: CommitPolicy(denied_paths=("ws/",)),
+    )
+    said = report_mod._unmeasurable(workflow, tmp_path, "c0ffee1")
+    assert said == "1 file(s) in the tree are in no commit: other/probe.py"
+
+
+def test_a_tree_that_moves_under_a_check_gives_no_verdict(tmp_path, task_file, monkeypatch):
+    git, inner = _Tree(), _checks()
+
+    def shell(command, env=None, timeout=0):
+        if "/boot." in command:
+            git.at = "moved00"  # the branch advanced while the engine was up
+        return inner(command, env, timeout)
+
+    run = dict(shell_runner=shell, git_runner=git, max_attempts=1)
+    _run(tmp_path, _spec(task_file), monkeypatch, Script(), **run)
+    note = _tasks(tmp_path)[1]["note"]
+    assert "[NO VERDICT] tp1:boot: the tree changed under the check: the tree is at moved00" in note
+    assert _verdicts(tmp_path) == [] and not _state(tmp_path).onboarded
+
+
+def test_libraries_rebuilt_under_a_check_or_a_tree_git_cannot_name_give_no_verdict(
+    tmp_path, task_file, repo, monkeypatch
+):
+    inner = _checks()
+
+    def rebuilds(command, env=None, timeout=0):
+        if "/boot." in command:
+            (repo / "tensorrt_llm" / "libtensorrt_llm.so").write_bytes(b"rebuilt meanwhile")
+        return inner(command, env, timeout)
+
+    _run(tmp_path, _spec(task_file), monkeypatch, Script(), shell_runner=rebuilds, max_attempts=1)
+    said = "the tree changed under the check: its native libraries are not the ones the check"
+    assert said in _tasks(tmp_path)[1]["note"]
+    assert _verdicts(tmp_path) == [] and not _state(tmp_path).onboarded
+
+    class Unnamed(_Head):
+        def __call__(self, repo, *args, stdin=None):
+            return "" if args[-1].endswith("^{tree}") else super().__call__(repo, *args)
+
+    # Nothing is established about content git names no tree for: not a pass to onboard on.
+    run = dict(shell_runner=_checks(), git_runner=Unnamed(), max_attempts=1)
+    _run(tmp_path, _spec(task_file), monkeypatch, Script(), **run)
+    assert "the tree's content cannot be identified: git names no commit" in (
+        (tmp_path / "ws" / "journal.md").read_text()
+    )
+    assert run["shell_runner"].ran == [] and not _state(tmp_path).onboarded
+
+
+def test_the_report_prints_what_this_start_used_or_measured_not_the_ledgers_latest(
+    tmp_path, task_file, monkeypatch
+):
+    git, shell = _Tree(), _checks()
+    task = _spec(task_file, KV_FP8)
+    run = dict(shell_runner=shell, git_runner=git)
+    _run(tmp_path, task, monkeypatch, Script(), **run)  # content A
+    git.at = "bbbbbbb"
+    _run(tmp_path, task, monkeypatch, Script(), **run)  # content B: measured again
+    # With the score it is held to: `tp1`'s, on the same content.
+    assert shell.ran[4:] == ["kv_fp8:boot", "tp1:accuracy", "kv_fp8:accuracy"]
+    report = _report(tmp_path)
+    assert "| `kv_fp8` | `boot` | - | - | PASS | through the endpoint | `bbbbbbb` |" in report
+    # Core's boot, which the final pass leaves alone, is the onboarded commit's.
+    assert "| `tp1` | `boot` | - | - | PASS | through the endpoint | `c0ffee1` |" in report
+    git.at = "c0ffee1"
+    _run(tmp_path, task, monkeypatch, Script(), **run)  # content A again: A's verdicts are used
+    assert len(shell.ran) == 7
+    report = _report(tmp_path)
+    assert "| `kv_fp8` | `boot` | - | - | PASS | through the endpoint | `c0ffee1` |" in report
+    assert "`bbbbbbb`" not in report.split("## Done")[1].split("##")[0]
+    # A boot that fails now: its benchmark is not run, and the row says so, whatever passed before.
+    git.at, shell.fail = "ddddddd", {"kv_fp8:boot"}
+    _run(tmp_path, task, monkeypatch, Script(), **run)
+    report = _report(tmp_path)
+    assert "| `kv_fp8` | `boot` | - | - | FAIL | through the endpoint | `ddddddd` |" in report
+    row = "| `kv_fp8` | `accuracy[gsm8k]` | - | relative (the score of `tp1`) | not run | - | `-` | - |"
+    assert row in report
+
+
 def test_the_run_state_round_trips_and_another_versions_is_refused(tmp_path):
     path = tmp_path / "state.json"
     record = dict(commit="abc", ref="refs/mv2/s/onboarded", libraries="e3b0", time="t")
@@ -1126,6 +1283,31 @@ def test_a_failed_preflight_ends_the_run_before_any_agent(tmp_path, task_file, m
     assert not (tmp_path / "ws" / "delivery_report.md").exists()
 
 
+def test_a_start_that_stops_early_after_onboarding_exits_zero_and_says_why_it_stopped(
+    tmp_path, task_file, monkeypatch
+):
+    _run(tmp_path, _spec(task_file, KV_FP8), monkeypatch, Script())
+    before = _report(tmp_path)
+    assert before.startswith("# onboarded: commit `c0ffee1`")
+    # A later start whose preflight fails: onboarded stays true, and the report of the
+    # earlier start does not stand as this one's.
+    for _ in range(2):
+        workflow = _workflow(tmp_path, command_runner=healthy_smi(free=20000))
+        calls = _install(monkeypatch, workflow, Script())
+        with workflow:
+            assert workflow.run(task_file) is True
+        assert calls == []
+    lines = _report(tmp_path).splitlines()
+    assert lines[0] == before.splitlines()[0] and lines[1] == ""
+    assert lines[2].startswith("- this start (20") and "stopped before its first task" in lines[2]
+    assert lines[2].endswith(
+        "preflight failed: `tp1` needs 1 free sm_103 device(s) on this host; 0 of 1 are free:"
+    )
+    # One line for the latest such start, then the earlier report as it was.
+    assert lines[3:] == before.splitlines()[2:]
+    assert _state(tmp_path).onboarded["commit"] == "c0ffee1"
+
+
 # ------------------------------------------------------- integration, on a real checkout
 
 _ENV = {"GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@example.com"}
@@ -1167,7 +1349,9 @@ def test_uncommitted_work_or_a_commit_that_breaks_the_rules_does_not_land(tmp_pa
     tree = integration.open("core")
     (tree / FAMILY / "a.py").write_text("A = 2\n")
     outcome = integration.integrate("core")
-    assert not outcome.merged and outcome.repairable and "uncommitted changes" in outcome.detail
+    assert not outcome.merged and outcome.repairable
+    assert f"files in {tree} that no commit holds" in outcome.detail
+    assert f"\n  {FAMILY}/a.py" in outcome.detail
     _git(tree, "commit", "-q", "-am", "unsigned")
     outcome = integration.integrate("core")
     assert not outcome.merged and outcome.repairable
@@ -1178,6 +1362,35 @@ def test_uncommitted_work_or_a_commit_that_breaks_the_rules_does_not_land(tmp_pa
     assert landed.merged and landed.commit == _git(repo, "rev-parse", "HEAD")
     assert (repo / FAMILY / "a.py").read_text() == "A = 2\n"
     assert _git(repo, "rev-list", "--merges", "--count", "HEAD") == "0"
+
+
+def test_what_lands_is_the_commit_that_was_checked_and_nothing_beside_it(tmp_path):
+    repo = _checkout(tmp_path)
+    integration = _integration(repo, tmp_path)
+    tree = integration.open("core")
+    (tree / FAMILY / "a.py").write_text("A = 2\n")
+    _git(tree, "commit", "-q", "-am", f"two{_SIGNED}")
+    # An untracked source: a check imports it, and the commit that lands does not hold it.
+    (tree / FAMILY / "extra.py").write_text("E = 1\n")
+    (tree / ".mcp.json").write_text("{}")  # what a sandbox drops is no source
+    outcome = integration.integrate("core")
+    assert not outcome.merged and outcome.repairable
+    assert outcome.detail.endswith(f"or remove them:\n  {FAMILY}/extra.py")
+    (tree / FAMILY / "extra.py").unlink()
+    checked: list[str] = []
+
+    def check(tree, tip):
+        checked.append(tip)
+        # The branch moves while the check runs: what it adds was not checked.
+        (tree / FAMILY / "a.py").write_text("A = 3\n")
+        _git(tree, "commit", "-q", "-am", f"three{_SIGNED}")
+        return ""
+
+    landed = integration.integrate("core", check)
+    assert landed.merged and [landed.commit] == checked
+    assert _git(repo, "rev-parse", "HEAD") == landed.commit
+    assert (repo / FAMILY / "a.py").read_text() == "A = 2\n"
+    assert [row["subject"] for row in load_labels(tmp_path / "ws")] == ["two"]
 
 
 def test_a_worker_whose_branch_is_behind_the_checkout_is_told_to_rebase_first(tmp_path):
@@ -1501,9 +1714,11 @@ def test_on_a_real_checkout_core_lands_only_the_commit_the_onboard_check_passed(
     assert kept.read_bytes() == b"rebuilt"
     later = _prompts(calls, "kv_fp8")[0]
     assert "- libraries were changed by `core`: rebuild before you boot" in later
-    assert f"kept in `{workspace / 'onboarded_libraries'}`" in later
+    said = f"kept and verified in `{workspace / 'onboarded_libraries'}` (1 file(s))"
+    assert f"The ones the onboard check accepted: {said}." in later
     report = _report(tmp_path)
     assert "are not the onboarded ones" in report and record["libraries"] in report
+    assert f"; the accepted ones: {said}" in report
     # Code other models run lands, labelled; a commit on a judge path is refused whole, the
     # task is not done, and the run goes on to its end.
     assert (repo / "shared.py").read_text() == "S = 2\n"
@@ -1668,39 +1883,167 @@ def test_a_process_that_died_after_the_commit_landed_goes_on_without_checking_ag
     assert _report(tmp_path).startswith(f"# onboarded: commit `{landed}`")
 
 
-def test_the_onboard_record_stands_when_the_accepted_libraries_cannot_be_kept(
-    tmp_path, monkeypatch
-):
+def _recording(tmp_path, refs: dict, events: list | None = None) -> SimpleNamespace:
+    """What the onboard record reads of a workflow: a scripted git with refs, the state, a journal."""
     repo, tree = tmp_path / "repo", tmp_path / "tree"
     for root in (repo, tree):
-        (root / "tensorrt_llm").mkdir(parents=True)
+        (root / "tensorrt_llm").mkdir(parents=True, exist_ok=True)
     (tree / "tensorrt_llm" / "libtensorrt_llm.so").write_bytes(b"rebuilt")
-    events: list[tuple[str, str]] = []
-    workflow = SimpleNamespace(
+    events = [] if events is None else events
+    return SimpleNamespace(
         task_data={"trtllm_repo_path": str(repo), "deployments": [{"name": "tp1", "options": {}}]},
         workspace=tmp_path / "ws",
-        _state=WorkflowState(task_path="t", slug="s"),
+        # The run began on a checkout with no library of its own: the tree's were rebuilt.
+        _state=WorkflowState(task_path="t", slug="s", libraries=contract_mod.library_digest(repo)),
         _contract=contract_mod.Contract((contract_mod.Check("tp1", "boot"),)),
         _contract_status=lambda: contract_mod.ContractStatus.load(tmp_path / "ws"),
-        _git=lambda *args: "",
+        _git=lambda repo, *args: scripted_refs(refs, "abc123", args),
         _checkpoint=lambda state: None,
         journal=SimpleNamespace(event=lambda what, detail="": events.append((what, detail))),
     )
+
+
+def _failing_once(monkeypatch, error: BaseException) -> None:
+    """The first write of a state that holds the onboard record fails with ``error``."""
+    real, fired = TrtllmModelingV2Workflow._checkpoint, []
+
+    def checkpoint(self, state):
+        if state.onboarded and not fired:
+            fired.append(True)
+            raise error
+        real(self, state)
+
+    monkeypatch.setattr(TrtllmModelingV2Workflow, "_checkpoint", checkpoint)
+
+
+def test_a_record_that_could_not_be_written_is_not_a_task_done(tmp_path, task_file, monkeypatch):
+    _failing_once(monkeypatch, OSError(28, "No space left on device"))
+    shell = _checks()
+    _run(tmp_path, _spec(task_file), monkeypatch, Script(), shell_runner=shell)
+    # The attempt ends with why; the next one finds its pass on record and writes the record.
+    core = _tasks(tmp_path)[1]
+    assert (core["status"], core["attempts"]) == ("done", 2)
+    assert shell.ran == ["tp1:boot", "tp1:accuracy"]
+    assert "the onboard record could not be written (OSError" in (
+        (tmp_path / "ws" / "journal.md").read_text()
+    )
+    assert _state(tmp_path).onboarded["commit"] == "c0ffee1"
+
+
+def test_a_start_that_finds_the_ref_and_no_record_takes_the_record_from_it(
+    tmp_path, task_file, monkeypatch
+):
+    git, shell = _Tree(), _checks()
+    run = dict(shell_runner=shell, git_runner=git, max_attempts=1)
+    # Cut after the ref was written and before the state.
+    _failing_once(monkeypatch, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        _run(tmp_path, _spec(task_file), monkeypatch, Script(), **run)
+    ref = f"refs/mv2/{SLUG}/onboarded"
+    assert git.refs == {ref: "c0ffee1"} and not _state(tmp_path).onboarded
+    # The head has moved since and no longer boots: the first accepted commit is the record
+    # all the same, and the ref is where it was.
+    git.at, shell.fail = "bbbbbbb", {"tp1:boot"}
+    workflow = _workflow(tmp_path, **run)
+    _install(monkeypatch, workflow, Script())
+    with workflow:
+        assert workflow.run(task_file) is True
+    assert _state(tmp_path).onboarded["commit"] == "c0ffee1" and git.refs == {ref: "c0ffee1"}
+    assert _report(tmp_path).startswith(f"# onboarded: commit `c0ffee1`, ref `{ref}`")
+
+
+def test_the_onboard_record_is_written_once_and_found_again(tmp_path):
+    refs: dict[str, str] = {}
+    workflow, tree, ref = _recording(tmp_path, refs), tmp_path / "tree", "refs/mv2/s/onboarded"
+    assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
+    record = dict(workflow._state.onboarded)
+    assert (record["commit"], record["ref"], refs) == ("abc123", ref, {ref: "abc123"})
+    assert record["accuracy"] == "unjudged (boot only)"
+    # Nothing later moves either: not another commit that passes, not a new start.
+    assert report_mod.record_onboarded(workflow, tree, "def456") == ""
+    report_mod.reconcile_onboarded(workflow)
+    assert workflow._state.onboarded == record and refs == {ref: "abc123"}
+    # A start cut after the ref and before the state: the ref is the record, whatever the
+    # head is by then, and it is not moved.
+    workflow._state.onboarded = {}
+    report_mod.reconcile_onboarded(workflow)
+    assert workflow._state.onboarded["commit"] == "abc123"
+    workflow._state.onboarded = {}
+    assert report_mod.record_onboarded(workflow, tree, "def456") == ""
+    assert workflow._state.onboarded["commit"] == "abc123" and refs == {ref: "abc123"}
+    # A state write that fails is not onboarded and is said; the ref holds it for the next start.
+    workflow._state.onboarded = {}
+
+    def full(state):
+        raise OSError(28, "No space left on device")
+
+    workflow._checkpoint = full
+    said = report_mod.record_onboarded(workflow, tree, "abc123")
+    assert said.startswith("the onboard record could not be written (OSError: [Errno 28]")
+    assert workflow._state.onboarded == {} and refs == {ref: "abc123"}
+    # A ref git did not write is not claimed, and is written on the next start.
+    refs.clear()
+    workflow._checkpoint, written = (lambda state: None), workflow._git
+    workflow._git = lambda repo, *args: None
+    assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
+    assert workflow._state.onboarded["ref"] == f"{ref} (git did not write it)"
+    workflow._git = written
+    # Created, never moved: a ref that is there for another commit stays, and is not claimed.
+    refs[ref] = "another"
+    report_mod.reconcile_onboarded(workflow)
+    assert workflow._state.onboarded["ref"].endswith("(git did not write it)")
+    assert refs == {ref: "another"}
+    refs.clear()
+    report_mod.reconcile_onboarded(workflow)
+    assert workflow._state.onboarded["ref"] == ref and refs == {ref: "abc123"}
+
+
+def test_the_accepted_libraries_are_kept_with_a_manifest_and_the_report_says_which(
+    tmp_path, monkeypatch
+):
+    events: list[tuple[str, str]] = []
+    workflow, tree = _recording(tmp_path, {}, events), tmp_path / "tree"
+    kept = tmp_path / "ws" / "onboarded_libraries"
+    assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
+    # Rebuilt since the run's start: copied, and the manifest, written last, says what.
+    assert (kept / "tensorrt_llm" / "libtensorrt_llm.so").read_bytes() == b"rebuilt"
+    manifest = json.loads((kept / "MANIFEST.json").read_text())
+    assert manifest["digest"] == workflow._state.onboarded["libraries"]
+    assert report_mod.kept_libraries(workflow) == f"kept and verified in `{kept}` (1 file(s))"
+    # A directory that merely exists says nothing: the bytes are held to the manifest.
+    (kept / "tensorrt_llm" / "libtensorrt_llm.so").write_bytes(b"built over")
+    said = report_mod.kept_libraries(workflow)
+    assert said == f"incomplete in `{kept}`: 1 file(s) are not what was copied"
+    (kept / "MANIFEST.json").unlink()
+    assert "no manifest of a finished copy" in report_mod.kept_libraries(workflow)
+    # A copy that fails takes nothing back, and is not said to be there.
+    workflow._state.onboarded = {}
 
     def full(source, target):
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(report_mod.shutil, "copy2", full)
-    report_mod.record_onboarded(workflow, tree, "abc123")
-    record = workflow._state.onboarded
-    assert record["commit"] == "abc123" and record["accuracy"] == "unjudged (boot only)"
-    assert record["ref"] == "refs/mv2/s/onboarded"
-    # A ref git refused to write is not claimed.
-    workflow._state.onboarded, workflow._git = {}, lambda *args: None
-    report_mod.record_onboarded(workflow, tree, "abc123")
-    assert workflow._state.onboarded["ref"] == "refs/mv2/s/onboarded (git did not write it)"
-    assert record["libraries"] == contract_mod.library_digest(tree)
+    assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
+    assert workflow._state.onboarded["commit"] == "abc123"
     assert events[-1][0] == "onboarded" and "were not kept" in events[-1][1]
+    assert report_mod.kept_libraries(workflow).startswith(f"incomplete in `{kept}`")
+    # A worktree links the checkout's build: rebuilt there, the checkout holds the same
+    # bytes, and a later task may build over them. They are kept all the same.
+    monkeypatch.undo()
+    shutil.rmtree(kept)
+    repo_lib = tmp_path / "repo" / "tensorrt_llm" / "libtensorrt_llm.so"
+    repo_lib.write_bytes(b"rebuilt")
+    workflow._state.onboarded = {}
+    assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
+    assert report_mod.kept_libraries(workflow).startswith("kept and verified in ")
+    repo_lib.unlink()
+    # Libraries that are the ones the run started with need no copy, linked or not.
+    workflow._state.onboarded = {}
+    workflow._state.libraries = contract_mod.library_digest(tree)
+    assert report_mod.record_onboarded(workflow, tree, "abc123") == ""
+    assert report_mod.kept_libraries(workflow) == (
+        "unchanged since the run's start, so none were kept"
+    )
 
 
 def test_a_pass_counts_only_for_the_content_it_measured(tmp_path):

@@ -271,7 +271,7 @@ def test_what_a_weak_run_slipped_without_is_in_the_text_its_worker_reads():
         assert "is the package at `/flow/trtllm_modeling_v2`" in said
         assert "One engine at a time: wait until one has exited before you start the next" in said
         assert "While a job you need is running, keep polling" in said
-        assert "Only commits are integrated; uncommitted work fails the task." in said
+        assert "Only commits are integrated: uncommitted work, or a source file left" in said
         assert "Read `/ws/operator_notes.md` first" in said
         assert "Read it again before you write your receipt." in said
 

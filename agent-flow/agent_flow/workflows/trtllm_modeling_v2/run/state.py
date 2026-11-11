@@ -27,9 +27,12 @@ class WorkflowState:
     slug: str = ""
     branch: str = ""
     devices: list[int] = field(default_factory=list)
+    #: The content hash of the checkout's native libraries at the run's first start: what
+    #: the onboard check accepted is kept beside the record when it differs from this.
+    libraries: str = ""
     #: Set when core's boot and benchmarks passed on the commit that then landed:
     #: ``commit``, ``ref``, ``libraries`` (their content hash), ``time`` and ``accuracy``
-    #: (``judged`` or ``unjudged (boot only)``). Empty until then.
+    #: (``judged`` or ``unjudged (boot only)``). Empty until then, and never changed after.
     onboarded: dict[str, str] = field(default_factory=dict)
 
 

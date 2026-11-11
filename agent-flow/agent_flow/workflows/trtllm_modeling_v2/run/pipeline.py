@@ -430,7 +430,7 @@ class Pipeline:
             commit = self.w._head()
             failed = check(repo, commit) if check else ""
             if not failed and task.kind == "core":
-                report_mod.record_onboarded(self.w, repo, commit)
+                failed = report_mod.record_onboarded(self.w, repo, commit)
             task.commit = "" if failed else commit
             return failed
         for turn in range(2, REPAIR_TURNS + 3):
@@ -438,10 +438,15 @@ class Pipeline:
             self.w.journal.event("integration", f"{task.id}: {outcome.detail}")
             if outcome.merged:
                 task.commit = outcome.commit
-                if task.kind == "core":
+                # A record that could not be written is not a task done: the next start
+                # finds the ref and takes the record from it.
+                failed = (
                     report_mod.record_onboarded(self.w, tree, outcome.commit)
+                    if task.kind == "core"
+                    else ""
+                )
                 self.integration.close(task.id)
-                return ""
+                return failed
             if outcome.checked:
                 return outcome.detail
             if not (outcome.base or outcome.repairable) or turn > REPAIR_TURNS + 1:
@@ -517,7 +522,6 @@ class Pipeline:
         deployment = found[self.units.index(task.unit)] if task.unit in self.units else found[0]
         target = str(getattr(w._preflight, "target_rel", "") or "")
         ended = [t for t in self.tasks if t is not task and t.status in (DONE, NOT_DONE, SKIPPED)]
-        kept = self.workspace / report_mod.LIBRARIES_DIRNAME
         head, lacks = behind(tree, self.integration.repo) if tree is not None else ("", "")
         work = str(tree or repo) if task.kind != "survey" else ""
         gates = self.workspace / "gates" / deployment.name
@@ -560,7 +564,8 @@ class Pipeline:
                 for t in self.tasks
                 if t is not task and t.lib_end not in ("", t.lib_start, task.lib_start)
             ],
-            kept=kept if kept.is_dir() else "",
+            # What the report says of them: kept and verified, incomplete, or not needed.
+            kept=report_mod.kept_libraries(w) if self.state.onboarded else "",
             python=w.environment.python if w.environment is not None else "",
             prefix=w.environment.prefix if w.environment is not None else "",
             devices=", ".join(map(str, self.state.devices)) or "none",

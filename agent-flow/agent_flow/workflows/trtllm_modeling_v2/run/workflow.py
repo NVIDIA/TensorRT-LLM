@@ -126,7 +126,11 @@ class TrtllmModelingV2Workflow:
         # owes, the verdict ledger, the state, what preflight resolved and recorded.
         self._contract: contract_mod.Contract | None = None
         self._status: contract_mod.ContractStatus | None = None
+        #: The verdict this start used or measured for each check: what its report prints.
+        self._selected: dict[str, contract_mod.Verdict] = {}
         self._state: WorkflowState | None = None
+        #: Why this start stopped before its first task, when it did (``run/start.py``).
+        self._stopped_at = ""
         self._preflight: Any = None
         self._surface_block: str = (
             "## Surface survey\n\nNot taken for this run: plan on the assumption that "
@@ -215,7 +219,10 @@ class TrtllmModelingV2Workflow:
         try:
             # On every start: each prompt and each check carries what preflight resolves.
             if not start_mod.start(self, state, log):
-                return False
+                # Onboarded stays true whatever a later start came to: it says so and why
+                # it stopped, over the report of the start that got further.
+                return report_mod.stopped_early(self, log)
+            report_mod.reconcile_onboarded(self)
             if self.dry_run:
                 print_message(
                     "[bold cyan]→ --dry-run: preflight passed; no agent turn follows.[/bold cyan]",

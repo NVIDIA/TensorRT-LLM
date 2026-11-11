@@ -35,7 +35,9 @@ from ..infra.git import (
     git_checked,
     git_output,
     link_native,
+    native_artifacts,
     repo_lock,
+    uncommitted,
 )
 from ..operators.coverage import INTEGRATION_TESTS_DIR, model_ops_tests_dir
 
@@ -230,12 +232,12 @@ class Integration:
                 f"(HEAD is {on or 'detached'}); check the branch out and finish there",
                 repairable=True,
             )
-        dirty = git_checked(tree, "status", "--porcelain", "--untracked-files=no", check=False)
-        if dirty.strip():
+        dirty = uncommitted(tree, self.unmeasured())
+        if dirty:
             return Outcome(
                 False,
-                f"uncommitted changes in {tree}; commit them with `git commit -s` before "
-                "finishing:\n" + dirty.strip(),
+                f"files in {tree} that no commit holds; commit them with `git commit -s` "
+                "before finishing, or remove them:\n  " + "\n  ".join(dirty[:20]),
                 repairable=True,
             )
         with repo_lock(self.repo):
@@ -266,21 +268,28 @@ class Integration:
         if failed:
             return Outcome(False, failed, checked=True)
         with repo_lock(self.repo):
-            merged = self._git(self.repo, "merge", "--ff-only", "--quiet", branch)
+            # The commit that was checked, by its hash: a branch that moved while the check
+            # ran lands nothing the check did not measure.
+            merged = self._git(self.repo, "merge", "--ff-only", "--quiet", tip)
             for _ in range(LOCK_RETRIES):
                 # Another git process held the checkout's index lock for a moment.
                 if merged.returncode == 0 or "index.lock" not in merged.stderr:
                     break
                 time.sleep(LOCK_RETRY_S)
-                merged = self._git(self.repo, "merge", "--ff-only", "--quiet", branch)
+                merged = self._git(self.repo, "merge", "--ff-only", "--quiet", tip)
             if merged.returncode != 0:
                 # The checkout moved while the check ran, or git refused: nothing landed.
                 return Outcome(False, f"fast-forward of {branch} failed: {merged.stderr.strip()}")
-            self._label(task_id, head, branch)
+            self._label(task_id, head, tip)
         said = (
             f"integrated {branch} ({ahead} commit(s))" if ahead != "0" else "nothing to integrate"
         )
         return Outcome(True, said, tip)
+
+    def unmeasured(self) -> tuple[str, ...]:
+        """What a worktree may hold outside its commit: the native build it links, the workspace."""
+        denied = self.policy.denied_paths if self.policy is not None else ()
+        return (*native_artifacts(self.repo), *denied)
 
     def _label(self, task_id: str, head: str, branch: str) -> None:
         """Record each commit the task landed as the target's own, shared code, or both."""

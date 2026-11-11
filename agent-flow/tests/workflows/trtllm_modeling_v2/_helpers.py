@@ -116,6 +116,8 @@ def _build_repo(tmp_path: Path, *, modeling: str = _MODELING) -> Path:
     target.mkdir(parents=True)
     (target / "modeling.py").write_text(modeling, encoding="utf-8")
     (target / "weights.py").write_text(_WEIGHTS, encoding="utf-8")
+    # As the tree does: what a build writes is not a source, and git does not list it.
+    (root / ".gitignore").write_text("*.so\n__pycache__/\n", encoding="utf-8")
 
     catalog = root / catalog_paths.CATALOG_DIR
     for category, name in _SHARED_ENTRIES:
@@ -262,16 +264,30 @@ def scripted_boot(workflow):
 def fake_git(*, head: str = "c0ffee1", dirt: str = ""):
     """Answer the git questions the orchestrator asks of the checkout, as `vcs.git_output` does."""
 
+    refs: dict[str, str] = {}
+
     def run(repo, *args, stdin=None):
         if args[:2] == ("log", "-1"):
             return head + "\n"
         if args[:2] == ("status", "--porcelain"):
             return dirt
-        if args[:1] == ("rev-parse",):
-            return head + "\n"
+        if args[:1] in (("rev-parse",), ("update-ref",)):
+            return scripted_refs(refs, head, args)
         return ""
 
     return run
+
+
+def scripted_refs(refs: dict, head: str, args: tuple) -> str | None:
+    """A scripted git's refs: one is there once written, and `update-ref <ref> <new> ""` only creates."""
+    if args[:3] == ("rev-parse", "--verify", "--quiet"):
+        return refs.get(args[3])
+    if args[0] == "update-ref":
+        if args[3:] == ("",) and args[1] in refs:
+            return None
+        refs[args[1]] = args[2]
+        return ""
+    return head + "\n"
 
 
 def healthy_smi(count: int = 1, free: int = 180000, cap: str = "10.3", **said):

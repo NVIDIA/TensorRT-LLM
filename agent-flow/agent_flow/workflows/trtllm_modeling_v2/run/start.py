@@ -44,6 +44,8 @@ def start(workflow, state, log) -> bool:
     def stop(title: str, body: str) -> bool:
         print_message(f"[bold red]✘ {title}: {escape_markup(body)}[/bold red]", log)
         workflow.journal.section(title, body)
+        # For the report of a run that was onboarded before this start.
+        workflow._stopped_at = f"{title}: {body}"
         return False
 
     task = workflow.task_data
@@ -114,6 +116,7 @@ def start(workflow, state, log) -> bool:
     body = "\n".join(lines + [f"- differs from the tree now: {line}" for line in moved])
     workflow.journal.section(f"deployments: {len(found)}", body)
     print_message(f"deployments ({len(found)}):\n{escape_markup(body)}")
+    state.libraries = state.libraries or contract_mod.library_digest(task["trtllm_repo_path"])
     workflow._checkpoint(state)
     return True
 

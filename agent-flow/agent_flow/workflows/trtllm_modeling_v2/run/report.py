@@ -27,6 +27,7 @@ judged it and what it attested of the engine that ran.
 
 from __future__ import annotations
 
+import json
 import shlex
 import shutil
 from dataclasses import dataclass
@@ -43,7 +44,7 @@ from ..checks import anchors, conventions, gate_cli, pytest_runner
 from ..checks import verdict as check_result
 from ..infra.compute.commands import CommandSpec
 from ..infra.files import write_text_atomic
-from ..infra.git import git_output
+from ..infra.git import git_output, native_artifacts, uncommitted
 from ..operators.coverage import CATALOG_TESTS_DIR, MODELING_V2_PACKAGE, model_ops_tests_dir
 from ..spec import deployments as deployments_mod
 from . import contract as contract_mod
@@ -56,6 +57,8 @@ CHECKS_DIRNAME = "gates"
 #: Under the workspace: the native libraries the onboard check accepted, when the checkout's
 #: are not those.
 LIBRARIES_DIRNAME = "onboarded_libraries"
+#: Written there after the copy: each library's content hash. No manifest, no finished copy.
+LIBRARIES_MANIFEST = "MANIFEST.json"
 #: How many times a check the infrastructure ended (no verdict) runs again.
 INFRASTRUCTURE_RERUNS = 1
 #: The most test modules of its own a target delivers that a reviewer accepts: reported past
@@ -63,6 +66,8 @@ INFRASTRUCTURE_RERUNS = 1
 TARGET_TEST_MODULES_MAX = 20
 #: The gates of core the onboard check runs; its others are the final pass's.
 ONBOARD_GATES = ("boot", "accuracy")
+#: The target's own tests, on the ledger beside the deployments' checks.
+DELIVERED_TESTS = contract_mod.Check("target", "delivered-tests")
 #: What no check of this flow looks at, said in every report.
 NOT_CHECKED: tuple[str, ...] = (
     "whether the target's tests are registered with the repository's CI",
@@ -77,21 +82,55 @@ def onboard_ref(slug: str) -> str:
     return f"refs/mv2/{slug or 'run'}/onboarded"
 
 
+def _unmeasurable(workflow, tree: Path, commit: str) -> str:
+    """Why a check on ``tree`` would not be a check of ``commit``; ``""`` when it would.
+
+    Another head, or files the commit does not hold (an untracked source too): what the
+    check measured would not be what lands.
+    """
+    head = (workflow._git(str(tree), "rev-parse", "HEAD") or "").split()
+    if commit and head and head[0] != commit:
+        return f"the tree is at {head[0][:12]}, not at the commit the check is for"
+    repo = Path(str(workflow.task_data["trtllm_repo_path"]))
+    ignore = (*native_artifacts(repo), *workflow._commit_policy().denied_paths)
+    stray = uncommitted(tree, ignore, workflow._git)
+    if stray:
+        return f"{len(stray)} file(s) in the tree are in no commit: {', '.join(stray[:6])}"
+    return ""
+
+
+def _no_verdict(workflow, check: contract_mod.Check, commit: str, why: str) -> contract_mod.Verdict:
+    """A check that measured nothing of ``commit``: said, kept for this start's report, not recorded."""
+    said = f"[NO VERDICT] {check.key}: {why}"
+    workflow.journal.event("check without a verdict", f"at {commit[:12]}: {said}")
+    print_message(f"[bold yellow]{escape_markup(said)}[/bold yellow]")
+    verdict = contract_mod.Verdict(
+        check.deployment, check.gate, False, why, commit=commit, summary=said, unjudged=True
+    )
+    workflow._selected[check.key] = verdict
+    return verdict
+
+
 def measure(
     workflow, check: contract_mod.Check, *, tree: Path, commit: str, bases: Collection[str] = ()
 ) -> contract_mod.Verdict:
     """``check`` on ``tree`` at ``commit``, recorded; a pass on record for this content is reused.
 
-    A relative anchor's score is the other deployment's on the same content: measured here
-    first when that deployment is one of ``bases``, else absent, and the check reports a
-    score with no verdict. A check that cannot be run at all is a failed check with why.
+    The tree must be the commit, clean, before the check and after it: otherwise nothing
+    was measured of the commit, and there is no verdict, on record or not. A relative
+    anchor's score is the other deployment's on the same content: measured here first
+    when that deployment is one of ``bases``, else absent, and the check reports a score
+    with no verdict; a score that stood so is judged from the record once the other
+    deployment has one. A check that cannot be run at all is a failed check with why.
     """
     identity = workflow._identity(commit, tree)
+    why = _unmeasurable(workflow, tree, commit) or (
+        "" if identity else "the tree's content cannot be identified: git names no commit"
+    )
+    if why:
+        return _no_verdict(workflow, check, commit, why)
     status = workflow._contract_status()
     have = status.on(identity)
-    if check.key in have and have[check.key].passed:
-        workflow.journal.event("check", f"{check.key}: on record for this content, reused")
-        return have[check.key]
     relative = None
     held = None
     if check.gate.startswith("accuracy["):
@@ -102,9 +141,26 @@ def measure(
         if scored is None and held.relative_to in bases:
             scored = measure(workflow, base, tree=tree, commit=commit)
         relative = scored.measured if scored is not None else None
+    kept = have.get(check.key)
+    # A score that waited for its base is judged now, from the record: no load.
+    waited = kept is not None and kept.unjudged and None not in (kept.measured, relative)
+    if kept is not None and kept.passed and not waited:
+        workflow.journal.event("check", f"{check.key}: on record for this content, reused")
+        workflow._selected[check.key] = kept
+        return kept
     result: Any = None
     for _ in range(1 + INFRASTRUCTURE_RERUNS):
         try:
+            if waited:
+                result = gate_cli.rejudge(
+                    workflow.task_data,
+                    check.gate,
+                    check.deployment,
+                    kept.measured,
+                    relative,
+                    workspace=workflow.workspace,
+                )
+                break
             result = gate_cli.run_check(
                 workflow.task_data,
                 check.gate,
@@ -126,7 +182,14 @@ def measure(
         if not result.infrastructure:
             break
         workflow.journal.event("check without a verdict", f"{check.key}: {result.infrastructure}")
+    # What was measured is the commit only when the tree is still it, as it was.
+    moved = _unmeasurable(workflow, tree, commit)
+    if not moved and workflow._identity(commit, tree) != identity:
+        moved = "its native libraries are not the ones the check started on"
+    if moved:
+        return _no_verdict(workflow, check, commit, f"the tree changed under the check: {moved}")
     verdict = status.record(check, result, tree=identity, commit=commit)
+    workflow._selected[check.key] = verdict
     workflow.journal.event("check", f"at {commit[:12]}: {result.summary()}")
     colour = "green" if verdict.passed else "yellow"
     print_message(f"[bold {colour}]{escape_markup(result.summary())}[/bold {colour}]")
@@ -138,21 +201,69 @@ def _onboard_checks(workflow) -> list[contract_mod.Check]:
     return [c for c in workflow._contract.of(core) if c.gate.partition("[")[0] in ONBOARD_GATES]
 
 
+def _unanchored(workflow, check: contract_mod.Check) -> bool:
+    """Whether ``check`` is a benchmark nothing judges: no declared anchor and no reference row."""
+    if not check.gate.startswith("accuracy["):
+        return False
+    held = anchors.frozen(workflow.workspace, check.deployment, check.gate[9:-1])
+    return held is not None and held.kind == anchors.NONE
+
+
 def onboard_check(workflow, tree: Path, commit: str) -> str:
-    """Core's boot and benchmarks on ``tree`` at ``commit``; the first failure's line, or ``""``."""
+    """Core's boot and benchmarks on ``tree`` at ``commit``; the first failure's line, or ``""``.
+
+    Only what has something to judge it can refuse: a benchmark with no anchor that
+    fails to run leaves the deployment onboarded on its boot, and is a line of the report.
+    """
     print_rule("[bold magenta]onboard check[/bold magenta]")
     for check in _onboard_checks(workflow):
         verdict = measure(workflow, check, tree=tree, commit=commit)
-        if not verdict.passed:
+        if not verdict.passed and not _unanchored(workflow, check):
             return verdict.summary or f"{check.key}: {verdict.detail}"
     return ""
 
 
-def record_onboarded(workflow, tree: Path, commit: str) -> None:
-    """Write the onboard record for ``commit``, once; see the module docstring."""
+def _pinned(workflow, repo: Path, ref: str) -> str:
+    """The commit ``ref`` points at in ``repo``; ``""`` when there is no such ref."""
+    return (workflow._git(str(repo), "rev-parse", "--verify", "--quiet", ref) or "").strip()
+
+
+def _pin(workflow, repo: Path, ref: str, commit: str) -> bool:
+    """Create ``ref`` at ``commit``, never move it; whether it now says ``commit``."""
+    # The empty old value: git writes the ref only when there is none.
+    workflow._git(str(repo), "update-ref", ref, commit, "")
+    return _pinned(workflow, repo, ref) == commit
+
+
+def reconcile_onboarded(workflow) -> None:
+    """On a new start, make the state and the ref say the same; neither is moved.
+
+    A ref an earlier start wrote and could not record is the record: the state takes its
+    commit. A ref the record names and git did not write is written now.
+    """
+    state = workflow._state
+    repo = Path(str(workflow.task_data["trtllm_repo_path"]))
+    record, ref = state.onboarded, onboard_ref(state.slug)
+    if not record:
+        pinned = _pinned(workflow, repo, ref)
+        if pinned:
+            workflow.journal.event("onboarded", f"taken from {ref}: an earlier start wrote it")
+            record_onboarded(workflow, repo, pinned)
+    elif record["ref"] != ref and _pin(workflow, repo, ref, record["commit"]):
+        state.onboarded = {**record, "ref": ref}
+        workflow._checkpoint(state)
+
+
+def record_onboarded(workflow, tree: Path, commit: str) -> str:
+    """Write the onboard record for ``commit``, once; why it is not written, or ``""``.
+
+    The ref is created and never moved: where one stands already, its commit is the
+    record. Nothing is onboarded that the state file does not hold: a write that fails
+    is said, and the next start takes the record from the ref.
+    """
     state = workflow._state
     if state.onboarded:
-        return
+        return ""
     repo = Path(str(workflow.task_data["trtllm_repo_path"]))
     status = workflow._contract_status()
     scores = [
@@ -161,29 +272,96 @@ def record_onboarded(workflow, tree: Path, commit: str) -> None:
     judged = any(v is not None and not v.unjudged for v in scores)
     libraries = contract_mod.library_digest(tree)
     ref = onboard_ref(state.slug)
-    if workflow._git(str(repo), "update-ref", ref, commit) is None:
-        ref += " (git did not write it)"
+    commit = _pinned(workflow, repo, ref) or commit
+    written = _pin(workflow, repo, ref, commit)
     state.onboarded = dict(
         commit=commit,
-        ref=ref,
+        ref=ref if written else f"{ref} (git did not write it)",
         libraries=libraries,
         time=utc_now(),
         accuracy="judged" if judged else "unjudged (boot only)",
     )
-    workflow._checkpoint(state)
+    try:
+        workflow._checkpoint(state)
+    except OSError as exc:
+        state.onboarded = {}
+        why = f"the onboard record could not be written ({type(exc).__name__}: {exc})"
+        workflow.journal.event("onboarded", f"{why}; {ref} holds it for the next start")
+        return why
     workflow.journal.event("onboarded", f"{commit} ({ref}); accuracy {state.onboarded['accuracy']}")
     print_message(f"[bold green]✔ onboarded at {commit[:12]}[/bold green]")
-    if Path(tree) == repo or libraries == contract_mod.library_digest(repo):
-        return
-    # This run rebuilt them: the checkout does not hold what was accepted. A copy that
-    # fails (a full disk) is said and takes nothing back.
+    if state.libraries and libraries != state.libraries:
+        _keep_libraries(workflow, Path(tree), libraries)
+    return ""
+
+
+def _keep_libraries(workflow, tree: Path, digest: str) -> None:
+    """Copy the native libraries the onboard check accepted, then say what was copied.
+
+    This run rebuilt them, in a worktree or through its links in the checkout itself: a
+    later task may build over them. The manifest is written last, so a copy that was
+    cut or failed has none. Nothing here takes the record back.
+    """
+    kept = workflow.workspace / LIBRARIES_DIRNAME
     try:
-        for library in contract_mod.native_libraries(Path(tree)):
-            kept = workflow.workspace / LIBRARIES_DIRNAME / library.relative_to(tree)
-            kept.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(library, kept)
+        files = {}
+        for library in contract_mod.native_libraries(tree):
+            target = kept / library.relative_to(tree)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(library, target)
+            files[library.relative_to(tree).as_posix()] = contract_mod.content_hash(target)
+        manifest = json.dumps({"digest": digest, "files": files}, indent=1)
+        write_text_atomic(kept / LIBRARIES_MANIFEST, manifest)
     except OSError as exc:
         workflow.journal.event("onboarded", f"the accepted libraries were not kept: {exc}")
+
+
+def kept_libraries(workflow) -> str:
+    """What the report says of the accepted libraries: not needed, kept and verified, or incomplete."""
+    state, kept = workflow._state, workflow.workspace / LIBRARIES_DIRNAME
+    record = state.onboarded
+    if not state.libraries or record["libraries"] == state.libraries:
+        return "unchanged since the run's start, so none were kept"
+    try:
+        manifest = json.loads((kept / LIBRARIES_MANIFEST).read_text(encoding="utf-8"))
+        wrong = [
+            name
+            for name, digest in manifest["files"].items()
+            if contract_mod.content_hash(kept / name) != digest
+        ]
+        if manifest["digest"] != record["libraries"] or wrong:
+            return f"incomplete in `{kept}`: {len(wrong)} file(s) are not what was copied"
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return f"incomplete in `{kept}`: no manifest of a finished copy ({type(exc).__name__})"
+    return f"kept and verified in `{kept}` ({len(manifest['files'])} file(s))"
+
+
+def stopped_early(workflow, log=None) -> bool:
+    """A start that ended before its first task: whether the run is onboarded all the same.
+
+    The earlier report must not stand as this start's: it gets a line saying that this
+    start stopped, and why.
+    """
+    record = workflow._state.onboarded
+    if not record:
+        return False
+    why = (workflow._stopped_at or "it did not say why").splitlines()[0]
+    note = f"- this start ({utc_now()}) stopped before its first task: {why}"
+    path = workflow.workspace / REPORT_FILENAME
+    old = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    rest = [line for line in old[1:] if not line.startswith("- this start (")]
+    rest = rest[1:] if rest[:1] == [""] else rest
+    write_text_atomic(path, "\n".join([_first_line(record), "", note, *rest]) + "\n")
+    said = f"onboarded at {record['commit'][:12]} by an earlier start; this one stopped: {why}"
+    workflow.journal.section("run closed", f"- {said}\n- report: `{path}`")
+    print_message(f"[bold green]{escape_markup(said)}[/bold green]\nreport: {path}", log)
+    return True
+
+
+def _first_line(record: dict) -> str:
+    unjudged = "" if record["accuracy"] == "judged" else f"; accuracy {record['accuracy']}"
+    where = f"commit `{record['commit']}`, ref `{record['ref']}`, {record['time']}"
+    return f"# onboarded: {where}{unjudged}"
 
 
 # ------------------------------------------------------------------------ the final pass
@@ -294,6 +472,12 @@ def delivered_tests(workflow, commit: str) -> Line | None:
     files = pytest_runner.list_test_files(repo, commit, paths) if commit else []
     if not files:
         return None
+    # On record like any check: a start cut after them does not run them again on this content.
+    check, identity = DELIVERED_TESTS, workflow._identity(commit, repo)
+    status = workflow._contract_status()
+    kept = status.on(identity).get(check.key)
+    if kept is not None and kept.passed:
+        return Line("tests", True, f"{kept.detail} (on record for this content)", kept.commit)
     python = str((workflow.task_data.get("environment") or {}).get("python") or "python3")
     report = workflow.workspace / CHECKS_DIRNAME / commit[:12] / "delivered-tests.xml"
     report.parent.mkdir(parents=True, exist_ok=True)
@@ -310,7 +494,10 @@ def delivered_tests(workflow, commit: str) -> Line | None:
         tail = (done.stdout + done.stderr)[-2000:]
         return Line("tests", False, f"INCOMPLETE (pytest exited {done.returncode}): {tail}", commit)
     said = f"{outcome.describe()}; {len(files)} test file(s) asked for"
-    return Line("tests", outcome.verdict() == "CLEAN", said, commit)
+    line = Line("tests", outcome.verdict() == "CLEAN", said, commit)
+    result = check_result.GateResult(check.gate, line.passed, said, deployment=check.deployment)
+    status.record(check, result, tree=identity, commit=commit)
+    return line
 
 
 def delivery_lines(workflow, commit: str) -> list[Line]:
@@ -420,15 +607,24 @@ def findings_left(workflow) -> list[str]:
 
 
 def _done_rows(workflow, pipeline) -> list[str]:
-    """One table row per check of each done deployment: what it measured, against what, where."""
+    """One table row per check of each done deployment: what it measured, against what, where.
+
+    The verdict is the one this start used or measured, never the ledger's latest for the
+    key: a check it did not run reads "not run". Core's own, which the final pass leaves
+    alone, are the ones of the onboarded commit.
+    """
     status, frozen = workflow._contract_status(), anchors.load(workflow.workspace)
+    onboarded = str((workflow._state.onboarded or {}).get("commit") or "")
+    first = _onboard_checks(workflow)
     left = {
         (r["deployment"], r["check"]) for r in getattr(workflow._preflight, "not_attempted", ())
     }
     rows = []
     for name in pipeline.done_deployments():
         for check in (c for c in workflow._contract.of(name) if (name, c.gate) not in left):
-            v = status.last(check.key)
+            v = workflow._selected.get(check.key)
+            if v is None and check in first:
+                v = status.at(check.key, onboarded)
             held = frozen.get(f"{name}:{check.gate[9:-1]}") if "[" in check.gate else None
             anchor = "-"
             if held is not None:
@@ -448,25 +644,26 @@ def write_report(workflow, pipeline) -> Path:
     """``delivery_report.md``: written whenever the pipeline ended, whatever it came to."""
     w, task, record = workflow, workflow.task_data, workflow._state.onboarded
     repo = Path(str(task["trtllm_repo_path"]))
-    if record:
-        unjudged = "" if record["accuracy"] == "judged" else f"; accuracy {record['accuracy']}"
-        where = f"commit `{record['commit']}`, ref `{record['ref']}`, {record['time']}"
-        lines = [f"# onboarded: {where}{unjudged}"]
-    else:
-        lines = _stopped(w, pipeline)
+    lines = [_first_line(record)] if record else _stopped(w, pipeline)
     lines += [
         "",
         f"- checkpoint: `{task.get('checkpoint_path')}`",
         f"- target: `{getattr(w._preflight, 'target_rel', '')}`",
         f"- repository: `{repo}` at `{w._head() or '(no commit)'}`",
     ]
+    for check in _onboard_checks(w) if record else ():
+        v = w._selected.get(check.key) or w._contract_status().at(check.key, record["commit"])
+        if v is not None and not v.passed and _unanchored(w, check):
+            said = v.summary or v.detail
+            lines.append(f"- `{check.key}` has no anchor, and its evaluation failed: {said}")
     if record:
-        now, kept = contract_mod.library_digest(repo), w.workspace / LIBRARIES_DIRNAME
+        now = contract_mod.library_digest(repo)
         same = now == record["libraries"]
         said = "are the onboarded ones" if same else f"({now}) are not the onboarded ones"
-        if not same and kept.is_dir():
-            said += f": the accepted ones are in `{kept}`"
-        lines.append(f"- native libraries: the head's {said} ({record['libraries']})")
+        lines.append(
+            f"- native libraries: the head's {said} ({record['libraries']}); the accepted "
+            f"ones: {kept_libraries(w)}"
+        )
     for t in pipeline.tasks:
         if t.lib_end and t.lib_end != t.lib_start and t.status != pipeline.DONE:
             lines.append(f"- native libraries were changed by `{t.id}`, which did not land")

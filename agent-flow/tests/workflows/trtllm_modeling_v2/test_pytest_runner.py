@@ -16,7 +16,7 @@ import pytest
 from agent_flow.workflows.trtllm_modeling_v2.checks import pytest_runner
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import model_ops_tests_dir
-from agent_flow.workflows.trtllm_modeling_v2.run import report
+from agent_flow.workflows.trtllm_modeling_v2.run import contract, report
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is not available")
 
@@ -57,7 +57,14 @@ class _Delivery:
         }
         self.workspace = tmp_path / "ws"
         self._preflight = SimpleNamespace(target_rel=TARGET)
+        self._status = contract.ContractStatus.load(self.workspace)
         self.ran: list[str] = []
+
+    def _identity(self, commit, tree=None):
+        return contract.tree_id(tree or self.repo, commit)
+
+    def _contract_status(self):
+        return self._status
 
     def _shell_runner(self, command, env=None, timeout=0):
         self.ran.append(command)
@@ -85,6 +92,16 @@ def test_the_delivered_tests_run_once_at_the_commit_and_hold_on_their_passing(tm
     [command] = stage.ran
     assert command.startswith(f"cd {stage.repo} && export PYTHONPATH={stage.repo}")
     assert "--junitxml=" in command and "--timeout=180" in command
+    # The result is on record like any check: a start cut after them, on the same content,
+    # does not run them again; another commit's content does.
+    again = stage.check()
+    assert again.passed and len(stage.ran) == 1 and again.commit == stage.head
+    assert again.detail.endswith("2 test file(s) asked for (on record for this content)")
+    assert contract.ContractStatus.load(stage.workspace).last("target:delivered-tests").passed
+    (stage.repo / tests / "test_forward.py").write_text(PASSING + "\n# changed\n")
+    _git(stage.repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "y")
+    stage.head = _git(stage.repo, "rev-parse", "HEAD")
+    assert stage.check().passed and len(stage.ran) == 2
 
 
 @pytest.mark.parametrize(

@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 Build a TensorRT-LLM Modeling V2 target from a HuggingFace checkpoint. Agents write the code; Python fixes the order of the tasks, lands their commits and runs every check.
 
-**`onboarded`** means: the first deployment of the spec (`core`) boots with `modeling_v2=require` on the commit that landed, and each of its benchmarks meets its frozen floor (`anchor - 2 x SE`, anchors in `<ws>/anchors.yaml`). With no anchor it holds on the boot alone, and the report says `accuracy unjudged (boot only)`. Once met, the flow writes `refs/mv2/<slug>/onboarded` and keeps rebuilt native libraries in `<ws>/onboarded_libraries/`; nothing later takes it back.
+**`onboarded`** means: the first deployment of the spec (`core`) boots with `modeling_v2=require` on the commit that landed, and each of its benchmarks meets its frozen floor (`anchor - 2 x SE`, anchors in `<ws>/anchors.yaml`). With no anchor it holds on the boot alone, and the report says `accuracy unjudged (boot only)`. Once met, the flow writes `refs/mv2/<slug>/onboarded` (created once, never moved) and keeps native libraries the run rebuilt in `<ws>/onboarded_libraries/`, with a manifest; nothing later takes it back, and a later start that stops early still exits 0 and says in the report why it stopped.
 
 **Exit status:** 0 onboarded (or a `--dry-run` whose preflight passed), 1 not onboarded, 2 a spec, state or usage error, 3 the workspace is held by another process.
 
@@ -49,7 +49,7 @@ A run that is not onboarded says in its first lines where it stopped, the result
 
 Nothing here names a scheduler. A site adds three fields:
 
-- `launch`, on a deployment or on each of `ctx` and `gen`: the prefix that places the server's ranks (allocation and container only; the flow adds the ranks' launcher). It starts one process per rank, which the flow checks before a load. It stays in the foreground, sees the same workspace, checkout and checkpoint paths, and gives rank 0 a hostname this host reaches. `environment.launch` is the prefix of one-GPU commands.
+- `launch`, on a deployment or on each of `ctx` and `gen`: the prefix that places the server's ranks (allocation and container only; the flow adds the ranks' launcher). It starts one process per rank, which the flow checks before a load; a prefix that starts one process per node and makes the ranks inside it is not supported. It stays in the foreground, sees the same workspace, checkout and checkpoint paths, and gives rank 0 a hostname this host reaches. `environment.launch` is the prefix of one-GPU commands.
 - `stop`, beside `launch`: the site's command that ends what `launch` started. Both receive `MV2FLOW_SERVER=<deployment>[.<role>]`.
 - `env`, on a deployment: what its servers need of the site.
 

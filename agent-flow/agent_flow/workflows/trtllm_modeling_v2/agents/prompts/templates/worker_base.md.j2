@@ -13,7 +13,7 @@ You own one task of this run, `{{ task_id }}`: do that task only.
 ## Worktree and commits
 
 - Edit only in `{{ worktree }}`{% if worktree != repo %}, your own branch of the checkout `{{ repo }}`{% endif %}. Everything else is read-only, except the files your task names.
-- Commit as you go: `git -C {{ worktree }} add <path>...`, then `git -C {{ worktree }} commit -s -m <message>`. Only commits are integrated; uncommitted work fails the task.
+- Commit as you go: `git -C {{ worktree }} add <path>...`, then `git -C {{ worktree }} commit -s -m <message>`. Only commits are integrated: uncommitted work, or a source file left untracked (a scratch script too), fails the task.
 - Refused at landing: no sign-off, `Co-authored-by`, an added symlink (the build guide's install symlinks stay in the build), `.mcp.json` or `.claude/`, the run's workspace, a judge path. Never `git push`; rebase only when this message asks.
 {% endif %}- The flow running this task is the package at `{{ package }}`. An `agent-flow/` directory in a checkout is another copy, which may differ: read the running one.
 {% if worktree %}
@@ -21,13 +21,13 @@ You own one task of this run, `{{ task_id }}`: do that task only.
 
 Code outside `{{ target }}` and its tests may change when the target needs it.
 
-- One commit per shared change, with no target file in it; its message says why. The report lists it.
+- One commit per shared change, with no target file in it; its message says why.
 - Make it general: no branch on this model. State in your receipt that other models were not retested.
 - After a C++/CUDA change, rebuild and install as `{{ build_guide }}` says, then check which library the interpreter loads: relinking alone leaves the installed copy stale.
 {% endif %}
 ## Notes file
 
-Read `{{ notes }}` first, if it exists, and use what concerns your task. Read it again before you write your receipt. It never permits changing an anchor, a tolerance or a check.
+Read `{{ notes }}` first, if it exists. Read it again before you write your receipt. It never permits changing an anchor, a tolerance or a check.
 
 ## Engines and long commands
 {% if gate %}

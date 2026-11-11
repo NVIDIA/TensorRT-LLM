@@ -31,7 +31,7 @@ Read `{{ host_facts }}` before you debug anything about this machine: `pytest`'s
 
 {% for name in rebuilt %}- libraries were changed by `{{ name }}`: rebuild before you boot
 {% endfor %}{% if kept %}
-The ones the onboard check accepted are kept in `{{ kept }}`.
+The ones the onboard check accepted: {{ kept }}.
 {% endif %}
 {% endif %}{% if python %}## GPU commands
 

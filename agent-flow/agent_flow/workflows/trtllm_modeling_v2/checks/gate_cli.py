@@ -205,12 +205,7 @@ def run_check(
             # With no score of that deployment, this one's is reported with no verdict.
             relative_score = None if first.infrastructure else first.measured
         if held.kind == anchors.RELATIVE and relative_score is not None:
-            # The other deployment's score is on its own scale: it is brought to this
-            # benchmark's before anything is held to it.
-            base = anchors.frozen(workspace, held.relative_to, benchmark.name)
-            other = deployments_mod.named(task_data, held.relative_to).benchmark(benchmark.name)
-            unit = base.unit if base else other.unit if other else held.unit
-            relative_score = anchors.rescale(relative_score, unit, held.unit)
+            relative_score = _on_scale(task_data, held, relative_score, workspace)
         judge = dict(anchor=held, relative_score=relative_score, runner=runner, **bound)
         if found.kind == AGGREGATED:
             result = accuracy_checks.run_accuracy_gate(
@@ -251,6 +246,51 @@ def run_check(
     # One load at a time: the run's checks and a worker's own never share the devices.
     with servers.engine_lock(workspace):
         return named()
+
+
+def _on_scale(
+    task_data: Mapping[str, Any], held: anchors.Anchor, score: float, workspace: Any
+) -> float:
+    """The score of the deployment ``held`` is relative to, on ``held``'s own scale.
+
+    The other deployment's score is on its own scale: it is brought to this benchmark's
+    before anything is held to it.
+    """
+    base = anchors.frozen(workspace, held.relative_to, held.benchmark)
+    other = deployments_mod.named(task_data, held.relative_to).benchmark(held.benchmark)
+    unit = base.unit if base else other.unit if other else held.unit
+    return anchors.rescale(score, unit, held.unit)
+
+
+def rejudge(
+    task_data: Mapping[str, Any],
+    gate: str,
+    deployment: str,
+    measured: float,
+    relative_score: float,
+    *,
+    workspace: str | Path,
+) -> check_result.GateResult:
+    """Judge a score on record against its base's score, measured since: nothing is run.
+
+    For a benchmark whose anchor is another deployment's score: its own score stood with
+    no verdict while that deployment had none.
+    """
+    found = deployments_mod.named(task_data, deployment)
+    benchmark = found.benchmark(gate.partition("[")[2].rstrip("]"))
+    held = anchors.frozen(workspace, found.name, benchmark.name) or anchors.resolve(
+        task_data, found, benchmark
+    )
+    fields = accuracy_checks.judged(
+        measured,
+        held,
+        benchmark,
+        relative_score=_on_scale(task_data, held, relative_score, workspace),
+        output="",
+        how=" (its score on record, judged now that the other deployment has one)",
+    )
+    path = TRTLLM_EVAL if found.kind == AGGREGATED else THROUGH_ENDPOINT
+    return check_result.GateResult(name=gate, deployment=found.name, path=path, **fields)
 
 
 def run_gate(args: argparse.Namespace) -> check_result.GateResult:
