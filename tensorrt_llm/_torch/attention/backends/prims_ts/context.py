@@ -397,7 +397,7 @@ def _make_context_kernel(
         head_paired=head_paired,
         window_size_left=window_left if window_left > 0 else 0,
         h_r=num_qo_heads // num_kv_heads,
-        enable_skip_correction=not store_softmax_stats,
+        corr_skip_threshold_log2=0.0 if store_softmax_stats else None,
         uses_ldtm_stat=uses_ldtm_stat,
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
         vc_attention=vc_attention,

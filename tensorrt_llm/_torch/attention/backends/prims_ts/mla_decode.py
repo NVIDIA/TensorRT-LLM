@@ -1127,28 +1127,6 @@ def _resolve_mla_decode_launch_spec(
             if not decision.implementation_ready:
                 raise NotImplementedError(decision.reason)
             split_kv = two_cta_split_kv
-            # These short, bounded SM107 plans avoid split scratch and a
-            # separate reduction. The rule describes local geometry, including
-            # packed queries, rather than a context-parallel rank count.
-            if (
-                policy_source == "auto"
-                and batch_size == 1
-                and num_qo_heads == 96
-                and seq_len_q == 8
-                and kv_lora_rank == 512
-                and qk_rope_head_dim == 64
-                and page_size == 128
-                and max_kv_len == 1024
-                and q_dtype_key == kv_dtype_key == "float8_e4m3fn"
-                and out_dtype_key == "bfloat16"
-                and mask_type == "causal"
-                and store_softmax_stats
-                and use_kv_bounds
-                and torch.cuda.get_device_capability(device_index) == (10, 7)
-                and torch.cuda.get_device_properties(device_index).multi_processor_count
-                == 212
-            ):
-                split_kv = 1
             capacity = 1 if split_kv == 1 else sm_count
             work_clusters = batch_size * launch_shape.num_tiles * max(split_kv, 1)
             # Dynamic cluster stealing only helps once logical work exceeds a
