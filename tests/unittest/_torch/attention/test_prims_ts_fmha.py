@@ -273,6 +273,7 @@ def _support_result(
     kv_cache_manager.mla_kv_cache_residual_dim = mla_kv_cache_residual_dim
     metadata = SimpleNamespace(
         helix_position_offsets=_TensorSpec((num_tokens,), torch.int32) if helix else None,
+        helix_context_local_slots=None,
         helix_kv_bounds=_TensorSpec((num_tokens,), torch.int32) if helix else None,
         _helix_spec_tokens_valid=helix_bounds_valid,
         num_sparse_topk=0,
@@ -381,12 +382,12 @@ def test_mla_context_rejects_unsupported_geometry(overrides: dict, expected_reas
 
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize(
-    "mask,store_stats,kv_len,spec_flags",
+    "mask,store_stats,kv_len,spec_flags,helix",
     [
-        (PredefinedAttentionMask.CAUSAL, False, 4, (True, False)),
-        (PredefinedAttentionMask.CAUSAL, True, 4, (False, True)),
-        (PredefinedAttentionMask.FULL, True, 4, (True, True)),
-        (PredefinedAttentionMask.FULL, True, 0, (True, True)),
+        (PredefinedAttentionMask.CAUSAL, False, 4, (True, False), False),
+        (PredefinedAttentionMask.CAUSAL, True, 4, (False, True), True),
+        (PredefinedAttentionMask.FULL, True, 4, (True, True), False),
+        (PredefinedAttentionMask.FULL, True, 0, (True, True), True),
     ],
     ids=["fresh", "final-chunk", "cached-chunk", "empty-cached-chunk"],
 )
@@ -396,6 +397,7 @@ def test_supports_linear_mla_context(
     mask: PredefinedAttentionMask,
     store_stats: bool,
     kv_len: int,
+    helix: bool,
 ) -> None:
     supported, reason = _support_result(
         attention_input_type=AttentionInputType.context_only,
@@ -407,15 +409,18 @@ def test_supports_linear_mla_context(
         tokens_per_block=128,
         kv_dtype=DataType.FP8 if fp8 else DataType.BF16,
         quant_mode=QuantMode.from_description(use_fp8_kv_cache=fp8),
+        helix=helix,
         metadata_overrides={
             "is_spec_decoding_enabled": spec_flags[0],
             "use_spec_decoding": spec_flags[1],
+            "helix_context_local_slots": _TensorSpec((4,), torch.int32) if helix else None,
+            "num_generations": 1 if helix else 0,
         },
         forward_overrides={
             "attention_mask": mask,
             "softmax_stats_tensor": _TensorSpec((4, 96, 2), torch.float32) if store_stats else None,
         },
-        kv_lens_override=[kv_len],
+        kv_lens_override=[kv_len, 64] if helix else [kv_len],
     )
     assert supported, reason
 
@@ -427,6 +432,22 @@ def test_supports_linear_mla_context(
         ({"metadata_overrides": {"is_spec_dec_dynamic_tree": True}}, "tree speculative"),
         ({"forward_overrides": {"attention_mask_data": torch.empty(1)}}, "custom attention"),
         ({"helix": True}, "Helix parallelism"),
+        (
+            {
+                "helix": True,
+                "metadata_overrides": {"helix_context_local_slots": torch.empty(4)},
+                "forward_overrides": {"latent_cache": torch.empty(4, 576)},
+            },
+            "Helix parallelism",
+        ),
+        (
+            {
+                "helix": True,
+                "metadata_overrides": {"helix_context_local_slots": torch.empty(4)},
+                "attention_input_type": AttentionInputType.mixed,
+            },
+            "Helix parallelism",
+        ),
         ({"attention_input_type": AttentionInputType.mixed}, "speculative decoding"),
         (
             {
@@ -1327,7 +1348,10 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     qo_indptr = torch.tensor([0, 2, 5], dtype=torch.int32)
     output = torch.empty(5, num_heads, v_head_dim, dtype=q.dtype)
     stats = torch.empty(5, num_heads, 2) if store_softmax_stats else None
+    helix = store_softmax_stats
     meta = SimpleNamespace(
+        helix_position_offsets=torch.empty(5, dtype=torch.int32) if helix else None,
+        helix_context_local_slots=torch.empty(5, dtype=torch.int32) if helix else None,
         mla_prepare_ctx_cu_seqlens=lambda: qo_indptr,
         max_seq_len=4096,
         kv_cache_block_offsets=torch.empty(2, 2, 64, dtype=torch.int32),
@@ -1378,6 +1402,7 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
         expected.update(softmax_scale=_ScaleKind.DEVICE, output_scale=_ScaleKind.DEVICE)
     assert recorded == expected
     assert native_preprocess.call_count == wrapper.run.call_count == 2
+    assert native_preprocess.call_args.args[3] is None
     torch.testing.assert_close(first_kv_offsets, torch.tensor([0, 4, 9], dtype=torch.int32))
     torch.testing.assert_close(
         wrapper.run.call_args.args[4], torch.tensor([0, 3, 9], dtype=torch.int32)
@@ -1430,6 +1455,31 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
             assert softmax_scale == pytest.approx(fmha._get_bmm1_scale(attn))
             assert output_scale == 1.0
     assert wrapper.run.call_args.kwargs["validate"] is False
+
+    if helix:
+        # A reused plan must not bypass the owner-prepared context contract.
+        params.fwd.latent_cache = torch.empty(5, 576)
+        with pytest.raises(AssertionError, match="owner-prepared Q/K/V"):
+            fmha.run_mla_context(params)
+        assert native_preprocess.call_count == wrapper.run.call_count == 2
+
+
+@pytest.mark.parametrize("input_type", [AttentionInputType.context_only, AttentionInputType.mixed])
+def test_mla_context_rejects_unprepared_helix_execution(input_type: AttentionInputType) -> None:
+    attn = _Attention(head_dim=192, is_mla=True)
+    params = FmhaParams(
+        attn=attn,
+        meta=SimpleNamespace(
+            helix_position_offsets=torch.empty(1),
+            helix_context_local_slots=None
+            if input_type == AttentionInputType.context_only
+            else torch.empty(1),
+        ),
+        fwd=AttentionForwardArgs(attention_input_type=input_type),
+        workspace=torch.empty(0),
+    )
+    with pytest.raises(AssertionError, match="owner-prepared Q/K/V"):
+        PrimsTSFmha(attn).run_mla_context(params)
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])

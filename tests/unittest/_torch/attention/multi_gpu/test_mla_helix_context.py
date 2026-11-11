@@ -38,6 +38,30 @@ def test_k3_mla_helix_compact_cache(fp8_cache):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
 @skip_pre_blackwell
+def test_prims_ts_k3_mla_helix_mtp7() -> None:
+    """Check strict FP8 MLA ownership, mixed MTP7 and graph replay across Helix pages."""
+    run_helix_test(
+        _check_context_heads,
+        _Scenario(
+            cp_size=2,
+            num_heads=96,
+            fp8=True,
+            fp8_cache=True,
+            check_kv_ownership=True,
+            chunked_history=True,
+            generation_query_width=8,
+            tokens_per_block=128,
+            strict_prims_ts=True,
+        ),
+        "nccl",
+        world_size=2,
+        max_mismatch_ratio=0.0,
+    )
+
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+@skip_pre_blackwell
 @pytest.mark.parametrize("fp8_cache", [False, True], ids=["bf16-kv", "fp8-kv"])
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16-weights", "fp8-weights"])
 @pytest.mark.parametrize(
