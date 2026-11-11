@@ -6,6 +6,7 @@ import torch
 
 from tensorrt_llm._torch.models.modeling_qwen3vl import \
     Qwen3VLInputProcessorBase
+from tensorrt_llm.inputs.multimodal import hash_mm_embeddings
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
@@ -112,6 +113,15 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     )
 
 
+def _attached_multimodal_input(processor, image_embeddings):
+    _, extra_processed_inputs = processor.attach_multimodal_embeddings(
+        {"prompt": "Describe the images."},
+        {"image": image_embeddings},
+        SamplingParams(),
+    )
+    return extra_processed_inputs["multimodal_input"]
+
+
 def test_qwen3_vl_attached_embeddings_are_hashed_by_content():
     hidden_size = 8
     config = _make_qwen3_vl_config(hidden_size)
@@ -127,12 +137,7 @@ def test_qwen3_vl_attached_embeddings_are_hashed_by_content():
     processor = _make_qwen3_vl_processor(config, tokenizer)
 
     def attach(image_embedding):
-        _, extra_processed_inputs = processor.attach_multimodal_embeddings(
-            {"prompt": "Describe this image."},
-            {"image": [image_embedding]},
-            SamplingParams(),
-        )
-        return extra_processed_inputs["multimodal_input"]
+        return _attached_multimodal_input(processor, [image_embedding])
 
     image_embedding = torch.arange(4 * embedding_width, dtype=torch.bfloat16)
     image_embedding = image_embedding.reshape(4, embedding_width)
@@ -144,6 +149,40 @@ def test_qwen3_vl_attached_embeddings_are_hashed_by_content():
     assert multimodal_input.multimodal_lengths == [5]
     assert attach(image_embedding.clone()).multimodal_hashes == hashes
     assert attach(image_embedding + 1).multimodal_hashes != hashes
+
+
+def test_qwen3_vl_attached_embedding_hashes_follow_prompt_order():
+    hidden_size = 8
+    config = _make_qwen3_vl_config(hidden_size)
+    embedding_width = hidden_size * (
+        1 + len(config.vision_config.deepstack_visual_indexes))
+    image = [
+        config.vision_start_token_id,
+        config.image_token_id,
+        config.vision_end_token_id,
+    ]
+    processor = _make_qwen3_vl_processor(
+        config, _make_tokenizer([7, *image, 8, *image, 9]))
+    first = torch.zeros(4, embedding_width, dtype=torch.bfloat16)
+    second = torch.ones(4, embedding_width, dtype=torch.bfloat16)
+
+    multimodal_input = _attached_multimodal_input(processor, [first, second])
+    swapped = _attached_multimodal_input(processor, [second, first])
+
+    assert multimodal_input.multimodal_positions == [1, 8]
+    assert multimodal_input.multimodal_lengths == [5, 5]
+    hashes = multimodal_input.multimodal_hashes
+    assert hashes[0] != hashes[1]
+    assert swapped.multimodal_hashes == hashes[::-1]
+
+
+def test_hash_mm_embeddings_covers_dtype_and_shape():
+    embedding = torch.arange(8, dtype=torch.float16).reshape(2, 4)
+    digest = hash_mm_embeddings([embedding])
+
+    assert hash_mm_embeddings([embedding.clone()]) == digest
+    assert hash_mm_embeddings([embedding.view(torch.bfloat16)]) != digest
+    assert hash_mm_embeddings([embedding.reshape(4, 2)]) != digest
 
 
 if __name__ == "__main__":
