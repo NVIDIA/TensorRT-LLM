@@ -58,9 +58,10 @@ preflight -> tasks in a fixed order, the onboard check after core -> the final p
    `accuracy unjudged (boot only)`.
 4. **The final pass**, once, after the last task: the remaining checks of every done deployment,
    the target's own tests and the commit audit, each a report line naming the commit it was
-   measured on. A pass on record for the same content is reused. When something failed or the
-   conventions scan has findings, one `fix` task names them all; then what failed and core's own
-   checks run once more.
+   measured on, the path that judged it and what it attested of the engine. A pass on record for
+   the same content is reused, and a deployment whose boot failed is not scored. When something
+   failed or the conventions scan has findings, one `fix` task names them all; then each
+   deployment that had a failure and core's own checks run once more.
 5. **The report**, `delivery_report.md`: its first line says `onboarded` (commit, ref, time) or
    `not onboarded` (where it stopped, the gate command that shows it again, the last commit where
    that check passed); then what is done, not done, not attempted, changed outside the target, the
@@ -133,6 +134,10 @@ time, to `operator_notes.md`, which every later turn is told to read first and a
 decides. No agent interprets it and it adds no task; to reach the turn in progress, stop the run
 and start it again. A note never changes an anchor or a check: the spec defines those, and it is
 read again on every start, so a new deployment is an edit of the spec.
+
+`core` is the first deployment of the spec: a start whose first deployment is another one than
+`core` was built for is refused. Add deployments after it; to onboard another first, use another
+workspace.
 
 **If it stops**, run the same command again. It goes on from `tasks.yaml`: a done task is not
 asked again, a task whose worker had already answered keeps that answer, a cut turn restarts, a
