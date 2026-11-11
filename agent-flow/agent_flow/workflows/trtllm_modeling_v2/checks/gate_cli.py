@@ -230,6 +230,7 @@ def run_check(
                 workspace=workspace,
                 spec=boot_checks.resolve_boot_spec(spec, found),
                 devices=devices,
+                mode=mode,
                 **bound,
             )
             return replace(result, path=THROUGH_ENDPOINT)

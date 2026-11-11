@@ -9,6 +9,7 @@ import json
 import math
 import re
 import sys
+import time
 import types
 
 import pytest
@@ -335,6 +336,30 @@ def test_a_boot_through_the_endpoint_holds_every_server_to_its_options(site, mon
     monkeypatch.setenv("FAKE_RANKS", "0")
     silent = boot()
     assert not silent.passed and "what the ctx server ran is unknown" in silent.detail
+
+
+def test_a_boot_through_the_endpoint_has_a_stock_path_control_and_the_specs_own_bound(
+    site, monkeypatch
+):
+    workspace = site / "ws"
+    one = Deployment(name="tp1", server=Server(options={"max_batch_size": 8}))
+    control = endpoint.run_endpoint_boot(
+        one, task_data=_task(site), workspace=workspace, mode="off"
+    )
+    # The same prompts on the stock implementation: recorded apart, and held to no target class.
+    assert control.passed and control.name == "boot[off]", control.detail
+    options = yaml.safe_load((workspace / "deployments/tp1/tp1.yaml").read_text())
+    assert options == {"max_batch_size": 8, "modeling_v2": "off"}
+    started = json.loads((workspace / "deployments/tp1/address.started.json").read_text())
+    assert started["env"]["TRTLLM_MODELING_V2"] == "off"
+    assert control.engine[0]["status"] == "match"
+    # A start is bounded by the spec's own `accuracy.boot.timeout`, the deployment's entry first.
+    monkeypatch.setenv("FAKE_SERVE_HANG", "1")
+    bounded = {**_task(site), "accuracy": {"boot": {"timeout": 600, "tp1": {"timeout": 1}}}}
+    began = time.monotonic()
+    late = endpoint.run_endpoint_boot(one, task_data=bounded, workspace=workspace)
+    assert not late.passed and "tp1 reported no address within its timeout" in late.detail
+    assert time.monotonic() - began < 30
 
 
 def test_a_boot_through_the_endpoint_fails_when_nothing_starts_or_ranks_are_left(

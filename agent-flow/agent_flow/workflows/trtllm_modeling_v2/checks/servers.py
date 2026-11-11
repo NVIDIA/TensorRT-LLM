@@ -456,12 +456,13 @@ def start(
     tree: str | Path | None = None,
     python: str | None = None,
     devices: Sequence[int] = (),
+    mode: str = MODE_REQUIRE,
 ) -> Running:
     """Start ``deployment``'s servers and wait until the one to ask is healthy.
 
     Ends first whatever an earlier process of the run left recorded (:func:`clean_owned`).
     ``env`` is the spec's environment; the deployment's own is laid over it. Every server
-    runs from ``tree`` with the Modeling V2 switch on and the rank hook loaded
+    runs from ``tree`` with the Modeling V2 switch at ``mode`` and the rank hook loaded
     (``check_runtime.engine_env``), so its ranks say what they run. A server with no
     launch prefix takes its ranks' share of ``devices``, in the order the servers start.
     Every wait ends at the deployment's ``timeout``. On any failure everything started
@@ -471,10 +472,10 @@ def start(
     budget = float(timeout or deployment.timeout or START_TIMEOUT_S)
     deadline = time.monotonic() + budget
     clean_owned(workspace, budget)
-    declared = engine_env({**(env or {}), **deployment.env}, tree=tree, python=python)
+    declared = engine_env({**(env or {}), **deployment.env}, mode=mode, tree=tree, python=python)
     directory = files_of(workspace, deployment.name)
     directory.mkdir(parents=True, exist_ok=True)
-    options = write_options(deployment, directory, {"modeling_v2": MODE_REQUIRE})
+    options = write_options(deployment, directory, {"modeling_v2": mode})
     left = list(devices)
     owned: list[Owned] = []
     running = Running(deployment, "", owned, workspace, budget)

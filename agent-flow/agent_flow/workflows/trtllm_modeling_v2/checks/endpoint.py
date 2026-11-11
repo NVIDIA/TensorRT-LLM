@@ -25,6 +25,7 @@ from typing import Any, Mapping, Sequence
 
 from ..infra.compute.environment import RunEnvironment
 from ..spec.deployments import Benchmark, Deployment, Server
+from ..spec.task_schema import resolve_gate_timeout
 from . import anchors as anchors_mod
 from . import attest, datasets, servers
 from .accuracy import judged, parse_eval_score, unparsed_score_detail
@@ -47,14 +48,20 @@ def _declared_env(task_data: Mapping[str, Any]) -> dict[str, str]:
 
 
 def _attested(
-    running: servers.Running, role: str, server: Server, task_data: Mapping[str, Any]
+    running: servers.Running,
+    role: str,
+    server: Server,
+    task_data: Mapping[str, Any],
+    mode: str = MODE_REQUIRE,
 ) -> attest.Attestation:
     """What the ranks of ``role``'s server printed, against its options and the switch."""
     return attest.attest(
         running.log(role),
-        {**server.options, "modeling_v2": MODE_REQUIRE},
+        {**server.options, "modeling_v2": mode},
         role=role,
         tree=task_data.get("trtllm_repo_path"),
+        # A control run on the stock path builds no Modeling V2 target.
+        target=mode == MODE_REQUIRE,
     )
 
 
@@ -71,7 +78,14 @@ def _stopped(running: servers.Running) -> tuple[str, str]:
     return "", f"; {note}" if note else ""
 
 
-def _started(deployment: Deployment, task_data: Mapping[str, Any], workspace, devices, timeout):
+def _started(
+    deployment: Deployment,
+    task_data: Mapping[str, Any],
+    workspace,
+    devices,
+    timeout,
+    mode: str = MODE_REQUIRE,
+):
     """``(running, None)``, or ``(None, fields)`` of the verdict of a deployment that did not start."""
     try:
         running = servers.start(
@@ -83,6 +97,7 @@ def _started(deployment: Deployment, task_data: Mapping[str, Any], workspace, de
             tree=task_data.get("trtllm_repo_path"),
             python=(task_data.get("environment") or {}).get("python"),
             devices=devices,
+            mode=mode,
         )
     except servers.Leftover as exc:
         return None, dict(passed=False, detail=str(exc), infrastructure=str(exc))
@@ -99,27 +114,33 @@ def run_endpoint_boot(
     spec: BootSpec | None = None,
     timeout: int | None = None,
     devices: Sequence[int] = (),
+    mode: str = MODE_REQUIRE,
 ) -> GateResult:
     """Start ``deployment``, hold its endpoint to the boot workload, and stop it.
 
     Every text prompt of the workload is sent as a completion. Each must come back with
-    text, and the workload's keywords must be in the answers, as for a boot in process.
+    text, and the workload's keywords must be in the answers. The start is bounded by
+    ``timeout``, else the spec's ``accuracy.boot.timeout``, else the deployment's own.
+    ``mode`` other than ``require`` is a control run on the stock implementation,
+    recorded as ``boot[<mode>]``.
     """
     spec = spec or BootSpec()
+    declared = resolve_gate_timeout(task_data.get("accuracy") or {}, "boot", deployment.name)
+    timeout = timeout or declared
     verdict = verdict_factory(inspect_tree(task_data))
     started = time.monotonic()
     records: list[Mapping[str, Any]] = []
 
     def ran(**fields: Any) -> GateResult:
         return verdict(
-            name="boot",
+            name="boot" if mode == MODE_REQUIRE else f"boot[{mode}]",
             deployment=deployment.name,
             duration_s=time.monotonic() - started,
             engine=tuple(records),
             **fields,
         )
 
-    running, refused = _started(deployment, task_data, workspace, devices, timeout)
+    running, refused = _started(deployment, task_data, workspace, devices, timeout, mode)
     if running is None:
         return ran(**refused)
     texts: list[str | None] = []
@@ -152,7 +173,9 @@ def run_endpoint_boot(
     except servers.ServerError as exc:
         failure = str(exc)
     finally:
-        attested = [_attested(running, role, server, task_data) for role, server in roles.items()]
+        attested = [
+            _attested(running, role, server, task_data, mode) for role, server in roles.items()
+        ]
         records += [found.record() for found in attested]
         left, note = _stopped(running)
     if left:
