@@ -94,6 +94,24 @@ def test_moe_row_settings_reach_every_role(
 
 # A small MoE checkpoint: 8 experts of intermediate size 64 over hidden size 32.
 _MOE_CONFIG = {"num_experts": 8, "moe_intermediate_size": 64, "hidden_size": 32}
+# The same expert shapes in the three config layouts the check reads: Qwen3 MoE
+# keys at the top level, a vision-language checkpoint's nested `text_config`, and
+# DeepSeek's `n_routed_experts` beside a dense-MLP `intermediate_size` that the
+# check must ignore.
+_MOE_CONFIGS = {
+    "qwen3-moe": _MOE_CONFIG,
+    "vlm-text-config": {
+        "architectures": ["VlmMoeForConditionalGeneration"],
+        "text_config": dict(_MOE_CONFIG),
+        "vision_config": {"hidden_size": 48},
+    },
+    "deepseek": {
+        "n_routed_experts": 8,
+        "moe_intermediate_size": 64,
+        "hidden_size": 32,
+        "intermediate_size": 512,
+    },
+}
 # Per-rank (`w3_w1_weight`, `w2_weight`) shapes of each partition of that checkpoint.
 _TP1_SHAPES = ((8, 128, 32), (8, 32, 64))
 _MOE_TP2_SHAPES = ((8, 64, 32), (8, 32, 32))
@@ -142,11 +160,12 @@ def _final_manifests(
     return {("final", role, rank): manifest for role in ROLES for rank in range(tp_size)}
 
 
-def _checkpoint(tmp_path: Path, config: dict[str, int]) -> Path:
+def _checkpoint(tmp_path: Path, config: dict[str, object]) -> Path:
     (tmp_path / "config.json").write_text(json.dumps(config))
     return tmp_path
 
 
+@pytest.mark.parametrize("config", list(_MOE_CONFIGS.values()), ids=list(_MOE_CONFIGS))
 @pytest.mark.parametrize(
     "tp_size, moe_ep_size, expert_shapes",
     [
@@ -160,14 +179,16 @@ def test_moe_partition_accepts_the_partition_a_row_names(
     tp_size: int,
     moe_ep_size: int,
     expert_shapes: tuple[tuple[int, ...], ...],
+    config: dict[str, object],
 ) -> None:
     assert_moe_partition(
         _moe_row(tp_size, moe_ep_size),
         _final_manifests(tp_size, expert_shapes),
-        _checkpoint(tmp_path, _MOE_CONFIG),
+        _checkpoint(tmp_path, config),
     )
 
 
+@pytest.mark.parametrize("config", list(_MOE_CONFIGS.values()), ids=list(_MOE_CONFIGS))
 @pytest.mark.parametrize(
     "moe_ep_size, realized_shapes",
     [
@@ -179,13 +200,14 @@ def test_moe_partition_rejects_a_partition_the_row_did_not_name(
     tmp_path: Path,
     moe_ep_size: int,
     realized_shapes: tuple[tuple[int, ...], ...],
+    config: dict[str, object],
 ) -> None:
     """A MoE size that never reached the model leaves every role on the same other partition."""
     with pytest.raises(AssertionError, match=f"did not realize MoE EP {moe_ep_size}"):
         assert_moe_partition(
             _moe_row(2, moe_ep_size),
             _final_manifests(2, realized_shapes),
-            _checkpoint(tmp_path, _MOE_CONFIG),
+            _checkpoint(tmp_path, config),
         )
 
 
@@ -209,8 +231,22 @@ def test_moe_partition_asks_to_be_extended_for_another_moe_layout(tmp_path: Path
         )
 
 
-def test_moe_partition_asks_to_be_extended_for_another_moe_config(tmp_path: Path) -> None:
-    config = {"num_experts": 8, "intermediate_size": 64, "hidden_size": 32}
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(
+            {"num_experts": 8, "intermediate_size": 64, "hidden_size": 32}, id="top-level"
+        ),
+        pytest.param(
+            {"hidden_size": 32, "text_config": {"num_experts": 8, "intermediate_size": 64}},
+            id="vlm-text-config",
+        ),
+    ],
+)
+def test_moe_partition_asks_to_be_extended_for_another_moe_config(
+    tmp_path: Path, config: dict[str, object]
+) -> None:
+    """The shape keys are read only next to the routed-expert count, never from another section."""
     with pytest.raises(AssertionError, match="teach `assert_moe_partition` this MoE config"):
         assert_moe_partition(
             _moe_row(2),
@@ -226,9 +262,16 @@ def test_moe_partition_requires_routed_experts_of_a_moe_checkpoint(tmp_path: Pat
         )
 
 
-def test_moe_partition_skips_dense_rows(tmp_path: Path) -> None:
-    dense_checkpoint = _checkpoint(tmp_path, {"hidden_size": 32})
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param({"hidden_size": 32}, id="text-only"),
+        pytest.param({"text_config": {"hidden_size": 32}}, id="vlm-text-config"),
+    ],
+)
+def test_moe_partition_skips_dense_rows(tmp_path: Path, config: dict[str, object]) -> None:
+    dense_checkpoint = _checkpoint(tmp_path, config)
 
     assert_moe_partition(_moe_row(2), _final_manifests(2, None), dense_checkpoint)
-    with pytest.raises(AssertionError, match="config has no `num_experts`"):
+    with pytest.raises(AssertionError, match="config names no routed-expert count"):
         assert_moe_partition(_moe_row(2), _final_manifests(2, _MOE_TP2_SHAPES), dense_checkpoint)
