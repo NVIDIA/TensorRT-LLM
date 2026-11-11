@@ -15,15 +15,17 @@ no catalog entries yet. ``UNCERTIFIED_GENERIC_CALLS`` names the stock code it ru
 **Split speculative decoding.** The causal LM is a ``SpecDecOneEngineForCausalLM``: the engine's
 speculative worker runs verification, acceptance, the recurrent-state commit and the draft loop. For one-model MTP
 the stock drafter builds this module's MTP layer (``Glm5NextModel.mtp_layer_cls``). Routing admits the modes whose
-worker commits the KDA state for the accepted tokens and that read no captured hidden states; the sibling
-``glm_5_3_flash_nvfp4__sm_100__default_mtp_fused`` target serves linear one-model MTP-Eagle with the step fused into
-its forward.
+worker commits the KDA state for the accepted tokens, that read no captured hidden states and that draft a linear
+chain, since the verify reads no tree mask; the sibling ``glm_5_3_flash_nvfp4__sm_100__default_mtp_fused`` target
+serves linear one-model MTP-Eagle with the step fused into its forward.
 
 ``default`` is the built-in model's parallel coverage: the weight shapes are computed from the engine's ``Mapping``
 (tensor-parallel or expert-parallel MoE, attention DP), without pipeline or context parallelism.
 
 **Text only.** The checkpoint is the vision-language wrapper. This target builds and loads no vision tower: the
-weight mapper's audit allowlists the ``model.visual.*`` namespace.
+weight mapper's audit allowlists the ``model.visual.*`` namespace. Routing sends it only deployments that serve the
+checkpoint text only (``disable_mm_encoder``), and a request that carries multimodal input is refused at admission
+(``validate_multimodal_request_data``).
 """
 
 from __future__ import annotations
@@ -83,8 +85,8 @@ from . import weights as _weights
 _SM = (10, 0)
 
 #: Stock code the generic path runs outside the catalog, declared so it is not consumed silently: every
-#: tensorrt_llm import of this module that computes (test_modeling_v2_claims.py checks the list both ways). An entry
-#: leaves the list when a catalog entry replaces it.
+#: tensorrt_llm import of this module that computes (this target's unit tests check the list both ways, with
+#: ``_glm5_next_generic_calls.py``). An entry leaves the list when a catalog entry replaces it.
 UNCERTIFIED_GENERIC_CALLS = (
     # The causal LM's and the text model's base classes and the checkpoint's weight mapper.
     "tensorrt_llm._torch.models.modeling_utils.DecoderModel",
@@ -2080,3 +2082,15 @@ class ModelingV2Glm53FlashNvfp4Sm100Default(Glm5NextForCausalLM):
 
     def load_weights(self, weights: Any, weight_mapper: BaseWeightMapper | None = None) -> None:
         _weights.load(self, weights, weight_mapper)
+
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Refuse, at admission, a request that carries multimodal input: this target runs no vision tower.
+
+        The executor calls this only for a request with multimodal data. Refusing here fails that request alone;
+        the forward would otherwise serve its text without the image or video.
+        """
+        del mm_data
+        raise ValueError(
+            "the GLM-5.3-Flash modeling_v2 target serves text only and runs no vision tower; the request carries "
+            "multimodal input"
+        )
