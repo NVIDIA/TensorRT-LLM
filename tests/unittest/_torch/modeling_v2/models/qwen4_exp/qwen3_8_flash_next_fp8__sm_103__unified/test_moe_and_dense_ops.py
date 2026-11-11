@@ -774,8 +774,56 @@ def _check_mtp_combine(cell):
 # ------------------------------------------------------------ moe_tpb_decode__decode ---
 
 
+_TPB_BLOCKS: dict = {}
+
+
+def _tpb_dims(rank: int) -> SimpleNamespace:
+    """The loader's dims of tep4 rank `rank` with the block-major copy on."""
+    return SimpleNamespace(
+        moe_tpb=True, tp_rank=rank, num_experts=512, moe_inter=640, shared_inter=640,
+        hidden=2560, dtype=torch.bfloat16,
+    )  # fmt: skip
+
+
+def _loaded(d, fake, names) -> list:
+    """The loader's parameters `names` of trunk layer 0, filled from `fake` as `load` fills them."""
+    entries = {e.name: e for e in M._weights.MODEL_WEIGHTS.WEIGHTS}
+    out = []
+    for name in names:
+        e = entries[name]
+        param = torch.empty(e.shape(d), dtype=e.dtype or d.dtype, device=DEV)
+        sources = [(*s, e.transform) for s in e.sources(d, 0, "")]
+        M._weights.MODEL_WEIGHTS.fill(param, sources, fake, d)
+        out.append(param)
+    return out
+
+
 def _tpb_blocks(rank: int):
-    return _tpb.block_major(*_weights(2560, 640, 512, seed=2560 + 640 + 512), rank)
+    """Tep4 rank `rank`'s block-major routed experts as the loader lays them out from a
+    checkpoint holding the stack `_weights` draws (rows `[up ; gate]`). Cached per rank."""
+    if rank not in _TPB_BLOCKS:
+        w1, w1s, w2, w2s = _weights(2560, 640, 512, seed=2560 + 640 + 512)
+        p = f"{M._weights._trunk_mlp(0)}.experts"
+        fake = {}
+        for e in range(512):
+            fake.update({
+                f"{p}.{e}.up_proj.weight": w1[e, :640],
+                f"{p}.{e}.gate_proj.weight": w1[e, 640:],
+                f"{p}.{e}.down_proj.weight": w2[e],
+                f"{p}.{e}.up_proj.weight_scale_inv": w1s[e, :5],
+                f"{p}.{e}.gate_proj.weight_scale_inv": w1s[e, 5:],
+                f"{p}.{e}.down_proj.weight_scale_inv": w2s[e],
+            })  # fmt: skip
+        names = ("tpb_w1", "tpb_s1", "tpb_w2", "tpb_s2")
+        _TPB_BLOCKS[rank] = _tpb.BlockExperts(*_loaded(_tpb_dims(rank), fake, names), rank)
+    return _TPB_BLOCKS[rank]
+
+
+def _tpb_shared_blocks(gate, up, dn, rank: int):
+    """Tep4 rank `rank`'s shared-expert slice `(gu, dn)` as the loader lays it out."""
+    p = f"{M._weights._trunk_mlp(0)}.shared_expert"
+    fake = {f"{p}.gate_proj.weight": gate, f"{p}.up_proj.weight": up, f"{p}.down_proj.weight": dn}
+    return tuple(_loaded(_tpb_dims(rank), fake, ("tpb_sh_gu", "tpb_sh_dn")))
 
 
 def _tpb_call(fn, logits, args, blocks, **kw):
@@ -863,7 +911,7 @@ def _tpb_shared_slice(rows):
     x, gate, up, gl, dn = _tpb_shared(rows, _seed(f"tpb-shared-w-{rows}"))
     total = torch.zeros(rows, 2560, device=DEV)
     for r in range(4):
-        gu_r, dn_r = _tpb.shared_blocks(gate, up, dn, r)
+        gu_r, dn_r = _tpb_shared_blocks(gate, up, dn, r)
         sh = _tpb.SharedBlocks(x, gu_r, gl, dn_r)
         blocks = _tpb_blocks(r)
         out = _tpb_call(_tpb.moe_tpb_decode, logits, args, blocks, shared=sh)
@@ -897,7 +945,7 @@ def _tpb_window(rank: int, shared) -> "M._weights.ExpertWindow":
     """Tep4 rank `rank`'s 128-expert window with its block-major copy and shared-expert slice."""
     bl = _tpb_blocks(rank)
     gate, up, gl, dn = shared
-    sh_gu, sh_dn = _tpb.shared_blocks(gate, up, dn, rank)
+    sh_gu, sh_dn = _tpb_shared_blocks(gate, up, dn, rank)
     bw = M._weights.BlockWindow(bl.w1, bl.s1, bl.w2, bl.s2, rank, sh_gu, gl, sh_dn)
     return _pad_window(128 * rank, 128)._replace(blocks=bw)
 

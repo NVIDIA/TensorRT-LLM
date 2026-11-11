@@ -9,7 +9,8 @@ on rank (e + b) % 4, and each rank returns its partial for the TP sum after the 
 runs a block's FC1 -> activation -> FC2, sharing the FC1 outputs through distributed shared
 memory; partials are summed in cluster order (deterministic).
 
-Operands (`BlockExperts`), block-major, a rank's 640 blocks:
+Operands (`BlockExperts`), block-major, a rank's 640 blocks as the loader lays them out
+(`weights._block_experts`, blocks dealt by `block_ids`):
 `w1 [640, 256, 2560]` e4m3 (rows: the block's 128 up rows, then its 128 gate rows), `s1 [640, 2, 20]`
 fp32, `w2 [640, 2560, 128]` e4m3 (the block's 128 down_proj columns), `s2 [640, 20]` fp32.
 """
@@ -62,29 +63,12 @@ class SharedBlocks(NamedTuple):
     """This rank's TP4 slice of the bf16 shared expert, folded into the launch (3..8 rows): `x` the
     MoE site's `[T, 2560]` bf16 rows, `gu` `[5, 64, 2560]` the slice's gate / up rows (item sb = columns
     `[160 rank + 32 sb, +32)` as 8 groups of 4 columns, each `[gate 4 ; up 4]`), `gl` the `[2560]` gate-logit row,
-    `dn` `[5, 2560, 32]` the slice's down_proj columns (`shared_blocks`)."""
+    `dn` `[5, 2560, 32]` the slice's down_proj columns (the loader's `tpb_sh_gu` / `tpb_sh_dn`)."""
 
     x: torch.Tensor
     gu: torch.Tensor
     gl: torch.Tensor
     dn: torch.Tensor
-
-
-def shared_blocks(gate, up, dn, rank: int):
-    """The checkpoint's shared-expert gate / up rows `[640, 2560]` and down `[2560, 640]` (bf16) -> this rank's
-    `(gu [5, 64, 2560], dn [5, 2560, 32])`."""
-    w = SHARED_INTER // RANKS
-    lo = rank * w
-    g = gate[lo : lo + w].reshape(SHARED_ITEMS, 8, 4, -1)
-    u = up[lo : lo + w].reshape(SHARED_ITEMS, 8, 4, -1)
-    gu = torch.stack([g, u], dim=2).reshape(SHARED_ITEMS, 64, -1).contiguous()
-    d = (
-        dn[:, lo : lo + w]
-        .reshape(dn.shape[0], SHARED_ITEMS, SHARED_ITEM_COLS)
-        .permute(1, 0, 2)
-        .contiguous()
-    )
-    return gu, d
 
 
 def block_ids(rank: int) -> tuple[list[int], list[int]]:
@@ -93,21 +77,6 @@ def block_ids(rank: int) -> tuple[list[int], list[int]]:
     experts = [j if j < EXPERTS else 4 * (j - EXPERTS) + rank for j in range(BLOCKS)]
     blocks = [(rank - j) % RANKS if j < EXPERTS else EXPERT_BLOCKS - 1 for j in range(BLOCKS)]
     return experts, blocks
-
-
-def block_major(fc1_w, fc1_s, fc2_w, fc2_s, rank: int) -> BlockExperts:
-    """Whole-expert operands of all 512 experts indexed by routing id (`[512, 1280, 2560]` rows
-    `[up ; gate]`, `[512, 10, 20]`, `[512, 2560, 640]`, `[512, 20, 5]`) -> the rank's block-major
-    operands."""
-    experts, blocks = block_ids(rank)
-    e = torch.tensor(experts, device=fc1_w.device)
-    b = torch.tensor(blocks, device=fc1_w.device)
-    n = fc1_w.shape[0]
-    w1 = fc1_w.view(n, 2, EXPERT_BLOCKS, 128, HIDDEN)[e, :, b].reshape(BLOCKS, 256, HIDDEN)
-    s1 = fc1_s.view(n, 2, EXPERT_BLOCKS, HIDDEN // 128)[e, :, b].reshape(BLOCKS, 2, HIDDEN // 128)
-    w2 = fc2_w.view(n, HIDDEN, EXPERT_BLOCKS, 128)[e, :, b]
-    s2 = fc2_s[e, :, b]
-    return BlockExperts(w1.contiguous(), s1.contiguous(), w2.contiguous(), s2.contiguous(), rank)
 
 
 _WORKSPACE: dict = {}

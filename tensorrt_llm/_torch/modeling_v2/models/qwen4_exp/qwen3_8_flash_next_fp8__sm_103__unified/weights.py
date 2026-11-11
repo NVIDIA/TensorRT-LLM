@@ -509,7 +509,7 @@ def _tpb_fc2_s(t: torch.Tensor, d) -> torch.Tensor:
 def _tpb_sh_gu(t: tuple[torch.Tensor, ...], d) -> torch.Tensor:
     """(gate, up) rows of one 32-column shared-expert item -> `[64, hidden]`.
 
-    8 groups of 4 columns, each `[gate 4 ; up 4]` (`moe_tpb_decode.shared_blocks`).
+    8 groups of 4 columns, each `[gate 4 ; up 4]` (`moe_tpb_decode.SharedBlocks`).
     """
     gate, up = t
     return (
