@@ -3028,6 +3028,14 @@ def _varlen_launcher(
                 and sm_version in _TUNED_SM_VERSIONS
             )
             static_k = None if k <= 512 and tuple(plan_free["tpl"][:2]) == (1024, 1) else k
+            # Hopper runs K=1024 batches beyond two waves of rows above 4K scores faster with the
+            # row stride read at run time than compiled in
+            runtime_npad = (
+                sm_version not in _BLACKWELL_SM_VERSIONS
+                and k == 1024
+                and num_rows > 2 * num_sms
+                and n_kernel > 4096
+            )
             fn = dev.get_compiled__reg(
                 tuple(plan_free["tpl"]),
                 varlen=True,
@@ -3046,6 +3054,7 @@ def _varlen_launcher(
                 )
                 and n_kernel > k
                 and sm_version in _TUNED_SM_VERSIONS
+                and not runtime_npad
                 else None,
                 dense_bracket=k <= 512,
                 dense_lower_bound=k > 512 and n_kernel < 2 * k,

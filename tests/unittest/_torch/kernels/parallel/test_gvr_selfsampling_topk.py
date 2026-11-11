@@ -1018,6 +1018,40 @@ def test_selfsampling_hopper_long_rows_sample_with_staging_headroom(monkeypatch)
     assert slab(1024, 65539, torch.bfloat16, 148, 100) == slab(1024, 65539, torch.float16, 148, 100)
 
 
+def test_selfsampling_hopper_tall_register_batches_read_row_stride_at_run_time(monkeypatch) -> None:
+    """FP32 K=1024 register kernels compile the row stride in, except on Hopper for batches beyond
+    two waves of rows above 4K scores."""
+    real = ss_host._device()
+    requests = []
+
+    class RecordingDevice:
+        def __getattr__(self, name: str):
+            if not name.startswith("get_compiled"):
+                return getattr(real, name)
+
+            def compile_request(*args: object, **kwargs: object):
+                requests.append((name, kwargs))
+                return lambda *launch_args: None
+
+            return compile_request
+
+    monkeypatch.setattr(ss_host, "_device", RecordingDevice)
+
+    def static_npad(rows, n, num_sms, sm_version):
+        monkeypatch.setattr(ss_host, "_VARLEN_CACHE", {})
+        requests.clear()
+        ss_host._varlen_launcher(rows, (n + 63) // 64 * 64, 1024, n, 1, 4, num_sms, sm_version)
+        reg = [kwargs for name, kwargs in requests if name == "get_compiled__reg"]
+        assert reg, (rows, n, sm_version, requests)
+        return reg[-1]["static_npad"]
+
+    for rows, n in ((512, 4099), (1024, 4099), (512, 8195), (1024, 8195)):
+        assert static_npad(rows, n, 132, 90) is None, (rows, n)
+        assert static_npad(rows, n, 148, 100) == (n + 63) // 64 * 64, (rows, n)
+    for rows, n in ((256, 4099), (1024, 2051)):
+        assert static_npad(rows, n, 132, 90) == (n + 63) // 64 * 64, (rows, n)
+
+
 @pytest.mark.skipif(
     getSMVersion() != 90
     or torch.cuda.get_device_properties(0).multi_processor_count != ss_host._HOPPER_CLUSTER_SMS,
