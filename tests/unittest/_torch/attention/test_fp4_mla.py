@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from _torch.helpers import triton_num_compiled
 
 import tensorrt_llm
 import tensorrt_llm._torch.attention.backends.fmha.fp4_mla as fp4_mla_fmha_backend
@@ -719,6 +720,37 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     assert ((metadata.helix_local_slots[gen] == -1) == (owner != cp_rank)).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA tensors")
+def test_helix_spec_buffers_reuse_the_compiled_kernel_across_batches() -> None:
+    kernel = fp4_mla_metadata._helix_spec_buffers_kernel
+    tokens_per_seq = 4
+    positions, local_slots, kv_bounds, kv_lens = (
+        torch.zeros(64, dtype=torch.int32, device="cuda") for _ in range(4)
+    )
+
+    def populate(num_contexts: int, num_seqs: int) -> None:
+        # kv_lens is batch-indexed: the view starts at the first generation row.
+        fp4_mla_metadata.populate_helix_spec_buffers(
+            positions,
+            local_slots,
+            kv_bounds,
+            kv_lens[num_contexts : num_contexts + num_seqs],
+            num_tokens=num_seqs * tokens_per_seq,
+            tokens_per_seq=tokens_per_seq,
+            tokens_per_block=64,
+            cp_size=8,
+            cp_rank=3,
+        )
+
+    # Context counts 1-3 misalign the int32 kv_lens view.
+    batches = [(0, 4), (1, 16), (2, 5), (3, 1)]
+    populate(*batches[0])
+    compiled = triton_num_compiled(kernel)
+    for batch in batches[1:]:
+        populate(*batch)
+    assert triton_num_compiled(kernel) == compiled
+
+
 @pytest.mark.parametrize("layer_offset", [0, 1, 3])
 def test_fp4_mla_v2_encoded_page_capacity_is_layer_invariant(layer_offset: int) -> None:
     manager = object.__new__(Fp4MlaKVCacheManagerV2)
@@ -734,7 +766,8 @@ def test_fp4_mla_v2_encoded_page_capacity_is_layer_invariant(layer_offset: int) 
     assert manager._role_encoded_page_capacity(0, Role.KEY) == 17
 
 
-def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(monkeypatch) -> None:
+@pytest.mark.parametrize("preemption", [False, True])
+def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(preemption, monkeypatch) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(
@@ -749,11 +782,18 @@ def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(monkeypatch) -> None:
         num_layers=2,
         tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
         max_batch_size=3,
+        gen_preemption_headroom=1 if preemption else 0,
         spec_config=SimpleNamespace(tokens_per_gen_step=4),
     )
 
     assert slope == 2 * (320 + 40 + 32)
-    assert intercept == 3 * 2 * (HP_BLOCK_SIZE + 3) * 576 * 2 * 2
+    residents = 3 * 2 + (1 if preemption else 0)
+    assert intercept == residents * (HP_BLOCK_SIZE + 3) * 576 * 2 * 2
+    manager = object.__new__(Fp4MlaKVCacheManagerV2)
+    manager.max_batch_size = 3
+    manager.gen_preemption_headroom = 1 if preemption else 0
+    manager.mapping = Mapping(world_size=2, tp_size=1, pp_size=2, rank=0)
+    assert manager._get_generation_request_capacity() == residents
 
 
 def test_fp4_mla_v2_cache_size_accounts_for_fp8_fallback(

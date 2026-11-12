@@ -1391,7 +1391,13 @@ class MTPForCausalLM(nn.Module):
         # Whether the MTP layer's forward takes the draft loop's deferred
         # ``kv_lens_increment``.
         folds_kv_lens_increment = False
+        # A target model that owns its MTP layer class (a Modeling V2
+        # target, for example) names it, and the drafter builds that class
+        # instead of the built-in one registered for the model type.
+        owned_mtp_layer = getattr(model, "mtp_layer_cls", None)
         match model_type:
+            case _ if owned_mtp_layer is not None:
+                mtp_layer = owned_mtp_layer
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
                 mtp_layer = Glm4MTP
