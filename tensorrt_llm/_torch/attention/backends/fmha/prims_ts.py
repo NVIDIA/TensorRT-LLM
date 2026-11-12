@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from functools import cache
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -58,6 +60,23 @@ if TYPE_CHECKING:
 
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _WORKSPACE_ALIGNMENT = 32
+
+
+@cache
+def _get_cached_workspace_size_functions() -> tuple[Callable[..., int], Callable[..., int]]:
+    """Share scalar size caches across layers without eagerly importing PrimTS.
+
+    Callers must pass an explicit device index and no tensor arguments.
+    """
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
+        get_prims_ts_batch_decode_workspace_size,
+        get_prims_ts_batch_mla_decode_workspace_size,
+    )
+
+    return (
+        cache(get_prims_ts_batch_decode_workspace_size),
+        cache(get_prims_ts_batch_mla_decode_workspace_size),
+    )
 
 
 def _is_prepared_helix_mla_context(
@@ -254,8 +273,7 @@ class PrimsTSFmha(PhasedFmha):
         # VC-Attention-QK16 K/V preparation with its token permutation, one per layer.
         self._decode_wrappers: dict[int, "BatchDecodePagedTSWrapper"] = {}
         self._mla_decode_wrappers: dict[tuple[int, int], "BatchMLADecodePagedTSWrapper"] = {}
-        self._mla_decode_workspace_sizes: dict[tuple[int, int], int] = {}
-        self._mla_decode_workspace_capacity: int | None = None
+        self._mla_decode_plan_capacity: int | None = None
         self._mla_context_wrappers: dict[
             tuple[int, int, int, str, bool], "BatchPrefillTSWrapper"
         ] = {}
@@ -1253,45 +1271,37 @@ class PrimsTSFmha(PhasedFmha):
         kernel_dtype = (
             torch.float8_e4m3fn if QuantMode(self.attn.quant_mode).has_fp8_kv_cache() else q.dtype
         )
+        (
+            get_prims_ts_batch_decode_workspace_size,
+            get_prims_ts_batch_mla_decode_workspace_size,
+        ) = _get_cached_workspace_size_functions()
         if self.attn.is_mla_enable:
-            # Like MLA decode plans, scalar sizes fix the layer's mask, dtypes
-            # and statistics mode. Warmup can replace the page-table capacity.
-            if self._mla_decode_workspace_capacity != max_seq_len:
-                if self._mla_decode_workspace_capacity is not None:
+            # Warmup can replace the page-table capacity even when the shared
+            # workspace allocation is unchanged. Decode plans retain that bound.
+            if self._mla_decode_plan_capacity != max_seq_len:
+                if self._mla_decode_plan_capacity is not None:
                     self._mla_decode_wrappers.clear()
                     self._mla_decode_plan_profiles.clear()
-                self._mla_decode_workspace_capacity = max_seq_len
-                self._mla_decode_workspace_sizes.clear()
-            size_key = (batch_size, seq_len_q)
-            required_bytes = self._mla_decode_workspace_sizes.get(size_key)
-            if required_bytes is None:
-                from tensorrt_llm._torch.attention.backends.prims_ts import (
-                    get_prims_ts_batch_mla_decode_workspace_size,
-                )
+                self._mla_decode_plan_capacity = max_seq_len
 
-                required_bytes = get_prims_ts_batch_mla_decode_workspace_size(
-                    batch_size,
-                    self.attn.num_heads,
-                    int(self.attn.kv_lora_rank),
-                    int(self.attn.qk_rope_head_dim),
-                    int(metadata.tokens_per_block),
-                    max_seq_len,
-                    max_q_len=seq_len_q,
-                    q_dtype=kernel_dtype,
-                    kv_dtype=kernel_dtype,
-                    out_dtype=forward_args.output.dtype,
-                    mask_type=mask_type,
-                    store_softmax_stats=forward_args.softmax_stats_tensor is not None,
-                    use_kv_bounds=metadata.helix_position_offsets is not None,
-                    device=q.device,
-                    validate=False,
-                )
-                self._mla_decode_workspace_sizes[size_key] = required_bytes
-        else:
-            from tensorrt_llm._torch.attention.backends.prims_ts import (
-                get_prims_ts_batch_decode_workspace_size,
+            required_bytes = get_prims_ts_batch_mla_decode_workspace_size(
+                batch_size,
+                self.attn.num_heads,
+                int(self.attn.kv_lora_rank),
+                int(self.attn.qk_rope_head_dim),
+                int(metadata.tokens_per_block),
+                max_seq_len,
+                max_q_len=seq_len_q,
+                q_dtype=kernel_dtype,
+                kv_dtype=kernel_dtype,
+                out_dtype=forward_args.output.dtype,
+                mask_type=mask_type,
+                store_softmax_stats=forward_args.softmax_stats_tensor is not None,
+                use_kv_bounds=metadata.helix_position_offsets is not None,
+                device=q.device,
+                validate=False,
             )
-
+        else:
             required_bytes = get_prims_ts_batch_decode_workspace_size(
                 batch_size,
                 self.attn.num_heads,
