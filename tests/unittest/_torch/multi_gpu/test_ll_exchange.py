@@ -332,10 +332,16 @@ CASES = {
     "group_allgather": _group_allgather,
     "create_agreement": _create_agreement,
 }
+# Cases that run at TP2 only: the agreement on a failed setup does not depend on
+# the TP size.
+TP2_ONLY_CASES = {"create_agreement"}
 
 
-@pytest.mark.parametrize("case", list(CASES))
-@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+@pytest.mark.parametrize(
+    "mpi_pool_executor, case",
+    [(tp, case) for tp in (2, 4) for case in CASES if tp == 2 or case not in TP2_ONLY_CASES],
+    indirect=["mpi_pool_executor"],
+)
 def test_ll_exchange(case, mpi_pool_executor):
     tp = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < tp:
