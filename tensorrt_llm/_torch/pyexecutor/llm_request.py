@@ -1146,6 +1146,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self._initialize_execution_state(seq_slot=None,
                                          orig_prompt_len=self.prompt_len,
                                          clear_draft_tokens=True)
+        # The replay prefills against the prefix cache as it is now.
+        self.py_uncached_prefill_probed = False
 
     @property
     def is_generation_only_request(self):

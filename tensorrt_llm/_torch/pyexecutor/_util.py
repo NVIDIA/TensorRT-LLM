@@ -2852,6 +2852,17 @@ class KvCacheCreator:
                 f"Unsupported draft_kv_dtype {declared_dtype} declared by the "
                 "drafter; expected torch.float8_e4m3fn, torch.bfloat16 or "
                 "torch.float16.")
+        weights_dtype = getattr(
+            getattr(effective_draft_config, "pretrained_config", None),
+            "torch_dtype", None)
+        if (declared_dtype is not None
+                and isinstance(weights_dtype, torch.dtype)
+                and declared_dtype != weights_dtype):
+            # An unquantized draft pool is stored in the drafter's weights dtype.
+            raise ValueError(
+                f"The drafter declares draft_kv_dtype {declared_dtype}, but its "
+                f"unquantized KV pool is stored in its weights dtype "
+                f"{weights_dtype}.")
         quant_config = getattr(effective_draft_config, "quant_config", None)
         if quant_config is None or not quant_config.quant_mode.has_kv_cache_quant(
         ):
@@ -2922,7 +2933,11 @@ class KvCacheCreator:
         """
         draft_model = getattr(self._model_engine.model, "draft_model", None)
         declared = getattr(draft_model, "draft_kv_dtype", None)
-        return declared if isinstance(declared, torch.dtype) else None
+        if declared is not None and not isinstance(declared, torch.dtype):
+            raise ValueError(
+                f"The drafter's draft_kv_dtype must be a torch.dtype, got "
+                f"{declared!r}.")
+        return declared
 
     @staticmethod
     def _get_kv_quantized_model_config(model_config: ModelConfig,

@@ -1929,10 +1929,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
         With ``new_conversation_follow="always"``:
         ``{"conversation_id", "num_tokens"}`` with a character-count token
-        estimate for the backlog load.
+        estimate for the backlog load, also for a request without a
+        conversation_id, so that every request counts in tokens.
         """
         conv_id = self._get_conversation_id(request)
-        if not conv_id or not self._follow_every_match:
+        if not self._follow_every_match:
             return conv_id
         num_tokens, _ = self._request_tokens(request)
         return {"conversation_id": conv_id, "num_tokens": num_tokens}
@@ -1986,6 +1987,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     raise ValueError(
                         f"No available servers after excluding {exclude_server}"
                     )
+                load = num_tokens
             # The backlog when the key carries a token count, else 1
             # (request-count load: there is no request object at the
             # coordinator). Keyed by the disagg req_id -- the sole id crossing

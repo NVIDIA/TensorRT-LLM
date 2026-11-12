@@ -3299,6 +3299,45 @@ class TestDisagg:
 # ===========================================================================
 
 
+class TestMidchunkSnapshotBudget:
+    """A budget-capped FORCE_CHUNK step of a request whose cache manager takes snapshots
+    inside the step (py_midchunk_snapshot_alignment / py_midchunk_pass_point): the cap
+    is rounded down to the 128-token unit and ends before the next point it may not pass.
+    An aligned point inside the step is the manager's to snapshot."""
+
+    @pytest.mark.parametrize(
+        "budget,prompt_len,points,branch,expected",
+        [
+            # The last point merges into the final step; the cap ends before it.
+            (512, 1000, [896], None, 512),
+            # A point that is not a multiple of the unit: the capped step passes the
+            # aligned point 192 and the manager snapshots it inside the step.
+            (256, 300, [192], None, 256),
+            # A branch point is passed; the cap ends before the following point.
+            (1536, 2100, [1024, 2048], 1024, 1536),
+            # Enough budget: the step ends at the following point.
+            (4096, 2100, [1024, 2048], 1024, 2048),
+        ],
+    )
+    def test_capped_step(self, budget, prompt_len, points, branch, expected):
+        sched = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=budget,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 128),
+        )
+        req = make_ctx_request(0, context_remaining_length=prompt_len, is_last_context_chunk=False)
+        req.expect_snapshot_points = points
+        req.py_midchunk_snapshot_alignment = 64
+        req.py_midchunk_pass_point = branch
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == expected
+        # Every point strictly inside the step is aligned, so the manager can take it.
+        assert all(p % 64 == 0 for p in points if 0 < p < expected)
+
+
 class TestChunkedContext:
     def test_budget_enough_for_all(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -5261,7 +5300,7 @@ class TestLongContextDemotionExact:
     def _make(self, exact=True, reused=None, prepared_remaining=None, **demote):
         """`reused`: probe result per request id. `prepared_remaining`: the exact
         remainder prepare_context leaves per request id (its claimed reuse)."""
-        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_block_reuse=True)
         reused = reused or {}
         prepared_remaining = prepared_remaining or {}
 
@@ -5363,6 +5402,28 @@ class TestLongContextDemotionExact:
         assert mgr.prepare_context.call_count == 3  # lost twice (deferred, retried), short once
         # The deferral released the first-chunk admission before the retry.
         mgr.free_resources.assert_called_once_with(lost)
+
+    def test_starved_requests_found_long_run_on_their_shares(self):
+        """Starved requests ordered as short are not deferred when their first
+        prepare shows a long remainder: a deferral would not move them, and
+        every iteration would order and defer them again."""
+        sched, _ = self._make(
+            prepared_remaining={0: 10_000, 1: 10_000},
+            context_scheduling_policy=ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST,
+            context_starvation_iterations=8,
+        )
+        sched._sched_iter = 100
+        first, second = self._req(0, 10_000, 256), self._req(1, 10_000, 256)
+        for req in (first, second):
+            req.py_ctx_sched_since_iter = 0
+        for _ in range(2):
+            for req in (first, second):
+                req.py_uncached_prefill_tokens = 256
+            out = sched.schedule_request([first, second], set())
+            assert sorted(ids(out.context_requests)) == [0, 1]
+            # Each holds 1024 // 4 = 256 tokens; the oldest takes the leftover.
+            assert first.context_chunk_size + second.context_chunk_size == 1024
+            assert min(first.context_chunk_size, second.context_chunk_size) >= 256
 
     def test_request_found_short_is_not_deferred(self):
         sched, _ = self._make(prepared_remaining={0: 512})

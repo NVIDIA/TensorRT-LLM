@@ -3359,3 +3359,34 @@ async def test_conversation_router_follow_always_keys_carry_token_counts():
     await router.finish_request_by_id(1)
     await router.finish_request_by_id(2)
     assert sum(router._server_content_load.values()) == 0
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_follow_always_keys_without_id_count_tokens():
+    """Coordinator path: a request without a conversation_id counts tokens.
+
+    Its estimated prompt tokens are its load, so loads of requests with and
+    without a conversation_id add up in the same unit.
+    """
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                **_FOLLOW_ALWAYS_ARGS)
+    anonymous = CompletionRequest(
+        model="TinyLlama",
+        prompt=list(range(7000, 7300)),
+        disaggregated_params=DisaggregatedParams(request_type="context_only"))
+    key = router.routing_key(anonymous)
+    assert key == {"conversation_id": None, "num_tokens": 300}
+    server, _, _ = await router.get_next_server_by_key(key, req_id=1)
+    assert router._server_content_load[server] == 300
+
+    # A conversation goes to the other server, which has no backlog.
+    conv = _conv_token_request("conv", list(range(9000, 9100)))
+    other, _, _ = await router.get_next_server_by_key(
+        router.content_routing_key(conv), req_id=2)
+    assert other != server
+    assert router._server_content_load[other] == 100
+
+    await router.finish_request_by_id(1)
+    await router.finish_request_by_id(2)
+    assert sum(router._server_content_load.values()) == 0

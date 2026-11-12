@@ -29,6 +29,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 def _random_values(dtype: torch.dtype, n: int, rng: random.Random):
     if dtype == torch.bool:
         return [rng.random() < 0.5 for _ in range(n)]
+    if dtype == torch.int64:
+        # Values past 32 bits, so a copy that drops the upper words fails.
+        return [rng.choice((-1, 1)) * ((1 << 40) + rng.randrange(1 << 30)) for _ in range(n)]
     return [rng.randrange(-(1 << 30), 1 << 30) for _ in range(n)]
 
 

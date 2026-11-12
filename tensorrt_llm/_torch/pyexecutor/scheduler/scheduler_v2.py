@@ -948,10 +948,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                     if action is ScheduleAction.DEFER:
                         # Ordered as short, prepared, found long: it goes behind
                         # the rest of this pass and counts as demoted for aging.
-                        # A starved request has its share held, so it is not moved.
+                        # Starved requests carry a token cap and are never deferred.
                         demoted_ids.add(req.py_request_id)
-                        if not starved_pass:
-                            ctx_requests.append(req)
+                        ctx_requests.append(req)
                         continue
                     has_chunking = has_chunking or chunking_flag
                     scheduled_ctx.append(req)
@@ -1589,9 +1588,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             # Ordered as short on the router's estimate alone; the reuse claimed
             # just now makes the remainder exact. Once per request per iteration.
             # A first chunk that is not scheduled releases its admission, so the
-            # retry matches its prefix again.
+            # retry matches its prefix again. A starved request (token_cap set)
+            # runs on the share it holds instead: deferring it would not move it,
+            # and the next iteration would order it as short and defer it again.
             self._ctx_unverified_short.discard(req.py_request_id)
-            if self._is_long_context(req):
+            if token_cap is None and self._is_long_context(req):
                 return ScheduleAction.DEFER, 0, False
 
         # Calculate chunk size from remaining budget

@@ -6,7 +6,9 @@ The scheduler ends a context chunk at the next snapshot point, unless the cache 
 the request as able to take that snapshot inside the step: ``py_midchunk_snapshot_alignment``
 lets the last snapshot point fall inside the final chunk, and ``py_midchunk_pass_point`` lets a
 step pass one other point, ending at the following point at the latest. A model's cache manager
-sets those marks (the Kimi K3 SM107 targets' manager, tested with the family).
+sets those marks (the Kimi K3 SM107 targets' manager, tested with the family). How a token
+budget caps such a chunk is tested with the scheduler (``test_kv_cache_v2_scheduler.py``,
+``TestMidchunkSnapshotBudget``).
 
 ``MambaHybridCacheManagerV2`` logs its recurrent snapshot and reuse counters at INFO, at most
 once a minute.
@@ -76,19 +78,6 @@ def test_forced_chunk_size(cur, prompt_len, points, alignment, expected):
     assert _is_forced_context_chunk_boundary(request, chunk)
 
 
-def test_budget_capped_chunk_never_passes_the_point():
-    """Capped chunks are rounded down to the unit, so they end at or before the point."""
-    unit = 128
-    for prompt_len in (300, 1000, 4099):
-        point = prompt_len // unit * unit
-        for cur in range(0, point, unit):
-            request = _sched_request(cur, prompt_len, [point], 64)
-            chunk = _get_forced_context_chunk_size(request)
-            assert chunk == prompt_len - cur
-            for budget in range(unit, chunk, unit):
-                assert cur + budget // unit * unit <= point
-
-
 @pytest.mark.parametrize(
     "cur,prompt_len,points,alignment,branch_point,expected",
     [
@@ -114,20 +103,6 @@ def test_forced_chunk_size_with_branch_point(
     chunk = _get_forced_context_chunk_size(request)
     assert chunk == expected
     assert _is_forced_context_chunk_boundary(request, chunk)
-
-
-def test_budget_capped_chunk_with_branch_point_never_passes_the_next_point():
-    unit = 128
-    branch, following, prompt_len = 1024, 2048, 2100
-    for cur in range(0, branch, unit):
-        request = _sched_request(cur, prompt_len, [branch, following], 64, branch)
-        chunk = _get_forced_context_chunk_size(request)
-        assert cur + chunk == following
-        for budget in range(unit, chunk, unit):
-            end = cur + budget // unit * unit
-            assert end <= following
-            # Inside a capped step the branch point is the only snapshot point.
-            assert len([p for p in (branch, following) if cur < p < end]) <= 1
 
 
 def _counters_stub():
