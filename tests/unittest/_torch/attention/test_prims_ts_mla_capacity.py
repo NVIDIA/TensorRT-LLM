@@ -126,7 +126,15 @@ def test_runtime_key_and_plan_use_the_same_normalized_capacities() -> None:
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "plan"
     )
-    keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in plan.keywords}
+    assert [ast.unparse(kw.value) for kw in plan.keywords if kw.arg is None] == ["plan_kwargs"]
+    assert not {"max_q_len", "max_kv_len", "packed_query"} & {kw.arg for kw in plan.keywords}
+    plan_kwargs = next(
+        node.value
+        for node in ast.walk(method)
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "plan_kwargs"
+    )
+    assert isinstance(plan_kwargs, ast.Call) and ast.unparse(plan_kwargs.func) == "dict"
+    keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in plan_kwargs.keywords}
     assert keywords["max_q_len"] == "q_capacity"
     assert keywords["max_kv_len"] == "kv_capacity"
     assert keywords["packed_query"] == "True"
