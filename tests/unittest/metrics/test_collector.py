@@ -1041,6 +1041,23 @@ class TestLogIterationStatsKvCacheIteration:
             == 10
         )
 
+    def test_prefix_snapshot_loss_counters(self):
+        collector = _make_kv_iter_collector()
+        collector.log_iteration_stats(
+            {"iterPrefixMatchedTokens": 20_000, "iterPrefixSnapshotLostTokens": 16_000}
+        )
+        collector.log_iteration_stats(
+            {"iterPrefixMatchedTokens": 8_000, "iterPrefixSnapshotLostTokens": 0}
+        )
+        assert (
+            _get_counter_value(collector, "kv_cache_prefix_matched_tokens_total", dp_rank=0)
+            == 28_000
+        )
+        assert (
+            _get_counter_value(collector, "kv_cache_prefix_snapshot_lost_tokens_total", dp_rank=0)
+            == 16_000
+        )
+
     def test_counters_incremented(self):
         """Counter metrics should accumulate deltas across calls."""
         collector = _make_kv_iter_collector()

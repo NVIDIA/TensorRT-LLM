@@ -85,6 +85,8 @@ class MetricsCollector:
             trtllm_kv_cache_onboard_bytes_total
             trtllm_kv_cache_offload_bytes_total
             trtllm_kv_cache_disk_prefetch_blocks_total
+            trtllm_kv_cache_prefix_matched_tokens_total
+            trtllm_kv_cache_prefix_snapshot_lost_tokens_total
             trtllm_kv_cache_intra_device_copy_bytes_total
             trtllm_num_requests_running
             trtllm_num_requests_waiting
@@ -367,6 +369,23 @@ class MetricsCollector:
                 "Process-lifetime total V2 KV-cache blocks migrated from disk "
                 "to host by the prefetch mechanism. "
                 "Resets only when the serving process restarts."),
+            labelnames=iteration_labelnames)
+        self.kv_cache_prefix_matched_tokens_total = Counter(
+            name=self.metric_prefix + "kv_cache_prefix_matched_tokens_total",
+            documentation=(
+                "Hybrid recurrent models: process-lifetime total prompt "
+                "tokens of this rank whose prefix matched in the attention KV "
+                "cache. Resets only when the serving process restarts."),
+            labelnames=iteration_labelnames)
+        self.kv_cache_prefix_snapshot_lost_tokens_total = Counter(
+            name=self.metric_prefix +
+            "kv_cache_prefix_snapshot_lost_tokens_total",
+            documentation=(
+                "Hybrid recurrent models: process-lifetime total matched "
+                "prefix tokens of this rank recomputed because no "
+                "recurrent-state snapshot covered them; its ratio to "
+                "kv_cache_prefix_matched_tokens_total is the share of prefix "
+                "reuse lost. Resets only when the serving process restarts."),
             labelnames=iteration_labelnames)
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
@@ -1151,6 +1170,14 @@ class MetricsCollector:
             iteration_stats.get("kvCacheLevelTiers"), rank)
         self._log_connector_cached_tokens(
             iteration_stats.get("iterConnectorCachedTokens"), rank)
+        prefix_matched = iteration_stats.get("iterPrefixMatchedTokens", 0)
+        if prefix_matched > 0:
+            self._log_counter(self.kv_cache_prefix_matched_tokens_total,
+                              rank_labels, prefix_matched)
+        prefix_lost = iteration_stats.get("iterPrefixSnapshotLostTokens", 0)
+        if prefix_lost > 0:
+            self._log_counter(self.kv_cache_prefix_snapshot_lost_tokens_total,
+                              rank_labels, prefix_lost)
 
         kv_iter = iteration_stats.get("kvCacheIterationStats")
         kv_iter_by_lifecycle = iteration_stats.get(
