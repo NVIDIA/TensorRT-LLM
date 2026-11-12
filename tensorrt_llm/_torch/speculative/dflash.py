@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import async_tensor_h2d, prefer_pinned
+from tensorrt_llm._utils import async_tensor_h2d, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -135,6 +135,10 @@ class DFlashSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Keep the full slot capacity across CUDA graph copies, whose
+        # max_num_requests is narrowed to the captured graph bucket.
+        self.num_seq_slots = self.num_seq_slots or self.max_num_requests
+
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
@@ -849,8 +853,7 @@ class DFlashWorker(SpecWorkerBase):
                 return True
             table = self._ctx_kv_manager.get_draft_block_table(request_ids[:num_seqs])
             # Pinned: a pageable upload would wait for the step in flight.
-            if prefer_pinned():
-                table = table.pin_memory()
+            table = maybe_pin_memory(table)
             self._ctx_block_tables[:num_seqs].copy_(table, non_blocking=True)
             self._ctx_block_counts[:num_seqs].copy_(
                 torch.tensor(
@@ -992,7 +995,11 @@ class DFlashWorker(SpecWorkerBase):
         # pass falling back to the arena still rebinds once the real pool lands.
         self._ctx_kv_manager = draft_kv_cache_manager
         self._ctx_block_tables = None
-        max_batch = spec_metadata.max_num_requests
+        # Allocated once and reused for every later batch shape, so size it by
+        # the full seq-slot pool: create_cuda_graph_metadata narrows
+        # max_num_requests to the captured graph bucket, and under
+        # disaggregated attention DP the pool can be 2 * max_batch_size.
+        max_batch = spec_metadata.num_seq_slots
 
         # The drafter's position space is 1:1 with the target's — prefill writes
         # one entry per prompt token, decode appends one per accepted token — so
