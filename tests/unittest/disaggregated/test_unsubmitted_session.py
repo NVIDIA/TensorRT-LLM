@@ -55,6 +55,7 @@ def _sender(*, ownership: bool = True) -> transfer_mod.Sender:
     sender._enforce_physical_ownership = ownership
     sender._sessions_lock, sender._sessions = threading.Lock(), {}
     sender._pre_cancelled_rids = {}
+    sender._retired_rids = {}
     sender._peer_requests_lock = threading.Lock()
     sender._peer_requests, sender._peer_requests_timestamps = {}, {}
     sender._shutdown, sender._shutdown_requested = True, False
