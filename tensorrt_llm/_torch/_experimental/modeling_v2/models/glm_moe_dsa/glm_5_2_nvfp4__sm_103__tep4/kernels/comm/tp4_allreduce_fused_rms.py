@@ -50,6 +50,8 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.experimental import primitives as prims
 
+from ..common import self_attn_prefill_act_quant_mxf8 as _mxf8
+
 try:
     from cutlass._mlir import ir as _ir
     from cutlass._mlir.dialects import llvm as _llvm
@@ -297,6 +299,58 @@ def _all_bf16x8_lanes_ready(values):
     for lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
         ready = ready & (values[lane].bitcast(cutlass.Int16) != neg_zero_bits)
     return ready
+
+
+@cute.jit
+def _reset_bf16x8(local_buffer, offset, neg_zero_vec):
+    """Self-cleaning slot: the one reader of a consumed Lamport vector puts the not-ready
+    marker back, so the slot needs no clear before its next use (its count is recorded 0)."""
+    local_buffer.store(
+        neg_zero_vec[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)],
+        offset,
+        _BF16_VEC_SIZE,
+        alignment=_ALIGNMENT_BYTES,
+        is_volatile=True,
+    )
+
+
+@cute.jit
+def _cta_head_load(tidx, head_vals, state_signal_ptr, signal_state):
+    """CTA head: thread 0 loads the three per-slot clear counts (relaxed) and the slot signal
+    (acquire) into `head_vals` = `[signal, count0, count1, count2]`, then the CTA syncs.
+
+    Every thread loading them put one L2 line under 147k loads per launch at 192 rows (768
+    CTAs x 192 threads): per-CTA stamps on 4x B300, 1.8 us from griddepcontrol.wait to the
+    slot, 0.9 us with one load per CTA. The counts are written only
+    by launches that completed before this grid's griddepcontrol.wait (a launch writes its own
+    ping slot's count, never the slot it clears), so the relaxed loads read what the dependent
+    acquire load after the signal would."""
+    if tidx == 0:
+        head_vals[1] = cute.arch.load(
+            (signal_state.iterator + cutlass.Int64(_SIGNAL_SLOT_COUNTS_INDEX)).llvm_ptr,
+            cutlass.Int32,
+            sem="relaxed",
+            scope="gpu",
+        )
+        head_vals[2] = cute.arch.load(
+            (signal_state.iterator + cutlass.Int64(_SIGNAL_SLOT_COUNTS_INDEX + 1)).llvm_ptr,
+            cutlass.Int32,
+            sem="relaxed",
+            scope="gpu",
+        )
+        head_vals[3] = cute.arch.load(
+            (signal_state.iterator + cutlass.Int64(_SIGNAL_SLOT_COUNTS_INDEX + 2)).llvm_ptr,
+            cutlass.Int32,
+            sem="relaxed",
+            scope="gpu",
+        )
+        head_vals[0] = cute.arch.load(
+            state_signal_ptr,
+            cutlass.Int32,
+            sem="acquire",
+            scope="gpu",
+        )
+    prims.barrier_cta_sync(0)
 
 
 @cute.jit
@@ -1039,6 +1093,129 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_kernel(
             )
 
 
+@cute.jit
+def _twoshot_push_partial(slice_owner, values, buffer_arrays, offset, LOCAL_RANK, WORLD_SIZE):
+    """Two-shot reduce-scatter, sending side: store this rank's (sanitized) partial vector of a
+    row slice into this rank's region of the slice owner's slot, unless this rank owns it."""
+    for target_rank in cutlass.range_constexpr(WORLD_SIZE):
+        if cutlass.const_expr(target_rank != LOCAL_RANK):
+            if slice_owner == cutlass.Int32(target_rank):
+                buffer_arrays[target_rank].store(
+                    values,
+                    offset,
+                    _BF16_VEC_SIZE,
+                    alignment=_ALIGNMENT_BYTES,
+                    is_volatile=True,
+                )
+
+
+@cute.jit
+def _twoshot_reduce_slice(
+    slice_owner,
+    local_buffer,
+    buffer_arrays,
+    input_values,
+    residual_vec,
+    ping_base,
+    numel_i64,
+    base_idx_i64,
+    LOCAL_RANK,
+    WORLD_SIZE,
+    PEER_ORDER,
+    neg_zero_vec,
+    SELF_CLEAN,
+):
+    """Two-shot sum of one 8-lane vector of a row slice: the bf16 `sum + residual`.
+
+    The owner waits for the three peers' partials in its slot (sentinel readiness, as the
+    one-shot), sums them with its own partial in rank order 0..WORLD_SIZE-1 in fp32, adds the
+    residual in fp32 and rounds once -- the one-shot's arithmetic, so every rank's bytes are
+    the one-shot's -- then stores the bf16 result into its own region of every peer's slot
+    (the all-gather half). A non-owner waits for that vector in the owner's region of its
+    own slot. A sum or residual rounds to -0.0 only from -0.0 operands, which the senders'
+    sanitize already turned into +0.0; the owner still sanitizes what it publishes, so the
+    in-band not-ready marker never travels as data and every rank keeps the same bytes.
+
+    `SELF_CLEAN`: every vector read here (the owner's three peer partials, a non-owner's one
+    reduced vector) is reset to the not-ready marker by its reader, so the slot is clean when
+    the kernel ends and the launch records a clear count of 0.
+    """
+    out = cutlass.Array(cutlass.BFloat16, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES)
+    if slice_owner == cutlass.Int32(LOCAL_RANK):
+        peer_values_all = cutlass.Array(
+            cutlass.BFloat16,
+            WORLD_SIZE * _BF16_VEC_SIZE,
+            alignment=_ALIGNMENT_BYTES,
+        )
+        for peer_ordinal in cutlass.range_constexpr(WORLD_SIZE):
+            source_rank = PEER_ORDER[peer_ordinal]
+            if cutlass.const_expr(source_rank != LOCAL_RANK):
+                read_offset = ping_base + cutlass.Int64(source_rank) * numel_i64 + base_idx_i64
+                peer_values = local_buffer.load(
+                    read_offset,
+                    _BF16_VEC_SIZE,
+                    alignment=_ALIGNMENT_BYTES,
+                    is_volatile=True,
+                )
+                while not _all_bf16x8_lanes_ready(peer_values):
+                    peer_values = local_buffer.load(
+                        read_offset,
+                        _BF16_VEC_SIZE,
+                        alignment=_ALIGNMENT_BYTES,
+                        is_volatile=True,
+                    )
+                peer_values_all[
+                    source_rank * _BF16_VEC_SIZE : _BF16_VEC_SIZE,
+                    cutlass.align(_ALIGNMENT_BYTES),
+                ] = peer_values
+                if cutlass.const_expr(SELF_CLEAN):
+                    _reset_bf16x8(local_buffer, read_offset, neg_zero_vec)
+        acc = cutlass.full((_BF16_VEC_SIZE,), 0.0, dtype=cutlass.Float32)
+        for source_rank in cutlass.range_constexpr(WORLD_SIZE):
+            if cutlass.const_expr(source_rank != LOCAL_RANK):
+                acc = acc + peer_values_all[
+                    source_rank * _BF16_VEC_SIZE : _BF16_VEC_SIZE,
+                    cutlass.align(_ALIGNMENT_BYTES),
+                ].to(cutlass.Float32)
+            else:
+                acc = acc + input_values.to(cutlass.Float32)
+        summed = (acc + residual_vec.to(cutlass.Float32)).to(cutlass.BFloat16)
+        neg_zero_bits = cutlass.Int16(_NEGATIVE_ZERO_BF16_BITS)
+        for lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+            lane_value = summed[lane]
+            if lane_value.bitcast(cutlass.Int16) == neg_zero_bits:
+                lane_value = cutlass.BFloat16(0.0)
+            out[lane] = lane_value
+        for peer_rank in cutlass.range_constexpr(WORLD_SIZE):
+            if cutlass.const_expr(peer_rank != LOCAL_RANK):
+                buffer_arrays[peer_rank].store(
+                    out[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)],
+                    ping_base + cutlass.Int64(LOCAL_RANK) * numel_i64 + base_idx_i64,
+                    _BF16_VEC_SIZE,
+                    alignment=_ALIGNMENT_BYTES,
+                    is_volatile=True,
+                )
+    else:
+        owner_offset = ping_base + cutlass.Int64(slice_owner) * numel_i64 + base_idx_i64
+        owner_values = local_buffer.load(
+            owner_offset,
+            _BF16_VEC_SIZE,
+            alignment=_ALIGNMENT_BYTES,
+            is_volatile=True,
+        )
+        while not _all_bf16x8_lanes_ready(owner_values):
+            owner_values = local_buffer.load(
+                owner_offset,
+                _BF16_VEC_SIZE,
+                alignment=_ALIGNMENT_BYTES,
+                is_volatile=True,
+            )
+        out[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)] = owner_values
+        if cutlass.const_expr(SELF_CLEAN):
+            _reset_bf16x8(local_buffer, owner_offset, neg_zero_vec)
+    return out[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)]
+
+
 @cute.kernel
 def _glm_tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
     input_tensor: cute.Tensor,
@@ -1078,6 +1255,8 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
     MULTICAST_PUBLISH: cutlass.Constexpr[bool],
     IKET_PHASES: cutlass.Constexpr[bool],
     ROTATED_POLL_ORDER: cutlass.Constexpr[bool],
+    CTA_HEAD: cutlass.Constexpr[bool],
+    SELF_CLEAN: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -1147,6 +1326,9 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
         signal_state.iterator + cutlass.Int64(_SIGNAL_RELEASE_EPOCH_INDEX)
     ).llvm_ptr
     signal_i32 = cutlass.Int32(0)
+    pre_count0 = cutlass.Int32(0)
+    pre_count1 = cutlass.Int32(0)
+    pre_count2 = cutlass.Int32(0)
     signal_i64 = signal
     entry_release_epoch = cutlass.Int32(0)
     if IKET_PHASES:
@@ -1180,12 +1362,25 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
                     sem="acquire",
                     scope="gpu",
                 )
-        signal_i32 = cute.arch.load(
-            state_signal_ptr,
-            cutlass.Int32,
-            sem="acquire",
-            scope="gpu",
-        )
+        if cutlass.const_expr(CTA_HEAD):
+            head_vals = cutlass.Array(
+                cutlass.Int32,
+                4,
+                space=cutlass.AddressSpace.smem,
+                alignment=_ALIGNMENT_BYTES,
+            )
+            _cta_head_load(tidx, head_vals, state_signal_ptr, signal_state)
+            signal_i32 = head_vals[0]
+            pre_count0 = head_vals[1]
+            pre_count1 = head_vals[2]
+            pre_count2 = head_vals[3]
+        else:
+            signal_i32 = cute.arch.load(
+                state_signal_ptr,
+                cutlass.Int32,
+                sem="acquire",
+                scope="gpu",
+            )
         signal_i64 = cutlass.Int64(signal_i32)
         if (not AGGREGATE_SIGNAL_AT_CLUSTER_ROOT) and (not LAST_CTA_SIGNAL_ADVANCE) and tidx == 0:
             prims.red(
@@ -1233,12 +1428,20 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
             + cutlass.Int64(_SIGNAL_SLOT_COUNTS_INDEX)
             + cutlass.Int64(clear_slot)
         ).llvm_ptr
-        clear_vectors = cute.arch.load(
-            clear_count_ptr,
-            cutlass.Int32,
-            sem="acquire",
-            scope="gpu",
-        )
+        clear_vectors = cutlass.Int32(0)
+        if cutlass.const_expr(CTA_HEAD):
+            clear_vectors = pre_count0
+            if clear_slot == cutlass.Int64(1):
+                clear_vectors = pre_count1
+            if clear_slot == cutlass.Int64(2):
+                clear_vectors = pre_count2
+        else:
+            clear_vectors = cute.arch.load(
+                clear_count_ptr,
+                cutlass.Int32,
+                sem="acquire",
+                scope="gpu",
+            )
         clear_vector_idx = bidx * THREADS_PER_BLOCK + tidx
         clear_stride = grid_x * THREADS_PER_BLOCK
         while clear_vector_idx < clear_vectors:
@@ -1415,6 +1618,10 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
                     active_vectors_i32 = (
                         cutlass.Int32(cute.size(input_tensor, mode=[0])) * cutlass.Int32(N)
                     ) // cutlass.Int32(_BF16_VEC_SIZE)
+                    if cutlass.const_expr(SELF_CLEAN):
+                        # Every vector the peers wrote into this rank's slot is reset by its one
+                        # reader: nothing for the launch two calls on to clear.
+                        active_vectors_i32 = cutlass.Int32(0)
                     _advance_signal_if_last_cta(
                         state_counter_ptr,
                         state_signal_ptr,
@@ -1604,6 +1811,8 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
                                     alignment=_ALIGNMENT_BYTES,
                                     is_volatile=True,
                                 )
+                            if cutlass.const_expr(SELF_CLEAN):
+                                _reset_bf16x8(local_buffer, read_offset, neg_zero_vec)
 
                         if ROTATED_POLL_ORDER:
                             peer_values_all[
@@ -1936,6 +2145,9 @@ def _glm_tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_ro
     IKET_PHASES: cutlass.Constexpr[bool],
     ROTATED_POLL_ORDER: cutlass.Constexpr[bool],
     PREFETCH_FUSED_INPUTS: cutlass.Constexpr[bool],
+    TWO_SHOT: cutlass.Constexpr[bool],
+    CTA_HEAD: cutlass.Constexpr[bool],
+    SELF_CLEAN: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -2005,6 +2217,9 @@ def _glm_tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_ro
         signal_state.iterator + cutlass.Int64(_SIGNAL_RELEASE_EPOCH_INDEX)
     ).llvm_ptr
     signal_i32 = cutlass.Int32(0)
+    pre_count0 = cutlass.Int32(0)
+    pre_count1 = cutlass.Int32(0)
+    pre_count2 = cutlass.Int32(0)
     signal_i64 = signal
     entry_release_epoch = cutlass.Int32(0)
     if IKET_PHASES:
@@ -2045,12 +2260,25 @@ def _glm_tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_ro
                     sem="acquire",
                     scope="gpu",
                 )
-        signal_i32 = cute.arch.load(
-            state_signal_ptr,
-            cutlass.Int32,
-            sem="acquire",
-            scope="gpu",
-        )
+        if cutlass.const_expr(CTA_HEAD):
+            head_vals = cutlass.Array(
+                cutlass.Int32,
+                4,
+                space=cutlass.AddressSpace.smem,
+                alignment=_ALIGNMENT_BYTES,
+            )
+            _cta_head_load(tidx, head_vals, state_signal_ptr, signal_state)
+            signal_i32 = head_vals[0]
+            pre_count0 = head_vals[1]
+            pre_count1 = head_vals[2]
+            pre_count2 = head_vals[3]
+        else:
+            signal_i32 = cute.arch.load(
+                state_signal_ptr,
+                cutlass.Int32,
+                sem="acquire",
+                scope="gpu",
+            )
         signal_i64 = cutlass.Int64(signal_i32)
         if (not AGGREGATE_SIGNAL_AT_CLUSTER_ROOT) and (not LAST_CTA_SIGNAL_ADVANCE) and tidx == 0:
             prims.red(
@@ -2098,12 +2326,20 @@ def _glm_tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_ro
             + cutlass.Int64(_SIGNAL_SLOT_COUNTS_INDEX)
             + cutlass.Int64(clear_slot)
         ).llvm_ptr
-        clear_vectors = cute.arch.load(
-            clear_count_ptr,
-            cutlass.Int32,
-            sem="acquire",
-            scope="gpu",
-        )
+        clear_vectors = cutlass.Int32(0)
+        if cutlass.const_expr(CTA_HEAD):
+            clear_vectors = pre_count0
+            if clear_slot == cutlass.Int64(1):
+                clear_vectors = pre_count1
+            if clear_slot == cutlass.Int64(2):
+                clear_vectors = pre_count2
+        else:
+            clear_vectors = cute.arch.load(
+                clear_count_ptr,
+                cutlass.Int32,
+                sem="acquire",
+                scope="gpu",
+            )
         clear_vector_idx = bidx * THREADS_PER_BLOCK + tidx
         clear_stride = grid_x * THREADS_PER_BLOCK
         while clear_vector_idx < clear_vectors:
@@ -2220,6 +2456,20 @@ def _glm_tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_ro
                         lane_value = cutlass.BFloat16(0.0)
                     sanitized_input_values[lane] = lane_value
 
+            if cutlass.const_expr(TWO_SHOT):
+                # Reduce-scatter half of the two-shot: this rank's partial of the slice goes
+                # to the slice's owner only (one remote store; the one-shot stores to all
+                # three peers). Every rank owns a quarter of the slices of every row,
+                # spread over the row's cluster.
+                slice_owner = (row + cta_rank) % cutlass.Int32(WORLD_SIZE)
+                _twoshot_push_partial(
+                    slice_owner,
+                    sanitized_input_values[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)],
+                    buffer_arrays,
+                    ping_base + cutlass.Int64(LOCAL_RANK) * numel_i64 + base_idx_i64,
+                    LOCAL_RANK,
+                    WORLD_SIZE,
+                )
             if MULTICAST_PUBLISH:
                 # One NVLS multicast store lands in slot[LOCAL_RANK] of every
                 # rank (including this one); the fabric does the replication,
@@ -2235,7 +2485,11 @@ def _glm_tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_ro
                 )
             for peer_ordinal in cutlass.range_constexpr(WORLD_SIZE):
                 target_rank = PEER_ORDER[peer_ordinal]
-                if (not MULTICAST_PUBLISH) and ((not ELIDE_SELF_RANK) or target_rank != LOCAL_RANK):
+                if (
+                    (not TWO_SHOT)
+                    and (not MULTICAST_PUBLISH)
+                    and ((not ELIDE_SELF_RANK) or target_rank != LOCAL_RANK)
+                ):
                     write_offset = ping_base + cutlass.Int64(LOCAL_RANK) * numel_i64 + base_idx_i64
                     if USE_READY_FLAGS:
                         ready_offset = (
@@ -2298,6 +2552,10 @@ def _glm_tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_ro
                     active_vectors_i32 = (
                         cutlass.Int32(cute.size(input_tensor, mode=[0])) * cutlass.Int32(N)
                     ) // cutlass.Int32(_BF16_VEC_SIZE)
+                    if cutlass.const_expr(SELF_CLEAN):
+                        # Every vector the peers wrote into this rank's slot is reset by its one
+                        # reader: nothing for the launch two calls on to clear.
+                        active_vectors_i32 = cutlass.Int32(0)
                     _advance_signal_if_last_cta(
                         state_counter_ptr,
                         state_signal_ptr,
@@ -2308,99 +2566,121 @@ def _glm_tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_ro
                         grid_x,
                     )
 
-            acc = cutlass.full((_BF16_VEC_SIZE,), 0.0, dtype=cutlass.Float32)
+            if cutlass.const_expr(TWO_SHOT):
+                residual_out_vec = _twoshot_reduce_slice(
+                    slice_owner,
+                    local_buffer,
+                    buffer_arrays,
+                    input_values,
+                    residual_vec,
+                    ping_base,
+                    numel_i64,
+                    base_idx_i64,
+                    LOCAL_RANK,
+                    WORLD_SIZE,
+                    PEER_ORDER,
+                    neg_zero_vec,
+                    SELF_CLEAN,
+                )
+                if IKET_PHASES:
+                    cute.experimental.iket.range_pop()
+                    cute.experimental.iket.range_push("ar_residual")
+            else:
+                acc = cutlass.full((_BF16_VEC_SIZE,), 0.0, dtype=cutlass.Float32)
 
-            peer_values_all = cutlass.Array(
-                cutlass.BFloat16,
-                WORLD_SIZE * _BF16_VEC_SIZE,
-                alignment=_ALIGNMENT_BYTES,
-            )
-            for peer_ordinal in cutlass.range_constexpr(WORLD_SIZE):
-                source_rank = PEER_ORDER[peer_ordinal] if ROTATED_POLL_ORDER else peer_ordinal
-                if (not ELIDE_SELF_RANK) or source_rank != LOCAL_RANK:
-                    read_offset = ping_base + cutlass.Int64(source_rank) * numel_i64 + base_idx_i64
-                    peer_values = cutlass.full(
-                        (_BF16_VEC_SIZE,),
-                        0.0,
-                        dtype=cutlass.BFloat16,
-                    )
-                    if USE_READY_FLAGS:
-                        read_ready_offset = (
-                            ping_ready_base
-                            + cutlass.Int64(source_rank) * num_vectors_i64
-                            + vector_idx_i64
+                peer_values_all = cutlass.Array(
+                    cutlass.BFloat16,
+                    WORLD_SIZE * _BF16_VEC_SIZE,
+                    alignment=_ALIGNMENT_BYTES,
+                )
+                for peer_ordinal in cutlass.range_constexpr(WORLD_SIZE):
+                    source_rank = PEER_ORDER[peer_ordinal] if ROTATED_POLL_ORDER else peer_ordinal
+                    if (not ELIDE_SELF_RANK) or source_rank != LOCAL_RANK:
+                        read_offset = (
+                            ping_base + cutlass.Int64(source_rank) * numel_i64 + base_idx_i64
                         )
-                        ready_value = cute.arch.load(
-                            (ready_flags[LOCAL_RANK].iterator + read_ready_offset).llvm_ptr,
-                            cutlass.Int32,
-                            sem="acquire",
-                            scope="sys",
+                        peer_values = cutlass.full(
+                            (_BF16_VEC_SIZE,),
+                            0.0,
+                            dtype=cutlass.BFloat16,
                         )
-                        while ready_value < cutlass.Int32(1):
+                        if USE_READY_FLAGS:
+                            read_ready_offset = (
+                                ping_ready_base
+                                + cutlass.Int64(source_rank) * num_vectors_i64
+                                + vector_idx_i64
+                            )
                             ready_value = cute.arch.load(
                                 (ready_flags[LOCAL_RANK].iterator + read_ready_offset).llvm_ptr,
                                 cutlass.Int32,
                                 sem="acquire",
                                 scope="sys",
                             )
-                        peer_values = local_buffer.load(
-                            read_offset,
-                            _BF16_VEC_SIZE,
-                            alignment=_ALIGNMENT_BYTES,
-                            is_volatile=True,
-                        )
-                    else:
-                        peer_values = local_buffer.load(
-                            read_offset,
-                            _BF16_VEC_SIZE,
-                            alignment=_ALIGNMENT_BYTES,
-                            is_volatile=True,
-                        )
-                        while not _all_bf16x8_lanes_ready(peer_values):
+                            while ready_value < cutlass.Int32(1):
+                                ready_value = cute.arch.load(
+                                    (ready_flags[LOCAL_RANK].iterator + read_ready_offset).llvm_ptr,
+                                    cutlass.Int32,
+                                    sem="acquire",
+                                    scope="sys",
+                                )
                             peer_values = local_buffer.load(
                                 read_offset,
                                 _BF16_VEC_SIZE,
                                 alignment=_ALIGNMENT_BYTES,
                                 is_volatile=True,
                             )
+                        else:
+                            peer_values = local_buffer.load(
+                                read_offset,
+                                _BF16_VEC_SIZE,
+                                alignment=_ALIGNMENT_BYTES,
+                                is_volatile=True,
+                            )
+                            while not _all_bf16x8_lanes_ready(peer_values):
+                                peer_values = local_buffer.load(
+                                    read_offset,
+                                    _BF16_VEC_SIZE,
+                                    alignment=_ALIGNMENT_BYTES,
+                                    is_volatile=True,
+                                )
 
-                    if ROTATED_POLL_ORDER:
-                        peer_values_all[
-                            source_rank * _BF16_VEC_SIZE : _BF16_VEC_SIZE,
-                            cutlass.align(_ALIGNMENT_BYTES),
-                        ] = peer_values
-                    else:
-                        acc = acc + peer_values.to(cutlass.Float32)
-                if (not ROTATED_POLL_ORDER) and ELIDE_SELF_RANK and source_rank == LOCAL_RANK:
-                    # Own partial enters the sum at its rank position so every
-                    # rank accumulates 0 -> WORLD_SIZE-1 (bit-identical, as TRT-LLM).
-                    acc = acc + input_values.to(cutlass.Float32)
-            if ROTATED_POLL_ORDER:
-                # Polled in PEER_ORDER (latency), summed in absolute rank order (numerics).
-                for source_rank in cutlass.range_constexpr(WORLD_SIZE):
-                    if (not ELIDE_SELF_RANK) or source_rank != LOCAL_RANK:
-                        peer_values = peer_values_all[
-                            source_rank * _BF16_VEC_SIZE : _BF16_VEC_SIZE,
-                            cutlass.align(_ALIGNMENT_BYTES),
-                        ]
-                        acc = acc + peer_values.to(cutlass.Float32)
-                    if ELIDE_SELF_RANK and source_rank == LOCAL_RANK:
+                        if ROTATED_POLL_ORDER:
+                            peer_values_all[
+                                source_rank * _BF16_VEC_SIZE : _BF16_VEC_SIZE,
+                                cutlass.align(_ALIGNMENT_BYTES),
+                            ] = peer_values
+                        else:
+                            acc = acc + peer_values.to(cutlass.Float32)
+                    if (not ROTATED_POLL_ORDER) and ELIDE_SELF_RANK and source_rank == LOCAL_RANK:
+                        # Own partial enters the sum at its rank position so every
+                        # rank accumulates 0 -> WORLD_SIZE-1 (bit-identical, as TRT-LLM).
                         acc = acc + input_values.to(cutlass.Float32)
-            if IKET_PHASES:
-                cute.experimental.iket.range_pop()
-                cute.experimental.iket.range_push("ar_residual")
-            if not PREFETCH_FUSED_INPUTS:
-                residual_vec = residual_array[row, :].load(
-                    col,
-                    _BF16_VEC_SIZE,
-                    alignment=_ALIGNMENT_BYTES,
-                )
-                weight_vec = norm_weight_array.load(
-                    col,
-                    _BF16_VEC_SIZE,
-                    alignment=_ALIGNMENT_BYTES,
-                )
-            residual_out_vec = (acc + residual_vec.to(cutlass.Float32)).to(cutlass.BFloat16)
+                if ROTATED_POLL_ORDER:
+                    # Polled in PEER_ORDER (latency), summed in absolute rank order (numerics).
+                    for source_rank in cutlass.range_constexpr(WORLD_SIZE):
+                        if (not ELIDE_SELF_RANK) or source_rank != LOCAL_RANK:
+                            peer_values = peer_values_all[
+                                source_rank * _BF16_VEC_SIZE : _BF16_VEC_SIZE,
+                                cutlass.align(_ALIGNMENT_BYTES),
+                            ]
+                            acc = acc + peer_values.to(cutlass.Float32)
+                        if ELIDE_SELF_RANK and source_rank == LOCAL_RANK:
+                            acc = acc + input_values.to(cutlass.Float32)
+                if IKET_PHASES:
+                    cute.experimental.iket.range_pop()
+                    cute.experimental.iket.range_push("ar_residual")
+                if not PREFETCH_FUSED_INPUTS:
+                    residual_vec = residual_array[row, :].load(
+                        col,
+                        _BF16_VEC_SIZE,
+                        alignment=_ALIGNMENT_BYTES,
+                    )
+                    weight_vec = norm_weight_array.load(
+                        col,
+                        _BF16_VEC_SIZE,
+                        alignment=_ALIGNMENT_BYTES,
+                    )
+                residual_out_vec = (acc + residual_vec.to(cutlass.Float32)).to(cutlass.BFloat16)
             residual_output_array[row, :].store(
                 residual_out_vec,
                 col,
@@ -2739,6 +3019,8 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row(
     MULTICAST_PUBLISH: cutlass.Constexpr[bool],
     IKET_PHASES: cutlass.Constexpr[bool],
     ROTATED_POLL_ORDER: cutlass.Constexpr[bool],
+    CTA_HEAD: cutlass.Constexpr[bool],
+    SELF_CLEAN: cutlass.Constexpr[bool],
 ) -> None:
     M = input_tensor.shape[0]
     _glm_tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row_kernel(
@@ -2779,6 +3061,8 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_oneshot_lamport_split_row(
         MULTICAST_PUBLISH,
         IKET_PHASES,
         ROTATED_POLL_ORDER,
+        CTA_HEAD,
+        SELF_CLEAN,
     ).launch(
         grid=(M * CTAS_PER_ROW, 1, 1),
         block=(THREADS_PER_BLOCK, 1, 1),
@@ -2826,6 +3110,9 @@ def _glm_tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_ro
     IKET_PHASES: cutlass.Constexpr[bool],
     ROTATED_POLL_ORDER: cutlass.Constexpr[bool],
     PREFETCH_FUSED_INPUTS: cutlass.Constexpr[bool],
+    TWO_SHOT: cutlass.Constexpr[bool],
+    CTA_HEAD: cutlass.Constexpr[bool],
+    SELF_CLEAN: cutlass.Constexpr[bool],
 ) -> None:
     M = input_tensor.shape[0]
     _glm_tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_row_kernel(
@@ -2864,6 +3151,9 @@ def _glm_tp_allreduce_residual_rms_norm_out_quant_nvfp4_oneshot_lamport_split_ro
         IKET_PHASES,
         PREFETCH_FUSED_INPUTS,
         ROTATED_POLL_ORDER,
+        TWO_SHOT,
+        CTA_HEAD,
+        SELF_CLEAN,
     ).launch(
         grid=(M * CTAS_PER_ROW, 1, 1),
         block=(THREADS_PER_BLOCK, 1, 1),
@@ -3092,6 +3382,185 @@ def _twoshot_row_epilogue(
                 + half_block * cutlass.Int32(_BF16_VEC_SIZE // 2)
             )
             prims.store_ext(packed_word, fp4_ptr + fp4_index)
+
+
+@cute.jit
+def _twoshot_block_epilogue(
+    row0,
+    m_rows,
+    block_values,
+    residual_array,
+    norm_weight_array,
+    norm_output_array,
+    residual_output_array,
+    warp_sums_block,
+    tidx,
+    lane_id,
+    warp_id,
+    global_scale,
+    fp4_ptr,
+    sf_ptr,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    N: cutlass.Constexpr[int],
+    THREADS_PER_BLOCK: cutlass.Constexpr[int],
+    VECS_PER_THREAD: cutlass.Constexpr[int],
+    ROWS_PER_CTA: cutlass.Constexpr[int],
+    EMIT_NVFP4: cutlass.Constexpr[bool],
+    q8_base,
+    sf8_base,
+    EMIT_MXF8: cutlass.Constexpr[bool],
+):
+    """`_twoshot_row_epilogue` for the ROWS_PER_CTA rows of one block at once.
+
+    ``EMIT_MXF8`` (push kernel only): the normalized BF16 rows are also written as MXF8
+    (e4m3 ``[M, N]`` at ``q8_base`` + blocked e8m0 scales at ``sf8_base``), the bytes
+    ``self_attn_prefill_act_quant_mxf8`` writes for the BF16 output -- the context kv_a
+    projection's operand without its own quant launch.  Thread ``t`` holds columns
+    ``(t + v * THREADS_PER_BLOCK) * 8``, so a 32-column scale block is threads ``4j .. 4j +
+    3`` (one warp) and the row predicate is CTA-uniform: every lane reaches the shuffles.
+
+    ``block_values`` holds the block's reduced rows (row ``rr``, vector ``v`` at
+    ``(rr * VECS_PER_THREAD + v) * 8``) and is overwritten with the residual
+    output. Every residual load of the block is issued before the first is
+    used, and the rows share one warp-sum round (``warp_sums_block`` is
+    ``[ROWS_PER_CTA][warps]``), so a block costs one latency chain and one
+    barrier pair instead of one per row. The per-row arithmetic and the
+    summation order are the row epilogue's, so the outputs are bit-identical.
+    """
+    WARPS = THREADS_PER_BLOCK // 32
+    weight_values = cutlass.Array(
+        cutlass.BFloat16,
+        VECS_PER_THREAD * _BF16_VEC_SIZE,
+        alignment=_ALIGNMENT_BYTES,
+    )
+    residual_values = cutlass.Array(
+        cutlass.BFloat16,
+        ROWS_PER_CTA * VECS_PER_THREAD * _BF16_VEC_SIZE,
+        alignment=_ALIGNMENT_BYTES,
+    )
+    for v in cutlass.range_constexpr(VECS_PER_THREAD):
+        col = (tidx + cutlass.Int32(v * THREADS_PER_BLOCK)) * cutlass.Int32(_BF16_VEC_SIZE)
+        weight_values[v * _BF16_VEC_SIZE : _BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)] = (
+            norm_weight_array.load(col, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES)
+        )
+    for rr in cutlass.range_constexpr(ROWS_PER_CTA):
+        row = row0 + cutlass.Int32(rr)
+        if row < m_rows:
+            for v in cutlass.range_constexpr(VECS_PER_THREAD):
+                col = (tidx + cutlass.Int32(v * THREADS_PER_BLOCK)) * cutlass.Int32(_BF16_VEC_SIZE)
+                base = (rr * VECS_PER_THREAD + v) * _BF16_VEC_SIZE
+                residual_values[base:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)] = (
+                    residual_array[row, :].load(col, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES)
+                )
+    for rr in cutlass.range_constexpr(ROWS_PER_CTA):
+        row = row0 + cutlass.Int32(rr)
+        if row < m_rows:
+            local_sum_sq = cutlass.Float32(0.0)
+            for v in cutlass.range_constexpr(VECS_PER_THREAD):
+                col = (tidx + cutlass.Int32(v * THREADS_PER_BLOCK)) * cutlass.Int32(_BF16_VEC_SIZE)
+                base = (rr * VECS_PER_THREAD + v) * _BF16_VEC_SIZE
+                sum_vec = block_values[base:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)]
+                residual_vec = residual_values[base:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)]
+                residual_out_vec = (
+                    sum_vec.to(cutlass.Float32) + residual_vec.to(cutlass.Float32)
+                ).to(cutlass.BFloat16)
+                residual_output_array[row, :].store(
+                    residual_out_vec, col, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES
+                )
+                block_values[base:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)] = (
+                    residual_out_vec
+                )
+                residual_f32 = residual_out_vec.to(cutlass.Float32)
+                local_sum_sq = local_sum_sq + (residual_f32 * residual_f32).reduce("add")
+            warp_sum = _warp_sum_f32(local_sum_sq)
+            if lane_id == 0:
+                warp_sums_block[rr * WARPS + warp_id] = warp_sum
+    prims.barrier_cta_sync(0)
+    for rr in cutlass.range_constexpr(ROWS_PER_CTA):
+        row = row0 + cutlass.Int32(rr)
+        if row < m_rows:
+            cta_sum = cutlass.Float32(0.0)
+            for warp_idx in cutlass.range_constexpr(WARPS):
+                cta_sum = cta_sum + warp_sums_block[rr * WARPS + warp_idx]
+            inv_rms = cute.math.rsqrt(cta_sum * (1.0 / cutlass.Float32(N)) + eps, fastmath=True)
+            for v in cutlass.range_constexpr(VECS_PER_THREAD):
+                col = (tidx + cutlass.Int32(v * THREADS_PER_BLOCK)) * cutlass.Int32(_BF16_VEC_SIZE)
+                base = (rr * VECS_PER_THREAD + v) * _BF16_VEC_SIZE
+                residual_vec = block_values[base:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)]
+                weight_vec = weight_values[
+                    v * _BF16_VEC_SIZE : _BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)
+                ]
+                norm_f32 = residual_vec.to(cutlass.Float32) * inv_rms
+                norm_f32 = norm_f32 * weight_vec.to(cutlass.Float32)
+                norm_bf16 = norm_f32.to(cutlass.BFloat16)
+                norm_output_array[row, :].store(
+                    norm_bf16, col, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES
+                )
+                if cutlass.const_expr(EMIT_MXF8):
+                    norm_q8_f32 = norm_bf16.to(cutlass.Float32)
+                    vals8 = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.Float32)
+                    for lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+                        vals8[lane] = norm_q8_f32[lane]
+                    _mxf8.mxf8_quant_store_x8(
+                        vals8,
+                        q8_base,
+                        cutlass.Int64(row) * cutlass.Int64(N) + cutlass.Int64(col),
+                        sf8_base,
+                        cutlass.Int64(row),
+                        cutlass.Int64(col),
+                        cutlass.Int64(N // 128),
+                        row < m_rows,
+                    )
+                if cutlass.const_expr(EMIT_NVFP4):
+                    quant_f32 = norm_bf16.to(cutlass.Float32)
+                    local_max = cutlass.Float32(0.0)
+                    for lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+                        magnitude = cute.math.abs(quant_f32[lane])
+                        if magnitude > local_max:
+                            local_max = magnitude
+                    block_max = local_max
+                    peer_max = cute.arch.shuffle_sync_bfly(block_max, 1)
+                    if peer_max > block_max:
+                        block_max = peer_max
+                    sf_unquantized = global_scale * block_max * cutlass.Float32(1.0 / 6.0)
+                    sf_packed = prims.cvt_f32x2_to_f8x2(
+                        sf_unquantized,
+                        sf_unquantized,
+                        cutlass.Float8E4M3FN,
+                        rnd=prims.FPRoundingMode.RN,
+                        sat=prims.SaturationMode.SATFINITE,
+                    )
+                    sf_code = cutlass.Int32(sf_packed) & cutlass.Int32(0xFF)
+                    half_block = (col // cutlass.Int32(_BF16_VEC_SIZE)) & cutlass.Int32(1)
+                    scale_block = col // cutlass.Int32(_SCALE_BLOCK)
+                    if half_block == cutlass.Int32(0):
+                        sf_index = row * cutlass.Int32(N // _SCALE_BLOCK) + scale_block
+                        prims.store_ext(cutlass.Int8(sf_code), sf_ptr + sf_index)
+                    narrowed_sf = _decode_positive_e4m3(sf_code)
+                    output_scale = cutlass.Float32(0.0)
+                    if block_max != cutlass.Float32(0.0):
+                        output_scale = cute.arch.rcp_approx(
+                            narrowed_sf * cute.arch.rcp_approx(global_scale)
+                        )
+                    packed_word = cutlass.Int32(0)
+                    for pair in cutlass.range_constexpr(_BF16_VEC_SIZE // 2):
+                        low = quant_f32[2 * pair] * output_scale
+                        high = quant_f32[2 * pair + 1] * output_scale
+                        packed_byte = prims.cvt_f32x2_to_f4x2(
+                            high,
+                            low,
+                            cutlass.Float4E2M1FN,
+                            rnd=prims.FPRoundingMode.RN,
+                        ) & cutlass.Int32(0xFF)
+                        packed_word = packed_word | (packed_byte << cutlass.Int32(pair * 8))
+                    fp4_index = (
+                        row * cutlass.Int32(N // 2)
+                        + scale_block * cutlass.Int32(_SCALE_BLOCK // 2)
+                        + half_block * cutlass.Int32(_BF16_VEC_SIZE // 2)
+                    )
+                    prims.store_ext(packed_word, fp4_ptr + fp4_index)
+    # The next block reuses warp_sums_block; keep slow readers from seeing its partials.
+    prims.barrier_cta_sync(0)
 
 
 @cute.jit
@@ -4008,6 +4477,481 @@ def _glm_tp_allreduce_residual_rms_norm_twoshot_nvls_kernel(
                 cute.arch.griddepcontrol_launch_dependents()
 
 
+# ---------------------------------------------------------------------------
+# Push two-shot (2026-10-16): the same op1/op7 contract and launch signature as
+# the two-shot above, with readiness carried in the payload (the one-shot
+# kernels' -0.0 sentinel) instead of ready flags.
+#
+# Row-block groups are as above (block b of a group is owned by rank
+# b % WORLD_SIZE).  Per group, every CTA:
+#   push    stores this rank's partial rows of each peer-owned block straight
+#           into the owner's slot region [ping][LOCAL_RANK] (remote 16 B
+#           stores, -0.0 written as +0.0) -- no local staging copy;
+#   reduce  polls its own slot regions [ping][src] for the peers' partials of
+#           its own block, adds them to its own partial (read from the input)
+#           in rank order 0..W-1 in fp32, rounds to BF16 (-0.0 -> +0.0) and
+#           stores the sums into every peer's region [ping][LOCAL_RANK] at the
+#           same rows (rows the reduce never uses there), then runs the block
+#           epilogue;
+#   gather  polls its region [ping][owner] for each peer block's sums and runs
+#           the block epilogue.
+# Every vector a CTA consumes from its own slot is written back to -0.0 right
+# after it is read, and the slot's clear count is recorded as 0, so no later
+# launch has to clear it (1.5 x P of local writes per launch instead of the
+# 4 x P a full clear of the slot costs; P = M x N x 2 B).
+#
+# There are no flags, no release fences and no staging copy, which is where the
+# flagged variant spends its time at prefill M (stamped breakdown at M=8192:
+# producers 0-270 us -- staging 94, sum-ready release fences 84 -- then the
+# consumers, which cannot become resident before the producers exit).  A CTA
+# depends only on the same group's CTA on the other ranks, which walks the
+# same group list, so a persistent grid of `_TWOSHOT_PUSH_CTAS` cannot wait on
+# a CTA that will not run.  The arithmetic is the flagged variant's (fp32 sum
+# in rank order, BF16 sum, the same row epilogue), so the outputs are
+# bit-identical to it except for the sign of an all-zero sum.
+#
+# 4xB300, op1, N=6144, 256 threads, back-to-back eager launches: 108 / 140 /
+# 226 / 257 us at M = 3072 / 4096 / 7168 / 8192 against 222 / 263 / 375 / 424
+# for the flagged variant at its served geometry (256 producers, 1024
+# consumers); NCCL all_reduce alone is 126 / 148 / 239 / 269.
+#
+# `_TWOSHOT_PUSH` = 1 selects it for every two-shot launch; `_TWOSHOT_PUSH_CTAS`
+# is the persistent grid (296 = 2 per SM on 148 SMs; 148 and 592 measured
+# within 3 %); `_TWOSHOT_PUSH_ROWS` the rows per block (1 measured best: 257 us
+# at M=8192 against 295 with 2 and 350 with 4).
+# ---------------------------------------------------------------------------
+_SUPPORTS_TWOSHOT_PUSH = True
+_TWOSHOT_PUSH = 1
+_TWOSHOT_PUSH_CTAS = 296
+_TWOSHOT_PUSH_ROWS = 1
+
+
+@cute.jit
+def _sanitize_bf16x8(values, out):
+    """Copy 8 BF16 lanes, turning the -0.0 sentinel into +0.0."""
+    neg_zero_bits = cutlass.Int16(_NEGATIVE_ZERO_BF16_BITS)
+    for lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+        lane_value = values[lane]
+        if lane_value.bitcast(cutlass.Int16) == neg_zero_bits:
+            lane_value = cutlass.BFloat16(0.0)
+        out[lane] = lane_value
+
+
+@cute.kernel
+def _glm_tp_allreduce_residual_rms_norm_twoshot_push_kernel(
+    input_tensor: cute.Tensor,
+    residual_tensor: cute.Tensor,
+    norm_weight_tensor: cute.Tensor,
+    global_scale_tensor: cute.Tensor,
+    norm_output_tensor: cute.Tensor,
+    fp4_output_tensor: cute.Tensor,
+    scale_output_tensor: cute.Tensor,
+    residual_output_tensor: cute.Tensor,
+    buffers: list[cute.Tensor],
+    ready_flags: list[cute.Tensor],
+    signal_state: cute.Tensor,
+    multicast_base: cutlass.Int64,
+    signal: cutlass.Int64,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    N: cutlass.Constexpr[int],
+    LOCAL_RANK: cutlass.Constexpr[int],
+    WORLD_SIZE: cutlass.Constexpr[int],
+    THREADS_PER_BLOCK: cutlass.Constexpr[int],
+    ROWS_PER_CTA: cutlass.Constexpr[int],
+    USE_DEVICE_SIGNAL_STATE: cutlass.Constexpr[bool],
+    USE_PDL: cutlass.Constexpr[bool],
+    PDL_RELEASE_AT_ENTRY: cutlass.Constexpr[bool],
+    EMIT_NVFP4: cutlass.Constexpr[bool],
+    EMIT_MXF8: cutlass.Constexpr[bool],
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    grid_x, _, _ = cute.arch.grid_dim()
+    lane_id = tidx % 32
+    warp_id = tidx // 32
+    VECS_PER_THREAD = N // (_BF16_VEC_SIZE * THREADS_PER_BLOCK)
+
+    m_rows = cutlass.Int32(cute.size(input_tensor, mode=[0]))
+    # EMIT_MXF8: fp4_output_tensor is the e4m3 [M, N] output, scale_output_tensor its
+    # blocked e8m0 scales (see `_twoshot_block_epilogue`).
+    q8_base = fp4_output_tensor.iterator
+    sf8_base = scale_output_tensor.iterator
+    input_array = cutlass.make_array_view(input_tensor)
+    residual_array = cutlass.make_array_view(residual_tensor)
+    norm_weight_array = cutlass.make_array_view(norm_weight_tensor)
+    norm_output_array = cutlass.make_array_view(norm_output_tensor)
+    residual_output_array = cutlass.make_array_view(residual_output_tensor)
+    buffer_arrays = [cutlass.make_array_view(buffer) for buffer in buffers]
+    local_buffer = buffer_arrays[LOCAL_RANK]
+    fp4_ptr = fp4_output_tensor.iterator.raw_ptr()
+    sf_ptr = scale_output_tensor.iterator.raw_ptr()
+
+    warp_sums_block = cutlass.Array(
+        cutlass.Float32,
+        ROWS_PER_CTA * (THREADS_PER_BLOCK // 32),
+        space=cutlass.AddressSpace.smem,
+        alignment=_ALIGNMENT_BYTES,
+    )
+
+    numel = cute.size(buffers[0], mode=[2])
+    numel_i64 = cutlass.Int64(numel)
+    state_counter_ptr = (signal_state.iterator + cutlass.Int64(_SIGNAL_COUNTER_INDEX)).llvm_ptr
+    state_signal_ptr = (signal_state.iterator + cutlass.Int64(_SIGNAL_VALUE_INDEX)).llvm_ptr
+
+    if cutlass.const_expr(USE_PDL):
+        cute.arch.griddepcontrol_wait()
+    global_scale = cutlass.Float32(0.0)
+    if cutlass.const_expr(EMIT_NVFP4):
+        global_scale = prims.load_ext(global_scale_tensor.iterator.raw_ptr(), dtype=cutlass.Float32)
+    if cutlass.const_expr(EMIT_MXF8):
+        # after the PDL wait, like every other store of this kernel
+        _mxf8.mxf8_fill_pad_scales(
+            sf8_base,
+            m_rows,
+            cutlass.Int32(N // 128),
+            bidx * THREADS_PER_BLOCK + tidx,
+            grid_x * THREADS_PER_BLOCK,
+        )
+
+    signal_i32 = cutlass.Int32(0)
+    signal_i64 = signal
+    if USE_DEVICE_SIGNAL_STATE:
+        signal_i32 = cute.arch.load(
+            state_signal_ptr,
+            cutlass.Int32,
+            sem="acquire",
+            scope="gpu",
+        )
+        signal_i64 = cutlass.Int64(signal_i32)
+    ping_slot = signal_i64 % _PING_PONG_SIZE
+    clear_slot = (signal_i64 + cutlass.Int64(1)) % _PING_PONG_SIZE
+    ping_base = cutlass.Int64(ping_slot) * cutlass.Int64(WORLD_SIZE) * numel_i64
+    clear_base = cutlass.Int64(clear_slot) * cutlass.Int64(WORLD_SIZE) * numel_i64
+    if USE_DEVICE_SIGNAL_STATE:
+        if tidx == 0:
+            _advance_signal_if_last_cta(
+                state_counter_ptr,
+                state_signal_ptr,
+                signal_state,
+                signal_i32,
+                ping_slot,
+                # self-cleaned below: nothing for the next user of the slot to clear
+                cutlass.Int32(0),
+                grid_x,
+            )
+    if cutlass.const_expr(USE_PDL):
+        if cutlass.const_expr(PDL_RELEASE_AT_ENTRY):
+            if tidx == 0:
+                cute.arch.griddepcontrol_launch_dependents()
+
+    neg_zero_vec = cutlass.Array(
+        cutlass.BFloat16,
+        _BF16_VEC_SIZE,
+        alignment=_ALIGNMENT_BYTES,
+    )
+    neg_zero_bits = cutlass.Int16(_NEGATIVE_ZERO_BF16_BITS)
+    for lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+        neg_zero_vec[lane] = neg_zero_bits.bitcast(cutlass.BFloat16)
+    if USE_DEVICE_SIGNAL_STATE:
+        clear_count_ptr = (
+            signal_state.iterator
+            + cutlass.Int64(_SIGNAL_SLOT_COUNTS_INDEX)
+            + cutlass.Int64(clear_slot)
+        ).llvm_ptr
+        clear_vectors = cute.arch.load(
+            clear_count_ptr,
+            cutlass.Int32,
+            sem="acquire",
+            scope="gpu",
+        )
+        clear_vector_idx = bidx * THREADS_PER_BLOCK + tidx
+        clear_stride = grid_x * THREADS_PER_BLOCK
+        while clear_vector_idx < clear_vectors:
+            clear_vector_idx_i64 = cutlass.Int64(clear_vector_idx)
+            for source_rank in cutlass.range_constexpr(WORLD_SIZE):
+                clear_offset = (
+                    clear_base
+                    + cutlass.Int64(source_rank) * numel_i64
+                    + clear_vector_idx_i64 * cutlass.Int64(_BF16_VEC_SIZE)
+                )
+                local_buffer.store(
+                    neg_zero_vec[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)],
+                    clear_offset,
+                    _BF16_VEC_SIZE,
+                    alignment=_ALIGNMENT_BYTES,
+                    is_volatile=True,
+                )
+            clear_vector_idx = clear_vector_idx + clear_stride
+
+    group_rows = cutlass.Int32(ROWS_PER_CTA * WORLD_SIZE)
+    num_groups = (m_rows + group_rows - cutlass.Int32(1)) // group_rows
+    row_block_rows = cutlass.Int32(ROWS_PER_CTA)
+    my_region = ping_base + cutlass.Int64(LOCAL_RANK) * numel_i64
+
+    stage_values = cutlass.Array(
+        cutlass.BFloat16,
+        ROWS_PER_CTA * VECS_PER_THREAD * _BF16_VEC_SIZE,
+        alignment=_ALIGNMENT_BYTES,
+    )
+    vec_tmp = cutlass.Array(cutlass.BFloat16, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES)
+    pull_values = cutlass.Array(
+        cutlass.BFloat16,
+        VECS_PER_THREAD * WORLD_SIZE * _BF16_VEC_SIZE,
+        alignment=_ALIGNMENT_BYTES,
+    )
+
+    group = bidx
+    while group < num_groups:
+        # ---- push this rank's partial rows of every peer-owned block to its owner.
+        for owner in cutlass.range_constexpr(WORLD_SIZE):
+            if cutlass.const_expr(owner != LOCAL_RANK):
+                block = group * cutlass.Int32(WORLD_SIZE) + cutlass.Int32(owner)
+                row0 = block * row_block_rows
+                for rr in cutlass.range_constexpr(ROWS_PER_CTA):
+                    row = row0 + cutlass.Int32(rr)
+                    if row < m_rows:
+                        for v in cutlass.range_constexpr(VECS_PER_THREAD):
+                            col = (tidx + cutlass.Int32(v * THREADS_PER_BLOCK)) * cutlass.Int32(
+                                _BF16_VEC_SIZE
+                            )
+                            base = (rr * VECS_PER_THREAD + v) * _BF16_VEC_SIZE
+                            stage_values[base:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)] = (
+                                input_array[row, :].load(
+                                    col, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES
+                                )
+                            )
+                for rr in cutlass.range_constexpr(ROWS_PER_CTA):
+                    row = row0 + cutlass.Int32(rr)
+                    if row < m_rows:
+                        for v in cutlass.range_constexpr(VECS_PER_THREAD):
+                            col = (tidx + cutlass.Int32(v * THREADS_PER_BLOCK)) * cutlass.Int32(
+                                _BF16_VEC_SIZE
+                            )
+                            base = (rr * VECS_PER_THREAD + v) * _BF16_VEC_SIZE
+                            _sanitize_bf16x8(
+                                stage_values[base:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)],
+                                vec_tmp,
+                            )
+                            buffer_arrays[owner].store(
+                                vec_tmp[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)],
+                                my_region
+                                + cutlass.Int64(row) * cutlass.Int64(N)
+                                + cutlass.Int64(col),
+                                _BF16_VEC_SIZE,
+                                alignment=_ALIGNMENT_BYTES,
+                            )
+        # ---- own block: reduce in rank order 0..W-1 (fp32), push the sums, epilogue.
+        own_block = group * cutlass.Int32(WORLD_SIZE) + cutlass.Int32(LOCAL_RANK)
+        own_row0 = own_block * row_block_rows
+        if own_row0 < m_rows:
+            for rr in cutlass.range_constexpr(ROWS_PER_CTA):
+                row = own_row0 + cutlass.Int32(rr)
+                if row < m_rows:
+                    row_off = cutlass.Int64(row) * cutlass.Int64(N)
+                    # every load of the row first: own partial + (W-1) peers x VECS vectors
+                    for v in cutlass.range_constexpr(VECS_PER_THREAD):
+                        col = (tidx + cutlass.Int32(v * THREADS_PER_BLOCK)) * cutlass.Int32(
+                            _BF16_VEC_SIZE
+                        )
+                        for src in cutlass.range_constexpr(WORLD_SIZE):
+                            pb = (v * WORLD_SIZE + src) * _BF16_VEC_SIZE
+                            if cutlass.const_expr(src == LOCAL_RANK):
+                                pull_values[pb:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)] = (
+                                    input_array[row, :].load(
+                                        col, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES
+                                    )
+                                )
+                            else:
+                                pull_values[pb:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)] = (
+                                    local_buffer.load(
+                                        ping_base
+                                        + cutlass.Int64(src) * numel_i64
+                                        + row_off
+                                        + cutlass.Int64(col),
+                                        _BF16_VEC_SIZE,
+                                        alignment=_ALIGNMENT_BYTES,
+                                        is_volatile=True,
+                                    )
+                                )
+                    for v in cutlass.range_constexpr(VECS_PER_THREAD):
+                        col = (tidx + cutlass.Int32(v * THREADS_PER_BLOCK)) * cutlass.Int32(
+                            _BF16_VEC_SIZE
+                        )
+                        for src in cutlass.range_constexpr(WORLD_SIZE):
+                            if cutlass.const_expr(src != LOCAL_RANK):
+                                pb = (v * WORLD_SIZE + src) * _BF16_VEC_SIZE
+                                src_off = (
+                                    ping_base
+                                    + cutlass.Int64(src) * numel_i64
+                                    + row_off
+                                    + cutlass.Int64(col)
+                                )
+                                while not _all_bf16x8_lanes_ready(
+                                    pull_values[
+                                        pb:_BF16_VEC_SIZE,
+                                        cutlass.align(_ALIGNMENT_BYTES),
+                                    ]
+                                ):
+                                    pull_values[
+                                        pb:_BF16_VEC_SIZE,
+                                        cutlass.align(_ALIGNMENT_BYTES),
+                                    ] = local_buffer.load(
+                                        src_off,
+                                        _BF16_VEC_SIZE,
+                                        alignment=_ALIGNMENT_BYTES,
+                                        is_volatile=True,
+                                    )
+                                local_buffer.store(
+                                    neg_zero_vec[
+                                        0:_BF16_VEC_SIZE,
+                                        cutlass.align(_ALIGNMENT_BYTES),
+                                    ],
+                                    src_off,
+                                    _BF16_VEC_SIZE,
+                                    alignment=_ALIGNMENT_BYTES,
+                                    is_volatile=True,
+                                )
+                        acc_vec = pull_values[
+                            (v * WORLD_SIZE) * _BF16_VEC_SIZE : _BF16_VEC_SIZE,
+                            cutlass.align(_ALIGNMENT_BYTES),
+                        ].to(cutlass.Float32)
+                        for src in cutlass.range_constexpr(1, WORLD_SIZE):
+                            acc_vec = acc_vec + pull_values[
+                                (v * WORLD_SIZE + src) * _BF16_VEC_SIZE : _BF16_VEC_SIZE,
+                                cutlass.align(_ALIGNMENT_BYTES),
+                            ].to(cutlass.Float32)
+                        base = (rr * VECS_PER_THREAD + v) * _BF16_VEC_SIZE
+                        _sanitize_bf16x8(
+                            acc_vec.to(cutlass.BFloat16),
+                            vec_tmp,
+                        )
+                        stage_values[base:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)] = (
+                            vec_tmp[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)]
+                        )
+                        for peer in cutlass.range_constexpr(WORLD_SIZE):
+                            if cutlass.const_expr(peer != LOCAL_RANK):
+                                buffer_arrays[peer].store(
+                                    vec_tmp[
+                                        0:_BF16_VEC_SIZE,
+                                        cutlass.align(_ALIGNMENT_BYTES),
+                                    ],
+                                    my_region + row_off + cutlass.Int64(col),
+                                    _BF16_VEC_SIZE,
+                                    alignment=_ALIGNMENT_BYTES,
+                                )
+            _twoshot_block_epilogue(
+                own_row0,
+                m_rows,
+                stage_values,
+                residual_array,
+                norm_weight_array,
+                norm_output_array,
+                residual_output_array,
+                warp_sums_block,
+                tidx,
+                lane_id,
+                warp_id,
+                global_scale,
+                fp4_ptr,
+                sf_ptr,
+                eps,
+                N,
+                THREADS_PER_BLOCK,
+                VECS_PER_THREAD,
+                ROWS_PER_CTA,
+                EMIT_NVFP4,
+                q8_base,
+                sf8_base,
+                EMIT_MXF8,
+            )
+        # ---- every peer block of the group: its owner's sums arrive in region [ping][owner].
+        for peer_ordinal in cutlass.range_constexpr(1, WORLD_SIZE):
+            owner = (LOCAL_RANK + peer_ordinal) % WORLD_SIZE
+            peer_row0 = (group * cutlass.Int32(WORLD_SIZE) + cutlass.Int32(owner)) * row_block_rows
+            if peer_row0 < m_rows:
+                owner_region = ping_base + cutlass.Int64(owner) * numel_i64
+                for rr in cutlass.range_constexpr(ROWS_PER_CTA):
+                    row = peer_row0 + cutlass.Int32(rr)
+                    if row < m_rows:
+                        for v in cutlass.range_constexpr(VECS_PER_THREAD):
+                            col = (tidx + cutlass.Int32(v * THREADS_PER_BLOCK)) * cutlass.Int32(
+                                _BF16_VEC_SIZE
+                            )
+                            base = (rr * VECS_PER_THREAD + v) * _BF16_VEC_SIZE
+                            stage_values[base:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)] = (
+                                local_buffer.load(
+                                    owner_region
+                                    + cutlass.Int64(row) * cutlass.Int64(N)
+                                    + cutlass.Int64(col),
+                                    _BF16_VEC_SIZE,
+                                    alignment=_ALIGNMENT_BYTES,
+                                    is_volatile=True,
+                                )
+                            )
+                for rr in cutlass.range_constexpr(ROWS_PER_CTA):
+                    row = peer_row0 + cutlass.Int32(rr)
+                    if row < m_rows:
+                        for v in cutlass.range_constexpr(VECS_PER_THREAD):
+                            col = (tidx + cutlass.Int32(v * THREADS_PER_BLOCK)) * cutlass.Int32(
+                                _BF16_VEC_SIZE
+                            )
+                            base = (rr * VECS_PER_THREAD + v) * _BF16_VEC_SIZE
+                            off = (
+                                owner_region
+                                + cutlass.Int64(row) * cutlass.Int64(N)
+                                + cutlass.Int64(col)
+                            )
+                            while not _all_bf16x8_lanes_ready(
+                                stage_values[base:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)]
+                            ):
+                                stage_values[
+                                    base:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)
+                                ] = local_buffer.load(
+                                    off,
+                                    _BF16_VEC_SIZE,
+                                    alignment=_ALIGNMENT_BYTES,
+                                    is_volatile=True,
+                                )
+                            local_buffer.store(
+                                neg_zero_vec[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)],
+                                off,
+                                _BF16_VEC_SIZE,
+                                alignment=_ALIGNMENT_BYTES,
+                                is_volatile=True,
+                            )
+                _twoshot_block_epilogue(
+                    peer_row0,
+                    m_rows,
+                    stage_values,
+                    residual_array,
+                    norm_weight_array,
+                    norm_output_array,
+                    residual_output_array,
+                    warp_sums_block,
+                    tidx,
+                    lane_id,
+                    warp_id,
+                    global_scale,
+                    fp4_ptr,
+                    sf_ptr,
+                    eps,
+                    N,
+                    THREADS_PER_BLOCK,
+                    VECS_PER_THREAD,
+                    ROWS_PER_CTA,
+                    EMIT_NVFP4,
+                    q8_base,
+                    sf8_base,
+                    EMIT_MXF8,
+                )
+        group = group + grid_x
+
+    if cutlass.const_expr(USE_PDL):
+        if cutlass.const_expr(not PDL_RELEASE_AT_ENTRY):
+            if tidx == 0:
+                cute.arch.griddepcontrol_launch_dependents()
+
+
 @cute.jit
 def _glm_tp_allreduce_residual_rms_norm_bf16_twoshot_nvls(
     input_tensor: cute.Tensor,
@@ -4032,21 +4976,121 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_twoshot_nvls(
     PDL_RELEASE_AT_ENTRY: cutlass.Constexpr[bool],
 ) -> None:
     M = input_tensor.shape[0]
-    grid_x = (M + ROWS_PER_CTA * WORLD_SIZE - 1) // (ROWS_PER_CTA * WORLD_SIZE)
-    if cutlass.const_expr(_TWOSHOT_MAX_CTAS > 0):
-        grid_x = cutlass.min(grid_x, cutlass.Int32(_TWOSHOT_MAX_CTAS))
-    if cutlass.const_expr(_TWOSHOT_CONSUMER_CTAS > 0):
-        grid_x = grid_x + cutlass.Int32(_TWOSHOT_CONSUMER_CTAS)
-    # The fused RMSNorm kernel has no NVFP4 outputs; the placeholder tensors are never touched
-    # because EMIT_NVFP4 is False (all uses sit under const_expr guards).
-    _glm_tp_allreduce_residual_rms_norm_twoshot_nvls_kernel(
+    if cutlass.const_expr(_TWOSHOT_PUSH):
+        PUSH_ROWS = _TWOSHOT_PUSH_ROWS if _TWOSHOT_PUSH_ROWS > 0 else ROWS_PER_CTA
+        push_grid = (M + PUSH_ROWS * WORLD_SIZE - 1) // (PUSH_ROWS * WORLD_SIZE)
+        push_grid = cutlass.min(push_grid, cutlass.Int32(_TWOSHOT_PUSH_CTAS))
+        _glm_tp_allreduce_residual_rms_norm_twoshot_push_kernel(
+            input_tensor,
+            residual_tensor,
+            norm_weight_tensor,
+            norm_weight_tensor,
+            norm_output_tensor,
+            norm_output_tensor,
+            norm_output_tensor,
+            residual_output_tensor,
+            buffers,
+            ready_flags,
+            signal_state,
+            multicast_base,
+            signal,
+            eps,
+            N,
+            LOCAL_RANK,
+            WORLD_SIZE,
+            THREADS_PER_BLOCK,
+            PUSH_ROWS,
+            USE_DEVICE_SIGNAL_STATE,
+            USE_PDL,
+            PDL_RELEASE_AT_ENTRY,
+            False,
+            False,
+        ).launch(
+            grid=(push_grid, 1, 1),
+            block=(THREADS_PER_BLOCK, 1, 1),
+            stream=stream,
+            use_pdl=USE_PDL,
+        )
+    else:
+        grid_x = (M + ROWS_PER_CTA * WORLD_SIZE - 1) // (ROWS_PER_CTA * WORLD_SIZE)
+        if cutlass.const_expr(_TWOSHOT_MAX_CTAS > 0):
+            grid_x = cutlass.min(grid_x, cutlass.Int32(_TWOSHOT_MAX_CTAS))
+        if cutlass.const_expr(_TWOSHOT_CONSUMER_CTAS > 0):
+            grid_x = grid_x + cutlass.Int32(_TWOSHOT_CONSUMER_CTAS)
+        # The fused RMSNorm kernel has no NVFP4 outputs; the placeholder tensors are never touched
+        # because EMIT_NVFP4 is False (all uses sit under const_expr guards).
+        _glm_tp_allreduce_residual_rms_norm_twoshot_nvls_kernel(
+            input_tensor,
+            residual_tensor,
+            norm_weight_tensor,
+            norm_weight_tensor,
+            norm_output_tensor,
+            norm_output_tensor,
+            norm_output_tensor,
+            residual_output_tensor,
+            buffers,
+            ready_flags,
+            signal_state,
+            multicast_base,
+            signal,
+            eps,
+            N,
+            LOCAL_RANK,
+            WORLD_SIZE,
+            THREADS_PER_BLOCK,
+            ROWS_PER_CTA,
+            USE_DEVICE_SIGNAL_STATE,
+            USE_PDL,
+            PDL_RELEASE_AT_ENTRY,
+            False,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(THREADS_PER_BLOCK, 1, 1),
+            stream=stream,
+            use_pdl=USE_PDL,
+        )
+
+
+@cute.jit
+def _glm_tp_allreduce_residual_rms_norm_out_mxf8_twoshot_push(
+    input_tensor: cute.Tensor,
+    residual_tensor: cute.Tensor,
+    norm_weight_tensor: cute.Tensor,
+    norm_output_tensor: cute.Tensor,
+    q8_output_tensor: cute.Tensor,
+    q8_scale_tensor: cute.Tensor,
+    residual_output_tensor: cute.Tensor,
+    buffers: list[cute.Tensor],
+    ready_flags: list[cute.Tensor],
+    signal_state: cute.Tensor,
+    multicast_base: cutlass.Int64,
+    signal: cutlass.Int64,
+    stream: cuda.CUstream,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    N: cutlass.Constexpr[int],
+    LOCAL_RANK: cutlass.Constexpr[int],
+    WORLD_SIZE: cutlass.Constexpr[int],
+    THREADS_PER_BLOCK: cutlass.Constexpr[int],
+    ROWS_PER_CTA: cutlass.Constexpr[int],
+    USE_DEVICE_SIGNAL_STATE: cutlass.Constexpr[bool],
+    USE_PDL: cutlass.Constexpr[bool],
+    PDL_RELEASE_AT_ENTRY: cutlass.Constexpr[bool],
+) -> None:
+    """op1 two-shot (push) with the normalized rows also emitted as MXF8 (e4m3 + blocked
+    e8m0 1x32 scales, the GLM-5.2 context kv_a projection's operand); same transport, slots
+    and signal state as op1, so the two interleave."""
+    M = input_tensor.shape[0]
+    PUSH_ROWS = _TWOSHOT_PUSH_ROWS if _TWOSHOT_PUSH_ROWS > 0 else ROWS_PER_CTA
+    push_grid = (M + PUSH_ROWS * WORLD_SIZE - 1) // (PUSH_ROWS * WORLD_SIZE)
+    push_grid = cutlass.min(push_grid, cutlass.Int32(_TWOSHOT_PUSH_CTAS))
+    _glm_tp_allreduce_residual_rms_norm_twoshot_push_kernel(
         input_tensor,
         residual_tensor,
         norm_weight_tensor,
         norm_weight_tensor,
         norm_output_tensor,
-        norm_output_tensor,
-        norm_output_tensor,
+        q8_output_tensor,
+        q8_scale_tensor,
         residual_output_tensor,
         buffers,
         ready_flags,
@@ -4058,13 +5102,14 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_twoshot_nvls(
         LOCAL_RANK,
         WORLD_SIZE,
         THREADS_PER_BLOCK,
-        ROWS_PER_CTA,
+        PUSH_ROWS,
         USE_DEVICE_SIGNAL_STATE,
         USE_PDL,
         PDL_RELEASE_AT_ENTRY,
         False,
+        True,
     ).launch(
-        grid=(grid_x, 1, 1),
+        grid=(push_grid, 1, 1),
         block=(THREADS_PER_BLOCK, 1, 1),
         stream=stream,
         use_pdl=USE_PDL,
@@ -4207,8 +5252,18 @@ def compile_fused_for_rank(
     multicast_publish: bool = False,
     iket_phases: bool = False,
     rotated_poll_order: bool = False,
+    cta_head: bool = False,
+    self_clean: bool = False,
 ):
+    """`cta_head` / `self_clean` as on `compile_fused_out_quant_for_rank` (split-row launches;
+    `self_clean` with sentinel readiness and the sequential peer poll)."""
     cutlass.cuda.initialize_cuda_context(device_id)
+    if (cta_head or self_clean) and not (split_rows and use_device_signal_state):
+        raise ValueError(
+            "cta_head / self_clean need the split-row launch and the device signal state"
+        )
+    if self_clean and (use_ready_flags or fused_batch_poll_peers or fused_ready_mask_poll_peers):
+        raise ValueError("self_clean needs sentinel readiness and the sequential peer poll")
     _validate_ctas_per_row(ctas_per_row)
     _validate_signal_advance_flags(
         last_cta_signal_advance,
@@ -4365,6 +5420,8 @@ def compile_fused_for_rank(
         compile_args.append(multicast_publish)
         compile_args.append(iket_phases)
         compile_args.append(rotated_poll_order)
+        compile_args.append(cta_head)
+        compile_args.append(self_clean)
 
     return cute.compile(
         fused_host,
@@ -4396,10 +5453,39 @@ def compile_fused_out_quant_for_rank(
     iket_phases: bool = False,
     prefetch_fused_inputs: bool = False,
     rotated_poll_order: bool = False,
+    two_shot: bool = False,
+    cta_head: bool = False,
+    self_clean: bool = False,
 ):
+    """`two_shot`: the sum is formed reduce-scatter + all-gather instead of one-shot. The owner
+    of each row slice (a quarter of every row's slices per rank) takes the three peers'
+    partials of it, sums in rank order exactly as the one-shot does, adds the residual and
+    publishes the bf16 result to the three peers; the norm and NVFP4 epilogue then run on
+    every rank as before. Same bytes as the one-shot on every rank, half the NVLink ingress
+    (1.5 instead of 3 partials per rank), one more NVLink hop. Needs sentinel readiness,
+    unicast publish, the self rank elided and the fused inputs prefetched.
+
+    `cta_head`: thread 0 of each CTA loads the slot signal and counts for the CTA
+    (`_cta_head_load`). `self_clean` (two-shot only): every reader resets what it consumed and
+    the launch records a clear count of 0 (`_reset_bf16x8`). Both leave the bytes unchanged."""
     cutlass.cuda.initialize_cuda_context(device_id)
     if n % _SCALE_BLOCK != 0:
         raise ValueError(f"n must be divisible by {_SCALE_BLOCK}, got {n}")
+    if self_clean and not two_shot:
+        raise ValueError("self_clean on the out-quant kernel needs the two-shot build")
+    if (cta_head or self_clean) and not use_device_signal_state:
+        raise ValueError("cta_head / self_clean need the device signal state")
+    if two_shot and (
+        use_ready_flags
+        or multicast_publish
+        or not elide_self_rank
+        or not prefetch_fused_inputs
+        or not use_device_signal_state
+    ):
+        raise ValueError(
+            "two_shot needs sentinel readiness (use_ready_flags=False), unicast publish, "
+            "elide_self_rank, prefetch_fused_inputs and the device signal state"
+        )
     _validate_ctas_per_row(ctas_per_row)
     if threads_per_block not in _OUT_QUANT_THREADS_PER_BLOCK_CHOICES:
         raise ValueError(
@@ -4546,6 +5632,9 @@ def compile_fused_out_quant_for_rank(
         iket_phases,
         prefetch_fused_inputs,
         rotated_poll_order,
+        two_shot,
+        cta_head,
+        self_clean,
         options="--enable-tvm-ffi",
     )
 
@@ -4564,8 +5653,14 @@ def _compile_twoshot_common(
     threads_per_block: int,
     rows_per_cta: int,
     emit_nvfp4: bool,
+    emit_mxf8: bool = False,
 ):
     cutlass.cuda.initialize_cuda_context(device_id)
+    if emit_mxf8 and (emit_nvfp4 or not _TWOSHOT_PUSH or n % 128 != 0):
+        raise ValueError(
+            "the MXF8-out two-shot is the push variant (module constant _TWOSHOT_PUSH = 1), n % 128 == 0, "
+            f"and excludes NVFP4; got push={_TWOSHOT_PUSH} n={n} nvfp4={emit_nvfp4}"
+        )
     if threads_per_block not in _TWOSHOT_THREADS_PER_BLOCK_CHOICES:
         raise ValueError(
             "threads_per_block must be one of "
@@ -4601,6 +5696,12 @@ def _compile_twoshot_common(
         )
     if _TWOSHOT_DIRECT not in (0, 1):
         raise ValueError(f"_TWOSHOT_DIRECT must be 0 or 1, got {_TWOSHOT_DIRECT}")
+    if _TWOSHOT_PUSH not in (0, 1) or _TWOSHOT_PUSH_CTAS < 1 or _TWOSHOT_PUSH_ROWS < 0:
+        raise ValueError(
+            "push two-shot constants out of range: _TWOSHOT_PUSH="
+            f"{_TWOSHOT_PUSH} (0/1), _TWOSHOT_PUSH_CTAS={_TWOSHOT_PUSH_CTAS} (>= 1), "
+            f"_TWOSHOT_PUSH_ROWS={_TWOSHOT_PUSH_ROWS} (>= 0, 0 = rows_per_cta)"
+        )
 
     sym_m = cute.sym_int32()
     input_tensor = make_fake_compact_tensor(
@@ -4671,6 +5772,28 @@ def _compile_twoshot_common(
         use_pdl,
         pdl_release_policy == "entry",
     )
+    if emit_mxf8:
+        q8_output_tensor = make_fake_compact_tensor(
+            cutlass.Uint8,
+            (sym_m, n),
+            stride_order=(1, 0),
+            assumed_align=_ALIGNMENT_BYTES,
+        )
+        q8_scale_tensor = make_fake_compact_tensor(
+            cutlass.Uint8, (cute.sym_int32(),), assumed_align=32
+        )
+        return cute.compile(
+            jit_entry,
+            input_tensor,
+            residual_tensor,
+            norm_weight_tensor,
+            norm_output_tensor,
+            q8_output_tensor,
+            q8_scale_tensor,
+            residual_output_tensor,
+            *tail,
+            options="--enable-tvm-ffi",
+        )
     if emit_nvfp4:
         global_scale_tensor = make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
         fp4_output_tensor = make_fake_compact_tensor(
@@ -4739,4 +5862,38 @@ def compile_fused_twoshot_for_rank(
         threads_per_block=threads_per_block,
         rows_per_cta=rows_per_cta,
         emit_nvfp4=False,
+    )
+
+
+def compile_fused_out_mxf8_twoshot_for_rank(
+    local_rank: int = 0,
+    world_size: int = 1,
+    device_id: int = 0,
+    n: int = _DEFAULT_N,
+    eps: float = _RMS_EPS,
+    use_device_signal_state: bool = _USES_DEVICE_SIGNAL_STATE,
+    use_pdl: bool | None = None,
+    pdl_release_policy: str = "output_safe",
+    threads_per_block: int = _TWOSHOT_THREADS_PER_BLOCK,
+    rows_per_cta: int = _TWOSHOT_ROWS_PER_CTA,
+    **_ignored_oneshot_knobs,
+):
+    """op1 two-shot (push only) that also writes the normalized rows as MXF8:
+    ``fn(input, residual, weight, out, q8 [M, n] uint8, sf uint8 (>= padded(M) * n / 32,
+    32-byte aligned), residual_out, buffers, flags, state, multicast_base, signal, stream)``;
+    q8 / sf are ``self_attn_prefill_act_quant_mxf8.quantize(out)`` bitwise."""
+    return _compile_twoshot_common(
+        _glm_tp_allreduce_residual_rms_norm_out_mxf8_twoshot_push,
+        local_rank=local_rank,
+        world_size=world_size,
+        device_id=device_id,
+        n=n,
+        eps=eps,
+        use_device_signal_state=use_device_signal_state,
+        use_pdl=use_pdl,
+        pdl_release_policy=pdl_release_policy,
+        threads_per_block=threads_per_block,
+        rows_per_cta=rows_per_cta,
+        emit_nvfp4=False,
+        emit_mxf8=True,
     )
