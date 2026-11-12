@@ -52,8 +52,7 @@ if TYPE_CHECKING:
 FA4_TILE_MN = (64, 128)
 FA4_NUM_THREADS = 256
 """FA4 SM90 tile for generation rows. With GQA packing a row holds ``q_len * heads_per_kv_head``
-query rows (28 for Qwen2.5-7B at q_len 4), so a 64-row tile wastes less than the default 128-row
-one: 193 vs 282 us per layer for 120 rows over 4.5k cached tokens (Qwen2.5-7B shapes, H100)."""
+query rows, usually far fewer than 128, so a 64-row tile pads less than the default 128-row one."""
 
 
 SPLITS_ENV = "TLLM_FLASH_ATTN4_GENERATION_SPLITS"
@@ -61,8 +60,8 @@ SPLITS_ENV = "TLLM_FLASH_ATTN4_GENERATION_SPLITS"
 1 turns splitting off, a larger value fixes the count."""
 MAX_SPLITS = 16
 MIN_SPLIT_TOKENS = 512
-"""Fewest cached tokens per KV split: a split of a short cache costs more in launches and merging
-than it saves (H100, Qwen2.5-7B, K=8, 1 row, ~1.6k cached tokens: 16 splits were slower than none)."""
+"""Fewest cached tokens per KV split: splitting a short cache costs more in launches and merging
+than it saves."""
 
 
 def generation_splits(
@@ -72,8 +71,7 @@ def generation_splits(
 
     FA4 launches one CTA per (row, KV head, 64-row tile of the row's packed GQA queries) and
     streams the row's whole cache in it; SM90 FA4 has no split-KV. A small batch then leaves
-    most SMs idle while each CTA walks thousands of keys: on H100 (Qwen2.5-7B, K=8, 1-4 rows,
-    ~5k cached tokens) 16 CTAs took ~65 us per layer. When the grid fills less than half the
+    most SMs idle while each CTA walks thousands of keys. When the grid fills less than half the
     SMs, the row's cache is cut into up to one wave's worth of splits (at most ``MAX_SPLITS``).
     """
     fixed = os.environ.get(SPLITS_ENV, "").strip()

@@ -109,8 +109,8 @@ SAMPLING_KEY = LIB_NAME + "_sampling"
 """Key of the per-metadata plan state in ``TrtllmAttentionMetadata.fmha_plan_caches``."""
 
 MIN_Q_LEN = 4
-"""Fewest query tokens per row (1 + draft tokens). The FA4 prefix tile needs the queries of a whole
-group; the library is measured with drafts of 3 and 8 tokens."""
+"""Fewest query tokens per row (1 + draft tokens). The FA4 prefix tile takes the queries of a whole
+group; rows with fewer tokens leave too little of it filled for sharing to pay."""
 MAX_GROUPS_ENV = "TLLM_SAMPLING_SHARED_PREFIX_MAX_GROUPS"
 DEFAULT_MAX_GROUPS = 8
 """Sharing groups the prefix call of a batch size can hold (capped at half the rows). FA4 launches
@@ -124,20 +124,13 @@ MIN_SHARED_ENV = "TLLM_SAMPLING_SHARED_PREFIX_MIN_SHARED_TOKENS"
 every group, a very large value none."""
 
 COST_MODEL = dict(mha_min_saved_bytes=8.0e6, gqa_min_saved_bytes=0.0)
-"""Size gate of a sharing group on H100: the group shares its prefix when the KV bytes it saves per
-layer, ``(rows - 1) * shared tokens * kv_bytes_per_token`` (``group_saved_bytes``), reach the
-threshold of its attention type (MHA: as many KV heads as query heads; GQA otherwise).
+"""Size gate of a sharing group: the group shares its prefix when the KV bytes it saves per layer,
+``(rows - 1) * shared tokens * kv_bytes_per_token`` (``group_saved_bytes``), reach the threshold of
+its attention type (MHA: as many KV heads as query heads; GQA otherwise).
 
-Measured per layer with CUDA graphs on H100 (SM90): the library with every group sharing against
-the same launches with every group demoted to the tail, 888 cases of 4-120 rows in groups of 2-80
-rows, 32-6,400 shared and 256-2,048 private tokens, 3 and 8 draft tokens, for MHA 20/20 and GQA
-28/4 heads of 128. With MHA, sharing loses up to 12 us per layer on small groups with short
-prefixes (2-12 rows, up to a few hundred tokens) and saves up to 700 us on wide groups with long
-ones; the threshold that loses least summed over the MHA cases is 7.2-10.2 MB (8 MB: 54 us over
-444 cases, at most 7.8 us in one case).
-GQA reads a fifth of the bytes per token and its savings and losses are small (-4 to +110 us);
-sharing every group loses least (74 us over 444 cases, at most 4.2 us). Other head layouts are
-not measured and take the rule of their attention type."""
+With MHA, sharing costs more than it saves on small groups with short prefixes, so a group must
+save a minimum number of bytes. GQA reads fewer KV bytes per query head, so its gains and losses
+are small either way and every group shares."""
 
 
 def _is_v2_manager(kv_cache_manager) -> bool:
@@ -223,19 +216,27 @@ class StepStats:
 
 
 _step_stats: dict = {}
-"""id(KV cache manager) -> (weak reference to the manager, its ``StepStats``)."""
+"""id(KV cache manager) -> (weak reference to the manager, its ``StepStats``); an entry is dropped
+when its manager is freed."""
+
+
+def _drop_stats(ref: weakref.ref, key: int) -> None:
+    entry = _step_stats.get(key)
+    if entry is not None and entry[0] is ref:
+        del _step_stats[key]
 
 
 def _stats_for(kv_cache_manager) -> Optional[StepStats]:
     """The counters of ``kv_cache_manager``, or None for a manager without weak-reference support
     (holding it strongly would keep its pools alive)."""
-    entry = _step_stats.get(id(kv_cache_manager))
+    key = id(kv_cache_manager)
+    entry = _step_stats.get(key)
     if entry is None or entry[0]() is not kv_cache_manager:
         try:
-            ref = weakref.ref(kv_cache_manager)
+            ref = weakref.ref(kv_cache_manager, lambda ref: _drop_stats(ref, key))
         except TypeError:
             return None
-        entry = _step_stats[id(kv_cache_manager)] = (ref, StepStats())
+        entry = _step_stats[key] = (ref, StepStats())
     return entry[1]
 
 
@@ -774,6 +775,16 @@ def _int_env(name: str, default: int) -> int:
     return int(value)
 
 
+def check_env() -> None:
+    """Parse the library's integer settings, so that a malformed value fails when the model is
+    built rather than inside a forward."""
+    for name in (MAX_GROUPS_ENV, MIN_GROUP_ENV, MIN_SHARED_ENV):
+        try:
+            _int_env(name, 0)
+        except ValueError:
+            raise ValueError(f"{name} must be an integer, got {os.environ[name]!r}.") from None
+
+
 def group_saved_bytes(rows: np.ndarray, tokens: np.ndarray, shape: tuple) -> np.ndarray:
     """KV bytes per layer that sharing groups of ``rows`` rows and ``tokens`` shared tokens do not
     read again: every row but one would read the shared prefix (K and V, bf16)."""
@@ -1032,6 +1043,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
+        check_env()
         self._pool_views: dict[int, torch.Tensor] = {}
         # (pool index, scale, divisor) of this layer; fixed for the manager lifetime.
         self._layout: Optional[tuple[int, int, int]] = None

@@ -31,8 +31,12 @@ if TYPE_CHECKING:
     )
 
 
-def generation_rows_uniform(q: torch.Tensor, metadata: "TrtllmAttentionMetadata") -> bool:
-    """Whether every generation row of a mixed batch carries the same number of query tokens.
+def generation_rows_uniform(
+    q: torch.Tensor,
+    metadata: "TrtllmAttentionMetadata",
+    num_gen_tokens: Optional[int] = None,
+) -> bool:
+    """Whether every generation row of a batch carries the same number of query tokens.
 
     A phased generation library slices the generation tokens into ``num_generations`` equal
     rows. The executor pads linear speculative drafts to ``max_total_draft_tokens``, but a
@@ -40,16 +44,20 @@ def generation_rows_uniform(q: torch.Tensor, metadata: "TrtllmAttentionMetadata"
     single-token row, and such a batch can still divide evenly. Rows hold between 1 and
     ``1 + max_total_draft_tokens`` tokens, so an average of either bound proves uniformity
     without touching a tensor; any other average is checked on the host sequence lengths.
+
+    ``num_gen_tokens`` defaults to the tokens of ``q`` after the context tokens (``q`` holds the
+    whole batch); pass it when ``q`` holds only the generation phase.
     """
     num_contexts = metadata.num_contexts
     num_generations = metadata.num_generations
-    num_gen_tokens = q.shape[0] - metadata.num_ctx_tokens
+    if num_gen_tokens is None:
+        num_gen_tokens = q.shape[0] - metadata.num_ctx_tokens
     if num_generations <= 0 or num_gen_tokens <= 0 or num_gen_tokens % num_generations:
         return False
     q_len = num_gen_tokens // num_generations
     if q_len == 1 or q_len == 1 + (getattr(metadata, "max_total_draft_tokens", None) or 0):
         return True
-    seq_lens = metadata.seq_lens
+    seq_lens = getattr(metadata, "seq_lens", None)
     if seq_lens is None or seq_lens.device.type != "cpu":
         return False
     gen_lens = seq_lens[num_contexts : num_contexts + num_generations]

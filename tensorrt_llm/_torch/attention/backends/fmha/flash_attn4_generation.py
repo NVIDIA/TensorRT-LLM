@@ -56,7 +56,9 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .combined import generation_rows_uniform
 from .flash_attn4_kernels import (
+    SPLITS_ENV,
     allocate_split_workspace,
     fa4_forward,
     fa4_paged_generation,
@@ -83,14 +85,12 @@ LIB_NAME = "flash_attn4_generation"
 
 CHECK_ENV = "TLLM_FLASH_ATTN4_GENERATION_CHECK"
 """Set to 1 to compare the device page table with the host block-offset table on eager steps.
-Debugging aid: it synchronizes the device and must stay off for measurements."""
+Debugging aid: it synchronizes the device on every eager step."""
 
 DRAFT_ENV = "TLLM_FLASH_ATTN4_GENERATION_DRAFT"
 """Serve the EAGLE-3 draft layer too (default 1). The draft forward swaps the draft KV-cache manager
 and its block offsets into the metadata (``draft_kv_cache_context``), so the page table and pool view
-below follow it. On H100 (Qwen2.5-7B, 120 rows, 4k-token prompts) the multi-token XQA kernel took 515 us
-(K=3) / 990 us (K=8) for the first draft step and ~260 us for each later one; set to 0 to keep draft
-layers on the regular kernel."""
+below follow it. Set to 0 to keep draft layers on the regular kernel."""
 
 
 PAGE_TABLE_CACHE_KEY = f"{LIB_NAME}.page_tables"
@@ -99,10 +99,10 @@ SPLIT_TABLE_CACHE_KEY = f"{LIB_NAME}.split_tables"
 
 
 MIXED_MIN_KV_ENV = "TLLM_FLASH_ATTN4_GENERATION_MIXED_MIN_KV"
-"""Mixed context+generation steps run eagerly, where each FA4 layer call costs ~110 us of host time
-(rope, page table, KV write and FA4 launches; H100, Qwen2.5-7B shapes) against a single attention-op
-call. The generation rows of a mixed step go to FA4 only when their mean KV length reaches this many
-tokens (default 2048), where FA4's kernel time saving outweighs that cost; 0 always uses FA4."""
+"""Mixed context+generation steps run eagerly, where each FA4 layer call issues several launches
+(RoPE and KV write, page table, FA4) against a single attention-op call. The generation rows of a
+mixed step go to FA4 only when their mean KV length reaches this many tokens (default 2048), so that
+the kernel time FA4 saves outweighs that host cost; 0 always uses FA4."""
 
 
 @functools.lru_cache(maxsize=4)
@@ -141,6 +141,11 @@ class FlashAttn4GenerationFmha(PhasedFmha):
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
+        # A malformed setting fails when the model is built rather than inside a forward.
+        for name in (SPLITS_ENV, MIXED_MIN_KV_ENV):
+            value = os.environ.get(name, "").strip()
+            if value and not value.isdigit():
+                raise ValueError(f"{name} must be a non-negative integer, got {value!r}.")
         self._pool_views: dict[int, torch.Tensor] = {}
         self._pool_manager: Optional[object] = None
         self._logged = False
@@ -189,6 +194,13 @@ class FlashAttn4GenerationFmha(PhasedFmha):
             return False
         if phase is None and metadata.num_contexts > 0:
             # Mixed batches are served phase by phase (CombinedFmha).
+            return False
+        num_gen_tokens = q.shape[0]
+        if forward_args.attention_input_type == AttentionInputType.mixed:
+            num_gen_tokens -= metadata.num_ctx_tokens
+        if not generation_rows_uniform(q, metadata, num_gen_tokens):
+            # run_generation gives every row tokens // rows query tokens; a row without drafts
+            # next to 1 + K rows needs the regular kernel (FmhaManager keys the selection on this).
             return False
         manager = metadata.kv_cache_manager
         if (

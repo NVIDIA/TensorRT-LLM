@@ -41,12 +41,15 @@ export TLLM_FMHA_LIBS=+sampling_shared_prefix,+flash_attn4_generation
 the remaining decode batches through FlashAttention-4.
 
 No per-request setting is needed: the samples of each `n > 1` request are grouped
-automatically, and `n = 1` requests in the same step use the regular attention.
+automatically. Samples without a group to share with, including `n = 1` requests, are
+attended on their own. In a decode step without groups, the regular attention runs unless
+the step replays a CUDA graph; such a step runs through shared-prefix attention, with every
+sample attended on its own.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `TLLM_SAMPLING_SHARED_PREFIX_MIN_GROUP` | `2` | Fewest samples in a group. |
-| `TLLM_SAMPLING_SHARED_PREFIX_MIN_SHARED_TOKENS` | unset | Fewest shared prefix tokens of a group, counted in full KV pages. When unset, a group shares only if the KV reads it saves pass a cost model measured on H100. |
+| `TLLM_SAMPLING_SHARED_PREFIX_MIN_SHARED_TOKENS` | unset | Fewest shared prefix tokens of a group, counted in full KV pages. When unset, a group with full multi-head attention shares only if it saves enough KV reads; a GQA group always shares. |
 | `TLLM_SAMPLING_SHARED_PREFIX_MAX_GROUPS` | `8` | Most groups that share in one step; further groups are attended as usual. |
 
 ## Metrics
