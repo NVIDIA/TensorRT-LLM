@@ -220,6 +220,7 @@ def _create(
 
     def kv_cache_creator(**_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(
+            _is_kv_cache_manager_v2=False,
             try_prepare_estimation=lambda: kv_cache == "estimated",
             build_managers=lambda _resources, estimating: log.append(
                 ("build_managers", estimating)
