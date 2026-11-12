@@ -21,8 +21,8 @@ import pytest
 import torch
 from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
-from tensorrt_llm.serve.openai_protocol import RerankDocument, RerankRequest, RerankV2Request
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.serve.openai_protocol import RerankDocument, RerankRequest, RerankV2Request
 from tensorrt_llm.serve.reranker import build_qwen3_rerank_input, format_qwen3_rerank_prompt
 
 _DEFAULT_QWEN3_RERANK_INSTRUCTION = (
@@ -96,9 +96,7 @@ async def test_document_count_rejected_before_tokenization(tmp_path, request_typ
         server._encode_max_queue_size = 2
         server.tokenizer = Mock()
         server.encode_batcher = Mock()
-        request = request_type(
-            model="reranker", query="query" * 1000, documents=[""] * 3, top_n=1
-        )
+        request = request_type(model="reranker", query="query" * 1000, documents=[""] * 3, top_n=1)
 
         response = await server._rerank(request)
 
@@ -273,7 +271,9 @@ async def test_v1_rerank_forwards_instruction(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("max_tokens_per_doc", [None, 4])
-async def test_v1_rerank_reuses_query_tokenization(tmp_path, max_tokens_per_doc: int | None) -> None:
+async def test_v1_rerank_reuses_query_tokenization(
+    tmp_path, max_tokens_per_doc: int | None
+) -> None:
     documents = ["first document", "second document", "third document"]
     with _server(tmp_path, [0.0] * len(documents)) as server:
         tokenizer = Mock(wraps=CharacterTokenizer())
@@ -303,7 +303,9 @@ async def test_v1_rerank_reuses_query_tokenization(tmp_path, max_tokens_per_doc:
 
 
 @pytest.mark.asyncio
-async def test_v1_rerank_transfers_logits_together(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_v1_rerank_transfers_logits_together(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     with _server(tmp_path, [-1000.0, 1000.0, 0.0]) as server:
         request = RerankRequest(query="query", documents=["low", "high", "middle"])
         transferred_shapes = []
@@ -375,7 +377,9 @@ async def test_v2_wire_shape_omits_documents(tmp_path):
 @pytest.mark.asyncio
 async def test_v2_rejects_nonzero_priority(tmp_path):
     with _server(tmp_path, [0.0]) as server:
-        request = RerankV2Request(model="reranker", query="query", documents=["document"], priority=1)
+        request = RerankV2Request(
+            model="reranker", query="query", documents=["document"], priority=1
+        )
         response = await server._rerank(request)
 
         assert response.status_code == 400
