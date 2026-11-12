@@ -288,10 +288,11 @@ def test_pools_keep_the_production_weight_cache_default(reuse_cache, monkeypatch
     assert s._real.spawn_env_weight_cache is None
 
 
-def test_weight_cache_env_respects_user_setting(reuse_cache, monkeypatch):
-    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_weight_cache_env_respects_user_setting(reuse_cache, monkeypatch, value):
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", value)
     s = reuse_cache.acquire(_FakePool, 2)
-    assert s._real.spawn_env_weight_cache == "1"  # an explicit user value still reaches workers
+    assert s._real.spawn_env_weight_cache == value  # an explicit user value reaches workers
 
 
 def test_abort_after_release_never_kills_cached_pool(reuse_cache):
