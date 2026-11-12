@@ -16,6 +16,7 @@ l0_cpu_musespark:
       orchestrator: mpi
   tests:
   - unittest/llmapi/apps/test_musespark_serve_extensions.py
+  - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/test_modeling_v2_tep4_extra_paths.py
   # Picked up on l0_cpu through the unittest/_torch/modeling directory entry.
   - unittest/_torch/modeling/test_modeling_musespark_open_preprocess.py
   # The cpu_only tests of DFlash on the TRTLLM attention backend, the shared target/draft KV

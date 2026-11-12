@@ -19,9 +19,12 @@ Knobs. These are the only variables the target reads for levers::
 
 ``<LEVER>`` is the lever's name upper-cased; ``__`` introduces a parameter or a resolver
 setting and never occurs inside a lever name. Values are case-insensitive and
-whitespace-stripped. Two shared-path variables are read as facts and never set or retired
-here: ``TRTLLM_KV_DEFER_CLOSE`` (on iff exactly ``1``, the KV cache manager's own test) and
-``UCX_RNDV_THRESH`` (set or not).
+whitespace-stripped. One variable outside these knobs decides which levers exist at all:
+``MUSESPARK_OPEN_SM103_TEP4_EXTRA_PATHS`` (``modeling.py``) adds fast paths to the sm103 TEP4
+composition, so a knob such as ``MUSESPARK_OPEN_LEVER_EARLY_EXPERT_IDS=on`` at TEP4 raises
+"does not serve" unless that variable names the path. Two shared-path variables are read as
+facts and never set or retired here: ``TRTLLM_KV_DEFER_CLOSE`` (on iff exactly ``1``, the KV
+cache manager's own test) and ``UCX_RNDV_THRESH`` (set or not).
 
 Semantics, in the order a lever is resolved:
 
