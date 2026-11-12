@@ -138,6 +138,7 @@ class FlashAttn4GenerationFmha(PhasedFmha):
     # Mixed context+generation batches: the thop op serves the context requests through a
     # context-only call and this library the generation rows (``CombinedFmha``).
     pairs_with_whole_batch_context = True
+    requires_uniform_generation_rows = True
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)

@@ -341,8 +341,9 @@ def test_only_flash_attn4_opts_in_to_whole_batch_pairing() -> None:
 
 def test_fmha_cache_separates_non_uniform_generation_rows() -> None:
     """Two rows of 3 + 3 and of 1 + 5 tokens (a row without drafts next to a 1 + K row) have the
-    same batch size and average Q length; a library selected for the first must not be reused from
-    the cache for the second."""
+    same batch size and average Q length; with a library that serves only uniform rows, one selected
+    for the first is not reused from the cache for the second. Without such a library the key does
+    not look at the rows."""
     events: list[tuple] = []
     attn, manager = _make_manager()
     uniform_only = FakeFmha(
@@ -353,6 +354,7 @@ def test_fmha_cache_separates_non_uniform_generation_rows() -> None:
     )
     fallback = FakeFmha(attn, "fallback", events)
     manager.fmha_libs = [uniform_only, fallback]
+    manager._keys_rows_uniform = True
     q = torch.empty((6, 4))
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
     metadata_by_rows = {}
@@ -372,6 +374,13 @@ def test_fmha_cache_separates_non_uniform_generation_rows() -> None:
             assert selected == {True: uniform_only, False: fallback}
 
     assert len(manager._cache) == 2
+    _, default_manager = _make_manager()
+    assert not default_manager._keys_rows_uniform
+    keys = {
+        default_manager._make_cache_key(q, metadata_by_rows[uniform], forward_args)
+        for uniform in (True, False)
+    }
+    assert len(keys) == 1
 
 
 @pytest.mark.parametrize(("lower_q_length", "upper_q_length"), [(3, 4), (7, 8)])

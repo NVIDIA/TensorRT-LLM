@@ -177,13 +177,32 @@ def step_stats_fmha_lib_classes() -> tuple[FmhaCls, ...]:
     return _step_stats_classes(_parse_fmha_libs_env())
 
 
+def fmha_step_stats(kv_cache_manager: object) -> dict[str, dict[str, int]] | None:
+    """Cumulative per-step counters of the enabled libraries that keep them, for the steps attended
+    on ``kv_cache_manager``'s cache, by iteration-stats record field; None when no such library is
+    enabled. Cumulative, so a consumer that misses records still reads exact totals."""
+    classes = step_stats_fmha_lib_classes()
+    if not classes or kv_cache_manager is None:
+        return None
+    return {cls.step_stats_field: cls.step_stats(kv_cache_manager) for cls in classes}
+
+
+def reset_fmha_step_stats(kv_cache_manager: object) -> None:
+    """Zero the counters of ``kv_cache_manager`` (the executor drops its warmup steps)."""
+    if kv_cache_manager is not None:
+        for cls in step_stats_fmha_lib_classes():
+            cls.reset_step_stats(kv_cache_manager)
+
+
 __all__ = [
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIBS",
     "FmhaCls",
+    "fmha_step_stats",
     "get_enabled_fmha_lib_classes",
     "init_fmha_libs",
     "is_fmha_lib_enabled",
+    "reset_fmha_step_stats",
     "step_planning_fmha_lib_classes",
     "step_stats_fmha_lib_classes",
 ]

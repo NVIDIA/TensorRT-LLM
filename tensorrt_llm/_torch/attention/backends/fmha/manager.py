@@ -356,6 +356,10 @@ class FmhaManager:
             fmha_cls for fmha_cls in step_planning_fmha_lib_classes() if fmha_cls in available
         )
         self._layer_idx = getattr(attn, "layer_idx", None)
+        # Only a library that serves uniform generation rows alone makes the key check them.
+        self._keys_rows_uniform = any(
+            getattr(fmha, "requires_uniform_generation_rows", False) for fmha in self.fmha_libs
+        )
 
     def _announce(self, fmha: Fmha, cache_key: _FmhaCacheKey) -> None:
         # One line per library per layer is enough to tell which kernel
@@ -386,8 +390,8 @@ class FmhaManager:
         are separate grid points so a support boundary at the candidate cannot
         alias with the interval below it. The executor pads linear
         speculative-decoding rows to a uniform Q length, but a row without
-        drafts keeps one token, so the key also records whether the
-        generation rows are uniform.
+        drafts keeps one token, so with a library that serves only uniform
+        rows the key also records whether the generation rows are uniform.
 
         The batch fields describe the complete source scheduler batch, even
         when ``q`` contains only one compacted phase. Ordinary attention
@@ -423,7 +427,8 @@ class FmhaManager:
             generation_num_tokens = q.shape[0]
             if attention_input_type == AttentionInputType.mixed:
                 generation_num_tokens -= metadata.num_ctx_tokens
-            rows_uniform = generation_rows_uniform(q, metadata, generation_num_tokens)
+            if self._keys_rows_uniform:
+                rows_uniform = generation_rows_uniform(q, metadata, generation_num_tokens)
             generation_seq_len_q = generation_num_tokens // metadata.num_generations
             generation_seq_len_q = _normalize_fmha_cache_grid_value(
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID

@@ -139,6 +139,9 @@ class PhasedFmha(Fmha):
     # serves the context requests; see ``FmhaManager._select_non_mla``. Opt-in per
     # library so that the selection of every other library is unchanged.
     pairs_with_whole_batch_context: ClassVar[bool] = False
+    # Whether the library serves only generation rows that all carry the same number of query
+    # tokens; FmhaManager then keys its selection cache on that (``generation_rows_uniform``).
+    requires_uniform_generation_rows: ClassVar[bool] = False
 
     def serves_mixed_generation_rows(self, metadata: "TrtllmAttentionMetadata") -> bool:
         """Per-step choice of a library paired with a whole-batch context library: whether it

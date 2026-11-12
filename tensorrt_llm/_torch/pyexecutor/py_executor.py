@@ -60,6 +60,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
 
+from ..attention.backends.fmha.registry import (fmha_step_stats,
+                                                reset_fmha_step_stats,
+                                                step_stats_fmha_lib_classes)
 from ..disaggregation import diagnostics as disagg_diagnostics
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.kv_cache_transceiver import KvCacheTransceiver
@@ -679,6 +682,9 @@ class PyExecutor:
     # Whether the model opted into running the overlap loop on the execution
     # stream (RuntimeHooks.loop_on_execution_stream); read once at construction.
     _execution_stream_loop_armed = False
+    # Whether an FMHA library that keeps per-step counters is enabled
+    # (TLLM_FMHA_LIBS); read once at construction, False by default.
+    _fmha_step_stats_enabled = False
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
@@ -969,6 +975,7 @@ class PyExecutor:
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
+        self._fmha_step_stats_enabled = bool(step_stats_fmha_lib_classes())
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
         self.iter_perf_stats_interval = self.llm_args.iter_perf_stats_interval
         # Request counts not yet reported by an IterationStats record. They
@@ -1377,11 +1384,8 @@ class PyExecutor:
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
             self.kv_cache_manager.snapshot_warmup_baseline()
         # Likewise drop the warmup steps from the FMHA libraries' step counters.
-        if self.kv_cache_manager is not None:
-            from tensorrt_llm._torch.attention.backends.fmha.registry import \
-                step_stats_fmha_lib_classes
-            for fmha_cls in step_stats_fmha_lib_classes():
-                fmha_cls.reset_step_stats(self.kv_cache_manager)
+        if self._fmha_step_stats_enabled:
+            reset_fmha_step_stats(self.kv_cache_manager)
 
         self.is_shutdown = False
         # Set at the executor loops' normal-exit `break` sites, and ONLY
@@ -3619,9 +3623,8 @@ class PyExecutor:
                 local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
             local_dict["schedulerMode"] = scheduler_mode
             local_dict["rank"] = self.dist.tp_rank
-            fmha_step_stats = self._fmha_step_stats()
-            if fmha_step_stats is not None:
-                local_dict.update(fmha_step_stats)
+            if self._fmha_step_stats_enabled:
+                local_dict.update(fmha_step_stats(self.kv_cache_manager) or {})
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
             # desync (reached from per-rank-divergent gates).
             self._pending_iter_stats_dict = local_dict
@@ -3638,41 +3641,20 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
-        #   [8] fmha_step_stats: Optional[Dict[str, Dict[str, int]]]
-        fmha_step_stats = self._fmha_step_stats(attention_dp_rank)
+        #   [8] fmha_step_stats: Dict[str, Dict[str, int]], only while an
+        #       FMHA library that keeps step counters is enabled; the counters
+        #       are local, so records for another attention-DP rank carry none.
+        record = (stats, req_stats, kv_iter_stats, attention_dp_rank,
+                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
+                  gpu_forward_time_ms)
+        if self._fmha_step_stats_enabled and attention_dp_rank in (
+                None, self.dist.tp_rank):
+            record += (fmha_step_stats(self.kv_cache_manager), )
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
                 self.stats.pop(0)
-            self.stats.append(
-                (stats, req_stats, kv_iter_stats, attention_dp_rank,
-                 host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms, fmha_step_stats))
-
-    def _fmha_step_stats(
-        self,
-        attention_dp_rank: Optional[int] = None
-    ) -> Optional[Dict[str, Dict[str, int]]]:
-        """Cumulative per-step counters of the enabled FMHA libraries that keep them
-        (``Fmha.step_stats``) for this executor's KV cache, by iteration-stats record field.
-
-        Cumulative, so a consumer that misses records (a bounded stats buffer)
-        still reads exact totals. None when no such library is enabled, and
-        for records this rank appends on behalf of another attention-DP rank
-        (the counters are local to each rank; TLLM_METRICS_ALL_RANKS=1 reports
-        every rank's own).
-        """
-        if (attention_dp_rank not in (None, self.dist.tp_rank)
-                or self.kv_cache_manager is None):
-            return None
-        from tensorrt_llm._torch.attention.backends.fmha.registry import \
-            step_stats_fmha_lib_classes
-        stats = {
-            fmha_cls.step_stats_field:
-            fmha_cls.step_stats(self.kv_cache_manager)
-            for fmha_cls in step_stats_fmha_lib_classes()
-        }
-        return stats or None
+            self.stats.append(record)
 
     def _process_iter_stats(
         self,

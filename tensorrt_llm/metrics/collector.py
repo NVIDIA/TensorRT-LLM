@@ -172,6 +172,7 @@ class MetricsCollector:
         self._registry = REGISTRY if registry is None else registry
         self._gauge_multiprocess_mode = gauge_multiprocess_mode
         Counter = partial(Counter, registry=self._registry)
+        self._counter_cls = Counter
         Histogram = partial(Histogram, registry=self._registry)
         Gauge = partial(Gauge,
                         registry=self._registry,
@@ -489,32 +490,11 @@ class MetricsCollector:
             documentation="Draft overhead in speculative decoding",
             labelnames=self.labels.keys())
 
-        # Shared-prefix attention for n-sample requests
-        # (TLLM_FMHA_LIBS=+sampling_shared_prefix). Each counts generation
-        # requests per decode step: a request decoding for 100 steps adds 100.
-        self.counters_shared_prefix_attn = {
-            key:
-            Counter(name=self.metric_prefix + name,
-                    documentation=documentation,
-                    labelnames=iteration_labelnames)
-            for key, name, documentation in (
-                ("requestSteps", "shared_prefix_attn_request_steps_total",
-                 "Generation requests decoded, summed over decode steps"),
-                ("shareableRequestSteps",
-                 "shared_prefix_attn_shareable_request_steps_total",
-                 "Generation requests that share prompt KV pages with another "
-                 "request of the step, summed over decode steps"),
-                ("sharedRequestSteps",
-                 "shared_prefix_attn_shared_request_steps_total",
-                 "Generation requests attended through shared-prefix "
-                 "attention, summed over decode steps"),
-            )
-        }
+        # Shared-prefix attention counters, registered by the first record
+        # that carries them (only when TLLM_FMHA_LIBS enables the library).
+        self.counters_shared_prefix_attn: Optional[Dict[str, Counter]] = None
         # Per counter: dp_rank -> last cumulative value seen.
-        self._prev_shared_prefix_attn: Dict[str, Dict[str, int]] = {
-            key: {}
-            for key in self.counters_shared_prefix_attn
-        }
+        self._prev_shared_prefix_attn: Dict[str, Dict[str, int]] = {}
 
         # Prompt cache hit tracking
         self.counter_tokens_cached_prompt = Counter(
@@ -825,6 +805,38 @@ class MetricsCollector:
         # Convenience function for logging to gauge.
         gauge.labels(**self._label_merge(labels)).set(data)
 
+    def _shared_prefix_attn_counters(self) -> Dict[str, "Counter"]:
+        """The shared-prefix attention counters, registered on first use.
+
+        Each counts generation requests per decode step: a request decoding for
+        100 steps adds 100.
+        """
+        if self.counters_shared_prefix_attn is None:
+            labelnames = (*self.labels, self.labelname_dp_rank)
+            self.counters_shared_prefix_attn = {
+                key:
+                self._counter_cls(name=self.metric_prefix + name,
+                                  documentation=documentation,
+                                  labelnames=labelnames)
+                for key, name, documentation in (
+                    ("requestSteps", "shared_prefix_attn_request_steps_total",
+                     "Generation requests decoded, summed over decode steps"),
+                    ("shareableRequestSteps",
+                     "shared_prefix_attn_shareable_request_steps_total",
+                     "Generation requests that share prompt KV pages with "
+                     "another request of the step, summed over decode steps"),
+                    ("sharedRequestSteps",
+                     "shared_prefix_attn_shared_request_steps_total",
+                     "Generation requests attended through shared-prefix "
+                     "attention, summed over decode steps"),
+                )
+            }
+            self._prev_shared_prefix_attn = {
+                key: {}
+                for key in self.counters_shared_prefix_attn
+            }
+        return self.counters_shared_prefix_attn
+
     def _log_cumulative_kv_counter(self,
                                    counter: "Counter",
                                    value: int,
@@ -1095,7 +1107,7 @@ class MetricsCollector:
 
         # Shared-prefix attention counters (cumulative per rank).
         if attn_stats := iteration_stats.get("sharedPrefixAttnStats"):
-            for key, counter in self.counters_shared_prefix_attn.items():
+            for key, counter in self._shared_prefix_attn_counters().items():
                 if key in attn_stats:
                     self._log_cumulative_kv_counter(
                         counter,
