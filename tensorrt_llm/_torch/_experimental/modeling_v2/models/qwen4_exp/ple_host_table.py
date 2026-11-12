@@ -14,15 +14,18 @@ The table's rows are cut into `CHUNKS` fixed chunks (`chunk_rows`); a rank of a 
 * `node`: every chunk is one CUDA VMM allocation on host NUMA memory, shared by every process of
   the host through `chunk_broker`; every rank maps all chunks back to back and gathers locally.
   A rank fills the chunks it is responsible for and attaches to the others. One copy per node.
+  Processes share a chunk when their tables have one `table_identity`: the bytes of a strided
+  sample of every chunk's rows, whatever directory the checkpoint was read from. A rank that
+  attaches compares the chunk with its own checkpoint at other sampled rows.
 
 `server` needs attention TP with a size that divides `CHUNKS`, else it runs as `rank`. When a
-rank cannot take part in `node` (no VMM host NUMA allocation, no checkpoint identity, no owner
-within the timeout), every rank of the server runs `server` instead, or `rank`.
+rank cannot take part in `node` (no VMM host NUMA allocation, no table identity, no owner
+within the timeout), every rank of the server runs `server` instead, or `rank`. A requested
+mode that does not run is a warning, once per process.
 """
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import math
 import os
@@ -52,7 +55,12 @@ CHUNKS = 8
 CHUNK_ALIGN = 2 << 20
 #: How long a rank waits for another process to publish a chunk before giving up on `node`.
 _ATTACH_TIMEOUT_S = 3600.0
+#: A chunk's sample (`sample_blocks`): this many blocks of `_SAMPLE_ROWS` rows at an even stride.
+_SAMPLE_BLOCKS = 256
+_SAMPLE_ROWS = 8
 _CUDA_MEMORY_TYPE_HOST = 1
+#: `(requested, running)` fallbacks this process has warned about.
+_WARNED: set = set()
 
 Copy = Callable[[torch.Tensor, int, int, int], None]
 Read = Callable[[int, int], torch.Tensor]
@@ -65,6 +73,17 @@ def host_table_mode() -> str:
     if value not in _MODES:
         raise ValueError(f"{PLE_HOST_TABLE_ENV}={value!r}: expected one of {', '.join(_MODES)}")
     return value
+
+
+def _warn_fallback(requested: str, running: str, why: str) -> None:
+    """Warn, once per process and pair, that the requested mode runs as `running`, and why: the
+    table then takes more host memory than the deployment asked for."""
+    if (requested, running) in _WARNED:
+        return
+    _WARNED.add((requested, running))
+    logger.warning(
+        f"ple host table: {PLE_HOST_TABLE_ENV}={requested} requested, running {running}: {why}"
+    )
 
 
 def chunk_rows(rows: int, cols: int, align: int = CHUNK_ALIGN) -> int:
@@ -96,24 +115,37 @@ def owned_rows(rank: int, world: int, rows: int, cols: int, align: int = CHUNK_A
     ]
 
 
-def checkpoint_identity(checkpoint_dir: Optional[str], *parts) -> Optional[str]:
-    """A key for the table's bytes: the checkpoint directory, its safetensors files' names, sizes
-    and modification times, and `parts`; None when the directory or its files cannot be read."""
-    if not checkpoint_dir:
-        return None
-    root = os.path.realpath(checkpoint_dir)
-    try:
-        files = sorted(glob.glob(os.path.join(root, "*.safetensors")))
-        stats = [(os.path.basename(f), os.stat(f)) for f in files]
-    except OSError:
-        return None
-    if not stats:
-        return None
-    digest = hashlib.sha256(root.encode())
-    for name, st in stats:
-        digest.update(f"\0{name}:{st.st_size}:{st.st_mtime_ns}".encode())
+def sample_blocks(k: int, rows: int, cols: int, align: int = CHUNK_ALIGN, phase: int = 0) -> list:
+    """Row blocks `[lo, hi)` of chunk `k` that `node` compares: `_SAMPLE_BLOCKS` blocks of
+    `_SAMPLE_ROWS` rows at an even stride, `phase` 1 halfway between phase 0's; the whole chunk
+    when it is too short to stride."""
+    lo, hi = chunk_range(k, rows, cols, align)
+    if hi - lo <= 2 * _SAMPLE_BLOCKS * _SAMPLE_ROWS:
+        return [(lo, hi)] if hi > lo else []
+    stride = (hi - lo) // _SAMPLE_BLOCKS
+    first = lo + phase * (stride // 2)
+    return [
+        (start, min(start + _SAMPLE_ROWS, hi))
+        for start in range(first, hi, stride)[:_SAMPLE_BLOCKS]
+    ]
+
+
+def _sample(read: Read, blocks) -> torch.Tensor:
+    """The checkpoint's rows at `blocks`, in order, as bytes on the CPU."""
+    return torch.cat([read(lo, hi).contiguous().view(torch.uint8).cpu() for lo, hi in blocks])
+
+
+def table_identity(read: Read, rows: int, cols: int, *parts, align: int = CHUNK_ALIGN) -> str:
+    """The `node` key of a `rows` x `cols` table that `read` returns rows of: a digest of
+    `parts` and of every chunk's phase-0 sample (`sample_blocks`). Two checkpoints share it only
+    if their tables agree at those rows, wherever each was read from."""
+    digest = hashlib.sha256(f"{rows}x{cols}".encode())
     for part in parts:
         digest.update(f"\0{part}".encode())
+    for k in range(CHUNKS):
+        blocks = sample_blocks(k, rows, cols, align)
+        if blocks:
+            digest.update(_sample(read, blocks).numpy())
     return digest.hexdigest()[:32]
 
 
@@ -213,9 +245,18 @@ class _VmmChunks:
         return prop
 
     def _map(self, k: int, handle, read_only: bool) -> None:
-        D = cuda_driver
         address = self.va + k * self.chunk_bytes
-        _cu(D.cuMemMap(address, self.chunk_bytes, 0, handle, 0))
+        _cu(cuda_driver.cuMemMap(address, self.chunk_bytes, 0, handle, 0))
+        try:
+            self._set_access(address, read_only)
+        except BaseException:
+            # The caller releases `handle`; nothing stays mapped to it.
+            cuda_driver.cuMemUnmap(address, self.chunk_bytes)
+            raise
+        self._handles[k] = handle
+
+    def _set_access(self, address: int, read_only: bool) -> None:
+        D = cuda_driver
         desc = D.CUmemAccessDesc()
         desc.location.type = D.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         desc.location.id = self.device_index
@@ -231,7 +272,6 @@ class _VmmChunks:
                 raise
             desc.flags = D.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
             _cu(D.cuMemSetAccess(address, self.chunk_bytes, [desc], 1))
-        self._handles[k] = handle
 
     def create(self, k: int) -> None:
         handle = _cu(cuda_driver.cuMemCreate(self.chunk_bytes, self._prop(self.node), 0))
@@ -358,9 +398,11 @@ class PleHostTable:
         else:
             self.mode = SERVER if mode == SERVER and self._shards() else RANK
             if mode == SERVER and self.mode == RANK and world > 1:
-                self._log(
-                    f"ple host table: {SERVER} needs attention TP over a size that divides "
-                    f"{CHUNKS} (tp {world}, attention DP {dp}); keeping one copy per rank"
+                _warn_fallback(
+                    mode,
+                    self.mode,
+                    f"{SERVER} needs attention TP over a size that divides {CHUNKS} (tp {world}, "
+                    f"attention DP {dp})",
                 )
             self._declare_private()
 
@@ -391,7 +433,7 @@ class PleHostTable:
         """Map nothing yet; own (create) the chunks this rank is responsible for if no process
         does. A failure is kept for `fill`, where every rank agrees on the mode."""
         if self.identity is None:
-            self._node_error = "no checkpoint identity"
+            self._node_error = "no table identity"
             return
         try:
             chunk_bytes = chunk_rows(self.rows, self.cols, self.align) * self.cols
@@ -404,8 +446,10 @@ class PleHostTable:
                 for k in owned_chunks(self.rank, self.world):
                     segment = _broker.try_own(self._key(k))
                     if segment is not None:
-                        self._vmm.create(k)
+                        # Recorded first: if `create` fails, `_abort_node` closes it, and the
+                        # processes waiting on it take the chunk over.
                         self._segments[k] = segment
+                        self._vmm.create(k)
         except (RuntimeError, OSError) as error:
             self._node_error = str(error)
             self._abort_node()
@@ -429,7 +473,7 @@ class PleHostTable:
             return
         reason = self._node_error or "another rank of this server could not share the table"
         self.mode = SERVER if self._shards() else RANK
-        self._log(f"ple host table: {NODE} unavailable ({reason}); running {self.mode}")
+        _warn_fallback(NODE, self.mode, reason)
         if ok:
             # Keep the full shared view; `server` reads only this rank's rows from it.
             if self.mode == SERVER:
@@ -453,8 +497,8 @@ class PleHostTable:
                     continue
                 got = _broker.acquire(self._key(k), _ATTACH_TIMEOUT_S, self._log)
                 if got[0] == _broker.OWNER:
-                    vmm.create(k)
                     self._segments[k] = got[1]
+                    vmm.create(k)
                     self._fill_and_publish(k, copy)
                     continue
                 _, fd, meta = got
@@ -466,7 +510,7 @@ class PleHostTable:
                     os.close(fd)
                 self._attached += 1
                 self._check_chunk(k, read)
-        except (RuntimeError, OSError, TimeoutError, AssertionError) as error:
+        except (RuntimeError, OSError, TimeoutError) as error:
             self._node_error = str(error)
             self._abort_node()
             return False
@@ -482,14 +526,17 @@ class PleHostTable:
         self._segments[k].publish(fd, {"chunk": k, "chunk_bytes": self._vmm.chunk_bytes})
 
     def _check_chunk(self, k: int, read: Read) -> None:
-        """An attached chunk's first and last rows are the checkpoint's."""
-        lo, hi = chunk_range(k, self.rows, self.cols, self.align)
-        for row in {lo, hi - 1} if hi > lo else ():
-            got = self.table[row : row + 1].view(torch.uint8).cpu()
-            want = read(row, row + 1).contiguous().view(torch.uint8).cpu()
-            assert torch.equal(got, want), (
-                f"shared chunk {k} differs from the checkpoint at row {row}"
-            )
+        """An attached chunk holds the checkpoint's bytes at its phase-1 sample, rows the key does
+        not hash; raises `RuntimeError` otherwise."""
+        blocks = sample_blocks(k, self.rows, self.cols, self.align, phase=1)
+        if not blocks:
+            return
+        rows = torch.cat([torch.arange(lo, hi) for lo, hi in blocks])
+        got = self.table.view(torch.uint8).index_select(0, rows.to(self.device)).cpu()
+        want = _sample(read, blocks)
+        if not torch.equal(got, want):
+            first = int(rows[(got != want).any(1)][0])
+            raise RuntimeError(f"shared chunk {k} differs from the checkpoint at row {first}")
 
     def _abort_node(self) -> None:
         for segment in self._segments.values():

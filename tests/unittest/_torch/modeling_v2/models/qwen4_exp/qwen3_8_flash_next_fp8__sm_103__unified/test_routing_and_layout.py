@@ -13,7 +13,7 @@ import torch
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import routing
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import ple_host_table, routing
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified import (  # noqa: E501
     modeling as M,
 )
@@ -105,6 +105,7 @@ def on_sm103(monkeypatch):
         M.MOE_COMM_METHOD_ENV,
         M.ROWTILE_SCRATCH_GROUPS_ENV,
         W.MOE_TPB_ENV,
+        ple_host_table.PLE_HOST_TABLE_ENV,
     ):
         monkeypatch.delenv(env, raising=False)
 
@@ -437,6 +438,10 @@ def test_another_moe_backend_or_gpu_or_no_gdn_replay_declines(on_sm103, monkeypa
     with pytest.raises(ValueError, match=f"{W.MOE_TPB_ENV}='1': expected rr"):
         modeling_v2_resolve(_routed_config("tep4"), _llm_args("auto"))
     monkeypatch.delenv(W.MOE_TPB_ENV)
+    monkeypatch.setenv(ple_host_table.PLE_HOST_TABLE_ENV, "nodes")
+    with pytest.raises(ValueError, match=f"{ple_host_table.PLE_HOST_TABLE_ENV}='nodes': expected"):
+        modeling_v2_resolve(_routed_config("tep4"), _llm_args("auto"))
+    monkeypatch.delenv(ple_host_table.PLE_HOST_TABLE_ENV)
 
 
 @pytest.mark.cpu_only

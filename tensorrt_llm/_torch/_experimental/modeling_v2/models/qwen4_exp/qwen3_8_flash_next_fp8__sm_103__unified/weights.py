@@ -1265,6 +1265,14 @@ class Qwen4ExpFp8Weights:
         d = self.dims(core)
         # Declared before the manifest: its height comes from the shards.
         rows_per_shard = _declare_ngram_table(core, d, weights)
+        try:
+            self._fill_declared(model, d, weights, rows_per_shard)
+        except BaseException:
+            _close_ngram_table(core)
+            raise
+
+    def _fill_declared(self, model, d: SimpleNamespace, weights, rows_per_shard: int) -> None:
+        core = model.model
         manifest = self.manifest(d)
         manifest["ple_table"] = ngram_table_sources(d, rows_per_shard)
         consumed: set = set()
@@ -1468,6 +1476,7 @@ def rank_dims(cfg, vcfg, mapping, *, mtp_enabled: bool, dtype: torch.dtype) -> S
         ngram_heads=ngram_heads,
         ple_head_dim=cfg.ple_embed_dim // ngram_heads,
         ple_shards=cfg.split_ngram_parts,
+        ngram_vocab_divisor=cfg.make_ngram_vocab_size_divisible_by,
         ple_table_dtype=PLE_TABLE_DTYPE,
         v_depth=vcfg.depth,
         v_hidden=v_hidden,
@@ -1545,12 +1554,12 @@ def _declare_ngram_table(core, d: SimpleNamespace, weights) -> int:
     )
     device = core.w["embed"].device
     rows = d.ple_shards * rows_per_shard
+    _check_ngram_id_space(d, weights, rows)
     mode = getattr(core, "ple_host_mode", _ple_host.RANK)
     identity = None
     if mode == _ple_host.NODE:
-        identity = _ple_host.checkpoint_identity(
-            getattr(core, "checkpoint_dir", None), rows, head_dim, dtype, *keys
-        )
+        _, read = _ple_host.shard_rows(weights, keys, rows_per_shard, _read)
+        identity = _ple_host.table_identity(read, rows, head_dim, dtype, *keys)
     mapping = getattr(core, "mapping", None)
     core._ple_table_host = _ple_host.PleHostTable(
         mode,
@@ -1568,6 +1577,33 @@ def _declare_ngram_table(core, d: SimpleNamespace, weights) -> int:
     return rows_per_shard
 
 
+def _check_ngram_id_space(d: SimpleNamespace, weights, rows: int) -> None:
+    """Raise `ValueError` unless a table of `rows` rows holds the id space the checkpoint's
+    per-head offsets and vocabulary sizes address, padded to a multiple of
+    `ngram_vocab_divisor` by less than one divisor.
+
+    An id past the end is a device-side assert that poisons the process. Shards padded one by
+    one carry more padding than that, and do not concatenate to the padded id space: every id
+    past the first shard would read a shifted row."""
+    prefix = f"{_LM}.layers.{d.ple_layer}.ple.ple_embedding"
+    offsets = _read(weights[f"{prefix}.ngram_heads_offsets"], None)
+    vocab = _read(weights[f"{prefix}.ngram_heads_vocab_sizes"], None)
+    used = int(offsets[-1]) + int(vocab[-1])
+    divisor = d.ngram_vocab_divisor
+    if used > rows:
+        raise ValueError(
+            f"the n-gram table has {rows} rows but its per-head offsets and vocabulary sizes "
+            f"address {used}"
+        )
+    if rows % divisor or rows - used >= divisor:
+        raise ValueError(
+            f"the n-gram table has {rows} rows for an id space of {used}: not padded to a "
+            f"multiple of make_ngram_vocab_size_divisible_by {divisor} by less than one "
+            "divisor. Shards padded one by one do not concatenate to the padded id space, and "
+            "every id past the first shard would read a shifted row"
+        )
+
+
 def _bind_ngram_table(core) -> None:
     """`core.w["ple_table"]` as the host table's current view (a placeholder until a `node`
     table is mapped)."""
@@ -1580,6 +1616,17 @@ def _bind_ngram_table(core) -> None:
     assert core.w["ple_table"].data_ptr() == table.data_ptr(), (
         "wrapping the n-gram table in nn.Parameter moved its storage"
     )
+
+
+def _close_ngram_table(core) -> None:
+    """Release the n-gram table (in `node`, its chunks and the broker names other processes of
+    the host may wait on); `ple_table` becomes the placeholder."""
+    host = core._ple_table_host
+    if host is None:
+        return
+    host.close()
+    _bind_ngram_table(core)
+    core._ple_table_host = None
 
 
 def _fill_ngram_table(core, d: SimpleNamespace, weights, rows_per_shard: int) -> set:

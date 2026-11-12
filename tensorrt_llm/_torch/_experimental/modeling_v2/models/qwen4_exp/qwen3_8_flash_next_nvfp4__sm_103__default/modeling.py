@@ -1229,7 +1229,6 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
                 f"{_ple_host.PLE_HOST_TABLE_ENV}={self.ple_host_mode} applies to the host-resident "
                 f"n-gram table; {_PLE_HOST_OFFLOAD_ENV}=0 keeps one device copy per rank"
             )
-        self.checkpoint_dir = getattr(composite_config, "_name_or_path", None)
         _check_switches(self.one_rank)
         # CPU allocation behind the offloaded table; the `ple_table` parameter is a
         # device-address view that owns none of those pages.
@@ -6873,6 +6872,8 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
                 f"target implements { ({k: _TEXT_SETTINGS[k] for k in differs}) }"
             )
 
+        # Read here so a misspelled value fails before the build.
+        _ple_host.host_table_mode()
         mapping = model_config.mapping
         one_rank = mapping.world_size == 1
         spec = model_config.spec_config
