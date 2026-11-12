@@ -9,7 +9,9 @@ import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          SparseAttentionConfig,
                                           is_speculators_dspark_config,
                                           translate_speculators_dspark_config)
 from tensorrt_llm.logger import logger
@@ -424,6 +426,18 @@ def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:
 def is_minimax_m3(sparse_attention_config):
     """True when the sparse attention config selects the MiniMax-M3 algorithm."""
     return sparse_attention_config is not None and sparse_attention_config.algorithm == "minimax_m3"
+
+
+def is_decode_only(
+        sparse_attention_config: Optional[SparseAttentionConfig]) -> bool:
+    """True when the sparse attention config restricts the worker to decode.
+
+    Sparse KV cache offload keeps attention history in host memory and admits
+    one query token per request per step, so an offloading worker serves the
+    decode phase of disaggregated serving and never runs a context batch.
+    """
+    return (sparse_attention_config is not None and
+            sparse_attention_config.get_kv_cache_offload_config() is not None)
 
 
 def is_qwen3_next(config):
@@ -1034,9 +1048,11 @@ def build_minimax_dspark_draft_config(
 
 def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
-                           checkpoint_format: Optional[str] = None,
+                           checkpoint_format: CheckpointFormat | str
+                           | None = None,
                            **kwargs) -> transformers.PretrainedConfig:
-    if checkpoint_format in ("mistral", "mistral_large_3"):
+    if checkpoint_format in (CheckpointFormat.MISTRAL,
+                             CheckpointFormat.MISTRAL_LARGE_3):
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
         return MistralConfigLoader().load(model_name_or_path).pretrained_config
@@ -1045,8 +1061,11 @@ def load_pretrained_config(model_name_or_path: str,
         model_name_or_path, **kwargs)
     model_type = config_dict.get("model_type")
     architectures = config_dict.get("architectures") or []
+    model_kwargs = kwargs.get("model_kwargs") or {}
+    requested_architectures = model_kwargs.get("architectures") or architectures
 
-    if checkpoint_format in ("mistral", "mistral_large_3"):
+    if checkpoint_format in (CheckpointFormat.MISTRAL,
+                             CheckpointFormat.MISTRAL_LARGE_3):
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
@@ -1081,6 +1100,22 @@ def load_pretrained_config(model_name_or_path: str,
         config_dict.pop("layer_types", None)
         model_config = _CONFIG_REGISTRY[model_type].from_dict(
             config_dict, **kwargs)
+    elif (requested_architectures
+          and requested_architectures[0] == "PplxDeciderForDecision"):
+        # pplx-decider packages a text-only decision model in a composite
+        # Qwen3.5 config. Flatten the nested text config before the generic
+        # Qwen3.5 VLM branches preserve the vision config.
+        from tensorrt_llm._torch.models.modeling_pplx_decider import \
+            PPLX_DECIDER_NUM_LABELS
+        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
+            Qwen35ConfigCompat
+        normalized_config = Qwen35ConfigCompat.normalize(
+            config_dict, require_text_config=True)
+        normalized_config["architectures"] = ["PplxDeciderForDecision"]
+        normalized_config["num_labels"] = PPLX_DECIDER_NUM_LABELS
+        model_config = transformers.Qwen3NextConfig.from_dict(normalized_config)
+        model_config.torch_dtype = _resolve_composite_torch_dtype(
+            config_dict, normalized_config)
     elif (model_type == "qwen3_5_moe" and
           (("text_config" in config_dict and "vision_config" in config_dict) or
            (architectures
@@ -1149,6 +1184,22 @@ def load_pretrained_config(model_name_or_path: str,
             text_dict["quantization_config"] = quantization_config
         model_config = Qwen4ExpTextConfig.from_dict(text_dict)
         model_config.architectures = ["Qwen4ExpForCausalLM"]
+    elif model_type in ("apertus1p5", "apertus1p5_text"):
+        # Apertus 1.5 runs text-only on the Apertus decoder; its image and
+        # audio tokenizers are not supported.
+        text_dict = dict(config_dict.get("text_config") or config_dict)
+        text_dict["model_type"] = "apertus"
+        # The input embedding also covers the image and audio codes; the
+        # runtime's vocab_size is the output (lm_head) vocabulary.
+        output_vocab_size = text_dict.get("output_vocab_size")
+        if output_vocab_size is not None:
+            text_dict["input_vocab_size"] = text_dict["vocab_size"]
+            text_dict["vocab_size"] = output_vocab_size
+        if "quantization_config" in config_dict:
+            text_dict.setdefault("quantization_config",
+                                 config_dict["quantization_config"])
+        model_config = transformers.ApertusConfig.from_dict(text_dict)
+        model_config.architectures = ["Apertus1p5ForConditionalGeneration"]
     elif model_type in ("deepseek_v41", "deepseek_v41_text"):
         # Preserve the composite config and propagate its dtype to the text tower.
         # Vision checkpoints use the internal ConditionalGeneration dispatch alias.

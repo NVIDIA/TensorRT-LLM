@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
     Cell,
     OpWrapper,
     true_fp32_matmul,
 )
+
+from ... import native_ops
 
 #: GLM-5.2's hidden size, the contraction of gate/up and the output width of down.
 HIDDEN = 6144
@@ -76,7 +77,7 @@ class GlmDenseMlpSmallM(OpWrapper):
     contiguous, 16-byte aligned operands on an sm_90 or newer device. The op
     raises on anything else, so the caller routes other shapes (more rows,
     context forwards, another TP) to a generic gated MLP.
-    `torch.ops.trtllm.glm_dense_mlp_small_m_supported(rows, hidden, inter)`
+    `native_ops.glm_dense_mlp_small_m_supported(rows, hidden, inter)`
     answers the shape question on the host.
 
     The weight layout is the caller's to get right and no check can see it: a
@@ -91,7 +92,7 @@ class GlmDenseMlpSmallM(OpWrapper):
     def __call__(
         self, x: torch.Tensor, gate_up_weight: torch.Tensor, down_weight: torch.Tensor
     ) -> torch.Tensor:
-        return torch.ops.trtllm.glm_dense_mlp_small_m(x, gate_up_weight, down_weight)
+        return native_ops.glm_dense_mlp_small_m(x, gate_up_weight, down_weight)
 
     def reference(
         self, x: torch.Tensor, gate_up_weight: torch.Tensor, down_weight: torch.Tensor

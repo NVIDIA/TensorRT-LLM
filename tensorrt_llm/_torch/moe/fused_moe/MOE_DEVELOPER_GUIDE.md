@@ -175,7 +175,7 @@ comprehensive early-validation layer for every incompatible feature.
 `ExternalCommMoEScheduler._forward_chunk_impl` runs per chunk:
 
 ```text
-[EPLB start_wait_gpu] → routing → [EPLB done_wait_gpu + update_statistic + route]
+[EPLB start_wait_gpu] → routing (or backend.try_route_with_sort) → [EPLB done_wait_gpu + update_statistic + route]
   → [comm.prepare_dispatch (NVLink2-sided)] → quantize/dispatch (adaptive order)
   → backend.run_moe → [EPLB start_set_cpu] → [unfinalized_combine_fn]
   → comm.combine → [EPLB done_set_cpu]
@@ -186,6 +186,16 @@ Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
 ```
 
 EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Multi-stream chunk overlap is enabled when `not enable_alltoall and aux_stream is not None`, unless the backend declares `input_requirement.run_moe_reuses_buffers`: its `run_moe` returns a view of a buffer the next call overwrites and keeps scratch across calls (the B12x leaves, whose `B12xMoEWrapper` output buffer is also shared across layers). `ExternalCommMoEScheduler` then runs its chunks on one stream and copies every chunk but the last out before the next chunk runs — the trailing `torch.cat` copies the last one. `FusedCommMoEScheduler` copies no chunk output at all, so it refuses a backend that declares the field rather than aliasing its chunks.
+
+Routing may come from one kernel that also writes the backend's `moe_sort` tables. `ConfigurableMoE.sort_routing_applies` decides once whether that can happen: the routed ids reach the rank unchanged (no comm strategy, EPLB or `apply_router_weight_on_input`) and the backend `consumes_sort_tables()` (`TrtllmCutedslGroupedGemmNvfp4Impl` and `TrtllmCutedslFusedFc12Nvfp4Impl`, both without a slot remap). Then, for forwards without `routing_aux`, the scheduler routes through `backend.try_route_with_sort(router_logits)`, which forwards to `routing_method.apply_with_sort(...)` for the backend's expert range; the tables reach `run_moe` as `MoERunContext.sort_tables` and the backend runs on them when their tile is the tuned one. `DeepSeekV3MoeRoutingMethod` serves ungrouped fused top-16 routing with `trtllm::noaux_tc_route_sort` (`moe/kernels/blackwell/kimi_k3_routing.py`: up to 256 tokens, any multiple of 128 experts up to 1024, SM100/SM103/SM107, bitwise `noaux_tc_op` + `moe_sort`)
+
+A staged routing override (e.g. the layer-wise benchmark's balanced replacement) must cover `apply_with_sort` as well: while `sort_routing_applies` lets it, the scheduler routes through that method, so replacing only `apply` leaves the override unexercised — `tools/layer_wise_benchmarks/runner.py`'s `replace_routing_method_ctx` patches `apply_with_sort` to decline and thereby routes every forward through the replaced `apply`.
+
+`MoESortTables` is the decode-time hand-off to a backend's `run_moe` (the sorting kernel wrote the tables for the ids it produced). `PreroutedRouting` is the other hand-off — routing a *caller* computed for one `run_moe` of an impl that declares `supports_prerouted_routing` (the TRT-LLM-Gen decode front): eager, stricter (one chunk, no comm) and table-format-specific. They are not interchangeable; folding them into one hand-off (covering `PreroutedRouting`, `MoESortTables` and the `MoERoutingTables` hand-off proposed in #21438) is tracked as TRTLLM-17649, under the TRTLLM-14607 MoE refactor epic — for now a producer that owns the whole front builds `PreroutedRouting` and a backend-side sorting forward builds `sort_tables`..
+
+A model that orders work around the routing asks `ConfigurableMoE.routes_with_sort_tables(num_tokens)` instead of re-deriving these conditions. Likewise, a producer that can emit the routed experts' NVFP4 input (e.g. from a GEMM epilogue) asks `ConfigurableMoE.nvfp4_input_scale(num_tokens)`: the global scale of an `Fp4QuantizedTensor` input (linear scale factors) that the forward takes as is, or `None` when the forward needs an unquantized input (the backend declares no `MoEImplBase.prequantized_nvfp4_input_scale()`, or a comm strategy, EPLB, `apply_router_weight_on_input` or more than one chunk). `ConfigurableMoE.quantize_nvfp4_input(x)` quantizes as the backend would.
+
+A model that runs other work on a side stream while the routed experts run (e.g. a shared expert) asks the backend, once per forwards's launch, to keep SMs free of its persistent grid: `backend.reserve_sms_for_concurrent_kernels(num_sms)` returns the SMs applied to that launch (default 0: declined). Ask for the shared work's count only while it runs beside the routed grid (multi-stream); an in-order launch hands 0 so the grid keeps every SM. The paired confinement is torch's SM carveout, which only GEMM launches issued through torch's cuBLAS (`F.linear`) honor — a CuTe DSL shared GEMM ignores it, and a model whose shared projections take those paths must not reserve SMs for them. `TrtllmCutedslFusedFc12Nvfp4Impl` applies the count to the fused FC12 kernel (`reserved_sms` of `trtllm::cute_dsl_nvfp4_fc12_fused_rubin`, alongside `cute_dsl_utils.sm_reserve()`).
 
 `unfinalized_combine_fn` is a constructor argument (`create_moe(..., unfinalized_combine_fn=...)`) for a model that needs a per-`(token, expert)` transform applied to each expert output *before* the top-k sum. Once registered it runs on **every** `do_finalize=False` forward, with or without a comm strategy, so the forward's return type (dense tensor vs. unfinalized triple) depends only on static config. Under a comm strategy the scheduler runs it on the dispatched rows and the combine reduces already-finalized partials — equal to finalizing after the combine, because each term depends on one row alone and non-local slots contribute exact zeros. That reordering is only sound for a combine that is an unweighted row sum over a dense per-token tensor; `DeepEPLowLatency.combine` is not one (it consumes expert-major rows and applies the routing weights itself), which is what `Communication.supports_finalize_before_combine()` declares. `ConfigurableMoE.validate_backend` rejects at construction: a backend without `supports_unfinalized_output()`, a comm without `supports_finalize_before_combine()`, and `apply_router_weight_on_input`. With no hook registered, `do_finalize=False` plus a comm strategy stays a named runtime refusal instead of a crash inside the comm layer.
 
@@ -276,7 +286,7 @@ Still on old path (standalone, with embedded communication):
 | `moe_comm_timeout_guard.py` | Device-side timeouts of communication kernels, relaxed during warmup — budget resolution and `MoECommTimeoutProxy` registration (see [Communication timeouts](#communication-timeouts)) |
 | `moe_load_balancer.py` | EPLB implementation |
 | `per_layer_dynamic_eplb/` | Per-layer dynamic EPLB, created by `maybe_create_moe_load_balancer`: model-level `manager`, per-layer handle `layer`, live-weight `arena`, and HALO-Q/TMA `planner` |
-| `moe_op_backend.py` | Op backend registry for TRTLLMGen (flashinfer/trtllm ops) |
+| `moe_op_backend.py` | Op backend registry for TRTLLMGen: `trtllm` ops for every quantized leaf, the FlashInfer bf16 runner for the unquantized one |
 
 ### Backends (`fused_moe/`)
 
@@ -363,48 +373,39 @@ holds no code: it defines `TRTLLMGenFusedMoE` (the abstract
 |------|------|
 | `identity.py` | TRTLLM-Gen's values of the types `impl_identity.py` defines: the identity constants (`PROVIDER_*`, `TECHNIQUE_TRTLLM_GEN`, `KERNEL_FUSED_MOE`), the two published contracts (`TRTLLM_GEN_CAPABILITIES`, `TRTLLM_GEN_INPUT_REQUIREMENT`), and the `trtllm_gen_descriptor` factory that stamps those segments into what the registry reads |
 | `base.py` | `TrtllmGenFusedMoEBase` — the abstract root every leaf shares: construction, the weight-creation skeleton, the two routing predicates the framework reads off a module, the fake-output shapes. Reads both axes as leaf-declared attributes and overridable hooks, never as a branch on `quant_config` or the provider string |
-| `fp4_block_scale.py` | `run_fp4_block_scale_moe` and the formats that reach it — NVFP4, W4A16_MXFP4, W4A8_MXFP4_MXFP8 — each supplying only its weight/input preparation, its SiTu alignment, and its scale group size. Two leaves per format, one per provider |
-| `fp8_block_scale.py` | DeepSeek-style FP8 with 1x128 block scales: `run_fp8_block_scale_moe`, the narrowed activation ABI (scalar clamp), and shared-expert fusion. Two leaves. Shares nothing with the fp4 module, which is why the two sit side by side rather than under a common quant layer |
+| `fp4_block_scale.py` | `run_fp4_block_scale_moe` and the formats that reach it — NVFP4, W4A16_MXFP4, W4A8_MXFP4_MXFP8 — each supplying only its weight/input preparation, its SiTu alignment, and its scale group size. One leaf per format |
+| `fp8_block_scale.py` | DeepSeek-style FP8 with 1x128 block scales: `run_fp8_block_scale_moe`, the narrowed activation ABI (scalar clamp), and shared-expert fusion. One leaf. Shares nothing with the fp4 module, which is why the two sit side by side rather than under a common quant layer |
 | `eligibility.py` | the eligibility checks each leaf's `can_implement` composes, as free functions — every caller is a leaf |
 | `kernel_inputs.py` | the `run_moe` prologue the kernel bodies share, as free functions taking the impl |
 | `trtllm_<quant>.py` | one registered native leaf each: `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `w4a8_nvfp4_fp8`, `w4a8_mxfp4_fp8` |
-| `flashinfer_<quant>.py` | one registered FlashInfer leaf each: `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `bf16` |
+| `flashinfer_bf16.py` | the one registered FlashInfer leaf: the unquantized format, which TRT-LLM's own cubins do not cover |
 
 #### The leaves
 
 Module names carry the two identity segments that differ: `provider` — the
 in-tree `trtllm` ops or the FlashInfer package — and `quant`. Technique and
 kernel are `trtllm_gen` / `fused_moe` for every leaf, which the package name
-says once. The grid is not full: FlashInfer has no `w4a8_nvfp4_fp8` or
-`w4a8_mxfp4_fp8` runner and alone serves the unquantized format, so some
-cells of the provider x format grid have no leaf.
+says once. Each format has exactly one leaf: every quantized format runs on the
+native provider, and FlashInfer serves only the unquantized format, for which
+TRT-LLM ships no bf16 x bf16 cubins.
 
-| `quant` segment | `trtllm.` leaf | `flashinfer.` leaf |
-|---|---|---|
-| `nvfp4` | `TrtllmTrtllmGenNvfp4Impl` | `FlashinferTrtllmGenNvfp4Impl` |
-| `fp8_block_scales` | `TrtllmTrtllmGenFp8BlockScalesImpl` | `FlashinferTrtllmGenFp8BlockScalesImpl` |
-| `w4a16_mxfp4` | `TrtllmTrtllmGenW4a16Mxfp4Impl` | `FlashinferTrtllmGenW4a16Mxfp4Impl` |
-| `w4a8_mxfp4_mxfp8` | `TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl` | `FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl` |
-| `w4a8_nvfp4_fp8` | `TrtllmTrtllmGenW4a8Nvfp4Fp8Impl` | — |
-| `w4a8_mxfp4_fp8` | `TrtllmTrtllmGenW4a8Mxfp4Fp8Impl` | — |
-| `none` (BF16) | — | `FlashinferTrtllmGenBf16Impl` |
+| `quant` segment | Leaf |
+|---|---|
+| `nvfp4` | `TrtllmTrtllmGenNvfp4Impl` |
+| `fp8_block_scales` | `TrtllmTrtllmGenFp8BlockScalesImpl` |
+| `w4a16_mxfp4` | `TrtllmTrtllmGenW4a16Mxfp4Impl` |
+| `w4a8_mxfp4_mxfp8` | `TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl` |
+| `w4a8_nvfp4_fp8` | `TrtllmTrtllmGenW4a8Nvfp4Fp8Impl` |
+| `w4a8_mxfp4_fp8` | `TrtllmTrtllmGenW4a8Mxfp4Fp8Impl` |
+| `none` (BF16) | `FlashinferTrtllmGenBf16Impl` |
 
 Ids follow the class names (`trtllm.trtllm_gen.fused_moe.nvfp4`,
 `flashinfer.trtllm_gen.fused_moe.none`), keeping the technique and kernel
 segments so a future non-TRTLLM-Gen kernel from the same wheel stays
-distinguishable. The two native-only formats subclass the family base directly:
-a per-quant parent implementing three methods for one subclass buys nothing.
-
-The provider split is a policy call, not a capability one. With the FlashInfer
-wheel installed a `TRTLLM` literal still picks the native leaf, and only
-`TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER=1` moves it — read through
-`MoEEnvironment.env_flag`, so `can_implement` never touches `os.environ`. A
-FlashInfer leaf asked for without the flag declines with `PATH_NOT_ENABLED`,
-which distinguishes "not chosen" from "not installed" (`DEP_MISSING`).
-`IMPL_PRIORITY` lists each FlashInfer leaf ahead of the native leaf of the same
-format, so the flag alone decides the order the two are asked in.
-`FlashinferTrtllmGenBf16Impl` is outside that policy — see the `§` footnote
-under [Quantization Support](#quantization-support).
+distinguishable. The two native formats on runner ops of their own subclass the
+family base directly: a per-quant parent implementing three methods for one
+subclass buys nothing. Because the `quant` segments are disjoint, the order of
+the TRTLLM-Gen leaves within `IMPL_PRIORITY` does not matter.
 
 Only a registered class may be resolved to, and importing the package is what
 registers, which `moe_resolution` guarantees. `trtllm_gen_leaf` sits at the
@@ -732,8 +733,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 § The unquantized TRTLLM-Gen path is `FlashinferTrtllmGenBf16Impl`, and it is
 not a TRTLLM-Gen kernel at all: it calls FlashInfer's `trtllm_bf16_moe` /
 `trtllm_bf16_routed_moe`, which is why it is gated on
-`MoEDep.FLASHINFER_BF16_MOE` rather than on a quant algo or on the
-`TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER` opt-in, and why `TRTLLMOpBackend` raises
+`MoEDep.FLASHINFER_BF16_MOE` and why `TRTLLMOpBackend` raises
 `NotImplementedError` for it. It is the only leaf reachable on a host with no
 quantization configured at all. The row reads `Y` because `can_implement`
 really can select it; without the FlashInfer symbols the layer degrades to

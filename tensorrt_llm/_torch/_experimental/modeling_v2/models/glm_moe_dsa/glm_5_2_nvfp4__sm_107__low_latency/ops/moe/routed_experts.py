@@ -3,7 +3,7 @@
 """GLM-5.2's routed experts at MoE TP16: DeepSeek-V3 routing without groups
 (sigmoid + bias, top-8 of 256, scaled sum normalization), grouped NVFP4 FC1 +
 SwiGLU + NVFP4 requantization + grouped NVFP4 FC2, in one call of
-`trtllm::glm_routed_experts`: the TRTLLM-Gen MoE kernels with GLM's own router
+`glm_routed_experts`: the TRTLLM-Gen MoE kernels with GLM's own router
 and FC2 kernels beside them.
 
 On the decode step (up to 24 rows) the call runs the router GEMV inside the
@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2._native import namespace_of
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
     Cell,
@@ -34,6 +34,10 @@ from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import (
     FP4BlockScaleMoERunner,
     prepare_dummy_topk_and_hook,
 )
+
+from ... import native_ops
+
+_NS = namespace_of(__name__)
 
 __all__ = [
     "ACT_TYPE_SWIGLU",
@@ -76,9 +80,9 @@ def make_fused_router_workspace(device: torch.device) -> torch.Tensor:
 
 
 class _RoutedExpertsTunableRunner(FP4BlockScaleMoERunner):
-    """The autotuner's runner for `trtllm::glm_routed_experts`: the tactics
+    """The autotuner's runner for `glm_routed_experts`: the tactics
     (tile N, FC1 / FC2 config pair) and tuning buckets of the TRTLLM-Gen FP4
-    MoE runner, run on `torch.classes.trtllm.GlmRoutedExpertsRunner`."""
+    MoE runner, run on the target's `GlmRoutedExpertsRunner`."""
 
     runner_dict = dict()
 
@@ -124,9 +128,9 @@ class _RoutedExpertsTunableRunner(FP4BlockScaleMoERunner):
     def get_runner(self):
         key = (self.act_type,)
         if key not in _RoutedExpertsTunableRunner.runner_dict:
-            _RoutedExpertsTunableRunner.runner_dict[key] = (
-                torch.classes.trtllm.GlmRoutedExpertsRunner(self.act_type)
-            )
+            _RoutedExpertsTunableRunner.runner_dict[key] = getattr(
+                torch.classes, _NS
+            ).GlmRoutedExpertsRunner(self.act_type)
         return _RoutedExpertsTunableRunner.runner_dict[key]
 
     def forward(
@@ -179,7 +183,7 @@ class _RoutedExpertsTunableRunner(FP4BlockScaleMoERunner):
         )
 
 
-@torch.library.custom_op("trtllm::glm_routed_experts", mutates_args=("output", "router_workspace"))
+@torch.library.custom_op(f"{_NS}::glm_routed_experts", mutates_args=("output", "router_workspace"))
 def _glm_routed_experts(
     routing_logits: Optional[torch.Tensor],
     routing_bias: Optional[torch.Tensor],
@@ -278,7 +282,7 @@ def _glm_routed_experts(
         topk_ids_for_tuner,
     ]
     kernel_runner, best_tactic = tuner.choose_one(
-        "trtllm::glm_routed_experts", [kernel_runner], tuning_config, input_tensors
+        f"{_NS}::glm_routed_experts", [kernel_runner], tuning_config, input_tensors
     )
     # The call itself runs on the caller's routing inputs, not the tuner's.
     input_tensors[0] = routing_logits
@@ -554,7 +558,7 @@ class GlmRoutedExperts(OpWrapper):
         router_workspace: Optional[torch.Tensor],
         prefer_specialized_gemm2: bool,
     ) -> list[torch.Tensor]:
-        result = torch.ops.trtllm.glm_routed_experts(
+        result = native_ops.glm_routed_experts(
             routing_logits,
             routing_bias,
             hidden_states,

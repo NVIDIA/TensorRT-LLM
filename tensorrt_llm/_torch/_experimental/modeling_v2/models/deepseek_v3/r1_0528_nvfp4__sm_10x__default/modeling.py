@@ -40,7 +40,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    disable_v2_by_default,
+    step_contract_enabled,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
@@ -1903,6 +1906,7 @@ class DraftModel:
         return self.core.w["embed"]
 
 
+@disable_v2_by_default
 class ModelingV2DeepseekR10528Nvfp4Sm10xDefault(
     DecoderModelForCausalLM[DeepseekV3DefaultModelingV2, PretrainedConfig]
 ):

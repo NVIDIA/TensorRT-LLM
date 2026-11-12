@@ -127,9 +127,9 @@ def test_symlinked_checkout_records_one_file_identity(tmp_path: Path, linked_roo
     assert database is not None
     with sqlite3.connect(database) as connection:
         rows = connection.execute(
-            "SELECT file, qualname FROM touch_rows WHERE qualname = 'run'"
+            "SELECT test, file, qualname FROM touch_rows WHERE qualname = 'run'"
         ).fetchall()
-    assert rows == [("examples/x.py", "run")]
+    assert rows == [("stage/test_scope", "examples/x.py", "run")]
 
 
 @_REQUIRES_MONITORING

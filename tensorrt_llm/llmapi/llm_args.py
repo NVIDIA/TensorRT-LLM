@@ -38,6 +38,8 @@ from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+
 try:
     from ray.util.placement_group import PlacementGroup
 except ImportError:
@@ -47,6 +49,7 @@ from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 
+from .._errors import ConfigInputError
 from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
 
@@ -73,6 +76,7 @@ from ..tokenizer import TOKENIZER_ALIASES  # noqa: F401
 from ..tokenizer import load_custom_tokenizer
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
+from ..watermark.config import WatermarkConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
@@ -925,6 +929,46 @@ class GuidedDecodingConfig(StrictBaseModel):
         description="The stop token ids for guided decoding config.")
 
 
+class SparseKvCacheOffloadConfig(StrictBaseModel):
+    """Memory sizing for sparse attention KV cache offload.
+
+    With offload, the KV history a sparse attention layer selects from lives in
+    host memory, and each request keeps a GPU cache of the units its selections
+    name.
+    """
+    gpu_cache_factor: float = Field(
+        default=2.0,
+        ge=1.0,
+        status="prototype",
+        description=
+        "Size of each request's GPU cache for offloaded attention history, in "
+        "selections: the cache holds this many times the units one decode step "
+        "selects, plus the unit being written, rounded up to whole pages. A "
+        "larger cache keeps more history on the GPU between decode steps, so "
+        "fewer units are fetched from host memory, at the cost of GPU memory per "
+        "request.")
+    host_history_size: Optional[NonNegativeInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Pinned host memory in bytes, per rank, for offloaded attention history "
+        "and the staging buffers that publish it to the GPU. The KV cache "
+        "manager holds the history pools within it, beside the GPU KV cache "
+        "quota, which it does not lower; a size too small for the batches the "
+        "manager must always hold, such as one max_seq_len request, is "
+        "rejected. It is separate from kv_cache_config.host_cache_size, the "
+        "host tier that evicted KV cache pages move to, and the two together "
+        "must fit this rank's share of available host memory and the "
+        "pinned-memory limit. When unset, the history pools come first: they "
+        "may take the host memory automatic sizing may pin, beside the staging "
+        "buffers and, unless kv_cache_config.host_cache_size or a disk tier is "
+        "set, room in the host tier for one max_seq_len request. Either way it "
+        "is an upper bound: the history pools share their slot count with the "
+        "GPU KV cache pools, so they pin only what the GPU quota's slots pair "
+        "with. When unset, the automatic host tier takes the host memory they "
+        "leave, up to the GPU KV cache quota.")
+
+
 class BaseSparseAttentionConfig(StrictBaseModel):
     """Configuration for sparse attention."""
     algorithm: str
@@ -934,6 +978,14 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         a subset of the possible backends.
         """
         return True
+
+    def get_kv_cache_offload_config(
+            self) -> Optional[SparseKvCacheOffloadConfig]:
+        """Return the KV cache offload sizing, or None without offload.
+
+        Override in algorithms that can offload attention history to host memory.
+        """
+        return None
 
     def to_sparse_params(self, **kwargs):
         """Lower user-facing config into SparseParams."""
@@ -1414,6 +1466,42 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         description=
         "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
         "it each step. Defaults to the model's HF config value.")
+    enable_kv_cache_offload: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Offload the KV history sparse attention selects from to host memory "
+        "with KV cache manager v2: the MLA latent cache, or for DeepSeek-V4 "
+        "the ratio-4 compressed cache. Each decode step fetches the units the "
+        "indexer selects into a per-request GPU cache; the indexer and "
+        "sliding-window caches remain on GPU. Only a decode-only worker, such "
+        "as the generation worker of a disaggregated deployment, can offload.")
+    kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
+        default_factory=SparseKvCacheOffloadConfig,
+        status="prototype",
+        description="Memory sizing for KV cache offload. Applies only with "
+        "enable_kv_cache_offload.")
+
+    @model_validator(mode="after")
+    def _validate_kv_cache_offload(self):
+        """Reject offload sizing without offload and a non-positive top-k.
+
+        ``index_topk`` may still be None here; the checkpoint fills it later.
+        """
+        if self.enable_kv_cache_offload:
+            if self.index_topk is not None and self.index_topk <= 0:
+                raise ValueError(
+                    "KV cache offload requires a positive index_topk.")
+        elif self.kv_cache_offload_config != SparseKvCacheOffloadConfig():
+            raise ValueError("kv_cache_offload_config requires "
+                             "enable_kv_cache_offload=True.")
+        return self
+
+    def get_kv_cache_offload_config(
+            self) -> Optional[SparseKvCacheOffloadConfig]:
+        if not self.enable_kv_cache_offload:
+            return None
+        return self.kv_cache_offload_config
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -1547,6 +1635,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 pretrained_config, kwargs.get("layer_idx")),
             mtp_index_share=bool(_value("index_share_for_mtp_iteration",
                                         False)),
+            enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1583,6 +1672,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             has_shared_indexer_layers=has_shared_indexer_layers,
             mtp_index_share=bool(_value("index_share_for_mtp_iteration",
                                         False)),
+            enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
 
 
@@ -1615,14 +1705,6 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         description="The sliding window size in tokens for SWA layers.")
     index_topk: Optional[int] = Field(default=512,
                                       description="The top-k for the indexer.")
-    enable_kv_cache_offload: bool = Field(
-        default=False,
-        status="prototype",
-        description=
-        "Offload ratio-4 compressed attention KV history to host memory with "
-        "KV cache manager v2. The indexer and sliding-window caches remain on "
-        "GPU. This feature is under development and currently cannot be "
-        "enabled for inference.")
 
     @field_validator("index_head_dim")
     @classmethod
@@ -1642,7 +1724,8 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         return [1 if ratio == 0 else ratio for ratio in compress_ratios]
 
     @model_validator(mode="after")
-    def validate_kv_cache_offload(self) -> "DeepSeekV4SparseAttentionConfig":
+    def _validate_deepseek_v4_kv_cache_offload(
+            self) -> "DeepSeekV4SparseAttentionConfig":
         if self.enable_kv_cache_offload:
             if 4 not in self.compress_ratios:
                 raise ValueError(
@@ -4547,6 +4630,41 @@ class DynamicBatchConfig(StrictBaseModel, PybindMirror):
             dynamic_batch_moving_average_window)
 
 
+class GenPreemptionConfig(StrictBaseModel):
+    """GEN slot preemption on a disaggregated generation worker.
+
+    When every slot is taken and the next waiting request is at risk of missing
+    its TTFT target, a decode request is paused in place for it. Set at most
+    one field to bound the TPOT cost (neither: off). Needs the auto GEN
+    admission policy and the KV cache manager V2 scheduler.
+    """
+    tpot_budget: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        lt=1.0,
+        description="Allowed mean-TPOT increase from pauses, as a fraction "
+        "(0.10 = +10%).",
+        status="prototype")
+    target_output_tps: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description="Per-request output tokens/s floor kept by about 80% of "
+        "requests.",
+        status="prototype")
+
+    @model_validator(mode="after")
+    def validate_one_bound(self) -> "GenPreemptionConfig":
+        if self.tpot_budget is not None and self.target_output_tps is not None:
+            raise ValueError(
+                "gen_preemption: set tpot_budget or target_output_tps, not both"
+            )
+        return self
+
+    @property
+    def enabled(self) -> bool:
+        return self.tpot_budget is not None or self.target_output_tps is not None
+
+
 @PybindMirror.mirror_pybind_fields(_SchedulerConfig)
 class SchedulerConfig(StrictBaseModel, PybindMirror):
     capacity_scheduler_policy: CapacitySchedulerPolicy = Field(
@@ -4578,6 +4696,11 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
                      "duplicate-request deferral, and token-budget decisions. "
                      "This is orthogonal to "
                      "kv_cache_config.enable_block_reuse."))
+
+    gen_preemption: GenPreemptionConfig = Field(
+        default_factory=GenPreemptionConfig,
+        description="GEN slot preemption on disaggregated generation workers.",
+        status="prototype")
 
     context_scheduling_policy: ContextSchedulingPolicy = Field(
         default=ContextSchedulingPolicy.FCFS,
@@ -6615,7 +6738,7 @@ class BaseLlmArgs(StrictBaseModel):
         if config_dict is None:
             config_dict = {}
         elif not isinstance(config_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
         return cls(**config_dict)
 
     @field_validator("gpus_per_node", mode='before')
@@ -7099,6 +7222,16 @@ class TorchLlmArgs(BaseLlmArgs):
         "Separated-routing MoE backends only.",
         status="beta")
 
+    watermark_config: Optional[WatermarkConfig] = Field(
+        default=None,
+        description=
+        "Enables statistical text watermarking of generated tokens (Gumbel-max). "
+        "Requests may opt out with SamplingParams.watermarking=False unless "
+        "allow_request_opt_out is False. Greedy and beam-search requests cannot "
+        "carry a watermark and are generated normally. The key is a secret and "
+        "must match at detection time (see tensorrt_llm.watermark).",
+        status="prototype")
+
     lm_head_output_dtype: Literal["auto", "float32"] = Field(
         default="auto",
         description=
@@ -7187,6 +7320,18 @@ class TorchLlmArgs(BaseLlmArgs):
         # tensor derives both from the model, and only the engine knows which
         # kind of encoder the model has. It still raises for the token encoders
         # that require them.
+        return self
+
+    @model_validator(mode="after")
+    def validate_watermark_config(self) -> 'TorchLlmArgs':
+        spec = self.speculative_config
+        if (self.watermark_config is not None and spec is not None
+                and spec.spec_dec_mode.is_dspark()):
+            raise ValueError(
+                "watermark_config is not supported with DSpark speculative "
+                "decoding: its ragged verification windows cannot be "
+                "watermarked. Use another speculation mode or drop "
+                "watermark_config.")
         return self
 
     attn_backend: str = Field(
@@ -7443,10 +7588,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    checkpoint_format: Optional[str] = Field(
+    checkpoint_format: Union[CheckpointFormat, str, None] = Field(
         default=None,
+        telemetry=False,
         description=
-        "The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P "
+        "The checkpoint loader format to use. Built-in formats use CheckpointFormat; custom registered formats accept strings. "
+        "`MX` selects ModelExpress as an opportunistic P2P "
         "loading path and falls back to loading the provided Hugging Face checkpoint; it does not require "
         "converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing "
         "`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\n"
@@ -7631,7 +7778,7 @@ class TorchLlmArgs(BaseLlmArgs):
         self._quant_config = value
 
     modeling_v2: Literal["off", "auto", "require"] = Field(
-        default="off",
+        default="auto",
         status="prototype",
         description=
         "Whether to build the model from a modeling_v2 target (experimental) "
@@ -7683,6 +7830,19 @@ class TorchLlmArgs(BaseLlmArgs):
     @extra_resource_managers.setter
     def extra_resource_managers(self, value: Dict[str, object]) -> None:
         self._extra_resource_managers = value
+
+    @model_validator(mode="after")
+    def validate_gen_preemption(self) -> 'TorchLlmArgs':
+        # PP has multiple in-flight microbatches, so removing a request needs
+        # stage-coordinated draining. Attention DP routes independent request
+        # sets across ranks, so a rank-0 clock alone cannot synchronize victims
+        # and admission capacity. The controller supports one shared batch.
+        if self.scheduler_config.gen_preemption.enabled and (
+                self.pipeline_parallel_size > 1 or self.enable_attention_dp):
+            raise ValueError(
+                "GEN slot preemption (scheduler_config.gen_preemption) does "
+                "not support pipeline parallelism or attention DP.")
+        return self
 
     @model_validator(mode="after")
     def validate_encoder_modes(self) -> 'TorchLlmArgs':
@@ -7992,6 +8152,8 @@ class TorchLlmArgs(BaseLlmArgs):
         fraction implies) and when a CUDA device is visible.
         ``memory_budget_bytes`` overrides the derivation (tests).
         """
+        from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import \
+            unsupported_headroom_reason
         from tensorrt_llm._torch.speculative.dflash import (
             derive_dflash_ctx_memory_budget_bytes,
             estimate_checkpoint_weight_bytes, validate_dflash_ctx_buffer_budget)
@@ -8068,6 +8230,10 @@ class TorchLlmArgs(BaseLlmArgs):
             tp_size=self.tensor_parallel_size,
             memory_budget_bytes=memory_budget_bytes,
             arena_before_pool=arena_before_pool,
+            gen_preemption_enabled=(self.scheduler_config.gen_preemption.enabled
+                                    and unsupported_headroom_reason(
+                                        self.scheduler_config.gen_preemption,
+                                        self) is None),
         )
 
     @model_validator(mode="after")
@@ -8434,6 +8600,19 @@ class TorchLlmArgs(BaseLlmArgs):
             self.enable_early_first_token_response = False
         return self
 
+    @field_validator("checkpoint_format", mode="before")
+    @classmethod
+    def convert_checkpoint_format(
+            cls, value: CheckpointFormat | str | None
+    ) -> CheckpointFormat | str | None:
+        if isinstance(value, str):
+            try:
+                return CheckpointFormat(value)
+            except ValueError:
+                # Custom loader registrations can define additional formats.
+                return value
+        return value
+
     @model_validator(mode="after")
     def validate_checkpoint_format(self):
         if self.checkpoint_format is not None and self.checkpoint_loader is not None:
@@ -8446,7 +8625,7 @@ class TorchLlmArgs(BaseLlmArgs):
             logger.info(
                 "neither checkpoint_format nor checkpoint_loader were provided, "
                 "checkpoint_format will be set to HF.")
-            self.checkpoint_format = "HF"
+            self.checkpoint_format = CheckpointFormat.HF
 
         return self
 
@@ -8457,7 +8636,7 @@ class TorchLlmArgs(BaseLlmArgs):
         # env var that the upstream ``modelexpress`` library reads. This
         # lets orchestrators configure MX via the environment while keeping
         # the resolved value visible on ``llm_args.mx_config.server_url``.
-        if self.checkpoint_format == "MX" and self.mx_config.server_url is None:
+        if self.checkpoint_format == CheckpointFormat.MX and self.mx_config.server_url is None:
             env_url = os.environ.get("MODEL_EXPRESS_URL")
             if env_url:
                 logger.info(
@@ -8465,7 +8644,7 @@ class TorchLlmArgs(BaseLlmArgs):
                     "from environment.", env_url)
                 self.mx_config.server_url = env_url
 
-        if self.mx_config.server_url is not None and self.checkpoint_format != "MX":
+        if self.mx_config.server_url is not None and self.checkpoint_format != CheckpointFormat.MX:
             logger.warning(
                 "mx_config.server_url is set but checkpoint_format is '%s', not "
                 "'MX'. The MX config will be ignored. Set "
@@ -8852,7 +9031,7 @@ def update_llm_args_with_extra_options(
         if llm_args_dict is None:
             llm_args_dict = {}
         elif not isinstance(llm_args_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
         llm_args = update_llm_args_with_extra_dict(
             llm_args,
             llm_args_dict,

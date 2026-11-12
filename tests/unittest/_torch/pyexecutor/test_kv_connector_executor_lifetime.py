@@ -312,7 +312,9 @@ def test_polling_continues_for_save_after_load_completion(use_kv_cache_manager_v
     assert not executor.async_transfer_manager.has_any_inflight_requests()
 
     executor._fetch_and_enqueue_requests(executor.waiting_queue, total_num_live_requests=0)
-    executor.executor_request_queue.get_from_request_queue.assert_called_with(None)
+    executor.executor_request_queue.get_from_request_queue.assert_called_with(
+        None, wait_for_batch=True
+    )
     executor.is_shutdown = True
     assert executor.should_stop_processing
 
@@ -426,7 +428,7 @@ def test_empty_iteration_keeps_request_broadcast_fast_path() -> None:
     broadcaster = RequestBroadcaster(dist, SimpleNamespace(pause=nullcontext))
     broadcaster._broadcast_requests = Mock(side_effect=AssertionError("Unexpected payload"))
 
-    assert broadcaster.broadcast([]) == ([], None)
+    assert broadcaster.broadcast([]) == []
 
 
 def test_completion_envelope_reaches_every_rank_without_a_compute_batch() -> None:

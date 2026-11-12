@@ -350,6 +350,94 @@ class TestRequestPreprocess:
             {"role": "user", "content": "note from the extension"},
         ]
 
+    def test_a_followup_replays_every_stored_turn_before_preparing_history(
+        self, scratch_model
+    ) -> None:
+        extension = scratch_model.extension
+        extension.history_note = "note from the extension"
+        store = ConversationHistoryStore()
+        tokenizer = _probe_tokenizer()
+        first = _request(store=True, instructions=None, input="first")
+        _preprocess(
+            first,
+            scratch_model.model_config,
+            tokenizer,
+            conversation_store=store,
+            enable_store=True,
+        )
+        stored = asyncio.run(store.get_conversation_history(first.request_id))
+        followup = _request(store=True, previous_response_id=first.request_id, input="next")
+
+        input_tokens, _ = _preprocess(
+            followup,
+            scratch_model.model_config,
+            tokenizer,
+            conversation_store=store,
+            enable_store=True,
+        )
+
+        assert extension.replayed == stored
+        assert tokenizer.decode(input_tokens) == (
+            "<|system|>Be brief.<|user|>replayed:first"
+            "<|user|>replayed:note from the extension<|user|>next"
+            "<|user|>note from the extension<|assistant|>"
+        )
+        assert asyncio.run(store.get_conversation_history(followup.request_id)) == [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "replayed:first"},
+            {"role": "user", "content": "replayed:note from the extension"},
+            {"role": "user", "content": "next"},
+            {"role": "user", "content": "note from the extension"},
+        ]
+
+    @pytest.mark.parametrize("reads_effort", [False, True])
+    def test_hooks_keep_native_tools_and_template_aware_musespark_effort(
+        self, monkeypatch, scratch_model, reads_effort
+    ) -> None:
+        # Exercise the real serving extension without loading a GPU model implementation.
+        model_type = scratch_model.model_config.model_type
+        muse_extension_type = type(serving_extensions.get_serving_extension("muse_spark"))
+        register_serving_extension(model_types=(model_type,))(muse_extension_type)
+        extension = serving_extensions.get_serving_extension(model_type)
+        calls = []
+
+        def prepare(messages):
+            calls.append(list(messages))
+            return [*messages, {"role": "user", "content": "hook note"}]
+
+        monkeypatch.setattr(extension, "prepare_responses_history", prepare)
+        template = (
+            "{% set deferred_render_mode = deferred_render_mode | default('native') %}"
+            "{% for tool in tools %}[{{ tool.type }}:{{ tool.name }}]{% endfor %}"
+            + ("[effort:{{ reasoning_effort }}]" if reads_effort else "")
+            + PROBE_TEMPLATE
+        )
+        tokenizer = _probe_tokenizer()
+        tokenizer.tokenizer.chat_template = template
+        request = _request(
+            reasoning={"effort": "none"},
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "agent",
+                    "description": "Agent tools.",
+                    "tools": [{"type": "function", "name": "exec"}],
+                }
+            ],
+        )
+        input_tokens, _ = _preprocess(request, scratch_model.model_config, tokenizer)
+
+        assert calls == [
+            [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "hi"},
+            ]
+        ]
+        effort = "[effort:low]" if reads_effort else ""
+        assert tokenizer.decode(input_tokens) == (
+            f"[namespace:agent]{effort}<|system|>Be brief.<|user|>hi<|user|>hook note<|assistant|>"
+        )
+
     def test_a_generic_model_is_preprocessed_as_before(self) -> None:
         """Without a registered extension the request and its sampling parameters are untouched."""
         request = _request(top_p=0.8, temperature=0.3)
