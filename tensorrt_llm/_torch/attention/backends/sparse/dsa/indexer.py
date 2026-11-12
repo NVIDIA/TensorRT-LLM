@@ -724,11 +724,25 @@ def _packed_logits_elem_budget(metadata: DSAtrtllmAttentionMetadata) -> int:
     reserves for the indexer logits workspace where it reserves one. Clamping
     the packed cap to it keeps a packed chunk within that reserve.
     """
-    single_request_tile = min(
-        _INDEXER_MQA_LOGITS_ELEM_BUDGET,
-        metadata.max_num_tokens * metadata.kv_cache_manager.max_seq_len,
+    return _packed_logits_cap(metadata.max_num_tokens, metadata.kv_cache_manager.max_seq_len)
+
+
+def _single_request_logits_tile(max_num_tokens: int, max_seq_len: int) -> int:
+    """Largest MQA-logits tile of one prefill request."""
+    return min(_INDEXER_MQA_LOGITS_ELEM_BUDGET, max_num_tokens * max_seq_len)
+
+
+def _packed_logits_cap(max_num_tokens: int, max_seq_len: int) -> int:
+    """Largest MQA-logits tile of a prefill chunk packing several requests."""
+    return min(
+        _INDEXER_PACKED_LOGITS_ELEM_BUDGET,
+        _single_request_logits_tile(max_num_tokens, max_seq_len),
     )
-    return min(_INDEXER_PACKED_LOGITS_ELEM_BUDGET, single_request_tile)
+
+
+# Column slack per decode row for the output padding of the paged MQA-logits kernels (DeepGEMM
+# rounds each row up to a multiple of 1024 bytes: 256 FP32 or 512 16-bit columns).
+_PAGED_LOGITS_COLUMN_SLACK = 1024
 
 
 def throwaway_unfused_logits_elem_bound(
@@ -742,8 +756,8 @@ def throwaway_unfused_logits_elem_bound(
     chunks: at most ``max_num_tokens`` query rows over ``(min_context + max_num_tokens) /
     compress_ratio`` keys (under query splitting a rank gates on its own rows, while the gathered
     keys cover the whole chunk). Decode is not tiled by the logits budget: its paged MQA logits
-    hold ``max_gen_tokens`` rows over ``max_seq_len / compress_ratio`` keys. Only valid when MLA
-    chunked prefill plans the prefill chunks.
+    hold ``max_gen_tokens`` rows over ``max_seq_len / compress_ratio`` keys plus the kernels'
+    column padding. Only valid when MLA chunked prefill plans the prefill chunks.
 
     Args:
         model: Model whose DSA indexers are inspected.
@@ -752,23 +766,35 @@ def throwaway_unfused_logits_elem_bound(
         max_gen_tokens: Max decode query tokens of one step (requests x tokens per step).
 
     Returns:
-        The tile bound in elements, or None if no indexer uses the fused path or one of them has
-        no built runner covering ``max_seq_len`` (the unfused path may then take any chunk).
+        The tile bound in elements, or None if one of this rank's indexers does not use the fused
+        path or has no built runner covering ``max_seq_len`` (the unfused path may then take any
+        chunk).
     """
-    indexers = [m for m in model.modules() if isinstance(m, Indexer) and m._use_throwaway_topk]
+    # Under pipeline parallelism the layers of other stages keep their modules but not their
+    # parameters; only the indexers this rank runs allocate logits here.
+    indexers = [
+        m
+        for m in model.modules()
+        if isinstance(m, Indexer) and getattr(getattr(m, "wq_b", None), "weight", None) is not None
+    ]
     if not indexers:
         return None
-    single_request_tile = min(_INDEXER_MQA_LOGITS_ELEM_BUDGET, max_num_tokens * max_seq_len)
-    bound = min(_INDEXER_PACKED_LOGITS_ELEM_BUDGET, single_request_tile)
+    single_request_tile = _single_request_logits_tile(max_num_tokens, max_seq_len)
+    bound = _packed_logits_cap(max_num_tokens, max_seq_len)
     for indexer in indexers:
         runner = indexer._throwaway_topk
-        if indexer._throwaway_topk_failed or runner is None or not runner.ready:
+        if (
+            not indexer._use_throwaway_topk
+            or indexer._throwaway_topk_failed
+            or runner is None
+            or not runner.ready
+        ):
             return None
         ratio = runner.compress_ratio
         if not runner.can_run(max_seq_len // ratio):
             return None
         short_keys = -(-(indexer._throwaway_topk_min_context + max_num_tokens) // ratio)
-        decode_keys = -(-max_seq_len // ratio)
+        decode_keys = -(-max_seq_len // ratio) + _PAGED_LOGITS_COLUMN_SLACK
         bound = max(
             bound,
             min(max_num_tokens * short_keys, single_request_tile),

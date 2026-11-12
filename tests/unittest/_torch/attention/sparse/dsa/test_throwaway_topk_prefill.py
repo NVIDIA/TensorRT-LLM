@@ -1004,6 +1004,27 @@ def test_runner_build_oom_falls_back(monkeypatch):
     assert len(warnings) == 1
 
 
+def test_runner_build_oom_releases_the_partial_build_before_emptying_the_cache(monkeypatch):
+    """The cache is emptied only once the partially built runner has been released."""
+    partial, alive_at_empty_cache = [], []
+
+    class _PartialBuild:
+        def __init__(self, **kwargs):
+            partial.append(weakref.ref(self))
+            raise torch.OutOfMemoryError("CUDA out of memory")
+
+    monkeypatch.setattr(throwaway_topk_module, "ThrowawayPrefillTopK", _PartialBuild)
+    _fresh_runner_cache(monkeypatch)
+    monkeypatch.setattr(throwaway_topk_module.logger, "warning", lambda message: None)
+    monkeypatch.setattr(
+        throwaway_topk_module.torch.cuda,
+        "empty_cache",
+        lambda: alive_at_empty_cache.append(partial[0]() is not None),
+    )
+    assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is None
+    assert alive_at_empty_cache == [False]
+
+
 class _ReadyRunner:
     def __init__(self, compress_ratio=4, num_keys=1 << 18, ready=True):
         self.compress_ratio = compress_ratio
@@ -1015,11 +1036,17 @@ class _ReadyRunner:
 
 
 def _model_with_indexers(*specs):
-    """A module tree holding Indexers with only the fields the logits bound reads."""
+    """A module tree holding Indexers with only the fields the logits bound reads.
+
+    Each spec is ``(enabled, failed, runner, min_context[, local])``; ``local=False`` marks an
+    indexer of another pipeline stage.
+    """
     model = torch.nn.Module()
-    for i, (enabled, failed, runner, min_context) in enumerate(specs):
+    for i, (enabled, failed, runner, min_context, *local) in enumerate(specs):
         indexer = Indexer.__new__(Indexer)
         torch.nn.Module.__init__(indexer)
+        # Layers of other pipeline stages keep their modules but not their parameters.
+        indexer.wq_b = SimpleNamespace(weight=torch.empty(0) if local != [False] else None)
         indexer._use_throwaway_topk = enabled
         indexer._throwaway_topk_failed = failed
         indexer._throwaway_topk = runner
@@ -1058,8 +1085,18 @@ def test_unfused_logits_bound_caps_prefill_terms_at_the_full_tile():
 def test_unfused_logits_bound_covers_decode_logits():
     """Decode logits are not tiled by the budget, so they bound the reserve from below."""
     model = _model_with_indexers((True, False, _ReadyRunner(), 1 << 16))
-    # 2048 decode tokens x 256K compressed keys = 2^29 elements, above the 2^28 prefill term.
-    assert throwaway_unfused_logits_elem_bound(model, 8192, _MAX_SEQ_LEN, 2048) == 1 << 29
+    # 2048 decode tokens x (256K compressed keys + column padding), above the 2^28 prefill term.
+    assert throwaway_unfused_logits_elem_bound(model, 8192, _MAX_SEQ_LEN, 2048) == 2048 * (
+        (1 << 18) + indexer_module._PAGED_LOGITS_COLUMN_SLACK
+    )
+
+
+def test_unfused_logits_bound_ignores_indexers_of_other_pipeline_stages():
+    """Indexers of other stages have no runner on this rank and allocate no logits here."""
+    model = _model_with_indexers(
+        (True, False, _ReadyRunner(), 1 << 16), (True, False, None, 1 << 16, False)
+    )
+    assert throwaway_unfused_logits_elem_bound(model, 8192, _MAX_SEQ_LEN, 1) == 1 << 28
 
 
 @pytest.mark.parametrize(
@@ -1072,6 +1109,8 @@ def test_unfused_logits_bound_covers_decode_logits():
         [(True, False, _ReadyRunner(ready=False), 0)],  # workspace not allocated / disabled
         [(True, False, _ReadyRunner(num_keys=1024), 0)],  # keys of long chunks do not fit
         [(True, False, _ReadyRunner(), 0), (True, True, None, 0)],  # one layer failed
+        [(True, False, _ReadyRunner(), 0), (False, False, None, 0)],  # one layer stays unfused
+        [(False, False, None, 0, False)],  # only indexers of other pipeline stages
     ],
 )
 def test_unfused_logits_bound_needs_a_ready_runner_on_every_layer(specs):

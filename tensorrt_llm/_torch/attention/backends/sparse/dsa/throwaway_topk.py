@@ -456,9 +456,6 @@ def get_throwaway_prefill_topk(
             qkv_dtype=qkv_dtype,
         )
     except (ValueError, ImportError, torch.OutOfMemoryError) as error:
-        if isinstance(error, torch.OutOfMemoryError):
-            # Return what the partial build allocated to the unfused path.
-            torch.cuda.empty_cache()
         logger.warning(
             f"{THROWAWAY_TOPK_ENV}=1 but the fused throwaway Top-K is unavailable for "
             f"heads={n_heads}, top_k={index_topk}, compress_ratio={compress_ratio}, "
@@ -466,6 +463,12 @@ def get_throwaway_prefill_topk(
             "using the unfused indexer + Top-K path"
         )
         _FAILED.add(key)
-        return None
-    _RUNNERS[key] = runner
-    return runner
+        out_of_memory = isinstance(error, torch.OutOfMemoryError)
+    else:
+        _RUNNERS[key] = runner
+        return runner
+    if out_of_memory:
+        # The partial build's tensors live until the exception (whose traceback holds them) is
+        # gone, so their cached blocks go back to the unfused path only here.
+        torch.cuda.empty_cache()
+    return None
