@@ -444,6 +444,8 @@ def _prefix_digests(words: bytes, prefix_lengths: Iterable[int]) -> Dict[int, by
 
 @dataclass(slots=True)
 class _RetainedTurn:
+    """A completed conversation turn whose committed state is still retained."""
+
     drop_handle: PlannedDropHandle
     # Set only with drop_extended_turns: identifies the turn's committed tokens.
     num_committed_tokens: int = 0

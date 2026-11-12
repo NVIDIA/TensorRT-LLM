@@ -643,6 +643,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.drop_extended_turns"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "kv_cache_config.block_reuse_config.enable_branch_snapshot"
     },
     {

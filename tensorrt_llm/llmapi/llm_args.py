@@ -5071,6 +5071,7 @@ class BlockReuseConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def validate_drop_extended_turns_policy(self) -> 'BlockReuseConfig':
+        """Reject drop_extended_turns outside the per_conversation policy."""
         if self.drop_extended_turns and self.policy != "per_conversation":
             raise ValueError("block_reuse_config.drop_extended_turns requires "
                              "block_reuse_config.policy='per_conversation'.")
