@@ -14,6 +14,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._utils import async_tensor_h2d
 
 from .params import CSA2BackendForwardArgs, CSA2Layer
 
@@ -2659,7 +2660,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         device = record["prior"].device
         record["prior"].fill_(-1)
         if count:
-            source_rows = torch.tensor(rows, dtype=torch.int64, device=device)
+            source_rows = async_tensor_h2d(rows, torch.int64, device)
             valid = (source_rows >= 0) & record["published_valid"][source_rows.clamp_min(0)]
             record["prior"][:count].copy_(
                 torch.where(valid[:, None], record["published"][source_rows.clamp_min(0)], -1)

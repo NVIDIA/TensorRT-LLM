@@ -210,8 +210,9 @@ def _run_triton_attention_decode(
     # Match the cutile path: only mark pages "full" when we can prove every
     # generation sequence has the same number of cached tokens AND
     # query_len_per_seq == 1 (so the kv_len adjustment is a no-op).
-    assume_full_pages = (
-        _infer_assume_full_pages(metadata, max_pages, metadata.page_size) and query_len_per_seq == 1
+    # Check the host value first; the page check may read kv lengths back from the GPU.
+    assume_full_pages = query_len_per_seq == 1 and _infer_assume_full_pages(
+        metadata, max_pages, metadata.page_size
     )
     # Leave validity checks on. Matches cutile's default and is correctness-
     # safe. The perfect-shape PV fast path (tl.ext.make_view + load_view_tko)

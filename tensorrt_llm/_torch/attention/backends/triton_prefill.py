@@ -546,6 +546,7 @@ def triton_prefill_with_custom_mask(
     window_left: int = -1,
     kv_scale_quant_orig: Optional[torch.Tensor] = None,
     out_scale: Optional[torch.Tensor] = None,
+    max_len_extend: Optional[int] = None,
 ) -> None:
     """Triton prefill attention with optional custom mask and paged KV cache.
 
@@ -581,6 +582,8 @@ def triton_prefill_with_custom_mask(
         kv_scale_quant_orig: Optional FP32 scalar dequantization scale for cached K/V.
             Contiguous K/V for new tokens are already in the compute dtype.
         out_scale: Optional FP32 scalar quantization multiplier for the output.
+        max_len_extend: Optional host max of the per-sequence extend lengths. When
+            None, it is read back from qo_indptr on the GPU.
     """
     device = q.device
     num_contexts = qo_indptr.shape[0] - 1
@@ -625,7 +628,8 @@ def triton_prefill_with_custom_mask(
         k_buffer = torch.empty(1, num_kv_heads, 1, head_dim, dtype=k.dtype, device=device)
         v_buffer = torch.empty(1, num_kv_heads, 1, head_dim, dtype=v.dtype, device=device)
 
-    max_len_extend = int(extend_lens.max().item()) if num_contexts > 0 else 0
+    if max_len_extend is None:
+        max_len_extend = int(extend_lens.max().item()) if num_contexts > 0 else 0
 
     _extend_attention_fwd(
         q_extend=q,
