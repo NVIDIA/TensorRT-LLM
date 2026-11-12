@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Scans the target branch tip and a temporary merge of the PR head, then uploads the
-# diagnostics the PR adds. This workflow runs PR code, so it holds no write permission;
-# pyrefly-report.yml publishes the result.
+# diagnostics the PR adds. Neither new diagnostics nor a check that could not finish
+# fail a job; the `result` job is skipped when the check could not finish. This workflow
+# runs PR code, so it holds no write permission; pyrefly-report.yml publishes the result.
 name: Pyrefly diff
 
 on:
@@ -24,6 +25,8 @@ jobs:
       cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      complete: ${{ steps.compare.outputs.complete }}
     env:
       # actions/checkout skips LFS only for its own git commands.
       GIT_LFS_SKIP_SMUDGE: 1
@@ -88,6 +91,7 @@ jobs:
           PYREFLY_REPORT_PATH: ${{ env.PYREFLY_REPORT_DIR }}/merged.json
         run: bash scripts/run_pyrefly.sh --full-project
       - name: Compare diagnostics
+        id: compare
         if: ${{ !cancelled() }}
         env:
           BASE_SHA: ${{ steps.prepare.outputs.base_sha }}
@@ -100,6 +104,7 @@ jobs:
           python3 .github/scripts/pyrefly_diff.py \
             --base-root "$PYREFLY_BASE_ROOT" --merged-root "$PYREFLY_MERGED_ROOT" \
             --base-sha "$BASE_SHA" --output "$PYREFLY_REPORT_DIR" --error "$CHECK_ERROR"
+          echo "complete=$(jq '.error == null' "$PYREFLY_REPORT_DIR/report.json")" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
@@ -107,3 +112,14 @@ jobs:
           path: ${{ env.PYREFLY_REPORT_DIR }}/*.json
           if-no-files-found: error
           retention-days: 14
+
+  # GitHub shows a job as skipped only when its condition is false; a running job cannot
+  # mark itself that way. This job passes when the comparison finished, with or without
+  # new diagnostics, and is skipped when it could not finish.
+  result:
+    needs: check
+    if: needs.check.outputs.complete == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo "The Pyrefly comparison finished. Any new diagnostics are in the PR review thread."

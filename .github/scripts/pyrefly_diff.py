@@ -7,7 +7,6 @@ import argparse
 import functools
 import json
 import os
-import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -119,7 +118,7 @@ def main() -> None:
         except (OSError, ValueError, KeyError) as error:
             report["error"] = str(error)[-2000:]
     if report["error"]:
-        print(f"Pyrefly comparison incomplete: {report['error']}", file=sys.stderr)
+        print(f"::warning::Pyrefly check incomplete: {report['error']}")
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
