@@ -270,7 +270,7 @@ def test_engagement_counters_skip_padding_rows_and_count_zero_mass_drafts():
     dp[2, 1] = 0.0  # a stale row: the drafted token has no mass in it
     dp[5, 0] = 0.0  # a padding row (below): not counted
     slots = torch.tensor([10, 11, 12, 13, 99, 99, 14, 15], dtype=torch.int64)  # 99 = dummy slot
-    key = torch.device(DEVICE)
+    key = torch.empty(0, device=DEVICE).device  # "cuda:0", not "cuda": the kernels' key
     bv._STATS[key] = torch.zeros(4, dtype=torch.int64, device=DEVICE)
     seed, off = _keys(batch)
     for _ in range(3):
@@ -309,7 +309,7 @@ def test_router_joint_up_to_the_limit_token_level_above_and_counters_say_which(m
             draft_token_ids, draft_probs, target_probs, seed, offset
         )  # any valid (tokens, num): the stub's rule is not under test
 
-    key = torch.device(DEVICE)
+    key = torch.empty(0, device=DEVICE).device  # "cuda:0", not "cuda": the kernels' key
     bv._STATS[key] = torch.zeros(7, dtype=torch.int64, device=DEVICE)
     generator = torch.Generator().manual_seed(23)
     k, vocab = 3, 40
