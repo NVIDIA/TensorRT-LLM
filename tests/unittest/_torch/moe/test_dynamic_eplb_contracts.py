@@ -2447,6 +2447,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         _load_balancer_update_statistic=lambda routes, *args, **kwargs: trace.append(
             ("update_statistic", routes.name)
         ),
+        _load_balancer_wait_for_statistic_allreduce=lambda: trace.append("wait_statistic"),
         _load_balancer_uses_replica_plan=lambda: mode == "per_layer_dynamic",
         _load_balancer_route=route,
         _load_balancer_start_set_cpu_stage=lambda is_last_call: trace.append("start_set_cpu"),
@@ -2494,6 +2495,9 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             ("statistic", "slots"),
             ("calibrator", "slots"),
             *tail,
+            # The fused kernel must not run alongside the statistic allreduce;
+            # quantization and staging before it still overlap it.
+            "wait_statistic",
             ("run_moe", "replayed slots", None),
             "start_set_cpu",
             "done_set_cpu",

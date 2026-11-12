@@ -354,9 +354,14 @@ class SingleLayerMoeLoadBalancer:
                 key: torch.cuda.Event()
                 for key in [EventType.Main, EventType.MoeBalancer]
             }
+            # Recorded on the auxiliary stream after the statistic allreduce of
+            # update_statistic_with_local_ids; see
+            # wait_for_statistic_allreduce.
+            self.statistic_allreduce_event = torch.cuda.Event()
         else:
             self.aux_stream = None
             self.event_dict = None
+            self.statistic_allreduce_event = None
 
         self.statistic_flag_tensor = None
         self.local_statistic_tensor = None
@@ -695,8 +700,26 @@ class SingleLayerMoeLoadBalancer:
             if do_multi_stream():
                 with torch.cuda.stream(self.aux_stream):
                     _update_statistic()
+                    self.statistic_allreduce_event.record()
             else:
                 _update_statistic()
+
+    def wait_for_statistic_allreduce(self) -> None:
+        """Order the current stream after this layer's statistic allreduce.
+
+        Under multi-stream, update_statistic_with_local_ids runs the EP-wide
+        allreduce on the auxiliary stream, overlapped with what the current
+        stream does next. A MoE kernel that waits for the other ranks inside
+        the kernel (fused communication) must not run alongside it: which of
+        the two becomes resident first can differ from rank to rank, in eager
+        forwards and in CUDA graph replays alike, and a rank whose MoE kernel
+        holds the SMs its allreduce needs blocks every rank. Such a kernel's
+        caller waits here right before the launch, so the work in between
+        (routing, quantization, staging) still overlaps the allreduce.
+        Without multi-stream the allreduce already ran on the current stream.
+        """
+        if self.updates_enabled and do_multi_stream():
+            self.statistic_allreduce_event.wait()
 
     def update_statistic_with_global_ids(self,
                                          gathered_raw_expert_ids: torch.Tensor,

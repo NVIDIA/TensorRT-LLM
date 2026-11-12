@@ -1615,12 +1615,14 @@ class FusedCommMoEScheduler(MoEScheduler):
         # as expert IDs; otherwise the recorded routes are the slots routed to.
         # With the load balancer off, slots are expert IDs, so one recording
         # drives both arms.
+        statistic_allreduce_pending = False
         if uses_replica_plan:
             token_selected_experts = _record_routes(moe, token_selected_experts, moe.num_experts)
             token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
             replica_plan = moe.layer_load_balancer.require_replica_plan()
         else:
             if moe.layer_load_balancer:
+                statistic_allreduce_pending = True
                 moe._load_balancer_done_wait_gpu_stage(is_first_call)
                 # ignore_allreduce=False: the fused kernel has no side channel
                 # for an external stats gather. The base helper runs its own
@@ -1664,6 +1666,12 @@ class FusedCommMoEScheduler(MoEScheduler):
             set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
 
         # ----- MoE compute -----
+        # The fused kernel waits for the other ranks inside the kernel, so it
+        # must not run alongside the statistic allreduce on the load
+        # balancer's auxiliary stream (eager or replayed); routing,
+        # quantization and staging above still overlap it.
+        if statistic_allreduce_pending:
+            moe._load_balancer_wait_for_statistic_allreduce()
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
         # ``num_experts`` template parameter (SymmBuffer / weights sized to
         # num_slots in quantization.py).
