@@ -74,6 +74,11 @@ def engine_refusal(llm_args: Optional[Any]) -> Optional[str]:
     reasons = []
     if getattr(llm_args, "cuda_graph_config", None) is not None:
         reasons.append("CUDA graphs are not supported by this eager Beam target")
+    if getattr(llm_args, "torch_compile_config", None) is not None:
+        reasons.append("torch_compile_config must be None for this eager Beam target")
+    prefill_backend = getattr(llm_args, "prefill_cuda_graph_backend", "disabled")
+    if getattr(prefill_backend, "value", prefill_backend) != "disabled":
+        reasons.append("prefill_cuda_graph_backend must be disabled for this eager Beam target")
     if not getattr(llm_args, "disable_overlap_scheduler", True):
         reasons.append("the overlap scheduler is not supported by this eager Beam target")
     max_tokens = getattr(llm_args, "max_num_tokens", None)

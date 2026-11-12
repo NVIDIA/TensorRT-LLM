@@ -4,6 +4,7 @@
 
 import builtins
 import sys
+from enum import Enum
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
@@ -150,9 +151,42 @@ def test_supported_cache_and_dflash_routes_remain_available(monkeypatch, spec, c
     reads = Mock(return_value=None)
     monkeypatch.setattr(routing, "checkpoint_refusal", reads)
     config = _config()
-    args = NS(cuda_graph_config=None, disable_overlap_scheduler=True, max_num_tokens=tokens)
+    args = NS(
+        cuda_graph_config=None,
+        disable_overlap_scheduler=True,
+        max_num_tokens=tokens,
+        torch_compile_config=None,
+        prefill_cuda_graph_backend="disabled",
+    )
     assert (
         routing.route(config.pretrained_config, config.mapping, (10, 3), spec, cache, llm_args=args)
         is target
     )
     reads.assert_called_once_with(config.pretrained_config, spec)
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("cuda_graph_config", object(), "CUDA graphs"),
+        ("disable_overlap_scheduler", False, "overlap scheduler"),
+        ("torch_compile_config", object(), "torch_compile_config must be None"),
+        ("prefill_cuda_graph_backend", "piecewise", "prefill_cuda_graph_backend must be disabled"),
+        ("prefill_cuda_graph_backend", "breakable", "prefill_cuda_graph_backend must be disabled"),
+        (
+            "prefill_cuda_graph_backend",
+            Enum("PrefillBackend", {"BREAKABLE": "breakable"}).BREAKABLE,
+            "prefill_cuda_graph_backend must be disabled",
+        ),
+    ],
+)
+@pytest.mark.parametrize("spec", [None, _dflash()])
+def test_execution_mode_refused_before_checkpoint_access(monkeypatch, field, value, message, spec):
+    reads = Mock(side_effect=AssertionError("unsupported options must not read checkpoints"))
+    monkeypatch.setattr(routing, "checkpoint_refusal", reads)
+    config = _config()
+    args = NS(cuda_graph_config=None, disable_overlap_scheduler=True, max_num_tokens=None)
+    setattr(args, field, value)
+    with pytest.raises(_router_index.NoTarget, match=message):
+        routing.route(config.pretrained_config, config.mapping, (10, 3), spec, None, llm_args=args)
+    reads.assert_not_called()
