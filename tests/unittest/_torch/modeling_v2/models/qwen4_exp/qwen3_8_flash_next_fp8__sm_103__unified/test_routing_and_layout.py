@@ -835,6 +835,56 @@ def test_a_moe_layer_enters_the_fp8_runner_over_its_window(
         lo += n
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "dp_size, graphed, want",
+    [(1, True, "front"), (1, False, "front"), (2, True, "front"), (4, False, "cublas")],
+    ids=["tp-graphed", "tp-eager", "adp-graphed", "adp-eager"],
+)
+def test_a_decode_router_under_attention_dp_follows_the_graphed_step(
+    dp_size, graphed, want, monkeypatch
+) -> None:
+    """Under attention DP a graphed decode step keeps the single-launch decode router (every rank
+    runs the same graph) and an eager one takes cuBLAS, the router of another rank's prefill."""
+    core = SimpleNamespace(
+        topk=TOPK,
+        num_experts=NUM_EXPERTS,
+        moe_inter=640,
+        dp_size=dp_size,
+        moe_max_rows=8192,
+        _decode_graph_step=graphed,
+    )
+    experts = W.ExpertWindow("fc1_w", "fc1_s", "fc2_w", "fc2_s", 384, 128)
+    x = torch.zeros(4, 8)
+    seen = []
+
+    def front(core_, rows, router, experts_):
+        seen.append("front")
+        return rows
+
+    def cublas(chunk, mat_b):
+        seen.append("cublas")
+        return chunk[:, :1]
+
+    monkeypatch.setattr(M, "_routed_experts_front", front)
+    monkeypatch.setattr(M, "cublas_mm", cublas)
+    monkeypatch.setattr(
+        M,
+        "renorm_moe_routing_op",
+        lambda logits, topk, output_dtype: (
+            logits.int().expand(-1, topk).contiguous(),
+            logits.expand(-1, topk).contiguous(),
+        ),
+    )
+    monkeypatch.setattr(
+        M, "fp8_quantize_1x128", lambda chunk, use_ue8m0: (chunk, chunk[:, :2].t().contiguous())
+    )
+    monkeypatch.setattr(M, "fp8_block_scale_moe_runner", lambda **kw: kw["hidden_states"])
+    M._routed_experts(core, x, "router", experts, mm=M._decode_projection)
+    assert seen == [want]
+    assert M._step_projection(core) is (M._decode_projection if graphed else cublas)
+
+
 def _pad(x: torch.Tensor, rows: int) -> torch.Tensor:
     return torch.cat([x, x.new_zeros(rows - x.shape[0], x.shape[1])], 0)
 
