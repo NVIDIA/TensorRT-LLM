@@ -109,7 +109,9 @@ class PageTableSpec:
             ``DataType`` name (``"nvfp4"``; ``"half"``, ``"bf16"`` or ``"fp8"``), as
             ``("nvfp4", "bf16")``: a mixed layer keeps its history in rows of the low
             type, scales inline, and its first and last tokens in its high layer, of the high
-            type; None without.
+            type. Under the cold-page first/last-N window both are the model's KV type, as
+            ``("bf16", "bf16")``: the high layer holds a copy of its layer's page, and only pages
+            leaving the GPU are quantized. None without.
 
     Raises:
         TypeError: If a role set is one role, or a layout is not a ``RoleLayoutV2``.
