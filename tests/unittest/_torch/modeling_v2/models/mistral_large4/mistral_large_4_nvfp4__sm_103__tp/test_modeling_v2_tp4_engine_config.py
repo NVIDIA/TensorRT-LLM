@@ -35,8 +35,8 @@ KV-capacity estimation send are pinned on the engine's own host code, the ranks 
 process where they exchange anything.
 
 The checkpoint is Mistral-native, as published (params.json, tekken.json, consolidated
-safetensors), and is loaded with checkpoint_format mistral_large_4: the gates' LLM-API options
-state it and the boot gate's command passes --checkpoint_format=mistral_large_4. The checkpoint
+safetensors), and is loaded with checkpoint_format mistral: the gates' LLM-API options
+state it and the boot gate's command passes --checkpoint_format=mistral. The checkpoint
 at tep4, at dep4 and at tep8 is checked to resolve and route as it did before this target. The
 checkpoint is looked up under ``LLM_MODELS_ROOT`` (as ``Mistral-Large-4-1T-A52B-NVFP4`` or
 ``mistral-large-4-nvfp4``) by its params.json, and its tests are skipped where it is absent.
@@ -144,7 +144,7 @@ _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attentio
 # capture list, task.yaml's runtime flags. No --kv_cache_dtype: the latent cache is the
 # checkpoint's default (quickstart's "auto"), the fp8_ds_mla pool.
 _GATE_ARGV = (
-    "--checkpoint_format=mistral_large_4",
+    "--checkpoint_format=mistral",
     "--max_tokens=2",
     "--tp_size=8",
     "--use_cuda_graph",
@@ -168,7 +168,7 @@ def _options(topology: dict, max_seq_len: int) -> dict:
     Mistral-native format, max_num_tokens = max_seq_len, with the latent KV cache at its
     default: the checkpoint's fp8_kv_cache, the fp8_ds_mla pool."""
     return dict(
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         **topology,
         max_batch_size=16,
         max_num_tokens=max_seq_len,

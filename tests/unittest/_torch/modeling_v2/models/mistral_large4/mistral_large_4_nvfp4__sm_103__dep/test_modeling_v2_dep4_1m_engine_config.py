@@ -34,8 +34,8 @@ Device-dependent values (the SM version) are fixed to sm_103 here; nothing is as
 visible device would decide.
 
 The checkpoint is Mistral-native, as published (params.json, tekken.json, consolidated
-safetensors), and every spelling loads it with checkpoint_format mistral_large_4 (the options'
-key, the boot gate's --checkpoint_format=mistral_large_4). The delivered 32K dep4 configuration
+safetensors), and every spelling loads it with checkpoint_format mistral (the options'
+key, the boot gate's --checkpoint_format=mistral). The delivered 32K dep4 configuration
 (unchunked) and the checkpoint at tep4 and tp4 are checked to resolve and route as they did
 before the 1M config. The checkpoint is looked up under ``LLM_MODELS_ROOT`` (as
 ``Mistral-Large-4-1T-A52B-NVFP4`` or ``mistral-large-4-nvfp4``) by its params.json, and its tests
@@ -172,7 +172,7 @@ def _options(
     if kv_dtype is not None:
         kv_cache_config.update(dtype=kv_dtype)
     return dict(
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         **topology,
         max_batch_size=16,
         max_num_tokens=max_num_tokens,
@@ -192,7 +192,7 @@ _DEP4_1M_CI = _options(_DEP4, _MAX_NUM_TOKENS, _MAX_SEQ_LEN, chunked=True)
 # The argv the boot gate hands quickstart_advanced.py (workspace
 # gates/geometry/geometry.core.dep4.json), after its --model_dir.
 _QUICKSTART_ARGV = (
-    "--checkpoint_format=mistral_large_4",
+    "--checkpoint_format=mistral",
     "--max_tokens=2",
     "--tp_size=4",
     "--moe_ep_size=4",

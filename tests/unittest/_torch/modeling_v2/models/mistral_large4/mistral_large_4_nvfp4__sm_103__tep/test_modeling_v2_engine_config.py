@@ -28,8 +28,8 @@ the allocation is taken on PyTorch's meta device; where it copies to the device,
 identity. Nothing asserted depends on a visible device or on its SM count.
 
 The checkpoint is Mistral-native, as published (params.json, tekken.json, consolidated
-safetensors), and is loaded with checkpoint_format mistral_large_4: the gates' LLM-API options
-state it and the boot gate's command passes --checkpoint_format=mistral_large_4. It is the
+safetensors), and is loaded with checkpoint_format mistral: the gates' LLM-API options
+state it and the boot gate's command passes --checkpoint_format=mistral. It is the
 ModelOpt MIXED_PRECISION export, whose params.json quantization_config names Mistral modules
 (NVFP4 routed experts, FP8_PB_WO block-FP8 linears, group_size 16). The checkpoint at dep4 and
 at tp4 is checked to resolve and route as it did before the 1M config was added.
@@ -225,7 +225,7 @@ def _options(
     if kv_dtype is not None:
         kv.update(dtype=kv_dtype)
     return dict(
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         **topology,
         max_batch_size=_MAX_BATCH_SIZE,
         max_num_tokens=max_num_tokens,
@@ -2095,7 +2095,7 @@ _CORE_32K = _options(_DELIVERED_MAX_SEQ_LEN, _MAX_NUM_TOKENS, False, _TEP8)
 # the tep8 topology flags, the core unit's CUDA-graph capture list, chunked prefill on and block
 # reuse off (task.yaml's runtime block), then task.yaml's extra flags.
 _GATE_ARGV = (
-    "--checkpoint_format=mistral_large_4",
+    "--checkpoint_format=mistral",
     "--max_tokens=4",
     "--tp_size=8",
     "--moe_ep_size=8",
@@ -2117,7 +2117,7 @@ _GATE_ARGV = (
 # The delivered boot gate's: 32768 tokens, chunked prefill off. No --kv_cache_dtype: the latent
 # cache is the checkpoint's default (quickstart's "auto"), the fp8_ds_mla pool.
 _GATE_ARGV_32K = (
-    "--checkpoint_format=mistral_large_4",
+    "--checkpoint_format=mistral",
     "--max_tokens=4",
     "--tp_size=8",
     "--moe_ep_size=8",

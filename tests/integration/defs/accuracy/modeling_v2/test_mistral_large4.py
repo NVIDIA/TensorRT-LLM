@@ -209,7 +209,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
             scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
             LLM(
                 self.MODEL_PATH,
-                checkpoint_format="mistral_large_4",
+                checkpoint_format="mistral",
                 kv_cache_config=self.KV,
                 modeling_v2="require",
                 env_overrides=rank_env,
@@ -241,7 +241,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
             scoped_env_overrides({}) as rank_env,
             LLM(
                 self.MODEL_PATH,
-                checkpoint_format="mistral_large_4",
+                checkpoint_format="mistral",
                 kv_cache_config=self.KV,
                 modeling_v2="require",
                 env_overrides=rank_env,
@@ -273,7 +273,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
             scoped_env_overrides({}) as rank_env,
             LLM(
                 self.MODEL_PATH,
-                checkpoint_format="mistral_large_4",
+                checkpoint_format="mistral",
                 kv_cache_config=self.KV,
                 modeling_v2="require",
                 env_overrides=rank_env,
@@ -356,7 +356,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
         # MISTRAL_LARGE4_CHECKPOINT_DIR names a copy of it elsewhere.
         model_path = os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR", model_path)
         # The panel's structured-output case needs xgrammar.
-        checkpoint = {"checkpoint_format": "mistral_large_4", "guided_decoding_backend": "xgrammar"}
+        checkpoint = {"checkpoint_format": "mistral", "guided_decoding_backend": "xgrammar"}
         rows = ruler.load_inputs(data, profile, Path(model_path) / "tekken.json")
         if profile == "long_lite" and attention_dp:
             # One attention-DP rank prefills a 1M request alone, about 15 minutes per row: the
@@ -683,7 +683,7 @@ class _TpTarget(_Nvfp4Target):
                 speculative_config=DSparkDecodingConfig(
                     max_draft_len=self.DRAFT_LENGTH, speculative_model=model_path
                 ),
-                checkpoint_format="mistral_large_4",
+                checkpoint_format="mistral",
                 guided_decoding_backend="llguidance",
                 kv_cache_config=self.KV.model_copy(update={"enable_block_reuse": True}),
                 modeling_v2="require",

@@ -55,7 +55,7 @@ def add_llm_args(parser):
     parser.add_argument('--checkpoint_format',
                         type=str,
                         default=None,
-                        choices=["HF", "mistral", "mistral_large_4"],
+                        choices=["HF", "mistral"],
                         help="Model checkpoint format.")
     # Build config
     parser.add_argument("--max_seq_len",

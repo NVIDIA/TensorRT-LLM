@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The native Mistral-Large-4 format reads no HF frontend file.
+"""Which HF frontend files the readers of a Mistral-Large-4 checkpoint use.
 
 A Mistral-Large-4 checkpoint may ship, beside its Mistral-native params.json and tekken.json,
 the HF frontend files tokenizer.json, tokenizer_config.json, chat_template.jinja,
-processor_config.json and generation_config.json. Under ``checkpoint_format="mistral_large_4"``
-the LLM tokenizes and renders chats with mistral-common's MistralTokenizer and takes no
-sampling defaults from generation_config.json; a directory without config.json loads
-MistralTokenizer for every reader, whatever HF tokenizer files it ships.
+processor_config.json and generation_config.json. Under ``checkpoint_format="mistral"``
+the LLM tokenizes and renders chats with mistral-common's MistralTokenizer, whatever HF
+tokenizer files the directory ships, and takes its sampling defaults from
+generation_config.json as under every other format; a directory without config.json loads
+MistralTokenizer for every reader.
 
 The directory tests run on CPU with mistral-common's bundled tekken file. The checkpoint
 test needs MISTRAL_LARGE4_CHECKPOINT_DIR.
@@ -24,9 +25,14 @@ import pytest
 mistral_common = pytest.importorskip("mistral_common")
 tokenizers = pytest.importorskip("tokenizers")
 
+import torch  # noqa: E402
 from transformers import PreTrainedTokenizerFast  # noqa: E402
 
+from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import (  # noqa: E402
+    MistralConfigLoader,
+)
 from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer  # noqa: E402
+from tensorrt_llm.inputs.registry import create_input_processor  # noqa: E402
 from tensorrt_llm.inputs.utils import apply_chat_template  # noqa: E402
 from tensorrt_llm.llmapi.llm import BaseLLM  # noqa: E402
 from tensorrt_llm.tokenizer import TransformersTokenizer, load_hf_tokenizer  # noqa: E402
@@ -94,21 +100,30 @@ def test_a_complete_hf_checkpoint_keeps_the_transformers_path(native_dir):
     assert type(load_hf_tokenizer(str(native_dir))) is TransformersTokenizer
 
 
-def test_the_native_format_loads_mistral_common_even_beside_a_config(native_dir):
+def test_the_native_format_tokenizes_with_mistral_common_even_beside_a_config(
+    native_dir, monkeypatch
+):
+    # The LLM takes its tokenizer from the input processor, which the Mistral-native format
+    # builds over mistral-common whatever the directory's other readers load.
     (native_dir / "config.json").write_text(json.dumps({"model_type": "mistral"}))
-    llm = _llm(native_dir, "mistral_large_4")
-    assert type(BaseLLM._try_load_tokenizer(llm)) is MistralTokenizer
+    assert type(load_hf_tokenizer(str(native_dir))) is TransformersTokenizer
+    config = SimpleNamespace(model_type="mistral_large_4", torch_dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        MistralConfigLoader, "load", lambda self, path: SimpleNamespace(pretrained_config=config)
+    )
+    processor = create_input_processor(str(native_dir), None, checkpoint_format="mistral")
+    assert type(processor.tokenizer) is MistralTokenizer
 
 
-def test_the_native_format_reads_no_generation_config(native_dir):
-    llm = _llm(native_dir, "mistral_large_4")
-    assert BaseLLM._try_load_generation_config(llm) is None
-    assert BaseLLM._try_load_generation_config_explicit_values(llm) == {}
-
-
-def test_other_formats_still_read_the_generation_config(native_dir):
-    llm = _llm(native_dir, "HF")
-    assert BaseLLM._try_load_generation_config_explicit_values(llm)["top_p"] == 0.95
+@pytest.mark.parametrize("checkpoint_format", ["mistral", "HF"])
+def test_every_format_reads_the_generation_config(native_dir, checkpoint_format):
+    llm = _llm(native_dir, checkpoint_format)
+    assert BaseLLM._try_load_generation_config(llm).top_p == 0.95
+    assert BaseLLM._try_load_generation_config_explicit_values(llm) == {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "eos_token_id": 2,
+    }
 
 
 def test_the_native_renderer_rejects_an_hf_tokenizer():
@@ -129,9 +144,7 @@ def test_the_checkpoint_loads_mistral_common_for_every_reader():
     if not path:
         pytest.skip("needs MISTRAL_LARGE4_CHECKPOINT_DIR")
     assert type(load_hf_tokenizer(path)) is MistralTokenizer
-    llm = _llm(path, "mistral_large_4")
-    assert type(BaseLLM._try_load_tokenizer(llm)) is MistralTokenizer
-    assert BaseLLM._try_load_generation_config(llm) is None
+    assert type(BaseLLM._try_load_tokenizer(_llm(path, "mistral"))) is MistralTokenizer
 
 
 def test_the_standalone_renderer_loads_no_hf_processor():
@@ -142,6 +155,6 @@ def test_the_standalone_renderer_loads_no_hf_processor():
         pytest.skip("needs MISTRAL_LARGE4_CHECKPOINT_DIR")
     from tensorrt_llm.serve.render.resources import RenderResources
 
-    rendered = RenderResources.load(path, checkpoint_format="mistral_large_4")
+    rendered = RenderResources.load(path, checkpoint_format="mistral")
     assert rendered.processor is None
     assert type(rendered.tokenizer) is MistralTokenizer

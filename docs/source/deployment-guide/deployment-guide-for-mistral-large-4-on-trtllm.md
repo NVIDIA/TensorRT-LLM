@@ -47,7 +47,7 @@ Pass the downloaded directory to TensorRT LLM as it is; no conversion is needed.
 
 ### Checkpoint Format
 
-The repository contains two sets of files. TensorRT LLM reads only the Mistral-format set:
+The repository contains two sets of files. TensorRT LLM reads the Mistral-format set and, from the Hugging Face set, only the sampling defaults:
 
 | Files | Contents | Read by TensorRT LLM |
 | :-- | :-- | :-- |
@@ -55,11 +55,11 @@ The repository contains two sets of files. TensorRT LLM reads only the Mistral-f
 | `tekken.json` | Mistral format: tokenizer, chat format and reasoning efforts, read through mistral-common | Yes |
 | `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` | Hugging Face tokenizer and chat template | No |
 | `processor_config.json` | Hugging Face image processor (`PixtralProcessor`) | No |
-| `generation_config.json` | Hugging Face sampling defaults (temperature 1.0, top_p 0.95) | No |
+| `generation_config.json` | Hugging Face sampling defaults (temperature 1.0, top_p 0.95) | With `generation_config: auto` |
 
-Every Mistral Large 4 configuration must set `checkpoint_format: mistral_large_4`. With it, the model configuration, the weights, the tokenizer, chat rendering and image preprocessing all come from the Mistral-format files and mistral-common, and the Hugging Face files are ignored. Every component of the server that tokenizes, including the post-processing workers, the multimodal input loader and the disaggregated router, uses `tekken.json`. Use `mistral_large_4`, not the `mistral` format that Mistral Large 3 uses.
+Every Mistral Large 4 configuration must set `checkpoint_format: mistral`. With it, the model configuration, the weights, the tokenizer, chat rendering and image preprocessing all come from the Mistral-format files and mistral-common, and the Hugging Face tokenizer, chat template and image processor are ignored. Every component of the server that tokenizes, including the post-processing workers, the multimodal input loader and the disaggregated router, uses `tekken.json`.
 
-Without `checkpoint_format`, TensorRT LLM expects the Hugging Face format, which needs a `config.json`, and fails with an error that names `mistral_large_4`. Mistral Large 4 is not served from the Hugging Face format.
+Without `checkpoint_format`, TensorRT LLM expects the Hugging Face format, which needs a `config.json`, and fails with an error that names `checkpoint_format='mistral'`. Mistral Large 4 is not served from the Hugging Face format.
 
 ## Supported Configurations
 
@@ -153,7 +153,7 @@ Create a YAML configuration file on the shared filesystem. The configuration bel
 EXTRA_LLM_API_FILE=/path/to/mistral-large-4-config.yml
 
 cat << EOF > ${EXTRA_LLM_API_FILE}
-checkpoint_format: mistral_large_4
+checkpoint_format: mistral
 modeling_v2: require
 tensor_parallel_size: 4
 moe_expert_parallel_size: 4
@@ -262,7 +262,7 @@ def main():
     model = "/path/to/mistral-large-4-nvfp4"
     with LLM(
             model,
-            checkpoint_format="mistral_large_4",
+            checkpoint_format="mistral",
             modeling_v2="require",
             tensor_parallel_size=4,
             moe_expert_parallel_size=4,
@@ -309,7 +309,7 @@ These options are set in the YAML file passed to `trtllm-serve --config`. See th
 
 #### `checkpoint_format`
 
-* **Description:** Must be `mistral_large_4`, which reads the checkpoint in the Mistral format and ignores its Hugging Face files (see [Checkpoint Format](#checkpoint-format)). The default, the Hugging Face format, fails with an error that names `mistral_large_4`.
+* **Description:** Must be `mistral`, which reads the checkpoint in the Mistral format (see [Checkpoint Format](#checkpoint-format)). The default, the Hugging Face format, fails with an error that names `checkpoint_format='mistral'`.
 
 #### `modeling_v2`
 
@@ -350,7 +350,7 @@ These options are set in the YAML file passed to `trtllm-serve --config`. See th
 * **Reasoning:** `reasoning_effort` accepts `low`, `medium` and `high`. Unset, the checkpoint's default, `high`, applies, so the model reasons before it answers. `none` and other values return HTTP 400. The effort can be given at the top level of the request or in `chat_template_kwargs`; when both are given they must agree. With `--reasoning_parser mistral_large_4`, the reasoning text is returned in `reasoning_content` and the answer in `content`. `thinking_token_budget` is not supported.
 * **Tool calling:** With `--tool_parser mistral_large_4`, tool calls are returned in `tool_calls`. `tool_choice: "auto"` works with every configuration. `tool_choice: "required"` and a named function need `guided_decoding_backend: llguidance`; the call and its arguments are then constrained to the declared tools. Otherwise these requests return HTTP 400, as they do when combined with `response_format`. Under `auto`, tools with `strict: true` are accepted, but their arguments are not constrained. For `tool_choice: "none"`, see [Known Limitations](#known-limitations).
 * **Images:** The deployments accept images as `image_url` content parts, as data URLs (PNG or JPEG; the tested form) or as `http(s)` URLs that the server downloads. URLs that resolve to private addresses are refused unless `TRTLLM_MEDIA_ALLOW_PRIVATE_URLS=1` is set on the server; keep it unset in production. The server sets no limit on the number of images per prompt (prompts with ten 1540x1540 images have been tested), so enforce one in front of the server if you need it. All image tokens count against `max_seq_len`. Video, audio and precomputed image embeddings are not supported.
-* **Sampling:** The model card recommends `temperature` 1.0 and `top_p` 0.95 at every reasoning effort, the values in the checkpoint's `generation_config.json`. TensorRT LLM does not apply that file, also not with `generation_config: auto`, so set both in each request. A chat request that sets neither samples with the server defaults, temperature 1.0 and top_p 1.0; an LLM API `SamplingParams` that sets no `temperature`, `top_p` or `top_k` decodes greedily. The examples below use `temperature: 0` for reproducible output.
+* **Sampling:** The model card recommends `temperature` 1.0 and `top_p` 0.95 at every reasoning effort, the values in the checkpoint's `generation_config.json`. Set `generation_config: auto` in the configuration to apply them to every request that sets neither, or set both in each request. Otherwise a chat request that sets neither samples with the server defaults, temperature 1.0 and top_p 1.0; an LLM API `SamplingParams` that sets no `temperature`, `top_p` or `top_k` decodes greedily. The examples below use `temperature: 0` for reproducible output.
 * **Output length:** On `/v1/chat/completions`, a `max_tokens` or `max_completion_tokens` larger than `max_seq_len` returns HTTP 400. Prompts longer than `max_num_tokens` return HTTP 400 when chunked prefill is off.
 * **Log probabilities:** Requests for `logprobs` or `top_logprobs` return HTTP 400 when speculative decoding is enabled.
 
@@ -476,7 +476,7 @@ Several images can be passed in one message; they are seen in the order given.
 Disaggregated serving is validated with one context server and one generation server, each a TEP4 deployment on its own GB300 node, with the NVFP4 checkpoint without speculative decoding, at `max_seq_len` 32768. The KV cache is transferred with NIXL. Both servers use this configuration:
 
 ```yaml
-checkpoint_format: mistral_large_4
+checkpoint_format: mistral
 modeling_v2: require
 tensor_parallel_size: 4
 moe_expert_parallel_size: 4
@@ -558,7 +558,7 @@ All 30 workloads passed with the existing accuracy references and tolerances unc
 
 * **GPU architectures.** GB300 (`sm_103`) and VR200 (`sm_107`) are supported. Other GPUs, including GB200 and B200, are not supported.
 * **NVFP4 checkpoint only.** Other exports of Mistral Large 4, including the FP8 checkpoint, are refused at load time.
-* **Mistral format only.** The checkpoint is read through `checkpoint_format: mistral_large_4`; the Hugging Face format is not supported. The Hugging Face files in the repository are not read, so the sampling defaults in its `generation_config.json` do not apply.
+* **Mistral format only.** The checkpoint is read through `checkpoint_format: mistral`; the Hugging Face format is not supported. The Hugging Face tokenizer, chat template and image processor in the repository are not read.
 * **Responses API.** Use `/v1/chat/completions`. On this revision `/v1/responses` drops image inputs, and with speculative decoding every `/v1/responses` request returns HTTP 400 because the request asks for log probabilities.
 * **Streamed requests that fail validation.** A streamed request that the engine rejects after the response has started (for example, with chunked prefill on, a prompt longer than `max_seq_len`; or, with speculative decoding, a request for log probabilities) receives HTTP 200 and then a closed connection instead of an error status. The same request without streaming returns HTTP 400.
 * **`tool_choice: "none"`.** The tools are still shown to the model. If it calls one anyway, the call is dropped and the response has empty content. To get a text answer, send the request without `tools`.
@@ -576,7 +576,7 @@ All 30 workloads passed with the existing accuracy references and tolerances unc
 
 | Symptom | Cause and fix |
 | :-- | :-- |
-| `... is a Mistral-Large-4 checkpoint in the Mistral-native format; load it with checkpoint_format='mistral_large_4'` | Set `checkpoint_format: mistral_large_4`. |
+| `... is a Mistral-Large-4 checkpoint in the Mistral-native format; load it with checkpoint_format='mistral'` | Set `checkpoint_format: mistral`. |
 | `Mistral-Large-4 is served from the ModelOpt MIXED_PRECISION export, whose params.json states quantization_config; found quantization=...` | The checkpoint is not the NVFP4 checkpoint. Only the NVFP4 checkpoint is supported. |
 | `The tekken.json of ... declares reasoning efforts the installed mistral-common does not know` | Install mistral-common 1.13.0 or later from PyPI. |
 | `Unknown architecture for AutoModelForCausalLM: MistralLarge4ForCausalLM` | Set `modeling_v2: require`. |
@@ -587,6 +587,6 @@ All 30 workloads passed with the existing accuracy references and tolerances unc
 | `Mistral DSpark max_draft_len must equal the trained block depth 3` or `Native Mistral DSpark must use the target checkpoint` | Set `max_draft_len: 3`, and set `speculative_model` to the checkpoint directory or leave it unset. |
 | Warning `max_seq_len ... is greater than max_num_tokens ... that can be allocated in kv cache manager, setting max_seq_len to ...` | Set `max_seq_len` explicitly; unset, it defaults to 1,048,576. |
 | Image requests fail with an error about OpenCV (`cv2`) | Install `mistral-common[opencv]`, or `opencv-python-headless`. |
-| Sampled outputs differ from another serving stack for the same request | The other stack may apply the checkpoint's `generation_config.json` (top_p 0.95); TensorRT LLM does not. Set `temperature` and `top_p` in the request. |
+| Sampled outputs differ from another serving stack for the same request | The other stack may apply the checkpoint's `generation_config.json` (top_p 0.95); TensorRT LLM applies it only with `generation_config: auto`. Set that, or set `temperature` and `top_p` in the request. |
 | CUDA out-of-memory errors at startup | Keep `free_gpu_memory_fraction` at 0.85 or lower, and check `max_batch_size` and `max_seq_len`. |
 | The 8-GPU server does not start, or ranks cannot reach each other | Check that both nodes are in one multi-node NVLink domain and that the container image, the checkpoint, the configuration file and, for a source build, the checkout resolve to the same paths on both nodes. |

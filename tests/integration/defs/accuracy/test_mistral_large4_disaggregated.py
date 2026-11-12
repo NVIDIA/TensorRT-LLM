@@ -81,7 +81,7 @@ def _check_serving(url: str, model: str, output: Path) -> None:
             return future
 
         llm = DuckLLM(
-            LlmArgs(model=model, checkpoint_format="mistral_large_4"),
+            LlmArgs(model=model, checkpoint_format="mistral"),
             load_hf_tokenizer(model),
             generate_async,
             url,
@@ -201,7 +201,7 @@ def test_mistral_large4_disagg(tmp_path: Path, capfd: pytest.CaptureFixture[str]
     url = f"http://{hosts[0]}:{proxy_port}"
 
     worker_config = dict(
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         tensor_parallel_size=4,
         moe_expert_parallel_size=4,
         enable_attention_dp=False,

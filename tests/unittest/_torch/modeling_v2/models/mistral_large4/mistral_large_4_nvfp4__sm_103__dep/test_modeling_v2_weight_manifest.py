@@ -1114,7 +1114,7 @@ class _ReadLog:
 @_each_rank
 def test_tiny_load_streams_from_the_shard_files(world, rank, tmp_path, monkeypatch):
     """With the checkpoint's shard files found through the directory the engine records on
-    the config, every source is read from them -- the engine's dict is never read: here it
+    the config, every source is read from them -- the given dict is never read: here it
     holds meta tensors, which cannot be copied out -- and the result is bit for bit the
     dict path's. Each key is read once; of the other ranks' experts only the scalars are read,
     and nothing of the DSpark draft. Each shard file's cached pages are dropped once, after
@@ -1143,6 +1143,26 @@ def test_tiny_load_streams_from_the_shard_files(world, rank, tmp_path, monkeypat
     own = {k for k in ck if not _is_draft(k)} - off
     assert read == own | {k for k in off if _is_expert_scalar(k)}
     assert sorted(dropped) == sorted(p.name for p in tmp_path.glob("*.safetensors"))
+
+
+@_each_world
+@pytest.mark.parametrize("with_index", [True, False])
+def test_tiny_load_checkpoint_reads_the_directory(world, with_index, tmp_path):
+    """Given the checkpoint directory alone, as the engine gives it, the result is bit for bit
+    the dict path's: the files come from the directory's index, or without one from the shard
+    files' headers."""
+    ck = _tiny_checkpoint(world)
+    _write_shards(ck, tmp_path)
+    if not with_index:
+        (tmp_path / W.SHARD_INDEX).unlink()
+    loaded = _Shell(_tiny(world), 2, world, "cpu")
+    W.MODEL_WEIGHTS.load_checkpoint(loaded, tmp_path)
+    direct = _Shell(_tiny(world), 2, world, "cpu")
+    W.MODEL_WEIGHTS.load(direct, dict(ck))
+    got, want = dict(loaded.named_parameters()), dict(direct.named_parameters())
+    assert set(got) == set(want)
+    for key in want:
+        assert torch.equal(_bytes(got[key].data), _bytes(want[key].data)), key
 
 
 @_each_world

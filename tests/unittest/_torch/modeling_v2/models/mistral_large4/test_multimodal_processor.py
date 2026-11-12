@@ -3,7 +3,7 @@
 """The mistral-native image processor takes an image in every form the media loaders
 hand one over.
 
-`checkpoint_format: mistral_large_4` builds `MistralNativeInputProcessor`, whose
+`checkpoint_format: mistral` builds `MistralNativeInputProcessor`, whose
 `MistralCommonImageProcessor` encodes each image for mistral-common. The loaders
 deliver a PIL image (`"pil"`), a float `(C, H, W)` tensor in [0, 1] (`"pt"`, the
 default of `default_multimodal_input_loader` and of the boot gate) or a uint8

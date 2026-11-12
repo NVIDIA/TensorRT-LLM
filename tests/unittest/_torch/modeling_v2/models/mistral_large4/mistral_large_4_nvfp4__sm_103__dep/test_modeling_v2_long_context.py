@@ -29,7 +29,7 @@ Runs with the ranks already in place: pytest under `trtllm-llmapi-launch`, as th
 accuracy class runs, with the checkpoint under `LLM_MODELS_ROOT` as
 `Mistral-Large-4-1T-A52B-NVFP4` (or `mistral-large-4-nvfp4`) as published,
 Mistral-native (params.json, tekken.json and the consolidated safetensors, which the engine loads
-with checkpoint_format "mistral_large_4") -- on four GB300s for the four-rank engine, on eight
+with checkpoint_format "mistral") -- on four GB300s for the four-rank engine, on eight
 over two nodes of four for the eight-rank one. Each world runs only in a launch of its own size
 (or unlaunched): the four-rank engine where four GPUs are visible, the eight-rank one where eight
 ranks are, counted on the launched MPI world rather than the devices a node shows (each node sees
@@ -205,7 +205,7 @@ def llm(world):
         pytest.skip(f"checkpoint {CHECKPOINTS} is not under LLM_MODELS_ROOT ({llm_models_root()})")
     with LLM(
         str(path),
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         modeling_v2="require",
         env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
         enable_iter_perf_stats=True,

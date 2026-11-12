@@ -72,37 +72,33 @@ def test_vocab_is_raw_bytes_with_control_tokens_empty(tokenizer):
 
 
 def test_mistral_large_4_config_takes_the_byte_vocab(tokenizer):
-    config = get_guided_decoding_config("xgrammar", tokenizer, checkpoint_format="mistral_large_4")
+    config = get_guided_decoding_config("xgrammar", tokenizer)
     assert config.backend == GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR
     assert config.encoded_vocab == tokenizer.xgrammar_tokenizer_info()["encoded_vocab"]
     assert config.stop_token_ids == [tokenizer.eos_token_id]
-    assert get_guided_decoding_config(None, tokenizer, checkpoint_format="mistral_large_4") is None
+    assert get_guided_decoding_config(None, tokenizer) is None
 
 
 def test_mistral_large_4_llguidance_config_defers_to_the_tokenizer(tokenizer):
     from tensorrt_llm._torch.pyexecutor.py_executor_creator import _llguidance_tokenizer
 
-    config = get_guided_decoding_config(
-        "llguidance", tokenizer, checkpoint_format="mistral_large_4"
-    )
+    config = get_guided_decoding_config("llguidance", tokenizer)
     assert config.backend == GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
     assert config.tokenizer_str is None and config.encoded_vocab is None
     assert config.stop_token_ids == [tokenizer.eos_token_id]
     n_words = tokenizer.tokenizer.n_words
-    assert _llguidance_tokenizer(config, tokenizer, "mistral_large_4", n_words) is not None
-    xgrammar = get_guided_decoding_config(
-        "xgrammar", tokenizer, checkpoint_format="mistral_large_4"
-    )
-    assert _llguidance_tokenizer(xgrammar, tokenizer, "mistral_large_4", n_words) is None
-    with pytest.raises(ValueError, match="xgrammar or llguidance"):
-        get_guided_decoding_config("outlines", tokenizer, checkpoint_format="mistral_large_4")
+    assert _llguidance_tokenizer(config, tokenizer, n_words) is not None
+    xgrammar = get_guided_decoding_config("xgrammar", tokenizer)
+    assert _llguidance_tokenizer(xgrammar, tokenizer, n_words) is None
+    with pytest.raises(ValueError, match="Unsupported guided decoding backend"):
+        get_guided_decoding_config("outlines", tokenizer)
 
 
 def _matcher(tokenizer, schema):
     from tensorrt_llm._torch.pyexecutor.grammar_matcher import XGrammarMatcherFactory
     from tensorrt_llm.bindings.executor import GuidedDecodingParams
 
-    config = get_guided_decoding_config("xgrammar", tokenizer, checkpoint_format="mistral_large_4")
+    config = get_guided_decoding_config("xgrammar", tokenizer)
     factory = XGrammarMatcherFactory(config, vocab_size_padded=tokenizer.tokenizer.n_words)
     return factory.create(
         GuidedDecodingParams(GuidedDecodingParams.GuideType.JSON_SCHEMA, json.dumps(schema))
@@ -143,21 +139,22 @@ def test_xgrammar_never_allows_control_tokens_inside_a_string(tokenizer):
         ({"guided_decoding_backend": "llguidance"}, "llguidance"),
         ({"speculative_config": object()}, None),
         ({"mm_encoder_only": True}, None),
-        ({"checkpoint_format": None}, None),
-        ({"checkpoint_format": "mistral_large_3"}, None),
+        ({"model_type": None}, None),
+        ({"model_type": "mistral_large_3"}, None),
     ],
 )
 def test_mistral_large_4_serves_structured_outputs_by_default(fields, expected):
+    fields = dict(fields)
+    model_type = fields.pop("model_type", "mistral_large_4")
     args = SimpleNamespace(
         **{
             "guided_decoding_backend": None,
-            "checkpoint_format": "mistral_large_4",
             "speculative_config": None,
             "mm_encoder_only": False,
             **fields,
         }
     )
-    assert _default_guided_decoding_backend(args) == expected
+    assert _default_guided_decoding_backend(args, model_type) == expected
 
 
 _WEATHER_TOOL = {
@@ -206,9 +203,7 @@ def _llg_matcher(tokenizer, llg, guide_type, guide):
     from tensorrt_llm._torch.pyexecutor.grammar_matcher import LLGuidanceMatcherFactory
     from tensorrt_llm.bindings.executor import GuidedDecodingParams
 
-    config = get_guided_decoding_config(
-        "llguidance", tokenizer, checkpoint_format="mistral_large_4"
-    )
+    config = get_guided_decoding_config("llguidance", tokenizer)
     factory = LLGuidanceMatcherFactory(config, tokenizer.tokenizer.n_words, tokenizer=llg)
     return factory.create(
         GuidedDecodingParams(getattr(GuidedDecodingParams.GuideType, guide_type), guide)
@@ -382,13 +377,9 @@ def _json_matcher(tokenizer, llg, guide_type, guide, *, reasoning_section=True):
     from tensorrt_llm._torch.pyexecutor.py_executor_creator import _llguidance_json_schema_lark
     from tensorrt_llm.bindings.executor import GuidedDecodingParams
 
-    config = get_guided_decoding_config(
-        "llguidance", tokenizer, checkpoint_format="mistral_large_4"
-    )
+    config = get_guided_decoding_config("llguidance", tokenizer)
     json_schema_lark = (
-        _llguidance_json_schema_lark(config, tokenizer, "mistral_large_4")
-        if reasoning_section
-        else None
+        _llguidance_json_schema_lark(config, tokenizer) if reasoning_section else None
     )
     factory = LLGuidanceMatcherFactory(
         config, tokenizer.tokenizer.n_words, tokenizer=llg, json_schema_lark=json_schema_lark
@@ -501,15 +492,16 @@ def test_llguidance_json_response_without_the_renderer_starts_at_the_json(
     assert _control(tokenizer, "[THINK]") in _allowed(matcher, reasoning_vocab.n_words)
 
 
-def test_llguidance_json_schema_lark_is_mistral_large_4_llguidance_only(tokenizer):
+def test_llguidance_json_schema_lark_needs_llguidance_and_a_grammar_tokenizer(tokenizer):
     from tensorrt_llm._torch.pyexecutor.py_executor_creator import _llguidance_json_schema_lark
 
-    llguidance = get_guided_decoding_config(
-        "llguidance", tokenizer, checkpoint_format="mistral_large_4"
-    )
-    xgrammar = get_guided_decoding_config(
-        "xgrammar", tokenizer, checkpoint_format="mistral_large_4"
-    )
-    assert _llguidance_json_schema_lark(llguidance, tokenizer, "mistral_large_4") is not None
-    assert _llguidance_json_schema_lark(xgrammar, tokenizer, "mistral_large_4") is None
-    assert _llguidance_json_schema_lark(llguidance, tokenizer, "mistral") is None
+    llguidance = get_guided_decoding_config("llguidance", tokenizer)
+    xgrammar = get_guided_decoding_config("xgrammar", tokenizer)
+    # A tokenizer mistral-common renders no grammars for (the bundled Tekken file is older
+    # than v11) constrains JSON from its first token.
+    rendered = _llguidance_json_schema_lark(llguidance, tokenizer)
+    assert (rendered is not None) is tokenizer.renders_grammars
+    assert _llguidance_json_schema_lark(xgrammar, tokenizer) is None
+    no_grammars = SimpleNamespace(renders_grammars=False)
+    assert _llguidance_json_schema_lark(llguidance, no_grammars) is None
+    assert _llguidance_json_schema_lark(llguidance, object()) is None

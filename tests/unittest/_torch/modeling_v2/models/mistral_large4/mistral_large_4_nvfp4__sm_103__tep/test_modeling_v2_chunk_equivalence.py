@@ -46,7 +46,7 @@ Text only: no image, no chat template. Runs with the ranks already in place, on 
 tep4 or on eight over two nodes of four at tep8: pytest under `trtllm-llmapi-launch`, as the
 whole-model accuracy class runs, with the checkpoint under `LLM_MODELS_ROOT` as
 `Mistral-Large-4-1T-A52B-NVFP4` (or `mistral-large-4-nvfp4`) in its Mistral-native format,
-which both engines load with checkpoint_format "mistral_large_4". The ranks' devices are not
+which both engines load with checkpoint_format "mistral". The ranks' devices are not
 there for two engines at once, so one process holds them in turn. The second engine sizes its
 KV pool from the memory the first left free, so before the first boots and after each shuts
 down every rank reports its device's free memory, through the launcher's MPI session (the
@@ -309,7 +309,7 @@ def _run(path: Path, engine: str, prompts, world: int) -> tuple[list, dict]:
     results = {}
     with LLM(
         str(path),
-        checkpoint_format="mistral_large_4",
+        checkpoint_format="mistral",
         modeling_v2="require",
         env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
         enable_iter_perf_stats=True,
