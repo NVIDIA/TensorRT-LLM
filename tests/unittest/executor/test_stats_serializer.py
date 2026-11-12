@@ -136,7 +136,6 @@ class TestStatsSerializer:
             prev_device_step_time_ms=1.25,
             scheduler_mode="overlap",
             gpu_forward_time_ms=4.25,
-            kv_transfer_outcomes=(3, 2, 1),
             executor_loop=loop,
         )
         expected = {
@@ -147,13 +146,12 @@ class TestStatsSerializer:
             "prevDeviceStepTimeMS": 1.25,
             "schedulerMode": "overlap",
             "gpuForwardTimeMS": 4.25,
-            "kvTransferOutcomes": {"success": 3, "error": 2, "timeout": 1},
             "executorLoop": loop,
         }
         assert json.loads(BaseWorker._stats_serializer(record)) == expected
         assert json.loads(BaseWorker._stats_serializer(tuple(record))) == expected
 
-    @pytest.mark.parametrize("field_count", range(2, 12))
+    @pytest.mark.parametrize("field_count", range(2, 11))
     def test_legacy_tuple_prefixes_and_future_trailing_fields(self, field_count):
         iter_stats = _make_mock_iteration_stats()
         loop = {"kind": "loop", "per_iter": {"iter": 9}}
@@ -166,7 +164,6 @@ class TestStatsSerializer:
             1.25,
             "overlap",
             4.25,
-            (3, 2, 1),
             loop,
             "future field",
         )[:field_count]
@@ -179,8 +176,7 @@ class TestStatsSerializer:
             (6, "prevDeviceStepTimeMS", 1.25),
             (7, "schedulerMode", "overlap"),
             (8, "gpuForwardTimeMS", 4.25),
-            (9, "kvTransferOutcomes", {"success": 3, "error": 2, "timeout": 1}),
-            (10, "executorLoop", loop),
+            (9, "executorLoop", loop),
         ):
             if field_count >= required_fields:
                 expected[key] = value

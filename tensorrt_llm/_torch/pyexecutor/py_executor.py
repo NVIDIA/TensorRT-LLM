@@ -3558,9 +3558,7 @@ class PyExecutor:
                            attention_dp_rank: Optional[int] = None,
                            host_step_time_ms: Optional[float] = None,
                            prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None,
-                           kv_transfer_outcomes: Optional[tuple[int, int,
-                                                                int]] = None):
+                           gpu_forward_time_ms: Optional[float] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -3586,7 +3584,6 @@ class PyExecutor:
             gpu_forward_time_ms: Batch-matched GPU forward time captured by
                 the events surrounding this batch's ``_forward_step``.
                 Surfaces as ``gpuForwardTimeMS`` in the /metrics JSON.
-            kv_transfer_outcomes: Rank-local cumulative request success/error/timeout counts.
         """
         # Non-ADP appends immediately, so the latest KV stats belong to this
         # IterationStats. ADP appends later and passes the saved iter-matched
@@ -3630,7 +3627,6 @@ class PyExecutor:
             prev_device_step_time_ms=prev_device_step_time_ms,
             scheduler_mode=scheduler_mode,
             gpu_forward_time_ms=gpu_forward_time_ms,
-            kv_transfer_outcomes=kv_transfer_outcomes,
             executor_loop=loop_metrics)
 
         tp_size = getattr(self.dist, "tp_size", 1)

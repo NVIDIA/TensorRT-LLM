@@ -37,7 +37,6 @@ _RANK_FIELDS = frozenset(
         "kvCacheMigrationTimings",
         "kvCacheMigrationTimingsSkipped",
         "kvCacheLevelTiers",
-        "kvTransferOutcomes",
         "iterSuspendedRequests",
         "iterResumedRequests",
         "iterDiskPrefetchBlocks",
@@ -77,7 +76,11 @@ def _thaw(value: MetricValue) -> object:
 
 
 def kv_cache_utilization(stats: Mapping) -> float | None:
-    """Return non-reclaimable utilization; missing/zero capacity is unavailable."""
+    """Return non-reclaimable utilization, preferring an explicit used count.
+
+    Basic snapshots can supply only capacity and free blocks. Missing or
+    non-positive capacity is unavailable, rather than measured zero utilization.
+    """
     capacity = stats.get("maxNumBlocks", 0)
     if not isinstance(capacity, (int, float)) or capacity <= 0:
         return None

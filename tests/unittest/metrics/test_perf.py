@@ -228,7 +228,6 @@ def test_iteration_record_preserves_transport_fields(tp_rank: int | None) -> Non
         prev_device_step_time_ms=1.0,
         scheduler_mode="overlap",
         gpu_forward_time_ms=2.0,
-        kv_transfer_outcomes=(0, 1, 2),
         executor_loop=loop,
     )
     expected = {
@@ -239,7 +238,6 @@ def test_iteration_record_preserves_transport_fields(tp_rank: int | None) -> Non
         "prevDeviceStepTimeMS": 1.0,
         "gpuForwardTimeMS": 2.0,
         "schedulerMode": "overlap",
-        "kvTransferOutcomes": {"success": 0, "error": 1, "timeout": 2},
         "executorLoop": loop,
     }
     if tp_rank is None:
@@ -250,7 +248,7 @@ def test_iteration_record_preserves_transport_fields(tp_rank: int | None) -> Non
     assert json.loads(PerfMetricsCollector.collect_iteration(expected).iteration_json()) == expected
 
 
-@pytest.mark.parametrize("width", range(1, 11))
+@pytest.mark.parametrize("width", range(1, len(IterationStatsRecord._fields) + 1))
 def test_iteration_record_accepts_historical_tuple_widths(width: int) -> None:
     stats = Mock()
     stats.to_json_str.return_value = '{"iter": 7}'
@@ -260,3 +258,46 @@ def test_iteration_record_accepts_historical_tuple_widths(width: int) -> None:
     assert entry.to_dict(tp_rank=3) == {"iter": 7, "rank": 3}
     assert IterationStatsRecord.from_tuple(entry) is entry
     assert IterationStatsRecord.from_tuple(legacy + (None,) * 10).to_dict() == entry.to_dict()
+
+
+@pytest.mark.parametrize(
+    ("stats", "expected"),
+    [
+        ({"maxNumBlocks": 10, "usedNumBlocks": 3, "freeNumBlocks": 1}, 0.3),
+        ({"maxNumBlocks": 10, "usedNumBlocks": 0, "freeNumBlocks": 1}, 0.0),
+        ({"maxNumBlocks": 10, "freeNumBlocks": 4}, 0.6),
+        ({"maxNumBlocks": 10, "freeNumBlocks": 10}, 0.0),
+        ({"maxNumBlocks": 0, "usedNumBlocks": 0}, None),
+        ({"maxNumBlocks": -1, "usedNumBlocks": 0}, None),
+        ({"maxNumBlocks": 10}, None),
+        ({"usedNumBlocks": 3}, None),
+        ({}, None),
+    ],
+)
+def test_kv_utilization_used_precedence_fallback_and_missing_capacity(
+    stats: dict, expected: float | None
+) -> None:
+    assert kv_cache_utilization(stats) == expected
+
+
+@pytest.mark.parametrize("capacity", [None, 0])
+def test_logger_reports_unavailable_kv_as_na(capacity: int | None) -> None:
+    collector = PerfMetricsCollector()
+    if capacity is not None:
+        collector.collect_rank(
+            {"kvCacheStats": {"maxNumBlocks": capacity, "usedNumBlocks": 0}},
+            capture_iter=0,
+        )
+    messages = []
+    LoggerExposure(messages.append).emit(collector.collect_loop(_loop()))
+    assert "kv_cache_util = N/A" in messages[0]
+
+
+def test_prometheus_missing_used_count_does_not_infer_utilization() -> None:
+    prom = _prometheus()
+    prom.emit(
+        PerfMetricsCollector.collect_iteration(
+            {"kvCacheStats": {"maxNumBlocks": 10, "freeNumBlocks": 4}}
+        )
+    )
+    assert prom.kv_cache_utilization.collect()[0].samples == []

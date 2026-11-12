@@ -30,7 +30,6 @@ class IterationStatsRecord(NamedTuple):
     prev_device_step_time_ms: float | None = None
     scheduler_mode: Literal["overlap", "non_overlap"] | None = None
     gpu_forward_time_ms: float | None = None
-    kv_transfer_outcomes: tuple[int, int, int] | None = None
     executor_loop: dict[str, object] | None = None
 
     @classmethod
@@ -70,8 +69,4 @@ class IterationStatsRecord(NamedTuple):
         for name, value in optional_fields:
             if value is not None:
                 stats[name] = value
-        if self.kv_transfer_outcomes is not None:
-            stats["kvTransferOutcomes"] = dict(
-                zip(("success", "error", "timeout"), self.kv_transfer_outcomes)
-            )
         return stats
