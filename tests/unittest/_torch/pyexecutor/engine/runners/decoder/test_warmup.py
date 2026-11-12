@@ -706,9 +706,14 @@ def test_autotuner_warmup_hands_pp_cache_off_before_waiting_on_gpu(
     for this rank's cache in a tuning op before it posts the receive.
     """
     events: list[str] = []
-    tuner = Mock(profiling_cache={})
-    tuner.cache_pp_recv.side_effect = lambda: events.append("cache_pp_recv")
-    tuner.cache_pp_send.side_effect = lambda: events.append("cache_pp_send")
+    tuner = SimpleNamespace(
+        profiling_cache={},
+        setup_distributed_state=lambda mapping, dist: None,
+        print_profiling_cache=lambda: None,
+        cache_pp_recv=lambda: events.append("cache_pp_recv"),
+        cache_pp_send=lambda: events.append("cache_pp_send"),
+        clean_pp_flag=lambda: events.append("clean_pp_flag"),
+    )
     requests = Mock()
     requests.create_warmup_request.return_value = ScheduledRequests()
     requests.release_batch_context.side_effect = lambda request, _resources: (
@@ -728,7 +733,7 @@ def test_autotuner_warmup_hands_pp_cache_off_before_waiting_on_gpu(
         mapping=mapping,
         agreement=WarmupAgreement(peer_dist, mapping),
         dummy_requests=requests,
-        forward_warmup=Mock(),
+        forward_warmup=Mock(side_effect=lambda *args, **kwargs: events.append("forward")),
     )
     cache = SimpleNamespace(get_num_available_tokens=lambda **_: 16)
     resources = SimpleNamespace(
@@ -747,9 +752,13 @@ def test_autotuner_warmup_hands_pp_cache_off_before_waiting_on_gpu(
 
     warmup._run_autotuner_warmup(resources)
 
-    assert {"cache_pp_recv", "cache_pp_send", "synchronize"} <= set(events)
-    assert events.index("cache_pp_recv") < events.index("synchronize")
-    assert events.index("cache_pp_send") < events.index("synchronize")
+    assert events == [
+        "forward",
+        "cache_pp_recv",
+        "cache_pp_send",
+        "clean_pp_flag",
+        "synchronize",
+    ]
 
 
 @pytest.mark.parametrize("phase", ["general", "attention", "mamba", "prefill"])
