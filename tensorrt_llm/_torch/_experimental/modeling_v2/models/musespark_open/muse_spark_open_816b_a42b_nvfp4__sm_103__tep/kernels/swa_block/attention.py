@@ -73,7 +73,15 @@ from ...attention import MuseSparkOpenTepAttention, MuseSparkOpenTepDecodeAttent
 from ...dispatch import LAUNCH_PDL
 from ...ops.attention.paged_decode_attention import window_splits
 from ...ops.attention.preattn_prep import HEAD_DIM, preattn_prep
-from ...ops.attention.swa_block import max_blocks, swa_block_attention
+from ...ops.attention.swa_block import (
+    CL8_MAX_REQUESTS,
+    MAX_ROWS,
+    MULTI_MAX_REQUESTS,
+    _cl8_on,
+    max_blocks,
+    swa_block_attention,
+    swa_block_multi_attention,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,6 +110,7 @@ class _SwaBlock:
     _swa_block: Optional[SwaBlockPlan]
     _swa_raw: bool
     _swa_gate: Optional[torch.Tensor]
+    _swa_multi: bool = False
     _swa_gated: bool
     _swa_position_ids: Optional[torch.Tensor]
 
@@ -297,8 +306,27 @@ class _SwaBlock:
         )
 
     def _step_requests(self, md) -> int:
-        """The sequences of this step the block takes in one call: 1."""
-        return 1
+        """The sequences of this step the block takes in one call: 1, or under ``_swa_multi`` the
+        2..``CL8_MAX_REQUESTS`` generation sequences of a step whose host ``seq_lens`` are all
+        ``rows / sequences`` (at most ``MAX_ROWS``) that the one-cluster block takes. Host-side reads only."""
+        if not self._swa_multi:
+            return 1
+        n = md.num_seqs
+        rows = md.num_tokens
+        seq_lens = getattr(md, "seq_lens", None)
+        if (
+            not 2 <= n <= MULTI_MAX_REQUESTS
+            or not _cl8_on(self.num_key_value_heads, n)
+            or md.num_generations != n
+            or rows % n
+            or rows // n > MAX_ROWS
+            or seq_lens is None
+            or seq_lens.is_cuda
+            or seq_lens.numel() < n
+            or bool((seq_lens[:n] != rows // n).any())
+        ):
+            return 1
+        return n
 
     def _swa_block_call(
         self,
@@ -329,10 +357,11 @@ class _SwaBlock:
             torch.bfloat16,
         )
         rope = raw and not self.skip_rope
-        return swa_block_attention(
+        multi = requests > 1
+        return (swa_block_multi_attention if multi else swa_block_attention)(
             q[:rows],
             kv_pool,
-            block_tables[0],
+            block_tables if multi else block_tables[0],
             md.kv_lens_cuda_runtime[:requests],
             attn.kv_scale_orig_quant,
             self.num_heads,
@@ -427,4 +456,38 @@ def log_installed(layers, plan: SwaBlockPlan) -> None:
     )
 
 
-__all__ = ["SwaBlockPlan", "attention_class", "log_installed"]
+def install_multi(model) -> int:
+    """``MUSESPARK_OPEN_SWA_BLOCK_MULTI``: sliding-window ``swa_block`` layers take 2..3-request steps.
+
+    Called after the attention re-class and after ``multi_request_prep_append``'s install. Sets ``_swa_multi`` on each
+    sliding-window layer whose attention carries ``swa_block`` and that ``MUSESPARK_OPEN_SWA_CL8`` takes at two requests
+    (TEP4, CL8 ``1`` or ``all``); returns how many. The block does its own prep and K/V append on these steps, so those
+    layers' ``multi_request_prep_append`` folds only steps above ``CL8_MAX_REQUESTS`` sequences.
+
+    Raises:
+        ValueError: if a sliding-window layer does not carry ``swa_block``.
+    """
+    count = 0
+    for layer in model.layers:
+        attention = layer.self_attn
+        if not attention.is_sliding:
+            continue
+        if not isinstance(attention, _SwaBlock):
+            raise ValueError(
+                "[musespark_open] swa_block multi extends swa_block; layer "
+                f"{layer.layer_idx} carries {type(attention).__name__}"
+            )
+        if not _cl8_on(attention.num_key_value_heads, 2):
+            continue
+        attention._swa_multi = True
+        if hasattr(attention, "_mr_append_min_seqs"):
+            attention._mr_append_min_seqs = max(attention._mr_append_min_seqs, CL8_MAX_REQUESTS + 1)
+        count += 1
+    logger.info(
+        f"[musespark_open] swa_block multi: swa_block on decode steps of 2..{CL8_MAX_REQUESTS} requests of up to "
+        f"{MAX_ROWS} rows each on {count} sliding-window layers (the one-cluster block, MUSESPARK_OPEN_SWA_CL8)"
+    )
+    return count
+
+
+__all__ = ["SwaBlockPlan", "attention_class", "install_multi", "log_installed"]
