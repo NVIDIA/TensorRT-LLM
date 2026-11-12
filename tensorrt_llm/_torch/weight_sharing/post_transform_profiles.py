@@ -326,6 +326,13 @@ class PostTransformRuntimeConfig:
     # config, or `None` when it declares none. A row that constrains
     # `weight_block_sizes` rejects an undeclared block size.
     weight_block_size: tuple[int, ...] | None = None
+    # MoE layer layout declared by a DeepSeek-style checkpoint config: the
+    # layers before `first_k_dense_replace` run a dense MLP, and a later layer
+    # runs MoE when its index is a multiple of `moe_layer_freq`. Each is `None`
+    # when the config declares no integer value, so a row that constrains
+    # `first_k_dense_replaces` or `moe_layer_freqs` rejects it.
+    first_k_dense_replace: int | None = None
+    moe_layer_freq: int | None = None
 
     @classmethod
     def from_model_config(
@@ -423,6 +430,10 @@ class PostTransformRuntimeConfig:
             sliding_window=sliding_window,
             sm_version=_canonical_int(sm_version),
             weight_block_size=_declared_weight_block_size(pretrained_config),
+            first_k_dense_replace=_canonical_int(
+                getattr(pretrained_config, "first_k_dense_replace", None)
+            ),
+            moe_layer_freq=_canonical_int(getattr(pretrained_config, "moe_layer_freq", None)),
         )
 
 
@@ -456,6 +467,8 @@ class PostTransformRuntimeConstraints:
         ("sliding_windows", "sliding_window"),
         ("sm_versions", "sm_version"),
         ("weight_block_sizes", "weight_block_size"),
+        ("first_k_dense_replaces", "first_k_dense_replace"),
+        ("moe_layer_freqs", "moe_layer_freq"),
     )
 
     dtypes: frozenset[str | None] | None = None
@@ -483,6 +496,8 @@ class PostTransformRuntimeConstraints:
     sliding_windows: frozenset[str | None] | None = None
     sm_versions: frozenset[int | None] | None = None
     weight_block_sizes: frozenset[tuple[int, ...] | None] | None = None
+    first_k_dense_replaces: frozenset[int | None] | None = None
+    moe_layer_freqs: frozenset[int | None] | None = None
 
     def __post_init__(self) -> None:
         for constraint_name, _runtime_name in self._DIMENSIONS:

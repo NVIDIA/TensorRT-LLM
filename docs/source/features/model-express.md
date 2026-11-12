@@ -34,7 +34,7 @@ profiles:
 | `phi3-for-causal-lm-bf16-target-v1` | `Phi3ForCausalLM` | `Phi3ForCausalLM` / `phi3` | Target model | 1 | `trtllm-phi3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen3_5-for-conditional-generation-bf16-complete-v1` | `Qwen3_5VLModel` | `Qwen3_5ForConditionalGeneration` / `qwen3_5` | Complete model | 1 | `trtllm-qwen3_5-dense-vl-complete-layout-v1` | Single-node dense BF16 vision-language model with its vision encoder, unquantized weights and KV cache, TRTLLM attention, fused QK-norm/M-RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen3-moe-for-causal-lm-bf16-cutlass-target-v1` | `Qwen3MoeForCausalLM` | `Qwen3MoeForCausalLM` / `qwen3_moe` | Target model | 1 | `trtllm-qwen3-moe-cutlass-target-layout-v1` | Single-node MoE BF16, unquantized weights and KV cache, TRTLLM attention, CUTLASS MoE backend, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, MoE TP=1 or 2 and MoE EP=1 or 2 with MoE TP x MoE EP = TP, MoE cluster=1, PP/CP=1, no LoRA, sparse attention, attention DP, MoE load balancer, DWDP, speculative mode, or separately loaded draft model |
-| `deepseek-v3-for-causal-lm-bf16-cutlass-target-v1` | `DeepseekV3ForCausalLM` | `DeepseekV3ForCausalLM` / `deepseek_v3` | Target model | 1 | `trtllm-deepseek-v3-mla-cutlass-target-layout-v1` | Single-node MoE BF16, unquantized weights and KV cache, TRTLLM attention, CUTLASS MoE backend, default fused RoPE, untied embeddings, TP=1 or 2, MoE TP=1 or 2 and MoE EP=1 or 2 with MoE TP x MoE EP = TP, MoE cluster=1, PP/CP=1, no LoRA, sparse attention, attention DP, MoE load balancer, DWDP, speculative mode, or separately loaded draft model |
+| `deepseek-v3-for-causal-lm-bf16-cutlass-target-v1` | `DeepseekV3ForCausalLM` | `DeepseekV3ForCausalLM` / `deepseek_v3` | Target model | 1 | `trtllm-deepseek-v3-mla-cutlass-target-layout-v1` | Single-node MoE BF16, unquantized weights and KV cache, TRTLLM attention, CUTLASS MoE backend, a dense first layer and MoE in every later layer, default fused RoPE, untied embeddings, TP=1 or 2, MoE TP=1 or 2 and MoE EP=1 or 2 with MoE TP x MoE EP = TP, MoE cluster=1, PP/CP=1, no LoRA, sparse attention, attention DP, MoE load balancer, DWDP, speculative mode, or separately loaded draft model |
 
 The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, the transfer scope that
@@ -149,15 +149,17 @@ cluster parallelism, the MoE load balancer, and DWDP fall back.
 
 The DeepSeek-V3 identity covers Hugging Face-format checkpoints that resolve to
 the exact `DeepseekV3ForCausalLM` / `deepseek_v3` pair, the Multi-head Latent
-Attention (MLA) path with a dense first layer, and routed plus shared experts;
-DeepSeek-V3-Lite BF16 is the qualified canary and the only checkpoint that the
-donor/receiver rows cover. The Hugging Face `kv_b_proj` weight is re-laid out
+Attention (MLA) path, and routed plus shared experts, with a dense first layer
+and MoE in every later layer (`first_k_dense_replace: 1` and
+`moe_layer_freq: 1` in the checkpoint config; any other layer layout falls
+back); DeepSeek-V3-Lite BF16 is the qualified canary and the only checkpoint
+that the donor/receiver rows cover. The Hugging Face `kv_b_proj` weight is re-laid out
 at load into all K-nope rows followed by all V rows per tensor-parallel head
 split, and the absorption weight `v_b_proj` is a view of those V rows; a
 staged receiver rebinds that view in `setup_aliases()` instead of loading it.
 The full DeepSeek-V3, R1, and V3.1 checkpoints share the identity but use YaRN
-RoPE scaling, FP8 weights, and TP=8, so the RoPE, quantization, and TP
-constraints exclude them. Checkpoints with another model type or root do not
+RoPE scaling, FP8 weights, three dense layers, and TP=8, so the RoPE,
+quantization, layer-layout, and TP constraints exclude them. Checkpoints with another model type or root do not
 match even though they reuse this implementation: Kimi K2 declares
 `DeepseekV3ForCausalLM` with `model_type` `kimi_k2`, DeepSeek-V3.2 declares
 `DeepseekV32ForCausalLM`, and GLM-5 (`GlmMoeDsaForCausalLM`) and Mistral Large 3
@@ -224,8 +226,8 @@ sliding-window checkpoints such as Ministral fall back to the Hugging Face path
 until they are qualified separately. The dense profiles do not constrain
 MoE-only backend and mapping settings because dense roots do not consume them;
 the Qwen3 MoE profile pins them as the table above lists, and the DeepSeek-V3
-profile pins the same MoE settings. `SourceIdentity` still requires donor and
-receiver configurations to match.
+profile pins the same MoE settings plus its MoE layer layout. `SourceIdentity`
+still requires donor and receiver configurations to match.
 
 The Qwen3.5 dense vision-language profile carries the vision encoder together
 with the language model and realizes interleaved M-RoPE (`rope_type=mrope`),
@@ -627,7 +629,8 @@ path.
   tied embeddings, or with quantized weights. - DeepSeek-V3 checkpoints fall
   back when they run with MTP or other speculative decoding, context
   parallelism, attention DP, FP8 or other quantized weights, a quantized KV
-  cache, YaRN scaling (the full DeepSeek-V3, R1, and V3.1 checkpoints), TP
+  cache, YaRN scaling (the full DeepSeek-V3, R1, and V3.1 checkpoints), a
+  layer layout other than a dense first layer followed by MoE layers, TP
   greater than 2, or an explicitly requested MoE backend other than CUTLASS.
   Kimi K2, DeepSeek-V3.2, GLM-5, and Mistral Large 3 use the Hugging Face
   fallback. - The MX server and Redis lifecycle is external to TensorRT LLM.
