@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from .fmha.gqa_decode import GqaDecodeFmha, GqaDecodeSetup
-    from .fmha.interface import Fmha
+    from .fmha.interface import Fmha, FmhaPrewarmConfig
     from .sparse.dsa.metadata import TokenMajorGenView
 
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
@@ -2239,12 +2239,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         context MLA FMHA, which reads FP8 Q, K and V."""
         return (self.is_mla_enable and self.has_fp8_kv_cache
                 and _has_fp8_context_mla_fmha(get_sm_version()))
-    def has_fmha_library(self, fmha_cls: type) -> bool:
-        """Whether this layer has the library configured; request support is checked later."""
+
+    def prewarm_fmha(self, config: "FmhaPrewarmConfig",
+                     attempted: set[type["Fmha"]]) -> None:
+        """Prewarm the initialized manager's eligible libraries, once per library."""
         manager = getattr(self, "_fmha_manager", None)
-        if manager is None:
-            return False
-        return any(isinstance(fmha, fmha_cls) for fmha in manager.fmha_libs)
+        if manager is not None:
+            manager.prewarm(config, attempted)
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()

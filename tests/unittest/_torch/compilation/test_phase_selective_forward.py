@@ -272,8 +272,8 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         monkeypatch.setattr(warmup, method, Mock())
     monkeypatch.setattr(
         warmup,
-        "_prewarm_flashinfer_trtllm_gen_fmha",
-        lambda: observed.append(("_prewarm_flashinfer_trtllm_gen_fmha", None)),
+        "_prewarm_fmha_libraries",
+        lambda _: observed.append(("_prewarm_fmha_libraries", None)),
     )
     for method in (
         "_run_attention_warmup",
@@ -302,7 +302,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         warmup._warmup_scheduled(Mock(), SimpleNamespace(context_swa_layer_limit=None))
 
     assert observed == [
-        ("_prewarm_flashinfer_trtllm_gen_fmha", None),
+        ("_prewarm_fmha_libraries", None),
         ("_run_attention_warmup", not enabled),
         ("_general_warmup", True),
         ("_run_autotuner_warmup", not enabled),

@@ -1920,44 +1920,57 @@ def test_decode_only_warmup_requests_generation_shapes_only(decode_only: bool) -
 
 def _fmha_prewarm_owner(modules: list, pp_size: int, tp_size: int = 1) -> SimpleNamespace:
     return SimpleNamespace(
-        model=SimpleNamespace(modules=lambda: iter(modules)),
-        mapping=SimpleNamespace(pp_size=pp_size, tp_size=tp_size),
+        model=torch.nn.ModuleList(modules),
+        mapping=SimpleNamespace(pp_size=pp_size, tp_size=tp_size, has_cp_helix=lambda: False),
         dist=Mock(),
+        _config=SimpleNamespace(dtype=torch.bfloat16),
+        sparse_attention_config=None,
     )
+
+
+def _fmha_prewarm_cache() -> SimpleNamespace:
+    from tensorrt_llm.bindings import DataType
+
+    return SimpleNamespace(dtype=DataType.BF16, tokens_per_block=32)
 
 
 def _attention_layer(
     uses_flashinfer_fmha: bool = True, trtllm_backend: bool = True, other_pp_stage: bool = False
-) -> Mock:
-    from tensorrt_llm._torch.attention.attention import Attention
+) -> torch.nn.Module:
+    from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
+    from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
-    layer = Mock(spec=Attention)
-    layer.attn = Mock(spec=TrtllmAttention) if trtllm_backend else Mock()
-    layer.attn.has_fmha_library.return_value = uses_flashinfer_fmha
+    layer = torch.nn.Linear(2, 2)
+    layer.attn = object.__new__(TrtllmAttention) if trtllm_backend else object()
+    if trtllm_backend:
+        fmha = object.__new__(FlashInferTrtllmGenFmha)
+        fmha.can_prewarm = Mock(return_value=True)
+        layer.attn._fmha_manager = object.__new__(FmhaManager)
+        layer.attn._fmha_manager.fmha_libs = [fmha] if uses_flashinfer_fmha else []
     if other_pp_stage:
-        # remove_weights() marks every module of a layer owned by another pipeline stage.
-        layer._weights_removed = True
+        remove_weights(layer)
     return layer
 
 
 @pytest.mark.cpu_only
-def test_flashinfer_fmha_prewarm_builds_once_under_pipeline_parallelism() -> None:
+@pytest.mark.parametrize("backend_name", ["attn", "mqa", "mha", "custom_backend"])
+def test_fmha_prewarm_builds_once_for_local_backends(backend_name: str) -> None:
     from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
 
     remote_layer = _attention_layer(other_pp_stage=True)
     local_layers = [_attention_layer(), _attention_layer()]
-    owner = _fmha_prewarm_owner([torch.nn.Linear(2, 2), remote_layer, *local_layers], pp_size=4)
+    for layer in local_layers:
+        backend = layer.attn
+        del layer.attn
+        setattr(layer, backend_name, backend)
+    owner = _fmha_prewarm_owner([remote_layer, *local_layers], pp_size=4)
 
-    with (
-        patch.object(FlashInferTrtllmGenFmha, "serves_only_extra_page_sizes", return_value=False),
-        patch.object(FlashInferTrtllmGenFmha, "prewarm") as prewarm,
-    ):
-        DecoderWarmup._prewarm_flashinfer_trtllm_gen_fmha(owner)
+    with patch.object(FlashInferTrtllmGenFmha, "prewarm") as prewarm:
+        DecoderWarmup._prewarm_fmha_libraries(owner, _fmha_prewarm_cache())
 
     prewarm.assert_called_once_with()
-    remote_layer.attn.has_fmha_library.assert_not_called()
-    local_layers[0].attn.has_fmha_library.assert_called_once_with(FlashInferTrtllmGenFmha)
+    remote_layer.attn._fmha_manager.fmha_libs[0].can_prewarm.assert_not_called()
 
 
 @pytest.mark.cpu_only
@@ -1968,10 +1981,10 @@ def test_flashinfer_fmha_prewarm_builds_once_under_pipeline_parallelism() -> Non
         "layers_of_other_pp_stage",
         "no_flashinfer_fmha",
         "other_backend",
-        "extra_page_sizes_only",
+        "no_weights_without_marker",
     ],
 )
-def test_flashinfer_fmha_prewarm_is_noop(case: str) -> None:
+def test_fmha_prewarm_is_noop(case: str) -> None:
     from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
 
     layer = _attention_layer(
@@ -1979,49 +1992,58 @@ def test_flashinfer_fmha_prewarm_is_noop(case: str) -> None:
         trtllm_backend=case != "other_backend",
         other_pp_stage=case == "layers_of_other_pp_stage",
     )
-    pp_size = 1 if case == "no_pipeline_parallelism" else 2
-    owner = _fmha_prewarm_owner([torch.nn.Linear(2, 2), layer], pp_size=pp_size)
+    if case == "no_weights_without_marker":
+        layer._parameters.clear()
+        assert not hasattr(layer, "_weights_removed")
+    owner = _fmha_prewarm_owner([layer], pp_size=1 if case == "no_pipeline_parallelism" else 2)
 
-    with (
-        patch.object(
-            FlashInferTrtllmGenFmha,
-            "serves_only_extra_page_sizes",
-            return_value=case == "extra_page_sizes_only",
-        ),
-        patch.object(FlashInferTrtllmGenFmha, "prewarm") as prewarm,
-    ):
-        DecoderWarmup._prewarm_flashinfer_trtllm_gen_fmha(owner)
+    with patch.object(FlashInferTrtllmGenFmha, "prewarm") as prewarm:
+        DecoderWarmup._prewarm_fmha_libraries(owner, _fmha_prewarm_cache())
 
     prewarm.assert_not_called()
 
 
 @pytest.mark.cpu_only
-def test_trtllm_attention_reports_its_fmha_libraries() -> None:
+@pytest.mark.parametrize("manager_state", ["absent", "none"])
+def test_fmha_prewarm_skips_uninitialized_manager(manager_state: str) -> None:
+    layer = _attention_layer()
+    if manager_state == "absent":
+        del layer.attn._fmha_manager
+    else:
+        layer.attn._fmha_manager = None
+    owner = _fmha_prewarm_owner([layer], pp_size=4, tp_size=2)
+
+    DecoderWarmup._prewarm_fmha_libraries(owner, _fmha_prewarm_cache())
+
+    owner.dist.tp_allgather.assert_called_once_with(1)
+
+
+@pytest.mark.cpu_only
+def test_fmha_prewarm_checks_later_layers_after_ineligible_layer() -> None:
     from tensorrt_llm._torch.attention.backends.fmha import FallbackFmha, FlashInferTrtllmGenFmha
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
-    attn = object.__new__(TrtllmAttention)
-    assert not attn.has_fmha_library(FlashInferTrtllmGenFmha)
-    attn._fmha_manager = None
-    assert not attn.has_fmha_library(FlashInferTrtllmGenFmha)
-    attn._fmha_manager = SimpleNamespace(fmha_libs=[object.__new__(FallbackFmha)])
-    assert not attn.has_fmha_library(FlashInferTrtllmGenFmha)
-
-    attn._fmha_manager.fmha_libs.insert(0, object.__new__(FlashInferTrtllmGenFmha))
-    assert attn.has_fmha_library(FlashInferTrtllmGenFmha)
+    first, second = _attention_layer(), _attention_layer()
+    first.attn._fmha_manager.fmha_libs[0].can_prewarm.return_value = False
+    first.attn._fmha_manager.fmha_libs.insert(0, object.__new__(FallbackFmha))
+    owner = _fmha_prewarm_owner([first, second], pp_size=4)
+    with (
+        patch.object(FlashInferTrtllmGenFmha, "prewarm") as prewarm,
+        patch.object(FallbackFmha, "prewarm") as fallback_prewarm,
+    ):
+        DecoderWarmup._prewarm_fmha_libraries(owner, _fmha_prewarm_cache())
+    prewarm.assert_called_once_with()
+    fallback_prewarm.assert_not_called()
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("eligible", [False, True])
 @pytest.mark.parametrize("build_fails", [False, True])
-def test_flashinfer_fmha_prewarm_meets_tp_peers_after_build(
-    eligible: bool, build_fails: bool
-) -> None:
+def test_fmha_prewarm_meets_tp_peers_after_build(eligible: bool, build_fails: bool) -> None:
     from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
 
-    owner = _fmha_prewarm_owner(
-        [_attention_layer(uses_flashinfer_fmha=eligible)], pp_size=4, tp_size=2
-    )
+    layer = _attention_layer()
+    layer.attn._fmha_manager.fmha_libs[0].can_prewarm.return_value = eligible
+    owner = _fmha_prewarm_owner([layer, _attention_layer(uses_flashinfer_fmha=False)], 4, 2)
     events = []
 
     def build() -> None:
@@ -2031,11 +2053,10 @@ def test_flashinfer_fmha_prewarm_meets_tp_peers_after_build(
 
     owner.dist.tp_allgather.side_effect = lambda _: events.append("barrier")
     with (
-        patch.object(FlashInferTrtllmGenFmha, "serves_only_extra_page_sizes", return_value=False),
         patch.object(FlashInferTrtllmGenFmha, "prewarm", side_effect=build),
         patch.object(decoder_warmup_module.logger, "warning") as warning,
     ):
-        DecoderWarmup._prewarm_flashinfer_trtllm_gen_fmha(owner)
+        DecoderWarmup._prewarm_fmha_libraries(owner, _fmha_prewarm_cache())
 
     assert events == (["build"] if eligible else []) + ["barrier"]
     owner.dist.tp_allgather.assert_called_once_with(1)
@@ -2043,16 +2064,118 @@ def test_flashinfer_fmha_prewarm_meets_tp_peers_after_build(
 
 
 @pytest.mark.cpu_only
-def test_flashinfer_fmha_prewarm_initializes_decode_and_prefill_modules() -> None:
+@pytest.mark.parametrize("fails", [False, True])
+def test_fmha_prewarm_uses_generic_library_hook_once(fails: bool) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
+
+    class OtherFmha(FlashInferTrtllmGenFmha):
+        pass
+
+    layers = [_attention_layer(), _attention_layer()]
+    for layer in layers:
+        other = object.__new__(OtherFmha)
+        other.can_prewarm = Mock(return_value=True)
+        layer.attn._fmha_manager.fmha_libs.append(other)
+    owner = _fmha_prewarm_owner(layers, pp_size=4)
+    with (
+        patch.object(
+            FlashInferTrtllmGenFmha, "prewarm", side_effect=RuntimeError() if fails else None
+        ) as first,
+        patch.object(OtherFmha, "prewarm") as second,
+        patch.object(decoder_warmup_module.logger, "warning"),
+    ):
+        DecoderWarmup._prewarm_fmha_libraries(owner, _fmha_prewarm_cache())
+    first.assert_called_once_with()
+    second.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "case, expected",
+    [
+        ("dense", True),
+        ("head72", False),
+        ("head80", False),
+        ("head96", False),
+        ("dtype_mismatch", False),
+        ("unsupported_input", False),
+        ("page128", False),
+        ("extra_page128", True),
+        ("sparse", False),
+        ("alibi", False),
+        ("helix", False),
+        ("extra_page_sizes_only", False),
+        ("mla_page16", True),
+        ("mla_page32", False),
+        ("mla_page64", True),
+        ("mla_context_only", False),
+        ("fp8_cache", True),
+    ],
+)
+def test_flashinfer_fmha_static_prewarm_eligibility(case: str, expected: bool) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
+    from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPrewarmConfig
+    from tensorrt_llm.bindings import DataType
+
+    attn = SimpleNamespace(
+        head_dim=int(case[4:]) if case.startswith("head") else 128,
+        sparse_params=object() if case == "sparse" else None,
+        position_embedding_type=4 if case == "alibi" else 0,
+        is_mla_enable=case.startswith("mla"),
+        num_heads=128,
+        num_kv_heads=8,
+        get_quantize_output_dtype=lambda _: None,
+    )
+    if attn.is_mla_enable:
+        attn.head_dim = 576
+        attn.kv_lora_rank = 512
+        attn.qk_rope_head_dim = 64
+    kv_dtype = {
+        "dtype_mismatch": DataType.HALF,
+        "fp8_cache": DataType.FP8,
+    }.get(case, DataType.BF16)
+    page_size = 32
+    if case.startswith("mla_page"):
+        page_size = int(case[8:])
+    elif "page128" in case:
+        page_size = 128
+    elif case == "mla_context_only":
+        page_size = 16
+    config = FmhaPrewarmConfig(
+        dtype=torch.float32 if case == "unsupported_input" else torch.bfloat16,
+        kv_cache_dtype=kv_dtype,
+        tokens_per_block=page_size,
+        extra_tokens_per_block=frozenset({128}) if case == "extra_page128" else frozenset(),
+        generation=case != "mla_context_only",
+        helix=case == "helix",
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    with (
+        patch.object(
+            FlashInferTrtllmGenFmha, "attn", new_callable=mock.PropertyMock, return_value=attn
+        ),
+        patch.object(
+            FlashInferTrtllmGenFmha,
+            "serves_only_extra_page_sizes",
+            return_value=case == "extra_page_sizes_only",
+        ),
+    ):
+        assert fmha.can_prewarm(config) is expected
+
+
+@pytest.mark.cpu_only
+def test_flashinfer_fmha_prewarm_builds_shared_decode_prefill_mla_module_once() -> None:
     from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen
 
-    decode, prefill = Mock(), Mock()
+    decode, prefill, mla = Mock(), Mock(), Mock()
     flashinfer = SimpleNamespace(
         decode=SimpleNamespace(get_trtllm_gen_fmha_module=decode),
         prefill=SimpleNamespace(get_trtllm_gen_fmha_module=prefill),
+        mla=SimpleNamespace(_core=SimpleNamespace(get_trtllm_gen_fmha_module=mla)),
     )
     with patch.object(flashinfer_trtllm_gen, "flashinfer", flashinfer, create=True):
         flashinfer_trtllm_gen.FlashInferTrtllmGenFmha.prewarm()
 
     decode.assert_called_once_with()
-    prefill.assert_called_once_with()
+    prefill.assert_not_called()
+    mla.assert_not_called()

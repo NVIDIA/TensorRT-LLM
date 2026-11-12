@@ -450,8 +450,8 @@ class DecoderWarmup:
         )
 
         log_mem_snapshot("warmup/before_warmup")
-        with self._warmup_timer.phase("flashinfer_fmha_prewarm"):
-            self._prewarm_flashinfer_trtllm_gen_fmha()
+        with self._warmup_timer.phase("fmha_module_prewarm"):
+            self._prewarm_fmha_libraries(kv_cache_manager)
         # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
         # collective-bearing forward, so their JIT cost is not charged against the
         # MoE all-to-all completion-flag deadline.
@@ -728,8 +728,8 @@ class DecoderWarmup:
                 )
         torch.cuda.synchronize()
 
-    def _prewarm_flashinfer_trtllm_gen_fmha(self) -> None:
-        """Build flashinfer's TRTLLM-Gen FMHA module before the first warmup forward.
+    def _prewarm_fmha_libraries(self, kv_cache_manager: KVCacheManager | KVCacheManagerV2) -> None:
+        """Build eligible FMHA modules before the first warmup forward.
 
         flashinfer builds the module on first use, and MPI workers keep a
         flashinfer workspace per process by default, so every rank builds its
@@ -737,35 +737,35 @@ class DecoderWarmup:
         the ranks one after another, so builds left to that forward run in turn
         and startup grows with the pipeline depth. Building here lets the ranks
         build at the same time. Without pipeline parallelism there is nothing
-        to overlap, and where the library serves only extra KV cache page sizes
-        most layers never use it, so there the module stays built on first use.
+        to overlap. Library-specific hooks decide static layer eligibility.
         """
         if self.mapping.pp_size == 1:
             return
-        from tensorrt_llm._torch.attention.attention import Attention
-        from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
+        from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPrewarmConfig
 
-        if FlashInferTrtllmGenFmha.serves_only_extra_page_sizes():
-            return
+        config = FmhaPrewarmConfig(
+            dtype=self._config.dtype,
+            kv_cache_dtype=kv_cache_manager.dtype,
+            tokens_per_block=kv_cache_manager.tokens_per_block,
+            extra_tokens_per_block=frozenset(
+                getattr(kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ())
+            ),
+            context=not self.mapping.has_cp_helix()
+            and not is_decode_only(self.sparse_attention_config),
+            generation=not is_context_only_kv_cache(kv_cache_manager),
+            helix=self.mapping.has_cp_helix(),
+        )
+        attempted: set[type[Fmha]] = set()
         for module in self.model.modules():
-            # Layers of other pipeline stages keep their modules but not their
-            # weights; they never run on this rank.
-            if (
-                isinstance(module, Attention)
-                and not getattr(module, "_weights_removed", False)
-                and isinstance(module.attn, TrtllmAttention)
-                and module.attn.has_fmha_library(FlashInferTrtllmGenFmha)
-            ):
-                try:
-                    FlashInferTrtllmGenFmha.prewarm()
-                except Exception as e:
-                    # This optional build may cover kernels the layer never selects.
-                    # Defer failures to the first forward that actually needs them.
-                    logger.warning(
-                        "FlashInfer TRTLLM-Gen FMHA prewarm failed; retrying lazily on first use. "
-                        f"{type(e).__name__}: {e}"
-                    )
-                break
+            # Locality follows retained projection weights, including models
+            # that do not set _weights_removed. Attention backends are plain
+            # attributes, so inspect them without assuming a wrapper or name
+            # (Attention.attn, MLA.mqa/mha, cross or custom attention).
+            if not any(True for _ in module.parameters()):
+                continue
+            for backend in vars(module).values():
+                if isinstance(backend, TrtllmAttention):
+                    backend.prewarm_fmha(config, attempted)
 
         # Eligibility and build success may differ across TP peers. Every peer
         # meets here before a forward can start a collective's timeout clock.
