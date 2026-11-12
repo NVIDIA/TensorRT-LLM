@@ -595,6 +595,22 @@
           "title": "Algorithm",
           "type": "string"
         },
+        "mixed_precision_first_n": {
+          "default": 0,
+          "description": "Number of leading tokens per sequence kept unquantized in the cold tiers, in whole cache pages. Applies to full-attention layers; sliding-window layers are stored as ordinary cold pages.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision First N",
+          "type": "integer"
+        },
+        "mixed_precision_last_n": {
+          "default": 0,
+          "description": "Number of most recent tokens per sequence kept unquantized in the cold tiers, in whole cache pages. Applies to full-attention layers; sliding-window layers are stored as ordinary cold pages. Rejected when a sliding-window layer keeps the same tokens (its window is this value plus one, with the same sink pages): the high layers would share that layer's page group, which the cold-page codec cannot split.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision Last N",
+          "type": "integer"
+        },
         "nvfp4_residual_dim": {
           "default": 64,
           "description": "64 (default): use two independently scaled FP4 components for the 64 DeepSeek-V4 target cold-page RoPE values: a main component and its residual. 0: use a single NVFP4 component. Only 0 and 64 are supported. Ignored for other models, draft caches, and when skip_rope_quantization preserves the original RoPE precision.",

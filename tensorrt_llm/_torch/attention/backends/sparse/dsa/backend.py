@@ -23,7 +23,10 @@ from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...fmha.prims_ts_dsa_sparse_mla import prims_ts_reads_nvfp4_mla_records
-from ..mixed_precision_high_rows import overlay_mixed_precision_high_rows
+from ..mixed_precision_high_rows import (
+    mixed_precision_high_row_indices,
+    overlay_mixed_precision_high_rows,
+)
 from ..offload_kernels import gather_sparse_batch_rows, merge_sparse_arena_indices
 from .cache_manager import NVFP4_MLA_RECORD_LAYOUT, get_nvfp4_mla_kv_cache_layout
 from .indexer import (
@@ -262,6 +265,23 @@ class DSATrtllmAttention(TrtllmAttention):
 
         topk_indices_global = self._remap_topk_to_global(topk_indices, metadata, is_generation)
 
+        manager = metadata.kv_cache_manager
+        if metadata.has_mixed_precision_high_rows and (
+            manager.mixed_precision_low_dtype == manager.mixed_precision_high_dtype
+        ):
+            # Cold-page window: a selected token the high layer holds is read from its row.
+            requests = (
+                metadata.req_idx_per_token[metadata.num_ctx_tokens : metadata.num_tokens]
+                if is_generation
+                else metadata._cached_req_idx_ctx
+            )
+            return (
+                mixed_precision_high_row_indices(
+                    metadata, self, topk_indices, topk_indices_global, requests
+                ),
+                None,
+            )
+
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4:
             if prims_ts_reads_nvfp4_mla_records(metadata, self):
                 # PrimTS dequantizes the selected records itself; it takes the global rows.
@@ -305,6 +325,10 @@ class DSATrtllmAttention(TrtllmAttention):
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
             return compact_indices, None
 
+        if metadata.has_mixed_precision_high_rows:
+            raise NotImplementedError(
+                f"No DSA read path for mixed-precision high rows with a {kv_cache_dtype} pool"
+            )
         return topk_indices_global, None
 
     def _sparse_offload_arena_indices(
