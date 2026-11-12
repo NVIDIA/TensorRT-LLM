@@ -30,7 +30,8 @@ The agent prepares the spec and launches the workflow; missing inputs must be re
 
 **The agent writes the spec by following [spec/INTAKE.md](spec/INTAKE.md)**: `trtllm-modeling-v2 intake
 derive` writes a starting spec (no `site.yaml` needed), and `trtllm-modeling-v2 intake lint` checks
-it for slow or stalling choices (eager gates, a batch below the claimed concurrency, a member too
+it for slow or stalling choices (eager gates, a batch below the claimed concurrency, a perf
+config whose CUDA graphs stop below the live requests a rank holds, a member too
 narrow for one engine, disaggregation wider than a session, variant cross products, variants that
 boot at every member, a feature proven
 at several members or again under another axis, unusable accuracy anchors, open-ended boot probes) and blocks an accuracy check that runs without CUDA graphs and
@@ -91,7 +92,11 @@ a container runtime, a shell). The run needs:
   directory, checkout and checkpoints at the same paths as every session.
 
 `trtllm-modeling-v2 monitor status` shows each session, and raises `SESSION_ENDING` while one is in
-hand-over with no newer session on its spool.
+hand-over with no newer session on its spool. A gate, substrate or regression job the run has
+waited on for 15 minutes writes a `waiting` event: the job, its spool, queued or running and since
+when, why the session holds it when its `status.json` says, and for a queued job what runs on its
+spool meanwhile; then at most one every 15 minutes while the wait lasts. The tune campaign's jobs
+say the same in its `tune` events.
 
 **While it runs**, you or the launching agent keep the sessions alive and leave the work to the run. Never cancel
 a job the run submitted (a gate, a worker's test) or run a replacement check beside it: a cancelled
@@ -111,7 +116,8 @@ must change before that.
    target. Commits are audited and integrated; shared-code changes require regression coverage.
    A regression check runs only when no contract check runs or waits, and only on the test files
    the change can reach (those it changed, those importing a module it changed, the claims
-   gates; every file when it touches code the whole package shares). A kernel task on a shared
+   gates; every file when it touches code the whole package shares). A test that already fails
+   at the check's base cannot regress, so the head does not run it. A kernel task on a shared
    catalog entry lands a local variant in the target's own `ops/`, and the target is delivered
    with it: the run never changes a shared entry, so other models are not disturbed mid-run.
 3. **Prove and deliver:** checks measure fixed-commit snapshots against framework-owned references.
@@ -127,9 +133,12 @@ must change before that.
    (`trtllm-modeling-v2 tune`): one baseline, parallel candidates kept one at a time, a checkpoint
    every few keeps that rolls them back on a loss, and the accuracy benchmark once on the final
    tree. Results stay on a separate best branch with `tune/summary.md`; nothing merges into
-   delivery, and the outcome is `state.tune["verdict"]`. A campaign deferred before delivery
-   resumes on the next ordinary invocation. Config or judgment-policy changes isolate stale
-   evidence; validated source changes invalidate profile shares and revalidate the kept stack.
+   delivery, and the outcome is `state.tune["verdict"]`. A deferral waiting can fix (a job to
+   finish, a session to come back) is waited out in process; a campaign still deferred before
+   delivery resumes on the next ordinary invocation. Config or judgment-policy changes isolate
+   stale evidence (a changed perf config's baseline alone is measured again, and the roadmap
+   stays without its step shares); validated source changes invalidate profile shares and
+   revalidate the kept stack.
    Micro checks require comparable finite outputs, with exact discrete results. Final performance
    validation uses a same-host control; cross-host summary deltas are descriptive.
    `tune/stage.py` and `tune/campaign.py` describe the policy.

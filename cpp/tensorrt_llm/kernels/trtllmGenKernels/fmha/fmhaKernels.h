@@ -294,6 +294,12 @@ public:
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
     {
+        bool const hasVariableWindowStarts = params.variableWindowTokenStartsPtr != nullptr;
+        bool const hasVariableWindowEnds = params.variableWindowTokenEndsPtr != nullptr;
+        if (hasVariableWindowStarts != hasVariableWindowEnds)
+        {
+            return std::make_pair(false, "VariableWindow requires both start and end bound arrays");
+        }
         // Some conditions to check if the kernel is supported.
         // This is meant to avoid occupying unnecessary hashId bits.
         if (params.mHeadDimQk % 8 != 0 || params.mHeadDimV % 8 != 0)
@@ -612,6 +618,13 @@ public:
             return;
         }
 
+        bool const hasVariableWindowStarts = params.variableWindowTokenStartsPtr != nullptr;
+        bool const hasVariableWindowEnds = params.variableWindowTokenEndsPtr != nullptr;
+        TLLM_CHECK_WITH_INFO(hasVariableWindowStarts == hasVariableWindowEnds,
+            "VariableWindow requires both start and end bound arrays.");
+        TLLM_CHECK_WITH_INFO(isVariableWindowMask(params.mMaskType) == hasVariableWindowStarts,
+            "VariableWindow mask type and bound arrays must be provided together.");
+
         // Keep the additional fail-fast validation Rubin-only so other architectures retain their existing behavior.
         // The output and scale-buffer shape are already validated by the Python caller; the inverse-RoPE cache has no
         // equivalent guard before reaching this ABI boundary.
@@ -880,14 +893,15 @@ private:
         {
             return;
         }
+        // The split cap is only set by the static-scheduler pre-clamp above; the autotuner reads
+        // but never sets it. The caller that reaches this clamp with an INT_MAX cap is the
+        // sparse-context FMHA branch of FmhaDispatcher::run(), which enables multiCtasKv so the
+        // autotuner can promote to CgaSmemReduction; it uses the persistent scheduler, so the
+        // Static-only pre-clamp does not apply. Clamp silently: the cap is simply unset here, not
+        // an explicitly configured value, so there is nothing actionable to report. Taking the min
+        // with the divided limit also avoids the signed overflow of clusterDimX * INT_MAX.
         constexpr int kMaxCgaClusterDimX = 16;
-        if (options.mClusterDimX * options.mMaxNumCtasPerSeqKv > kMaxCgaClusterDimX)
-        {
-            TLLM_LOG_WARNING(
-                "CGA reduction is not supported when numCtasPerSeqKv * clusterDimX > 16. Set mMaxNumCtasPerSeqKv to "
-                "16 / clusterDimX");
-            options.mMaxNumCtasPerSeqKv = kMaxCgaClusterDimX / options.mClusterDimX;
-        }
+        options.mMaxNumCtasPerSeqKv = std::min(options.mMaxNumCtasPerSeqKv, kMaxCgaClusterDimX / options.mClusterDimX);
     }
 
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
@@ -1338,6 +1352,10 @@ private:
         // Softmax optimization
         options.mSkipSoftmaxThresholdScaleFactor = params.mSkipSoftmaxThresholdScaleFactor;
         options.mSkipsSoftmaxWhenPossible = params.mSkipSoftmaxThresholdScaleFactor != 0.0f;
+#ifdef TLLM_RUBIN_FEATURES
+        // hashFromFmhaOptions reads this field to pick the fp16-softmax Sm107a cubins.
+        options.mEnablesFp16Softmax = params.mFp16Softmax;
+#endif // TLLM_RUBIN_FEATURES
 
         // Paged KV cache
         options.mMaxNumPagesPerSeqKv = params.mMaxNumPagesPerSeqKv;

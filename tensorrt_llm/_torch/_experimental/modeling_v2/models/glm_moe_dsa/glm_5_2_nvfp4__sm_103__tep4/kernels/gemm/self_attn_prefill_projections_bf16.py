@@ -73,7 +73,9 @@ class PrefillProjectionAbi:
 
     Operands are BF16; the output is ``out_dtype`` (BF16 for the attention
     projections, FP32 for the indexer's fused wk + weights projection whose
-    consumers read FP32 ``weights`` and cast ``indexer_k`` themselves).
+    consumers read FP32 ``weights`` and cast ``indexer_k`` themselves, E4M3 for the
+    FP8 context-MHA operands -- the FP32 accumulator converted RN satfinite; any
+    dequantization scale is folded into the caller's weight).
     """
 
     name: str
@@ -83,6 +85,13 @@ class PrefillProjectionAbi:
     # Row-range schedule table ``((max_rows, schedule), ...)`` ascending; ``None`` = the attention
     # projections' default (``SCHEDULE_SMALL`` to ``SCHEDULE_SPLIT_ROWS``, ``SCHEDULE_LARGE`` above).
     schedules: tuple[tuple[int, "GemmSchedule"], ...] | None = None
+    # Per-T tile choice above ``SCHEDULE_SPLIT_ROWS`` (``tile_choice_index``); ``None`` keeps the table's
+    # schedule for every T. The table must then be ``((SCHEDULE_SPLIT_ROWS, ...), (MAX_ROWS, ...))``.
+    tile_choice: tuple["TileChoice", ...] | None = None
+    # Accept an input whose rows are strided (stride(1) == 1, row stride a multiple of 8
+    # elements, 16-byte aligned base): the compiled ``bmm`` has dynamic layouts, so the row
+    # stride reaches the TMA descriptor as is. Direct-orientation schedules only.
+    row_strided_input: bool = False
 
     @property
     def kernel_name_prefix(self) -> str:
@@ -100,6 +109,80 @@ MAX_ROWS = 8_192
 SCHEDULE_SMALL = GemmSchedule(True, (256, 176), (2, 1), orientation="direct")
 SCHEDULE_LARGE = GemmSchedule(True, (256, 256), (2, 1), orientation="direct")
 SCHEDULE_SPLIT_ROWS = 2_048
+# kv_a / o_proj above 2048 rows: same tile, tiles walked along N. Raster-M streams the [T, K] activation
+# once per N column (ncu, kv_a T=7895: 520 MB DRAM read vs ~130 MB of operands, L2 hit 56 %); raster-N
+# keeps one row band's activation in L2 across its N tiles. 1-GPU sweep (L2 flushed), bitwise identical:
+# kv_a 172.0 -> 159.7 us, o_proj 254.8 -> 245.8 us at T=7895.
+SCHEDULE_LARGE_RASTER_N = GemmSchedule(
+    True, (256, 256), (2, 1), orientation="direct", raster_along="n"
+)
+RASTER_N_SCHEDULES = (
+    (SCHEDULE_SPLIT_ROWS, SCHEDULE_SMALL),
+    (MAX_ROWS, SCHEDULE_LARGE_RASTER_N),
+)
+
+
+# Per-T tile choice for kv_a / o_proj above SCHEDULE_SPLIT_ROWS. The persistent GEMM gives each cluster one
+# 256 x tile_n tile per wave, so a call runs ceil(ceil(T / 256) * ceil(N / tile_n) / clusters) waves, and the
+# time of a wave is close to proportional to tile_n (B300 sweep: o_proj ~0.090 us per tile column, kv_a
+# ~0.133). With a single 256-column tile the step's T alone decides how empty the last wave is: kv_a at
+# T = 7206 is 29 x 11 = 319 tiles = 5 waves of 74 clusters, the 176-column tile makes it 29 x 15 = 435 tiles =
+# 6 shorter waves (-12 %). Every candidate keeps the 2-CTA M = 256 MMA, cluster (2, 1), direct orientation
+# and K-block order of the served schedule, so the output is bitwise identical whichever is chosen (all
+# candidates == served == cuBLAS at T 7000..8192); only the wave count changes. ``wave_us`` is the measured
+# median time per wave (B300, L2 flushed, interleaved rounds); only the ratios matter. Under the 1.1 kW power
+# cap the measured gain shrinks but keeps its sign (kv_a -7.7 / -3.6 / -1.3 %, o_proj -0.9 / -1.3 / -1.8 % at
+# T = 7206 / 7874 / 8090). q_b has no entry: its candidates lost 5-6 % under the cap at T >= 7874.
+@dataclass(frozen=True)
+class TileChoice:
+    """One candidate of a per-T tile choice: a raster-N 2-CTA schedule and its measured time per wave."""
+
+    tile_n: int
+    wave_us: float
+
+    @property
+    def schedule(self) -> GemmSchedule:
+        return GemmSchedule(
+            True, (256, self.tile_n), (2, 1), orientation="direct", raster_along="n"
+        )
+
+
+KV_A_TILE_CHOICE = (
+    TileChoice(256, 33.34),
+    TileChoice(224, 29.90),
+    TileChoice(208, 27.65),
+    TileChoice(192, 25.94),
+    TileChoice(176, 23.71),
+)
+O_PROJ_TILE_CHOICE = (
+    TileChoice(256, 23.08),
+    TileChoice(224, 20.15),
+    TileChoice(208, 18.77),
+    TileChoice(192, 17.87),
+)
+
+
+def tile_choice_index(
+    rows: int,
+    out_features: int,
+    tile_ns: tuple[int, ...],
+    wave_us: tuple[float, ...],
+    clusters: int,
+) -> int:
+    """Index of the candidate with the fewest predicted microseconds for ``rows`` tokens.
+
+    Predicted time = waves x time per wave, waves = ceil(tiles / clusters) with one 256-row x ``tile_n``
+    tile per cluster per wave. Ties keep the earlier (wider, served) candidate. Pure integer / float
+    arithmetic, so a test can execute it without a GPU.
+    """
+    best, best_us = 0, None
+    row_tiles = -(-rows // 256)
+    for index, (tile_n, us) in enumerate(zip(tile_ns, wave_us, strict=True)):
+        tiles = row_tiles * -(-out_features // tile_n)
+        predicted = -(-tiles // clusters) * us
+        if best_us is None or predicted < best_us:
+            best, best_us = index, predicted
+    return best
 
 
 # Indexer-chain schedules (measured for T from 256 to 7500): N=160 is best served by a
@@ -115,9 +198,21 @@ INDEXER_WK_WEIGHTS_SCHEDULES = (
 
 
 ABIS: dict[str, PrefillProjectionAbi] = {
-    "kv_a_proj_with_mqa": PrefillProjectionAbi("kv_a_proj_with_mqa", 2_624, 6_144),
+    "kv_a_proj_with_mqa": PrefillProjectionAbi(
+        "kv_a_proj_with_mqa",
+        2_624,
+        6_144,
+        schedules=RASTER_N_SCHEDULES,
+        tile_choice=KV_A_TILE_CHOICE,
+    ),
     "q_b_proj": PrefillProjectionAbi("q_b_proj", 4_096, 2_048),
-    "o_proj": PrefillProjectionAbi("o_proj", 6_144, 4_096),
+    "o_proj": PrefillProjectionAbi(
+        "o_proj",
+        6_144,
+        4_096,
+        schedules=RASTER_N_SCHEDULES,
+        tile_choice=O_PROJ_TILE_CHOICE,
+    ),
     # Indexer Q side on context / mixed steps : same TP4 shape as q_b_proj,
     # its own owner symbol so a context-step census can tell the two apart.
     "indexer_wq_b": PrefillProjectionAbi(
@@ -152,6 +247,43 @@ ABIS: dict[str, PrefillProjectionAbi] = {
     "shared_gate_up": PrefillProjectionAbi("shared_gate_up", 1_024, 6_144),
     "shared_down": PrefillProjectionAbi("shared_down", 6_144, 512),
     "router": PrefillProjectionAbi("router", 256, 6_144, out_dtype=torch.float32),
+    # The non-absorbed context attention's K/V expansion: the latent row
+    # [c_kv 512 | rope(k_pe) 64] (a [T, 576] view of the kv_a output, row stride 2624) times
+    # one half of the augmented kv_b weight [8192, 576]: K per head = [W_UK_h | 0 ; 0 | I_64]
+    # (nope 192 + k_pe copied exactly by the identity block), V per head = [W_UV_h | 0].
+    # Outputs are contiguous [T, 16 * 256] -- the MHA's K and V operands.
+    "kv_b_expand_k": PrefillProjectionAbi("kv_b_expand_k", 4_096, 576, row_strided_input=True),
+    "kv_b_expand_v": PrefillProjectionAbi("kv_b_expand_v", 4_096, 576, row_strided_input=True),
+    # The V half without its zero rope block: the latent row's c_kv part ([T, 512] view, row
+    # stride 2624) times W_UV [16 * 256, 512]. The augmented V rows' last 64 columns are zero and
+    # form the last k-block of the K = 576 GEMM, so dropping them only removes "+ 0" terms:
+    # the output bytes equal ``kv_b_expand_v``'s, with 1/9 fewer MMAs and B bytes.
+    "kv_b_expand_v512": PrefillProjectionAbi(
+        "kv_b_expand_v512", 4_096, 512, row_strided_input=True
+    ),
+    # FP8 context MHA operands (BF16 MMA, FP32 accumulation, E4M3 output): K and V from the same
+    # expansion GEMMs and the context rows' Q from the q_b GEMM. The caller folds power-of-two
+    # scales into route-only weight copies (per head for K / V, per tensor for Q): a power-of-two
+    # factor on a BF16 weight is exact, and the shared GEMM epilogue converts the FP32
+    # accumulator to the output type before any elementwise epilogue_op could scale it. The
+    # E4M3 conversion saturates (cvt.rn.satfinite): an out-of-range value clamps to +-448.
+    "kv_b_expand_k_e4m3": PrefillProjectionAbi(
+        "kv_b_expand_k_e4m3",
+        4_096,
+        576,
+        out_dtype=torch.float8_e4m3fn,
+        row_strided_input=True,
+    ),
+    "kv_b_expand_v512_e4m3": PrefillProjectionAbi(
+        "kv_b_expand_v512_e4m3",
+        4_096,
+        512,
+        out_dtype=torch.float8_e4m3fn,
+        row_strided_input=True,
+    ),
+    "q_b_proj_e4m3": PrefillProjectionAbi(
+        "q_b_proj_e4m3", 4_096, 2_048, out_dtype=torch.float8_e4m3fn
+    ),
 }
 
 
@@ -249,6 +381,9 @@ def compile_persistent_gemm_tvm_ffi(
         schedule.swizzle_size,
         schedule.raster_along,
     )
+    # The E4M3 entries (FP8 context-MHA operands) are defined as the FP32 accumulator rounded
+    # once, RN satfinite (module doc), not the FP8 q-base double round.
+    gemm.glm_fp8_single_round = output.dtype == torch.float8_e4m3fn
     if not gemm.can_implement(mnkl, a.element_type, b.element_type, c.element_type, *majors):
         raise testing.CantImplementError(
             f"persistent GLM projection cannot implement mnkl={mnkl}, majors={majors}, schedule={schedule}"
@@ -297,13 +432,16 @@ def compiled_instance_key(
 
 
 class PrefillProjection:
-    """One owner projection with two runtime-M compiled instances.
+    """One owner projection with one runtime-M compiled instance per schedule.
 
     ``__call__(input, weight, output)`` is the registry launcher ABI; ``forward``
     allocates the output.  The weight passed at call time must be the tensor the
     adapter was built from (same shape/dtype; pointer may differ -- the weight
     operand view is re-derived and cached per data pointer).  Compiled instances
     are shared process-wide per ``compiled_instance_key`` (see ``_COMPILED_INSTANCES``).
+    With ``abi.tile_choice`` every candidate is compiled here, at construction, and a
+    call above ``SCHEDULE_SPLIT_ROWS`` takes the candidate ``tile_choice_index`` picks
+    for its row count (a precomputed table: one list lookup per call).
     """
 
     def __init__(
@@ -329,37 +467,92 @@ class PrefillProjection:
         # the two launchers are compiled on the weight's device; calls on another device are refused
         self._device = weight.device
         self._table = abi.schedule_table()
-        global COMPILE_COUNT
         for split_rows, schedule in self._table:
-            key = compiled_instance_key(abi, split_rows, schedule, launch_mode, weight.device)
-            shared = _COMPILED_INSTANCES.get(key)
-            if shared is not None:
-                self._compiled[split_rows], self._orientation[split_rows] = shared
-                continue
-            COMPILE_COUNT += 1
-            compile_input = weight.new_empty((split_rows, abi.in_features))
-            compile_output = weight.new_empty((split_rows, abi.out_features), dtype=abi.out_dtype)
-            if launch_mode == "tvm_ffi":
-                compiled = compile_persistent_gemm_tvm_ffi(
-                    compile_input,
-                    weight,
-                    compile_output,
-                    schedule,
-                    kernel_name_prefix=abi.kernel_name_prefix,
+            self._compiled[split_rows], self._orientation[split_rows] = self._compile_instance(
+                split_rows, schedule, weight
+            )
+        # Per-T tile choice: (compiled, orientation) per candidate, the candidate index for
+        # every row count in (SCHEDULE_SPLIT_ROWS, MAX_ROWS], and launches per candidate.
+        self._choice_launch: list[tuple[object, str]] | None = None
+        self._choice_pick: list[int] | None = None
+        self.choice_hits: list[int] = []
+        if abi.tile_choice:
+            bounds = tuple(bound for bound, _ in self._table)
+            if bounds != (SCHEDULE_SPLIT_ROWS, MAX_ROWS):
+                raise ValueError(
+                    f"{abi.name}: tile_choice needs the table bounds "
+                    f"({SCHEDULE_SPLIT_ROWS}, {MAX_ROWS}), got {bounds}"
                 )
-            else:
-                # keep only the dynamic-layout compiled bmm; the helper's exact-shape
-                # guard is replaced by the runtime-M guard below
-                compiled = compile_persistent_gemm(
-                    compile_input,
-                    weight,
-                    compile_output,
-                    schedule,
-                    kernel_name_prefix=abi.kernel_name_prefix,
-                ).compiled_bmm
-            self._compiled[split_rows] = compiled
-            self._orientation[split_rows] = schedule.orientation
-            _COMPILED_INSTANCES[key] = (compiled, schedule.orientation)
+            self._choice_launch = [
+                self._compile_instance(MAX_ROWS, choice.schedule, weight)
+                for choice in abi.tile_choice
+            ]
+            # One tile per cluster per wave: every candidate is cluster (2, 1).
+            clusters = _DENSE_GEMM.utils.HardwareInfo().get_max_active_clusters(2)
+            tile_ns = tuple(choice.tile_n for choice in abi.tile_choice)
+            wave_us = tuple(choice.wave_us for choice in abi.tile_choice)
+            self._choice_pick = [
+                tile_choice_index(rows, abi.out_features, tile_ns, wave_us, clusters)
+                for rows in range(SCHEDULE_SPLIT_ROWS + 1, MAX_ROWS + 1)
+            ]
+            self.choice_hits = [0] * len(abi.tile_choice)
+
+    def _compile_instance(
+        self, split_rows: int, schedule: "GemmSchedule", weight: torch.Tensor
+    ) -> tuple[object, str]:
+        """The compiled runtime-M instance of ``schedule``, shared process-wide per key."""
+        global COMPILE_COUNT
+        abi = self.abi
+        key = compiled_instance_key(abi, split_rows, schedule, self.launch_mode, weight.device)
+        shared = _COMPILED_INSTANCES.get(key)
+        if shared is not None:
+            return shared
+        COMPILE_COUNT += 1
+        compile_input = weight.new_empty((split_rows, abi.in_features))
+        compile_output = weight.new_empty((split_rows, abi.out_features), dtype=abi.out_dtype)
+        if self.launch_mode == "tvm_ffi":
+            compiled = compile_persistent_gemm_tvm_ffi(
+                compile_input,
+                weight,
+                compile_output,
+                schedule,
+                kernel_name_prefix=abi.kernel_name_prefix,
+            )
+        else:
+            # keep only the dynamic-layout compiled bmm; the helper's exact-shape
+            # guard is replaced by the runtime-M guard below
+            compiled = compile_persistent_gemm(
+                compile_input,
+                weight,
+                compile_output,
+                schedule,
+                kernel_name_prefix=abi.kernel_name_prefix,
+            ).compiled_bmm
+        _COMPILED_INSTANCES[key] = (compiled, schedule.orientation)
+        return compiled, schedule.orientation
+
+    def warm_rows(self, floor: int = 65) -> tuple[int, ...]:
+        """One row count (>= ``floor``) per compiled instance this launcher dispatches to.
+
+        A first launch of each compiled kernel loads its module (blocking the host), so
+        a warm-up must launch every instance, not only every table group: launching
+        these row counts through ``__call__`` reaches each table group and each tile
+        choice candidate once.
+        """
+        rows: list[int] = []
+        lo = floor
+        for bound, _ in self._table:
+            if self._choice_pick is not None and lo > SCHEDULE_SPLIT_ROWS:
+                break
+            if lo <= bound:
+                rows.append(lo)
+            lo = bound + 1
+        if self._choice_pick is not None:
+            first: dict[int, int] = {}
+            for offset, index in enumerate(self._choice_pick):
+                first.setdefault(index, SCHEDULE_SPLIT_ROWS + 1 + offset)
+            rows.extend(r for r in first.values() if r >= floor)
+        return tuple(sorted(set(rows)))
 
     def _weight_view(self, weight: torch.Tensor, orientation: str) -> torch.Tensor:
         """Cached detached weight operand view (TRT-LLM weights carry requires_grad)."""
@@ -388,10 +581,17 @@ class PrefillProjection:
         rows = shape[0]
         if not 1 <= rows <= MAX_ROWS:
             raise ValueError(f"{self.abi.name}: 1 <= T <= {MAX_ROWS} required, got {rows}")
+        input_ok = input_tensor.is_contiguous() or (
+            self.abi.row_strided_input
+            and input_tensor.stride(1) == 1
+            and input_tensor.stride(0) % 8 == 0
+            and input_tensor.data_ptr() % 16 == 0
+            and all(o == "direct" for o in self._orientation.values())
+        )
         if (
             input_tensor.dtype != torch.bfloat16
             or output.dtype != self.abi.out_dtype
-            or not input_tensor.is_contiguous()
+            or not input_ok
             or not output.is_contiguous()
         ):
             raise ValueError(
@@ -412,9 +612,14 @@ class PrefillProjection:
             raise ValueError(
                 f"{self.abi.name}: launchers compiled for {self._device}, called on {dev}"
             )
-        key = next(bound for bound, _ in self._table if rows <= bound)
-        compiled = self._compiled[key]
-        orientation = self._orientation[key]
+        if self._choice_pick is not None and rows > SCHEDULE_SPLIT_ROWS:
+            index = self._choice_pick[rows - SCHEDULE_SPLIT_ROWS - 1]
+            self.choice_hits[index] += 1
+            compiled, orientation = self._choice_launch[index]
+        else:
+            key = next(bound for bound, _ in self._table if rows <= bound)
+            compiled = self._compiled[key]
+            orientation = self._orientation[key]
         if self.launch_mode == "legacy":
             if tuple(weight.shape) != self.weight_shape or weight.dtype != torch.bfloat16:
                 raise ValueError(f"{self.abi.name}: weight does not match the built ABI")

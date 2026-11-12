@@ -861,6 +861,30 @@ def test_shutdown_skips_registered_process_that_never_started() -> None:
     worker.join.assert_not_called()
 
 
+@pytest.mark.parametrize("finishes", [True, False], ids=["teardown-finishes", "teardown-hangs"])
+def test_shutdown_waits_for_external_worker_teardown(finishes: bool) -> None:
+    teardown = MagicMock()
+    teardown.is_alive.side_effect = lambda: not teardown.join.called or not finishes
+
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    client._shutdown_lock = threading.Lock()
+    client._shutdown_started = False
+    client._shutdown_complete = threading.Event()
+    client.pending_requests = MagicMock()
+    client.background_thread = MagicMock()
+    client.background_thread.is_alive.return_value = False
+    client.worker_processes = []
+    client._worker_spawner = None
+    client._ext_worker_thread = teardown
+
+    if finishes:
+        client.shutdown()
+    else:
+        with pytest.raises(RuntimeError, match="did not finish its teardown"):
+            client.shutdown()
+    teardown.join.assert_called_once_with(timeout=executor_module.EXT_WORKER_TEARDOWN_TIMEOUT)
+
+
 def test_worker_death_during_request_send_is_contained() -> None:
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     dead_worker = MagicMock()

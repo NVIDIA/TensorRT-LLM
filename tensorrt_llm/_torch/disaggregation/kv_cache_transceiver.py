@@ -3,7 +3,10 @@
 
 from abc import ABC, abstractmethod
 from os import getenv
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional
+
+if TYPE_CHECKING:
+    import torch
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -429,9 +432,50 @@ class KvCacheTransceiver(ABC):
         """
         raise NotImplementedError
 
+    def cancel_gen_logically(
+            self,
+            req: LlmRequest,
+            ready: Optional["torch.cuda.Event"] = None) -> bool:
+        """Accept logical GEN cancellation without authorizing memory release.
+
+        Args:
+            req: Model-idle generation request to cancel.
+            ready: Unpublished destination's outstanding admission fence, if any.
+
+        Returns:
+            Whether cancellation was accepted under a qualified retirement policy.
+            The caller must still use cancel_request to establish safe retirement.
+            Under that policy, the transceiver retains a passed ready fence until
+            cancel_request returns True, even if an earlier failure makes this
+            method return False. Unsupported implementations return False without
+            taking ownership of ready.
+        """
+        return False
+
     def supports_inflight_request_cancellation(self) -> bool:
         """Return True when in-flight transfers can be cancelled safely."""
         return False
+
+    def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
+        """Whether a context send is still waiting for its peer to ask for the data.
+
+        ``respond_and_send_async`` only posts the send; nothing is written until
+        the generation peer requests it, which can be long after the context
+        finished when the peer's request queues behind a full generation batch.
+        Runtimes that can observe that boundary report it here so the transfer
+        timeout measures the transfer rather than the peer's queueing delay.
+        The default keeps the timeout unchanged for runtimes that cannot.
+        """
+        return False
+
+    def context_transfer_peer_ready_time(self,
+                                         req: LlmRequest) -> Optional[float]:
+        """``time.monotonic()`` at which every peer rank had asked for this send.
+
+        The transfer timeout is measured from this moment when it is later than
+        the send itself. None when unknown, which keeps the timeout unchanged.
+        """
+        return None
 
     def supports_idle_request_cancellation(self,
                                            req: Optional[LlmRequest] = None
@@ -497,6 +541,18 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                  attention_type: AttentionTypeCpp,
                  cache_transceiver_config: CacheTransceiverConfig,
                  mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+        logger.warning_once(
+            "The C++ cache transceiver "
+            "(cache_transceiver_config.transceiver_runtime='CPP' or None) is "
+            "deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed "
+            "after the 3-month migration period; it keeps working until then. "
+            "Use the Python transceiver (transceiver_runtime='PYTHON', the "
+            "default) with backend='NIXL' and KV cache manager V2. "
+            "Experimental in-flight cancellation "
+            "(TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1) still requires a "
+            "supported C++ configuration until Python support is available. See "
+            "https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy",
+            key="deprecated_cpp_cache_transceiver")
         _validate_disagg_inflight_cancel_config(cache_transceiver_config)
         world_config = mapping_to_world_config(mapping)
         # Filter out mamba/recurrent state layers (kv_heads == 0) so that

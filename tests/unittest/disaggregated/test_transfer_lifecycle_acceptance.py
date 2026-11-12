@@ -46,6 +46,15 @@ _NEW_REQUEST = 42
 _SENTINEL = b"new-data"
 
 
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
+
+
 class _PrematureReuse(AssertionError):
     """The pending destination was exposed to a subsequent allocation."""
 
@@ -182,7 +191,6 @@ class _ReceiveCase:
                 canceled_request_ids=lambda: self.cancelled_ids,
             ),
             enable_attention_dp=True,
-            force_terminate_ctx_for_partial_reuse=False,
         )
 
     def _publish(self, task: KVRecvTask) -> None:
@@ -257,7 +265,10 @@ class _ReceiveCase:
     def complete(self, resource: Literal["kv", "aux"]) -> None:
         if resource == "kv":
             self.kv.data[:] = b"old-data"
-            self.session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+            _publish_report_tokens(self.session)
+            self.session.process_kv_agent_result(
+                0, 0, True, AgentResult.SUCCESS, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+            )
         else:
             self.aux.slot.data[:] = b"old-data"
             self.session.process_aux_agent_result(0, AgentResult.SUCCESS)
@@ -286,7 +297,10 @@ def test_cancelled_receive_retains_destinations_until_all_accessors_settle(
     assert case.kv.allocate(_NEW_REQUEST)
     assert case.aux.slot.allocate(_NEW_REQUEST)
     # Duplicate control-plane completion reports carry no new memory access.
-    case.session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+    _publish_report_tokens(case.session)
+    case.session.process_kv_agent_result(
+        0, 0, True, AgentResult.SUCCESS, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+    )
     case.session.process_aux_agent_result(0, AgentResult.SUCCESS)
     for _ in range(2):
         case.poll_and_cleanup()
