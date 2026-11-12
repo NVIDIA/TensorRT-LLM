@@ -75,6 +75,7 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 _EP_SIZE = int(os.environ.get("HALO_R_TEST_EP", "4"))
 _SEEDS = int(os.environ.get("HALO_R_TEST_SEEDS", "1"))
 _HOME_EXPERTS = 8
+# Helper slots per rank, unless a case sets its own count.
 _HELPER_SLOTS = 2
 _TOPK = 4
 _MAX_TOKENS = 256
@@ -164,6 +165,39 @@ def _uniform_routes(rank: int, num_tokens: int, experts: int, device: int) -> to
         for i in range(num_tokens * _TOPK)
     ]
     return torch.tensor(flat, dtype=torch.int32, device=f"cuda:{device}").reshape(-1, _TOPK)
+
+
+def _spread_rows(step: int, rank: int, num_tokens: int, experts: int) -> list:
+    """Routes that give one receiver four helper experts from three owners.
+
+    The receiver, rank ``step % ep``, owns no routed expert. Of the other
+    ranks, two each own one hot expert, larger than their excess, and the
+    third carries its load over all its home experts, so it sends several
+    experts smaller than its excess. At EP 4 the plan fills all four helper
+    slots of the receiver with experts of three owners.
+    """
+    ep = experts // _HOME_EXPERTS
+    rng = random.Random(1000 * step + rank)
+    receiver = step % ep
+    owners = [(receiver + 1 + i) % ep for i in range(ep - 1)]
+    hot = [
+        owners[1] * _HOME_EXPERTS + step % _HOME_EXPERTS,
+        owners[2] * _HOME_EXPERTS + step % _HOME_EXPERTS,
+    ]
+    spread = owners[0]
+    cold = [expert for expert in range(experts) if expert // _HOME_EXPERTS != receiver]
+    rows = []
+    for _ in range(num_tokens):
+        choice = [expert for expert in hot if rng.random() < 0.8]
+        while len(choice) < _TOPK:
+            if rng.random() < 0.3:
+                expert = spread * _HOME_EXPERTS + rng.randrange(_HOME_EXPERTS)
+            else:
+                expert = rng.choice(cold)
+            if expert not in choice:
+                choice.append(expert)
+        rows.append(choice)
+    return rows
 
 
 def _any_rank(failures: list) -> bool:
@@ -388,6 +422,7 @@ class _Layers:
         auxiliary_sms: int = _AUXILIARY_SMS,
         helper_slot_mode: str = "shared_banks",
         bundle_dims: tuple = (_HIDDEN, _INTERMEDIATE),
+        helper_slots: int = _HELPER_SLOTS,
     ) -> None:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
             PerLayerDynamicMoeLoadBalancer,
@@ -403,9 +438,10 @@ class _Layers:
         self.max_tokens = _MAX_TOKENS
         self.experts = _HOME_EXPERTS * world
         self.auxiliary_sms = auxiliary_sms
+        self.helper_slots = helper_slots
         self.resident = helper_slot_mode == "per_layer_resident"
         config = SimpleNamespace(
-            num_slots=self.experts + world * _HELPER_SLOTS,
+            num_slots=self.experts + world * helper_slots,
             auxiliary_sms=auxiliary_sms,
             helper_slot_mode=helper_slot_mode,
             planner="halo_r",
@@ -419,7 +455,7 @@ class _Layers:
             self.arenas.append(
                 allocate_rebalance_arena(
                     home_experts=_HOME_EXPERTS,
-                    helper_slots=_HELPER_SLOTS,
+                    helper_slots=helper_slots,
                     bundle=bundle,
                     ep_comm=self.manager.get_ep_comm(self.process_group),
                     mapping=self.mapping,
@@ -462,9 +498,13 @@ class _Layers:
         self.captures = 0
         # A model of each layer's residency table, [rank][helper slot], with per-layer helper slots.
         self.tables = [
-            [[-1] * _HELPER_SLOTS for _ in range(world)] if self.resident else None
+            [[-1] * helper_slots for _ in range(world)] if self.resident else None
             for _ in range(count)
         ]
+        # The reference plan of the last launch the model applied.
+        self.last_plan = None
+        # COPY of the hog cases, set by _starve_relay.
+        self.starved_copy_stream = None
         self.dead = False
 
     def routes(self, step: int, tokens: int) -> torch.Tensor:
@@ -481,7 +521,7 @@ class _Layers:
             views = self._helper_views[layer] = [
                 _row(
                     int(bound.local_plane_views[plane].data_ptr()) + _HOME_EXPERTS * int(nbytes),
-                    _HELPER_SLOTS * int(nbytes),
+                    self.helper_slots * int(nbytes),
                     self.device,
                 )
                 for plane, nbytes in enumerate(bound.plane_bytes)
@@ -507,7 +547,7 @@ class _Layers:
         # What the layer handle's rebind calls on every rank once a loader has rewritten the weights.
         self.groups[layer].forget_helper_residency()
         if self.tables[layer] is not None:
-            self.tables[layer] = [[-1] * _HELPER_SLOTS for _ in range(self.ep)]
+            self.tables[layer] = [[-1] * self.helper_slots for _ in range(self.ep)]
         MPI.COMM_WORLD.Barrier()
 
     def build_groups(self) -> None:
@@ -523,7 +563,7 @@ class _Layers:
                     mapping=self.mapping,
                     ep_process_group=self.process_group,
                     home_experts=_HOME_EXPERTS,
-                    helper_slots=_HELPER_SLOTS,
+                    helper_slots=self.helper_slots,
                     topk=_TOPK,
                     max_tokens_per_rank=self.max_tokens,
                     layer_idx=layer,
@@ -593,8 +633,9 @@ class _Layers:
         histogram = [sum(c) for c in zip(*MPI.COMM_WORLD.allgather(counts))]
         table = self.tables[layer]
         plan = halo_r_reference.plan_halo_r(
-            histogram, self.ep, _HELPER_SLOTS, send_count=4, residency=table
+            histogram, self.ep, self.helper_slots, send_count=4, residency=table
         )
+        self.last_plan = plan
         copies = 0
         for b in plan.broadcasts:
             for destination, slot in b.helper.items():
@@ -618,7 +659,7 @@ class _Layers:
     def _route_failures(self, plan, routes: torch.Tensor, slots: torch.Tensor, where: str) -> list:
         """Every route goes to its owner or to a receiver's helper slot of its expert, at the plan's quota."""
         failures = []
-        rank, local_slots = self.rank, _HOME_EXPERTS + _HELPER_SLOTS
+        rank, local_slots = self.rank, _HOME_EXPERTS + self.helper_slots
         moved = {}
         for expert, slot in zip(routes.flatten().cpu().tolist(), slots.flatten().cpu().tolist()):
             destination, local = divmod(slot, local_slots)
@@ -789,6 +830,42 @@ def _case_alternating_layers(layers: _Layers) -> list:
     return failures
 
 
+def _case_four_helper_slots(layers: _Layers) -> list:
+    """Four per-layer helper slots, all filled: slots 2 and 3 set the high helper-mask bit.
+
+    Each step's routes (``_spread_rows``) give a different receiver experts of
+    three owners; the last steps repeat the first ones, so resident experts
+    in every slot are skipped. At EP 4 some launch must fill all four slots
+    of a receiver with experts of at least three owners.
+    """
+    rank = layers.rank
+    if layers.ep < 4:
+        raise _Skip(f"four helper experts from three owners need EP 4 or more, not {layers.ep}")
+    main = torch.cuda.Stream()
+    failures = []
+    filled = False
+    for step in list(range(layers.ep)) + [0, 1]:
+        rows = _spread_rows(step, rank, layers.max_tokens, layers.experts)
+        routes = torch.tensor(rows, dtype=torch.int32, device=f"cuda:{layers.device}")
+        layers.call(0, routes, main)
+        failures += layers.check(0, routes)
+        filled = filled or any(
+            min(row) >= 0 and len({expert // _HOME_EXPERTS for expert in row}) >= 3
+            for row in layers.last_plan.helper_table
+        )
+        if _any_rank(failures):
+            return failures
+    if not filled:
+        if layers.ep != 4:
+            raise _Skip(f"the four-slot routes are built for EP 4, not {layers.ep}")
+        failures.append(
+            f"rank {rank}: no launch filled four helper slots with three owners' experts"
+        )
+    if layers.receiver_skips[0] == 0:
+        failures.append(f"rank {rank}: the repeated routes skipped no receiver")
+    return failures
+
+
 def _case_resident_repeat(layers: _Layers) -> list:
     """Repeated routes copy nothing and keep the rows, even a row the test overwrote.
 
@@ -822,7 +899,7 @@ def _case_resident_repeat(layers: _Layers) -> list:
     if rank == sentinel_rank and not torch.equal(row, sentinel):
         failures.append(f"rank {rank}: the repeated call rewrote a resident helper row")
     layers.groups[0].forget_helper_residency()
-    layers.tables[0] = [[-1] * _HELPER_SLOTS for _ in range(layers.ep)]
+    layers.tables[0] = [[-1] * layers.helper_slots for _ in range(layers.ep)]
     MPI.COMM_WORLD.Barrier()
     layers.call(0, routes, main)
     failures += layers.check(0, routes)
@@ -915,6 +992,7 @@ def _starve_relay(layers: _Layers) -> None:
     least, _ = torch.cuda.Stream.priority_range()
     copy_stream = torch.cuda.Stream(device=layers.device, priority=least)
     layers.manager.get_copy_stream = lambda device: copy_stream
+    layers.starved_copy_stream = copy_stream
 
 
 def _case_gate_under_hog(layers: _Layers, use_graph: bool) -> list:
@@ -927,6 +1005,9 @@ def _case_gate_under_hog(layers: _Layers, use_graph: bool) -> list:
     """
     group = layers.groups[0]
     kernels = layers.kernels
+    # The group must have taken COPY from the replaced get_copy_stream, or the relay is not starved.
+    if group.copy_stream is not layers.starved_copy_stream:
+        return [f"rank {layers.rank}: the group's COPY is not the low-priority stream"]
     _, greatest = torch.cuda.Stream.priority_range()
     main = torch.cuda.Stream(device=layers.device, priority=greatest)
     side = torch.cuda.Stream(device=layers.device)
@@ -1435,56 +1516,121 @@ def _case_trap(layers: _Layers, kind: str) -> dict:
     return {"rank": rank, "error": error, "where": where, "seconds": time.monotonic() - start}
 
 
-# case: (case function, layers, auxiliary SMs, helper-slot mode)
+# case: (case function, layers, auxiliary SMs, helper-slot mode, helper slots)
 _CASES = {
-    "reference": (_case_reference, 1, _AUXILIARY_SMS, "shared_banks"),
-    "reference_aux12": (_case_reference, 1, 12, "shared_banks"),
-    "reference_aux16": (_case_reference, 1, 16, "shared_banks"),
-    "reference_production_bundle": (_case_reference, 1, _AUXILIARY_SMS, "shared_banks"),
-    "balanced_and_empty": (_case_balanced_and_empty, 1, _AUXILIARY_SMS, "shared_banks"),
-    "default_stream": (_case_default_stream, 1, _AUXILIARY_SMS, "shared_banks"),
-    "resident_repeat": (_case_resident_repeat, 1, _AUXILIARY_SMS, "per_layer_resident"),
-    "resident_sequence": (_case_resident_sequence, 1, _AUXILIARY_SMS, "per_layer_resident"),
-    "resident_layers": (_case_alternating_layers, 3, _AUXILIARY_SMS, "per_layer_resident"),
-    "resident_reload": (_case_resident_reload, 1, _AUXILIARY_SMS, "per_layer_resident"),
-    "shared_banks": (_case_shared_banks, 3, _AUXILIARY_SMS, "shared_banks"),
-    "stable_slot": (_case_stable_slot, 1, _AUXILIARY_SMS, "per_layer_resident"),
+    "reference": (_case_reference, 1, _AUXILIARY_SMS, "shared_banks", _HELPER_SLOTS),
+    "reference_aux16": (_case_reference, 1, 16, "shared_banks", _HELPER_SLOTS),
+    "reference_production_bundle": (
+        _case_reference,
+        1,
+        _AUXILIARY_SMS,
+        "shared_banks",
+        _HELPER_SLOTS,
+    ),
+    "balanced_and_empty": (
+        _case_balanced_and_empty,
+        1,
+        _AUXILIARY_SMS,
+        "shared_banks",
+        _HELPER_SLOTS,
+    ),
+    "default_stream": (_case_default_stream, 1, _AUXILIARY_SMS, "shared_banks", _HELPER_SLOTS),
+    "four_helper_slots": (_case_four_helper_slots, 1, 16, "per_layer_resident", 4),
+    "resident_repeat": (
+        _case_resident_repeat,
+        1,
+        _AUXILIARY_SMS,
+        "per_layer_resident",
+        _HELPER_SLOTS,
+    ),
+    "resident_sequence": (
+        _case_resident_sequence,
+        1,
+        _AUXILIARY_SMS,
+        "per_layer_resident",
+        _HELPER_SLOTS,
+    ),
+    "resident_layers": (
+        _case_alternating_layers,
+        3,
+        _AUXILIARY_SMS,
+        "per_layer_resident",
+        _HELPER_SLOTS,
+    ),
+    "resident_reload": (
+        _case_resident_reload,
+        1,
+        _AUXILIARY_SMS,
+        "per_layer_resident",
+        _HELPER_SLOTS,
+    ),
+    "shared_banks": (_case_shared_banks, 3, _AUXILIARY_SMS, "shared_banks", _HELPER_SLOTS),
+    "stable_slot": (_case_stable_slot, 1, _AUXILIARY_SMS, "per_layer_resident", _HELPER_SLOTS),
     "gate_under_hog": (
         lambda layers: _case_gate_under_hog(layers, use_graph=False),
         1,
         _AUXILIARY_SMS,
         "shared_banks",
+        _HELPER_SLOTS,
     ),
     "gate_under_hog_aux16": (
         lambda layers: _case_gate_under_hog(layers, use_graph=False),
         1,
         16,
         "shared_banks",
+        _HELPER_SLOTS,
     ),
     "gate_under_hog_graph": (
         lambda layers: _case_gate_under_hog(layers, use_graph=True),
         1,
         _AUXILIARY_SMS,
         "shared_banks",
+        _HELPER_SLOTS,
     ),
-    "graphs_single": (_case_graphs_single, 1, _AUXILIARY_SMS, "per_layer_resident"),
-    "graphs_layers_resident": (_case_graphs_layers, 3, _AUXILIARY_SMS, "per_layer_resident"),
-    "graphs_layers_shared": (_case_graphs_layers, 3, _AUXILIARY_SMS, "shared_banks"),
-    "graphs_interleaved": (_case_graphs_interleaved, 1, _AUXILIARY_SMS, "per_layer_resident"),
+    "graphs_single": (_case_graphs_single, 1, _AUXILIARY_SMS, "per_layer_resident", _HELPER_SLOTS),
+    "graphs_layers_resident": (
+        _case_graphs_layers,
+        3,
+        _AUXILIARY_SMS,
+        "per_layer_resident",
+        _HELPER_SLOTS,
+    ),
+    "graphs_layers_shared": (_case_graphs_layers, 3, _AUXILIARY_SMS, "shared_banks", _HELPER_SLOTS),
+    "graphs_interleaved": (
+        _case_graphs_interleaved,
+        1,
+        _AUXILIARY_SMS,
+        "per_layer_resident",
+        _HELPER_SLOTS,
+    ),
     "graphs_capturing_switch": (
         _case_graphs_capturing_switch,
         1,
         _AUXILIARY_SMS,
         "shared_banks",
+        _HELPER_SLOTS,
     ),
     "graphs_route_wait_edge": (
         _case_graphs_route_wait_edge,
         3,
         _AUXILIARY_SMS,
         "per_layer_resident",
+        _HELPER_SLOTS,
     ),
-    "graphs_serialized": (_case_graphs_serialized, 3, _AUXILIARY_SMS, "per_layer_resident"),
-    "graphs_failed_capture": (_case_graphs_failed_capture, 1, _AUXILIARY_SMS, "shared_banks"),
+    "graphs_serialized": (
+        _case_graphs_serialized,
+        3,
+        _AUXILIARY_SMS,
+        "per_layer_resident",
+        _HELPER_SLOTS,
+    ),
+    "graphs_failed_capture": (
+        _case_graphs_failed_capture,
+        1,
+        _AUXILIARY_SMS,
+        "shared_banks",
+        _HELPER_SLOTS,
+    ),
 }
 _TRAPS = ("status_word", "ready_drain_timeout", "grid_rendezvous_timeout")
 for _kind in _TRAPS:
@@ -1493,6 +1639,7 @@ for _kind in _TRAPS:
         2,
         _AUXILIARY_SMS,
         "shared_banks",
+        _HELPER_SLOTS,
     )
 
 
@@ -1506,7 +1653,7 @@ def _run_worker(case: str) -> tuple[str | None, list[str]]:
     layers = None
     try:
         torch.cuda.set_device(device)
-        function, count, auxiliary_sms, mode = _CASES[case]
+        function, count, auxiliary_sms, mode, helper_slots = _CASES[case]
         reason = _skip_reason()
         if reason is None and world != _EP_SIZE:
             reason = f"the MPI world has {world} ranks, HALO_R_TEST_EP is {_EP_SIZE}"
@@ -1517,7 +1664,7 @@ def _run_worker(case: str) -> tuple[str | None, list[str]]:
         dims = (
             _PRODUCTION_BUNDLE if case.endswith("production_bundle") else (_HIDDEN, _INTERMEDIATE)
         )
-        layers = _Layers(rank, world, device, count, auxiliary_sms, mode, dims)
+        layers = _Layers(rank, world, device, count, auxiliary_sms, mode, dims, helper_slots)
         if case.startswith("gate_under_hog"):
             _starve_relay(layers)
         try:
