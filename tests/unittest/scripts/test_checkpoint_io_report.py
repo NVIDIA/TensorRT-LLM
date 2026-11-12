@@ -14,9 +14,12 @@
 # limitations under the License.
 """Tests of the checkpoint I/O CI experiment report, on synthetic rows without OpenSearch."""
 
+import copy
+import dataclasses
 import importlib.util
 import json
 import math
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +33,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 REPORT_PATH = REPO_ROOT / "jenkins" / "scripts" / "perf" / "checkpoint_io_report.py"
 X86_BUILD_URL = "https://ci/job/LLM/job/main/job/L0_Test-x86_64-Multi-GPU/7/"
 SBSA_BUILD_URL = "https://ci/job/LLM/job/main/job/L0_Test-SBSA-Multi-Node/7/"
+RELEASE_BUILD_URL = "https://ci/job/LLM/job/release-1.3/job/L0_Test-x86_64-Multi-GPU/7/"
+IMAGE = "repo/img:1"
 METRIC = "checkpoint_pipeline_seconds"
 
 
@@ -54,6 +59,7 @@ def make_row(build: int, arm: str, classification: str, seconds: float, **fields
         "s_host_node_name": "node-1",
         "s_test_case_name": "qwen3_32b_fp8_tp2_6k1k-con96_iter10_6k1k",
         "s_model_name": "qwen3_32b_fp8",
+        "s_runtime_image": IMAGE,
         "s_startup_observation_id": f"startup-{build}",
         "s_checkpoint_io_experiment_assigned_arm": arm,
         "s_checkpoint_io_experiment_assignment_source": "postmerge_build_number",
@@ -98,7 +104,7 @@ def test_aggregated_row_gives_one_server_observation(report: ModuleType) -> None
         "checkpoint_pipeline_seconds": 12.5,
         "total_model_loading_seconds": 13.5,
     }
-    assert (observation.image, observation.image_source) == ("unknown", "unknown")
+    assert (observation.image, observation.image_source) == (IMAGE, "row")
 
 
 def test_disaggregated_row_gives_ctx_and_gen_observations(report: ModuleType) -> None:
@@ -163,13 +169,24 @@ def test_resolve_images_prefers_the_row_then_the_commit(report: ModuleType) -> N
 
     rows = [
         make_row(1, "auto", "rank_striped_activated", 1.0, s_runtime_image="repo/img:a@sha256:0"),
-        make_row(2, "native", "native_control", 1.0, s_build_url=SBSA_BUILD_URL),
-        make_row(3, "auto", "rank_striped_activated", 1.0, s_build_url="", s_gpu_type="gb300"),
+        make_row(
+            2, "native", "native_control", 1.0, s_build_url=SBSA_BUILD_URL, s_runtime_image=""
+        ),
+        make_row(
+            3,
+            "auto",
+            "rank_striped_activated",
+            1.0,
+            s_build_url="",
+            s_gpu_type="gb300",
+            s_runtime_image="",
+        ),
         make_row(
             4,
             "auto",
             "rank_striped_activated",
             1.0,
+            s_runtime_image="",
             **{"s_checkpoint_io_experiment_assignment_source": "premerge_default"},
         ),
     ]
@@ -254,20 +271,71 @@ def test_compare_effective_policy_and_intent_to_treat(report: ModuleType) -> Non
     assert summary.share_treatment_faster == pytest.approx(0.9)
 
 
-def test_pairs_stay_within_one_image_and_pipeline(report: ModuleType) -> None:
+@pytest.mark.parametrize(
+    ("control_fields", "n_pairs"),
+    [
+        pytest.param({}, 1, id="same-image-and-pipeline"),
+        pytest.param({"s_runtime_image": "repo/img:2"}, 0, id="other-image"),
+        pytest.param({"s_build_url": RELEASE_BUILD_URL}, 0, id="other-pipeline"),
+    ],
+)
+def test_pairs_stay_within_one_image_and_pipeline(
+    report: ModuleType, control_fields: dict, n_pairs: int
+) -> None:
     rows = [
-        make_row(1, "auto", "rank_striped_activated", 8.0, s_runtime_image="img:a"),
-        make_row(2, "native", "native_control", 10.0, s_runtime_image="img:b"),
-        make_row(
-            3, "auto", "rank_striped_activated", 8.0, s_build_url="https://ci/job/LLM/job/r/x"
-        ),
+        make_row(1, "auto", "rank_striped_activated", 8.0),
+        make_row(2, "native", "native_control", 10.0, **control_fields),
     ]
 
     (summary,), pairs = report.compare(
         observe(report, rows), report.COMPARISONS[0], METRIC, 3, 10, 0
     )
 
-    assert pairs == [] and summary.n_pairs == 0 and math.isnan(summary.change)
+    assert len(pairs) == summary.n_pairs == n_pairs
+    assert (summary.n_treatment, summary.n_control) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    ("fields", "unknown"),
+    [
+        pytest.param({"s_runtime_image": ""}, "runtime image", id="image"),
+        pytest.param({"s_build_url": ""}, "pipeline", id="pipeline"),
+        pytest.param(
+            {"l_checkpoint_io_experiment_root_build_number": None}, "root build", id="root-build"
+        ),
+    ],
+)
+def test_startups_with_an_unknown_pairing_field_are_left_out(
+    report: ModuleType, fields: dict, unknown: str
+) -> None:
+    rows = [
+        make_row(1, "auto", "rank_striped_activated", 8.0, **fields),
+        make_row(2, "native", "native_control", 10.0, **fields),
+    ]
+    observations = observe(report, rows)
+
+    assert [report.unknown_pairing_field(obs) for obs in observations] == [unknown, unknown]
+    assert report.compare(observations, report.COMPARISONS[0], METRIC, 3, 10, 0) == ([], [])
+
+
+def test_change_is_the_median_log_ratio(report: ModuleType) -> None:
+    # Pairs (1, 2), (3, 4), (5, 6) and (7, 8) have ratios 0.5, 0.5, 1.8 and 1.8. The median of
+    # their percentage changes would be +15%; the median log ratio gives about -5.1%.
+    seconds = {1: 5.0, 3: 5.0, 5: 18.0, 7: 18.0}
+    rows = [
+        make_row(build, "auto", "rank_striped_activated", seconds[build])
+        if build % 2
+        else make_row(build, "native", "native_control", 10.0)
+        for build in range(1, 9)
+    ]
+
+    (summary,), pairs = report.compare(
+        observe(report, rows), report.COMPARISONS[0], METRIC, 3, 10, 0
+    )
+
+    assert sorted(math.exp(pair.log_ratio) for pair in pairs) == pytest.approx([0.5, 0.5, 1.8, 1.8])
+    assert summary.change == pytest.approx(math.expm1((math.log(0.5) + math.log(1.8)) / 2))
+    assert summary.change < 0
 
 
 def test_bootstrap_interval_is_deterministic(report: ModuleType) -> None:
@@ -306,6 +374,27 @@ def test_repeat_loads(report: ModuleType) -> None:
     marked = report.mark_repeat_loads(observe(report, rows))
 
     assert [obs.repeat_load for obs in marked] == [False, True, False, False, False]
+
+
+def test_repeat_loads_are_marked_before_the_filters(report: ModuleType) -> None:
+    # Two test cases load the same model in one job on one host; keeping only the later one must
+    # not turn its load into a first load.
+    rows = [
+        make_row(5, "auto", "rank_striped_activated", 1.0, ts_created=1000, s_test_case_name="a"),
+        make_row(
+            5,
+            "auto",
+            "rank_striped_activated",
+            1.0,
+            ts_created=2000,
+            s_test_case_name="b",
+            s_startup_observation_id="later",
+        ),
+    ]
+
+    (kept,) = report.select_observations(rows, {"h200"}, re.compile("^b$"), lambda *_: "unknown")
+
+    assert (kept.test_case, kept.repeat_load) == ("b", True)
 
 
 def test_fallback_summary(report: ModuleType) -> None:
@@ -353,10 +442,72 @@ def test_fallback_summary(report: ModuleType) -> None:
     assert summary.example_reason == reason.format(30, 10)
 
 
+def test_fetch_rows_pages_with_search_after(report: ModuleType, monkeypatch) -> None:
+    pages = [
+        [
+            {"_source": {"s_startup_observation_id": "a"}, "sort": [1, "a"]},
+            {"_source": {"s_startup_observation_id": "b"}, "sort": [2, "b"]},
+        ],
+        [{"_source": {"s_startup_observation_id": "c"}, "sort": [3, "c"]}],
+    ]
+    queries = []
+
+    class Response:
+        def __init__(self, hits: list[dict]) -> None:
+            self.hits = hits
+
+        def json(self) -> dict:
+            return {"hits": {"hits": self.hits}}
+
+    class FakeOpenSearchDB:
+        @staticmethod
+        def queryFromOpenSearchDB(query: dict, project: str) -> Response:  # noqa: N802
+            queries.append((copy.deepcopy(query), project))
+            return Response(pages[len(queries) - 1])
+
+    open_search_db = ModuleType("open_search_db")
+    open_search_db.PERF_SANITY_PROJECT_NAME = "perf_sanity"
+    open_search_db.OpenSearchDB = FakeOpenSearchDB
+    monkeypatch.setitem(sys.modules, "open_search_db", open_search_db)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+    rows = report.fetch_rows("v4", None, None, page_size=2)
+
+    assert [row["s_startup_observation_id"] for row in rows] == ["a", "b", "c"]
+    assert len(queries) == 2 and {project for _, project in queries} == {"perf_sanity"}
+    assert "search_after" not in queries[0][0]
+    assert queries[1][0]["search_after"] == [2, "b"]
+
+
+def test_csv_cells_cannot_start_a_formula(report: ModuleType, tmp_path: Path) -> None:
+    @dataclasses.dataclass(frozen=True)
+    class Cells:
+        text: str
+        number: float
+
+    path = tmp_path / "cells.csv"
+    texts = ("=1+2", "+1", "-1", "@A1", "a-b")
+
+    report._write_csv(path, Cells, [Cells(text, -0.5) for text in texts])
+
+    assert path.read_text().splitlines() == [
+        "text,number",
+        "'=1+2,-0.5",
+        "'+1,-0.5",
+        "'-1,-0.5",
+        "'@A1,-0.5",
+        "a-b,-0.5",
+    ]
+
+
 def test_main_writes_the_report_from_a_rows_cache(report: ModuleType, tmp_path: Path) -> None:
     cache = tmp_path / "rows.json"
     query = {"version": report.DEFAULT_EXPERIMENT_VERSION, "since": None, "until": None}
-    cache.write_text(json.dumps({"query": query, "rows": alternating_rows(range(1, 21))}))
+    rows = alternating_rows(range(1, 21)) + [
+        make_row(41, "auto", "rank_striped_activated", 8.0, s_runtime_image=""),
+        make_row(42, "native", "native_control", 10.0, s_runtime_image=""),
+    ]
+    cache.write_text(json.dumps({"query": query, "rows": rows}))
     out_dir = tmp_path / "out"
     args = ["--out-dir", str(out_dir), "--rows-json", str(cache), "--repo-root", str(tmp_path)]
 
@@ -365,8 +516,15 @@ def test_main_writes_the_report_from_a_rows_cache(report: ModuleType, tmp_path: 
     text = (out_dir / "report.md").read_text()
     assert "## Effective policy: RANK-STRIPED activated vs NATIVE control" in text
     assert "| qwen3_32b_fp8_tp2_6k1k-con96_iter10_6k1k | h200 | server | 10 | -20.0% |" in text
-    assert (out_dir / "pairs.csv").read_text().count("\n") == 21
-    assert (out_dir / "per_test.csv").exists() and (out_dir / "fallbacks.csv").exists()
+    assert "pipeline or runtime image: 2 (runtime image 2)." in text
+    pairs_csv = (out_dir / "pairs.csv").read_text().splitlines()
+    assert pairs_csv[0] == ",".join(field.name for field in dataclasses.fields(report.PairRecord))
+    assert len(pairs_csv) == 21
+    assert (out_dir / "per_test.csv").exists()
+    # No startup fell back, so fallbacks.csv holds only its header.
+    assert (out_dir / "fallbacks.csv").read_text().splitlines() == [
+        ",".join(field.name for field in dataclasses.fields(report.FallbackSummary))
+    ]
 
     with pytest.raises(ValueError, match="pass --refresh"):
         report.main([*args, "--since", "2026-01-01"])

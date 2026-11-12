@@ -399,19 +399,25 @@ All date strings are interpreted as UTC for consistent timestamp conversion.
 Reads the startup rows of the checkpoint I/O CI experiment (see "CI startup experiment" in
 [`docs/source/features/checkpoint-loading.md`](../../../docs/source/features/checkpoint-loading.md))
 back from OpenSearch and compares rank-striped read-ahead with native checkpoint loading. Post-merge
-builds alternate the two policies by root build number, so the script pairs each `auto` startup
-with the nearest `native` startup of the same test case, GPU type, server role, Jenkins pipeline,
-branch and runtime image, and reports per test:
+builds alternate the two policies by root build number, so the script pairs `auto` startups
+one-to-one with `native` startups of the same test case, GPU type, server role, Jenkins pipeline,
+branch and runtime image, nearest root builds first and at most `--pair-window` root builds apart.
+A startup with no counterpart in that window stays unpaired, and taking the nearest pairs first can
+leave a few startups unpaired that another matching would pair. Startups whose root build, pipeline
+or runtime image is unknown are left out; the report counts them. It reports per test:
 
 - **Effective policy**: startups that activated rank-striped read-ahead against native controls.
 - **Intent to treat**: startups of builds assigned `auto` against builds assigned `native`, with
   `auto` fallbacks kept in the `auto` arm.
 
-It gives the median paired change of `d_checkpoint_pipeline_seconds` (or `--metric`) with a
-bootstrap 95% interval, roll-ups per GPU type and model, a split into first and repeated loads of
-a model in a job (repeated loads are likely warm), and the reasons for `auto` fallbacks. Rows from
-before the runtime image was recorded get the image that `jenkins/current_image_tags.properties`
-names at their commit, so run it from a checkout that has those commits.
+It gives the median paired change of `d_checkpoint_pipeline_seconds` (or `--metric`) on the log
+scale, `expm1` of the median of `log(auto / native)`, with a bootstrap 95% interval. With an even
+number of pairs that is the geometric mean of the two middle ratios, which can differ from the
+median of the percentage changes in `pairs.csv`. It also gives roll-ups per GPU type and model, a
+split into first and repeated loads of a model in a job (repeated loads are likely warm), and the
+reasons for `auto` fallbacks. Rows from before the runtime image was recorded get the image that
+`jenkins/current_image_tags.properties` names at their commit, so run it from a checkout that has
+those commits.
 
 Reading needs `OPEN_SEARCH_DB_BASE_URL` but no credentials; the script never writes to OpenSearch.
 
@@ -424,4 +430,4 @@ python3 jenkins/scripts/perf/checkpoint_io_report.py --out-dir checkpoint_io_rep
 It writes `report.md`, `per_test.csv`, `pairs.csv` and `fallbacks.csv`. `--rows-json` caches the
 queried rows; later runs with the same `--experiment-version`, `--since` and `--until` read the
 cache instead of OpenSearch (pass `--refresh` to query again). Filter with `--gpu` and
-`--test-regex`.
+`--test-regex`; repeated loads are marked over all rows before the filters apply.

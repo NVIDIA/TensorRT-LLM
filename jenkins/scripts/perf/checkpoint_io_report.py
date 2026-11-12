@@ -26,12 +26,19 @@ the two arms for every test case, GPU type and server role:
 * intent to treat: startups of builds assigned `auto` against startups of builds assigned
   `native`, with `auto` fallbacks counted in the `auto` arm.
 
-Every treatment startup is paired with the nearest control startup of the same test case, GPU
-type, role, Jenkins pipeline, branch and runtime image at most `--pair-window` root builds away,
-so both sides of a pair ran nearly the same code. The report gives the median paired change with a bootstrap confidence
-interval, unpaired medians and percentiles, roll-ups per GPU type and model, and the reasons for
-`auto` fallbacks. Rows recorded before the runtime image was uploaded get the image that
-`jenkins/current_image_tags.properties` names at their commit.
+Treatment and control startups of the same test case, GPU type, role, Jenkins pipeline, branch and
+runtime image are paired one-to-one, nearest root builds first, at most `--pair-window` root
+builds apart, so both sides of a pair ran nearly the same code. A startup with no counterpart in
+that window stays unpaired, and taking the nearest pairs first can leave a few startups unpaired
+that another matching would pair. Startups whose root build, pipeline or runtime image is unknown
+are left out of the comparisons. Rows recorded before the runtime image was uploaded get the image
+that `jenkins/current_image_tags.properties` names at their commit.
+
+The change of a test is its median paired change on the log scale: `expm1` of the median of
+`log(treatment / control)`. With an even number of pairs it is the geometric mean of the two middle
+ratios, which can differ from the median of the percentage changes in `pairs.csv`. The report gives
+it with a bootstrap confidence interval, unpaired medians and percentiles, roll-ups per GPU type
+and model, and the reasons for `auto` fallbacks.
 
 Timings are rank 0's of each server and the maximum over the servers of a role. CI does not
 record whether the checkpoint was already in the page cache, so pairs are also split by whether
@@ -53,7 +60,7 @@ import subprocess
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -190,6 +197,28 @@ class Pair:
     treatment: Observation
     control: Observation
     log_ratio: float
+
+
+@dataclass(frozen=True)
+class PairRecord:
+    """One row of `pairs.csv`."""
+
+    comparison: str
+    test_case: str
+    gpu_type: str
+    role: str
+    pipeline: str
+    branch: str
+    image: str
+    treatment_root_build: int
+    control_root_build: int
+    treatment_seconds: float
+    control_seconds: float
+    change: float
+    treatment_repeat_load: bool
+    control_repeat_load: bool
+    treatment_startup_id: str
+    control_startup_id: str
 
 
 @dataclass(frozen=True)
@@ -430,10 +459,45 @@ def mark_repeat_loads(observations: Sequence[Observation]) -> list[Observation]:
     ]
 
 
+def select_observations(
+    rows: Iterable[Row],
+    gpus: set[str],
+    test_regex: re.Pattern[str] | None,
+    lookup: ImageLookup,
+) -> list[Observation]:
+    """Return the observations of the rows that pass the GPU type and test case filters.
+
+    Repeat loads are marked over all rows first, so a startup of a test case that the filters
+    leave out still counts as an earlier load of its model. Runtime images are then resolved for
+    the observations kept.
+    """
+    observations = mark_repeat_loads([obs for row in rows for obs in observations_from_row(row)])
+    kept = [
+        observation
+        for observation in observations
+        if (not gpus or observation.gpu_type in gpus)
+        and (test_regex is None or test_regex.search(observation.test_case))
+    ]
+    return resolve_images(kept, lookup)
+
+
+def unknown_pairing_field(observation: Observation) -> str | None:
+    """Return the first field that pairing needs and the observation lacks, or None."""
+    if observation.root_build < 0:
+        return "root build"
+    if observation.pipeline == UNKNOWN:
+        return "pipeline"
+    if observation.image == UNKNOWN:
+        return "runtime image"
+    return None
+
+
 def pair_observations(
     treatment: Sequence[Observation], control: Sequence[Observation], window: int
 ) -> list[tuple[Observation, Observation]]:
     """Match startups of the two arms one-to-one, nearest root builds first.
+
+    Taking the nearest pairs first can leave a startup unpaired that another matching would pair.
 
     Args:
         treatment: Treatment startups that share a test case, GPU type, role, pipeline, branch
@@ -507,7 +571,7 @@ def compare(
 
     Returns:
         One summary per test case, GPU type and role with at least one startup in each arm, and
-        all pairs.
+        all pairs. Observations with an `unknown_pairing_field` are left out.
     """
     arms: dict[tuple[str, ...], tuple[list[Observation], list[Observation]]] = defaultdict(
         lambda: ([], [])
@@ -515,7 +579,7 @@ def compare(
     for observation in observations:
         if not (observation.post_merge and observation.timing_complete):
             continue
-        if observation.metrics.get(metric, 0.0) <= 0:
+        if observation.metrics.get(metric, 0.0) <= 0 or unknown_pairing_field(observation):
             continue
         test = (observation.test_case, observation.gpu_type, observation.role)
         key = (*test, observation.pipeline, observation.branch, observation.image)
@@ -796,6 +860,15 @@ def render_report(
     post_merge = [obs for obs in observations if obs.post_merge]
     created = [obs.created_ms for obs in observations if obs.created_ms]
     titles = {comparison.name: comparison for comparison in COMPARISONS}
+    left_out = Counter(
+        field
+        for field in (unknown_pairing_field(obs) for obs in post_merge if obs.timing_complete)
+        if field is not None
+    )
+    left_out_text = str(sum(left_out.values()))
+    if left_out:
+        counts = ", ".join(f"{name} {count}" for name, count in left_out.most_common())
+        left_out_text += f" ({counts})"
     lines = [
         "# Checkpoint I/O CI startup experiment: RANK-STRIPED vs NATIVE",
         "",
@@ -819,10 +892,12 @@ def render_report(
             for name, count in Counter(obs.image_source for obs in post_merge).most_common()
         )
         + ".",
+        "- Post-merge observations left out of the comparisons for an unknown root build, "
+        f"pipeline or runtime image: {left_out_text}.",
         f"- Pairs: same test case, GPU type, role, pipeline, branch and runtime image, at most "
-        f"{args.pair_window} "
-        f"root builds apart; 95% intervals from {args.bootstrap} bootstrap resamples. Tables "
-        f"below list tests with at least {args.min_pairs} pairs.",
+        f"{args.pair_window} root builds apart, nearest first. A test's change is `expm1` of its "
+        f"median paired log ratio, with a 95% interval from {args.bootstrap} bootstrap resamples. "
+        f"Tables below list tests with at least {args.min_pairs} pairs.",
         "",
     ]
     for comparison in COMPARISONS:
@@ -942,34 +1017,47 @@ def render_report(
     return "\n".join(lines)
 
 
-def _write_csv(path: Path, records: Sequence[dict[str, object]]) -> None:
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+"""Leading characters that make spreadsheets evaluate a cell as a formula."""
+
+
+def _spreadsheet_safe(value: object) -> object:
+    """Return a CSV cell value that spreadsheets show as text instead of evaluating."""
+    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+        return f"'{value}"
+    return value
+
+
+def _write_csv(path: Path, record_type: type, records: Iterable[Any]) -> None:
+    """Write dataclass records of `record_type` under a header row, written even without records."""
     with path.open("w", newline="") as handle:
-        if not records:
-            return
-        writer = csv.DictWriter(handle, fieldnames=list(records[0]))
+        writer = csv.DictWriter(handle, fieldnames=[field.name for field in fields(record_type)])
         writer.writeheader()
-        writer.writerows(records)
+        for record in records:
+            writer.writerow(
+                {name: _spreadsheet_safe(value) for name, value in asdict(record).items()}
+            )
 
 
-def _pair_record(pair: Pair, metric: str) -> dict[str, object]:
-    return {
-        "comparison": pair.comparison,
-        "test_case": pair.treatment.test_case,
-        "gpu_type": pair.treatment.gpu_type,
-        "role": pair.treatment.role,
-        "pipeline": pair.treatment.pipeline,
-        "branch": pair.treatment.branch,
-        "image": pair.treatment.image,
-        "treatment_root_build": pair.treatment.root_build,
-        "control_root_build": pair.control.root_build,
-        "treatment_seconds": pair.treatment.metrics[metric],
-        "control_seconds": pair.control.metrics[metric],
-        "change": math.expm1(pair.log_ratio),
-        "treatment_repeat_load": pair.treatment.repeat_load,
-        "control_repeat_load": pair.control.repeat_load,
-        "treatment_startup_id": pair.treatment.startup_id,
-        "control_startup_id": pair.control.startup_id,
-    }
+def _pair_record(pair: Pair, metric: str) -> PairRecord:
+    return PairRecord(
+        comparison=pair.comparison,
+        test_case=pair.treatment.test_case,
+        gpu_type=pair.treatment.gpu_type,
+        role=pair.treatment.role,
+        pipeline=pair.treatment.pipeline,
+        branch=pair.treatment.branch,
+        image=pair.treatment.image,
+        treatment_root_build=pair.treatment.root_build,
+        control_root_build=pair.control.root_build,
+        treatment_seconds=pair.treatment.metrics[metric],
+        control_seconds=pair.control.metrics[metric],
+        change=math.expm1(pair.log_ratio),
+        treatment_repeat_load=pair.treatment.repeat_load,
+        control_repeat_load=pair.control.repeat_load,
+        treatment_startup_id=pair.treatment.startup_id,
+        control_startup_id=pair.control.startup_id,
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1032,16 +1120,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the report and return the process exit code."""
     args = parse_args(argv)
     rows = load_rows(args)
-    test_regex: re.Pattern[str] | None = args.test_regex
-    gpus = {gpu.lower() for gpu in args.gpu}
-    observations = [
-        observation
-        for row in rows
-        for observation in observations_from_row(row)
-        if (not gpus or observation.gpu_type in gpus)
-        and (test_regex is None or test_regex.search(observation.test_case))
-    ]
-    observations = mark_repeat_loads(resolve_images(observations, git_image_lookup(args.repo_root)))
+    observations = select_observations(
+        rows,
+        {gpu.lower() for gpu in args.gpu},
+        args.test_regex,
+        git_image_lookup(args.repo_root),
+    )
     summaries: list[CaseSummary] = []
     pairs: list[Pair] = []
     for comparison in COMPARISONS:
@@ -1057,9 +1141,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     (out_dir / "report.md").write_text(
         render_report(args, rows, observations, summaries, pairs, fallbacks)
     )
-    _write_csv(out_dir / "per_test.csv", [asdict(summary) for summary in summaries])
-    _write_csv(out_dir / "pairs.csv", [_pair_record(pair, args.metric) for pair in pairs])
-    _write_csv(out_dir / "fallbacks.csv", [asdict(fallback) for fallback in fallbacks])
+    _write_csv(out_dir / "per_test.csv", CaseSummary, summaries)
+    _write_csv(
+        out_dir / "pairs.csv", PairRecord, (_pair_record(pair, args.metric) for pair in pairs)
+    )
+    _write_csv(out_dir / "fallbacks.csv", FallbackSummary, fallbacks)
     print(f"Wrote {out_dir / 'report.md'}", file=sys.stderr)
     return 0
 
