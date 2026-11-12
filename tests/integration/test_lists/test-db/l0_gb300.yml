@@ -150,6 +150,10 @@ l0_gb300:
   # 3k-6k-token pass keys with their acceptance-length floor. The other layouts and KV dtypes
   # run post-merge (l0_gb300_multi_gpus).
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
+  # qwen4_exp FP8 target, pre-merge: its 2- and 4-rank collective matrices (l0_b300 skips them)
+  # and tep4 MTP3 over an FP8 KV pool. dep4 and dep2 disaggregated run post-merge.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/comm
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_gsm8k[tep4_fp8_kv_breakable] TIMEOUT (60)
 
 # K3 collectives and decode-path exchanges, four ranks in one NVLink domain.
 - condition:

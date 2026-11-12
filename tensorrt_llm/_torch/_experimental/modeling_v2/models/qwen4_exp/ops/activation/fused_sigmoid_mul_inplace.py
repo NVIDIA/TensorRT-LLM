@@ -4,20 +4,61 @@
 
 The gated attention's output gate, between the attention core and o_proj, in
 one Triton kernel (`torch.ops.trtllm.fused_sigmoid_mul_inplace`). Called by the
-qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`) at every layout -- its
-trunk, gate off the fused input-projection row, and its MTP layer, gate as the strided
-half of the q projection.
+qwen4_exp targets at every layout -- the trunk, gate off the fused input-projection row,
+and the MTP layer, gate as the strided half of the q projection.
 """
 
 from __future__ import annotations
 
 import torch
+import triton
 
 # Registered by the module that defines it: after `import
 # tensorrt_llm._torch.custom_ops` alone, torch.ops.trtllm has no
 # `fused_sigmoid_mul_inplace` (measured).
-import tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate  # noqa: F401
+import tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate as _gate_mod
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+
+def _launch(attention_output: torch.Tensor, gate: torch.Tensor) -> bool:
+    """The registered op's launch, made here when its preconditions hold: the same kernel,
+    grid, block, warps and PDL policy, without the custom-op dispatch around it. False
+    (nothing launched) when they do not, for the op to refuse loudly."""
+    if attention_output.dim() != 2 or attention_output.stride(-1) != 1 or gate.stride(-1) != 1:
+        return False
+    num_tokens, hidden = attention_output.shape
+    if gate.dim() == 3:
+        if gate.shape[0] != num_tokens or gate.shape[1] * gate.shape[2] != hidden:
+            return False
+        head_dim, gate_stride_head = gate.shape[2], gate.stride(1)
+    elif gate.dim() == 2 and gate.shape == attention_output.shape:
+        head_dim, gate_stride_head = hidden, hidden
+    else:
+        return False
+    if num_tokens == 0:
+        return True
+    block = min(triton.next_power_of_2(hidden), 1024 if num_tokens < 1024 else 2048)
+    pdl = (
+        dict(LAUNCH_WITH_PDL=True, launch_pdl=True)
+        if _gate_mod._sigmoid_mul_pdl(attention_output.device.index)
+        else {}
+    )
+    _gate_mod._fused_sigmoid_mul_kernel[(num_tokens, triton.cdiv(hidden, block))](
+        attention_output,
+        attention_output,
+        gate,
+        attention_output.stride(0),
+        attention_output.stride(0),
+        gate.stride(0),
+        gate_stride_head,
+        hidden_size=hidden,
+        head_dim=head_dim,
+        block_size=block,
+        num_warps=4,
+        **pdl,
+    )
+    return True
+
 
 #: The checkpoint's gated attention: 24 q heads of 256, q projection [T, 24, 512].
 _CKPT = dict(heads=24, head_dim=256, dtype=torch.bfloat16, gate="interleaved")
@@ -135,7 +176,9 @@ class FusedSigmoidMulInplace(OpWrapper):
     the running device at the first call of each (hidden, head_dim, block)
     specialization, no autotuner: grid `(T, cdiv(hidden, block))`,
     `block = min(next_pow2(hidden), 1024 if T < 1024 else 2048)`, 4 warps. The
-    cells ran on sm_103.
+    cells ran on sm_103. With `direct_launch=True` (the FP8 target), `_launch` makes
+    that same launch itself where the preconditions below hold and skips only the
+    custom-op dispatch; otherwise the op is called and refuses the call.
 
     Call sites, each the attention output gate between the attention core and
     o_proj:
@@ -192,7 +235,10 @@ class FusedSigmoidMulInplace(OpWrapper):
     gate) at 24 heads (`[T, 24, 512]`, hidden 6144) at 1 token, and at 6 heads
     (a compact `[T, 6, 512]`, hidden 1536) at 1, 128, 512, 1024 and 8192 rows;
     CUDA-graph capture and replay of the 1536-wide fused-row form at 8 rows and
-    of the 6-head 3-D gate at 1, 128 and 1024 rows.
+    of the 6-head 3-D gate at 1, 128 and 1024 rows. With `direct_launch` (the FP8
+    target's cells in the test): the 2-D window at hidden 3072 (row stride 7424,
+    gate column 3584) at 1 and 8192 rows, the 24-head 3-D gate at 128 and 8192
+    rows, and graph capture of the 1536-wide fused-row form.
 
     Hard limits
       T * row stride  token offset computed in int64  boundary 2^63  not probed
@@ -202,19 +248,24 @@ class FusedSigmoidMulInplace(OpWrapper):
 
     Not certified: 0 tokens; rows past 8192; the 3-D gate at a token stride
     other than its own q_proj's (heads x 2 x head_dim, e.g. a gate inside a
-    fused q|k|v row); the 24-head strided q_proj half above 1 token (a dep4
-    rank's MTP layer: drafter 1..32 rows and its verify); a strided
-    `attention_output`; a gate dtype other than `attention_output.dtype`;
-    fp16/fp32 operands; hidden sizes other than 1536 and 6144; CUDA-graph
-    capture of the 6144-wide forms; torch.compile.
+    fused q|k|v row); the 24-head strided q_proj half above 1 token without
+    `direct_launch`; a strided `attention_output`; a gate dtype other than
+    `attention_output.dtype`; fp16/fp32 operands; hidden sizes other than 1536,
+    3072 and 6144; CUDA-graph capture of the 6144-wide forms; torch.compile.
     """
 
-    def __call__(self, attention_output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        torch.ops.trtllm.fused_sigmoid_mul_inplace(attention_output, gate)
+    def __call__(
+        self, attention_output: torch.Tensor, gate: torch.Tensor, direct_launch: bool = False
+    ) -> torch.Tensor:
+        if not (direct_launch and _launch(attention_output, gate)):
+            torch.ops.trtllm.fused_sigmoid_mul_inplace(attention_output, gate)
         return attention_output
 
-    def reference(self, attention_output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def reference(
+        self, attention_output: torch.Tensor, gate: torch.Tensor, direct_launch: bool = False
+    ) -> torch.Tensor:
         """What `attention_output` holds after the call; neither input is mutated.
+        `direct_launch` does not change it.
 
         `gate.reshape(T, hidden)` is the per-head `(t, i // D, i % D)` read, for
         the 2-D and 3-D forms alike.

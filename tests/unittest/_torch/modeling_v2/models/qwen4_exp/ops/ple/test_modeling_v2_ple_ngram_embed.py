@@ -9,6 +9,7 @@ float64 gather-and-scale. Beyond the cells: the `query_start_loc` length guard
 and graph capture at the note's replay cells.
 """
 
+import importlib
 import zlib
 from types import SimpleNamespace
 
@@ -37,6 +38,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_
     ple_ngram_embed as op,
 )
 from tensorrt_llm._utils import CUASSERT
+
+_embed_module = importlib.import_module(
+    "tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_ngram_embed"
+)
 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
@@ -217,3 +222,49 @@ def test_cuda_graph_capture_and_replay(lengths, pool_slots) -> None:
     assert torch.equal(graph_out, want)
     assert torch.equal(args[1], want_pool)
     assert not torch.equal(args[1], pool_before)
+
+
+def test_per_sequence_rows_compile_one_variant() -> None:
+    """1 to 4 rows a sequence launch one compiled variant per carry flag, matching the reference."""
+    kernel = _embed_module._ple_ngram_embed_kernel
+    dev = torch.cuda.current_device()
+    seen = {}
+    for carries in (None, [True, False, True, True]):
+        for rows in (1, 2, 3, 4):
+            spec = dict(lengths=(rows,) * 4, pool_slots=8, carries=carries, eos_density=0.1)
+            args = _build(spec, seed=20 + rows)
+            ref, ref_pool = op.reference(*args)
+            out = op(*args)
+            torch.cuda.synchronize()
+            assert torch.equal(out, ref) and torch.equal(args[1], ref_pool), (rows, carries)
+            seen[(carries is None, rows)] = len(kernel.device_caches[dev][0])
+    for flag in (True, False):
+        counts = {seen[(flag, rows)] for rows in (1, 2, 3, 4)}
+        assert len(counts) == 1, f"carry={not flag}: variants per row count {seen}"
+
+
+@pytest.mark.parametrize("world", (2, 4))
+@pytest.mark.parametrize("lengths", ((3, 1, 4), (300, 7)), ids=("per-sequence", "rows"))
+def test_row_windows_sum_to_the_whole_table(world, lengths) -> None:
+    """Each rank's `row_window` share matches the reference, from a slice of the table (its own
+    rows, `base = lo`) or from the whole table (`base = 0`); the shares sum to the whole output."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import ple_host_table
+
+    args = _build(dict(lengths=lengths, pool_slots=8), seed=31 + world)
+    table = args[5]
+    rows, cols = table.shape
+    whole = op(*([a.clone() if isinstance(a, torch.Tensor) else a for a in args]))
+    total = torch.zeros_like(whole, dtype=torch.float32)
+    for rank in range(world):
+        lo, hi = ple_host_table.owned_rows(rank, world, rows, cols, align=cols)
+        for view, base in ((table[lo:hi], lo), (table, 0)):
+            # Fresh arguments for each call: the op advances the context pool in place.
+            call, ref_call = (
+                [a.clone() if isinstance(a, torch.Tensor) else a for a in args] for _ in range(2)
+            )
+            call[5] = ref_call[5] = view
+            share = op(*call, row_window=(lo, hi, base))
+            ref, _ = op.reference(*ref_call, row_window=(lo, hi, base))
+            assert torch.equal(share, ref), (rank, base)
+        total += share.float()
+    assert torch.equal(total.to(whole.dtype), whole)

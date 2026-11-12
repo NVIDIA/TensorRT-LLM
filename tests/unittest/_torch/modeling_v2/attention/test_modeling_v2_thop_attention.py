@@ -7235,6 +7235,8 @@ def _cell_paged(cell, arm) -> None:
     _seed(cell)
     fp8 = bool(spec["quant_mode"] & QUANT_MODE_FP8_KV_CACHE)
     nvfp4 = bool(spec["quant_mode"] & QUANT_MODE_NVFP4_KV_CACHE)
+    cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
+    longest = max(c + n for c, n in zip(cached, new))
     env = _PagedAttnEnv(
         num_heads=spec["num_heads"],
         num_kv_heads=spec["num_kv_heads"],
@@ -7242,20 +7244,24 @@ def _cell_paged(cell, arm) -> None:
         tokens_per_block=spec["tokens_per_block"],
         num_blocks=spec["num_blocks"],
         max_batch=spec["max_num_requests"],
-        max_blocks_per_seq=16,
+        max_blocks_per_seq=max(16, -(-longest // spec["tokens_per_block"])),
         pool_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
         quant_mode=spec["quant_mode"],
         kv_scaling_factor=spec["kv_scale"] if fp8 or nvfp4 else None,
     )
-    cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
     p, paged = spec["predicted_tokens_per_seq"], spec["use_paged_context_fmha"]
     assert all(n == p for n in new[nc:]), "a generation row carries P q rows"
     assert paged or not any(cached[:nc]), "a cached prefix needs the paged-context path"
     rids = list(range(len(new)))
     for rid in rids:
         env.add_request(rid, cached[rid] + (new[rid] if rid < nc else 0))
-    prior = [rid for rid in rids if cached[rid]]
-    if prior:
+    # The histories go in through context calls of at most `_FILL_TOKENS` rows each.
+    groups: List[List[int]] = []
+    for rid in (rid for rid in rids if cached[rid]):
+        if not groups or sum(cached[r] for r in groups[-1]) + cached[rid] > _FILL_TOKENS:
+            groups.append([])
+        groups[-1].append(rid)
+    for prior in groups:
         hist = [cached[rid] for rid in prior]
         env.call_op(
             env.random_qkv(sum(hist)),
@@ -7414,6 +7420,40 @@ def _spread(batch: int, longest: int) -> tuple[int, ...]:
     """`batch` histories rising evenly from 1 to `longest` tokens: one-page, page-boundary
     and multi-page sequences in one verify step."""
     return tuple(1 + (longest - 1) * i // (batch - 1) for i in range(batch))
+
+
+#: The most rows one uncertified history-filling context call of `_cell_paged` takes.
+_FILL_TOKENS = 8192
+#: One rank of an attention-TP member of qwen4_exp: 12 q / 1 kv heads (TP2), 6 / 1 (TP4).
+_QWEN4_TP2 = dict(QWEN4_DENSE, num_heads=12, num_kv_heads=1)
+_QWEN4_TP4 = dict(QWEN4_DENSE, num_heads=6, num_kv_heads=1)
+
+
+def _qwen4_batch(base: dict, requests: int, longest: int, p: int) -> dict:
+    """A generation step of `requests` `_spread` histories at P = `p`, plus 32 unwritten pages."""
+    cached = _spread(requests, longest)
+    pages = sum(-(-(c + p) // base["tokens_per_block"]) for c in cached)
+    return dict(
+        base,
+        max_num_requests=requests,
+        num_blocks=pages + 32,
+        cached=cached,
+        new=(p,) * requests,
+        num_contexts=0,
+        predicted_tokens_per_seq=p,
+    )
+
+
+def _qwen4_prefill_chunk(base: dict) -> dict:
+    """max_num_tokens of fresh prefill: four 2048-token contexts, 8192 q rows."""
+    return dict(
+        base,
+        num_blocks=4 * 2048 // base["tokens_per_block"] + 32,
+        cached=(0,) * 4,
+        new=(2048,) * 4,
+        num_contexts=4,
+        predicted_tokens_per_seq=1,
+    )
 
 
 # The shapes each shipped target calls this entry with, by target directory
@@ -7896,6 +7936,56 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
                 num_contexts=1,
                 predicted_tokens_per_seq=4,
             ),
+        ),
+    ),
+    # One rank of each attention layout at the target's largest batches; its other shapes are
+    # the NVFP4 target's above.
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+        Cell(
+            why="tp2 decode 12q/1kv at the dense ceiling: one row over a 2047-token history",
+            spec=dict(
+                _QWEN4_TP2,
+                cached=(2047,),
+                new=(1,),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="tp2 decode 12q/1kv at 128 requests over histories 1..2047",
+            spec=_qwen4_batch(_QWEN4_TP2, 128, 2047, 1),
+        ),
+        Cell(
+            why="tp2 prefill chunk 12q/1kv: four 2048-token contexts, 8192 rows",
+            spec=_qwen4_prefill_chunk(_QWEN4_TP2),
+        ),
+        Cell(
+            why="tp4 decode 6q/1kv at 128 requests over histories 1..2047",
+            spec=_qwen4_batch(_QWEN4_TP4, 128, 2047, 1),
+        ),
+        Cell(
+            why="tep4 MTP3 verify P=4 6q/1kv: 128 blocks over histories 1..2040, 512 rows",
+            spec=_qwen4_batch(_QWEN4_TP4, 128, 2040, 4),
+        ),
+        Cell(
+            why="tep4 MTP7 verify P=8 6q/1kv: 128 blocks over histories 1..2040, 1024 rows",
+            spec=_qwen4_batch(_QWEN4_TP4, 128, 2040, 8),
+        ),
+        Cell(
+            why="tp4 prefill chunk 6q/1kv: four 2048-token contexts, 8192 rows",
+            spec=_qwen4_prefill_chunk(_QWEN4_TP4),
+        ),
+        Cell(
+            why="dep4 decode 24q/2kv at 128 requests per rank over histories 1..2047",
+            spec=_qwen4_batch(QWEN4_DENSE, 128, 2047, 1),
+        ),
+        Cell(
+            why="dep4 MTP3 verify P=4 24q/2kv: 128 blocks over histories 1..2040, 512 rows",
+            spec=_qwen4_batch(QWEN4_DENSE, 128, 2040, 4),
+        ),
+        Cell(
+            why="tp1 prefill chunk 24q/2kv: four 2048-token contexts, 8192 rows",
+            spec=_qwen4_prefill_chunk(QWEN4_DENSE),
         ),
     ),
 }

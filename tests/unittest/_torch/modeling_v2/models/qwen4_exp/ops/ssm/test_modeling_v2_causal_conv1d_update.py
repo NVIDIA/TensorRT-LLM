@@ -7,18 +7,22 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_update import (  # noqa: E501
     CKPT_DIM,
     CKPT_X_STRIDE,
+    GDN_PAGE_LAYERS,
     RANK_DIM,
     RANK_X_STRIDE,
     _decode_conv_ok,
+    _spread,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_update import (  # noqa: E501
     causal_conv1d_update as op,
 )
 
 __extra_import_path__ = ["../../../.."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "causal_conv1d_update requires a CUDA device"
@@ -94,7 +98,29 @@ def _run(args, extras):
     return returned, got[1]
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+#: A tp2/tep2 rank of the FP8 target: 5120 channels (the TRT-LLM kernel below 64 rows, the CuTe
+#: one from 64), in_proj row stride 8240, over the largest pool the TRT-LLM kernel addresses (its
+#: `int slot * uint32_t stride` slot offset wraps from slot 7768 at this page's slot stride).
+_TP2 = dict(dim=5120, x_row_stride=8240, pool_slots=7768, pool_layers=GDN_PAGE_LAYERS)
+
+#: The shapes each target calls this entry with beyond its own cells, by target directory.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+        Cell(
+            why="fp8 tp2/tep2 decode, 1 row at 5120 / stride 8240: the top addressable slot",
+            spec=dict(_TP2, batch=1, slots=_spread(1, 7768)),
+        ),
+        Cell(
+            why="fp8 tp2/tep2, 128 rows at 5120 / stride 8240, pad rows (-1) on the CuTe kernel",
+            spec=dict(_TP2, batch=128, slots=_spread(128, 7768, 21)),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
     args, extras = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))

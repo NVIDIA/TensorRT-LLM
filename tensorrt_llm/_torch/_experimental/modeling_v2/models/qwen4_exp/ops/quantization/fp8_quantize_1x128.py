@@ -69,6 +69,8 @@ class Fp8Quantize1x128(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
+    # spec: tokens, hidden, use_ue8m0, capture (False: eager; True: replayed from a captured
+    # CUDA graph over two steps' activations).
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTPLayer._moe decode: one token at hidden 2560", spec=dict(tokens=1, **_CKPT)),
         Cell(
@@ -91,6 +93,20 @@ class Fp8Quantize1x128(OpWrapper):
             why="8192 rows: the MTP layer over one max_num_tokens context chunk",
             spec=dict(tokens=8192, **_CKPT),
         ),
+        # The FP8 unified target's routed experts in its captured decode graph (1..128 rows).
+        Cell(
+            why="FP8 unified captured decode: 8 rows (batch 8; dep2 2 x 4, dep4 4 x 2)",
+            spec=dict(tokens=8, **_CKPT, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured decode: 72 rows (batch 72)",
+            spec=dict(tokens=72, **_CKPT, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured decode: 128 rows, the largest (batch 128; dep2 2 x 64, "
+            "dep4 4 x 32 gathered)",
+            spec=dict(tokens=128, **_CKPT, capture=True),
+        ),
     )
 
     note = """
@@ -110,6 +126,8 @@ class Fp8Quantize1x128(OpWrapper):
     stop at `T`. At a `T` that is a multiple of 4 (128, 1024, 8192) nothing is
     padded and `scales` is the kernel's own buffer, not a compacting copy.
     CUDA-graph capture and replay are certified at 64, 128 and 1024 rows.
+    At the `capture` cells the replay is bitwise the eager call, and a second
+    step's activations replay bitwise their own eager call.
 
     Source: compiled-in C++, `torch.ops.trtllm.fp8_quantize_1x128` from
     `thop/fp8Quantize.cpp` (`fp8_1x128_cs` -> `launch_scale_1x128`). The
@@ -129,14 +147,17 @@ class Fp8Quantize1x128(OpWrapper):
       T   certified at 1, 20, 128, 1024, 8192 and 16384 at H 2560 (128: the
           drafter's decode at max_batch_size 128; 1024: the first draft over
           mtp7's 128 x 8 verify rows; 8192: a max_num_tokens context chunk;
-          16384: max_num_tokens of the tuned config); above that not probed
+          16384: max_num_tokens of the tuned config), captured at 8, 72 and
+          128; above that not probed
       H   multiple of 16 (raises otherwise); certified at 2560, the draft layer's
           width
 
     Not certified: `T == 0` (the op accepts it and returns `[0, H]` /
     `[NB, 0]`); a short tail block (`H % 128 != 0`); all-zero blocks (the
     `AMAX_FLOOR` scale), `inf` / NaN inputs and saturation; `use_ue8m0=True`;
-    the element-wise fallback kernel; the registered fake.
+    the element-wise fallback kernel; the registered fake. Not driven under
+    capture: the other captured row counts, and a count that is not a multiple
+    of 4 (the compacting copy).
     """
 
     def __call__(
