@@ -22,11 +22,19 @@ collective or auxiliary copy submitter is needed in the serving path.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, TypeVar
 
 import torch
 
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
+    from tensorrt_llm.mapping import Mapping
+
+    from .arena import RebalanceLiveArena
+    from .manager import PerLayerDynamicMoeLoadBalancer
 
 __all__ = [
     "RebalanceSlotSchedulerGroup",
@@ -267,7 +275,7 @@ class RebalanceSlotSchedulerGroup:
 
         logger.debug("[MegaMoECuteDsl] layer=%s rebalance producer initialized", layer_idx)
 
-    def _bind_copy_endpoint(self, *, arena: Any, helper_residency: bool) -> None:
+    def _bind_copy_endpoint(self, *, arena: RebalanceLiveArena, helper_residency: bool) -> None:
         """Build this layer's copy endpoint as ``self.broadcaster`` and bind it to the scheduler.
 
         ``__init__`` calls it once every rank has connected the scheduler's
@@ -507,20 +515,23 @@ def build_rebalance_slot_scheduler_group(
     )
 
 
+_GroupT = TypeVar("_GroupT", bound=RebalanceSlotSchedulerGroup)
+
+
 def build_scheduler_group_from_manager(
-    group_cls: type,
+    group_cls: type[_GroupT],
     *,
-    arena: Any,
-    manager: Any,
-    mapping: Any,
-    ep_process_group: Any,
+    arena: RebalanceLiveArena,
+    manager: PerLayerDynamicMoeLoadBalancer,
+    mapping: Mapping,
+    ep_process_group: ProcessGroup,
     home_experts: int,
     helper_slots: int,
     topk: int,
     max_tokens_per_rank: int,
     layer_idx: Optional[int],
-) -> Any:
-    """Build one layer's ``group_cls``, a ``RebalanceSlotSchedulerGroup``, from its manager.
+) -> _GroupT:
+    """Build one layer's ``group_cls`` from its manager.
 
     Every planner's builder takes these keywords and the same manager
     resources; the communicator is resolved before the stream.

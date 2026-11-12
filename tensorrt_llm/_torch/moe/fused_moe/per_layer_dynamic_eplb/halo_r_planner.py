@@ -41,7 +41,7 @@ count exchange, which every rank enters after its own consumers.
 from __future__ import annotations
 
 import threading
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
@@ -53,6 +53,17 @@ from .planner import (
     SchedulerSpinBound,
     build_scheduler_group_from_manager,
 )
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
+    from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler import (
+        CudaPhysicalSlotScheduler,
+    )
+    from tensorrt_llm.mapping import Mapping
+
+    from .arena import RebalanceLiveArena, _SharedSlotPool
+    from .manager import PerLayerDynamicMoeLoadBalancer
 
 __all__ = [
     "HaloRRelayEndpoint",
@@ -146,7 +157,9 @@ def validate_halo_r_config(*, num_slots: int, num_experts: int, ep_size: int) ->
         )
 
 
-def _relay_tables(arena: Any, pool: Any, *, ep_rank: int, home_experts: int) -> tuple:
+def _relay_tables(
+    arena: RebalanceLiveArena, pool: _SharedSlotPool, *, ep_rank: int, home_experts: int
+) -> tuple[list[int], list[int], list[int], int, int]:
     """The relay's source and destination address tables, plane sizes and READY cell."""
     # HALO-R's helper sets have no multicast object, so its provider hands out
     # the base arena without HALO levels; a hierarchical arena has it as ``base``.
@@ -196,10 +209,10 @@ class HaloRRelayEndpoint(LiveBankLease):
     def __init__(
         self,
         *,
-        scheduler: Any,
+        scheduler: CudaPhysicalSlotScheduler,
         route_counter: torch.Tensor,
-        arena: Any,
-        pool: Any,
+        arena: RebalanceLiveArena,
+        pool: _SharedSlotPool,
         home_experts: int,
         copy_stream: torch.cuda.Stream,
         helper_residency: bool,
@@ -245,7 +258,7 @@ class HaloRRelayEndpoint(LiveBankLease):
         if len(destinations) != ep * len(plane_bytes):
             raise RuntimeError("HALO-R relay destination table does not cover every EP rank")
 
-        def int64(values: list) -> torch.Tensor:
+        def int64(values: list[int]) -> torch.Tensor:
             return torch.tensor(values, dtype=torch.int64).to(self.device)
 
         self.relay_sources = int64(sources)
@@ -539,7 +552,7 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
             layer_idx=layer_idx,
         )
 
-    def _bind_copy_endpoint(self, *, arena: Any, helper_residency: bool) -> None:
+    def _bind_copy_endpoint(self, *, arena: RebalanceLiveArena, helper_residency: bool) -> None:
         """Build the ``HaloRRelayEndpoint`` and set this layer's READY row, on every rank or none.
 
         Each rank maps every peer's helper chunks and builds its native
@@ -671,10 +684,10 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
 
 def build_halo_r_slot_scheduler_group(
     *,
-    arena: Any,
-    manager: Any,
-    mapping: Any,
-    ep_process_group: Any,
+    arena: RebalanceLiveArena,
+    manager: PerLayerDynamicMoeLoadBalancer,
+    mapping: Mapping,
+    ep_process_group: ProcessGroup,
     home_experts: int,
     helper_slots: int,
     topk: int,
