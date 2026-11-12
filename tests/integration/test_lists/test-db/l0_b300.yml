@@ -159,6 +159,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/qwen4_exp/ops TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py --import-mode=importlib TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_copy_plans.py --import-mode=importlib TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
   # K3 single-GPU kernel and wrapper checks.
