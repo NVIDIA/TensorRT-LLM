@@ -171,7 +171,7 @@ inline __device__ void quantizeAndWriteMlaFp4Residual(PackedVec<T> const& values
 }
 
 template <typename T>
-inline __device__ uint2 convertMlaVecToE4m3(PackedVec<T> const& values, float scale)
+inline __device__ uint2 convertMlaVecToE4m3(PackedVec<T> const& values)
 {
     static_assert(sizeof(T) * 8 == sizeof(PackedVec<T>));
     auto const* elements = reinterpret_cast<T const*>(&values);
@@ -180,7 +180,7 @@ inline __device__ uint2 convertMlaVecToE4m3(PackedVec<T> const& values, float sc
 #pragma unroll
     for (int32_t index = 0; index < 8; ++index)
     {
-        output[index] = __nv_fp8_e4m3(static_cast<float>(elements[index]) * scale);
+        output[index] = __nv_fp8_e4m3(static_cast<float>(elements[index]));
     }
     return packed;
 }
@@ -196,7 +196,8 @@ inline __device__ void quantizeAndWriteMlaFp4(KVBlockArray const& dataCache, KVB
 
     // Inline-scale record (FlashInfer PrimTS D576 "nvfp4.fp8rope"): E2M1 NoPE codes, the last
     // kResidualVecsPerToken vectors (RoPE) as E4M3, then the NoPE block scales with block b at
-    // 8 * (b % 4) + b / 4. The scale pool is unused. Callers pass a unit second-level scale.
+    // 8 * (b % 4) + b / 4. The scale pool is unused, and the block scales and the RoPE values are
+    // real-valued: the second-level scale of the other layouts does not apply.
     constexpr int32_t kNopeVecsPerToken = kMainVecsPerToken - kResidualVecsPerToken;
     constexpr int32_t kRecordRopeOffset = kNopeVecsPerToken * static_cast<int32_t>(sizeof(uint32_t));
     constexpr int32_t kRecordScaleOffset
@@ -212,13 +213,12 @@ inline __device__ void quantizeAndWriteMlaFp4(KVBlockArray const& dataCache, KVB
             int32_t const scaleBlock = vecIdx / 2;
             uint8_t* scaleOut
                 = (vecIdx & 1) == 0 ? record + kRecordScaleOffset + 8 * (scaleBlock % 4) + scaleBlock / 4 : nullptr;
-            reinterpret_cast<uint32_t*>(record)[vecIdx]
-                = cvt_warp_fp16_to_fp4<T, 16, false>(values, secondLevelScale, scaleOut);
+            reinterpret_cast<uint32_t*>(record)[vecIdx] = cvt_warp_fp16_to_fp4<T, 16, false>(values, 1.F, scaleOut);
         }
         else
         {
             reinterpret_cast<uint2*>(record + kRecordRopeOffset)[vecIdx - kNopeVecsPerToken]
-                = convertMlaVecToE4m3(values, secondLevelScale);
+                = convertMlaVecToE4m3(values);
         }
         return;
     }

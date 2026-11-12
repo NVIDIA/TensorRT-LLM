@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Storage of the ``fp8rope`` NVFP4 DSA KV-cache layout: one inline-scale record per token."""
+"""Layout of the NVFP4 DSA KV cache: ``fp8rope`` records where the cache can hold them."""
 
 from types import SimpleNamespace
 
@@ -21,7 +21,11 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
     NVFP4_MLA_KV_CACHE_LAYOUT_ENV,
+    NVFP4_MLA_RECORD_LAYOUT,
+    NVFP4_MLA_RESIDUAL_LAYOUT,
     DSACacheManagerV2,
+    _get_nvfp4_mla_record_unsupported_reason,
+    resolve_nvfp4_mla_kv_cache_layout,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm.bindings import DataType
@@ -62,15 +66,24 @@ def _make_manager(sparse_config):
     )
 
 
-@pytest.mark.parametrize("layout", ["residual", "fp8rope"])
+def _request_layout(monkeypatch, layout):
+    """Set ``TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT``; None leaves it unset, which asks for ``auto``."""
+    if layout is None:
+        monkeypatch.delenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, layout)
+
+
+@pytest.mark.parametrize("layout", [None, "auto", "residual", "fp8rope"])
 def test_record_layout_has_no_scale_pool(monkeypatch, layout):
-    monkeypatch.setenv(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, layout)
+    _request_layout(monkeypatch, layout)
     sparse_config = DeepSeekSparseAttentionConfig(index_head_dim=128)
     manager = _make_manager(sparse_config)
     try:
         roles = manager._get_layer_roles_by_local_id(0)
         pointers = manager.kv_cache_pool_pointers
         if layout == "residual":
+            assert manager.mla_kv_cache_layout == NVFP4_MLA_RESIDUAL_LAYOUT
             assert manager.mla_kv_cache_residual_dim == 64
             assert Role.KEY_BLOCK_SCALE in roles
             assert manager.get_layer_bytes_per_token(0, Role.KEY) == 320
@@ -78,6 +91,7 @@ def test_record_layout_has_no_scale_pool(monkeypatch, layout):
             assert int(pointers[0, 0, 1]) != 0
             latent_bytes = 360
         else:
+            assert manager.mla_kv_cache_layout == NVFP4_MLA_RECORD_LAYOUT
             assert manager.mla_kv_cache_residual_dim == 128
             assert Role.KEY_BLOCK_SCALE not in roles
             assert manager.get_layer_bytes_per_token(0, Role.KEY) == _RECORD_BYTES
@@ -109,3 +123,43 @@ def test_record_layout_rejects_kv_cache_offload(monkeypatch):
     sparse_config = DeepSeekSparseAttentionConfig(index_head_dim=128, enable_kv_cache_offload=True)
     with pytest.raises(ValueError, match="KV cache offload"):
         _make_manager(sparse_config)
+
+
+@pytest.mark.parametrize(
+    "head_dim, rope_head_dim, kv_cache_config, kv_cache_offload, unsupported",
+    [
+        (576, 64, KvCacheConfig(), False, None),
+        (320, 64, KvCacheConfig(), False, "512 \\+ 64 latent"),
+        (576, 64, SimpleNamespace(mixed_precision_kv=object()), False, "mixed-precision"),
+        (576, 64, KvCacheConfig(), True, "KV cache offload"),
+    ],
+)
+def test_cache_that_cannot_hold_records_keeps_the_residual_layout(
+    monkeypatch, head_dim, rope_head_dim, kv_cache_config, kv_cache_offload, unsupported
+):
+    reason = _get_nvfp4_mla_record_unsupported_reason(
+        head_dim, rope_head_dim, kv_cache_config, kv_cache_offload
+    )
+    assert (reason is None) == (unsupported is None)
+
+    for layout in (None, "auto"):
+        _request_layout(monkeypatch, layout)
+        expected = NVFP4_MLA_RECORD_LAYOUT if unsupported is None else NVFP4_MLA_RESIDUAL_LAYOUT
+        assert resolve_nvfp4_mla_kv_cache_layout(reason) == expected
+
+    _request_layout(monkeypatch, "residual")
+    assert resolve_nvfp4_mla_kv_cache_layout(reason) == NVFP4_MLA_RESIDUAL_LAYOUT
+
+    # An explicit request for records is not overridden.
+    _request_layout(monkeypatch, "fp8rope")
+    if unsupported is None:
+        assert resolve_nvfp4_mla_kv_cache_layout(reason) == NVFP4_MLA_RECORD_LAYOUT
+    else:
+        with pytest.raises(ValueError, match=unsupported):
+            resolve_nvfp4_mla_kv_cache_layout(reason)
+
+
+def test_unknown_layout_request_is_rejected(monkeypatch):
+    _request_layout(monkeypatch, "records")
+    with pytest.raises(ValueError, match=NVFP4_MLA_KV_CACHE_LAYOUT_ENV):
+        resolve_nvfp4_mla_kv_cache_layout(None)

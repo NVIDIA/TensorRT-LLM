@@ -53,38 +53,84 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, SparseAttentionConfig
 
 NVFP4_MLA_KV_CACHE_LAYOUT_ENV = "TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT"
+NVFP4_MLA_AUTO_LAYOUT = "auto"
 NVFP4_MLA_RESIDUAL_LAYOUT = "residual"
 NVFP4_MLA_RECORD_LAYOUT = "fp8rope"
 
 
-def get_nvfp4_mla_kv_cache_layout() -> str:
-    """Return the NVFP4 DSA latent-cache layout selected by ``TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT``.
+def get_requested_nvfp4_mla_kv_cache_layout() -> str:
+    """Return the NVFP4 DSA latent-cache layout that ``TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT`` asks for.
 
-    ``residual`` (default) keeps the 576 E2M1 values, plus residual E2M1 codes for the RoPE part
-    when ``TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION`` is on, in the data pool and their E4M3 block
-    scales in the scale pool, all under one global scale. ``fp8rope`` stores the 352-byte record
-    that FlashInfer PrimTS's D576 sparse MLA reads as ``kv_cache_format="nvfp4.fp8rope"``: 256 B of
-    E2M1 NoPE, 64 B of E4M3 RoPE and the 32 NoPE block scales (block ``b`` at byte
-    ``320 + 8 * (b % 4) + b // 4``), with real-valued block scales, no global scale and no
-    scale pool.
+    ``fp8rope`` stores the 352-byte record that FlashInfer PrimTS's D576 sparse MLA reads as
+    ``kv_cache_format="nvfp4.fp8rope"``: 256 B of E2M1 NoPE, 64 B of E4M3 RoPE and the 32 NoPE
+    block scales (block ``b`` at byte ``320 + 8 * (b % 4) + b // 4``), with real-valued block
+    scales, no global scale and no scale pool. ``residual`` keeps the 576 E2M1 values, plus
+    residual E2M1 codes for the RoPE part when ``TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION`` is on,
+    in the data pool and their E4M3 block scales in the scale pool, all under one global scale.
+    ``auto`` (default) takes ``fp8rope`` for a cache that can hold records and ``residual`` for
+    any other; :func:`resolve_nvfp4_mla_kv_cache_layout` settles it for one cache.
     """
-    layout = os.environ.get(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, NVFP4_MLA_RESIDUAL_LAYOUT)
-    if layout not in (NVFP4_MLA_RESIDUAL_LAYOUT, NVFP4_MLA_RECORD_LAYOUT):
+    layout = os.environ.get(NVFP4_MLA_KV_CACHE_LAYOUT_ENV, NVFP4_MLA_AUTO_LAYOUT)
+    if layout not in (NVFP4_MLA_AUTO_LAYOUT, NVFP4_MLA_RESIDUAL_LAYOUT, NVFP4_MLA_RECORD_LAYOUT):
         raise ValueError(
-            f"{NVFP4_MLA_KV_CACHE_LAYOUT_ENV} must be {NVFP4_MLA_RESIDUAL_LAYOUT!r} or "
-            f"{NVFP4_MLA_RECORD_LAYOUT!r}, got {layout!r}"
+            f"{NVFP4_MLA_KV_CACHE_LAYOUT_ENV} must be {NVFP4_MLA_AUTO_LAYOUT!r}, "
+            f"{NVFP4_MLA_RESIDUAL_LAYOUT!r} or {NVFP4_MLA_RECORD_LAYOUT!r}, got {layout!r}"
         )
     return layout
 
 
-def get_nvfp4_mla_kv_cache_storage_extra_dim(rope_head_dim: int) -> int:
+def resolve_nvfp4_mla_kv_cache_layout(record_unsupported_reason: Optional[str]) -> str:
+    """Return the layout of one NVFP4 DSA latent cache: ``residual`` or ``fp8rope``.
+
+    Args:
+        record_unsupported_reason: Why the cache cannot hold ``fp8rope`` records, worded as the
+            predicate of a sentence about that layout; None if it can.
+
+    Raises:
+        ValueError: ``fp8rope`` is requested for a cache that cannot hold records.
+    """
+    requested = get_requested_nvfp4_mla_kv_cache_layout()
+    if requested == NVFP4_MLA_RESIDUAL_LAYOUT:
+        return NVFP4_MLA_RESIDUAL_LAYOUT
+    if record_unsupported_reason is None:
+        return NVFP4_MLA_RECORD_LAYOUT
+    if requested == NVFP4_MLA_RECORD_LAYOUT:
+        raise ValueError(
+            f"The {NVFP4_MLA_RECORD_LAYOUT!r} NVFP4 MLA cache layout {record_unsupported_reason}"
+        )
+    logger.info_once(
+        f"The NVFP4 DSA KV cache uses the {NVFP4_MLA_RESIDUAL_LAYOUT!r} layout: the "
+        f"{NVFP4_MLA_RECORD_LAYOUT!r} layout {record_unsupported_reason}.",
+        key=f"nvfp4_mla_kv_cache_layout_fallback:{record_unsupported_reason}",
+    )
+    return NVFP4_MLA_RESIDUAL_LAYOUT
+
+
+def _get_nvfp4_mla_record_unsupported_reason(
+    head_dim: int, rope_head_dim: int, kv_cache_config: object, kv_cache_offload: bool
+) -> Optional[str]:
+    """Why a ``DSACacheManagerV2`` cache cannot hold ``fp8rope`` records, or None if it can."""
+    if head_dim != 576 or rope_head_dim != 64:
+        return (
+            f"requires a 512 + 64 latent, got head_dim={head_dim} and "
+            f"qk_rope_head_dim={rope_head_dim}"
+        )
+    if getattr(kv_cache_config, "mixed_precision_kv", None) is not None:
+        return "does not support mixed-precision KV caches"
+    if kv_cache_offload:
+        # The offload arena reads an NVFP4 latent with a block-scale pool.
+        return "does not support KV cache offload"
+    return None
+
+
+def get_nvfp4_mla_kv_cache_storage_extra_dim(rope_head_dim: int, layout: str) -> int:
     """Return the FP4 element slots each NVFP4 DSA cache row stores beyond the latent width.
 
     The native cache ops take this as ``residual_dim``: ``rope_head_dim`` for the residual RoPE
     codes, and ``2 * rope_head_dim`` for the record layout, whose E4M3 RoPE and inline NoPE scales
     take 64 more bytes per row than 576 E2M1 values.
     """
-    if get_nvfp4_mla_kv_cache_layout() == NVFP4_MLA_RECORD_LAYOUT:
+    if layout == NVFP4_MLA_RECORD_LAYOUT:
         return 2 * rope_head_dim
     if os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1":
         return rope_head_dim
@@ -262,11 +308,11 @@ class DSACacheManager(KVCacheManager):
         # quantization is enabled by DSACacheManagerV2, whose buffer sizes are
         # role-configurable.
         self.mla_kv_cache_residual_dim = 0
-        self.mla_kv_cache_layout = NVFP4_MLA_RESIDUAL_LAYOUT if dtype == DataType.NVFP4 else None
-        if dtype == DataType.NVFP4 and get_nvfp4_mla_kv_cache_layout() == NVFP4_MLA_RECORD_LAYOUT:
-            raise ValueError(
-                f"The {NVFP4_MLA_RECORD_LAYOUT!r} NVFP4 MLA cache layout requires DSACacheManagerV2"
-            )
+        self.mla_kv_cache_layout = (
+            resolve_nvfp4_mla_kv_cache_layout("requires DSACacheManagerV2")
+            if dtype == DataType.NVFP4
+            else None
+        )
         # FP4 mode packs the indexer K cache as head_dim/2 data bytes + 4
         # scale bytes (vs. head_dim + 4 for FP8). The C++ WindowBlockManager
         # allocates the pool with this smaller stride when the flag is set.
@@ -522,30 +568,19 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         )
         rope_head_dim = int(getattr(residual_config, "qk_rope_head_dim", 0))
         self.mla_kv_cache_layout = (
-            get_nvfp4_mla_kv_cache_layout() if dtype == DataType.NVFP4 else None
+            resolve_nvfp4_mla_kv_cache_layout(
+                _get_nvfp4_mla_record_unsupported_reason(
+                    head_dim, rope_head_dim, kv_cache_config, sparse_params.enable_kv_cache_offload
+                )
+            )
+            if dtype == DataType.NVFP4
+            else None
         )
         self.mla_kv_cache_residual_dim = (
-            get_nvfp4_mla_kv_cache_storage_extra_dim(rope_head_dim)
+            get_nvfp4_mla_kv_cache_storage_extra_dim(rope_head_dim, self.mla_kv_cache_layout)
             if dtype == DataType.NVFP4
             else 0
         )
-        if self.mla_kv_cache_layout == NVFP4_MLA_RECORD_LAYOUT:
-            if head_dim != 576 or rope_head_dim != 64:
-                raise ValueError(
-                    f"The {NVFP4_MLA_RECORD_LAYOUT!r} NVFP4 MLA cache layout requires a 512 + 64 "
-                    f"latent, got head_dim={head_dim} and qk_rope_head_dim={rope_head_dim}"
-                )
-            if getattr(kv_cache_config, "mixed_precision_kv", None) is not None:
-                raise ValueError(
-                    f"The {NVFP4_MLA_RECORD_LAYOUT!r} NVFP4 MLA cache layout does not support "
-                    "mixed-precision KV caches"
-                )
-            if sparse_params.enable_kv_cache_offload:
-                # The offload arena reads an NVFP4 latent with a block-scale pool.
-                raise ValueError(
-                    f"The {NVFP4_MLA_RECORD_LAYOUT!r} NVFP4 MLA cache layout does not support "
-                    "KV cache offload"
-                )
         if self.mla_kv_cache_residual_dim % 16 != 0:
             raise ValueError(
                 "NVFP4 MLA residual dimension must be divisible by 16, got "
@@ -1093,15 +1128,20 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         quant_config = model_config.quant_config
         if quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache():
             config = model_config.pretrained_config
-            residual_dim = get_nvfp4_mla_kv_cache_storage_extra_dim(
-                int(getattr(config, "qk_rope_head_dim", 0))
+            rope_head_dim = int(getattr(config, "qk_rope_head_dim", 0))
+            head_dim = int(getattr(config, "kv_lora_rank", 0)) + rope_head_dim
+            # The cache manager settles the layout from the same facts; offload returned above.
+            layout = resolve_nvfp4_mla_kv_cache_layout(
+                _get_nvfp4_mla_record_unsupported_reason(
+                    head_dim, rope_head_dim, kwargs.get("kv_cache_config"), False
+                )
             )
+            residual_dim = get_nvfp4_mla_kv_cache_storage_extra_dim(rope_head_dim, layout)
             num_attention_layers = KVCacheManager._resolve_num_attention_layers(
                 model_config, mapping, num_layers
             )
-            if get_nvfp4_mla_kv_cache_layout() == NVFP4_MLA_RECORD_LAYOUT:
+            if layout == NVFP4_MLA_RECORD_LAYOUT:
                 # The record carries its block scales inline instead of in a scale pool.
-                head_dim = config.kv_lora_rank + config.qk_rope_head_dim
                 cache_bytes += num_attention_layers * (residual_dim // 2 - math.ceil(head_dim / 16))
             else:
                 cache_bytes += num_attention_layers * (

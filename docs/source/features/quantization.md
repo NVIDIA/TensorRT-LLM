@@ -75,6 +75,24 @@ This configures an active NVFP4 KV cache on the GPU. To keep the active GPU KV
 cache in its normal runtime type and use NVFP4 only while Pages reside in Host
 or Disk storage, see [KV Cache Compression](kv-cache-compression.md).
 
+#### NVFP4 KV Cache Layout of DSA Models
+
+Models with DeepSeek sparse attention (DSA) and a 512 + 64 MLA latent
+(DeepSeek-V3.2, GLM-5) store each token of an NVFP4 KV cache as one 352-byte
+record per layer: the 512 compressed values as E2M1 with one E4M3 scale per 16
+values, and the 64 rotary values as E4M3. On SM100 and SM103 the generation
+attention reads these records in place; elsewhere they are expanded to FP8 rows
+first.
+
+`TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT` selects the layout. `auto` (default) stores
+records wherever the cache supports them and falls back to the `residual` layout
+with a mixed-precision KV cache (`kv_cache_config.dtype="mixed_*"`), with sparse
+KV cache offload, and with KV cache manager V1. `residual` stores all 576 values
+as E2M1 under one global scale, with a second E2M1 code for the rotary values.
+`fp8rope` requests records and fails where they are not supported.
+Servers that exchange KV caches, such as the context and generation servers of a
+disaggregated deployment, must use the same layout.
+
 #### MLA Latent Scale for Quantized KV Caches
 
 MLA models (DeepSeek-V3 family, GLM) store one latent per token in the KV cache.

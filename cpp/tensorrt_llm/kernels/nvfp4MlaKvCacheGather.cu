@@ -249,18 +249,6 @@ __device__ __forceinline__ uint4 convertGloballyScaledE2m1x16ToE4m3(
     return output;
 }
 
-__device__ __forceinline__ uint32_t rescaleE4m3x4(uint32_t packed, float scale)
-{
-    __nv_fp8x4_e4m3 values;
-    values.__x = packed;
-    float4 floats = static_cast<float4>(values);
-    floats.x *= scale;
-    floats.y *= scale;
-    floats.z *= scale;
-    floats.w *= scale;
-    return convertFloat4ToE4m3(floats);
-}
-
 __device__ __forceinline__ uint32_t convertResidualE2m1x4ToE4m3(
     uint16_t mainPacked, uint16_t residualPacked, __nv_fp8_e4m3 mainScale, __nv_fp8_e4m3 residualScale)
 {
@@ -500,8 +488,9 @@ __device__ __forceinline__ void dequantizeRow(uint8_t const* __restrict__ dataPo
 }
 
 // Expands one inline-scale record (kMlaRecordBytes) to a 576-wide E4M3 row. One warp per row.
+// The record's block scales and RoPE values are real-valued: no global scale applies.
 __device__ __forceinline__ void dequantizeRecordRow(uint8_t const* __restrict__ dataPool,
-    __nv_fp8_e4m3* __restrict__ output, int32_t globalIdx, int32_t outputIdx, float dequantScale, int32_t lane)
+    __nv_fp8_e4m3* __restrict__ output, int32_t globalIdx, int32_t outputIdx, int32_t lane)
 {
     auto const* record = dataPool + static_cast<int64_t>(globalIdx) * kMlaRecordBytes;
     auto* outputRow = output + static_cast<int64_t>(outputIdx) * kMlaHeadDim;
@@ -509,38 +498,28 @@ __device__ __forceinline__ void dequantizeRecordRow(uint8_t const* __restrict__ 
     uint2 const packed = *reinterpret_cast<uint2 const*>(record + static_cast<int64_t>(group) * 8);
     __nv_fp8_e4m3 const scale
         = reinterpret_cast<__nv_fp8_e4m3 const*>(record + kMlaRecordScaleOffset)[8 * (group % 4) + group / 4];
-    uint4 const values = dequantScale == 1.F ? convertUnitScaledE2m1x16ToE4m3(packed, scale)
-                                             : convertGloballyScaledE2m1x16ToE4m3(packed, scale, dequantScale);
-    *reinterpret_cast<uint4*>(outputRow + static_cast<int64_t>(group) * 16) = values;
+    *reinterpret_cast<uint4*>(outputRow + static_cast<int64_t>(group) * 16)
+        = convertUnitScaledE2m1x16ToE4m3(packed, scale);
     if (lane < kMlaResidualDim / 16)
     {
-        uint4 rope = *reinterpret_cast<uint4 const*>(record + kMlaRecordRopeOffset + lane * 16);
-        if (dequantScale != 1.F)
-        {
-            rope.x = rescaleE4m3x4(rope.x, dequantScale);
-            rope.y = rescaleE4m3x4(rope.y, dequantScale);
-            rope.z = rescaleE4m3x4(rope.z, dequantScale);
-            rope.w = rescaleE4m3x4(rope.w, dequantScale);
-        }
-        *reinterpret_cast<uint4*>(outputRow + kMlaRecordNopeGroups * 16 + lane * 16) = rope;
+        *reinterpret_cast<uint4*>(outputRow + kMlaRecordNopeGroups * 16 + lane * 16)
+            = *reinterpret_cast<uint4 const*>(record + kMlaRecordRopeOffset + lane * 16);
     }
 }
 
 __global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp4MlaRecordKvCacheGatherKernel(
     uint8_t const* __restrict__ dataPool, int32_t const* __restrict__ globalIndices, __nv_fp8_e4m3* __restrict__ output,
-    int32_t* __restrict__ compactIndices, float const* __restrict__ globalDequantScale, int64_t numPairs,
-    int64_t numPoolTokens)
+    int32_t* __restrict__ compactIndices, int64_t numPairs, int64_t numPoolTokens)
 {
     int32_t const warp = threadIdx.x / kWarpSize;
     int32_t const lane = threadIdx.x % kWarpSize;
-    float const dequantScale = globalDequantScale == nullptr ? 1.F : globalDequantScale[0];
     int64_t const pairStride = static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
     for (int64_t pair = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp; pair < numPairs; pair += pairStride)
     {
         int32_t const globalIdx = fetchGlobalIndex(globalIndices, compactIndices, pair, numPoolTokens, lane);
         if (globalIdx >= 0)
         {
-            dequantizeRecordRow(dataPool, output, globalIdx, static_cast<int32_t>(pair), dequantScale, lane);
+            dequantizeRecordRow(dataPool, output, globalIdx, static_cast<int32_t>(pair), lane);
         }
     }
 }
@@ -856,7 +835,7 @@ __global__ void nvFp4MlaContextKvCacheGatherKernel(uint8_t const* __restrict__ d
         {
             if constexpr (kLayout == MlaContextRowLayout::kRecord)
             {
-                dequantizeRecordRow(dataPool, output, globalIdx, outputIdx, dequantScale, lane);
+                dequantizeRecordRow(dataPool, output, globalIdx, outputIdx, lane);
             }
             else if (dequantScale == 1.F)
             {
@@ -965,7 +944,7 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
     {
         int32_t const blocks = getPersistentBlockCount(numPairs, kGenerationBlocksPerSm);
         nvFp4MlaRecordKvCacheGatherKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-            dataPool, globalIndices, output, compactIndices, globalDequantScale, numPairs, numPoolTokens);
+            dataPool, globalIndices, output, compactIndices, numPairs, numPoolTokens);
     }
     else if (headDim == kMlaHeadDim && residualDim == kMlaResidualDim)
     {
