@@ -3,6 +3,7 @@
 
 """Private host read-ahead primitives for Hugging Face SafeTensors."""
 
+import math
 import os
 import threading
 import time
@@ -177,10 +178,53 @@ def _reclaimable_file_cache(stat_path: Path, unified: bool) -> int:
     return sum(max(0, stats.get(name, 0)) for name in names)
 
 
+def _memory_protection(cgroup: Path) -> float:
+    """Return the larger of a cgroup v2's `memory.min` and `memory.low`, infinite for `max`."""
+    protection = 0.0
+    for name in ("memory.min", "memory.low"):
+        try:
+            value = (cgroup / name).read_text().strip()
+        except (OSError, UnicodeError):
+            continue
+        if value == "max":
+            return math.inf
+        try:
+            protection = max(protection, int(value))
+        except ValueError:
+            continue
+    return protection
+
+
+def _protected_file_cache(cgroup: Path, own_child: Path | None) -> int:
+    """Return the page cache that a cgroup v2's other children protect from its reclaim.
+
+    Reclaim for the cgroup's limit leaves each child's memory up to the child's `memory.min`, and
+    takes memory up to the child's `memory.low` only after all unprotected memory, such as the
+    pages this process reads. Up to that protection, a child's file-backed page cache is not
+    available to this process. `own_child`, the child on this process's path, is left out: setups
+    that protect it, such as Kubernetes pods and containers, also give it a limit, and reclaim for
+    a cgroup's own limit does not apply that cgroup's protection.
+    """
+    try:
+        children = list(cgroup.iterdir())
+    except OSError:
+        return 0
+    protected = 0
+    for child in children:
+        if child == own_child:
+            continue
+        protection = _memory_protection(child)
+        if protection > 0:
+            file_cache = _reclaimable_file_cache(child / "memory.stat", unified=True)
+            protected += int(min(protection, file_cache))
+    return protected
+
+
 def cgroup_available_host_memory() -> int | None:
     """Return the tightest remaining cgroup limit, including ancestors.
 
-    Reclaimable file-backed page cache charged to a cgroup counts as available.
+    Reclaimable file-backed page cache charged to a cgroup counts as available, except, on cgroup
+    v2, the page cache that the cgroup's other children protect.
     """
     unified_path, memory_path = _cgroup_paths()
     candidates: list[tuple[Path, Path, bool]] = []
@@ -200,7 +244,8 @@ def cgroup_available_host_memory() -> int | None:
     available = []
     seen = set()
     for leaf, mount_root, unified in candidates:
-        for path in _walk_to_mount_root(leaf, mount_root):
+        walk = list(_walk_to_mount_root(leaf, mount_root))
+        for own_child, path in zip([None, *walk], walk):
             key = (path, unified)
             if key in seen:
                 continue
@@ -216,10 +261,14 @@ def cgroup_available_host_memory() -> int | None:
                 limits = (
                     _read_cgroup_value(path / "memory.limit_in_bytes", unlimited_threshold=1 << 60),
                 )
-            if current is None:
+            finite_limits = [limit for limit in limits if limit is not None]
+            if current is None or not finite_limits:
                 continue
-            in_use = max(0, current - _reclaimable_file_cache(path / "memory.stat", unified))
-            available.extend(max(0, limit - in_use) for limit in limits if limit is not None)
+            reclaimable = _reclaimable_file_cache(path / "memory.stat", unified)
+            if unified:
+                reclaimable -= _protected_file_cache(path, own_child)
+            in_use = max(0, current - max(0, reclaimable))
+            available.extend(max(0, limit - in_use) for limit in finite_limits)
 
     return min(available) if available else None
 

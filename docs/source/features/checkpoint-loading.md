@@ -164,7 +164,10 @@ model-load mapping, native loading safely skips prefetch.
 Memory admission reserves cgroup-aware startup headroom. Inside a memory-limited
 cgroup, file-backed page cache charged to it, such as checkpoints that earlier
 loads left cached, counts as available, as it does for host memory, because the
-kernel reclaims it before the cgroup runs out of memory. Reader setup failures
+kernel reclaims it before the cgroup runs out of memory. On cgroup v2, page
+cache that another child of a limited cgroup protects with `memory.min` or
+`memory.low` does not count, because reclaim for that limit keeps it or takes
+it last. Reader setup failures
 also clean up and fall back before mapping; mapping, transformation, or H2D
 failure after activation never retries a partially mutated model. A later
 advisory read failure keeps successfully materialized weights.
