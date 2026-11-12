@@ -117,6 +117,12 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
     def has_retired_send_session(self, req: LlmRequest) -> bool:
         return self._transceiver.has_retired_send_session(req)
 
+    def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
+        return self._transceiver.context_transfer_is_waiting_for_peer(req)
+
+    def context_transfer_peer_ready_time(self, req: LlmRequest) -> float | None:
+        return self._transceiver.context_transfer_peer_ready_time(req)
+
     def transfer_resource_ownership(self, req: LlmRequest) -> bool | None:
         return self._transceiver.transfer_resource_ownership(req)
 
