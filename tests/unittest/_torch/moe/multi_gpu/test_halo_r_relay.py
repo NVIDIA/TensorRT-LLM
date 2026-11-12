@@ -1165,7 +1165,8 @@ def _case_graphs_failed_capture(layers: _Layers) -> list:
     with torch.cuda.stream(capture):
         group.wait_for_routes()
         group.finish()
-    # Without the fix, an eager route wait on the capture stream never passes and this hangs.
+    # wait_for_routes() skips the route wait and finish() the COPY join of a launch whose capture
+    # ended, so nothing on the capture stream waits for the kernel that never runs and this returns.
     torch.cuda.synchronize()
     MPI.COMM_WORLD.Barrier()
     try:
