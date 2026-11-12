@@ -2546,6 +2546,23 @@ def _tallws_launcher(
     return ("tallws", launch, pre, ())
 
 
+def _route_fp32_varlen(
+    num_rows: int, n: int, npad: int, k: int, num_sms: int, sm_version: int, *, det: bool = False, r_cap: int = 0
+) -> dict:
+    """Apply resource-aware Rubin tuning only to the production FP32 varlen entry."""
+    if sm_version == 107 and not det and r_cap == 0:
+        try:
+            from .gvr_topk_rubin_dispatch import make_plan, select_tuning
+        except ImportError:
+            from gvr_topk_rubin_dispatch import make_plan, select_tuning
+        tuning = select_tuning(num_rows, n, k, num_sms, sm_version)
+        if tuning is not None:
+            return make_plan(
+                tuning, num_rows, n, npad, k, num_sms, route, route_streaming, route_dynamic
+            )
+    return route(num_rows, n, npad, k, num_sms, sm_version, det=det, r_cap=r_cap)
+
+
 def _varlen_launcher(
     num_rows: int,
     npad: int,
@@ -2565,7 +2582,7 @@ def _varlen_launcher(
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher for one logits dtype.
 
-    FP32 picks the family with ``route``; the 16-bit dtypes pick it with ``_route_16bit`` and add
+    FP32 picks the family with ``_route_fp32_varlen``; the 16-bit dtypes pick it with ``_route_16bit`` and add
     their own plans, compile options and tuning scalars (many of them per dtype) and a near-K
     ``complement`` launcher. Batches ``_tallws_gate`` admits run the tall-batch engine. Every
     choice is a function of capture-stable quantities only.
@@ -2619,7 +2636,12 @@ def _varlen_launcher(
     if low:
         plan_free = _route_16bit(num_rows, n_route, npad, k, num_sms, sm_version, dtype=dtype)
     else:
-        plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det, r_cap=r_cap)
+        plan_free = _route_fp32_varlen(
+            num_rows, n_route, npad, k, num_sms, sm_version, det=det, r_cap=r_cap
+        )
+        # Select host options without changing the compilation target.
+        if plan_free.get("_rubin_blackwell_options", False):
+            sm_version = 100
     if (
         dtype is torch.float16
         and k == 2048
@@ -3319,8 +3341,7 @@ def _varlen_launcher(
                 and num_rows > 2 * num_sms
                 and n_kernel > 4096
             )
-            fn = dev.get_compiled__reg(
-                tuple(plan_free["tpl"]),
+            fp32_options = dict(
                 varlen=True,
                 next_n=next_n,
                 cr_shift=cr_shift,
@@ -3358,6 +3379,9 @@ def _varlen_launcher(
                     and tuple(plan_free["tpl"][:3]) == (256, 5, 4)
                 ),
             )
+            fp32_options.update(plan_free.get("_rubin_options", {}))
+            stage_output = fp32_options["stage_output"]
+            fn = dev.get_compiled__reg(tuple(plan_free["tpl"]), **fp32_options)
         rt_f = plan_free["rt"]
         lc = (
             "reg",
@@ -3444,7 +3468,11 @@ def _varlen_launcher(
                 num_rows, n_route, npad, k, True, dtype, num_sms, sm_version
             )
         else:
-            plan = route_streaming(num_rows, n_route, npad, k, True, num_sms, sm_version)
+            plan = (
+                plan_free
+                if plan_free.get("_rubin_tuning", False)
+                else route_streaming(num_rows, n_route, npad, k, True, num_sms, sm_version)
+            )
         tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
         rt = plan["rt"]
         r_const = rt["R"]
@@ -3656,6 +3684,17 @@ def _varlen_launcher(
                 and k == 2048
             ):
                 main_options["load_ahead"] = True
+
+        if not low:
+            main_options.update(plan_free.get("_rubin_options", {}))
+            overrides = plan_free.get("_rubin_runtime", {})
+            if "aim_num" in overrides:
+                aim_base = overrides["aim_num"] * k // 2
+            if "amin_num" in overrides:
+                amin = overrides["amin_num"] * k // 2
+            sfac = overrides.get("sfac", sfac)
+            sd_en = overrides.get("sd_en", sd_en)
+            tsh_en = overrides.get("tsh_en", tsh_en)
 
         # TSHG (tpl[6]) is dead under varlen; normalize it out of the compile key.
         fn = dev.get_compiled(
