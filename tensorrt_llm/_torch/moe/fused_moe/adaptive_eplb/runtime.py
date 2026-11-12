@@ -220,10 +220,9 @@ class _Decider:
         if (tail["stats_copy_ms"] > 0).all():
             self.stats_copies.append(float(tail["stats_copy_ms"].max()))
         update = LayoutUpdate(window)
+        self.awaiting_copy[window] = (close, None, None, 0)  # until the window gives a decision
         forwards = stats[:, layers * experts : layers * (experts + 1)].astype(np.float64)
-        if forwards.min() < 1:
-            # A rank counted no forward of some layer: this window gives no rows.
-            self.awaiting_copy[window] = (close, None, None, 0)
+        if forwards.min() < 1:  # a rank counted no forward of some layer: this window gives no rows
             return update
         # Rows per forward of every expert: every rank's rows over its own forwards, summed.
         routed = stats[:, : layers * experts].astype(np.float64).reshape(len(stats), layers, -1)
@@ -234,13 +233,12 @@ class _Decider:
         if per_forward > 0.0:
             self.next_forwards = window_forwards(per_forward, experts)
         if sizing:
-            self.awaiting_copy[window] = (close, None, None, 0)
             return update
         total = {name: float(values.astype(np.float64).sum()) for name, values in tail.items()}
         steps_left = None
         if min(total["accepted"], total["requests"]) > 0:
-            accepted_per_step = total["accepted"] / total["requests"]
-            steps_left = total["remaining"] / accepted_per_step / total["requests"]
+            per_step = total["accepted"] / total["requests"]  # tokens a request accepts per step
+            steps_left = total["remaining"] / per_step / total["requests"]
         # A batch that changed between two closes more than it ever did (a steady batch never does, a
         # draining one keeps doing so) is priced where the new layouts serve it: the requests at this
         # close carried a window ahead at that rate, over their mean across the window.
@@ -260,9 +258,8 @@ class _Decider:
         new_layout = np.empty((len(planned), slots), dtype=np.int64)
         new_shares, resolved = np.empty((2, len(planned), slots))
         home, installed = cfg.home_layouts[planned], self.layout[planned]
-        previous_load = rows[
-            planned
-        ]  # replaced below by an earlier window's rows where one is kept
+        # This window's rows, replaced below by an earlier window's rows where one is kept.
+        previous_load = rows[planned]
         for i, layer in enumerate(planned.tolist()):
             plan = plan_layout(rows[layer], geometry, home[i], installed[i], self.active)
             new_layout[i] = plan.layout
@@ -380,11 +377,9 @@ class DecisionProcess:
         self._conn = Connection(parent.detach())
         self._conn.send(dataclasses.replace(config, stats_fd=fd))
 
-    def submit(self, message: tuple) -> None:
+    def ask(self, message: tuple) -> tuple:
+        """Send ``message`` and wait for the answer; ``RuntimeError`` once the process failed or exited."""
         self._conn.send(message)
-
-    def recv(self) -> tuple:
-        """Wait for the process's next answer; raise ``RuntimeError`` once it failed or exited."""
         try:
             message = self._conn.recv()
         except EOFError:
@@ -630,8 +625,7 @@ class AdaptiveRuntime:
         elif call == self.close_at:
             self._close_window()
         if self._pending_stats_copy is not None and not self.wants_request_progress:
-            copied = self._pending_stats_copy
-            self._pending_stats_copy = None
+            copied, self._pending_stats_copy = self._pending_stats_copy, None
             totals = self.request_totals.copy()
             window = self.window
             worker.post(lambda: self._gather_window(copied, totals, window))
@@ -642,12 +636,8 @@ class AdaptiveRuntime:
         layer lists (tables, copies and statistics are not printed)."""
         from tensorrt_llm.logger import logger
 
-        shown = ", ".join(
-            f"{key}={value}"
-            for key, value in data.items()
-            if not isinstance(value, (dict, np.ndarray))
-        )
-        logger.debug(f"adaptive EPLB {event}: {shown}")
+        shown = {k: v for k, v in data.items() if not isinstance(v, (dict, np.ndarray))}
+        logger.debug(f"adaptive EPLB {event}: {', '.join(f'{k}={v}' for k, v in shown.items())}")
 
     def _open_window(self) -> None:
         """Zero the statistics."""
@@ -690,8 +680,7 @@ class AdaptiveRuntime:
             open_call=self.window_opened_call,
             stats=self.decision.stats.numpy(),
         )
-        self.decision.submit(("window", window))
-        return self.decision.recv()
+        return self.decision.ask(("window", window))
 
     def _copies_done(self, update: LayoutUpdate, rows: np.ndarray) -> None:
         """Every rank's copies of ``update`` ran: check that all ranks decided alike."""
@@ -705,13 +694,7 @@ class AdaptiveRuntime:
         assert not self.pending_updates, "one update is in flight at a time"
         self.pending_updates.append((apply_call, update))
         self._event("copied", window=update.window, apply_call=apply_call, rows=rows)
-        window = update.window
-
-        def schedule() -> tuple:
-            self.decision.submit(("copied", window, rows))
-            return self.decision.recv()
-
-        self.worker.post(schedule)
+        self.worker.post(lambda: self.decision.ask(("copied", update.window, rows)))
 
     def _install(self, update: LayoutUpdate) -> tuple:
         """Worker thread: copy the update's experts as one batch, then all-gather the completion."""

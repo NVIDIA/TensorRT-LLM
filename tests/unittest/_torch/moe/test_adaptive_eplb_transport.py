@@ -37,24 +37,19 @@ CPU = torch.device("cpu")
 
 
 class _Comm:
-    """The EP group: allgather ``n`` answers ``answers[n](value)``, else ``[value] * size``."""
+    """The EP group: allgather ``n`` answers ``answers[n](value)``, else ``[value] * EP_SIZE``."""
 
-    def __init__(self, rank: int = EP_RANK, size: int = EP_SIZE, answers=None) -> None:
-        self.rank = rank
-        self.size = size
+    Get_rank = staticmethod(lambda: EP_RANK)
+    Get_size = staticmethod(lambda: EP_SIZE)
+
+    def __init__(self, answers=None) -> None:
         self.answers = answers or {}
         self.calls = 0
-
-    def Get_rank(self) -> int:
-        return self.rank
-
-    def Get_size(self) -> int:
-        return self.size
 
     def allgather(self, value: object) -> list:
         self.calls += 1
         answer = self.answers.get(self.calls)
-        return answer(value) if answer else [value] * self.size
+        return answer(value) if answer else [value] * EP_SIZE
 
 
 def _memory(comm: _Comm) -> type:
@@ -69,7 +64,7 @@ def _memory(comm: _Comm) -> type:
             return comm
 
         def __init__(self, mapping: object, nbytes: int) -> None:
-            self.block = torch.zeros(comm.size, nbytes, dtype=torch.uint8)
+            self.block = torch.zeros(EP_SIZE, nbytes, dtype=torch.uint8)
             Memory.blocks.append(self.block)
             Memory.mapped += 1
 
@@ -104,14 +99,8 @@ def _transport(comm=None, batches=None) -> PeerSlotTransport:
     return PeerSlotTransport(None, memory=memory, copy_batch=batches or _Batches())
 
 
-def _layout(planes=PLANES, slots=SLOTS) -> LayerBlockLayout:
-    return LayerBlockLayout(planes, slots, min_alignment=8)
-
-
-def _ready(transport: PeerSlotTransport, layouts=(None,)) -> PeerSlotTransport:
-    for layer, layout in enumerate(layouts):
-        transport.add_layer(layer, layout or _layout())
-    return transport
+def _layout(planes=PLANES) -> LayerBlockLayout:
+    return LayerBlockLayout(planes, SLOTS, min_alignment=8)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -136,8 +125,7 @@ def test_layout_aligns_every_plane_and_keeps_them_apart():
 
 
 def test_peer_table_views_every_rank_block():
-    comm = _Comm()
-    transport = _transport(comm)
+    transport = _transport()
     transport.add_layer(0, _layout())  # the returned block is not kept: the transport keeps it
     gc.collect()
     assert transport._memory.mapped == 1
@@ -157,7 +145,9 @@ def test_peer_table_views_every_rank_block():
 
 def test_a_copy_moves_every_plane_row_in_one_batch_between_its_events_and_nothing_else():
     batches = _Batches()
-    transport = _ready(_transport(batches=batches), layouts=(None, None))
+    transport = _transport(batches=batches)
+    for layer in range(2):
+        transport.add_layer(layer, _layout())
     blocks = transport._memory.blocks
     for index, block in enumerate(blocks):
         block.copy_((torch.arange(block.numel()).view_as(block) * (index + 3)) % 251)
@@ -198,19 +188,11 @@ def test_ep_mnnvl_memory_groups_ranks_by_ep_rank_with_its_own_state():
     assert issubclass(EpMnnvlMemory, MnnvlMemory)
     assert EpMnnvlMemory.allocated_map is not MnnvlMemory.allocated_map
     pg = object()
+    fixed = dict(cp_rank=0, cp_size=1, moe_tp_size=2, moe_cluster_size=1, moe_cluster_rank=0)
 
     def mapping(pp_rank, moe_tp_rank, moe_ep_rank):
-        return SimpleNamespace(
-            pp_rank=pp_rank,
-            cp_rank=0,
-            cp_size=1,
-            moe_tp_size=2,
-            moe_tp_rank=moe_tp_rank,
-            moe_cluster_size=1,
-            moe_cluster_rank=0,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_group_pg=pg,
-        )
+        ranks = dict(pp_rank=pp_rank, moe_tp_rank=moe_tp_rank, moe_ep_rank=moe_ep_rank)
+        return SimpleNamespace(**fixed, **ranks, moe_ep_group_pg=pg)
 
     assert EpMnnvlMemory.comm_process_group(mapping(0, 0, 0)) is pg
     ranks = [(0, 0, 0), (0, 0, 3), (0, 1, 3), (1, 0, 3)]

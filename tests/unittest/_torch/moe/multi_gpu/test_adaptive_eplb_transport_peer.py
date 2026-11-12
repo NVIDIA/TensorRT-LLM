@@ -72,7 +72,6 @@ class Rig:
     """One rank's transport, filled with the source halves of its slots."""
 
     transport: PeerSlotTransport
-    layout: LayerBlockLayout
     copy_stream: torch.cuda.Stream
     peers: list[int]
 
@@ -102,7 +101,7 @@ def make_rig(rank, world, per_node, device) -> Rig:
     dist.barrier()
     stream = dedicated_copy_stream(device)
     assert stream.cuda_stream != torch.cuda.current_stream(device).cuda_stream
-    return Rig(transport, layout, stream, found)
+    return Rig(transport, stream, found)
 
 
 def copy_on_a_thread(rig: Rig, copies: list, events: tuple) -> None:

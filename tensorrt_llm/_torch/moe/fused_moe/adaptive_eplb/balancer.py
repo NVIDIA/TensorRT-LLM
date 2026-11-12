@@ -72,8 +72,7 @@ def time_layer_copy(
     experts = [
         (layer, homes + j, (rank + size // 2 + j) % size, j % homes) for j in range(replicas)
     ]
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
     transport.allgather(None)
     for _ in range(2):
@@ -120,9 +119,7 @@ def calibration_identity(backend: object, ep_size: int, hosts: int, tokens: Sequ
     return dict(
         device=torch.cuda.get_device_name(),
         sm=get_sm_version(),
-        sm_count=torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).multi_processor_count,
+        sm_count=torch.cuda.get_device_properties().multi_processor_count,
         ep_size=int(ep_size),
         hosts=int(hosts),
         **backend.decode_calibration_identity(list(tokens)),
@@ -286,9 +283,7 @@ class AdaptiveMoeLayerLoadBalancer:
         flag = manager.recording_flag(device)
         self.statistics = ExpertStatistics.of(manager.statistics(device), self.layer_idx, flag)
         tables = manager.route_tables(device)[self.layer_idx]
-        experts = self.expert_count
-        slots = self.num_slots
-        self._tables = tables.split([experts, experts, slots, slots])
+        self._tables = tables.split([self.expert_count] * 2 + [self.num_slots] * 2)
         self._slot_dtype = slot_dtype
         self._route_staging = route_staging
         self._route_into = torch.ops.trtllm.adaptive_eplb_route_into

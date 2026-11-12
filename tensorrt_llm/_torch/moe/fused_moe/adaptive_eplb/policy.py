@@ -46,11 +46,10 @@ class ExpertGeometry:
 
     def home_layout(self) -> np.ndarray:
         """``[num_slots]`` int64: rank ``r`` holds expert ``r * local_experts + j`` in local slot ``j``."""
-        layout = np.full(self.num_slots, -1, dtype=np.int64)
         experts = np.arange(self.num_experts)
-        layout[experts // self.local_experts * self.local_slots + experts % self.local_experts] = (
-            experts
-        )
+        slots = experts // self.local_experts * self.local_slots + experts % self.local_experts
+        layout = np.full(self.num_slots, -1, dtype=np.int64)
+        layout[slots] = experts
         return layout
 
 
@@ -132,8 +131,7 @@ def active_slots(geometry: ExpertGeometry) -> int:
     return geometry.num_slots - geometry.ep_size * (spare // 2)
 
 
-@dataclass(frozen=True)
-class Plan:
+class Plan(NamedTuple):
     """A planned layout: ``expert_slots`` lists the ascending slots of every expert."""
 
     expert_slots: _ExpertSlots
@@ -180,8 +178,6 @@ def _expert_slots_of(layout: list[int], num_experts: int) -> _ExpertSlots:
 def _copies(rows: list[float], total: int) -> list[int]:
     """Copies of every expert; without rows the extra slots go to the lowest ids."""
     num_experts = len(rows)
-    if total == num_experts:
-        return [1] * num_experts
     if not any(rows):
         base, rest = divmod(total, num_experts)
         return [base + (expert < rest) for expert in range(num_experts)]
@@ -217,40 +213,28 @@ def _place_replicas(
         ((rows[e] / copies[e], e) for e in range(num_experts) for _ in range(copies[e] - 1)),
         key=lambda item: (-item[0], item[1]),
     )
-    taken = [0] * ep_size
     placed: list[list[int]] = [[] for _ in range(ep_size)]
     # Min-heap on (rows, GPU) of the GPUs with room left.
-    heap = [(gpu_rows[r], r) for r in range(ep_size) if taken[r] < limit[r]]
+    heap = [(gpu_rows[r], r) for r in range(ep_size) if limit[r] > 0]
     heapq.heapify(heap)
     for size, expert in replicas:
         holding = []
-        gpu = -1
-        while heap:
-            entry = heapq.heappop(heap)
-            if expert in experts_on_gpu[entry[1]]:
-                holding.append(entry)
-                continue
-            gpu = entry[1]
-            break
-        if gpu < 0:
-            # Every GPU with room already holds the expert: add a copy on the least loaded one.
-            gpu = holding.pop(0)[1]
+        while heap and expert in experts_on_gpu[heap[0][1]]:
+            holding.append(heapq.heappop(heap))
+        # When every GPU with room already holds the expert, add a copy on the least loaded one.
+        gpu = heapq.heappop(heap)[1] if heap else holding.pop(0)[1]
         for entry in holding:
             heapq.heappush(heap, entry)
         experts_on_gpu[gpu].add(expert)
         gpu_rows[gpu] += size
-        taken[gpu] += 1
         placed[gpu].append(expert)
-        if taken[gpu] < limit[gpu]:
+        if len(placed[gpu]) < limit[gpu]:
             heapq.heappush(heap, (gpu_rows[gpu], gpu))
-    slots: dict[int, list[int]] = {}
+    slots = [[slot] for slot in home_slot]
     for gpu in range(ep_size):
-        for k, expert in enumerate(placed[gpu]):
-            slots.setdefault(expert, [home_slot[expert]]).append(free[gpu][k])
-    expert_slots: _ExpertSlots = [(slot,) for slot in home_slot]
-    for expert, chosen in slots.items():
-        expert_slots[expert] = tuple(sorted(chosen))
-    return expert_slots
+        for expert, slot in zip(placed[gpu], free[gpu]):
+            slots[expert].append(slot)
+    return [tuple(sorted(chosen)) for chosen in slots]
 
 
 def _changes(
@@ -324,19 +308,16 @@ def _keep_replica_slots(
             for slot in sorted(slots):
                 if not is_home[slot]:
                     installed_replicas.setdefault((expert, slot // local), []).append(slot)
-    result = list(proposed)
     rebuilt: dict[int, list[int]] = {}
     loose: dict[int, list[tuple[int, int]]] = {}
     taken: dict[int, set[int]] = {}
     for expert, expert_slots in enumerate(proposed):
         if len(expert_slots) == 1:
             continue
+        slots = [slot for slot in sorted(expert_slots) if is_home[slot]]
         by_gpu: dict[int, list[int]] = {}
-        slots = []
         for slot in sorted(expert_slots):
-            if is_home[slot]:
-                slots.append(slot)
-            else:
+            if not is_home[slot]:
                 by_gpu.setdefault(slot // local, []).append(slot)
         for gpu, want in by_gpu.items():
             have = installed_replicas.get((expert, gpu), [])
@@ -346,8 +327,7 @@ def _keep_replica_slots(
             paired = same + rest_have[: len(rest_want)]
             slots.extend(paired)
             taken.setdefault(gpu, set()).update(paired)
-            if len(rest_want) > len(rest_have):
-                loose.setdefault(gpu, []).extend((expert, s) for s in rest_want[len(rest_have) :])
+            loose.setdefault(gpu, []).extend((expert, s) for s in rest_want[len(rest_have) :])
         rebuilt[expert] = slots
     for gpu, items in loose.items():
         used = taken.setdefault(gpu, set())
@@ -363,9 +343,7 @@ def _keep_replica_slots(
         ]
         for expert, slot in zip(moved, spare):
             rebuilt[expert].append(slot)
-    for expert, slots in rebuilt.items():
-        result[expert] = tuple(sorted(slots))
-    return result
+    return [tuple(sorted(rebuilt[e])) if e in rebuilt else s for e, s in enumerate(proposed)]
 
 
 def _one_install(
@@ -449,8 +427,7 @@ def fixed_install_ms(timings: Sequence[tuple[int, int, float]]) -> float | None:
     return max(0.0, mean_ms - slope * mean_n)
 
 
-@dataclass(frozen=True)
-class CostGrowth:
+class CostGrowth(NamedTuple):
     """Growth ``rate`` (ms per call) of the layouts' cost over ``layers`` read in two windows."""
 
     rate: float | None
@@ -458,8 +435,7 @@ class CostGrowth:
     interval: int
 
 
-@dataclass(frozen=True)
-class EvaluationPlan:
+class EvaluationPlan(NamedTuple):
     """Calls from an evaluation's apply call to the next evaluation (``interval``) and to the open
     of the next statistics window (``open_after``)."""
 
@@ -505,10 +481,8 @@ class EvaluationScheduler:
                 previous[i] = self._previous_load[layers[i]]
             balanced = self.model.balanced_time_us(load, self._geometry)
             now = self.model.layer_time_us(slot_rows(load, layout, shares), ep) - balanced
-            total = previous.sum(1)
-            previous *= np.where(total > 0.0, load.sum(1) / np.where(total > 0.0, total, 1.0), 0.0)[
-                :, None
-            ]
+            total, target = previous.sum(1), load.sum(1)  # the earlier rows at this window's total
+            previous *= np.divide(target, total, out=np.zeros_like(total), where=total > 0)[:, None]
             old = self.model.layer_time_us(slot_rows(previous, layout, shares), ep) - balanced
             cost_now = sum(float(now[i]) for i in both) / 1e3
             cost_prev = sum(float(old[i]) for i in both) / 1e3
@@ -544,20 +518,14 @@ class EvaluationScheduler:
         calls_since_gather = int(call) - int(gather_call)
         min_interval = 1 + int(next_window_calls) + calls_since_gather
         copies = [float(x) for x in stats_copy_ms]
-        stats_copy = statistics.median(copies) if copies else None
-        install_fixed = fixed_install_ms(install_timings)
-        fixed = None if stats_copy is None else stats_copy + (install_fixed or 0.0)
-        rate = None
-        if growth is not None:
-            if growth.rate is not None and growth.rate > self.min_resolvable_rate(
-                growth.layers, growth.interval
-            ):
+        if growth is not None and growth.rate is not None:
+            if growth.rate > self.min_resolvable_rate(growth.layers, growth.interval):
                 self._last_positive_rate = growth.rate
-            rate = self._last_positive_rate
-        best = None
-        if fixed is not None and rate is not None:
-            best = math.sqrt(2.0 * fixed / rate)
-        interval = min_interval if best is None else max(min_interval, int(math.ceil(best)))
+        rate = None if growth is None else self._last_positive_rate
+        interval = min_interval
+        if copies and rate is not None:
+            fixed = statistics.median(copies) + (fixed_install_ms(install_timings) or 0.0)
+            interval = max(min_interval, math.ceil(math.sqrt(2.0 * fixed / rate)))
         if steps_left is not None:
             interval = min(interval, max(min_interval, int(math.ceil(steps_left))))
         open_after = max(1, interval - int(next_window_calls) - calls_since_gather)
@@ -579,15 +547,14 @@ def solve_shares(
     time by ``model`` where that model's ``time_shares`` is set."""
     import torch
 
-    load = np.ascontiguousarray(load, dtype=np.float64)
     slots = np.asarray(layout)
     if not np.issubdtype(slots.dtype, np.integer):
         raise ValueError("layout must hold integers")
+    load = torch.from_numpy(np.ascontiguousarray(load, dtype=np.float64))
     slots = torch.from_numpy(np.ascontiguousarray(slots, dtype=np.int64))
     timed = model is not None and model.time_shares  # then its fields up to the tile rows
     costs = [float(getattr(model, f.name)) for f in fields(model)[:6]] if timed else None
-    solve = torch.ops.trtllm.adaptive_eplb_solve_shares
-    return solve(torch.from_numpy(load), slots, geometry.ep_size, costs).numpy()
+    return torch.ops.trtllm.adaptive_eplb_solve_shares(load, slots, geometry.ep_size, costs).numpy()
 
 
 class RouteTables(NamedTuple):
@@ -612,9 +579,8 @@ def build_route_tables(
 ) -> RouteTables:
     """Route tables of a ``[num_slots]`` layout and the ``shares`` of its slots; without
     ``shares``, every expert's rows split evenly over its copies."""
-    layout = [int(e) for e in (layout.tolist() if hasattr(layout, "tolist") else layout)]
-    shares = [1.0] * num_slots if shares is None else shares
-    shares = [float(s) for s in (shares.tolist() if hasattr(shares, "tolist") else shares)]
+    layout = np.asarray(layout, dtype=np.int64).tolist()
+    shares = np.asarray([1.0] * num_slots if shares is None else shares, dtype=np.float64).tolist()
     expert_slots = _expert_slots_of(layout, num_experts)
     counts = [len(copies) for copies in expert_slots]
     if 0 in counts:

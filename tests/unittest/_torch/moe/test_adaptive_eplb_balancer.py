@@ -35,10 +35,8 @@ ASSIGNMENTS = [(2 * r + j) % 8 for r in range(4) for j in range(3)]  # rank r, s
 @pytest.fixture(autouse=True)
 def cpu_ops(monkeypatch):
     """The route and statistics ops on CPU tensors: their Python versions."""
-    monkeypatch.setattr(
-        torch.ops.trtllm, "adaptive_eplb_route_into", reference.route_into, raising=False
-    )
-    monkeypatch.setattr(torch.ops.trtllm, "adaptive_eplb_record", reference.record, raising=False)
+    monkeypatch.setattr(torch.ops.trtllm, "adaptive_eplb_route_into", reference.route_into, False)
+    monkeypatch.setattr(torch.ops.trtllm, "adaptive_eplb_record", reference.record, False)
 
 
 def _balancer(ep_rank: int = 1, **fields) -> AdaptiveMoeLoadBalancer:
@@ -206,13 +204,12 @@ def _prepare(monkeypatch, path=None, tokens=(8, 16), domain=(None, 1), others=()
     monkeypatch.setattr(module, "nvlink_domain_error", lambda comm: domain)
     monkeypatch.setattr(module, "peer_copy_gap", lambda mapping: fake.get("gap"))
     monkeypatch.setattr(module, "_plan_layer", lambda i, b: SimpleNamespace(expert_bytes=1000 + i))
-    monkeypatch.setattr(
-        torch.cuda, "get_device_name", lambda: f"NVIDIA {fake.get('device', 'GB300')}"
-    )
+    device = f"NVIDIA {fake.get('device', 'GB300')}"
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: device)
     monkeypatch.setattr(module, "get_sm_version", lambda: 103)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     gpu = SimpleNamespace(multi_processor_count=152)
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: gpu)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index=None: gpu)
     monkeypatch.setattr(
         module, "migrate_model_weights", lambda *a: seen.update(moved=a) or "stream"
     )
@@ -465,26 +462,12 @@ def test_a_moe_layer_runs_a_forward_through_the_load_balancer_hooks():
     from tensorrt_llm._torch.moe.fused_moe.interface import MoE
     from tensorrt_llm._torch.moe.fused_moe.quantization import FusedMoEMethodBase
 
-    class Module(MoEEplbWeightLayoutMixin):
-        """A MoE backend's load balancer hooks: the mixin's and the MoE layer's."""
-
-        _load_balancer_start_wait_gpu_stage = MoE._load_balancer_start_wait_gpu_stage
-        _load_balancer_done_wait_gpu_stage = MoE._load_balancer_done_wait_gpu_stage
-        _load_balancer_update_statistic = MoE._load_balancer_update_statistic
-        _load_balancer_records_statistics = MoE._load_balancer_records_statistics
-        _load_balancer_route = MoE._load_balancer_route
-        _load_balancer_uses_replica_plan = MoE._load_balancer_uses_replica_plan
-        _load_balancer_start_set_cpu_stage = MoE._load_balancer_start_set_cpu_stage
-        _load_balancer_done_set_cpu_stage = MoE._load_balancer_done_set_cpu_stage
-
-        def __init__(self, layer: object) -> None:
-            self.layer_load_balancer = layer
-            self.allreduce = None
-            self._load_balancer_overlap_fn = None
-
     balancer = _balancer(ep_rank=0)
     layer = balancer.add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE)
-    module = Module(layer)
+    # A MoE backend's load balancer hooks: the mixin's and the MoE layer's.
+    hooks = {name: f for name, f in vars(MoE).items() if name.startswith("_load_balancer_")}
+    state = dict(layer_load_balancer=layer, allreduce=None, _load_balancer_overlap_fn=None)
+    module = type("Module", (MoEEplbWeightLayoutMixin,), {**hooks, **state})()
     assert isinstance(layer, base.MoeLayerLoadBalancer) and layer.get_load_expert_ids() == [0, 1]
     assert layer.home_layout() == [0, 1, -1, 2, 3, -1, 4, 5, -1, 6, 7, -1]
     assert not layer.is_dynamic_routing() and layer.records_statistics()
