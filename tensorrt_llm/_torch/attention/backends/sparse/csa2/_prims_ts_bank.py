@@ -31,6 +31,7 @@ __all__ = [
     "main_bank_reserved_rows",
     "main_bank_rows_limit",
     "main_bank_storage",
+    "main_record_owners",
     "main_records_rows_limit",
     "main_records_storage",
 ]
@@ -507,9 +508,10 @@ def main_record_owners(
     """Return the device's INT64 per-MAIN-pool-row owner slots and its INT64[1] epoch.
 
     A slot holds ``(epoch << 32) | (2**31 - 1 - f)`` for the smallest selection ``f``
-    of the latest :func:`decode_main_records` call that read its row. Each call claims
+    of the latest :func:`dedup_main_records` call that read its row. Each call claims
     with the next epoch, so older values never win and no slot is ever cleared. Both are
-    allocated zero-filled outside CUDA Graph capture and only grow.
+    allocated zero-filled outside CUDA Graph capture and only grow; the fill completes
+    before this returns, since compaction may claim on a stream that does not wait for it.
     """
     key = (_OWNERS_CACHE_KEY, device)
     owners = arenas.get(key)
@@ -523,6 +525,7 @@ def main_record_owners(
         arenas.setdefault(
             (_EPOCH_CACHE_KEY, device), torch.zeros((1,), device=device, dtype=torch.int64)
         )
+        torch.cuda.current_stream(device).synchronize()
     return owners, arenas[(_EPOCH_CACHE_KEY, device)]
 
 
@@ -690,10 +693,11 @@ def dedup_main_records(
     bank_rows: torch.Tensor,
     bank: torch.Tensor,
     arenas: dict,
+    claimed: bool = False,
 ) -> None:
     """Decode each MAIN row a generation tile selects once, on the current stream.
 
-    A tile's query rows of one request select largely the same MAIN rows. Selection ``f``
+    A tile's query rows of one request may select the same MAIN rows. Selection ``f``
     (flat index of ``records``) reading pool row ``records.flat[f]`` is served by the
     smallest selection reading that row: ``bank_rows.flat[f]`` becomes that owner's bank
     row, and only owners decode, converting exactly as :func:`decode_main_records`. A
@@ -706,6 +710,8 @@ def dedup_main_records(
         bank_rows: Contiguous CUDA INT32 tensor shaped like ``records`` (output).
         bank: Contiguous CUDA UINT8[rows * width, 512] from :func:`main_records_storage`.
         arenas: The arenas that hold ``bank`` and the owner slots.
+        claimed: Whether ``prepare_prims_ts_metadata`` already claimed the owner slots of
+            ``records`` (its ``claims``) since the previous call; else this call claims them.
     """
     if (
         main_pool.dtype != torch.uint8
@@ -737,6 +743,7 @@ def dedup_main_records(
     pool_rows = int(main_pool.shape[0])
     owners, epoch = main_record_owners(arenas, main_pool.device, pool_rows)
     flat = records.view(-1)
-    grid = ((count + _OWNER_BLOCK - 1) // _OWNER_BLOCK, 1, 1)
-    _claim_kernel()[grid](flat, owners, epoch, count, pool_rows, BLOCK=_OWNER_BLOCK)
+    if not claimed:
+        grid = ((count + _OWNER_BLOCK - 1) // _OWNER_BLOCK, 1, 1)
+        _claim_kernel()[grid](flat, owners, epoch, count, pool_rows, BLOCK=_OWNER_BLOCK)
     _compiled_records()(main_pool, flat, owners, epoch, bank_rows.view(-1), bank, count)

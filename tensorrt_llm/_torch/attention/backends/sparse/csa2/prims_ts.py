@@ -270,6 +270,7 @@ class CSA2PrimsTS:
             dedup_main_records,
             main_bank_marks,
             main_bank_storage,
+            main_record_owners,
             main_records_storage,
         )
         from ._prims_ts_metadata import prepare_prims_ts_metadata
@@ -331,6 +332,7 @@ class CSA2PrimsTS:
                     # After this layer's MAIN publication, on the stream that wrote it.
                     decode_main_bank(inputs.main_pool, bank, main_source)
             extra_indices = prepared.extra_indices
+            dedup, claims = False, None
             if selection_bank:
                 if not has_extra or inputs.main_pool is None:
                     raise ValueError("CSA2 PrimTS selection banks need MAIN selections")
@@ -355,6 +357,9 @@ class CSA2PrimsTS:
                 # Selection c of query r reads bank row r * width + c, or with dedup the bank
                 # row of the first selection of its MAIN row, the only selections decoded.
                 extra_indices = record["selection_rows" if dedup else "selection_indices"]
+                if dedup:
+                    # The compaction claims each kept MAIN row's owner slot for the decode.
+                    claims = main_record_owners(arenas, q.device, int(inputs.main_pool.shape[0]))
             sources = dict(
                 swa_cache=inputs.swa_pool,
                 swa_indices=prepared.indices,
@@ -363,34 +368,50 @@ class CSA2PrimsTS:
                 extra_sparse_indices=extra_indices if has_extra else None,
                 extra_sparse_lens=prepared.extra_lengths if has_extra else None,
             )
-            if raw.selection_ready is None or marks is not None:
-                # Every layer's bank shares the device's marks, so a selected-row
-                # bank marks and decodes them in this stream's order.
-                prepare_prims_ts_metadata(inputs, prepared, bank, marks)
-            else:
-                # The selections were final before this layer's projections, so
-                # compact them beside the projections and this layer's KV write.
-                side = csa2_side_stream(q.device, _SELECTION_STREAM)
-                if self._selection_done is None:
-                    self._selection_done = torch.cuda.Event()
-                with torch.cuda.stream(side):
-                    side.wait_event(raw.selection_ready)
-                    prepare_prims_ts_metadata(inputs, prepared, bank)
-                    self._selection_done.record()
-                self._selection_done.wait()
-            if marks is not None:
-                # The rows the compaction kept, after this layer's MAIN publication.
-                decode_main_bank(inputs.main_pool, bank, main_source, marks)
-            if selection_bank:
-                # The compacted MAIN records, after this layer's MAIN publication.
+
+            def decode_selection_bank() -> None:
                 if dedup:
                     dedup_main_records(
-                        inputs.main_pool, prepared.extra_indices, extra_indices, main_source, arenas
+                        inputs.main_pool,
+                        prepared.extra_indices,
+                        extra_indices,
+                        main_source,
+                        arenas,
+                        claimed=True,
                     )
                 else:
                     decode_main_records(
                         inputs.main_pool, prepared.extra_indices, main_source, arenas
                     )
+
+            early = raw.selection_ready is not None and marks is None
+            if not early:
+                # Every layer's bank shares the device's marks, so a selected-row
+                # bank marks and decodes them in this stream's order.
+                prepare_prims_ts_metadata(inputs, prepared, bank, marks, claims)
+            else:
+                # The selections and the MAIN rows they address were final before this
+                # layer's projections, so compact them and decode their selection bank
+                # beside the projections and this layer's KV write. The previous layer's
+                # attention, which read the shared metadata and bank, and its bank decode,
+                # which advanced the owner slots' epoch, precede ``selection_ready`` on the
+                # model stream.
+                side = csa2_side_stream(q.device, _SELECTION_STREAM)
+                if self._selection_done is None:
+                    self._selection_done = torch.cuda.Event()
+                with torch.cuda.stream(side):
+                    side.wait_event(raw.selection_ready)
+                    prepare_prims_ts_metadata(inputs, prepared, bank, claims=claims)
+                    if selection_bank:
+                        decode_selection_bank()
+                    self._selection_done.record()
+                self._selection_done.wait()
+            if marks is not None:
+                # The rows the compaction kept, after this layer's MAIN publication.
+                decode_main_bank(inputs.main_pool, bank, main_source, marks)
+            if selection_bank and not early:
+                # The compacted MAIN records, after this layer's MAIN publication.
+                decode_selection_bank()
             output = forward_args.output
             if output is None:
                 output = torch.empty_like(q, memory_format=torch.contiguous_format)

@@ -53,8 +53,8 @@ MAIN `uint8[N,288]` (packed E2M1 plus group-16 E4M3 scales), including padded
 outer strides. The format is explicit; padding never determines its encoding.
 Aligned payload chunks use vector loads; misaligned rows use bounded byte loads.
 The producer folds persistent group scales into kernel-local E4M3 K/V operands;
-no requantized KV bank is allocated, and generation and captured context fill
-no decoded bank either. Each context query selects up to `index_topk` MAIN rows
+it allocates no requantized KV bank, and captured context phases fill no decoded
+bank either. Each context query selects up to `index_topk` MAIN rows
 from its request's GLOBAL rows, so decoding selections converts the same records
 many times. An eager context phase instead reads its MAIN rows from a
 unit-scale E4M3 `uint8[rows,512]` bank laid out by the native shared tables'
@@ -71,6 +71,17 @@ four rows at a time before converting them. The bank is decoded on the model
 stream after the layer's MAIN publication; its storage and marks are retained,
 grow by powers of two up to 64 MiB of bank and are part of the PrimTS workspace
 reservation. Larger phases keep decoding selections in the kernel.
+Generation tiles with FP8 SWA whose gather schedule applies decode their
+selections into a selection bank instead, one unit-scale E4M3 `uint8[512]` row per
+compacted selection. Query rows of one request may select the same MAIN row: the
+compaction then also claims an epoch-tagged INT64 owner slot per kept pool row
+(never cleared, since each call claims with the next epoch), and
+`dedup_main_records` decodes each selected row once, into the bank row of its
+smallest selection, which all of that row's selections read. A layer whose
+selections and MAIN rows are final before its projections (a Reuse layer of a
+generation-only forward) compacts and decodes its selection bank on a side stream
+beside its projections and KV write; other layers do both on the model stream
+after their MAIN publication.
 External BF16 Q is converted at unit scale into preallocated E4M3 Q scratch,
 except in eager context phases of at least 1024 tokens on the fused MXFP8 prefill
 Q projection: its Q-B GEMM applies RoPE and rounds the BF16 Q RN/satfinite to E4M3

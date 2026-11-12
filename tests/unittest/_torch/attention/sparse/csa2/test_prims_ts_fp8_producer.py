@@ -1237,6 +1237,133 @@ def test_prims_ts_main_records_dedup() -> None:
         dedup_main_records(main, records, bank_rows[:-1], bank, arenas)
 
 
+@pytest.mark.parametrize("mapped", [False, True], ids=["physical", "paged"])
+@torch.inference_mode()
+def test_prims_ts_compaction_claims_dedup_owners(
+    mapped: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Compaction claims the owner slots the deduplicated selection bank decodes from.
+
+    Claiming each kept MAIN row while compacting leaves the decode exactly the owners its
+    own claim would: every selection reads its first selection's bank row, in eager calls,
+    in CUDA Graph replays with other selections, and with the compaction on another stream.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_bank
+    from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_bank import (
+        decode_main_records,
+        dedup_main_records,
+        main_record_owners,
+        main_records_storage,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_metadata import (
+        prepare_prims_ts_metadata,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import _PrimsTSMetadata
+
+    def no_claim_kernel():
+        raise AssertionError("the compaction claims the owner slots")
+
+    monkeypatch.setattr(_prims_ts_bank, "_claim_kernel", no_claim_kernel)
+    torch.manual_seed(4127)
+    device = torch.device("cuda", torch.cuda.current_device())
+    main = _pool("main", 288, 2000)
+    rows, width, page = 24, 512, 64
+    selection = torch.empty((rows, width), device=device, dtype=torch.int32)
+    compact = _PrimsTSMetadata(
+        torch.empty((rows, 128), device=device, dtype=torch.int32),
+        torch.empty((rows,), device=device, dtype=torch.int32),
+        torch.empty((rows, width), device=device, dtype=torch.int32),
+        torch.empty((rows,), device=device, dtype=torch.int32),
+    )
+    pages = (main.shape[0] + page - 1) // page
+    inputs = CSA2BackendForwardArgs(
+        swa_pool=_pool("swa_fp8", 512, 300),
+        swa_indices=torch.arange(128, device=device, dtype=torch.int32).repeat(rows, 1),
+        main_pool=main,
+        topk_indices=selection,
+        # Every request's page table maps logical MAIN row i to pool row i.
+        main_mapping=(
+            torch.arange(pages, device=device, dtype=torch.int32).repeat(rows // 4, 1),
+            page,
+            main.shape[0],
+            torch.arange(rows, device=device, dtype=torch.int32) // 4,
+            torch.full((rows,), main.shape[0], device=device, dtype=torch.int32),
+        )
+        if mapped
+        else None,
+    )
+    arenas, plain_arenas = {}, {}
+    bank = main_records_storage(arenas, device, rows * width)
+    plain = main_records_storage(plain_arenas, device, rows * width)
+    bank_rows = torch.empty((rows, width), device=device, dtype=torch.int32)
+    claims = main_record_owners(arenas, device, main.shape[0])
+
+    def case(seed: int) -> torch.Tensor:
+        generator = torch.Generator(device=device).manual_seed(seed)
+        # Four query rows per request draw from one shared set, as draft tokens do.
+        shared = torch.randint(
+            0, main.shape[0], (rows // 4, 700), device=device, generator=generator
+        )
+        pick = torch.randint(0, 700, (rows, width), device=device, generator=generator)
+        records = shared[torch.arange(rows, device=device)[:, None] // 4, pick].to(torch.int32)
+        # Invalid selections between valid ones, which the compaction drops.
+        records[:, 5::31] = -1
+        records[3, 7::13] = main.shape[0] + 9
+        return records
+
+    def check(source: torch.Tensor) -> None:
+        kept = [[v for v in row if 0 <= v < main.shape[0]] for row in source.tolist()]
+        expected = torch.tensor([row + [-1] * (width - len(row)) for row in kept], device=device)
+        torch.testing.assert_close(compact.extra_indices, expected.int(), atol=0, rtol=0)
+        assert compact.extra_lengths.tolist() == [len(row) for row in kept]
+        records = compact.extra_indices
+        decode_main_records(main, records, plain, plain_arenas)
+        owners = _dedup_reference(records.cpu(), main.shape[0]).to(device)
+        torch.testing.assert_close(bank_rows, owners, atol=0, rtol=0)
+        valid = (records >= 0).view(-1)
+        read = bank[bank_rows.view(-1).long()]
+        torch.testing.assert_close(read[valid], plain[valid], atol=0, rtol=0)
+
+    def forward() -> None:
+        prepare_prims_ts_metadata(inputs, compact, claims=claims)
+        dedup_main_records(main, compact.extra_indices, bank_rows, bank, arenas, claimed=True)
+
+    for seed in (1, 2):
+        selection.copy_(case(seed))
+        forward()
+        check(selection)
+    # Compaction on a side stream that waits only for the selections.
+    selection.copy_(case(3))
+    ready, done = torch.cuda.Event(), torch.cuda.Event()
+    ready.record()
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        side.wait_event(ready)
+        prepare_prims_ts_metadata(inputs, compact, claims=claims)
+        done.record()
+    done.wait()
+    dedup_main_records(main, compact.extra_indices, bank_rows, bank, arenas, claimed=True)
+    check(selection)
+    # A captured call claims with the device epoch each replay advances.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        forward()
+    for seed in (4, 5):
+        selection.copy_(case(seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        check(selection)
+    padded = _PrimsTSMetadata(
+        compact.indices,
+        compact.lengths,
+        torch.empty((rows, width + 8), device=device, dtype=torch.int32)[:, :width],
+        compact.extra_lengths,
+    )
+    with pytest.raises(ValueError, match="MAIN claims"):
+        prepare_prims_ts_metadata(inputs, padded, claims=claims)
+
+
 @torch.inference_mode()
 def test_prims_ts_selection_bank_storage_capacity() -> None:
     """The selection bank is sized once for its largest planned tile and never moves under it.

@@ -482,6 +482,71 @@ def test_prims_ts_early_selection_matches_serial(
 
 
 @skip_prims_ts_unsupported
+@pytest.mark.parametrize("early", [False, True], ids=["serial", "early-selection"])
+@torch.inference_mode()
+def test_prims_ts_selection_bank_claims_in_compaction(
+    early: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compaction claims a deduplicated selection bank's owner slots, on either stream.
+
+    The bank decode launches no claim kernel of its own, and the attention matches the
+    selection bank without deduplication bit for bit. With final selections, both
+    decodes run on the compaction's side stream.
+    """
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_bank
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _forbid_prims_ts_staging(monkeypatch)
+    decodes = []
+    dedup, plain_decode = _prims_ts_bank.dedup_main_records, _prims_ts_bank.decode_main_records
+
+    def record_dedup(*args, **kwargs):
+        decodes.append(("dedup", kwargs.get("claimed", False), torch.cuda.current_stream()))
+        return dedup(*args, **kwargs)
+
+    def record_plain(*args, **kwargs):
+        decodes.append(("plain", False, torch.cuda.current_stream()))
+        return plain_decode(*args, **kwargs)
+
+    def no_claim_kernel():
+        pytest.fail("the compaction claims the owner slots")
+
+    monkeypatch.setattr(_prims_ts_bank, "dedup_main_records", record_dedup)
+    monkeypatch.setattr(_prims_ts_bank, "decode_main_records", record_plain)
+    monkeypatch.setattr(_prims_ts_bank, "_claim_kernel", no_claim_kernel)
+    torch.manual_seed(503)
+    count, heads = 192, 64
+    attn = _backend(heads, compute_backend="prims_ts", kv_cache_dtype="fp8")
+    q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(count, 128, 512, device="cuda", dtype=torch.bfloat16)
+    main = torch.randn(count, 512, 512, device="cuda", dtype=torch.bfloat16)
+    swa_valid = torch.ones(count, 128, device="cuda", dtype=torch.bool)
+    main_valid = torch.ones(count, 512, device="cuda", dtype=torch.bool)
+    swa_valid[:, 1::7] = False
+    main_valid[:, 2::13] = False
+    sink = torch.linspace(-1.0, 1.0, heads, device="cuda")
+    args = _inputs(
+        q, swa, main, swa_valid, main_valid, sink, swa_cache_format=attn.swa_cache_format
+    )
+    if early:
+        ready = torch.cuda.Event()
+        ready.record()
+        args = replace(
+            args, sparse_backend_args=replace(args.sparse_backend_args, selection_ready=ready)
+        )
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 512, kv_input_mode="packed")
+    model_stream = torch.cuda.current_stream()
+    deduplicated = _helper_forward(attn, q.flatten(1), metadata, args).clone()
+    attn._test_compute_helper.dedup_selection_bank = False
+    plain = _helper_forward(attn, q.flatten(1), metadata, args)
+    torch.testing.assert_close(deduplicated, plain, atol=0, rtol=0)
+    assert [(kind, claimed) for kind, claimed, _ in decodes] == [("dedup", True), ("plain", False)]
+    assert all((stream != model_stream) == early for _, _, stream in decodes)
+
+
+@skip_prims_ts_unsupported
 @pytest.mark.parametrize(
     "main_bank", ["", "all", "selected"], ids=["in-kernel-decode", "main-bank", "selected-rows"]
 )

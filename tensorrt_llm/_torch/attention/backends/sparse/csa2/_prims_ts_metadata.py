@@ -71,7 +71,13 @@ def _compact_kernel() -> type:
         return kind(cutlass.select_(inside, value, kind(-1)))
 
     class _Compact:
-        """Write each list's valid rows as a prefix, then -1 up to its capacity."""
+        """Write each list's valid rows as a prefix, then -1 up to its capacity.
+
+        With ``claim``, every kept MAIN row also claims its owner slot for the selection
+        bank decode, as ``_prims_ts_bank.dedup_main_records`` claims: the slot keeps the
+        largest ``tag | (2^31 - 1 - f)``, so the smallest flat selection ``f`` of this
+        call reading the row, where ``tag`` is the epoch after the device's current one.
+        """
 
         def __init__(
             self,
@@ -84,6 +90,7 @@ def _compact_kernel() -> type:
             bank: bool,
             page_size: int,
             marks: bool,
+            claim: bool,
         ) -> None:
             self.swa_width = swa_width
             self.swa_capacity = swa_capacity
@@ -94,6 +101,14 @@ def _compact_kernel() -> type:
             self.bank = bank
             self.page_size = page_size
             self.marks = marks
+            self.claim = claim
+
+        @cute.jit
+        def _claim(self, owners, tag, row, column, record):
+            """Offer flat selection ``row * main_capacity + column`` as ``record``'s owner."""
+            flat = row * Int32(self.main_capacity) + column
+            value = tag | Int64(Int32(_INT32_LIMIT - 1) - flat)
+            cute.arch.atomic_max(owners.iterator + Int64(record), value, sem="relaxed", scope="gpu")
 
         @cute.jit
         def _finish(self, compact, lengths, row, lane, count, capacity):
@@ -122,6 +137,8 @@ def _compact_kernel() -> type:
             extra_lengths: cute.Tensor,
             offsets: cute.Tensor,
             marks: cute.Tensor,
+            owners: cute.Tensor,
+            epoch: cute.Tensor,
             num_rows: Int32,
             swa_rows: Int64,
             main_rows: Int64,
@@ -170,6 +187,10 @@ def _compact_kernel() -> type:
                 extra = Int32(0)
                 if cutlass.const_expr(self.has_main):
                     kind = main.element_type
+                    tag = Int64(0)
+                    if cutlass.const_expr(self.claim):
+                        # The bank decode advances the device epoch to this call's.
+                        tag = (Int64(epoch[0]) + Int64(1)) << Int64(32)
                     if cutlass.const_expr(self.mapped):
                         request = Int64(requests[row])
                         # Every row-wide bound folds into one logical range [lo, hi):
@@ -231,10 +252,13 @@ def _compact_kernel() -> type:
                                 target = logical + kind(shift)
                             votes = cute.arch.vote_ballot_sync(kept)
                             if kept:
-                                extra_compact[extra + cute.arch.popc(votes & below)] = Int32(target)
+                                column = extra + cute.arch.popc(votes & below)
+                                extra_compact[column] = Int32(target)
                                 if cutlass.const_expr(self.marks):
                                     # The bank decodes only the rows some selection keeps.
                                     marks[target] = cutlass.Uint8(1)
+                                if cutlass.const_expr(self.claim):
+                                    self._claim(owners, tag, row, column, target)
                             extra = extra + cute.arch.popc(votes)
                     else:
                         for chunk in cutlass.range_constexpr(main_chunks):
@@ -242,7 +266,10 @@ def _compact_kernel() -> type:
                             keep = _within(kind, value, 0, main_rows)
                             ballot = cute.arch.vote_ballot_sync(keep)
                             if keep:
-                                extra_compact[extra + cute.arch.popc(ballot & below)] = Int32(value)
+                                column = extra + cute.arch.popc(ballot & below)
+                                extra_compact[column] = Int32(value)
+                                if cutlass.const_expr(self.claim):
+                                    self._claim(owners, tag, row, column, value)
                             extra = extra + cute.arch.popc(ballot)
                 self._finish(extra_compact, extra_lengths, row, lane, extra, self.main_capacity)
 
@@ -260,6 +287,8 @@ def _compact_kernel() -> type:
             extra_lengths: cute.Tensor,
             offsets: cute.Tensor,
             marks: cute.Tensor,
+            owners: cute.Tensor,
+            epoch: cute.Tensor,
             num_rows: Int32,
             swa_rows: Int64,
             main_rows: Int64,
@@ -284,6 +313,8 @@ def _compact_kernel() -> type:
                 extra_lengths,
                 offsets,
                 marks,
+                owners,
+                epoch,
                 num_rows,
                 swa_rows,
                 main_rows,
@@ -319,6 +350,7 @@ def _compiled(key: tuple) -> "Callable[..., object]":
         bank,
         page_size,
         marks,
+        claim,
     ) = key
     element = {torch.int32: cutlass.Int32, torch.int64: cutlass.Int64}
 
@@ -338,7 +370,16 @@ def _compiled(key: tuple) -> "Callable[..., object]":
             assumed_align=4,
         )
 
-    swa, main, pages, requests, visible, offsets = dtypes
+    def slots(dtype: torch.dtype) -> object:
+        # Owner slots take 8-byte atomics; INT32 stand-ins are never read.
+        return cute.runtime.make_fake_compact_tensor(
+            element[dtype],
+            (cute.sym_int(),),
+            stride_order=(0,),
+            assumed_align=8 if dtype == torch.int64 else 4,
+        )
+
+    swa, main, pages, requests, visible, offsets, owners = dtypes
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile[cute.FrontendNext](
         _compact_kernel()(
@@ -351,6 +392,7 @@ def _compiled(key: tuple) -> "Callable[..., object]":
             bank,
             page_size,
             marks,
+            claim,
         ),
         matrix(swa),
         matrix(main),
@@ -365,6 +407,8 @@ def _compiled(key: tuple) -> "Callable[..., object]":
         cute.runtime.make_fake_compact_tensor(
             cutlass.Uint8, (cute.sym_int(),), stride_order=(0,), assumed_align=1
         ),
+        slots(owners),
+        slots(owners),
         cutlass.Int32(0),
         *(cutlass.Int64(0) for _ in range(9)),
         stream,
@@ -399,6 +443,7 @@ def prepare_prims_ts_metadata(
     prepared: "_PrimsTSMetadata",
     main_bank: "CSA2PrimsTSMainBank | None" = None,
     marks: torch.Tensor | None = None,
+    claims: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Refresh two compact lists without allocations or host tensor reads.
 
@@ -412,6 +457,11 @@ def prepare_prims_ts_metadata(
     request's rows of that decoded bank instead of the packed pool. ``marks``, a
     contiguous UINT8[main_bank.rows] vector, then also gets a nonzero byte at
     every bank row a selection keeps; other bytes are left as they are.
+
+    ``claims``, the device's ``(owners, epoch)`` from ``main_record_owners``, makes
+    every kept MAIN pool row claim its owner slot for the next
+    ``dedup_main_records(..., claimed=True)`` over ``prepared.extra_indices``, which must
+    then be contiguous: flat selection ``r * width + c`` is its entry ``[r, c]``.
     """
     rows, swa_capacity = prepared.indices.shape
     main_capacity = prepared.extra_indices.shape[1]
@@ -474,6 +524,25 @@ def prepare_prims_ts_metadata(
         or marks.device != device
     ):
         raise ValueError("CSA2 PrimTS bank row marks must be a CUDA UINT8[bank rows] vector")
+    if claims is not None:
+        owners, epoch = claims
+        if (
+            main_bank is not None
+            or not prepared.extra_indices.is_contiguous()
+            or rows * main_capacity >= _INT32_LIMIT
+            or owners.dtype != torch.int64
+            or owners.ndim != 1
+            or not owners.is_contiguous()
+            or owners.device != device
+            or owners.shape[0] < (inputs.main_pool.shape[0] if has_main else 0)
+            or epoch.dtype != torch.int64
+            or epoch.shape != (1,)
+            or epoch.device != device
+        ):
+            raise ValueError(
+                "CSA2 PrimTS MAIN claims need pool rows, contiguous compact MAIN rows and an "
+                "INT64 owner slot per pool row"
+            )
     if rows == 0:
         return
     # Clamped page reads need a table entry; an empty table admits no MAIN row, so
@@ -490,6 +559,9 @@ def prepare_prims_ts_metadata(
     main_rows = main_pool_rows if main_bank is not None else min(main_pool_rows, _INT32_LIMIT)
     mapped = reads_main and mapping is not None
     marked = mapped and marks is not None
+    claimed = reads_main and claims is not None
+    # An unclaimed launch reads no owner slots; any INT32 vector stands in.
+    owners, epoch = claims if claimed else (prepared.lengths, prepared.lengths)
     if (
         mapped
         and inputs.topk_indices.dtype == torch.int32
@@ -507,6 +579,7 @@ def prepare_prims_ts_metadata(
             requests.dtype,
             visible.dtype,
             offsets.dtype,
+            owners.dtype,
         ),
         inputs.swa_indices.shape[1],
         swa_capacity,
@@ -517,6 +590,7 @@ def prepare_prims_ts_metadata(
         mapped and main_bank is not None,
         page_size if mapped else 1,
         marked,
+        claimed,
     )
     _compiled(key)(
         inputs.swa_indices,
@@ -531,6 +605,8 @@ def prepare_prims_ts_metadata(
         offsets,
         # An unmarked launch writes no marks; any UINT8 vector stands in.
         marks if marked else prepared.indices[0].view(torch.uint8),
+        owners,
+        epoch,
         rows,
         min(inputs.swa_pool.shape[0], _INT32_LIMIT),
         main_rows,
