@@ -54,6 +54,8 @@ def test_spec_names_roles_and_layer_ids_by_plain_values():
 
 def test_spec_names_mixed_precision_types_as_a_pair():
     assert PageTableSpec(mixed_precision=["nvfp4", "bf16"]).mixed_precision == ("nvfp4", "bf16")
+    # The cold-page window keeps both at the model's KV type.
+    assert PageTableSpec(mixed_precision=("bf16", "bf16")).mixed_precision == ("bf16", "bf16")
     assert PageTableSpec().mixed_precision is None
     with pytest.raises(ValueError, match="low and a high type"):
         PageTableSpec(mixed_precision=("nvfp4",))
