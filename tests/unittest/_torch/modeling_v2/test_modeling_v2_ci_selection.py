@@ -302,12 +302,23 @@ def _runs(entry: str, path: str) -> bool:
 
 
 def _qa_entries(repo: Path) -> list[str]:
-    return [
+    """The QA list entries: the lines of each text list and the cases of each YAML case list."""
+    entries = [
         line.strip()
         for path in sorted((repo / _QA_LISTS).glob("*.txt"))
         for line in path.read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
+    for path in sorted((repo / _QA_LISTS).glob("*.yml")):
+        data = yaml.safe_load(path.read_text())
+        tests = data.get("tests") if isinstance(data, dict) else None
+        if isinstance(tests, list):
+            entries.extend(
+                test["case"]
+                for test in tests
+                if isinstance(test, dict) and isinstance(test.get("case"), str)
+            )
+    return entries
 
 
 # Unit tests that need hardware no CI stage provides, by test-db path, with what they

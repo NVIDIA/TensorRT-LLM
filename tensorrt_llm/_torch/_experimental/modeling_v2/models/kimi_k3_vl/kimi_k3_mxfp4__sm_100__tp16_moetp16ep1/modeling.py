@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# >>> route B: this target's layout, and decoding without speculation
 """ModelingV2 target: Kimi K3 (MXFP4) / sm_100 / tp16 attention, routed experts moe_tp 16 x moe_ep 1.
 
 Kimi K3's language model: 93 layers, hidden 7168. Every fourth layer (3, 7, ..., 91) is MLA attention with 96
@@ -16,9 +15,6 @@ intermediate width (192 of 3072 values, zero-padded to 256 when they load). With
 engine resolves the same sizes, but Kimi K3 then runs the experts expert-parallel over the 16 ranks, a layout no
 target serves. This is Kimi K3's layout for decoding without speculation; `tp16_moetp4ep4` serves speculative
 decoding.
-
-**This module is `tp16_moetp4ep4`'s, copied** (targets share no files) and changed only inside its marked route B
-blocks; test_modeling_v2_kimi_k3_drift.py checks that the two modules match everywhere else.
 
 **Each step is classified once, on the host, from its shape** (`decode_step`, a `DecodeStep` or None), and the
 classification decides which kernels each module runs:
@@ -82,7 +78,6 @@ The DSpark drafter (`K3DSparkDrafter`) and the speculative worker (`spec_worker.
 place of the shell's stock ones, also stay as `tp16_moetp4ep4` has them and are never built here; the drafter's decode
 GEMV sites are warmed with the others and never called.
 """
-# <<< route B
 
 from __future__ import annotations
 
@@ -158,9 +153,6 @@ from . import decode_moe as _decode_moe
 from . import spec_worker as _spec_worker
 from . import weights as _weights
 
-# >>> route B: no KDA verify kernels, and no trtllm::kda_mtp_decode (the built-in KDA verify's)
-# <<< route B
-
 native_ops = load_family_ops(__name__)
 
 if TYPE_CHECKING:
@@ -181,11 +173,11 @@ REQUIRED_TRTLLM_OPS = (
     "attn_res_add_rmsnorm_persistent_fwd",
     "kda_prefill",
     "kda_decode",
-    # >>> route B: no KDA verify (kda_mtp_decode, k3_kda_attn, k3_kda_verify)
+    # No KDA verify ops (the built-in verify's kda_mtp_decode, k3_kda_attn, k3_kda_verify): this target decodes
+    # without speculation, so no step verifies drafts.
     "dsv3_router_gemm_op",
     "dsv3_fused_a_gemm_op",
     "k3_kda_decode_attn",
-    # <<< route B
     "k3_mla_qkv",
     "k3_mla_attn_vb_out",
     # The decode path's GEMVs, the dense MLP's activation, the LM head and the embedding (decode_gemv.py).
@@ -205,10 +197,9 @@ REQUIRED_TRTLLM_OPS = (
     "k3_latent_reduce",
     "k3_route_quant",
     "mnnvl_allgather_split",
-    # >>> route B: the MoE engines of one and two tokens
+    # The MoE engines of one and two tokens.
     "k3_moe_m1",
     "k3_moe_m2",
-    # <<< route B
     # The DSpark drafter's decode path (K3DSparkDrafter): its GEMV sites, its block attention, and its all-reduces
     # with the residual add and RMSNorm (the split context projection's with hidden_norm).
     "k3_ctm_gemv",
@@ -1056,11 +1047,9 @@ class KimiK3MoERuntime(nn.Module):
 
     @staticmethod
     def _select_moe_tp_ep(mapping: Mapping) -> Tuple[int, int]:
-        # >>> route B: this target's split
         """The routed-expert ``(moe_tp, moe_ep)`` split: the user config's explicit
         ``moe_tensor_parallel_size`` / ``moe_expert_parallel_size`` (16 x 1, asserted at
         construction)."""
-        # <<< route B
         return mapping.moe_tp_size, mapping.moe_ep_size
 
     @staticmethod
@@ -1926,14 +1915,11 @@ class KimiLinearModel(DecoderModel):
             key="kimi_k3_aux_capture_mode",
         )
 
-    # >>> route B: no per-token KDA verify states (kda_draft_records): no speculative decoding
     @property
     def kda_draft_records(self) -> bool:
         """False: this target decodes without speculation, so the hybrid cache manager keeps no KDA state after
         each verify token, and a captured step's latent-push decision (``_latent_push``) reads that."""
         return False
-
-    # <<< route B
 
     def _latent_push(self, attn_metadata: AttentionMetadata, step: DecodeStep) -> bool:
         """Whether the MoE layers push on ``step`` (``latent_push``): read only while a CUDA graph is being captured,
@@ -2163,7 +2149,6 @@ class KimiLinearModel(DecoderModel):
 
 
 class K3DecodeKDA(KimiKDALinearAttention):
-    # >>> route B: no verify kernels
     """Kimi K3's KDA attention: the built-in module, with the decode kernels on the steps they take.
 
     * A decode step of one token per request runs the fused input projection and the plain decode in one
@@ -2173,10 +2158,9 @@ class K3DecodeKDA(KimiKDALinearAttention):
 
     Every other step runs the built-in module. The kernels read one ``[q | k | v | g | f_a | b]`` weight, built at the
     checkpoint load from the module's own, and the device's ``K3KdaBuffers`` and decode GEMVs' state, which the
-    target sets in ``post_load_weights``.
+    target sets in ``post_load_weights``. There are no verify kernels: a verify step needs speculative decoding,
+    which this target does not serve.
     """
-
-    # <<< route B
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -2318,9 +2302,6 @@ class K3DecodeKDA(KimiKDALinearAttention):
         # Speculative decoding's replay caches keep their committed conv window in step with the pool's.
         self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv)
         return core
-
-    # >>> route B: no verify kernels (a verify step needs speculative decoding)
-    # <<< route B
 
 
 class K3DecodeMLA(KimiK3MLAAttention):
@@ -3180,7 +3161,6 @@ def _check_construction(model_config: ModelConfig) -> None:
         mapping.moe_ep_size,
         mapping.enable_attention_dp,
     )
-    # >>> route B: this target's topology, its expert split set explicitly, and no speculative decoding
     assert topology == (16, 16, 1, 16, 1, False), (
         "the tp16_moetp16ep1 target needs world_size 16, tensor_parallel_size 16, pipeline_parallel_size 1, "
         "moe_tensor_parallel_size 16, moe_expert_parallel_size 1 and enable_attention_dp false; the engine built "
@@ -3195,7 +3175,6 @@ def _check_construction(model_config: ModelConfig) -> None:
         "the tp16_moetp16ep1 target decodes without speculation; for DSpark, DFlash or SA set "
         "moe_tensor_parallel_size 4 and moe_expert_parallel_size 4 (the tp16_moetp4ep4 target)"
     )
-    # <<< route B
     assert model_config.torch_dtype == torch.bfloat16, (
         f"this target computes in bf16; the engine resolved dtype {model_config.torch_dtype}"
     )
@@ -3215,9 +3194,7 @@ def _check_construction(model_config: ModelConfig) -> None:
     )
 
 
-# >>> route B: this target's name
 class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
-    # <<< route B
     """The class ``route`` returns: this target's text model (`KimiLinearModel` above) behind its checks.
 
     It inherits the built-in Kimi K3 causal LM for the checkpoint load and the engine hooks (`load_weights` through
@@ -3238,8 +3215,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
         )
         _check_construction(model_config)
         text = _text_model_config(model_config)
-        # >>> route B: no speculative decoding (_check_construction), so the one-engine shell builds no drafter
-        # <<< route B
+        # _check_construction rejects speculative decoding, so the one-engine shell below builds no drafter.
         # The inherited loader reads these: this target has neither helix context parallelism nor the fp8
         # weight-read conversion of the shared / latent MLPs.
         self._fp8_weight_read_moe_mlp = False
@@ -3255,10 +3231,9 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
         )
         self._own_spec_branch(text)
         self._step_checked = False
-        # >>> route B: no drafter to hand the LM head to
-        # The LM head on gemm/k3_head_gemv at decode size, once cache_derived_state has built its state.
+        # The LM head on gemm/k3_head_gemv at decode size, once cache_derived_state has built its state. No drafter
+        # shares it: this target builds none.
         self.logits_processor = _decode_gemv.K3LogitsProcessor(self.logits_processor)
-        # <<< route B
         # The executor reads generation settings (eos_token_id, ...) off the model config the engine holds, which
         # must therefore be the text config, as the built-in wrapper leaves it.
         model_config._frozen = False
@@ -3354,9 +3329,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
             _decode_comm.use_decode_one_shot(self)
         moe_layers = 0 if comm is None else self._build_decode_moe(comm)
         logger.info(
-            # >>> route B: no verify kernels
             "Kimi K3 decode kernels: KDA on k3_kda_decode_attn "
-            # <<< route B
             f"({sum(m.takes_k3_kernels for m in kda)} / {len(kda)} layers take them), MLA on k3_mla_qkv and "
             f"k3_mla_attn_vb_out ({len(mla)} layers); the post-attention all-reduce of at most "
             f"{_decode_comm.AR_ATTN_RES_MAX_TOKENS} tokens "
@@ -3368,9 +3341,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
                 if comm is not None
                 else "unfused (an attention all-reduce does not run over MNNVL)"
             )
-            # >>> route B: this target's MoE engines
             + f"; MoE on k3_moe_front, k3_moe_m1 / k3_moe_m2 / k3_moe and the row-parallel tail ({moe_layers} layers)"
-            # <<< route B
         )
         self._gate_spec_worker_kernels(comm)
         self._gate_drafter_comm(comm)
@@ -3403,12 +3374,11 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
             backend.w3_w1_weight.shape[1] // 2,
             backend.expert_size_per_partition,
             comm.mnnvl,
-            # >>> route B: the experts' logical slice (192 of the loader's 256), which k3_moe_m1 / k3_moe_m2 stream
+            # The experts' logical slice (192 of the loader's 256), which k3_moe_m1 / k3_moe_m2 stream.
             i_logical=(
                 getattr(backend.quant_method, "intermediate_size_per_partition_lean", None)
                 or backend.intermediate_size_per_partition
             ),
-            # <<< route B
         )
         for moe in takes:
             _decode_moe.fold_latent_norm(moe)
