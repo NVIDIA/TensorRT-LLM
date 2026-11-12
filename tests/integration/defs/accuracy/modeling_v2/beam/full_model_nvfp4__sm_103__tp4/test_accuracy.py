@@ -4,7 +4,7 @@
 
 Stage an authorized NVFP4 target below LLM_MODELS_ROOT and name it with
 TRTLLM_TEST_TARGET_RELATIVE_PATH. Stage the pinned dataset at datasets/openai/gsm8k.
-Missing inputs fail a selected run. This manual qualification uses four GB300s,
+Missing inputs fail a selected run. This QA/on-demand gate uses four GB300s,
 BF16 KV, no drafting, eager execution and no overlap; it never runs full GSM8K.
 """
 
@@ -21,6 +21,10 @@ from gsm8k_eval import runner  # noqa: E402
 
 
 def _run_first100(models_root, output_dir, time_budget_s):
+    # Leave time to stop the server and write results before pytest's hard timeout.
+    evaluation_budget_s = min(2700, time_budget_s) - 300
+    if evaluation_budget_s <= 0:
+        raise ValueError("the gate timeout must exceed the 300-second cleanup reserve")
     root = Path(models_root).resolve()
     relative = Path(os.environ["TRTLLM_TEST_TARGET_RELATIVE_PATH"])
     if relative.is_absolute() or ".." in relative.parts or relative == Path("."):
@@ -52,7 +56,7 @@ def _run_first100(models_root, output_dir, time_budget_s):
         output_dir=output,
         num_questions=100,
         concurrency=1,
-        time_budget_s=min(2700, time_budget_s),
+        time_budget_s=evaluation_budget_s,
         max_seq_len=config["max_seq_len"],
         min_correct=95,
         managed=runner.ManagedServer(
