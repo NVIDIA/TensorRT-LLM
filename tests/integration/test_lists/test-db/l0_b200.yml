@@ -268,6 +268,10 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_nvfp4_pre_quant_scale_matches_cutlass
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_count_native_cutedsl_matches_legacy_sort_bitwise
+  # MXFP8 fused FC12 leaf on SM100: A/B against the MXFP8 reference module and the
+  # gate/up interleave across partial refits (the op itself runs via kernels/parallel).
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_mxfp8_fused_fc12_accuracy_ab
+  - unittest/_torch/moe/test_mxfp8_moe_partial_refit.py
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"

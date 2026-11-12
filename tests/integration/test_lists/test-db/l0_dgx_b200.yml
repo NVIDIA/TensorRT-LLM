@@ -153,7 +153,7 @@ l0_dgx_b200:
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A16_MXFP4"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_MXFP8"
-  # --- CUTEDSL (NVFP4 only) ---
+  # --- CUTEDSL (NVFP4, and MXFP8 via the fused FC12 leaf) ---
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTEDSL"
   # --- DEEPGEMM (FP8_BLOCK_SCALES only) ---
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"

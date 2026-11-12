@@ -42,6 +42,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Mxfp8Impl,
     TrtllmCutedslFusedFc12Nvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
@@ -115,6 +116,7 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     BACKEND_FAMILY,
     IMPL_PRIORITY,
+    backend_family_of,
     impl_class_for,
     resolve_moe_impl,
 )
@@ -938,6 +940,157 @@ def test_pinned_fc12_identity_fails_hard_where_the_backend_literal_degrades():
     ]
     with pytest.raises(ValueError, match="no MoE implementation can serve"):
         impl_class_for(by_identity)
+
+
+# =====================================================================
+# TrtllmCutedslFusedFc12Mxfp8Impl implementation identity
+# =====================================================================
+# The MXFP8 fused FC12 leaf is what ``moe_backend: CUTEDSL`` resolves to for an
+# MXFP8 checkpoint. Its gates read SM, the CuTe DSL dependencies of that SM's
+# kernel copy, EPLB, the hidden size's alignment to the FC1 scale gather and
+# the per-rank intermediate size's alignment to the 128-row scale atoms.
+
+_FC12_MXFP8_IMPL_ID = "trtllm.cutedsl.fused_fc12.mxfp8"
+_FC12_MXFP8_DEPS = (
+    MoEDep.CUTEDSL_RUBIN.value,
+    MoEDep.CUTEDSL_MXFP8_FUSED_FC12.value,
+    MoEDep.CUTEDSL_MXFP8_FUSED_FC12_BLACKWELL.value,
+)
+
+
+def _fc12_mxfp8_problem(hidden_size: int = 4096, intermediate_size: int = 1024) -> MoEProblem:
+    """The Qwen3.5-397B routed shape."""
+    return MoEProblem(
+        quant=canonical_quant(QuantAlgo.MXFP8),
+        dtype_act=torch.bfloat16,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=512,
+        top_k=10,
+        swiglu_gptoss_style=False,
+    )
+
+
+def _fc12_mxfp8_environment(sm: int = 107, deps=_FC12_MXFP8_DEPS) -> MoEEnvironment:
+    return MoEEnvironment(sm=sm, available_deps=deps)
+
+
+def test_fc12_mxfp8_identity_round_trips_through_registry():
+    impl = TrtllmCutedslFusedFc12Mxfp8Impl
+    identity = impl.descriptor.identity
+    assert identity.canonical() == _FC12_MXFP8_IMPL_ID
+    assert MoEImplId.parse(_FC12_MXFP8_IMPL_ID) == identity
+    assert MOE_IMPL_REGISTRY.lookup(identity) is impl
+    assert "descriptor" in vars(impl)
+    for name in _ABSTRACT_METHODS:
+        assert name in vars(impl)
+    assert not impl.__abstractmethods__
+    assert impl.scheduler_kind is MoESchedulerKind.EXTERNAL_COMM
+    assert impl.capabilities == MoEStaticCapability(supports_apply_router_weight_on_input=True)
+    assert impl.activation_support == MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu}),
+        limit=ActivationParamShape.UNIFORM_SCALAR,
+        limit_when_absent=float("inf"),
+    )
+    # Not a grouped-GEMM leaf: the family name gates grouped-GEMM-only paths.
+    assert not issubclass(impl, CuteDslFusedMoE)
+    assert backend_family_of(impl) == "CUTEDSL"
+
+
+def test_fc12_mxfp8_is_admitted_on_rubin_and_blackwell():
+    problem = _fc12_mxfp8_problem()
+    admitted = {
+        sm
+        for sm in range(75, 125)
+        if TrtllmCutedslFusedFc12Mxfp8Impl.can_implement(
+            problem, _single_rank_deployment(_fc12_mxfp8_environment(sm))
+        ).eligible
+    }
+    assert admitted == {100, 103, 107}
+
+
+@pytest.mark.parametrize(
+    "problem, deployment, reason",
+    [
+        pytest.param(
+            _fc12_mxfp8_problem(),
+            _single_rank_deployment(_fc12_mxfp8_environment(deps=(MoEDep.CUTEDSL_RUBIN.value,))),
+            MoERejectReason.DEP_MISSING,
+            id="dsl-too-old",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(),
+            _single_rank_deployment(
+                _fc12_mxfp8_environment(
+                    sm=100,
+                    deps=(MoEDep.CUTEDSL_RUBIN.value, MoEDep.CUTEDSL_MXFP8_FUSED_FC12.value),
+                )
+            ),
+            MoERejectReason.DEP_MISSING,
+            id="sm100-without-blackwell-port",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(hidden_size=2304),
+            _single_rank_deployment(_fc12_mxfp8_environment()),
+            MoERejectReason.SHAPE_UNALIGNED,
+            id="hidden-not-512-aligned",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(intermediate_size=1088),
+            _single_rank_deployment(_fc12_mxfp8_environment()),
+            MoERejectReason.SHAPE_UNALIGNED,
+            id="intermediate-not-128-aligned",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(),
+            dataclasses.replace(_single_rank_deployment(_fc12_mxfp8_environment()), tp_size=16),
+            MoERejectReason.SHAPE_UNALIGNED,
+            id="tp-shard-not-128-aligned",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(),
+            dataclasses.replace(
+                _single_rank_deployment(_fc12_mxfp8_environment()), eplb_enabled=True
+            ),
+            MoERejectReason.EPLB_UNSUPPORTED,
+            id="eplb",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(),
+            dataclasses.replace(
+                _single_rank_deployment(_fc12_mxfp8_environment()),
+                fused_finalize_enabled=False,
+            ),
+            MoERejectReason.FINALIZE_FUSION_REQUIRED,
+            id="no-fused-finalize",
+        ),
+        pytest.param(
+            dataclasses.replace(_fc12_mxfp8_problem(), quant=canonical_quant(QuantAlgo.NVFP4)),
+            _single_rank_deployment(_fc12_mxfp8_environment()),
+            MoERejectReason.QUANT_UNSUPPORTED,
+            id="nvfp4",
+        ),
+    ],
+)
+def test_fc12_mxfp8_gate_rejections(problem, deployment, reason):
+    verdict = TrtllmCutedslFusedFc12Mxfp8Impl.can_implement(problem, deployment)
+    assert not verdict.eligible
+    assert verdict.reject_reason is reason
+
+
+@pytest.mark.parametrize("sm", [100, 103, 107])
+def test_cutedsl_literal_serves_mxfp8_with_the_fused_fc12_leaf_on_every_sm(sm):
+    with override_moe_environment(_fc12_mxfp8_environment(sm)):
+        report = resolve_moe_impl(_cutedsl_model_config(QuantAlgo.MXFP8))
+    assert impl_class_for(report) is TrtllmCutedslFusedFc12Mxfp8Impl
+    assert not report.degraded
+
+
+def test_cutedsl_literal_degrades_mxfp8_to_cutlass_on_an_old_dsl():
+    with override_moe_environment(_fc12_mxfp8_environment(deps=(MoEDep.CUTEDSL_RUBIN.value,))):
+        report = resolve_moe_impl(_cutedsl_model_config(QuantAlgo.MXFP8))
+    assert impl_class_for(report) is TrtllmCutlassMxfp8Impl
+    assert report.degraded
 
 
 # =====================================================================

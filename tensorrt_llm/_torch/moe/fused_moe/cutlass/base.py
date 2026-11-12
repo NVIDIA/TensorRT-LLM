@@ -35,7 +35,7 @@ from ..activation import (
     MoEActivation,
     MoEActivationSupport,
 )
-from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
+from ..impl_base import MoEImplBase, apply_moe_impl_construction_state, moe_tune_max_num_tokens
 from ..impl_contract import MoERunContext, require_comm_plan
 from ..impl_environment import collect_moe_environment
 from ..quantization import MoEWeightLoadingMode
@@ -211,16 +211,8 @@ class CutlassFusedMoEBase(MoEImplBase):
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size
         self.moe_max_num_tokens = model_config.moe_max_num_tokens
-        default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
-
-        # The profiler converges on the same best tactic when the number of tokens is large enough.
-        # To avoid long profiling time, the max number of tokens used in the profiling is capped to
-        # around 16k tokens per expert, which is well into the compute bound domain.
-        self.tune_max_num_tokens = min(
-            self.moe_max_num_tokens,
-            16384 * self.num_slots // routing_method.get_experts_per_token(),
-            # A forward can never present more tokens than this.
-            default_moe_max_num_tokens,
+        self.tune_max_num_tokens = moe_tune_max_num_tokens(
+            model_config, self.num_slots, routing_method.get_experts_per_token()
         )
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
