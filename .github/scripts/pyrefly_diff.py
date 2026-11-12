@@ -86,7 +86,7 @@ def _renames(changes: Path) -> dict[str, str]:
     return result
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--event", type=Path, default=os.environ.get("GITHUB_EVENT_PATH"))
     parser.add_argument("--base-root", type=Path, required=True)
@@ -117,10 +117,13 @@ def main() -> None:
             )
         except (OSError, ValueError, KeyError) as error:
             report["error"] = str(error)[-2000:]
-    if report["error"]:
-        print(f"::warning::Pyrefly check incomplete: {report['error']}")
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    if report["error"]:
+        # An incomplete check fails its job; new diagnostics alone do not.
+        print(f"::error::Pyrefly check incomplete: {report['error']}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
