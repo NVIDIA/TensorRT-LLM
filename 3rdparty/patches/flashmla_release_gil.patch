@@ -1,0 +1,52 @@
+--- a/csrc/api/api.cpp
++++ b/csrc/api/api.cpp
+@@ -7,9 +7,44 @@
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.doc() = "FlashMLA";
+-    m.def("sparse_decode_fwd", &sparse_attn_decode_interface);
+-    m.def("dense_decode_fwd", &dense_attn_decode_interface);
+-    m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface);
+-    m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
+-    m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
++    // Every binding releases the GIL for the duration of its C++ call.
++    //
++    // A binding that kept the GIL could deadlock a process that also queues Python host functions on a
++    // CUDA stream, as TensorRT-LLM does. What is seen then: under load, the thread that runs the model
++    // never returns from a call into this module, and in a multi-rank deployment the other ranks stall
++    // in their next collective.
++    //
++    // Three facts make the cycle:
++    //   1. A kernel launch is normally asynchronous, but once the launch queue is full it blocks until
++    //      the device has worked through part of the queue.
++    //   2. A host function queued with cudaLaunchHostFunc blocks the work queued behind it until it has
++    //      returned, and one that calls back into Python must take the GIL before it can run.
++    //   3. pybind11 keeps the GIL for the whole call of a function bound with a plain m.def, also while
++    //      a launch inside it blocks.
++    // So when a launch made from here blocks on a full queue that has a Python host function ahead of
++    // it, the launch waits for the host function and the host function waits for the GIL.
++    //
++    // In TensorRT-LLM the host functions come from tensorrt_llm/_torch/hostfunc.py; the capturable
++    // guided decoder (guided decoding beside one-model speculative decoding) queues them for every
++    // step. Those captured into a CUDA graph run when a replay reaches them, which is after the Python
++    // call that started the replay has returned, so they can still be pending when the next step runs
++    // eagerly and calls into this module. Whether the launch queue is full at that moment depends on
++    // the load, so the hang shows up under serving load and not on every request.
++    //
++    // Releasing the GIL is safe for the functions bound here: their arguments and results are tensors
++    // and scalars, which pybind11 converts before the guard is constructed and after it is destroyed;
++    // they never call into Python; and they keep no mutable state between calls, so calls from
++    // different Python threads need no serialization by the GIL. A binding that takes or returns
++    // Python objects, calls into Python, or shares mutable state must not get this guard.
++    //
++    // These conditions were checked for the FlashMLA commit pinned in 3rdparty/fetch_content.json, and
++    // they are properties of that commit only. Whenever the pin moves, check them again for every
++    // binding of the new version and for the functions they bind. The patch still applying does not
++    // show that they hold: a binding added upstream gets no guard (and can deadlock as described above
++    // if it launches kernels), and a change inside a bound function leaves this file untouched.
++    m.def("sparse_decode_fwd", &sparse_attn_decode_interface, pybind11::call_guard<pybind11::gil_scoped_release>());
++    m.def("dense_decode_fwd", &dense_attn_decode_interface, pybind11::call_guard<pybind11::gil_scoped_release>());
++    m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface, pybind11::call_guard<pybind11::gil_scoped_release>());
++    m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun, pybind11::call_guard<pybind11::gil_scoped_release>());
++    m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun, pybind11::call_guard<pybind11::gil_scoped_release>());
+ }

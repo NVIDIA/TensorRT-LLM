@@ -60,15 +60,29 @@ def _build(spec, seed):
         used += n
     t = sum(new)
     q = torch.randn(t, HEADS, QK, generator=g, device="cuda").to(torch.bfloat16)
+    # The fp8 attention's query: the e4m3 q_b output (values within the e4m3 range).
+    e4m3 = bool(spec.get("q_e4m3", False))
+    if e4m3:
+        q = (q.float() * 64.0).to(torch.float8_e4m3fn)
+    # The latent as the target hands it over: the tail of a wider projection row when the
+    # cell names a stride, else packed.
+    stride = spec.get("latent_stride", LATENT)
+    row = torch.randn(t, stride, generator=g, device="cuda").to(torch.bfloat16)
     cu = torch.tensor([0] + torch.tensor(new).cumsum(0).tolist(), dtype=torch.int32)
+    # The non-absorbed attention's mode: no fused or fp8 query, rope(q_pe) back into q.
+    in_place = bool(spec.get("q_in_place", False))
     return dict(
         # The absorbed half random, the rope tail garbage the kernel must overwrite.
-        fused_q=torch.randn(t, HEADS, LATENT, generator=g, device="cuda").to(torch.bfloat16),
+        fused_q=None
+        if in_place
+        else torch.randn(t, HEADS, LATENT, generator=g, device="cuda").to(torch.bfloat16),
         q_pe=q[..., QK - ROPE :],
-        latent_cache=torch.randn(t, LATENT, generator=g, device="cuda").to(torch.bfloat16),
-        quant_q_buffer=torch.full(
-            (t, HEADS, LATENT), SENTINEL, dtype=torch.uint8, device="cuda"
-        ).view(torch.float8_e4m3fn),
+        latent_cache=row[:, stride - LATENT :],
+        quant_q_buffer=None
+        if in_place
+        else torch.full((t, HEADS, LATENT), SENTINEL, dtype=torch.uint8, device="cuda").view(
+            torch.float8_e4m3fn
+        ),
         kv_pool=torch.full(
             (num_pages * layers * PAGE * LATENT,), SENTINEL, dtype=torch.uint8, device="cuda"
         ),
@@ -78,6 +92,11 @@ def _build(spec, seed):
         cached_lens=torch.tensor(cached, dtype=torch.int32, device="cuda"),
         rotary_cos_sin=_rope_table(max(c + n for c, n in zip(cached, new)) + 3),
         tokens_per_block=PAGE,
+        # After the fp8 q-base K-B: the q-base bytes are already in quant_q_buffer (here
+        # the sentinel, which must survive) and fused_q's first 512 columns are not read.
+        skip_q_base=bool(spec.get("skip_q_base", False)),
+        q_in_place=in_place,
+        q_e4m3=e4m3,
     )
 
 
@@ -97,23 +116,39 @@ def test_certified_cells(cell, compiled) -> None:
     args = _build(cell.spec, zlib.crc32(cell.why.encode()) % 2**31)
     ref = op.reference(**{k: v.clone() if torch.is_tensor(v) else v for k, v in args.items()},
                        compiled=compiled)  # fmt: skip
+    lat = args["latent_cache"]
+    head = None
+    if lat.stride(0) != LATENT:
+        # The projection row's columns ahead of the latent are q_a: read by nothing here,
+        # and the kernel must not write them.
+        parent = torch.as_strided(lat, (lat.shape[0], lat.stride(0)), (lat.stride(0), 1),
+                                  lat.storage_offset() - (lat.stride(0) - LATENT))  # fmt: skip
+        head = (parent, parent[:, : lat.stride(0) - LATENT].clone())
     with validating(op):
         got = op(**args, compiled=compiled)
     torch.cuda.synchronize()
-    assert got[0] is args["fused_q"] and got[3] is args["kv_pool"]
-    names = ("fused_q", "latent_cache", "quant_q_buffer", "kv_pool")
+    if head is not None:
+        assert torch.equal(head[0][:, : head[1].shape[1]], head[1]), "the q_a columns were written"
+    first = "q_pe" if args["q_in_place"] else "fused_q"
+    assert got[0] is args[first] and got[3] is args["kv_pool"]
+    names = (first, "latent_cache", "quant_q_buffer", "kv_pool")
     for name, out, want in zip(names, got, ref):
+        if want is None:
+            assert out is None, f"{name}: the q_in_place mode returns None"
+            continue
         out = out.view(torch.uint8) if out.dtype == torch.float8_e4m3fn else out
+        want = want.view(torch.uint8) if want.dtype == torch.float8_e4m3fn else want
         bad = int((out.reshape(-1) != want.reshape(-1)).sum())
         assert bad == 0, f"{name}: {bad} elements differ from the reference"
 
 
 def test_the_op_refuses_a_layout_it_did_not_compile(compiled) -> None:
-    """A strided latent selects another specialization, which would compile here."""
+    """A latent stride outside LATENT_STRIDES selects another specialization, which would
+    compile here."""
     args = _build(dict(new=[8], cached=[0], layers=1, layer=0), seed=1)
-    wide = torch.zeros(8, 2624, dtype=torch.bfloat16, device="cuda")
-    args["latent_cache"] = wide[:, 2624 - LATENT :]
-    with pytest.raises(ValueError, match="packed"):
+    wide = torch.zeros(8, 2 * LATENT, dtype=torch.bfloat16, device="cuda")
+    args["latent_cache"] = wide[:, LATENT:]
+    with pytest.raises(ValueError, match="row stride in"):
         op(**args, compiled=compiled)
 
 
@@ -126,6 +161,14 @@ def _handle() -> "entry.CompiledMlaRopeAppendPrefill":
 
 def test_is_valid_admits_a_well_formed_call() -> None:
     op.is_valid(**_build(_GUARD, 2), compiled=_handle())
+
+
+def test_is_valid_refuses_e4m3_outside_q_in_place() -> None:
+    """`q_e4m3` only exists as a variant of the in-place mode."""
+    args = _build(_GUARD, 6)
+    args["q_e4m3"] = True
+    with pytest.raises(AssertionError, match="variant of q_in_place"):
+        op.is_valid(**args, compiled=_handle())
 
 
 def test_is_valid_refuses_a_prefix_sum_short_of_the_rows() -> None:
@@ -150,3 +193,69 @@ def test_is_valid_refuses_a_position_past_the_rope_table() -> None:
     args["rotary_cos_sin"] = args["rotary_cos_sin"][:, : 20 * ROPE * 2]
     with pytest.raises(AssertionError, match="past the rope table"):
         op.is_valid(**args, compiled=_handle())
+
+
+#: Context row counts of the e4m3-query mode's split build: a partial last tile, mid-size and
+#: served steps, the token budget and twice it.
+_PAR_ROWS = (513, 4128, 7340, 8192, 16448)
+
+
+def _par_spec(rows: int) -> dict:
+    """`rows` new rows over up to 8 requests, cached prefixes on most, the target's latent stride."""
+    n = 8 if rows >= 4096 else 3
+    new = [rows // n] * (n - 1) + [rows - rows // n * (n - 1)]
+    cached = [(17 * b) % 300 for b in range(n)]
+    return dict(new=new, cached=cached, layers=2, layer=1, latent_stride=2624, q_in_place=True,
+                q_e4m3=True)  # fmt: skip
+
+
+def _fresh(rows: int, seed: int) -> dict:
+    """A new copy of the same inputs. Not `.clone()`: `q_pe` is a view of the query's rope tail
+    and the latent a view of a wider row, and the op checks those strides."""
+    return _build(_par_spec(rows), seed=seed)
+
+
+def _outputs(args: dict) -> list[torch.Tensor]:
+    """The bytes the op may write: the query's rope tail, the latent rows, the whole pool."""
+    return [args["q_pe"].contiguous().view(torch.uint8), args["latent_cache"].contiguous(),
+            args["kv_pool"]]  # fmt: skip
+
+
+@pytest.fixture(scope="module")
+def compiled_one_cta():
+    """The e4m3-query mode on one CTA per token tile: the build the split one replaces."""
+    return entry.compile(
+        tokens_per_block=PAGE, device_index=torch.cuda.current_device(), rope_par=0
+    )
+
+
+@pytest.mark.parametrize("rows", _PAR_ROWS)
+def test_split_build_is_the_one_cta_build_bitwise(rows, compiled, compiled_one_cta) -> None:
+    assert compiled.rope_par == entry.ROPE_PAR and compiled_one_cta.rope_par == 0
+    a, b = _fresh(rows, rows), _fresh(rows, rows)
+    op(**a, compiled=compiled)
+    op(**b, compiled=compiled_one_cta)
+    torch.cuda.synchronize()
+    for got, want, name in zip(_outputs(a), _outputs(b), ("q_pe", "latent", "pool")):
+        assert torch.equal(got, want), f"{name}: the split build differs at {rows} rows"
+
+
+def test_split_build_graph_replay_is_eager(compiled) -> None:
+    args = _fresh(7340, 11)
+    eager, static = _fresh(7340, 11), _fresh(7340, 11)
+    op(**eager, compiled=compiled)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op(**_fresh(7340, 11), compiled=compiled)  # warm on the capture stream
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        op(**static, compiled=compiled)
+    for k, v in args.items():  # the capture ran nothing: restore the inputs and replay
+        if torch.is_tensor(v):
+            static[k].copy_(v)
+    graph.replay()
+    torch.cuda.synchronize()
+    for got, want, name in zip(_outputs(static), _outputs(eager), ("q_pe", "latent", "pool")):
+        assert torch.equal(got, want), f"{name}: graph replay differs from eager"
