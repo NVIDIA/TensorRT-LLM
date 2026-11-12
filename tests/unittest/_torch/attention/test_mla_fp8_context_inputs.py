@@ -3,9 +3,10 @@
 """MLA cached-KV context attention with caller-quantized FP8 Q / K / V.
 
 With an FP8 KV cache, the attention op's FP8 context MLA FMHA reads FP8 Q, K and V. Given BF16
-K / V it quantizes them itself (unit scale, round to nearest, saturating). A caller may hand it
-those FP8 tensors directly (``key`` / ``value`` in E4M3, and ``quant_q_buffer`` with
-``quant_scale_qkv``); the output must be bit-identical to handing it the BF16 inputs.
+K / V it quantizes them itself with ``kv_scale_orig_quant``, the inverse of the KV cache scale
+(round to nearest, saturating). A caller may hand it those FP8 tensors, quantized with the same
+scale, directly (``key`` / ``value`` in E4M3, and ``quant_q_buffer`` with ``quant_scale_qkv``);
+the output must be bit-identical to handing it the BF16 inputs.
 The last test checks such a run against a BF16 KV cache on the same inputs: the
 bit-identity alone would let a scaling bug that skews every run equally through.
 """

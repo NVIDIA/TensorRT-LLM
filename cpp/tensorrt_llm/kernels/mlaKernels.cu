@@ -1923,9 +1923,9 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
 
             quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128, false>
                 <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
-                    nullptr, nullptr, nullptr, nullptr, q_len, 0, srcVTokenStride, params.quant_scale_qkv,
-                    params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.dequant_scale_q,
-                    params.dequant_scale_kv, params.host_bmm1_scale);
+                    /*k_buf=*/nullptr, /*quant_k_buf=*/nullptr, /*v_buf=*/nullptr, /*quant_v_buf=*/nullptr, q_len,
+                    /*total_kv_len=*/0, srcVTokenStride, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                    params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
         }
         else
         {

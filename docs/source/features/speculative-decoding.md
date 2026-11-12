@@ -190,7 +190,10 @@ automatically when its config lists both context and generation servers, both
 enable compatible speculation, and they shard attention alike: the same
 `tensor_parallel_size`, where `enable_attention_dp` counts as 1 because every
 rank keeps all KV heads. A config that lists only one side (for example, a
-context-only MPI world) leaves sharing off unless the variable is `1`.
+context-only MPI world) leaves sharing off unless the variable is `1`. A
+two-sided config with attention DP on both sides and different
+`tensor_parallel_size` values shards attention alike too, so it also shares;
+set `TRTLLM_DISAGG_SHARED_DRAFT_KV=0` to keep separate draft KV caches.
 
 When sharing is enabled, the context server's draft pages are transferred to
 the generation server with the target pages, so the drafter starts generation
