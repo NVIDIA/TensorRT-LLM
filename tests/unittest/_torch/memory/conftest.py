@@ -40,11 +40,15 @@ _SETTING_VARS = (
 
 
 def _reset_monitor() -> None:
+    # Providers go first: settings.configure() keeps the configuration while
+    # an executor a test leaked is still registered.
+    providers.clear_registered_providers()
     settings.configure(None)
     startup.clear()
     claims.clear_claims()
+    if tagging.tagging_window_active():
+        tagging.stop_tagging_window()
     tagging.set_frozen_map(tagging.TagSnapshot(supported=False))
-    providers.clear_registered_providers()
     triggers.uninstall_oom_reporter()
     stacks.stop_stack_recording()
 

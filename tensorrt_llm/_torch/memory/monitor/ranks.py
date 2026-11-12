@@ -30,7 +30,9 @@ dropped. A report is larger than MPI's eager limit, so a reply only
 completes once rank 0 receives it; replies are therefore sent without
 blocking, and a listener that is stopped while its reply is uncollected
 abandons it instead of waiting in MPI. Rank 0 drains uncollected replies
-when it stops.
+when it stops. A gather that overlaps shutdown returns at once, listing the
+ranks it has not heard from as not gathered, and stopping never raises: an
+MPI error while draining is logged.
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ _POLL_S = 0.2
 _SEND_POLL_S = 0.05
 _GATHER_POLL_S = 0.05
 _DEFAULT_TIMEOUT_S = 30.0
+_SHUTTING_DOWN = "not gathered; shutting down"
 
 #: Replies whose send was abandoned when a listener stopped. MPI may still
 #: read their buffers, so they stay referenced for the life of the process.
@@ -116,10 +119,16 @@ class RankReporter:
         return True
 
     def gather(self, timeout: float = _DEFAULT_TIMEOUT_S) -> list[str]:
-        """Reports from ranks 1..N-1, in rank order. Rank 0 only."""
+        """Reports from ranks 1..N-1, in rank order. Rank 0 only.
+
+        Stops waiting as soon as :meth:`stop` is called; ranks not heard
+        from by then are listed as not gathered.
+        """
         if self._rank != 0:
             return []
         with self._gather_lock:
+            if self._stop.is_set():
+                return [f"rank {r}: {_SHUTTING_DOWN}" for r in range(1, self._world_size)]
             sequence = next(self._sequence)
             for dest in range(1, self._world_size):
                 self._comm.send(sequence, dest=dest, tag=_REQUEST_TAG)
@@ -131,7 +140,7 @@ class RankReporter:
                 # A reply to an earlier request that timed out is dropped.
                 return reply[0] == sequence
 
-            while pending and time.monotonic() < deadline:
+            while pending and time.monotonic() < deadline and not self._stop.is_set():
                 for source in sorted(pending):
                     received, reply = try_recv(self._comm, source, _REPLY_TAG, current)
                     if not received:
@@ -139,9 +148,17 @@ class RankReporter:
                     replies[source] = reply[1] or f"rank {source}: the report could not be built"
                     pending.discard(source)
                 if pending:
-                    time.sleep(_GATHER_POLL_S)
+                    self._stop.wait(_GATHER_POLL_S)
+            stopped = self._stop.is_set()
             for source in pending:
-                replies[source] = f"rank {source}: no report within {timeout:g} s"
+                replies[source] = (
+                    f"rank {source}: {_SHUTTING_DOWN}"
+                    if stopped
+                    else f"rank {source}: no report within {timeout:g} s"
+                )
+            if stopped and pending:
+                # stop() could not drain while this gather held the lock.
+                self._drain_quietly()
             return [replies[source] for source in sorted(replies)]
 
     def _drain_replies(self) -> None:
@@ -149,13 +166,25 @@ class RankReporter:
         for source in range(1, self._world_size):
             try_recv(self._comm, source, _REPLY_TAG, accept=lambda _reply: False)
 
+    def _drain_quietly(self) -> None:
+        """:meth:`_drain_replies`, logging an MPI error instead of raising it."""
+        try:
+            self._drain_replies()
+        except RuntimeError as exc:  # mpi4py's MPI.Exception derives from it
+            logger.warning(
+                f"memory monitor: could not drain rank reports at shutdown "
+                f"({type(exc).__name__}: {exc})"
+            )
+
     def stop(self) -> None:
-        """End this rank's listener. Each rank stops its own."""
+        """End this rank's listener. Each rank stops its own. Never raises.
+
+        A gather still running returns promptly and drains its own replies.
+        """
         self._stop.set()
-        # A gather still running receives its own replies.
         if self._rank == 0 and self._gather_lock.acquire(blocking=False):
             try:
-                self._drain_replies()
+                self._drain_quietly()
             finally:
                 self._gather_lock.release()
         if self._thread is not None:

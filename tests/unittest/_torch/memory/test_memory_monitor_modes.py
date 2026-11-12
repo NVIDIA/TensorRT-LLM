@@ -17,12 +17,26 @@
 import threading
 
 import pytest
-import torch
+import yaml
 
 import tensorrt_llm._torch.memory.monitor as mon
-from tensorrt_llm._torch.memory.monitor import settings, startup, tagging, triggers
+from tensorrt_llm._torch.memory.monitor import providers, startup, tagging, triggers
+from tensorrt_llm.logger import logger
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _capture_warnings(monkeypatch) -> list[str]:
+    """Warnings logged from now on, each once-only warning included again."""
+    warnings: list[str] = []
+    monkeypatch.setattr(logger, "_appeared_keys", set())
+
+    def log(severity, *msg):
+        if severity == logger.WARNING:
+            warnings.append(" ".join(str(m) for m in msg))
+
+    monkeypatch.setattr(logger, "log", log)
+    return warnings
 
 
 @pytest.fixture(autouse=True)
@@ -53,12 +67,8 @@ def test_values(monkeypatch):
         assert mon.mode() == expected, f"TLLM_MEM_MONITOR={value!r}"
 
     # An unknown value falls back to the default, with a warning.
-    warnings = []
     monkeypatch.setenv("TLLM_MEM_MONITOR", "yes-please")
-    from tensorrt_llm.logger import logger
-
-    monkeypatch.setattr(logger, "warning", warnings.append)
-    monkeypatch.setattr(settings, "_warned", set())
+    warnings = _capture_warnings(monkeypatch)
     assert mon.mode() == "oom"
     assert mon.mode() == "oom"
     assert len(warnings) == 1 and "is not one of 0, oom, 1" in warnings[0], "warned once"
@@ -84,9 +94,9 @@ class TestDefaultReportsOnlyOutOfMemory:
         assert not startup._on()
         with tagging.startup_window() as recording:
             assert recording is False
-        # ... and an unforced report (startup, periodic, warmup logging) is not built.
-        if torch.cuda.is_available():
-            assert mon.capture(tag="unit") is None
+        # ... and an unforced report (startup, periodic, warmup logging) is not
+        # built; it returns before touching CUDA, so this holds without a GPU.
+        assert mon.capture(tag="unit") is None
 
         triggers.uninstall_oom_reporter()
         monkeypatch.setenv("TLLM_MEM_MONITOR_RANKS", "3")
@@ -124,7 +134,9 @@ def test_llm_args_configure_the_monitor_and_the_environment_overrides(monkeypatc
         oom_report_interval=5,
         report_dir=str(tmp_path),
     )
-    args = TorchLlmArgs(model="/tmp/dummy_model", memory_monitor_config=config)
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model", tensor_parallel_size=4, memory_monitor_config=config
+    )
     try:
         mon.configure(args.memory_monitor_config)
         assert mon.mode() == "full", "the configured mode"
@@ -154,3 +166,117 @@ def test_llm_args_configure_the_monitor_and_the_environment_overrides(monkeypatc
     ):
         with pytest.raises(ValidationError):
             MemoryMonitorConfig(**bad)
+
+    for bad in (
+        {"oom_report_interval": float("inf")},
+        {"periodic_report_interval": float("inf")},
+        {"periodic_report_interval": float("nan")},
+        {"periodic_report_interval": 1e10},  # beyond threading.TIMEOUT_MAX on some hosts
+        {"oom_report_interval": 1e10},
+    ):
+        with pytest.raises(ValidationError):
+            MemoryMonitorConfig(**bad)
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("mode: off", "off"),
+        ("mode: on", "full"),
+        ("mode: 0", "off"),
+        ("mode: 1", "full"),
+        ("mode: '0'", "off"),
+        ("mode: full", "full"),
+        ("mode: oom", "oom"),
+    ],
+)
+def test_yaml_mode_scalars_are_read_as_modes(text, expected):
+    from tensorrt_llm.llmapi import MemoryMonitorConfig
+
+    assert MemoryMonitorConfig(**yaml.safe_load(text)).mode == expected
+
+
+@pytest.mark.parametrize(
+    "text", ["oom_report_interval: .inf", "periodic_report_interval: .inf", "mode: 2"]
+)
+def test_yaml_values_the_runtime_would_replace_are_rejected(text):
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi import MemoryMonitorConfig
+
+    with pytest.raises(ValidationError):
+        MemoryMonitorConfig(**yaml.safe_load(text))
+
+
+def test_ranks_outside_the_job_are_rejected():
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi import MemoryMonitorConfig, TorchLlmArgs
+
+    TorchLlmArgs(
+        model="/tmp/dummy_model",
+        tensor_parallel_size=2,
+        memory_monitor_config=MemoryMonitorConfig(ranks=[1]),
+    )
+    with pytest.raises(ValidationError, match=r"\[2, 8\] are not ranks of this job"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            tensor_parallel_size=2,
+            memory_monitor_config=MemoryMonitorConfig(ranks=[0, 2, 8]),
+        )
+
+
+def test_an_empty_variable_does_not_override_the_configuration(monkeypatch):
+    from tensorrt_llm.llmapi import MemoryMonitorConfig
+
+    mon.configure(MemoryMonitorConfig(mode="full", ranks=[1], oom_report_interval=5))
+    # Launchers export variables empty: docker -e VAR=, export VAR=${VAR:-}.
+    monkeypatch.setenv(mon.ENV_VAR, "")
+    monkeypatch.setenv(mon.RANK_ENV_VAR, "")
+    monkeypatch.setenv(triggers.OOM_INTERVAL_VAR, "")
+    assert mon.mode() == "full"
+    assert mon.selected_ranks() == frozenset({1})
+    assert triggers._oom_interval_s() == 5.0
+
+
+def test_an_overriding_variable_is_reported_once(monkeypatch):
+    from tensorrt_llm.llmapi import MemoryMonitorConfig
+
+    warnings = _capture_warnings(monkeypatch)
+    mon.configure(MemoryMonitorConfig(mode="full", oom_report_interval=5))
+    monkeypatch.setenv(mon.ENV_VAR, "1")  # the same mode, spelled differently
+    monkeypatch.setenv(triggers.OOM_INTERVAL_VAR, "5.0")
+    assert mon.mode() == "full" and triggers._oom_interval_s() == 5.0
+    assert warnings == [], "a variable that agrees with the configuration"
+
+    monkeypatch.setenv(mon.ENV_VAR, "0")
+    assert mon.mode() == "off" and mon.mode() == "off"
+    assert warnings == [
+        "memory monitor: TLLM_MEM_MONITOR='0' overrides memory_monitor_config.mode='full'"
+    ]
+
+
+def test_a_second_executor_keeps_the_first_executors_settings(monkeypatch):
+    from tensorrt_llm.llmapi import MemoryMonitorConfig
+
+    warnings = _capture_warnings(monkeypatch)
+    first_config = MemoryMonitorConfig(mode="full", periodic_report_interval=30)
+    mon.configure(first_config)
+    first = providers.begin_executor()
+    try:
+        # The second LLM uses the default configuration.
+        mon.configure(None)
+        second = providers.begin_executor()
+        assert mon.mode() == "full", "the first executor's mode stays on"
+        assert triggers._periodic_interval_s() == 30.0
+        assert len(warnings) == 1 and "is not applied" in warnings[0]
+        mon.configure(None)
+        assert len(warnings) == 1, "warned once"
+        # The same configuration is not a conflict.
+        mon.configure(first_config)
+        assert len(warnings) == 1
+        providers.end_executor(second)
+    finally:
+        providers.end_executor(first)
+    mon.configure(None)
+    assert mon.mode() == "oom", "applied once no executor is alive"

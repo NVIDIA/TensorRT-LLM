@@ -30,9 +30,12 @@ silent downgrade, not a conflict, so the probe reports the facts and does not
 warn.
 """
 
+import atexit
 import os
+import threading
 from dataclasses import dataclass
 
+import pynvml
 import torch
 
 __all__ = [
@@ -124,6 +127,61 @@ _NOT_LISTED = (
 )
 
 
+class _NvmlSession:
+    """One NVML session for the process, with device handles cached by UUID.
+
+    NVML is initialised on first use and shut down at interpreter exit, not
+    per reading: ``nvmlInit`` costs milliseconds, and a report reads NVML
+    for every device it describes. NVML counts initialisations, so code
+    elsewhere that opens and closes its own session is unaffected. A failed
+    initialisation is remembered rather than retried on every report.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ready: bool | None = None
+        self._handles: dict[str, object] = {}
+
+    def ready(self) -> bool:
+        """Whether NVML is initialised, initialising it on first call."""
+        with self._lock:
+            if self._ready is None:
+                try:
+                    pynvml.nvmlInit()
+                except pynvml.NVMLError:
+                    self._ready = False
+                else:
+                    self._ready = True
+                    atexit.register(self._shutdown)
+            return self._ready
+
+    def handle(self, uuid: str) -> object:
+        """The device handle for ``uuid``; raises ``pynvml.NVMLError``."""
+        handle = self._handles.get(uuid)
+        if handle is None:
+            handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+            self._handles[uuid] = handle
+        return handle
+
+    def forget(self, uuid: str) -> None:
+        """Drop a handle NVML rejected, so the next reading looks it up again."""
+        self._handles.pop(uuid, None)
+
+    def _shutdown(self) -> None:
+        with self._lock:
+            if not self._ready:
+                return
+            self._ready = None
+            self._handles.clear()
+            try:
+                pynvml.nvmlShutdown()
+            except pynvml.NVMLError:
+                pass
+
+
+_nvml = _NvmlSession()
+
+
 def nvml_process_usage(device_index: int) -> tuple[int | None, str]:
     """This process's device memory according to NVML, and why not if not.
 
@@ -134,58 +192,42 @@ def nvml_process_usage(device_index: int) -> tuple[int | None, str]:
     """
     unavailable = (None, NVML_UNAVAILABLE)
     try:
-        # pynvml is optional; without it the report says NVML is unavailable.
-        import pynvml
-
-        from tensorrt_llm import profiler
-    except ImportError:
-        return unavailable
-    pynvml_context = getattr(profiler, "pynvml_context", None)
-    if pynvml_context is None:
-        return unavailable
-    try:
         # By UUID, not by index: torch numbers only the devices
         # CUDA_VISIBLE_DEVICES exposes, NVML numbers every device on the
         # host, and the two disagree whenever the variable remaps them.
         uuid = f"GPU-{torch.cuda.get_device_properties(device_index).uuid}"
     except (AssertionError, RuntimeError):
         return unavailable
-    try:
-        with pynvml_context():
-            handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
-            pid = os.getpid()
-            for proc in pynvml.nvmlDeviceGetComputeRunningProcesses_v3(handle):
-                if proc.pid == pid:
-                    used = proc.usedGpuMemory
-                    # NVML reports None/0 for this field on some platforms;
-                    # treat that as "unknown" rather than "nothing".
-                    if used:
-                        return int(used), ""
-                    return None, "NVML reports no per-process usage on this platform"
-    except pynvml.NVMLError:
+    if not _nvml.ready():
         return unavailable
+    try:
+        handle = _nvml.handle(uuid)
+        processes = pynvml.nvmlDeviceGetComputeRunningProcesses_v3(handle)
+    except pynvml.NVMLError:
+        _nvml.forget(uuid)
+        return unavailable
+    pid = os.getpid()
+    for proc in processes:
+        if proc.pid == pid:
+            used = proc.usedGpuMemory
+            # NVML reports None/0 for this field on some platforms;
+            # treat that as "unknown" rather than "nothing".
+            if used:
+                return int(used), ""
+            return None, "NVML reports no per-process usage on this platform"
     return None, _NOT_LISTED
 
 
 def _nvml_available() -> bool:
     """Whether NVML initialises and reports at least one device.
 
-    An importable helper is not enough: on some hosts it imports while every
+    Initialising is not enough: on some hosts NVML initialises while every
     query fails.
     """
-    try:
-        # pynvml is optional; without it the report says NVML is unavailable.
-        import pynvml
-
-        from tensorrt_llm import profiler
-    except ImportError:
-        return False
-    context = getattr(profiler, "pynvml_context", None)
-    if context is None:
+    if not _nvml.ready():
         return False
     try:
-        with context():
-            return pynvml.nvmlDeviceGetCount() > 0
+        return pynvml.nvmlDeviceGetCount() > 0
     except pynvml.NVMLError:
         return False
 

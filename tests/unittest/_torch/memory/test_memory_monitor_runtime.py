@@ -50,6 +50,14 @@ def reports(monkeypatch):
     return seen
 
 
+def _wait_for_logged_report():
+    """A logged error's report is built on its own thread; wait for it."""
+    building = triggers._background_report
+    if building is not None:
+        building.join(30)
+        assert not building.is_alive()
+
+
 class TestPeriodic:
     @needs_gpu
     def test_reports_on_its_interval_and_stops(self, monkeypatch, tmp_path):
@@ -81,6 +89,7 @@ def test_errors_from_other_threads(reports, monkeypatch):
 
     # How the KV transfer workers report a failed delivery.
     logger.error("_process_task_queue[0]: unhandled exception: CUDA error: out of memory")
+    _wait_for_logged_report()
     assert len(reports) == 1 and reports[0][0] == "out_of_memory", "a logged OOM"
 
     level = logger.level
@@ -91,6 +100,7 @@ def test_errors_from_other_threads(reports, monkeypatch):
         logger.warning("autotuner: tactic 3 ran out of memory, skipping")
     finally:
         logger.set_level(level)
+    _wait_for_logged_report()
     assert len(reports) == 1, "other errors and warnings are ignored"
 
     def run():
@@ -104,7 +114,41 @@ def test_errors_from_other_threads(reports, monkeypatch):
     triggers.uninstall_oom_reporter()
     assert threading.excepthook is previous, "the hooks are removed with the reporter"
     logger.error("CUDA out of memory")
+    _wait_for_logged_report()
     assert len(reports) == 2
+
+
+@pytest.mark.cpu_only
+def test_a_logged_oom_is_reported_without_holding_up_the_logging_thread(monkeypatch):
+    """The executor logs an OOM before it sends error responses and arms its
+    crash watchdog; the report must not be built on that thread first."""
+    release = threading.Event()
+    started = threading.Event()
+    seen = []
+
+    def slow_report_now(tag, rank=None, **kw):
+        started.set()
+        release.wait(30)
+        seen.append((tag, kw.get("headline", ""), threading.current_thread().name))
+        return "report"
+
+    monkeypatch.setattr(triggers, "report_now", slow_report_now)
+    monkeypatch.setattr(triggers, "_attached", True)
+    triggers.install_oom_reporter()
+    try:
+        logger.error("Encountered an error in forward function: CUDA out of memory")
+        assert seen == [], "logger.error returned before the report was built"
+        assert started.wait(30), "the report is being built meanwhile"
+        logger.error("CUDA out of memory")  # a burst starts one report
+        release.set()
+        _wait_for_logged_report()
+    finally:
+        release.set()
+        triggers.uninstall_oom_reporter()
+    assert len(seen) == 1
+    tag, headline, thread_name = seen[0]
+    assert tag == "out_of_memory" and "forward function" in headline
+    assert thread_name != threading.current_thread().name
 
 
 class TestOnRequest:
@@ -127,7 +171,7 @@ def test_every_rank_has_an_entry(monkeypatch):
 
     # Under MPI without full mode only rank 0 answers; the rest are named.
     engine = SimpleNamespace(
-        dist=SimpleNamespace(rank=0, world_size=3), _disable_mpi=False, _memory_report_ranks=None
+        dist=SimpleNamespace(rank=0, world_size=3), _disable_mpi=False, _rank_reporter=None
     )
     engine.gather_memory_reports = lambda: PyExecutor.gather_memory_reports(engine)
     monkeypatch.setattr(triggers, "report_now", lambda **kw: None)
@@ -318,6 +362,40 @@ def test_a_reply_nobody_collects_does_not_hold_up_shutdown(monkeypatch):
 
 
 @pytest.mark.cpu_only
+def test_a_gather_overlapping_shutdown_returns_at_once(monkeypatch):
+    reporters, _, _ = _ranks(monkeypatch, 3, set())  # nobody answers
+    result = []
+    gathering = threading.Thread(target=lambda: result.extend(reporters[0].gather(timeout=30)))
+    started = time.monotonic()
+    gathering.start()
+    time.sleep(0.1)
+    reporters[0].stop()
+    gathering.join(5)
+    assert not gathering.is_alive() and time.monotonic() - started < 5, "not the 30 s timeout"
+    assert result == [
+        "rank 1: not gathered; shutting down",
+        "rank 2: not gathered; shutting down",
+    ]
+    assert reporters[0].gather() == result, "a gather after stop() does not ask at all"
+
+
+@pytest.mark.cpu_only
+def test_stopping_logs_an_mpi_error_instead_of_raising(monkeypatch):
+    from tensorrt_llm._torch.memory.monitor import ranks
+
+    warnings = []
+    monkeypatch.setattr(ranks.logger, "warning", warnings.append)
+    reporters, _, _ = _ranks(monkeypatch, 2, set())
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("MPI_ERR_COMM: invalid communicator")
+
+    reporters[0]._comm.Iprobe = broken
+    reporters[0].stop()  # must not raise into PyExecutor.shutdown
+    assert any("could not drain rank reports" in w and "MPI_ERR_COMM" in w for w in warnings)
+
+
+@pytest.mark.cpu_only
 def test_bounded_receive_is_shared_with_the_sleep_wakeup_acks(monkeypatch):
     from tensorrt_llm._torch.pyexecutor import mpi_polling
     from tensorrt_llm._torch.pyexecutor import py_executor as pe
@@ -359,3 +437,68 @@ def test_bounded_receive_is_shared_with_the_sleep_wakeup_acks(monkeypatch):
     assert len(warnings) == 2 and all("Ignoring stale sleep/wakeup ACK" in w for w in warnings)
     with pytest.raises(TimeoutError, match="timed out waiting for sleep/wakeup ACK from rank 1"):
         pe._recv_sleep_wakeup_ack(rank0, 1, 0.0)
+
+
+@pytest.mark.cpu_only
+def test_nvml_is_initialised_once_per_process(monkeypatch):
+    """Every reading used to open and close its own NVML session."""
+    import os
+
+    from tensorrt_llm._torch.memory.monitor import capability
+
+    calls = {"init": 0, "shutdown": 0, "handle": 0}
+
+    class NVMLError(Exception):
+        pass
+
+    def count(name, result=None):
+        def call(*_args):
+            calls[name] += 1
+            return result
+
+        return call
+
+    fake = SimpleNamespace(
+        NVMLError=NVMLError,
+        nvmlInit=count("init"),
+        nvmlShutdown=count("shutdown"),
+        nvmlDeviceGetHandleByUUID=count("handle", "handle"),
+        nvmlDeviceGetComputeRunningProcesses_v3=lambda handle: [
+            SimpleNamespace(pid=os.getpid(), usedGpuMemory=7 * MB)
+        ],
+        nvmlDeviceGetCount=lambda: 1,
+    )
+    monkeypatch.setattr(capability, "pynvml", fake)
+    session = capability._NvmlSession()
+    monkeypatch.setattr(capability, "_nvml", session)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: SimpleNamespace(uuid="x"))
+    for _ in range(5):
+        assert capability.nvml_process_usage(0) == (7 * MB, "")
+        assert capability._nvml_available()
+    assert calls == {"init": 1, "shutdown": 0, "handle": 1}, "one session, one handle"
+
+    def fails(*_args):
+        raise NVMLError("NVML_ERROR_GPU_IS_LOST")
+
+    # A handle NVML rejects is looked up again next time.
+    fake.nvmlDeviceGetComputeRunningProcesses_v3 = fails
+    assert capability.nvml_process_usage(0) == (None, capability.NVML_UNAVAILABLE)
+    assert calls["handle"] == 1, "the cached handle was used and then dropped"
+    assert capability.nvml_process_usage(0) == (None, capability.NVML_UNAVAILABLE)
+    assert calls["handle"] == 2, "so the next reading looked it up again"
+
+    session._shutdown()
+    assert calls["shutdown"] == 1, "closed once, at exit"
+
+    # NVML that cannot initialise is not retried on every report.
+    failing = capability._NvmlSession()
+    monkeypatch.setattr(capability, "_nvml", failing)
+
+    def init_fails():
+        calls["init"] += 1
+        raise NVMLError("NVML_ERROR_DRIVER_NOT_LOADED")
+
+    fake.nvmlInit = init_fails
+    assert capability.nvml_process_usage(0) == (None, capability.NVML_UNAVAILABLE)
+    assert not capability._nvml_available()
+    assert calls["init"] == 2

@@ -4318,11 +4318,15 @@ class _SleepConfigDefaultFactory:
         return self.default_mode
 
 
+#: Longest memory monitor interval: a week, far below ``threading.TIMEOUT_MAX``.
+_MEMORY_MONITOR_MAX_INTERVAL_S = 7 * 24 * 3600.0
+
+
 class MemoryMonitorConfig(StrictBaseModel):
     """Configuration for the GPU memory monitor.
 
     Each field corresponds to a ``TLLM_MEM_MONITOR*`` environment variable;
-    a variable that is set overrides the field. See
+    a variable set to a non-empty value overrides the field. See
     ``docs/source/features/memory-monitor.md``.
     """
 
@@ -4331,12 +4335,13 @@ class MemoryMonitorConfig(StrictBaseModel):
         description="'oom' reports when GPU memory runs out and does nothing "
         "until then; 'full' also records startup, reports when it completes "
         "and compares later reports with that point; 'off' produces no "
-        "reports on its own. Overridden by TLLM_MEM_MONITOR.")
+        "reports on its own. YAML's unquoted off and on (booleans) and 0 and "
+        "1 are read as 'off' and 'full'. Overridden by TLLM_MEM_MONITOR.")
     ranks: Optional[List[NonNegativeInt]] = Field(
         default=None,
         min_length=1,
-        description="Ranks that report; all ranks when unset. Overridden by "
-        "TLLM_MEM_MONITOR_RANKS.")
+        description="Ranks that report; all ranks when unset. Each must be "
+        "below the job's world size. Overridden by TLLM_MEM_MONITOR_RANKS.")
     record_stacks: bool = Field(
         default=False,
         description="In 'full' mode, record the Python stack of every live "
@@ -4347,17 +4352,43 @@ class MemoryMonitorConfig(StrictBaseModel):
     periodic_report_interval: Optional[float] = Field(
         default=None,
         ge=1.0,
+        le=_MEMORY_MONITOR_MAX_INTERVAL_S,
+        allow_inf_nan=False,
         description="In 'full' mode, report every this many seconds while "
-        "serving. Overridden by TLLM_MEM_MONITOR_INTERVAL.")
-    oom_report_interval: NonNegativeFloat = Field(
+        "serving, at most once a week. Overridden by "
+        "TLLM_MEM_MONITOR_INTERVAL.")
+    oom_report_interval: float = Field(
         default=60.0,
-        description="Minimum seconds between two out-of-memory reports. "
-        "Overridden by TLLM_MEM_MONITOR_OOM_INTERVAL.")
+        ge=0.0,
+        le=_MEMORY_MONITOR_MAX_INTERVAL_S,
+        allow_inf_nan=False,
+        description="Minimum seconds between two out-of-memory reports, at "
+        "most a week. Overridden by TLLM_MEM_MONITOR_OOM_INTERVAL.")
     report_dir: Optional[str] = Field(
         default=None,
         min_length=1,
         description="Directory to which every report is also written, one "
-        "file per report. Overridden by TLLM_MEM_MONITOR_DIR.")
+        "file per report. It is created readable by its owner only, and only "
+        "the newest 100 periodic reports of each rank are kept. Overridden by "
+        "TLLM_MEM_MONITOR_DIR.")
+
+    @field_validator("mode",
+                     mode="before",
+                     json_schema_input_type=Union[Literal["off", "oom", "full",
+                                                          "0", "1"], bool,
+                                                  Literal[0, 1]])
+    @classmethod
+    def _mode_from_yaml_scalar(cls, value: object) -> object:
+        """Read YAML's unquoted ``off``/``on`` and ``0``/``1`` as modes.
+
+        ``yaml.safe_load`` turns ``mode: off`` into ``False`` and ``mode: 1``
+        into ``1``. ``bool`` is checked first because it is an ``int``.
+        """
+        if isinstance(value, bool):
+            return "full" if value else "off"
+        if isinstance(value, (int, str)) and str(value) in ("0", "1"):
+            return "full" if str(value) == "1" else "off"
+        return value
 
 
 class SleepConfig(StrictBaseModel):
@@ -7919,6 +7950,24 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "GEN slot preemption (scheduler_config.gen_preemption) does "
                 "not support pipeline parallelism or attention DP.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_memory_monitor_ranks(self) -> 'TorchLlmArgs':
+        """Reject a memory monitor rank filter naming ranks the job lacks.
+
+        Such a filter would turn the monitor off on every rank without a
+        word. ``TLLM_MEM_MONITOR_RANKS`` is checked when the monitor arms.
+        """
+        config = self.memory_monitor_config
+        if config is None or config.ranks is None:
+            return self
+        world_size = self.parallel_config.world_size
+        outside = sorted(rank for rank in config.ranks if rank >= world_size)
+        if outside:
+            raise ValueError(
+                f"memory_monitor_config.ranks {outside} are not ranks of this "
+                f"job, which has {world_size} (0-{world_size - 1}).")
         return self
 
     @model_validator(mode="after")

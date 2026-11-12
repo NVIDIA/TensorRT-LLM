@@ -6108,29 +6108,47 @@
     },
     "MemoryMonitorConfig": {
       "additionalProperties": false,
-      "description": "Configuration for the GPU memory monitor.\n\nEach field corresponds to a ``TLLM_MEM_MONITOR*`` environment variable;\na variable that is set overrides the field. See\n``docs/source/features/memory-monitor.md``.",
+      "description": "Configuration for the GPU memory monitor.\n\nEach field corresponds to a ``TLLM_MEM_MONITOR*`` environment variable;\na variable set to a non-empty value overrides the field. See\n``docs/source/features/memory-monitor.md``.",
       "properties": {
         "mode": {
-          "default": "oom",
-          "description": "'oom' reports when GPU memory runs out and does nothing until then; 'full' also records startup, reports when it completes and compares later reports with that point; 'off' produces no reports on its own. Overridden by TLLM_MEM_MONITOR.",
-          "enum": [
-            "off",
-            "oom",
-            "full"
+          "anyOf": [
+            {
+              "enum": [
+                "off",
+                "oom",
+                "full",
+                "0",
+                "1"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "enum": [
+                0,
+                1
+              ],
+              "type": "integer"
+            }
           ],
-          "title": "Mode",
-          "type": "string"
+          "default": "oom",
+          "description": "'oom' reports when GPU memory runs out and does nothing until then; 'full' also records startup, reports when it completes and compares later reports with that point; 'off' produces no reports on its own. YAML's unquoted off and on (booleans) and 0 and 1 are read as 'off' and 'full'. Overridden by TLLM_MEM_MONITOR.",
+          "title": "Mode"
         },
         "oom_report_interval": {
           "default": 60.0,
-          "description": "Minimum seconds between two out-of-memory reports. Overridden by TLLM_MEM_MONITOR_OOM_INTERVAL.",
-          "minimum": 0,
+          "description": "Minimum seconds between two out-of-memory reports, at most a week. Overridden by TLLM_MEM_MONITOR_OOM_INTERVAL.",
+          "maximum": 604800.0,
+          "minimum": 0.0,
           "title": "Oom Report Interval",
           "type": "number"
         },
         "periodic_report_interval": {
           "anyOf": [
             {
+              "maximum": 604800.0,
               "minimum": 1.0,
               "type": "number"
             },
@@ -6139,7 +6157,7 @@
             }
           ],
           "default": null,
-          "description": "In 'full' mode, report every this many seconds while serving. Overridden by TLLM_MEM_MONITOR_INTERVAL.",
+          "description": "In 'full' mode, report every this many seconds while serving, at most once a week. Overridden by TLLM_MEM_MONITOR_INTERVAL.",
           "title": "Periodic Report Interval"
         },
         "ranks": {
@@ -6157,7 +6175,7 @@
             }
           ],
           "default": null,
-          "description": "Ranks that report; all ranks when unset. Overridden by TLLM_MEM_MONITOR_RANKS.",
+          "description": "Ranks that report; all ranks when unset. Each must be below the job's world size. Overridden by TLLM_MEM_MONITOR_RANKS.",
           "title": "Ranks"
         },
         "record_stacks": {
@@ -6177,7 +6195,7 @@
             }
           ],
           "default": null,
-          "description": "Directory to which every report is also written, one file per report. Overridden by TLLM_MEM_MONITOR_DIR.",
+          "description": "Directory to which every report is also written, one file per report. It is created readable by its owner only, and only the newest 100 periodic reports of each rank are kept. Overridden by TLLM_MEM_MONITOR_DIR.",
           "title": "Report Dir"
         }
       },
