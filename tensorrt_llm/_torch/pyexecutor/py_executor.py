@@ -1640,6 +1640,7 @@ class PyExecutor:
             raise RuntimeError(
                 "Cannot rebind an executor after an execution failure")
         self._resources_released = False
+        self._perf_metrics.reset()
         try:
             self._initialize_execution(resources)
         except BaseException:

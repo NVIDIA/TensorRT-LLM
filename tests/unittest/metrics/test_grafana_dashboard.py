@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Portability, safe publication, and authentication boundary tests."""
 
+import base64
 import hashlib
 import importlib.util
 import io
@@ -11,6 +12,7 @@ import subprocess
 import tempfile
 import unittest
 import urllib.error
+import urllib.response
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
@@ -516,3 +518,132 @@ class ReviewedPublicationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodeRabbitRegressionTests(unittest.TestCase):
+    def test_omitted_logs_flag_renders_metrics_without_logs_navigation(self) -> None:
+        c = config()
+        del c["dashboard"]["include_logs"]
+        dashboards, cm, _ = app.render(c)
+        self.assertEqual(set(dashboards), {"metrics"})
+        self.assertNotIn("logs.json", cm["data"])
+        self.assertFalse(
+            any(
+                link.get("url") == "/d/" + c["dashboard"]["logs_uid"]
+                for link in dashboards["metrics"]["links"]
+            )
+        )
+
+    def test_loopback_credentials_bypass_environment_proxy(self) -> None:
+        c = config()
+        c["grafana"]["auth"] = {"token_env": "DASHBOARD_TEST_TOKEN"}
+        for host in ("127.0.0.1", "localhost", "[::1]"):
+            with self.subTest(host=host):
+                c["grafana"]["url"] = "http://" + host + ":3000"
+                requests = []
+
+                def respond(handler: object, request: object) -> object:
+                    requests.append(request)
+                    response = urllib.response.addinfourl(
+                        io.BytesIO(b"{}"), {}, request.full_url, 200
+                    )
+                    response.msg = "OK"
+                    return response
+
+                with (
+                    patch.dict(os.environ, {"DASHBOARD_TEST_TOKEN": "test-token"}),
+                    patch(
+                        "urllib.request.getproxies",
+                        return_value={"http": "http://proxy.invalid:3128"},
+                    ),
+                    patch("urllib.request.HTTPHandler.http_open", respond),
+                ):
+                    self.assertEqual(app.Client(c).api("/health"), {})
+                self.assertEqual(len(requests), 1)
+                self.assertFalse(requests[0].has_proxy())
+                self.assertNotEqual(requests[0].host, "proxy.invalid:3128")
+                self.assertEqual(requests[0].get_header("Authorization"), "Bearer test-token")
+
+    def test_custom_role_legend_and_instance_worker_scope(self) -> None:
+        c = config()
+        c["workload"]["log_role_label"] = "worker_role"
+        dashboards, _, _ = app.render(c)
+        logs = dashboards["logs"]
+        instance = logs["elements"]["panel-15"]["spec"]
+        query = instance["data"]["spec"]["queries"][0]["spec"]["query"]["spec"]["expr"]
+        self.assertIn("${worker:regex}", query)
+        self.assertIn(c["workload"]["frontend_pod_regex"], query)
+        self.assertEqual(query.count("pod=~"), 1)
+        self.assertIn("${container:regex}", query)
+        text = json.dumps(logs)
+        self.assertGreaterEqual(text.count("{{worker_role}}"), 12)
+        self.assertNotIn("{{role}}", text)
+
+    def test_finalize_only_accepts_matching_checkpoint_without_applying_it(self) -> None:
+        c = config()
+        c["grafana"]["publication"] = "configmap-v2"
+        dashboards, cm, scrape = app.render(c)
+        client = FakeClient(c)
+        client.kube(c["grafana"]["namespace"], "apply", payload=cm)
+        client.calls.clear()
+        app.deploy(c, dashboards, cm, scrape, client, finalize_only=True)
+        self.assertFalse(
+            any(
+                call[0] == "kube" and call[2][0] == "apply" and "--dry-run=server" not in call[2]
+                for call in client.calls
+            )
+        )
+
+    def test_finalize_only_rejects_changed_checkpoint(self) -> None:
+        c = config()
+        c["grafana"]["publication"] = "configmap-v2"
+        dashboards, cm, scrape = app.render(c)
+        client = FakeClient(c)
+        client.cm = deepcopy(cm)
+        client.cm["metadata"]["resourceVersion"] = "1"
+        client.cm["data"]["metrics.json"] = "{}"
+        with self.assertRaisesRegex(
+            app.SetupError, "Resume requires the exact rendered ConfigMap checkpoint"
+        ):
+            app.deploy(c, dashboards, cm, scrape, client, finalize_only=True)
+
+    def test_file_provisioner_timeout_is_bounded(self) -> None:
+        c = config()
+        c["grafana"]["publication"] = "configmap-v2"
+        dashboards, cm, scrape = app.render(c)
+        client = FakeClient(c)
+        client.cm = deepcopy(cm)
+        client.cm["metadata"]["resourceVersion"] = "1"
+        with (
+            patch.object(app.time, "monotonic", side_effect=[0, 100]),
+            patch.object(
+                app.time, "sleep", side_effect=AssertionError("Should fail before sleeping")
+            ),
+            self.assertRaisesRegex(app.SetupError, "File provisioner did not acknowledge"),
+        ):
+            app.deploy(c, dashboards, cm, scrape, client, finalize_only=True)
+
+    def test_secret_auth_decodes_keys_and_rejects_missing_values(self) -> None:
+        c = config()
+        c["grafana"]["auth"] = {
+            "secret": "grafana-auth",
+            "username_key": "user",
+            "password_key": "password",
+        }
+        with patch.object(
+            app.Client,
+            "kube",
+            return_value={
+                "data": {
+                    "user": base64.b64encode(b"admin").decode(),
+                    "password": base64.b64encode(b"test-password").decode(),
+                }
+            },
+        ):
+            expected = "Basic " + base64.b64encode(b"admin:test-password").decode()
+            self.assertEqual(app.Client(c).authorization, expected)
+        with (
+            patch.object(app.Client, "kube", return_value={"data": {}}),
+            self.assertRaisesRegex(app.SetupError, "missing valid authentication keys"),
+        ):
+            app.Client(c)

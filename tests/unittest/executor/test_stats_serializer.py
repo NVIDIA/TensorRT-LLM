@@ -369,7 +369,7 @@ class TestStatsSerializer:
             },
         }
         result = BaseWorker._stats_serializer(
-            (iter_stats, None, None, None, 12.5, None, "overlap", 4.25, None, loop)
+            (iter_stats, None, None, None, 12.5, None, "overlap", 4.25, loop)
         )
         data = json.loads(result)
         assert data["executorLoop"] == loop
