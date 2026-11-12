@@ -918,9 +918,11 @@ class GuidedDecodingConfig(StrictBaseModel):
     backend: GuidedDecodingBackend = Field(
         default=GuidedDecodingBackend.XGRAMMAR,
         description="The backend for guided decoding config.")
-    encoded_vocab: Optional[List[str]] = Field(
+    encoded_vocab: Optional[List[Union[str, bytes]]] = Field(
         default=None,
-        description="The encoded vocab for guided decoding config.")
+        description=
+        "The encoded vocab for guided decoding config: each token's text, or "
+        "its raw bytes for tokenizers whose tokens need not be valid UTF-8.")
     tokenizer_str: Optional[str] = Field(
         default=None,
         description="The tokenizer string for guided decoding config.")

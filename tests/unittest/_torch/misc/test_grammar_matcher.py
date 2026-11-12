@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Draft tokens from the padded part of the vocabulary reaching the guided-decoding matcher."""
 
-import pytest
+import json
 
-from tensorrt_llm._torch.pyexecutor.grammar_matcher import XGrammarMatcherFactory
+import pytest
+from utils.llm_data import llm_models_root
+
+from tensorrt_llm._torch.pyexecutor.grammar_matcher import (
+    LLGuidanceMatcherFactory,
+    XGrammarMatcherFactory,
+)
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm.bindings.executor import GuidedDecodingParams
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 
@@ -41,3 +48,42 @@ def test_vocabulary_ids_are_decided_by_the_grammar():
     matcher = _json_matcher()
     assert not matcher.accept_token(VOCAB.index("}"))
     assert matcher.accept_token(VOCAB.index("["))
+
+
+def test_llguidance_over_a_hugging_face_tokenizer_rejects_a_padded_draft_token():
+    """llguidance builds its tokenizer from the Hugging Face tokenizer JSON.
+
+    A padded id is rejected without breaking the matcher, a valid answer is accepted
+    through to the stop token, and a rejected draft rolls back.
+    """
+    from tensorrt_llm.tokenizer import TransformersTokenizer
+
+    root = llm_models_root()
+    model_dir = None if root is None else root / "Qwen3" / "Qwen3-0.6B"
+    if model_dir is None or not model_dir.is_dir():
+        pytest.skip("needs Qwen3/Qwen3-0.6B under LLM_MODELS_ROOT")
+    tokenizer = TransformersTokenizer.from_pretrained(str(model_dir))
+    vocab_size = len(tokenizer.tokenizer)
+    vocab_size_padded = (vocab_size + 127) // 128 * 128 + 128
+    config = get_guided_decoding_config("llguidance", tokenizer)
+    assert config.backend == GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
+    factory = LLGuidanceMatcherFactory(config, vocab_size_padded)
+    schema = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+    params = GuidedDecodingParams(GuidedDecodingParams.GuideType.JSON_SCHEMA, json.dumps(schema))
+
+    matcher = factory.create(params)
+    assert not matcher.accept_token(vocab_size_padded - 1)
+    answer = tokenizer.encode('{"city": "Paris"}', add_special_tokens=False)
+    for token_id in answer:
+        assert matcher.accept_token(token_id), token_id
+    assert matcher.accept_token(tokenizer.eos_token_id)
+    assert matcher.is_terminated()
+
+    matcher = factory.create(params)
+    assert matcher.accept_token(answer[0])
+    for token_id in answer[1:]:
+        assert matcher.accept_token(token_id)
+    matcher.rollback(len(answer) - 1)
+    for token_id in answer[1:]:
+        assert matcher.accept_token(token_id)
+    assert not matcher.accept_token(answer[0])
