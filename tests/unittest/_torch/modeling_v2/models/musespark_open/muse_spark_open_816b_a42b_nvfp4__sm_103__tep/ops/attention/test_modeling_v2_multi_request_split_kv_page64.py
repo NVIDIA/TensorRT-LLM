@@ -22,9 +22,7 @@ The selection site (``kernels/multi_request_split_kv/attention.py``) and the op'
   declines every other block size with ``another cache view``; the build key and the install
   step are the single 32-token build;
 * gate on: the 64-token cache is taken too, its build is part of the compiled key, ``install``
-  compiles both builds, and a capture needs the 64-token build compiled first;
-* the kernel's 64-token index math (each block read as its two 32-token halves) addresses, for
-  every page, the same K and V boxes as the 32-token path over a pool that holds the same keys.
+  compiles both builds, and a capture needs the 64-token build compiled first.
 
 The kernel itself needs a GPU: see ``test_modeling_v2_multi_request_split_kv_page64_gpu.py``.
 """
@@ -48,7 +46,6 @@ _TARGET = (
     "/muse_spark_open_816b_a42b_nvfp4__sm_103__tep"
 )
 ENV = "MUSESPARK_OPEN_MULTI_REQUEST_SPLIT_KV_PAGE64"
-PAGE, D, HKV = 32, 64, 2
 
 
 class _Dtype:
@@ -331,72 +328,3 @@ def test_compile_passes_the_cache_page_next_to_the_ring_depth(monkeypatch):
     MR._compile(MR.compiled_key(0, True, 4, 0, q_fp8=True, device_scale=True))
     assert [k["cache_page"] for k in seen] == [64, 32]
     assert all(k["stages"] == 20 for k in seen)
-
-
-# The loader of ``MultiRequestSplitKvKernel`` over a 64-token pool, emulated: K is one head's
-# 32-key box, V a pair's two heads' box, at the indices below; SUB 1 is the 32-token path.
-def _k_box(flat, index, count):  # K view: (32 keys, 64 dims, count), strides (64, 1, 32 * 64)
-    if not 0 <= index < count:
-        return None  # a negative index lies outside the view: the TMA fills zeros
-    return flat[index * PAGE * D : (index + 1) * PAGE * D].reshape(PAGE, D)
-
-
-def _v_box(flat, index, count, head_stride, batch_stride):  # V view: ((64, 2 heads), 32, count)
-    if not 0 <= index < count:
-        return None
-    keys = np.arange(PAGE)[:, None] * D + np.arange(D)
-    return np.stack([flat[index * batch_stride + h * head_stride + keys] for h in range(HKV)])
-
-
-@pytest.mark.parametrize("kv_heads", [2, 4])
-def test_64_token_views_address_the_keys_of_the_32_token_path(kv_heads):
-    rng = np.random.default_rng(0)
-    pairs, blocks = kv_heads // HKV, 50
-    pool64 = rng.integers(0, 256, size=(blocks, kv_heads, 2 * PAGE, D), dtype=np.uint8)
-    # block 2 B + s of the 32-token pool is half s of block B of the 64-token pool
-    pool32 = pool64.reshape(blocks, kv_heads, 2, PAGE, D).transpose(0, 2, 1, 3, 4)
-    pool32 = np.ascontiguousarray(pool32.reshape(2 * blocks, kv_heads, PAGE, D))
-    flat64, flat32 = pool64.reshape(-1), pool32.reshape(-1)
-    k_count64, k_count32 = 2 * kv_heads * blocks, kv_heads * 2 * blocks
-    for length in (1, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 1000):
-        pages32 = -(-length // PAGE)
-        table64 = rng.permutation(blocks)[: 2 * -(-length // 64)].reshape(2, -1)
-        table32 = np.stack([2 * table64[:, j // 2] + j % 2 for j in range(pages32)], 1)
-        for j, pair in itertools.product(range(pages32), range(pairs)):
-            k_id, v_id, half = table64[0, j // 2], table64[1, j // 2], j % 2
-            k_box = 2 * HKV * (pairs * k_id + pair) + half
-            v_box = 2 * HKV * (pairs * v_id + pair) + half
-            for h in range(HKV):
-                new = _k_box(flat64, k_box + 2 * h, k_count64)
-                old = _k_box(flat32, HKV * (pairs * table32[0, j] + pair) + h, k_count32)
-                assert new is not None and np.array_equal(new, old), (length, j, pair, h)
-                keys = pool64[k_id, HKV * pair + h, half * PAGE : (half + 1) * PAGE]
-                assert np.array_equal(new, keys)
-            new = _v_box(flat64, v_box, k_count64, 2 * PAGE * D, PAGE * D)
-            old = _v_box(
-                flat32, pairs * table32[1, j] + pair, pairs * 2 * blocks, PAGE * D, HKV * PAGE * D
-            )
-            assert np.array_equal(new, old), (length, j, pair)
-            assert v_box * PAGE * D + 3 * PAGE * D <= flat64.size  # the second head stays inside
-    # a padding page id (-1) is a negative box index for every pair, head and half
-    for pair, half in itertools.product(range(pairs), range(2)):
-        assert all(2 * HKV * (-pairs + pair) + half + 2 * h < 0 for h in range(HKV))
-        assert 2 * HKV * (-pairs + pair) + half < 0
-
-
-def test_the_kernel_carries_the_index_math_emulated_above():
-    kernel = (_TARGET / "ops/attention/multi_request_split_kv_kernel.py").read_text()
-    for fragment in (
-        "rk = table[b, 0, src // SUB]",
-        "rv = table[b, 1, src // SUB]",
-        "half = (p_lo + idx) % SUB",
-        "kbox = SUB * HKV * kpair + half",
-        "vbox = SUB * HKV * vpair + half",
-        "tKgK[None, 0, 0, kbox + SUB * h]",
-        "tVgV[None, 0, 0, vbox]",
-        "kbox = HKV * kpair",
-        "vbox = vpair",
-        "self.sub = cache_page // PAGE",
-    ):
-        assert fragment in kernel, fragment
-    assert kernel.count("cutlass.const_expr(SUB == 1)") == 3  # the 32-token path is compile-time

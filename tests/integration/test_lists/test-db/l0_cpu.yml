@@ -54,6 +54,7 @@ l0_cpu:
   # modeling_v2 routing and routing-table claims: config shapes and a monkeypatched
   # compute capability, no device. The rest of unittest/_torch/modeling_v2 needs a GPU.
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
+  - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/attention/test_modeling_v2_multi_request_split_kv_page64.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
