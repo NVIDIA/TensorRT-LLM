@@ -8,8 +8,9 @@ from typing import Optional
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from ... import native_ops
 
 
 class GlmVerifyHeadAccept(OpWrapper):
@@ -139,7 +140,7 @@ class GlmVerifyHeadAccept(OpWrapper):
         slot_stride: int,
         pool_size: int,
     ) -> torch.Tensor:
-        return torch.ops.trtllm.glm_verify_head_accept(
+        return native_ops.glm_verify_head_accept(
             target_tokens,
             draft_tokens,
             num_contexts,

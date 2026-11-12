@@ -3,7 +3,9 @@
 """GLM CuTe DSL projection: self_attn.indexer.pre_indexer_proj for GLM-5.2 decode.
 
 Contract: C[M, 160] = A[M, 6144] @ B[160, 6144].T, no bias, FP32 accumulate; M in
-{1, 2, 4, 8, 16, 32, 48, 64} (rows past M compute on zeros, nothing is written).
+{1, 2, 4, 8, 16, 32, 48, 64}, plus the MTP3 / MTP5 decode batches 128 and 192 (two and
+three 64-row tiles, each its own grid row of clusters); rows past M compute on zeros,
+nothing is written.
 Split-output entry: columns 0-127 stored as BF16 ``indexer_k``, 128-159 as FP32
 ``indexer_weight`` (caller-owned, non-aliasing, 16 B aligned). Kernel: one CTA_1
 tcgen05 MMA per (M tile, N tile), N tile 16, K split over an 8-CTA cluster with a
@@ -415,6 +417,20 @@ def _indexer_splitk_kernel(
                         (coord_k, coord_n),
                         full_mbar.subview(stage),
                     )
+        # Producer tail: the loop waits on a stage's empty barrier only to refill it, so
+        # the last `PIPE_STAGES` commit-arrives (multicast to the K-split peers when
+        # SPLITK_B_MCAST) are awaited here. Nothing orders them against the `acc_mbar`
+        # commit the CTA does wait for, and an arrive still in flight at exit lands in the
+        # shared memory of the next CTA on the SM.
+        for t in cutlass.range_constexpr(PIPE_STAGES):
+            last = num_split_k_tiles - cutlass.Int64(PIPE_STAGES - t)
+            if last >= cutlass.Int64(0):
+                while not prims.mbarrier_try_wait_parity(
+                    empty_mbar.subview(last % cutlass.Int64(PIPE_STAGES)),
+                    ((last // cutlass.Int64(PIPE_STAGES)) & cutlass.Int64(1)).to(cutlass.Int32),
+                    time_limit=10_000_000,
+                ):
+                    pass
 
     if warp_idx == 1:
         scale_d = cutlass.Boolean(False)
@@ -703,7 +719,9 @@ def _launch_splitk(
         box_dims=[k_tile, MMA_N],
         swizzle=cuda_exp.TensorMapSwizzle.s128b,
     )
-    grid_m: cutlass.Constexpr[int] = cute.ceil_div(a_tensor.shape[0], MMA_M * SPLITK_M_PARTS)
+    # A Python int at a compiled M; a runtime value on a symbolic M
+    # (``compile_split_outputs_runtime_m``), like the A descriptor's row extent above.
+    grid_m = cute.ceil_div(a_tensor.shape[0], MMA_M * SPLITK_M_PARTS)
     grid_n: cutlass.Constexpr[int] = cute.ceil_div(b_tensor.shape[0], MMA_N)
     num_k_tiles_total = a_tensor.shape[1] // k_tile
     _indexer_splitk_kernel(
@@ -746,12 +764,17 @@ _COMPILED: dict[tuple[int, str], CompiledKernel] = {}
 
 @dataclass(frozen=True)
 class CompiledSplitOutputs:
-    """A split-output callable bound to its output ABI, active M and operand path."""
+    """A split-output callable bound to its output ABI, active M and operand path.
+
+    ``max_m`` 0: compiled for exactly ``active_m`` rows. Otherwise compiled on a symbolic
+    row count (``compile_split_outputs_runtime_m``): any M in ``1..max_m``.
+    """
 
     _raw: CompiledKernel
     active_m: int
     split_outputs: bool = True
     operand_dtype: str = DEFAULT_OPERAND_DTYPE
+    max_m: int = 0
 
 
 _COMPILED_SPLIT_OUTPUTS: dict[tuple[int, str], CompiledSplitOutputs] = {}
@@ -886,6 +909,51 @@ def compile_split_outputs(
     return _compile_split_outputs_for_m(active_m, operand_dtype)
 
 
+_COMPILED_SPLIT_OUTPUTS_RUNTIME_M: dict[tuple[int, str], CompiledSplitOutputs] = {}
+
+
+def compile_split_outputs_runtime_m(
+    max_m: int, operand_dtype: str = DEFAULT_OPERAND_DTYPE
+) -> CompiledSplitOutputs:
+    """Compile the split-output kernel once on a symbolic row count: one handle for every M
+    in ``1..max_m``.
+
+    Same kernel and constants as a compiled M: the A descriptor's row extent and the grid's
+    M tiles are runtime values (``ceil_div(M, 64)``), the epilogue already bounds its stores
+    by the output's rows, and rows past M load zeros. A row is computed by the same tile,
+    split-K partition and DSMEM reduction as at a compiled M, so it is bitwise that M's
+    output for the row. Memoized per ``(max_m, operand_dtype)``.
+    """
+    if max_m <= 0:
+        raise ValueError(f"max_m must be positive; got {max_m}")
+    path = operand_path(operand_dtype)
+    cached = _COMPILED_SPLIT_OUTPUTS_RUNTIME_M.get((max_m, path.name))
+    if cached is not None:
+        return cached
+    rows = cute.sym_int32()
+    indexer_weight_fake = make_fake_compact_tensor(
+        cutlass.Float32, (rows, INDEXER_WEIGHT_DIM), stride_order=(1, 0), assumed_align=16
+    )
+    compiled = cute.compile(
+        _launch_splitk,
+        _ab_fake((rows, K), path),
+        _ab_fake((N, K), path),
+        indexer_weight_fake,
+        make_fake_compact_tensor(
+            cutlass.BFloat16, (rows, INDEXER_K_DIM), stride_order=(1, 0), assumed_align=16
+        ),
+        indexer_weight_fake,
+        True,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        path.prefetch_w_k_steps,
+        path.bf16_operands,
+        options="--enable-tvm-ffi",
+    )
+    launcher = CompiledSplitOutputs(compiled, int(max_m), operand_dtype=path.name, max_m=int(max_m))
+    _COMPILED_SPLIT_OUTPUTS_RUNTIME_M[(max_m, path.name)] = launcher
+    return launcher
+
+
 def _validate_split_outputs(
     input_tensor: torch.Tensor,
     weight: torch.Tensor,
@@ -969,9 +1037,9 @@ def run_split_outputs(
 
     The operand path is the handle's: the validator requires A / B in the dtype
     the handle was compiled for (FP32 for ``"tf32"``, BF16 for ``"bf16"``).
-    The row count must equal the handle's ``active_m``: the caller selects the
-    handle from the route's bucket, so a mismatch is a routing fault, not a
-    shape to adapt to.
+    The row count must equal the handle's ``active_m`` (a runtime-M handle: be
+    in ``1..max_m``): the caller selects the handle from the route's bucket, so
+    a mismatch is a routing fault, not a shape to adapt to.
     """
     if not isinstance(compiled_fn, CompiledSplitOutputs):
         raise TypeError("compiled_fn must be a CompiledSplitOutputs handle")
@@ -981,7 +1049,13 @@ def run_split_outputs(
             f"split_outputs={compiled_fn.split_outputs}, "
             f"active_m={compiled_fn.active_m}"
         )
-    if input_tensor.shape[0] != compiled_fn.active_m:
+    if compiled_fn.max_m:
+        if not 0 < int(input_tensor.shape[0]) <= compiled_fn.max_m:
+            raise ValueError(
+                "run_split_outputs runtime-M handle serves "
+                f"M=1..{compiled_fn.max_m}, got M={int(input_tensor.shape[0])}"
+            )
+    elif input_tensor.shape[0] != compiled_fn.active_m:
         raise ValueError(
             "run_split_outputs handle is compiled for "
             f"M={compiled_fn.active_m}, got M={int(input_tensor.shape[0])}"

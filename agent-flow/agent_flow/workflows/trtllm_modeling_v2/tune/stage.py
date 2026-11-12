@@ -357,7 +357,14 @@ class TuneStage:
         target = self.spec.target.replace(MODELING_V2_PACKAGE, CATALOG_TESTS_DIR)
         shared = [
             f"{CATALOG_TESTS_DIR}/test_modeling_v2_{name}.py"
-            for name in ("claims", "no_stale_claims", "target_contract", "routing")
+            for name in (
+                "claims",
+                "no_stale_claims",
+                "ci_selection",
+                "contracts",
+                "target_contract",
+                "routing",
+            )
         ]
         # The target path is required even when absent: the gate must fail closed. Shared
         # contracts vary across source revisions and are discovered on the tree being gated.

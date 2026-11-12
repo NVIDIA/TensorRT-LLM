@@ -6,6 +6,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ... import native_ops
 from ._ipc_workspace import residual_norm_reference, validate_ipc_operands
 
 
@@ -38,7 +39,7 @@ class GlmIntraNodeMoeFinalize(OpWrapper):
         nranks,
         buffer_bytes,
     ):
-        return torch.ops.trtllm.glm_intra_node_moe_finalize(
+        return native_ops.glm_intra_node_moe_finalize(
             fc2,
             weights,
             indices,

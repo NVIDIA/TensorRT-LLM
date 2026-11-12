@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MLA generation RoPE + fp8 query + paged latent append, on the CuTe DSL kernel, at MTP 2."""
+"""MLA generation RoPE + fp8 query + paged latent append on the CuTe DSL kernel, MTP 1 / 2 / 4 / 6."""
 
 from __future__ import annotations
 
@@ -16,8 +16,10 @@ from ...kernels.attention import (
     self_attn_mla_rope_generation_h16_kv512_rope64_page32_mtp2_bf16_fp8 as _kernel,
 )
 
-#: The MTP width the kernel is built for. Every other width takes the stock
-#: `mla_rope_generation` at the call site.
+#: The MTP width the kernel is built for by default (MTP1). MTP3 / MTP5 also build
+#: 4 / 6 and 1 (`compile(predicted_tokens_per_seq=...)`; 1: the MTP layer's 1-token
+#: draft steps); every other width takes the stock `mla_rope_generation` at the call
+#: site.
 MTP_WIDTH = 2
 #: The KV page size the kernel is built for.
 TOKENS_PER_BLOCK = _kernel.TOKENS_PER_BLOCK
@@ -50,6 +52,7 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
     device_index: int,
     predicted_tokens_per_seq: int = MTP_WIDTH,
     tokens_per_block: int = TOKENS_PER_BLOCK,
+    q_base_from_kb: bool = False,
 ) -> CompiledMlaRopeGeneration:
     """Compile the two variants a decode batch can reach; return the handle.
 
@@ -62,20 +65,27 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
     The block-table width is an engine value, so a target calls this at its
     first forward (which is eager), not at weight load. Costs two CuTe DSL
     compiles; a second call with the same keys returns the cached kernels.
+
+    `q_base_from_kb` also builds the two variants for a call whose K-B GEMM writes the
+    e4m3 q-base itself (`build_decode_fp8_q_base`): they skip the q-base groups and wait
+    for their PDL predecessor only at their end, so they run beside that GEMM. Two more
+    compiles.
     """
     kernels = {}
-    for full_token_tiles in (True, False):
-        spec = _kernel.MlaRopeSpecialization(
-            predicted_tokens_per_seq=int(predicted_tokens_per_seq),
-            max_blocks_per_seq=int(max_blocks_per_seq),
-            tokens_per_block=int(tokens_per_block),
-            q_pe_ld=int(q_pe_head_stride),
-            q_pe_stride=int(q_pe_token_stride),
-            latent_cache_stride=int(latent_row_stride),
-            emit_q_base=True,
-            full_token_tiles=full_token_tiles,
-        )
-        kernels[spec] = _kernel._compile_for(spec, int(device_index))
+    for from_kb in (False, True) if q_base_from_kb else (False,):
+        for full_token_tiles in (True, False):
+            spec = _kernel.MlaRopeSpecialization(
+                predicted_tokens_per_seq=int(predicted_tokens_per_seq),
+                max_blocks_per_seq=int(max_blocks_per_seq),
+                tokens_per_block=int(tokens_per_block),
+                q_pe_ld=int(q_pe_head_stride),
+                q_pe_stride=int(q_pe_token_stride),
+                latent_cache_stride=int(latent_row_stride),
+                emit_q_base=not from_kb,
+                full_token_tiles=full_token_tiles,
+                late_wait=from_kb,
+            )
+            kernels[spec] = _kernel._compile_for(spec, int(device_index))
     return CompiledMlaRopeGeneration(device_index=int(device_index), kernels=kernels)
 
 
@@ -85,7 +95,7 @@ def _latent_row_stride(latent_cache: torch.Tensor) -> int:
 
 
 class CuteDslMlaRopeGeneration(OpWrapper):
-    """One decode step's MLA preprocessing at MTP width 2, generation rows only.
+    """One decode step's MLA preprocessing at MTP width 1, 2, 4 or 6, generation rows only.
 
     Takes the stock `mla_rope_generation` positional list without
     `residual_dim` (38 arguments), plus the `compiled` handle. Each sequence
@@ -108,11 +118,15 @@ class CuteDslMlaRopeGeneration(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The target runs this only on a pure decode step at MTP width 2, 1 to 32
+    # The target runs this only on a pure decode step at MTP width 2 (MTP1) or
+    # max_draft_len + 1 (MTP3 / MTP5: 4 / 6, verify and draft step 0), and at
+    # MTP3 / MTP5 on the MTP layer's 1-token draft steps (width 1), 1 to 32
     # sequences, with `q_pe` the rope half of the q_b output (head stride 256,
     # token stride 16 * 256) and the latent the kv_a output's tail (row
     # stride 2048 + 576 = 2624). The cells cover both token-tile variants and
-    # a pool with more than one layer.
+    # a pool with more than one layer. At width 4 / 6 a K-B decode cell serves
+    # the rows only up to 64 (16 / 10 sequences); the full batch's 128 / 192
+    # rows take the prefill K-B, so the kernel emits the q-base itself there.
     _GLM = dict(
         num_heads=16,
         kv_lora_rank=512,
@@ -123,8 +137,57 @@ class CuteDslMlaRopeGeneration(OpWrapper):
         predicted_tokens_per_seq=MTP_WIDTH,
         latent_row_stride=2624,
     )
+    _GLM_MTP3 = dict(_GLM, predicted_tokens_per_seq=4)
+    _GLM_MTP5 = dict(_GLM, predicted_tokens_per_seq=6)
+    _GLM_DRAFT1 = dict(_GLM, predicted_tokens_per_seq=1)
 
     CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="MTP3 / MTP5's 1-token draft step, 32 sequences x 1: one full tile, the "
+            "q-base from the K-B decode cell",
+            spec=dict(
+                num_seqs=32,
+                cached=[13 + 29 * i for i in range(32)],
+                num_layers=2,
+                layer_idx=1,
+                q_base_from_kb=True,
+                **_GLM_DRAFT1,
+            ),
+        ),
+        Cell(
+            why="a 1-token draft step at 17 sequences: the partial tile, the kernel "
+            "emitting the q-base",
+            spec=dict(
+                num_seqs=17,
+                cached=[31 + 37 * i for i in range(17)],
+                num_layers=1,
+                layer_idx=0,
+                **_GLM_DRAFT1,
+            ),
+        ),
+        Cell(
+            why="the full decode batch with the q-base from the K-B GEMM: the late-wait "
+            "variant leaves the base bytes alone",
+            spec=dict(
+                num_seqs=32,
+                cached=[7 + 29 * i for i in range(32)],
+                num_layers=1,
+                layer_idx=0,
+                q_base_from_kb=True,
+                **_GLM,
+            ),
+        ),
+        Cell(
+            why="3 sequences with the q-base from the K-B GEMM: the late-wait partial tile",
+            spec=dict(
+                num_seqs=3,
+                cached=[30, 31, 32],
+                num_layers=1,
+                layer_idx=0,
+                q_base_from_kb=True,
+                **_GLM,
+            ),
+        ),
         Cell(
             why="3 sequences, 6 rows: the partial-tile variant; the two rows of a "
             "sequence share a page, straddle a page boundary, or start a fresh page",
@@ -161,16 +224,80 @@ class CuteDslMlaRopeGeneration(OpWrapper):
                 **_GLM,
             ),
         ),
+        Cell(
+            why="MTP3, the full decode batch: 32 sequences x 4, four full tiles; the prefill "
+            "K-B serves 128 rows, so the kernel emits the q-base",
+            spec=dict(
+                num_seqs=32,
+                cached=[3 + 29 * i for i in range(32)],
+                num_layers=1,
+                layer_idx=0,
+                **_GLM_MTP3,
+            ),
+        ),
+        Cell(
+            why="MTP5, the full decode batch: 32 sequences x 6, six full tiles, the kernel "
+            "emitting the q-base",
+            spec=dict(
+                num_seqs=32,
+                cached=[11 + 29 * i for i in range(32)],
+                num_layers=1,
+                layer_idx=0,
+                **_GLM_MTP5,
+            ),
+        ),
+        Cell(
+            why="MTP3 at 16 sequences, 64 rows: a K-B decode cell writes the q-base, the "
+            "late-wait full tiles at width 4",
+            spec=dict(
+                num_seqs=16,
+                cached=[29 + 31 * i for i in range(16)],
+                num_layers=1,
+                layer_idx=0,
+                q_base_from_kb=True,
+                **_GLM_MTP3,
+            ),
+        ),
+        Cell(
+            why="MTP5 at 8 sequences, 48 rows: a K-B decode cell writes the q-base, the "
+            "late-wait partial tile at width 6",
+            spec=dict(
+                num_seqs=8,
+                cached=[6 + 61 * i for i in range(8)],
+                num_layers=1,
+                layer_idx=0,
+                q_base_from_kb=True,
+                **_GLM_MTP5,
+            ),
+        ),
+        Cell(
+            why="MTP5 at 5 sequences, 30 rows, written at layer 1 of a three-layer pool: the "
+            "partial tile; each sequence's 6 rows cross a page boundary at another offset",
+            spec=dict(
+                num_seqs=5,
+                cached=[27, 28, 30, 31, 32],
+                num_layers=3,
+                layer_idx=1,
+                **_GLM_MTP5,
+            ),
+        ),
     )
 
     note = """
-    The target compiles one handle, at its first forward, for its own
-    block-table width, `q_pe` strides and latent row stride; both token-tile
+    The target compiles one handle per MTP width, at its first forward, for its
+    own block-table width, `q_pe` strides and latent row stride; both token-tile
     variants are in it. It calls this op only when every sequence carries
-    exactly 2 tokens (`gen_p == 2`, a pure decode step); every other width,
-    and the mixed context+generation batch, takes the stock
-    `mla_rope_generation` at the call site. An operand layout outside the
-    handle raises here; it never compiles.
+    exactly that many tokens (`gen_p` 2, or 4 / 6 at MTP3 / MTP5, a pure decode
+    step; at MTP3 / MTP5 also 1, the MTP layer's 1-token draft steps, where the
+    stock op needed the strided latent packed first). Every other width (no
+    speculation's 1-token trunk steps) and the mixed context+generation batch
+    take the stock `mla_rope_generation` at the call site. An operand layout
+    outside the handle raises here; it never compiles.
+
+    On those steps, where a decode K-B cell serves the row count (1..64), the K-B GEMM
+    writes the e4m3 q-base (`q_base_from_kb`): the kernel then skips its q-base groups and
+    waits for the GEMM only at its end, so the two run concurrently (12.93 -> 11.94 us per
+    layer on B300 at MTP 2).
 
     The runner is prepared on every call: it binds the addresses of this
     call's allocations, so a CUDA-graph replay reproduces them. Preparing reads
@@ -229,6 +356,7 @@ class CuteDslMlaRopeGeneration(OpWrapper):
         v_head_dim: int,
         rope_append: bool,
         compiled: CompiledMlaRopeGeneration,
+        q_base_from_kb: bool = False,
     ) -> None:
         # The specialization the kernel would pick from these operands; it has
         # to be one the handle holds, or preparing the runner would compile.
@@ -240,8 +368,9 @@ class CuteDslMlaRopeGeneration(OpWrapper):
             q_pe_ld=int(q_pe.stride(-2)),
             q_pe_stride=int(q_pe.stride(0)),
             latent_cache_stride=stride,
-            emit_q_base=True,
+            emit_q_base=not q_base_from_kb,
             full_token_tiles=int(fused_q.shape[0]) % TOKENS_PER_CTA == 0,
+            late_wait=q_base_from_kb,
         )
         kernel = compiled.kernels.get(spec)
         if kernel is None or fused_q.device.index != compiled.device_index:
@@ -290,6 +419,8 @@ class CuteDslMlaRopeGeneration(OpWrapper):
             rope_append,
             # A packed latent keys as `HEAD_SIZE`; a strided one as its pitch.
             split_source=stride != HEAD_SIZE,
+            emit_q_base=not q_base_from_kb,
+            late_wait=q_base_from_kb,
         )
         runner.compiled = kernel
         runner()
@@ -335,13 +466,15 @@ class CuteDslMlaRopeGeneration(OpWrapper):
         v_head_dim: int,
         rope_append: bool,
         compiled: CompiledMlaRopeGeneration,
+        q_base_from_kb: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Everything the call writes, keyed by the argument it lands in.
 
         The op returns None and writes buffers, so this returns what each
         buffer should hold afterwards:
 
-        * `quant_q_buffer`: e4m3 `[T, H, kv_lora + rope]`;
+        * `quant_q_buffer`: e4m3 `[T, H, kv_lora + rope]` (with `q_base_from_kb` the
+          `[..., :kv_lora]` base as the buffer held it: the K-B GEMM writes it);
         * `latent_cache`: the e4m3 `[T, kv_lora + rope]` row each token appends,
           with `positions` `[T]` the absolute position it lands at. The pool
           addressing arguments only say where that is; the test reads the slot
@@ -382,7 +515,8 @@ class CuteDslMlaRopeGeneration(OpWrapper):
 
         q_rot = rotate(q_pe, cos[:, None, :], sin[:, None, :])
         k_rot = rotate(latent_cache[:, c : c + rope], cos, sin)
-        quant_q = e4m3(torch.cat([fused_q[..., :c], q_rot], dim=-1))
+        base = quant_q_buffer[..., :c].clone() if q_base_from_kb else e4m3(fused_q[..., :c])
+        quant_q = torch.cat([base, e4m3(q_rot)], dim=-1)
         rows = e4m3(torch.cat([latent_cache[:, :c], k_rot], dim=-1))
 
         dev = fused_q.device
@@ -444,6 +578,7 @@ class CuteDslMlaRopeGeneration(OpWrapper):
         v_head_dim: int,
         rope_append: bool,
         compiled: CompiledMlaRopeGeneration,
+        q_base_from_kb: bool = False,
     ) -> None:
         """The inputs the kernel takes and answers wrongly. Reads the lengths
         back to the host, which is why it is never on the serving path."""

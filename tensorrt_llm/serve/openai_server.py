@@ -423,7 +423,8 @@ def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
 
     1. Asking the caller to prepend ``begin_prefix`` (e.g.
        ``<tool_call>\n{"name":"X", "arguments":``) to the rendered prompt
-       so the model starts generation *already inside* the tool call.
+       so the model starts generation *already inside* the tool call. It is
+       the parser's `forced_call_prefix` followed by its `begin`.
     2. Constraining what follows with a plain JSON-schema (or json-object)
        guided-decoding mode so the arguments are guaranteed to be valid
        against ``tool.function.parameters``.
@@ -467,7 +468,8 @@ def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
             f"not present in `tools`. Available functions: {available}.")
 
     info = parser.structure_info()(forced_tool.function.name)
-    begin_prefix = info.begin
+    begin_prefix = parser.forced_call_prefix(
+        forced_tool.function.name) + info.begin
 
     if forced_tool.function.parameters:
         guided = GuidedDecodingParams(json=forced_tool.function.parameters)
@@ -2502,6 +2504,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
+            if raw_request is not None:
+                # The executor client id, which the perf metrics, the
+                # post-processor hook records and the disconnect log carry. A
+                # caller that names its reply after the request (the Anthropic
+                # route) reads it here; a non-streamed chat completion's own id
+                # is random.
+                raw_request.state.executor_client_id = promise.request_id
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -2562,10 +2571,14 @@ class OpenAIServer(_VideoRoutesMixin):
             return anthropic_error_response("Internal server error",
                                             "api_error", 500)
 
+        # The reply is named after the request (see anthropic_message_id).
+        executor_client_id = getattr(raw_request.state, "executor_client_id",
+                                     None)
         if isinstance(response, StreamingResponse):
             return StreamingResponse(
                 content=reframe_openai_stream(response.body_iterator,
-                                              model=self.model),
+                                              model=self.model,
+                                              request_id=executor_client_id),
                 media_type="text/event-stream",
             )
 
@@ -2582,7 +2595,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            anthropic_response = convert_chat_response(
+                chat_response, request_id=executor_client_id)
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error("Invalid response from OpenAI chat pipeline:\n"
                          f"{traceback.format_exc()}")
@@ -2732,7 +2746,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            anthropic_response = convert_chat_response(
+                chat_response,
+                request_id=getattr(raw_request.state, "executor_client_id",
+                                   None))
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error(
                 "Invalid response from OpenAI chat pipeline in batch:\n"

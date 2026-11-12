@@ -658,8 +658,8 @@ Except in exceptional circumstances, use the built-in exception types.  For whic
 
 #### Static Typing
 
-1. Static type checking at pre-commit time is opt-in by submodule PICs. This is highly recommended because static type checking eliminates an entire class of bugs and makes your code more readable and maintainable overall.
-2. The presubmit system currently uses mypy.  However, many developers use pyright variants in their editors, so the code also has some `#pyright:` annotations.  As we don’t currently enforce pyright, maintaining these is best effort.  But if you notice they are broken, please fix them.
+1. Pre-commit and presubmit run Pyrefly on product Python code. Static type checking eliminates an entire class of bugs and makes code more readable and maintainable.
+2. Many developers use pyright variants in their editors, so the code also has some `#pyright:` annotations. As we don’t currently enforce pyright, maintaining these is best effort. But if you notice they are broken, please fix them.
 3. Do not use `typing.Any` if you can avoid it. Similarly, avoid bypassing the type checker with `# type: ignore` annotations.
 4. Always annotate functions. Make the return type `None` if the function does not return anything (if you leave it empty, the type checker will infer the return type as `Any`).
 5. Annotate class members and other variables when necessary. Always annotate `dataclass` and `NamedTuple` members.

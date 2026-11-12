@@ -23,7 +23,6 @@ from typing import Optional, Tuple
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch.distributed.ops import (
     _get_mnnvl_workspace_comm,
     _make_mnnvl_mcast_buffer,
@@ -32,6 +31,8 @@ from tensorrt_llm._torch.distributed.ops import (
     get_or_scale_allreduce_mnnvl_workspace,
 )
 from tensorrt_llm.mapping import Mapping
+
+from ... import native_ops
 
 # Lamport buffers of an MNNVL all-reduce workspace.
 NUM_LAMPORT_BUFFERS = 3
@@ -50,7 +51,7 @@ def hop_supported(num_tokens: int, hidden_size: int, tp_size: int) -> bool:
     elements per thread, covering the row exactly. Hidden 6144 on 16 ranks: 1 to 8 rows. Another
     shape runs on the built-in ``AllReduce``.
     """
-    return bool(torch.ops.trtllm.glm_mnnvl_hop_supported(num_tokens, hidden_size, tp_size))
+    return bool(native_ops.glm_mnnvl_hop_supported(num_tokens, hidden_size, tp_size))
 
 
 def _all_reduce_workspace(mapping: Mapping, num_tokens: int, hidden_size: int) -> dict:

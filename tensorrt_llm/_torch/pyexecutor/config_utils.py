@@ -11,6 +11,7 @@ import transformers
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          SparseAttentionConfig,
                                           is_speculators_dspark_config,
                                           translate_speculators_dspark_config)
 from tensorrt_llm.logger import logger
@@ -425,6 +426,18 @@ def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:
 def is_minimax_m3(sparse_attention_config):
     """True when the sparse attention config selects the MiniMax-M3 algorithm."""
     return sparse_attention_config is not None and sparse_attention_config.algorithm == "minimax_m3"
+
+
+def is_decode_only(
+        sparse_attention_config: Optional[SparseAttentionConfig]) -> bool:
+    """True when the sparse attention config restricts the worker to decode.
+
+    Sparse KV cache offload keeps attention history in host memory and admits
+    one query token per request per step, so an offloading worker serves the
+    decode phase of disaggregated serving and never runs a context batch.
+    """
+    return (sparse_attention_config is not None and
+            sparse_attention_config.get_kv_cache_offload_config() is not None)
 
 
 def is_qwen3_next(config):
@@ -1048,6 +1061,8 @@ def load_pretrained_config(model_name_or_path: str,
         model_name_or_path, **kwargs)
     model_type = config_dict.get("model_type")
     architectures = config_dict.get("architectures") or []
+    model_kwargs = kwargs.get("model_kwargs") or {}
+    requested_architectures = model_kwargs.get("architectures") or architectures
 
     if checkpoint_format in (CheckpointFormat.MISTRAL,
                              CheckpointFormat.MISTRAL_LARGE_3):
@@ -1085,6 +1100,22 @@ def load_pretrained_config(model_name_or_path: str,
         config_dict.pop("layer_types", None)
         model_config = _CONFIG_REGISTRY[model_type].from_dict(
             config_dict, **kwargs)
+    elif (requested_architectures
+          and requested_architectures[0] == "PplxDeciderForDecision"):
+        # pplx-decider packages a text-only decision model in a composite
+        # Qwen3.5 config. Flatten the nested text config before the generic
+        # Qwen3.5 VLM branches preserve the vision config.
+        from tensorrt_llm._torch.models.modeling_pplx_decider import \
+            PPLX_DECIDER_NUM_LABELS
+        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
+            Qwen35ConfigCompat
+        normalized_config = Qwen35ConfigCompat.normalize(
+            config_dict, require_text_config=True)
+        normalized_config["architectures"] = ["PplxDeciderForDecision"]
+        normalized_config["num_labels"] = PPLX_DECIDER_NUM_LABELS
+        model_config = transformers.Qwen3NextConfig.from_dict(normalized_config)
+        model_config.torch_dtype = _resolve_composite_torch_dtype(
+            config_dict, normalized_config)
     elif (model_type == "qwen3_5_moe" and
           (("text_config" in config_dict and "vision_config" in config_dict) or
            (architectures
