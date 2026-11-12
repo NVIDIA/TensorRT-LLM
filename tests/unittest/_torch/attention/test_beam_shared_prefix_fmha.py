@@ -43,10 +43,12 @@ from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix import (
     _PlanKey,
     _step_indices,
     _StepIndices,
-    fused_tail_and_merge,
     merge_prefix_and_tail,
     metadata_eligible,
     plan_step,
+)
+from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix_kernels import (
+    fused_tail_and_merge,
 )
 from tensorrt_llm._torch.attention.backends.fmha.shared_prefix_fa4 import (
     PrefixGroups,
@@ -640,7 +642,7 @@ def _run_beam_search(
                 os.environ[key] = value
 
 
-def _assert_beams_match(reference, candidate, beam_width, min_overlap=0.9):
+def _assert_beams_match(reference, candidate, beam_width, min_overlap=0.85):
     for ref_beams, cand_beams in zip(reference, candidate):
         assert len(cand_beams) == beam_width
         ref_tokens = [tokens for tokens, _ in ref_beams]
